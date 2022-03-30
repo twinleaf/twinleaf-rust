@@ -13,10 +13,10 @@ enum ReadResult {
 
 #[derive(Debug)]
 enum ReadError {
-    //    IO(io::Error),
-//    Encoding(Vec<u8>),
-//    CRC(Vec<u8>),
-//    Validation(Vec<u8>),
+    IO(io::Error),
+    //    Encoding(Vec<u8>),
+    //    CRC(Vec<u8>),
+    //    Validation(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -209,8 +209,31 @@ impl mio::event::Source for TioSerial {
     }
 }
 
+use std::net::{SocketAddr, ToSocketAddrs};
+
+fn tio_addr(addr: &str) -> Result<SocketAddr, io::Error> {
+    let mut iter = match addr.to_socket_addrs() {
+        Ok(iter) => iter,
+        Err(err) => {
+            let addr = format!("{}:7855", addr);
+            match addr.to_socket_addrs() {
+                Ok(iter) => iter,
+                _ => {
+                    return Err(err);
+                }
+            }
+        }
+    };
+    match iter.next() {
+        Some(sa) => Ok(sa),
+        None => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "address resolution failed",
+        )),
+    }
+}
+
 use mio::net::TcpStream;
-use std::net::SocketAddr;
 
 pub struct TioTCP {
     stream: TcpStream,
@@ -219,9 +242,8 @@ pub struct TioTCP {
 }
 
 impl TioTCP {
-    pub fn new(addr: &str) -> Result<TioTCP, io::Error> {
-        let address = SocketAddr::new(addr.parse().unwrap(), 7855);
-        let stream = TcpStream::connect(address)?;
+    pub fn new(address: &SocketAddr) -> Result<TioTCP, io::Error> {
+        let stream = TcpStream::connect(*address)?;
         Ok(TioTCP {
             stream: stream,
             rxbuf: IOBuf::new(),
@@ -300,7 +322,79 @@ impl mio::event::Source for TioTCP {
     }
 }
 
-//pub struct TioUDP {}
+use mio::net::UdpSocket;
+
+pub struct TioUDP {
+    sock: UdpSocket,
+}
+
+impl TioUDP {
+    pub fn new(address: &SocketAddr) -> Result<TioUDP, io::Error> {
+        let sock = UdpSocket::bind("0.0.0.0:0".parse().unwrap())?;
+        sock.connect(*address)?;
+        Ok(TioUDP { sock })
+    }
+}
+
+impl TioRawPort for TioUDP {
+    fn recv(&mut self) -> Result<ReadResult, ReadError> {
+        let mut buf = [0u8; 1024];
+        let size = match self.sock.recv(&mut buf) {
+            Ok(s) => s,
+            Err(err) => {
+                return Err(ReadError::IO(err));
+            }
+        };
+        if size < 4 {
+            Ok(ReadResult::WouldBlock)
+        } else {
+            let payload_len = (buf[2] as usize) + (buf[3] as usize) * 256;
+            let routing_size = (buf[1] & 0xF) as usize;
+            if size == 4 + payload_len + routing_size {
+                Ok(ReadResult::Packet(buf[..size].to_vec()))
+            } else {
+                Ok(ReadResult::WouldBlock)
+            }
+        }
+    }
+
+    fn send(&mut self, pkt: &[u8]) -> Result<WriteResult, WriteError> {
+        match self.sock.send(pkt) {
+            Ok(_size) => Ok(WriteResult::Ok), // TODO
+            _ => {
+                panic!("TODO");
+            }
+        }
+    }
+
+    fn drain(&self) -> Result<WriteResult, WriteError> {
+        Ok(WriteResult::Ok)
+    }
+}
+
+impl mio::event::Source for TioUDP {
+    fn register(
+        &mut self,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()> {
+        self.sock.register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()> {
+        self.sock.reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
+        self.sock.deregister(registry)
+    }
+}
 
 struct TioPort {
     thd: thread::JoinHandle<()>,
@@ -308,6 +402,8 @@ struct TioPort {
     rx: crossbeam::channel::Receiver<Vec<u8>>, // TODO: via Fn()
     waker: mio::Waker,
 }
+
+use std::time::{Duration, Instant};
 
 impl TioPort {
     fn poller_thread<T: TioRawPort + mio::event::Source>(
@@ -322,22 +418,31 @@ impl TioPort {
             .register(&mut port, mio::Token(1), mio::Interest::READABLE)
             .unwrap();
 
+        let mut last_sent = Instant::now();
         loop {
-            poll.poll(&mut events, None).unwrap();
+            let mut until_hb = Duration::from_millis(100).saturating_sub(last_sent.elapsed());
+            if until_hb == Duration::ZERO {
+                port.send(&[5u8, 0, 0, 0]);
+                last_sent = Instant::now();
+                until_hb = Duration::from_millis(100);
+            }
+            poll.poll(&mut events, Some(until_hb)).unwrap();
 
-            match events.iter().next().unwrap().token() {
-                mio::Token(0) => {
-                    for pkt in tx.try_iter() {
-                        port.send(&pkt);
+            for event in events.iter() {
+                match event.token() {
+                    mio::Token(0) => {
+                        for pkt in tx.try_iter() {
+                            port.send(&pkt);
+                        }
                     }
-                }
-                mio::Token(1) => {
-                    while let Ok(ReadResult::Packet(pkt)) = port.recv() {
-                        rx.send(pkt);
+                    mio::Token(1) => {
+                        while let Ok(ReadResult::Packet(pkt)) = port.recv() {
+                            rx.send(pkt);
+                        }
                     }
-                }
-                mio::Token(x) => {
-                    panic!("Unexpected token {}", x);
+                    mio::Token(x) => {
+                        panic!("Unexpected token {}", x);
+                    }
                 }
             }
         }
@@ -374,23 +479,40 @@ pub mod packet;
 
 pub fn stub() {
     println!("TIO Module");
-    //let port = TioPort::new(TioTCP::new("127.0.0.1").unwrap()).unwrap();
-    let port = TioPort::new(TioSerial::new("/dev/ttyUSB0").unwrap()).unwrap();
-    let mut sent = false;
+    //let port = TioPort::new(TioSerial::new("/dev/ttyUSB0").unwrap()).unwrap();
+    //let port = TioPort::new(TioTCP::new(&tio_addr("localhost").unwrap()).unwrap()).unwrap();
+    let port = TioPort::new(TioUDP::new(&tio_addr("tio-SYNC8.local").unwrap()).unwrap()).unwrap();
+    let mut send_counter = 0u32;
     while let Ok(pkt) = TioPacket::deserialize(&port.recv()) {
-        if (!sent) {
-            port.send(TioPacket::make_rpc("dev.desc".to_string(), &[]).serialize());
-            sent = true;
+        let mut routing = pkt
+            .routing
+            .iter()
+            .fold(String::new(), |acc, hop| acc + &format!("/{}", hop));
+        if routing.len() == 0 {
+            routing = "/".to_string();
+            match send_counter {
+                20 => {
+                    port.send(TioPacket::make_rpc("dev.desc".to_string(), &[]).serialize());
+                    send_counter += 1;
+                }
+                21 => {}
+                _ => send_counter += 1,
+            }
         }
         match pkt.payload {
             TioData::Stream(sample) => {
                 println!(
-                    "Stream {}: sample {} {:?}",
-                    sample.stream_id, sample.sample_n, sample.payload
+                    "{}: Stream {}: sample {} {:?}",
+                    routing, sample.stream_id, sample.sample_n, sample.payload
                 );
             }
             TioData::RpcReply(rep) => {
-                println!("Reply: {:?}", rep.reply);
+                let human_readable = if let Ok(s) = std::str::from_utf8(&rep.reply) {
+                    s
+                } else {
+                    ""
+                };
+                println!("Reply: **{}** {:?}", human_readable, rep.reply);
                 break;
             }
             TioData::RpcRequest(_) => {
