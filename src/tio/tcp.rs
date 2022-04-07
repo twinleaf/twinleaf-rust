@@ -1,8 +1,8 @@
+use super::{proto, IOBuf, Packet, RawPort, RecvError, SendError};
+use mio::net::TcpStream;
 use std::io;
 use std::io::Write;
-use super::{RecvError,SendError,IOBuf, proto, Packet,RawPort};
 use std::net::SocketAddr;
-use mio::net::TcpStream;
 
 pub struct Port {
     stream: TcpStream,
@@ -29,16 +29,12 @@ impl Port {
         let start = &mut self.rxbuf.start;
         let end = self.rxbuf.end;
         match Packet::deserialize(&buf[*start..end]) {
-            Ok((pkt,size)) => {
+            Ok((pkt, size)) => {
                 *start += size;
                 Ok(pkt)
             }
-            Err(proto::Error::NeedMore) => {
-                Err(RecvError::NotReady)
-            }
-            Err(perr) => {
-                Err(RecvError::Protocol(perr))
-            }
+            Err(proto::Error::NeedMore) => Err(RecvError::NotReady),
+            Err(perr) => Err(RecvError::Protocol(perr)),
         }
     }
 }
@@ -49,7 +45,7 @@ impl RawPort for Port {
         if let Err(RecvError::NotReady) = res {
             if let Err(e) = self.rxbuf.refill(&mut self.stream) {
                 //println!("PORT  RET ERR: {:?}", e);
-                return Err(e)
+                return Err(e);
             }
             res = self.recv_buffered();
         }
@@ -67,7 +63,7 @@ impl RawPort for Port {
                     panic!("TODO")
                 }
             }
-            Err(err) => { Err(SendError::IO(err)) }
+            Err(err) => Err(SendError::IO(err)),
         }
     }
 

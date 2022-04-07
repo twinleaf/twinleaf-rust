@@ -79,65 +79,89 @@ pub enum Error {
 
 impl Packet {
     pub fn deserialize(raw: &[u8]) -> Result<(Packet, usize), Error> {
-        if raw.len() < 1 { return Err(Error::NeedMore) }
+        if raw.len() < 1 {
+            return Err(Error::NeedMore);
+        }
         let packet_type = raw[0];
-        if let 9 | 10 | 13 = packet_type { return Err(Error::InvalidPacketType) }
-        if raw.len() < 2 { return Err(Error::NeedMore) }
+        if let 9 | 10 | 13 = packet_type {
+            return Err(Error::InvalidPacketType);
+        }
+        if raw.len() < 2 {
+            return Err(Error::NeedMore);
+        }
         let ttl = raw[1] >> 4;
         let routing_len = (raw[1] & 0xF) as usize;
-        if routing_len > 8 { return Err(Error::RoutingTooBig) }
-        if raw.len() < 4 { return Err(Error::NeedMore) }
+        if routing_len > 8 {
+            return Err(Error::RoutingTooBig);
+        }
+        if raw.len() < 4 {
+            return Err(Error::NeedMore);
+        }
         let payload_len = u16::from_le_bytes(raw[2..4].try_into().unwrap()) as usize;
         let routing_start = 4 + payload_len;
         let packet_len = routing_start + routing_len;
-        if packet_len > 512 { return Err(Error::PayloadTooBig) }
+        if packet_len > 512 {
+            return Err(Error::PayloadTooBig);
+        }
         if raw.len() < packet_len {
             return Err(Error::NeedMore);
         }
         let payload = match packet_type {
             3 => {
-                if routing_start < 6 { return Err(Error::PayloadTooSmall) }            
-                Payload::RpcReply(RpcReplyPayload{
+                if routing_start < 6 {
+                    return Err(Error::PayloadTooSmall);
+                }
+                Payload::RpcReply(RpcReplyPayload {
                     id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
                     reply: raw[6..routing_start].to_vec(),
                 })
             }
             ptype if ptype >= 128 => {
-                if routing_start < 9 { return Err(Error::PayloadTooSmall) }
-                Payload::StreamData(StreamDataPayload{
+                if routing_start < 9 {
+                    return Err(Error::PayloadTooSmall);
+                }
+                Payload::StreamData(StreamDataPayload {
                     stream_id: ptype - 128,
                     sample_n: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
                     data: raw[8..routing_start].to_vec(),
                 })
             }
-            ptype => {
-                Payload::Unknown(GenericPayload{
-                    packet_type: ptype,
-                    payload: raw[4..routing_start].to_vec(),
-                })
-            }
+            ptype => Payload::Unknown(GenericPayload {
+                packet_type: ptype,
+                payload: raw[4..routing_start].to_vec(),
+            }),
         };
-        
-        Ok((Packet {
-            payload: payload,
-            routing: raw[routing_start..packet_len].to_vec(),
-            ttl: ttl,
-        },packet_len))
+
+        Ok((
+            Packet {
+                payload: payload,
+                routing: raw[routing_start..packet_len].to_vec(),
+                ttl: ttl,
+            },
+            packet_len,
+        ))
     }
 
     fn prepare_header(&self, packet_type: u8, payload_len: usize) -> Vec<u8> {
-        vec![packet_type, (self.ttl & 0xF) << 4 | (self.routing.len() as u8), (payload_len & 0xFF) as u8, ((payload_len & 0xFF00) >> 8) as u8]
+        vec![
+            packet_type,
+            (self.ttl & 0xF) << 4 | (self.routing.len() as u8),
+            (payload_len & 0xFF) as u8,
+            ((payload_len & 0xFF00) >> 8) as u8,
+        ]
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         match &self.payload {
             Payload::RpcRequest(req) => {
-                let mut ret = self.prepare_header(2, 4 +
-                    if let RpcMethod::Name(name) = &req.method {
+                let mut ret = self.prepare_header(
+                    2,
+                    4 + if let RpcMethod::Name(name) = &req.method {
                         name.len()
                     } else {
                         0
-                    });
+                    },
+                );
                 ret.extend(req.id.to_le_bytes());
                 match &req.method {
                     RpcMethod::Id(id) => {

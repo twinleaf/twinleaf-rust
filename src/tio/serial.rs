@@ -1,8 +1,8 @@
+use super::{proto, IOBuf, Packet, RawPort, RecvError, SendError};
+use crc::{Crc, CRC_32_ISO_HDLC};
+use mio_serial::SerialPortBuilderExt;
 use std::io;
 use std::io::Write;
-use super::{RecvError,SendError,IOBuf, proto, Packet,RawPort};
-use mio_serial::SerialPortBuilderExt;
-use crc::{Crc, CRC_32_ISO_HDLC};
 
 pub struct Port {
     port: mio_serial::SerialStream,
@@ -12,7 +12,7 @@ pub struct Port {
 
 impl Port {
     pub fn new(port_name: &str) -> Result<Port, io::Error> {
-        Ok(Port{
+        Ok(Port {
             port: mio_serial::new(port_name, 115200).open_native_async()?,
             rxbuf: IOBuf::new(),
         })
@@ -31,14 +31,14 @@ impl Port {
             if (buf[offset] == 0xC0) || (pkt.len() > 600) {
                 *start = offset + 1;
                 if let Ok(parseres) = Packet::deserialize(&pkt) {
-                    return Ok(parseres.0)
+                    return Ok(parseres.0);
                 }
                 pkt.truncate(0);
                 esc = false;
                 offset = *start;
                 continue;
             }
-//            let ch = char::from_u32_unchecked(buf[offset] as u32);
+            //            let ch = char::from_u32_unchecked(buf[offset] as u32);
             if esc {
                 if buf[offset] == 0xDC {
                     pkt.push(0xC0);
@@ -64,7 +64,7 @@ impl RawPort for Port {
         let mut res = self.recv_buffered();
         if let Err(RecvError::NotReady) = res {
             if let Err(e) = self.rxbuf.refill(&mut self.port) {
-                return Err(e)
+                return Err(e);
             }
             res = self.recv_buffered();
         }
@@ -101,7 +101,7 @@ impl RawPort for Port {
                     panic!("TODO");
                 }
             }
-            Err(err) => { Err(SendError::IO(err)) }
+            Err(err) => Err(SendError::IO(err)),
         }
     }
 

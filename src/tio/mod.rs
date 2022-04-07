@@ -91,7 +91,7 @@ pub struct TioPort {
     thd: thread::JoinHandle<()>,
     tx: crossbeam::channel::Sender<Option<Packet>>,
     // TODO: not public
-    pub rx: crossbeam::channel::Receiver<Result<Packet,RecvError>>, // TODO: via Fn()
+    pub rx: crossbeam::channel::Receiver<Result<Packet, RecvError>>, // TODO: via Fn()
     waker: mio::Waker,
 }
 
@@ -99,7 +99,7 @@ impl TioPort {
     fn poller_thread<T: RawPort + mio::event::Source>(
         mut port: T,
         mut poll: mio::Poll,
-        rx: crossbeam::channel::Sender<Result<Packet,RecvError>>,
+        rx: crossbeam::channel::Sender<Result<Packet, RecvError>>,
         tx: crossbeam::channel::Receiver<Option<Packet>>,
     ) {
         use crossbeam::channel::TrySendError;
@@ -120,17 +120,22 @@ impl TioPort {
                 until_hb = Duration::from_millis(100);
             }
             // Note: here we always sleep an additional millisecond, otherwise we just poll in a loop for one millisecond on some systems when until_hb is above zero but below 1 ms.
-            poll.poll(&mut events, Some(until_hb+Duration::from_millis(1))).unwrap();
+            poll.poll(&mut events, Some(until_hb + Duration::from_millis(1)))
+                .unwrap();
 
             //println!("POLL {:?}", until_hb);
-            
+
             for event in events.iter() {
                 match event.token() {
                     mio::Token(0) => {
                         for pkt in tx.try_iter() {
                             match pkt {
-                                Some(pkt) => { port.send(&pkt); }
-                                None => { break 'ioloop; }
+                                Some(pkt) => {
+                                    port.send(&pkt);
+                                }
+                                None => {
+                                    break 'ioloop;
+                                }
                             }
                         }
                     }
@@ -151,14 +156,23 @@ impl TioPort {
                                         }
                                         Ok(_) => {
                                             if rx_drop_count > 0 {
-                                                println!("Resumed RX. Dropped {} packets.", rx_drop_count);
+                                                println!(
+                                                    "Resumed RX. Dropped {} packets.",
+                                                    rx_drop_count
+                                                );
                                                 rx_drop_count = 0;
                                             }
                                         }
                                     }
                                 }
-                                Err(RecvError::NotReady)  => { break; }
-                                Err(e) => { rx.send(Err(e)); println!("rx error"); break 'ioloop;}
+                                Err(RecvError::NotReady) => {
+                                    break;
+                                }
+                                Err(e) => {
+                                    rx.send(Err(e));
+                                    println!("rx error");
+                                    break 'ioloop;
+                                }
                             };
                         }
                     }
@@ -173,8 +187,8 @@ impl TioPort {
     pub fn new<T: RawPort + mio::event::Source + Send + 'static>(
         raw_port: T,
     ) -> Result<TioPort, io::Error> {
-        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(10);
-        let (trx, rx) = crossbeam::channel::bounded::<Result<Packet,RecvError>>(10);
+        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(32);
+        let (trx, rx) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(32);
         let poll = mio::Poll::new()?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(0))?;
         io::Result::Ok(TioPort {
@@ -192,17 +206,17 @@ impl TioPort {
         self.waker.wake();
     }
 
-    pub fn recv(&self) -> Result<Packet,RecvError> {
+    pub fn recv(&self) -> Result<Packet, RecvError> {
         self.rx.recv().unwrap() // TODO
     }
-    
-//    fn recv_timeout(&self, timeout: Duration) -> Result<TioPacket, ReadError> {
-//    }
-    
+
+    //    fn recv_timeout(&self, timeout: Duration) -> Result<TioPacket, ReadError> {
+    //    }
+
     /*
     fn iter(&self) -> TioPortIterator {
     }
-    
+
     fn iter_timeout(&self, timeout: Duration) -> TioPortIterator {
     }
     */
