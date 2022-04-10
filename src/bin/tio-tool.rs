@@ -6,8 +6,9 @@ use std::env;
 use std::net::TcpListener;
 
 fn random_stuff() {
-    let port = tio::TioPort::new(tio::serial::Port::new("/dev/ttyUSB0").unwrap()).unwrap();
-    //let port = tio::TioPort::new(tio::tcp::Port::new(&tio_addr("localhost").unwrap()).unwrap()).unwrap();
+    //let port = tio::TioPort::new(tio::serial::Port::new("/dev/ttyUSB0").unwrap()).unwrap();
+    let port =
+        tio::TioPort::new(tio::tcp::Port::new(&tio_addr("127.0.0.1").unwrap()).unwrap()).unwrap();
     //let port = TioPort::new(TioUDP::new(&tio_addr("tio-SYNC8.local").unwrap()).unwrap()).unwrap();
     let mut send_counter = 0u32;
     loop {
@@ -71,7 +72,7 @@ fn random_stuff() {
 }
 
 // this is wrong in so many ways
-fn seqproxy(wasteful: bool) -> std::io::Result<()> {
+fn seqproxy() -> std::io::Result<()> {
     use crossbeam::select;
 
     let port = tio::TioPort::new(tio::serial::Port::new("/dev/ttyUSB0").unwrap()).unwrap();
@@ -87,47 +88,28 @@ fn seqproxy(wasteful: bool) -> std::io::Result<()> {
             _ => continue,
         };
 
-        if wasteful {
-            use crossbeam::channel::TryRecvError;
-            loop {
-                match port.rx.try_recv() {
-                    Ok(Ok(pkt)) => {
-                        client.send(pkt);
-                    }
-                    Err(TryRecvError::Empty) => {}
-                    _ => {
-                        panic!("Sensor error");
-                    }
+        // Initial drain of port buffer
+        while !port.rx.is_empty() {
+            port.recv();
+        }
+
+        loop {
+            select! {
+                recv(port.rx) -> res => {
+                    let pkt = res.unwrap().unwrap(); // port failing will close program
+                    println!("{}", tio::log_msg("port->client", &pkt));
+                    client.send(pkt);
                 }
-                match client.rx.try_recv() {
-                    Ok(Ok(pkt)) => {
-                        port.send(pkt);
-                    }
-                    Err(TryRecvError::Empty) => {}
-                    _ => {
-                        // client failing will listen for the next client
-                        println!("Client exiting");
-                        break;
-                    }
-                }
-            }
-        } else {
-            loop {
-                select! {
-                    recv(port.rx) -> res => {
-                        let pkt = res.unwrap().unwrap(); // port failing will close program
-                        client.send(pkt);
-                    }
-                    recv(client.rx) -> res => {
-                        match res {
-                            Ok(Ok(pkt)) => {
-                                port.send(pkt);
-                            }
-                            _ => {
-                                // client failing will listen for the next client
-                                println!("Client exiting");
-                                break;
-                            }
+                recv(client.rx) -> res => {
+                    match res {
+                        Ok(Ok(pkt)) => {
+                            println!("{}", tio::log_msg("client->port", &pkt));
+                            port.send(pkt);
+                        }
+                        _ => {
+                            // client failing will listen for the next client
+                            println!("Client exiting");
+                            break;
                         }
                     }
                 }
@@ -141,10 +123,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     match args[1].as_str() {
         "proxy" => {
-            seqproxy(false).unwrap();
-        }
-        "pproxy" => {
-            seqproxy(true).unwrap();
+            seqproxy().unwrap();
         }
         "test" => {
             random_stuff();

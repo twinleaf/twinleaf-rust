@@ -95,6 +95,10 @@ pub struct TioPort {
     waker: mio::Waker,
 }
 
+pub fn log_msg(desc: &str, what: &Packet) -> String {
+    format!("{:?} {}  -- {:?}", Instant::now(), desc, what.payload)
+}
+
 impl TioPort {
     fn poller_thread<T: RawPort + mio::event::Source>(
         mut port: T,
@@ -132,6 +136,7 @@ impl TioPort {
                             match pkt {
                                 Some(pkt) => {
                                     port.send(&pkt);
+                                    println!("{}", log_msg("sent to port", &pkt));
                                 }
                                 None => {
                                     break 'ioloop;
@@ -143,12 +148,15 @@ impl TioPort {
                         loop {
                             match port.recv() {
                                 Ok(pkt) => {
+                                    let dropped = log_msg("recv and dropped", &pkt);
+                                    let queued = log_msg("recv and enqueued", &pkt);
                                     match rx.try_send(Ok(pkt)) {
                                         Err(TrySendError::Full(_)) => {
                                             if rx_drop_count == 0 {
                                                 println!("Dropping rx packets.");
                                             }
                                             rx_drop_count += 1;
+                                            println!("{}", dropped);
                                         }
                                         Err(_) => {
                                             // TODO
@@ -162,6 +170,7 @@ impl TioPort {
                                                 );
                                                 rx_drop_count = 0;
                                             }
+                                            println!("{}", queued);
                                         }
                                     }
                                 }
