@@ -196,8 +196,8 @@ impl TioPort {
     pub fn new<T: RawPort + mio::event::Source + Send + 'static>(
         raw_port: T,
     ) -> Result<TioPort, io::Error> {
-        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(32);
-        let (trx, rx) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(32);
+        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(128);
+        let (trx, rx) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(128);
         let poll = mio::Poll::new()?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(0))?;
         io::Result::Ok(TioPort {
