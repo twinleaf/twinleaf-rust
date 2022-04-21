@@ -49,10 +49,10 @@ impl IOBuf {
             self.start = 0;
             self.end = len;
         }
-        //println!("REFILL READ: {} {}", self.start, self.end);
         match reader.read(&mut self.buf[self.end..]) {
             Ok(size) => {
                 if size > 0 {
+                    println!("REFILL READ: {} {} {}", self.start, self.end, size);
                     self.end += size;
                     Ok(self.end == IOBUF_SIZE)
                 } else {
@@ -61,6 +61,7 @@ impl IOBuf {
             }
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
+                    println!("NOT READY");
                     Err(RecvError::NotReady)
                 } else {
                     Err(RecvError::IO(e))
@@ -99,6 +100,10 @@ pub fn log_msg(desc: &str, what: &Packet) -> String {
     format!("{:?} {}  -- {:?}", Instant::now(), desc, what.payload)
 }
 
+pub fn log_msg2(desc: &str) {
+    println!("{:?} {}", Instant::now(), desc)
+}
+
 impl TioPort {
     fn poller_thread<T: RawPort + mio::event::Source>(
         mut port: T,
@@ -124,12 +129,15 @@ impl TioPort {
                 until_hb = Duration::from_millis(100);
             }
             // Note: here we always sleep an additional millisecond, otherwise we just poll in a loop for one millisecond on some systems when until_hb is above zero but below 1 ms.
+            log_msg2("before poll");
             poll.poll(&mut events, Some(until_hb + Duration::from_millis(1)))
                 .unwrap();
+            log_msg2("after poll");
 
             //println!("POLL {:?}", until_hb);
 
             for event in events.iter() {
+                log_msg2(&format!("EVENT {:?}", event.token()));
                 match event.token() {
                     mio::Token(0) => {
                         for pkt in tx.try_iter() {
@@ -196,8 +204,8 @@ impl TioPort {
     pub fn new<T: RawPort + mio::event::Source + Send + 'static>(
         raw_port: T,
     ) -> Result<TioPort, io::Error> {
-        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(128);
-        let (trx, rx) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(128);
+        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(32);
+        let (trx, rx) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(32);
         let poll = mio::Poll::new()?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(0))?;
         io::Result::Ok(TioPort {

@@ -9,9 +9,13 @@ readme = "README.md"
 
 [dependencies]
 crossbeam = "0.5"
-mio-serial = "5.0"
+#mio-serial = "5.0"
 crc = "2.1"
 
 [dependencies.mio]
 version = "0.8"
 features = ["os-poll", "net"]
+
+[dependencies.mio-serial]
+version = "5.0"
+path = "mio-serial"

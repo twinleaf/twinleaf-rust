@@ -75,7 +75,10 @@ fn random_stuff() {
 fn seqproxy() -> std::io::Result<()> {
     use crossbeam::select;
 
+    #[cfg(unix)]
     let port = tio::TioPort::new(tio::serial::Port::new("/dev/ttyUSB0").unwrap()).unwrap();
+    #[cfg(windows)]
+    let port = tio::TioPort::new(tio::serial::Port::new("COM13").unwrap()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:7855")?;
 
     // accept connections and process them serially
