@@ -285,6 +285,8 @@ dependencies = [
 [[package]]
 name = "mio-serial"
 version = "5.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "531e0f6dc55a5aa7b8d320407c5c4ced464e23815c60f6a1e6d9e225d2b45905"
 dependencies = [
  "log",
  "mio",
@@ -505,6 +507,7 @@ dependencies = [
  "crossbeam",
  "mio",
  "mio-serial",
+ "winapi",
 ]
 
 [[package]]

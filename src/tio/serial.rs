@@ -12,8 +12,25 @@ pub struct Port {
 
 impl Port {
     pub fn new(port_name: &str) -> Result<Port, io::Error> {
+        let mio_port = mio_serial::new(port_name, 115200).open_native_async()?;
+        #[cfg(windows)]
+        {
+            use winapi::um::commapi::SetCommTimeouts;
+            use winapi::um::winbase::COMMTIMEOUTS;
+            let handle = mio_port.as_handle();
+            let mut timeouts = COMMTIMEOUTS {
+                ReadIntervalTimeout: 0xFFFFFFFF,
+                ReadTotalTimeoutMultiplier: 0xFFFFFFFF,
+                ReadTotalTimeoutConstant: 0xFFFFFFFE,
+                WriteTotalTimeoutMultiplier: 0,
+                WriteTotalTimeoutConstant: 0,
+            };
+            if unsafe { SetCommTimeouts(handle, &mut timeouts) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         Ok(Port {
-            port: mio_serial::new(port_name, 115200).open_native_async()?,
+            port: mio_port,
             rxbuf: IOBuf::new(),
         })
     }
@@ -38,7 +55,7 @@ impl Port {
                 offset = *start;
                 continue;
             }
-            //            let ch = char::from_u32_unchecked(buf[offset] as u32);
+            // let ch = char::from_u32_unchecked(buf[offset] as u32);
             if esc {
                 if buf[offset] == 0xDC {
                     pkt.push(0xC0);
