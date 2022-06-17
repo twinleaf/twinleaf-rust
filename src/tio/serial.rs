@@ -3,6 +3,7 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 use mio_serial::SerialPortBuilderExt;
 use std::io;
 use std::io::Write;
+use std::time::Duration;
 
 pub struct Port {
     port: mio_serial::SerialStream,
@@ -89,7 +90,6 @@ impl RawPort for Port {
     }
 
     fn send(&mut self, pkt: &Packet) -> Result<(), SendError> {
-        // TODO: much inefficient. rework.
         let raw = pkt.serialize();
         let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
         let mut encoded = vec![0xC0u8];
@@ -122,8 +122,8 @@ impl RawPort for Port {
         }
     }
 
-    fn drain(&self) -> Result<(), SendError> {
-        panic!("TODO");
+    fn max_send_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
     }
 }
 

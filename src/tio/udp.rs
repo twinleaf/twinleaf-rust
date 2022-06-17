@@ -47,6 +47,10 @@ impl TioRawPort for TioUDP {
     fn drain(&self) -> Result<WriteResult, WriteError> {
         Ok(WriteResult::Ok)
     }
+
+    fn needs_periodic_heartbeats() -> bool {
+        true
+    }
 }
 
 impl mio::event::Source for TioUDP {

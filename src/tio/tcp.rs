@@ -66,10 +66,6 @@ impl RawPort for Port {
             Err(err) => Err(SendError::IO(err)),
         }
     }
-
-    fn drain(&self) -> Result<(), SendError> {
-        panic!("TODO");
-    }
 }
 
 impl mio::event::Source for Port {

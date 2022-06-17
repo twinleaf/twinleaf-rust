@@ -9,6 +9,8 @@ use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::str::FromStr; // for SocketAddr::from_str
+
 #[derive(Debug)]
 pub enum RecvError {
     NotReady,
@@ -21,7 +23,54 @@ pub enum RecvError {
 pub enum SendError {
     MustDrain,
     Full,
+    Disconnected,
     IO(io::Error),
+}
+
+#[derive(Debug)]
+pub enum RateError {
+    Unsupported,
+    Failed(io::Error),
+}
+
+pub trait RawPort {
+    // Returns a packet without blocking, or RecvError::NotReady if one is not available.
+    // For all the other error values, the port should be torn down, and possibly recreated.
+    fn recv(&mut self) -> Result<Packet, RecvError>;
+
+    // Attempts to send a packet. If it doesn't return Ok:
+    // - if it returned MustDrain, the packet was sent partially, and must be drained manually via drain()
+    // - if it returned Full, the last packet written was MustDrain and it hasn't been drained yet
+    // - for all other errors, the appropriate action is to tear down this port and recreate.
+    fn send(&mut self, pkt: &Packet) -> Result<(), SendError>;
+
+    // Drain partially written packet. Note: if a send returned MustDrain, no subsequent
+    // packets can be sent without successfully draining first.
+    fn drain(&mut self) -> Result<(), SendError> {
+        Ok(())
+    }
+    fn has_data_to_drain(&self) -> bool {
+        false
+    }
+
+    // Set data rate. Note that this purely changes the rate on the host computer. All RPC
+    // interactions with the device to change rate must be done manually.
+    fn set_rate(&mut self, _rate: u32) -> Result<(), RateError> {
+        Err(RateError::Unsupported)
+    }
+
+    // Reset data rate to default.
+    fn reset_rate(&mut self) -> Result<(), RateError> {
+        Err(RateError::Unsupported)
+    }
+    fn has_settable_rate(&self) -> bool {
+        false
+    }
+
+    // If not ZERO, a packet should be sent on this port at most this long after the last send.
+    fn max_send_interval(&self) -> Option<Duration> {
+        None
+    }
 }
 
 const IOBUF_SIZE: usize = 4096;
@@ -41,27 +90,30 @@ impl IOBuf {
         }
     }
 
-    // returns true: should refill again once done
-    fn refill<T: io::Read>(&mut self, reader: &mut T) -> Result<bool, RecvError> {
+    fn compact(&mut self) {
         if self.start != 0 {
             let len = self.end - self.start;
             self.buf.copy_within(self.start..self.end, 0);
             self.start = 0;
             self.end = len;
         }
+    }
+
+    fn refill<T: io::Read>(&mut self, reader: &mut T) -> Result<(), RecvError> {
+        self.compact();
         match reader.read(&mut self.buf[self.end..]) {
             Ok(size) => {
                 if size > 0 {
-                    println!("REFILL READ: {} {} {}", self.start, self.end, size);
+                    // TODO: how does this work with windows timing out?
+                    // check that it errs below and change this code accordingly.
                     self.end += size;
-                    Ok(self.end == IOBUF_SIZE)
+                    Ok(())
                 } else {
                     Err(RecvError::Disconnected)
                 }
             }
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    println!("NOT READY");
                     Err(RecvError::NotReady)
                 } else {
                     Err(RecvError::IO(e))
@@ -70,22 +122,45 @@ impl IOBuf {
         }
     }
 
-    /*
-    fn drain(&mut self, writer: &mut dyn io::Write) -> Result<bool, io::Error> {
-        if self.end > 0 {
-            match writer.write(&self.buf[self.start..self.end]) {
-                _ => { panic!("TODO"); }
-            }
+    fn add_data(&mut self, data: &[u8]) -> Result<(), usize> {
+        self.compact();
+        let copy_size = std::cmp::min(IOBUF_SIZE - self.end, data.len());
+        &self.buf[self.end..self.end + copy_size].copy_from_slice(&data[0..copy_size]);
+        if copy_size == data.len() {
+            Ok(())
+        } else {
+            Err(copy_size)
         }
-        Ok(true)
     }
-    */
-}
 
-pub trait RawPort {
-    fn recv(&mut self) -> Result<Packet, RecvError>;
-    fn send(&mut self, pkt: &Packet) -> Result<(), SendError>;
-    fn drain(&self) -> Result<(), SendError>;
+    fn drain<T: io::Write>(&mut self, writer: &mut T) -> Result<(), SendError> {
+        if self.end > self.start {
+            match writer.write(&self.buf[self.start..self.end]) {
+                Ok(size) => {
+                    self.start += size;
+                    if self.start == self.end {
+                        Ok(())
+                    } else {
+                        Err(SendError::MustDrain)
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        Err(SendError::MustDrain)
+                    } else {
+                        Err(SendError::IO(e))
+                    }
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn flush(&mut self) {
+        self.start = 0;
+        self.end = 0;
+    }
 }
 
 pub struct TioPort {
@@ -94,14 +169,6 @@ pub struct TioPort {
     // TODO: not public
     pub rx: crossbeam::channel::Receiver<Result<Packet, RecvError>>, // TODO: via Fn()
     waker: mio::Waker,
-}
-
-pub fn log_msg(desc: &str, what: &Packet) -> String {
-    format!("{:?} {}  -- {:?}", Instant::now(), desc, what.payload)
-}
-
-pub fn log_msg2(desc: &str) {
-    println!("{:?} {}", Instant::now(), desc)
 }
 
 impl TioPort {
@@ -122,29 +189,32 @@ impl TioPort {
         let mut rx_drop_count: usize = 0;
 
         'ioloop: loop {
-            let mut until_hb = Duration::from_millis(100).saturating_sub(last_sent.elapsed());
-            if until_hb == Duration::ZERO {
-                port.send(&Packet::make_hb(None));
-                last_sent = Instant::now();
-                until_hb = Duration::from_millis(100);
-            }
-            // Note: here we always sleep an additional millisecond, otherwise we just poll in a loop for one millisecond on some systems when until_hb is above zero but below 1 ms.
-            log_msg2("before poll");
-            poll.poll(&mut events, Some(until_hb + Duration::from_millis(1)))
-                .unwrap();
-            log_msg2("after poll");
+            let timeout = if let Some(max_interval) = port.max_send_interval() {
+                Some({
+                    let mut until_hb = max_interval.saturating_sub(last_sent.elapsed());
+                    if until_hb == Duration::ZERO {
+                        port.send(&Packet::make_hb(None));
+                        last_sent = Instant::now();
+                        until_hb = max_interval;
+                    }
+                    // Note: here we always sleep an additional millisecond, otherwise we just poll in a loop for one millisecond on some systems when until_hb is above zero but below 1 ms.
+                    until_hb + Duration::from_millis(1)
+                })
+            } else {
+                None
+            };
+
+            poll.poll(&mut events, timeout).unwrap();
 
             //println!("POLL {:?}", until_hb);
 
             for event in events.iter() {
-                log_msg2(&format!("EVENT {:?}", event.token()));
                 match event.token() {
                     mio::Token(0) => {
                         for pkt in tx.try_iter() {
                             match pkt {
                                 Some(pkt) => {
                                     port.send(&pkt);
-                                    println!("{}", log_msg("sent to port", &pkt));
                                 }
                                 None => {
                                     break 'ioloop;
@@ -156,15 +226,12 @@ impl TioPort {
                         loop {
                             match port.recv() {
                                 Ok(pkt) => {
-                                    let dropped = log_msg("recv and dropped", &pkt);
-                                    let queued = log_msg("recv and enqueued", &pkt);
                                     match rx.try_send(Ok(pkt)) {
                                         Err(TrySendError::Full(_)) => {
                                             if rx_drop_count == 0 {
                                                 println!("Dropping rx packets.");
                                             }
                                             rx_drop_count += 1;
-                                            println!("{}", dropped);
                                         }
                                         Err(_) => {
                                             // TODO
@@ -178,7 +245,7 @@ impl TioPort {
                                                 );
                                                 rx_drop_count = 0;
                                             }
-                                            println!("{}", queued);
+                                            //println!("{}", queued);
                                         }
                                     }
                                 }
@@ -203,7 +270,7 @@ impl TioPort {
 
     pub fn new<T: RawPort + mio::event::Source + Send + 'static>(
         raw_port: T,
-    ) -> Result<TioPort, io::Error> {
+    ) -> io::Result<TioPort> {
         let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(32);
         let (trx, rx) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(32);
         let poll = mio::Poll::new()?;
@@ -216,6 +283,26 @@ impl TioPort {
             rx: rx,
             waker: waker,
         })
+    }
+
+    pub fn from_url(url: &str) -> io::Result<TioPort> {
+        // Special case: serial ports can be given directly
+        #[cfg(unix)]
+        if url.starts_with("/dev/") {
+            return TioPort::new(serial::Port::new(url)?);
+        }
+        #[cfg(windows)]
+        if url.starts_with("COM") {
+            return TioPort::new(serial::Port::new(url)?);
+        }
+
+        let split_url: Vec<&str> = url.splitn(2, "://").collect();
+        match split_url[..] {
+            ["serial", port] => TioPort::new(serial::Port::new(port)?),
+            ["tcp", addr] => TioPort::new(tcp::Port::new(&tio_addr(addr).unwrap())?),
+            //["udp",addr] => { TioPort::new(udp::Port::new(addr)?) }
+            _ => io::Result::Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid url")),
+        }
     }
 
     pub fn send(&self, packet: Packet) {
@@ -268,4 +355,12 @@ pub fn tio_addr(addr: &str) -> Result<SocketAddr, io::Error> {
             "address resolution failed",
         )),
     }
+}
+
+pub fn log_msg(desc: &str, what: &Packet) -> String {
+    format!("{:?} {}  -- {:?}", Instant::now(), desc, what.payload)
+}
+
+pub fn log_msg2(desc: &str) {
+    println!("{:?} {}", Instant::now(), desc)
 }

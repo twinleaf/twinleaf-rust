@@ -116,6 +116,21 @@ impl Packet {
                     reply: raw[6..routing_start].to_vec(),
                 })
             }
+            4 => {
+                if routing_start < 8 {
+                    return Err(Error::PayloadTooSmall);
+                }
+                Payload::RpcError(RpcErrorPayload {
+                    id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
+                    error: match u16::from_le_bytes(raw[6..8].try_into().unwrap()) {
+                        0 => RpcErrorCode::NoError,
+                        1 => RpcErrorCode::Undefined,
+                        2 => RpcErrorCode::NotFound,
+                        code => RpcErrorCode::Unknown(code),
+                    },
+                    extra: raw[8..routing_start].to_vec(),
+                })
+            }
             ptype if ptype >= 128 => {
                 if routing_start < 9 {
                     return Err(Error::PayloadTooSmall);
