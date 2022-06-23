@@ -1,29 +1,29 @@
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GenericPayload {
     pub packet_type: u8,
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RpcMethod {
     Id(u16),
     Name(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RpcRequestPayload {
     pub id: u16,
     pub method: RpcMethod,
     pub arg: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RpcReplyPayload {
     pub id: u16,
     pub reply: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RpcErrorCode {
     NoError,
     Undefined,
@@ -31,27 +31,27 @@ pub enum RpcErrorCode {
     Unknown(u16),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RpcErrorPayload {
     pub id: u16,
     pub error: RpcErrorCode,
     pub extra: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HeartbeatPayload {
     Session(u32),
     Any(Vec<u8>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StreamDataPayload {
     pub stream_id: u8,
     pub sample_n: u32,
     pub data: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Payload {
     RpcRequest(RpcRequestPayload),
     RpcReply(RpcReplyPayload),
@@ -61,7 +61,7 @@ pub enum Payload {
     Unknown(GenericPayload),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Packet {
     pub payload: Payload,
     pub routing: Vec<u8>,
