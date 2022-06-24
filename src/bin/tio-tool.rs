@@ -438,6 +438,70 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn testproxy() {
+    let listener = TcpListener::bind(std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        7855,
+    ))
+    .unwrap();
+
+    let url = {
+        let devices = enum_devices(false);
+        if devices.len() != 1 {
+            panic!("TODO");
+        }
+        devices[0].url.clone()
+    };
+
+    let port = tio::TioProxyPort::new(&url);
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            _ => {
+                continue;
+            }
+        };
+        stream.set_nonblocking(true);
+        let client = tio::tcp::Port::from_stream(mio::net::TcpStream::from_std(stream));
+        let client = match tio::TioChannelPort::new(client.unwrap()) {
+            Ok(client_port) => client_port,
+            _ => continue,
+        };
+
+        let (sender, receiver) = port.new_proxy();
+        let thd = std::thread::spawn(move || {
+            use crossbeam::select;
+            loop {
+                select! {
+                    recv(receiver) -> res => {
+                        let pkt = res.unwrap(); // port failing will close program
+                        //if verbose {
+                        println!("{}", tio::log_msg("port->client", &pkt));
+                        //}
+                        client.send(pkt);
+                    }
+                    recv(client.rx) -> res => {
+                        match res {
+                            Ok(Ok(pkt)) => {
+                                //if verbose {
+                                println!("{}", tio::log_msg("client->port", &pkt));
+                                //}
+                                sender.send(pkt);
+                            }
+                            _ => {
+                                // client failing will listen for the next client
+                                println!("Client exiting PROXY");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn testthread(id: u32, rx: crossbeam::channel::Receiver<tio::Packet>) {
     loop {
         let pkt = match rx.recv() {
@@ -456,24 +520,19 @@ fn testthread(id: u32, rx: crossbeam::channel::Receiver<tio::Packet>) {
     }
 }
 
-fn testproxy() {
-    //let port = tio::TioProxyPort::new("/dev/ttyUSB0");
-    let port = tio::TioProxyPort::new("tcp://localhost");
+fn testproxyport() {
+    let port = tio::TioProxyPort::new("/dev/ttyUSB0");
+    //let port = tio::TioProxyPort::new("tcp://localhost");
 
     let (send1, recv1) = port.new_proxy();
     let thd1 = std::thread::spawn(move || {
         testthread(1, recv1);
     });
-
-    // TODO insert sleep
-
     let (send2, recv2) = port.new_proxy();
     let thd2 = std::thread::spawn(move || {
         testthread(2, recv2);
     });
-
     loop {}
-    // TODO termination by dropping send side.
 }
 
 fn main() {
@@ -488,8 +547,11 @@ fn main() {
         "test" => {
             random_stuff();
         }
-        "test2" => {
+        "proxy2" => {
             testproxy();
+        }
+        "test2" => {
+            testproxyport();
         }
         "rpc" => {
             rpc(&args[2..]).unwrap();

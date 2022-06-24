@@ -163,39 +163,42 @@ impl IOBuf {
 
 pub struct TioPort {
     thd: thread::JoinHandle<()>,
-    tx: crossbeam::channel::Sender<Option<Packet>>,
+    tx: Option<Box<crossbeam::channel::Sender<Packet>>>,
     waker: mio::Waker,
 }
 
 impl TioPort {
     fn poller_thread<
-        T: RawPort + mio::event::Source,
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()>,
+        RawPortT: RawPort + mio::event::Source,
+        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()>,
     >(
-        mut port: T,
+        mut raw_port: RawPortT,
         mut poll: mio::Poll,
-        //rx: crossbeam::channel::Sender<Result<Packet, RecvError>>,
-        rx: RXT,
-        tx: crossbeam::channel::Receiver<Option<Packet>>,
+        rx: RxCallbackT,
+        tx: crossbeam::channel::Receiver<Packet>,
     ) {
+        use crossbeam::channel::TryRecvError;
+
         let mut events = mio::Events::with_capacity(1);
 
         poll.registry()
-            .register(&mut port, mio::Token(1), mio::Interest::READABLE)
+            .register(&mut raw_port, mio::Token(1), mio::Interest::READABLE)
             .unwrap();
 
         let mut last_sent = Instant::now();
 
         'ioloop: loop {
-            let timeout = if let Some(max_interval) = port.max_send_interval() {
+            let timeout = if let Some(max_interval) = raw_port.max_send_interval() {
                 Some({
                     let mut until_hb = max_interval.saturating_sub(last_sent.elapsed());
                     if until_hb == Duration::ZERO {
-                        port.send(&Packet::make_hb(None));
+                        raw_port.send(&Packet::make_hb(None));
                         last_sent = Instant::now();
                         until_hb = max_interval;
                     }
-                    // Note: here we always sleep an additional millisecond, otherwise we just poll in a loop for one millisecond on some systems when until_hb is above zero but below 1 ms.
+                    // Note: here we always sleep an additional millisecond, otherwise we just poll
+                    // in a loop for one millisecond on some systems when until_hb is above zero
+                    // but below 1 ms.
                     until_hb + Duration::from_millis(1)
                 })
             } else {
@@ -204,28 +207,33 @@ impl TioPort {
 
             poll.poll(&mut events, timeout).unwrap();
 
-            //println!("POLL {:?}", until_hb);
-
             for event in events.iter() {
                 match event.token() {
                     mio::Token(0) => {
-                        for pkt in tx.try_iter() {
-                            match pkt {
-                                Some(pkt) => {
-                                    port.send(&pkt);
+                        // One or more packets were sent on the tx queue, or the tx queue was closed.
+                        // Dequeue and send to the device port, or break out.
+                        loop {
+                            match tx.try_recv() {
+                                Ok(pkt) => {
+                                    // TODO: handle partial writes and draining
+                                    raw_port.send(&pkt);
                                 }
-                                None => {
+                                Err(TryRecvError::Empty) => {
+                                    break;
+                                }
+                                Err(TryRecvError::Disconnected) => {
                                     break 'ioloop;
                                 }
                             }
                         }
                     }
                     mio::Token(1) => {
+                        // Packet or error available from the device
                         loop {
-                            match port.recv() {
+                            match raw_port.recv() {
                                 Ok(pkt) => {
                                     if let Err(_) = rx(Ok(pkt)) {
-                                        // TODO: handle
+                                        // RX callback signaled an error, terminate.
                                         break 'ioloop;
                                     }
                                 }
@@ -233,10 +241,11 @@ impl TioPort {
                                     break;
                                 }
                                 Err(e) => {
-                                    rx(Err(e));
-                                    //rx.send(Err(e));
-                                    println!("rx error");
-                                    break 'ioloop;
+                                    // Pass error along. Rx callback will determine what to do.
+                                    // if it returns an error, break out.
+                                    if let Err(_) = rx(Err(e)) {
+                                        break 'ioloop;
+                                    }
                                 }
                             };
                         }
@@ -250,64 +259,22 @@ impl TioPort {
     }
 
     pub fn new<
-        T: RawPort + mio::event::Source + Send + 'static,
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RawPortT: RawPort + mio::event::Source + Send + 'static,
+        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
     >(
-        raw_port: T,
-        rx: RXT,
+        raw_port: RawPortT,
+        rx: RxCallbackT,
     ) -> io::Result<TioPort> {
-        let (tx, ttx) = crossbeam::channel::bounded::<Option<Packet>>(32);
+        let (tx, ttx) = crossbeam::channel::bounded::<Packet>(32);
         let poll = mio::Poll::new()?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(0))?;
         io::Result::Ok(TioPort {
             thd: thread::spawn(move || {
                 TioPort::poller_thread(raw_port, poll, rx, ttx);
             }),
-            tx: tx,
+            tx: Some(Box::new(tx)),
             waker: waker,
         })
-    }
-
-    // TODO: put this in TioChannelPort
-    pub fn new_channel<T: RawPort + mio::event::Source + Send + 'static>(
-        raw_port: T,
-        rx: crossbeam::channel::Sender<Result<Packet, RecvError>>,
-    ) -> io::Result<TioPort> {
-        TioPort::new(
-            raw_port,
-            move |rxdata: Result<Packet, RecvError>| -> io::Result<()> {
-                use crossbeam::channel::TrySendError;
-                match rx.try_send(rxdata) {
-                    Err(TrySendError::Full(_)) => {
-                        //if rx_drop_count == 0 {
-                        //println!("Dropping rx packets.");
-                        //}
-                        //rx_drop_count += 1;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let TrySendError::Disconnected(_) = e {
-                            Err(io::Error::from(io::ErrorKind::BrokenPipe))
-                        } else {
-                            Err(io::Error::from(io::ErrorKind::Other))
-                        }
-                    }
-                    Ok(_) => {
-                        /*
-                        if rx_drop_count > 0 {
-                            println!(
-                                "Resumed RX. Dropped {} packets.",
-                                rx_drop_count
-                            );
-                            rx_drop_count = 0;
-                        }
-                        */
-                        //println!("{}", queued);
-                        Ok(())
-                    }
-                }
-            },
-        )
     }
 
     pub fn from_url<RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static>(
@@ -334,17 +301,17 @@ impl TioPort {
     }
 
     pub fn send(&self, packet: Packet) {
-        self.tx.send(Some(packet));
+        self.tx.as_ref().unwrap().send(packet);
         self.waker.wake();
     }
 }
 
 impl Drop for TioPort {
     fn drop(&mut self) {
-        // TODO: by closing
-        self.tx.send(None);
+        let mut channel = None;
+        std::mem::swap(&mut self.tx, &mut channel);
+        drop(channel);
         self.waker.wake();
-        // TODO: do we wait on thread??
     }
 }
 
@@ -391,9 +358,10 @@ impl TioProxyPort {
             crossbeam::channel::Receiver<Packet>,
         )>,
     ) {
+        use crossbeam::channel::TryRecvError;
         use std::collections::HashMap;
 
-        let mut rpc_id: u16 = 0;
+        //let mut rpc_id: u16 = 0;
         let mut client_id: u64 = 0;
         let mut clients: HashMap<
             u64,
@@ -403,48 +371,92 @@ impl TioProxyPort {
             ),
         > = HashMap::new();
         let port = TioChannelPort::from_url(&url).unwrap();
-        loop {
+        let mut drop_client: Option<u64> = None;
+
+        'mainloop: loop {
+            if let Some(client_id) = drop_client {
+                // TODO: check that if let leaves drop_client to None
+                drop(clients.remove(&client_id));
+            }
             let mut sel = crossbeam::channel::Select::new();
-            let mut ids = Vec::new();
-            for (id, client) in &clients {
+            let mut ids: Vec<u64> = Vec::new();
+            for (id, client) in clients.iter() {
                 sel.recv(&client.1);
-                ids.push(id);
+                ids.push(*id);
             }
             sel.recv(&port.rx);
             sel.recv(&new_queue);
 
             let index = sel.ready();
+            println!("PP: READY {}", index);
 
             // TODO: for all these should loop
             if index < ids.len() {
                 // data from a client to send to the port
-                let receiver = &clients.get(ids[index]).unwrap().1;
-                if let Ok(pkt) = receiver.try_recv() {
-                    port.send(pkt)
+                loop {
+                    match clients.get(&ids[index]).unwrap().1.try_recv() {
+                        Ok(pkt) => {
+                            // TODO: check for failure
+                            port.send(pkt);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            drop_client = Some(ids[index]);
+                            break;
+                        }
+                    }
                 }
             } else if index == ids.len() {
                 // data from the device
-                if let Ok(pkt) = port.recv() {
-                    for (_, client) in &clients {
-                        client.0.send(pkt.clone());
+                loop {
+                    //println!("PP: devdata");
+                    match port.rx.try_recv() {
+                        Ok(Ok(pkt)) => {
+                            //println!("PP: devdata pkt {:?}", pkt);
+                            for (_, client) in clients.iter() {
+                                // TODO: check for failure
+                                client.0.send(pkt.clone());
+                            }
+                        }
+                        Err(TryRecvError::Empty) => {
+                            break;
+                        }
+                        Ok(Err(_)) => {
+                            // TODO: not all error should be fatal
+                            println!("PP: porterror");
+                            break 'mainloop;
+                        }
+                        Err(_) => {
+                            // TODO: not all error should be fatal
+                            println!("PP: porterror");
+                            break 'mainloop;
+                        }
                     }
                 }
             } else {
                 // new proxy client
-                if let Ok((sender, receiver)) = new_queue.try_recv() {
-                    clients.insert(client_id, (sender, receiver));
-                    client_id += 1;
+                loop {
+                    println!("PP: newclient");
+                    match new_queue.try_recv() {
+                        Ok((sender, receiver)) => {
+                            println!("PP: new client {}", client_id);
+                            clients.insert(client_id, (sender, receiver));
+                            client_id += 1;
+                        }
+                        Err(TryRecvError::Empty) => {
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            // channel closed.
+                            println!("PP: channelclosed");
+                            break 'mainloop;
+                        }
+                    }
                 }
             }
         }
-    }
-}
-
-impl Drop for TioProxyPort {
-    fn drop(&mut self) {
-        // TODO: how??
-        //drop self.new_queue;
-        // TODO: do we wait on thread??
     }
 }
 
@@ -454,34 +466,73 @@ pub struct TioChannelPort {
 }
 
 impl TioChannelPort {
+    // TODO: is this useful? create a regular port to a channel
+    /*
+        pub fn new_channel<T: RawPort + mio::event::Source + Send + 'static>(
+            raw_port: T,
+            rx: crossbeam::channel::Sender<Result<Packet, RecvError>>,
+        ) -> io::Result<TioPort> {
+            TioPort::new(
+                raw_port,
+                move |rxdata: Result<Packet, RecvError>| -> io::Result<()> {
+                    TioChannelPort::rx(rx, rxdata)
+                },
+            )
+        }
+    */
+
     pub fn new<T: RawPort + mio::event::Source + Send + 'static>(
         raw_port: T,
     ) -> io::Result<TioChannelPort> {
         let (sender, receiver) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(32);
         Ok(TioChannelPort {
-            port: TioPort::new_channel(raw_port, sender)?,
+            port: TioPort::new(raw_port, move |rxdata| TioChannelPort::rx(&sender, rxdata))?,
             rx: receiver,
         })
     }
 
     // TODO: avoid code duplication
     pub fn from_url(url: &str) -> io::Result<TioChannelPort> {
-        // Special case: serial ports can be given directly
-        #[cfg(unix)]
-        if url.starts_with("/dev/") {
-            return TioChannelPort::new(serial::Port::new(url)?);
-        }
-        #[cfg(windows)]
-        if url.starts_with("COM") {
-            return TioChannelPort::new(serial::Port::new(url)?);
-        }
+        let (sender, receiver) = crossbeam::channel::bounded::<Result<Packet, RecvError>>(32);
+        Ok(TioChannelPort {
+            port: TioPort::from_url(&url, move |rxdata| TioChannelPort::rx(&sender, rxdata))?,
+            rx: receiver,
+        })
+    }
 
-        let split_url: Vec<&str> = url.splitn(2, "://").collect();
-        match split_url[..] {
-            ["serial", port] => TioChannelPort::new(serial::Port::new(port)?),
-            ["tcp", addr] => TioChannelPort::new(tcp::Port::new(&tio_addr(addr).unwrap())?),
-            //["udp",addr] => { TioPort::new(udp::Port::new(addr)?) }
-            _ => io::Result::Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid url")),
+    fn rx(
+        rx_channel: &crossbeam::channel::Sender<Result<Packet, RecvError>>,
+        data: Result<Packet, RecvError>,
+    ) -> io::Result<()> {
+        use crossbeam::channel::TrySendError;
+        match rx_channel.try_send(data) {
+            Err(TrySendError::Full(_)) => {
+                //if rx_drop_count == 0 {
+                //println!("Dropping rx packets.");
+                //}
+                //rx_drop_count += 1;
+                Ok(())
+            }
+            Err(e) => {
+                if let TrySendError::Disconnected(_) = e {
+                    Err(io::Error::from(io::ErrorKind::BrokenPipe))
+                } else {
+                    Err(io::Error::from(io::ErrorKind::Other))
+                }
+            }
+            Ok(_) => {
+                /*
+                if rx_drop_count > 0 {
+                    println!(
+                        "Resumed RX. Dropped {} packets.",
+                        rx_drop_count
+                    );
+                    rx_drop_count = 0;
+                }
+                */
+                //println!("{}", queued);
+                Ok(())
+            }
         }
     }
 
