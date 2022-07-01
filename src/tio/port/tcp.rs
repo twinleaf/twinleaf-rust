@@ -1,4 +1,4 @@
-use super::{proto, IOBuf, Packet, RawPort, RecvError, SendError};
+use super::{iobuf::IOBuf, proto, Packet, RawPort, RecvError, SendError};
 use mio::net::TcpStream;
 use std::io;
 use std::io::Write;
@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 pub struct Port {
     stream: TcpStream,
     rxbuf: IOBuf,
-    //    txbuf: IOBuf,
+    txbuf: IOBuf,
 }
 
 impl Port {
@@ -15,7 +15,7 @@ impl Port {
         Ok(Port {
             stream: stream,
             rxbuf: IOBuf::new(),
-            //txbuf: IOBuf::new(),
+            txbuf: IOBuf::new(),
         })
     }
 
@@ -25,12 +25,9 @@ impl Port {
     }
 
     fn recv_buffered(&mut self) -> Result<Packet, RecvError> {
-        let buf = &self.rxbuf.buf;
-        let start = &mut self.rxbuf.start;
-        let end = self.rxbuf.end;
-        match Packet::deserialize(&buf[*start..end]) {
+        match Packet::deserialize(self.rxbuf.data()) {
             Ok((pkt, size)) => {
-                *start += size;
+                self.rxbuf.consume(size);
                 Ok(pkt)
             }
             Err(proto::Error::NeedMore) => Err(RecvError::NotReady),
@@ -44,27 +41,46 @@ impl RawPort for Port {
         let mut res = self.recv_buffered();
         if let Err(RecvError::NotReady) = res {
             if let Err(e) = self.rxbuf.refill(&mut self.stream) {
-                //println!("PORT  RET ERR: {:?}", e);
                 return Err(e);
             }
             res = self.recv_buffered();
         }
-        //println!("PORT  RET NORM: {:?}", res);
         res
     }
 
     fn send(&mut self, pkt: &Packet) -> Result<(), SendError> {
+        if self.has_data_to_drain() {
+            return Err(SendError::Full);
+        }
+
         let raw = pkt.serialize();
         match self.stream.write(&raw) {
             Ok(size) => {
                 if size == raw.len() {
                     Ok(())
                 } else {
-                    panic!("TODO")
+                    // IOBuf sized such that it can always store at least a full packet.
+                    self.txbuf.add_data(&raw[size..]).unwrap();
+                    Err(SendError::MustDrain)
                 }
             }
-            Err(err) => Err(SendError::IO(err)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // This can happen if we happen to send with the TCP buffer completely full.
+                // Maintain the same semantics and buffer the whole thing in txbuf.
+                // IOBuf sized such that it can always store at least a full packet.
+                self.txbuf.add_data(&raw[..]).unwrap();
+                Err(SendError::MustDrain)
+            }
+            Err(e) => Err(SendError::IO(e)),
         }
+    }
+
+    fn drain(&mut self) -> Result<(), SendError> {
+        self.txbuf.drain(&mut self.stream)
+    }
+
+    fn has_data_to_drain(&self) -> bool {
+        !self.txbuf.empty()
     }
 }
 

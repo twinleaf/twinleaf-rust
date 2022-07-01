@@ -107,6 +107,24 @@ impl Packet {
             return Err(Error::NeedMore);
         }
         let payload = match packet_type {
+            2 => {
+                if routing_start < 8 {
+                    return Err(Error::PayloadTooSmall);
+                }
+                let mut arg_start: usize = 8;
+                let method = u16::from_le_bytes(raw[6..8].try_into().unwrap());
+                let method = if (method & 0x8000) != 0 {
+                    arg_start += (method & 0x7FFF) as usize;
+                    RpcMethod::Name(String::from_utf8_lossy(&raw[8..arg_start]).to_string())
+                } else {
+                    RpcMethod::Id(method)
+                };
+                Payload::RpcRequest(RpcRequestPayload {
+                    id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
+                    method: method,
+                    arg: raw[arg_start..].to_vec(),
+                })
+            }
             3 => {
                 if routing_start < 6 {
                     return Err(Error::PayloadTooSmall);
@@ -171,11 +189,12 @@ impl Packet {
             Payload::RpcRequest(req) => {
                 let mut ret = self.prepare_header(
                     2,
-                    4 + if let RpcMethod::Name(name) = &req.method {
-                        name.len()
-                    } else {
-                        0
-                    },
+                    4 + req.arg.len()
+                        + if let RpcMethod::Name(name) = &req.method {
+                            name.len()
+                        } else {
+                            0
+                        },
                 );
                 ret.extend(req.id.to_le_bytes());
                 match &req.method {
@@ -196,9 +215,27 @@ impl Packet {
                 ret.extend(&rep.reply);
                 ret
             }
+            Payload::RpcError(err) => {
+                let mut ret = self.prepare_header(4, 4 + err.extra.len());
+                ret.extend(err.id.to_le_bytes());
+                let code: u16 = match err.error {
+                    RpcErrorCode::NoError => 0,
+                    RpcErrorCode::Undefined => 1,
+                    RpcErrorCode::NotFound => 2,
+                    RpcErrorCode::Unknown(code) => code,
+                };
+                ret.extend(code.to_le_bytes());
+                ret.extend(&err.extra);
+                ret
+            }
             Payload::Heartbeat(payload) => {
-                // TODO: payload
-                vec![5u8, 0, 0, 0]
+                let raw_payload = match payload {
+                    HeartbeatPayload::Session(session) => session.to_le_bytes().to_vec(),
+                    HeartbeatPayload::Any(raw) => raw.clone(),
+                };
+                let mut ret = self.prepare_header(5, raw_payload.len());
+                ret.extend(raw_payload);
+                ret
             }
             Payload::StreamData(sample) => {
                 let mut ret = self.prepare_header(128 + sample.stream_id, 4 + sample.data.len());
@@ -230,9 +267,13 @@ impl Packet {
     }
 
     pub fn make_hb(payload: Option<Vec<u8>>) -> Packet {
-        // TODO
         Packet {
-            payload: Payload::Heartbeat(HeartbeatPayload::Any(vec![])),
+            payload: Payload::Heartbeat(HeartbeatPayload::Any(match payload {
+                Some(v) => v,
+                None => {
+                    vec![]
+                }
+            })),
             routing: vec![],
             ttl: 0,
         }
