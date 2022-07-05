@@ -122,7 +122,7 @@ impl Packet {
                 Payload::RpcRequest(RpcRequestPayload {
                     id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
                     method: method,
-                    arg: raw[arg_start..].to_vec(),
+                    arg: raw[arg_start..routing_start].to_vec(),
                 })
             }
             3 => {
