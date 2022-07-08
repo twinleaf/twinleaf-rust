@@ -5,6 +5,22 @@ pub struct GenericPayload {
 }
 
 #[derive(Debug, Clone)]
+pub enum LogLevel {
+    CRITICAL = 0,
+    ERROR = 1,
+    WARNING = 2,
+    INFO = 3,
+    DEBUG = 4,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogMessagePayload {
+    pub data: u32,
+    pub level: LogLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum RpcMethod {
     Id(u16),
     Name(String),
@@ -28,6 +44,8 @@ pub enum RpcErrorCode {
     NoError,
     Undefined,
     NotFound,
+    Timeout,
+    NoBufs,
     Unknown(u16),
 }
 
@@ -53,6 +71,7 @@ pub struct StreamDataPayload {
 
 #[derive(Debug, Clone)]
 pub enum Payload {
+    LogMessage(LogMessagePayload),
     RpcRequest(RpcRequestPayload),
     RpcReply(RpcReplyPayload),
     RpcError(RpcErrorPayload),
@@ -60,6 +79,17 @@ pub enum Payload {
     StreamData(StreamDataPayload),
     Unknown(GenericPayload),
 }
+
+// TODO: route as own object with parsing, etc, instead of vec
+/*
+#[derive(Debug, Clone)]
+pub struct DeviceRoute {
+    route: Vec<u8>,
+}
+
+impl DeviceRoute {
+}
+*/
 
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -107,6 +137,22 @@ impl Packet {
             return Err(Error::NeedMore);
         }
         let payload = match packet_type {
+            1 => {
+                if routing_start < 9 {
+                    return Err(Error::PayloadTooSmall);
+                }
+                Payload::LogMessage(LogMessagePayload {
+                    data: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+                    level: match raw[8] {
+                        0 => LogLevel::CRITICAL,
+                        1 => LogLevel::ERROR,
+                        2 => LogLevel::WARNING,
+                        3 => LogLevel::INFO,
+                        _ => LogLevel::DEBUG,
+                    },
+                    message: String::from_utf8_lossy(&raw[9..routing_start]).to_string(),
+                })
+            }
             2 => {
                 if routing_start < 8 {
                     return Err(Error::PayloadTooSmall);
@@ -144,6 +190,8 @@ impl Packet {
                         0 => RpcErrorCode::NoError,
                         1 => RpcErrorCode::Undefined,
                         2 => RpcErrorCode::NotFound,
+                        8 => RpcErrorCode::Timeout,
+                        16 => RpcErrorCode::NoBufs,
                         code => RpcErrorCode::Unknown(code),
                     },
                     extra: raw[8..routing_start].to_vec(),
@@ -186,6 +234,19 @@ impl Packet {
 
     pub fn serialize(&self) -> Vec<u8> {
         match &self.payload {
+            Payload::LogMessage(log) => {
+                let mut ret = self.prepare_header(1, 5 + log.message.len());
+                ret.extend(log.data.to_le_bytes());
+                ret.push(match log.level {
+                    LogLevel::CRITICAL => 0,
+                    LogLevel::ERROR => 1,
+                    LogLevel::WARNING => 2,
+                    LogLevel::INFO => 3,
+                    LogLevel::DEBUG => 4,
+                });
+                ret.extend(log.message.as_bytes());
+                ret
+            }
             Payload::RpcRequest(req) => {
                 let mut ret = self.prepare_header(
                     2,
@@ -222,6 +283,8 @@ impl Packet {
                     RpcErrorCode::NoError => 0,
                     RpcErrorCode::Undefined => 1,
                     RpcErrorCode::NotFound => 2,
+                    RpcErrorCode::Timeout => 8,
+                    RpcErrorCode::NoBufs => 16,
                     RpcErrorCode::Unknown(code) => code,
                 };
                 ret.extend(code.to_le_bytes());
@@ -274,6 +337,18 @@ impl Packet {
                     vec![]
                 }
             })),
+            routing: vec![],
+            ttl: 0,
+        }
+    }
+
+    pub fn make_rpc_error(id: u16, error: RpcErrorCode) -> Packet {
+        Packet {
+            payload: Payload::RpcError(RpcErrorPayload {
+                id: id,
+                error: error,
+                extra: vec![],
+            }),
             routing: vec![],
             ttl: 0,
         }

@@ -334,6 +334,9 @@ impl Port {
         rx_send: crossbeam::channel::Sender<Result<Packet, RecvError>>,
     ) -> impl Fn(Result<Packet, RecvError>) -> io::Result<()> {
         move |rxdata| -> io::Result<()> {
+            if let Err(RecvError::Disconnected) = rxdata {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
             use crossbeam::channel::TrySendError;
             match rx_send.try_send(rxdata) {
                 Err(TrySendError::Full(_)) => {

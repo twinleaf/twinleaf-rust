@@ -191,49 +191,87 @@ fn proxy(args: &[String]) {
     ))
     .unwrap();
 
-    let port = tio::TioProxyPort::new(&sensor_url);
+    let (status_send, port_status) = crossbeam::channel::bounded::<tio::TioProxyEvent>(10);
+    let port = tio::TioProxyPort::new(
+        &sensor_url,
+        Some(std::time::Duration::from_secs(10)),
+        Some(status_send),
+    );
 
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            _ => continue,
-        };
-        let (rx_send, client_rx) = tio::Port::rx_channel();
-        let client = match tio::Port::from_tcp_stream(stream, tio::Port::rx_to_channel(rx_send)) {
-            Ok(client_port) => client_port,
-            _ => continue,
-        };
+    let (proxy_tx, proxy_rx) = port.port().unwrap();
 
-        let (sender, receiver) = port.new_proxy();
-        std::thread::spawn(move || {
-            use crossbeam::select;
-            loop {
-                select! {
-                    recv(receiver) -> res => {
-                        let pkt = res.unwrap(); // port failing will close program
-                        if verbose {
-                            println!("{}", log_msg("port->client", &pkt));
-                        }
-                        client.send(pkt);
-                    }
-                    recv(client_rx) -> res => {
-                        match res {
-                            Ok(Ok(pkt)) => {
-                                if verbose {
-                                    println!("{}", log_msg("client->port", &pkt));
+    let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => client_send.send(s),
+                _ => continue,
+            };
+        }
+    });
+
+    use crossbeam::select;
+    loop {
+        select! {
+            recv(new_client) -> tcp_client => {
+                match tcp_client {
+                    Ok(stream) => {
+                        let (rx_send, client_rx) = tio::Port::rx_channel();
+                        let client = match tio::Port::from_tcp_stream(stream, tio::Port::rx_to_channel(rx_send)) {
+                            Ok(client_port) => client_port,
+                            _ => continue,
+                        };
+
+                        let (sender, receiver) = port.port().unwrap();
+                        std::thread::spawn(move || {
+                            loop {
+                                select! {
+                                    recv(receiver) -> res => {
+                                        let pkt = res.unwrap(); // port failing will close program
+                                        if verbose {
+                                            println!("{}", log_msg("port->client", &pkt));
+                                        }
+                                        client.send(pkt);
+                                    }
+                                    recv(client_rx) -> res => {
+                                        match res {
+                                            Ok(Ok(pkt)) => {
+                                                if verbose {
+                                                    println!("{}", log_msg("client->port", &pkt));
+                                                }
+                                                sender.send(pkt);
+                                            }
+                                            _ => {
+                                                // client failing will listen for the next client
+                                                println!("Client exiting PROXY");
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
-                                sender.send(pkt);
                             }
-                            _ => {
-                                // client failing will listen for the next client
-                                println!("Client exiting PROXY");
-                                break;
-                            }
-                        }
+                        });
+                    }
+                    Err(_) => {
+                        break;
                     }
                 }
             }
-        });
+            recv(port_status) -> status => {
+                match status {
+                    Ok(s) => {println!("port status: {:?}", s);}
+                    Err(Disconnected) => {break;}
+                }
+            }
+            recv(proxy_rx) -> pkt_or_err => {
+                if let Ok(pkt) = pkt_or_err {
+                    if let proto::Payload::LogMessage(log) = pkt.payload {
+                        println!("Sensor {:?}: {}", log.level, log.message);
+                    }
+                }
+            }
+        }
     }
 }
 
