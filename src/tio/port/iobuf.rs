@@ -1,9 +1,8 @@
 use super::{RecvError, SendError};
-use std::io; // TODO: can we do without these?
+use std::io;
 
 const IOBUF_SIZE: usize = 4096;
 
-// TODO: interface without these being public?
 pub struct IOBuf {
     buf: [u8; IOBUF_SIZE],
     start: usize,

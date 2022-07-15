@@ -80,21 +80,98 @@ pub enum Payload {
     Unknown(GenericPayload),
 }
 
-// TODO: route as own object with parsing, etc, instead of vec
-/*
 #[derive(Debug, Clone)]
 pub struct DeviceRoute {
     route: Vec<u8>,
 }
 
 impl DeviceRoute {
+    pub fn root() -> DeviceRoute {
+        DeviceRoute { route: vec![] }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> DeviceRoute {
+        let mut ret = DeviceRoute {
+            route: bytes.to_vec(),
+        };
+        ret.route.reverse();
+        ret
+    }
+
+    pub fn from_str(route_str: &str) -> Result<DeviceRoute, ()> {
+        let mut ret = DeviceRoute::root();
+        let stripped = match route_str.strip_prefix("/") {
+            Some(s) => s,
+            None => route_str,
+        };
+        if stripped.len() > 0 {
+            for segment in stripped.split('/') {
+                match segment.parse() {
+                    Ok(n) => {
+                        ret.route.push(n);
+                    }
+                    _ => {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(ret)
+    }
+
+    pub fn len(&self) -> usize {
+        self.route.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<u8> {
+        self.route.iter()
+    }
+
+    pub fn serialize(&self, mut rest_of_packet: Vec<u8>) -> Vec<u8> {
+        for hop in self.route.iter().rev() {
+            rest_of_packet.push(*hop);
+        }
+        rest_of_packet
+    }
+
+    // Returns the relative route from this to other_route (which is absolute.
+    // Error if other route is not in the subtree rooted by this route.
+    pub fn relative_route(&self, other_route: &DeviceRoute) -> Result<DeviceRoute, ()> {
+        if (self.len() <= other_route.len()) && (self.route == other_route.route[0..self.len()]) {
+            Ok(DeviceRoute {
+                route: other_route.route[self.len()..].to_vec(),
+            })
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn absolute_route(&self, other_route: &DeviceRoute) -> DeviceRoute {
+        let mut route = self.route.clone();
+        route.extend_from_slice(&other_route.route[..]);
+        DeviceRoute { route }
+    }
 }
-*/
+
+use std::fmt::{Display, Formatter};
+
+impl Display for DeviceRoute {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        if self.route.len() == 0 {
+            write!(f, "/").unwrap();
+        } else {
+            for segment in &self.route {
+                write!(f, "/{}", segment).unwrap();
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Packet {
     pub payload: Payload,
-    pub routing: Vec<u8>,
+    pub routing: DeviceRoute,
     pub ttl: u8,
 }
 
@@ -216,7 +293,7 @@ impl Packet {
         Ok((
             Packet {
                 payload: payload,
-                routing: raw[routing_start..packet_len].to_vec(),
+                routing: DeviceRoute::from_bytes(&raw[routing_start..packet_len]),
                 ttl: ttl,
             },
             packet_len,
@@ -245,7 +322,7 @@ impl Packet {
                     LogLevel::DEBUG => 4,
                 });
                 ret.extend(log.message.as_bytes());
-                ret
+                self.routing.serialize(ret)
             }
             Payload::RpcRequest(req) => {
                 let mut ret = self.prepare_header(
@@ -268,13 +345,13 @@ impl Packet {
                     }
                 }
                 ret.extend(&req.arg);
-                ret
+                self.routing.serialize(ret)
             }
             Payload::RpcReply(rep) => {
                 let mut ret = self.prepare_header(3, 2 + rep.reply.len());
                 ret.extend(rep.id.to_le_bytes());
                 ret.extend(&rep.reply);
-                ret
+                self.routing.serialize(ret)
             }
             Payload::RpcError(err) => {
                 let mut ret = self.prepare_header(4, 4 + err.extra.len());
@@ -289,7 +366,7 @@ impl Packet {
                 };
                 ret.extend(code.to_le_bytes());
                 ret.extend(&err.extra);
-                ret
+                self.routing.serialize(ret)
             }
             Payload::Heartbeat(payload) => {
                 let raw_payload = match payload {
@@ -298,22 +375,21 @@ impl Packet {
                 };
                 let mut ret = self.prepare_header(5, raw_payload.len());
                 ret.extend(raw_payload);
-                ret
+                self.routing.serialize(ret)
             }
             Payload::StreamData(sample) => {
                 let mut ret = self.prepare_header(128 + sample.stream_id, 4 + sample.data.len());
                 ret.extend(sample.sample_n.to_le_bytes());
                 ret.extend(&sample.data);
-                ret
+                self.routing.serialize(ret)
             }
             Payload::Unknown(payload) => {
                 let mut ret = self.prepare_header(payload.packet_type, payload.payload.len());
                 ret.extend(&payload.payload);
-                ret
-            }
-            _ => {
-                vec![]
-            }
+                self.routing.serialize(ret)
+            } //            _ => {
+              //                vec![]
+              //            }
         }
     }
 
@@ -324,7 +400,7 @@ impl Packet {
                 method: RpcMethod::Name(name),
                 arg: arg.to_vec(),
             }),
-            routing: vec![],
+            routing: DeviceRoute::root(),
             ttl: 0,
         }
     }
@@ -337,7 +413,7 @@ impl Packet {
                     vec![]
                 }
             })),
-            routing: vec![],
+            routing: DeviceRoute::root(),
             ttl: 0,
         }
     }
@@ -349,7 +425,7 @@ impl Packet {
                 error: error,
                 extra: vec![],
             }),
-            routing: vec![],
+            routing: DeviceRoute::root(),
             ttl: 0,
         }
     }

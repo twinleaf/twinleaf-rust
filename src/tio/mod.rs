@@ -2,7 +2,7 @@ mod port;
 pub mod proto;
 
 pub use port::{Port, RecvError, SendError};
-pub use proto::Packet;
+pub use proto::{DeviceRoute, Packet};
 
 use std::io;
 use std::thread;
@@ -18,6 +18,11 @@ pub enum TioProxyEvent {
     SensorConnected,
     SensorDisconnected,
     FailedToConnect,
+    Exiting,
+    NewClient(u64),
+    RpcRemap((u64, u16), u16),
+    RpcRestore(u16, (u64, u16)),
+    RpcTimeout(u16),
 }
 
 // Internal proxy state per client
@@ -25,20 +30,19 @@ struct TioProxyClient {
     tx: channel::Sender<Packet>,
     rx: channel::Receiver<Packet>,
     rpc_timeout: Duration,
-    scope: Vec<u8>,
+    scope: DeviceRoute,
     forward_data: bool,
     forward_nonrpc: bool,
 }
 
 impl TioProxyClient {
     fn send(&self, pkt: &Packet) -> Result<(), channel::TrySendError<Packet>> {
-        // TODO: encapsulate this stuff in a routing type
-        if pkt.routing.len() < self.scope.len() {
+        let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.routing) {
+            r
+        } else {
+            println!("REJECTED PKT {:?}", pkt);
             return Ok(());
-        }
-        if pkt.routing[0..self.scope.len()] != self.scope {
-            return Ok(());
-        }
+        };
         if !match pkt.payload {
             proto::Payload::RpcRequest(_)
             | proto::Payload::RpcReply(_)
@@ -50,18 +54,14 @@ impl TioProxyClient {
         }
         self.tx.try_send(Packet {
             payload: pkt.payload.clone(),
-            routing: pkt.routing[self.scope.len()..].to_vec(),
+            routing: scoped_route,
             ttl: pkt.ttl,
         })
     }
 
     fn recv(&self) -> Result<Packet, channel::TryRecvError> {
         let mut pkt = self.rx.try_recv()?;
-        if self.scope.len() != 0 {
-            let mut routing = self.scope.clone();
-            routing.extend_from_slice(&pkt.routing[..]);
-            pkt.routing = routing;
-        }
+        pkt.routing = self.scope.absolute_route(&pkt.routing);
         Ok(pkt)
     }
 }
@@ -69,7 +69,7 @@ impl TioProxyClient {
 struct RpcMapEntry {
     id: u16,
     client: u64,
-    route: Vec<u8>,
+    route: DeviceRoute,
     timeout: Instant,
 }
 
@@ -126,11 +126,8 @@ impl TioProxy {
                 return false;
             }
         };
-        if let Some(rates) = port.rate_info() {
-            println!(
-                "RATES: {} {} {}",
-                rates.default_bps, rates.min_bps, rates.max_bps
-            );
+        if let Some(_rates) = port.rate_info() {
+            // TODO: this means we can try rate autonegotiation
         }
         self.device = Some(ProxyDevice {
             tio_port: port,
@@ -139,7 +136,7 @@ impl TioProxy {
         true
     }
 
-    fn rpc_remap(&mut self, wire_id: u16) -> Option<(u16, &TioProxyClient)> {
+    fn rpc_restore(&mut self, wire_id: u16) -> Option<(u16, &TioProxyClient)> {
         let remap = match self.rpc_map.remove(&wire_id) {
             None => {
                 return None;
@@ -152,6 +149,7 @@ impl TioProxy {
             self.rpc_timeouts.remove(&remap.timeout);
         }
         if let Some(client) = self.clients.get(&remap.client) {
+            self.send_event(TioProxyEvent::RpcRestore(wire_id, (remap.client, remap.id)));
             Some((remap.id, client))
         } else {
             None
@@ -182,7 +180,7 @@ impl TioProxy {
                     timeout: timeout,
                 },
             );
-            println!("RPC ID MAPPED: {} -> {}", req.id, wire_id);
+            self.send_event(TioProxyEvent::RpcRemap((client_id, req.id), wire_id));
             req.id = wire_id;
             rpc_mapped_id = Some(wire_id);
         }
@@ -218,6 +216,7 @@ impl TioProxy {
             }
             to_remove.push(*timeout);
             for rpc_id in rpc_ids {
+                self.send_event(TioProxyEvent::RpcTimeout(*rpc_id));
                 let remap = self.rpc_map.remove(&rpc_id).unwrap();
                 let client = if let Some(c) = self.clients.get(&remap.client) {
                     c
@@ -226,7 +225,9 @@ impl TioProxy {
                     // TODO: maybe inform via status channel
                     continue;
                 };
-                client.send(&Packet::make_rpc_error(remap.id, error.clone()));
+                let mut pkt = Packet::make_rpc_error(remap.id, error.clone());
+                pkt.routing = remap.route;
+                client.send(&pkt).unwrap(); // TODO
             }
         }
         for timeout in to_remove {
@@ -251,11 +252,20 @@ impl TioProxy {
         );
     }
 
+    fn send_event(&self, event: TioProxyEvent) {
+        if self.status_queue.is_some() {
+            self.status_queue.as_ref().unwrap().send(event).unwrap(); // TODO
+        }
+    }
+
     fn run(&mut self) {
         use channel::TryRecvError;
 
         if !self.try_setup_device() {
+            self.send_event(TioProxyEvent::FailedToConnect);
             return;
+        } else {
+            self.send_event(TioProxyEvent::SensorConnected);
         }
         let mut device_timeout = Instant::now();
 
@@ -267,9 +277,12 @@ impl TioProxy {
                 self.cancel_active_rpcs();
                 if !self.try_setup_device() {
                     if Instant::now() > device_timeout {
+                        self.send_event(TioProxyEvent::FailedToConnect);
                         break;
                     }
                     timeout = std::cmp::min(timeout, Duration::from_secs(1));
+                } else {
+                    self.send_event(TioProxyEvent::SensorConnected);
                 }
             }
             for client_id in clients_to_drop.drain() {
@@ -299,7 +312,7 @@ impl TioProxy {
                         Ok(pkt) => {
                             if let Err(rpkt) = self.forward_to_device(pkt, client_id) {
                                 // TODO: error handling. not much we can do here but inform the status queue
-                                self.clients.get(&client_id).unwrap().send(&rpkt);
+                                self.clients.get(&client_id).unwrap().send(&rpkt).unwrap();
                             }
                         }
                         Err(TryRecvError::Empty) => {
@@ -314,10 +327,9 @@ impl TioProxy {
             } else if index == ids.len() {
                 // new proxy client
                 loop {
-                    println!("PP: newclient");
                     match self.new_client_queue.try_recv() {
                         Ok(client) => {
-                            println!("PP: new client {}", self.next_client_id);
+                            self.send_event(TioProxyEvent::NewClient(self.next_client_id));
                             self.clients.insert(self.next_client_id, client);
                             self.next_client_id += 1;
                         }
@@ -325,8 +337,7 @@ impl TioProxy {
                             break;
                         }
                         Err(TryRecvError::Disconnected) => {
-                            // channel closed.
-                            println!("PP: channelclosed");
+                            self.send_event(TioProxyEvent::Exiting);
                             break 'mainloop;
                         }
                     }
@@ -340,31 +351,31 @@ impl TioProxy {
                             match &mut pkt.payload {
                                 proto::Payload::RpcReply(rep) => {
                                     let (original_id, client) =
-                                        if let Some((o, c)) = self.rpc_remap(rep.id) {
+                                        if let Some((o, c)) = self.rpc_restore(rep.id) {
                                             (o, c)
                                         } else {
                                             // TODO: say something
                                             continue;
                                         };
                                     rep.id = original_id;
-                                    client.send(&pkt);
+                                    client.send(&pkt).unwrap(); // TODO
                                 }
                                 // TODO: find a good way to avoid duplication
                                 proto::Payload::RpcError(err) => {
                                     let (original_id, client) =
-                                        if let Some((o, c)) = self.rpc_remap(err.id) {
+                                        if let Some((o, c)) = self.rpc_restore(err.id) {
                                             (o, c)
                                         } else {
                                             // TODO: say something
                                             continue;
                                         };
                                     err.id = original_id;
-                                    client.send(&pkt);
+                                    client.send(&pkt).unwrap(); // TODO
                                 }
                                 _ => {
                                     for (_, client) in self.clients.iter() {
                                         // TODO: check for failure
-                                        client.send(&pkt);
+                                        client.send(&pkt).unwrap();
                                     }
                                 }
                             }
@@ -384,8 +395,8 @@ impl TioProxy {
                                     Some(t) => t,
                                     None => Duration::from_secs(0),
                                 };
+                            self.send_event(TioProxyEvent::SensorDisconnected);
                             break;
-                            //break 'mainloop;
                         }
                     }
                 }
@@ -418,7 +429,7 @@ impl TioProxyPort {
     pub fn new_port(
         &self,
         rpc_timeout: Option<Duration>,
-        scope: Vec<u8>,
+        scope: DeviceRoute,
         forward_data: bool,
         forward_nonrpc: bool,
     ) -> io::Result<(channel::Sender<Packet>, channel::Receiver<Packet>)> {
@@ -439,7 +450,7 @@ impl TioProxyPort {
 
         let (client_to_proxy_sender, proxy_from_client_receiver) = channel::bounded::<Packet>(32);
         let (proxy_to_client_sender, client_from_proxy_receiver) = channel::bounded::<Packet>(32);
-        if let Err(e) = self.new_client_queue.send(TioProxyClient {
+        if let Err(_) = self.new_client_queue.send(TioProxyClient {
             tx: proxy_to_client_sender,
             rx: proxy_from_client_receiver,
             rpc_timeout: rpc_timeout,
@@ -456,10 +467,13 @@ impl TioProxyPort {
     }
 
     pub fn port(&self) -> io::Result<(channel::Sender<Packet>, channel::Receiver<Packet>)> {
-        self.new_port(None, vec![], true, true)
+        self.new_port(None, DeviceRoute::root(), true, true)
     }
 
-    pub fn scoped_port() {}
-
-    pub fn direct_port() {}
+    pub fn scoped_port(
+        &self,
+        root: DeviceRoute,
+    ) -> io::Result<(channel::Sender<Packet>, channel::Receiver<Packet>)> {
+        self.new_port(None, root, true, true)
+    }
 }
