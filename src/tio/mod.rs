@@ -40,7 +40,6 @@ impl TioProxyClient {
         let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.routing) {
             r
         } else {
-            println!("REJECTED PKT {:?}", pkt);
             return Ok(());
         };
         if !match pkt.payload {
