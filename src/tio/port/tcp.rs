@@ -1,16 +1,29 @@
+//! TCP Port
+//!
+//! Implements a `RawPort` for a TCP stream, and an MIO event source.
+//! TIO packets are sent unmodified to the TCP stream. The TIO protocol
+//! packets have a header that allows for figuring out the total size
+//! of a packet, so it can be split up again at the receiving end.
+
 use super::{iobuf::IOBuf, proto, Packet, RawPort, RecvError, SendError};
 use mio::net::TcpStream;
 use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
 
+/// RawPort to communicate via TCP
 pub struct Port {
+    /// Underlying stream
     stream: TcpStream,
+    /// Incoming buffer, used to buffer partial packets.
     rxbuf: IOBuf,
+    /// Outgoing buffer, used for all-or-none sends of packets
+    /// when the TCP buffer fills up.
     txbuf: IOBuf,
 }
 
 impl Port {
+    /// Takes ownership of a MIO `TcpStream` and constructs a `Port` over it.
     pub fn from_stream(stream: TcpStream) -> Result<Port, io::Error> {
         Ok(Port {
             stream: stream,
@@ -19,11 +32,14 @@ impl Port {
         })
     }
 
+    /// Returns a new `tcp::Port` for communication with the given `address`.
     pub fn new(address: &SocketAddr) -> Result<Port, io::Error> {
         let stream = TcpStream::connect(*address)?;
         Port::from_stream(stream)
     }
 
+    /// Attempts to receive a packet only from the data currently present
+    /// in the incoming buffer.
     fn recv_buffered(&mut self) -> Result<Packet, RecvError> {
         match Packet::deserialize(self.rxbuf.data()) {
             Ok((pkt, size)) => {
@@ -57,10 +73,14 @@ impl RawPort for Port {
         match self.stream.write(&raw) {
             Ok(size) => {
                 if size == raw.len() {
+                    // The entire packet was written out
                     Ok(())
                 } else {
-                    // IOBuf sized such that it can always store at least a full packet.
-                    self.txbuf.add_data(&raw[size..]).unwrap();
+                    // Partial write, the TCP buffer is full. To guarantee packetization
+                    // we must send the remaining data, so add it to the outgoing buffer.
+                    // IOBuf sized such that it can always store at least a full packet,
+                    // so this should never happen.
+                    self.txbuf.add_data(&raw[size..]).expect("No fit in IOBuf");
                     Err(SendError::MustDrain)
                 }
             }
@@ -68,7 +88,7 @@ impl RawPort for Port {
                 // This can happen if we happen to send with the TCP buffer completely full.
                 // Maintain the same semantics and buffer the whole thing in txbuf.
                 // IOBuf sized such that it can always store at least a full packet.
-                self.txbuf.add_data(&raw[..]).unwrap();
+                self.txbuf.add_data(&raw[..]).expect("No fit in IOBuf");
                 Err(SendError::MustDrain)
             }
             Err(e) => Err(SendError::IO(e)),

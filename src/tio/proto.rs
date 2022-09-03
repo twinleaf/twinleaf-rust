@@ -175,13 +175,19 @@ pub struct Packet {
     pub ttl: u8,
 }
 
+pub static MAX_PACKET_LEN: usize = 512;
+
 #[derive(Debug)]
 pub enum Error {
     NeedMore,
-    InvalidPacketType,
-    PayloadTooBig,
-    RoutingTooBig,
-    PayloadTooSmall,
+    Text(String),
+    CRC32(Vec<u8>),
+    PacketTooBig(Vec<u8>),
+    PacketTooSmall(Vec<u8>),
+    InvalidPacketType(Vec<u8>),
+    PayloadTooBig(Vec<u8>),
+    RoutingTooBig(Vec<u8>),
+    PayloadTooSmall(Vec<u8>),
 }
 
 impl Packet {
@@ -191,7 +197,7 @@ impl Packet {
         }
         let packet_type = raw[0];
         if let 9 | 10 | 13 = packet_type {
-            return Err(Error::InvalidPacketType);
+            return Err(Error::InvalidPacketType(raw.to_vec()));
         }
         if raw.len() < 2 {
             return Err(Error::NeedMore);
@@ -199,7 +205,7 @@ impl Packet {
         let ttl = raw[1] >> 4;
         let routing_len = (raw[1] & 0xF) as usize;
         if routing_len > 8 {
-            return Err(Error::RoutingTooBig);
+            return Err(Error::RoutingTooBig(raw.to_vec()));
         }
         if raw.len() < 4 {
             return Err(Error::NeedMore);
@@ -208,7 +214,7 @@ impl Packet {
         let routing_start = 4 + payload_len;
         let packet_len = routing_start + routing_len;
         if packet_len > 512 {
-            return Err(Error::PayloadTooBig);
+            return Err(Error::PayloadTooBig(raw.to_vec()));
         }
         if raw.len() < packet_len {
             return Err(Error::NeedMore);
@@ -216,7 +222,7 @@ impl Packet {
         let payload = match packet_type {
             1 => {
                 if routing_start < 9 {
-                    return Err(Error::PayloadTooSmall);
+                    return Err(Error::PayloadTooSmall(raw.to_vec()));
                 }
                 Payload::LogMessage(LogMessagePayload {
                     data: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
@@ -232,7 +238,7 @@ impl Packet {
             }
             2 => {
                 if routing_start < 8 {
-                    return Err(Error::PayloadTooSmall);
+                    return Err(Error::PayloadTooSmall(raw.to_vec()));
                 }
                 let mut arg_start: usize = 8;
                 let method = u16::from_le_bytes(raw[6..8].try_into().unwrap());
@@ -250,7 +256,7 @@ impl Packet {
             }
             3 => {
                 if routing_start < 6 {
-                    return Err(Error::PayloadTooSmall);
+                    return Err(Error::PayloadTooSmall(raw.to_vec()));
                 }
                 Payload::RpcReply(RpcReplyPayload {
                     id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
@@ -259,7 +265,7 @@ impl Packet {
             }
             4 => {
                 if routing_start < 8 {
-                    return Err(Error::PayloadTooSmall);
+                    return Err(Error::PayloadTooSmall(raw.to_vec()));
                 }
                 Payload::RpcError(RpcErrorPayload {
                     id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
@@ -274,9 +280,18 @@ impl Packet {
                     extra: raw[8..routing_start].to_vec(),
                 })
             }
+            5 => {
+                let payload = raw[4..routing_start].to_vec();
+                if payload.len() == 4 {
+                    let session = u32::from_le_bytes(payload[..].try_into().unwrap());
+                    Payload::Heartbeat(HeartbeatPayload::Session(session))
+                } else {
+                    Payload::Heartbeat(HeartbeatPayload::Any(payload))
+                }
+            }
             ptype if ptype >= 128 => {
                 if routing_start < 9 {
-                    return Err(Error::PayloadTooSmall);
+                    return Err(Error::PayloadTooSmall(raw.to_vec()));
                 }
                 Payload::StreamData(StreamDataPayload {
                     stream_id: ptype - 128,

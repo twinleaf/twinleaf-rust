@@ -118,10 +118,7 @@ impl RpcMeta {
     }
 }
 
-fn rpc_get_reply(
-    rx: &crossbeam::channel::Receiver<proto::Packet>,
-    expected_len: usize,
-) -> Result<Vec<u8>, ()> {
+fn rpc_get_response(rx: &crossbeam::channel::Receiver<proto::Packet>) -> Result<tio::Packet, ()> {
     loop {
         let pkt = match rx.recv() {
             Ok(pkt) => pkt,
@@ -130,30 +127,41 @@ fn rpc_get_reply(
             }
         };
         match pkt.payload {
-            proto::Payload::RpcReply(rep) => {
-                return if (expected_len == 0) || (rep.reply.len() == expected_len) {
-                    Ok(rep.reply)
-                } else {
-                    Err(())
-                };
-            }
-            proto::Payload::RpcError(err) => {
-                println!("Rpc Error: {:?}", err.error);
-                return Err(());
+            proto::Payload::RpcReply(_) | proto::Payload::RpcError(_) => {
+                return Ok(pkt);
             }
             _ => {}
         }
     }
 }
 
+fn rpc_get_reply(
+    rx: &crossbeam::channel::Receiver<proto::Packet>,
+    expected_len: usize,
+) -> Result<Vec<u8>, ()> {
+    if let Ok(pkt) = rpc_get_response(rx) {
+        match pkt.payload {
+            proto::Payload::RpcReply(rep) => {
+                if (expected_len == 0) || (rep.reply.len() == expected_len) {
+                    Ok(rep.reply)
+                } else {
+                    Err(())
+                }
+            }
+            proto::Payload::RpcError(err) => {
+                println!("Rpc Error: {:?}", err.error);
+                Err(())
+            }
+            _ => Err(()),
+        }
+    } else {
+        Err(())
+    }
+}
+
 fn tio_opts() -> Options {
     let mut opts = Options::new();
-    opts.optopt(
-        "r",
-        "",
-        "sensor root (default tcp://localhost:7855)",
-        "address",
-    );
+    opts.optopt("r", "", "sensor root (default tcp://localhost)", "address");
     opts.optopt(
         "s",
         "",
@@ -173,7 +181,7 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
     let root = if let Some(url) = matches.opt_str("r") {
         url
     } else {
-        "tcp://localhost:7855".to_string()
+        "tcp://localhost".to_string()
     };
     let route = if let Some(path) = matches.opt_str("s") {
         DeviceRoute::from_str(&path).unwrap()
@@ -430,7 +438,7 @@ fn proxy(args: &[String]) {
     let (status_send, port_status) = crossbeam::channel::bounded::<tio::TioProxyEvent>(10);
     let port = tio::TioProxyPort::new(
         &sensor_url,
-        Some(std::time::Duration::from_secs(10)),
+        Some(std::time::Duration::from_secs(30)),
         Some(status_send),
     );
 
@@ -524,6 +532,96 @@ fn proxy(args: &[String]) {
     }
 }
 
+fn dump(args: &[String]) {
+    let opts = tio_opts();
+    let (_matches, root, _route) = tio_parseopts(opts, args);
+
+    // TODO: is there a way to do this with proxy port??
+    //let port = tio::TioProxyPort::new(&root, None, None);
+    let (rx_send, rx) = tio::Port::rx_channel();
+    let _port = tio::Port::from_url(&root, tio::Port::rx_to_channel(rx_send)).unwrap();
+
+    loop {
+        match rx.recv() {
+            Ok(Ok(pkt)) => {
+                println!("PKT: {:?}", pkt);
+            }
+            Ok(Err(tio::RecvError::Protocol(proto::Error::Text(txt)))) => {
+                println!("TXT: {}", txt);
+            }
+            Ok(Err(tio::RecvError::Protocol(perr))) => {
+                println!("PROTO: {:?}", perr);
+            }
+            reason => {
+                println!("BREAKING: {:?}", reason);
+                break;
+            }
+        }
+    }
+}
+
+fn firmware_upgrade(args: &[String]) {
+    let opts = tio_opts();
+    let (matches, root, route) = tio_parseopts(opts, args);
+
+    if matches.free.len() != 1 {
+        panic!("Must specify firmware path only")
+    }
+
+    let firmware_data = std::fs::read(matches.free[0].clone()).unwrap();
+
+    println!("Loaded {} bytes firmware", firmware_data.len());
+
+    let port = tio::TioProxyPort::new(&root, None, None);
+    let (tx, rx) = port.new_port(None, route, false, false).unwrap();
+
+    tx.send(tio::Packet::rpc("dev.stop".to_string(), &vec![]))
+        .unwrap();
+    if let Err(_) = rpc_get_response(&rx) {
+        // only if an error with the RPC happened.
+        // TODO: some rpc errors should also fail, like timeouts or others.
+        panic!("Failed to stop device");
+    }
+
+    let mut offset: usize = 0;
+
+    while offset < firmware_data.len() {
+        let chunk_end = if (offset + 288) > firmware_data.len() {
+            firmware_data.len()
+        } else {
+            offset + 288
+        };
+        tx.send(tio::Packet::rpc(
+            "dev.firmware.upload".to_string(),
+            &firmware_data[offset..chunk_end],
+        ))
+        .unwrap();
+        match rpc_get_reply(&rx, 0) {
+            Ok(_reply) => {}
+            _ => {
+                panic!("upload failed");
+            }
+        };
+        offset = chunk_end;
+        let pct = 100.0 * (offset as f64) / (firmware_data.len() as f64);
+        println!("Uploaded {:.1}%", pct);
+    }
+
+    tx.send(tio::Packet::rpc(
+        "dev.firmware.upgrade".to_string(),
+        &vec![],
+    ))
+    .unwrap();
+    match rpc_get_reply(&rx, 0) {
+        Ok(_) => {
+            println!("Upgrade successful. Wait for sensor to reboot.");
+        }
+        _ => {
+            panic!("upload failed");
+        }
+    };
+}
+
 fn main() {
     let mut args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -538,6 +636,12 @@ fn main() {
         }
         "proxy" => {
             proxy(&args[2..]); //.unwrap();
+        }
+        "dump" => {
+            dump(&args[2..]); //.unwrap();
+        }
+        "firmware-upgrade" => {
+            firmware_upgrade(&args[2..]); //.unwrap();
         }
         _ => {
             // TODO: do usage right

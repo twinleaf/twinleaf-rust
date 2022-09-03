@@ -1,26 +1,83 @@
-use super::{iobuf::IOBuf, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
+//! Serial Port
+//!
+//! Implements a `RawPort` for a serial port, and an MIO event source.
+//! Tio packets have their CRC32 appended, and are then encoded on the
+//! serial stream using SLIP.
+//! When receiving, this implementation also attempts to parse newline
+//! delimited, plain text ascii, which is returned as a
+//! `RecvError::Protocol(proto::Error::Text(textual_data))`
+
+use super::{iobuf::IOBuf, proto, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
 use crc::{Crc, CRC_32_ISO_HDLC};
 use mio_serial::{SerialPort, SerialPortBuilderExt};
 use std::io;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+/// RawPort to communicate via a serial port
 pub struct Port {
+    /// Underlying serial port stream
     port: mio_serial::SerialStream,
+    /// This contains the default and target data rates,
+    /// for the higher level ports to switch speeds.
     rates: RateInfo,
+    /// Incoming buffer, used to buffer partial packets.
     rxbuf: IOBuf,
-    need_refill: bool,
+    /// Instant when we received data most recently. This is used
+    /// to clear out stale data from `rxbuf`.
+    last_rx: Instant,
+    /// Outgoing buffer, used for all-or-none sends of packets
+    /// when the OS buffer fills up.
     txbuf: IOBuf,
 }
 
+/// Default data rate on the serial port.
+static DEFAULT_RATE: u32 = 115200;
+
 impl Port {
-    pub fn new(port_name: &str) -> Result<Port, io::Error> {
-        let mio_port = mio_serial::new(port_name, 115200).open_native_async()?;
+    /// Returns a new `tcp::Port`. The `url` should look like
+    /// `serial_port[:target_rate[:default_rate]]``. It must start with a serial port,
+    /// like `/dev/tty??` or `COMn`. The second parameter is optional, and it
+    /// indicates the rate at which tio should try to configure the connected device.
+    /// The final parameter is the default rate: this is the data rate that the device
+    /// will start at, and to which we fall back to if issues arise with the communication.
+    /// Both optional parameters default to 115200.
+    ///
+    /// For example, `COM3:400000:115200` will start off at 115.2k and try to
+    /// negotiate 400k. If it fails to do so, or at any point later, it will
+    /// fall back to 115.2k.
+    pub fn new(url: &str) -> Result<Port, io::Error> {
+        let url_tokens: Vec<&str> = url.split(':').collect();
+        if (url_tokens.len() < 1) || (url_tokens.len() > 3) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let port_name = url_tokens[0];
+        let target_rate = if url_tokens.len() > 1 {
+            if let Ok(rate) = url_tokens[1].parse::<u32>() {
+                rate
+            } else {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+        } else {
+            DEFAULT_RATE
+        };
+        let default_rate = if url_tokens.len() > 2 {
+            if let Ok(rate) = url_tokens[2].parse::<u32>() {
+                rate
+            } else {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+        } else {
+            DEFAULT_RATE
+        };
+        let mio_port = mio_serial::new(port_name, default_rate).open_native_async()?;
         #[cfg(windows)]
         {
+            // Windows requires some custom settings to replicate the unix behavior.
+            use std::os::windows::io::AsRawHandle;
             use winapi::um::commapi::SetCommTimeouts;
             use winapi::um::winbase::COMMTIMEOUTS;
-            let handle = mio_port.as_handle();
+            let handle = mio_port.as_raw_handle();
             let mut timeouts = COMMTIMEOUTS {
                 ReadIntervalTimeout: 0xFFFFFFFF,
                 ReadTotalTimeoutMultiplier: 0xFFFFFFFF,
@@ -35,34 +92,81 @@ impl Port {
         Ok(Port {
             port: mio_port,
             rates: RateInfo {
-                default_bps: 115200,
-                min_bps: 9600,
-                max_bps: 400000,
+                default_bps: default_rate,
+                target_bps: target_rate,
             },
             rxbuf: IOBuf::new(),
-            need_refill: true,
+            last_rx: Instant::now(),
             txbuf: IOBuf::new(),
         })
     }
 
+    /// Attempts to receive a packet only from the data currently present
+    /// in the incoming buffer.
     fn recv_buffered(&mut self) -> Result<Packet, RecvError> {
         let mut pkt = Vec::<u8>::new();
         let mut esc = false;
+        let mut text = true;
         let mut offset = 0;
         let mut consume_to = 0;
         let data = &self.rxbuf.data();
         while offset < data.len() {
-            // TODO: better validation, timeouts, text
-            if (data[offset] == 0xC0) || (pkt.len() > 600) {
-                if let Ok(parseres) = Packet::deserialize(&pkt) {
+            // Avoid packets that are too long, since we know they are invalid.
+            // If pkt's size reached the max packet length + CRC32 + separator,
+            // we know it's too long.
+            if pkt.len() >= (proto::MAX_PACKET_LEN + std::mem::size_of::<u32>() + 1) {
+                self.rxbuf.consume(offset);
+                return Err(RecvError::Protocol(proto::Error::PacketTooBig(pkt)));
+            }
+            // This will always succeed when converting an u8.
+            let c = char::from_u32(data[offset].into()).expect("byte to char conversion");
+            if text && ((c == '\n') || (c == '\r')) {
+                // Newline character preceded by valid text characters (possibly none).
+                // By the way the tio wire protocol over serial is designed, this can
+                // only be a text packet.
+                if pkt.len() > 0 {
                     self.rxbuf.consume(offset + 1);
-                    return Ok(parseres.0);
+                    return Err(RecvError::Protocol(proto::Error::Text(
+                        String::from_utf8_lossy(&pkt).to_string(),
+                    )));
                 } else {
                     consume_to = offset + 1;
                 }
-                pkt.truncate(0);
-                esc = false;
+            } else if data[offset] == 0xC0 {
+                // This denotes the end of a SLIP packet. no matter what, we'll return
+                // from here, either successfully with a packet, or with an error,
+                // so consume the data so far.
+                self.rxbuf.consume(offset + 1);
+                if pkt.len() < 4 + std::mem::size_of::<u32>() {
+                    // A packet must fit at least the header and its final CRC32
+                    return Err(RecvError::Protocol(proto::Error::PacketTooSmall(pkt)));
+                }
+                let len = pkt.len() - std::mem::size_of::<u32>();
+                let expected_crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&pkt[..len]);
+                // This will always succeed, because the vec slice must be 4 bytes
+                let received_crc = u32::from_le_bytes(pkt[len..].try_into().expect("array size"));
+                if received_crc != expected_crc {
+                    return Err(RecvError::Protocol(proto::Error::CRC32(pkt)));
+                }
+                // At this point the whole packet should be here, and there should not
+                // be any bytes left over.
+                return match Packet::deserialize(&pkt[..len]) {
+                    Ok((tio_pkt, size)) => {
+                        if size != len {
+                            Err(RecvError::IO(io::Error::from(io::ErrorKind::InvalidData)))
+                        } else {
+                            Ok(tio_pkt)
+                        }
+                    }
+                    Err(proto::Error::NeedMore) => {
+                        Err(RecvError::Protocol(proto::Error::PacketTooSmall(pkt)))
+                    }
+                    Err(perr) => Err(RecvError::Protocol(perr)),
+                };
             } else {
+                if !c.is_ascii_graphic() && (c != ' ') && (c != '\t') {
+                    text = false;
+                }
                 if esc {
                     if data[offset] == 0xDC {
                         pkt.push(0xC0);
@@ -87,28 +191,21 @@ impl Port {
 
 impl RawPort for Port {
     fn recv(&mut self) -> Result<Packet, RecvError> {
-        let mut refilled = false;
-        while !refilled {
-            if self.need_refill {
-                if let Err(e) = self.rxbuf.refill(&mut self.port) {
-                    return Err(e);
-                }
-                refilled = true;
+        let mut res = self.recv_buffered();
+        if let Err(RecvError::NotReady) = res {
+            // First discard stale data if there is any in the buffer.
+            // This could happen e.g. reprogramming a board mid-packet.
+            let now = Instant::now();
+            if now.duration_since(self.last_rx) > Duration::from_millis(200) {
+                self.rxbuf.flush();
             }
-            match self.recv_buffered() {
-                Ok(pkt) => {
-                    self.need_refill = self.rxbuf.empty();
-                    return Ok(pkt);
-                }
-                Err(RecvError::NotReady) => {
-                    self.need_refill = true;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
+            if let Err(e) = self.rxbuf.refill(&mut self.port) {
+                return Err(e);
             }
+            self.last_rx = now;
+            res = self.recv_buffered();
         }
-        Err(RecvError::NotReady)
+        res
     }
 
     fn send(&mut self, pkt: &Packet) -> Result<(), SendError> {
@@ -142,7 +239,9 @@ impl RawPort for Port {
                     Ok(())
                 } else {
                     // IOBuf sized such that it can always store at least a full encoded packet.
-                    self.txbuf.add_data(&encoded[size..]).unwrap();
+                    self.txbuf
+                        .add_data(&encoded[size..])
+                        .expect("No fit in IOBuf");
                     Err(SendError::MustDrain)
                 }
             }
@@ -150,7 +249,7 @@ impl RawPort for Port {
                 // This can happen if we happen to send with the OS buffer completely full.
                 // Maintain the same semantics and buffer the whole thing in txbuf.
                 // IOBuf sized such that it can always store at least a full encoded packet.
-                self.txbuf.add_data(&encoded[..]).unwrap();
+                self.txbuf.add_data(&encoded[..]).expect("No fit in IOBuf");
                 Err(SendError::MustDrain)
             }
             Err(e) => Err(SendError::IO(e)),
