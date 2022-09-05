@@ -308,8 +308,14 @@ impl Port {
                                 }
                                 Err(e) => {
                                     // Pass error along. Rx callback will determine what to do.
-                                    // if it returns an error, break out.
-                                    if let Err(_) = rx(Err(e)) {
+                                    // if it returns an error, break out. No matter what it says
+                                    // though, break out if disconnected.
+                                    let disconnect = if let RecvError::Disconnected = e {
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    if rx(Err(e)).is_err() || disconnect {
                                         break 'ioloop;
                                     }
                                 }

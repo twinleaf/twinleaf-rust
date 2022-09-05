@@ -200,6 +200,14 @@ impl RawPort for Port {
                 self.rxbuf.flush();
             }
             if let Err(e) = self.rxbuf.refill(&mut self.port) {
+                #[cfg(target_os = "macos")]
+                // On macos, disconnecting a serial port while connected will
+                // generate this error, so translate it.
+                if let RecvError::IO(ioerr) = &e {
+                    if Some(6) == ioerr.raw_os_error() {
+                        return Err(RecvError::Disconnected);
+                    }
+                }
                 return Err(e);
             }
             self.last_rx = now;
