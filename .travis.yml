@@ -7,3 +7,6 @@ os:
 branches:
 - main
 - gb-dev
+addons:
+ artifacts: true
+ apt_packages: libudev-dev
