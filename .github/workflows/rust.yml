@@ -28,7 +28,7 @@ jobs:
     - name: Upload tool binary
       uses: actions/upload-artifact@v3
       with:
-        name: tio-tool.${{ matrix.platform }}}
+        name: twinleaf-tools.${{ matrix.platform }}
         path: |
           target/release/tio-tool
           target/release/tio-tool.exe
