@@ -684,7 +684,7 @@ impl TioProxyPort {
         }
 
         let (client_to_proxy_sender, proxy_from_client_receiver) = channel::bounded::<Packet>(32);
-        let (proxy_to_client_sender, client_from_proxy_receiver) = channel::bounded::<Packet>(32);
+        let (proxy_to_client_sender, client_from_proxy_receiver) = channel::bounded::<Packet>(256);
         if let Err(_) = self.new_client_queue.send(TioProxyClient {
             tx: proxy_to_client_sender,
             rx: proxy_from_client_receiver,
