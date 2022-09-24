@@ -3,52 +3,8 @@ use tio::proto::DeviceRoute;
 use twinleaf::tio;
 
 use std::env;
-use std::net::TcpListener;
 
 use getopts::Options;
-
-// Unfortunately we cannot access USB details via the serialport module, so
-// we are stuck guessing based on VID/PID. This returns a vector of possible
-// serial ports.
-
-#[derive(Debug)]
-enum TwinleafPortInterface {
-    FTDI,
-    STM32,
-    Unknown(u16, u16),
-}
-
-struct SerialDevice {
-    url: String,
-    ifc: TwinleafPortInterface,
-}
-
-fn enum_devices(all: bool) -> Vec<SerialDevice> {
-    let mut ports: Vec<SerialDevice> = Vec::new();
-
-    if let Ok(avail_ports) = serialport::available_ports() {
-        for p in avail_ports.iter() {
-            if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
-                let interface = match (info.vid, info.pid) {
-                    (0x0403, 0x6015) => TwinleafPortInterface::FTDI,
-                    (0x0483, 0x5740) => TwinleafPortInterface::STM32,
-                    (vid, pid) => {
-                        if !all {
-                            continue;
-                        };
-                        TwinleafPortInterface::Unknown(vid, pid)
-                    }
-                };
-                ports.push(SerialDevice {
-                    url: format!("serial://{}", p.port_name),
-                    ifc: interface,
-                });
-            } // else ignore other types for now: bluetooth, pci, unknown
-        }
-    }
-
-    ports
-}
 
 struct RpcMeta {
     arg_type: String,
@@ -192,17 +148,10 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
 }
 
 fn list_rpcs(args: &[String]) -> std::io::Result<()> {
-    let mut opts = tio_opts();
-    opts.optflag("l", "", "List RPCs");
-    opts.optopt(
-        "t",
-        "",
-        "RPC type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
-        "type",
-    );
+    let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, args);
-    let proxy = tio::TioProxyPort::new(&root, None, None);
-    let (tx, rx) = proxy.new_port(None, route, false, false).unwrap();
+    let proxy = tio::ProxyPort::new(&root, None, None);
+    let (tx, rx) = proxy.port(None, route, false, false).unwrap();
 
     tx.send(tio::Packet::rpc("rpc.listinfo".to_string(), &vec![]))
         .unwrap();
@@ -260,8 +209,8 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         None
     };
 
-    let port = tio::TioProxyPort::new(&root, None, None);
-    let (tx, rx) = port.new_port(None, route, false, false).unwrap();
+    let proxy = tio::ProxyPort::new(&root, None, None);
+    let (tx, rx) = proxy.port(None, route, false, false).unwrap();
 
     let mut rpc_type = if let Some(rpc_type) = matches.opt_str("t") {
         Some(rpc_type)
@@ -332,231 +281,15 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-static mut _TIME_FMT: String = String::new();
-
-fn set_global_timefmt(fmt: String) {
-    unsafe {
-        _TIME_FMT = fmt;
-    }
-}
-
-fn global_timefmt() -> &'static str {
-    unsafe { &_TIME_FMT }
-}
-
-macro_rules! log{
-    ($f:expr,$($a:tt)*)=>{
-       {
-           println!(concat!("{}", $f),chrono::Local::now().format(global_timefmt()), $($a)*)
-       }
-    }
-}
-
-fn proxy(args: &[String]) {
-    let mut opts = Options::new();
-    opts.optopt(
-        "p",
-        "",
-        "TCP port to listen on for clients (default 7855)",
-        "port",
-    );
-    opts.optflag("v", "", "Verbose/debug printout of proxy events");
-    opts.optflag(
-        "d",
-        "",
-        "Dump traffic data through the proxy (does not include internal heartbeats)",
-    );
-    opts.optopt("t", "", "Timestamp format (default '%T%.3f ')", "port");
-    opts.optflag("", "auto", "automatically connect to a USB sensor if there is a single device on the system that could be a Twinleaf device");
-    let matches = match opts.parse(args) {
-        Ok(m) => m,
-        Err(f) => {
-            panic!("{}", f.to_string())
-        }
-    };
-    let tcp_port = if let Some(p) = matches.opt_str("p") {
-        p
-    } else {
-        "7855".to_string()
-    };
-    let tcp_port = if let Ok(p) = tcp_port.parse::<u16>() {
-        p
-    } else {
-        panic!("Invalid port {}", tcp_port);
-    };
-    let verbose = matches.opt_present("v");
-    let dump_traffic = matches.opt_present("d");
-    let auto_sensor = matches.opt_present("auto");
-
-    if let Some(t) = matches.opt_str("t") {
-        set_global_timefmt(t);
-    } else {
-        set_global_timefmt("%T%.3f ".to_string());
-    };
-
-    if matches.free.len() > 1 {
-        panic!("This program supports only a single sensor")
-    }
-
-    if (matches.free.len() == 1) && auto_sensor {
-        panic!("auto+explicit sensor given");
-    }
-    if (matches.free.len() == 0) && !auto_sensor {
-        panic!("need sensor url or --auto");
-    }
-
-    let sensor_url = if matches.free.len() == 1 {
-        matches.free[0].clone()
-    } else {
-        let devices = enum_devices(false);
-        let mut valid_urls = Vec::new();
-        for dev in devices {
-            match dev.ifc {
-                TwinleafPortInterface::STM32 | TwinleafPortInterface::FTDI => {
-                    valid_urls.push(dev.url.clone());
-                }
-                _ => {}
-            }
-        }
-        if valid_urls.len() == 0 {
-            panic!("Cannot find sensor to connect to, specify URL manually")
-        }
-        if valid_urls.len() > 1 {
-            panic!("Too many sensors detected, specify URL manually")
-        }
-        valid_urls[0].clone() // TODO
-    };
-
-    log!("Using sensor url: {}", sensor_url);
-
-    let listener = TcpListener::bind(std::net::SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        tcp_port,
-    ))
-    .unwrap();
-
-    let (status_send, port_status) = crossbeam::channel::bounded::<tio::TioProxyEvent>(10);
-    let port = tio::TioProxyPort::new(
-        &sensor_url,
-        Some(std::time::Duration::from_secs(30)),
-        Some(status_send),
-    );
-
-    // These are used by the proxy itself to communicate with the
-    // device tree.
-    // for now only used to receive log messages and dump traffic.
-    let (_proxy_tx, proxy_rx) = port.port().unwrap();
-
-    let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
-
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(s) => client_send.send(s).unwrap(), // TODO
-                _ => continue,
-            };
-        }
-    });
-
-    use crossbeam::select;
-    loop {
-        select! {
-            recv(new_client) -> tcp_client => {
-                match tcp_client {
-                    Ok(stream) => {
-                        let addr = stream.peer_addr().unwrap().to_string();
-                        let (rx_send, client_rx) = tio::Port::rx_channel();
-                        let client = match tio::Port::from_tcp_stream(stream, tio::Port::rx_to_channel(rx_send)) {
-                            Ok(client_port) => client_port,
-                            _ => continue,
-                        };
-
-                        if verbose {
-                            log!("Accepted client from {}", addr);
-                        }
-                        let (sender, receiver) = port.port().unwrap();
-                        std::thread::spawn(move || {
-                            loop {
-                                select! {
-                                    recv(receiver) -> res => {
-                                        let pkt = res.unwrap(); // port failing will close program
-                                        client.send(pkt).unwrap(); // TODO
-                                    }
-                                    recv(client_rx) -> res => {
-                                        match res {
-                                            Ok(Ok(pkt)) => {
-                                                if dump_traffic {
-                                                    log!("{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
-                                                }
-                                                sender.send(pkt).unwrap();// TODO
-                                            }
-                                            _ => {
-                                                // client failing will listen for the next client
-                                                if verbose {
-                                                    log!("Client {} exiting", addr);
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-            recv(port_status) -> status => {
-                match status {
-                    Ok(s) => {
-                        if verbose {
-                            log!("ProxyPort event: {:?}", s);
-                        }
-                    }
-                    Err(crossbeam::RecvError) => {break;}
-                }
-            }
-            recv(proxy_rx) -> pkt_or_err => {
-                if let Ok(pkt) = pkt_or_err {
-                    if dump_traffic {
-                        log!("Packet from {} -- {:?}", pkt.routing, pkt.payload);
-                    }
-                    if let proto::Payload::LogMessage(log) = pkt.payload {
-                        log!("{} {:?}: {}", pkt.routing, log.level, log.message);
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn dump(args: &[String]) {
     let opts = tio_opts();
     let (_matches, root, _route) = tio_parseopts(opts, args);
 
-    // TODO: is there a way to do this with proxy port??
-    //let port = tio::TioProxyPort::new(&root, None, None);
-    let (rx_send, rx) = tio::Port::rx_channel();
-    let _port = tio::Port::from_url(&root, tio::Port::rx_to_channel(rx_send)).unwrap();
+    let proxy = tio::ProxyPort::new(&root, None, None);
+    let (_tx, rx) = proxy.full_port().unwrap();
 
-    loop {
-        match rx.recv() {
-            Ok(Ok(pkt)) => {
-                println!("PKT: {:?}", pkt);
-            }
-            Ok(Err(tio::RecvError::Protocol(proto::Error::Text(txt)))) => {
-                println!("TXT: {}", txt);
-            }
-            Ok(Err(tio::RecvError::Protocol(perr))) => {
-                println!("PROTO: {:?}", perr);
-            }
-            reason => {
-                println!("BREAKING: {:?}", reason);
-                break;
-            }
-        }
+    for pkt in rx.iter() {
+        println!("{:?}", pkt);
     }
 }
 
@@ -572,8 +305,8 @@ fn firmware_upgrade(args: &[String]) {
 
     println!("Loaded {} bytes firmware", firmware_data.len());
 
-    let port = tio::TioProxyPort::new(&root, None, None);
-    let (tx, rx) = port.new_port(None, route, false, false).unwrap();
+    let proxy = tio::ProxyPort::new(&root, None, None);
+    let (tx, rx) = proxy.port(None, route, false, false).unwrap();
 
     tx.send(tio::Packet::rpc("dev.stop".to_string(), &vec![]))
         .unwrap();
@@ -634,9 +367,6 @@ fn main() {
         "rpc" => {
             rpc(&args[2..]).unwrap();
         }
-        "proxy" => {
-            proxy(&args[2..]); //.unwrap();
-        }
         "dump" => {
             dump(&args[2..]); //.unwrap();
         }
@@ -647,9 +377,10 @@ fn main() {
             // TODO: do usage right
             println!("Usage:");
             println!(" tio-tool help");
-            println!(" tio-tool proxy [-p port] [-v] [-d] [-t timefmt] (--auto | device-url)");
-            println!(" tio-tool rpc [-r url] [-s sensor] [-t type] <rpc-name> [rpc-arg]");
+            println!(" tio-tool dump [-r url] [-s sensor]");
             println!(" tio-tool rpc-list [-r url] [-s sensor]");
+            println!(" tio-tool rpc [-r url] [-s sensor] [-t type] <rpc-name> [rpc-arg]");
+            println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
         }
     }
 }

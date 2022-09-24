@@ -29,10 +29,18 @@ pub struct Port {
     /// Outgoing buffer, used for all-or-none sends of packets
     /// when the OS buffer fills up.
     txbuf: IOBuf,
+    /// Time when the port is initialized, used for startup_holdoff
+    startup_time: Instant,
+    /// If true, the next data received will be the first data and
+    /// should be discarded since it's usually corrupt/stale.
+    first_rx: bool,
 }
 
 /// Default data rate on the serial port.
 static DEFAULT_RATE: u32 = 115200;
+
+/// Discard anything for this long after the port is opened.
+static HOLDOFF_TIME: Duration = Duration::from_millis(50);
 
 impl Port {
     /// Returns a new `tcp::Port`. The `url` should look like
@@ -98,6 +106,8 @@ impl Port {
             rxbuf: IOBuf::new(),
             last_rx: Instant::now(),
             txbuf: IOBuf::new(),
+            startup_time: Instant::now(),
+            first_rx: true,
         })
     }
 
@@ -210,6 +220,16 @@ impl RawPort for Port {
                 }
                 return Err(e);
             }
+            // If this is the very first data we receive, discard it. Likely it's
+            // a combination of stale data and possibly corrupted initial data
+            // from the driver, so it's better to throw it away otherwise the
+            // parser gets confused and waits for a large amount of data before
+            // declaring it invalid.
+            if self.first_rx && !self.rxbuf.empty() {
+                self.rxbuf.flush();
+                self.first_rx = false;
+                return Err(RecvError::NotReady);
+            }
             self.last_rx = now;
             res = self.recv_buffered();
         }
@@ -288,6 +308,10 @@ impl RawPort for Port {
 
     fn max_send_interval(&self) -> Option<Duration> {
         Some(Duration::from_millis(100))
+    }
+
+    fn startup_holdoff(&self) -> bool {
+        self.startup_time.elapsed() < HOLDOFF_TIME
     }
 }
 

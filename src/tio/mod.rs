@@ -14,19 +14,35 @@ use crossbeam::channel;
 
 // Status event that is sent back to an optional user specified channel
 #[derive(Debug)]
-pub enum TioProxyEvent {
+pub enum ProxyEvent {
     SensorConnected,
     SensorDisconnected,
+    SensorReconnected,
     FailedToConnect,
+    FailedToReconnect,
     Exiting,
+    ProtocolError(proto::Error),
+    FatalError(RecvError),
     NewClient(u64),
     RpcRemap((u64, u16), u16),
     RpcRestore(u16, (u64, u16)),
     RpcTimeout(u16),
+    ClientTerminated(u64),
+    RootDeviceRestarted, // TODO
+    AutoRateGaveUp,
+    AutoRateQueried(u32),
+    AutoRateRpcError(proto::RpcErrorCode),
+    AutoRateIncompatible(u32),
+    AutoRateCompatible(u32),
+    AutoRateWait,
+    AutoRateSet(u32),
+    SetRate(u32),
+    SetRateFailed,
+    NoData,
 }
 
 // Internal proxy state per client
-struct TioProxyClient {
+struct ProxyClient {
     tx: channel::Sender<Packet>,
     rx: channel::Receiver<Packet>,
     rpc_timeout: Duration,
@@ -35,7 +51,7 @@ struct TioProxyClient {
     forward_nonrpc: bool,
 }
 
-impl TioProxyClient {
+impl ProxyClient {
     fn send(&self, pkt: &Packet) -> Result<(), channel::TrySendError<Packet>> {
         let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.routing) {
             r
@@ -73,6 +89,7 @@ struct RpcMapEntry {
 }
 
 /// States for the rate autonegotiation state machine
+#[derive(Debug, Clone)]
 enum RateChange {
     DoNothing,
     WaitingForSession,
@@ -124,9 +141,11 @@ impl ProxyDevice {
                                     if let RateChange::WaitingForSession = self.rate_change_state {
                                         self.rate_change_state = RateChange::QueryDeviceRate;
                                     } else if session != self.last_session {
+                                        // TODO: can we send status updates from here??
+                                        //proxy.send_event(ProxyEvent::RootDeviceRestarted);
                                         // It has restarted, restart autonegotiation if needed.
+                                        // TODO: what happens here if the device restarted before either succeeding or giving up???
                                         if let RateChange::GaveUp = self.rate_change_state {
-                                            println!("Detected device restart. Attempting rate negotiation.");
                                             self.rate_change_state = RateChange::QueryDeviceRate;
                                         }
                                     }
@@ -148,32 +167,32 @@ impl ProxyDevice {
     }
 }
 
-struct TioProxy {
+struct Proxy {
     url: String,
     reconnect_timeout: Option<Duration>,
-    new_client_queue: channel::Receiver<TioProxyClient>,
-    status_queue: Option<channel::Sender<TioProxyEvent>>,
+    new_client_queue: channel::Receiver<ProxyClient>,
+    status_queue: Option<channel::Sender<ProxyEvent>>,
 
     device: Option<ProxyDevice>,
 
     /// Id to assign to the next client, 64 bits.
     /// It is realistic to assume that it will never wrap around.
     next_client_id: u64,
-    clients: HashMap<u64, TioProxyClient>,
+    clients: HashMap<u64, ProxyClient>,
 
     next_rpc_id: u16,
     rpc_map: HashMap<u16, RpcMapEntry>,
     rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
 }
 
-impl TioProxy {
+impl Proxy {
     fn new(
         url: String,
         reconnect_timeout: Option<Duration>,
-        new_client_queue: channel::Receiver<TioProxyClient>,
-        status_queue: Option<channel::Sender<TioProxyEvent>>,
-    ) -> TioProxy {
-        TioProxy {
+        new_client_queue: channel::Receiver<ProxyClient>,
+        status_queue: Option<channel::Sender<ProxyEvent>>,
+    ) -> Proxy {
+        Proxy {
             url: url,
             reconnect_timeout: reconnect_timeout,
             new_client_queue: new_client_queue,
@@ -193,7 +212,7 @@ impl TioProxy {
             return true;
         }
         let (port_rx_send, port_rx) = Port::rx_channel();
-        let port = match Port::from_url(&self.url, Port::rx_to_channel(port_rx_send)) {
+        let port = match Port::new(&self.url, Port::rx_to_channel(port_rx_send)) {
             Ok(p) => p,
             Err(_) => {
                 return false;
@@ -229,7 +248,7 @@ impl TioProxy {
         if ids.len() == 0 {
             self.rpc_timeouts.remove(&remap.timeout);
         }
-        self.send_event(TioProxyEvent::RpcRestore(wire_id, (remap.client, remap.id)));
+        self.send_event(ProxyEvent::RpcRestore(wire_id, (remap.client, remap.id)));
         Some((remap.id, remap.client))
     }
 
@@ -262,7 +281,7 @@ impl TioProxy {
                     timeout: timeout,
                 },
             );
-            self.send_event(TioProxyEvent::RpcRemap((client_id, req.id), wire_id));
+            self.send_event(ProxyEvent::RpcRemap((client_id, req.id), wire_id));
             req.id = wire_id;
             rpc_mapped_id = Some(wire_id);
         }
@@ -298,7 +317,7 @@ impl TioProxy {
             }
             to_remove.push(*timeout);
             for rpc_id in rpc_ids {
-                self.send_event(TioProxyEvent::RpcTimeout(*rpc_id));
+                self.send_event(ProxyEvent::RpcTimeout(*rpc_id));
                 let remap = self.rpc_map.remove(&rpc_id).unwrap();
                 let client = if let Some(c) = self.clients.get(&remap.client) {
                     c
@@ -332,40 +351,42 @@ impl TioProxy {
     }
 
     fn internal_rpc_reply(&mut self, rep: &proto::RpcReplyPayload) {
-        //println!("GOT INTERNAL REPLY: {:?}", rep);
         // TODO: better handling. now we just assume it's 4 bytes
         let value = u32::from_le_bytes(rep.reply[0..4].try_into().unwrap());
         if let Some(dev) = self.device.as_ref() {
             let target = dev.tio_port.rate_info().unwrap().target_bps;
-            let new_state = match dev.rate_change_state {
+            let new_state = match dev.rate_change_state.clone() {
                 RateChange::WaitingDeviceRate => {
                     if value == 0 {
-                        println!("RATE NOT SUPPORTED BY DEVICE");
+                        self.send_event(ProxyEvent::AutoRateIncompatible(0));
+                        self.send_event(ProxyEvent::AutoRateGaveUp);
                         RateChange::GaveUp
                     } else {
                         let error = (((target as f64) - (value as f64)) / (value as f64)).abs();
                         if error > 0.015 {
-                            println!("RATE WOULD BE OFF BY >1.5% {} {}", target, value);
+                            self.send_event(ProxyEvent::AutoRateIncompatible(value));
+                            self.send_event(ProxyEvent::AutoRateGaveUp);
                             RateChange::GaveUp
                         } else {
-                            // TODO: wait for RPCs completed??
-                            println!("DEVICE RATE WILL BE SET TO: {}", value);
+                            self.send_event(ProxyEvent::AutoRateCompatible(value));
                             RateChange::SetDeviceRate
                         }
                     }
                 }
                 RateChange::WaitingNewRate => {
-                    println!("SETTING NEW RATE: {}", target);
+                    self.send_event(ProxyEvent::SetRate(target));
                     match dev.tio_port.set_rate(target) {
                         Ok(_) => RateChange::RateChanged,
                         Err(_) => {
-                            println!("Failed to set rate, reverting to default");
+                            self.send_event(ProxyEvent::AutoRateGaveUp);
                             RateChange::GaveUp
                         }
                     }
                 }
-                _ => {
-                    panic!("unexpected internal rpc reply");
+                state => {
+                    #[cfg(build = "debug")]
+                    eprintln!("Unexpected internal rpc reply in state {:?}", state);
+                    state
                 }
             };
             self.device.as_mut().unwrap().rate_change_state = new_state; // TODO: rework this mess
@@ -373,11 +394,11 @@ impl TioProxy {
     }
 
     fn internal_rpc_error(&mut self, err: &proto::RpcErrorPayload) {
-        println!("GOT INTERNAL ERROR: {:?}", err);
-        // We could handle this better, but just set the device to the default speed until the port is reset
-        println!("Keeping port at default rate");
+        // We could handle this better, but just keep the device to the default speed until the port is reset
+        self.send_event(ProxyEvent::AutoRateRpcError(err.error.clone()));
         if let Some(dev) = self.device.as_mut() {
             dev.rate_change_state = RateChange::GaveUp;
+            self.send_event(ProxyEvent::AutoRateGaveUp);
         }
     }
 
@@ -398,6 +419,7 @@ impl TioProxy {
                     &target.to_le_bytes(),
                 ))
                 .unwrap(); // TODO
+                self.send_event(ProxyEvent::AutoRateQueried(target));
                 self.device.as_mut().unwrap().rate_change_state = RateChange::WaitingDeviceRate;
             }
             RateChange::SetDeviceRate => {
@@ -410,28 +432,26 @@ impl TioProxy {
                         .rate_info()
                         .unwrap()
                         .target_bps;
-                    println!("SETTING PORT RATE TO {}", target);
                     self.send_internal_rpc(proto::Packet::rpc(
                         "dev.port.rate".to_string(),
                         &target.to_le_bytes(),
                     ))
                     .unwrap(); //TODO
+                    self.send_event(ProxyEvent::AutoRateSet(target));
                     self.device.as_mut().unwrap().rate_change_state = RateChange::WaitingNewRate;
                 } else {
-                    println!("active RPCs, waiting to rate change");
+                    self.send_event(ProxyEvent::AutoRateWait);
                 }
             }
             RateChange::RateChanged => {
                 let last_rx_delta = self.device.as_ref().unwrap().last_rx.elapsed();
                 if last_rx_delta > Duration::from_millis(1000) {
-                    println!(
-                        "Did not receive sensor data in one second. Reverting to default rate."
-                    );
+                    self.send_event(ProxyEvent::NoData);
                     let dev = self.device.as_mut().unwrap();
-                    dev.tio_port
-                        .set_rate(dev.tio_port.rate_info().unwrap().default_bps)
-                        .unwrap();
+                    let default_bps = dev.tio_port.rate_info().unwrap().default_bps;
+                    dev.tio_port.set_rate(default_bps).unwrap();
                     dev.rate_change_state = RateChange::GaveUp;
+                    self.send_event(ProxyEvent::SetRate(default_bps));
                 }
             }
             // In any other case, do nothing
@@ -446,7 +466,7 @@ impl TioProxy {
         );
     }
 
-    fn send_event(&self, event: TioProxyEvent) {
+    fn send_event(&self, event: ProxyEvent) {
         if self.status_queue.is_some() {
             self.status_queue.as_ref().unwrap().send(event).unwrap(); // TODO
         }
@@ -456,10 +476,10 @@ impl TioProxy {
         use channel::TryRecvError;
 
         if !self.try_setup_device() {
-            self.send_event(TioProxyEvent::FailedToConnect);
+            self.send_event(ProxyEvent::FailedToConnect);
             return;
         } else {
-            self.send_event(TioProxyEvent::SensorConnected);
+            self.send_event(ProxyEvent::SensorConnected);
         }
         let mut device_timeout = Instant::now();
 
@@ -471,12 +491,12 @@ impl TioProxy {
                 self.cancel_active_rpcs();
                 if !self.try_setup_device() {
                     if Instant::now() > device_timeout {
-                        self.send_event(TioProxyEvent::FailedToConnect);
+                        self.send_event(ProxyEvent::FailedToReconnect);
                         break;
                     }
                     timeout = std::cmp::min(timeout, Duration::from_secs(1));
                 } else {
-                    self.send_event(TioProxyEvent::SensorConnected);
+                    self.send_event(ProxyEvent::SensorReconnected);
                 }
             }
             if let Some(dev) = &self.device {
@@ -522,6 +542,7 @@ impl TioProxy {
                         }
                         Err(TryRecvError::Disconnected) => {
                             clients_to_drop.insert(client_id);
+                            self.send_event(ProxyEvent::ClientTerminated(client_id));
                             break;
                         }
                     }
@@ -531,7 +552,7 @@ impl TioProxy {
                 loop {
                     match self.new_client_queue.try_recv() {
                         Ok(client) => {
-                            self.send_event(TioProxyEvent::NewClient(self.next_client_id));
+                            self.send_event(ProxyEvent::NewClient(self.next_client_id));
                             self.clients.insert(self.next_client_id, client);
                             self.next_client_id += 1;
                         }
@@ -539,7 +560,7 @@ impl TioProxy {
                             break;
                         }
                         Err(TryRecvError::Disconnected) => {
-                            self.send_event(TioProxyEvent::Exiting);
+                            self.send_event(ProxyEvent::Exiting);
                             break 'mainloop;
                         }
                     }
@@ -547,7 +568,6 @@ impl TioProxy {
             } else {
                 // data from the device
                 loop {
-                    //println!("PP: devdata");
                     match self.device.as_mut().unwrap().try_recv() {
                         Ok(Ok(mut pkt)) => {
                             match &mut pkt.payload {
@@ -605,17 +625,13 @@ impl TioProxy {
                         // Got a RecvError
                         Ok(Err(err)) => {
                             match err {
-                                // TODO: complete list of non-fatal errors
-                                RecvError::Protocol(proto::Error::Text(txt)) => {
-                                    println!("PP: TEXT: {}", txt); //TODO: send event
-                                }
                                 RecvError::Protocol(perror) => {
-                                    println!("PP: protocol error: {:?}", perror);
-                                    //TODO: send event
+                                    self.send_event(ProxyEvent::ProtocolError(perror));
                                 }
+                                // TODO: are there non-fatal errors that should just restart the low level port?
                                 // All other errors are treated as fatal.
-                                _ => {
-                                    println!("PP: porterror {:?}", err); //TODO: send event
+                                err => {
+                                    self.send_event(ProxyEvent::FatalError(err));
                                     break 'mainloop;
                                 }
                             }
@@ -630,7 +646,7 @@ impl TioProxy {
                                     Some(t) => t,
                                     None => Duration::from_secs(0),
                                 };
-                            self.send_event(TioProxyEvent::SensorDisconnected);
+                            self.send_event(ProxyEvent::SensorDisconnected);
                             break;
                         }
                     }
@@ -640,28 +656,29 @@ impl TioProxy {
     }
 }
 
-pub struct TioProxyPort {
-    new_client_queue: channel::Sender<TioProxyClient>,
+pub struct ProxyPort {
+    new_client_queue: channel::Sender<ProxyClient>,
 }
 
-impl TioProxyPort {
+impl ProxyPort {
     pub fn new(
         url: &str,
         reconnect_timeout: Option<Duration>,
-        status_queue: Option<channel::Sender<TioProxyEvent>>,
-    ) -> TioProxyPort {
-        let (sender, receiver) = channel::bounded::<TioProxyClient>(5);
+        status_queue: Option<channel::Sender<ProxyEvent>>,
+    ) -> ProxyPort {
+        let (sender, receiver) = channel::bounded::<ProxyClient>(5);
         let url_string = url.to_string();
         thread::spawn(move || {
-            let mut proxy = TioProxy::new(url_string, reconnect_timeout, receiver, status_queue);
+            let mut proxy = Proxy::new(url_string, reconnect_timeout, receiver, status_queue);
             proxy.run();
         });
-        TioProxyPort {
+        ProxyPort {
             new_client_queue: sender,
         }
     }
 
-    pub fn new_port(
+    // TODO: allow to restrict to scope's root?
+    pub fn port(
         &self,
         rpc_timeout: Option<Duration>,
         scope: DeviceRoute,
@@ -685,7 +702,7 @@ impl TioProxyPort {
 
         let (client_to_proxy_sender, proxy_from_client_receiver) = channel::bounded::<Packet>(32);
         let (proxy_to_client_sender, client_from_proxy_receiver) = channel::bounded::<Packet>(256);
-        if let Err(_) = self.new_client_queue.send(TioProxyClient {
+        if let Err(_) = self.new_client_queue.send(ProxyClient {
             tx: proxy_to_client_sender,
             rx: proxy_from_client_receiver,
             rpc_timeout: rpc_timeout,
@@ -701,14 +718,14 @@ impl TioProxyPort {
         Ok((client_to_proxy_sender, client_from_proxy_receiver))
     }
 
-    pub fn port(&self) -> io::Result<(channel::Sender<Packet>, channel::Receiver<Packet>)> {
-        self.new_port(None, DeviceRoute::root(), true, true)
-    }
-
     pub fn scoped_port(
         &self,
         root: DeviceRoute,
     ) -> io::Result<(channel::Sender<Packet>, channel::Receiver<Packet>)> {
-        self.new_port(None, root, true, true)
+        self.port(None, root, true, true)
+    }
+
+    pub fn full_port(&self) -> io::Result<(channel::Sender<Packet>, channel::Receiver<Packet>)> {
+        self.scoped_port(DeviceRoute::root())
     }
 }
