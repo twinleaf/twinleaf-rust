@@ -2,7 +2,7 @@ name: Rust
 
 on:
   push:
-    branches: [ "gb-dev" ]
+    branches: [ "main", "dev" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,11 +24,20 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libudev-dev
     - name: Build
-      run: cargo build --release --verbose
-    - name: Upload tool binary
+      run: cargo build --all --release --verbose
+    - name: Strip binaries
+      if: matrix.platform != 'windows-latest'
+      run: |
+        strip target/release/tio-proxy
+        strip target/release/tio-tool
+        sudo apt-get update
+        sudo apt-get install -y libudev-dev
+    - name: Upload binaries
       uses: actions/upload-artifact@v3
       with:
         name: twinleaf-tools.${{ matrix.platform }}
         path: |
+          target/release/tio-proxy
+          target/release/tio-proxy.exe
           target/release/tio-tool
           target/release/tio-tool.exe
