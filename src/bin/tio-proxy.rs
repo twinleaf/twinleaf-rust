@@ -4,6 +4,7 @@
 
 use getopts::Options;
 use std::env;
+use std::io;
 use std::net::TcpListener;
 use std::process::ExitCode;
 use tio::proto;
@@ -63,6 +64,24 @@ macro_rules! log{
         log!($tf, format!($f, $($a)*));
     }
     };
+}
+
+fn create_listener_thread(
+    addr: std::net::SocketAddr,
+    client_send: crossbeam::channel::Sender<std::net::TcpStream>,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+    std::thread::Builder::new()
+        .name("listener".to_string())
+        .spawn(move || {
+            for res in listener.incoming() {
+                match res {
+                    Ok(stream) => client_send.send(stream).expect("New client queue full"),
+                    Err(err) => panic!("Error accepting client {:?}", err),
+                };
+            }
+        })?;
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -190,15 +209,33 @@ fn main() -> ExitCode {
         log!(tf, "Using sensor url: {}", sensor_url);
     }
 
-    let listener = TcpListener::bind(std::net::SocketAddr::new(
-        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        tcp_port,
-    ));
-    let listener = match listener {
-        Ok(l) => l,
-        Err(err) => {
-            die!("Failed to bind server: {:?}", err);
+    let new_client = {
+        let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
+        let started_v6 = create_listener_thread(
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                tcp_port,
+            ),
+            client_send.clone(),
+        );
+        let started_v4 = if let (Ok(()), false) = (&started_v6, cfg!(windows)) {
+            // If v6 started correctly and we are not in windows, pretend
+            // v4 also started correctly. The OS will pass the new clients
+            // through the v6 socket.
+            Ok(())
+        } else {
+            create_listener_thread(
+                std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    tcp_port,
+                ),
+                client_send.clone(),
+            )
+        };
+        if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
+            die!("Failed to start up server: {:?}/{:?}", e1, e2);
         }
+        new_client
     };
 
     let (status_send, port_status) = crossbeam::channel::bounded::<tio::ProxyEvent>(10);
@@ -218,22 +255,6 @@ fn main() -> ExitCode {
             }
         );
     };
-
-    let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
-
-    if let Err(err) = std::thread::Builder::new()
-        .name("listener".to_string())
-        .spawn(move || {
-            for res in listener.incoming() {
-                match res {
-                    Ok(stream) => client_send.send(stream).expect("New client queue full"),
-                    Err(err) => panic!("Error accepting client {:?}", err),
-                };
-            }
-        })
-    {
-        die!("Failed to start up listener thread {:?}", err)
-    }
 
     use crossbeam::select;
     loop {
