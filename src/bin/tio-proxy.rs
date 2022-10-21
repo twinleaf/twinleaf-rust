@@ -7,7 +7,7 @@ use std::env;
 use std::io;
 use std::net::TcpListener;
 use std::process::ExitCode;
-use tio::proto;
+use tio::{proto, proxy};
 use twinleaf::tio;
 
 // Unfortunately we cannot access USB details via the serialport module, so
@@ -238,8 +238,8 @@ fn main() -> ExitCode {
         new_client
     };
 
-    let (status_send, port_status) = crossbeam::channel::bounded::<tio::ProxyEvent>(10);
-    let proxy = tio::ProxyPort::new(&sensor_url, Some(reconnect_timeout), Some(status_send));
+    let (status_send, port_status) = crossbeam::channel::bounded::<proxy::Event>(10);
+    let proxy = proxy::Port::new(&sensor_url, Some(reconnect_timeout), Some(status_send));
 
     // These are used by the proxy itself to communicate with the
     // device tree.
@@ -262,8 +262,8 @@ fn main() -> ExitCode {
             recv(new_client) -> tcp_client => {
                 if let Ok(stream) = tcp_client {
                     let addr = stream.peer_addr().unwrap().to_string();
-                    let (rx_send, client_rx) = tio::Port::rx_channel();
-                    let client = match tio::Port::from_tcp_stream(stream, tio::Port::rx_to_channel(rx_send)) {
+                    let (rx_send, client_rx) = tio::port::Port::rx_channel();
+                    let client = match tio::port::Port::from_tcp_stream(stream, tio::port::Port::rx_to_channel(rx_send)) {
                         Ok(client_port) => client_port,
                         _ => continue,
                     };
@@ -334,23 +334,23 @@ fn main() -> ExitCode {
             recv(port_status) -> status => {
                 if let Ok(evt) = status {
                     match evt {
-                        tio::ProxyEvent::SensorDisconnected => {
+                        proxy::Event::SensorDisconnected => {
                             log!(tf, "Sensor disconnected");
                         }
-                        tio::ProxyEvent::SensorReconnected => {
+                        proxy::Event::SensorReconnected => {
                             log!(tf, "Sensor reconnected");
                         }
-                        tio::ProxyEvent::FailedToReconnect => {
+                        proxy::Event::FailedToReconnect => {
                             log!(tf, "Stopping reconnection attempts due to timeout");
                         }
-                        tio::ProxyEvent::FailedToConnect => {
+                        proxy::Event::FailedToConnect => {
                             log!(tf, "Fatal proxy error: failed to connect to sensor");
                         }
-                        tio::ProxyEvent::FatalError(err) => {
+                        proxy::Event::FatalError(err) => {
                             log!(tf, "Fatal proxy error: {:?}", err);
                             // the proxy thread will exit and we'll detect it at the next iteration.
                         }
-                        tio::ProxyEvent::ProtocolError(perr) => {
+                        proxy::Event::ProtocolError(perr) => {
                             match perr {
                                 proto::Error::Text(txt) => {
                                     log!(tf, "Text: {}", txt);

@@ -69,7 +69,11 @@ impl RawPort for Port {
             return Err(SendError::Full);
         }
 
-        let raw = pkt.serialize();
+        let raw = if let Ok(raw) = pkt.serialize() {
+            raw
+        } else {
+            return Err(SendError::Serialization);
+        };
         match self.stream.write(&raw) {
             Ok(size) => {
                 if size == raw.len() {

@@ -1,3 +1,6 @@
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
+
 #[derive(Debug, Clone)]
 pub struct GenericPayload {
     pub packet_type: u8,
@@ -5,6 +8,8 @@ pub struct GenericPayload {
 }
 
 #[derive(Debug, Clone)]
+#[repr(u8)]
+#[derive(FromPrimitive)]
 pub enum LogLevel {
     CRITICAL = 0,
     ERROR = 1,
@@ -40,12 +45,32 @@ pub struct RpcReplyPayload {
 }
 
 #[derive(Debug, Clone)]
+#[repr(u16)]
+#[derive(FromPrimitive)]
+pub enum RpcErrorCodeRaw {
+    NoError = 0,
+    Undefined = 1,
+    NotFound = 2,
+    MalformedRequest = 3,
+    WrongSizeArgs = 4,
+    InvalidArgs = 5,
+    ReadOnly = 6,
+    WriteOnly = 7,
+    Timeout = 8,
+    Busy = 9,
+    WrongDeviceState = 10,
+    LoadFailed = 11,
+    LoadRpcFailed = 12,
+    SaveFailed = 13,
+    SaveWriteFailed = 14,
+    Internal = 15,
+    OutOfMemory = 16,
+    OutOfRange = 17,
+}
+
+#[derive(Debug, Clone)]
 pub enum RpcErrorCode {
-    NoError,
-    Undefined,
-    NotFound,
-    Timeout,
-    NoBufs,
+    Known(RpcErrorCodeRaw),
     Unknown(u16),
 }
 
@@ -63,6 +88,38 @@ pub enum HeartbeatPayload {
 }
 
 #[derive(Debug, Clone)]
+#[repr(u8)]
+#[derive(FromPrimitive)]
+pub enum TimebaseSource {
+    Invalid = 0,
+    Local = 1,
+    Global = 2,
+}
+
+#[derive(Debug, Clone)]
+#[repr(u8)]
+#[derive(FromPrimitive)]
+pub enum TimebaseEpoch {
+    Invalid = 0,
+    Start = 1,
+    SysTime = 2,
+    Unix = 3,
+    GPS = 4,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimebaseInfoPayload {
+    pub id: u16,
+    pub source: u8,
+    pub epoch: u8,
+    pub start_time: u64,
+    pub period_numerator_us: u32,
+    pub period_denominator_us: u32,
+    pub flags: u32,
+    pub stability: f32,
+}
+
+#[derive(Debug, Clone)]
 pub struct StreamDataPayload {
     pub stream_id: u8,
     pub sample_n: u32,
@@ -76,6 +133,9 @@ pub enum Payload {
     RpcReply(RpcReplyPayload),
     RpcError(RpcErrorPayload),
     Heartbeat(HeartbeatPayload),
+    //TimebaseInfo(TimebaseInfoPayload),
+    //SourceInfo(),
+    //StreamUpdate(),
     StreamData(StreamDataPayload),
     Unknown(GenericPayload),
 }
@@ -90,12 +150,14 @@ impl DeviceRoute {
         DeviceRoute { route: vec![] }
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> DeviceRoute {
-        let mut ret = DeviceRoute {
-            route: bytes.to_vec(),
-        };
-        ret.route.reverse();
-        ret
+    fn from_bytes(bytes: &[u8]) -> Result<DeviceRoute, ()> {
+        if bytes.len() > TIO_PACKET_MAX_ROUTING_SIZE {
+            Err(())
+        } else {
+            let mut route = bytes.to_vec();
+            route.reverse();
+            Ok(DeviceRoute { route })
+        }
     }
 
     pub fn from_str(route_str: &str) -> Result<DeviceRoute, ()> {
@@ -106,13 +168,13 @@ impl DeviceRoute {
         };
         if stripped.len() > 0 {
             for segment in stripped.split('/') {
-                match segment.parse() {
-                    Ok(n) => {
-                        ret.route.push(n);
-                    }
-                    _ => {
-                        return Err(());
-                    }
+                if ret.route.len() >= TIO_PACKET_MAX_ROUTING_SIZE {
+                    return Err(());
+                }
+                if let Ok(n) = segment.parse() {
+                    ret.route.push(n);
+                } else {
+                    return Err(());
                 }
             }
         }
@@ -127,11 +189,18 @@ impl DeviceRoute {
         self.route.iter()
     }
 
-    pub fn serialize(&self, mut rest_of_packet: Vec<u8>) -> Vec<u8> {
-        for hop in self.route.iter().rev() {
-            rest_of_packet.push(*hop);
+    pub fn serialize(&self, mut rest_of_packet: Vec<u8>) -> Result<Vec<u8>, ()> {
+        if (self.route.len() > TIO_PACKET_MAX_ROUTING_SIZE)
+            || (rest_of_packet.len() < std::mem::size_of::<TioPktHdr>())
+        {
+            Err(())
+        } else {
+            rest_of_packet[1] |= self.route.len() as u8;
+            for hop in self.route.iter().rev() {
+                rest_of_packet.push(*hop);
+            }
+            Ok(rest_of_packet)
         }
-        rest_of_packet
     }
 
     // Returns the relative route from this to other_route (which is absolute.
@@ -148,7 +217,7 @@ impl DeviceRoute {
 
     pub fn absolute_route(&self, other_route: &DeviceRoute) -> DeviceRoute {
         let mut route = self.route.clone();
-        route.extend_from_slice(&other_route.route[..]);
+        route.extend_from_slice(&other_route.route);
         DeviceRoute { route }
     }
 }
@@ -172,10 +241,8 @@ impl Display for DeviceRoute {
 pub struct Packet {
     pub payload: Payload,
     pub routing: DeviceRoute,
-    pub ttl: u8,
+    pub ttl: usize,
 }
-
-pub static MAX_PACKET_LEN: usize = 512;
 
 #[derive(Debug)]
 pub enum Error {
@@ -188,260 +255,472 @@ pub enum Error {
     PayloadTooBig(Vec<u8>),
     RoutingTooBig(Vec<u8>),
     PayloadTooSmall(Vec<u8>),
+    InvalidPayload(Vec<u8>),
+}
+
+#[repr(u8)]
+enum TioPktType {
+    Invalid = 0,
+    Log = 1,
+    RpcReq = 2,
+    RpcRep = 3,
+    RpcError = 4,
+    Heartbeat = 5,
+    Timebase = 6,
+    Source = 7,
+    Stream = 8,
+    Reserved0 = 9,
+    Reserved1 = 10,
+    Reserved2 = 13,
+}
+
+static TIO_PTYPE_STREAM0: u8 = 128;
+
+#[repr(C, packed)]
+struct TioPktHdr {
+    pkt_type: u8,
+    routing_size_and_ttl: u8,
+    payload_size: u16,
+}
+
+static TIO_PACKET_HEADER_SIZE: usize = 4;
+static TIO_PACKET_MAX_ROUTING_SIZE: usize = 8;
+pub static TIO_PACKET_MAX_TOTAL_SIZE: usize = 512;
+static TIO_PACKET_MAX_PAYLOAD_SIZE: usize =
+    TIO_PACKET_MAX_TOTAL_SIZE - TIO_PACKET_HEADER_SIZE - TIO_PACKET_MAX_ROUTING_SIZE;
+
+impl TioPktHdr {
+    fn deserialize(raw: &[u8]) -> Result<TioPktHdr, Error> {
+        if raw.len() < 1 {
+            return Err(Error::NeedMore);
+        }
+
+        // Keep the raw packet type for forward compatibility even if it does not match
+        // a known type, as long as it's not one of the reserved values
+        let packet_type: u8 = raw[0];
+        if (packet_type == TioPktType::Invalid as u8)
+            || (packet_type == TioPktType::Reserved0 as u8)
+            || (packet_type == TioPktType::Reserved1 as u8)
+            || (packet_type == TioPktType::Reserved2 as u8)
+        {
+            return Err(Error::InvalidPacketType(raw.to_vec()));
+        }
+
+        // If the packet type appears valid, wait to have a full header
+        if raw.len() < std::mem::size_of::<TioPktHdr>() {
+            return Err(Error::NeedMore);
+        }
+        let pkt_hdr = TioPktHdr {
+            pkt_type: packet_type,
+            routing_size_and_ttl: raw[1],
+            payload_size: u16::from_le_bytes([raw[2], raw[3]]),
+        };
+
+        if pkt_hdr.routing_size() > TIO_PACKET_MAX_ROUTING_SIZE {
+            return Err(Error::RoutingTooBig(raw.to_vec()));
+        }
+        if pkt_hdr.payload_size as usize > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(Error::PayloadTooBig(raw.to_vec()));
+        }
+
+        let packet_len = pkt_hdr.packet_size();
+
+        if raw.len() < packet_len {
+            return Err(Error::NeedMore);
+        }
+        Ok(pkt_hdr)
+    }
+
+    fn serialize_new(ptype: u8, rsize: u8, psize: u16) -> Vec<u8> {
+        let mut ret = vec![ptype, rsize];
+        ret.extend(psize.to_le_bytes());
+        ret
+    }
+
+    fn ptype(&self) -> Option<TioPktType> {
+        match self.pkt_type {
+            1 => Some(TioPktType::Log),
+            2 => Some(TioPktType::RpcReq),
+            3 => Some(TioPktType::RpcRep),
+            4 => Some(TioPktType::RpcError),
+            5 => Some(TioPktType::Heartbeat),
+            6 => Some(TioPktType::Timebase),
+            7 => Some(TioPktType::Source),
+            8 => Some(TioPktType::Stream),
+            _ => None,
+        }
+    }
+
+    fn stream_id(&self) -> Option<usize> {
+        if self.pkt_type >= TIO_PTYPE_STREAM0 {
+            Some((self.pkt_type - TIO_PTYPE_STREAM0) as usize)
+        } else {
+            None
+        }
+    }
+
+    fn ttl(&self) -> usize {
+        (self.routing_size_and_ttl >> 4) as usize
+    }
+
+    fn routing_offset(&self) -> usize {
+        self.payload_offset() + self.payload_size()
+    }
+
+    fn routing_size(&self) -> usize {
+        (self.routing_size_and_ttl & 0x0Fu8) as usize
+    }
+
+    fn payload_offset(&self) -> usize {
+        std::mem::size_of::<TioPktHdr>()
+    }
+
+    fn payload_size(&self) -> usize {
+        self.payload_size as usize
+    }
+
+    fn packet_size(&self) -> usize {
+        self.routing_offset() + self.routing_size()
+    }
+}
+
+fn too_small(full_data: &[u8]) -> Error {
+    Error::PayloadTooSmall(full_data.to_vec())
+}
+
+impl LogMessagePayload {
+    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<LogMessagePayload, Error> {
+        if raw.len() < 5 {
+            return Err(too_small(full_data));
+        }
+        Ok(LogMessagePayload {
+            data: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            level: if let Some(log_level) = LogLevel::from_u8(raw[4]) {
+                log_level
+            } else {
+                LogLevel::DEBUG
+            },
+            message: String::from_utf8_lossy(&raw[5..]).to_string(),
+        })
+    }
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let raw_message = self.message.as_bytes();
+        let payload_size = raw_message.len() + 5;
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(TioPktType::Log as u8, 0, payload_size as u16);
+        ret.extend(self.data.to_le_bytes());
+        ret.push(self.level as u8);
+        ret.extend(self.message.as_bytes());
+        Ok(ret)
+    }
+}
+
+impl RpcRequestPayload {
+    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcRequestPayload, Error> {
+        if raw.len() < 4 {
+            return Err(too_small(full_data));
+        }
+        let id = u16::from_le_bytes([raw[0], raw[1]]);
+        let method = u16::from_le_bytes([raw[2], raw[3]]);
+        let (method, arg_start) = if (method & 0x8000) != 0 {
+            let arg_start = (method & 0x7FFF) as usize + 4;
+            if arg_start > TIO_PACKET_MAX_PAYLOAD_SIZE {
+                return Err(Error::InvalidPayload(full_data.to_vec()));
+            }
+            if raw.len() < arg_start {
+                return Err(too_small(full_data));
+            }
+            (
+                RpcMethod::Name(String::from_utf8_lossy(&raw[4..arg_start]).to_string()),
+                arg_start,
+            )
+        } else {
+            (RpcMethod::Id(method), 4)
+        };
+        Ok(RpcRequestPayload {
+            id: id,
+            method: method,
+            arg: raw[arg_start..].to_vec(),
+        })
+    }
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let method_name_len = if let RpcMethod::Name(method_name) = &self.method {
+            method_name.as_bytes().len() as u16
+        } else {
+            0
+        };
+        let payload_size = 4 + (method_name_len as usize) + self.arg.len();
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcReq as u8, 0, payload_size as u16);
+        ret.extend(self.id.to_le_bytes());
+        match &self.method {
+            RpcMethod::Id(method) => {
+                ret.extend(method.to_le_bytes());
+            }
+            RpcMethod::Name(method) => {
+                ret.extend((method_name_len | 0x8000).to_le_bytes());
+                ret.extend(method.as_bytes())
+            }
+        }
+        ret.extend_from_slice(&self.arg);
+        Ok(ret)
+    }
+}
+
+impl RpcReplyPayload {
+    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcReplyPayload, Error> {
+        if raw.len() < 2 {
+            return Err(too_small(full_data));
+        }
+        let id = u16::from_le_bytes([raw[0], raw[1]]);
+        Ok(RpcReplyPayload {
+            id: id,
+            reply: raw[2..].to_vec(),
+        })
+    }
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let payload_size = 2 + self.reply.len();
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcRep as u8, 0, payload_size as u16);
+        ret.extend(self.id.to_le_bytes());
+        ret.extend_from_slice(&self.reply);
+        Ok(ret)
+    }
+}
+
+impl RpcErrorPayload {
+    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcErrorPayload, Error> {
+        if raw.len() < 4 {
+            return Err(too_small(full_data));
+        }
+        let error_code_raw = u16::from_le_bytes([raw[2], raw[3]]);
+        Ok(RpcErrorPayload {
+            id: u16::from_le_bytes([raw[0], raw[1]]),
+            error: if let Some(code) = RpcErrorCodeRaw::from_u16(error_code_raw) {
+                RpcErrorCode::Known(code)
+            } else {
+                RpcErrorCode::Unknown(error_code_raw)
+            },
+            extra: raw[4..].to_vec(),
+        })
+    }
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let payload_size = 4 + self.extra.len();
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let error_code_raw = match self.error.clone() {
+            RpcErrorCode::Known(err) => err as u16,
+            RpcErrorCode::Unknown(err) => err,
+        };
+        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcError as u8, 0, payload_size as u16);
+        ret.extend(self.id.to_le_bytes());
+        ret.extend(error_code_raw.to_le_bytes());
+        ret.extend_from_slice(&self.extra);
+        Ok(ret)
+    }
+}
+
+impl HeartbeatPayload {
+    fn deserialize(raw: &[u8], _full_data: &[u8]) -> Result<HeartbeatPayload, Error> {
+        if raw.len() == 4 {
+            let session = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            Ok(HeartbeatPayload::Session(session))
+        } else {
+            Ok(HeartbeatPayload::Any(raw.to_vec()))
+        }
+    }
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let payload_size = match self {
+            HeartbeatPayload::Session(_) => 4,
+            HeartbeatPayload::Any(payload) => payload.len(),
+        };
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(TioPktType::Heartbeat as u8, 0, payload_size as u16);
+        match self {
+            HeartbeatPayload::Session(session) => ret.extend(session.to_le_bytes()),
+            HeartbeatPayload::Any(payload) => ret.extend(payload),
+        };
+        Ok(ret)
+    }
+}
+
+impl StreamDataPayload {
+    /*
+    fn deserialize(raw: &[u8], _full_data: &[u8]) -> Result<HeartbeatPayload,Error> {
+        if raw.len() == 4 {
+            let session = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            Ok(HeartbeatPayload::Session(session))
+        } else {
+            Ok(HeartbeatPayload::Any(raw.to_vec()))
+        }
+    }
+    */
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        if self.stream_id > 127 {
+            return Err(());
+        }
+        let payload_size = 4 + self.data.len();
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(
+            (TIO_PTYPE_STREAM0 + self.stream_id) as u8,
+            0,
+            payload_size as u16,
+        );
+        ret.extend(self.sample_n.to_le_bytes());
+        ret.extend(&self.data);
+        Ok(ret)
+    }
+}
+
+impl GenericPayload {
+    /*
+    fn deserialize(raw: &[u8], _full_data: &[u8]) -> Result<HeartbeatPayload,Error> {
+        if raw.len() == 4 {
+            let session = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            Ok(HeartbeatPayload::Session(session))
+        } else {
+            Ok(HeartbeatPayload::Any(raw.to_vec()))
+        }
+    }
+    */
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        if self.payload.len() > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(self.packet_type, 0, self.payload.len() as u16);
+        ret.extend(&self.payload);
+        Ok(ret)
+    }
+}
+
+impl Payload {
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        match self {
+            // TODO: this could be done with trait?
+            Payload::LogMessage(p) => p.serialize(),
+            Payload::RpcRequest(p) => p.serialize(),
+            Payload::RpcReply(p) => p.serialize(),
+            Payload::RpcError(p) => p.serialize(),
+            Payload::Heartbeat(p) => p.serialize(),
+            Payload::StreamData(p) => p.serialize(),
+            Payload::Unknown(p) => p.serialize(),
+        }
+    }
+    fn deserialize(
+        hdr: &TioPktHdr,
+        raw_payload: &[u8],
+        full_data: &[u8],
+    ) -> Result<Payload, Error> {
+        match hdr.ptype() {
+            Some(TioPktType::Log) => Ok(Payload::LogMessage(LogMessagePayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            Some(TioPktType::RpcReq) => Ok(Payload::RpcRequest(RpcRequestPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            Some(TioPktType::RpcRep) => Ok(Payload::RpcReply(RpcReplyPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            Some(TioPktType::RpcError) => Ok(Payload::RpcError(RpcErrorPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            Some(TioPktType::Heartbeat) => Ok(Payload::Heartbeat(HeartbeatPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            Some(TioPktType::Timebase) => {
+                // TODO
+                Ok(Payload::Unknown(GenericPayload {
+                    packet_type: hdr.pkt_type,
+                    payload: raw_payload.to_vec(),
+                }))
+            }
+            Some(TioPktType::Source) => {
+                // TODO
+                Ok(Payload::Unknown(GenericPayload {
+                    packet_type: hdr.pkt_type,
+                    payload: raw_payload.to_vec(),
+                }))
+            }
+            Some(TioPktType::Stream) => {
+                // TODO
+                Ok(Payload::Unknown(GenericPayload {
+                    packet_type: hdr.pkt_type,
+                    payload: raw_payload.to_vec(),
+                }))
+            }
+            Some(TioPktType::Invalid)
+            | Some(TioPktType::Reserved0)
+            | Some(TioPktType::Reserved1)
+            | Some(TioPktType::Reserved2) => {
+                // This should never happen for how the code is organized, since
+                // it should be ruled out by parsing the header first, but handle
+                // this case anyway.
+                return Err(Error::InvalidPacketType(full_data.to_vec()));
+            }
+            None => {
+                if let Some(stream_id) = hdr.stream_id() {
+                    // This is stream data
+                    if raw_payload.len() < 4 {
+                        return Err(too_small(full_data));
+                    }
+                    Ok(Payload::StreamData(StreamDataPayload {
+                        stream_id: stream_id as u8,
+                        sample_n: u32::from_le_bytes([
+                            raw_payload[0],
+                            raw_payload[1],
+                            raw_payload[2],
+                            raw_payload[3],
+                        ]),
+                        data: raw_payload[4..].to_vec(),
+                    }))
+                } else {
+                    Ok(Payload::Unknown(GenericPayload {
+                        packet_type: hdr.pkt_type,
+                        payload: raw_payload.to_vec(),
+                    }))
+                }
+            }
+        }
+    }
 }
 
 impl Packet {
     pub fn deserialize(raw: &[u8]) -> Result<(Packet, usize), Error> {
-        if raw.len() < 1 {
-            return Err(Error::NeedMore);
-        }
-        let packet_type = raw[0];
-        if let 9 | 10 | 13 = packet_type {
-            return Err(Error::InvalidPacketType(raw.to_vec()));
-        }
-        if raw.len() < 2 {
-            return Err(Error::NeedMore);
-        }
-        let ttl = raw[1] >> 4;
-        let routing_len = (raw[1] & 0xF) as usize;
-        if routing_len > 8 {
-            return Err(Error::RoutingTooBig(raw.to_vec()));
-        }
-        if raw.len() < 4 {
-            return Err(Error::NeedMore);
-        }
-        let payload_len = u16::from_le_bytes(raw[2..4].try_into().unwrap()) as usize;
-        let routing_start = 4 + payload_len;
-        let packet_len = routing_start + routing_len;
-        if packet_len > 512 {
-            return Err(Error::PayloadTooBig(raw.to_vec()));
-        }
-        if raw.len() < packet_len {
-            return Err(Error::NeedMore);
-        }
-        let payload = match packet_type {
-            1 => {
-                if routing_start < 9 {
-                    return Err(Error::PayloadTooSmall(raw.to_vec()));
-                }
-                Payload::LogMessage(LogMessagePayload {
-                    data: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
-                    level: match raw[8] {
-                        0 => LogLevel::CRITICAL,
-                        1 => LogLevel::ERROR,
-                        2 => LogLevel::WARNING,
-                        3 => LogLevel::INFO,
-                        _ => LogLevel::DEBUG,
-                    },
-                    message: String::from_utf8_lossy(&raw[9..routing_start]).to_string(),
-                })
-            }
-            2 => {
-                if routing_start < 8 {
-                    return Err(Error::PayloadTooSmall(raw.to_vec()));
-                }
-                let mut arg_start: usize = 8;
-                let method = u16::from_le_bytes(raw[6..8].try_into().unwrap());
-                let method = if (method & 0x8000) != 0 {
-                    arg_start += (method & 0x7FFF) as usize;
-                    RpcMethod::Name(String::from_utf8_lossy(&raw[8..arg_start]).to_string())
-                } else {
-                    RpcMethod::Id(method)
-                };
-                Payload::RpcRequest(RpcRequestPayload {
-                    id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
-                    method: method,
-                    arg: raw[arg_start..routing_start].to_vec(),
-                })
-            }
-            3 => {
-                if routing_start < 6 {
-                    return Err(Error::PayloadTooSmall(raw.to_vec()));
-                }
-                Payload::RpcReply(RpcReplyPayload {
-                    id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
-                    reply: raw[6..routing_start].to_vec(),
-                })
-            }
-            4 => {
-                if routing_start < 8 {
-                    return Err(Error::PayloadTooSmall(raw.to_vec()));
-                }
-                Payload::RpcError(RpcErrorPayload {
-                    id: u16::from_le_bytes(raw[4..6].try_into().unwrap()),
-                    error: match u16::from_le_bytes(raw[6..8].try_into().unwrap()) {
-                        0 => RpcErrorCode::NoError,
-                        1 => RpcErrorCode::Undefined,
-                        2 => RpcErrorCode::NotFound,
-                        8 => RpcErrorCode::Timeout,
-                        16 => RpcErrorCode::NoBufs,
-                        code => RpcErrorCode::Unknown(code),
-                    },
-                    extra: raw[8..routing_start].to_vec(),
-                })
-            }
-            5 => {
-                let payload = raw[4..routing_start].to_vec();
-                if payload.len() == 4 {
-                    let session = u32::from_le_bytes(payload[..].try_into().unwrap());
-                    Payload::Heartbeat(HeartbeatPayload::Session(session))
-                } else {
-                    Payload::Heartbeat(HeartbeatPayload::Any(payload))
-                }
-            }
-            ptype if ptype >= 128 => {
-                if routing_start < 9 {
-                    return Err(Error::PayloadTooSmall(raw.to_vec()));
-                }
-                Payload::StreamData(StreamDataPayload {
-                    stream_id: ptype - 128,
-                    sample_n: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
-                    data: raw[8..routing_start].to_vec(),
-                })
-            }
-            ptype => Payload::Unknown(GenericPayload {
-                packet_type: ptype,
-                payload: raw[4..routing_start].to_vec(),
-            }),
-        };
+        let pkt_hdr = TioPktHdr::deserialize(raw)?;
+        let pkt_len = pkt_hdr.packet_size();
+        let payload_raw = &raw[pkt_hdr.payload_offset()..pkt_hdr.routing_offset()];
+        let routing_raw = &raw[pkt_hdr.routing_offset()..pkt_len];
+        let payload = Payload::deserialize(&pkt_hdr, payload_raw, raw)?;
 
         Ok((
             Packet {
                 payload: payload,
-                routing: DeviceRoute::from_bytes(&raw[routing_start..packet_len]),
-                ttl: ttl,
+                routing: DeviceRoute::from_bytes(routing_raw)
+                    .expect("routing should have been validated in header deserialization"),
+                ttl: pkt_hdr.ttl(),
             },
-            packet_len,
+            pkt_len,
         ))
     }
 
-    fn prepare_header(&self, packet_type: u8, payload_len: usize) -> Vec<u8> {
-        vec![
-            packet_type,
-            (self.ttl & 0xF) << 4 | (self.routing.len() as u8),
-            (payload_len & 0xFF) as u8,
-            ((payload_len & 0xFF00) >> 8) as u8,
-        ]
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        match &self.payload {
-            Payload::LogMessage(log) => {
-                let mut ret = self.prepare_header(1, 5 + log.message.len());
-                ret.extend(log.data.to_le_bytes());
-                ret.push(match log.level {
-                    LogLevel::CRITICAL => 0,
-                    LogLevel::ERROR => 1,
-                    LogLevel::WARNING => 2,
-                    LogLevel::INFO => 3,
-                    LogLevel::DEBUG => 4,
-                });
-                ret.extend(log.message.as_bytes());
-                self.routing.serialize(ret)
-            }
-            Payload::RpcRequest(req) => {
-                let mut ret = self.prepare_header(
-                    2,
-                    4 + req.arg.len()
-                        + if let RpcMethod::Name(name) = &req.method {
-                            name.len()
-                        } else {
-                            0
-                        },
-                );
-                ret.extend(req.id.to_le_bytes());
-                match &req.method {
-                    RpcMethod::Id(id) => {
-                        ret.extend(id.to_le_bytes());
-                    }
-                    RpcMethod::Name(name) => {
-                        ret.extend(((name.len() | 0x8000) as u16).to_le_bytes());
-                        ret.extend(name.as_bytes());
-                    }
-                }
-                ret.extend(&req.arg);
-                self.routing.serialize(ret)
-            }
-            Payload::RpcReply(rep) => {
-                let mut ret = self.prepare_header(3, 2 + rep.reply.len());
-                ret.extend(rep.id.to_le_bytes());
-                ret.extend(&rep.reply);
-                self.routing.serialize(ret)
-            }
-            Payload::RpcError(err) => {
-                let mut ret = self.prepare_header(4, 4 + err.extra.len());
-                ret.extend(err.id.to_le_bytes());
-                let code: u16 = match err.error {
-                    RpcErrorCode::NoError => 0,
-                    RpcErrorCode::Undefined => 1,
-                    RpcErrorCode::NotFound => 2,
-                    RpcErrorCode::Timeout => 8,
-                    RpcErrorCode::NoBufs => 16,
-                    RpcErrorCode::Unknown(code) => code,
-                };
-                ret.extend(code.to_le_bytes());
-                ret.extend(&err.extra);
-                self.routing.serialize(ret)
-            }
-            Payload::Heartbeat(payload) => {
-                let raw_payload = match payload {
-                    HeartbeatPayload::Session(session) => session.to_le_bytes().to_vec(),
-                    HeartbeatPayload::Any(raw) => raw.clone(),
-                };
-                let mut ret = self.prepare_header(5, raw_payload.len());
-                ret.extend(raw_payload);
-                self.routing.serialize(ret)
-            }
-            Payload::StreamData(sample) => {
-                let mut ret = self.prepare_header(128 + sample.stream_id, 4 + sample.data.len());
-                ret.extend(sample.sample_n.to_le_bytes());
-                ret.extend(&sample.data);
-                self.routing.serialize(ret)
-            }
-            Payload::Unknown(payload) => {
-                let mut ret = self.prepare_header(payload.packet_type, payload.payload.len());
-                ret.extend(&payload.payload);
-                self.routing.serialize(ret)
-            } //            _ => {
-              //                vec![]
-              //            }
-        }
-    }
-
-    pub fn rpc(name: String, arg: &[u8]) -> Packet {
-        Packet {
-            payload: Payload::RpcRequest(RpcRequestPayload {
-                id: 0,
-                method: RpcMethod::Name(name),
-                arg: arg.to_vec(),
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
-    }
-
-    pub fn make_hb(payload: Option<Vec<u8>>) -> Packet {
-        Packet {
-            payload: Payload::Heartbeat(HeartbeatPayload::Any(match payload {
-                Some(v) => v,
-                None => {
-                    vec![]
-                }
-            })),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
-    }
-
-    pub fn make_rpc_error(id: u16, error: RpcErrorCode) -> Packet {
-        Packet {
-            payload: Payload::RpcError(RpcErrorPayload {
-                id: id,
-                error: error,
-                extra: vec![],
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let ret = self.payload.serialize()?;
+        self.routing.serialize(ret)
     }
 }

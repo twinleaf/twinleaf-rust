@@ -21,6 +21,7 @@ mod tcp;
 mod udp;
 
 use super::proto::{self, Packet};
+use super::util;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::thread;
@@ -46,10 +47,14 @@ pub enum SendError {
     /// Low level RawPort
     /// This should never happen for a `Port`, only for the internal low level `RawPort`.
     MustDrain,
-    /// The port outgoing queue is full
+    /// The port outgoing queue is full.
     Full,
+    /// This port is not connected.
     Disconnected,
+    /// Issue with the underlying IO operation.
     IO(io::Error),
+    /// Issue with serialization (packet would exceed protocol limits)
+    Serialization,
 }
 
 /// Possible errors when setting a custom data rate
@@ -248,7 +253,7 @@ impl Port {
                 Some({
                     let mut until_hb = max_interval.saturating_sub(last_sent.elapsed());
                     if (until_hb == Duration::ZERO) | startup {
-                        match raw_port.send(&Packet::make_hb(None)) {
+                        match raw_port.send(&util::make_hb(None)) {
                             Err(SendError::MustDrain) => {
                                 needs_draining = true;
                                 poll.registry()

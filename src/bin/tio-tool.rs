@@ -1,5 +1,7 @@
 use tio::proto;
-use tio::proto::DeviceRoute;
+use tio::proto::{DeviceRoute, Packet};
+use tio::proxy;
+use tio::util;
 use twinleaf::tio;
 
 use std::env;
@@ -74,7 +76,7 @@ impl RpcMeta {
     }
 }
 
-fn rpc_get_response(rx: &crossbeam::channel::Receiver<proto::Packet>) -> Result<tio::Packet, ()> {
+fn rpc_get_response(rx: &crossbeam::channel::Receiver<Packet>) -> Result<Packet, ()> {
     loop {
         let pkt = match rx.recv() {
             Ok(pkt) => pkt,
@@ -92,7 +94,7 @@ fn rpc_get_response(rx: &crossbeam::channel::Receiver<proto::Packet>) -> Result<
 }
 
 fn rpc_get_reply(
-    rx: &crossbeam::channel::Receiver<proto::Packet>,
+    rx: &crossbeam::channel::Receiver<Packet>,
     expected_len: usize,
 ) -> Result<Vec<u8>, ()> {
     if let Ok(pkt) = rpc_get_response(rx) {
@@ -150,22 +152,14 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
 fn list_rpcs(args: &[String]) -> std::io::Result<()> {
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, args);
-    let proxy = tio::ProxyPort::new(&root, None, None);
-    let (tx, rx) = proxy.port(None, route, false, false).unwrap();
+    let proxy = proxy::Port::new(&root, None, None);
 
-    tx.send(tio::Packet::rpc("rpc.listinfo".to_string(), &vec![]))
-        .unwrap();
-    let nrpcs = u16::from_le_bytes(rpc_get_reply(&rx, 2).unwrap()[0..2].try_into().unwrap());
+    let device = util::Rpc::new(&proxy, Some(route));
+    let nrpcs: u16 = device.get("rpc.listinfo").unwrap();
 
-    for rpc_id in 0..nrpcs {
-        tx.send(tio::Packet::rpc(
-            "rpc.listinfo".to_string(),
-            &rpc_id.to_le_bytes(),
-        ))
-        .unwrap();
-        let reply = rpc_get_reply(&rx, 0).unwrap();
-        let meta = RpcMeta::parse(u16::from_le_bytes(reply[0..2].try_into().unwrap()));
-        let name = String::from_utf8_lossy(&reply[2..]).to_string();
+    for rpc_id in 0u16..nrpcs {
+        let (meta, name): (u16, String) = device.rpc("rpc.listinfo", &rpc_id).unwrap();
+        let meta = RpcMeta::parse(meta);
         println!("{} {}({})", meta.perm_str(), name, meta.type_str());
     }
 
@@ -177,7 +171,7 @@ fn get_rpctype(
     tx: &crossbeam::channel::Sender<proto::Packet>,
     rx: &crossbeam::channel::Receiver<proto::Packet>,
 ) -> String {
-    tx.send(tio::Packet::rpc("rpc.info".to_string(), name.as_bytes()))
+    tx.send(util::Rpc::make_request("rpc.info", name.as_bytes()))
         .unwrap();
     RpcMeta::parse(u16::from_le_bytes(
         rpc_get_reply(&rx, 2).unwrap()[0..2].try_into().unwrap(),
@@ -209,7 +203,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         None
     };
 
-    let proxy = tio::ProxyPort::new(&root, None, None);
+    let proxy = proxy::Port::new(&root, None, None);
     let (tx, rx) = proxy.port(None, route, false, false).unwrap();
 
     let mut rpc_type = if let Some(rpc_type) = matches.opt_str("t") {
@@ -223,8 +217,8 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         }
     };
 
-    tx.send(tio::Packet::rpc(
-        rpc_name.clone(),
+    tx.send(util::Rpc::make_request(
+        &rpc_name,
         &if rpc_arg.is_none() {
             vec![]
         } else {
@@ -285,7 +279,7 @@ fn dump(args: &[String]) {
     let opts = tio_opts();
     let (_matches, root, _route) = tio_parseopts(opts, args);
 
-    let proxy = tio::ProxyPort::new(&root, None, None);
+    let proxy = proxy::Port::new(&root, None, None);
     let (_tx, rx) = proxy.full_port().unwrap();
 
     for pkt in rx.iter() {
@@ -305,10 +299,10 @@ fn firmware_upgrade(args: &[String]) {
 
     println!("Loaded {} bytes firmware", firmware_data.len());
 
-    let proxy = tio::ProxyPort::new(&root, None, None);
+    let proxy = proxy::Port::new(&root, None, None);
     let (tx, rx) = proxy.port(None, route, false, false).unwrap();
 
-    tx.send(tio::Packet::rpc("dev.stop".to_string(), &vec![]))
+    tx.send(util::Rpc::make_request("dev.stop", &vec![]))
         .unwrap();
     if let Err(_) = rpc_get_response(&rx) {
         // only if an error with the RPC happened.
@@ -324,8 +318,8 @@ fn firmware_upgrade(args: &[String]) {
         } else {
             offset + 288
         };
-        tx.send(tio::Packet::rpc(
-            "dev.firmware.upload".to_string(),
+        tx.send(util::Rpc::make_request(
+            "dev.firmware.upload",
             &firmware_data[offset..chunk_end],
         ))
         .unwrap();
@@ -340,11 +334,8 @@ fn firmware_upgrade(args: &[String]) {
         println!("Uploaded {:.1}%", pct);
     }
 
-    tx.send(tio::Packet::rpc(
-        "dev.firmware.upgrade".to_string(),
-        &vec![],
-    ))
-    .unwrap();
+    tx.send(util::Rpc::make_request("dev.firmware.upgrade", &vec![]))
+        .unwrap();
     match rpc_get_reply(&rx, 0) {
         Ok(_) => {
             println!("Upgrade successful. Wait for sensor to reboot.");

@@ -72,7 +72,11 @@ impl RawPort for Port {
     }
 
     fn send(&mut self, pkt: &Packet) -> Result<(), SendError> {
-        let raw = pkt.serialize();
+        let raw = if let Ok(raw) = pkt.serialize() {
+            raw
+        } else {
+            return Err(SendError::Serialization);
+        };
         match self.sock.send(&raw) {
             Ok(size) => {
                 if size == raw.len() {

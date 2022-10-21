@@ -124,7 +124,7 @@ impl Port {
             // Avoid packets that are too long, since we know they are invalid.
             // If pkt's size reached the max packet length + CRC32 + separator,
             // we know it's too long.
-            if pkt.len() >= (proto::MAX_PACKET_LEN + std::mem::size_of::<u32>() + 1) {
+            if pkt.len() >= (proto::TIO_PACKET_MAX_TOTAL_SIZE + std::mem::size_of::<u32>() + 1) {
                 self.rxbuf.consume(offset);
                 return Err(RecvError::Protocol(proto::Error::PacketTooBig(pkt)));
             }
@@ -241,7 +241,11 @@ impl RawPort for Port {
             return Err(SendError::Full);
         }
 
-        let raw = pkt.serialize();
+        let raw = if let Ok(raw) = pkt.serialize() {
+            raw
+        } else {
+            return Err(SendError::Serialization);
+        };
         let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
         let mut encoded = vec![0xC0u8];
         for byte in [&raw, &crc32.checksum(&raw).to_le_bytes()[..]].concat() {
