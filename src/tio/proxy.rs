@@ -261,9 +261,8 @@ impl Proxy {
             // next time.
             self.next_rpc_id += 1;
             if self.rpc_map.contains_key(&wire_id) {
-                let mut fail = util::make_rpc_error(req.id, proto::RpcErrorCodeRaw::OutOfMemory);
-                fail.routing = pkt.routing;
-                return Err(fail);
+                return Err(util::PacketBuilder::new(pkt.routing)
+                    .rpc_error(req.id, proto::RpcErrorCodeRaw::OutOfMemory));
             }
             timeout += if client_id != 0 {
                 self.clients.get(&client_id).unwrap().rpc_timeout
@@ -300,9 +299,8 @@ impl Proxy {
         // but remove the rpc from the map and send back an error to the client.
         if let Some(rpc_id) = rpc_mapped_id {
             let remap = self.rpc_map.remove(&rpc_id).unwrap();
-            let mut fail = util::make_rpc_error(remap.id, proto::RpcErrorCodeRaw::Undefined);
-            fail.routing = remap.route;
-            Err(fail)
+            return Err(util::PacketBuilder::new(remap.route)
+                .rpc_error(remap.id, proto::RpcErrorCodeRaw::Undefined));
         } else {
             Ok(())
         }
@@ -325,9 +323,9 @@ impl Proxy {
                     // TODO: maybe inform via status channel
                     continue;
                 };
-                let mut pkt = util::make_rpc_error(remap.id, error.clone());
-                pkt.routing = remap.route;
-                client.send(&pkt).unwrap(); // TODO
+                client
+                    .send(&util::PacketBuilder::new(remap.route).rpc_error(remap.id, error.clone()))
+                    .unwrap(); // TODO
             }
         }
         for timeout in to_remove {
@@ -413,7 +411,7 @@ impl Proxy {
                     .rate_info()
                     .unwrap()
                     .target_bps;
-                self.send_internal_rpc(util::Rpc::make_request(
+                self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
                     "dev.port.rate.near",
                     &target.to_le_bytes(),
                 ))
@@ -431,7 +429,7 @@ impl Proxy {
                         .rate_info()
                         .unwrap()
                         .target_bps;
-                    self.send_internal_rpc(util::Rpc::make_request(
+                    self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
                         "dev.port.rate",
                         &target.to_le_bytes(),
                     ))
@@ -674,6 +672,10 @@ impl Port {
         Port {
             new_client_queue: sender,
         }
+    }
+
+    pub fn default() -> Port {
+        Self::new(util::default_proxy_url(), None, None)
     }
 
     // TODO: allow to restrict to scope's root?

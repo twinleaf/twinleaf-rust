@@ -253,7 +253,7 @@ impl Port {
                 Some({
                     let mut until_hb = max_interval.saturating_sub(last_sent.elapsed());
                     if (until_hb == Duration::ZERO) | startup {
-                        match raw_port.send(&util::make_hb(None)) {
+                        match raw_port.send(&util::PacketBuilder::make_empty_heartbeat()) {
                             Err(SendError::MustDrain) => {
                                 needs_draining = true;
                                 poll.registry()

@@ -107,6 +107,7 @@ pub enum TimebaseEpoch {
     GPS = 4,
 }
 
+/*
 #[derive(Debug, Clone)]
 pub struct TimebaseInfoPayload {
     pub id: u16,
@@ -117,7 +118,22 @@ pub struct TimebaseInfoPayload {
     pub period_denominator_us: u32,
     pub flags: u32,
     pub stability: f32,
+    pub source_id: [u8; 16],
 }
+
+#[derive(Debug, Clone)]
+pub struct SourceInfoPayload {
+    pub id: u16,
+    pub timebase_id: u16,
+    pub period: u32,
+    pub offset: u32,
+    fmt: i32, // originally intended for formatting hints, unused might be recycled
+    pub deleted: bool,
+    unknown_flags: u16, // only deleted is parsed. pass this along though if software is outdated
+    pub channels: u16,
+    pub datatype: u8,
+}
+*/
 
 #[derive(Debug, Clone)]
 pub struct StreamDataPayload {
@@ -134,7 +150,7 @@ pub enum Payload {
     RpcError(RpcErrorPayload),
     Heartbeat(HeartbeatPayload),
     //TimebaseInfo(TimebaseInfoPayload),
-    //SourceInfo(),
+    //SourceInfo(SourceInfoPayload),
     //StreamUpdate(),
     StreamData(StreamDataPayload),
     Unknown(GenericPayload),

@@ -1,5 +1,4 @@
-use tio::proto;
-use tio::proto::{DeviceRoute, Packet};
+use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::tio;
@@ -76,50 +75,14 @@ impl RpcMeta {
     }
 }
 
-fn rpc_get_response(rx: &crossbeam::channel::Receiver<Packet>) -> Result<Packet, ()> {
-    loop {
-        let pkt = match rx.recv() {
-            Ok(pkt) => pkt,
-            Err(_) => {
-                return Err(());
-            }
-        };
-        match pkt.payload {
-            proto::Payload::RpcReply(_) | proto::Payload::RpcError(_) => {
-                return Ok(pkt);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn rpc_get_reply(
-    rx: &crossbeam::channel::Receiver<Packet>,
-    expected_len: usize,
-) -> Result<Vec<u8>, ()> {
-    if let Ok(pkt) = rpc_get_response(rx) {
-        match pkt.payload {
-            proto::Payload::RpcReply(rep) => {
-                if (expected_len == 0) || (rep.reply.len() == expected_len) {
-                    Ok(rep.reply)
-                } else {
-                    Err(())
-                }
-            }
-            proto::Payload::RpcError(err) => {
-                println!("Rpc Error: {:?}", err.error);
-                Err(())
-            }
-            _ => Err(()),
-        }
-    } else {
-        Err(())
-    }
-}
-
 fn tio_opts() -> Options {
     let mut opts = Options::new();
-    opts.optopt("r", "", "sensor root (default tcp://localhost)", "address");
+    opts.optopt(
+        "r",
+        "",
+        &format!("sensor root (default {})", util::default_proxy_url()),
+        "address",
+    );
     opts.optopt(
         "s",
         "",
@@ -152,13 +115,14 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
 fn list_rpcs(args: &[String]) -> std::io::Result<()> {
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, args);
-    let proxy = proxy::Port::new(&root, None, None);
 
-    let device = util::Rpc::new(&proxy, Some(route));
+    let proxy = proxy::Port::new(&root, None, None);
+    let device = util::DeviceRpc::new(&proxy, Some(route));
+
     let nrpcs: u16 = device.get("rpc.listinfo").unwrap();
 
     for rpc_id in 0u16..nrpcs {
-        let (meta, name): (u16, String) = device.rpc("rpc.listinfo", &rpc_id).unwrap();
+        let (meta, name): (u16, String) = device.rpc("rpc.listinfo", rpc_id).unwrap();
         let meta = RpcMeta::parse(meta);
         println!("{} {}({})", meta.perm_str(), name, meta.type_str());
     }
@@ -168,15 +132,16 @@ fn list_rpcs(args: &[String]) -> std::io::Result<()> {
 
 fn get_rpctype(
     name: &String,
-    tx: &crossbeam::channel::Sender<proto::Packet>,
-    rx: &crossbeam::channel::Receiver<proto::Packet>,
+    device: &util::DeviceRpc,
+    //    tx: &crossbeam::channel::Sender<proto::Packet>,
+    //    rx: &crossbeam::channel::Receiver<proto::Packet>,
 ) -> String {
-    tx.send(util::Rpc::make_request("rpc.info", name.as_bytes()))
-        .unwrap();
-    RpcMeta::parse(u16::from_le_bytes(
-        rpc_get_reply(&rx, 2).unwrap()[0..2].try_into().unwrap(),
-    ))
-    .arg_type
+    //tx.send(util::Rpc::make_request("rpc.info", name.as_bytes()))
+    //    .unwrap();
+    //RpcMeta::parse(u16::from_le_bytes(
+    //    rpc_get_reply(&rx, 2).unwrap()[0..2].try_into().unwrap(),
+    //))
+    RpcMeta::parse(device.rpc("rpc.info", name).unwrap()).arg_type
 }
 
 fn rpc(args: &[String]) -> std::io::Result<()> {
@@ -204,47 +169,47 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
     };
 
     let proxy = proxy::Port::new(&root, None, None);
-    let (tx, rx) = proxy.port(None, route, false, false).unwrap();
+    let device = util::DeviceRpc::new(&proxy, Some(route));
 
     let mut rpc_type = if let Some(rpc_type) = matches.opt_str("t") {
         Some(rpc_type)
     } else {
         if rpc_arg.is_some() {
-            let t = get_rpctype(&rpc_name, &tx, &rx);
+            let t = get_rpctype(&rpc_name, &device);
             Some(if t == "" { "string".to_string() } else { t })
         } else {
             None
         }
     };
 
-    tx.send(util::Rpc::make_request(
-        &rpc_name,
-        &if rpc_arg.is_none() {
-            vec![]
-        } else {
-            let s = rpc_arg.unwrap();
-            match &rpc_type.as_ref().unwrap()[..] {
-                "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
-                "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
-                "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
-                "u64" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
-                "i8" => s.parse::<i8>().unwrap().to_le_bytes().to_vec(),
-                "i16" => s.parse::<i16>().unwrap().to_le_bytes().to_vec(),
-                "i32" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
-                "i64" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
-                "f32" => s.parse::<f32>().unwrap().to_le_bytes().to_vec(),
-                "f64" => s.parse::<f64>().unwrap().to_le_bytes().to_vec(),
-                "string" => s.as_bytes().to_vec(),
-                _ => panic!("Invalid type"),
-            }
-        },
-    ))
-    .unwrap();
+    let reply = device
+        .raw_rpc(
+            &rpc_name,
+            &if rpc_arg.is_none() {
+                vec![]
+            } else {
+                let s = rpc_arg.unwrap();
+                match &rpc_type.as_ref().unwrap()[..] {
+                    "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
+                    "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
+                    "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
+                    "u64" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
+                    "i8" => s.parse::<i8>().unwrap().to_le_bytes().to_vec(),
+                    "i16" => s.parse::<i16>().unwrap().to_le_bytes().to_vec(),
+                    "i32" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
+                    "i64" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
+                    "f32" => s.parse::<f32>().unwrap().to_le_bytes().to_vec(),
+                    "f64" => s.parse::<f64>().unwrap().to_le_bytes().to_vec(),
+                    "string" => s.as_bytes().to_vec(),
+                    _ => panic!("Invalid type"),
+                }
+            },
+        )
+        .unwrap();
 
-    let reply = rpc_get_reply(&rx, 0).unwrap();
     if reply.len() != 0 {
         if rpc_type.is_none() {
-            let t = get_rpctype(&rpc_name, &tx, &rx);
+            let t = get_rpctype(&rpc_name, &device);
             rpc_type = Some(if t == "" { "string".to_string() } else { t })
         }
         let reply_str = match &rpc_type.as_ref().unwrap()[..] {
@@ -300,14 +265,12 @@ fn firmware_upgrade(args: &[String]) {
     println!("Loaded {} bytes firmware", firmware_data.len());
 
     let proxy = proxy::Port::new(&root, None, None);
-    let (tx, rx) = proxy.port(None, route, false, false).unwrap();
+    let device = util::DeviceRpc::new(&proxy, Some(route));
 
-    tx.send(util::Rpc::make_request("dev.stop", &vec![]))
-        .unwrap();
-    if let Err(_) = rpc_get_response(&rx) {
-        // only if an error with the RPC happened.
-        // TODO: some rpc errors should also fail, like timeouts or others.
-        panic!("Failed to stop device");
+    if let Err(_) = device.action("dev.stop") {
+        // TODO: should ignore some errors, such as method not existing or if already stopped.
+        //panic!("Failed to stop device");
+        println!("Failed to stop device");
     }
 
     let mut offset: usize = 0;
@@ -318,12 +281,7 @@ fn firmware_upgrade(args: &[String]) {
         } else {
             offset + 288
         };
-        tx.send(util::Rpc::make_request(
-            "dev.firmware.upload",
-            &firmware_data[offset..chunk_end],
-        ))
-        .unwrap();
-        match rpc_get_reply(&rx, 0) {
+        match device.raw_rpc("dev.firmware.upload", &firmware_data[offset..chunk_end]) {
             Ok(_reply) => {}
             _ => {
                 panic!("upload failed");
@@ -334,16 +292,9 @@ fn firmware_upgrade(args: &[String]) {
         println!("Uploaded {:.1}%", pct);
     }
 
-    tx.send(util::Rpc::make_request("dev.firmware.upgrade", &vec![]))
-        .unwrap();
-    match rpc_get_reply(&rx, 0) {
-        Ok(_) => {
-            println!("Upgrade successful. Wait for sensor to reboot.");
-        }
-        _ => {
-            panic!("upload failed");
-        }
-    };
+    if let Err(_) = device.action("dev.firmware.upgrade") {
+        panic!("upgrade failed");
+    }
 }
 
 fn main() {
