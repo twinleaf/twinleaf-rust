@@ -252,6 +252,21 @@ fn dump(args: &[String]) {
     }
 }
 
+fn log(args: &[String]) {
+    let opts = tio_opts();
+    let (_matches, root, _route) = tio_parseopts(opts, args);
+
+    let proxy = proxy::Port::new(&root, None, None);
+    let (_tx, rx) = proxy.full_port().unwrap();
+
+    let mut file = File::create("log.tio")?; // TODO: Nice filename with date?
+    
+    for pkt in rx.iter() {
+        file.write_all(pkt)?;
+    }
+
+}
+
 fn firmware_upgrade(args: &[String]) {
     let opts = tio_opts();
     let (matches, root, route) = tio_parseopts(opts, args);
@@ -311,6 +326,9 @@ fn main() {
         }
         "dump" => {
             dump(&args[2..]); //.unwrap();
+        }
+        "log" => {
+            log(&args[2..]); //.unwrap();
         }
         "firmware-upgrade" => {
             firmware_upgrade(&args[2..]); //.unwrap();
