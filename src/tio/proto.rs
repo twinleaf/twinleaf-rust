@@ -7,7 +7,7 @@ pub struct GenericPayload {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 #[derive(FromPrimitive)]
 pub enum LogLevel {
