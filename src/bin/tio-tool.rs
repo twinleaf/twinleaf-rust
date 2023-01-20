@@ -4,6 +4,8 @@ use tio::util;
 use twinleaf::tio;
 
 use std::env;
+use std::fs::File;
+use std::io::prelude::*;
 
 use getopts::Options;
 
@@ -253,16 +255,18 @@ fn dump(args: &[String]) {
 }
 
 fn log(args: &[String]) {
+    // TODO: Handle optional filename
     let opts = tio_opts();
     let (_matches, root, _route) = tio_parseopts(opts, args);
 
     let proxy = proxy::Port::new(&root, None, None);
     let (_tx, rx) = proxy.full_port().unwrap();
 
-    let mut file = File::create("log.tio")?; // TODO: Nice filename with date?
+    let mut file = File::create("log.tio").unwrap(); // TODO: Nice filename with date?
     
     for pkt in rx.iter() {
-        file.write_all(pkt)?;
+        let raw = pkt.serialize().unwrap();
+        file.write_all(&raw).unwrap();
     }
 
 }
@@ -338,6 +342,7 @@ fn main() {
             println!("Usage:");
             println!(" tio-tool help");
             println!(" tio-tool dump [-r url] [-s sensor]");
+            println!(" tio-tool log [-r url] [-s sensor] [filename]");
             println!(" tio-tool rpc-list [-r url] [-s sensor]");
             println!(" tio-tool rpc [-r url] [-s sensor] [-t type] <rpc-name> [rpc-arg]");
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
