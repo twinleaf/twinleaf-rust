@@ -255,20 +255,40 @@ fn dump(args: &[String]) {
 }
 
 fn log(args: &[String]) {
-    // TODO: Handle optional filename
-    let opts = tio_opts();
-    let (_matches, root, _route) = tio_parseopts(opts, args);
+    let output_path = chrono::Local::now().format("log.%Y%m%d-%H%M%S.tio");
+    let mut opts = tio_opts();
+    opts.optopt(
+        "f",
+        "",
+        &format!("path of file where to log the data (default {})", output_path),
+        "path",
+    );
+    opts.optflag(
+        "u",
+        "",
+        "unbuffered output",
+    );
+    let (matches, root, route) = tio_parseopts(opts, args);
+
+    let output_path = if let Some(path) = matches.opt_str("f") {
+        path
+    } else {
+        output_path.to_string()
+    };
 
     let proxy = proxy::Port::new(&root, None, None);
-    let (_tx, rx) = proxy.full_port().unwrap();
+    let (_tx, rx) = proxy.port(None, route, true, true).unwrap();
 
-    let mut file = File::create("log.tio").unwrap(); // TODO: Nice filename with date?
+    let mut file = File::create(output_path).unwrap();
+    let sync = matches.opt_present("u");
     
     for pkt in rx.iter() {
         let raw = pkt.serialize().unwrap();
         file.write_all(&raw).unwrap();
+        if sync {
+            file.flush().unwrap();
+        }
     }
-
 }
 
 fn firmware_upgrade(args: &[String]) {

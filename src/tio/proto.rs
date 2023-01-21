@@ -7,7 +7,7 @@ pub struct GenericPayload {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[repr(u8)]
 #[derive(FromPrimitive)]
 pub enum LogLevel {
@@ -427,7 +427,7 @@ impl LogMessagePayload {
         }
         let mut ret = TioPktHdr::serialize_new(TioPktType::Log as u8, 0, payload_size as u16);
         ret.extend(self.data.to_le_bytes());
-        ret.push(self.level as u8);
+        ret.push(self.level.clone() as u8);
         ret.extend(self.message.as_bytes());
         Ok(ret)
     }
