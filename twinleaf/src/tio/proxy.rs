@@ -123,7 +123,7 @@ impl ProxyDevice {
         }
     }
 
-    fn try_recv(&mut self) -> Result<Result<Packet, RecvError>, crossbeam::TryRecvError> {
+    fn try_recv(&mut self) -> Result<Result<Packet, RecvError>, crossbeam::channel::TryRecvError> {
         if self.has_static_rate() {
             self.rx_channel.try_recv()
         } else {
@@ -381,7 +381,7 @@ impl Proxy {
                     }
                 }
                 state => {
-                    #[cfg(build = "debug")]
+                    #[cfg(debug_assertions)]
                     eprintln!("Unexpected internal rpc reply in state {:?}", state);
                     state
                 }

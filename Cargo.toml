@@ -1,24 +1,8 @@
-[package]
-name = "twinleaf"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-readme = "README.md"
+[workspace]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+members = [
+    "twinleaf",
+    "twinleaf-tools",
+]
 
-[dependencies]
-crossbeam = "0.5"
-mio-serial = "5.0"
-crc = "2.1"
-serialport = "4.1"
-getopts = "0.2"
-chrono = "0.4"
-num_enum = "0.7.3"
-
-[dependencies.mio]
-version = "0.8"
-features = ["os-poll", "net"]
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["commapi", "handleapi", "winbase"] }
+resolver = "2"

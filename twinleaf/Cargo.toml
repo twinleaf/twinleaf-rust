@@ -1,0 +1,19 @@
+[package]
+name = "twinleaf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+crossbeam = "0.8.4"
+mio-serial = "5.0.5"
+crc = "3.2.1"
+num_enum = "0.7.3"
+
+[dependencies.mio]
+version = "0.8"
+features = ["os-poll", "net"]
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["commapi", "handleapi", "winbase"] }
