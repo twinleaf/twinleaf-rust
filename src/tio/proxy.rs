@@ -262,7 +262,7 @@ impl Proxy {
             self.next_rpc_id += 1;
             if self.rpc_map.contains_key(&wire_id) {
                 return Err(util::PacketBuilder::new(pkt.routing)
-                    .rpc_error(req.id, proto::RpcErrorCodeRaw::OutOfMemory));
+                    .rpc_error(req.id, proto::RpcErrorCode::OutOfMemory));
             }
             timeout += if client_id != 0 {
                 self.clients.get(&client_id).unwrap().rpc_timeout
@@ -300,13 +300,13 @@ impl Proxy {
         if let Some(rpc_id) = rpc_mapped_id {
             let remap = self.rpc_map.remove(&rpc_id).unwrap();
             return Err(util::PacketBuilder::new(remap.route)
-                .rpc_error(remap.id, proto::RpcErrorCodeRaw::Undefined));
+                .rpc_error(remap.id, proto::RpcErrorCode::Undefined));
         } else {
             Ok(())
         }
     }
 
-    fn dispatch_rpc_timeouts(&mut self, until: Instant, error: proto::RpcErrorCodeRaw) {
+    fn dispatch_rpc_timeouts(&mut self, until: Instant, error: proto::RpcErrorCode) {
         let mut to_remove = Vec::new();
         for (timeout, rpc_ids) in self.rpc_timeouts.iter() {
             if *timeout >= until {
@@ -335,7 +335,7 @@ impl Proxy {
 
     fn process_rpc_timeouts(&mut self) -> Duration {
         let now = Instant::now();
-        self.dispatch_rpc_timeouts(now, proto::RpcErrorCodeRaw::Timeout);
+        self.dispatch_rpc_timeouts(now, proto::RpcErrorCode::Timeout);
         if let Some(timeout) = self.rpc_timeouts.keys().next() {
             timeout.saturating_duration_since(now) + Duration::from_millis(1)
         } else {
@@ -459,7 +459,7 @@ impl Proxy {
     fn cancel_active_rpcs(&mut self) {
         self.dispatch_rpc_timeouts(
             Instant::now() + Duration::from_secs(1000),
-            proto::RpcErrorCodeRaw::Undefined,
+            proto::RpcErrorCode::Undefined,
         );
     }
 

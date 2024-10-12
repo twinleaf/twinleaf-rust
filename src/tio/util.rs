@@ -33,11 +33,11 @@ impl PacketBuilder {
         ret
     }
 
-    pub fn make_rpc_error(id: u16, error: proto::RpcErrorCodeRaw) -> Packet {
+    pub fn make_rpc_error(id: u16, error: proto::RpcErrorCode) -> Packet {
         Packet {
             payload: Payload::RpcError(proto::RpcErrorPayload {
                 id: id,
-                error: proto::RpcErrorCode::Known(error),
+                error: error,
                 extra: vec![],
             }),
             routing: DeviceRoute::root(),
@@ -45,7 +45,7 @@ impl PacketBuilder {
         }
     }
 
-    pub fn rpc_error(&self, id: u16, error: proto::RpcErrorCodeRaw) -> Packet {
+    pub fn rpc_error(&self, id: u16, error: proto::RpcErrorCode) -> Packet {
         let mut ret = Self::make_rpc_error(id, error);
         ret.routing = self.routing.clone();
         ret
