@@ -111,7 +111,8 @@ fn main() -> ExitCode {
         "dump",
         "Dump traffic data through the proxy (does not include internal heartbeats)",
     );
-    opts.optflag("", "auto", "automatically connect to a USB sensor if there is a single device on the system that could be a Twinleaf device");
+    opts.optflag("", "auto", "Automatically connect to a USB sensor if there is a single device on the system that could be a Twinleaf device");
+    opts.optflag("", "enum", "Enumerate all serial devices, then quit");
 
     let mut args: Vec<String> = env::args().collect();
 
@@ -136,7 +137,7 @@ fn main() -> ExitCode {
         };
         ($msg:expr)=>{
         {
-            let usage = format!("Usage: {} [-p port] [-v] [-d] [-t fmt] (--auto | sensor_url)", &args[0]);
+            let usage = format!("Usage: {} [-p port] [-v] [-d] [-t fmt] (--auto | sensor_url)  or {} --enum", &args[0], &args[0]);
             die!("{}\n{}", $msg, opts.usage(&usage));
         }
         };
@@ -146,6 +147,32 @@ fn main() -> ExitCode {
         Ok(m) => m,
         Err(f) => die_usage!("{}", f.to_string()),
     };
+
+    if matches.opt_present("enum") {
+        let mut unknown_devices = vec![];
+        let mut found_any = false;
+        for dev in enum_devices(true) {
+            if let TwinleafPortInterface::Unknown(vid, pid) = dev.ifc {
+                unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
+            } else {
+                if !found_any {
+                    println!("Possible tio ports:");
+                    found_any = true;
+                }
+                println!(" * {}", dev.url);
+            }
+        }
+        if !found_any {
+            println!("No likely ports found")
+        }
+        if unknown_devices.len() > 0 {
+            println!("Also found these serial ports");
+            for dev in unknown_devices {
+                println!(" * {}", dev);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let tcp_port = matches.opt_str("p").unwrap_or("7855".to_string());
     let tcp_port = if let Ok(port) = tcp_port.parse::<u16>() {
