@@ -17,7 +17,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install dependencies
       if: matrix.platform == 'ubuntu-latest'
       run: |
@@ -31,7 +31,7 @@ jobs:
         strip target/release/tio-proxy
         strip target/release/tio-tool
     - name: Upload binaries
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: twinleaf-tools.${{ matrix.platform }}
         path: |
