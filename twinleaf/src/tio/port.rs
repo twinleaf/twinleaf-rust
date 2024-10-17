@@ -184,7 +184,7 @@ fn find_addr(addr: &str, family: AddrFamilyRestrict) -> Result<SocketAddr, io::E
     ))
 }
 
-/// The communication to the `Port` thread occurst over a single
+/// The communication to the `Port` thread occurs over a single
 /// channel. This enum is used to multiplex data and control messages.
 enum PacketOrControl {
     Pkt(Packet),
@@ -327,10 +327,8 @@ impl Port {
                                     }
                                 }
                             } else {
-                                // REVISIT
-                                // At the time of writing this with the most current libraries,
-                                // under windows the interest appears to always writable if we
-                                // can write to the port, regardless of registered interest.
+                                // In windows, there is no way to check writeable interest for an
+                                // underlying handle, and mio will always show the port as writable.
                                 #[cfg(unix)]
                                 panic!("Unexpected writable raw port when not draining");
                             }
@@ -453,8 +451,8 @@ impl Port {
             // If anything panics in this thread and it causes unwinding, this
             // closure terminates and the channels are closed.
             // At the level above, the proxy thread will notice the channel getting,
-            // closed and attemps to reconnect. This seems to not work correctly in
-            // windows, where the port is kept open unless `std::mem::drop(raw_port)`
+            // closed and will attempt to reconnect. This seems to not work correctly
+            // in windows, where the port is kept open unless `std::mem::drop(raw_port)`
             // is called manually on the port before panicking, and the reconnection
             // always fails until the tool is restarted.
             // One possible solution would be to use panic::catch_unwind around this
@@ -568,7 +566,7 @@ impl Port {
         Port::rx_channel_custom(DEFAULT_RX_CHANNEL_SIZE)
     }
 
-    /// Returns a RX callback which sendd the received results to a channel
+    /// Returns a RX callback which sends the received results to a channel
     /// (see `rx_channel`) and silently drops results when the channel
     /// is full.
     pub fn rx_to_channel(

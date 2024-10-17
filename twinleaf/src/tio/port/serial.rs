@@ -220,15 +220,17 @@ impl RawPort for Port {
                 }
                 return Err(e);
             }
-            // If this is the very first data we receive, discard it. Likely it's
-            // a combination of stale data and possibly corrupted initial data
-            // from the driver, so it's better to throw it away otherwise the
-            // parser gets confused and waits for a large amount of data before
-            // declaring it invalid.
+            // If this is the very first data we receive, discard it if received
+            // before the startup holdoff. Likely it's a combination of stale
+            // data and possibly corrupted initial data from the driver, so it's
+            // better to throw it away otherwise the parser gets confused and
+            // waits for a large amount of data before declaring it invalid.
             if self.first_rx && !self.rxbuf.empty() {
-                self.rxbuf.flush();
                 self.first_rx = false;
-                return Err(RecvError::NotReady);
+                if self.startup_holdoff() {
+                    self.rxbuf.flush();
+                    return Err(RecvError::NotReady);
+                }
             }
             self.last_rx = now;
             res = self.recv_buffered();

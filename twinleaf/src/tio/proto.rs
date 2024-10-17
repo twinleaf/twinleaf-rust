@@ -264,7 +264,7 @@ impl DeviceRoute {
         }
     }
 
-    // Returns the relative route from this to other_route (which is absolute.
+    // Returns the relative route from this to other_route (which is absolute).
     // Error if other route is not in the subtree rooted by this route.
     pub fn relative_route(&self, other_route: &DeviceRoute) -> Result<DeviceRoute, ()> {
         if (self.len() <= other_route.len()) && (self.route == other_route.route[0..self.len()]) {
@@ -286,12 +286,12 @@ impl DeviceRoute {
 use std::fmt::{Display, Formatter};
 
 impl Display for DeviceRoute {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if self.route.len() == 0 {
-            write!(f, "/").unwrap();
+            write!(f, "/")?;
         } else {
             for segment in &self.route {
-                write!(f, "/{}", segment).unwrap();
+                write!(f, "/{}", segment)?;
             }
         }
         Ok(())

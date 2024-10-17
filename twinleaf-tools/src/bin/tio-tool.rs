@@ -260,14 +260,13 @@ fn log(args: &[String]) {
     opts.optopt(
         "f",
         "",
-        &format!("path of file where to log the data (default {})", output_path),
+        &format!(
+            "path of file where to log the data (default {})",
+            output_path
+        ),
         "path",
     );
-    opts.optflag(
-        "u",
-        "",
-        "unbuffered output",
-    );
+    opts.optflag("u", "", "unbuffered output");
     let (matches, root, route) = tio_parseopts(opts, args);
 
     let output_path = if let Some(path) = matches.opt_str("f") {
@@ -281,7 +280,7 @@ fn log(args: &[String]) {
 
     let mut file = File::create(output_path).unwrap();
     let sync = matches.opt_present("u");
-    
+
     for pkt in rx.iter() {
         let raw = pkt.serialize().unwrap();
         file.write_all(&raw).unwrap();
