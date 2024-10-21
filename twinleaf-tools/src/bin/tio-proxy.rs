@@ -1,12 +1,14 @@
 //! tio-proxy
 //!
-//! TODO: rustdoc
+//! Multiplexes access to a sensor, exposing the functionality of tio::proxy
+//! via TCP.
 
 use getopts::Options;
 use std::env;
 use std::io;
 use std::net::TcpListener;
 use std::process::ExitCode;
+use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::tio;
 
@@ -97,6 +99,7 @@ fn main() -> ExitCode {
         "",
         "Kick off slow clients, instead of dropping traffic.",
     );
+    opts.optopt("s", "", "Sensor subtree to look at (default /)", "path");
     opts.optflag("v", "", "Verbose output");
     opts.optflag("d", "", "Debugging output");
     opts.optopt("t", "", "Timestamp format (default '%T%.3f ')", "fmt");
@@ -236,6 +239,12 @@ fn main() -> ExitCode {
         log!(tf, "Using sensor url: {}", sensor_url);
     }
 
+    let subtree = if let Some(path) = matches.opt_str("s") {
+        tio::proto::DeviceRoute::from_str(&path).expect("Invalid sensor subtree")
+    } else {
+        tio::proto::DeviceRoute::root()
+    };
+
     let new_client = {
         let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
         let started_v6 = create_listener_thread(
@@ -266,12 +275,12 @@ fn main() -> ExitCode {
     };
 
     let (status_send, port_status) = crossbeam::channel::bounded::<proxy::Event>(10);
-    let proxy = proxy::Port::new(&sensor_url, Some(reconnect_timeout), Some(status_send));
+    let proxy =
+        proxy::Interface::new_proxy(&sensor_url, Some(reconnect_timeout), Some(status_send));
 
-    // These are used by the proxy itself to communicate with the
-    // device tree.
+    // This is used by the proxy itself to communicate with the device tree.
     // for now only used to receive log messages and dump traffic.
-    let (_proxy_tx, proxy_rx) = if let Ok(port) = proxy.full_port() {
+    let proxy_port = if let Ok(port) = proxy.subtree_full(subtree.clone()) {
         port
     } else {
         die!(
@@ -288,7 +297,13 @@ fn main() -> ExitCode {
         select! {
             recv(new_client) -> tcp_client => {
                 if let Ok(stream) = tcp_client {
-                    let addr = stream.peer_addr().unwrap().to_string();
+                    let addr = match stream.peer_addr() {
+                        Ok(addr) => addr.to_string(),
+                        Err(err) => {
+                            log!(tf, "Failed to determine client address: {:?}", err);
+                            continue;
+                        }
+                    };
                     let (rx_send, client_rx) = tio::port::Port::rx_channel();
                     let client = match tio::port::Port::from_tcp_stream(stream, tio::port::Port::rx_to_channel(rx_send)) {
                         Ok(client_port) => client_port,
@@ -298,15 +313,18 @@ fn main() -> ExitCode {
                     if verbose {
                         log!(tf, "Accepted client from {}", addr);
                     }
-                    let (sender, receiver) = proxy.full_port().unwrap();
+                    let port = proxy.new_port(Some(Duration::from_millis(2000)), subtree.clone(), usize::MAX, true, true).expect("Failed to create new proxy port");
                     let tf = tf.clone();
                     std::thread::spawn(move || {
                         let mut is_slow = false;
                         let mut dropped: usize = 0;
                         loop {
                             select! {
-                                recv(receiver) -> res => {
-                                    let pkt = res.unwrap(); // TODO: this will kill this thread
+                                recv(port.receiver()) -> res => {
+                                    let pkt = if let Ok(pkt) = res { pkt } else {
+                                        log!(tf, "Disconnecting client {} due to internal error receiving tio data in thread", addr);
+                                            break;
+                                    };
                                     match client.try_send(pkt) {
                                         Err(tio::SendError::Full) => {
                                             if disconnect_slow {
@@ -341,7 +359,10 @@ fn main() -> ExitCode {
                                             if dump_traffic {
                                                 log!(tf, "{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
                                             }
-                                            sender.try_send(pkt).unwrap();// TODO
+                                            if let Err(_) = port.try_send(pkt) {
+                                                log!(tf, "Disconnecting client {} due to internal error forwarding tio data in thread", addr);
+                                                    break;
+                                            }
                                         }
                                         _ => {
                                             if verbose {
@@ -401,7 +422,7 @@ fn main() -> ExitCode {
                     break;
                 }
             }
-            recv(proxy_rx) -> pkt_or_err => {
+            recv(proxy_port.receiver()) -> pkt_or_err => {
                 if let Ok(pkt) = pkt_or_err {
                     if dump_traffic {
                         log!(tf, "Packet from {} -- {:?}", pkt.routing, pkt.payload);

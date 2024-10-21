@@ -1,6 +1,4 @@
 use crate::tio::proto::{self, DeviceRoute, Packet, Payload};
-use crate::tio::proxy;
-use crossbeam::channel;
 
 pub fn default_proxy_url() -> &'static str {
     "tcp://localhost"
@@ -15,40 +13,36 @@ impl PacketBuilder {
         PacketBuilder { routing }
     }
 
-    pub fn make_rpc_request(name: &str, arg: &[u8]) -> Packet {
+    pub fn make_rpc_request(name: &str, arg: &[u8], id: u16, routing: DeviceRoute) -> Packet {
         Packet {
             payload: Payload::RpcRequest(proto::RpcRequestPayload {
-                id: 0,
+                id: id,
                 method: proto::RpcMethod::Name(name.into()),
                 arg: arg.to_vec(),
             }),
-            routing: DeviceRoute::root(),
+            routing: routing,
             ttl: 0,
         }
     }
 
-    pub fn rpc_request(&self, name: &str, arg: &[u8]) -> Packet {
-        let mut ret = Self::make_rpc_request(name, arg);
-        ret.routing = self.routing.clone();
-        ret
+    pub fn rpc_request(&self, name: &str, arg: &[u8], id: u16) -> Packet {
+        Self::make_rpc_request(name, arg, id, self.routing.clone())
     }
 
-    pub fn make_rpc_error(id: u16, error: proto::RpcErrorCode) -> Packet {
+    pub fn make_rpc_error(id: u16, error: proto::RpcErrorCode, routing: DeviceRoute) -> Packet {
         Packet {
             payload: Payload::RpcError(proto::RpcErrorPayload {
                 id: id,
                 error: error,
                 extra: vec![],
             }),
-            routing: DeviceRoute::root(),
+            routing: routing,
             ttl: 0,
         }
     }
 
     pub fn rpc_error(&self, id: u16, error: proto::RpcErrorCode) -> Packet {
-        let mut ret = Self::make_rpc_error(id, error);
-        ret.routing = self.routing.clone();
-        ret
+        Self::make_rpc_error(id, error, self.routing.clone())
     }
 
     pub fn make_heartbeat(payload: Vec<u8>) -> Packet {
@@ -195,54 +189,4 @@ impl<
         B: TioRpcReplyable<B> + TioRpcReplyableFixedSize,
     > TioRpcReplyableFixedSize for (A, B)
 {
-}
-
-pub struct DeviceRpc {
-    tx: channel::Sender<Packet>,
-    rx: channel::Receiver<Packet>,
-}
-
-impl DeviceRpc {
-    pub fn new(proxy: &proxy::Port, device: Option<DeviceRoute>) -> DeviceRpc {
-        let route = match device {
-            Some(route) => route,
-            None => DeviceRoute::root(),
-        };
-        let (tx, rx) = proxy.port(None, route, false, false).unwrap();
-        DeviceRpc { tx, rx }
-    }
-
-    // TODO: error type
-
-    /// Generic any sized input/output RPC
-    pub fn raw_rpc(&self, name: &str, arg: &[u8]) -> Result<Vec<u8>, ()> {
-        // TODO: error handling
-        self.tx
-            .send(PacketBuilder::make_rpc_request(name, arg))
-            .unwrap();
-        let rep = self.rx.recv().unwrap();
-        if let Payload::RpcReply(rep) = rep.payload {
-            Ok(rep.reply)
-        } else {
-            Err(())
-        }
-    }
-
-    pub fn rpc<ReqT: TioRpcRequestable<ReqT>, RepT: TioRpcReplyable<RepT>>(
-        &self,
-        name: &str,
-        arg: ReqT,
-    ) -> Result<RepT, ()> {
-        let ret = self.raw_rpc(name, &arg.to_request())?;
-        RepT::from_reply(&ret)
-    }
-
-    /// Action: rpc with no argument which returns nothing
-    pub fn action(&self, name: &str) -> Result<(), ()> {
-        self.rpc(name, ())
-    }
-
-    pub fn get<T: TioRpcReplyable<T>>(&self, name: &str) -> Result<T, ()> {
-        self.rpc(name, ())
-    }
 }

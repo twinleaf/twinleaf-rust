@@ -118,8 +118,8 @@ fn list_rpcs(args: &[String]) -> std::io::Result<()> {
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, args);
 
-    let proxy = proxy::Port::new(&root, None, None);
-    let device = util::DeviceRpc::new(&proxy, Some(route));
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_rpc(route).unwrap();
 
     let nrpcs: u16 = device.get("rpc.listinfo").unwrap();
 
@@ -134,7 +134,7 @@ fn list_rpcs(args: &[String]) -> std::io::Result<()> {
 
 fn get_rpctype(
     name: &String,
-    device: &util::DeviceRpc,
+    device: &proxy::Port,
     //    tx: &crossbeam::channel::Sender<proto::Packet>,
     //    rx: &crossbeam::channel::Receiver<proto::Packet>,
 ) -> String {
@@ -170,8 +170,8 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         None
     };
 
-    let proxy = proxy::Port::new(&root, None, None);
-    let device = util::DeviceRpc::new(&proxy, Some(route));
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_rpc(route).unwrap();
 
     let mut rpc_type = if let Some(rpc_type) = matches.opt_str("t") {
         Some(rpc_type)
@@ -246,10 +246,9 @@ fn dump(args: &[String]) {
     let opts = tio_opts();
     let (_matches, root, _route) = tio_parseopts(opts, args);
 
-    let proxy = proxy::Port::new(&root, None, None);
-    let (_tx, rx) = proxy.full_port().unwrap();
+    let proxy = proxy::Interface::new(&root);
 
-    for pkt in rx.iter() {
+    for pkt in proxy.tree_full().unwrap().iter() {
         println!("{:?}", pkt);
     }
 }
@@ -275,13 +274,12 @@ fn log(args: &[String]) {
         output_path.to_string()
     };
 
-    let proxy = proxy::Port::new(&root, None, None);
-    let (_tx, rx) = proxy.port(None, route, true, true).unwrap();
+    let proxy = proxy::Interface::new(&root);
 
     let mut file = File::create(output_path).unwrap();
     let sync = matches.opt_present("u");
 
-    for pkt in rx.iter() {
+    for pkt in proxy.device_full(route).unwrap().iter() {
         let raw = pkt.serialize().unwrap();
         file.write_all(&raw).unwrap();
         if sync {
@@ -302,8 +300,8 @@ fn firmware_upgrade(args: &[String]) {
 
     println!("Loaded {} bytes firmware", firmware_data.len());
 
-    let proxy = proxy::Port::new(&root, None, None);
-    let device = util::DeviceRpc::new(&proxy, Some(route));
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_rpc(route).unwrap();
 
     if let Err(_) = device.action("dev.stop") {
         // TODO: should ignore some errors, such as method not existing or if already stopped.
