@@ -150,9 +150,20 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
     let mut opts = tio_opts();
     opts.optopt(
         "t",
-        "",
-        "RPC type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
+        "req-type",
+        "RPC request type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
         "type",
+    );
+    opts.optopt(
+        "T",
+        "rep-type",
+        "RPC reply type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
+        "type",
+    );
+    opts.optflag(
+        "d",
+        "",
+        "Debug printouts.",
     );
     let (matches, root, route) = tio_parseopts(opts, args);
 
@@ -170,11 +181,14 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         None
     };
 
-    let proxy = proxy::Interface::new(&root);
+    let debug = matches.opt_present("d");
+
+    let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
+    let proxy = proxy::Interface::new_proxy(&root, None, Some(status_send));
     let device = proxy.device_rpc(route).unwrap();
 
-    let mut rpc_type = if let Some(rpc_type) = matches.opt_str("t") {
-        Some(rpc_type)
+    let req_type = if let Some(req_type) = matches.opt_str("req-type") {
+        Some(req_type)
     } else {
         if rpc_arg.is_some() {
             let t = get_rpctype(&rpc_name, &device);
@@ -184,14 +198,14 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         }
     };
 
-    let reply = device
+    let reply = match device
         .raw_rpc(
             &rpc_name,
             &if rpc_arg.is_none() {
                 vec![]
             } else {
                 let s = rpc_arg.unwrap();
-                match &rpc_type.as_ref().unwrap()[..] {
+                match &req_type.as_ref().unwrap()[..] {
                     "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
                     "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
                     "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
@@ -206,15 +220,32 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
                     _ => panic!("Invalid type"),
                 }
             },
-        )
-        .unwrap();
+        ) {
+            Ok(rep) => {rep}
+            Err(err) => {
+                if debug {
+                    drop(proxy);
+                    println!("RPC failed: {:?}", err);
+                    for s in proxy_status.try_iter() {
+                        println!("{:?}", s);
+                    }
+                }
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "RPC failed"));
+            }
+        };
 
     if reply.len() != 0 {
-        if rpc_type.is_none() {
-            let t = get_rpctype(&rpc_name, &device);
-            rpc_type = Some(if t == "" { "string".to_string() } else { t })
-        }
-        let reply_str = match &rpc_type.as_ref().unwrap()[..] {
+        let rep_type = if let Some(rep_type) = matches.opt_str("rep-type") {
+            Some(rep_type)
+        } else {
+            if let None = req_type {
+                let t = get_rpctype(&rpc_name, &device);
+                Some(if t == "" { "string".to_string() } else { t })
+            } else {
+                req_type
+            }
+        };
+        let reply_str = match &rep_type.as_ref().unwrap()[..] {
             "u8" => u8::from_le_bytes(reply[0..1].try_into().unwrap()).to_string(),
             "u16" => u16::from_le_bytes(reply[0..2].try_into().unwrap()).to_string(),
             "u32" => u32::from_le_bytes(reply[0..4].try_into().unwrap()).to_string(),
@@ -239,6 +270,50 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         println!("Reply: {}", reply_str);
     }
     println!("OK");
+    drop(proxy);
+    for s in proxy_status.iter() {
+        if debug {
+            println!("{:?}", s);
+        }
+    }
+    Ok(())
+}
+
+fn rpc_dump(args: &[String]) -> std::io::Result<()> {
+    let opts = tio_opts();
+    let (matches, root, route) = tio_parseopts(opts, args);
+
+    let rpc_name = if matches.free.len() != 1 {
+        panic!("must specify rpc name")
+    } else {
+        matches.free[0].clone()
+    };
+
+
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_rpc(route).unwrap();
+
+    let mut full_reply = vec![];
+
+    for i in 0u16..=65535u16 {
+        match device.raw_rpc(&rpc_name, &i.to_le_bytes().to_vec()) {
+            Ok(mut rep) => {full_reply.append(&mut rep)}
+            Err(proxy::RpcError::ExecError(err)) => {
+                if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
+                    break;
+                } else {
+                    panic!("RPC error");
+                }
+            }
+            _ => {panic!("RPC error")}
+        }
+    }
+
+    if let Ok(s) = std::str::from_utf8(&full_reply) {
+        println!("{}", s);
+    } else {
+        std::io::stdout().write(&full_reply)?;
+    }
     Ok(())
 }
 
@@ -344,6 +419,9 @@ fn main() {
         }
         "rpc" => {
             rpc(&args[2..]).unwrap();
+        }
+        "rpc-dump" => {
+            rpc_dump(&args[2..]).unwrap();
         }
         "dump" => {
             dump(&args[2..]); //.unwrap();

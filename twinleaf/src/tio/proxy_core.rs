@@ -620,8 +620,8 @@ impl ProxyCore {
                 let last_rx_delta = device(self).last_rx.elapsed();
                 if last_rx_delta > Duration::from_millis(1000) {
                     self.status_queue.send(Event::NoData);
-                    let default_bps = device(self).rates().default_bps;
                     let dev = device(self);
+                    let default_bps = dev.rates().default_bps;
                     dev.tio_port
                         .set_rate(default_bps)
                         .expect("Failed to set default port rate");
