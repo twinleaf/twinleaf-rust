@@ -44,6 +44,10 @@ fn enum_devices(all: bool) -> Vec<SerialDevice> {
                         TwinleafPortInterface::Unknown(vid, pid)
                     }
                 };
+		#[cfg(target_os = "macos")]
+		if p.port_name.starts_with("/dev/tty.") && !all {
+		   continue;
+		}
                 ports.push(SerialDevice {
                     url: format!("serial://{}", p.port_name),
                     ifc: interface,

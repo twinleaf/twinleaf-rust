@@ -350,7 +350,7 @@ impl ProxyCore {
             let wire_id = self.next_rpc_id;
             // Always increment even if it fails, on the slim chance it hits an open spot
             // next time.
-            self.next_rpc_id += 1;
+            self.next_rpc_id = self.next_rpc_id.wrapping_add(1);
             if self.rpc_map.contains_key(&wire_id) {
                 return Err(util::PacketBuilder::new(pkt.routing)
                     .rpc_error(req.id, proto::RpcErrorCode::OutOfMemory));
