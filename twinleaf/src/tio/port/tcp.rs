@@ -88,14 +88,21 @@ impl RawPort for Port {
                     Err(SendError::MustDrain)
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // This can happen if we happen to send with the TCP buffer completely full.
-                // Maintain the same semantics and buffer the whole thing in txbuf.
-                // IOBuf sized such that it can always store at least a full packet.
-                self.txbuf.add_data(&raw[..]).expect("No fit in IOBuf");
-                Err(SendError::MustDrain)
+            Err(err) => {
+                match err.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::NotConnected => {
+                        // These errors can occur when a packet is sent right after the
+                        // nonblocking connection is initiated and before the handshake
+                        // completes. WouldBlock can also occur if we happen to send with
+                        // the TCP buffer completely full.
+                        // Maintain the same semantics and buffer the whole thing in txbuf.
+                        // IOBuf sized such that it can always store at least a full packet.
+                        self.txbuf.add_data(&raw[..]).expect("No fit in IOBuf");
+                        Err(SendError::MustDrain)
+                    }
+                    _ => Err(SendError::IO(err)),
+                }
             }
-            Err(e) => Err(SendError::IO(e)),
         }
     }
 
