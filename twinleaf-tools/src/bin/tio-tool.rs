@@ -160,11 +160,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         "RPC reply type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
         "type",
     );
-    opts.optflag(
-        "d",
-        "",
-        "Debug printouts.",
-    );
+    opts.optflag("d", "", "Debug printouts.");
     let (matches, root, route) = tio_parseopts(opts, args);
 
     let rpc_name = if matches.free.len() < 1 {
@@ -198,41 +194,40 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         }
     };
 
-    let reply = match device
-        .raw_rpc(
-            &rpc_name,
-            &if rpc_arg.is_none() {
-                vec![]
-            } else {
-                let s = rpc_arg.unwrap();
-                match &req_type.as_ref().unwrap()[..] {
-                    "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
-                    "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
-                    "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
-                    "u64" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
-                    "i8" => s.parse::<i8>().unwrap().to_le_bytes().to_vec(),
-                    "i16" => s.parse::<i16>().unwrap().to_le_bytes().to_vec(),
-                    "i32" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
-                    "i64" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
-                    "f32" => s.parse::<f32>().unwrap().to_le_bytes().to_vec(),
-                    "f64" => s.parse::<f64>().unwrap().to_le_bytes().to_vec(),
-                    "string" => s.as_bytes().to_vec(),
-                    _ => panic!("Invalid type"),
-                }
-            },
-        ) {
-            Ok(rep) => {rep}
-            Err(err) => {
-                if debug {
-                    drop(proxy);
-                    println!("RPC failed: {:?}", err);
-                    for s in proxy_status.try_iter() {
-                        println!("{:?}", s);
-                    }
-                }
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "RPC failed"));
+    let reply = match device.raw_rpc(
+        &rpc_name,
+        &if rpc_arg.is_none() {
+            vec![]
+        } else {
+            let s = rpc_arg.unwrap();
+            match &req_type.as_ref().unwrap()[..] {
+                "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
+                "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
+                "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
+                "u64" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
+                "i8" => s.parse::<i8>().unwrap().to_le_bytes().to_vec(),
+                "i16" => s.parse::<i16>().unwrap().to_le_bytes().to_vec(),
+                "i32" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
+                "i64" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
+                "f32" => s.parse::<f32>().unwrap().to_le_bytes().to_vec(),
+                "f64" => s.parse::<f64>().unwrap().to_le_bytes().to_vec(),
+                "string" => s.as_bytes().to_vec(),
+                _ => panic!("Invalid type"),
             }
-        };
+        },
+    ) {
+        Ok(rep) => rep,
+        Err(err) => {
+            if debug {
+                drop(proxy);
+                println!("RPC failed: {:?}", err);
+                for s in proxy_status.try_iter() {
+                    println!("{:?}", s);
+                }
+            }
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "RPC failed"));
+        }
+    };
 
     if reply.len() != 0 {
         let rep_type = if let Some(rep_type) = matches.opt_str("rep-type") {
@@ -289,7 +284,6 @@ fn rpc_dump(args: &[String]) -> std::io::Result<()> {
         matches.free[0].clone()
     };
 
-
     let proxy = proxy::Interface::new(&root);
     let device = proxy.device_rpc(route).unwrap();
 
@@ -297,7 +291,7 @@ fn rpc_dump(args: &[String]) -> std::io::Result<()> {
 
     for i in 0u16..=65535u16 {
         match device.raw_rpc(&rpc_name, &i.to_le_bytes().to_vec()) {
-            Ok(mut rep) => {full_reply.append(&mut rep)}
+            Ok(mut rep) => full_reply.append(&mut rep),
             Err(proxy::RpcError::ExecError(err)) => {
                 if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
                     break;
@@ -305,7 +299,9 @@ fn rpc_dump(args: &[String]) -> std::io::Result<()> {
                     panic!("RPC error");
                 }
             }
-            _ => {panic!("RPC error")}
+            _ => {
+                panic!("RPC error")
+            }
         }
     }
 
