@@ -1,14 +1,17 @@
-pub mod vararg;
+pub mod legacy;
 pub mod meta;
 pub mod route;
-pub mod legacy;
 pub mod rpc;
+pub mod vararg;
 
-pub use legacy::{LegacyTimebaseInfoPayload,LegacySourceInfoPayload,LegacyStreamInfoPayload,LegacyStreamDataPayload};
-pub use meta::MetadataPayload;
-pub use route::DeviceRoute;
-pub use rpc::{RpcMethod,RpcRequestPayload,RpcReplyPayload,RpcErrorPayload,RpcErrorCode};
+pub use legacy::{
+    LegacySourceInfoPayload, LegacyStreamDataPayload, LegacyStreamInfoPayload,
+    LegacyTimebaseInfoPayload,
+};
+pub use meta::{MetadataPayload, MetadataType};
 use num_enum::{FromPrimitive, IntoPrimitive};
+pub use route::DeviceRoute;
+pub use rpc::{RpcErrorCode, RpcErrorPayload, RpcMethod, RpcReplyPayload, RpcRequestPayload};
 
 #[derive(Debug, Clone)]
 pub struct GenericPayload {
@@ -319,12 +322,7 @@ impl StreamDataPayload {
             0,
             payload_size as u16,
         );
-        ret.extend([
-            sample_ser[0],
-            sample_ser[1],
-            sample_ser[2],
-            self.segment_id,
-        ]);
+        ret.extend([sample_ser[0], sample_ser[1], sample_ser[2], self.segment_id]);
         ret.extend(&self.data);
         Ok(ret)
     }

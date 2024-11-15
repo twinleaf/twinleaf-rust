@@ -1,4 +1,4 @@
-use super::{Error, too_small, TIO_PACKET_MAX_PAYLOAD_SIZE, TioPktHdr, TioPktType};
+use super::{too_small, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone)]

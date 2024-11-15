@@ -1,7 +1,7 @@
-use super::{Error,too_small};
+use super::{too_small, Error};
 
 // Split a varlen message into fixed and variable length parts
-pub fn split<'a>(raw: &'a[u8], full_data: &[u8]) -> Result<(&'a[u8], &'a[u8]), Error> {
+pub fn split<'a>(raw: &'a [u8], full_data: &[u8]) -> Result<(&'a [u8], &'a [u8]), Error> {
     if raw.len() < 1 {
         return Err(too_small(full_data));
     }
@@ -13,7 +13,11 @@ pub fn split<'a>(raw: &'a[u8], full_data: &[u8]) -> Result<(&'a[u8], &'a[u8]), E
     }
 }
 
-pub fn peel<'a>(varlen: &'a[u8], len: u8, full_data: &[u8]) -> Result<(&'a[u8], &'a[u8]), Error> {
+pub fn peel<'a>(
+    varlen: &'a [u8],
+    len: u8,
+    full_data: &[u8],
+) -> Result<(&'a [u8], &'a [u8]), Error> {
     let len = usize::from(len);
     if len <= varlen.len() {
         Ok((&varlen[0..len], &varlen[len..]))
@@ -22,7 +26,11 @@ pub fn peel<'a>(varlen: &'a[u8], len: u8, full_data: &[u8]) -> Result<(&'a[u8], 
     }
 }
 
-pub fn peel_string<'a>(varlen: &'a[u8], len: u8, full_data: &[u8]) -> Result<(String, &'a[u8]), Error> {
+pub fn peel_string<'a>(
+    varlen: &'a [u8],
+    len: u8,
+    full_data: &[u8],
+) -> Result<(String, &'a [u8]), Error> {
     let (arg, rest) = peel(varlen, len, full_data)?;
     Ok((String::from_utf8_lossy(&arg).to_string(), rest))
 }
@@ -50,7 +58,12 @@ pub fn append_string(varlen: &mut Vec<u8>, value: &str) -> Result<u8, ()> {
     checked_u8_size(len)
 }
 
-pub fn extend(mut fixed: Vec<u8>, mut varlen: Vec<u8>, extra_fixed: &[u8], extra_varlen: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+pub fn extend(
+    mut fixed: Vec<u8>,
+    mut varlen: Vec<u8>,
+    extra_fixed: &[u8],
+    extra_varlen: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), ()> {
     if (extra_varlen.len() > 0) && (extra_fixed.len() == 0) {
         return Err(());
     }
