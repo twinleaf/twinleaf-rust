@@ -1,3 +1,13 @@
+pub mod vararg;
+pub mod meta;
+pub mod route;
+pub mod legacy;
+pub mod rpc;
+
+pub use legacy::{LegacyTimebaseInfoPayload,LegacySourceInfoPayload,LegacyStreamInfoPayload,LegacyStreamDataPayload};
+pub use meta::MetadataPayload;
+pub use route::DeviceRoute;
+pub use rpc::{RpcMethod,RpcRequestPayload,RpcReplyPayload,RpcErrorPayload,RpcErrorCode};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone)]
@@ -10,11 +20,11 @@ pub struct GenericPayload {
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
 pub enum LogLevel {
-    CRITICAL = 0,
-    ERROR = 1,
-    WARNING = 2,
-    INFO = 3,
-    DEBUG = 4,
+    Critical = 0,
+    Error = 1,
+    Warning = 2,
+    Info = 3,
+    Debug = 4,
     #[num_enum(catch_all)]
     Unknown(u8),
 }
@@ -27,58 +37,6 @@ pub struct LogMessagePayload {
 }
 
 #[derive(Debug, Clone)]
-pub enum RpcMethod {
-    Id(u16),
-    Name(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct RpcRequestPayload {
-    pub id: u16,
-    pub method: RpcMethod,
-    pub arg: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RpcReplyPayload {
-    pub id: u16,
-    pub reply: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u16)]
-#[derive(FromPrimitive, IntoPrimitive)]
-pub enum RpcErrorCode {
-    NoError = 0,
-    Undefined = 1,
-    NotFound = 2,
-    MalformedRequest = 3,
-    WrongSizeArgs = 4,
-    InvalidArgs = 5,
-    ReadOnly = 6,
-    WriteOnly = 7,
-    Timeout = 8,
-    Busy = 9,
-    WrongDeviceState = 10,
-    LoadFailed = 11,
-    LoadRpcFailed = 12,
-    SaveFailed = 13,
-    SaveWriteFailed = 14,
-    Internal = 15,
-    OutOfMemory = 16,
-    OutOfRange = 17,
-    #[num_enum(catch_all)]
-    Unknown(u16),
-}
-
-#[derive(Debug, Clone)]
-pub struct RpcErrorPayload {
-    pub id: u16,
-    pub error: RpcErrorCode,
-    pub extra: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
 pub enum HeartbeatPayload {
     Session(u32),
     Any(Vec<u8>),
@@ -87,102 +45,28 @@ pub enum HeartbeatPayload {
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
-pub enum TimebaseSource {
-    Invalid = 0,
-    Local = 1,
-    Global = 2,
-    #[num_enum(catch_all)]
-    Unknown(u8),
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-#[derive(FromPrimitive, IntoPrimitive)]
-pub enum TimebaseEpoch {
-    Invalid = 0,
-    Start = 1,
-    SysTime = 2,
-    Unix = 3,
-    GPS = 4,
-    #[num_enum(catch_all)]
-    Unknown(u8),
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-#[derive(FromPrimitive, IntoPrimitive)]
 pub enum DataType {
-    UINT8 = 0x10,
-    INT8 = 0x11,
-    UINT16 = 0x20,
-    INT16 = 0x21,
-    UINT24 = 0x30,
-    INT24 = 0x31,
-    UINT32 = 0x40,
-    INT32 = 0x41,
-    UINT64 = 0x80,
-    INT64 = 0x81,
-    FLOAT32 = 0x42,
-    FLOAT64 = 0x82,
+    UInt8 = 0x10,
+    Int8 = 0x11,
+    UInt16 = 0x20,
+    Int16 = 0x21,
+    UInt24 = 0x30,
+    Int24 = 0x31,
+    UInt32 = 0x40,
+    Int32 = 0x41,
+    UInt64 = 0x80,
+    Int64 = 0x81,
+    Float32 = 0x42,
+    Float64 = 0x82,
     #[num_enum(catch_all)]
     Unknown(u8),
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacyTimebaseInfoPayload {
-    pub id: u16,
-    pub source: TimebaseSource,
-    pub epoch: TimebaseEpoch,
-    pub start_time: u64,
-    pub period_numerator_us: u32,
-    pub period_denominator_us: u32,
-    pub flags: u32,
-    pub stability: f32,
-    pub source_id: [u8; 16],
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacySourceInfoPayload {
-    pub id: u16,
-    pub timebase_id: u16,
-    pub period: u32,
-    pub offset: u32,
-    _fmt: i32, // originally intended for formatting hints, unused
-    pub flags: u16,
-    pub channels: u16,
-    pub datatype: DataType,
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacyStreamComponentInfo {
-    pub source_id: u16,
-    pub flags: u16,
-    pub period: u32,
-    pub offset: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacyStreamInfoPayload {
-    pub id: u16,
-    pub timebase_id: u16,
-    pub period: u32,
-    pub offset: u32,
-    pub sample_number: u64, // originally intended for formatting hints, unused might be recycled
-    pub flags: u16,
-    pub components: Vec<LegacyStreamComponentInfo>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacyStreamDataPayload {
-    pub sample_n: u32,
-    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StreamDataPayload {
     pub stream_id: u8,
     pub first_sample_n: u32,
-    pub metadata_id: u8,
+    pub segment_id: u8,
     pub data: Vec<u8>,
 }
 
@@ -197,105 +81,9 @@ pub enum Payload {
     LegacySourceUpdate(LegacySourceInfoPayload),
     LegacyStreamUpdate(LegacyStreamInfoPayload),
     LegacyStreamData(LegacyStreamDataPayload),
+    Metadata(MetadataPayload),
     StreamData(StreamDataPayload),
     Unknown(GenericPayload),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DeviceRoute {
-    route: Vec<u8>,
-}
-
-impl DeviceRoute {
-    pub fn root() -> DeviceRoute {
-        DeviceRoute { route: vec![] }
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Result<DeviceRoute, ()> {
-        if bytes.len() > TIO_PACKET_MAX_ROUTING_SIZE {
-            Err(())
-        } else {
-            let mut route = bytes.to_vec();
-            route.reverse();
-            Ok(DeviceRoute { route })
-        }
-    }
-
-    pub fn from_str(route_str: &str) -> Result<DeviceRoute, ()> {
-        let mut ret = DeviceRoute::root();
-        let stripped = match route_str.strip_prefix("/") {
-            Some(s) => s,
-            None => route_str,
-        };
-        if stripped.len() > 0 {
-            for segment in stripped.split('/') {
-                if ret.route.len() >= TIO_PACKET_MAX_ROUTING_SIZE {
-                    return Err(());
-                }
-                if let Ok(n) = segment.parse() {
-                    ret.route.push(n);
-                } else {
-                    return Err(());
-                }
-            }
-        }
-        Ok(ret)
-    }
-
-    pub fn len(&self) -> usize {
-        self.route.len()
-    }
-
-    pub fn iter(&self) -> std::slice::Iter<u8> {
-        self.route.iter()
-    }
-
-    pub fn serialize(&self, mut rest_of_packet: Vec<u8>) -> Result<Vec<u8>, ()> {
-        if (self.route.len() > TIO_PACKET_MAX_ROUTING_SIZE)
-            || (rest_of_packet.len() < std::mem::size_of::<TioPktHdr>())
-        {
-            Err(())
-        } else {
-            rest_of_packet[1] |= self.route.len() as u8;
-            for hop in self.route.iter().rev() {
-                rest_of_packet.push(*hop);
-            }
-            Ok(rest_of_packet)
-        }
-    }
-
-    // Returns the relative route from this to other_route (which is absolute).
-    // Error if other route is not in the subtree rooted by this route.
-    pub fn relative_route(&self, other_route: &DeviceRoute) -> Result<DeviceRoute, ()> {
-        if (self.len() <= other_route.len()) && (self.route == other_route.route[0..self.len()]) {
-            Ok(DeviceRoute {
-                route: other_route.route[self.len()..].to_vec(),
-            })
-        } else {
-            Err(())
-        }
-    }
-
-    pub fn absolute_route(&self, other_route: &DeviceRoute) -> DeviceRoute {
-        let mut route = self.route.clone();
-        route.extend_from_slice(&other_route.route);
-        DeviceRoute { route }
-    }
-}
-
-use std::fmt::{Display, Formatter};
-
-impl Display for DeviceRoute {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.route.len() == 0 {
-            write!(f, "/")?;
-        } else {
-            for segment in &self.route {
-                write!(f, "/{}", segment)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +121,7 @@ enum TioPktType {
     LegacyStreamUpdate = 8,
     Reserved0 = 9,
     Reserved1 = 10,
+    Metadata = 11,
     Reserved2 = 13,
     LegacyStreamData = 128,
     #[num_enum(catch_all)]
@@ -475,107 +264,6 @@ impl LogMessagePayload {
     }
 }
 
-impl RpcRequestPayload {
-    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcRequestPayload, Error> {
-        if raw.len() < 4 {
-            return Err(too_small(full_data));
-        }
-        let id = u16::from_le_bytes([raw[0], raw[1]]);
-        let method = u16::from_le_bytes([raw[2], raw[3]]);
-        let (method, arg_start) = if (method & 0x8000) != 0 {
-            let arg_start = (method & 0x7FFF) as usize + 4;
-            if arg_start > TIO_PACKET_MAX_PAYLOAD_SIZE {
-                return Err(Error::InvalidPayload(full_data.to_vec()));
-            }
-            if raw.len() < arg_start {
-                return Err(too_small(full_data));
-            }
-            (
-                RpcMethod::Name(String::from_utf8_lossy(&raw[4..arg_start]).to_string()),
-                arg_start,
-            )
-        } else {
-            (RpcMethod::Id(method), 4)
-        };
-        Ok(RpcRequestPayload {
-            id: id,
-            method: method,
-            arg: raw[arg_start..].to_vec(),
-        })
-    }
-    fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let method_name_len = if let RpcMethod::Name(method_name) = &self.method {
-            method_name.as_bytes().len() as u16
-        } else {
-            0
-        };
-        let payload_size = 4 + (method_name_len as usize) + self.arg.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcReq, 0, payload_size as u16);
-        ret.extend(self.id.to_le_bytes());
-        match &self.method {
-            RpcMethod::Id(method) => {
-                ret.extend(method.to_le_bytes());
-            }
-            RpcMethod::Name(method) => {
-                ret.extend((method_name_len | 0x8000).to_le_bytes());
-                ret.extend(method.as_bytes())
-            }
-        }
-        ret.extend_from_slice(&self.arg);
-        Ok(ret)
-    }
-}
-
-impl RpcReplyPayload {
-    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcReplyPayload, Error> {
-        if raw.len() < 2 {
-            return Err(too_small(full_data));
-        }
-        let id = u16::from_le_bytes([raw[0], raw[1]]);
-        Ok(RpcReplyPayload {
-            id: id,
-            reply: raw[2..].to_vec(),
-        })
-    }
-    fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size = 2 + self.reply.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcRep, 0, payload_size as u16);
-        ret.extend(self.id.to_le_bytes());
-        ret.extend_from_slice(&self.reply);
-        Ok(ret)
-    }
-}
-
-impl RpcErrorPayload {
-    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcErrorPayload, Error> {
-        if raw.len() < 4 {
-            return Err(too_small(full_data));
-        }
-        Ok(RpcErrorPayload {
-            id: u16::from_le_bytes([raw[0], raw[1]]),
-            error: RpcErrorCode::from(u16::from_le_bytes([raw[2], raw[3]])),
-            extra: raw[4..].to_vec(),
-        })
-    }
-    fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size = 4 + self.extra.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcError, 0, payload_size as u16);
-        ret.extend(self.id.to_le_bytes());
-        ret.extend(u16::from(self.error).to_le_bytes());
-        ret.extend_from_slice(&self.extra);
-        Ok(ret)
-    }
-}
-
 impl HeartbeatPayload {
     fn deserialize(raw: &[u8], _full_data: &[u8]) -> Result<HeartbeatPayload, Error> {
         if raw.len() == 4 {
@@ -602,29 +290,6 @@ impl HeartbeatPayload {
     }
 }
 
-impl LegacyStreamDataPayload {
-    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<LegacyStreamDataPayload, Error> {
-        if raw.len() < 5 {
-            return Err(too_small(full_data));
-        }
-        Ok(LegacyStreamDataPayload {
-            sample_n: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-            data: raw[4..].to_vec(),
-        })
-    }
-    fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size = 4 + self.data.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret =
-            TioPktHdr::serialize_new(TioPktType::LegacyStreamData, 0, payload_size as u16);
-        ret.extend(self.sample_n.to_le_bytes());
-        ret.extend(&self.data);
-        Ok(ret)
-    }
-}
-
 impl StreamDataPayload {
     fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<StreamDataPayload, Error> {
         if raw.len() < 5 {
@@ -633,7 +298,7 @@ impl StreamDataPayload {
         Ok(StreamDataPayload {
             stream_id: full_data[0] - TIO_PTYPE_STREAM0,
             first_sample_n: u32::from_le_bytes([raw[0], raw[1], raw[2], 0u8]),
-            metadata_id: raw[3],
+            segment_id: raw[3],
             data: raw[4..].to_vec(),
         })
     }
@@ -658,7 +323,7 @@ impl StreamDataPayload {
             sample_ser[0],
             sample_ser[1],
             sample_ser[2],
-            self.metadata_id,
+            self.segment_id,
         ]);
         ret.extend(&self.data);
         Ok(ret)
@@ -690,6 +355,7 @@ impl Payload {
             Payload::RpcReply(p) => p.serialize(),
             Payload::RpcError(p) => p.serialize(),
             Payload::Heartbeat(p) => p.serialize(),
+            Payload::Metadata(p) => p.serialize(),
             Payload::LegacyStreamData(p) => p.serialize(),
             Payload::StreamData(p) => p.serialize(),
             Payload::Unknown(p) => p.serialize(),
@@ -746,6 +412,10 @@ impl Payload {
             TioPktType::LegacyStreamData => Ok(Payload::LegacyStreamData(
                 LegacyStreamDataPayload::deserialize(raw_payload, full_data)?,
             )),
+            TioPktType::Metadata => Ok(Payload::Metadata(MetadataPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
             TioPktType::UnknownOrStream(_) => {
                 if let Some(_) = hdr.stream_id() {
                     Ok(Payload::StreamData(StreamDataPayload::deserialize(
