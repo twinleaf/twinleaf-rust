@@ -404,6 +404,49 @@ fn firmware_upgrade(args: &[String]) {
     }
 }
 
+fn data_dump(args: &[String]) {
+    use twinleaf::data::{ColumnData, Device};
+    let opts = tio_opts();
+    let (_matches, root, route) = tio_parseopts(opts, args);
+
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_full(route).unwrap();
+    let mut device = Device::new(device);
+
+    loop {
+        let sample = device.next();
+        if sample.meta_changed {
+            println!("# DEVICE {:?}", sample.device);
+            println!("# STREAM {:?}", sample.stream);
+            for col in &sample.columns {
+                println!("# COLUMN {:?}", col.desc);
+            }
+        }
+        if sample.segment_changed {
+            println!("# SEGMENT {:?}", sample.segment);
+        }
+        print!(
+            "SAMPLE({}:{}) {:.6}",
+            sample.stream.stream_id,
+            sample.segment.segment_id,
+            sample.timestamp_end()
+        );
+        for col in &sample.columns {
+            print!(
+                " {}: {}",
+                col.desc.name,
+                match col.value {
+                    ColumnData::Int(x) => format!("{}", x),
+                    ColumnData::UInt(x) => format!("{}", x),
+                    ColumnData::Float(x) => format!("{}", x),
+                    ColumnData::Unknown => "?".to_string(),
+                }
+            );
+        }
+        println!(" [#{}]", sample.n);
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -428,6 +471,9 @@ fn main() {
         "firmware-upgrade" => {
             firmware_upgrade(&args[2..]); //.unwrap();
         }
+        "data-dump" => {
+            data_dump(&args[2..]); //.unwrap();
+        }
         _ => {
             // TODO: do usage right
             println!("Usage:");
@@ -437,6 +483,7 @@ fn main() {
             println!(" tio-tool rpc-list [-r url] [-s sensor]");
             println!(" tio-tool rpc [-r url] [-s sensor] [-t type] <rpc-name> [rpc-arg]");
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
+            println!(" tio-tool data-dump [-r url] [-s sensor]");
         }
     }
 }

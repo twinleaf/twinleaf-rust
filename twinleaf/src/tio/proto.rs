@@ -45,7 +45,7 @@ pub enum HeartbeatPayload {
     Any(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
 pub enum DataType {
@@ -63,6 +63,13 @@ pub enum DataType {
     Float64 = 0x82,
     #[num_enum(catch_all)]
     Unknown(u8),
+}
+
+impl DataType {
+    pub fn size(&self) -> usize {
+        let raw: u8 = (*self).into();
+        (raw >> 4).into()
+    }
 }
 
 #[derive(Debug, Clone)]

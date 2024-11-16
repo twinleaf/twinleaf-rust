@@ -12,7 +12,7 @@ pub struct DeviceMetadata {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamMetadata {
     pub stream_id: u8,
     pub name: String,
@@ -22,7 +22,7 @@ pub struct StreamMetadata {
     pub buf_samples: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
 pub enum MetadataEpoch {
@@ -34,7 +34,7 @@ pub enum MetadataEpoch {
     Unknown(u8),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
 pub enum MetadataFilter {
@@ -48,7 +48,7 @@ pub enum MetadataFilter {
 static TL_METADATA_SEGMENT_VALID: u8 = 0x01;
 static TL_METADATA_SEGMENT_ACTIVE: u8 = 0x02;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SegmentMetadata {
     pub stream_id: u8,
     pub segment_id: u8,
@@ -63,7 +63,7 @@ pub struct SegmentMetadata {
     pub filter_type: MetadataFilter,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMetadata {
     pub stream_id: u8,
     pub index: usize,
@@ -105,7 +105,7 @@ pub struct MetadataPayload {
 }
 
 impl DeviceMetadata {
-    fn deserialize(
+    pub fn deserialize(
         raw: &[u8],
         full_data: &[u8],
     ) -> Result<(DeviceMetadata, Vec<u8>, Vec<u8>), Error> {
@@ -131,7 +131,11 @@ impl DeviceMetadata {
             varlen.to_vec(),
         ))
     }
-    fn serialize(&self, extra_fixed: &[u8], extra_varlen: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    pub fn serialize(
+        &self,
+        extra_fixed: &[u8],
+        extra_varlen: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
@@ -146,7 +150,7 @@ impl DeviceMetadata {
 }
 
 impl StreamMetadata {
-    fn deserialize(
+    pub fn deserialize(
         raw: &[u8],
         full_data: &[u8],
     ) -> Result<(StreamMetadata, Vec<u8>, Vec<u8>), Error> {
@@ -171,7 +175,11 @@ impl StreamMetadata {
             varlen.to_vec(),
         ))
     }
-    fn serialize(&self, extra_fixed: &[u8], extra_varlen: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    pub fn serialize(
+        &self,
+        extra_fixed: &[u8],
+        extra_varlen: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
@@ -193,7 +201,7 @@ impl SegmentMetadata {
     pub fn active(&self) -> bool {
         (self.flags & TL_METADATA_SEGMENT_ACTIVE) != 0
     }
-    fn deserialize(
+    pub fn deserialize(
         raw: &[u8],
         full_data: &[u8],
     ) -> Result<(SegmentMetadata, Vec<u8>, Vec<u8>), Error> {
@@ -223,7 +231,11 @@ impl SegmentMetadata {
             varlen.to_vec(),
         ))
     }
-    fn serialize(&self, extra_fixed: &[u8], extra_varlen: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    pub fn serialize(
+        &self,
+        extra_fixed: &[u8],
+        extra_varlen: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
@@ -244,7 +256,7 @@ impl SegmentMetadata {
 }
 
 impl ColumnMetadata {
-    fn deserialize(
+    pub fn deserialize(
         raw: &[u8],
         full_data: &[u8],
     ) -> Result<(ColumnMetadata, Vec<u8>, Vec<u8>), Error> {
@@ -271,7 +283,11 @@ impl ColumnMetadata {
             varlen.to_vec(),
         ))
     }
-    fn serialize(&self, extra_fixed: &[u8], extra_varlen: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    pub fn serialize(
+        &self,
+        extra_fixed: &[u8],
+        extra_varlen: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
