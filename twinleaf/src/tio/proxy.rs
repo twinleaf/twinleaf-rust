@@ -292,6 +292,8 @@ impl Interface {
                 return Err(PortError::FailedNewClientSetup);
             }
         }
+        // TODO: slow down to ensure connection is made before using the connection
+        std::thread::sleep(std::time::Duration::from_millis(10));
         Ok(Port {
             tx: client_to_proxy_sender,
             rx: client_from_proxy_receiver,
