@@ -357,15 +357,15 @@ impl MetadataPayload {
             }
             MetadataContent::Stream(sm) => {
                 let (f, v) = sm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Device.into())
+                (f, v, MetadataType::Stream.into())
             }
             MetadataContent::Segment(sm) => {
                 let (f, v) = sm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Device.into())
+                (f, v, MetadataType::Segment.into())
             }
             MetadataContent::Column(cm) => {
                 let (f, v) = cm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Device.into())
+                (f, v, MetadataType::Column.into())
             }
             MetadataContent::Unknown(mtype) => (
                 self.unknown_fixed.clone(),
@@ -377,8 +377,7 @@ impl MetadataPayload {
         if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
             return Err(());
         }
-        let mut ret =
-            TioPktHdr::serialize_new(TioPktType::LegacyStreamData, 0, payload_size as u16);
+        let mut ret = TioPktHdr::serialize_new(TioPktType::Metadata, 0, payload_size as u16);
         ret.push(mtype.into());
         ret.push(self.flags);
         ret.extend(fixed);

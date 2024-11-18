@@ -324,6 +324,53 @@ fn dump(args: &[String]) {
     }
 }
 
+fn print_sample(sample: &twinleaf::data::Sample) {
+    use twinleaf::data::ColumnData;
+    if sample.meta_changed {
+        println!("# DEVICE {:?}", sample.device);
+        println!("# STREAM {:?}", sample.stream);
+        for col in &sample.columns {
+            println!("# COLUMN {:?}", col.desc);
+        }
+    }
+    if sample.segment_changed {
+        println!("# SEGMENT {:?}", sample.segment);
+    }
+    print!(
+        "SAMPLE({}:{}) {:.6}",
+        sample.stream.stream_id,
+        sample.segment.segment_id,
+        sample.timestamp_end()
+    );
+    for col in &sample.columns {
+        print!(
+            " {}: {}",
+            col.desc.name,
+            match col.value {
+                ColumnData::Int(x) => format!("{}", x),
+                ColumnData::UInt(x) => format!("{}", x),
+                ColumnData::Float(x) => format!("{}", x),
+                ColumnData::Unknown => "?".to_string(),
+            }
+        );
+    }
+    println!(" [#{}]", sample.n);
+}
+
+fn data_dump(args: &[String]) {
+    use twinleaf::data::Device;
+    let opts = tio_opts();
+    let (_matches, root, route) = tio_parseopts(opts, args);
+
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_full(route).unwrap();
+    let mut device = Device::new(device);
+
+    loop {
+        print_sample(&device.next());
+    }
+}
+
 fn log(args: &[String]) {
     let output_path = chrono::Local::now().format("log.%Y%m%d-%H%M%S.tio");
     let mut opts = tio_opts();
@@ -355,6 +402,33 @@ fn log(args: &[String]) {
         file.write_all(&raw).unwrap();
         if sync {
             file.flush().unwrap();
+        }
+    }
+}
+
+fn log_dump(args: &[String]) {
+    for path in args {
+        let mut rest: &[u8] = &std::fs::read(path).unwrap();
+        while rest.len() > 0 {
+            let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
+            rest = &rest[len..];
+            println!("{:?}", pkt);
+        }
+    }
+}
+
+fn log_data_dump(args: &[String]) {
+    use twinleaf::data::DeviceDataParser;
+    let mut parser = DeviceDataParser::new(args.len() > 1);
+
+    for path in args {
+        let mut rest: &[u8] = &std::fs::read(path).unwrap();
+        while rest.len() > 0 {
+            let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
+            rest = &rest[len..];
+            for sample in parser.process_packet(&pkt) {
+                print_sample(&sample);
+            }
         }
     }
 }
@@ -404,49 +478,6 @@ fn firmware_upgrade(args: &[String]) {
     }
 }
 
-fn data_dump(args: &[String]) {
-    use twinleaf::data::{ColumnData, Device};
-    let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(opts, args);
-
-    let proxy = proxy::Interface::new(&root);
-    let device = proxy.device_full(route).unwrap();
-    let mut device = Device::new(device);
-
-    loop {
-        let sample = device.next();
-        if sample.meta_changed {
-            println!("# DEVICE {:?}", sample.device);
-            println!("# STREAM {:?}", sample.stream);
-            for col in &sample.columns {
-                println!("# COLUMN {:?}", col.desc);
-            }
-        }
-        if sample.segment_changed {
-            println!("# SEGMENT {:?}", sample.segment);
-        }
-        print!(
-            "SAMPLE({}:{}) {:.6}",
-            sample.stream.stream_id,
-            sample.segment.segment_id,
-            sample.timestamp_end()
-        );
-        for col in &sample.columns {
-            print!(
-                " {}: {}",
-                col.desc.name,
-                match col.value {
-                    ColumnData::Int(x) => format!("{}", x),
-                    ColumnData::UInt(x) => format!("{}", x),
-                    ColumnData::Float(x) => format!("{}", x),
-                    ColumnData::Unknown => "?".to_string(),
-                }
-            );
-        }
-        println!(" [#{}]", sample.n);
-    }
-}
-
 fn main() {
     let mut args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -468,6 +499,12 @@ fn main() {
         "log" => {
             log(&args[2..]); //.unwrap();
         }
+        "log-dump" => {
+            log_dump(&args[2..]); //.unwrap();
+        }
+        "log-data-dump" => {
+            log_data_dump(&args[2..]); //.unwrap();
+        }
         "firmware-upgrade" => {
             firmware_upgrade(&args[2..]); //.unwrap();
         }
@@ -480,8 +517,11 @@ fn main() {
             println!(" tio-tool help");
             println!(" tio-tool dump [-r url] [-s sensor]");
             println!(" tio-tool log [-r url] [-s sensor] [filename]");
+            println!(" tio-tool log-dump filename [filename ...]");
+            println!(" tio-tool log-data-dump filename [filename ...]");
             println!(" tio-tool rpc-list [-r url] [-s sensor]");
-            println!(" tio-tool rpc [-r url] [-s sensor] [-t type] <rpc-name> [rpc-arg]");
+            println!(" tio-tool rpc [-r url] [-s sensor] [-t type] [-d] <rpc-name> [rpc-arg]");
+            println!(" tio-tool rpc-dump [-r url] [-s sensor] <rpc-name>");
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
             println!(" tio-tool data-dump [-r url] [-s sensor]");
         }

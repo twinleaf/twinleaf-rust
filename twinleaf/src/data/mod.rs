@@ -219,6 +219,7 @@ struct DeviceStream {
 
     id: u8,
     last_seg: u8,
+    last_sample_number: u32,
     segment_changed: bool,
     meta_changed: bool,
 }
@@ -269,14 +270,36 @@ impl DeviceStream {
         if self.stream.is_none() || self.segment.is_none() {
             return vec![];
         }
-        let segment = self.segment.as_ref().unwrap().clone();
-        if segment.segment_id != data.segment_id {
-            return vec![];
-        }
+
         let stream = self.stream.as_ref().unwrap().clone();
         if stream.n_columns != self.columns.len() {
             return vec![];
         }
+
+        let segment = self.segment.as_ref().unwrap().clone();
+        if segment.segment_id != data.segment_id {
+            // Here, generate proactively a new segment if this looks like
+            // a sample number rollover
+            let next_sample = self.last_sample_number + 1;
+            let next_segment = if usize::from(segment.segment_id) == stream.n_segments {
+                0
+            } else {
+                segment.segment_id + 1
+            };
+            let rate = segment.sampling_rate / segment.decimation;
+            if (data.first_sample_n == 0)
+                && ((next_sample % rate) == 0)
+                && (data.segment_id == next_segment)
+            {
+                let mut new_seg = (*segment).clone();
+                new_seg.start_time += next_sample / rate;
+                self.segment = Some(Arc::new(new_seg));
+            } else {
+                return vec![];
+            }
+        }
+
+        let segment = self.segment.as_ref().unwrap().clone();
 
         let mut ret = vec![];
         let mut sample_n = data.first_sample_n;
@@ -304,17 +327,18 @@ impl DeviceStream {
     }
 }
 
-#[derive(Debug)]
-struct DeviceDataParser {
+pub struct DeviceDataParser {
     device: Option<Arc<DeviceMetadata>>,
     streams: HashMap<u8, DeviceStream>,
+    ignore_session: bool,
 }
 
 impl DeviceDataParser {
-    fn new() -> DeviceDataParser {
+    pub fn new(ignore_session: bool) -> DeviceDataParser {
         DeviceDataParser {
             device: None,
             streams: HashMap::new(),
+            ignore_session: ignore_session,
         }
     }
 
@@ -328,6 +352,7 @@ impl DeviceDataParser {
                     columns: vec![],
                     id: stream_id,
                     last_seg: 0,
+                    last_sample_number: 0,
                     segment_changed: true,
                     meta_changed: true,
                 },
@@ -435,7 +460,7 @@ impl DeviceDataParser {
         }
     }
 
-    fn process_packet(&mut self, pkt: &tio::Packet) -> Vec<Sample> {
+    pub fn process_packet(&mut self, pkt: &tio::Packet) -> Vec<Sample> {
         match &pkt.payload {
             tio::proto::Payload::RpcReply(rep) => {
                 for metadata in parse_metarep(rep.reply.clone()) {
@@ -446,7 +471,7 @@ impl DeviceDataParser {
             tio::proto::Payload::Heartbeat(hb) => {
                 if let tio::proto::HeartbeatPayload::Session(session_id) = hb {
                     if let Some(dev) = &self.device {
-                        if dev.session_id != *session_id {
+                        if (dev.session_id != *session_id) && !self.ignore_session {
                             self.device.take();
                             self.streams.clear();
                         }
@@ -475,7 +500,7 @@ impl DeviceDataParser {
         return vec![];
     }
 
-    fn requests(&self) -> Vec<tio::Packet> {
+    pub fn requests(&self) -> Vec<tio::Packet> {
         // Determine all the metadata requests to issue.
         let mut reqs = vec![];
         match self.device.as_ref() {
@@ -531,7 +556,7 @@ impl Device {
     pub fn new(dev_port: proxy::Port) -> Device {
         Device {
             dev_port: dev_port,
-            parser: DeviceDataParser::new(),
+            parser: DeviceDataParser::new(false),
             n_reqs: 0,
             sample_queue: VecDeque::new(),
         }
