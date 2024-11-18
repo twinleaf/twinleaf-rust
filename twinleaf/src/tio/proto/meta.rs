@@ -373,7 +373,7 @@ impl MetadataPayload {
                 MetadataType::Unknown(*mtype),
             ),
         };
-        let payload_size = 4 + 2 + fixed.len() + varlen.len();
+        let payload_size = 2 + fixed.len() + varlen.len();
         if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
             return Err(());
         }

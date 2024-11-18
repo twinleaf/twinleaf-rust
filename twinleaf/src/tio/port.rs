@@ -266,7 +266,7 @@ impl Port {
                                 continue;
                             }
                             Err(_) => {
-                                break;
+                                break 'ioloop;
                             }
                             Ok(_) => {
                                 last_sent = Instant::now();
