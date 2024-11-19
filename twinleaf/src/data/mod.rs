@@ -531,7 +531,7 @@ impl DeviceDataParser {
                 n_reqs
             };
             ret.push(util::PacketBuilder::make_rpc_request(
-                "ndata.meta",
+                "data.metadata",
                 &make_metareq((&reqs[0..n_reqs]).to_vec()),
                 7855,
                 DeviceRoute::root(),
