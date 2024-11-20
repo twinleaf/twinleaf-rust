@@ -13,4 +13,4 @@ chrono = "0.4.38"
 crossbeam = "0.8.4"
 getopts = "0.2.21"
 serialport = "4.5.1"
-twinleaf = { version = "0.1.0", path = "../twinleaf" }
+twinleaf = { version = "1.0.0", path = "../twinleaf" }
