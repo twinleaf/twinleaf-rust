@@ -1,18 +1,29 @@
-# Twinleaf I/O Tool in Rust
+# Twinleaf I/O Tools in Rust
 
-This tool connects to a Twinleaf sensor attached to a serial port. The primary tool is the proxy, which makes the sensor available via ethernet:
+This repository contains a set of tools that are useful for working with Twinleaf quantum sensors and accessories. 
 
-		tio-tool proxy
+The primary tool is the proxy, which makes the device available via ethernet:
 
-when there are more than one serial port available, it is necessary to specify the port
+		tio-proxy --auto
 
-		[linux]> tio-tool proxy -r /dev/ttyACM0
-		[macOS]> tio-tool proxy -r /dev/cu.usbserialXXXXXX
-		[wsl1] > tio-tool proxy -r COM3
+When there are more than one serial port available, it is necessary to specify the port
 
-There is also a simple RPC function:
+		[linux]> tio-proxy -r /dev/ttyACM0
+		[macOS]> tio-proxy -r /dev/cu.usbserialXXXXXX
+		[wsl1] > tio-proxy -r COM3
 
-		tio-tool rpc "dev.name"
+With the proxy running, a set of tools can be used on the data stream. 
+
+Logging data:
+		
+		tio-tool log
+
+Issuing commands:
+		
+		tio-tool rpc dev.name
+
+And a variety of additional useful functions.
+
 
 ## Installation
 
@@ -25,7 +36,7 @@ Now build:
 
 		cargo build --release
 
-The tool can be run as follows:
+The resulting tools can be found in the target directory:
 
 		cd target/release
 		./tio-tool
