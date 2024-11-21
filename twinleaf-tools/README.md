@@ -12,17 +12,33 @@ When there are more than one serial port available, it is necessary to specify t
 		[macOS]> tio-proxy -r /dev/cu.usbserialXXXXXX
 		[wsl1] > tio-proxy -r COM3
 
+When a sensor is attached to a hub at port `0`, it is possible to proxy the data directly to that port using the `-s` flag:
+
+		tio-proxy --auto -s /0
+
 With the proxy running, a set of tools can be used on the data stream. 
 
 Logging data:
-		
+
 		tio-tool log
 
 Issuing commands:
-		
+
 		tio-tool rpc dev.name
 
-And a variety of additional useful functions.
+List available commands:
+
+		tio-tool rpc-list
+
+Firmware upgrade:
+
+		tio-tool firmware-upgrade <firmware.bin>
+
+Monitoring the data stream:
+
+		tio-tool data-dump
+
+And a variety of additional functions for use with Twinleaf sensors.
 
 
 ## Installation
