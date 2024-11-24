@@ -27,19 +27,18 @@ And a variety of additional useful functions.
 
 ## Installation
 
+With rust language tools, install the tools using:
+
+		cargo install twinleaf-tools
+
+
+## Development
+
 On macOS and linux, there is a dependency on libudev; to install it use:
 
 		sudo apt install libudev-dev  # debian linux
 		brew install libudev          # macOS homebrew
 
-Now build:
-
-		cargo build --release
-
-The resulting tools can be found in the target directory:
-
-		cd target/release
-		./tio-tool
 
 ## Cross compilation 
 
