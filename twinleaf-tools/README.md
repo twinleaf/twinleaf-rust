@@ -18,9 +18,13 @@ When a sensor is attached to a hub at port `0`, it is possible to proxy the data
 
 With the proxy running, a set of tools can be used on the data stream. 
 
-Logging data:
+Logging data to a raw binary file:
 
 		tio-tool log
+
+Parsing that log data for stream id 1 to a csv file:
+
+		tio-tool log-csv 1 logfile.tio
 
 Issuing commands:
 

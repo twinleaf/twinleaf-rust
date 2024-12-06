@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf-tools"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "MIT"
 description = "Tools for the Twinleaf I/O protocol for reading data from Twinleaf quantum sensors." 
@@ -12,5 +12,6 @@ readme = "README.md"
 chrono = "0.4.38"
 crossbeam = "0.8.4"
 getopts = "0.2.21"
+pancurses = "0.17.0"
 serialport = "4.5.1"
 twinleaf = { version = "1.1.0", path = "../twinleaf" }
