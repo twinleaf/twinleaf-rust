@@ -49,9 +49,9 @@ With rust language tools, install the tools using:
 
 ## Development
 
-On linux, there is a dependency on libudev; to install it use:
+On linux, there is a dependency on libudev and ncurses; to install it use:
 
-		sudo apt install libudev-dev  # debian linux
+		sudo apt install libudev-dev libncurses-dev # debian linux
 
 ## Cross compilation 
 

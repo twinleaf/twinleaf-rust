@@ -96,6 +96,7 @@ impl IOBuf {
         self.compact();
         let copy_size = std::cmp::min(IOBUF_SIZE - self.end, data.len());
         self.buf[self.end..self.end + copy_size].copy_from_slice(&data[0..copy_size]);
+        self.end += copy_size;
         if copy_size == data.len() {
             Ok(())
         } else {

@@ -278,7 +278,7 @@ fn main() -> ExitCode {
         new_client
     };
 
-    let (status_send, port_status) = crossbeam::channel::bounded::<proxy::Event>(10);
+    let (status_send, port_status) = crossbeam::channel::bounded::<proxy::Event>(100);
     let proxy =
         proxy::Interface::new_proxy(&sensor_url, Some(reconnect_timeout), Some(status_send));
 
