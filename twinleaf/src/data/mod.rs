@@ -5,30 +5,7 @@ use tio::{proto, proxy, util};
 use std::collections::HashMap;
 use tio::proto::meta::MetadataType;
 
-/*
-#[derive(Debug)]
-struct StreamRpcStreamInfo {
-    n_columns: u8,
-    n_segments: u8,
-}
-
-
-fn parse_streamsrep(rep: Vec<u8>) -> HashMap<u8, StreamRpcStreamInfo> {
-    let mut ret = HashMap::new();
-    for i in 0..(rep.len() / 2) {
-        let si = StreamRpcStreamInfo {
-            n_columns: rep[i * 2],
-            n_segments: rep[i * 2 + 1],
-        };
-        if (si.n_columns != 0) && (si.n_segments != 0) {
-            ret.insert(i as u8, si);
-        }
-    }
-    ret
-}
-*/
-
-static TL_STREAMRPC_MAX_META: usize = 12;
+static TL_STREAMRPC_MAX_META: usize = 16;
 
 #[derive(Debug, Clone)]
 struct StreamRpcMetaReq {
@@ -82,14 +59,14 @@ fn make_metareq(reqs: Vec<StreamRpcMetaReq>) -> Vec<u8> {
 }
 
 fn parse_metarep(rep: Vec<u8>) -> Vec<tio::proto::meta::MetadataContent> {
-    use tio::proto::{meta, vararg};
+    use tio::proto::meta;
     let mut ret = vec![];
-    let fixed_len = TL_STREAMRPC_MAX_META * 2;
-    let (fixed, mut varlen) = (&rep[0..fixed_len], &rep[fixed_len..]);
-    for i in 0..(fixed_len / 2) {
-        let mtype = MetadataType::from(fixed[i * 2]);
-        let (metadata, varlen_next) = vararg::peel(&varlen, fixed[i * 2 + 1], &[]).unwrap();
-        varlen = varlen_next;
+    let mut offset: usize = 0;
+    while (offset + 2) <= rep.len() {
+        let mtype = MetadataType::from(rep[offset]);
+        let varlen = usize::from(rep[offset + 1]);
+        let metadata = &rep[offset + 2..offset + 2 + varlen];
+        offset += varlen + 2;
         match mtype {
             MetadataType::Device => {
                 let (dm, _, _) = meta::DeviceMetadata::deserialize(metadata, &[]).unwrap();
@@ -524,11 +501,21 @@ impl DeviceDataParser {
             if reqs.len() == 0 {
                 break;
             }
-            let n_reqs = reqs.len();
-            let n_reqs = if n_reqs > TL_STREAMRPC_MAX_META {
+            let n_reqs = if reqs.len() > TL_STREAMRPC_MAX_META {
                 TL_STREAMRPC_MAX_META
+            } else if reqs.len() == 1 {
+                // If we don't know anything about the device, send zero
+                // arguments to get an automatic reply fitting as many things
+                // as possible at the beginning, to bootstrap the process
+                // more efficiently
+                if let MetadataType::Device = reqs[0].mtype {
+                    reqs = reqs[1..].to_vec();
+                    0
+                } else {
+                    1
+                }
             } else {
-                n_reqs
+                reqs.len()
             };
             ret.push(util::PacketBuilder::make_rpc_request(
                 "dev.metadata",
