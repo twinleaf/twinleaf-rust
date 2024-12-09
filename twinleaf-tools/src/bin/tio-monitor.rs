@@ -1,13 +1,12 @@
-use twinleaf::tio;
-use twinleaf::data::{ColumnData, Device};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
+use twinleaf::data::{ColumnData, Device};
+use twinleaf::tio;
 
 use getopts::Options;
-use std::env;
 use pancurses::*;
-
+use std::env;
 
 fn tio_opts() -> Options {
     let mut opts = Options::new();
@@ -59,14 +58,17 @@ fn run_monitor(args: &[String]) {
     window.refresh();
     noecho();
     let mut y_position = 3;
-    
-    loop{
+
+    loop {
         let sample = device.next();
 
-        let name = format!("Device Name: {}  Serial: {}   Session ID: {}", sample.device.name, sample.device.serial_number, sample.device.session_id);
-        window.mvprintw(1,0, &name);
+        let name = format!(
+            "Device Name: {}  Serial: {}   Session ID: {}",
+            sample.device.name, sample.device.serial_number, sample.device.session_id
+        );
+        window.mvprintw(1, 0, &name);
 
-        for col in &sample.columns{
+        for col in &sample.columns {
             let string = format!(
                 " {}: {}",
                 col.desc.name,
@@ -76,22 +78,21 @@ fn run_monitor(args: &[String]) {
                     ColumnData::Float(x) => format!("{:.3}", x),
                     ColumnData::Unknown => "?".to_string(),
                 }
-            ); 
-    
+            );
+
             if sample.stream.stream_id == 0x02 {
                 y_position += 1;
             }
 
-            window.mvprintw(y_position, 0, &string);                
+            window.mvprintw(y_position, 0, &string);
             window.refresh();
         }
         y_position = 3;
     }
 }
 
-fn main(){
+fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     run_monitor(&args);
 }
-

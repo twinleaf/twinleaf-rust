@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# stash anything that we are not committing now.
+git stash --keep-index --include-untracked
+
+if cargo fmt --check --verbose; then
+    echo "Formatting OK"
+    ret = 0
+else
+    echo "Code formatting issues. Please run 'cargo fmt' before commit"
+    ret = 1
+fi
+
+# restore other modified files from stash
+git stash pop
+
+exit $ret

@@ -1,13 +1,13 @@
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
+use twinleaf::data::{ColumnData, DeviceDataParser};
 use twinleaf::tio;
-use twinleaf::data::{DeviceDataParser, ColumnData};
 
 use std::env;
 use std::fs::File;
-use std::io::prelude::*;
 use std::fs::OpenOptions;
+use std::io::prelude::*;
 
 use getopts::Options;
 
@@ -435,7 +435,7 @@ fn log_data_dump(args: &[String]) {
     }
 }
 
-//match 
+//match
 fn match_value(data: ColumnData) -> String {
     let data_type = match data {
         ColumnData::Int(x) => format!("{}", x),
@@ -452,8 +452,8 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
     let output_name = args.get(3).unwrap_or(&args[2]);
 
     let s = output_name.replace("csv", "");
-    let path= format!("{}{}.csv", s, &args[1]).to_string();
-    
+    let path = format!("{}{}.csv", s, &args[1]).to_string();
+
     let mut file = OpenOptions::new().append(true).create(true).open(path)?;
     let mut streamhead: bool = false;
     let mut first: bool = true;
@@ -470,44 +470,46 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
                     for col in &sample.columns {
                         let time = format!("{:.6}", sample.timestamp_end());
                         let value = match_value(col.value.clone());
-                    
+
                         //write in column names
-                        if !streamhead{
+                        if !streamhead {
                             let timehead = format!("{},", "time");
-                            let _= file.write_all(timehead.as_bytes()); 
-                            
+                            let _ = file.write_all(timehead.as_bytes());
+
                             for col in &sample.columns {
                                 let mut header = format!("{},", col.desc.name);
-                                
-                                if col.desc.name == sample.columns[&sample.columns.len() -1].desc.name.clone() {
+
+                                if col.desc.name
+                                    == sample.columns[&sample.columns.len() - 1].desc.name.clone()
+                                {
                                     header = format!("{}", col.desc.name);
                                 }
-                                
+
                                 file.write_all(header.as_bytes())?;
                             }
                             file.write_all(b"\n")?;
                             streamhead = true;
                         }
-                        
+
                         //write in data
                         let timefmt = format!("{},", time);
-                        let mut formatted_value = format!("{},", value );
-                        if first{
-                            let _= file.write_all(timefmt.as_bytes());
+                        let mut formatted_value = format!("{},", value);
+                        if first {
+                            let _ = file.write_all(timefmt.as_bytes());
                             first = false;
                         }
 
-                        if value == match_value(sample.columns[&sample.columns.len() - 1].value.clone()) {
+                        if value
+                            == match_value(sample.columns[&sample.columns.len() - 1].value.clone())
+                        {
                             formatted_value = format!("{}", value);
                         }
-                            
+
                         file.write_all(formatted_value.as_bytes())?;
-                        
                     }
                     file.write_all(b"\n")?;
                     first = true;
                 }
-
             }
         }
     }
@@ -587,8 +589,7 @@ fn main() {
             log_data_dump(&args[2..]); //.unwrap();
         }
         "log-csv" => {
-            
-            let _= log_csv(&args[1..]); //.unwrap();
+            let _ = log_csv(&args[1..]); //.unwrap();
         }
         "firmware-upgrade" => {
             firmware_upgrade(&args[2..]); //.unwrap();
