@@ -72,9 +72,9 @@ async fn run_monitor() {
     'drawing: loop {
         let mut delay = Delay::new(Duration::from_nanos(1)).fuse();
         let mut event = reader.next().fuse();
-        
+
         let sample = device.next();
-        
+
         //write in title
         let name = format!(
             "Device Name: {}  Serial: {}   Session ID: {}",
@@ -83,7 +83,6 @@ async fn run_monitor() {
         _ = stdout.execute(MoveToRow(0));
         println!("\r\n{}", name);
         _ = stdout.execute(MoveToNextLine(1));
-        
 
         select! {
             _= delay => {
@@ -104,7 +103,7 @@ async fn run_monitor() {
                     }
                     _ = stdout.execute(Clear(ClearType::CurrentLine));
                     println!("{}\r", string);
-                    
+
                 }
             },
             some_event = event => {
