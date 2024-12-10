@@ -9,9 +9,12 @@ repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
 [dependencies]
+async-std = "1.13.0"
 chrono = "0.4.38"
 crossbeam = "0.8.4"
+crossterm = {version = "0.28.1", features = ["event-stream"]}
+futures = "0.3.31"
+futures-timer = "3.0.3"
 getopts = "0.2.21"
-pancurses = "0.17.0"
 serialport = "4.5.1"
 twinleaf = { version = "1.1.0", path = "../twinleaf" }
