@@ -60,10 +60,6 @@ async fn run_monitor() {
 
     let args: Vec<String> = env::args().collect();
 
-    //optional yaml file input
-    let default_path = "default.yaml".to_string();
-    let _path = args.get(2).unwrap_or(&default_path);
-
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, &args);
 
@@ -77,7 +73,7 @@ async fn run_monitor() {
         let mut delay = Delay::new(Duration::from_nanos(1)).fuse();
         let mut event = reader.next().fuse();
         
-        let sample = device.next(); //BREAKING HERE
+        let sample = device.next();
         
         //write in title
         let name = format!(
@@ -109,10 +105,7 @@ async fn run_monitor() {
                     _ = stdout.execute(Clear(ClearType::CurrentLine));
                     println!("{}\r", string);
                     
-
-
                 }
-               // _ = stdout.execute(Clear(ClearType::UntilNewLine));
             },
             some_event = event => {
                 match some_event {
