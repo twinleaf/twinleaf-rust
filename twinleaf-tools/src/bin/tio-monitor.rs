@@ -6,6 +6,7 @@ use twinleaf::{
 
 use getopts::Options;
 use std::{env, io::stdout, time::Duration};
+use std::collections::HashMap;
 
 use futures::{future::FutureExt, select, StreamExt};
 use futures_timer::Delay;
@@ -57,33 +58,32 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
 
 async fn run_monitor() {
     let mut reader = EventStream::new();
+    let mut stdout = stdout();
 
     let args: Vec<String> = env::args().collect();
-
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, &args);
 
     let proxy = proxy::Interface::new(&root);
     let device = proxy.device_full(route).unwrap();
+
     let mut device = Device::new(device);
-
-    let mut stdout = stdout();
-    let row: usize = 2;
-
+    let meta = device.get_metadata();
+    let mut positions: HashMap<u8, usize> = HashMap::new();
+    for (_id, stream) in &meta.streams {
+        positions.insert(stream.stream.stream_id, stream.stream.n_columns); 
+    }
+    
     'drawing: loop {
         let mut delay = Delay::new(Duration::from_nanos(1)).fuse();
         let mut event = reader.next().fuse();
-
         let sample = device.next();
         
-        //write in title
-        let name = format!(
-            "Device Name: {}  Serial: {}   Session ID: {}",
-            sample.device.name, sample.device.serial_number, sample.device.session_id
-        );
+        //write in device info
+        let name = format!("Device Name: {}  Serial: {}   Session ID: {}", sample.device.name, sample.device.serial_number, sample.device.session_id);
         _ = stdout.execute(MoveToRow(0));
-        println!("\r{}", name);
-        
+        println!("\r{:?}", name);
+
         select! {
             _= delay => {
                 for col in &sample.columns{
@@ -91,45 +91,35 @@ async fn run_monitor() {
                     let unit_width = sample.columns.iter().map(|col| col.desc.units.len().clone()).max().unwrap();
                     let string = format!(
                         " {:<width$}({:<unit_width$}) {}",
-                        col.desc.name, 
+                        col.desc.name,
                         col.desc.units,
                         match col.value {
                             ColumnData::Int(x) => format!("{}", x),
-                            ColumnData::UInt(x) => format!("{}", x),
+                            ColumnData::UInt(x) => format!("{:.3}", x),
                             ColumnData::Float(x) => format!("{:.3}", x),
                             ColumnData::Unknown => "?".to_string(),
                         }
                     );
-                    //if on first column and first stream move to default position
-                    if col.desc.name == sample.columns[0].desc.name.clone() {
-                        if sample.stream.stream_id == 1 {
-                            _ = stdout.execute(MoveToRow(row.try_into().unwrap())); 
-                        } else{
-                            _ = stdout.execute(RestorePosition);
-                        }
+
+                    if col.desc.name == sample.columns[0].desc.name.clone(){
+                        match positions.get(&sample.stream.stream_id) {
+                            Some(_row) => {
+                                let mut row_position = 0;
+                                for pos in positions.keys() {
+                                    if &sample.stream.stream_id > pos {
+                                        _ = stdout.execute(MoveToNextLine(1));
+                                        row_position += positions[pos];
+                                    }
+                                }
+                                _ = stdout.execute(MoveDown((row_position + 1).try_into().unwrap()));
+                            }, 
+                            None => println!("\rError, stream not found")
+                        };
                     }
                     
-                    //first two streams overwrite on each position line
-                    if sample.stream.stream_id < 3{
-                        _ = stdout.execute(Clear(ClearType::CurrentLine));
-                        println!("\r{}", string);
-                    } else{ 
-                        //TODO: Get third stream to dynamically display under stream 2
-                        //third stream dynamically is moved to row 31
-                        _ = stdout.execute(MoveToRow(31));
-                        _ = stdout.execute(Clear(ClearType::CurrentLine));
-                        println!("\r{}", string);
-                        _ = stdout.execute(RestorePosition);
-                    }   
-                    
-                    //if the value is the last in stream 1, move down the length of rows
-                    if col.desc.name == sample.columns[&sample.columns.len() -1].desc.name.clone() && sample.stream.stream_id == 1 {
-                        _ = stdout.execute(MoveToRow((sample.columns.len().clone() + row + 1).try_into().unwrap()));
-                    }
-                        
-                    _ = stdout.execute(SavePosition);    
+                    _ = stdout.execute(Clear(ClearType::CurrentLine));
+                    println!("\r{}", string);
                 }
-                
             },
             some_event = event => {
                 match some_event {
@@ -137,9 +127,6 @@ async fn run_monitor() {
                         if event == Event::Key(KeyCode::Char('q').into()) {
                             break 'drawing;
                         } else if event == Event::Key(KeyCode::Esc.into()) {
-                            break 'drawing;
-                        //TODO: Fix Ctrl c bug
-                        } else if event == Event::Key(KeyCode::Char('c').into()){
                             break 'drawing;
                         }
                     }
