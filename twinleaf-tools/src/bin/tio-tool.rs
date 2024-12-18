@@ -326,6 +326,26 @@ fn dump(args: &[String]) {
     }
 }
 
+fn meta_dump(args: &[String]) {
+    use twinleaf::data::Device;
+    let opts = tio_opts();
+    let (_matches, root, route) = tio_parseopts(opts, args);
+
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_full(route).unwrap();
+    let mut device = Device::new(device);
+
+    let meta = device.get_metadata();
+    println!("{:?}", meta.device);
+    for (_id, stream) in meta.streams {
+        println!("{:?}", stream.stream);
+        println!("{:?}", stream.segment);
+        for col in stream.columns {
+            println!("{:?}", col);
+        }
+    }
+}
+
 fn print_sample(sample: &twinleaf::data::Sample) {
     use twinleaf::data::ColumnData;
     if sample.meta_changed {
@@ -597,6 +617,9 @@ fn main() {
         "data-dump" => {
             data_dump(&args[2..]); //.unwrap();
         }
+        "meta-dump" => {
+            meta_dump(&args[2..]); //.unwrap();
+        }
         _ => {
             // TODO: do usage right
             println!("Usage:");
@@ -611,6 +634,7 @@ fn main() {
             println!(" tio-tool rpc-dump [-r url] [-s sensor] <rpc-name>");
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
             println!(" tio-tool data-dump [-r url] [-s sensor]");
+            println!(" tio-tool meta-dump [-r url] [-s sensor]");
         }
     }
 }

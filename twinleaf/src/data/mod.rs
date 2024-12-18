@@ -58,6 +58,41 @@ fn make_metareq(reqs: Vec<StreamRpcMetaReq>) -> Vec<u8> {
     ret
 }
 
+// Convert a number of metadata requests to RPC request packets.
+fn metareqs_to_rpcs(metareqs: &Vec<StreamRpcMetaReq>) -> Vec<tio::Packet> {
+    let mut ret = vec![];
+    let mut reqs = &metareqs[..];
+    loop {
+        if reqs.len() == 0 {
+            break;
+        }
+        let n_reqs = if reqs.len() > TL_STREAMRPC_MAX_META {
+            TL_STREAMRPC_MAX_META
+        } else if reqs.len() == 1 {
+            // If we don't know anything about the device, send zero
+            // arguments to get an automatic reply fitting as many things
+            // as possible at the beginning, to bootstrap the process
+            // more efficiently
+            if let MetadataType::Device = reqs[0].mtype {
+                reqs = &reqs[1..];
+                0
+            } else {
+                1
+            }
+        } else {
+            reqs.len()
+        };
+        ret.push(util::PacketBuilder::make_rpc_request(
+            "dev.metadata",
+            &make_metareq((&reqs[0..n_reqs]).to_vec()),
+            7855,
+            DeviceRoute::root(),
+        ));
+        reqs = &reqs[n_reqs..];
+    }
+    ret
+}
+
 fn parse_metarep(rep: Vec<u8>) -> Vec<tio::proto::meta::MetadataContent> {
     use tio::proto::meta;
     let mut ret = vec![];
@@ -183,6 +218,13 @@ impl Sample {
 }
 
 #[derive(Debug)]
+pub struct DeviceStreamMetadata {
+    pub stream: Arc<StreamMetadata>,
+    pub segment: Arc<SegmentMetadata>,
+    pub columns: Vec<Arc<ColumnMetadata>>,
+}
+
+#[derive(Debug)]
 struct DeviceColumn {
     metadata: Arc<ColumnMetadata>,
     offset: usize,
@@ -302,6 +344,25 @@ impl DeviceStream {
 
         ret
     }
+
+    fn get_metadata(&self) -> Result<DeviceStreamMetadata, Vec<StreamRpcMetaReq>> {
+        let reqs = self.requests();
+        if reqs.is_empty() {
+            Ok(DeviceStreamMetadata {
+                stream: self.stream.as_ref().unwrap().clone(),
+                segment: self.segment.as_ref().unwrap().clone(),
+                columns: self.columns.iter().map(|x| x.metadata.clone()).collect(),
+            })
+        } else {
+            Err(reqs)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DeviceFullMetadata {
+pub device: Arc<DeviceMetadata>,
+pub streams: HashMap<u8, DeviceStreamMetadata>,
 }
 
 pub struct DeviceDataParser {
@@ -495,37 +556,22 @@ impl DeviceDataParser {
                 reqs.push(StreamRpcMetaReq::device());
             }
         }
-        // Convert the requests to RPC request packets.
-        let mut ret = vec![];
-        loop {
-            if reqs.len() == 0 {
-                break;
-            }
-            let n_reqs = if reqs.len() > TL_STREAMRPC_MAX_META {
-                TL_STREAMRPC_MAX_META
-            } else if reqs.len() == 1 {
-                // If we don't know anything about the device, send zero
-                // arguments to get an automatic reply fitting as many things
-                // as possible at the beginning, to bootstrap the process
-                // more efficiently
-                if let MetadataType::Device = reqs[0].mtype {
-                    reqs = reqs[1..].to_vec();
-                    0
-                } else {
-                    1
-                }
-            } else {
-                reqs.len()
-            };
-            ret.push(util::PacketBuilder::make_rpc_request(
-                "dev.metadata",
-                &make_metareq((&reqs[0..n_reqs]).to_vec()),
-                7855,
-                DeviceRoute::root(),
-            ));
-            reqs = reqs[n_reqs..].to_vec();
+        metareqs_to_rpcs(&reqs)
+    }
+
+    fn get_metadata(&self) -> Result<DeviceFullMetadata, Vec<tio::Packet>> {
+        let reqs = self.requests();
+        if !reqs.is_empty() {
+            return Err(reqs);
         }
-        ret
+        let mut streams = HashMap::new();
+        for (id, stream) in &self.streams {
+            streams.insert(*id, stream.get_metadata().unwrap());
+        }
+        Ok(DeviceFullMetadata {
+            device: self.device.as_ref().unwrap().clone(),
+            streams: streams,
+        })
     }
 }
 
@@ -581,6 +627,24 @@ impl Device {
         self.sample_queue
             .append(&mut VecDeque::from(self.parser.process_packet(&pkt)));
         None
+    }
+
+    pub fn get_metadata(&mut self) -> DeviceFullMetadata {
+        loop {
+            if self.n_reqs == 0 {
+                match self.parser.get_metadata() {
+                    Ok(full_meta) => return full_meta,
+                    Err(reqs) => {
+                        for req in reqs {
+                            self.dev_port.send(req).unwrap();
+                            self.n_reqs += 1;
+                        }
+                    }
+                }
+            }
+            let pkt = self.dev_port.recv().unwrap();
+            self.process_packet(pkt);
+        }
     }
 
     pub fn next(&mut self) -> Sample {
