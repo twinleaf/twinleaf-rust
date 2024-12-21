@@ -96,10 +96,11 @@ fn tio_opts() -> Options {
     opts
 }
 
-fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, DeviceRoute) {
+fn tio_parseopts(opts: &Options, args: &[String]) -> (getopts::Matches, String, DeviceRoute) {
     let matches = match opts.parse(args) {
         Ok(m) => m,
         Err(f) => {
+            print!("{}", opts.usage("Invalid tool invocation"));
             panic!("{}", f.to_string())
         }
     };
@@ -118,7 +119,7 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
 
 fn list_rpcs(args: &[String]) -> std::io::Result<()> {
     let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(opts, args);
+    let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
     let device = proxy.device_rpc(route).unwrap();
@@ -163,7 +164,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
         "type",
     );
     opts.optflag("d", "", "Debug printouts.");
-    let (matches, root, route) = tio_parseopts(opts, args);
+    let (matches, root, route) = tio_parseopts(&opts, args);
 
     let rpc_name = if matches.free.len() < 1 {
         panic!("must specify rpc name")
@@ -278,7 +279,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
 
 fn rpc_dump(args: &[String]) -> std::io::Result<()> {
     let opts = tio_opts();
-    let (matches, root, route) = tio_parseopts(opts, args);
+    let (matches, root, route) = tio_parseopts(&opts, args);
 
     let rpc_name = if matches.free.len() != 1 {
         panic!("must specify rpc name")
@@ -317,7 +318,7 @@ fn rpc_dump(args: &[String]) -> std::io::Result<()> {
 
 fn dump(args: &[String]) {
     let opts = tio_opts();
-    let (_matches, root, _route) = tio_parseopts(opts, args);
+    let (_matches, root, _route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
 
@@ -329,7 +330,7 @@ fn dump(args: &[String]) {
 fn meta_dump(args: &[String]) {
     use twinleaf::data::Device;
     let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(opts, args);
+    let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
     let device = proxy.device_full(route).unwrap();
@@ -382,7 +383,7 @@ fn print_sample(sample: &twinleaf::data::Sample) {
 fn data_dump(args: &[String]) {
     use twinleaf::data::Device;
     let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(opts, args);
+    let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
     let device = proxy.device_full(route).unwrap();
@@ -406,7 +407,11 @@ fn log(args: &[String]) {
         "path",
     );
     opts.optflag("u", "", "unbuffered output");
-    let (matches, root, route) = tio_parseopts(opts, args);
+    let (matches, root, route) = tio_parseopts(&opts, args);
+    if matches.free.len() != 0 {
+        print!("{}", opts.usage("Unexpected argument"));
+        return;
+    }
 
     let output_path = if let Some(path) = matches.opt_str("f") {
         path
@@ -424,6 +429,47 @@ fn log(args: &[String]) {
         file.write_all(&raw).unwrap();
         if sync {
             file.flush().unwrap();
+        }
+    }
+}
+
+fn log_metadata(args: &[String]) {
+    use twinleaf::data::Device;
+    let mut opts = tio_opts();
+    opts.optopt(
+        "f",
+        "",
+        "path of file where to store the metadata (defaults meta.tio)",
+        "path",
+    );
+    let (matches, root, route) = tio_parseopts(&opts, args);
+    if matches.free.len() != 0 {
+        print!("{}", opts.usage("Unexpected argument"));
+        return;
+    }
+
+    let proxy = proxy::Interface::new(&root);
+    let device = proxy.device_full(route).unwrap();
+    let mut device = Device::new(device);
+
+    let meta = device.get_metadata();
+    let output_path = if let Some(path) = matches.opt_str("f") {
+        path
+    } else {
+        "meta.tio".to_string()
+    };
+    let mut file = File::create(output_path).unwrap();
+
+    file.write_all(&meta.device.make_update().serialize().unwrap())
+        .unwrap();
+    for (_id, stream) in meta.streams {
+        file.write_all(&stream.stream.make_update().serialize().unwrap())
+            .unwrap();
+        file.write_all(&stream.segment.make_update().serialize().unwrap())
+            .unwrap();
+        for col in stream.columns {
+            file.write_all(&col.make_update().serialize().unwrap())
+                .unwrap();
         }
     }
 }
@@ -538,7 +584,7 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
 
 fn firmware_upgrade(args: &[String]) {
     let opts = tio_opts();
-    let (matches, root, route) = tio_parseopts(opts, args);
+    let (matches, root, route) = tio_parseopts(&opts, args);
 
     if matches.free.len() != 1 {
         panic!("Must specify firmware path only")
@@ -557,8 +603,67 @@ fn firmware_upgrade(args: &[String]) {
         println!("Failed to stop device");
     }
 
-    let mut offset: usize = 0;
+    let mut next_send_chunk: u16 = 0;
+    let mut next_ack_chunk: u16 = 0;
+    let mut more_to_send = true;
+    const MAX_CHUNKS_IN_FLIGHT: u16 = 2;
 
+    while more_to_send || (next_ack_chunk != next_send_chunk) {
+        if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
+            let offset = usize::from(next_send_chunk) * 288;
+            let chunk_end = if (offset + 288) > firmware_data.len() {
+                firmware_data.len()
+            } else {
+                offset + 288
+            };
+
+            if let Err(_) = device.send(util::PacketBuilder::make_rpc_request(
+                "dev.firmware.upload",
+                &firmware_data[offset..chunk_end],
+                next_send_chunk,
+                DeviceRoute::root(),
+            )) {
+                panic!("Upload failed");
+            }
+            next_send_chunk += 1;
+            more_to_send = chunk_end < firmware_data.len();
+        }
+
+        let pkt = if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
+            match device.try_recv() {
+                Ok(pkt) => pkt,
+                Err(proxy::RecvError::WouldBlock) => continue,
+                Err(_) => panic!("Upload failed"),
+            }
+        } else {
+            device.recv().expect("Upload failed")
+        };
+
+        match pkt.payload {
+            tio::proto::Payload::RpcReply(rep) => {
+                if rep.id != next_ack_chunk {
+                    panic!("Upload failed");
+                }
+
+                let pct = 100.0 * ((next_ack_chunk as f64) * 288.0) / (firmware_data.len() as f64);
+                println!("Uploaded {:.1}%", pct);
+                next_ack_chunk += 1;
+            }
+            tio::proto::Payload::RpcError(err) => {
+                //if let RpcError::InvalidArgs = err.error {
+                // TODO: we could handle this condition, likely caused by
+                // a packet dropped
+                //}
+                panic!("Upload failed: {:?}", err)
+            }
+            _ => continue,
+        }
+    }
+
+    // The loop above conceptually does this, but allowing multiple
+    // RPCs in flight.
+    /*
+    let mut offset: usize = 0;
     while offset < firmware_data.len() {
         let chunk_end = if (offset + 288) > firmware_data.len() {
             firmware_data.len()
@@ -575,6 +680,7 @@ fn firmware_upgrade(args: &[String]) {
         let pct = 100.0 * (offset as f64) / (firmware_data.len() as f64);
         println!("Uploaded {:.1}%", pct);
     }
+    */
 
     if let Err(_) = device.action("dev.firmware.upgrade") {
         panic!("upgrade failed");
@@ -602,6 +708,9 @@ fn main() {
         "log" => {
             log(&args[2..]); //.unwrap();
         }
+        "log-metadata" => {
+            log_metadata(&args[2..]); //.unwrap();
+        }
         "log-dump" => {
             log_dump(&args[2..]); //.unwrap();
         }
@@ -625,7 +734,8 @@ fn main() {
             println!("Usage:");
             println!(" tio-tool help");
             println!(" tio-tool dump [-r url] [-s sensor]");
-            println!(" tio-tool log [-r url] [-s sensor] [filename]");
+            println!(" tio-tool log [-r url] [-s sensor] [-f filename] [-u]");
+            println!(" tio-tool log-metadata [-r url] [-s sensor] [-f filename]");
             println!(" tio-tool log-dump filename [filename ...]");
             println!(" tio-tool log-data-dump filename [filename ...]");
             println!(" tio-tool log-csv <stream id> [metadata] <csv>");
