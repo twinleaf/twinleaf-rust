@@ -1,6 +1,7 @@
 use super::{
     too_small, vararg, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE,
 };
+use super::{DeviceRoute, Packet, Payload};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone)]
@@ -94,6 +95,10 @@ pub enum MetadataType {
     Unknown(u8),
 }
 
+static TL_METADATA_PERIODIC: u8 = 0x01;
+static TL_METADATA_UPDATE: u8 = 0x02;
+static TL_METADATA_LAST: u8 = 0x04;
+
 #[derive(Debug, Clone)]
 pub struct MetadataPayload {
     pub content: MetadataContent,
@@ -147,6 +152,18 @@ impl DeviceMetadata {
         fixed.push(vararg::checked_u8_size(self.n_streams)?);
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
+    pub fn make_update(&self) -> Packet {
+        Packet {
+            payload: Payload::Metadata(MetadataPayload {
+                content: MetadataContent::Device(self.clone()),
+                flags: TL_METADATA_UPDATE,
+                unknown_fixed: vec![],
+                unknown_varlen: vec![],
+            }),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        }
+    }
 }
 
 impl StreamMetadata {
@@ -191,6 +208,18 @@ impl StreamMetadata {
         fixed.extend(vararg::checked_u16_size(self.buf_samples)?.to_le_bytes());
         fixed.push(vararg::append_string(&mut varlen, &self.name)?);
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
+    }
+    pub fn make_update(&self) -> Packet {
+        Packet {
+            payload: Payload::Metadata(MetadataPayload {
+                content: MetadataContent::Stream(self.clone()),
+                flags: TL_METADATA_UPDATE,
+                unknown_fixed: vec![],
+                unknown_varlen: vec![],
+            }),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        }
     }
 }
 
@@ -253,6 +282,18 @@ impl SegmentMetadata {
         fixed.push(self.filter_type.clone().into());
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
+    pub fn make_update(&self) -> Packet {
+        Packet {
+            payload: Payload::Metadata(MetadataPayload {
+                content: MetadataContent::Segment(self.clone()),
+                flags: TL_METADATA_UPDATE,
+                unknown_fixed: vec![],
+                unknown_varlen: vec![],
+            }),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        }
+    }
 }
 
 impl ColumnMetadata {
@@ -300,11 +341,19 @@ impl ColumnMetadata {
         fixed.push(vararg::append_string(&mut varlen, &self.description)?);
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
+    pub fn make_update(&self) -> Packet {
+        Packet {
+            payload: Payload::Metadata(MetadataPayload {
+                content: MetadataContent::Column(self.clone()),
+                flags: TL_METADATA_UPDATE,
+                unknown_fixed: vec![],
+                unknown_varlen: vec![],
+            }),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        }
+    }
 }
-
-static TL_METADATA_PERIODIC: u8 = 0x01;
-static TL_METADATA_UPDATE: u8 = 0x02;
-static TL_METADATA_LAST: u8 = 0x04;
 
 impl MetadataPayload {
     pub fn periodic(&self) -> bool {

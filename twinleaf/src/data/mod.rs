@@ -361,8 +361,8 @@ impl DeviceStream {
 
 #[derive(Debug)]
 pub struct DeviceFullMetadata {
-pub device: Arc<DeviceMetadata>,
-pub streams: HashMap<u8, DeviceStreamMetadata>,
+    pub device: Arc<DeviceMetadata>,
+    pub streams: HashMap<u8, DeviceStreamMetadata>,
 }
 
 pub struct DeviceDataParser {
