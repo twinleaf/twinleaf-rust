@@ -14,7 +14,7 @@ use futures_timer::Delay;
 use crossterm::ExecutableCommand;
 use crossterm::{
     cursor::*,
-    event::{Event, EventStream, KeyCode},
+    event::{Event, EventStream, KeyCode, KeyModifiers},
     style::*,
     terminal::*,
 };
@@ -96,7 +96,7 @@ async fn run_monitor() {
                         match col.value {
                             ColumnData::Int(x) => format!("{}", x),
                             ColumnData::UInt(x) => format!("{:.3}", x),
-                            ColumnData::Float(x) => format!("{:.3}", x),
+                            ColumnData::Float(x) => format!("{:.4}", x),
                             ColumnData::Unknown => "?".to_string(),
                         }
                     );
@@ -124,12 +124,18 @@ async fn run_monitor() {
             some_event = event => {
                 match some_event {
                     Some(Ok(event)) => {
-                        if event == Event::Key(KeyCode::Char('q').into()) {
+                        if let Event::Resize(_x, _y) = event{
+                            _ = stdout.execute(Clear(ClearType::All));
+                        } else if event == Event::Key(KeyCode::Char('q').into()) {
                             break 'drawing;
-                        } else if event == Event::Key(KeyCode::Esc.into()) {
-                            break 'drawing;
+                        } else{
+                            if let Event::Key(key_event) = event{
+                                if key_event.code == KeyCode::Esc|| (key_event.code == KeyCode::Char('c') && key_event.modifiers == KeyModifiers::CONTROL){
+                                    break 'drawing;
+                                }
+                            }
                         }
-                    }
+                    },
                     Some(Err(e)) => println!("Error{}\r", e),
                     None => continue,
                 }
