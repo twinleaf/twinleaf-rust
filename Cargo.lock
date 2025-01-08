@@ -996,7 +996,7 @@ checksum = "e672c95779cf947c5311f83787af4fa8fffd12fb27e4993211a84bdfd9610f9c"
 
 [[package]]
 name = "twinleaf"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "crc",
  "crossbeam",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "twinleaf-tools"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-std",
  "chrono",
