@@ -70,7 +70,7 @@ async fn run_monitor() {
     let mut device = Device::new(device);
     let meta = device.get_metadata();
     let mut positions: HashMap<u8, usize> = HashMap::new();
-    for (_id, stream) in &meta.streams {
+    for stream in meta.streams.values() {
         positions.insert(stream.stream.stream_id, stream.stream.n_columns);
     }
 
@@ -90,18 +90,17 @@ async fn run_monitor() {
         select! {
             _= delay => {
                 for col in &sample.columns{
-                    let width = sample.columns.iter().map(|col| col.desc.name.len().clone()).max().unwrap();
-                    let unit_width = sample.columns.iter().map(|col| col.desc.units.len().clone()).max().unwrap();
+                    let width = sample.columns.iter().map(|col| col.desc.description.len().clone()).max().unwrap();
                     let string = format!(
-                        " {:<width$}({:<unit_width$}) {}",
-                        col.desc.name,
-                        col.desc.units,
+                        " {:<width$} {} {}",
+                        col.desc.description,
                         match col.value {
                             ColumnData::Int(x) => format!("{}", x),
                             ColumnData::UInt(x) => format!("{:.3}", x),
                             ColumnData::Float(x) => format!("{:.4}", x),
                             ColumnData::Unknown => "?".to_string(),
-                        }
+                        },
+                        col.desc.units
                     );
 
                     if col.desc.name == sample.columns[0].desc.name.clone(){
