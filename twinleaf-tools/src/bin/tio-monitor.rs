@@ -113,7 +113,7 @@ fn set_text_color(match_color: u32){
     let mut stdout = stdout();
 
     match match_color {
-        1 => {_ = stdout.execute(SetForegroundColor(Color::White));}
+        1 => {_ = stdout.execute(SetForegroundColor(Color::Reset));}
         2 => {_ = stdout.execute(SetForegroundColor(Color::Green));}
         3 => {_ = stdout.execute(SetForegroundColor(Color::Red));}
         _ => {}
