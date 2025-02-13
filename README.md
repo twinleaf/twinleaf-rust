@@ -32,12 +32,14 @@ There are a variety of additional useful functions. To see all tool options run:
 
 ## tio-monitor
 
-Displays a live stream of incoming data.
+Displays a live stream of incoming data with an optional color-coded threshold option.
 
 Running the tool:
 
-		tio-monitor
+		tio-monitor [yaml_path]
 
+Yaml format to specify desired ranges:
+		field_name: {min: 0.0, max: 10000.0}
 
 ## Installation
 

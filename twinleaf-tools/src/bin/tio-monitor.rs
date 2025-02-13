@@ -6,7 +6,8 @@ use twinleaf::{
 
 use getopts::Options;
 use std::collections::HashMap;
-use std::{env, io::stdout, time::Duration};
+use std::{env, io::stdout, time::Duration, io::Read, fs};
+use serde::{ser::StdError, Deserialize};
 
 use futures::{future::FutureExt, select, StreamExt};
 use futures_timer::Delay;
@@ -15,8 +16,8 @@ use crossterm::ExecutableCommand;
 use crossterm::{
     cursor::*,
     event::{Event, EventStream, KeyCode, KeyModifiers},
-    style::*,
     terminal::*,
+    style::*
 };
 
 fn tio_opts() -> Options {
@@ -56,11 +57,77 @@ fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, D
     (matches, root, route)
 }
 
+#[derive(Deserialize, Debug)]
+struct Threshold {
+    min: f32,
+    max: f32,
+}
+
+impl Threshold {
+    fn within_range(&self, value: f32) -> bool {
+        value >= self.min && value <= self.max
+    }
+
+    fn no_value(&self) -> bool {
+        self.min == self.max
+    }
+}
+
+fn read_file(file_path: String) -> std::result::Result<String, Box<dyn StdError >>{
+    //read file contents to string
+    let mut file = fs::File::open(&file_path)?;
+    let mut file_content = String::new();
+    _ = file.read_to_string(&mut file_content);
+
+    Ok(file_content)
+}
+
+fn test_range(column: String, value: f32, file_path: Option<String>) -> u32 {
+    let path = file_path.unwrap_or(String::from("default.yaml"));
+    let clean_name = str::replace(&column, ".", "_");
+
+    match read_file(path) {
+        Ok(result) => {
+            let read_yaml: HashMap<String, Threshold> = serde_yaml::from_str(&result).expect("FAILED TO READ YAML");
+
+            if let Some(range) = read_yaml.get(&clean_name) {
+                if range.no_value(){
+                    return 1; 
+
+                } else if range.within_range(value) {
+                    return 2;
+                
+                } else{
+                    return 3;
+                }
+        }
+        }
+        Err(_err) => {
+            return 1;
+        }
+    }
+    1
+}
+
+fn set_text_color(match_color: u32){
+    let mut stdout = stdout();
+
+    match match_color {
+        1 => {_ = stdout.execute(SetForegroundColor(Color::White));}
+        2 => {_ = stdout.execute(SetForegroundColor(Color::Green));}
+        3 => {_ = stdout.execute(SetForegroundColor(Color::Red));}
+        _ => {}
+    };
+}
+
 async fn run_monitor() {
     let mut reader = EventStream::new();
     let mut stdout = stdout();
 
     let args: Vec<String> = env::args().collect();
+    let default_path = "default.yaml".to_string();
+    let path = args.get(2).unwrap_or(&default_path);
+
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(opts, &args);
 
@@ -81,15 +148,25 @@ async fn run_monitor() {
 
         //write in device info
         let name = format!(
-            "Device Name: {}  Serial: {}   Session ID: {}",
-            sample.device.name, sample.device.serial_number, sample.device.session_id
+            "{}  Serial: {}",
+            sample.device.name, sample.device.serial_number
         );
         _ = stdout.execute(MoveToRow(0));
-        println!("\r{:?}", name);
+        println!("\r{}", name);
 
         select! {
             _= delay => {
                 for col in &sample.columns{
+                    let color_pair = test_range(col.desc.name.clone(), 
+                        match col.value {
+                        ColumnData::Int(x) => x as f32,
+                        ColumnData::UInt(x) => x as f32,
+                        ColumnData::Float(x) => x as f32,
+                        ColumnData::Unknown => 0.0,
+                        }, Some(path.to_string()));
+
+                    set_text_color(color_pair);
+
                     let width = sample.columns.iter().map(|col| col.desc.description.len().clone()).max().unwrap();
                     let string = format!(
                         " {:<width$} {} {}",
@@ -147,23 +224,31 @@ async fn run_monitor() {
 }
 
 fn main() -> std::io::Result<()> {
-    let mut stdout = stdout();
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.len() < 2{
+        args.push("run".to_string())
+    } 
+    match args[1].as_str() {
+        "run" => {
+            let mut stdout = stdout();
 
-    //setup terminal
-    enable_raw_mode()?;
-    stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(SetBackgroundColor(Color::Black))?;
-    stdout.execute(SetForegroundColor(Color::White))?;
-    stdout.execute(Clear(ClearType::All))?;
-    stdout.execute(SavePosition)?;
-    stdout.execute(Hide)?;
+            enable_raw_mode()?;
+            stdout.execute(EnterAlternateScreen)?;
+            stdout.execute(Clear(ClearType::All))?;
+            stdout.execute(SavePosition)?;
+            stdout.execute(Hide)?;
 
-    async_std::task::block_on(run_monitor());
-
-    //clean up terminal on end
-    stdout.execute(LeaveAlternateScreen)?;
-    stdout.execute(Show)?;
-    disable_raw_mode()?;
+            async_std::task::block_on(run_monitor());
+            stdout.execute(LeaveAlternateScreen)?;
+            stdout.execute(Show)?;
+            disable_raw_mode()?;
+        }
+        _ => {
+            println!("Usage:");
+            println!(" tio-monitor help");
+            println!(" tio-monitor run [yaml_file_path]"); 
+        }
+    }
 
     Ok(())
 }
