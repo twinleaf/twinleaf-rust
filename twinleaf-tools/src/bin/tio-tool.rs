@@ -149,7 +149,7 @@ fn get_rpctype(
     RpcMeta::parse(device.rpc("rpc.info", name).unwrap()).arg_type
 }
 
-fn rpc(args: &[String]) -> std::io::Result<()> {
+fn rpc(args: &[String]) -> std::io::Result<String> {
     let mut opts = tio_opts();
     opts.optopt(
         "t",
@@ -185,7 +185,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
     let proxy = proxy::Interface::new_proxy(&root, None, Some(status_send));
     let device = proxy.device_rpc(route).unwrap();
-
+    let mut result = String::new();
     let req_type = if let Some(req_type) = matches.opt_str("req-type") {
         Some(req_type)
     } else {
@@ -265,6 +265,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
             ),
             _ => panic!("Invalid type"),
         };
+        result = reply_str.clone();
         println!("Reply: {}", reply_str);
     }
     println!("OK");
@@ -274,7 +275,7 @@ fn rpc(args: &[String]) -> std::io::Result<()> {
             println!("{:?}", s);
         }
     }
-    Ok(())
+    Ok(result)
 }
 
 fn rpc_dump(args: &[String]) -> std::io::Result<()> {
@@ -582,6 +583,35 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn read_capture(args: &[String]){
+    let prefix = &args[0];
+    let data_type = &args[1];
+    let trigger = format!("{}.trigger", prefix.clone());
+    let block = format!("{}.block", prefix.clone());
+    let size = format!{"{}.size", prefix.clone()};
+    let blocksize = format!{"{}.blocksize", prefix.clone()};
+
+    let _ = rpc(&[trigger]);
+
+    let mut num_blocks: f32 = 0.0;
+    if let Ok(sizenum) = rpc(&[size]) {
+        let size32: f32 = sizenum.parse().expect("err");
+        if let Ok(blocknum) = rpc(&[blocksize]){
+            let blocksize32: f32 = blocknum.parse().expect("err");
+            let block_len = (size32/blocksize32).floor();
+            num_blocks = block_len; 
+        }
+    }
+    for i in 0..(num_blocks as i32 - 1){
+        let mut command = vec!["rpc".to_string(), "-t".to_string(), "-T".to_string(), "string".to_string()];
+        command.insert(1, block.clone());
+        command.insert(2, i.to_string());
+        command.insert(4, data_type.clone());
+
+        _ = rpc(&command[1..]);
+    }      
+}
+
 fn firmware_upgrade(args: &[String]) {
     let opts = tio_opts();
     let (matches, root, route) = tio_parseopts(&opts, args);
@@ -729,6 +759,9 @@ fn main() {
         "meta-dump" => {
             meta_dump(&args[2..]); //.unwrap();
         }
+        "capture" => {
+            read_capture(&args[2..]);
+        }
         _ => {
             // TODO: do usage right
             println!("Usage:");
@@ -745,6 +778,7 @@ fn main() {
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
             println!(" tio-tool data-dump [-r url] [-s sensor]");
             println!(" tio-tool meta-dump [-r url] [-s sensor]");
+            println!(" tio-tool capture <rpc-prefix> <data-type>");
         }
     }
 }
