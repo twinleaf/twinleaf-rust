@@ -151,6 +151,7 @@ async fn run_monitor() {
             "{}  Serial: {}",
             sample.device.name, sample.device.serial_number
         );
+        _ = stdout.execute(SetForegroundColor(Color::White));
         _ = stdout.execute(MoveToRow(0));
         println!("\r{}", name);
 
