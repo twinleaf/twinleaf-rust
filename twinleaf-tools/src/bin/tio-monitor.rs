@@ -5,9 +5,9 @@ use twinleaf::{
 };
 
 use getopts::Options;
-use std::collections::HashMap;
-use std::{env, io::stdout, time::Duration, io::Read, fs};
 use serde::{ser::StdError, Deserialize};
+use std::collections::HashMap;
+use std::{env, fs, io::stdout, io::Read, time::Duration};
 
 use futures::{future::FutureExt, select, StreamExt};
 use futures_timer::Delay;
@@ -16,8 +16,8 @@ use crossterm::ExecutableCommand;
 use crossterm::{
     cursor::*,
     event::{Event, EventStream, KeyCode, KeyModifiers},
+    style::*,
     terminal::*,
-    style::*
 };
 
 fn tio_opts() -> Options {
@@ -73,7 +73,7 @@ impl Threshold {
     }
 }
 
-fn read_file(file_path: String) -> std::result::Result<String, Box<dyn StdError >>{
+fn read_file(file_path: String) -> std::result::Result<String, Box<dyn StdError>> {
     //read file contents to string
     let mut file = fs::File::open(&file_path)?;
     let mut file_content = String::new();
@@ -88,19 +88,18 @@ fn test_range(column: String, value: f32, file_path: Option<String>) -> u32 {
 
     match read_file(path) {
         Ok(result) => {
-            let read_yaml: HashMap<String, Threshold> = serde_yaml::from_str(&result).expect("FAILED TO READ YAML");
+            let read_yaml: HashMap<String, Threshold> =
+                serde_yaml::from_str(&result).expect("FAILED TO READ YAML");
 
             if let Some(range) = read_yaml.get(&clean_name) {
-                if range.no_value(){
-                    return 1; 
-
+                if range.no_value() {
+                    return 1;
                 } else if range.within_range(value) {
                     return 2;
-                
-                } else{
+                } else {
                     return 3;
                 }
-        }
+            }
         }
         Err(_err) => {
             return 1;
@@ -109,13 +108,19 @@ fn test_range(column: String, value: f32, file_path: Option<String>) -> u32 {
     1
 }
 
-fn set_text_color(match_color: u32){
+fn set_text_color(match_color: u32) {
     let mut stdout = stdout();
 
     match match_color {
-        1 => {_ = stdout.execute(SetForegroundColor(Color::Reset));}
-        2 => {_ = stdout.execute(SetForegroundColor(Color::Green));}
-        3 => {_ = stdout.execute(SetForegroundColor(Color::Red));}
+        1 => {
+            _ = stdout.execute(SetForegroundColor(Color::Reset));
+        }
+        2 => {
+            _ = stdout.execute(SetForegroundColor(Color::Green));
+        }
+        3 => {
+            _ = stdout.execute(SetForegroundColor(Color::Red));
+        }
         _ => {}
     };
 }
@@ -151,14 +156,13 @@ async fn run_monitor() {
             "{}  Serial: {}",
             sample.device.name, sample.device.serial_number
         );
-        _ = stdout.execute(SetForegroundColor(Color::White));
         _ = stdout.execute(MoveToRow(0));
         println!("\r{}", name);
 
         select! {
             _= delay => {
                 for col in &sample.columns{
-                    let color_pair = test_range(col.desc.name.clone(), 
+                    let color_pair = test_range(col.desc.name.clone(),
                         match col.value {
                         ColumnData::Int(x) => x as f32,
                         ColumnData::UInt(x) => x as f32,
@@ -226,9 +230,9 @@ async fn run_monitor() {
 
 fn main() -> std::io::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
-    if args.len() < 2{
+    if args.len() < 2 {
         args.push("run".to_string())
-    } 
+    }
     match args[1].as_str() {
         "run" => {
             let mut stdout = stdout();
@@ -247,7 +251,7 @@ fn main() -> std::io::Result<()> {
         _ => {
             println!("Usage:");
             println!(" tio-monitor help");
-            println!(" tio-monitor run [yaml_file_path]"); 
+            println!(" tio-monitor run [yaml_file_path]");
         }
     }
 

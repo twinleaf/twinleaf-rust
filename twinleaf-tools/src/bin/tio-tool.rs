@@ -583,33 +583,38 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_capture(args: &[String]){
+fn read_capture(args: &[String]) {
     let prefix = &args[0];
     let data_type = &args[1];
     let trigger = format!("{}.trigger", prefix.clone());
     let block = format!("{}.block", prefix.clone());
-    let size = format!{"{}.size", prefix.clone()};
-    let blocksize = format!{"{}.blocksize", prefix.clone()};
+    let size = format! {"{}.size", prefix.clone()};
+    let blocksize = format! {"{}.blocksize", prefix.clone()};
 
     let _ = rpc(&[trigger]);
 
     let mut num_blocks: f32 = 0.0;
     if let Ok(sizenum) = rpc(&[size]) {
         let size32: f32 = sizenum.parse().expect("err");
-        if let Ok(blocknum) = rpc(&[blocksize]){
+        if let Ok(blocknum) = rpc(&[blocksize]) {
             let blocksize32: f32 = blocknum.parse().expect("err");
-            let block_len = (size32/blocksize32).floor();
-            num_blocks = block_len; 
+            let block_len = (size32 / blocksize32).floor();
+            num_blocks = block_len;
         }
     }
-    for i in 0..(num_blocks as i32 - 1){
-        let mut command = vec!["rpc".to_string(), "-t".to_string(), "-T".to_string(), "string".to_string()];
+    for i in 0..(num_blocks as i32 - 1) {
+        let mut command = vec![
+            "rpc".to_string(),
+            "-t".to_string(),
+            "-T".to_string(),
+            "string".to_string(),
+        ];
         command.insert(1, block.clone());
         command.insert(2, i.to_string());
         command.insert(4, data_type.clone());
 
         _ = rpc(&command[1..]);
-    }      
+    }
 }
 
 fn firmware_upgrade(args: &[String]) {
