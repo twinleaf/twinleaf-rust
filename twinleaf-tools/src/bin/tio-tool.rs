@@ -8,6 +8,7 @@ use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
+use std::process::ExitCode;
 
 use getopts::Options;
 
@@ -117,7 +118,7 @@ fn tio_parseopts(opts: &Options, args: &[String]) -> (getopts::Matches, String, 
     (matches, root, route)
 }
 
-fn list_rpcs(args: &[String]) -> std::io::Result<()> {
+fn list_rpcs(args: &[String]) -> Result<(), ()> {
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
@@ -149,7 +150,7 @@ fn get_rpctype(
     RpcMeta::parse(device.rpc("rpc.info", name).unwrap()).arg_type
 }
 
-fn rpc(args: &[String]) -> std::io::Result<String> {
+fn rpc(args: &[String]) -> Result<(), ()> {
     let mut opts = tio_opts();
     opts.optopt(
         "t",
@@ -185,7 +186,6 @@ fn rpc(args: &[String]) -> std::io::Result<String> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
     let proxy = proxy::Interface::new_proxy(&root, None, Some(status_send));
     let device = proxy.device_rpc(route).unwrap();
-    let mut result = String::new();
     let req_type = if let Some(req_type) = matches.opt_str("req-type") {
         Some(req_type)
     } else {
@@ -221,14 +221,20 @@ fn rpc(args: &[String]) -> std::io::Result<String> {
     ) {
         Ok(rep) => rep,
         Err(err) => {
+            drop(proxy);
             if debug {
-                drop(proxy);
                 println!("RPC failed: {:?}", err);
                 for s in proxy_status.try_iter() {
                     println!("{:?}", s);
                 }
+            } else {
+                if let proxy::RpcError::ExecError(rpc_err) = err {
+                    println!("RPC failed: {:?}", rpc_err.error);
+                } else {
+                    println!("RPC failed, run with `-d` for more details.");
+                }
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "RPC failed"));
+            return Err(());
         }
     };
 
@@ -265,7 +271,6 @@ fn rpc(args: &[String]) -> std::io::Result<String> {
             ),
             _ => panic!("Invalid type"),
         };
-        result = reply_str.clone();
         println!("Reply: {}", reply_str);
     }
     println!("OK");
@@ -275,21 +280,32 @@ fn rpc(args: &[String]) -> std::io::Result<String> {
             println!("{:?}", s);
         }
     }
-    Ok(result)
+    Ok(())
 }
 
-fn rpc_dump(args: &[String]) -> std::io::Result<()> {
-    let opts = tio_opts();
+fn rpc_dump(args: &[String]) -> Result<(), ()> {
+    let mut opts = tio_opts();
+    opts.optflag("", "capture", "Trigger and dump a capture buffer");
     let (matches, root, route) = tio_parseopts(&opts, args);
+    let is_capture = matches.opt_present("capture");
 
     let rpc_name = if matches.free.len() != 1 {
         panic!("must specify rpc name")
     } else {
-        matches.free[0].clone()
+        if is_capture {
+            matches.free[0].clone() + ".block"
+        } else {
+            matches.free[0].clone()
+        }
     };
 
     let proxy = proxy::Interface::new(&root);
     let device = proxy.device_rpc(route).unwrap();
+
+    if is_capture {
+        let trigger_rpc_name = matches.free[0].clone() + ".trigger";
+        device.action(&trigger_rpc_name).unwrap();
+    }
 
     let mut full_reply = vec![];
 
@@ -312,12 +328,48 @@ fn rpc_dump(args: &[String]) -> std::io::Result<()> {
     if let Ok(s) = std::str::from_utf8(&full_reply) {
         println!("{}", s);
     } else {
-        std::io::stdout().write(&full_reply)?;
+        std::io::stdout().write(&full_reply).or(Err(()))?;
     }
     Ok(())
 }
 
-fn dump(args: &[String]) {
+/*
+fn read_capture(args: &[String]) -> Result<(),()> {
+    let prefix = &args[0];
+    let data_type = &args[1];
+    let trigger = format!("{}.trigger", prefix.clone());
+    let block = format!("{}.block", prefix.clone());
+    let size = format! {"{}.size", prefix.clone()};
+    let blocksize = format! {"{}.blocksize", prefix.clone()};
+
+    let _ = rpc(&[trigger]);
+
+    let mut num_blocks: f32 = 0.0;
+    if let Ok(sizenum) = rpc(&[size]) {
+        let size32: f32 = sizenum.parse().expect();
+        if let Ok(blocknum) = rpc(&[blocksize]) {
+            let blocksize32: f32 = blocknum.parse().expect();
+            let block_len = (size32 / blocksize32).floor();
+            num_blocks = block_len;
+        }
+    }
+    for i in 0..(num_blocks as i32 - 1) {
+        let mut command = vec![
+            "rpc".to_string(),
+            "-t".to_string(),
+            "-T".to_string(),
+            "string".to_string(),
+        ];
+        command.insert(1, block.clone());
+        command.insert(2, i.to_string());
+        command.insert(4, data_type.clone());
+
+        _ = rpc(&command[1..]);
+    }
+    Ok(())
+}
+*/
+fn dump(args: &[String]) -> Result<(), ()> {
     let opts = tio_opts();
     let (_matches, root, _route) = tio_parseopts(&opts, args);
 
@@ -326,9 +378,10 @@ fn dump(args: &[String]) {
     for pkt in proxy.tree_full().unwrap().iter() {
         println!("{:?}", pkt);
     }
+    Ok(())
 }
 
-fn meta_dump(args: &[String]) {
+fn meta_dump(args: &[String]) -> Result<(), ()> {
     use twinleaf::data::Device;
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(&opts, args);
@@ -346,6 +399,7 @@ fn meta_dump(args: &[String]) {
             println!("{:?}", col);
         }
     }
+    Ok(())
 }
 
 fn print_sample(sample: &twinleaf::data::Sample) {
@@ -381,7 +435,7 @@ fn print_sample(sample: &twinleaf::data::Sample) {
     println!(" [#{}]", sample.n);
 }
 
-fn data_dump(args: &[String]) {
+fn data_dump(args: &[String]) -> Result<(), ()> {
     use twinleaf::data::Device;
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(&opts, args);
@@ -393,9 +447,10 @@ fn data_dump(args: &[String]) {
     loop {
         print_sample(&device.next());
     }
+    // Ok(())
 }
 
-fn log(args: &[String]) {
+fn log(args: &[String]) -> Result<(), ()> {
     let output_path = chrono::Local::now().format("log.%Y%m%d-%H%M%S.tio");
     let mut opts = tio_opts();
     opts.optopt(
@@ -411,7 +466,7 @@ fn log(args: &[String]) {
     let (matches, root, route) = tio_parseopts(&opts, args);
     if matches.free.len() != 0 {
         print!("{}", opts.usage("Unexpected argument"));
-        return;
+        return Err(());
     }
 
     let output_path = if let Some(path) = matches.opt_str("f") {
@@ -432,9 +487,10 @@ fn log(args: &[String]) {
             file.flush().unwrap();
         }
     }
+    Ok(())
 }
 
-fn log_metadata(args: &[String]) {
+fn log_metadata(args: &[String]) -> Result<(), ()> {
     use twinleaf::data::Device;
     let mut opts = tio_opts();
     opts.optopt(
@@ -446,7 +502,7 @@ fn log_metadata(args: &[String]) {
     let (matches, root, route) = tio_parseopts(&opts, args);
     if matches.free.len() != 0 {
         print!("{}", opts.usage("Unexpected argument"));
-        return;
+        return Err(());
     }
 
     let proxy = proxy::Interface::new(&root);
@@ -473,9 +529,10 @@ fn log_metadata(args: &[String]) {
                 .unwrap();
         }
     }
+    Ok(())
 }
 
-fn log_dump(args: &[String]) {
+fn log_dump(args: &[String]) -> Result<(), ()> {
     for path in args {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
         while rest.len() > 0 {
@@ -484,9 +541,10 @@ fn log_dump(args: &[String]) {
             println!("{:?}", pkt);
         }
     }
+    Ok(())
 }
 
-fn log_data_dump(args: &[String]) {
+fn log_data_dump(args: &[String]) -> Result<(), ()> {
     use twinleaf::data::DeviceDataParser;
     let mut parser = DeviceDataParser::new(args.len() > 1);
 
@@ -500,9 +558,9 @@ fn log_data_dump(args: &[String]) {
             }
         }
     }
+    Ok(())
 }
 
-//match
 fn match_value(data: ColumnData) -> String {
     let data_type = match data {
         ColumnData::Int(x) => format!("{}", x),
@@ -513,7 +571,7 @@ fn match_value(data: ColumnData) -> String {
     data_type
 }
 
-fn log_csv(args: &[String]) -> std::io::Result<()> {
+fn log_csv(args: &[String]) -> Result<(), ()> {
     let mut parser = DeviceDataParser::new(args.len() > 1);
     let id: u8 = args[1].parse().unwrap();
     let output_name = args.get(3).unwrap_or(&args[2]);
@@ -521,7 +579,11 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
     let s = output_name.replace("csv", "");
     let path = format!("{}{}.csv", s, &args[1]).to_string();
 
-    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .or(Err(()))?;
     let mut streamhead: bool = false;
     let mut first: bool = true;
 
@@ -552,9 +614,9 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
                                     header = format!("{}", col.desc.name);
                                 }
 
-                                file.write_all(header.as_bytes())?;
+                                file.write_all(header.as_bytes()).or(Err(()))?;
                             }
-                            file.write_all(b"\n")?;
+                            file.write_all(b"\n").or(Err(()))?;
                             streamhead = true;
                         }
 
@@ -572,9 +634,9 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
                             formatted_value = format!("{}", value);
                         }
 
-                        file.write_all(formatted_value.as_bytes())?;
+                        file.write_all(formatted_value.as_bytes()).or(Err(()))?;
                     }
-                    file.write_all(b"\n")?;
+                    file.write_all(b"\n").or(Err(()))?;
                     first = true;
                 }
             }
@@ -583,41 +645,7 @@ fn log_csv(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_capture(args: &[String]) {
-    let prefix = &args[0];
-    let data_type = &args[1];
-    let trigger = format!("{}.trigger", prefix.clone());
-    let block = format!("{}.block", prefix.clone());
-    let size = format! {"{}.size", prefix.clone()};
-    let blocksize = format! {"{}.blocksize", prefix.clone()};
-
-    let _ = rpc(&[trigger]);
-
-    let mut num_blocks: f32 = 0.0;
-    if let Ok(sizenum) = rpc(&[size]) {
-        let size32: f32 = sizenum.parse().expect("err");
-        if let Ok(blocknum) = rpc(&[blocksize]) {
-            let blocksize32: f32 = blocknum.parse().expect("err");
-            let block_len = (size32 / blocksize32).floor();
-            num_blocks = block_len;
-        }
-    }
-    for i in 0..(num_blocks as i32 - 1) {
-        let mut command = vec![
-            "rpc".to_string(),
-            "-t".to_string(),
-            "-T".to_string(),
-            "string".to_string(),
-        ];
-        command.insert(1, block.clone());
-        command.insert(2, i.to_string());
-        command.insert(4, data_type.clone());
-
-        _ = rpc(&command[1..]);
-    }
-}
-
-fn firmware_upgrade(args: &[String]) {
+fn firmware_upgrade(args: &[String]) -> Result<(), ()> {
     let opts = tio_opts();
     let (matches, root, route) = tio_parseopts(&opts, args);
 
@@ -720,53 +748,27 @@ fn firmware_upgrade(args: &[String]) {
     if let Err(_) = device.action("dev.firmware.upgrade") {
         panic!("upgrade failed");
     }
+    Ok(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         args.push("help".to_string());
     }
-    match args[1].as_str() {
-        "rpc-list" => {
-            list_rpcs(&args[2..]).unwrap();
-        }
-        "rpc" => {
-            rpc(&args[2..]).unwrap();
-        }
-        "rpc-dump" => {
-            rpc_dump(&args[2..]).unwrap();
-        }
-        "dump" => {
-            dump(&args[2..]); //.unwrap();
-        }
-        "log" => {
-            log(&args[2..]); //.unwrap();
-        }
-        "log-metadata" => {
-            log_metadata(&args[2..]); //.unwrap();
-        }
-        "log-dump" => {
-            log_dump(&args[2..]); //.unwrap();
-        }
-        "log-data-dump" => {
-            log_data_dump(&args[2..]); //.unwrap();
-        }
-        "log-csv" => {
-            let _ = log_csv(&args[1..]); //.unwrap();
-        }
-        "firmware-upgrade" => {
-            firmware_upgrade(&args[2..]); //.unwrap();
-        }
-        "data-dump" => {
-            data_dump(&args[2..]); //.unwrap();
-        }
-        "meta-dump" => {
-            meta_dump(&args[2..]); //.unwrap();
-        }
-        "capture" => {
-            read_capture(&args[2..]);
-        }
+    if let Ok(_) = match args[1].as_str() {
+        "rpc-list" => list_rpcs(&args[2..]),
+        "rpc" => rpc(&args[2..]),
+        "rpc-dump" => rpc_dump(&args[2..]),
+        "dump" => dump(&args[2..]),
+        "log" => log(&args[2..]),
+        "log-metadata" => log_metadata(&args[2..]),
+        "log-dump" => log_dump(&args[2..]),
+        "log-data-dump" => log_data_dump(&args[2..]),
+        "log-csv" => log_csv(&args[1..]),
+        "firmware-upgrade" => firmware_upgrade(&args[2..]),
+        "data-dump" => data_dump(&args[2..]),
+        "meta-dump" => meta_dump(&args[2..]),
         _ => {
             // TODO: do usage right
             println!("Usage:");
@@ -784,6 +786,16 @@ fn main() {
             println!(" tio-tool data-dump [-r url] [-s sensor]");
             println!(" tio-tool meta-dump [-r url] [-s sensor]");
             println!(" tio-tool capture <rpc-prefix> <data-type>");
+            if args[1] == "help" {
+                Ok(())
+            } else {
+                Err(())
+            }
         }
+    } {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("FAILED");
+        ExitCode::FAILURE
     }
 }
