@@ -14,6 +14,7 @@ use super::proxy_core::{ProxyClient, ProxyCore};
 use super::util;
 use super::util::{TioRpcReplyable, TioRpcRequestable};
 
+use std::env;
 use std::thread;
 use std::time::Duration;
 
@@ -210,6 +211,7 @@ pub enum PortError {
 pub struct Interface {
     new_client_queue: channel::Sender<ProxyClient>,
     new_client_confirm: Option<channel::Receiver<Event>>,
+    client_rx_channel_size: usize,
 }
 
 impl Interface {
@@ -242,6 +244,7 @@ impl Interface {
         Interface {
             new_client_queue: client_sender,
             new_client_confirm: status_receiver,
+            client_rx_channel_size: Self::get_client_rx_channel_size(),
         }
     }
 
@@ -254,6 +257,15 @@ impl Interface {
     /// the default address.
     pub fn default() -> Interface {
         Self::new(util::default_proxy_url())
+    }
+
+    fn get_client_rx_channel_size() -> usize {
+        let min_size = 256usize;
+        if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
+            std::cmp::min(req.parse().unwrap_or(0), min_size)
+        } else {
+            min_size
+        }
     }
 
     /// Create a new port
@@ -275,7 +287,8 @@ impl Interface {
         }
 
         let (client_to_proxy_sender, proxy_from_client_receiver) = channel::bounded::<Packet>(32);
-        let (proxy_to_client_sender, client_from_proxy_receiver) = channel::bounded::<Packet>(256);
+        let (proxy_to_client_sender, client_from_proxy_receiver) =
+            channel::bounded::<Packet>(self.client_rx_channel_size);
         if let Err(_) = self.new_client_queue.send(ProxyClient::new(
             proxy_to_client_sender,
             proxy_from_client_receiver,

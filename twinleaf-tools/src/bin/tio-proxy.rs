@@ -116,8 +116,11 @@ fn main() -> ExitCode {
     opts.optflag(
         "",
         "dump",
-        "Dump traffic data through the proxy (does not include internal heartbeats)",
+        "Dump packet traffic except sample data/metadata or heartbeats",
     );
+    opts.optflag("", "dump-data", "Dump sample data traffic");
+    opts.optflag("", "dump-meta", "Dump sample metadata traffic");
+    opts.optflag("", "dump-hb", "Dump heartbeat traffic");
     opts.optflag("", "auto", "Automatically connect to a USB sensor if there is a single device on the system that could be a Twinleaf device");
     opts.optflag("", "enum", "Enumerate all serial devices, then quit");
 
@@ -202,6 +205,9 @@ fn main() -> ExitCode {
     let verbose = matches.opt_present("v");
     let debugging = matches.opt_present("d");
     let dump_traffic = matches.opt_present("dump");
+    let dump_data = matches.opt_present("dump-data");
+    let dump_meta = matches.opt_present("dump-meta");
+    let dump_hb = matches.opt_present("dump-hb");
     let tf = matches.opt_str("t").unwrap_or("%T%.3f ".to_string());
 
     if (matches.free.len() == 0) && !auto_sensor {
@@ -329,6 +335,14 @@ fn main() -> ExitCode {
                                         log!(tf, "Disconnecting client {} due to internal error receiving tio data in thread", addr);
                                             break;
                                     };
+                                    if dump_traffic {
+                                        if match pkt.payload {
+                                            proto::Payload::RpcRequest(_) | proto::Payload::RpcReply(_) | proto::Payload::RpcError(_) => true,
+                                            _ => false,
+                                        } {
+                                            log!(tf, "{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
+                                        }
+                                    }
                                     match client.try_send(pkt) {
                                         Err(tio::SendError::Full) => {
                                             if disconnect_slow {
@@ -428,7 +442,13 @@ fn main() -> ExitCode {
             }
             recv(proxy_port.receiver()) -> pkt_or_err => {
                 if let Ok(pkt) = pkt_or_err {
-                    if dump_traffic {
+                    let dump = match pkt.payload {
+                        proto::Payload::Heartbeat(_) => dump_hb,
+                        proto::Payload::Metadata(_) => dump_meta,
+                        proto::Payload::StreamData(_) => dump_data,
+                        _ => dump_traffic
+                    };
+                    if dump {
                         log!(tf, "Packet from {} -- {:?}", pkt.routing, pkt.payload);
                     }
                     if let proto::Payload::LogMessage(log) = pkt.payload {
