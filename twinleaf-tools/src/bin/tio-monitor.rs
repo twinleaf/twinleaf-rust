@@ -1,259 +1,303 @@
-use tio::{proto::DeviceRoute, proxy, util};
-use twinleaf::{
-    data::{ColumnData, Device},
-    tio,
-};
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
+use std::time::{Duration, Instant};
 
-use getopts::Options;
-use serde::{ser::StdError, Deserialize};
-use std::collections::HashMap;
-use std::{env, fs, io::stdout, io::Read, time::Duration};
+use toml_edit::{DocumentMut, InlineTable, Value};
 
-use futures::{future::FutureExt, select, StreamExt};
-use futures_timer::Delay;
+use twinleaf::{data, tio};
+use twinleaf_tools::{tio_opts, tio_parseopts};
 
-use crossterm::ExecutableCommand;
-use crossterm::{
-    cursor::*,
-    event::{Event, EventStream, KeyCode, KeyModifiers},
-    style::*,
-    terminal::*,
-};
+use crossterm;
+use crossterm::QueueableCommand;
+use crossterm::{cursor, style, terminal};
 
-fn tio_opts() -> Options {
-    let mut opts = Options::new();
-    opts.optopt(
-        "r",
-        "",
-        &format!("sensor root (default {})", util::default_proxy_url()),
-        "address",
-    );
-    opts.optopt(
-        "s",
-        "",
-        "sensor path in the sensor tree (default /)",
-        "path",
-    );
-    opts
+struct ColumnFormatter {
+    bounds: HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
 }
 
-fn tio_parseopts(opts: Options, args: &[String]) -> (getopts::Matches, String, DeviceRoute) {
-    let matches = match opts.parse(args) {
-        std::result::Result::Ok(m) => m,
-        Err(f) => {
-            panic!("{}", f.to_string())
+impl ColumnFormatter {
+    fn new() -> ColumnFormatter {
+        ColumnFormatter {
+            bounds: HashMap::new(),
         }
-    };
-    let root = if let Some(url) = matches.opt_str("r") {
-        url
-    } else {
-        "tcp://localhost".to_string()
-    };
-    let route = if let Some(path) = matches.opt_str("s") {
-        DeviceRoute::from_str(&path).unwrap()
-    } else {
-        DeviceRoute::root()
-    };
-    (matches, root, route)
-}
-
-#[derive(Deserialize, Debug)]
-struct Threshold {
-    min: f32,
-    max: f32,
-}
-
-impl Threshold {
-    fn within_range(&self, value: f32) -> bool {
-        value >= self.min && value <= self.max
     }
 
-    fn no_value(&self) -> bool {
-        self.min == self.max
-    }
-}
+    fn from_conf(conf_file_path: &String) -> ColumnFormatter {
+        use std::{fs::File, io::Read, str::FromStr};
 
-fn read_file(file_path: String) -> std::result::Result<String, Box<dyn StdError>> {
-    //read file contents to string
-    let mut file = fs::File::open(&file_path)?;
-    let mut file_content = String::new();
-    _ = file.read_to_string(&mut file_content);
-
-    Ok(file_content)
-}
-
-fn test_range(column: String, value: f32, file_path: Option<String>) -> u32 {
-    let path = file_path.unwrap_or(String::from("default.yaml"));
-    let clean_name = str::replace(&column, ".", "_");
-
-    match read_file(path) {
-        Ok(result) => {
-            let read_yaml: HashMap<String, Threshold> =
-                serde_yaml::from_str(&result).expect("FAILED TO READ YAML");
-
-            if let Some(range) = read_yaml.get(&clean_name) {
-                if range.no_value() {
-                    return 1;
-                } else if range.within_range(value) {
-                    return 2;
-                } else {
-                    return 3;
+        let file_contents = match File::open(&conf_file_path) {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                if let Err(e) = file.read_to_string(&mut contents) {
+                    panic!("Unable to read {}: {:?}", conf_file_path, e);
                 }
+                contents
+            }
+            Err(e) => {
+                panic!("Failed to open {}: {:?}", conf_file_path, e);
+            }
+        };
+
+        let doc = DocumentMut::from_str(&file_contents).unwrap();
+        let mut bounds = HashMap::new();
+
+        for (keys, value) in doc.get_values() {
+            let column_name = keys.iter().map(|k| k.get()).collect::<Vec<_>>().join(".");
+            if let Value::InlineTable(it) = value {
+                let (is_temperature, lower_bound) =
+                    if let Some(min) = Self::get_value(it, "cold", &column_name) {
+                        (true, min)
+                    } else if let Some(min) = Self::get_value(it, "min", &column_name) {
+                        (false, min)
+                    } else {
+                        (false, f64::NEG_INFINITY)
+                    };
+                let (is_temperature, upper_bound) =
+                    if let Some(max) = Self::get_value(it, "hot", &column_name) {
+                        (true, max)
+                    } else if let Some(max) = Self::get_value(it, "max", &column_name) {
+                        (is_temperature, max)
+                    } else {
+                        (is_temperature, f64::INFINITY)
+                    };
+                if let Some(_) = bounds.insert(
+                    column_name,
+                    (
+                        std::ops::RangeInclusive::new(lower_bound, upper_bound),
+                        is_temperature,
+                    ),
+                ) {
+                    // Should not happen (caught upon parsing toml)
+                    panic!("Duplicate stream column");
+                }
+            } else {
+                panic!("Unexpected type for {}", column_name);
             }
         }
-        Err(_err) => {
-            return 1;
+        ColumnFormatter { bounds }
+    }
+
+    fn get_value(it: &InlineTable, key: &str, column_name: &str) -> Option<f64> {
+        let value = it.get(key)?;
+        match value {
+            Value::Float(x) => {
+                let fvalue = x.clone().into_value();
+                if fvalue.is_nan() {
+                    None
+                } else {
+                    Some(fvalue)
+                }
+            }
+            Value::Integer(x) => Some(x.clone().into_value() as f64),
+            _ => {
+                panic!("Cannot parse {}::{} as a number", column_name, key);
+            }
         }
     }
-    1
+
+    fn render_header(
+        &self,
+        mut stdout: &std::io::Stdout,
+        dev: Option<&tio::proto::meta::DeviceMetadata>,
+    ) -> std::io::Result<()> {
+        stdout.queue(terminal::Clear(terminal::ClearType::All))?;
+        stdout.queue(cursor::MoveTo(0, 0))?;
+        if let Some(&ref device) = dev {
+            stdout.queue(style::SetAttribute(style::Attribute::Bold))?;
+            stdout.queue(style::Print(&device.name))?;
+            stdout.queue(style::SetAttribute(style::Attribute::Reset))?;
+            stdout.queue(style::Print(format!("  Serial: {}", device.serial_number)))?;
+        } else {
+            stdout.queue(style::Print("Waiting for data..."))?;
+        }
+        stdout.queue(cursor::MoveToNextLine(1))?;
+        Ok(())
+    }
+
+    fn render_column(
+        &self,
+        mut stdout: &std::io::Stdout,
+        col: &data::Column,
+        stream: &tio::proto::meta::StreamMetadata,
+        age: Duration,
+        desc_width: usize,
+    ) -> std::io::Result<()> {
+        use data::ColumnData;
+        let (fval, fmtval) = match col.value {
+            ColumnData::Int(x) => (x as f64, format!("{:10}      ", x)),
+            ColumnData::UInt(x) => (x as f64, format!("{:10}      ", x)),
+            ColumnData::Float(x) => (
+                x,
+                if x.is_nan() {
+                    format!("{:10}      ", x)
+                } else {
+                    format!("{:15.4} ", x)
+                },
+            ),
+            ColumnData::Unknown => (f64::NAN, format!("{:>15} ", "unsupported")),
+        };
+
+        stdout.queue(cursor::MoveToNextLine(1))?;
+
+        let name = format!("{}.{}", stream.name, col.desc.name);
+        let old = age > Duration::from_millis(1200);
+
+        stdout.queue(style::SetAttribute(if old {
+            style::Attribute::Dim
+        } else {
+            style::Attribute::Bold
+        }))?;
+        stdout.queue(style::Print(&col.desc.description))?;
+        stdout.queue(cursor::MoveToColumn((desc_width + 2) as u16))?;
+
+        let color = if fval.is_nan() {
+            style::Color::Yellow
+        } else if let Some((range, temperature)) = self.bounds.get(&name) {
+            if fval < *range.start() {
+                if *temperature {
+                    style::Color::Blue
+                } else {
+                    style::Color::Red
+                }
+            } else if fval > *range.end() {
+                style::Color::Red
+            } else {
+                style::Color::Green
+            }
+        } else {
+            style::Color::Reset
+        };
+        if color != style::Color::Reset {
+            stdout.queue(style::SetForegroundColor(color))?;
+        }
+        stdout.queue(style::Print(fmtval))?;
+        if color != style::Color::Reset {
+            stdout.queue(style::SetForegroundColor(style::Color::Reset))?;
+        }
+
+        stdout.queue(style::Print(&col.desc.units))?;
+        stdout.queue(style::SetAttribute(style::Attribute::Reset))?;
+
+        Ok(())
+    }
 }
 
-fn set_text_color(match_color: u32) {
-    let mut stdout = stdout();
+fn terminal_setup(mut stdout: &std::io::Stdout) -> std::io::Result<()> {
+    terminal::enable_raw_mode()?;
+    //stdout.queue(terminal::EnterAlternateScreen)?;
+    stdout.queue(cursor::Hide)?;
+    stdout.flush()
+}
 
-    match match_color {
-        1 => {
-            _ = stdout.execute(SetForegroundColor(Color::Reset));
-        }
-        2 => {
-            _ = stdout.execute(SetForegroundColor(Color::Green));
-        }
-        3 => {
-            _ = stdout.execute(SetForegroundColor(Color::Red));
-        }
-        _ => {}
+fn terminal_teardown(mut stdout: &std::io::Stdout) {
+    _ = stdout.queue(cursor::MoveToNextLine(1));
+    _ = stdout.queue(cursor::Show);
+    //_ = stdout.execute(terminal::LeaveAlternateScreen);
+    _ = stdout.flush();
+    _ = terminal::disable_raw_mode();
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mut opts = tio_opts();
+    opts.optopt(
+        "c",
+        "colors",
+        "Configuration file for colorizing stream column values",
+        "conf.toml",
+    );
+    let (matches, root, route) = tio_parseopts(&opts, &args);
+
+    let formatter = if let Some(path) = matches.opt_str("colors") {
+        ColumnFormatter::from_conf(&path)
+    } else {
+        ColumnFormatter::new()
     };
-}
 
-async fn run_monitor() {
-    let mut reader = EventStream::new();
-    let mut stdout = stdout();
-
-    let args: Vec<String> = env::args().collect();
-    let default_path = "default.yaml".to_string();
-    let path = args.get(2).unwrap_or(&default_path);
-
-    let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(opts, &args);
-
-    let proxy = proxy::Interface::new(&root);
+    let proxy = tio::proxy::Interface::new(&root);
     let device = proxy.device_full(route).unwrap();
+    let mut device = data::Device::new(device);
 
-    let mut device = Device::new(device);
-    let meta = device.get_metadata();
-    let mut positions: HashMap<u8, usize> = HashMap::new();
-    for stream in meta.streams.values() {
-        positions.insert(stream.stream.stream_id, stream.stream.n_columns);
+    let mut stdout = std::io::stdout();
+    if let Ok(()) = terminal_setup(&stdout) {
+        std::panic::set_hook(Box::new(|_| {
+            terminal_teardown(&std::io::stdout());
+        }));
+    } else {
+        terminal_teardown(&stdout);
+        return;
     }
+
+    let mut wait_until = Instant::now();
+    let mut width: usize = 0;
+    let mut last_sample: BTreeMap<u8, (data::Sample, Instant)> = BTreeMap::new();
 
     'drawing: loop {
-        let mut delay = Delay::new(Duration::from_nanos(1)).fuse();
-        let mut event = reader.next().fuse();
-        let sample = device.next();
+        let now = Instant::now();
+        let sleep_time = wait_until.saturating_duration_since(now);
+        std::thread::sleep(sleep_time);
+        wait_until = now + sleep_time + Duration::from_millis(50);
 
-        //write in device info
-        let name = format!(
-            "{}  Serial: {}",
-            sample.device.name, sample.device.serial_number
-        );
-        _ = stdout.execute(MoveToRow(0));
-        println!("\r{}", name);
-
-        select! {
-            _= delay => {
-                for col in &sample.columns{
-                    let color_pair = test_range(col.desc.name.clone(),
-                        match col.value {
-                        ColumnData::Int(x) => x as f32,
-                        ColumnData::UInt(x) => x as f32,
-                        ColumnData::Float(x) => x as f32,
-                        ColumnData::Unknown => 0.0,
-                        }, Some(path.to_string()));
-
-                    set_text_color(color_pair);
-
-                    let width = sample.columns.iter().map(|col| col.desc.description.len().clone()).max().unwrap();
-                    let string = format!(
-                        " {:<width$} {} {}",
-                        col.desc.description,
-                        match col.value {
-                            ColumnData::Int(x) => format!("{}", x),
-                            ColumnData::UInt(x) => format!("{:.3}", x),
-                            ColumnData::Float(x) => format!("{:.4}", x),
-                            ColumnData::Unknown => "?".to_string(),
-                        },
-                        col.desc.units
-                    );
-
-                    if col.desc.name == sample.columns[0].desc.name.clone(){
-                        match positions.get(&sample.stream.stream_id) {
-                            Some(_row) => {
-                                let mut row_position = 0;
-                                for pos in positions.keys() {
-                                    if &sample.stream.stream_id > pos {
-                                        _ = stdout.execute(MoveToNextLine(1));
-                                        row_position += positions[pos];
-                                    }
-                                }
-                                _ = stdout.execute(MoveDown((row_position + 1).try_into().unwrap()));
-                            },
-                            None => println!("\rError, stream not found")
-                        };
-                    }
-
-                    _ = stdout.execute(Clear(ClearType::CurrentLine));
-                    println!("\r{}", string);
+        loop {
+            use crossterm::event::*;
+            match poll(Duration::from_secs(0)) {
+                Ok(false) => {
+                    break;
                 }
-            },
-            some_event = event => {
-                match some_event {
-                    Some(Ok(event)) => {
-                        if let Event::Resize(_x, _y) = event{
-                            _ = stdout.execute(Clear(ClearType::All));
-                        } else if event == Event::Key(KeyCode::Char('q').into()) {
+                Ok(true) => match read() {
+                    Ok(Event::Key(key_event)) => {
+                        if key_event.code == KeyCode::Char('q')
+                            || key_event.code == KeyCode::Esc
+                            || (key_event.code == KeyCode::Char('c')
+                                && key_event.modifiers == KeyModifiers::CONTROL)
+                        {
                             break 'drawing;
-                        } else{
-                            if let Event::Key(key_event) = event{
-                                if key_event.code == KeyCode::Esc|| (key_event.code == KeyCode::Char('c') && key_event.modifiers == KeyModifiers::CONTROL){
-                                    break 'drawing;
-                                }
-                            }
                         }
-                    },
-                    Some(Err(e)) => println!("Error{}\r", e),
-                    None => continue,
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        break 'drawing;
+                    }
+                },
+                Err(_) => {
+                    break 'drawing;
                 }
             }
         }
-    }
-}
 
-fn main() -> std::io::Result<()> {
-    let mut args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        args.push("run".to_string())
-    }
-    match args[1].as_str() {
-        "run" => {
-            let mut stdout = stdout();
-
-            enable_raw_mode()?;
-            stdout.execute(EnterAlternateScreen)?;
-            stdout.execute(Clear(ClearType::All))?;
-            stdout.execute(SavePosition)?;
-            stdout.execute(Hide)?;
-
-            async_std::task::block_on(run_monitor());
-            stdout.execute(LeaveAlternateScreen)?;
-            stdout.execute(Show)?;
-            disable_raw_mode()?;
+        let mut recompute_width = false;
+        while let Some(sample) = device.try_next() {
+            recompute_width = recompute_width || sample.meta_changed;
+            last_sample.insert(sample.stream.as_ref().stream_id, (sample, now));
         }
-        _ => {
-            println!("Usage:");
-            println!(" tio-monitor help");
-            println!(" tio-monitor run [yaml_file_path]");
+        if recompute_width {
+            for (_, (sample, _)) in &last_sample {
+                for col in &sample.columns {
+                    width = std::cmp::max(width, col.desc.description.len());
+                }
+            }
+        }
+
+        let dev_meta = if let Some((_, (sample, _))) = last_sample.first_key_value() {
+            Some(sample.device.as_ref())
+        } else {
+            None
+        };
+        if let Err(_) = formatter.render_header(&stdout, dev_meta) {
+            break 'drawing;
+        }
+        for (_, (sample, time)) in &last_sample {
+            let age = now - *time;
+            for col in &sample.columns {
+                if let Err(_) = formatter.render_column(&stdout, &col, &sample.stream, age, width) {
+                    break 'drawing;
+                }
+            }
+        }
+        if let Err(_) = stdout.flush() {
+            break 'drawing;
         }
     }
 
-    Ok(())
+    terminal_teardown(&stdout);
 }

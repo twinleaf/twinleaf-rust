@@ -3,14 +3,13 @@ use tio::proxy;
 use tio::util;
 use twinleaf::data::{ColumnData, DeviceDataParser};
 use twinleaf::tio;
+use twinleaf_tools::{tio_opts, tio_parseopts};
 
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
 use std::process::ExitCode;
-
-use getopts::Options;
 
 struct RpcMeta {
     arg_type: String,
@@ -78,44 +77,6 @@ impl RpcMeta {
             )
         }
     }
-}
-
-fn tio_opts() -> Options {
-    let mut opts = Options::new();
-    opts.optopt(
-        "r",
-        "",
-        &format!("sensor root (default {})", util::default_proxy_url()),
-        "address",
-    );
-    opts.optopt(
-        "s",
-        "",
-        "sensor path in the sensor tree (default /)",
-        "path",
-    );
-    opts
-}
-
-fn tio_parseopts(opts: &Options, args: &[String]) -> (getopts::Matches, String, DeviceRoute) {
-    let matches = match opts.parse(args) {
-        Ok(m) => m,
-        Err(f) => {
-            print!("{}", opts.usage("Invalid tool invocation"));
-            panic!("{}", f.to_string())
-        }
-    };
-    let root = if let Some(url) = matches.opt_str("r") {
-        url
-    } else {
-        "tcp://localhost".to_string()
-    };
-    let route = if let Some(path) = matches.opt_str("s") {
-        DeviceRoute::from_str(&path).unwrap()
-    } else {
-        DeviceRoute::root()
-    };
-    (matches, root, route)
 }
 
 fn list_rpcs(args: &[String]) -> Result<(), ()> {
