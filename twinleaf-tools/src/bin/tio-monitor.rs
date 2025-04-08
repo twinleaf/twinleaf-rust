@@ -100,8 +100,8 @@ impl ColumnFormatter {
         mut stdout: &std::io::Stdout,
         dev: Option<&tio::proto::meta::DeviceMetadata>,
     ) -> std::io::Result<()> {
-        stdout.queue(terminal::Clear(terminal::ClearType::All))?;
         stdout.queue(cursor::MoveTo(0, 0))?;
+        stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
         if let Some(&ref device) = dev {
             stdout.queue(style::SetAttribute(style::Attribute::Bold))?;
             stdout.queue(style::Print(&device.name))?;
