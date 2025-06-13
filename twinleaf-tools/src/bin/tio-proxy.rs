@@ -12,52 +12,7 @@ use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::tio;
 
-// Unfortunately we cannot access USB details via the serialport module, so
-// we are stuck guessing based on VID/PID. This returns a vector of possible
-// serial ports.
-
-#[derive(Debug)]
-enum TwinleafPortInterface {
-    FTDI,
-    STM32,
-    Unknown(u16, u16),
-}
-
-struct SerialDevice {
-    url: String,
-    ifc: TwinleafPortInterface,
-}
-
-fn enum_devices(all: bool) -> Vec<SerialDevice> {
-    let mut ports: Vec<SerialDevice> = Vec::new();
-
-    if let Ok(avail_ports) = serialport::available_ports() {
-        for p in avail_ports.iter() {
-            if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
-                let interface = match (info.vid, info.pid) {
-                    (0x0403, 0x6015) => TwinleafPortInterface::FTDI,
-                    (0x0483, 0x5740) => TwinleafPortInterface::STM32,
-                    (vid, pid) => {
-                        if !all {
-                            continue;
-                        };
-                        TwinleafPortInterface::Unknown(vid, pid)
-                    }
-                };
-                #[cfg(target_os = "macos")]
-                if p.port_name.starts_with("/dev/tty.") && !all {
-                    continue;
-                }
-                ports.push(SerialDevice {
-                    url: format!("serial://{}", p.port_name),
-                    ifc: interface,
-                });
-            } // else ignore other types for now: bluetooth, pci, unknown
-        }
-    }
-
-    ports
-}
+use twinleaf_core::workflows::connect;
 
 macro_rules! log{
     ($tf:expr, $msg:expr)=>{
@@ -161,17 +116,22 @@ fn main() -> ExitCode {
     if matches.opt_present("enum") {
         let mut unknown_devices = vec![];
         let mut found_any = false;
-        for dev in enum_devices(true) {
-            if let TwinleafPortInterface::Unknown(vid, pid) = dev.ifc {
-                unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
-            } else {
-                if !found_any {
-                    println!("Possible tio ports:");
-                    found_any = true;
+        match connect::enum_devices(true) {
+        Ok(devices) => {
+            for dev in devices {
+                if let connect::TwinleafPortInterface::Unknown(vid, pid) = dev.ifc {
+                    unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
+                } else {
+                    if !found_any {
+                        println!("Possible tio ports:");
+                        found_any = true;
+                    }
+                    println!(" * {}", dev.url);
                 }
-                println!(" * {}", dev.url);
             }
         }
+        Err(e) => die!("Could not enumerate devices: {}", e),
+    };
         if !found_any {
             println!("No likely ports found")
         }
@@ -226,23 +186,10 @@ fn main() -> ExitCode {
     let sensor_url = if matches.free.len() == 1 {
         matches.free[0].clone()
     } else {
-        let devices = enum_devices(false);
-        let mut valid_urls = Vec::new();
-        for dev in devices {
-            match dev.ifc {
-                TwinleafPortInterface::STM32 | TwinleafPortInterface::FTDI => {
-                    valid_urls.push(dev.url.clone());
-                }
-                _ => {}
-            }
+        match connect::auto_detect_sensor() {
+            Ok(url) => url,
+            Err(e) => die!("{}", e),
         }
-        if valid_urls.len() == 0 {
-            die!("Cannot find any sensor to connect to, specify URL manually")
-        }
-        if valid_urls.len() > 1 {
-            die!("Too many sensors detected, specify URL manually")
-        }
-        valid_urls[0].clone()
     };
 
     if verbose || auto_sensor {
