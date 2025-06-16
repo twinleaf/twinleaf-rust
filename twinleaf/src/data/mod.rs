@@ -217,6 +217,32 @@ impl Sample {
     }
 }
 
+impl std::fmt::Display for Sample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SAMPLE({}:{}) {:.6}",
+            self.stream.stream_id,
+            self.segment.segment_id,
+            self.timestamp_end()
+        )?;
+        for col in &self.columns {
+            write!(
+                f,
+                " {}: {}",
+                col.desc.name,
+                match col.value {
+                    ColumnData::Int(x) => format!("{}", x),
+                    ColumnData::UInt(x) => format!("{}", x),
+                    ColumnData::Float(x) => format!("{}", x),
+                    ColumnData::Unknown => "?".to_string(),
+                }
+            )?;
+        }
+        write!(f, " [#{}]", self.n)
+    }
+}
+
 #[derive(Debug)]
 pub struct DeviceStreamMetadata {
     pub stream: Arc<StreamMetadata>,

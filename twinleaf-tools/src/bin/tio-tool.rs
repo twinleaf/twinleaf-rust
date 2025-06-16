@@ -364,7 +364,6 @@ fn meta_dump(args: &[String]) -> Result<(), ()> {
 }
 
 fn print_sample(sample: &twinleaf::data::Sample) {
-    use twinleaf::data::ColumnData;
     if sample.meta_changed {
         println!("# DEVICE {:?}", sample.device);
         println!("# STREAM {:?}", sample.stream);
@@ -375,25 +374,7 @@ fn print_sample(sample: &twinleaf::data::Sample) {
     if sample.segment_changed {
         println!("# SEGMENT {:?}", sample.segment);
     }
-    print!(
-        "SAMPLE({}:{}) {:.6}",
-        sample.stream.stream_id,
-        sample.segment.segment_id,
-        sample.timestamp_end()
-    );
-    for col in &sample.columns {
-        print!(
-            " {}: {}",
-            col.desc.name,
-            match col.value {
-                ColumnData::Int(x) => format!("{}", x),
-                ColumnData::UInt(x) => format!("{}", x),
-                ColumnData::Float(x) => format!("{}", x),
-                ColumnData::Unknown => "?".to_string(),
-            }
-        );
-    }
-    println!(" [#{}]", sample.n);
+    println!("{}", sample);
 }
 
 fn data_dump(args: &[String]) -> Result<(), ()> {
