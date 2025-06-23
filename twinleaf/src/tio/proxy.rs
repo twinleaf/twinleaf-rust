@@ -327,6 +327,11 @@ impl Interface {
         self.subtree_full(DeviceRoute::root())
     }
 
+    /// New port for the full device tree, useful to probe connected devices.
+    pub fn tree_probe(&self) -> Result<Port, PortError> {
+        self.new_port(None, DeviceRoute::root(), usize::MAX, false, true)
+    }
+
     /// New port with default parameters for the full device tree, receiving only RPCs.
     pub fn tree_rpc(&self) -> Result<Port, PortError> {
         self.subtree_rpc(DeviceRoute::root())

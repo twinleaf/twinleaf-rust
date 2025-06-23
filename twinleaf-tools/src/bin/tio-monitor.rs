@@ -215,8 +215,7 @@ fn main() {
     };
 
     let proxy = tio::proxy::Interface::new(&root);
-    let device = proxy.device_full(route).unwrap();
-    let mut device = data::Device::new(device);
+    let mut device = twinleaf::Device::open(&proxy, route);
 
     let mut stdout = std::io::stdout();
     if let Ok(()) = terminal_setup(&stdout) {

@@ -343,13 +343,11 @@ fn dump(args: &[String]) -> Result<(), ()> {
 }
 
 fn meta_dump(args: &[String]) -> Result<(), ()> {
-    use twinleaf::data::Device;
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
-    let device = proxy.device_full(route).unwrap();
-    let mut device = Device::new(device);
+    let mut device = twinleaf::Device::open(&proxy, route);
 
     let meta = device.get_metadata();
     println!("{:?}", meta.device);
@@ -378,13 +376,11 @@ fn print_sample(sample: &twinleaf::data::Sample) {
 }
 
 fn data_dump(args: &[String]) -> Result<(), ()> {
-    use twinleaf::data::Device;
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
-    let device = proxy.device_full(route).unwrap();
-    let mut device = Device::new(device);
+    let mut device = twinleaf::Device::open(&proxy, route);
 
     loop {
         print_sample(&device.next());
@@ -433,7 +429,6 @@ fn log(args: &[String]) -> Result<(), ()> {
 }
 
 fn log_metadata(args: &[String]) -> Result<(), ()> {
-    use twinleaf::data::Device;
     let mut opts = tio_opts();
     opts.optopt(
         "f",
@@ -448,8 +443,7 @@ fn log_metadata(args: &[String]) -> Result<(), ()> {
     }
 
     let proxy = proxy::Interface::new(&root);
-    let device = proxy.device_full(route).unwrap();
-    let mut device = Device::new(device);
+    let mut device = twinleaf::Device::open(&proxy, route);
 
     let meta = device.get_metadata();
     let output_path = if let Some(path) = matches.opt_str("f") {
