@@ -3,6 +3,7 @@
 members = [
     "twinleaf",
     "twinleaf-tools",
+    "twinleaf-core",
 ]
 
 resolver = "2"
