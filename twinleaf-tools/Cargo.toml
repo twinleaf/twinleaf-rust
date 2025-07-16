@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf-tools"
-version = "1.5.1"
+version = "1.5.2"
 edition = "2021"
 license = "MIT"
 description = "Tools for the Twinleaf I/O protocol for reading data from Twinleaf quantum sensors." 
@@ -15,4 +15,4 @@ crossterm = {version = "0.29.0"}
 getopts = "0.2.21"
 serialport = "4.5.1"
 toml_edit = {version = "0.22.24", features = ["parse"]}
-twinleaf = { version = "1.3.3", path = "../twinleaf" }
+twinleaf = { version = "1.3.4", path = "../twinleaf" }
