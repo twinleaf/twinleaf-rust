@@ -11,6 +11,17 @@ pub enum ColumnData {
     Unknown,
 }
 
+impl ColumnData {
+    pub fn try_as_f64(&self) -> Option<f64> {
+        match *self {
+            ColumnData::Int(i) => Some(i as f64),
+            ColumnData::UInt(u) => Some(u as f64),
+            ColumnData::Float(f) => Some(f),
+            ColumnData::Unknown => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Column {
     pub value: ColumnData,
