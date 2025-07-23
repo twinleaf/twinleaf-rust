@@ -22,6 +22,17 @@ impl ColumnData {
     }
 }
 
+impl std::fmt::Display for ColumnData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ColumnData::Int(x) => write!(f, "{}", x),
+            ColumnData::UInt(x) => write!(f, "{}", x),
+            ColumnData::Float(x) => write!(f, "{}", x),
+            ColumnData::Unknown => write!(f, "?"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Column {
     pub value: ColumnData,
