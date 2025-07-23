@@ -123,18 +123,19 @@ impl ColumnFormatter {
         desc_width: usize,
     ) -> std::io::Result<()> {
         use data::ColumnData;
-        let (fval, fmtval) = match col.value {
-            ColumnData::Int(x) => (x as f64, format!("{:10}      ", x)),
-            ColumnData::UInt(x) => (x as f64, format!("{:10}      ", x)),
-            ColumnData::Float(x) => (
-                x,
+
+        let fval = col.value.try_as_f64().unwrap_or(f64::NAN);
+        let fmtval = match col.value {
+            ColumnData::Int(x) => format!("{:10}      ", x),
+            ColumnData::UInt(x) => format!("{:10}      ", x),
+            ColumnData::Float(x) => {
                 if x.is_nan() {
                     format!("{:10}      ", x)
                 } else {
                     format!("{:15.4} ", x)
-                },
-            ),
-            ColumnData::Unknown => (f64::NAN, format!("{:>15} ", "unsupported")),
+                }
+            }
+            ColumnData::Unknown => format!("{:>15} ", "unsupported"),
         };
 
         stdout.queue(cursor::MoveToNextLine(1))?;
