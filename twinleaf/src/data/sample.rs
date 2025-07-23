@@ -122,17 +122,7 @@ impl std::fmt::Display for Sample {
             self.timestamp_end()
         )?;
         for col in &self.columns {
-            write!(
-                f,
-                " {}: {}",
-                col.desc.name,
-                match col.value {
-                    ColumnData::Int(x) => format!("{}", x),
-                    ColumnData::UInt(x) => format!("{}", x),
-                    ColumnData::Float(x) => format!("{}", x),
-                    ColumnData::Unknown => "?".to_string(),
-                }
-            )?;
+            write!(f, " {}: {}", col.desc.name, col.value)?;
         }
         write!(f, " [#{}]", self.n)
     }
