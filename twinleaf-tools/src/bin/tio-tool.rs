@@ -1,7 +1,7 @@
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
-use twinleaf::data::{ColumnData, DeviceDataParser};
+use twinleaf::data::{DeviceDataParser};
 use twinleaf::tio;
 use twinleaf_tools::{tio_opts, tio_parseopts};
 
@@ -497,16 +497,6 @@ fn log_data_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn match_value(data: ColumnData) -> String {
-    let data_type = match data {
-        ColumnData::Int(x) => format!("{}", x),
-        ColumnData::UInt(x) => format!("{}", x),
-        ColumnData::Float(x) => format!("{}", x),
-        ColumnData::Unknown => "?".to_string(),
-    };
-    data_type
-}
-
 fn log_csv(args: &[String]) -> Result<(), ()> {
     let mut parser = DeviceDataParser::new(args.len() > 1);
     let id: u8 = args[1].parse().unwrap();
@@ -520,8 +510,8 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
         .create(true)
         .open(path)
         .or(Err(()))?;
-    let mut streamhead: bool = false;
-    let mut first: bool = true;
+    
+    let mut header_written: bool = false;
 
     for path in &args[2..] {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
@@ -529,52 +519,24 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
             for sample in parser.process_packet(&pkt) {
-                //match stream id
-                if sample.stream.stream_id == id as u8 {
-                    //iterate through values
-                    for col in &sample.columns {
-                        let time = format!("{:.6}", sample.timestamp_end());
-                        let value = match_value(col.value.clone());
-
-                        //write in column names
-                        if !streamhead {
-                            let timehead = format!("{},", "time");
-                            let _ = file.write_all(timehead.as_bytes());
-
-                            for col in &sample.columns {
-                                let mut header = format!("{},", col.desc.name);
-
-                                if col.desc.name
-                                    == sample.columns[&sample.columns.len() - 1].desc.name.clone()
-                                {
-                                    header = format!("{}", col.desc.name);
-                                }
-
-                                file.write_all(header.as_bytes()).or(Err(()))?;
-                            }
-                            file.write_all(b"\n").or(Err(()))?;
-                            streamhead = true;
-                        }
-
-                        //write in data
-                        let timefmt = format!("{},", time);
-                        let mut formatted_value = format!("{},", value);
-                        if first {
-                            let _ = file.write_all(timefmt.as_bytes());
-                            first = false;
-                        }
-
-                        if value
-                            == match_value(sample.columns[&sample.columns.len() - 1].value.clone())
-                        {
-                            formatted_value = format!("{}", value);
-                        }
-
-                        file.write_all(formatted_value.as_bytes()).or(Err(()))?;
-                    }
-                    file.write_all(b"\n").or(Err(()))?;
-                    first = true;
+                if sample.stream.stream_id != id {
+                    continue;
                 }
+
+                if !header_written {
+                    let mut headers: Vec<String> = vec!["time".to_string()];
+                    headers.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
+                    
+                    writeln!(file, "{}", headers.join(",")).or(Err(()))?;
+                    header_written = true;
+                }
+
+                let mut values: Vec<String> = Vec::new();
+                values.push(format!("{:.6}", sample.timestamp_end()));
+                
+                values.extend(sample.columns.iter().map(|col| col.value.to_string()));
+
+                writeln!(file, "{}", values.join(",")).or(Err(()))?;
             }
         }
     }
