@@ -80,37 +80,39 @@ impl Device {
         }
     }
 
-    pub fn next(&mut self) -> Sample {
+    pub fn next(&mut self) -> Result<Sample, tio::proxy::RpcError> {
         loop {
             if !self.sample_queue.is_empty() {
-                return self.sample_queue.pop_front().unwrap();
+                return Ok(self.sample_queue.pop_front().unwrap());
             }
 
-            self.internal_rpcs();
-            let pkt = self.dev_port.recv().expect("no packet in blocking recv");
+            self.internal_rpcs().map_err(tio::proxy::RpcError::SendFailed)?;
+            
+            let pkt = self.dev_port.recv().map_err(tio::proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
         }
     }
 
-    pub fn try_next(&mut self) -> Result<Option<Sample>, tio::proxy::RecvError> {
+    pub fn try_next(&mut self) -> Result<Option<Sample>, tio::proxy::RpcError> {
         loop {
             if !self.sample_queue.is_empty() {
                 return Ok(self.sample_queue.pop_front());
             }
 
-            self.internal_rpcs();
+            self.internal_rpcs().map_err(tio::proxy::RpcError::SendFailed)?;
+
             let pkt = match self.dev_port.try_recv() {
                 Ok(pkt) => pkt,
                 Err(proxy::RecvError::WouldBlock) => return Ok(None),
-                Err(e @ proxy::RecvError::ProxyDisconnected) => return Err(e),
+                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
             };
             self.process_packet(pkt);
         }
     }
 
-    pub fn drain(&mut self) -> Result<Vec<Sample>, tio::proxy::RecvError> {
+    pub fn drain(&mut self) -> Result<Vec<Sample>, tio::proxy::RpcError> {
         loop {
-            self.internal_rpcs();
+            self.internal_rpcs().map_err(tio::proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
                 Ok(pkt) => {
                     self.process_packet(pkt);
@@ -119,7 +121,7 @@ impl Device {
                     break;
                 }
                 Err(e) => {
-                    return Err(e);
+                    return Err(tio::proxy::RpcError::RecvFailed(e));
                 }
             }
         }
@@ -137,7 +139,7 @@ impl Device {
             return Err(tio::proxy::RpcError::SendFailed(err));
         }
         loop {
-            self.internal_rpcs();
+            self.internal_rpcs().map_err(tio::proxy::RpcError::SendFailed)?;
             let pkt = match self.dev_port.recv() {
                 Ok(packet) => packet,
                 Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
