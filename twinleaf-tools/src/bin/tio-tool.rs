@@ -385,12 +385,20 @@ fn data_dump(args: &[String]) -> Result<(), ()> {
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route);
+    let mut device = twinleaf::Device::open(&proxy, route).map_err(|e| {
+        eprintln!("Failed to open device: {:?}", e);
+    })?;
 
     loop {
-        print_sample(&device.next());
+        match device.next() {
+            Ok(sample) => print_sample(&sample),
+            Err(e) => {
+                eprintln!("\nDevice error: {:?}. Exiting.", e);
+                break;
+            }
+        }
     }
-    // Ok(())
+    Ok(())
 }
 
 fn log(args: &[String]) -> Result<(), ()> {
