@@ -202,7 +202,9 @@ impl Device {
         Ok(full_reply)
     }
 
-    pub fn get_multi_str(&mut self, name: &str) -> String {
-        String::from_utf8_lossy(&self.get_multi(name)).to_string()
+    pub fn get_multi_str(&mut self, name: &str) -> Result<String, tio::proxy::RpcError> {
+        let reply_bytes = self.get_multi(name)?;
+        let result_string = String::from_utf8_lossy(&reply_bytes).to_string();
+        Ok(result_string)
     }
 }
