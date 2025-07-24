@@ -347,9 +347,14 @@ fn meta_dump(args: &[String]) -> Result<(), ()> {
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route);
+    let mut device = twinleaf::Device::open(&proxy, route).map_err(|e| {
+        eprintln!("Failed to open device: {:?}", e);
+    })?;
 
-    let meta = device.get_metadata();
+    let meta = device.get_metadata().map_err(|e| {
+        eprintln!("Failed to get metadata: {:?}", e);
+    })?;
+
     println!("{:?}", meta.device);
     for (_id, stream) in meta.streams {
         println!("{:?}", stream.stream);
@@ -443,9 +448,14 @@ fn log_metadata(args: &[String]) -> Result<(), ()> {
     }
 
     let proxy = proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route);
+    let mut device = twinleaf::Device::open(&proxy, route).map_err(|e| {
+        eprintln!("Failed to open device: {:?}", e);
+    })?;
 
-    let meta = device.get_metadata();
+    let meta = device.get_metadata().map_err(|e| {
+        eprintln!("Failed to get metadata: {:?}", e);
+    })?;
+    
     let output_path = if let Some(path) = matches.opt_str("f") {
         path
     } else {
