@@ -215,17 +215,16 @@ fn main() {
     };
 
     let proxy = tio::proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route);
+    let mut device = twinleaf::Device::open(&proxy, route)
+        .expect("Failed to open device. Check connection and permissions.");
 
     let mut stdout = std::io::stdout();
-    if let Ok(()) = terminal_setup(&stdout) {
-        std::panic::set_hook(Box::new(|_| {
-            terminal_teardown(&std::io::stdout());
-        }));
-    } else {
-        terminal_teardown(&stdout);
-        return;
-    }
+    terminal_setup(&stdout).expect("Failed to setup terminal");
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        terminal_teardown(&std::io::stdout());
+        original_hook(panic_info);
+    }));
 
     let mut wait_until = Instant::now();
     let mut width: usize = 0;
@@ -237,37 +236,37 @@ fn main() {
         std::thread::sleep(sleep_time);
         wait_until = now + sleep_time + Duration::from_millis(50);
 
-        loop {
-            use crossterm::event::*;
-            match poll(Duration::from_secs(0)) {
-                Ok(false) => {
-                    break;
-                }
-                Ok(true) => match read() {
-                    Ok(Event::Key(key_event)) => {
-                        if key_event.code == KeyCode::Char('q')
-                            || key_event.code == KeyCode::Esc
-                            || (key_event.code == KeyCode::Char('c')
-                                && key_event.modifiers == KeyModifiers::CONTROL)
-                        {
-                            break 'drawing;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
+        if crossterm::event::poll(Duration::from_secs(0)).unwrap_or(false) {
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(key)) => {
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    if key.code == KeyCode::Char('q')
+                        || key.code == KeyCode::Esc
+                        || (key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+                    {
                         break 'drawing;
                     }
-                },
-                Err(_) => {
-                    break 'drawing;
                 }
+                Err(_) => break 'drawing,
+                _ => {}
             }
         }
 
         let mut recompute_width = false;
-        while let Some(sample) = device.try_next() {
-            recompute_width = recompute_width || sample.meta_changed;
-            last_sample.insert(sample.stream.as_ref().stream_id, (sample, now));
+        loop {
+            match device.try_next() {
+                Ok(Some(sample)) => {
+                    recompute_width = recompute_width || sample.meta_changed;
+                    last_sample.insert(sample.stream.as_ref().stream_id, (sample, now));
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("\nError receiving data from device: {:?}. Exiting.", e);
+                    break 'drawing;
+                }
+            }
         }
         if recompute_width {
             for (_, (sample, _)) in &last_sample {
