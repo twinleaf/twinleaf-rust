@@ -27,14 +27,15 @@ impl Device {
         Ok(Self::new(port))
     }
 
-    fn internal_rpcs(&mut self) {
+    fn internal_rpcs(&mut self) -> Result<(), proxy::SendError> {
         if self.n_reqs == 0 {
             let reqs = self.parser.requests();
             for req in reqs {
-                self.dev_port.send(req).unwrap();
+                self.dev_port.send(req)?;
                 self.n_reqs += 1;
             }
         }
+        Ok(())
     }
 
     fn process_packet(&mut self, pkt: tio::Packet) -> Option<tio::Packet> {
@@ -61,20 +62,20 @@ impl Device {
         None
     }
 
-    pub fn get_metadata(&mut self) -> DeviceFullMetadata {
+    pub fn get_metadata(&mut self) -> Result<DeviceFullMetadata, tio::proxy::RpcError> {
         loop {
             if self.n_reqs == 0 {
                 match self.parser.get_metadata() {
-                    Ok(full_meta) => return full_meta,
+                    Ok(full_meta) => return Ok(full_meta),
                     Err(reqs) => {
                         for req in reqs {
-                            self.dev_port.send(req).unwrap();
+                            self.dev_port.send(req).map_err(tio::proxy::RpcError::SendFailed)?;
                             self.n_reqs += 1;
                         }
                     }
                 }
             }
-            let pkt = self.dev_port.recv().unwrap();
+            let pkt = self.dev_port.recv().map_err(tio::proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
         }
     }
