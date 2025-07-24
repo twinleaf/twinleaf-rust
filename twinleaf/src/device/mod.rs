@@ -22,9 +22,9 @@ impl Device {
         }
     }
 
-    pub fn open(proxy: &tio::proxy::Interface, route: DeviceRoute) -> Device {
-        let port = proxy.device_full(route).unwrap(); // TODO
-        Self::new(port)
+    pub fn open(proxy: &tio::proxy::Interface, route: DeviceRoute) -> Result<Device, proxy::PortError> {
+        let port = proxy.device_full(route)?;
+        Ok(Self::new(port))
     }
 
     fn internal_rpcs(&mut self) {
@@ -91,40 +91,39 @@ impl Device {
         }
     }
 
-    pub fn try_next(&mut self) -> Option<Sample> {
+    pub fn try_next(&mut self) -> Result<Option<Sample>, tio::proxy::RecvError> {
         loop {
             if !self.sample_queue.is_empty() {
-                return self.sample_queue.pop_front();
+                return Ok(self.sample_queue.pop_front());
             }
 
             self.internal_rpcs();
-            self.process_packet(match self.dev_port.try_recv() {
+            let pkt = match self.dev_port.try_recv() {
                 Ok(pkt) => pkt,
-                Err(proxy::RecvError::WouldBlock) => {
-                    return None;
-                }
-                _ => {
-                    panic!("receive error");
-                }
-            });
+                Err(proxy::RecvError::WouldBlock) => return Ok(None),
+                Err(e @ proxy::RecvError::ProxyDisconnected) => return Err(e),
+            };
+            self.process_packet(pkt);
         }
     }
 
-    pub fn drain(&mut self) -> Vec<Sample> {
+    pub fn drain(&mut self) -> Result<Vec<Sample>, tio::proxy::RecvError> {
         loop {
             self.internal_rpcs();
-            self.process_packet(match self.dev_port.try_recv() {
-                Ok(pkt) => pkt,
+            match self.dev_port.try_recv() {
+                Ok(pkt) => {
+                    self.process_packet(pkt);
+                }
                 Err(proxy::RecvError::WouldBlock) => {
                     break;
                 }
-                _ => {
-                    panic!("receive error");
+                Err(e) => {
+                    return Err(e);
                 }
-            });
+            }
         }
-
-        self.sample_queue.drain(0..).collect()
+        
+        Ok(self.sample_queue.drain(0..).collect())
     }
 
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, tio::proxy::RpcError> {
@@ -138,14 +137,18 @@ impl Device {
         }
         loop {
             self.internal_rpcs();
-            let pkt = self.dev_port.recv().expect("no packet in blocking recv");
+            let pkt = match self.dev_port.recv() {
+                Ok(packet) => packet,
+                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
+            };
+
             if let Some(pkt) = self.process_packet(pkt) {
                 match pkt.payload {
                     tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
                     tio::proto::Payload::RpcError(err) => {
                         return Err(tio::proxy::RpcError::ExecError(err))
                     }
-                    _ => panic!("unexpected"),
+                    _ => unreachable!("process_packet returned a non-RPC packet to raw_rpc"),
                 }
             }
         }
@@ -176,26 +179,27 @@ impl Device {
         self.rpc(name, ())
     }
 
-    pub fn get_multi(&mut self, name: &str) -> Vec<u8> {
+    pub fn get_multi(&mut self, name: &str) -> Result<Vec<u8>, tio::proxy::RpcError> {
         let mut full_reply = vec![];
 
         for i in 0u16..=65535u16 {
             match self.raw_rpc(&name, &i.to_le_bytes().to_vec()) {
                 Ok(mut rep) => full_reply.append(&mut rep),
-                Err(proxy::RpcError::ExecError(err)) => {
-                    if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
-                        break;
-                    } else {
-                        panic!("RPC error");
+                Err(err @ proxy::RpcError::ExecError(_)) => {
+                    if let proxy::RpcError::ExecError(payload) = &err {
+                        if let tio::proto::RpcErrorCode::InvalidArgs = payload.error {
+                            break;
+                        }
                     }
+                    return Err(err);
                 }
-                _ => {
-                    panic!("RPC error")
+                Err(e) => {
+                    return Err(e);
                 }
             }
         }
 
-        full_reply
+        Ok(full_reply)
     }
 
     pub fn get_multi_str(&mut self, name: &str) -> String {
