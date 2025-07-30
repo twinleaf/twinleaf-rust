@@ -11,6 +11,28 @@ pub enum ColumnData {
     Unknown,
 }
 
+impl ColumnData {
+    pub fn try_as_f64(&self) -> Option<f64> {
+        match *self {
+            ColumnData::Int(i) => Some(i as f64),
+            ColumnData::UInt(u) => Some(u as f64),
+            ColumnData::Float(f) => Some(f),
+            ColumnData::Unknown => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ColumnData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ColumnData::Int(x) => write!(f, "{}", x),
+            ColumnData::UInt(x) => write!(f, "{}", x),
+            ColumnData::Float(x) => write!(f, "{}", x),
+            ColumnData::Unknown => write!(f, "?"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Column {
     pub value: ColumnData,
@@ -100,17 +122,7 @@ impl std::fmt::Display for Sample {
             self.timestamp_end()
         )?;
         for col in &self.columns {
-            write!(
-                f,
-                " {}: {}",
-                col.desc.name,
-                match col.value {
-                    ColumnData::Int(x) => format!("{}", x),
-                    ColumnData::UInt(x) => format!("{}", x),
-                    ColumnData::Float(x) => format!("{}", x),
-                    ColumnData::Unknown => "?".to_string(),
-                }
-            )?;
+            write!(f, " {}: {}", col.desc.name, col.value)?;
         }
         write!(f, " [#{}]", self.n)
     }
