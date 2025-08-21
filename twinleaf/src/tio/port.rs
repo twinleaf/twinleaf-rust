@@ -209,7 +209,10 @@ pub struct Port {
 }
 
 /// Default size of the rx channel when receiving to a crossbeam channel.
-static DEFAULT_RX_CHANNEL_SIZE: usize = 64;
+pub static DEFAULT_RX_CHANNEL_SIZE: usize = 256;
+
+/// Default size of the tx channel when sending to a crossbeam channel.
+pub static DEFAULT_TX_CHANNEL_SIZE: usize = 64;
 
 impl Port {
     /// Method running the `Port` thread event loop. It bridges `mio` and
@@ -433,16 +436,21 @@ impl Port {
         }
     }
 
-    /// Create a `Port` from a `RawPort` and a rx callback.
-    fn from_raw<
+    /// Create a `Port` from a `RawPort` and a rx callback with a specified
+    /// tx channel size.
+    fn from_raw_custom<
         RawPortT: RawPort + mio::event::Source + Send + 'static,
         RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
     >(
         raw_port: RawPortT,
         rx: RxCallbackT,
+        tx_size: usize,
     ) -> io::Result<Port> {
         let rates = raw_port.rate_info();
-        let (tx, ttx) = crossbeam::channel::bounded::<PacketOrControl>(32);
+        let (tx, ttx) = crossbeam::channel::bounded::<PacketOrControl>(std::cmp::max(
+            DEFAULT_RX_CHANNEL_SIZE,
+            tx_size,
+        ));
         let (ctl_ret_sender, ctl_ret_receiver) = crossbeam::channel::bounded::<ControlResult>(1);
         let poll = mio::Poll::new()?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(0))?;
@@ -468,6 +476,17 @@ impl Port {
             waker: waker,
             rates: rates,
         })
+    }
+
+    /// Create a `Port` from a `RawPort` and a rx callback.
+    fn from_raw<
+        RawPortT: RawPort + mio::event::Source + Send + 'static,
+        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+    >(
+        raw_port: RawPortT,
+        rx: RxCallbackT,
+    ) -> io::Result<Port> {
+        Self::from_raw_custom(raw_port, rx, DEFAULT_RX_CHANNEL_SIZE)
     }
 
     /// Creates a new `Port` for the physical device at `url`, sending the received
@@ -550,6 +569,29 @@ impl Port {
     ) -> io::Result<Port> {
         stream.set_nonblocking(true)?;
         Port::from_mio_stream(mio::net::TcpStream::from_std(stream), rx)
+    }
+
+    /// Same as `from_mio_stream`, but with configurable tx channel size.
+    pub fn from_mio_stream_custom<
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+    >(
+        stream: mio::net::TcpStream,
+        rx: RXT,
+        tx_size: usize,
+    ) -> io::Result<Port> {
+        Port::from_raw_custom(tcp::Port::from_stream(stream)?, rx, tx_size)
+    }
+
+    /// Same as `from_tcp_stream`, but with configurable tx channel size.
+    pub fn from_tcp_stream_custom<
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+    >(
+        stream: std::net::TcpStream,
+        rx: RXT,
+        tx_size: usize,
+    ) -> io::Result<Port> {
+        stream.set_nonblocking(true)?;
+        Port::from_mio_stream_custom(mio::net::TcpStream::from_std(stream), rx, tx_size)
     }
 
     /// Creates a sender/receiver pair to be used with `rx_to_channel`:

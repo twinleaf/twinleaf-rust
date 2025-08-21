@@ -212,6 +212,7 @@ pub struct Interface {
     new_client_queue: channel::Sender<ProxyClient>,
     new_client_confirm: Option<channel::Receiver<Event>>,
     client_rx_channel_size: usize,
+    client_tx_channel_size: usize,
 }
 
 impl Interface {
@@ -245,6 +246,7 @@ impl Interface {
             new_client_queue: client_sender,
             new_client_confirm: status_receiver,
             client_rx_channel_size: Self::get_client_rx_channel_size(),
+            client_tx_channel_size: Self::get_client_tx_channel_size(),
         }
     }
 
@@ -259,10 +261,19 @@ impl Interface {
         Self::new(util::default_proxy_url())
     }
 
-    fn get_client_rx_channel_size() -> usize {
-        let min_size = 256usize;
+    pub fn get_client_rx_channel_size() -> usize {
+        let min_size = port::DEFAULT_RX_CHANNEL_SIZE;
         if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
-            std::cmp::min(req.parse().unwrap_or(0), min_size)
+            std::cmp::max(req.parse().unwrap_or(0), min_size)
+        } else {
+            min_size
+        }
+    }
+
+    pub fn get_client_tx_channel_size() -> usize {
+        let min_size = port::DEFAULT_TX_CHANNEL_SIZE;
+        if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
+            std::cmp::max(req.parse().unwrap_or(0), min_size)
         } else {
             min_size
         }
@@ -286,7 +297,8 @@ impl Interface {
             return Err(PortError::RpcTimeoutTooLong);
         }
 
-        let (client_to_proxy_sender, proxy_from_client_receiver) = channel::bounded::<Packet>(32);
+        let (client_to_proxy_sender, proxy_from_client_receiver) =
+            channel::bounded::<Packet>(self.client_tx_channel_size);
         let (proxy_to_client_sender, client_from_proxy_receiver) =
             channel::bounded::<Packet>(self.client_rx_channel_size);
         if let Err(_) = self.new_client_queue.send(ProxyClient::new(
