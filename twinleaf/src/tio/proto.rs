@@ -147,8 +147,8 @@ struct TioPktHdr {
     payload_size: u16,
 }
 
-static TIO_PACKET_HEADER_SIZE: usize = 4;
-static TIO_PACKET_MAX_ROUTING_SIZE: usize = 8;
+pub static TIO_PACKET_HEADER_SIZE: usize = 4;
+pub static TIO_PACKET_MAX_ROUTING_SIZE: usize = 8;
 pub static TIO_PACKET_MAX_TOTAL_SIZE: usize = 512;
 static TIO_PACKET_MAX_PAYLOAD_SIZE: usize =
     TIO_PACKET_MAX_TOTAL_SIZE - TIO_PACKET_HEADER_SIZE - TIO_PACKET_MAX_ROUTING_SIZE;

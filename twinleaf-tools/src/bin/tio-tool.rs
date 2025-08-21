@@ -294,49 +294,31 @@ fn rpc_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-/*
-fn read_capture(args: &[String]) -> Result<(),()> {
-    let prefix = &args[0];
-    let data_type = &args[1];
-    let trigger = format!("{}.trigger", prefix.clone());
-    let block = format!("{}.block", prefix.clone());
-    let size = format! {"{}.size", prefix.clone()};
-    let blocksize = format! {"{}.blocksize", prefix.clone()};
-
-    let _ = rpc(&[trigger]);
-
-    let mut num_blocks: f32 = 0.0;
-    if let Ok(sizenum) = rpc(&[size]) {
-        let size32: f32 = sizenum.parse().expect();
-        if let Ok(blocknum) = rpc(&[blocksize]) {
-            let blocksize32: f32 = blocknum.parse().expect();
-            let block_len = (size32 / blocksize32).floor();
-            num_blocks = block_len;
-        }
-    }
-    for i in 0..(num_blocks as i32 - 1) {
-        let mut command = vec![
-            "rpc".to_string(),
-            "-t".to_string(),
-            "-T".to_string(),
-            "string".to_string(),
-        ];
-        command.insert(1, block.clone());
-        command.insert(2, i.to_string());
-        command.insert(4, data_type.clone());
-
-        _ = rpc(&command[1..]);
-    }
-    Ok(())
-}
-*/
 fn dump(args: &[String]) -> Result<(), ()> {
-    let opts = tio_opts();
-    let (_matches, root, _route) = tio_parseopts(&opts, args);
+    let mut opts = tio_opts();
+    opts.optopt(
+        "d",
+        "depth",
+        "Dump depth (default: dump everything)",
+        "max-depth",
+    );
+    let (matches, root, route) = tio_parseopts(&opts, args);
+    let depth = matches
+        .opt_str("d")
+        .unwrap_or(format!("{}", tio::proto::TIO_PACKET_MAX_ROUTING_SIZE))
+        .parse::<usize>()
+        .map_err(|e| {
+            eprintln!("Failed to parse depth: {:?}", e);
+        })?;
 
     let proxy = proxy::Interface::new(&root);
+    let port = proxy
+        .new_port(None, route, depth, true, true)
+        .map_err(|e| {
+            eprintln!("Failed to initialize proxy port: {:?}", e);
+        })?;
 
-    for pkt in proxy.tree_full().unwrap().iter() {
+    for pkt in port.iter() {
         println!("{:?}", pkt);
     }
     Ok(())
@@ -414,7 +396,20 @@ fn log(args: &[String]) -> Result<(), ()> {
         "path",
     );
     opts.optflag("u", "", "unbuffered output");
+    opts.optopt(
+        "d",
+        "depth",
+        "Dump depth (default: dump everything)",
+        "max-depth",
+    );
     let (matches, root, route) = tio_parseopts(&opts, args);
+    let depth = matches
+        .opt_str("d")
+        .unwrap_or(format!("{}", tio::proto::TIO_PACKET_MAX_ROUTING_SIZE))
+        .parse::<usize>()
+        .map_err(|e| {
+            eprintln!("Failed to parse depth: {:?}", e);
+        })?;
     if matches.free.len() != 0 {
         print!("{}", opts.usage("Unexpected argument"));
         return Err(());
@@ -427,11 +422,16 @@ fn log(args: &[String]) -> Result<(), ()> {
     };
 
     let proxy = proxy::Interface::new(&root);
+    let port = proxy
+        .new_port(None, route, depth, true, true)
+        .map_err(|e| {
+            eprintln!("Failed to initialize proxy port: {:?}", e);
+        })?;
 
     let mut file = File::create(output_path).unwrap();
     let sync = matches.opt_present("u");
 
-    for pkt in proxy.device_full(route).unwrap().iter() {
+    for pkt in port.iter() {
         let raw = pkt.serialize().unwrap();
         file.write_all(&raw).unwrap();
         if sync {
@@ -516,26 +516,66 @@ fn log_data_dump(args: &[String]) -> Result<(), ()> {
 }
 
 fn log_csv(args: &[String]) -> Result<(), ()> {
-    let mut parser = DeviceDataParser::new(args.len() > 1);
-    let id: u8 = args[1].parse().unwrap();
-    let output_name = args.get(3).unwrap_or(&args[2]);
-
-    let s = output_name.replace("csv", "");
-    let path = format!("{}{}.csv", s, &args[1]).to_string();
+    let mut opts = getopts::Options::new();
+    opts.optopt(
+        "s",
+        "",
+        "sensor path in the sensor tree (default /)",
+        "path",
+    );
+    opts.optopt("m", "", "metadata file (if separate)", "path");
+    opts.optopt("o", "", "output file prefix", "prefix");
+    let matches = opts.parse(args).map_err(|e| {
+        eprintln!("Invalid invocation: {:?}", e);
+    })?;
+    if matches.free.len() < 3 {
+        eprintln!("Invalid invocation: missing log file");
+        return Err(());
+    }
+    let route = if let Some(path) = matches.opt_str("s") {
+        DeviceRoute::from_str(&path).unwrap()
+    } else {
+        DeviceRoute::root()
+    };
+    let mut parser = if let Some(path) = matches.opt_str("m") {
+        let mut parser = DeviceDataParser::new(true);
+        let mut meta: &[u8] = &std::fs::read(path).unwrap();
+        while meta.len() > 0 {
+            let (pkt, len) = tio::Packet::deserialize(meta).unwrap();
+            meta = &meta[len..];
+            for _ in parser.process_packet(&pkt) {}
+        }
+        parser
+    } else {
+        DeviceDataParser::new(matches.free.len() > 3)
+    };
+    let id: u8 = matches.free[1].parse().unwrap();
+    let output_path = format!(
+        "{}.{}.csv",
+        if let Some(path) = matches.opt_str("o") {
+            path
+        } else {
+            matches.free[2].clone()
+        },
+        id
+    );
 
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
-        .open(path)
+        .open(output_path)
         .or(Err(()))?;
 
     let mut header_written: bool = false;
 
-    for path in &args[2..] {
+    for path in &matches.free[2..] {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
         while rest.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
+            if pkt.routing != route {
+                continue;
+            }
             for sample in parser.process_packet(&pkt) {
                 if sample.stream.stream_id != id {
                     continue;
