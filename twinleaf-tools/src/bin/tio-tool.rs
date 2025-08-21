@@ -1,7 +1,7 @@
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
-use twinleaf::data::{DeviceDataParser};
+use twinleaf::data::DeviceDataParser;
 use twinleaf::tio;
 use twinleaf_tools::{tio_opts, tio_parseopts};
 
@@ -463,7 +463,7 @@ fn log_metadata(args: &[String]) -> Result<(), ()> {
     let meta = device.get_metadata().map_err(|e| {
         eprintln!("Failed to get metadata: {:?}", e);
     })?;
-    
+
     let output_path = if let Some(path) = matches.opt_str("f") {
         path
     } else {
@@ -528,7 +528,7 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
         .create(true)
         .open(path)
         .or(Err(()))?;
-    
+
     let mut header_written: bool = false;
 
     for path in &args[2..] {
@@ -544,14 +544,14 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
                 if !header_written {
                     let mut headers: Vec<String> = vec!["time".to_string()];
                     headers.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
-                    
+
                     writeln!(file, "{}", headers.join(",")).or(Err(()))?;
                     header_written = true;
                 }
 
                 let mut values: Vec<String> = Vec::new();
                 values.push(format!("{:.6}", sample.timestamp_end()));
-                
+
                 values.extend(sample.columns.iter().map(|col| col.value.to_string()));
 
                 writeln!(file, "{}", values.join(",")).or(Err(()))?;

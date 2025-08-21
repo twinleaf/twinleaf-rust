@@ -243,7 +243,8 @@ fn main() {
                     use crossterm::event::{KeyCode, KeyModifiers};
                     if key.code == KeyCode::Char('q')
                         || key.code == KeyCode::Esc
-                        || (key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers == KeyModifiers::CONTROL)
                     {
                         break 'drawing;
                     }
