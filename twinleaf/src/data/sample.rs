@@ -97,6 +97,7 @@ pub struct Sample {
     pub device: Arc<DeviceMetadata>,
     pub segment_changed: bool,
     pub meta_changed: bool,
+    pub source: tio::proto::StreamDataPayload,
 }
 
 impl Sample {

@@ -354,18 +354,23 @@ fn meta_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn print_sample(sample: &twinleaf::data::Sample) {
+fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
+    let route_str = if let Some(r) = route {
+        format!("{} ", r)
+    } else {
+        "".to_string()
+    };
     if sample.meta_changed {
-        println!("# DEVICE {:?}", sample.device);
-        println!("# STREAM {:?}", sample.stream);
+        println!("# {}DEVICE {:?}", route_str, sample.device);
+        println!("# {}STREAM {:?}", route_str, sample.stream);
         for col in &sample.columns {
-            println!("# COLUMN {:?}", col.desc);
+            println!("# {}COLUMN {:?}", route_str, col.desc);
         }
     }
     if sample.segment_changed {
-        println!("# SEGMENT {:?}", sample.segment);
+        println!("# {}SEGMENT {:?}", route_str, sample.segment);
     }
-    println!("{}", sample);
+    println!("{}{}", route_str, sample);
 }
 
 fn data_dump(args: &[String]) -> Result<(), ()> {
@@ -379,11 +384,25 @@ fn data_dump(args: &[String]) -> Result<(), ()> {
 
     loop {
         match device.next() {
-            Ok(sample) => print_sample(&sample),
+            Ok(sample) => print_sample(&sample, None),
             Err(e) => {
                 eprintln!("\nDevice error: {:?}. Exiting.", e);
                 break;
             }
+        }
+    }
+    Ok(())
+}
+
+fn all_data_dump(args: &[String]) -> Result<(), ()> {
+    let opts = tio_opts();
+    let (_matches, root, route) = tio_parseopts(&opts, args);
+    let proxy = proxy::Interface::new(&root);
+
+    let mut devs = twinleaf::device::DeviceTree::open(proxy, route).map_err(|_| {})?;
+    while let Ok(samples) = devs.drain(true) {
+        for (sample, route) in samples {
+            print_sample(&sample, Some(&route));
         }
     }
     Ok(())
@@ -440,6 +459,98 @@ fn log(args: &[String]) -> Result<(), ()> {
     for pkt in port.iter() {
         let raw = pkt.serialize().unwrap();
         file.write_all(&raw).unwrap();
+        if sync {
+            file.flush().unwrap();
+        }
+    }
+    Ok(())
+}
+
+fn log_data(args: &[String]) -> Result<(), ()> {
+    let output_path = chrono::Local::now().format("log.%Y%m%d-%H%M%S.tio");
+    let mut opts = tio_opts();
+    opts.optopt(
+        "f",
+        "",
+        &format!(
+            "path of file where to log the data (default {})",
+            output_path
+        ),
+        "path",
+    );
+    opts.optflag("u", "", "unbuffered output");
+    let (matches, root, route) = tio_parseopts(&opts, args);
+    if matches.free.len() != 0 {
+        print!("{}", opts.usage("Unexpected argument"));
+        return Err(());
+    }
+
+    let output_path = if let Some(path) = matches.opt_str("f") {
+        path
+    } else {
+        output_path.to_string()
+    };
+    let sync = matches.opt_present("u");
+
+    let proxy = proxy::Interface::new(&root);
+    let mut file = File::create(output_path).unwrap();
+
+    let mut devs = twinleaf::device::DeviceTree::open(proxy, route).map_err(|e| {
+        eprintln!("Failed to open device: {:?}", e);
+    })?;
+
+    while let Ok(samples) = devs.drain(true) {
+        for (sample, route) in samples {
+            if sample.meta_changed {
+                file.write_all(
+                    &sample
+                        .device
+                        .make_update2(route.clone())
+                        .serialize()
+                        .unwrap(),
+                )
+                .unwrap();
+                file.write_all(
+                    &sample
+                        .stream
+                        .make_update2(route.clone())
+                        .serialize()
+                        .unwrap(),
+                )
+                .unwrap();
+                file.write_all(
+                    &sample
+                        .segment
+                        .make_update2(route.clone())
+                        .serialize()
+                        .unwrap(),
+                )
+                .unwrap();
+                for col in sample.columns {
+                    file.write_all(&col.desc.make_update2(route.clone()).serialize().unwrap())
+                        .unwrap();
+                }
+            } else if sample.segment_changed {
+                file.write_all(
+                    &sample
+                        .segment
+                        .make_update2(route.clone())
+                        .serialize()
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            file.write_all(
+                &tio::Packet {
+                    payload: tio::proto::Payload::StreamData(sample.source),
+                    routing: route.clone(),
+                    ttl: 0,
+                }
+                .serialize()
+                .unwrap(),
+            )
+            .unwrap();
+        }
         if sync {
             file.flush().unwrap();
         }
@@ -514,7 +625,7 @@ fn log_data_dump(args: &[String]) -> Result<(), ()> {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
             for sample in parser.process_packet(&pkt) {
-                print_sample(&sample);
+                print_sample(&sample, None);
             }
         }
     }
@@ -724,12 +835,14 @@ fn main() -> ExitCode {
         "rpc-dump" => rpc_dump(&args[2..]),
         "dump" => dump(&args[2..]),
         "log" => log(&args[2..]),
+        "log-data" => log_data(&args[2..]),
         "log-metadata" => log_metadata(&args[2..]),
         "log-dump" => log_dump(&args[2..]),
         "log-data-dump" => log_data_dump(&args[2..]),
         "log-csv" => log_csv(&args[1..]),
         "firmware-upgrade" => firmware_upgrade(&args[2..]),
         "data-dump" => data_dump(&args[2..]),
+        "all-data-dump" => all_data_dump(&args[2..]),
         "meta-dump" => meta_dump(&args[2..]),
         _ => {
             // TODO: do usage right

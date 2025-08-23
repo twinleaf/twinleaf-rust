@@ -30,6 +30,10 @@ impl Device {
         Ok(Self::new(port))
     }
 
+    pub fn route(&self) -> DeviceRoute {
+        self.dev_port.scope()
+    }
+
     fn internal_rpcs(&mut self) -> Result<(), proxy::SendError> {
         if self.n_reqs == 0 {
             let reqs = self.parser.requests();
@@ -143,6 +147,10 @@ impl Device {
         Ok(self.sample_queue.drain(0..).collect())
     }
 
+    pub fn select_recv<'a>(&'a self, sel: &mut crossbeam::channel::Select<'a>) -> usize {
+        self.dev_port.select_recv(sel)
+    }
+
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, tio::proxy::RpcError> {
         if let Err(err) = self.dev_port.send(util::PacketBuilder::make_rpc_request(
             name,
@@ -224,5 +232,94 @@ impl Device {
         let reply_bytes = self.get_multi(name)?;
         let result_string = String::from_utf8_lossy(&reply_bytes).to_string();
         Ok(result_string)
+    }
+}
+
+pub struct DeviceTree {
+    proxy: proxy::Interface,
+    probe: proxy::Port,
+    devices: Vec<Device>,
+    route_map: std::collections::HashMap<DeviceRoute, usize>,
+}
+
+impl DeviceTree {
+    pub fn open(
+        proxy: tio::proxy::Interface,
+        route: DeviceRoute,
+    ) -> Result<DeviceTree, proxy::PortError> {
+        let probe = proxy.subtree_probe(route)?;
+        Ok(DeviceTree {
+            proxy,
+            probe,
+            devices: vec![],
+            route_map: std::collections::HashMap::new(),
+        })
+    }
+
+    fn get_or_create(&mut self, route: &DeviceRoute) -> Result<(), proxy::PortError> {
+        if self.route_map.contains_key(route) {
+            //Ok(self.devices[*self.route_map.get(route).unwrap()].clone())
+        } else {
+            self.devices.push(Device::open(&self.proxy, route.clone())?);
+            self.route_map.insert(route.clone(), self.devices.len() - 1);
+            //Ok(self.devices.last().unwrap().clone())
+        }
+        Ok(())
+    }
+
+    pub fn drain_next(&mut self, wait: bool) -> Result<Vec<(Sample, DeviceRoute)>, ()> {
+        loop {
+            let mut sel = crossbeam::channel::Select::new();
+            self.probe.select_recv(&mut sel);
+            for dev in self.devices.iter() {
+                dev.select_recv(&mut sel);
+            }
+            let index = if wait {
+                sel.ready()
+            } else {
+                if let Ok(index) = sel.try_ready() {
+                    index
+                } else {
+                    break;
+                }
+            };
+
+            if index == 0 {
+                if let Ok(pkt) = self.probe.try_recv() {
+                    self.get_or_create(&pkt.routing).map_err(|_| {})?;
+                }
+            } else {
+                let dev = &mut self.devices[index - 1];
+                let samples = dev.drain().map_err(|_| {})?;
+                return Ok(samples
+                    .iter()
+                    .map(|sample| (sample.clone(), dev.route()))
+                    .collect());
+            }
+            if wait {
+                break;
+            }
+        }
+        return Ok(vec![]);
+    }
+
+    pub fn drain(&mut self, wait: bool) -> Result<Vec<(Sample, DeviceRoute)>, ()> {
+        let mut ret = vec![];
+        loop {
+            let mut chunk = if ret.is_empty() && wait {
+                self.drain_next(true)?
+            } else {
+                if let Ok(samples) = self.drain_next(false) {
+                    samples
+                } else {
+                    break;
+                }
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            ret.append(&mut chunk);
+        }
+        Ok(ret)
     }
 }

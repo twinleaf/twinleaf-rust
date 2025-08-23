@@ -59,6 +59,7 @@ pub struct Port {
     tx: channel::Sender<Packet>,
     rx: channel::Receiver<Packet>,
     depth: usize,
+    scope: DeviceRoute,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +84,11 @@ pub enum RpcError {
 }
 
 impl Port {
+    /// Get the scope for this port
+    pub fn scope(&self) -> DeviceRoute {
+        self.scope.clone()
+    }
+
     /// Sends a TIO packet to this port synchronously. This call will
     /// block if the port is backed up.
     pub fn send(&self, packet: Packet) -> Result<(), SendError> {
@@ -315,7 +321,7 @@ impl Interface {
             proxy_to_client_sender,
             proxy_from_client_receiver,
             rpc_timeout,
-            scope,
+            scope.clone(),
             depth,
             forward_data,
             forward_nonrpc,
@@ -331,6 +337,7 @@ impl Interface {
             tx: client_to_proxy_sender,
             rx: client_from_proxy_receiver,
             depth: depth,
+            scope: scope,
         })
     }
 
@@ -344,14 +351,19 @@ impl Interface {
         self.new_port(None, subtree_root, usize::MAX, false, false)
     }
 
-    /// New port with default parameters for the full device tree, receiving all packets.
-    pub fn tree_full(&self) -> Result<Port, PortError> {
-        self.subtree_full(DeviceRoute::root())
+    /// New port with default parameters for a subtree, useful to probe connected devices.
+    pub fn subtree_probe(&self, subtree_root: DeviceRoute) -> Result<Port, PortError> {
+        self.new_port(None, subtree_root, usize::MAX, false, true)
     }
 
     /// New port for the full device tree, useful to probe connected devices.
     pub fn tree_probe(&self) -> Result<Port, PortError> {
-        self.new_port(None, DeviceRoute::root(), usize::MAX, false, true)
+        self.subtree_probe(DeviceRoute::root())
+    }
+
+    /// New port with default parameters for the full device tree, receiving all packets.
+    pub fn tree_full(&self) -> Result<Port, PortError> {
+        self.subtree_full(DeviceRoute::root())
     }
 
     /// New port with default parameters for the full device tree, receiving only RPCs.
