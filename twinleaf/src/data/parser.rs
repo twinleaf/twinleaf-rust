@@ -212,11 +212,7 @@ impl DeviceStream {
             // Here, generate proactively a new segment if this looks like
             // a sample number rollover
             let next_sample = self.last_sample_number + 1;
-            let next_segment = if usize::from(segment.segment_id) == stream.n_segments {
-                0
-            } else {
-                segment.segment_id + 1
-            };
+            let next_segment = (segment.segment_id + 1).rem_euclid(stream.n_segments as u8);
             let rate = segment.sampling_rate / segment.decimation;
             if (data.first_sample_n == 0)
                 && ((next_sample % rate) == 0)
@@ -251,6 +247,7 @@ impl DeviceStream {
             self.segment_changed = false;
             self.meta_changed = false;
             offset += stream.sample_size;
+            self.last_sample_number = sample_n;
             sample_n += 1;
         }
 

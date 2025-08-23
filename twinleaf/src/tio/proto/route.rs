@@ -46,7 +46,7 @@ impl DeviceRoute {
         self.route.len()
     }
 
-    pub fn iter(&self) -> std::slice::Iter<u8> {
+    pub fn iter(&self) -> std::slice::Iter<'_, u8> {
         self.route.iter()
     }
 
