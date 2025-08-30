@@ -23,7 +23,13 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     println!("Connection from: {}", peer_addr);
 
     loop {
-        let sample = device.next();
+        let sample = match device.next() {
+            Ok(sample) => sample,
+            Err(_) => {
+                eprintln!("Failed to parse sample");
+                break;
+            }
+        };
         
         // Only process samples from stream ID 1
         if sample.stream.stream_id != 1 {
