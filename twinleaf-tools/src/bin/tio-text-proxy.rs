@@ -10,7 +10,7 @@ fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String])
         sentence.push(',');
         sentence.push_str(field);
     }
-    
+
     // Calculate checksum
     let checksum = sentence[1..].bytes().fold(0u8, |acc, b| acc ^ b);
     format!("{}*{:02X}\r\n", sentence, checksum)
@@ -30,19 +30,19 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
                 break;
             }
         };
-        
+
         // Only process samples from stream ID 1
         if sample.stream.stream_id != 1 {
             continue;
         }
-        
+
         // Convert timestamp to NMEA format (HHMMSS.SS)
         let timestamp = sample.timestamp_end();
         let hours = (timestamp / 3600.0) as u32;
         let minutes = ((timestamp % 3600.0) / 60.0) as u32;
         let seconds = timestamp % 60.0;
         let time_str = format!("{:02}{:02}{:05.2}", hours, minutes, seconds);
-        
+
         // Format data fields
         let mut fields = vec![time_str];
         for col in &sample.columns {
@@ -54,10 +54,10 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
             };
             fields.push(value);
         }
-        
+
         // Create NMEA sentence
         let nmea = format_nmea_sentence("TL", "MAG", &fields);
-        
+
         if let Err(_) = write!(stream, "{}", nmea) {
             break;
         }

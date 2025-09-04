@@ -97,18 +97,12 @@ fn list_rpcs(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn get_rpctype(
-    name: &String,
-    device: &proxy::Port,
-    //    tx: &crossbeam::channel::Sender<proto::Packet>,
-    //    rx: &crossbeam::channel::Receiver<proto::Packet>,
-) -> String {
-    //tx.send(util::Rpc::make_request("rpc.info", name.as_bytes()))
-    //    .unwrap();
-    //RpcMeta::parse(u16::from_le_bytes(
-    //    rpc_get_reply(&rx, 2).unwrap()[0..2].try_into().unwrap(),
-    //))
-    RpcMeta::parse(device.rpc("rpc.info", name).unwrap()).arg_type
+fn get_rpctype(name: &String, device: &proxy::Port) -> String {
+    if let Ok(reply) = device.rpc("rpc.info", name) {
+        RpcMeta::parse(reply).arg_type
+    } else {
+        "".to_string()
+    }
 }
 
 fn rpc(args: &[String]) -> Result<(), ()> {
@@ -152,7 +146,12 @@ fn rpc(args: &[String]) -> Result<(), ()> {
     } else {
         if rpc_arg.is_some() {
             let t = get_rpctype(&rpc_name, &device);
-            Some(if t == "" { "string".to_string() } else { t })
+            Some(if t == "" {
+                println!("Unknown RPC arg type, assuming 'string'. Use -t/--req-type to override.");
+                "string".to_string()
+            } else {
+                t
+            })
         } else {
             None
         }
@@ -205,7 +204,14 @@ fn rpc(args: &[String]) -> Result<(), ()> {
         } else {
             if let None = req_type {
                 let t = get_rpctype(&rpc_name, &device);
-                Some(if t == "" { "string".to_string() } else { t })
+                Some(if t == "" {
+                    println!(
+                        "Unknown RPC ret type, assuming 'string'. Use -T/--ret-type to override."
+                    );
+                    "string".to_string()
+                } else {
+                    t
+                })
             } else {
                 req_type
             }
