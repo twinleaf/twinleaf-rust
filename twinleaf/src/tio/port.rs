@@ -514,7 +514,7 @@ impl Port {
         if url.starts_with("/dev/") {
             return Port::from_raw(serial::Port::new(url)?, rx);
         }
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         if url.starts_with("COM") {
             return Port::from_raw(serial::Port::new(url)?, rx);
         }

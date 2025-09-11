@@ -13,10 +13,17 @@ crossbeam = "0.8"
 mio-serial = "5.0"
 crc = "3.2"
 num_enum = "0.7"
+objc2-foundation = "0.3.1"
+objc2 = "0.6.2"
 
 [dependencies.mio]
 version = "1.0"
 features = ["os-poll", "net"]
 
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["commapi", "handleapi", "winbase"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Devices_Communication",
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }

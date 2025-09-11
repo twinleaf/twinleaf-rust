@@ -79,13 +79,13 @@ impl Port {
             DEFAULT_RATE
         };
         let mio_port = mio_serial::new(port_name, default_rate).open_native_async()?;
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             // Windows requires some custom settings to replicate the unix behavior.
             use std::os::windows::io::AsRawHandle;
-            use winapi::um::commapi::SetCommTimeouts;
-            use winapi::um::winbase::COMMTIMEOUTS;
-            let handle = mio_port.as_raw_handle();
+            use windows_sys::Win32::Devices::Communication::{SetCommTimeouts, COMMTIMEOUTS};
+            use windows_sys::Win32::Foundation::HANDLE;
+            let handle: HANDLE = mio_port.as_raw_handle() as HANDLE;
             let mut timeouts = COMMTIMEOUTS {
                 ReadIntervalTimeout: 0xFFFFFFFF,
                 ReadTotalTimeoutMultiplier: 0xFFFFFFFF,
