@@ -233,6 +233,16 @@ impl Interface {
         };
         let url_string = url.to_string();
         thread::spawn(move || {
+            #[cfg(target_os = "windows")]
+            let _priority = super::os::windows_helpers::ActivityGuard::latency_critical()
+                .map_err(|e| eprintln!("proxy core: failed to raise thread priority: {e}"))
+                .ok();
+
+            #[cfg(target_os = "macos")]
+            let _activity = super::os::macos_helpers::ActivityGuard::latency_critical(
+                "Twinleaf proxy core"
+            );
+            
             let mut proxy = ProxyCore::new(
                 url_string,
                 reconnect_timeout,

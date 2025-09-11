@@ -455,6 +455,15 @@ impl Port {
         let poll = mio::Poll::new()?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(0))?;
         thread::spawn(move || {
+            #[cfg(target_os = "windows")]
+            let _priority = super::os::windows_helpers::ActivityGuard::latency_critical()
+                .map_err(|e| eprintln!("port poller: failed to raise thread priority: {e}"))
+                .ok();
+
+            #[cfg(target_os = "macos")]
+            let _activity = super::os::macos_helpers::ActivityGuard::latency_critical(
+                "Twinleaf I/O poller"
+            );
             // REVISIT
             // If anything panics in this thread and it causes unwinding, this
             // closure terminates and the channels are closed.
