@@ -272,7 +272,7 @@ impl PktStats {
 }
 
 #[derive(Clone)]
-struct ErrEntry { at: Instant, msg: String }
+struct ErrEntry { at: std::time::SystemTime, msg: String }
 const ERR_CAP: usize = 200;
 
 fn push_err(
@@ -282,10 +282,29 @@ fn push_err(
     count_key: Option<String>,
 ) {
     if err_log.len() >= ERR_CAP { err_log.pop_front(); }
-    err_log.push_back(ErrEntry { at: std::time::Instant::now(), msg });
+    err_log.push_back(ErrEntry { at: std::time::SystemTime::now(), msg });
     if let Some(k) = count_key {
         *err_counts.entry(k).or_insert(0) += 1;
     }
+}
+
+fn fmt_local_pretty(t: std::time::SystemTime) -> String {
+    use time::{OffsetDateTime, UtcOffset};
+    use time::macros::format_description;
+
+    // Convert to OffsetDateTime (UTC), then shift to local offset.
+    let odt_utc = OffsetDateTime::from(t);
+    let local_off = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let odt_local = odt_utc.to_offset(local_off);
+
+    // Example: "Fri Sep 19 14:31:12.345 -0400 2025"
+    // (close to `date` default; includes milliseconds)
+    let fmt = format_description!(
+        "[weekday repr:short] [month repr:short] [day padding:space] \
+         [hour]:[minute]:[second].[subsecond digits:3] \
+         [year]"
+    );
+    odt_local.format(&fmt).unwrap_or_else(|_| "<bad time>".to_string())
 }
 
 // ---------------- TUI ----------------
@@ -339,7 +358,7 @@ impl Tui {
         quiet: bool,
         show_columns: bool,
         mode: Mode,
-        err_recent: &[(f64, String)],
+        err_recent: &[(String, String)],
         err_top: &[(u64, String)], 
     ) -> io::Result<()> {
         self.stdout.queue(cursor::MoveTo(0,0))?;
@@ -477,8 +496,8 @@ impl Tui {
                 self.stdout.queue(style::Print("recent"))?;
                 self.stdout.queue(SetAttribute(Attribute::Reset))?;
                 self.stdout.queue(cursor::MoveToNextLine(1))?;
-                for (age_s, msg) in err_recent.iter().take(10) {
-                    self.stdout.queue(style::Print(format!("-{:>6.1}s  {}", age_s, msg)))?;
+                for (ts, msg) in err_recent.iter().take(10) {
+                    self.stdout.queue(style::Print(format!("[{}]  {}", ts, msg)))?;
                     self.stdout.queue(cursor::MoveToNextLine(1))?;
                 }
             }
@@ -678,13 +697,13 @@ fn main() {
             }
 
             let header = format!(
-                "tio-health  mode={:?}  rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  spike={}ms  rate_warn={}%%  fps={}  stale={}ms",
+                "tio-health  mode={:?}  rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  spike={}ms  rate_warn={}%  fps={}  stale={}ms",
                 cli.mode, cli.rate_window_s, cli.jitter_window_s, cli.ppm_warn, cli.ppm_err, cli.spike_ms, cli.rate_warn_pct, cli.fps, cli.stale_ms
             );
-            let err_recent: Vec<(f64, String)> = err_log.iter()
+            let err_recent: Vec<(String, String)> = err_log.iter()
                 .rev()
                 .take(12)
-                .map(|e| (now.duration_since(e.at).as_secs_f64(), e.msg.clone()))
+                .map(|e| (fmt_local_pretty(e.at), e.msg.clone()))
                 .collect();
 
             let mut err_top: Vec<(u64, String)> = err_counts.iter()
