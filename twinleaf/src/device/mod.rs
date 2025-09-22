@@ -3,7 +3,7 @@ use super::tio;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
 
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 
 pub struct Device {
     dev_port: proxy::Port,
@@ -301,6 +301,32 @@ impl DeviceTree {
             }
         }
         return Ok(vec![]);
+    }
+    
+    pub fn discover_for(&mut self, timeout: std::time::Duration) -> Result<(), String> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let _ = self.drain(false).map_err(|e| format!("{e:?}"))?;
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    pub fn get_all_metadata(
+        &mut self,
+    ) -> Result<HashMap<DeviceRoute, DeviceFullMetadata>, proxy::RpcError> {
+        if self.devices.is_empty() {
+            eprintln!("device tree: get_all_metadata called with no devices discovered");
+        }
+
+        let mut out = HashMap::new();
+
+        for dev in &mut self.devices {
+            let meta = dev.get_metadata()?; 
+            out.insert(dev.route(), meta);
+        }
+
+        Ok(out)
     }
 
     pub fn drain(&mut self, wait: bool) -> Result<Vec<(Sample, DeviceRoute)>, ()> {
