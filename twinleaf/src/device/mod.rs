@@ -247,7 +247,7 @@ impl DeviceTree {
         proxy: tio::proxy::Interface,
         route: DeviceRoute,
     ) -> Result<DeviceTree, proxy::PortError> {
-        let probe = proxy.subtree_probe(route)?;
+        let probe = proxy.subtree_full(route)?;
         Ok(DeviceTree {
             proxy,
             probe,
@@ -256,15 +256,15 @@ impl DeviceTree {
         })
     }
 
-    fn get_or_create(&mut self, route: &DeviceRoute) -> Result<(), proxy::PortError> {
-        if self.route_map.contains_key(route) {
-            //Ok(self.devices[*self.route_map.get(route).unwrap()].clone())
-        } else {
-            self.devices.push(Device::open(&self.proxy, route.clone())?);
-            self.route_map.insert(route.clone(), self.devices.len() - 1);
-            //Ok(self.devices.last().unwrap().clone())
+    fn get_or_create(&mut self, route: &DeviceRoute) -> Result<&mut Device, proxy::PortError> {
+        if let Some(&idx) = self.route_map.get(route) {
+            return Ok(&mut self.devices[idx]);
         }
-        Ok(())
+        let dev = Device::open(&self.proxy, route.clone())?;
+        self.devices.push(dev);
+        let idx = self.devices.len() - 1;
+        self.route_map.insert(route.clone(), idx);
+        Ok(&mut self.devices[idx])
     }
 
     pub fn drain_next(&mut self, wait: bool) -> Result<Vec<(Sample, DeviceRoute)>, ()> {
