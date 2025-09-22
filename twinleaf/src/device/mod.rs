@@ -1,9 +1,10 @@
 use super::data::{DeviceDataParser, DeviceFullMetadata, Sample};
 use super::tio;
+use crossbeam::channel::Select;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
 
-use std::collections::{VecDeque, HashMap};
+use std::collections::{HashMap, VecDeque};
 
 pub struct Device {
     dev_port: proxy::Port,
@@ -22,10 +23,7 @@ impl Device {
         }
     }
 
-    pub fn open(
-        proxy: &proxy::Interface,
-        route: DeviceRoute,
-    ) -> Result<Device, proxy::PortError> {
+    pub fn open(proxy: &proxy::Interface, route: DeviceRoute) -> Result<Device, proxy::PortError> {
         let port = proxy.device_full(route)?;
         Ok(Self::new(port))
     }
@@ -84,10 +82,7 @@ impl Device {
                     }
                 }
             }
-            let pkt = self
-                .dev_port
-                .recv()
-                .map_err(proxy::RpcError::RecvFailed)?;
+            let pkt = self.dev_port.recv().map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
         }
     }
@@ -98,13 +93,9 @@ impl Device {
                 return Ok(self.sample_queue.pop_front().unwrap());
             }
 
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
 
-            let pkt = self
-                .dev_port
-                .recv()
-                .map_err(proxy::RpcError::RecvFailed)?;
+            let pkt = self.dev_port.recv().map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
         }
     }
@@ -115,8 +106,7 @@ impl Device {
                 return Ok(self.sample_queue.pop_front());
             }
 
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
 
             let pkt = match self.dev_port.try_recv() {
                 Ok(pkt) => pkt,
@@ -129,8 +119,7 @@ impl Device {
 
     pub fn drain(&mut self) -> Result<Vec<Sample>, proxy::RpcError> {
         loop {
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
                 Ok(pkt) => {
                     self.process_packet(pkt);
@@ -161,8 +150,7 @@ impl Device {
             return Err(proxy::RpcError::SendFailed(err));
         }
         loop {
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             let pkt = match self.dev_port.recv() {
                 Ok(packet) => packet,
                 Err(e) => return Err(proxy::RpcError::RecvFailed(e)),
@@ -171,9 +159,7 @@ impl Device {
             if let Some(pkt) = self.process_packet(pkt) {
                 match pkt.payload {
                     proto::Payload::RpcReply(rep) => return Ok(rep.reply),
-                    proto::Payload::RpcError(err) => {
-                        return Err(proxy::RpcError::ExecError(err))
-                    }
+                    proto::Payload::RpcError(err) => return Err(proxy::RpcError::ExecError(err)),
                     _ => unreachable!("process_packet returned a non-RPC packet to raw_rpc"),
                 }
             }
@@ -198,10 +184,7 @@ impl Device {
         self.rpc(name, ())
     }
 
-    pub fn get<T: util::TioRpcReplyable<T>>(
-        &mut self,
-        name: &str,
-    ) -> Result<T, proxy::RpcError> {
+    pub fn get<T: util::TioRpcReplyable<T>>(&mut self, name: &str) -> Result<T, proxy::RpcError> {
         self.rpc(name, ())
     }
 
@@ -256,58 +239,42 @@ impl DeviceTree {
         })
     }
 
-    fn get_or_create(&mut self, route: &DeviceRoute) -> Result<&mut Device, proxy::PortError> {
+    fn get_or_create(
+        &mut self,
+        route: &DeviceRoute,
+    ) -> Result<Option<&mut Device>, proxy::RecvError> {
         if let Some(&idx) = self.route_map.get(route) {
-            return Ok(&mut self.devices[idx]);
+            return Ok(Some(&mut self.devices[idx]));
         }
-        let dev = Device::open(&self.proxy, route.clone())?;
-        self.devices.push(dev);
-        let idx = self.devices.len() - 1;
-        self.route_map.insert(route.clone(), idx);
-        Ok(&mut self.devices[idx])
-    }
-
-    pub fn drain_next(&mut self, wait: bool) -> Result<Vec<(Sample, DeviceRoute)>, ()> {
-        loop {
-            let mut sel = crossbeam::channel::Select::new();
-            self.probe.select_recv(&mut sel);
-            for dev in self.devices.iter() {
-                dev.select_recv(&mut sel);
+        match Device::open(&self.proxy, route.clone()) {
+            Ok(dev) => {
+                let idx = self.devices.len();
+                self.route_map.insert(route.clone(), idx);
+                self.devices.push(dev);
+                Ok(self.devices.last_mut())
             }
-            let index = if wait {
-                sel.ready()
-            } else {
-                if let Ok(index) = sel.try_ready() {
-                    index
-                } else {
-                    break;
-                }
-            };
-
-            if index == 0 {
-                if let Ok(pkt) = self.probe.try_recv() {
-                    self.get_or_create(&pkt.routing).map_err(|_| {})?;
-                }
-            } else {
-                let dev = &mut self.devices[index - 1];
-                let samples = dev.drain().map_err(|_| {})?;
-                return Ok(samples
-                    .iter()
-                    .map(|sample| (sample.clone(), dev.route()))
-                    .collect());
+            Err(e @ proxy::PortError::FailedNewClientSetup) => {
+                eprintln!("device open failed for {route:?}: {:?}", e);
+                Ok(None)
             }
-            if wait {
-                break;
+            Err(e @ proxy::PortError::RpcTimeoutTooShort)
+            | Err(e @ proxy::PortError::RpcTimeoutTooLong) => {
+                eprintln!("device open failed for {route:?}: {:?}", e);
+                Ok(None)
             }
         }
-        return Ok(vec![]);
     }
-    
-    pub fn discover_for(&mut self, timeout: std::time::Duration) -> Result<(), String> {
+
+    pub fn discover_for(&mut self, timeout: std::time::Duration) -> Result<(), proxy::RecvError> {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
-            let _ = self.drain(false).map_err(|e| format!("{e:?}"))?;
-            std::thread::yield_now();
+            match self.probe.try_recv() {
+                Ok(pkt) => {
+                    self.get_or_create(&pkt.routing)?;
+                }
+                Err(proxy::RecvError::WouldBlock) => std::thread::yield_now(),
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -321,31 +288,101 @@ impl DeviceTree {
 
         let mut out = HashMap::new();
 
-        for dev in &mut self.devices {
-            let meta = dev.get_metadata()?; 
+        for dev in self.devices.iter_mut() {
+            let meta = dev.get_metadata()?;
             out.insert(dev.route(), meta);
         }
 
         Ok(out)
     }
 
-    pub fn drain(&mut self, wait: bool) -> Result<Vec<(Sample, DeviceRoute)>, ()> {
-        let mut ret = vec![];
+    pub fn next(&mut self) -> Result<(Sample, DeviceRoute), proxy::RpcError> {
         loop {
-            let mut chunk = if ret.is_empty() && wait {
-                self.drain_next(true)?
-            } else {
-                if let Ok(samples) = self.drain_next(false) {
-                    samples
-                } else {
-                    break;
-                }
-            };
-            if chunk.is_empty() {
-                break;
+            let mut sel = Select::new();
+            self.probe.select_recv(&mut sel);
+            for dev in &self.devices {
+                dev.select_recv(&mut sel);
             }
-            ret.append(&mut chunk);
+
+            let idx = sel.ready();
+
+            if idx == 0 {
+                // discover, then continue waiting for a sample.
+                let pkt = self.probe.recv().map_err(proxy::RpcError::RecvFailed)?;
+                self.get_or_create(&pkt.routing)
+                    .map_err(proxy::RpcError::RecvFailed)?;
+                continue;
+            } else {
+                // Device fired: return one sample from that device.
+                let dev = &mut self.devices[idx - 1];
+                if let Ok(s) = dev.next() {
+                    return Ok((s, dev.route()));
+                }
+            }
         }
-        Ok(ret)
+    }
+
+    pub fn try_next(&mut self) -> Result<Option<(Sample, DeviceRoute)>, proxy::RpcError> {
+        loop {
+            match self.probe.try_recv() {
+                Ok(pkt) => {
+                    self.get_or_create(&pkt.routing)
+                        .map_err(proxy::RpcError::RecvFailed)?;
+                    continue;
+                }
+                Err(proxy::RecvError::WouldBlock) => break,
+                Err(e) => return Err(proxy::RpcError::RecvFailed(e)),
+            }
+        }
+
+        if self.devices.is_empty() {
+            return Ok(None);
+        }
+
+        let mut sel = crossbeam::channel::Select::new();
+        for dev in &self.devices {
+            dev.select_recv(&mut sel);
+        }
+
+        let idx = match sel.try_ready() {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+
+        let dev = &mut self.devices[idx];
+        match dev.try_next()? {
+            Some(s) => Ok(Some((s, dev.route()))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn drain(&mut self) -> Result<Vec<(Sample, DeviceRoute)>, proxy::RpcError> {
+        let mut out = Vec::new();
+        loop {
+            let mut sel = Select::new();
+            self.probe.select_recv(&mut sel);
+            for dev in &self.devices {
+                dev.select_recv(&mut sel);
+            }
+
+            let idx = match sel.try_ready() {
+                Ok(i) => i,
+                Err(_) => break,
+            };
+
+            if idx == 0 {
+                while let Ok(pkt) = self.probe.try_recv() {
+                    self.get_or_create(&pkt.routing)
+                        .map_err(proxy::RpcError::RecvFailed)?;
+                }
+            } else {
+                let dev = &mut self.devices[idx - 1];
+                let route = dev.route();
+                for s in dev.drain()? {
+                    out.push((s, route.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 }
