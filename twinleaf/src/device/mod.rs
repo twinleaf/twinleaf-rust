@@ -23,7 +23,7 @@ impl Device {
     }
 
     pub fn open(
-        proxy: &tio::proxy::Interface,
+        proxy: &proxy::Interface,
         route: DeviceRoute,
     ) -> Result<Device, proxy::PortError> {
         let port = proxy.device_full(route)?;
@@ -47,14 +47,14 @@ impl Device {
 
     fn process_packet(&mut self, pkt: tio::Packet) -> Option<tio::Packet> {
         match &pkt.payload {
-            tio::proto::Payload::RpcReply(rep) => {
+            proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     self.n_reqs -= 1
                 } else {
                     return Some(pkt);
                 }
             }
-            tio::proto::Payload::RpcError(err) => {
+            proto::Payload::RpcError(err) => {
                 if err.id == 7855 {
                     self.n_reqs -= 1
                 } else {
@@ -69,7 +69,7 @@ impl Device {
         None
     }
 
-    pub fn get_metadata(&mut self) -> Result<DeviceFullMetadata, tio::proxy::RpcError> {
+    pub fn get_metadata(&mut self) -> Result<DeviceFullMetadata, proxy::RpcError> {
         loop {
             if self.n_reqs == 0 {
                 match self.parser.get_metadata() {
@@ -78,7 +78,7 @@ impl Device {
                         for req in reqs {
                             self.dev_port
                                 .send(req)
-                                .map_err(tio::proxy::RpcError::SendFailed)?;
+                                .map_err(proxy::RpcError::SendFailed)?;
                             self.n_reqs += 1;
                         }
                     }
@@ -87,50 +87,50 @@ impl Device {
             let pkt = self
                 .dev_port
                 .recv()
-                .map_err(tio::proxy::RpcError::RecvFailed)?;
+                .map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
         }
     }
 
-    pub fn next(&mut self) -> Result<Sample, tio::proxy::RpcError> {
+    pub fn next(&mut self) -> Result<Sample, proxy::RpcError> {
         loop {
             if !self.sample_queue.is_empty() {
                 return Ok(self.sample_queue.pop_front().unwrap());
             }
 
             self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
+                .map_err(proxy::RpcError::SendFailed)?;
 
             let pkt = self
                 .dev_port
                 .recv()
-                .map_err(tio::proxy::RpcError::RecvFailed)?;
+                .map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
         }
     }
 
-    pub fn try_next(&mut self) -> Result<Option<Sample>, tio::proxy::RpcError> {
+    pub fn try_next(&mut self) -> Result<Option<Sample>, proxy::RpcError> {
         loop {
             if !self.sample_queue.is_empty() {
                 return Ok(self.sample_queue.pop_front());
             }
 
             self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
+                .map_err(proxy::RpcError::SendFailed)?;
 
             let pkt = match self.dev_port.try_recv() {
                 Ok(pkt) => pkt,
                 Err(proxy::RecvError::WouldBlock) => return Ok(None),
-                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
+                Err(e) => return Err(proxy::RpcError::RecvFailed(e)),
             };
             self.process_packet(pkt);
         }
     }
 
-    pub fn drain(&mut self) -> Result<Vec<Sample>, tio::proxy::RpcError> {
+    pub fn drain(&mut self) -> Result<Vec<Sample>, proxy::RpcError> {
         loop {
             self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
+                .map_err(proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
                 Ok(pkt) => {
                     self.process_packet(pkt);
@@ -139,7 +139,7 @@ impl Device {
                     break;
                 }
                 Err(e) => {
-                    return Err(tio::proxy::RpcError::RecvFailed(e));
+                    return Err(proxy::RpcError::RecvFailed(e));
                 }
             }
         }
@@ -151,28 +151,28 @@ impl Device {
         self.dev_port.select_recv(sel)
     }
 
-    pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, tio::proxy::RpcError> {
+    pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
         if let Err(err) = self.dev_port.send(util::PacketBuilder::make_rpc_request(
             name,
             arg,
             0,
             DeviceRoute::root(),
         )) {
-            return Err(tio::proxy::RpcError::SendFailed(err));
+            return Err(proxy::RpcError::SendFailed(err));
         }
         loop {
             self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
+                .map_err(proxy::RpcError::SendFailed)?;
             let pkt = match self.dev_port.recv() {
                 Ok(packet) => packet,
-                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
+                Err(e) => return Err(proxy::RpcError::RecvFailed(e)),
             };
 
             if let Some(pkt) = self.process_packet(pkt) {
                 match pkt.payload {
-                    tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
-                    tio::proto::Payload::RpcError(err) => {
-                        return Err(tio::proxy::RpcError::ExecError(err))
+                    proto::Payload::RpcReply(rep) => return Ok(rep.reply),
+                    proto::Payload::RpcError(err) => {
+                        return Err(proxy::RpcError::ExecError(err))
                     }
                     _ => unreachable!("process_packet returned a non-RPC packet to raw_rpc"),
                 }
@@ -180,32 +180,32 @@ impl Device {
         }
     }
 
-    pub fn rpc<ReqT: tio::util::TioRpcRequestable<ReqT>, RepT: tio::util::TioRpcReplyable<RepT>>(
+    pub fn rpc<ReqT: util::TioRpcRequestable<ReqT>, RepT: util::TioRpcReplyable<RepT>>(
         &mut self,
         name: &str,
         arg: ReqT,
-    ) -> Result<RepT, tio::proxy::RpcError> {
+    ) -> Result<RepT, proxy::RpcError> {
         let ret = self.raw_rpc(name, &arg.to_request())?;
         if let Ok(val) = RepT::from_reply(&ret) {
             Ok(val)
         } else {
-            Err(tio::proxy::RpcError::TypeError)
+            Err(proxy::RpcError::TypeError)
         }
     }
 
     /// Action: rpc with no argument which returns nothing
-    pub fn action(&mut self, name: &str) -> Result<(), tio::proxy::RpcError> {
+    pub fn action(&mut self, name: &str) -> Result<(), proxy::RpcError> {
         self.rpc(name, ())
     }
 
-    pub fn get<T: tio::util::TioRpcReplyable<T>>(
+    pub fn get<T: util::TioRpcReplyable<T>>(
         &mut self,
         name: &str,
-    ) -> Result<T, tio::proxy::RpcError> {
+    ) -> Result<T, proxy::RpcError> {
         self.rpc(name, ())
     }
 
-    pub fn get_multi(&mut self, name: &str) -> Result<Vec<u8>, tio::proxy::RpcError> {
+    pub fn get_multi(&mut self, name: &str) -> Result<Vec<u8>, proxy::RpcError> {
         let mut full_reply = vec![];
 
         for i in 0u16..=65535u16 {
@@ -213,7 +213,7 @@ impl Device {
                 Ok(mut rep) => full_reply.append(&mut rep),
                 Err(err @ proxy::RpcError::ExecError(_)) => {
                     if let proxy::RpcError::ExecError(payload) = &err {
-                        if let tio::proto::RpcErrorCode::InvalidArgs = payload.error {
+                        if let proto::RpcErrorCode::InvalidArgs = payload.error {
                             break;
                         }
                     }
@@ -228,7 +228,7 @@ impl Device {
         Ok(full_reply)
     }
 
-    pub fn get_multi_str(&mut self, name: &str) -> Result<String, tio::proxy::RpcError> {
+    pub fn get_multi_str(&mut self, name: &str) -> Result<String, proxy::RpcError> {
         let reply_bytes = self.get_multi(name)?;
         let result_string = String::from_utf8_lossy(&reply_bytes).to_string();
         Ok(result_string)
@@ -244,7 +244,7 @@ pub struct DeviceTree {
 
 impl DeviceTree {
     pub fn open(
-        proxy: tio::proxy::Interface,
+        proxy: proxy::Interface,
         route: DeviceRoute,
     ) -> Result<DeviceTree, proxy::PortError> {
         let probe = proxy.subtree_full(route)?;
