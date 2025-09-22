@@ -400,9 +400,21 @@ fn all_data_dump(args: &[String]) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&root);
 
     let mut devs = twinleaf::device::DeviceTree::open(proxy, route).map_err(|_| {})?;
-    while let Ok(samples) = devs.drain(true) {
-        for (sample, route) in samples {
-            print_sample(&sample, Some(&route));
+
+    loop {
+        let (first, r0) = match devs.next() {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        print_sample(&first, Some(&r0));
+
+        match devs.drain() {
+            Ok(batch) => {
+                for (s, r) in batch {
+                    print_sample(&s, Some(&r));
+                }
+            }
+            Err(_) => break,
         }
     }
     Ok(())
@@ -480,81 +492,113 @@ fn log_data(args: &[String]) -> Result<(), ()> {
     );
     opts.optflag("u", "", "unbuffered output");
     let (matches, root, route) = tio_parseopts(&opts, args);
-    if matches.free.len() != 0 {
+    if !matches.free.is_empty() {
         print!("{}", opts.usage("Unexpected argument"));
         return Err(());
     }
 
-    let output_path = if let Some(path) = matches.opt_str("f") {
-        path
-    } else {
-        output_path.to_string()
-    };
+    let output_path = matches
+        .opt_str("f")
+        .unwrap_or_else(|| output_path.to_string());
     let sync = matches.opt_present("u");
 
     let proxy = proxy::Interface::new(&root);
-    let mut file = File::create(output_path).unwrap();
+    let mut file = File::create(output_path).map_err(|e| {
+        eprintln!("create failed: {e:?}");
+    })?;
 
     let mut devs = twinleaf::device::DeviceTree::open(proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
 
-    while let Ok(samples) = devs.drain(true) {
-        for (sample, route) in samples {
-            if sample.meta_changed {
-                file.write_all(
-                    &sample
-                        .device
-                        .make_update2(route.clone())
-                        .serialize()
-                        .unwrap(),
-                )
-                .unwrap();
-                file.write_all(
-                    &sample
-                        .stream
-                        .make_update2(route.clone())
-                        .serialize()
-                        .unwrap(),
-                )
-                .unwrap();
-                file.write_all(
-                    &sample
-                        .segment
-                        .make_update2(route.clone())
-                        .serialize()
-                        .unwrap(),
-                )
-                .unwrap();
-                for col in sample.columns {
-                    file.write_all(&col.desc.make_update2(route.clone()).serialize().unwrap())
-                        .unwrap();
-                }
-            } else if sample.segment_changed {
-                file.write_all(
-                    &sample
-                        .segment
-                        .make_update2(route.clone())
-                        .serialize()
-                        .unwrap(),
-                )
-                .unwrap();
-            }
+    fn write_one(
+        file: &mut File,
+        sample: twinleaf::data::Sample,
+        route: &DeviceRoute,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        if sample.meta_changed {
             file.write_all(
-                &tio::Packet {
-                    payload: tio::proto::Payload::StreamData(sample.source),
-                    routing: route.clone(),
-                    ttl: 0,
-                }
-                .serialize()
-                .unwrap(),
-            )
-            .unwrap();
+                &sample
+                    .device
+                    .make_update_with_route(route.clone())
+                    .serialize()
+                    .unwrap(),
+            )?;
+            file.write_all(
+                &sample
+                    .stream
+                    .make_update_with_route(route.clone())
+                    .serialize()
+                    .unwrap(),
+            )?;
+            file.write_all(
+                &sample
+                    .segment
+                    .make_update_with_route(route.clone())
+                    .serialize()
+                    .unwrap(),
+            )?;
+            for col in sample.columns {
+                file.write_all(&col.desc.make_update_with_route(route.clone()).serialize().unwrap())?;
+            }
+        } else if sample.segment_changed {
+            file.write_all(
+                &sample
+                    .segment
+                    .make_update_with_route(route.clone())
+                    .serialize()
+                    .unwrap(),
+            )?;
         }
+        file.write_all(
+            &tio::Packet {
+                payload: tio::proto::Payload::StreamData(sample.source),
+                routing: route.clone(),
+                ttl: 0,
+            }
+            .serialize()
+            .unwrap(),
+        )?;
+        Ok(())
+    }
+
+    loop {
+        let (first, r0) = match devs.next() {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("recv error: {e:?}");
+                break;
+            }
+        };
+        if let Err(e) = write_one(&mut file, first, &r0) {
+            eprintln!("write error: {e:?}");
+            break;
+        }
+
+        match devs.drain() {
+            Ok(batch) => {
+                for (s, r) in batch {
+                    if let Err(e) = write_one(&mut file, s, &r) {
+                        eprintln!("write error: {e:?}");
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("drain error: {e:?}");
+                break;
+            }
+        }
+
         if sync {
-            file.flush().unwrap();
+            if let Err(e) = file.flush() {
+                eprintln!("flush error: {e:?}");
+                break;
+            }
         }
     }
+
     Ok(())
 }
 
@@ -859,6 +903,7 @@ fn main() -> ExitCode {
             println!(" tio-tool rpc-dump [-r url] [-s sensor] <rpc-name>");
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
             println!(" tio-tool data-dump [-r url] [-s sensor]");
+            println!(" tio-tool all-data-dump [-r url] [-s sensor]");
             println!(" tio-tool meta-dump [-r url] [-s sensor]");
             println!(" tio-tool capture <rpc-prefix> <data-type>");
             if args[1] == "help" {
