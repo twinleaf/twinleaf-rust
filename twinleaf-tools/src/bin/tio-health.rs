@@ -1,10 +1,11 @@
 // tio-health (live diagnostics)
 // Live-only TUI showing packet continuity and time/rate health, grouped by device route.
 //
-// Deps: crossterm = "0.27", getopts = "0.2", twinleaf, twinleaf-tools, tio
+// Deps: crossterm = "0.27", getopts = "0.2", crossbeam = "0.8", twinleaf, twinleaf-tools, tio
 
 use crossterm::{cursor, event, style, terminal, ExecutableCommand, QueueableCommand};
 use crossterm::style::{Color, SetForegroundColor, ResetColor, SetAttribute, Attribute};
+use crossbeam::channel; // select!, tick, key channel
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 use std::num::Wrapping;
@@ -292,13 +293,10 @@ fn fmt_local_pretty(t: std::time::SystemTime) -> String {
     use time::{OffsetDateTime, UtcOffset};
     use time::macros::format_description;
 
-    // Convert to OffsetDateTime (UTC), then shift to local offset.
     let odt_utc = OffsetDateTime::from(t);
     let local_off = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     let odt_local = odt_utc.to_offset(local_off);
 
-    // Example: "Fri Sep 19 14:31:12.345 -0400 2025"
-    // (close to `date` default; includes milliseconds)
     let fmt = format_description!(
         "[weekday repr:short] [month repr:short] [day padding:space] \
          [hour]:[minute]:[second].[subsecond digits:3] \
@@ -480,7 +478,6 @@ impl Tui {
             self.stdout.queue(style::Print("— none so far —"))?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
         } else {
-            // Top by count
             self.stdout.queue(SetAttribute(Attribute::Bold))?;
             self.stdout.queue(style::Print("top by count"))?;
             self.stdout.queue(SetAttribute(Attribute::Reset))?;
@@ -489,7 +486,6 @@ impl Tui {
                 self.stdout.queue(style::Print(format!("{:>6}  {}", count, kind)))?;
                 self.stdout.queue(cursor::MoveToNextLine(1))?;
             }
-            // Recent
             if !err_recent.is_empty() {
                 self.stdout.queue(cursor::MoveToNextLine(1))?;
                 self.stdout.queue(SetAttribute(Attribute::Bold))?;
@@ -508,6 +504,87 @@ impl Tui {
             self.stdout.queue(style::Print("q/Esc to quit"))?;
         }
         self.stdout.flush()
+    }
+}
+
+// ---------------- Helpers to avoid long-lived borrows ----------------
+
+fn handle_packet(
+    pkt: tio::Packet,
+    streams_filter: &Option<Vec<u8>>,
+    rate_window: Duration,
+    devices: &mut BTreeMap<String, twinleaf::Device>,
+    proxy: &tio::proxy::Interface,
+    pkt_stats: &mut BTreeMap<StreamKey, PktStats>,
+    err_log: &mut VecDeque<ErrEntry>,
+    err_counts: &mut BTreeMap<String, u64>,
+) {
+    let route_str = pkt.routing.to_string();
+    if let tio::proto::Payload::StreamData(sd) = &pkt.payload {
+        let now = Instant::now();
+        let sid = sd.stream_id as u8;
+        if let Some(f) = streams_filter { if !f.contains(&sid) { return; } }
+        let key = StreamKey::new(route_str.clone(), sid);
+
+        if !devices.contains_key(&route_str) {
+            match twinleaf::Device::open(proxy, pkt.routing.clone()) {
+                Ok(dev) => { devices.insert(route_str.clone(), dev); }
+                Err(e) => {
+                    let kind = format!("open device: {:?}", e);
+                    push_err(err_log, err_counts, kind.clone(), Some(kind));
+                }
+            }
+        }
+
+        let ps = pkt_stats.entry(key).or_default();
+        ps.on_streamdata(sd.first_sample_n as u32, sd.segment_id as u32, now, rate_window);
+    }
+}
+
+fn drain_devices_once(
+    devices: &mut BTreeMap<String, twinleaf::Device>,
+    streams_filter: &Option<Vec<u8>>,
+    jitter_window_s: u64,
+    rate_window: Duration,
+    spike_ms: f64,
+    time_stats: &mut BTreeMap<StreamKey, TimeStats>,
+    smp_stats: &mut BTreeMap<StreamKey, SampleStats>,
+    stream_names: &mut BTreeMap<StreamKey, String>,
+    stream_cols: &mut BTreeMap<StreamKey, Vec<(String,String)>>,
+    err_log: &mut VecDeque<ErrEntry>,
+    err_counts: &mut BTreeMap<String, u64>,
+) {
+    // Iterate by key list to avoid borrow/iteration pitfalls
+    let keys: Vec<String> = devices.keys().cloned().collect();
+    for route_str in keys {
+        if let Some(dev) = devices.get_mut(&route_str) {
+            loop {
+                match dev.try_next() {
+                    Ok(Some(sample)) => {
+                        let now = Instant::now();
+                        let sid = sample.stream.stream_id as u8;
+                        if let Some(f) = streams_filter { if !f.contains(&sid) { continue; } }
+                        let key = StreamKey::new(route_str.clone(), sid);
+
+                        let ts = time_stats.entry(key.clone()).or_default();
+                        ts.on_sample(sample.timestamp_end(), now, spike_ms, jitter_window_s);
+
+                        let ss = smp_stats.entry(key.clone()).or_default();
+                        ss.on_sample(now, rate_window);
+
+                        stream_names.entry(key.clone()).or_insert_with(|| sample.stream.name.clone());
+                        let cols = sample.columns.iter().map(|c| (c.desc.name.clone(), c.desc.units.clone())).collect::<Vec<_>>();
+                        if !cols.is_empty() { stream_cols.insert(key, cols); }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let kind = format!("dev[{}] try_next: {:?}", route_str, e);
+                        push_err(err_log, err_counts, kind.clone(), Some(kind));
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -543,181 +620,171 @@ fn main() {
 
     let mut err_log: VecDeque<ErrEntry> = VecDeque::with_capacity(ERR_CAP);
     let mut err_counts: BTreeMap<String, u64> = BTreeMap::new();
-    
+
+    // Tuning
     let rate_window   = Duration::from_secs(cli.rate_window_s.max(1));
     let jitter_window = cli.jitter_window_s;
     let stale_dur     = Duration::from_millis(cli.stale_ms.max(1));
-    let mut next_draw = Instant::now();
 
+    // Redraw cadence
+    let frame = Duration::from_millis((1000 / cli.fps.max(1)) as u64);
+    let tick  = channel::tick(frame);
+
+    // Keyboard: dedicated blocking thread -> channel
+    let (key_tx, key_rx) = channel::unbounded();
+    std::thread::spawn({
+        let key_tx = key_tx.clone();
+        move || {
+            loop {
+                if let Ok(ev) = event::read() {
+                    let _ = key_tx.send(ev);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    });
+
+    // Track port liveness so we don't select on a closed receiver
+    let mut port_alive = true;
+
+    // Main event loop
     'main: loop {
-        // Keyboard
-        if event::poll(Duration::from_millis(0)).unwrap_or(false) {
-            if let Ok(event::Event::Key(k)) = event::read() {
-                use event::{KeyCode, KeyModifiers};
-                if k.code == KeyCode::Char('q') || k.code == KeyCode::Esc || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL) {
+        crossbeam::select! {
+            // Packets
+            recv(port.receiver()) -> msg => {
+                match msg {
+                    Ok(pkt) => {
+                        handle_packet(
+                            pkt, &cli.streams_filter, rate_window,
+                            &mut devices, &proxy, &mut pkt_stats, &mut err_log, &mut err_counts
+                        );
+
+                        {
+                            let mut more = Vec::new();
+                            for p in port.try_iter() { more.push(p); }
+                            for p in more {
+                                handle_packet(
+                                    p, &cli.streams_filter, rate_window,
+                                    &mut devices, &proxy, &mut pkt_stats, &mut err_log, &mut err_counts
+                                );
+                            }
+                        }
+
+                        drain_devices_once(
+                            &mut devices, &cli.streams_filter, jitter_window, rate_window, cli.spike_ms,
+                            &mut time_stats, &mut smp_stats, &mut stream_names, &mut stream_cols,
+                            &mut err_log, &mut err_counts
+                        );
+                    }
+                    Err(_) => {
+                        let kind = "proxy recv: disconnected".to_string();
+                        push_err(&mut err_log, &mut err_counts, kind.clone(), Some(kind));
+                        port_alive = false;
+                    }
+                }
+            }
+
+            // Keyboard
+            recv(key_rx) -> ev => {
+                if let Ok(event::Event::Key(k)) = ev {
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    let quit = k.code == KeyCode::Char('q')
+                            || k.code == KeyCode::Esc
+                            || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
+                    if quit { break 'main; }
+                }
+            }
+
+            recv(tick) -> _ => {
+                if !port_alive {
+                    match proxy.subtree_full(route.clone()) {
+                        Ok(p) => {
+                            port = p;
+                            devices.clear();
+                            port_alive = true;
+                            push_err(&mut err_log, &mut err_counts, "recovered: reopened subtree port".to_string(), None);
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let now = Instant::now();
+
+                let mut keys: BTreeSet<StreamKey> = BTreeSet::new();
+                keys.extend(pkt_stats.keys().cloned());
+
+                let mut pkt_rows = Vec::new();
+                if cli.mode != Mode::Time {
+                    for k in &keys {
+                        if let Some(ps) = pkt_stats.get(k) {
+                            let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
+                            let smps_rate = smp_stats.get(k).map(|s| s.rate_smps).unwrap_or(0.0);
+                            let stale = ps.last_seen.map(|t| now.duration_since(t) > stale_dur).unwrap_or(true);
+                            pkt_rows.push((k.route.clone(), k.stream_id, sname, ps, smps_rate, stale));
+                        }
+                    }
+                    pkt_rows.sort_by(|a,b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                }
+
+                let mut time_rows = Vec::new();
+                if cli.mode != Mode::Pkt {
+                    for k in &keys {
+                        if let Some(ts) = time_stats.get(k) {
+                            let mut status = if ts.ppm.abs() >= cli.ppm_err { "ERROR" }
+                                             else if ts.ppm.abs() >= cli.ppm_warn { "WARN" }
+                                             else { "OK" };
+                            if let Some(ps) = pkt_stats.get(k) {
+                                if ps.last_gap_samples > 0 { status = "GAP"; }
+                            }
+                            if let Some(ss) = smp_stats.get(k) {
+                                if ss.baseline_smps > 0.0 &&
+                                   ss.rate_smps < ss.baseline_smps * (1.0 - 0.01 * cli.rate_warn_pct) {
+                                    status = "RATE↓";
+                                }
+                            }
+                            let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
+                            let stale = pkt_stats.get(k).and_then(|ps| ps.last_seen).map(|t| now.duration_since(t) > stale_dur).unwrap_or(true);
+                            let status = if stale { "STALLED" } else { status };
+                            time_rows.push((k.route.clone(), k.stream_id, sname, ts, status, stale));
+                        }
+                    }
+                    time_rows.sort_by(|a,b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                }
+
+                let mut meta_rows: Vec<(String, u8, String, Vec<(String,String)>)> = Vec::new();
+                if cli.show_columns {
+                    for k in &keys {
+                        if let Some(cols) = stream_cols.get(k) {
+                            let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
+                            meta_rows.push((k.route.clone(), k.stream_id, sname, cols.clone()));
+                        }
+                    }
+                    meta_rows.sort_by(|a,b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                }
+
+                let header = format!(
+                    "tio-health  mode={:?}  rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  spike={}ms  rate_warn={}%  fps={}  stale={}ms",
+                    cli.mode, cli.rate_window_s, cli.jitter_window_s, cli.ppm_warn, cli.ppm_err, cli.spike_ms, cli.rate_warn_pct, cli.fps, cli.stale_ms
+                );
+                let err_recent: Vec<(String, String)> = err_log.iter()
+                    .rev()
+                    .take(12)
+                    .map(|e| (fmt_local_pretty(e.at), e.msg.clone()))
+                    .collect();
+
+                let mut err_top: Vec<(u64, String)> = err_counts.iter()
+                    .map(|(k,v)| (*v, k.clone()))
+                    .collect();
+                err_top.sort_by(|a,b| b.0.cmp(&a.0));
+
+                if let Err(_) = tui.draw(
+                    &header, &pkt_rows, &time_rows, &meta_rows,
+                    cli.quiet, cli.show_columns, cli.mode,
+                    &err_recent, &err_top,
+                ) {
                     break 'main;
                 }
-            }
-        }
-
-        // A) Drain raw packets for packet continuity + pkts/s; discover routes
-        let mut drained = 0u32;
-        loop {
-            match port.try_recv() {
-                Ok(pkt) => {
-                    drained += 1;
-                    let route_str = pkt.routing.to_string();
-                    if let tio::proto::Payload::StreamData(sd) = &pkt.payload {
-                        let now = Instant::now();
-                        let sid = sd.stream_id as u8;
-                        if let Some(f) = &cli.streams_filter { if !f.contains(&sid) { continue; } }
-                        let key = StreamKey::new(route_str.clone(), sid);
-                        // open per-route Device if needed
-                        if !devices.contains_key(&route_str) {
-                            if let Ok(dev) = twinleaf::Device::open(&proxy, pkt.routing.clone()) {
-                                devices.insert(route_str.clone(), dev);
-                            }
-                        }
-                        let ps = pkt_stats.entry(key).or_default();
-                        ps.on_streamdata(sd.first_sample_n as u32, sd.segment_id as u32, now, rate_window);
-                    }
-                }
-                Err(tio::proxy::RecvError::WouldBlock) => break,
-                Err(e) => {
-                    let kind = format!("{:?}", e);
-                    push_err(&mut err_log, &mut err_counts, format!("proxy try_recv: {}", kind), Some(kind.clone()));
-
-                    if let Ok(new_port) = proxy.subtree_full(route.clone()) {
-                        port = new_port;
-                        devices.clear();
-                        push_err(&mut err_log, &mut err_counts, "recovered: reopened subtree port".to_string(), None);
-                    } else {
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                    break;
-                }
-            }
-            if drained > 500 { break; } // keep UI responsive
-        }
-        if drained == 0 { std::thread::sleep(Duration::from_millis(2)); }
-
-        // B) Drain per-route Devices for time+rate+metadata
-        for (route_str, dev) in devices.iter_mut() {
-            loop {
-                match dev.try_next() {
-                    Ok(Some(sample)) => {
-                        let now = Instant::now();
-                        let sid = sample.stream.stream_id as u8;
-                        if let Some(f) = &cli.streams_filter { if !f.contains(&sid) { continue; } }
-                        let key = StreamKey::new(route_str.clone(), sid);
-
-                        // time stats
-                        let ts = time_stats.entry(key.clone()).or_default();
-                        ts.on_sample(sample.timestamp_end(), now, cli.spike_ms, jitter_window);
-
-                        // sample rate (smps/s)
-                        let ss = smp_stats.entry(key.clone()).or_default();
-                        ss.on_sample(now, rate_window);
-
-                        // names + columns (from sample metadata)
-                        stream_names.entry(key.clone()).or_insert_with(|| sample.stream.name.clone());
-                        let cols = sample.columns.iter().map(|c| (c.desc.name.clone(), c.desc.units.clone())).collect::<Vec<_>>();
-                        if !cols.is_empty() { stream_cols.insert(key, cols); }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        let kind = format!("{:?}", e);
-                        push_err(&mut err_log, &mut err_counts, format!("dev[{}] try_next: {}", route_str, kind), Some(kind));
-                        break;
-                    }
-                }
-            }
-        }
-
-        // C) Redraw
-        let now = Instant::now();
-        let frame = Duration::from_millis((1000 / cli.fps.max(1)) as u64);
-        if now >= next_draw {
-            next_draw = now + frame;
-
-            // union of keys with anything to show (but only show streams we've seen packets for at least once)
-            let mut keys: BTreeSet<StreamKey> = BTreeSet::new();
-            keys.extend(pkt_stats.keys().cloned());
-
-            // packet rows (include smps/s looked up from smp_stats), mark stale by last packet time
-            let mut pkt_rows = Vec::new();
-            if cli.mode != Mode::Time {
-                for k in &keys {
-                    if let Some(ps) = pkt_stats.get(k) {
-                        let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
-                        let smps_rate = smp_stats.get(k).map(|s| s.rate_smps).unwrap_or(0.0);
-                        let stale = ps.last_seen.map(|t| now.duration_since(t) > stale_dur).unwrap_or(true);
-                        pkt_rows.push((k.route.clone(), k.stream_id, sname, ps, smps_rate, stale));
-                    }
-                }
-                pkt_rows.sort_by(|a,b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            }
-
-            // time rows + status (ppm + rate drop + gap), stale by packets (not samples) so UI reflects continuity
-            let mut time_rows = Vec::new();
-            if cli.mode != Mode::Pkt {
-                for k in &keys {
-                    if let Some(ts) = time_stats.get(k) {
-                        let mut status = if ts.ppm.abs() >= cli.ppm_err { "ERROR" }
-                                         else if ts.ppm.abs() >= cli.ppm_warn { "WARN" }
-                                         else { "OK" };
-                        if let Some(ps) = pkt_stats.get(k) {
-                            if ps.last_gap_samples > 0 { status = "GAP"; }
-                        }
-                        if let Some(ss) = smp_stats.get(k) {
-                            if ss.baseline_smps > 0.0 &&
-                               ss.rate_smps < ss.baseline_smps * (1.0 - 0.01 * cli.rate_warn_pct) {
-                                status = "RATE↓";
-                            }
-                        }
-                        let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
-                        let stale = pkt_stats.get(k).and_then(|ps| ps.last_seen).map(|t| now.duration_since(t) > stale_dur).unwrap_or(true);
-                        let status = if stale { "STALLED" } else { status };
-                        time_rows.push((k.route.clone(), k.stream_id, sname, ts, status, stale));
-                    }
-                }
-                time_rows.sort_by(|a,b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            }
-
-            // optional columns panel
-            let mut meta_rows: Vec<(String, u8, String, Vec<(String,String)>)> = Vec::new();
-            if cli.show_columns {
-                for k in &keys {
-                    if let Some(cols) = stream_cols.get(k) {
-                        let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
-                        meta_rows.push((k.route.clone(), k.stream_id, sname, cols.clone()));
-                    }
-                }
-                meta_rows.sort_by(|a,b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            }
-
-            let header = format!(
-                "tio-health  mode={:?}  rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  spike={}ms  rate_warn={}%  fps={}  stale={}ms",
-                cli.mode, cli.rate_window_s, cli.jitter_window_s, cli.ppm_warn, cli.ppm_err, cli.spike_ms, cli.rate_warn_pct, cli.fps, cli.stale_ms
-            );
-            let err_recent: Vec<(String, String)> = err_log.iter()
-                .rev()
-                .take(12)
-                .map(|e| (fmt_local_pretty(e.at), e.msg.clone()))
-                .collect();
-
-            let mut err_top: Vec<(u64, String)> = err_counts.iter()
-                .map(|(k,v)| (*v, k.clone()))
-                .collect();
-            err_top.sort_by(|a,b| b.0.cmp(&a.0));
-
-            if let Err(_) = (Tui { stdout: io::stdout() }).stdout.flush() { /* noop */ }
-            if let Err(_) = tui.draw(
-                &header, &pkt_rows, &time_rows, &meta_rows,
-                cli.quiet, cli.show_columns, cli.mode,
-                &err_recent, &err_top,
-            ) {
-                break 'main;
             }
         }
     }
