@@ -461,9 +461,8 @@ impl Port {
                 .ok();
 
             #[cfg(target_os = "macos")]
-            let _activity = super::os::macos_helpers::ActivityGuard::latency_critical(
-                "Twinleaf I/O poller"
-            );
+            let _activity =
+                super::os::macos_helpers::ActivityGuard::latency_critical("Twinleaf I/O poller");
             // REVISIT
             // If anything panics in this thread and it causes unwinding, this
             // closure terminates and the channels are closed.

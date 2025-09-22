@@ -245,10 +245,9 @@ impl Interface {
                 .ok();
 
             #[cfg(target_os = "macos")]
-            let _activity = super::os::macos_helpers::ActivityGuard::latency_critical(
-                "Twinleaf proxy core"
-            );
-            
+            let _activity =
+                super::os::macos_helpers::ActivityGuard::latency_critical("Twinleaf proxy core");
+
             let mut proxy = ProxyCore::new(
                 url_string,
                 reconnect_timeout,
