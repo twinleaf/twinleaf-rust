@@ -399,7 +399,9 @@ fn all_data_dump(args: &[String]) -> Result<(), ()> {
     let (_matches, root, route) = tio_parseopts(&opts, args);
     let proxy = proxy::Interface::new(&root);
 
-    let mut devs = twinleaf::device::DeviceTree::open(proxy, route).map_err(|_| {})?;
+    let mut devs = twinleaf::device::DeviceTreeBuilder::new(proxy, route)
+        .build()
+        .map_err(|e| { eprintln!("build failed: {:?}", e); })?;
 
     loop {
         let (first, r0) = match devs.next() {
@@ -507,9 +509,9 @@ fn log_data(args: &[String]) -> Result<(), ()> {
         eprintln!("create failed: {e:?}");
     })?;
 
-    let mut devs = twinleaf::device::DeviceTree::open(proxy, route).map_err(|e| {
-        eprintln!("Failed to open device: {:?}", e);
-    })?;
+    let mut devs = twinleaf::device::DeviceTreeBuilder::new(proxy, route)
+        .build()
+        .map_err(|e| { eprintln!("build failed: {:?}", e); })?;
 
     fn write_one(
         file: &mut File,
@@ -540,7 +542,12 @@ fn log_data(args: &[String]) -> Result<(), ()> {
                     .unwrap(),
             )?;
             for col in sample.columns {
-                file.write_all(&col.desc.make_update_with_route(route.clone()).serialize().unwrap())?;
+                file.write_all(
+                    &col.desc
+                        .make_update_with_route(route.clone())
+                        .serialize()
+                        .unwrap(),
+                )?;
             }
         } else if sample.segment_changed {
             file.write_all(
