@@ -160,11 +160,12 @@ impl Device {
     }
 
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
+        let route = self.dev_port.scope();
         if let Err(err) = self.dev_port.send(util::PacketBuilder::make_rpc_request(
             name,
             arg,
             0,
-            DeviceRoute::root(),
+            route,
         )) {
             return Err(proxy::RpcError::SendFailed(err));
         }
