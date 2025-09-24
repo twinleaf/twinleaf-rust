@@ -19,9 +19,21 @@ pub enum BuildError {
     MissingDiscoveryDeadline,
     NoDevicesDiscovered,
 }
-impl From<proxy::PortError> for BuildError { fn from(e: proxy::PortError) -> Self { Self::Port(e) } }
-impl From<proxy::RecvError> for BuildError { fn from(e: proxy::RecvError) -> Self { Self::Recv(e) } }
-impl From<proxy::RpcError> for BuildError { fn from(e: proxy::RpcError) -> Self { Self::Rpc(e) } }
+impl From<proxy::PortError> for BuildError {
+    fn from(e: proxy::PortError) -> Self {
+        Self::Port(e)
+    }
+}
+impl From<proxy::RecvError> for BuildError {
+    fn from(e: proxy::RecvError) -> Self {
+        Self::Recv(e)
+    }
+}
+impl From<proxy::RpcError> for BuildError {
+    fn from(e: proxy::RpcError) -> Self {
+        Self::Rpc(e)
+    }
+}
 
 pub struct Device {
     dev_port: proxy::Port,
@@ -63,10 +75,18 @@ impl Device {
     fn process_packet(&mut self, pkt: tio::Packet) -> Option<tio::Packet> {
         match &pkt.payload {
             proto::Payload::RpcReply(rep) => {
-                if rep.id == 7855 { self.n_reqs -= 1 } else { return Some(pkt); }
+                if rep.id == 7855 {
+                    self.n_reqs -= 1
+                } else {
+                    return Some(pkt);
+                }
             }
             proto::Payload::RpcError(err) => {
-                if err.id == 7855 { self.n_reqs -= 1 } else { return Some(pkt); }
+                if err.id == 7855 {
+                    self.n_reqs -= 1
+                } else {
+                    return Some(pkt);
+                }
             }
             _ => {}
         }
@@ -82,7 +102,9 @@ impl Device {
                     Ok(full_meta) => return Ok(full_meta),
                     Err(reqs) => {
                         for req in reqs {
-                            self.dev_port.send(req).map_err(proxy::RpcError::SendFailed)?;
+                            self.dev_port
+                                .send(req)
+                                .map_err(proxy::RpcError::SendFailed)?;
                             self.n_reqs += 1;
                         }
                     }
@@ -95,7 +117,9 @@ impl Device {
 
     pub fn next(&mut self) -> Result<Sample, proxy::RpcError> {
         loop {
-            if let Some(s) = self.sample_queue.pop_front() { return Ok(s); }
+            if let Some(s) = self.sample_queue.pop_front() {
+                return Ok(s);
+            }
             self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             let pkt = self.dev_port.recv().map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(pkt);
@@ -104,7 +128,9 @@ impl Device {
 
     pub fn try_next(&mut self) -> Result<Option<Sample>, proxy::RpcError> {
         loop {
-            if let Some(s) = self.sample_queue.pop_front() { return Ok(Some(s)); }
+            if let Some(s) = self.sample_queue.pop_front() {
+                return Ok(Some(s));
+            }
             self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             let pkt = match self.dev_port.try_recv() {
                 Ok(pkt) => pkt,
@@ -119,7 +145,9 @@ impl Device {
         loop {
             self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
-                Ok(pkt) => { self.process_packet(pkt); }
+                Ok(pkt) => {
+                    self.process_packet(pkt);
+                }
                 Err(proxy::RecvError::WouldBlock) => break,
                 Err(e) => return Err(proxy::RpcError::RecvFailed(e)),
             }
@@ -133,7 +161,10 @@ impl Device {
 
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
         if let Err(err) = self.dev_port.send(util::PacketBuilder::make_rpc_request(
-            name, arg, 0, DeviceRoute::root(),
+            name,
+            arg,
+            0,
+            DeviceRoute::root(),
         )) {
             return Err(proxy::RpcError::SendFailed(err));
         }
@@ -151,13 +182,21 @@ impl Device {
     }
 
     pub fn rpc<ReqT: util::TioRpcRequestable<ReqT>, RepT: util::TioRpcReplyable<RepT>>(
-        &mut self, name: &str, arg: ReqT,
+        &mut self,
+        name: &str,
+        arg: ReqT,
     ) -> Result<RepT, proxy::RpcError> {
         let ret = self.raw_rpc(name, &arg.to_request())?;
-        if let Ok(val) = RepT::from_reply(&ret) { Ok(val) } else { Err(proxy::RpcError::TypeError) }
+        if let Ok(val) = RepT::from_reply(&ret) {
+            Ok(val)
+        } else {
+            Err(proxy::RpcError::TypeError)
+        }
     }
 
-    pub fn action(&mut self, name: &str) -> Result<(), proxy::RpcError> { self.rpc(name, ()) }
+    pub fn action(&mut self, name: &str) -> Result<(), proxy::RpcError> {
+        self.rpc(name, ())
+    }
 
     pub fn get<T: util::TioRpcReplyable<T>>(&mut self, name: &str) -> Result<T, proxy::RpcError> {
         self.rpc(name, ())
@@ -170,7 +209,9 @@ impl Device {
                 Ok(mut rep) => full_reply.append(&mut rep),
                 Err(err @ proxy::RpcError::ExecError(_)) => {
                     if let proxy::RpcError::ExecError(payload) = &err {
-                        if let proto::RpcErrorCode::InvalidArgs = payload.error { break; }
+                        if let proto::RpcErrorCode::InvalidArgs = payload.error {
+                            break;
+                        }
                     }
                     return Err(err);
                 }
@@ -212,8 +253,13 @@ impl DeviceTree<Live> {
         self.probe.as_mut().expect("Live tree must have a probe")
     }
 
-    fn get_or_create(&mut self, route: &DeviceRoute) -> Result<Option<&mut Device>, proxy::RecvError> {
-        if let Some(&idx) = self.route_map.get(route) { return Ok(Some(&mut self.devices[idx])); }
+    fn get_or_create(
+        &mut self,
+        route: &DeviceRoute,
+    ) -> Result<Option<&mut Device>, proxy::RecvError> {
+        if let Some(&idx) = self.route_map.get(route) {
+            return Ok(Some(&mut self.devices[idx]));
+        }
         match Device::open(&self.proxy, route.clone()) {
             Ok(dev) => {
                 let idx = self.devices.len();
@@ -238,20 +284,24 @@ impl DeviceTree<Live> {
         let start = Instant::now();
         let mut last_new = Instant::now();
         loop {
-            if let Some(b) = total { if start.elapsed() >= b { break; } }
-            if let Some(q) = quiet { if last_new.elapsed() >= q { break; } }
+            if let Some(b) = total {
+                if start.elapsed() >= b {
+                    break;
+                }
+            }
+            if let Some(q) = quiet {
+                if last_new.elapsed() >= q {
+                    break;
+                }
+            }
             match self.probe_mut().try_recv() {
-                Ok(pkt) => { self.get_or_create(&pkt.routing)?; last_new = Instant::now(); }
+                Ok(pkt) => {
+                    self.get_or_create(&pkt.routing)?;
+                    last_new = Instant::now();
+                }
                 Err(proxy::RecvError::WouldBlock) => std::thread::yield_now(),
                 Err(e) => return Err(e),
             }
-        }
-        Ok(())
-    }
-
-    pub fn prefetch_metadata(&mut self) -> Result<(), proxy::RpcError> {
-        for dev in self.devices.iter_mut() {
-            let _ = dev.get_metadata()?;
         }
         Ok(())
     }
@@ -260,11 +310,17 @@ impl DeviceTree<Live> {
         loop {
             let mut sel = Select::new();
             self.probe.as_ref().unwrap().select_recv(&mut sel);
-            for dev in &self.devices { dev.select_recv(&mut sel); }
+            for dev in &self.devices {
+                dev.select_recv(&mut sel);
+            }
             let idx = sel.ready();
             if idx == 0 {
-                let pkt = self.probe_mut().recv().map_err(proxy::RpcError::RecvFailed)?;
-                self.get_or_create(&pkt.routing).map_err(proxy::RpcError::RecvFailed)?;
+                let pkt = self
+                    .probe_mut()
+                    .recv()
+                    .map_err(proxy::RpcError::RecvFailed)?;
+                self.get_or_create(&pkt.routing)
+                    .map_err(proxy::RpcError::RecvFailed)?;
                 continue;
             } else {
                 let dev = &mut self.devices[idx - 1];
@@ -277,15 +333,26 @@ impl DeviceTree<Live> {
     pub fn try_next(&mut self) -> Result<Option<(Sample, DeviceRoute)>, proxy::RpcError> {
         loop {
             match self.probe_mut().try_recv() {
-                Ok(pkt) => { self.get_or_create(&pkt.routing).map_err(proxy::RpcError::RecvFailed)?; continue; }
+                Ok(pkt) => {
+                    self.get_or_create(&pkt.routing)
+                        .map_err(proxy::RpcError::RecvFailed)?;
+                    continue;
+                }
                 Err(proxy::RecvError::WouldBlock) => break,
                 Err(e) => return Err(proxy::RpcError::RecvFailed(e)),
             }
         }
-        if self.devices.is_empty() { return Ok(None); }
+        if self.devices.is_empty() {
+            return Ok(None);
+        }
         let mut sel = Select::new();
-        for dev in &self.devices { dev.select_recv(&mut sel); }
-        let idx = match sel.try_ready() { Ok(i) => i, Err(_) => return Ok(None) };
+        for dev in &self.devices {
+            dev.select_recv(&mut sel);
+        }
+        let idx = match sel.try_ready() {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
         let dev = &mut self.devices[idx];
         match dev.try_next()? {
             Some(s) => Ok(Some((s, dev.route()))),
@@ -298,16 +365,24 @@ impl DeviceTree<Live> {
         loop {
             let mut sel = Select::new();
             self.probe.as_ref().unwrap().select_recv(&mut sel);
-            for dev in &self.devices { dev.select_recv(&mut sel); }
-            let idx = match sel.try_ready() { Ok(i) => i, Err(_) => break };
+            for dev in &self.devices {
+                dev.select_recv(&mut sel);
+            }
+            let idx = match sel.try_ready() {
+                Ok(i) => i,
+                Err(_) => break,
+            };
             if idx == 0 {
                 while let Ok(pkt) = self.probe_mut().try_recv() {
-                    self.get_or_create(&pkt.routing).map_err(proxy::RpcError::RecvFailed)?;
+                    self.get_or_create(&pkt.routing)
+                        .map_err(proxy::RpcError::RecvFailed)?;
                 }
             } else {
                 let dev = &mut self.devices[idx - 1];
                 let route = dev.route();
-                for s in dev.drain()? { out.push((s, route.clone())); }
+                for s in dev.drain()? {
+                    out.push((s, route.clone()));
+                }
             }
         }
         Ok(out)
@@ -352,7 +427,10 @@ impl DeviceTree<Frozen> {
         let n = self.devices.len();
         let mut sel = Select::new();
         self.select_rotated(&mut sel);
-        let ready = match sel.try_ready() { Ok(i) => i, Err(_) => return Ok(None) };
+        let ready = match sel.try_ready() {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
         let actual = (self.rr_next + ready) % n;
         let dev = &mut self.devices[actual];
         match dev.try_next()? {
@@ -380,7 +458,9 @@ impl DeviceTree<Frozen> {
         Ok(out)
     }
 
-    pub fn devices(&self) -> &[Device] { &self.devices }
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
+    }
 
     pub fn sort_by_route(&mut self) {
         self.devices.sort_by_key(|d| format!("{:?}", d.route()));
@@ -400,7 +480,7 @@ impl DeviceTree<Frozen> {
 
     fn sort_by_meta<F>(&mut self, f: F) -> Result<(), proxy::RpcError>
     where
-        F: Fn(&DeviceFullMetadata) -> String
+        F: Fn(&DeviceFullMetadata) -> String,
     {
         let mut keys: Vec<(usize, String, String)> = Vec::with_capacity(self.devices.len());
         for (i, dev) in self.devices.iter_mut().enumerate() {
@@ -439,15 +519,25 @@ pub struct DeviceTreeBuilder<M = Live> {
 }
 
 impl<M> DeviceTreeBuilder<M> {
-    pub fn discover_for(mut self, d: Duration) -> Self { self.discover_for = Some(d); self }
-    pub fn watchdog_for(mut self, d: Duration) -> Self { self.watchdog_for = Some(d); self }
-    pub fn prefetch_metadata(mut self) -> Self { self.prefetch_metadata = true; self }
+    pub fn discover_for(mut self, d: Duration) -> Self {
+        self.discover_for = Some(d);
+        self
+    }
+    pub fn watchdog_for(mut self, d: Duration) -> Self {
+        self.watchdog_for = Some(d);
+        self
+    }
+    pub fn prefetch_metadata(mut self) -> Self {
+        self.prefetch_metadata = true;
+        self
+    }
 }
 
 impl DeviceTreeBuilder<Live> {
     pub fn new(proxy: proxy::Interface, route: DeviceRoute) -> Self {
         Self {
-            proxy, route,
+            proxy,
+            route,
             discover_for: None,
             watchdog_for: None,
             prefetch_metadata: false,
@@ -473,16 +563,16 @@ impl DeviceTreeBuilder<Live> {
         if self.discover_for.is_some() || self.watchdog_for.is_some() {
             tree.discover_with_watchdog(self.discover_for, self.watchdog_for)?;
         }
-        if self.prefetch_metadata {
-            tree.prefetch_metadata()?;
-        }
         Ok(tree)
     }
 }
 
 impl DeviceTreeBuilder<Frozen> {
     pub fn sort_by_route(mut self) -> Self {
-        self.sorter = Some(|t: &mut DeviceTree<Frozen>| { t.sort_by_route(); Ok(()) });
+        self.sorter = Some(|t: &mut DeviceTree<Frozen>| {
+            t.sort_by_route();
+            Ok(())
+        });
         self
     }
     pub fn sort_by_device_name(mut self) -> Self {
@@ -507,9 +597,16 @@ impl DeviceTreeBuilder<Frozen> {
             prefetch_metadata: self.prefetch_metadata,
             sorter: None,
             _mode: PhantomData,
-        }.build()?;
+        }
+        .build()?;
 
-        let mut frozen = live.freeze(); 
+        let mut frozen = live.freeze();
+
+        if self.prefetch_metadata {
+        for dev in frozen.devices.iter_mut() {
+            dev.get_metadata()?;
+        }
+    }
         if let Some(sort) = self.sorter {
             sort(&mut frozen)?;
         }

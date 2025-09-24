@@ -401,7 +401,9 @@ fn all_data_dump(args: &[String]) -> Result<(), ()> {
 
     let mut devs = twinleaf::device::DeviceTreeBuilder::new(proxy, route)
         .build()
-        .map_err(|e| { eprintln!("build failed: {:?}", e); })?;
+        .map_err(|e| {
+            eprintln!("build failed: {:?}", e);
+        })?;
 
     loop {
         let (first, r0) = match devs.next() {
@@ -511,7 +513,9 @@ fn log_data(args: &[String]) -> Result<(), ()> {
 
     let mut devs = twinleaf::device::DeviceTreeBuilder::new(proxy, route)
         .build()
-        .map_err(|e| { eprintln!("build failed: {:?}", e); })?;
+        .map_err(|e| {
+            eprintln!("build failed: {:?}", e);
+        })?;
 
     fn write_one(
         file: &mut File,
