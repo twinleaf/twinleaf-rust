@@ -161,12 +161,10 @@ impl Device {
 
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
         let route = self.dev_port.scope();
-        if let Err(err) = self.dev_port.send(util::PacketBuilder::make_rpc_request(
-            name,
-            arg,
-            0,
-            route,
-        )) {
+        if let Err(err) = self
+            .dev_port
+            .send(util::PacketBuilder::make_rpc_request(name, arg, 0, route))
+        {
             return Err(proxy::RpcError::SendFailed(err));
         }
         loop {
@@ -528,10 +526,6 @@ impl<M> DeviceTreeBuilder<M> {
         self.watchdog_for = Some(d);
         self
     }
-    pub fn prefetch_metadata(mut self) -> Self {
-        self.prefetch_metadata = true;
-        self
-    }
 }
 
 impl DeviceTreeBuilder<Live> {
@@ -554,6 +548,18 @@ impl DeviceTreeBuilder<Live> {
             discover_for: self.discover_for,
             watchdog_for: self.watchdog_for,
             prefetch_metadata: self.prefetch_metadata,
+            sorter: None,
+            _mode: PhantomData,
+        }
+    }
+
+    pub fn prefetch_metadata(self) -> DeviceTreeBuilder<Frozen> {
+        DeviceTreeBuilder::<Frozen> {
+            proxy: self.proxy,
+            route: self.route,
+            discover_for: self.discover_for,
+            watchdog_for: self.watchdog_for,
+            prefetch_metadata: true,
             sorter: None,
             _mode: PhantomData,
         }
@@ -585,6 +591,10 @@ impl DeviceTreeBuilder<Frozen> {
         self
     }
 
+    pub fn freeze(self) -> Self {
+        self
+    }
+
     pub fn build(self) -> Result<DeviceTree<Frozen>, BuildError> {
         if self.discover_for.is_none() && self.watchdog_for.is_none() {
             return Err(BuildError::MissingDiscoveryDeadline);
@@ -604,10 +614,10 @@ impl DeviceTreeBuilder<Frozen> {
         let mut frozen = live.freeze();
 
         if self.prefetch_metadata {
-        for dev in frozen.devices.iter_mut() {
-            dev.get_metadata()?;
+            for dev in frozen.devices.iter_mut() {
+                dev.get_metadata()?;
+            }
         }
-    }
         if let Some(sort) = self.sorter {
             sort(&mut frozen)?;
         }
