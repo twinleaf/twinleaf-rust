@@ -58,56 +58,24 @@ fn print_help_and_exit(opts: &getopts::Options, program: &str, code: i32) -> ! {
 fn parse_cli() -> (String, tio::proto::DeviceRoute, Cli) {
     let mut opts = tio_opts();
     opts.optflag("h", "help", "Show help.");
-    opts.optopt(
-        "",
-        "mode",
-        "Diagnostic mode: all|time|rate (default all)",
-        "m",
-    );
-    opts.optopt(
-        "",
-        "rate-window",
-        "Seconds for rate window (default 5)",
-        "sec",
-    );
-    opts.optopt(
-        "",
-        "jitter-window",
-        "Seconds for jitter window (default 10)",
-        "sec",
-    );
+    opts.optopt("", "mode", "Diagnostic mode: all|time|rate (default all)", "m");
+    opts.optopt("", "rate-window", "Seconds for rate window (default 5)", "sec");
+    opts.optopt("", "jitter-window", "Seconds for jitter window (default 10)", "sec");
     opts.optopt("", "ppm-warn", "Warn threshold in ppm (default 100)", "ppm");
     opts.optopt("", "ppm-err", "Error threshold in ppm (default 200)", "ppm");
     opts.optopt("", "spike-ms", "Spike threshold in ms (default 20)", "ms");
-    opts.optopt(
-        "",
-        "rate-warn-pct",
-        "Warn if smps/s drops by this % from baseline (default 5.0)",
-        "%",
-    );
-    opts.optopt(
-        "",
-        "streams",
-        "Comma-separated list of stream IDs to include",
-        "list",
-    );
+    opts.optopt("", "rate-warn-pct", "Warn if smps/s drops by this % from baseline (default 5.0)", "%");
+    opts.optopt("", "streams", "Comma-separated list of stream IDs to include", "list");
     opts.optflag("", "quiet", "Suppress footer hint");
     opts.optopt("", "fps", "UI refresh frames per second (default 10)", "n");
     opts.optflag("", "columns", "Show stream->column breakdown header");
-    opts.optopt(
-        "",
-        "stale-ms",
-        "Grey rows after this many ms without samples (default 2000)",
-        "ms",
-    );
+    opts.optopt("", "stale-ms", "Grey rows after this many ms without samples (default 2000)", "ms");
 
     let (matches, root, route) = tio_parseopts(&opts, &std::env::args().collect::<Vec<_>>());
     if matches.opt_present("help") {
         print_help_and_exit(
             &opts,
-            &std::env::args()
-                .next()
-                .unwrap_or_else(|| "tio-health".into()),
+            &std::env::args().next().unwrap_or_else(|| "tio-health".into()),
             0,
         );
     }
@@ -117,61 +85,19 @@ fn parse_cli() -> (String, tio::proto::DeviceRoute, Cli) {
         Some("rate") => Mode::Rate,
         _ => Mode::All,
     };
-    let rate_window_s = matches
-        .opt_str("rate-window")
-        .as_deref()
-        .unwrap_or("5")
-        .parse()
-        .unwrap_or(5);
-    let jitter_window_s = matches
-        .opt_str("jitter-window")
-        .as_deref()
-        .unwrap_or("10")
-        .parse()
-        .unwrap_or(10);
-    let ppm_warn = matches
-        .opt_str("ppm-warn")
-        .as_deref()
-        .unwrap_or("100")
-        .parse()
-        .unwrap_or(100.0);
-    let ppm_err = matches
-        .opt_str("ppm-err")
-        .as_deref()
-        .unwrap_or("200")
-        .parse()
-        .unwrap_or(200.0);
-    let spike_ms = matches
-        .opt_str("spike-ms")
-        .as_deref()
-        .unwrap_or("20")
-        .parse()
-        .unwrap_or(20.0);
-    let rate_warn_pct = matches
-        .opt_str("rate-warn-pct")
-        .as_deref()
-        .unwrap_or("5.0")
-        .parse()
-        .unwrap_or(5.0);
+    let rate_window_s = matches.opt_str("rate-window").as_deref().unwrap_or("5").parse().unwrap_or(5);
+    let jitter_window_s = matches.opt_str("jitter-window").as_deref().unwrap_or("10").parse().unwrap_or(10);
+    let ppm_warn = matches.opt_str("ppm-warn").as_deref().unwrap_or("100").parse().unwrap_or(100.0);
+    let ppm_err = matches.opt_str("ppm-err").as_deref().unwrap_or("200").parse().unwrap_or(200.0);
+    let spike_ms = matches.opt_str("spike-ms").as_deref().unwrap_or("20").parse().unwrap_or(20.0);
+    let rate_warn_pct = matches.opt_str("rate-warn-pct").as_deref().unwrap_or("5.0").parse().unwrap_or(5.0);
     let streams_filter = matches.opt_str("streams").map(|s| {
-        s.split(',')
-            .filter_map(|x| x.trim().parse::<u8>().ok())
-            .collect::<Vec<_>>()
+        s.split(',').filter_map(|x| x.trim().parse::<u8>().ok()).collect::<Vec<_>>()
     });
     let quiet = matches.opt_present("quiet");
-    let fps = matches
-        .opt_str("fps")
-        .as_deref()
-        .unwrap_or("10")
-        .parse()
-        .unwrap_or(10);
+    let fps = matches.opt_str("fps").as_deref().unwrap_or("10").parse().unwrap_or(10);
     let show_columns = matches.opt_present("columns");
-    let stale_ms = matches
-        .opt_str("stale-ms")
-        .as_deref()
-        .unwrap_or("2000")
-        .parse()
-        .unwrap_or(2000);
+    let stale_ms = matches.opt_str("stale-ms").as_deref().unwrap_or("2000").parse().unwrap_or(2000);
 
     (
         root,
@@ -216,31 +142,18 @@ struct TimeWindow {
 impl TimeWindow {
     fn new(seconds: u64, hz_guess: f64) -> Self {
         let cap = ((seconds as f64 * hz_guess).round() as usize).max(16);
-        Self {
-            buf: vec![0.0; cap],
-            cap,
-            idx: 0,
-            filled: false,
-        }
+        Self { buf: vec![0.0; cap], cap, idx: 0, filled: false }
     }
     fn push(&mut self, v: f64) {
         self.buf[self.idx] = v;
         self.idx = (self.idx + 1) % self.cap;
-        if self.idx == 0 {
-            self.filled = true;
-        }
+        if self.idx == 0 { self.filled = true; }
     }
     fn std_ms(&self) -> f64 {
         let n = if self.filled { self.cap } else { self.idx };
-        if n == 0 {
-            return 0.0;
-        }
+        if n == 0 { return 0.0; }
         let mean: f64 = self.buf[..n].iter().sum::<f64>() / (n as f64);
-        let var: f64 = self.buf[..n]
-            .iter()
-            .map(|x| (x - mean) * (x - mean))
-            .sum::<f64>()
-            / (n as f64);
+        let var: f64 = self.buf[..n].iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n as f64);
         var.sqrt()
     }
 }
@@ -268,12 +181,8 @@ impl TimeStats {
     }
     fn on_sample(&mut self, t_data: f64, now: Instant, spike_ms: f64, window_s: u64) {
         self.ensure_window(window_s);
-        if self.t0_host.is_none() {
-            self.t0_host = Some(now);
-        }
-        if self.t0_data.is_none() {
-            self.t0_data = Some(t_data);
-        }
+        if self.t0_host.is_none() { self.t0_host = Some(now); }
+        if self.t0_data.is_none() { self.t0_data = Some(t_data); }
         if let (Some(lh), Some(ld)) = (self.last_host, self.last_data) {
             let dh = now.duration_since(lh).as_secs_f64();
             let dd = t_data - ld;
@@ -300,54 +209,32 @@ impl TimeStats {
     }
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 struct SampleStats {
     arrivals: VecDeque<Instant>, // timestamps of arrivals (for sliding window)
     rate_smps: f64,              // last computed live rate
     baseline_smps: f64,          // max observed live rate
 }
-impl Default for SampleStats {
-    fn default() -> Self {
-        Self {
-            arrivals: VecDeque::new(),
-            rate_smps: 0.0,
-            baseline_smps: 0.0,
-        }
-    }
-}
 impl SampleStats {
     fn on_sample(&mut self, now: Instant) {
         self.arrivals.push_back(now);
     }
-
     /// Compute sliding-window rate and update baseline.
     fn rate_living(&mut self, now: Instant, window: Duration) -> f64 {
-        // Cutoff time for the window; if underflow, just use 'now'
         let cutoff = now.checked_sub(window).unwrap_or(now);
-
-        // Drop arrivals older than the window
         while let Some(&front) = self.arrivals.front() {
-            if front < cutoff {
-                self.arrivals.pop_front();
-            } else {
-                break;
-            }
+            if front < cutoff { self.arrivals.pop_front(); } else { break; }
         }
-
-        // Compute rate as count per window seconds
         let count = self.arrivals.len() as f64;
         let win_secs = window.as_secs_f64().max(1e-6);
         let rate = count / win_secs;
-
         self.rate_smps = rate;
-        if rate > self.baseline_smps {
-            self.baseline_smps = rate;
-        }
+        if rate > self.baseline_smps { self.baseline_smps = rate; }
         rate
     }
 }
 
-// ---------------- Skip/Error tracking ----------------
+// ---------------- Skip + Proxy-Error tracking ----------------
 
 #[derive(Default, Clone)]
 struct SeqStats {
@@ -365,12 +252,58 @@ struct SkipEvent {
 }
 
 #[derive(Clone)]
-struct ErrorEvent {
-    when: SystemTime, // wall-clock
-    route: String,
-    stream_id: u8,
-    ppm: f64,
-    drift_s: f64,
+struct ProxyErrEvent {
+    when: SystemTime,             // wall-clock
+    kind: &'static str,           // SendFailed | ExecError | RecvFailed | TypeError
+    detail: String,               // short debug string of payload/cause
+    route_hint: Option<String>,   // usually None (DeviceTree::try_next() doesn't expose)
+}
+
+#[derive(Default)]
+struct Diagnostics {
+    // Skips
+    recent_skips: VecDeque<SkipEvent>,
+    route_skip_missing: BTreeMap<String, u64>,
+    route_skip_events: BTreeMap<String, u64>,
+    skip_total_events: u64,
+
+    // Proxy errors
+    recent_proxy_errs: VecDeque<ProxyErrEvent>,
+    err_by_kind: BTreeMap<&'static str, u64>,
+    err_total_events: u64,
+}
+
+impl Diagnostics {
+    fn log_skip(&mut self, route: String, stream_id: u8, from: u32, to: u32, missing: u32) {
+        self.skip_total_events += 1;
+        *self.route_skip_missing.entry(route.clone()).or_insert(0) += missing as u64;
+        *self.route_skip_events.entry(route.clone()).or_insert(0) += 1;
+        self.recent_skips.push_back(SkipEvent {
+            when: SystemTime::now(),
+            route,
+            stream_id,
+            from,
+            to,
+            missing,
+        });
+        if self.recent_skips.len() > 5 {
+            self.recent_skips.pop_front();
+        }
+    }
+
+    fn log_proxy_error(&mut self, kind: &'static str, detail: String, route_hint: Option<String>) {
+        self.err_total_events += 1;
+        *self.err_by_kind.entry(kind).or_insert(0) += 1;
+        self.recent_proxy_errs.push_back(ProxyErrEvent {
+            when: SystemTime::now(),
+            kind,
+            detail,
+            route_hint,
+        });
+        if self.recent_proxy_errs.len() > 5 {
+            self.recent_proxy_errs.pop_front();
+        }
+    }
 }
 
 struct DiagSnapshot {
@@ -379,10 +312,10 @@ struct DiagSnapshot {
     by_route_skips: Vec<(String, u64, u64)>, // route, missing_total, events_total
     skip_total_events: u64,
 
-    // Errors
-    recent_errors: Vec<ErrorEvent>,
-    by_route_errors: Vec<(String, u64)>, // route, events_total
-    error_total_events: u64,
+    // Proxy errors
+    recent_proxy_errs: Vec<ProxyErrEvent>,
+    by_kind_errs: Vec<(String, u64)>, // kind, count
+    err_total_events: u64,
 }
 
 // ---------------- TUI ----------------
@@ -419,6 +352,7 @@ impl Tui {
     const WHEN_W: usize = 19; // "YYYY-MM-DD HH:MM:SS"
     const MISS_W: usize = 9;  // width for missing count
     const EVTS_W: usize = 6;  // width for event count
+    const KIND_W: usize = 12; // error kind column
 
     fn section_header(&mut self, title: &str) -> io::Result<()> {
         self.stdout.queue(SetAttribute(Attribute::Bold))?;
@@ -495,8 +429,8 @@ impl Tui {
         Ok(())
     }
 
-    fn render_recent_errors(&mut self, recent: &[ErrorEvent], total: u64) -> io::Result<()> {
-        self.section_header(&format!("Recent errors (max 5) — total events: {total}"))?;
+    fn render_recent_proxy_errors(&mut self, recent: &[ProxyErrEvent], total: u64) -> io::Result<()> {
+        self.section_header(&format!("Recent proxy errors (max 5) — total events: {total}"))?;
         if recent.is_empty() {
             self.stdout.queue(style::Print("None"))?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -504,17 +438,17 @@ impl Tui {
         }
         for ev in recent.iter().rev() {
             let when_str = Self::fmt_when(ev.when);
+            let route = ev.route_hint.as_deref().unwrap_or("-");
             self.stdout.queue(SetForegroundColor(Color::Red))?;
             self.stdout.queue(style::Print(format!(
-                "{when:<when_w$} {route:<route_w$} {sid:>sid_w$}  ppm={ppm:>6.0}  drift={drift:+.3}s",
+                "{when:<when_w$} {kind:<kind_w$} {route:<route_w$} {detail}",
                 when = when_str,
-                route = ev.route,
-                sid = ev.stream_id,
-                ppm = ev.ppm,
-                drift = ev.drift_s,
+                kind = ev.kind,
+                route = route,
+                detail = ev.detail,
                 when_w = Self::WHEN_W,
+                kind_w = Self::KIND_W,
                 route_w = Self::ROUTE_W,
-                sid_w = Self::SID_W
             )))?;
             self.stdout.queue(ResetColor)?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -522,8 +456,8 @@ impl Tui {
         Ok(())
     }
 
-    fn render_errors_by_route(&mut self, rows: &[(String, u64)]) -> io::Result<()> {
-        self.section_header("Errors by route (events):")?;
+    fn render_proxy_errors_by_kind(&mut self, rows: &[(String, u64)]) -> io::Result<()> {
+        self.section_header("Proxy errors by kind:")?;
         if rows.is_empty() {
             self.stdout.queue(style::Print("None"))?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -531,20 +465,17 @@ impl Tui {
         }
         self.stdout.queue(SetAttribute(Attribute::Bold))?;
         self.stdout.queue(style::Print(format!(
-            "{route:<route_w$}  {evts:>evts_w$}",
-            route = "route",
-            evts = "events",
-            route_w = Self::ROUTE_W,
-            evts_w = Self::EVTS_W,
+            "{kind:<kind_w$}  {evts:>evts_w$}",
+            kind = "kind", evts = "events", kind_w = Self::KIND_W, evts_w = Self::EVTS_W
         )))?;
         self.stdout.queue(SetAttribute(Attribute::Reset))?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
-        for (route, events) in rows {
+        for (kind, events) in rows {
             self.stdout.queue(style::Print(format!(
-                "{route:<route_w$}  {evts:>evts_w$}",
-                route = route,
+                "{kind:<kind_w$}  {evts:>evts_w$}",
+                kind = kind,
                 evts = events,
-                route_w = Self::ROUTE_W,
+                kind_w = Self::KIND_W,
                 evts_w = Self::EVTS_W,
             )))?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -567,7 +498,7 @@ impl Tui {
             f64,          // last_spike_ms
             &'static str, // status
             bool,         // stale
-            bool,         // bold_ppm (ERROR cause)
+            bool,         // bold_ppm
         )],
         meta_rows: &[(String, u8, String, Vec<(String, String)>)],
         show_columns: bool,
@@ -576,8 +507,7 @@ impl Tui {
         diag: &DiagSnapshot,
     ) -> io::Result<()> {
         self.stdout.queue(cursor::MoveTo(0, 0))?;
-        self.stdout
-            .queue(terminal::Clear(terminal::ClearType::All))?;
+        self.stdout.queue(terminal::Clear(terminal::ClearType::All))?;
         self.stdout.queue(SetAttribute(Attribute::Bold))?;
         self.stdout.queue(style::Print(header))?;
         self.stdout.queue(SetAttribute(Attribute::Reset))?;
@@ -603,16 +533,9 @@ impl Tui {
                 if !cols.is_empty() {
                     let colnames: Vec<String> = cols
                         .iter()
-                        .map(|(n, u)| {
-                            if u.is_empty() {
-                                n.clone()
-                            } else {
-                                format!("{} [{}]", n, u)
-                            }
-                        })
+                        .map(|(n, u)| if u.is_empty() { n.clone() } else { format!("{} [{}]", n, u) })
                         .collect();
-                    self.stdout
-                        .queue(style::Print(format!("  -> {}", colnames.join(", "))))?;
+                    self.stdout.queue(style::Print(format!("  -> {}", colnames.join(", "))))?;
                 }
                 self.stdout.queue(cursor::MoveToNextLine(1))?;
             }
@@ -658,9 +581,7 @@ impl Tui {
         self.stdout.queue(cursor::MoveToNextLine(1))?;
 
         let mut last_route = String::new();
-        for (route, sid, sname, smps_rate, drift_s, ppm, jitter_ms, last_spike_ms, status, stale, bold_ppm) in
-            rows
-        {
+        for (route, sid, sname, smps_rate, drift_s, ppm, jitter_ms, last_spike_ms, status, stale, bold_ppm) in rows {
             if *route != last_route {
                 if !last_route.is_empty() {
                     self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -714,16 +635,9 @@ impl Tui {
                 )))?;
 
                 // PPM (bold only this cell if it's the offending column)
+                if *bold_ppm { self.stdout.queue(SetAttribute(Attribute::Bold))?; }
+                self.stdout.queue(style::Print(format!("{ppm:>ppm_w$.0}", ppm = ppm, ppm_w = Self::PPM_W)))?;
                 if *bold_ppm {
-                    self.stdout.queue(SetAttribute(Attribute::Bold))?;
-                }
-                self.stdout.queue(style::Print(format!(
-                    "{ppm:>ppm_w$.0}",
-                    ppm = ppm,
-                    ppm_w = Self::PPM_W
-                )))?;
-                if *bold_ppm {
-                    // reset attributes but keep color
                     self.stdout.queue(SetAttribute(Attribute::Reset))?;
                     self.stdout.queue(SetForegroundColor(color))?;
                 }
@@ -745,15 +659,13 @@ impl Tui {
 
         // ------- Diagnostics sections -------
         self.stdout.queue(cursor::MoveToNextLine(1))?;
-
         self.render_recent_skips(&diag.recent_skips, diag.skip_total_events)?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
         self.render_skips_by_route(&diag.by_route_skips)?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
-
-        self.render_recent_errors(&diag.recent_errors, diag.error_total_events)?;
+        self.render_recent_proxy_errors(&diag.recent_proxy_errs, diag.err_total_events)?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
-        self.render_errors_by_route(&diag.by_route_errors)?;
+        self.render_proxy_errors_by_kind(&diag.by_kind_errs)?;
 
         if !quiet {
             self.stdout.queue(cursor::MoveToNextLine(2))?;
@@ -773,12 +685,8 @@ fn drain_tree_once(
     smp_stats: &mut BTreeMap<StreamKey, SampleStats>,
     stream_names: &mut BTreeMap<StreamKey, String>,
     stream_cols: &mut BTreeMap<StreamKey, Vec<(String, String)>>,
-    // --- skip tracking accumulators ---
     seq_stats: &mut BTreeMap<StreamKey, SeqStats>,
-    recent_skips: &mut VecDeque<SkipEvent>,
-    route_skip_missing: &mut BTreeMap<String, u64>,
-    route_skip_events: &mut BTreeMap<String, u64>,
-    skip_occ_total: &mut u64,
+    diag: &mut Diagnostics,
 ) {
     loop {
         match tree.try_next() {
@@ -802,66 +710,51 @@ fn drain_tree_once(
                 ss.on_sample(now);
 
                 // Name + columns (memoize)
-                stream_names
-                    .entry(key.clone())
-                    .or_insert_with(|| sample.stream.name.clone());
-
+                stream_names.entry(key.clone()).or_insert_with(|| sample.stream.name.clone());
                 if let Some(cols) = {
                     let cols = sample
                         .columns
                         .iter()
                         .map(|c| (c.desc.name.clone(), c.desc.units.clone()))
                         .collect::<Vec<_>>();
-                    if cols.is_empty() {
-                        None
-                    } else {
-                        Some(cols)
-                    }
+                    if cols.is_empty() { None } else { Some(cols) }
                 } {
                     stream_cols.insert(key.clone(), cols);
                 }
 
-                // --- Sequence gap detection (emulates awk check of non-consecutive sample numbers) ---
-                // We assume a per-sample u32 counter `sample.n` that increments by 1 each sample, wrapping at u32::MAX.
-                // If your type exposes a different field name, adjust here.
+                // --- Sequence gap detection (wrap-safe) ---
+                // Adjust this field access to your actual counter, if different.
                 let n: u32 = sample.n;
-
                 let seq = seq_stats.entry(key).or_default();
                 if let Some(last) = seq.last_n {
                     let expected = last.wrapping_add(1);
-                    if n != expected {
-                        if n > last {
-                            let missing = n - last - 1;
-                            if missing > 0 {
-                                *skip_occ_total += 1;
-                                *route_skip_missing
-                                    .entry(route_str.clone())
-                                    .or_insert(0) += missing as u64;
-                                *route_skip_events
-                                    .entry(route_str.clone())
-                                    .or_insert(0) += 1;
-
-                                recent_skips.push_back(SkipEvent {
-                                    when: SystemTime::now(),
-                                    route: route_str.clone(),
-                                    stream_id: sid,
-                                    from: last,
-                                    to: n,
-                                    missing,
-                                });
-                                if recent_skips.len() > 5 {
-                                    recent_skips.pop_front();
-                                }
-                            }
-                        } else {
-                            // Backward/reset: treat as re-baseline without logging.
+                    if n != expected && n > last {
+                        let missing = n - last - 1;
+                        if missing > 0 {
+                            diag.log_skip(route_str.clone(), sid, last, n, missing);
                         }
                     }
+                    // backward/non-monotonic -> re-baseline without logging
                 }
                 seq.last_n = Some(n);
             }
-            Ok(None) => break,
-            Err(_) => break, // Keep UI alive; we can add logging if desired
+            Ok(None) => break, // no more ready samples right now
+            Err(e) => {
+                // --- Proxy/RPC error logging (no route available at this layer) ---
+                use twinleaf::tio::proxy::RpcError;
+                let (kind, detail) = match e.clone() {
+                    RpcError::SendFailed(se) => ("SendFailed", format!("{:?}", se)),
+                    RpcError::ExecError(payload) => ("ExecError", format!("{:?}", payload)),
+                    RpcError::RecvFailed(re) => ("RecvFailed", format!("{:?}", re)),
+                    RpcError::TypeError => ("TypeError", "type mismatch".to_string()),
+                };
+                // We don't have route context here; pass None. If you can surface it upstream,
+                // fill Some(route_string) instead.
+                diag.log_proxy_error(kind, detail, None);
+
+                // Keep UI responsive; bail out of this drain pass.
+                break;
+            }
         }
     }
 }
@@ -874,9 +767,7 @@ fn main() {
     let mut tui = Tui::setup().expect("TUI setup failed");
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let mut t = Tui {
-            stdout: io::stdout(),
-        };
+        let mut t = Tui { stdout: io::stdout() };
         t.teardown();
         original_hook(panic_info);
     }));
@@ -904,18 +795,9 @@ fn main() {
     let mut stream_names: BTreeMap<StreamKey, String> = BTreeMap::new();
     let mut stream_cols: BTreeMap<StreamKey, Vec<(String, String)>> = BTreeMap::new();
 
-    // Skip diagnostics
+    // Skip + error diagnostics
     let mut seq_stats: BTreeMap<StreamKey, SeqStats> = BTreeMap::new();
-    let mut recent_skips: VecDeque<SkipEvent> = VecDeque::new();
-    let mut route_skip_missing: BTreeMap<String, u64> = BTreeMap::new(); // sum of missing samples
-    let mut route_skip_events: BTreeMap<String, u64> = BTreeMap::new(); // number of skip events
-    let mut skip_occ_total: u64 = 0; // global tally of skip occurrences
-
-    // Error diagnostics
-    let mut recent_errors: VecDeque<ErrorEvent> = VecDeque::new();
-    let mut route_error_events: BTreeMap<String, u64> = BTreeMap::new();
-    let mut error_occ_total: u64 = 0;
-    let mut stream_in_error: BTreeMap<StreamKey, bool> = BTreeMap::new(); // edge-trigger on transitions
+    let mut diag = Diagnostics::default();
 
     // Tunables
     let rate_window = Duration::from_secs(cli.rate_window_s.max(1));
@@ -951,25 +833,25 @@ fn main() {
             }
 
             recv(tick) -> _ => {
-                // Pull samples from the tree (also does skip detection)
+                // Pull samples from the tree (also does skip detection and logs proxy errors)
                 drain_tree_once(
                     &mut tree, &cli.streams_filter,
                     cli.jitter_window_s, cli.spike_ms,
                     &mut time_stats, &mut smp_stats, &mut stream_names, &mut stream_cols,
-                    &mut seq_stats, &mut recent_skips, &mut route_skip_missing, &mut route_skip_events, &mut skip_occ_total
+                    &mut seq_stats, &mut diag
                 );
 
                 let now = Instant::now();
                 let mut keys: BTreeSet<StreamKey> = BTreeSet::new();
                 keys.extend(time_stats.keys().cloned());
 
-                // Build table rows + detect ERROR transitions
+                // Build table rows
                 let mut rows = Vec::new();
                 for k in &keys {
                     let ts = match time_stats.get(k) { Some(v) => v, None => continue };
                     let sname = stream_names.get(k).cloned().unwrap_or_else(|| format!("stream_{}", k.stream_id));
 
-                    // Live rate and baseline (avoid double-borrow/move)
+                    // Live rate and baseline
                     let mut smps_rate = 0.0;
                     let mut baseline_smps = 0.0;
                     if let Some(ss) = smp_stats.get_mut(k) {
@@ -977,7 +859,7 @@ fn main() {
                         baseline_smps = ss.baseline_smps;
                     }
 
-                    // Compute status with clear priority:
+                    // Status priority:
                     //   STALLED > ERROR > WARN > RATE↓ > OK
                     let abs_ppm = ts.ppm.abs();
                     let stale = ts.last_seen.map(|t| now.duration_since(t) > stale_dur).unwrap_or(true);
@@ -1001,25 +883,6 @@ fn main() {
                     } else {
                         bold_ppm = false;
                     }
-
-                    // ERROR transition logging (edge-trigger)
-                    let now_error = status == "ERROR";
-                    let was_error = *stream_in_error.get(k).unwrap_or(&false);
-                    if now_error && !was_error {
-                        error_occ_total += 1;
-                        *route_error_events.entry(k.route.clone()).or_insert(0) += 1;
-                        recent_errors.push_back(ErrorEvent {
-                            when: SystemTime::now(),
-                            route: k.route.clone(),
-                            stream_id: k.stream_id,
-                            ppm: ts.ppm,
-                            drift_s: ts.drift_s,
-                        });
-                        if recent_errors.len() > 5 {
-                            recent_errors.pop_front();
-                        }
-                    }
-                    stream_in_error.insert(k.clone(), now_error);
 
                     rows.push((
                         k.route.clone(),
@@ -1051,27 +914,27 @@ fn main() {
 
                 // --- Build diagnostic snapshot for TUI ---
                 // Skips by route rows sorted by most missing, then route
-                let mut by_route_skips: Vec<(String, u64, u64)> = route_skip_missing
+                let mut by_route_skips: Vec<(String, u64, u64)> = diag.route_skip_missing
                     .iter()
-                    .map(|(r, miss)| (r.clone(), *miss, *route_skip_events.get(r).unwrap_or(&0)))
+                    .map(|(r, miss)| (r.clone(), *miss, *diag.route_skip_events.get(r).unwrap_or(&0)))
                     .collect();
                 by_route_skips.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-                // Errors by route rows sorted by most events, then route
-                let mut by_route_errors: Vec<(String, u64)> = route_error_events
+                // Proxy errors by kind rows sorted by most events, then kind
+                let mut by_kind_errs: Vec<(String, u64)> = diag.err_by_kind
                     .iter()
-                    .map(|(r, ev)| (r.clone(), *ev))
+                    .map(|(k, n)| ((*k).to_string(), *n))
                     .collect();
-                by_route_errors.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                by_kind_errs.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-                let diag = DiagSnapshot {
-                    recent_skips: recent_skips.iter().cloned().collect(),
+                let snapshot = DiagSnapshot {
+                    recent_skips: diag.recent_skips.iter().cloned().collect(),
                     by_route_skips,
-                    skip_total_events: skip_occ_total,
+                    skip_total_events: diag.skip_total_events,
 
-                    recent_errors: recent_errors.iter().cloned().collect(),
-                    by_route_errors,
-                    error_total_events: error_occ_total,
+                    recent_proxy_errs: diag.recent_proxy_errs.iter().cloned().collect(),
+                    by_kind_errs,
+                    err_total_events: diag.err_total_events,
                 };
 
                 let header = format!(
@@ -1079,7 +942,7 @@ fn main() {
                     cli.mode, cli.rate_window_s, cli.jitter_window_s, cli.ppm_warn, cli.ppm_err, cli.spike_ms, cli.rate_warn_pct, cli.fps, cli.stale_ms
                 );
 
-                if let Err(_) = tui.draw(&header, &rows, &meta_rows, cli.show_columns, cli.quiet, cli.mode, &diag) {
+                if let Err(_) = tui.draw(&header, &rows, &meta_rows, cli.show_columns, cli.quiet, cli.mode, &snapshot) {
                     break 'main;
                 }
             }
