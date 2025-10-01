@@ -206,7 +206,7 @@ fn rpc(args: &[String]) -> Result<(), ()> {
                 let t = get_rpctype(&rpc_name, &device);
                 Some(if t == "" {
                     println!(
-                        "Unknown RPC ret type, assuming 'string'. Use -T/--ret-type to override."
+                        "Unknown RPC rep type, assuming 'string'. Use -T/--rep-type to override."
                     );
                     "string".to_string()
                 } else {
