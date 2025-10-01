@@ -107,6 +107,7 @@ fn get_rpctype(name: &String, device: &proxy::Port) -> String {
 
 fn rpc(args: &[String]) -> Result<(), ()> {
     let mut opts = tio_opts();
+    opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
     opts.optopt(
         "t",
         "req-type",
