@@ -8,7 +8,7 @@ pub mod macos_helpers {
 
     impl ActivityGuard {
         pub fn latency_critical(reason: &str) -> Option<Self> {
-            let opts = NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+            let opts = NSActivityOptions::UserInteractive | NSActivityOptions::LatencyCritical;
             let pi = NSProcessInfo::processInfo();
             let reason = NSString::from_str(reason);
             let token = unsafe { pi.beginActivityWithOptions_reason(opts, &reason) };
@@ -26,47 +26,60 @@ pub mod macos_helpers {
 #[cfg(target_os = "windows")]
 pub mod windows_helpers {
     use std::io;
+    use core::ffi::c_void;
+    use windows_sys::w;
+
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, GetThreadPriority, SetThreadInformation, SetThreadPriority,
+        GetCurrentThread, GetThreadPriority, SetThreadInformation,
         THREAD_INFORMATION_CLASS, ThreadPowerThrottling,
         THREAD_POWER_THROTTLING_STATE, THREAD_POWER_THROTTLING_CURRENT_VERSION,
         THREAD_POWER_THROTTLING_EXECUTION_SPEED,
-        THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, AvRevertMmThreadCharacteristics,
+        AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL,
     };
     use windows_sys::Win32::System::WindowsProgramming::THREAD_PRIORITY_ERROR_RETURN;
 
+    type AvrtHandle = *mut c_void;
+
     pub struct ActivityGuard {
-        prev: i32,
+        mmcss_handle: AvrtHandle,
+        _prev_priority: i32,
     }
 
     impl ActivityGuard {
         pub fn latency_critical() -> io::Result<Self> {
             unsafe {
-                let h = GetCurrentThread();
+                let thread = GetCurrentThread();
 
-                let prev_raw = GetThreadPriority(h);
-                if prev_raw == (THREAD_PRIORITY_ERROR_RETURN as i32) {
+                let prev_raw = GetThreadPriority(thread);
+                if prev_raw == THREAD_PRIORITY_ERROR_RETURN as i32 {
                     return Err(io::Error::last_os_error());
                 }
-                let prev = prev_raw;
 
                 let mut pstate = THREAD_POWER_THROTTLING_STATE {
                     Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
                     ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
-                    StateMask: 0
+                    StateMask: 0, // 0 = disable throttling
                 };
                 let _ = SetThreadInformation(
-                    h,
+                    thread,
                     ThreadPowerThrottling as THREAD_INFORMATION_CLASS,
-                    &mut pstate as *mut _ as *mut _,
+                    (&mut pstate as *mut _ as *const c_void),
                     core::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
                 );
 
-                if SetThreadPriority(h, THREAD_PRIORITY_TIME_CRITICAL) == 0 {
-                    return Err(io::Error::last_os_error());
+                // Join MMCSS "Pro Audio"
+                let mut task_index: u32 = 0;
+                let handle: AvrtHandle = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index);
+                if handle.is_null() {
+                    // MMCSS unavailable; continue without it
+                    return Ok(ActivityGuard { mmcss_handle: core::ptr::null_mut(), _prev_priority: prev_raw });
                 }
 
-                Ok(ActivityGuard { prev })
+                // Raise within MMCSS class
+                let _ = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL as AVRT_PRIORITY);
+
+                Ok(ActivityGuard { mmcss_handle: handle, _prev_priority: prev_raw })
             }
         }
     }
@@ -74,9 +87,9 @@ pub mod windows_helpers {
     impl Drop for ActivityGuard {
         fn drop(&mut self) {
             unsafe {
-                let h = GetCurrentThread();
-                let _ = SetThreadPriority(h, self.prev);
-                let _ = SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+                if !self.mmcss_handle.is_null() {
+                    AvRevertMmThreadCharacteristics(self.mmcss_handle);
+                }
             }
         }
     }
