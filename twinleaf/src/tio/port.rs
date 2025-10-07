@@ -209,10 +209,10 @@ pub struct Port {
 }
 
 /// Default size of the rx channel when receiving to a crossbeam channel.
-pub static DEFAULT_RX_CHANNEL_SIZE: usize = 256;
+pub static DEFAULT_RX_CHANNEL_SIZE: usize = 32768;
 
 /// Default size of the tx channel when sending to a crossbeam channel.
-pub static DEFAULT_TX_CHANNEL_SIZE: usize = 64;
+pub static DEFAULT_TX_CHANNEL_SIZE: usize = 32768;
 
 impl Port {
     /// Method running the `Port` thread event loop. It bridges `mio` and
