@@ -107,6 +107,7 @@ fn get_rpctype(name: &String, device: &proxy::Port) -> String {
 
 fn rpc(args: &[String]) -> Result<(), ()> {
     let mut opts = tio_opts();
+    opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
     opts.optopt(
         "t",
         "req-type",
@@ -167,11 +168,11 @@ fn rpc(args: &[String]) -> Result<(), ()> {
                 "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
                 "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
                 "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
-                "u64" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
+                "u64" => s.parse::<u64>().unwrap().to_le_bytes().to_vec(),
                 "i8" => s.parse::<i8>().unwrap().to_le_bytes().to_vec(),
                 "i16" => s.parse::<i16>().unwrap().to_le_bytes().to_vec(),
                 "i32" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
-                "i64" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
+                "i64" => s.parse::<i64>().unwrap().to_le_bytes().to_vec(),
                 "f32" => s.parse::<f32>().unwrap().to_le_bytes().to_vec(),
                 "f64" => s.parse::<f64>().unwrap().to_le_bytes().to_vec(),
                 "string" => s.as_bytes().to_vec(),
@@ -206,7 +207,7 @@ fn rpc(args: &[String]) -> Result<(), ()> {
                 let t = get_rpctype(&rpc_name, &device);
                 Some(if t == "" {
                     println!(
-                        "Unknown RPC ret type, assuming 'string'. Use -T/--ret-type to override."
+                        "Unknown RPC rep type, assuming 'string'. Use -T/--rep-type to override."
                     );
                     "string".to_string()
                 } else {

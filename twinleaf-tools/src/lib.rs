@@ -31,7 +31,7 @@ pub fn tio_parseopts(opts: &Options, args: &[String]) -> (getopts::Matches, Stri
     let root = if let Some(url) = matches.opt_str("r") {
         url
     } else {
-        "tcp://localhost".to_string()
+        util::default_proxy_url().to_string()
     };
     let route = if let Some(path) = matches.opt_str("s") {
         DeviceRoute::from_str(&path).unwrap()
