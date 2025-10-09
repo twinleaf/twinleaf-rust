@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf-tools"
-version = "1.5.3"
+version = "1.5.4"
 edition = "2021"
 license = "MIT"
 description = "Tools for the Twinleaf I/O protocol for reading data from Twinleaf quantum sensors." 
