@@ -227,7 +227,7 @@ impl Interface {
             if let Some(status_sender) = status_queue {
                 (status_sender, None, false)
             } else {
-                let (s, r) = channel::bounded::<Event>(5);
+                let (s, r) = channel::bounded::<Event>(50);
                 (s, Some(r), true)
             }
         };
