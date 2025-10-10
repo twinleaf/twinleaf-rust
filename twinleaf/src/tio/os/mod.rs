@@ -64,7 +64,7 @@ pub mod windows_helpers {
                 let _ = SetThreadInformation(
                     thread,
                     ThreadPowerThrottling as THREAD_INFORMATION_CLASS,
-                    (&mut pstate as *mut _ as *const c_void),
+                    &mut pstate as *mut _ as *const c_void,
                     core::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
                 );
 

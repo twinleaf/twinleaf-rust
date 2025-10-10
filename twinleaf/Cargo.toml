@@ -13,11 +13,6 @@ crossbeam = "0.8"
 mio-serial = "5.0"
 crc = "3.2"
 num_enum = "0.7"
-windows-sys = { version = "0.61", features = [
-  "Win32_System_Threading",
-  "Win32_System_WindowsProgramming",
-] }
-
 
 [dependencies.mio]
 version = "1.0"
@@ -31,4 +26,5 @@ objc2 = "0.6.2"
 windows-sys = { version = "0.61", features = [
   "Win32_System_Threading",
   "Win32_System_WindowsProgramming",
+  "Win32_Devices_Communication"
 ] }
