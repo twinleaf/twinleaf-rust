@@ -8,7 +8,9 @@ pub mod macos_helpers {
 
     impl ActivityGuard {
         pub fn latency_critical(reason: &str) -> Option<Self> {
-            let opts = NSActivityOptions::UserInteractive | NSActivityOptions::LatencyCritical;
+            let opts = NSActivityOptions::UserInteractive 
+                                        | NSActivityOptions::LatencyCritical 
+                                        | NSActivityOptions::IdleSystemSleepDisabled;
             let pi = NSProcessInfo::processInfo();
             let reason = NSString::from_str(reason);
             let token = unsafe { pi.beginActivityWithOptions_reason(opts, &reason) };
@@ -29,6 +31,9 @@ pub mod windows_helpers {
     use core::ffi::c_void;
     use windows_sys::w;
 
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED
+    };
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, GetThreadPriority, SetThreadInformation,
         THREAD_INFORMATION_CLASS, ThreadPowerThrottling,
@@ -41,9 +46,28 @@ pub mod windows_helpers {
 
     type AvrtHandle = *mut c_void;
 
+    pub struct SleepGuard {
+        _prev: u32,
+    }
+    impl SleepGuard {
+        pub fn prevent_sleep(keep_display_on: bool) -> io::Result<Self> {
+            let mut flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED;
+            if keep_display_on { flags |= ES_DISPLAY_REQUIRED; }
+            let prev = unsafe { SetThreadExecutionState(flags) };
+            if prev == 0 { Err(io::Error::last_os_error()) } else { Ok(SleepGuard { _prev: prev }) }
+        }
+    }
+    impl Drop for SleepGuard {
+        fn drop(&mut self) {
+            unsafe { let _ = SetThreadExecutionState(ES_CONTINUOUS); }
+        }
+    }
+
     pub struct ActivityGuard {
         mmcss_handle: AvrtHandle,
         _prev_priority: i32,
+        #[allow(dead_code)]
+        _sleep: Option<SleepGuard>,
     }
 
     impl ActivityGuard {
@@ -56,6 +80,7 @@ pub mod windows_helpers {
                     return Err(io::Error::last_os_error());
                 }
 
+                // Disable CPU power throttling for this thread
                 let mut pstate = THREAD_POWER_THROTTLING_STATE {
                     Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
                     ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
@@ -68,18 +93,15 @@ pub mod windows_helpers {
                     core::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
                 );
 
-                // Join MMCSS "Pro Audio"
+                // Join MMCSS "Pro Audio" and raise priority within it
                 let mut task_index: u32 = 0;
                 let handle: AvrtHandle = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index);
-                if handle.is_null() {
-                    // MMCSS unavailable; continue without it
-                    return Ok(ActivityGuard { mmcss_handle: core::ptr::null_mut(), _prev_priority: prev_raw });
-                }
+                let _ = if !handle.is_null() { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL as AVRT_PRIORITY) } else { 0 };
 
-                // Raise within MMCSS class
-                let _ = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL as AVRT_PRIORITY);
+                // Also keep the system awake while this thread runs
+                let sleep = SleepGuard::prevent_sleep(false).ok();
 
-                Ok(ActivityGuard { mmcss_handle: handle, _prev_priority: prev_raw })
+                Ok(ActivityGuard { mmcss_handle: handle, _prev_priority: prev_raw, _sleep: sleep })
             }
         }
     }
