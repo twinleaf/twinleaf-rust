@@ -2,6 +2,7 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::{env, thread};
 use twinleaf::tio;
+use twinleaf::device::Device;
 use twinleaf_tools::{tio_opts, tio_parseopts};
 
 fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String]) -> String {
@@ -17,7 +18,6 @@ fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String])
 }
 
 fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
-    use twinleaf::data::Device;
     let mut device = Device::new(port);
     let peer_addr = stream.peer_addr().unwrap();
     println!("Connection from: {}", peer_addr);
