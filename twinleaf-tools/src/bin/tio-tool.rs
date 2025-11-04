@@ -1,6 +1,7 @@
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
+use twinleaf::device::{Device, DeviceTree};
 use twinleaf::data::DeviceDataParser;
 use twinleaf::tio;
 use twinleaf_tools::{tio_opts, tio_parseopts};
@@ -335,7 +336,7 @@ fn meta_dump(args: &[String]) -> Result<(), ()> {
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route).map_err(|e| {
+    let mut device = Device::open(&proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
 
@@ -378,7 +379,7 @@ fn data_dump(args: &[String]) -> Result<(), ()> {
     let (_matches, root, route) = tio_parseopts(&opts, args);
 
     let proxy = proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route).map_err(|e| {
+    let mut device = Device::open(&proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
 
@@ -394,24 +395,17 @@ fn data_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn all_data_dump(args: &[String]) -> Result<(), ()> {
+fn data_dump_all(args: &[String]) -> Result<(), ()> {
     let opts = tio_opts();
     let (_matches, root, route) = tio_parseopts(&opts, args);
     let proxy = proxy::Interface::new(&root);
 
-    let mut devs = twinleaf::device::DeviceTreeBuilder::new(proxy, route)
-        .build()
+    let mut devs = twinleaf::device::DeviceTree::open(&proxy, route)
         .map_err(|e| {
-            eprintln!("build failed: {:?}", e);
+            eprintln!("open failed: {:?}", e);
         })?;
 
     loop {
-        let (first, r0) = match devs.next() {
-            Ok(x) => x,
-            Err(_) => break,
-        };
-        print_sample(&first, Some(&r0));
-
         match devs.drain() {
             Ok(batch) => {
                 for (s, r) in batch {
@@ -511,10 +505,9 @@ fn log_data(args: &[String]) -> Result<(), ()> {
         eprintln!("create failed: {e:?}");
     })?;
 
-    let mut devs = twinleaf::device::DeviceTreeBuilder::new(proxy, route)
-        .build()
+    let mut devs = DeviceTree::open(&proxy, route)
         .map_err(|e| {
-            eprintln!("build failed: {:?}", e);
+            eprintln!("open failed: {:?}", e);
         })?;
 
     fn write_one(
@@ -575,24 +568,12 @@ fn log_data(args: &[String]) -> Result<(), ()> {
     }
 
     loop {
-        let (first, r0) = match devs.next() {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("recv error: {e:?}");
-                break;
-            }
-        };
-        if let Err(e) = write_one(&mut file, first, &r0) {
-            eprintln!("write error: {e:?}");
-            break;
-        }
-
         match devs.drain() {
             Ok(batch) => {
                 for (s, r) in batch {
                     if let Err(e) = write_one(&mut file, s, &r) {
                         eprintln!("write error: {e:?}");
-                        break;
+                        return Err(());
                     }
                 }
             }
@@ -628,7 +609,7 @@ fn log_metadata(args: &[String]) -> Result<(), ()> {
     }
 
     let proxy = proxy::Interface::new(&root);
-    let mut device = twinleaf::Device::open(&proxy, route).map_err(|e| {
+    let mut device = Device::open(&proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
 
@@ -897,7 +878,7 @@ fn main() -> ExitCode {
         "log-csv" => log_csv(&args[1..]),
         "firmware-upgrade" => firmware_upgrade(&args[2..]),
         "data-dump" => data_dump(&args[2..]),
-        "all-data-dump" => all_data_dump(&args[2..]),
+        "data-dump-all" => data_dump_all(&args[2..]),
         "meta-dump" => meta_dump(&args[2..]),
         _ => {
             // TODO: do usage right
@@ -914,7 +895,7 @@ fn main() -> ExitCode {
             println!(" tio-tool rpc-dump [-r url] [-s sensor] <rpc-name>");
             println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
             println!(" tio-tool data-dump [-r url] [-s sensor]");
-            println!(" tio-tool all-data-dump [-r url] [-s sensor]");
+            println!(" tio-tool data-dump-all [-r url] [-s sensor]");
             println!(" tio-tool meta-dump [-r url] [-s sensor]");
             println!(" tio-tool capture <rpc-prefix> <data-type>");
             if args[1] == "help" {
