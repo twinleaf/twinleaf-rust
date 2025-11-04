@@ -243,7 +243,7 @@ impl Tui {
     fn draw(
         &mut self,
         header: &str,
-        rows: &[(String, u8, String, f64, f64, f64, f64, u64, &'static str, bool)],
+        rows: &[(String, u8, String, f64, f64, f64, f64, u64, u32, f64, &'static str, bool)],
         quiet: bool,
     ) -> io::Result<()> {
         self.stdout.queue(cursor::MoveTo(0, 0))?;
@@ -259,15 +259,15 @@ impl Tui {
         // Table header
         self.stdout.queue(SetAttribute(Attribute::Bold))?;
         self.stdout.queue(style::Print(format!(
-            "{:<10} {:>3}  {:<22}  {:>9}  {:>9}  {:>8}  {:>11}  {:>8}  {:>8}",
-            "route", "sid", "stream_name", "smps/s", "drift(s)", "ppm", "jitter(ms)", "dropped", "status"
+            "{:<10} {:>3}  {:<22}  {:>9}  {:>9}  {:>8}  {:>11}  {:>8}  {:>10}  {:>12}  {:>8}",
+            "route", "sid", "stream_name", "smps/s", "drift(s)", "ppm", "jitter(ms)", "dropped", "last_n", "last_time", "status"
         )))?;
         self.stdout.queue(SetAttribute(Attribute::Reset))?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
         
         // Data rows
         let mut last_route = String::new();
-        for (route, sid, name, rate, drift, ppm, jitter, dropped, status, stale) in rows {
+        for (route, sid, name, rate, drift, ppm, jitter, dropped, last_n, last_timestamp, status, stale) in rows {
             if *route != last_route {
                 if !last_route.is_empty() {
                     self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -288,8 +288,8 @@ impl Tui {
             
             self.stdout.queue(SetForegroundColor(color))?;
             self.stdout.queue(style::Print(format!(
-                "{:<10} {:>3}  {:<22}  {:>9.1}  {:>9.3}  {:>8.0}  {:>11.2}  {:>8}  {:>8}",
-                route, sid, name, rate, drift, ppm, jitter, dropped, status
+                "{:<10} {:>3}  {:<22}  {:>9.1}  {:>9.3}  {:>8.0}  {:>11.2}  {:>8}  {:>10}  {:>12.3}  {:>8}",
+                route, sid, name, rate, drift, ppm, jitter, dropped, last_n, last_timestamp, status
             )))?;
             self.stdout.queue(ResetColor)?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
@@ -437,6 +437,8 @@ fn main() {
                         st.ppm,
                         st.jitter_ms,
                         st.samples_dropped,
+                        st.last_n.unwrap_or(0),
+                         st.last_data.unwrap_or(0.0),
                         status,
                         stale,
                     ));
