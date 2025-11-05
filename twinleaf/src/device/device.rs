@@ -41,28 +41,22 @@ impl Device {
         Ok(())
     }
 
-    fn process_packet(&mut self, pkt: tio::Packet) -> Option<tio::Packet> {
+    fn process_packet(&mut self, pkt: &tio::Packet) {
         match &pkt.payload {
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     self.n_reqs -= 1
-                } else {
-                    return Some(pkt);
                 }
             }
             tio::proto::Payload::RpcError(err) => {
                 if err.id == 7855 {
                     self.n_reqs -= 1
-                } else {
-                    return Some(pkt);
                 }
             }
             _ => {}
         }
-
         self.sample_queue
             .append(&mut VecDeque::from(self.parser.process_packet(&pkt)));
-        None
     }
 
     pub fn get_metadata(&mut self) -> Result<DeviceFullMetadata, tio::proxy::RpcError> {
@@ -84,7 +78,7 @@ impl Device {
                 .dev_port
                 .recv()
                 .map_err(tio::proxy::RpcError::RecvFailed)?;
-            self.process_packet(pkt);
+            self.process_packet(&pkt);
         }
     }
 
@@ -101,7 +95,7 @@ impl Device {
                 .dev_port
                 .recv()
                 .map_err(tio::proxy::RpcError::RecvFailed)?;
-            self.process_packet(pkt);
+            self.process_packet(&pkt);
         }
     }
 
@@ -119,7 +113,7 @@ impl Device {
                 Err(proxy::RecvError::WouldBlock) => return Ok(None),
                 Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
             };
-            self.process_packet(pkt);
+            self.process_packet(&pkt);
         }
     }
 
@@ -129,7 +123,7 @@ impl Device {
                 .map_err(tio::proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
                 Ok(pkt) => {
-                    self.process_packet(pkt);
+                    self.process_packet(&pkt);
                 }
                 Err(proxy::RecvError::WouldBlock) => {
                     break;
@@ -160,13 +154,16 @@ impl Device {
                 Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
             };
 
-            if let Some(pkt) = self.process_packet(pkt) {
-                match pkt.payload {
-                    tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
-                    tio::proto::Payload::RpcError(err) => {
-                        return Err(tio::proxy::RpcError::ExecError(err))
-                    }
-                    _ => unreachable!("process_packet returned a non-RPC packet to raw_rpc"),
+            self.process_packet(&pkt);
+
+            match pkt.payload {
+                tio::proto::Payload::RpcReply(rep) if rep.id != 7855 => {
+                    return Ok(rep.reply);
+                }
+                tio::proto::Payload::RpcError(err) if err.id != 7855 => {
+                    return Err(tio::proxy::RpcError::ExecError(err));
+                }
+                _ => {
                 }
             }
         }
@@ -185,7 +182,6 @@ impl Device {
         }
     }
 
-    /// Action: rpc with no argument which returns nothing
     pub fn action(&mut self, name: &str) -> Result<(), tio::proxy::RpcError> {
         self.rpc(name, ())
     }

@@ -11,6 +11,7 @@ pub struct DeviceTree {
     parsers: HashMap<DeviceRoute, DeviceDataParser>,
     n_reqs: HashMap<DeviceRoute, usize>,
     sample_queue: VecDeque<(Sample, DeviceRoute)>,
+    metadata_ready: HashMap<DeviceRoute, bool>,
 }
 
 impl DeviceTree {
@@ -21,6 +22,7 @@ impl DeviceTree {
             parsers: HashMap::new(),
             n_reqs: HashMap::new(),
             sample_queue: VecDeque::new(),
+            metadata_ready: HashMap::new(),
         }
     }
 
@@ -33,6 +35,7 @@ impl DeviceTree {
     }
 
     fn get_or_create_parser(&mut self, route: &DeviceRoute) -> &mut DeviceDataParser {
+        self.metadata_ready.entry(route.clone()).or_insert(false);
         self.parsers
             .entry(route.clone())
             .or_insert_with(|| DeviceDataParser::new(false))
@@ -43,14 +46,20 @@ impl DeviceTree {
 
         for route in routes {
             let n_reqs = self.n_reqs.get(&route).copied().unwrap_or(0);
-            
-            if n_reqs == 0 {
+            let is_ready = self.metadata_ready.get(&route).copied().unwrap_or(false);
+
+            if n_reqs == 0 && !is_ready {
                 let parser = self.parsers.get_mut(&route).unwrap();
                 let reqs = parser.requests();
-                for mut req in reqs {
-                    req.routing = route.clone();
-                    self.port.send(req)?;
-                    *self.n_reqs.entry(route.clone()).or_insert(0) += 1;
+                
+                if reqs.is_empty() {
+                    *self.metadata_ready.entry(route.clone()).or_default() = true;
+                } else {
+                    for mut req in reqs {
+                        req.routing = route.clone();
+                        self.port.send(req)?;
+                        *self.n_reqs.entry(route.clone()).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -58,9 +67,9 @@ impl DeviceTree {
         Ok(())
     }
 
-    fn process_packet(&mut self, pkt: tio::Packet) {
+    fn process_packet(&mut self, pkt: &tio::Packet) {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
-        
+
         match &pkt.payload {
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
@@ -81,9 +90,10 @@ impl DeviceTree {
 
         let parser = self.get_or_create_parser(&absolute_route);
         let samples: Vec<Sample> = parser.process_packet(&pkt);
-        
+
         for sample in samples {
-            self.sample_queue.push_back((sample, absolute_route.clone()));
+            self.sample_queue
+                .push_back((sample, absolute_route.clone()));
         }
     }
 
@@ -97,7 +107,10 @@ impl DeviceTree {
             if n_reqs == 0 {
                 let parser = self.get_or_create_parser(&route);
                 match parser.get_metadata() {
-                    Ok(full_meta) => return Ok(full_meta),
+                    Ok(full_meta) => {
+                        *self.metadata_ready.entry(route.clone()).or_default() = true;
+                        return Ok(full_meta);
+                    },
                     Err(reqs) => {
                         for mut req in reqs {
                             req.routing = route.clone();
@@ -113,7 +126,41 @@ impl DeviceTree {
                 .port
                 .recv()
                 .map_err(tio::proxy::RpcError::RecvFailed)?;
-            self.process_packet(pkt);
+            self.process_packet(&pkt);
+        }
+    }
+
+    pub fn next(&mut self) -> Result<(Sample, DeviceRoute), tio::proxy::RpcError> {
+        loop {
+            if let Some(sample) = self.sample_queue.pop_front() {
+                return Ok(sample);
+            }
+            self.internal_rpcs()
+                .map_err(tio::proxy::RpcError::SendFailed)?;
+
+            let pkt = self.port
+                .recv()
+                .map_err(tio::proxy::RpcError::RecvFailed)?;
+
+            self.process_packet(&pkt);
+        }
+    }
+
+     pub fn try_next(&mut self) -> Result<Option<(Sample, DeviceRoute)>, tio::proxy::RpcError> {
+        loop {
+            if let Some(sample) = self.sample_queue.pop_front() {
+                return Ok(Some(sample));
+            }
+            self.internal_rpcs()
+                .map_err(tio::proxy::RpcError::SendFailed)?;
+
+            let pkt = match self.port.try_recv() {
+                Ok(pkt) => pkt,
+                Err(proxy::RecvError::WouldBlock) => return Ok(None),
+                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
+            };
+
+            self.process_packet(&pkt);
         }
     }
 
@@ -123,7 +170,7 @@ impl DeviceTree {
                 .map_err(tio::proxy::RpcError::SendFailed)?;
             match self.port.try_recv() {
                 Ok(pkt) => {
-                    self.process_packet(pkt);
+                    self.process_packet(&pkt);
                 }
                 Err(proxy::RecvError::WouldBlock) => {
                     break;
@@ -177,7 +224,7 @@ impl DeviceTree {
                 }
             }
 
-            self.process_packet(pkt);
+            self.process_packet(&pkt);
         }
     }
 
@@ -242,6 +289,10 @@ impl DeviceTree {
         let reply_bytes = self.get_multi(route, name)?;
         let result_string = String::from_utf8_lossy(&reply_bytes).to_string();
         Ok(result_string)
+    }
+
+    pub fn is_route_ready(&self, route: &DeviceRoute) -> bool {
+        self.metadata_ready.get(route).copied().unwrap_or(false)
     }
 
     pub fn known_routes(&self) -> Vec<DeviceRoute> {
