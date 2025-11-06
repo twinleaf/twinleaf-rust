@@ -84,8 +84,8 @@ impl Device {
 
     pub fn next(&mut self) -> Result<Sample, tio::proxy::RpcError> {
         loop {
-            if !self.sample_queue.is_empty() {
-                return Ok(self.sample_queue.pop_front().unwrap());
+            if let Some(sample) = self.sample_queue.pop_front() {
+                return Ok(sample);
             }
 
             self.internal_rpcs()
@@ -101,8 +101,8 @@ impl Device {
 
     pub fn try_next(&mut self) -> Result<Option<Sample>, tio::proxy::RpcError> {
         loop {
-            if !self.sample_queue.is_empty() {
-                return Ok(self.sample_queue.pop_front());
+            if let Some(sample) = self.sample_queue.pop_front() {
+                return Ok(Some(sample));
             }
 
             self.internal_rpcs()
