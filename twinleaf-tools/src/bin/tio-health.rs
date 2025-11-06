@@ -142,6 +142,7 @@ struct StreamStats {
     // Metadata
     name: String,
     last_seen: Option<Instant>,
+    metadata_ok: bool,
 }
 
 impl StreamStats {
@@ -200,7 +201,6 @@ impl StreamStats {
         
         // Rate tracking
         self.arrivals.push_back(now);
-        self.last_seen = Some(now);
     }
     
     fn compute_rate(&mut self, now: Instant, window: Duration) -> f64 {
@@ -282,6 +282,7 @@ impl Tui {
                     "ERROR" => Color::Red,
                     "WARN" => Color::Yellow,
                     "OK" => Color::Green,
+                    "META" => Color::Blue,
                     _ => Color::White,
                 }
             };
@@ -390,12 +391,23 @@ fn main() {
                         }
                     });
                     
-                    st.on_sample(
-                        sample.n,
-                        sample.timestamp_end(),
-                        now,
-                        cli.jitter_window_s,
-                    );
+                    if !st.metadata_ok {
+                        st.metadata_ok = tree.is_route_ready(&route);
+                    }
+                    
+                    // Update name, last_seen, and last_data regardless
+                    st.name = sample.stream.name.clone();
+                    st.last_seen = Some(now);
+                    st.last_data = Some(sample.timestamp_end());
+
+                    if st.metadata_ok {
+                        st.on_sample(
+                            sample.n,
+                            sample.timestamp_end(),
+                            now,
+                            cli.jitter_window_s,
+                        );
+                    }
                 }
                 
                 // Build display rows
@@ -414,11 +426,13 @@ fn main() {
                         st.ppm = 0.0;
                         st.jitter_ms = 0.0;
                         st.jitter_window = None;
-                        st.last_n = None;
+                        st.last_n = None; // Reset last_n on stale
                     }
                     
                     let abs_ppm = st.ppm.abs();
-                    let status = if stale {
+                    let status = if !st.metadata_ok {
+                        "META"
+                    } else if stale {
                         "STALLED"
                     } else if abs_ppm >= cli.ppm_err {
                         "ERROR"
@@ -432,13 +446,13 @@ fn main() {
                         key.route.clone(),
                         key.stream_id,
                         st.name.clone(),
-                        rate,
-                        st.drift_s,
-                        st.ppm,
-                        st.jitter_ms,
-                        st.samples_dropped,
+                        if st.metadata_ok { rate } else { 0.0 },
+                        if st.metadata_ok { st.drift_s } else { 0.0 },
+                        if st.metadata_ok { st.ppm } else { 0.0 },
+                        if st.metadata_ok { st.jitter_ms } else { 0.0 },
+                        if st.metadata_ok { st.samples_dropped } else { 0 },
                         st.last_n.unwrap_or(0),
-                         st.last_data.unwrap_or(0.0),
+                        st.last_data.unwrap_or(0.0),
                         status,
                         stale,
                     ));
