@@ -4,13 +4,192 @@ use tio::util;
 use twinleaf::data::DeviceDataParser;
 use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
-use twinleaf_tools::{tio_opts, tio_parseopts};
+use twinleaf_tools::TioOpts;
+use clap::{Parser, Subcommand};
 
-use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
 use std::process::ExitCode;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-tool",
+    version,
+    about = "Twinleaf sensor management and data logging tool"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// List available RPCs on the device
+    RpcList {
+        #[command(flatten)]
+        tio: TioOpts,
+    },
+    /// Execute an RPC on the device
+    Rpc {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// RPC name to execute
+        rpc_name: String,
+        
+        /// RPC argument value
+        #[arg(
+            allow_negative_numbers = true,
+            value_name = "ARG",
+            help_heading = "RPC Arguments"
+        )]
+        rpc_arg: Option<String>,
+        
+        /// RPC request type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
+        #[arg(short = 't', long = "req-type", help_heading = "Type Options")]
+        req_type: Option<String>,
+        
+        /// RPC reply type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
+        #[arg(short = 'T', long = "rep-type", help_heading = "Type Options")]
+        rep_type: Option<String>,
+        
+        /// Enable debug output
+        #[arg(short = 'd', long)]
+        debug: bool,
+    },
+    
+    /// Dump RPC data from the device
+    RpcDump {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// RPC name to dump
+        rpc_name: String,
+        
+        /// Trigger and dump a capture buffer
+        #[arg(long)]
+        capture: bool,
+    },
+    
+    /// Dump raw packets from the device
+    Dump {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// Dump depth (default: dump everything)
+        #[arg(short = 'd', long = "depth")]
+        depth: Option<usize>,
+    },
+    
+    /// Log raw packets to a file
+    Log {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// Path of file where to log the data
+        #[arg(short = 'f', default_value_t = default_log_path())]
+        file: String,
+        
+        /// Unbuffered output
+        #[arg(short = 'u')]
+        unbuffered: bool,
+        
+        /// Dump depth (default: dump everything)
+        #[arg(short = 'd', long = "depth")]
+        depth: Option<usize>,
+    },
+    
+    /// Log data samples to a file
+    LogData {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// Path of file where to log the data
+        #[arg(short = 'f', default_value_t = default_log_path())]
+        file: String,
+        
+        /// Unbuffered output
+        #[arg(short = 'u')]
+        unbuffered: bool,
+    },
+    
+    /// Log metadata to a file
+    LogMetadata {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// Path of file where to store the metadata
+        #[arg(short = 'f', default_value = "meta.tio")]
+        file: String,
+    },
+    
+    /// Dump logged packets from file(s)
+    LogDump {
+        /// Log file paths
+        files: Vec<String>,
+    },
+    
+    /// Dump logged data from file(s)
+    LogDataDump {
+        /// Log file paths
+        files: Vec<String>,
+    },
+    
+    /// Convert logged data to CSV
+    LogCsv {
+        /// Stream ID
+        stream_id: u8,
+        
+        /// Log file paths (first file after stream_id)
+        files: Vec<String>,
+        
+        /// Sensor path in the sensor tree (default /)
+        #[arg(short = 's')]
+        sensor: Option<String>,
+        
+        /// Metadata file (if separate)
+        #[arg(short = 'm')]
+        metadata: Option<String>,
+        
+        /// Output file prefix
+        #[arg(short = 'o')]
+        output: Option<String>,
+    },
+    
+    /// Upgrade device firmware
+    FirmwareUpgrade {
+        #[command(flatten)]
+        tio: TioOpts,
+        
+        /// Firmware image path
+        firmware_path: String,
+    },
+    
+    /// Dump data samples from the device
+    DataDump {
+        #[command(flatten)]
+        tio: TioOpts,
+    },
+    
+    /// Dump data samples from all devices in tree
+    DataDumpAll {
+        #[command(flatten)]
+        tio: TioOpts,
+    },
+    
+    /// Dump device metadata
+    MetaDump {
+        #[command(flatten)]
+        tio: TioOpts,
+    },
+}
+
+fn default_log_path() -> String {
+    chrono::Local::now()
+        .format("log.%Y%m%d-%H%M%S.tio")
+        .to_string()
+}
 
 struct RpcMeta {
     arg_type: String,
@@ -80,11 +259,9 @@ impl RpcMeta {
     }
 }
 
-fn list_rpcs(args: &[String]) -> Result<(), ()> {
-    let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(&opts, args);
-
-    let proxy = proxy::Interface::new(&root);
+fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
     let nrpcs: u16 = device.get("rpc.listinfo").unwrap();
@@ -106,43 +283,20 @@ fn get_rpctype(name: &String, device: &proxy::Port) -> String {
     }
 }
 
-fn rpc(args: &[String]) -> Result<(), ()> {
-    let mut opts = tio_opts();
-    opts.optopt(
-        "t",
-        "req-type",
-        "RPC request type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
-        "type",
-    );
-    opts.optopt(
-        "T",
-        "rep-type",
-        "RPC reply type (one of u8/u16/u32/u64 i8/i16/i32/i64 f32/f64 string). ",
-        "type",
-    );
-    opts.optflag("d", "", "Debug printouts.");
-    let (matches, root, route) = tio_parseopts(&opts, args);
-
-    let rpc_name = if matches.free.len() < 1 {
-        panic!("must specify rpc name")
-    } else {
-        matches.free[0].clone()
-    };
-
-    let rpc_arg = if matches.free.len() > 2 {
-        panic!("usage: name [arg]")
-    } else if matches.free.len() == 2 {
-        Some(matches.free[1].clone())
-    } else {
-        None
-    };
-
-    let debug = matches.opt_present("d");
-
+fn rpc(
+    tio: &TioOpts,
+    rpc_name: String,
+    rpc_arg: Option<String>,
+    req_type: Option<String>,
+    rep_type: Option<String>,
+    debug: bool,
+) -> Result<(), ()> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
-    let proxy = proxy::Interface::new_proxy(&root, None, Some(status_send));
+    let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
+    let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
-    let req_type = if let Some(req_type) = matches.opt_str("req-type") {
+    
+    let req_type = if let Some(req_type) = req_type {
         Some(req_type)
     } else {
         if rpc_arg.is_some() {
@@ -200,7 +354,7 @@ fn rpc(args: &[String]) -> Result<(), ()> {
     };
 
     if reply.len() != 0 {
-        let rep_type = if let Some(rep_type) = matches.opt_str("rep-type") {
+        let rep_type = if let Some(rep_type) = rep_type {
             Some(rep_type)
         } else {
             if let None = req_type {
@@ -251,27 +405,19 @@ fn rpc(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn rpc_dump(args: &[String]) -> Result<(), ()> {
-    let mut opts = tio_opts();
-    opts.optflag("", "capture", "Trigger and dump a capture buffer");
-    let (matches, root, route) = tio_parseopts(&opts, args);
-    let is_capture = matches.opt_present("capture");
-
-    let rpc_name = if matches.free.len() != 1 {
-        panic!("must specify rpc name")
+fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(), ()> {
+    let rpc_name = if is_capture {
+        rpc_name.clone() + ".block"
     } else {
-        if is_capture {
-            matches.free[0].clone() + ".block"
-        } else {
-            matches.free[0].clone()
-        }
+        rpc_name.clone()
     };
 
-    let proxy = proxy::Interface::new(&root);
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
     if is_capture {
-        let trigger_rpc_name = matches.free[0].clone() + ".trigger";
+        let trigger_rpc_name = rpc_name[..rpc_name.len() - 6].to_string() + ".trigger";
         device.action(&trigger_rpc_name).unwrap();
     }
 
@@ -301,24 +447,11 @@ fn rpc_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn dump(args: &[String]) -> Result<(), ()> {
-    let mut opts = tio_opts();
-    opts.optopt(
-        "d",
-        "depth",
-        "Dump depth (default: dump everything)",
-        "max-depth",
-    );
-    let (matches, root, route) = tio_parseopts(&opts, args);
-    let depth = matches
-        .opt_str("d")
-        .unwrap_or(format!("{}", tio::proto::TIO_PACKET_MAX_ROUTING_SIZE))
-        .parse::<usize>()
-        .map_err(|e| {
-            eprintln!("Failed to parse depth: {:?}", e);
-        })?;
+fn dump(tio: &TioOpts, depth: Option<usize>) -> Result<(), ()> {
+    let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
 
-    let proxy = proxy::Interface::new(&root);
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
     let port = proxy
         .new_port(None, route, depth, true, true)
         .map_err(|e| {
@@ -331,11 +464,10 @@ fn dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn meta_dump(args: &[String]) -> Result<(), ()> {
-    let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(&opts, args);
+fn meta_dump(tio: &TioOpts) -> Result<(), ()> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
 
-    let proxy = proxy::Interface::new(&root);
     let mut device = Device::open(&proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
@@ -374,11 +506,10 @@ fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
     println!("{}{}", route_str, sample);
 }
 
-fn data_dump(args: &[String]) -> Result<(), ()> {
-    let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(&opts, args);
+fn data_dump(tio: &TioOpts) -> Result<(), ()> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
 
-    let proxy = proxy::Interface::new(&root);
     let mut device = Device::open(&proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
@@ -395,10 +526,9 @@ fn data_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn data_dump_all(args: &[String]) -> Result<(), ()> {
-    let opts = tio_opts();
-    let (_matches, root, route) = tio_parseopts(&opts, args);
-    let proxy = proxy::Interface::new(&root);
+fn data_dump_all(tio: &TioOpts) -> Result<(), ()> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
 
     let mut devs = twinleaf::device::DeviceTree::open(&proxy, route).map_err(|e| {
         eprintln!("open failed: {:?}", e);
@@ -417,90 +547,35 @@ fn data_dump_all(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn log(args: &[String]) -> Result<(), ()> {
-    let output_path = chrono::Local::now().format("log.%Y%m%d-%H%M%S.tio");
-    let mut opts = tio_opts();
-    opts.optopt(
-        "f",
-        "",
-        &format!(
-            "path of file where to log the data (default {})",
-            output_path
-        ),
-        "path",
-    );
-    opts.optflag("u", "", "unbuffered output");
-    opts.optopt(
-        "d",
-        "depth",
-        "Dump depth (default: dump everything)",
-        "max-depth",
-    );
-    let (matches, root, route) = tio_parseopts(&opts, args);
-    let depth = matches
-        .opt_str("d")
-        .unwrap_or(format!("{}", tio::proto::TIO_PACKET_MAX_ROUTING_SIZE))
-        .parse::<usize>()
-        .map_err(|e| {
-            eprintln!("Failed to parse depth: {:?}", e);
-        })?;
-    if matches.free.len() != 0 {
-        print!("{}", opts.usage("Unexpected argument"));
-        return Err(());
-    }
 
-    let output_path = if let Some(path) = matches.opt_str("f") {
-        path
-    } else {
-        output_path.to_string()
-    };
+fn log(tio: &TioOpts, file: String, unbuffered: bool, depth: Option<usize>) -> Result<(), ()> {
+    let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
 
-    let proxy = proxy::Interface::new(&root);
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
     let port = proxy
         .new_port(None, route, depth, true, true)
         .map_err(|e| {
             eprintln!("Failed to initialize proxy port: {:?}", e);
         })?;
 
-    let mut file = File::create(output_path).unwrap();
-    let sync = matches.opt_present("u");
+    let mut file = File::create(file).unwrap();
 
     for pkt in port.iter() {
         let raw = pkt.serialize().unwrap();
         file.write_all(&raw).unwrap();
-        if sync {
+        if unbuffered {
             file.flush().unwrap();
         }
     }
     Ok(())
 }
 
-fn log_data(args: &[String]) -> Result<(), ()> {
-    let output_path = chrono::Local::now().format("log.%Y%m%d-%H%M%S.tio");
-    let mut opts = tio_opts();
-    opts.optopt(
-        "f",
-        "",
-        &format!(
-            "path of file where to log the data (default {})",
-            output_path
-        ),
-        "path",
-    );
-    opts.optflag("u", "", "unbuffered output");
-    let (matches, root, route) = tio_parseopts(&opts, args);
-    if !matches.free.is_empty() {
-        print!("{}", opts.usage("Unexpected argument"));
-        return Err(());
-    }
+fn log_data(tio: &TioOpts, file: String, unbuffered: bool) -> Result<(), ()> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
 
-    let output_path = matches
-        .opt_str("f")
-        .unwrap_or_else(|| output_path.to_string());
-    let sync = matches.opt_present("u");
-
-    let proxy = proxy::Interface::new(&root);
-    let mut file = File::create(output_path).map_err(|e| {
+    let mut file = File::create(file).map_err(|e| {
         eprintln!("create failed: {e:?}");
     })?;
 
@@ -581,7 +656,7 @@ fn log_data(args: &[String]) -> Result<(), ()> {
             }
         }
 
-        if sync {
+        if unbuffered {
             if let Err(e) = file.flush() {
                 eprintln!("flush error: {e:?}");
                 break;
@@ -592,21 +667,10 @@ fn log_data(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn log_metadata(args: &[String]) -> Result<(), ()> {
-    let mut opts = tio_opts();
-    opts.optopt(
-        "f",
-        "",
-        "path of file where to store the metadata (defaults meta.tio)",
-        "path",
-    );
-    let (matches, root, route) = tio_parseopts(&opts, args);
-    if matches.free.len() != 0 {
-        print!("{}", opts.usage("Unexpected argument"));
-        return Err(());
-    }
+fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
 
-    let proxy = proxy::Interface::new(&root);
     let mut device = Device::open(&proxy, route).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
@@ -615,12 +679,7 @@ fn log_metadata(args: &[String]) -> Result<(), ()> {
         eprintln!("Failed to get metadata: {:?}", e);
     })?;
 
-    let output_path = if let Some(path) = matches.opt_str("f") {
-        path
-    } else {
-        "meta.tio".to_string()
-    };
-    let mut file = File::create(output_path).unwrap();
+    let mut file = File::create(file).unwrap();
 
     file.write_all(&meta.device.make_update().serialize().unwrap())
         .unwrap();
@@ -637,8 +696,8 @@ fn log_metadata(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn log_dump(args: &[String]) -> Result<(), ()> {
-    for path in args {
+fn log_dump(files: Vec<String>) -> Result<(), ()> {
+    for path in files {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
         while rest.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
@@ -649,11 +708,11 @@ fn log_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn log_data_dump(args: &[String]) -> Result<(), ()> {
+fn log_data_dump(files: Vec<String>) -> Result<(), ()> {
     use twinleaf::data::DeviceDataParser;
-    let mut parser = DeviceDataParser::new(args.len() > 1);
+    let mut parser = DeviceDataParser::new(files.len() > 1);
 
-    for path in args {
+    for path in files {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
         while rest.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
@@ -666,29 +725,25 @@ fn log_data_dump(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn log_csv(args: &[String]) -> Result<(), ()> {
-    let mut opts = getopts::Options::new();
-    opts.optopt(
-        "s",
-        "",
-        "sensor path in the sensor tree (default /)",
-        "path",
-    );
-    opts.optopt("m", "", "metadata file (if separate)", "path");
-    opts.optopt("o", "", "output file prefix", "prefix");
-    let matches = opts.parse(args).map_err(|e| {
-        eprintln!("Invalid invocation: {:?}", e);
-    })?;
-    if matches.free.len() < 3 {
+fn log_csv(
+    stream_id: u8,
+    files: Vec<String>,
+    sensor: Option<String>,
+    metadata: Option<String>,
+    output: Option<String>,
+) -> Result<(), ()> {
+    if files.is_empty() {
         eprintln!("Invalid invocation: missing log file");
         return Err(());
     }
-    let route = if let Some(path) = matches.opt_str("s") {
+
+    let route = if let Some(path) = sensor {
         DeviceRoute::from_str(&path).unwrap()
     } else {
         DeviceRoute::root()
     };
-    let mut parser = if let Some(path) = matches.opt_str("m") {
+
+    let mut parser = if let Some(path) = metadata {
         let mut parser = DeviceDataParser::new(true);
         let mut meta: &[u8] = &std::fs::read(path).unwrap();
         while meta.len() > 0 {
@@ -698,17 +753,13 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
         }
         parser
     } else {
-        DeviceDataParser::new(matches.free.len() > 3)
+        DeviceDataParser::new(files.len() > 1)
     };
-    let id: u8 = matches.free[1].parse().unwrap();
+
     let output_path = format!(
         "{}.{}.csv",
-        if let Some(path) = matches.opt_str("o") {
-            path
-        } else {
-            matches.free[2].clone()
-        },
-        id
+        output.unwrap_or_else(|| files[0].clone()),
+        stream_id
     );
 
     let mut file = OpenOptions::new()
@@ -719,7 +770,7 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
 
     let mut header_written: bool = false;
 
-    for path in &matches.free[2..] {
+    for path in &files {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
         while rest.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
@@ -728,7 +779,7 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
                 continue;
             }
             for sample in parser.process_packet(&pkt) {
-                if sample.stream.stream_id != id {
+                if sample.stream.stream_id != stream_id {
                     continue;
                 }
 
@@ -752,19 +803,13 @@ fn log_csv(args: &[String]) -> Result<(), ()> {
     Ok(())
 }
 
-fn firmware_upgrade(args: &[String]) -> Result<(), ()> {
-    let opts = tio_opts();
-    let (matches, root, route) = tio_parseopts(&opts, args);
-
-    if matches.free.len() != 1 {
-        panic!("Must specify firmware path only")
-    }
-
-    let firmware_data = std::fs::read(matches.free[0].clone()).unwrap();
+fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> {
+    let firmware_data = std::fs::read(firmware_path).unwrap();
 
     println!("Loaded {} bytes firmware", firmware_data.len());
 
-    let proxy = proxy::Interface::new(&root);
+    let proxy = proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
     if let Err(_) = device.action("dev.stop") {
@@ -859,50 +904,52 @@ fn firmware_upgrade(args: &[String]) -> Result<(), ()> {
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        args.push("help".to_string());
-    }
-    if let Ok(_) = match args[1].as_str() {
-        "rpc-list" => list_rpcs(&args[2..]),
-        "rpc" => rpc(&args[2..]),
-        "rpc-dump" => rpc_dump(&args[2..]),
-        "dump" => dump(&args[2..]),
-        "log" => log(&args[2..]),
-        "log-data" => log_data(&args[2..]),
-        "log-metadata" => log_metadata(&args[2..]),
-        "log-dump" => log_dump(&args[2..]),
-        "log-data-dump" => log_data_dump(&args[2..]),
-        "log-csv" => log_csv(&args[1..]),
-        "firmware-upgrade" => firmware_upgrade(&args[2..]),
-        "data-dump" => data_dump(&args[2..]),
-        "data-dump-all" => data_dump_all(&args[2..]),
-        "meta-dump" => meta_dump(&args[2..]),
-        _ => {
-            // TODO: do usage right
-            println!("Usage:");
-            println!(" tio-tool help");
-            println!(" tio-tool dump [-r url] [-s sensor]");
-            println!(" tio-tool log [-r url] [-s sensor] [-f filename] [-u]");
-            println!(" tio-tool log-metadata [-r url] [-s sensor] [-f filename]");
-            println!(" tio-tool log-dump filename [filename ...]");
-            println!(" tio-tool log-data-dump filename [filename ...]");
-            println!(" tio-tool log-csv <stream id> [metadata] <csv>");
-            println!(" tio-tool rpc-list [-r url] [-s sensor]");
-            println!(" tio-tool rpc [-r url] [-s sensor] [-t type] [-d] <rpc-name> [rpc-arg]");
-            println!(" tio-tool rpc-dump [-r url] [-s sensor] <rpc-name>");
-            println!(" tio-tool firmware-upgrade [-r url] [-s sensor] <firmware_image.bin>");
-            println!(" tio-tool data-dump [-r url] [-s sensor]");
-            println!(" tio-tool data-dump-all [-r url] [-s sensor]");
-            println!(" tio-tool meta-dump [-r url] [-s sensor]");
-            println!(" tio-tool capture <rpc-prefix> <data-type>");
-            if args[1] == "help" {
-                Ok(())
-            } else {
-                Err(())
-            }
-        }
-    } {
+    let cli = Cli::parse();
+
+    let result = match cli.command {
+        Commands::RpcList { tio } => list_rpcs(&tio),
+        Commands::Rpc {
+            tio,
+            rpc_name,
+            rpc_arg,
+            req_type,
+            rep_type,
+            debug,
+        } => rpc(&tio, rpc_name, rpc_arg, req_type, rep_type, debug),
+        Commands::RpcDump {
+            tio,
+            rpc_name,
+            capture,
+        } => rpc_dump(&tio, rpc_name, capture),
+        Commands::Dump { tio, depth } => dump(&tio, depth),
+        Commands::Log {
+            tio,
+            file,
+            unbuffered,
+            depth,
+        } => log(&tio, file, unbuffered, depth),
+        Commands::LogData {
+            tio,
+            file,
+            unbuffered,
+        } => log_data(&tio, file, unbuffered),
+        Commands::LogMetadata { tio, file } => log_metadata(&tio, file),
+        Commands::LogDump { files } => log_dump(files),
+        Commands::LogDataDump { files } => log_data_dump(files),
+        Commands::LogCsv {
+            stream_id,
+            files,
+            sensor,
+            metadata,
+            output,
+        } => log_csv(stream_id, files, sensor, metadata, output),
+        Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
+        Commands::DataDump { tio } => data_dump(&tio),
+        Commands::DataDumpAll { tio } => data_dump_all(&tio),
+        Commands::MetaDump { tio } => meta_dump(&tio),
+    };
+
+    if result.is_ok() {
         ExitCode::SUCCESS
     } else {
         eprintln!("FAILED");
