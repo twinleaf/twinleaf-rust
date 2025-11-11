@@ -1,8 +1,8 @@
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::{env, thread};
-use twinleaf::tio;
 use twinleaf::device::Device;
+use twinleaf::tio;
 use twinleaf_tools::{tio_opts, tio_parseopts};
 
 fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String]) -> String {

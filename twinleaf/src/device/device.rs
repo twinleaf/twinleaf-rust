@@ -163,8 +163,7 @@ impl Device {
                 tio::proto::Payload::RpcError(err) if err.id != 7855 => {
                     return Err(tio::proxy::RpcError::ExecError(err));
                 }
-                _ => {
-                }
+                _ => {}
             }
         }
     }

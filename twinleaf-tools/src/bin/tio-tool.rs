@@ -1,8 +1,8 @@
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
-use twinleaf::device::{Device, DeviceTree};
 use twinleaf::data::DeviceDataParser;
+use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::{tio_opts, tio_parseopts};
 
@@ -400,10 +400,9 @@ fn data_dump_all(args: &[String]) -> Result<(), ()> {
     let (_matches, root, route) = tio_parseopts(&opts, args);
     let proxy = proxy::Interface::new(&root);
 
-    let mut devs = twinleaf::device::DeviceTree::open(&proxy, route)
-        .map_err(|e| {
-            eprintln!("open failed: {:?}", e);
-        })?;
+    let mut devs = twinleaf::device::DeviceTree::open(&proxy, route).map_err(|e| {
+        eprintln!("open failed: {:?}", e);
+    })?;
 
     loop {
         match devs.drain() {
@@ -505,10 +504,9 @@ fn log_data(args: &[String]) -> Result<(), ()> {
         eprintln!("create failed: {e:?}");
     })?;
 
-    let mut devs = DeviceTree::open(&proxy, route)
-        .map_err(|e| {
-            eprintln!("open failed: {:?}", e);
-        })?;
+    let mut devs = DeviceTree::open(&proxy, route).map_err(|e| {
+        eprintln!("open failed: {:?}", e);
+    })?;
 
     fn write_one(
         file: &mut File,

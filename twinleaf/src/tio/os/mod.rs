@@ -8,9 +8,9 @@ pub mod macos_helpers {
 
     impl ActivityGuard {
         pub fn latency_critical(reason: &str) -> Option<Self> {
-            let opts = NSActivityOptions::UserInteractive 
-                                        | NSActivityOptions::LatencyCritical 
-                                        | NSActivityOptions::IdleSystemSleepDisabled;
+            let opts = NSActivityOptions::UserInteractive
+                | NSActivityOptions::LatencyCritical
+                | NSActivityOptions::IdleSystemSleepDisabled;
             let pi = NSProcessInfo::processInfo();
             let reason = NSString::from_str(reason);
             let token = unsafe { pi.beginActivityWithOptions_reason(opts, &reason) };
@@ -27,20 +27,19 @@ pub mod macos_helpers {
 
 #[cfg(target_os = "windows")]
 pub mod windows_helpers {
-    use std::io;
     use core::ffi::c_void;
+    use std::io;
     use windows_sys::w;
 
     use windows_sys::Win32::System::Power::{
-        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED
+        SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, GetThreadPriority, SetThreadInformation,
-        THREAD_INFORMATION_CLASS, ThreadPowerThrottling,
-        THREAD_POWER_THROTTLING_STATE, THREAD_POWER_THROTTLING_CURRENT_VERSION,
-        THREAD_POWER_THROTTLING_EXECUTION_SPEED,
-        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, AvRevertMmThreadCharacteristics,
-        AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL,
+        AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+        GetCurrentThread, GetThreadPriority, SetThreadInformation, ThreadPowerThrottling,
+        AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL, THREAD_INFORMATION_CLASS,
+        THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        THREAD_POWER_THROTTLING_STATE,
     };
     use windows_sys::Win32::System::WindowsProgramming::THREAD_PRIORITY_ERROR_RETURN;
 
@@ -52,14 +51,22 @@ pub mod windows_helpers {
     impl SleepGuard {
         pub fn prevent_sleep(keep_display_on: bool) -> io::Result<Self> {
             let mut flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED;
-            if keep_display_on { flags |= ES_DISPLAY_REQUIRED; }
+            if keep_display_on {
+                flags |= ES_DISPLAY_REQUIRED;
+            }
             let prev = unsafe { SetThreadExecutionState(flags) };
-            if prev == 0 { Err(io::Error::last_os_error()) } else { Ok(SleepGuard { _prev: prev }) }
+            if prev == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(SleepGuard { _prev: prev })
+            }
         }
     }
     impl Drop for SleepGuard {
         fn drop(&mut self) {
-            unsafe { let _ = SetThreadExecutionState(ES_CONTINUOUS); }
+            unsafe {
+                let _ = SetThreadExecutionState(ES_CONTINUOUS);
+            }
         }
     }
 
@@ -95,13 +102,22 @@ pub mod windows_helpers {
 
                 // Join MMCSS "Pro Audio" and raise priority within it
                 let mut task_index: u32 = 0;
-                let handle: AvrtHandle = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index);
-                let _ = if !handle.is_null() { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL as AVRT_PRIORITY) } else { 0 };
+                let handle: AvrtHandle =
+                    AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index);
+                let _ = if !handle.is_null() {
+                    AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL as AVRT_PRIORITY)
+                } else {
+                    0
+                };
 
                 // Also keep the system awake while this thread runs
                 let sleep = SleepGuard::prevent_sleep(false).ok();
 
-                Ok(ActivityGuard { mmcss_handle: handle, _prev_priority: prev_raw, _sleep: sleep })
+                Ok(ActivityGuard {
+                    mmcss_handle: handle,
+                    _prev_priority: prev_raw,
+                    _sleep: sleep,
+                })
             }
         }
     }
