@@ -117,7 +117,8 @@ impl std::fmt::Display for Sample {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SAMPLE({}:{}) {:.6}",
+            "SAMPLE({}:{}:{}:{}) {:.6}",
+            self.device.session_id,
             self.stream.stream_id,
             self.segment.segment_id,
             self.timestamp_end()
