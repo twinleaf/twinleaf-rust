@@ -329,8 +329,10 @@ impl Buffer {
     }
 
     pub fn process_sample(&mut self, sample: Sample, route: DeviceRoute) {
-        if self.forward_samples {
-            let _ = self.event_tx.try_send(BufferEvent::Samples(vec![(sample.clone(), route.clone())]));
+        if self.routes_seen.insert(route.clone()) {
+            let _ = self
+                .event_tx
+                .try_send(BufferEvent::RouteDiscovered(route.clone()));
         }
         if sample.meta_changed {
             let _ = self
@@ -342,10 +344,8 @@ impl Buffer {
                 .event_tx
                 .try_send(BufferEvent::SegmentChanged(route.clone()));
         }
-        if self.routes_seen.insert(route.clone()) {
-            let _ = self
-                .event_tx
-                .try_send(BufferEvent::RouteDiscovered(route.clone()));
+        if self.forward_samples {
+            let _ = self.event_tx.try_send(BufferEvent::Samples(vec![(sample.clone(), route.clone())]));
         }
 
         let stream_id = sample.stream.stream_id;
