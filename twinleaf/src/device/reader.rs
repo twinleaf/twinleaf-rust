@@ -1,185 +1,112 @@
 //! Reader
 //! Takes keys (e.g., `DeviceKey`, `StreamKey`, `ColumnKey`) and tracks a uniform cursor from a `Buffer`
-//! - Derives `DeviceKey` from `DeviceRoute`
-//! - Derives `StreamKey` from `stream_id` and `DeviceRoute`
-//! - Derives `ColumnKey` from `column_id` and `stream_id` and `DeviceRoute`
-//! 
-//! Has atomic reference to a `Buffer`, allowing it to return either aligned `Sample`s or a more efficient data structure ([timestamp, value, route] matrix / HashMap)
-//! 
-//! Concerns:
-//! 1. What a `Reader` returns (window contents).
-//! 2. Whether it may wait (blocking vs. non-blocking).
-//! 3. How frames are aligned across routes (exact time alignment).
+//! - Derives `StreamKey` from `(DeviceRoute, StreamId)`
+//!
+//! Has atomic reference to a `Buffer` using Arc<RwLock<Buffer>>
 //!
 //! Anchors:
-//! - T: cursor from `Buffer`, given by min(latest_timestamp) across the `Reader` routes.
+//! - T: cursor from `Buffer`, given by min(latest_timestamp) across the `Reader` (route,stream) keys.
 //! - C: cursor from `Reader` (advanced only by successful `next` reads).
-//!
-//! - `get_next(N)`
-//!     Blocking; consume-based. Anchor at C.
-//!     Wait until there are at least N aligned samples strictly after C for each `DeviceRoute` in `Reader.routes()`.
-//!     Return exactly N samples per route; advance C by N.
-//!
-//! - `try_next(N)`
-//!     Non-blocking; consume-based. Anchor at C.
-//!     If there are at least N aligned samples after C for each `DeviceRoute` in `Reader.routes()`, return exactly N and advance C by N.
-//!     Otherwise, return None and do not advance C.
-//!
-//! - `get_last(N)`
-//!     Blocking; snapshot-based. Anchor at T.
-//!     Wait until each `DeviceRoute` in `Reader.routes()` has at least N aligned samples ending at T.
-//!     Return exactly N samples per route
-//!
-//! - `try_last(N)`
-//!     Non-blocking; snapshot-based. Anchor at T.
-//!     If each `DeviceRoute` in `Reader.routes()` has at least N aligned samples ending at T, return exactly N. 
-//!     Otherwise, return None.
 
-use std::collections::HashMap;
-use crate::{data::Sample, device::buffer::Buffer, tio::{self, proto::DeviceRoute}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use crate::device::{
+    buffer::{AlignedWindow, Buffer, ReadError},
+    ColumnSpec, CursorPosition, StreamKey,
+};
 
 pub struct Reader {
-    routes: Vec<DeviceRoute>,
-    cursors: HashMap<DeviceRoute, usize>,
+    buffer: Arc<RwLock<Buffer>>,
+    columns: Vec<ColumnSpec>,
+    cursor: ReaderCursor,
+}
+
+struct ReaderCursor {
+    positions: HashMap<StreamKey, CursorPosition>,
+}
+
+impl ReaderCursor {
+    fn new() -> Self {
+        Self {
+            positions: HashMap::new(),
+        }
+    }
 }
 
 impl Reader {
-    pub fn new(routes: Vec<DeviceRoute>) -> Self {
-        let mut cursors = HashMap::new();
-        for route in &routes {
-            cursors.insert(route.clone(), 0);
+    pub fn new(buffer: Arc<RwLock<Buffer>>, columns: Vec<ColumnSpec>) -> Self {
+        Self {
+            buffer,
+            columns,
+            cursor: ReaderCursor::new(),
         }
-        
-        Reader { routes, cursors }
     }
-    
-    pub fn routes(&self) -> &[DeviceRoute] {
-        &self.routes
+
+    pub fn next(&mut self, n_samples: usize) -> Result<AlignedWindow, ReadError> {
+        loop {
+            let buffer = self.buffer.read().unwrap();
+            match self.try_read_from_cursor(&buffer, n_samples) {
+                Ok(window) => {
+                    drop(buffer);
+                    self.advance_cursor(&window);
+                    return Ok(window);
+                }
+                Err(ReadError::InsufficientData { .. }) => {
+                    drop(buffer);
+                    std::thread::sleep(Duration::from_millis(1)); // didn't do: find actual blocking implementaiton
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
-    
-    fn compute_t(&self, buffer: &Buffer) -> Option<f64> {
-        self.routes
-            .iter()
-            .filter_map(|route| buffer.latest_timestamps.get(route))
-            .copied()
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+
+    pub fn try_next(&mut self, n_samples: usize) -> Result<Option<AlignedWindow>, ReadError> {
+        let buffer = self.buffer.read().unwrap();
+        match self.try_read_from_cursor(&buffer, n_samples) {
+            Ok(window) => {
+                drop(buffer);
+                self.advance_cursor(&window);
+                Ok(Some(window))
+            }
+            Err(ReadError::InsufficientData { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
-    
-    fn get_newest_session_id(&self, buffer: &Buffer, route: &DeviceRoute) -> Option<u32> {
-        let route_map = buffer.route_buffers.get(route)?;
-        route_map.keys().max().copied()
-    }
-    
-    fn get_samples_from_cursor(
+
+    fn try_read_from_cursor(
         &self,
         buffer: &Buffer,
-        route: &DeviceRoute,
-        n: usize,
-    ) -> Option<Vec<Sample>> {
-        let route_map = buffer.route_buffers.get(route)?;
-        let newest_session_id = self.get_newest_session_id(buffer, route)?;
-        let session_buffer = route_map.get(&newest_session_id)?;
-        
-        if session_buffer.len() < n {
-            return None;
+        n_samples: usize,
+    ) -> Result<AlignedWindow, ReadError> {
+        if self.cursor.positions.is_empty() {
+            return buffer.read_aligned_window(&self.columns, n_samples);
         }
-        
-        Some(session_buffer.iter().take(n).cloned().collect())
+
+        buffer.read_from_cursor(&self.columns, &self.cursor.positions, n_samples)
     }
-    
-    pub fn get_next(
-        &mut self,
-        buffer: &mut Buffer,
-        n: usize,
-    ) -> Result<HashMap<DeviceRoute, Vec<Sample>>, tio::proxy::RpcError> {
-        loop {
-            if let Some(result) = self.try_next(buffer, n)? {
-                return Ok(result);
-            }
-            
-            buffer.drain_tree()?;
-        }
-    }
-    
-    pub fn try_next(
-        &mut self,
-        buffer: &mut Buffer,
-        n: usize,
-    ) -> Result<Option<HashMap<DeviceRoute, Vec<Sample>>>, tio::proxy::RpcError> {
-        buffer.drain_tree()?;
-        
-        let mut result = HashMap::new();
-        
-        for route in &self.routes {
-            match self.get_samples_from_cursor(buffer, route, n) {
-                Some(samples) => {
-                    result.insert(route.clone(), samples);
-                }
-                None => {
-                    return Ok(None);
-                }
-            }
-        }
-        
-        for route in &self.routes {
-            *self.cursors.get_mut(route).unwrap() += n;
-        }
-        
-        Ok(Some(result))
-    }
-    
-    pub fn get_last(
-        &mut self,
-        buffer: &mut Buffer,
-        n: usize,
-    ) -> Result<HashMap<DeviceRoute, Vec<Sample>>, tio::proxy::RpcError> {
-        loop {
-            if let Some(result) = self.try_last(buffer, n)? {
-                return Ok(result);
-            }
-            
-            buffer.drain_tree()?;
-        }
-    }
-    
-    pub fn try_last(
-        &mut self,
-        buffer: &mut Buffer,
-        n: usize,
-    ) -> Result<Option<HashMap<DeviceRoute, Vec<Sample>>>, tio::proxy::RpcError> {
-        buffer.drain_tree()?;
-        
-        let t = match self.compute_t(buffer) {
-            Some(t) => t,
-            None => return Ok(None),
+
+    fn advance_cursor(&mut self, window: &AlignedWindow) {
+        let Some(&last_sample_number) = window.sample_numbers.last() else {
+            return;
         };
-        
-        let mut result = HashMap::new();
-        
-        for route in &self.routes {
-            let route_map = buffer.route_buffers.get(route)
-                .ok_or(tio::proxy::RpcError::TypeError)?;
-            
-            let newest_session_id = self.get_newest_session_id(buffer, route)
-                .ok_or(tio::proxy::RpcError::TypeError)?;
-            
-            let session_buffer = route_map.get(&newest_session_id)
-                .ok_or(tio::proxy::RpcError::TypeError)?;
-            
-            let valid_samples: Vec<Sample> = session_buffer
-                .iter()
-                .filter(|s| s.timestamp_end() <= t)
-                .cloned()
-                .collect();
-            
-            if valid_samples.len() < n {
-                return Ok(None);
-            }
-            
-            let last_n = valid_samples[valid_samples.len() - n..].to_vec();
-            result.insert(route.clone(), last_n);
+
+        for (stream_key, segment_meta) in &window.segment_metadata {
+            let session_id = *window.session_ids.get(stream_key).unwrap();
+            let segment_id = segment_meta.segment_id;
+
+            self.cursor.positions.insert(
+                stream_key.clone(),
+                CursorPosition {
+                    session_id,
+                    segment_id,
+                    last_sample_number,
+                },
+            );
         }
-        
-        Ok(Some(result))
     }
 }
