@@ -74,7 +74,11 @@ struct Cli {
     streams: Option<Vec<u8>>,
 
     /// Suppress the footer help text ("q/Esc to quit")
-    #[arg(long = "quiet", help = "Suppress footer hint")]
+    #[arg(
+        short = 'q',
+        long = "quiet", 
+        help = "Suppress footer hint"
+    )]
     quiet: bool,
 
     /// UI refresh rate in frames per second
@@ -97,6 +101,7 @@ struct Cli {
 
     /// Maximum number of events to keep in the event log
     #[arg(
+        short ='n',
         long = "event-log-size",
         default_value = "5",
         value_name = "N",
@@ -106,6 +111,7 @@ struct Cli {
 
     /// Only show warning and error events in the log (yellow and red)
     #[arg(
+        short = 'w',
         long = "warnings-only",
         help = "Show only red and yellow events in the log"
     )]
