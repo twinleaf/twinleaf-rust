@@ -1,173 +1,145 @@
 // tio-health
 //
-// Simplified live timing & rate diagnostics by device route.
+// Live timing & rate diagnostics by device route.
 //
 // Build: cargo run --release -- <tio-url> [route] [options]
 // Quit:  q / Esc / Ctrl-C
 
 use chrono::{DateTime, Local};
+use clap::Parser;
 use crossbeam::channel;
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, event, style, terminal, ExecutableCommand, QueueableCommand};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime};
-use twinleaf::device::DeviceTree;
 use twinleaf::device::{Buffer, BufferEvent};
+use twinleaf::device::{DeviceTree, StreamKey};
 use twinleaf::tio;
-use twinleaf_tools::{tio_opts, tio_parseopts};
+use twinleaf_tools::TioOpts;
 
-#[derive(Debug)]
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-health",
+    version,
+    about = "Live timing & rate diagnostics for TIO (Twinleaf) devices"
+)]
 struct Cli {
-    rate_window_s: u64,
-    jitter_window_s: u64,
+    #[command(flatten)]
+    tio: TioOpts,
+
+    /// Time window in seconds for calculating sample rate
+    #[arg(
+        long = "rate-window",
+        default_value = "5",
+        value_name = "SECONDS",
+        help = "Seconds for rate calculation window"
+    )]
+    rate_window: u64,
+
+    /// Time window in seconds for calculating jitter statistics
+    #[arg(
+        long = "jitter-window",
+        default_value = "10",
+        value_name = "SECONDS",
+        help = "Seconds for jitter calculation window"
+    )]
+    jitter_window: u64,
+
+    /// PPM threshold for yellow warning indicators
+    #[arg(
+        long = "ppm-warn",
+        default_value = "100",
+        value_name = "PPM",
+        help = "Warning threshold in parts per million"
+    )]
+    ppm_warn: f64,
+
+    /// PPM threshold for red error indicators
+    #[arg(
+        long = "ppm-err",
+        default_value = "200",
+        value_name = "PPM",
+        help = "Error threshold in parts per million"
+    )]
+    ppm_err: f64,
+
+    /// Filter to only show specific stream IDs (comma-separated)
+    #[arg(
+        long = "streams",
+        value_delimiter = ',',
+        value_name = "IDS",
+        help = "Comma-separated stream IDs to monitor (e.g., 0,1,5)"
+    )]
+    streams: Option<Vec<u8>>,
+
+    /// Suppress the footer help text ("q/Esc to quit")
+    #[arg(long = "quiet", help = "Suppress footer hint")]
+    quiet: bool,
+
+    /// UI refresh rate in frames per second
+    #[arg(
+        long = "fps",
+        default_value = "10",
+        value_name = "FPS",
+        help = "UI refresh rate (frames per second)"
+    )]
+    fps: u64,
+
+    /// Time in milliseconds before marking a stream as stale
+    #[arg(
+        long = "stale-ms",
+        default_value = "2000",
+        value_name = "MS",
+        help = "Mark streams as stale after this many milliseconds without data"
+    )]
+    stale_ms: u64,
+
+    /// Maximum number of events to keep in the event log
+    #[arg(
+        long = "event-log-size",
+        default_value = "5",
+        value_name = "N",
+        help = "Maximum number of events to display in the log"
+    )]
+    event_log_size: usize,
+
+    /// Only show warning and error events in the log (yellow and red)
+    #[arg(
+        long = "warnings-only",
+        help = "Show only red and yellow events in the log"
+    )]
+    warnings_only: bool,
+}
+
+struct Config {
+    rate_window: Duration,
+    jitter_window: u64,
+    stale_dur: Duration,
     ppm_warn: f64,
     ppm_err: f64,
-    streams_filter: Option<Vec<u8>>,
-    quiet: bool,
     fps: u64,
-    stale_ms: u64,
     event_log_size: usize,
-    show_warnings_only: bool,
+    warnings_only: bool,
+    quiet: bool,
+    streams_filter: Option<Vec<u8>>,
 }
 
-fn print_help_and_exit(opts: &getopts::Options, program: &str, code: i32) -> ! {
-    let brief = format!(
-        "Usage: {program} [options] <tio-url> [route]\n\n\
-         Live timing & rate diagnostics for TIO devices."
-    );
-    let usage = opts.usage(&brief);
-    eprintln!("{usage}");
-    std::process::exit(code)
-}
-
-fn parse_cli() -> (String, tio::proto::DeviceRoute, Cli) {
-    let mut opts = tio_opts();
-    opts.optflag("h", "help", "Show help");
-    opts.optopt(
-        "",
-        "rate-window",
-        "Seconds for rate window (default 5)",
-        "sec",
-    );
-    opts.optopt(
-        "",
-        "jitter-window",
-        "Seconds for jitter window (default 10)",
-        "sec",
-    );
-    opts.optopt("", "ppm-warn", "Warn threshold in ppm (default 100)", "ppm");
-    opts.optopt("", "ppm-err", "Error threshold in ppm (default 200)", "ppm");
-    opts.optopt(
-        "",
-        "streams",
-        "Comma-separated stream IDs to include",
-        "list",
-    );
-    opts.optflag("", "quiet", "Suppress footer hint");
-    opts.optopt("", "fps", "UI refresh rate (default 10)", "n");
-    opts.optopt(
-        "",
-        "stale-ms",
-        "Grey rows after this many ms (default 2000)",
-        "ms",
-    );
-    opts.optopt(
-        "",
-        "event-log-size",
-        "Max events to show in log (default 5)",
-        "n",
-    );
-    opts.optflag(
-        "", 
-        "warnings-only", 
-        "Show only red and yellow events"
-    );
-
-
-    let (matches, root, route) = tio_parseopts(&opts, &std::env::args().collect::<Vec<_>>());
-    if matches.opt_present("help") {
-        print_help_and_exit(
-            &opts,
-            &std::env::args()
-                .next()
-                .unwrap_or_else(|| "tio-health".into()),
-            0,
-        );
+impl From<&Cli> for Config {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            rate_window: Duration::from_secs(cli.rate_window.max(1)),
+            jitter_window: cli.jitter_window,
+            stale_dur: Duration::from_millis(cli.stale_ms.max(1)),
+            ppm_warn: cli.ppm_warn,
+            ppm_err: cli.ppm_err,
+            fps: cli.fps,
+            event_log_size: cli.event_log_size,
+            warnings_only: cli.warnings_only,
+            quiet: cli.quiet,
+            streams_filter: cli.streams.clone(),
+        }
     }
-
-    let rate_window_s = matches
-        .opt_str("rate-window")
-        .as_deref()
-        .unwrap_or("5")
-        .parse()
-        .unwrap_or(5);
-    let jitter_window_s = matches
-        .opt_str("jitter-window")
-        .as_deref()
-        .unwrap_or("10")
-        .parse()
-        .unwrap_or(10);
-    let ppm_warn = matches
-        .opt_str("ppm-warn")
-        .as_deref()
-        .unwrap_or("100")
-        .parse()
-        .unwrap_or(100.0);
-    let ppm_err = matches
-        .opt_str("ppm-err")
-        .as_deref()
-        .unwrap_or("200")
-        .parse()
-        .unwrap_or(200.0);
-    let streams_filter = matches.opt_str("streams").map(|s| {
-        s.split(',')
-            .filter_map(|x| x.trim().parse::<u8>().ok())
-            .collect()
-    });
-    let quiet = matches.opt_present("quiet");
-    let fps = matches
-        .opt_str("fps")
-        .as_deref()
-        .unwrap_or("10")
-        .parse()
-        .unwrap_or(10);
-    let stale_ms = matches
-        .opt_str("stale-ms")
-        .as_deref()
-        .unwrap_or("2000")
-        .parse()
-        .unwrap_or(2000);
-    let event_log_size = matches
-        .opt_str("event-log-size")
-        .as_deref()
-        .unwrap_or("5")
-        .parse()
-        .unwrap_or(5);
-    let show_warnings_only = matches.opt_present("warnings-only");
-
-    (
-        root,
-        route,
-        Cli {
-            rate_window_s,
-            jitter_window_s,
-            ppm_warn,
-            ppm_err,
-            streams_filter,
-            quiet,
-            fps,
-            stale_ms,
-            event_log_size,
-            show_warnings_only,
-        },
-    )
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct StreamKey {
-    route: String,
-    stream_id: u8,
 }
 
 struct TimeWindow {
@@ -239,9 +211,32 @@ struct StreamStats {
 }
 
 impl StreamStats {
-    fn ensure_jitter_window(&mut self, seconds: u64) {
+    fn update_jitter(&mut self, t_data: f64, now: Instant, window_s: u64) {
         if self.jitter_window.is_none() {
-            self.jitter_window = Some(TimeWindow::new(seconds, 100.0));
+            self.jitter_window = Some(TimeWindow::new(window_s, 100.0));
+        }
+
+        if let (Some(lh), Some(ld)) = (self.last_host, self.last_data) {
+            let dh = now.duration_since(lh).as_secs_f64();
+            let dd = t_data - ld;
+            let delta_ms = (dd - dh) * 1000.0;
+
+            if let Some(w) = &mut self.jitter_window {
+                w.push(delta_ms);
+                self.jitter_ms = w.std_ms();
+            }
+        }
+    }
+
+    fn update_drift(&mut self, t_data: f64, now: Instant) {
+        if let (Some(h0), Some(d0)) = (self.t0_host, self.t0_data) {
+            let host_elapsed = now.duration_since(h0).as_secs_f64();
+            let data_elapsed = t_data - d0;
+            self.drift_s = data_elapsed - host_elapsed;
+
+            if host_elapsed.abs() > 1e-9 {
+                self.ppm = 1e6 * self.drift_s / host_elapsed;
+            }
         }
     }
 
@@ -261,8 +256,6 @@ impl StreamStats {
     }
 
     fn on_sample(&mut self, sample_n: u32, t_data: f64, now: Instant, jitter_window_s: u64) {
-        self.ensure_jitter_window(jitter_window_s);
-
         // First sample initialization
         if self.t0_host.is_none() {
             self.t0_host = Some(now);
@@ -271,36 +264,11 @@ impl StreamStats {
             self.t0_data = Some(t_data);
         }
 
-        // Compute jitter from consecutive samples
-        if let (Some(lh), Some(ld)) = (self.last_host, self.last_data) {
-            let dh = now.duration_since(lh).as_secs_f64();
-            let dd = t_data - ld;
-            let delta_ms = (dd - dh) * 1000.0;
-
-            if let Some(w) = &mut self.jitter_window {
-                w.push(delta_ms);
-                self.jitter_ms = w.std_ms();
-            }
-        }
-
+        self.update_jitter(t_data, now, jitter_window_s);
         self.last_host = Some(now);
         self.last_data = Some(t_data);
-
-        // Compute drift and ppm
-        let h0 = self.t0_host.unwrap();
-        let d0 = self.t0_data.unwrap();
-        let host_elapsed = now.duration_since(h0).as_secs_f64();
-        let data_elapsed = t_data - d0;
-        self.drift_s = data_elapsed - host_elapsed;
-
-        if host_elapsed.abs() > 1e-9 {
-            self.ppm = 1e6 * self.drift_s / host_elapsed;
-        }
-
-        // Note: Sample dropping is now tracked via BufferEvent::SamplesSkipped
+        self.update_drift(t_data, now);
         self.last_n = Some(sample_n);
-
-        // Rate tracking
         self.arrivals.push_back(now);
     }
 
@@ -318,6 +286,97 @@ impl StreamStats {
         let win_secs = window.as_secs_f64().max(1e-6);
         self.rate_smps = count / win_secs;
         self.rate_smps
+    }
+
+    fn is_stale(&self, now: Instant, stale_dur: Duration) -> bool {
+        self.last_seen
+            .map(|t| now.duration_since(t) > stale_dur)
+            .unwrap_or(true)
+    }
+
+    fn reset_timing(&mut self) {
+        self.t0_host = None;
+        self.t0_data = None;
+        self.last_host = None;
+        self.last_data = None;
+        self.drift_s = 0.0;
+        self.ppm = 0.0;
+        self.jitter_ms = 0.0;
+        self.jitter_window = None;
+        self.last_n = None;
+    }
+
+    fn get_status(&self, ppm_warn: f64, ppm_err: f64, stale: bool) -> &'static str {
+        if !self.metadata_ok {
+            "META"
+        } else if stale {
+            "STALLED"
+        } else if self.ppm.abs() >= ppm_err {
+            "ERROR"
+        } else if self.ppm.abs() >= ppm_warn {
+            "WARN"
+        } else {
+            "OK"
+        }
+    }
+
+    fn to_display_row(
+        &self,
+        route: String,
+        stream_id: u8,
+        config: &Config,
+        now: Instant,
+    ) -> DisplayRow {
+        let stale = self.is_stale(now, config.stale_dur);
+        let status = self.get_status(config.ppm_warn, config.ppm_err, stale);
+
+        DisplayRow {
+            route,
+            stream_id,
+            name: self.name.clone(),
+            rate_smps: self.rate_smps,
+            drift_s: self.drift_s,
+            ppm: self.ppm,
+            jitter_ms: self.jitter_ms,
+            samples_dropped: self.samples_dropped,
+            last_n: self.last_n,
+            last_data: self.last_data,
+            metadata_ok: self.metadata_ok,
+            status,
+            stale,
+        }
+    }
+}
+
+struct DisplayRow {
+    route: String,
+    stream_id: u8,
+    name: String,
+    rate_smps: f64,
+    drift_s: f64,
+    ppm: f64,
+    jitter_ms: f64,
+    samples_dropped: u64,
+    last_n: Option<u32>,
+    last_data: Option<f64>,
+    metadata_ok: bool,
+    status: &'static str,
+    stale: bool,
+}
+
+impl DisplayRow {
+    fn get_color(&self) -> Color {
+        if self.stale {
+            Color::DarkGrey
+        } else {
+            match self.status {
+                "ERROR" => Color::Red,
+                "WARN" => Color::Yellow,
+                "OK" => Color::Green,
+                "META" => Color::Blue,
+                _ => Color::White,
+            }
+        }
     }
 }
 
@@ -351,37 +410,36 @@ impl Tui {
     fn draw(
         &mut self,
         header: &str,
-        rows: &[(
-            String,
-            u8,
-            String,
-            f64,
-            f64,
-            f64,
-            f64,
-            u64,
-            u32,
-            f64,
-            &'static str,
-            bool,
-        )],
+        rows: &[DisplayRow],
         event_log: &VecDeque<LoggedEvent>,
-        event_log_size: usize,
-        show_warnings_only: bool,
-        quiet: bool,
+        config: &Config,
     ) -> io::Result<()> {
+        self.clear_screen()?;
+        self.draw_header(header)?;
+        self.draw_table_header()?;
+        self.draw_data_rows(rows)?;
+        self.draw_event_log(event_log, config)?;
+        self.draw_footer(config.quiet)?;
+        self.stdout.flush()
+    }
+
+    fn clear_screen(&mut self) -> io::Result<()> {
         self.stdout.queue(cursor::MoveTo(0, 0))?;
         self.stdout
             .queue(terminal::Clear(terminal::ClearType::All))?;
+        Ok(())
+    }
 
-        // Header
+    fn draw_header(&mut self, header: &str) -> io::Result<()> {
         self.stdout.queue(SetAttribute(Attribute::Bold))?;
         self.stdout.queue(style::Print(header))?;
         self.stdout.queue(SetAttribute(Attribute::Reset))?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
+        Ok(())
+    }
 
-        // Table header
+    fn draw_table_header(&mut self) -> io::Result<()> {
         self.stdout.queue(SetAttribute(Attribute::Bold))?;
         self.stdout.queue(style::Print(format!(
             "{:<10} {:>3}  {:<22}  {:>9}  {:>9}  {:>8}  {:>11}  {:>8}  {:>10}  {:>12}  {:>8}",
@@ -399,92 +457,95 @@ impl Tui {
         )))?;
         self.stdout.queue(SetAttribute(Attribute::Reset))?;
         self.stdout.queue(cursor::MoveToNextLine(1))?;
+        Ok(())
+    }
 
-        // Data rows
+    fn draw_data_rows(&mut self, rows: &[DisplayRow]) -> io::Result<()> {
         let mut last_route = String::new();
-        for (
-            route,
-            sid,
-            name,
-            rate,
-            drift,
-            ppm,
-            jitter,
-            dropped,
-            last_n,
-            last_timestamp,
-            status,
-            stale,
-        ) in rows
-        {
-            if *route != last_route {
+
+        for row in rows {
+            if row.route != last_route {
                 if !last_route.is_empty() {
                     self.stdout.queue(cursor::MoveToNextLine(1))?;
                 }
-                last_route = route.clone();
+                last_route = row.route.clone();
             }
 
-            let color = if *stale {
-                Color::DarkGrey
-            } else {
-                match *status {
-                    "ERROR" => Color::Red,
-                    "WARN" => Color::Yellow,
-                    "OK" => Color::Green,
-                    "META" => Color::Blue,
-                    _ => Color::White,
-                }
-            };
-
+            let color = row.get_color();
             self.stdout.queue(SetForegroundColor(color))?;
             self.stdout.queue(style::Print(format!(
                 "{:<10} {:>3}  {:<22}  {:>9.1}  {:>9.3}  {:>8.0}  {:>11.2}  {:>8}  {:>10}  {:>12.3}  {:>8}",
-                route, sid, name, rate, drift, ppm, jitter, dropped, last_n, last_timestamp, status
+                row.route,
+                row.stream_id,
+                row.name,
+                if row.metadata_ok { row.rate_smps } else { 0.0 },
+                if row.metadata_ok { row.drift_s } else { 0.0 },
+                if row.metadata_ok { row.ppm } else { 0.0 },
+                if row.metadata_ok { row.jitter_ms } else { 0.0 },
+                if row.metadata_ok { row.samples_dropped } else { 0 },
+                row.last_n.unwrap_or(0),
+                row.last_data.unwrap_or(0.0),
+                row.status
             )))?;
             self.stdout.queue(ResetColor)?;
             self.stdout.queue(cursor::MoveToNextLine(1))?;
         }
 
-        // Event log section
-        if !event_log.is_empty() {
-            let shown_count = if show_warnings_only {
-                event_log.iter().filter(|e| matches!(e.color, Color::Red | Color::Yellow)).count()
-            } else {
-                event_log.len()
-            };
-            self.stdout.queue(cursor::MoveToNextLine(2))?;
-            self.stdout.queue(SetAttribute(Attribute::Bold))?;
-            self.stdout.queue(style::Print(format!(
-                "Recent Events ({} of {}):",
-                shown_count, event_log_size
-            )))?;
-            self.stdout.queue(SetAttribute(Attribute::Reset))?;
-            self.stdout.queue(cursor::MoveToNextLine(1))?;
+        Ok(())
+    }
 
-            // Only show red events if flag set
-            let iter = event_log.iter().filter(|e| {
-                !show_warnings_only || matches!(e.color, Color::Red) || matches!(e.color, Color::Yellow)
-            });
-
-            for logged in iter {
-                let datetime: DateTime<Local> = logged.timestamp.into();
-                self.stdout.queue(SetForegroundColor(logged.color))?;
-                self.stdout.queue(style::Print(format!(
-                    "[{}] {}",
-                    datetime.format("%H:%M:%S%.3f"),
-                    logged.event
-                )))?;
-                self.stdout.queue(ResetColor)?;
-                self.stdout.queue(cursor::MoveToNextLine(1))?;
-            }
+    fn draw_event_log(
+        &mut self,
+        event_log: &VecDeque<LoggedEvent>,
+        config: &Config,
+    ) -> io::Result<()> {
+        if event_log.is_empty() {
+            return Ok(());
         }
 
+        let shown_count = if config.warnings_only {
+            event_log
+                .iter()
+                .filter(|e| matches!(e.color, Color::Red | Color::Yellow))
+                .count()
+        } else {
+            event_log.len()
+        };
+
+        self.stdout.queue(cursor::MoveToNextLine(2))?;
+        self.stdout.queue(SetAttribute(Attribute::Bold))?;
+        self.stdout.queue(style::Print(format!(
+            "Recent Events ({} of {}):",
+            shown_count, config.event_log_size
+        )))?;
+        self.stdout.queue(SetAttribute(Attribute::Reset))?;
+        self.stdout.queue(cursor::MoveToNextLine(1))?;
+
+        let events_to_show = event_log
+            .iter()
+            .filter(|e| !config.warnings_only || matches!(e.color, Color::Red | Color::Yellow));
+
+        for logged in events_to_show {
+            let datetime: DateTime<Local> = logged.timestamp.into();
+            self.stdout.queue(SetForegroundColor(logged.color))?;
+            self.stdout.queue(style::Print(format!(
+                "[{}] {}",
+                datetime.format("%H:%M:%S%.3f"),
+                logged.event
+            )))?;
+            self.stdout.queue(ResetColor)?;
+            self.stdout.queue(cursor::MoveToNextLine(1))?;
+        }
+
+        Ok(())
+    }
+
+    fn draw_footer(&mut self, quiet: bool) -> io::Result<()> {
         if !quiet {
             self.stdout.queue(cursor::MoveToNextLine(1))?;
             self.stdout.queue(style::Print("q/Esc to quit"))?;
         }
-
-        self.stdout.flush()
+        Ok(())
     }
 }
 
@@ -498,9 +559,8 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
             ..
         } => {
             let stream_name = stats
-                .iter()
-                .find(|(k, _)| k.route == route.to_string() && k.stream_id == *stream_id)
-                .map(|(_, s)| s.name.as_str())
+                .get(&(route.clone(), *stream_id))
+                .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
             (
                 format!(
@@ -518,9 +578,8 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
             current,
         } => {
             let stream_name = stats
-                .iter()
-                .find(|(k, _)| k.route == route.to_string() && k.stream_id == *stream_id)
-                .map(|(_, s)| s.name.as_str())
+                .get(&(route.clone(), *stream_id))
+                .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
             (
                 format!(
@@ -534,15 +593,17 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
             route,
             stream_id,
             new_id,
-            old_id
+            old_id,
         } => {
             let stream_name = stats
-                .iter()
-                .find(|(k, _)| k.route == route.to_string() && k.stream_id == *stream_id)
-                .map(|(_, s)| s.name.as_str())
+                .get(&(route.clone(), *stream_id))
+                .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
             (
-                format!("[{}/{}] SESSION CHANGED: {} → {}", route, stream_name, old_id, new_id),
+                format!(
+                    "[{}/{}] SESSION CHANGED: {} → {}",
+                    route, stream_name, old_id, new_id
+                ),
                 Color::Green,
             )
         }
@@ -559,8 +620,67 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
     }
 }
 
+fn handle_samples_event(
+    samples: Vec<(
+        twinleaf::data::Sample,
+        twinleaf::tio::proto::route::DeviceRoute,
+    )>,
+    stats: &mut BTreeMap<StreamKey, StreamStats>,
+    config: &Config,
+) {
+    let now = Instant::now();
+
+    for (sample, route) in samples {
+        let sid = sample.stream.stream_id as u8;
+
+        if let Some(ref filter) = config.streams_filter {
+            if !filter.contains(&sid) {
+                continue;
+            }
+        }
+
+        let key = (route.clone(), sid);
+        let st = stats.entry(key).or_insert_with(|| StreamStats {
+            name: sample.stream.name.clone(),
+            metadata_ok: true,
+            current_session_id: Some(sample.device.session_id),
+            ..Default::default()
+        });
+
+        st.name = sample.stream.name.clone();
+        st.last_seen = Some(now);
+        st.last_data = Some(sample.timestamp_end());
+        st.on_sample(sample.n, sample.timestamp_end(), now, config.jitter_window);
+    }
+}
+
+fn handle_session_changed(
+    route: twinleaf::tio::proto::route::DeviceRoute,
+    stream_id: u8,
+    new_id: u32,
+    stats: &mut BTreeMap<StreamKey, StreamStats>,
+) {
+    let key = (route, stream_id);
+    if let Some(st) = stats.get_mut(&key) {
+        st.reset_for_new_session(new_id);
+    }
+}
+
+fn handle_samples_skipped(
+    route: twinleaf::tio::proto::route::DeviceRoute,
+    stream_id: u8,
+    count: u32,
+    stats: &mut BTreeMap<StreamKey, StreamStats>,
+) {
+    let key = (route, stream_id);
+    if let Some(st) = stats.get_mut(&key) {
+        st.samples_dropped += count as u64;
+    }
+}
+
 fn main() {
-    let (root, route, cli) = parse_cli();
+    let cli = Cli::parse();
+    let config = Config::from(&cli);
 
     let mut tui = Tui::setup().expect("TUI setup failed");
     let original_hook = std::panic::take_hook();
@@ -572,7 +692,8 @@ fn main() {
         original_hook(panic_info);
     }));
 
-    let proxy = tio::proxy::Interface::new(&root);
+    let proxy = tio::proxy::Interface::new(&cli.tio.root);
+    let route = cli.tio.parse_route();
     let tree = match DeviceTree::open(&proxy, route.clone()) {
         Ok(t) => t,
         Err(e) => {
@@ -590,28 +711,24 @@ fn main() {
     ));
     let event_log = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<LoggedEvent>::new()));
 
-    let rate_window = Duration::from_secs(cli.rate_window_s.max(1));
-    let stale_dur = Duration::from_millis(cli.stale_ms.max(1));
-    let frame = Duration::from_millis((1000 / cli.fps.max(1)) as u64);
+    let frame = Duration::from_millis((1000 / config.fps.max(1)) as u64);
 
     let stats_clone = stats.clone();
     let event_log_clone = event_log.clone();
-    let jitter_window_s = cli.jitter_window_s;
-    let event_log_size = cli.event_log_size;
-    let streams_filter = cli.streams_filter.clone();
+    let config_clone = Config::from(&cli);
 
     std::thread::spawn(move || loop {
         let (sample, route) = match buffer.tree.next() {
             Ok(s) => s,
             Err(_) => break,
         };
-        
+
         buffer.process_sample(sample, route);
-        
+
         if buffer.drain().is_err() {
             break;
         }
-        
+
         while let Ok(event) = event_rx.try_recv() {
             let (event_str, event_color) = {
                 let stats = stats_clone.lock().unwrap();
@@ -625,58 +742,25 @@ fn main() {
                     event: event_str,
                     color: event_color,
                 });
-                if log.len() > event_log_size {
+                if log.len() > config_clone.event_log_size {
                     log.pop_back();
                 }
             }
 
             match event {
                 BufferEvent::Samples(samples) => {
-                    let now = Instant::now();
                     let mut stats = stats_clone.lock().unwrap();
-
-                    for (sample, route) in samples {
-                        let route_str = route.to_string();
-                        let sid = sample.stream.stream_id as u8;
-
-                        if let Some(ref filter) = streams_filter {
-                            if !filter.contains(&sid) {
-                                continue;
-                            }
-                        }
-
-                        let key = StreamKey {
-                            route: route_str,
-                            stream_id: sid,
-                        };
-                        let st = stats.entry(key).or_insert_with(|| StreamStats {
-                            name: sample.stream.name.clone(),
-                            metadata_ok: true,
-                            current_session_id: Some(sample.device.session_id),
-                            ..Default::default()
-                        });
-
-                        st.name = sample.stream.name.clone();
-                        st.last_seen = Some(now);
-                        st.last_data = Some(sample.timestamp_end());
-                        st.on_sample(sample.n, sample.timestamp_end(), now, jitter_window_s);
-                    }
+                    handle_samples_event(samples, &mut stats, &config_clone);
                 }
 
                 BufferEvent::SessionChanged {
                     route,
                     stream_id,
                     new_id,
-                    old_id: _
+                    old_id: _,
                 } => {
                     let mut stats = stats_clone.lock().unwrap();
-                    let key = StreamKey {
-                        route: route.to_string(),
-                        stream_id,
-                    };
-                    if let Some(st) = stats.get_mut(&key) {
-                        st.reset_for_new_session(new_id);
-                    }
+                    handle_session_changed(route, stream_id, new_id, &mut stats);
                 }
 
                 BufferEvent::SamplesSkipped {
@@ -686,13 +770,7 @@ fn main() {
                     ..
                 } => {
                     let mut stats = stats_clone.lock().unwrap();
-                    let key = StreamKey {
-                        route: route.to_string(),
-                        stream_id,
-                    };
-                    if let Some(st) = stats.get_mut(&key) {
-                        st.samples_dropped += count as u64;
-                    }
+                    handle_samples_skipped(route, stream_id, count, &mut stats);
                 }
 
                 _ => {}
@@ -715,8 +793,7 @@ fn main() {
             recv(key_rx) -> ev => {
                 if let Ok(event::Event::Key(k)) = ev {
                     use event::{KeyCode, KeyModifiers};
-                    let quit = k.code == KeyCode::Char('q')
-                             || k.code == KeyCode::Esc
+                    let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
                              || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
                     if quit { break 'main; }
                 }
@@ -725,67 +802,33 @@ fn main() {
             recv(tick) -> _ => {
                 let now = Instant::now();
 
-                // Build display rows
-                let mut rows = Vec::new();
-                {
+                let rows: Vec<DisplayRow> = {
                     let mut stats = stats.lock().unwrap();
-                    for (key, st) in stats.iter_mut() {
-                        let rate = st.compute_rate(now, rate_window);
-                        let stale = st.last_seen.map(|t| now.duration_since(t) > stale_dur).unwrap_or(true);
+                    stats
+                        .iter_mut()
+                        .map(|((route, stream_id), st)| {
+                            st.compute_rate(now, config.rate_window);
+                            if st.is_stale(now, config.stale_dur) && st.t0_host.is_some() {
+                                st.reset_timing();
+                            }
+                            st.to_display_row(route.to_string(), *stream_id, &config, now)
+                        })
+                        .collect()
+                };
 
-                        // Reset timing on stale
-                        if stale && st.t0_host.is_some() {
-                            st.t0_host = None;
-                            st.t0_data = None;
-                            st.last_host = None;
-                            st.last_data = None;
-                            st.drift_s = 0.0;
-                            st.ppm = 0.0;
-                            st.jitter_ms = 0.0;
-                            st.jitter_window = None;
-                            st.last_n = None;
-                        }
-
-                        let abs_ppm = st.ppm.abs();
-                        let status = if !st.metadata_ok {
-                            "META"
-                        } else if stale {
-                            "STALLED"
-                        } else if abs_ppm >= cli.ppm_err {
-                            "ERROR"
-                        } else if abs_ppm >= cli.ppm_warn {
-                            "WARN"
-                        } else {
-                            "OK"
-                        };
-
-                        rows.push((
-                            key.route.clone(),
-                            key.stream_id,
-                            st.name.clone(),
-                            if st.metadata_ok { rate } else { 0.0 },
-                            if st.metadata_ok { st.drift_s } else { 0.0 },
-                            if st.metadata_ok { st.ppm } else { 0.0 },
-                            if st.metadata_ok { st.jitter_ms } else { 0.0 },
-                            if st.metadata_ok { st.samples_dropped } else { 0 },
-                            st.last_n.unwrap_or(0),
-                            st.last_data.unwrap_or(0.0),
-                            status,
-                            stale,
-                        ));
-                    }
-                }
-
-                rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                let mut sorted_rows = rows;
+                sorted_rows.sort_by(|a, b| {
+                    a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id))
+                });
 
                 let header = format!(
                     "tio-health — rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  fps={}  stale={}ms",
-                    cli.rate_window_s, cli.jitter_window_s, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
+                    cli.rate_window, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
                 );
 
                 let log = event_log.lock().unwrap().clone();
 
-                if tui.draw(&header, &rows, &log, cli.event_log_size, cli.show_warnings_only, cli.quiet).is_err() {
+                if tui.draw(&header, &sorted_rows, &log, &config).is_err() {
                     break 'main;
                 }
             }

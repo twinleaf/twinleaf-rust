@@ -4,12 +4,33 @@ use std::time::{Duration, Instant};
 
 use toml_edit::{DocumentMut, InlineTable, Value};
 
+use clap::Parser;
 use twinleaf::{data, tio};
-use twinleaf_tools::{tio_opts, tio_parseopts};
+use twinleaf_tools::TioOpts;
 
 use crossterm;
 use crossterm::QueueableCommand;
 use crossterm::{cursor, style, terminal};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-monitor",
+    version,
+    about = "Display live sensor data with color-coded values"
+)]
+
+struct Cli {
+    #[command(flatten)]
+    tio: TioOpts,
+
+    #[arg(
+        short = 'c',
+        long = "colors",
+        value_name = "FILE",
+        help = "TOML configuration file for value colorization"
+    )]
+    colors: Option<String>,
+}
 
 struct ColumnFormatter {
     bounds: HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
@@ -199,23 +220,16 @@ fn terminal_teardown(mut stdout: &std::io::Stdout) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut opts = tio_opts();
-    opts.optopt(
-        "c",
-        "colors",
-        "Configuration file for colorizing stream column values",
-        "conf.toml",
-    );
-    let (matches, root, route) = tio_parseopts(&opts, &args);
+    let cli = Cli::parse();
 
-    let formatter = if let Some(path) = matches.opt_str("colors") {
-        ColumnFormatter::from_conf(&path)
+    let formatter = if let Some(path) = &cli.colors {
+        ColumnFormatter::from_conf(path)
     } else {
         ColumnFormatter::new()
     };
 
-    let proxy = tio::proxy::Interface::new(&root);
+    let proxy = tio::proxy::Interface::new(&cli.tio.root);
+    let route = cli.tio.parse_route();
     let mut device = twinleaf::Device::open(&proxy, route)
         .expect("Failed to open device. Check connection and permissions.");
 
