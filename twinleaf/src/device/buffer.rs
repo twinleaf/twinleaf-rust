@@ -292,7 +292,7 @@ impl SegmentBuffer {
 pub struct Buffer {
     pub tree: DeviceTree,
     routes_seen: HashSet<DeviceRoute>,
-    active_segments: HashMap<StreamKey, ActiveSegment>,
+    pub active_segments: HashMap<StreamKey, ActiveSegment>,
     event_tx: crossbeam::channel::Sender<BufferEvent>,
     pub forward_samples: bool,
     capacity: usize,
