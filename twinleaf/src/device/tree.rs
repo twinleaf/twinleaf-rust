@@ -49,7 +49,12 @@ impl DeviceTree {
                 let reqs = parser.requests();
 
                 for mut req in reqs {
-                    req.routing = route.clone();
+                    let rel = self
+                        .root_route
+                        .relative_route(&route)
+                        .expect("parser routes must be under root_route");
+                    req.routing = rel;
+
                     self.port.send(req)?;
                     *self.n_reqs.entry(route.clone()).or_insert(0) += 1;
                 }
@@ -58,6 +63,7 @@ impl DeviceTree {
 
         Ok(())
     }
+
 
     fn process_packet(&mut self, pkt: &tio::Packet) {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
