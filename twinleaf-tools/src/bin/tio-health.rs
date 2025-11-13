@@ -17,13 +17,14 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::num::ParseFloatError;
 use std::time::{Duration, Instant, SystemTime};
 use twinleaf::device::{Buffer, BufferEvent};
 use twinleaf::device::{DeviceTree, StreamKey};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "tio-health",
     version,
@@ -38,7 +39,8 @@ struct Cli {
         long = "rate-window",
         default_value = "5",
         value_name = "SECONDS",
-        help = "Seconds for rate calculation window"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Seconds for rate calculation window (>= 1)"
     )]
     rate_window: u64,
 
@@ -47,7 +49,8 @@ struct Cli {
         long = "jitter-window",
         default_value = "10",
         value_name = "SECONDS",
-        help = "Seconds for jitter calculation window"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Seconds for jitter calculation window (>= 1)"
     )]
     jitter_window: u64,
 
@@ -56,7 +59,8 @@ struct Cli {
         long = "ppm-warn",
         default_value = "100",
         value_name = "PPM",
-        help = "Warning threshold in parts per million"
+        value_parser = nonneg_f64,
+        help = "Warning threshold in parts per million (>= 0)"
     )]
     ppm_warn: f64,
 
@@ -65,7 +69,8 @@ struct Cli {
         long = "ppm-err",
         default_value = "200",
         value_name = "PPM",
-        help = "Error threshold in parts per million"
+        value_parser = nonneg_f64,
+        help = "Error threshold in parts per million (>= 0)"
     )]
     ppm_err: f64,
 
@@ -74,16 +79,13 @@ struct Cli {
         long = "streams",
         value_delimiter = ',',
         value_name = "IDS",
+        value_parser = clap::value_parser!(u8),
         help = "Comma-separated stream IDs to monitor (e.g., 0,1,5)"
     )]
     streams: Option<Vec<u8>>,
 
     /// Suppress the footer help text ("q/Esc to quit")
-    #[arg(
-        short = 'q',
-        long = "quiet",
-        help = "Suppress footer hint"
-    )]
+    #[arg(short = 'q', long = "quiet", help = "Suppress footer hint")]
     quiet: bool,
 
     /// UI refresh rate in frames per second
@@ -91,7 +93,8 @@ struct Cli {
         long = "fps",
         default_value = "10",
         value_name = "FPS",
-        help = "UI refresh rate (frames per second)"
+        value_parser = clap::value_parser!(u64).range(1..=1000),
+        help = "UI refresh rate (frames per second, 1–1000)"
     )]
     fps: u64,
 
@@ -100,7 +103,8 @@ struct Cli {
         long = "stale-ms",
         default_value = "2000",
         value_name = "MS",
-        help = "Mark streams as stale after this many milliseconds without data"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Mark streams as stale after this many milliseconds without data (>= 1)"
     )]
     stale_ms: u64,
 
@@ -110,16 +114,18 @@ struct Cli {
         long = "event-log-size",
         default_value = "100",
         value_name = "N",
-        help = "Maximum number of events to keep in history"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Maximum number of events to keep in history (>= 1)"
     )]
-    event_log_size: usize,
+    event_log_size: u64,
 
     /// Number of event lines to display on screen
     #[arg(
         long = "event-display-lines",
         default_value = "8",
         value_name = "LINES",
-        help = "Number of event lines to show (scrollable)"
+        value_parser = clap::value_parser!(u16).range(3..),
+        help = "Number of event lines to show (>= 3)"
     )]
     event_display_lines: u16,
 
@@ -132,39 +138,29 @@ struct Cli {
     warnings_only: bool,
 }
 
-#[derive(Clone)]
-struct Config {
-    rate_window: Duration,
-    jitter_window: u64,
-    stale_dur: Duration,
-    ppm_warn: f64,
-    ppm_err: f64,
-    fps: u64,
-    event_log_size: usize,
-    event_display_lines: u16,
-    warnings_only: bool,
-    quiet: bool,
-    streams_filter: Option<Vec<u8>>,
-}
-
-impl From<&Cli> for Config {
-    fn from(cli: &Cli) -> Self {
-        Self {
-            rate_window: Duration::from_secs(cli.rate_window.max(1)),
-            jitter_window: cli.jitter_window,
-            stale_dur: Duration::from_millis(cli.stale_ms.max(1)),
-            ppm_warn: cli.ppm_warn,
-            ppm_err: cli.ppm_err,
-            fps: cli.fps,
-            event_log_size: cli.event_log_size,
-            event_display_lines: cli.event_display_lines.max(3),
-            warnings_only: cli.warnings_only,
-            quiet: cli.quiet,
-            streams_filter: cli.streams.clone(),
-        }
+impl Cli {
+    #[inline]
+    fn rate_window_dur(&self) -> Duration {
+        Duration::from_secs(self.rate_window)
+    }
+    #[inline]
+    fn jitter_window_s(&self) -> u64 {
+        self.jitter_window
+    }
+    #[inline]
+    fn stale_dur(&self) -> Duration {
+        Duration::from_millis(self.stale_ms)
     }
 }
 
+fn nonneg_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e: ParseFloatError| e.to_string())?;
+    if v < 0.0 {
+        Err("must be \u{2265} 0".into())
+    } else {
+        Ok(v)
+    }
+}
 struct TimeWindow {
     buf: Vec<f64>,
     cap: usize,
@@ -320,12 +316,12 @@ impl StreamStats {
             .unwrap_or(true)
     }
 
-    fn get_display_style(&self, config: &Config, stale: bool) -> (Color, &'static str) {
+    fn get_display_style(&self, ppm_warn: f64, ppm_err: f64, stale: bool) -> (Color, &'static str) {
         if stale {
             (Color::DarkGray, "STALLED")
-        } else if self.ppm.abs() >= config.ppm_err {
+        } else if self.ppm.abs() >= ppm_err {
             (Color::Red, "ERROR")
-        } else if self.ppm.abs() >= config.ppm_warn {
+        } else if self.ppm.abs() >= ppm_warn {
             (Color::Yellow, "WARN")
         } else {
             (Color::Green, "OK")
@@ -336,11 +332,13 @@ impl StreamStats {
         &self,
         route: String,
         stream_id: u8,
-        config: &Config,
         now: Instant,
+        stale_dur: Duration,
+        ppm_warn: f64,
+        ppm_err: f64,
     ) -> DisplayRow {
-        let stale = self.is_stale(now, config.stale_dur);
-        let (color, status) = self.get_display_style(config, stale);
+        let stale = self.is_stale(now, stale_dur);
+        let (color, status) = self.get_display_style(ppm_warn, ppm_err, stale);
 
         DisplayRow {
             route,
@@ -419,7 +417,6 @@ impl UiState {
 fn draw_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &UiState,
-    config: &Config,
     cli: &Cli,
 ) -> io::Result<()> {
     terminal.draw(|f| {
@@ -429,12 +426,10 @@ fn draw_ui(
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),        // Header
-                Constraint::Min(10),          // Table (takes remaining space)
-                Constraint::Length(if state.event_log.is_empty() { 0 } else { 
-                    config.event_display_lines + 2  // Events + border (top/bottom)
-                }),
-                Constraint::Length(if config.quiet { 0 } else { 1 }), // Footer
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(if state.event_log.is_empty() { 0 } else { cli.event_display_lines + 2 }),
+                Constraint::Length(if cli.quiet { 0 } else { 1 }),
             ])
             .split(size);
 
@@ -454,7 +449,6 @@ fn draw_ui(
         ]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
-        
         let header_row = Row::new(header_cells).height(1);
 
         let rows: Vec<Row> = state.rows.iter().map(|r| r.to_table_row()).collect();
@@ -481,15 +475,12 @@ fn draw_ui(
 
         // Event log
         if !state.event_log.is_empty() {
-            let events_to_show = state.filtered_events(config.warnings_only);
+            let events_to_show = state.filtered_events(cli.warnings_only);
 
             let total_events = events_to_show.len();
-            let display_count = config.event_display_lines as usize;
-            
-            // Calculate which events to show based on scroll offset
+            let display_count = cli.event_display_lines as usize;
             let start = state.event_scroll_offset.min(total_events.saturating_sub(1));
             let end = (start + display_count).min(total_events);
-            
             let visible_events: Vec<Line> = events_to_show[start..end]
                 .iter()
                 .map(|logged| {
@@ -522,7 +513,7 @@ fn draw_ui(
         }
 
         // Footer
-        if !config.quiet {
+        if !cli.quiet {
             let footer = Paragraph::new("q/Esc to quit  |  ↑/↓/PgUp/PgDn/Home/End to scroll events")
                 .style(Style::default().fg(Color::Gray));
             f.render_widget(footer, chunks[3]);
@@ -531,7 +522,10 @@ fn draw_ui(
     Ok(())
 }
 
-fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -> Option<(String, Color)> {
+fn format_event(
+    event: &BufferEvent,
+    stats: &BTreeMap<StreamKey, StreamStats>,
+) -> Option<(String, Color)> {
     match event {
         BufferEvent::SamplesSkipped {
             route,
@@ -608,14 +602,15 @@ fn handle_samples_event(
         twinleaf::tio::proto::route::DeviceRoute,
     )>,
     stats: &mut BTreeMap<StreamKey, StreamStats>,
-    config: &Config,
+    streams_filter: Option<&[u8]>,
+    jitter_window_s: u64,
 ) {
     let now = Instant::now();
 
     for (sample, route) in samples {
         let sid = sample.stream.stream_id as u8;
 
-        if let Some(ref filter) = config.streams_filter {
+        if let Some(filter) = streams_filter {
             if !filter.contains(&sid) {
                 continue;
             }
@@ -631,7 +626,7 @@ fn handle_samples_event(
         st.name = sample.stream.name.clone();
         st.last_seen = Some(now);
         st.last_data = Some(sample.timestamp_end());
-        st.on_sample(sample.n, sample.timestamp_end(), now, config.jitter_window);
+        st.on_sample(sample.n, sample.timestamp_end(), now, jitter_window_s);
     }
 }
 
@@ -661,7 +656,6 @@ fn handle_samples_skipped(
 
 fn main() {
     let cli = Cli::parse();
-    let config = Config::from(&cli);
 
     let mut terminal = ratatui::init();
 
@@ -680,11 +674,17 @@ fn main() {
     let buffer = Buffer::new(tree, event_tx, 1, true);
 
     // How often we want UI/data snapshots
-    let frame = Duration::from_millis((1000 / config.fps.max(1)) as u64);
+    let frame = Duration::from_millis(1000 / cli.fps);
 
     // Channel: data thread -> UI thread
     let (state_tx, state_rx) = channel::bounded::<UiState>(1);
-    let config_clone = config.clone();
+    let streams_filter = cli.streams.clone();
+    let jitter_window_s = cli.jitter_window_s();
+    let rate_window = cli.rate_window_dur();
+    let stale_dur = cli.stale_dur();
+    let event_log_cap = cli.event_log_size;
+    let ppm_warn = cli.ppm_warn;
+    let ppm_err = cli.ppm_err;
 
     // Data / drain thread owns all stats and builds UiState snapshots
     std::thread::spawn(move || {
@@ -706,7 +706,6 @@ fn main() {
                 break;
             }
 
-            // Handle all pending events from Buffer
             while let Ok(event) = event_rx.try_recv() {
                 if let Some((event_str, event_color)) = format_event(&event, &stats) {
                     event_log.push_front(LoggedEvent {
@@ -714,25 +713,28 @@ fn main() {
                         event: event_str,
                         color: event_color,
                     });
-                    if event_log.len() > config_clone.event_log_size {
+                    if event_log.len() > event_log_cap.try_into().unwrap() {
                         event_log.pop_back();
                     }
                 }
 
                 match event {
                     BufferEvent::Samples(samples) => {
-                        handle_samples_event(samples, &mut stats, &config_clone);
+                        handle_samples_event(
+                            samples,
+                            &mut stats,
+                            streams_filter.as_deref(),
+                            jitter_window_s,
+                        );
                     }
-
                     BufferEvent::SessionChanged {
                         route,
                         stream_id,
                         new_id,
-                        old_id: _,
+                        ..
                     } => {
                         handle_session_changed(route, stream_id, new_id, &mut stats);
                     }
-
                     BufferEvent::SamplesSkipped {
                         route,
                         stream_id,
@@ -741,37 +743,39 @@ fn main() {
                     } => {
                         handle_samples_skipped(route, stream_id, count, &mut stats);
                     }
-
                     _ => {}
                 }
             }
 
-            // Periodically build snapshot of rows + event log for the UI
             let now = Instant::now();
             if now.duration_since(last_snapshot) >= frame {
                 let mut rows: Vec<DisplayRow> = stats
                     .iter_mut()
                     .map(|((route, stream_id), st)| {
-                        st.compute_rate(now, config_clone.rate_window);
-                        if st.is_stale(now, config_clone.stale_dur) && st.t0_host.is_some() {
+                        st.compute_rate(now, rate_window);
+                        if st.is_stale(now, stale_dur) && st.t0_host.is_some() {
                             st.reset_timing();
                         }
-                        st.to_display_row(route.to_string(), *stream_id, &config_clone, now)
+                        st.to_display_row(
+                            route.to_string(),
+                            *stream_id,
+                            now,
+                            stale_dur,
+                            ppm_warn,
+                            ppm_err,
+                        )
                     })
                     .collect();
 
-                rows.sort_by(|a, b| {
-                    a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id))
-                });
+                rows.sort_by(|a, b| a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id)));
 
                 let snapshot = UiState {
                     rows,
                     event_log: event_log.clone(),
-                    event_scroll_offset: 0,  // Always show newest events
+                    event_scroll_offset: 0,
                 };
 
                 let _ = state_tx.try_send(snapshot);
-
                 last_snapshot = now;
             }
         }
@@ -787,7 +791,7 @@ fn main() {
 
     // Main event loop
     let mut current_state: Option<UiState> = None;
-    
+
     'main: loop {
         crossbeam::select! {
             recv(key_rx) -> ev => {
@@ -796,23 +800,23 @@ fn main() {
                     if k.kind != KeyEventKind::Press {
                         continue;
                     }
-                    
+
                     let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
                             || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
                     if quit { break 'main; }
-                    
+
                     // Handle scroll keys
                     if let Some(ref mut state) = current_state {
-                        let events_to_show = state.filtered_events(config.warnings_only);
-                        
+                        let events_to_show = state.filtered_events(cli.warnings_only);
+
                         let total_events = events_to_show.len();
-                        let display_count = config.event_display_lines as usize;
-                        
+                        let display_count = cli.event_display_lines as usize;
+
                         match k.code {
                             KeyCode::Up => {
                                 if state.event_scroll_offset > 0 {
                                     state.event_scroll_offset -= 1;
-                                    let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                    let _ = draw_ui(&mut terminal, state, &cli);
                                 }
                             }
                             KeyCode::Down => {
@@ -820,29 +824,29 @@ fn main() {
                                     let max_offset = total_events.saturating_sub(display_count);
                                     if state.event_scroll_offset < max_offset {
                                         state.event_scroll_offset += 1;
-                                        let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                        let _ = draw_ui(&mut terminal, state, &cli);
                                     }
                                 }
                             }
                             KeyCode::PageUp => {
                                 state.event_scroll_offset = state.event_scroll_offset.saturating_sub(display_count);
-                                let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                let _ = draw_ui(&mut terminal, state, &cli);
                             }
                             KeyCode::PageDown => {
                                 if total_events > display_count {
                                     let max_offset = total_events.saturating_sub(display_count);
                                     state.event_scroll_offset = (state.event_scroll_offset + display_count).min(max_offset);
-                                    let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                    let _ = draw_ui(&mut terminal, state, &cli);
                                 }
                             }
                             KeyCode::Home => {
                                 state.event_scroll_offset = 0;
-                                let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                let _ = draw_ui(&mut terminal, state, &cli);
                             }
                             KeyCode::End => {
                                 if total_events > display_count {
                                     state.event_scroll_offset = total_events.saturating_sub(display_count);
-                                    let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                    let _ = draw_ui(&mut terminal, state, &cli);
                                 }
                             }
                             _ => {}
@@ -858,11 +862,11 @@ fn main() {
                         if let Some(ref prev_state) = current_state {
                             state.event_scroll_offset = prev_state.event_scroll_offset;
                         }
-                        
-                        if draw_ui(&mut terminal, &state, &config, &cli).is_err() {
+
+                        if draw_ui(&mut terminal, &state, &cli).is_err() {
                             break 'main;
                         }
-                        
+
                         current_state = Some(state);
                     }
                     Err(_) => {
