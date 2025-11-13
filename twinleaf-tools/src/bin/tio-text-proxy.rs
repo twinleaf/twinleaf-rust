@@ -1,10 +1,10 @@
+use clap::Parser;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use twinleaf::device::Device;
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
-use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(

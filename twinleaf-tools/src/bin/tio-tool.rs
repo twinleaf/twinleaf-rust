@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
@@ -5,7 +6,6 @@ use twinleaf::data::DeviceDataParser;
 use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
-use clap::{Parser, Subcommand};
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -34,10 +34,10 @@ enum Commands {
     Rpc {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// RPC name to execute
         rpc_name: String,
-        
+
         /// RPC argument value
         #[arg(
             allow_negative_numbers = true,
@@ -45,139 +45,139 @@ enum Commands {
             help_heading = "RPC Arguments"
         )]
         rpc_arg: Option<String>,
-        
+
         /// RPC request type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
         #[arg(short = 't', long = "req-type", help_heading = "Type Options")]
         req_type: Option<String>,
-        
+
         /// RPC reply type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
         #[arg(short = 'T', long = "rep-type", help_heading = "Type Options")]
         rep_type: Option<String>,
-        
+
         /// Enable debug output
         #[arg(short = 'd', long)]
         debug: bool,
     },
-    
+
     /// Dump RPC data from the device
     RpcDump {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// RPC name to dump
         rpc_name: String,
-        
+
         /// Trigger and dump a capture buffer
         #[arg(long)]
         capture: bool,
     },
-    
+
     /// Dump raw packets from the device
     Dump {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// Dump depth (default: dump everything)
         #[arg(short = 'd', long = "depth")]
         depth: Option<usize>,
     },
-    
+
     /// Log raw packets to a file
     Log {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// Path of file where to log the data
         #[arg(short = 'f', default_value_t = default_log_path())]
         file: String,
-        
+
         /// Unbuffered output
         #[arg(short = 'u')]
         unbuffered: bool,
-        
+
         /// Dump depth (default: dump everything)
         #[arg(short = 'd', long = "depth")]
         depth: Option<usize>,
     },
-    
+
     /// Log data samples to a file
     LogData {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// Path of file where to log the data
         #[arg(short = 'f', default_value_t = default_log_path())]
         file: String,
-        
+
         /// Unbuffered output
         #[arg(short = 'u')]
         unbuffered: bool,
     },
-    
+
     /// Log metadata to a file
     LogMetadata {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// Path of file where to store the metadata
         #[arg(short = 'f', default_value = "meta.tio")]
         file: String,
     },
-    
+
     /// Dump logged packets from file(s)
     LogDump {
         /// Log file paths
         files: Vec<String>,
     },
-    
+
     /// Dump logged data from file(s)
     LogDataDump {
         /// Log file paths
         files: Vec<String>,
     },
-    
+
     /// Convert logged data to CSV
     LogCsv {
         /// Stream ID
         stream_id: u8,
-        
+
         /// Log file paths (first file after stream_id)
         files: Vec<String>,
-        
+
         /// Sensor path in the sensor tree (default /)
         #[arg(short = 's')]
         sensor: Option<String>,
-        
+
         /// Metadata file (if separate)
         #[arg(short = 'm')]
         metadata: Option<String>,
-        
+
         /// Output file prefix
         #[arg(short = 'o')]
         output: Option<String>,
     },
-    
+
     /// Upgrade device firmware
     FirmwareUpgrade {
         #[command(flatten)]
         tio: TioOpts,
-        
+
         /// Firmware image path
         firmware_path: String,
     },
-    
+
     /// Dump data samples from the device
     DataDump {
         #[command(flatten)]
         tio: TioOpts,
     },
-    
+
     /// Dump data samples from all devices in tree
     DataDumpAll {
         #[command(flatten)]
         tio: TioOpts,
     },
-    
+
     /// Dump device metadata
     MetaDump {
         #[command(flatten)]
@@ -295,7 +295,7 @@ fn rpc(
     let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
-    
+
     let req_type = if let Some(req_type) = req_type {
         Some(req_type)
     } else {
@@ -546,7 +546,6 @@ fn data_dump_all(tio: &TioOpts) -> Result<(), ()> {
     }
     Ok(())
 }
-
 
 fn log(tio: &TioOpts, file: String, unbuffered: bool, depth: Option<usize>) -> Result<(), ()> {
     let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);

@@ -11,7 +11,6 @@ use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::tio;
 
-
 #[derive(Parser, Debug)]
 #[command(
     name = "tio-proxy",
@@ -68,14 +67,13 @@ struct Cli {
     dump_hb: bool,
 
     /// Automatically connect to a USB sensor if there is a single device
-    #[arg(short = 'a', long="auto")]
+    #[arg(short = 'a', long = "auto")]
     auto: bool,
 
     /// Enumerate all serial devices, then quit
-    #[arg(short = 'e', long="enumerate", name = "enum")]
+    #[arg(short = 'e', long = "enumerate", name = "enum")]
     enumerate: bool,
 }
-
 
 // Unfortunately we cannot access USB details via the serialport module, so
 // we are stuck guessing based on VID/PID. This returns a vector of possible
@@ -241,22 +239,39 @@ fn main() -> ExitCode {
         valid_urls[0].clone()
     };
 
-    let subtree = tio::proto::DeviceRoute::from_str(&cli.subtree)
-        .expect("Invalid sensor subtree");
+    let subtree = tio::proto::DeviceRoute::from_str(&cli.subtree).expect("Invalid sensor subtree");
 
     println!("tio-proxy starting:");
-    println!("  Sensor: {} {}", sensor_url, if cli.auto { "(auto-detected)" } else { "" });
+    println!(
+        "  Sensor: {} {}",
+        sensor_url,
+        if cli.auto { "(auto-detected)" } else { "" }
+    );
     println!("  TCP port: {}", tcp_port);
     println!("  Subtree: {}", subtree);
     if verbose || debugging || dump_traffic || dump_data || dump_meta || dump_hb {
         print!("  Flags:");
-        if verbose { print!(" verbose"); }
-        if debugging { print!(" debug"); }
-        if disconnect_slow { print!(" kick-slow"); }
-        if dump_traffic { print!(" dump"); }
-        if dump_data { print!(" dump-data"); }
-        if dump_meta { print!(" dump-meta"); }
-        if dump_hb { print!(" dump-hb"); }
+        if verbose {
+            print!(" verbose");
+        }
+        if debugging {
+            print!(" debug");
+        }
+        if disconnect_slow {
+            print!(" kick-slow");
+        }
+        if dump_traffic {
+            print!(" dump");
+        }
+        if dump_data {
+            print!(" dump-data");
+        }
+        if dump_meta {
+            print!(" dump-meta");
+        }
+        if dump_hb {
+            print!(" dump-hb");
+        }
         println!();
     }
     println!();
