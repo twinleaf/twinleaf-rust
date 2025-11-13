@@ -8,10 +8,15 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
 use crossbeam::channel;
-use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
-use crossterm::{cursor, event, style, terminal, ExecutableCommand, QueueableCommand};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::Terminal;
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Write};
+use std::io;
 use std::time::{Duration, Instant, SystemTime};
 use twinleaf::device::{Buffer, BufferEvent};
 use twinleaf::device::{DeviceTree, StreamKey};
@@ -76,7 +81,7 @@ struct Cli {
     /// Suppress the footer help text ("q/Esc to quit")
     #[arg(
         short = 'q',
-        long = "quiet", 
+        long = "quiet",
         help = "Suppress footer hint"
     )]
     quiet: bool,
@@ -101,13 +106,22 @@ struct Cli {
 
     /// Maximum number of events to keep in the event log
     #[arg(
-        short ='n',
+        short = 'n',
         long = "event-log-size",
-        default_value = "5",
+        default_value = "100",
         value_name = "N",
-        help = "Maximum number of events to display in the log"
+        help = "Maximum number of events to keep in history"
     )]
     event_log_size: usize,
+
+    /// Number of event lines to display on screen
+    #[arg(
+        long = "event-display-lines",
+        default_value = "8",
+        value_name = "LINES",
+        help = "Number of event lines to show (scrollable)"
+    )]
+    event_display_lines: u16,
 
     /// Only show warning and error events in the log (yellow and red)
     #[arg(
@@ -118,6 +132,7 @@ struct Cli {
     warnings_only: bool,
 }
 
+#[derive(Clone)]
 struct Config {
     rate_window: Duration,
     jitter_window: u64,
@@ -126,6 +141,7 @@ struct Config {
     ppm_err: f64,
     fps: u64,
     event_log_size: usize,
+    event_display_lines: u16,
     warnings_only: bool,
     quiet: bool,
     streams_filter: Option<Vec<u8>>,
@@ -141,6 +157,7 @@ impl From<&Cli> for Config {
             ppm_err: cli.ppm_err,
             fps: cli.fps,
             event_log_size: cli.event_log_size,
+            event_display_lines: cli.event_display_lines.max(3),
             warnings_only: cli.warnings_only,
             quiet: cli.quiet,
             streams_filter: cli.streams.clone(),
@@ -213,7 +230,6 @@ struct StreamStats {
     // Metadata
     name: String,
     last_seen: Option<Instant>,
-    metadata_ok: bool,
 }
 
 impl StreamStats {
@@ -246,7 +262,7 @@ impl StreamStats {
         }
     }
 
-    fn reset_for_new_session(&mut self, session_id: u32) {
+    fn reset_timing(&mut self) {
         self.t0_host = None;
         self.t0_data = None;
         self.last_host = None;
@@ -256,6 +272,10 @@ impl StreamStats {
         self.jitter_ms = 0.0;
         self.jitter_window = None;
         self.last_n = None;
+    }
+
+    fn reset_for_new_session(&mut self, session_id: u32) {
+        self.reset_timing();
         self.samples_dropped = 0;
         self.current_session_id = Some(session_id);
         self.arrivals.clear();
@@ -300,29 +320,15 @@ impl StreamStats {
             .unwrap_or(true)
     }
 
-    fn reset_timing(&mut self) {
-        self.t0_host = None;
-        self.t0_data = None;
-        self.last_host = None;
-        self.last_data = None;
-        self.drift_s = 0.0;
-        self.ppm = 0.0;
-        self.jitter_ms = 0.0;
-        self.jitter_window = None;
-        self.last_n = None;
-    }
-
-    fn get_status(&self, ppm_warn: f64, ppm_err: f64, stale: bool) -> &'static str {
-        if !self.metadata_ok {
-            "META"
-        } else if stale {
-            "STALLED"
-        } else if self.ppm.abs() >= ppm_err {
-            "ERROR"
-        } else if self.ppm.abs() >= ppm_warn {
-            "WARN"
+    fn get_display_style(&self, config: &Config, stale: bool) -> (Color, &'static str) {
+        if stale {
+            (Color::DarkGray, "STALLED")
+        } else if self.ppm.abs() >= config.ppm_err {
+            (Color::Red, "ERROR")
+        } else if self.ppm.abs() >= config.ppm_warn {
+            (Color::Yellow, "WARN")
         } else {
-            "OK"
+            (Color::Green, "OK")
         }
     }
 
@@ -334,7 +340,7 @@ impl StreamStats {
         now: Instant,
     ) -> DisplayRow {
         let stale = self.is_stale(now, config.stale_dur);
-        let status = self.get_status(config.ppm_warn, config.ppm_err, stale);
+        let (color, status) = self.get_display_style(config, stale);
 
         DisplayRow {
             route,
@@ -347,9 +353,8 @@ impl StreamStats {
             samples_dropped: self.samples_dropped,
             last_n: self.last_n,
             last_data: self.last_data,
-            metadata_ok: self.metadata_ok,
             status,
-            stale,
+            color,
         }
     }
 }
@@ -365,24 +370,27 @@ struct DisplayRow {
     samples_dropped: u64,
     last_n: Option<u32>,
     last_data: Option<f64>,
-    metadata_ok: bool,
     status: &'static str,
-    stale: bool,
+    color: Color,
 }
 
 impl DisplayRow {
-    fn get_color(&self) -> Color {
-        if self.stale {
-            Color::DarkGrey
-        } else {
-            match self.status {
-                "ERROR" => Color::Red,
-                "WARN" => Color::Yellow,
-                "OK" => Color::Green,
-                "META" => Color::Blue,
-                _ => Color::White,
-            }
-        }
+    fn to_table_row(&self) -> Row<'static> {
+        let style = Style::default().fg(self.color);
+
+        Row::new(vec![
+            Cell::from(self.route.clone()).style(style),
+            Cell::from(format!("{}", self.stream_id)).style(style),
+            Cell::from(self.name.clone()).style(style),
+            Cell::from(format!("{:.1}", self.rate_smps)).style(style),
+            Cell::from(format!("{:.3}", self.drift_s)).style(style),
+            Cell::from(format!("{:.0}", self.ppm)).style(style),
+            Cell::from(format!("{:.2}", self.jitter_ms)).style(style),
+            Cell::from(format!("{}", self.samples_dropped)).style(style),
+            Cell::from(format!("{}", self.last_n.unwrap_or(0))).style(style),
+            Cell::from(format!("{:.3}", self.last_data.unwrap_or(0.0))).style(style),
+            Cell::from(self.status).style(style),
+        ])
     }
 }
 
@@ -393,169 +401,137 @@ struct LoggedEvent {
     color: Color,
 }
 
-struct Tui {
-    stdout: io::Stdout,
+struct UiState {
+    rows: Vec<DisplayRow>,
+    event_log: VecDeque<LoggedEvent>,
+    event_scroll_offset: usize,
 }
 
-impl Tui {
-    fn setup() -> io::Result<Self> {
-        let mut stdout = io::stdout();
-        terminal::enable_raw_mode()?;
-        stdout.execute(terminal::EnterAlternateScreen)?;
-        stdout.execute(cursor::Hide)?;
-        Ok(Self { stdout })
-    }
-
-    fn teardown(&mut self) {
-        let _ = self.stdout.execute(cursor::Show);
-        let _ = self.stdout.execute(terminal::LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
-        let _ = self.stdout.flush();
-    }
-
-    fn draw(
-        &mut self,
-        header: &str,
-        rows: &[DisplayRow],
-        event_log: &VecDeque<LoggedEvent>,
-        config: &Config,
-    ) -> io::Result<()> {
-        self.clear_screen()?;
-        self.draw_header(header)?;
-        self.draw_table_header()?;
-        self.draw_data_rows(rows)?;
-        self.draw_event_log(event_log, config)?;
-        self.draw_footer(config.quiet)?;
-        self.stdout.flush()
-    }
-
-    fn clear_screen(&mut self) -> io::Result<()> {
-        self.stdout.queue(cursor::MoveTo(0, 0))?;
-        self.stdout
-            .queue(terminal::Clear(terminal::ClearType::All))?;
-        Ok(())
-    }
-
-    fn draw_header(&mut self, header: &str) -> io::Result<()> {
-        self.stdout.queue(SetAttribute(Attribute::Bold))?;
-        self.stdout.queue(style::Print(header))?;
-        self.stdout.queue(SetAttribute(Attribute::Reset))?;
-        self.stdout.queue(cursor::MoveToNextLine(1))?;
-        self.stdout.queue(cursor::MoveToNextLine(1))?;
-        Ok(())
-    }
-
-    fn draw_table_header(&mut self) -> io::Result<()> {
-        self.stdout.queue(SetAttribute(Attribute::Bold))?;
-        self.stdout.queue(style::Print(format!(
-            "{:<10} {:>3}  {:<22}  {:>9}  {:>9}  {:>8}  {:>11}  {:>8}  {:>10}  {:>12}  {:>8}",
-            "route",
-            "sid",
-            "stream_name",
-            "smps/s",
-            "drift(s)",
-            "ppm",
-            "jitter(ms)",
-            "dropped",
-            "last_n",
-            "last_time",
-            "status"
-        )))?;
-        self.stdout.queue(SetAttribute(Attribute::Reset))?;
-        self.stdout.queue(cursor::MoveToNextLine(1))?;
-        Ok(())
-    }
-
-    fn draw_data_rows(&mut self, rows: &[DisplayRow]) -> io::Result<()> {
-        let mut last_route = String::new();
-
-        for row in rows {
-            if row.route != last_route {
-                if !last_route.is_empty() {
-                    self.stdout.queue(cursor::MoveToNextLine(1))?;
-                }
-                last_route = row.route.clone();
-            }
-
-            let color = row.get_color();
-            self.stdout.queue(SetForegroundColor(color))?;
-            self.stdout.queue(style::Print(format!(
-                "{:<10} {:>3}  {:<22}  {:>9.1}  {:>9.3}  {:>8.0}  {:>11.2}  {:>8}  {:>10}  {:>12.3}  {:>8}",
-                row.route,
-                row.stream_id,
-                row.name,
-                if row.metadata_ok { row.rate_smps } else { 0.0 },
-                if row.metadata_ok { row.drift_s } else { 0.0 },
-                if row.metadata_ok { row.ppm } else { 0.0 },
-                if row.metadata_ok { row.jitter_ms } else { 0.0 },
-                if row.metadata_ok { row.samples_dropped } else { 0 },
-                row.last_n.unwrap_or(0),
-                row.last_data.unwrap_or(0.0),
-                row.status
-            )))?;
-            self.stdout.queue(ResetColor)?;
-            self.stdout.queue(cursor::MoveToNextLine(1))?;
-        }
-
-        Ok(())
-    }
-
-    fn draw_event_log(
-        &mut self,
-        event_log: &VecDeque<LoggedEvent>,
-        config: &Config,
-    ) -> io::Result<()> {
-        if event_log.is_empty() {
-            return Ok(());
-        }
-
-        let shown_count = if config.warnings_only {
-            event_log
-                .iter()
-                .filter(|e| matches!(e.color, Color::Red | Color::Yellow))
-                .count()
-        } else {
-            event_log.len()
-        };
-
-        self.stdout.queue(cursor::MoveToNextLine(2))?;
-        self.stdout.queue(SetAttribute(Attribute::Bold))?;
-        self.stdout.queue(style::Print(format!(
-            "Recent Events ({} of {}):",
-            shown_count, config.event_log_size
-        )))?;
-        self.stdout.queue(SetAttribute(Attribute::Reset))?;
-        self.stdout.queue(cursor::MoveToNextLine(1))?;
-
-        let events_to_show = event_log
+impl UiState {
+    fn filtered_events(&self, warnings_only: bool) -> Vec<&LoggedEvent> {
+        self.event_log
             .iter()
-            .filter(|e| !config.warnings_only || matches!(e.color, Color::Red | Color::Yellow));
-
-        for logged in events_to_show {
-            let datetime: DateTime<Local> = logged.timestamp.into();
-            self.stdout.queue(SetForegroundColor(logged.color))?;
-            self.stdout.queue(style::Print(format!(
-                "[{}] {}",
-                datetime.format("%H:%M:%S%.3f"),
-                logged.event
-            )))?;
-            self.stdout.queue(ResetColor)?;
-            self.stdout.queue(cursor::MoveToNextLine(1))?;
-        }
-
-        Ok(())
-    }
-
-    fn draw_footer(&mut self, quiet: bool) -> io::Result<()> {
-        if !quiet {
-            self.stdout.queue(cursor::MoveToNextLine(1))?;
-            self.stdout.queue(style::Print("q/Esc to quit"))?;
-        }
-        Ok(())
+            .filter(|e| !warnings_only || matches!(e.color, Color::Red | Color::Yellow))
+            .collect()
     }
 }
 
-fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -> (String, Color) {
+fn draw_ui(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &UiState,
+    config: &Config,
+    cli: &Cli,
+) -> io::Result<()> {
+    terminal.draw(|f| {
+        let size = f.area();
+
+        // Calculate layout: header + table + event log + footer
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),        // Header
+                Constraint::Min(10),          // Table (takes remaining space)
+                Constraint::Length(if state.event_log.is_empty() { 0 } else { 
+                    config.event_display_lines + 2  // Events + border (top/bottom)
+                }),
+                Constraint::Length(if config.quiet { 0 } else { 1 }), // Footer
+            ])
+            .split(size);
+
+        // Header
+        let header_text = format!(
+            "tio-health — rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  fps={}  stale={}ms",
+            cli.rate_window, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
+        );
+        let header = Paragraph::new(header_text)
+            .style(Style::default().add_modifier(Modifier::BOLD));
+        f.render_widget(header, chunks[0]);
+
+        // Table
+        let header_cells = [
+            "route", "sid", "stream_name", "smps/s", "drift(s)", "ppm",
+            "jitter(ms)", "dropped", "last_n", "last_time", "status",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+        
+        let header_row = Row::new(header_cells).height(1);
+
+        let rows: Vec<Row> = state.rows.iter().map(|r| r.to_table_row()).collect();
+
+        let widths = [
+            Constraint::Length(10),  // route
+            Constraint::Length(4),   // sid
+            Constraint::Length(22),  // stream_name
+            Constraint::Length(9),   // smps/s
+            Constraint::Length(9),   // drift(s)
+            Constraint::Length(8),   // ppm
+            Constraint::Length(11),  // jitter(ms)
+            Constraint::Length(8),   // dropped
+            Constraint::Length(10),  // last_n
+            Constraint::Length(12),  // last_time
+            Constraint::Length(8),   // status
+        ];
+
+        let table = Table::new(rows, widths)
+            .header(header_row)
+            .column_spacing(2);
+
+        f.render_stateful_widget(table, chunks[1], &mut TableState::default());
+
+        // Event log
+        if !state.event_log.is_empty() {
+            let events_to_show = state.filtered_events(config.warnings_only);
+
+            let total_events = events_to_show.len();
+            let display_count = config.event_display_lines as usize;
+            
+            // Calculate which events to show based on scroll offset
+            let start = state.event_scroll_offset.min(total_events.saturating_sub(1));
+            let end = (start + display_count).min(total_events);
+            
+            let visible_events: Vec<Line> = events_to_show[start..end]
+                .iter()
+                .map(|logged| {
+                    let datetime: DateTime<Local> = logged.timestamp.into();
+                    Line::from(vec![
+                        Span::styled(
+                            format!("[{}] ", datetime.format("%H:%M:%S%.3f")),
+                            Style::default().fg(logged.color),
+                        ),
+                        Span::styled(logged.event.clone(), Style::default().fg(logged.color)),
+                    ])
+                })
+                .collect();
+
+            // Show scroll indicator if there are more events
+            let title = if total_events > display_count {
+                format!("Recent Events [{}-{}/{}] (↑/↓ to scroll)", 
+                    start + 1, end, total_events)
+            } else {
+                "Recent Events".to_string()
+            };
+
+            let event_block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray));
+
+            let events_paragraph = Paragraph::new(visible_events).block(event_block);
+            f.render_widget(events_paragraph, chunks[2]);
+        }
+
+        // Footer
+        if !config.quiet {
+            let footer = Paragraph::new("q/Esc to quit  |  ↑/↓/PgUp/PgDn/Home/End to scroll events")
+                .style(Style::default().fg(Color::Gray));
+            f.render_widget(footer, chunks[3]);
+        }
+    })?;
+    Ok(())
+}
+
+fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -> Option<(String, Color)> {
     match event {
         BufferEvent::SamplesSkipped {
             route,
@@ -568,13 +544,13 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
                 .get(&(route.clone(), *stream_id))
                 .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
-            (
+            Some((
                 format!(
                     "[{}/{}] SAMPLES DROPPED: {} samples (session: {})",
                     route, stream_name, count, session_id
                 ),
                 Color::Red,
-            )
+            ))
         }
         BufferEvent::SamplesBackward {
             route,
@@ -587,13 +563,13 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
                 .get(&(route.clone(), *stream_id))
                 .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
-            (
+            Some((
                 format!(
                     "[{}/{}] SAMPLES BACKWARD: {} → {} (session: {})",
                     route, stream_name, previous, current, session_id
                 ),
                 Color::Yellow,
-            )
+            ))
         }
         BufferEvent::SessionChanged {
             route,
@@ -605,24 +581,24 @@ fn format_event(event: &BufferEvent, stats: &BTreeMap<StreamKey, StreamStats>) -
                 .get(&(route.clone(), *stream_id))
                 .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
-            (
+            Some((
                 format!(
                     "[{}/{}] SESSION CHANGED: {} → {}",
                     route, stream_name, old_id, new_id
                 ),
                 Color::Green,
-            )
+            ))
         }
         BufferEvent::MetadataChanged(route) => {
-            (format!("[{}] METADATA CHANGED", route), Color::Green)
+            Some((format!("[{}] METADATA CHANGED", route), Color::Green))
         }
         BufferEvent::SegmentChanged(route) => {
-            (format!("[{}] SEGMENT CHANGED", route), Color::Green)
+            Some((format!("[{}] SEGMENT CHANGED", route), Color::Green))
         }
         BufferEvent::RouteDiscovered(route) => {
-            (format!("[{}] ROUTE DISCOVERED", route), Color::Green)
+            Some((format!("[{}] ROUTE DISCOVERED", route), Color::Green))
         }
-        _ => (String::new(), Color::White),
+        _ => None,
     }
 }
 
@@ -648,7 +624,6 @@ fn handle_samples_event(
         let key = (route.clone(), sid);
         let st = stats.entry(key).or_insert_with(|| StreamStats {
             name: sample.stream.name.clone(),
-            metadata_ok: true,
             current_session_id: Some(sample.device.session_id),
             ..Default::default()
         });
@@ -688,98 +663,116 @@ fn main() {
     let cli = Cli::parse();
     let config = Config::from(&cli);
 
-    let mut tui = Tui::setup().expect("TUI setup failed");
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let mut t = Tui {
-            stdout: io::stdout(),
-        };
-        t.teardown();
-        original_hook(panic_info);
-    }));
+    let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&cli.tio.root);
     let route = cli.tio.parse_route();
     let tree = match DeviceTree::open(&proxy, route.clone()) {
         Ok(t) => t,
         Err(e) => {
-            tui.teardown();
+            ratatui::restore();
             eprintln!("Failed to open device tree: {:?}", e);
             std::process::exit(1);
         }
     };
 
     let (event_tx, event_rx) = channel::unbounded();
-    let mut buffer = Buffer::new(tree, event_tx, 1, true);
+    let buffer = Buffer::new(tree, event_tx, 1, true);
 
-    let stats = std::sync::Arc::new(std::sync::Mutex::new(
-        BTreeMap::<StreamKey, StreamStats>::new(),
-    ));
-    let event_log = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<LoggedEvent>::new()));
-
+    // How often we want UI/data snapshots
     let frame = Duration::from_millis((1000 / config.fps.max(1)) as u64);
 
-    let stats_clone = stats.clone();
-    let event_log_clone = event_log.clone();
-    let config_clone = Config::from(&cli);
+    // Channel: data thread -> UI thread
+    let (state_tx, state_rx) = channel::bounded::<UiState>(1);
+    let config_clone = config.clone();
 
-    std::thread::spawn(move || loop {
-        let (sample, route) = match buffer.tree.next() {
-            Ok(s) => s,
-            Err(_) => break,
-        };
+    // Data / drain thread owns all stats and builds UiState snapshots
+    std::thread::spawn(move || {
+        let mut buffer = buffer;
+        let mut stats = BTreeMap::<StreamKey, StreamStats>::new();
+        let mut event_log = VecDeque::<LoggedEvent>::new();
+        let mut last_snapshot = Instant::now();
 
-        buffer.process_sample(sample, route);
-
-        if buffer.drain().is_err() {
-            break;
-        }
-
-        while let Ok(event) = event_rx.try_recv() {
-            let (event_str, event_color) = {
-                let stats = stats_clone.lock().unwrap();
-                format_event(&event, &stats)
+        loop {
+            // Blocking read from device tree
+            let (sample, route) = match buffer.tree.next() {
+                Ok(s) => s,
+                Err(_) => break,
             };
 
-            if !event_str.is_empty() {
-                let mut log = event_log_clone.lock().unwrap();
-                log.push_front(LoggedEvent {
-                    timestamp: SystemTime::now(),
-                    event: event_str,
-                    color: event_color,
-                });
-                if log.len() > config_clone.event_log_size {
-                    log.pop_back();
+            buffer.process_sample(sample, route);
+
+            if buffer.drain().is_err() {
+                break;
+            }
+
+            // Handle all pending events from Buffer
+            while let Ok(event) = event_rx.try_recv() {
+                if let Some((event_str, event_color)) = format_event(&event, &stats) {
+                    event_log.push_front(LoggedEvent {
+                        timestamp: SystemTime::now(),
+                        event: event_str,
+                        color: event_color,
+                    });
+                    if event_log.len() > config_clone.event_log_size {
+                        event_log.pop_back();
+                    }
+                }
+
+                match event {
+                    BufferEvent::Samples(samples) => {
+                        handle_samples_event(samples, &mut stats, &config_clone);
+                    }
+
+                    BufferEvent::SessionChanged {
+                        route,
+                        stream_id,
+                        new_id,
+                        old_id: _,
+                    } => {
+                        handle_session_changed(route, stream_id, new_id, &mut stats);
+                    }
+
+                    BufferEvent::SamplesSkipped {
+                        route,
+                        stream_id,
+                        count,
+                        ..
+                    } => {
+                        handle_samples_skipped(route, stream_id, count, &mut stats);
+                    }
+
+                    _ => {}
                 }
             }
 
-            match event {
-                BufferEvent::Samples(samples) => {
-                    let mut stats = stats_clone.lock().unwrap();
-                    handle_samples_event(samples, &mut stats, &config_clone);
-                }
+            // Build snapshot of rows + event log for the UI according to FPS
+            let now = Instant::now();
+            if now.duration_since(last_snapshot) >= frame {
+                let mut rows: Vec<DisplayRow> = stats
+                    .iter_mut()
+                    .map(|((route, stream_id), st)| {
+                        st.compute_rate(now, config_clone.rate_window);
+                        if st.is_stale(now, config_clone.stale_dur) && st.t0_host.is_some() {
+                            st.reset_timing();
+                        }
+                        st.to_display_row(route.to_string(), *stream_id, &config_clone, now)
+                    })
+                    .collect();
 
-                BufferEvent::SessionChanged {
-                    route,
-                    stream_id,
-                    new_id,
-                    old_id: _,
-                } => {
-                    let mut stats = stats_clone.lock().unwrap();
-                    handle_session_changed(route, stream_id, new_id, &mut stats);
-                }
+                rows.sort_by(|a, b| {
+                    a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id))
+                });
 
-                BufferEvent::SamplesSkipped {
-                    route,
-                    stream_id,
-                    count,
-                    ..
-                } => {
-                    let mut stats = stats_clone.lock().unwrap();
-                    handle_samples_skipped(route, stream_id, count, &mut stats);
-                }
+                let snapshot = UiState {
+                    rows,
+                    event_log: event_log.clone(),
+                    event_scroll_offset: 0,  // Always show newest events
+                };
 
-                _ => {}
+                let _ = state_tx.try_send(snapshot);
+
+                last_snapshot = now;
             }
         }
     });
@@ -792,54 +785,89 @@ fn main() {
         }
     });
 
-    // UI loop
-    let tick = channel::tick(frame);
+    // Main event loop
+    let mut current_state: Option<UiState> = None;
+    
     'main: loop {
         crossbeam::select! {
             recv(key_rx) -> ev => {
-                if let Ok(event::Event::Key(k)) = ev {
-                    use event::{KeyCode, KeyModifiers};
+                if let Ok(Event::Key(k)) = ev {
                     let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                             || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
+                            || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
                     if quit { break 'main; }
+                    
+                    // Handle scroll keys
+                    if let Some(ref mut state) = current_state {
+                        let events_to_show = state.filtered_events(config.warnings_only);
+                        
+                        let total_events = events_to_show.len();
+                        let display_count = config.event_display_lines as usize;
+                        
+                        match k.code {
+                            KeyCode::Up => {
+                                if state.event_scroll_offset > 0 {
+                                    state.event_scroll_offset -= 1;
+                                    let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                }
+                            }
+                            KeyCode::Down => {
+                                if total_events > display_count {
+                                    let max_offset = total_events.saturating_sub(display_count);
+                                    if state.event_scroll_offset < max_offset {
+                                        state.event_scroll_offset += 1;
+                                        let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                    }
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                state.event_scroll_offset = state.event_scroll_offset.saturating_sub(display_count);
+                                let _ = draw_ui(&mut terminal, state, &config, &cli);
+                            }
+                            KeyCode::PageDown => {
+                                if total_events > display_count {
+                                    let max_offset = total_events.saturating_sub(display_count);
+                                    state.event_scroll_offset = (state.event_scroll_offset + display_count).min(max_offset);
+                                    let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                }
+                            }
+                            KeyCode::Home => {
+                                state.event_scroll_offset = 0;
+                                let _ = draw_ui(&mut terminal, state, &config, &cli);
+                            }
+                            KeyCode::End => {
+                                if total_events > display_count {
+                                    state.event_scroll_offset = total_events.saturating_sub(display_count);
+                                    let _ = draw_ui(&mut terminal, state, &config, &cli);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
 
-            recv(tick) -> _ => {
-                let now = Instant::now();
-
-                let rows: Vec<DisplayRow> = {
-                    let mut stats = stats.lock().unwrap();
-                    stats
-                        .iter_mut()
-                        .map(|((route, stream_id), st)| {
-                            st.compute_rate(now, config.rate_window);
-                            if st.is_stale(now, config.stale_dur) && st.t0_host.is_some() {
-                                st.reset_timing();
-                            }
-                            st.to_display_row(route.to_string(), *stream_id, &config, now)
-                        })
-                        .collect()
-                };
-
-                let mut sorted_rows = rows;
-                sorted_rows.sort_by(|a, b| {
-                    a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id))
-                });
-
-                let header = format!(
-                    "tio-health — rate_window={}s  jitter_window={}s  warn/err={}ppm/{}ppm  fps={}  stale={}ms",
-                    cli.rate_window, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
-                );
-
-                let log = event_log.lock().unwrap().clone();
-
-                if tui.draw(&header, &sorted_rows, &log, &config).is_err() {
-                    break 'main;
+            recv(state_rx) -> msg => {
+                match msg {
+                    Ok(mut state) => {
+                        // Preserve scroll offset if we already have state
+                        if let Some(ref prev_state) = current_state {
+                            state.event_scroll_offset = prev_state.event_scroll_offset;
+                        }
+                        
+                        if draw_ui(&mut terminal, &state, &config, &cli).is_err() {
+                            break 'main;
+                        }
+                        
+                        current_state = Some(state);
+                    }
+                    Err(_) => {
+                        // data thread exited
+                        break 'main;
+                    }
                 }
             }
         }
     }
 
-    tui.teardown();
+    ratatui::restore();
 }
