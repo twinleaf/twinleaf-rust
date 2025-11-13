@@ -378,10 +378,6 @@ impl Buffer {
                     old_id: active.session_id,
                     new_id: session_id,
                 });
-                eprintln!(
-                    "Session changed on {:?} stream {}: {} -> {}",
-                    route, stream_id, active.session_id, session_id
-                );
             }
         }
 
@@ -424,10 +420,6 @@ impl Buffer {
                 previous: last_n,
                 current: sample.n,
             });
-            eprintln!(
-                "Samples backward on {:?} stream {}: {} -> {}",
-                route, stream_id, last_n, sample.n
-            );
         } else if sample.n > last_n + 1 {
             let skipped_count = sample.n.saturating_sub(last_n + 1);
             let _ = self.event_tx.try_send(BufferEvent::SamplesSkipped {
@@ -438,14 +430,6 @@ impl Buffer {
                 received: sample.n,
                 count: skipped_count,
             });
-            eprintln!(
-                "Samples skipped on {:?} stream {}: expected {}, got {} (skipped {})",
-                route,
-                stream_id,
-                last_n + 1,
-                sample.n,
-                skipped_count
-            );
         }
 
         // Update tracking
