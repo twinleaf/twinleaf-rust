@@ -8,7 +8,7 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
 use crossbeam::channel;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -746,7 +746,7 @@ fn main() {
                 }
             }
 
-            // Build snapshot of rows + event log for the UI according to FPS
+            // Periodically build snapshot of rows + event log for the UI
             let now = Instant::now();
             if now.duration_since(last_snapshot) >= frame {
                 let mut rows: Vec<DisplayRow> = stats
@@ -792,6 +792,11 @@ fn main() {
         crossbeam::select! {
             recv(key_rx) -> ev => {
                 if let Ok(Event::Key(k)) = ev {
+                    // Only process key press events to avoid double-triggering on Windows
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    
                     let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
                             || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
                     if quit { break 'main; }
