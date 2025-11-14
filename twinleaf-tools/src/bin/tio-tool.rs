@@ -197,13 +197,17 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    let specs = device::util::load_rpc_specs(&device)
-        .map_err(|e| {
-            eprintln!("Failed to load RPC specs: {:?}", e);
-        })?;
+    let specs = device::util::load_rpc_specs(&device).map_err(|e| {
+        eprintln!("Failed to load RPC specs: {:?}", e);
+    })?;
 
     for spec in specs {
-        println!("{} {}({})", spec.perm_str(), spec.full_name, spec.type_str());
+        println!(
+            "{} {}({})",
+            spec.perm_str(),
+            spec.full_name,
+            spec.type_str()
+        );
     }
 
     Ok(())
