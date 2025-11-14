@@ -1,13 +1,15 @@
-mod buffer;
+pub mod buffer;
 mod device;
 mod reader;
 mod subscription;
 mod tree;
-mod util;
+pub mod util;
+pub mod rpc_meta;
 
 pub use buffer::{Buffer, BufferEvent};
 pub use device::Device;
 pub use reader::Reader;
+pub use subscription::SubscriptionManager;
 pub use tree::DeviceTree;
 
 pub type SampleNumber = u32;

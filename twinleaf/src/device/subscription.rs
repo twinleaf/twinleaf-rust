@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
 };
 
 use crate::device::{buffer::AlignedWindow, Buffer, ColumnSpec, SubscriptionId};
+
 pub struct SubscriptionManager {
-    buffer: Arc<Mutex<Buffer>>,
+    buffer: Arc<RwLock<Buffer>>,
     subscriptions: HashMap<SubscriptionId, Subscription>,
     next_id: SubscriptionId,
 }
@@ -17,7 +18,7 @@ pub struct Subscription {
 }
 
 impl SubscriptionManager {
-    pub fn new(buffer: Arc<Mutex<Buffer>>) -> Self {
+    pub fn new(buffer: Arc<RwLock<Buffer>>) -> Self {
         Self {
             buffer,
             subscriptions: HashMap::new(),
@@ -50,17 +51,21 @@ impl SubscriptionManager {
         self.subscriptions.remove(&id);
     }
 
-    pub fn broadcast(&self) {
-        let buffer = self.buffer.lock().unwrap();
+    pub fn unsubscribe_all(&mut self) {
+        self.subscriptions.clear();
+    }
 
-        for sub in self.subscriptions.values() {
-            match buffer.read_aligned_window(&sub.columns, sub.n_samples) {
-                Ok(window) => {
-                    // try_send will drop if channel full (subscriber too slow)
-                    let _ = sub.tx.try_send(window);
-                }
-                Err(_) => {
-                    // Subscriber will detect missing data
+    pub fn broadcast(&self) {
+        if let Ok(buffer) = self.buffer.read() {
+            for sub in self.subscriptions.values() {
+                match buffer.read_aligned_window(&sub.columns, sub.n_samples) {
+                    Ok(window) => {
+                        // latest-wins downstream; drop if receiver is full
+                        let _ = sub.tx.try_send(window);
+                    }
+                    Err(_) => {
+                        // No data yet; subscriber will display "buffering"
+                    }
                 }
             }
         }
