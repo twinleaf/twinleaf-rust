@@ -3,6 +3,7 @@ use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
+use twinleaf::device;
 use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
@@ -191,93 +192,27 @@ fn default_log_path() -> String {
         .to_string()
 }
 
-struct RpcMeta {
-    arg_type: String,
-    size: usize,
-    read: bool,
-    write: bool,
-    persistent: bool,
-    unknown: bool,
-}
-
-impl RpcMeta {
-    pub fn parse(meta: u16) -> RpcMeta {
-        let size = ((meta >> 4) & 0xF) as usize;
-        let atype = meta & 0xF;
-        RpcMeta {
-            arg_type: match atype {
-                0 => match size {
-                    1 => "u8",
-                    2 => "u16",
-                    4 => "u32",
-                    8 => "u64",
-                    _ => "",
-                },
-                1 => match size {
-                    1 => "i8",
-                    2 => "i16",
-                    4 => "i32",
-                    8 => "i64",
-                    _ => "",
-                },
-                2 => match size {
-                    4 => "f32",
-                    8 => "f64",
-                    _ => "",
-                },
-                3 => "string",
-                _ => "",
-            }
-            .to_string(),
-            size: size,
-            read: (meta & 0x0100) != 0,
-            write: (meta & 0x0200) != 0,
-            persistent: (meta & 0x0400) != 0,
-            unknown: meta == 0,
-        }
-    }
-
-    pub fn type_str(&self) -> String {
-        if (self.arg_type == "string") && (self.size != 0) {
-            format!("string<{}>", self.size)
-        } else {
-            self.arg_type.clone()
-        }
-    }
-
-    pub fn perm_str(&self) -> String {
-        if self.unknown {
-            "???".to_string()
-        } else {
-            format!(
-                "{}{}{}",
-                if self.read { "R" } else { "-" },
-                if self.write { "W" } else { "-" },
-                if self.persistent { "P" } else { "-" }
-            )
-        }
-    }
-}
-
 fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    let nrpcs: u16 = device.get("rpc.listinfo").unwrap();
+    let specs = device::util::load_rpc_specs(&device)
+        .map_err(|e| {
+            eprintln!("Failed to load RPC specs: {:?}", e);
+        })?;
 
-    for rpc_id in 0u16..nrpcs {
-        let (meta, name): (u16, String) = device.rpc("rpc.listinfo", rpc_id).unwrap();
-        let meta = RpcMeta::parse(meta);
-        println!("{} {}({})", meta.perm_str(), name, meta.type_str());
+    for spec in specs {
+        println!("{} {}({})", spec.perm_str(), spec.full_name, spec.type_str());
     }
 
     Ok(())
 }
 
 fn get_rpctype(name: &String, device: &proxy::Port) -> String {
-    if let Ok(reply) = device.rpc("rpc.info", name) {
-        RpcMeta::parse(reply).arg_type
+    if let Ok(meta) = device.rpc("rpc.info", name) {
+        let spec = device::util::parse_rpc_spec(meta, name.clone());
+        spec.type_str()
     } else {
         "".to_string()
     }

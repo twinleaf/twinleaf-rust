@@ -219,7 +219,6 @@ pub fn rpc_encode_arg(input: &str, kind: &RpcDataKind) -> Result<Vec<u8>, Encode
         },
 
         RpcDataKind::Raw { .. } => {
-            // If you prefer to disallow, return Err(NotEncodableForKind("raw")).
             Ok(Vec::new())
         }
     }
