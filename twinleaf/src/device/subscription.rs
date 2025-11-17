@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
 };
 
 use crate::device::{buffer::AlignedWindow, Buffer, ColumnSpec, SubscriptionId};
 
 pub struct SubscriptionManager {
-    buffer: Arc<RwLock<Buffer>>,
+    pub buffer: Buffer,
     subscriptions: HashMap<SubscriptionId, Subscription>,
     next_id: SubscriptionId,
 }
@@ -18,7 +17,7 @@ pub struct Subscription {
 }
 
 impl SubscriptionManager {
-    pub fn new(buffer: Arc<RwLock<Buffer>>) -> Self {
+    pub fn new(buffer: Buffer) -> Self {
         Self {
             buffer,
             subscriptions: HashMap::new(),
@@ -56,16 +55,12 @@ impl SubscriptionManager {
     }
 
     pub fn broadcast(&self) {
-        if let Ok(buffer) = self.buffer.read() {
-            for sub in self.subscriptions.values() {
-                match buffer.read_aligned_window(&sub.columns, sub.n_samples) {
-                    Ok(window) => {
-                        // latest-wins downstream; drop if receiver is full
-                        let _ = sub.tx.try_send(window);
-                    }
-                    Err(_) => {
-                        // No data yet; subscriber will display "buffering"
-                    }
+        for sub in self.subscriptions.values() {
+            match self.buffer.read_aligned_window(&sub.columns, sub.n_samples) {
+                Ok(window) => {
+                    let _ = sub.tx.try_send(window);
+                }
+                Err(_) => {
                 }
             }
         }
