@@ -1,6 +1,7 @@
 // tio-health
 //
 // Live timing & rate diagnostics by device route.
+// Example of only utilizing BufferEvents
 //
 // Build: cargo run --release -- <tio-url> [route] [options]
 // Quit:  q / Esc / Ctrl-C
@@ -9,7 +10,6 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use crossbeam::channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,8 +19,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::num::ParseFloatError;
 use std::time::{Duration, Instant, SystemTime};
-use twinleaf::device::{Buffer, BufferEvent};
-use twinleaf::device::{DeviceTree, StreamKey};
+use twinleaf::device::{Buffer, BufferEvent, DeviceTree, StreamKey};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
 
@@ -161,6 +160,7 @@ fn nonneg_f64(s: &str) -> Result<f64, String> {
         Ok(v)
     }
 }
+
 struct TimeWindow {
     buf: Vec<f64>,
     cap: usize,
@@ -263,7 +263,7 @@ impl StreamStats {
         self.t0_data = None;
         self.last_host = None;
         self.last_data = None;
-        self.drift_s = 0.0;
+               self.drift_s = 0.0;
         self.ppm = 0.0;
         self.jitter_ms = 0.0;
         self.jitter_window = None;
@@ -357,6 +357,7 @@ impl StreamStats {
     }
 }
 
+#[derive(Clone)]
 struct DisplayRow {
     route: String,
     stream_id: u8,
@@ -399,6 +400,7 @@ struct LoggedEvent {
     color: Color,
 }
 
+#[derive(Clone)]
 struct UiState {
     rows: Vec<DisplayRow>,
     event_log: VecDeque<LoggedEvent>,
@@ -414,8 +416,13 @@ impl UiState {
     }
 }
 
+enum HealthReq {
+    Snapshot,
+    Shutdown,
+}
+
 fn draw_ui(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     state: &UiState,
     cli: &Cli,
 ) -> io::Result<()> {
@@ -423,13 +430,21 @@ fn draw_ui(
         let size = f.area();
 
         // Calculate layout: header + table + event log + footer
+        let event_block_height = if state.event_log.is_empty() {
+            0
+        } else {
+            cli.event_display_lines + 2
+        };
+
+        let footer_height = if cli.quiet { 0 } else { 1 };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(10),
-                Constraint::Length(if state.event_log.is_empty() { 0 } else { cli.event_display_lines + 2 }),
-                Constraint::Length(if cli.quiet { 0 } else { 1 }),
+                Constraint::Length(event_block_height),
+                Constraint::Length(footer_height),
             ])
             .split(size);
 
@@ -497,8 +512,12 @@ fn draw_ui(
 
             // Show scroll indicator if there are more events
             let title = if total_events > display_count {
-                format!("Recent Events [{}-{}/{}] (↑/↓ to scroll)", 
-                    start + 1, end, total_events)
+                format!(
+                    "Recent Events [{}-{}/{}] (↑/↓ to scroll)",
+                    start + 1,
+                    end,
+                    total_events
+                )
             } else {
                 "Recent Events".to_string()
             };
@@ -624,9 +643,18 @@ fn handle_samples_event(
         });
 
         st.name = sample.stream.name.clone();
-        st.last_seen = Some(now);
-        st.last_data = Some(sample.timestamp_end());
-        st.on_sample(sample.n, sample.timestamp_end(), now, jitter_window_s);
+
+        let new_n = sample.n;
+        let advance = match st.last_n {
+            Some(prev_n) => new_n != prev_n,
+            None => true,
+        };
+
+        if advance {
+            st.last_seen = Some(now);
+        }
+
+        st.on_sample(new_n, sample.timestamp_end(), now, jitter_window_s);
     }
 }
 
@@ -672,11 +700,10 @@ fn main() {
 
     let (event_tx, event_rx) = channel::unbounded();
     let buffer = Buffer::new(event_tx, 100_000, true);
-    // How often we want UI/data snapshots
-    let frame = Duration::from_millis(1000 / cli.fps);
 
-    // Channel: data thread -> UI thread
+    let (req_tx, req_rx) = channel::unbounded::<HealthReq>();
     let (state_tx, state_rx) = channel::bounded::<UiState>(1);
+
     let streams_filter = cli.streams.clone();
     let jitter_window_s = cli.jitter_window_s();
     let rate_window = cli.rate_window_dur();
@@ -685,108 +712,109 @@ fn main() {
     let ppm_warn = cli.ppm_warn;
     let ppm_err = cli.ppm_err;
 
+    // Data ingestion thread
     std::thread::spawn(move || {
         let mut tree = tree;
         let mut buffer = buffer;
-        let mut stats = BTreeMap::<StreamKey, StreamStats>::new();
-        let mut event_log = VecDeque::<LoggedEvent>::new();
-        let mut last_snapshot = Instant::now();
 
         loop {
-            // Blocking I/O - read from device tree
-            let (sample, route) = match tree.next() {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-
-            buffer.process_sample(sample, route);
-
-            loop {
-                match tree.try_next() {
-                    Ok(Some((s, r))) => {
-                        buffer.process_sample(s, r);
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
+            match tree.next() {
+                Ok((sample, route)) => {
+                    buffer.process_sample(sample, route);
                 }
-            }
-
-            while let Ok(event) = event_rx.try_recv() {
-                if let Some((event_str, event_color)) = format_event(&event, &stats) {
-                    event_log.push_front(LoggedEvent {
-                        timestamp: SystemTime::now(),
-                        event: event_str,
-                        color: event_color,
-                    });
-                    if event_log.len() > event_log_cap.try_into().unwrap() {
-                        event_log.pop_back();
-                    }
+                Err(e) => {
+                    eprintln!("Device error: {:?}", e);
+                    break;
                 }
-
-                match event {
-                    BufferEvent::Samples(samples) => {
-                        handle_samples_event(
-                            samples,
-                            &mut stats,
-                            streams_filter.as_deref(),
-                            jitter_window_s,
-                        );
-                    }
-                    BufferEvent::SessionChanged {
-                        route,
-                        stream_id,
-                        new_id,
-                        ..
-                    } => {
-                        handle_session_changed(route, stream_id, new_id, &mut stats);
-                    }
-                    BufferEvent::SamplesSkipped {
-                        route,
-                        stream_id,
-                        count,
-                        ..
-                    } => {
-                        handle_samples_skipped(route, stream_id, count, &mut stats);
-                    }
-                    _ => {}
-                }
-            }
-
-            let now = Instant::now();
-            if now.duration_since(last_snapshot) >= frame {
-                let mut rows: Vec<DisplayRow> = stats
-                    .iter_mut()
-                    .map(|((route, stream_id), st)| {
-                        st.compute_rate(now, rate_window);
-                        if st.is_stale(now, stale_dur) && st.t0_host.is_some() {
-                            st.reset_timing();
-                        }
-                        st.to_display_row(
-                            route.to_string(),
-                            *stream_id,
-                            now,
-                            stale_dur,
-                            ppm_warn,
-                            ppm_err,
-                        )
-                    })
-                    .collect();
-
-                rows.sort_by(|a, b| a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id)));
-
-                let snapshot = UiState {
-                    rows,
-                    event_log: event_log.clone(),
-                    event_scroll_offset: 0,
-                };
-
-                let _ = state_tx.try_send(snapshot);
-                last_snapshot = now;
             }
         }
     });
 
-    // Keyboard handler
+    // Stats / health worker thread
+    std::thread::spawn(move || {
+        let mut stats = BTreeMap::<StreamKey, StreamStats>::new();
+        let mut event_log = VecDeque::<LoggedEvent>::new();
+
+        loop {
+            crossbeam::select! {
+                recv(event_rx) -> msg => {
+                    let event = match msg {
+                        Ok(ev) => ev,
+                        Err(_) => break,
+                    };
+
+                    // Log human-readable events
+                    if let Some((event_str, event_color)) = format_event(&event, &stats) {
+                        event_log.push_front(LoggedEvent {
+                            timestamp: SystemTime::now(),
+                            event: event_str,
+                            color: event_color,
+                        });
+                        if event_log.len() > event_log_cap as usize {
+                            event_log.pop_back();
+                        }
+                    }
+
+                    match event {
+                        BufferEvent::Samples(samples) => {
+                            handle_samples_event(
+                                samples,
+                                &mut stats,
+                                streams_filter.as_deref(),
+                                jitter_window_s,
+                            );
+                        }
+                        BufferEvent::SessionChanged { route, stream_id, new_id, .. } => {
+                            handle_session_changed(route, stream_id, new_id, &mut stats);
+                        }
+                        BufferEvent::SamplesSkipped { route, stream_id, count, .. } => {
+                            handle_samples_skipped(route, stream_id, count, &mut stats);
+                        }
+                        _ => {}
+                    }
+                }
+
+                recv(req_rx) -> msg => {
+                    match msg {
+                        Ok(HealthReq::Snapshot) => {
+                            let now = Instant::now();
+
+                            let mut rows: Vec<DisplayRow> = stats
+                                .iter_mut()
+                                .map(|((route, stream_id), st)| {
+                                    st.compute_rate(now, rate_window);
+                                    if st.is_stale(now, stale_dur) && st.t0_host.is_some() {
+                                        st.reset_timing();
+                                    }
+                                    st.to_display_row(
+                                        route.to_string(),
+                                        *stream_id,
+                                        now,
+                                        stale_dur,
+                                        ppm_warn,
+                                        ppm_err,
+                                    )
+                                })
+                                .collect();
+
+                            rows.sort_by(|a, b| a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id)));
+
+                            let snapshot = UiState {
+                                rows,
+                                event_log: event_log.clone(),
+                                event_scroll_offset: 0,
+                            };
+
+                            let _ = state_tx.try_send(snapshot);
+                        }
+                        Ok(HealthReq::Shutdown) | Err(_) => break,
+                    }
+                }
+            }
+        }
+    });
+
+    // Key-reading thread
     let (key_tx, key_rx) = channel::unbounded();
     std::thread::spawn(move || loop {
         if let Ok(ev) = event::read() {
@@ -794,7 +822,9 @@ fn main() {
         }
     });
 
-    // Main event loop
+    let frame = Duration::from_millis(1000 / cli.fps);
+    let ticker = channel::tick(frame);
+
     let mut current_state: Option<UiState> = None;
 
     'main: loop {
@@ -807,8 +837,11 @@ fn main() {
                     }
 
                     let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                            || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
-                    if quit { break 'main; }
+                        || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
+                    if quit {
+                        let _ = req_tx.send(HealthReq::Shutdown);
+                        break 'main;
+                    }
 
                     // Handle scroll keys
                     if let Some(ref mut state) = current_state {
@@ -821,7 +854,6 @@ fn main() {
                             KeyCode::Up => {
                                 if state.event_scroll_offset > 0 {
                                     state.event_scroll_offset -= 1;
-                                    let _ = draw_ui(&mut terminal, state, &cli);
                                 }
                             }
                             KeyCode::Down => {
@@ -829,33 +861,32 @@ fn main() {
                                     let max_offset = total_events.saturating_sub(display_count);
                                     if state.event_scroll_offset < max_offset {
                                         state.event_scroll_offset += 1;
-                                        let _ = draw_ui(&mut terminal, state, &cli);
                                     }
                                 }
                             }
                             KeyCode::PageUp => {
-                                state.event_scroll_offset = state.event_scroll_offset.saturating_sub(display_count);
-                                let _ = draw_ui(&mut terminal, state, &cli);
+                                state.event_scroll_offset =
+                                    state.event_scroll_offset.saturating_sub(display_count);
                             }
                             KeyCode::PageDown => {
                                 if total_events > display_count {
                                     let max_offset = total_events.saturating_sub(display_count);
-                                    state.event_scroll_offset = (state.event_scroll_offset + display_count).min(max_offset);
-                                    let _ = draw_ui(&mut terminal, state, &cli);
+                                    state.event_scroll_offset =
+                                        (state.event_scroll_offset + display_count).min(max_offset);
                                 }
                             }
                             KeyCode::Home => {
                                 state.event_scroll_offset = 0;
-                                let _ = draw_ui(&mut terminal, state, &cli);
                             }
                             KeyCode::End => {
                                 if total_events > display_count {
                                     state.event_scroll_offset = total_events.saturating_sub(display_count);
-                                    let _ = draw_ui(&mut terminal, state, &cli);
                                 }
                             }
                             _ => {}
                         }
+
+                        let _ = draw_ui(&mut terminal, state, &cli);
                     }
                 }
             }
@@ -863,7 +894,6 @@ fn main() {
             recv(state_rx) -> msg => {
                 match msg {
                     Ok(mut state) => {
-                        // Preserve scroll offset if we already have state
                         if let Some(ref prev_state) = current_state {
                             state.event_scroll_offset = prev_state.event_scroll_offset;
                         }
@@ -875,10 +905,13 @@ fn main() {
                         current_state = Some(state);
                     }
                     Err(_) => {
-                        // data thread exited
                         break 'main;
                     }
                 }
+            }
+
+            recv(ticker) -> _ => {
+                let _ = req_tx.send(HealthReq::Snapshot);
             }
         }
     }
