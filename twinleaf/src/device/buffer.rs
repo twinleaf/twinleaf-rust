@@ -9,11 +9,10 @@
 use crate::{
     data::{ColumnData, Sample},
     device::{
-        util, ColumnId, ColumnSpec, CursorPosition, DeviceTree, SampleNumber, SegmentId, SessionId,
+        util, ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId,
         StreamId, StreamKey,
     },
     tio::{
-        self,
         proto::{
             meta::{ColumnMetadata, SegmentMetadata},
             DeviceRoute,
@@ -290,7 +289,6 @@ impl SegmentBuffer {
     }
 }
 pub struct Buffer {
-    pub tree: DeviceTree,
     routes_seen: HashSet<DeviceRoute>,
     pub active_segments: HashMap<StreamKey, ActiveSegment>,
     event_tx: crossbeam::channel::Sender<BufferEvent>,
@@ -300,32 +298,17 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(
-        tree: DeviceTree,
         event_tx: crossbeam::channel::Sender<BufferEvent>,
         capacity: usize,
         forward_samples: bool,
     ) -> Self {
         Buffer {
-            tree,
             routes_seen: HashSet::new(),
             active_segments: HashMap::new(),
             event_tx,
             forward_samples,
             capacity,
         }
-    }
-
-    pub fn drain(&mut self) -> Result<(), tio::proxy::RpcError> {
-        let samples = self.tree.drain()?;
-        if samples.is_empty() {
-            return Ok(());
-        }
-
-        for (sample, route) in samples {
-            self.process_sample(sample, route);
-        }
-
-        Ok(())
     }
 
     pub fn process_sample(&mut self, sample: Sample, route: DeviceRoute) {

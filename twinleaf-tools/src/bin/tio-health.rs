@@ -671,8 +671,7 @@ fn main() {
     };
 
     let (event_tx, event_rx) = channel::unbounded();
-    let buffer = Buffer::new(tree, event_tx, 1, true);
-
+    let buffer = Buffer::new(event_tx, 100_000, true);
     // How often we want UI/data snapshots
     let frame = Duration::from_millis(1000 / cli.fps);
 
@@ -686,24 +685,30 @@ fn main() {
     let ppm_warn = cli.ppm_warn;
     let ppm_err = cli.ppm_err;
 
-    // Data / drain thread owns all stats and builds UiState snapshots
     std::thread::spawn(move || {
+        let mut tree = tree;
         let mut buffer = buffer;
         let mut stats = BTreeMap::<StreamKey, StreamStats>::new();
         let mut event_log = VecDeque::<LoggedEvent>::new();
         let mut last_snapshot = Instant::now();
 
         loop {
-            // Blocking read from device tree
-            let (sample, route) = match buffer.tree.next() {
+            // Blocking I/O - read from device tree
+            let (sample, route) = match tree.next() {
                 Ok(s) => s,
                 Err(_) => break,
             };
 
             buffer.process_sample(sample, route);
 
-            if buffer.drain().is_err() {
-                break;
+            loop {
+                match tree.try_next() {
+                    Ok(Some((s, r))) => {
+                        buffer.process_sample(s, r);
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
             }
 
             while let Ok(event) = event_rx.try_recv() {

@@ -345,73 +345,72 @@ impl App {
 
     pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
         let col_spec = self.current_selection()?;
-        let buffer = self.buffer.read().ok()?;
         let stream_key = col_spec.stream_key();
 
-        let active = buffer.active_segments.get(&stream_key)?;
-        let sampling_rate =
-            (active.buffer.segment_metadata.sampling_rate / active.buffer.segment_metadata.decimation)
-                as f64;
+        let window = {
+            let buffer = self.buffer.read().ok()?;
 
-        let n_samples = (self.plot_window_seconds * sampling_rate).ceil() as usize;
-        let n_samples = n_samples.max(10);
+            let active = buffer.active_segments.get(&stream_key)?;
+            let sampling_rate = (active.buffer.segment_metadata.sampling_rate
+                / active.buffer.segment_metadata.decimation) as f64;
 
-        let window = buffer
-            .read_aligned_window(&[col_spec.clone()], n_samples)
-            .ok()?;
+            let n_samples = (self.plot_window_seconds * sampling_rate).ceil() as usize;
+            let n_samples = n_samples.max(10);
 
-        let current_value = window
-            .columns
-            .get(&col_spec)
-            .and_then(|data| data.last())
-            .and_then(|cd| match cd {
-                data::ColumnData::Float(x) => Some(*x),
-                data::ColumnData::Int(x) => Some(*x as f64),
-                data::ColumnData::UInt(x) => Some(*x as f64),
-                _ => None,
-            })?;
+            buffer.read_aligned_window(&[col_spec.clone()], n_samples).ok()?
+        };
 
-        let current_time = window.timestamps.last().copied()?;
+        let column_data = window.columns.get(&col_spec)?;
 
-        let mut data = Vec::new();
-        if let Some(column_data) = window.columns.get(&col_spec) {
-            for (i, cd) in column_data.iter().enumerate() {
-                if let Some(&timestamp) = window.timestamps.get(i) {
-                    let value = match cd {
-                        data::ColumnData::Float(x) => *x,
-                        data::ColumnData::Int(x) => *x as f64,
-                        data::ColumnData::UInt(x) => *x as f64,
-                        _ => continue,
-                    };
-
-                    data.push((timestamp, value));
-                }
-            }
+        if column_data.is_empty() || window.timestamps.is_empty() {
+            return None;
         }
 
+        let mut data = Vec::with_capacity(column_data.len());
+        for (i, cd) in column_data.iter().enumerate() {
+            let timestamp = *window.timestamps.get(i)?;
+            let value = match cd {
+                data::ColumnData::Float(x) => *x,
+                data::ColumnData::Int(x) => *x as f64,
+                data::ColumnData::UInt(x) => *x as f64,
+                _ => continue,
+            };
+            data.push((timestamp, value));
+        }
+
+        if data.is_empty() {
+            return None;
+        }
+
+        let (current_time, current_value) = *data.last().unwrap();
         Some((data, current_value, current_time))
     }
 
+
     pub fn get_spectral_density_data(&self) -> Option<(Vec<(f64, f64)>, f64)> {
         let col_spec = self.current_selection()?;
-        let buffer = self.buffer.read().ok()?;
         let stream_key = col_spec.stream_key();
 
-        let active = buffer.active_segments.get(&stream_key)?;
-        let sampling_rate =
-            (active.buffer.segment_metadata.sampling_rate / active.buffer.segment_metadata.decimation)
-                as f64;
+        let (window, sampling_rate) = {
+            let buffer = self.buffer.read().ok()?;
 
-        let n_samples = (self.plot_window_seconds * sampling_rate).ceil() as usize;
-        let n_samples = n_samples.max(1024);
+            let active = buffer.active_segments.get(&stream_key)?;
+            let sampling_rate = (active.buffer.segment_metadata.sampling_rate
+                / active.buffer.segment_metadata.decimation) as f64;
 
-        let window = buffer
-            .read_aligned_window(&[col_spec.clone()], n_samples)
-            .ok()?;
+            let n_samples = (self.plot_window_seconds * sampling_rate).ceil() as usize;
+            let n_samples = n_samples.max(1024);
 
-        let signal: Vec<f64> = window
-            .columns
-            .get(&col_spec)?
+            let window = buffer.read_aligned_window(&[col_spec.clone()], n_samples).ok()?;
+            (window, sampling_rate)
+        };
+
+        let column_data = window.columns.get(&col_spec)?;
+        if column_data.len() < 256 {
+            return None;
+        }
+
+        let signal: Vec<f64> = column_data
             .iter()
             .filter_map(|cd| match cd {
                 data::ColumnData::Float(x) => Some(*x),
@@ -428,10 +427,8 @@ impl App {
         let welch: SpectralDensity<f64> = SpectralDensity::builder(&signal, sampling_rate).build();
         let sd = welch.periodogram();
 
-        // Take a copy so we can filter / normalize.
         let raw_sd: Vec<f64> = sd.iter().copied().collect();
 
-        // Use only positive, finite bins to estimate the average noise floor.
         let valid_vals: Vec<f64> = raw_sd
             .iter()
             .copied()
@@ -447,7 +444,6 @@ impl App {
             return None;
         }
 
-        // Keep the full (freq, PSD) data, still in linear units.
         let data: Vec<(f64, f64)> = sd
             .frequency()
             .into_iter()
@@ -1225,7 +1221,7 @@ fn main() {
     let proxy = tio::proxy::Interface::new(&cli.tio.root);
     let parent_route: DeviceRoute = cli.tio.parse_route();
 
-    let tree = match DeviceTree::open(&proxy, parent_route.clone()) {
+    let mut tree = match DeviceTree::open(&proxy, parent_route.clone()) {
         Ok(t) => t,
         Err(e) => {
             ratatui::restore();
@@ -1235,20 +1231,16 @@ fn main() {
     };
 
     let (event_tx, event_rx) = channel::unbounded();
-    let buffer = Buffer::new(
-        tree,
-        event_tx,
-        /*capacity*/ 100_000,
-        /*forward_samples*/ true,
-    );
-    let buffer = Arc::new(RwLock::new(buffer));
-
-    // Drain thread: blocks inside drain() on device I/O, wakes only when data arrives.
+    let buffer = Arc::new(RwLock::new(Buffer::new(event_tx, 100_000, true)));
     {
         let buffer_clone = buffer.clone();
         std::thread::spawn(move || loop {
-            if buffer_clone.write().unwrap().drain().is_err() {
-                break;
+            match tree.next() {
+                Ok((sample, route)) => {
+                    let mut buf = buffer_clone.write().unwrap();
+                    buf.process_sample(sample, route);
+                }
+                Err(_) => break,
             }
         });
     }
