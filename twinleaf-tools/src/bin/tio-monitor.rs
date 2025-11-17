@@ -1,3 +1,10 @@
+// tio-monitor
+//
+// Live monitoring with basic scope and spectrogram
+// Example of single thread Buffer access
+//
+// Build: cargo run --release -- <tio-url> [route] [options]
+// Quit:  q / Esc / Ctrl-C
 use std::{
     collections::{BTreeMap, HashMap},
     io,
