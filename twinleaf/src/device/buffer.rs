@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Debug, Clone)]
 pub struct AlignedWindow {
     pub sample_numbers: Vec<SampleNumber>,
     pub timestamps: Vec<f64>,
