@@ -1,6 +1,6 @@
 // tio-monitor
 //
-// Live monitoring with basic scope and spectrogram
+// Live monitoring with basic scope and periodogram
 // Example of single thread Buffer access
 //
 // Build: cargo run --release -- <tio-url> [route] [options]
@@ -660,10 +660,10 @@ fn render_footer(f: &mut Frame, _show_scroll: bool, device_count: usize, area: R
 
     let toggle_line = Line::from(vec![
         Span::styled("  Toggle     ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        key_span("Enter"), Span::raw(" Toggle Plot  "),
-        key_span("f"), Span::raw(" Toggle FFT View  "),
-        key_span("h"), Span::raw(" Toggle Footer  "),
-        key_span("r"), Span::raw(" Toggle Routes"),
+        key_span("Enter"), Span::raw(" Plot  "),
+        key_span("f"), Span::raw(" FFT  "),
+        key_span("h"), Span::raw(" Footer  "),
+        key_span("r"), Span::raw(" Routes"),
     ]);
 
     let window_line = Line::from(vec![
