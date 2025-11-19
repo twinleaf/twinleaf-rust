@@ -4,7 +4,7 @@ mod reader;
 mod subscription;
 mod tree;
 pub mod util;
-pub mod rpc_meta;
+pub mod rpc_registry;
 
 pub use buffer::{Buffer, BufferEvent};
 pub use device::Device;

@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::device::util;
 
 #[derive(Debug, Clone)]
 pub enum RpcValue {
@@ -115,21 +117,100 @@ impl RpcMeta {
     }
 }
 
-
 #[derive(Default)]
 struct RpcNode {
     children: BTreeMap<String, RpcNode>,
     rpc: Option<RpcMeta>,
 }
 
-fn build_tree(specs: &[RpcMeta]) -> RpcNode {
-    let mut root = RpcNode::default();
-    for spec in specs {
-        let mut node = &mut root;
-        for seg in &spec.segments {
-            node = node.children.entry(seg.clone()).or_default();
+impl RpcNode {
+    fn insert(&mut self, segments: &[String], spec: RpcMeta) {
+        if let Some((first, rest)) = segments.split_first() {
+            let child = self.children.entry(first.clone()).or_default();
+            child.insert(rest, spec);
+        } else {
+            self.rpc = Some(spec);
         }
-        node.rpc = Some(spec.clone());
     }
-    root
+
+    fn completions(&self, prefix_segments: &[String]) -> Vec<String> {
+        if let Some((first, rest)) = prefix_segments.split_first() {
+            if let Some(child) = self.children.get(first) {
+                return child.completions(rest);
+            } 
+            
+            if rest.is_empty() {
+               return self.children.keys()
+                   .filter(|k| k.starts_with(first))
+                   .cloned()
+                   .collect();
+            }
+            return vec![];
+        }
+        
+        self.children.keys().cloned().collect()
+    }
+    
+    fn find(&self, segments: &[String]) -> Option<&RpcMeta> {
+        if let Some((first, rest)) = segments.split_first() {
+             self.children.get(first)?.find(rest)
+        } else {
+            self.rpc.as_ref()
+        }
+    }
+}
+
+pub struct RpcRegistry {
+    root: RpcNode,
+    flat: HashMap<String, RpcMeta>,
+}
+
+impl RpcRegistry {
+    pub fn new(specs: Vec<RpcMeta>) -> Self {
+        let mut root = RpcNode::default();
+        let mut flat = HashMap::new();
+
+        for spec in specs {
+            flat.insert(spec.full_name.clone(), spec.clone());
+            root.insert(&spec.segments, spec.clone());
+        }
+        Self { root, flat }
+    }
+
+    pub fn find(&self, name: &str) -> Option<&RpcMeta> {
+        self.flat.get(name)
+    }
+
+    pub fn suggest(&self, query: &str) -> Vec<String> {
+        let parts: Vec<String> = query.split('.').map(|s| s.to_string()).collect();
+        self.flat.keys()
+            .filter(|k| k.starts_with(query))
+            .take(10)
+            .cloned()
+            .collect()
+    }
+
+    pub fn prepare_request(&self, input_line: &str) -> Result<(String, Vec<u8>), String> {
+        let parts: Vec<&str> = input_line.split_whitespace().collect();
+        if parts.is_empty() { return Err("Empty command".into()); }
+
+        let name = parts[0];
+        let arg_str = parts.get(1).unwrap_or(&"");
+
+        let meta = self.flat.get(name).ok_or_else(|| format!("Unknown RPC: {}", name))?;
+        
+        let payload = util::rpc_encode_arg(arg_str, &meta.data_kind)
+            .map_err(|e| format!("Encoding error: {:?}", e))?;
+
+        Ok((name.to_string(), payload))
+    }
+    
+    pub fn decode_response(&self, name: &str, data: &[u8]) -> Result<String, String> {
+         let meta = self.flat.get(name).ok_or_else(|| format!("Unknown RPC: {}", name))?;
+         
+         let val = util::rpc_decode_reply(data, &meta.data_kind)
+             .map_err(|e| format!("Decode error: {:?}", e))?;
+             
+         Ok(util::format_rpc_value_for_cli(&val, &meta.data_kind))
+    }
 }

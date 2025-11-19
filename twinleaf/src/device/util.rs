@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{device::{
-    ColumnSpec, StreamKey, buffer::{ActiveSegment, AlignedWindow, ReadError, SegmentWindow}, rpc_meta::{DecodeError, EncodeError, RpcDataKind, RpcMeta, RpcValue}
+    ColumnSpec, StreamKey, buffer::{ActiveSegment, AlignedWindow, ReadError, SegmentWindow}, rpc_registry::{DecodeError, EncodeError, RpcDataKind, RpcMeta, RpcValue}
 }, tio::proxy};
 
 pub fn validate_sampling_rates(
