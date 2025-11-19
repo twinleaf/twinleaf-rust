@@ -8,6 +8,8 @@ use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
@@ -83,7 +85,8 @@ enum Commands {
         depth: Option<usize>,
     },
 
-    /// Log raw packets to a file
+    /// Log samples to a file, by default including metadata. 
+    /// Use --raw to skip metadata request and dump raw packets.
     Log {
         #[command(flatten)]
         tio: TioOpts,
@@ -92,27 +95,17 @@ enum Commands {
         #[arg(short = 'f', default_value_t = default_log_path())]
         file: String,
 
-        /// Unbuffered output
+        /// Unbuffered output (flush every packet)
         #[arg(short = 'u')]
         unbuffered: bool,
 
-        /// Dump depth (default: dump everything)
+        /// Raw mode: Dumps all packets read
+        #[arg(long)]
+        raw: bool,
+
+        /// Packet depth (only used in --raw mode)
         #[arg(short = 'd', long = "depth")]
         depth: Option<usize>,
-    },
-
-    /// Log data samples to a file
-    LogData {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// Path of file where to log the data
-        #[arg(short = 'f', default_value_t = default_log_path())]
-        file: String,
-
-        /// Unbuffered output
-        #[arg(short = 'u')]
-        unbuffered: bool,
     },
 
     /// Log metadata to a file
@@ -486,110 +479,100 @@ fn data_dump_all(tio: &TioOpts) -> Result<(), ()> {
     Ok(())
 }
 
-fn log(tio: &TioOpts, file: String, unbuffered: bool, depth: Option<usize>) -> Result<(), ()> {
-    let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
-
+fn log(
+    tio: &TioOpts,
+    file: String,
+    unbuffered: bool,
+    raw: bool,
+    depth: Option<usize>,
+) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
-    let port = proxy
-        .new_port(None, route, depth, true, true)
-        .map_err(|e| {
-            eprintln!("Failed to initialize proxy port: {:?}", e);
-        })?;
 
-    let mut file = File::create(file).unwrap();
+    if raw {
+        let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
+        let port = proxy
+            .new_port(None, route, depth, true, true)
+            .map_err(|e| {
+                eprintln!("Failed to initialize proxy port: {:?}", e);
+            })?;
 
-    for pkt in port.iter() {
-        let raw = pkt.serialize().unwrap();
-        file.write_all(&raw).unwrap();
-        if unbuffered {
-            file.flush().unwrap();
+        let mut file = File::create(file).unwrap();
+        println!("Logging raw packets...");
+
+        for pkt in port.iter() {
+            let raw = pkt.serialize().unwrap();
+            file.write_all(&raw).unwrap();
+            if unbuffered {
+                file.flush().unwrap();
+            }
         }
+        return Ok(());
     }
-    Ok(())
-}
-
-fn log_data(tio: &TioOpts, file: String, unbuffered: bool) -> Result<(), ()> {
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
 
     let mut file = File::create(file).map_err(|e| {
         eprintln!("create failed: {e:?}");
     })?;
 
-    let mut devs = DeviceTree::open(&proxy, route).map_err(|e| {
+    let mut devs = DeviceTree::open(&proxy, route.clone()).map_err(|e| {
         eprintln!("open failed: {:?}", e);
     })?;
 
-    fn write_one(
-        file: &mut File,
-        sample: twinleaf::data::Sample,
-        route: &DeviceRoute,
-    ) -> std::io::Result<()> {
-        use std::io::Write;
-        if sample.meta_changed {
-            file.write_all(
-                &sample
-                    .device
-                    .make_update_with_route(route.clone())
-                    .serialize()
-                    .unwrap(),
-            )?;
-            file.write_all(
-                &sample
-                    .stream
-                    .make_update_with_route(route.clone())
-                    .serialize()
-                    .unwrap(),
-            )?;
-            file.write_all(
-                &sample
-                    .segment
-                    .make_update_with_route(route.clone())
-                    .serialize()
-                    .unwrap(),
-            )?;
-            for col in sample.columns {
-                file.write_all(
-                    &col.desc
-                        .make_update_with_route(route.clone())
-                        .serialize()
-                        .unwrap(),
-                )?;
+    let mut seen_routes: HashSet<DeviceRoute> = HashSet::new();
+
+    let write_packet = |pkt: tio::Packet, f: &mut File| -> std::io::Result<()> {
+        f.write_all(&pkt.serialize().unwrap())
+    };
+
+    match devs.get_metadata(route.clone()) {
+        Ok(meta) => {
+            seen_routes.insert(route.clone());
+            
+            let _ = write_packet(meta.device.make_update_with_route(route.clone()), &mut file);
+            for (_id, stream) in meta.streams {
+                let _ = write_packet(stream.stream.make_update_with_route(route.clone()), &mut file);
+                let _ = write_packet(stream.segment.make_update_with_route(route.clone()), &mut file);
+                for col in stream.columns {
+                    let _ = write_packet(col.make_update_with_route(route.clone()), &mut file);
+                }
             }
-        } else if sample.segment_changed {
-            file.write_all(
-                &sample
-                    .segment
-                    .make_update_with_route(route.clone())
-                    .serialize()
-                    .unwrap(),
-            )?;
+            if unbuffered { let _ = file.flush(); }
         }
-        file.write_all(
-            &tio::Packet {
-                payload: tio::proto::Payload::StreamData(sample.source),
-                routing: route.clone(),
-                ttl: 0,
-            }
-            .serialize()
-            .unwrap(),
-        )?;
-        Ok(())
+        Err(e) => {
+            eprintln!("Note: Initial metadata fetch skipped: {:?}", e);
+        }
     }
+
+    println!("Logging data...");
 
     loop {
         match devs.drain() {
             Ok(batch) => {
-                for (s, r) in batch {
-                    if let Err(e) = write_one(&mut file, s, &r) {
-                        eprintln!("write error: {e:?}");
-                        return Err(());
+                for (sample, sample_route) in batch {
+                    let is_new_device = seen_routes.insert(sample_route.clone());
+                    let force_header = is_new_device; 
+
+                    if sample.meta_changed || force_header {
+                        let _ = write_packet(sample.device.make_update_with_route(sample_route.clone()), &mut file);
+                        let _ = write_packet(sample.stream.make_update_with_route(sample_route.clone()), &mut file);
+                        let _ = write_packet(sample.segment.make_update_with_route(sample_route.clone()), &mut file);
+                        for col in sample.columns {
+                            let _ = write_packet(col.desc.make_update_with_route(sample_route.clone()), &mut file);
+                        }
+                    } else if sample.segment_changed {
+                        let _ = write_packet(sample.segment.make_update_with_route(sample_route.clone()), &mut file);
                     }
+
+                    let data_pkt = tio::Packet {
+                        payload: tio::proto::Payload::StreamData(sample.source),
+                        routing: sample_route.clone(),
+                        ttl: 0,
+                    };
+                    let _ = write_packet(data_pkt, &mut file);
                 }
             }
             Err(e) => {
-                eprintln!("drain error: {e:?}");
+                eprintln!("Device error: {e:?}");
                 break;
             }
         }
@@ -601,7 +584,6 @@ fn log_data(tio: &TioOpts, file: String, unbuffered: bool) -> Result<(), ()> {
             }
         }
     }
-
     Ok(())
 }
 
@@ -648,15 +630,19 @@ fn log_dump(files: Vec<String>) -> Result<(), ()> {
 
 fn log_data_dump(files: Vec<String>) -> Result<(), ()> {
     use twinleaf::data::DeviceDataParser;
-    let mut parser = DeviceDataParser::new(files.len() > 1);
+    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
+    let ignore_session = files.len() > 1;
 
     for path in files {
         let mut rest: &[u8] = &std::fs::read(path).unwrap();
         while rest.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
+
+            let parser = parsers.entry(pkt.routing.clone()).or_insert_with(|| DeviceDataParser::new(ignore_session));
+
             for sample in parser.process_packet(&pkt) {
-                print_sample(&sample, None);
+                print_sample(&sample, Some(&pkt.routing));
             }
         }
     }
@@ -675,24 +661,25 @@ fn log_csv(
         return Err(());
     }
 
-    let route = if let Some(path) = sensor {
+    let target_route = if let Some(path) = sensor {
         DeviceRoute::from_str(&path).unwrap()
     } else {
         DeviceRoute::root()
     };
 
-    let mut parser = if let Some(path) = metadata {
-        let mut parser = DeviceDataParser::new(true);
+    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
+    let ignore_session = files.len() > 1 || metadata.is_some();
+
+    if let Some(path) = metadata {
         let mut meta: &[u8] = &std::fs::read(path).unwrap();
         while meta.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(meta).unwrap();
             meta = &meta[len..];
+
+            let parser = parsers.entry(pkt.routing.clone()).or_insert_with(|| DeviceDataParser::new(ignore_session));
             for _ in parser.process_packet(&pkt) {}
         }
-        parser
-    } else {
-        DeviceDataParser::new(files.len() > 1)
-    };
+    }
 
     let output_path = format!(
         "{}.{}.csv",
@@ -713,10 +700,15 @@ fn log_csv(
         while rest.len() > 0 {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
-            if pkt.routing != route {
+
+            let parser = parsers.entry(pkt.routing.clone()).or_insert_with(|| DeviceDataParser::new(ignore_session));
+            let samples = parser.process_packet(&pkt);
+
+            if pkt.routing != target_route {
                 continue;
             }
-            for sample in parser.process_packet(&pkt) {
+
+            for sample in samples {
                 if sample.stream.stream_id != stream_id {
                     continue;
                 }
@@ -864,13 +856,9 @@ fn main() -> ExitCode {
             tio,
             file,
             unbuffered,
+            raw,
             depth,
-        } => log(&tio, file, unbuffered, depth),
-        Commands::LogData {
-            tio,
-            file,
-            unbuffered,
-        } => log_data(&tio, file, unbuffered),
+        } => log(&tio, file, unbuffered, raw, depth),
         Commands::LogMetadata { tio, file } => log_metadata(&tio, file),
         Commands::LogDump { files } => log_dump(files),
         Commands::LogDataDump { files } => log_data_dump(files),
