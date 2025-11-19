@@ -85,7 +85,7 @@ enum Commands {
         depth: Option<usize>,
     },
 
-    /// Log samples to a file, by default including metadata. 
+    /// Log samples to a file, by default including metadata.
     /// Use --raw to skip metadata request and dump raw packets.
     Log {
         #[command(flatten)]
@@ -527,16 +527,24 @@ fn log(
     match devs.get_metadata(route.clone()) {
         Ok(meta) => {
             seen_routes.insert(route.clone());
-            
+
             let _ = write_packet(meta.device.make_update_with_route(route.clone()), &mut file);
             for (_id, stream) in meta.streams {
-                let _ = write_packet(stream.stream.make_update_with_route(route.clone()), &mut file);
-                let _ = write_packet(stream.segment.make_update_with_route(route.clone()), &mut file);
+                let _ = write_packet(
+                    stream.stream.make_update_with_route(route.clone()),
+                    &mut file,
+                );
+                let _ = write_packet(
+                    stream.segment.make_update_with_route(route.clone()),
+                    &mut file,
+                );
                 for col in stream.columns {
                     let _ = write_packet(col.make_update_with_route(route.clone()), &mut file);
                 }
             }
-            if unbuffered { let _ = file.flush(); }
+            if unbuffered {
+                let _ = file.flush();
+            }
         }
         Err(e) => {
             eprintln!("Note: Initial metadata fetch skipped: {:?}", e);
@@ -550,17 +558,32 @@ fn log(
             Ok(batch) => {
                 for (sample, sample_route) in batch {
                     let is_new_device = seen_routes.insert(sample_route.clone());
-                    let force_header = is_new_device; 
+                    let force_header = is_new_device;
 
                     if sample.meta_changed || force_header {
-                        let _ = write_packet(sample.device.make_update_with_route(sample_route.clone()), &mut file);
-                        let _ = write_packet(sample.stream.make_update_with_route(sample_route.clone()), &mut file);
-                        let _ = write_packet(sample.segment.make_update_with_route(sample_route.clone()), &mut file);
+                        let _ = write_packet(
+                            sample.device.make_update_with_route(sample_route.clone()),
+                            &mut file,
+                        );
+                        let _ = write_packet(
+                            sample.stream.make_update_with_route(sample_route.clone()),
+                            &mut file,
+                        );
+                        let _ = write_packet(
+                            sample.segment.make_update_with_route(sample_route.clone()),
+                            &mut file,
+                        );
                         for col in sample.columns {
-                            let _ = write_packet(col.desc.make_update_with_route(sample_route.clone()), &mut file);
+                            let _ = write_packet(
+                                col.desc.make_update_with_route(sample_route.clone()),
+                                &mut file,
+                            );
                         }
                     } else if sample.segment_changed {
-                        let _ = write_packet(sample.segment.make_update_with_route(sample_route.clone()), &mut file);
+                        let _ = write_packet(
+                            sample.segment.make_update_with_route(sample_route.clone()),
+                            &mut file,
+                        );
                     }
 
                     let data_pkt = tio::Packet {
@@ -639,7 +662,9 @@ fn log_data_dump(files: Vec<String>) -> Result<(), ()> {
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
 
-            let parser = parsers.entry(pkt.routing.clone()).or_insert_with(|| DeviceDataParser::new(ignore_session));
+            let parser = parsers
+                .entry(pkt.routing.clone())
+                .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
             for sample in parser.process_packet(&pkt) {
                 print_sample(&sample, Some(&pkt.routing));
@@ -678,7 +703,9 @@ fn log_csv(
             let (pkt, len) = tio::Packet::deserialize(meta).unwrap();
             meta = &meta[len..];
 
-            let parser = parsers.entry(pkt.routing.clone()).or_insert_with(|| DeviceDataParser::new(ignore_session));
+            let parser = parsers
+                .entry(pkt.routing.clone())
+                .or_insert_with(|| DeviceDataParser::new(ignore_session));
             for _ in parser.process_packet(&pkt) {}
         }
     }
@@ -703,7 +730,9 @@ fn log_csv(
             let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
             rest = &rest[len..];
 
-            let parser = parsers.entry(pkt.routing.clone()).or_insert_with(|| DeviceDataParser::new(ignore_session));
+            let parser = parsers
+                .entry(pkt.routing.clone())
+                .or_insert_with(|| DeviceDataParser::new(ignore_session));
             let samples = parser.process_packet(&pkt);
 
             if pkt.routing != target_route {
