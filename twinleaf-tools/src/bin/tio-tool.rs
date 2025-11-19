@@ -132,8 +132,8 @@ enum Commands {
 
     /// Convert logged data to CSV
     LogCsv {
-        /// Stream ID
-        stream_id: u8,
+        /// Stream ID (e.g., 1) or Name (e.g., "vector", "field")
+        stream: String,
 
         /// Log file paths (first file after stream_id)
         files: Vec<String>,
@@ -650,7 +650,7 @@ fn log_data_dump(files: Vec<String>) -> Result<(), ()> {
 }
 
 fn log_csv(
-    stream_id: u8,
+    stream_arg: String,
     files: Vec<String>,
     sensor: Option<String>,
     metadata: Option<String>,
@@ -660,6 +660,8 @@ fn log_csv(
         eprintln!("Invalid invocation: missing log file");
         return Err(());
     }
+
+    let target_id = stream_arg.parse::<u8>().ok();
 
     let target_route = if let Some(path) = sensor {
         DeviceRoute::from_str(&path).unwrap()
@@ -684,7 +686,7 @@ fn log_csv(
     let output_path = format!(
         "{}.{}.csv",
         output.unwrap_or_else(|| files[0].clone()),
-        stream_id
+        stream_arg
     );
 
     let mut file = OpenOptions::new()
@@ -709,7 +711,13 @@ fn log_csv(
             }
 
             for sample in samples {
-                if sample.stream.stream_id != stream_id {
+                let is_match = if let Some(id) = target_id {
+                    sample.stream.stream_id == id
+                } else {
+                    sample.stream.name == stream_arg
+                };
+
+                if !is_match {
                     continue;
                 }
 
@@ -863,12 +871,12 @@ fn main() -> ExitCode {
         Commands::LogDump { files } => log_dump(files),
         Commands::LogDataDump { files } => log_data_dump(files),
         Commands::LogCsv {
-            stream_id,
+            stream,
             files,
             sensor,
             metadata,
             output,
-        } => log_csv(stream_id, files, sensor, metadata, output),
+        } => log_csv(stream, files, sensor, metadata, output),
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
         Commands::DataDump { tio } => data_dump(&tio),
         Commands::DataDumpAll { tio } => data_dump_all(&tio),
