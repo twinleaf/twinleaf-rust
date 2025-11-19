@@ -9,7 +9,7 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
 use crossbeam::channel;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -263,7 +263,7 @@ impl StreamStats {
         self.t0_data = None;
         self.last_host = None;
         self.last_data = None;
-               self.drift_s = 0.0;
+        self.drift_s = 0.0;
         self.ppm = 0.0;
         self.jitter_ms = 0.0;
         self.jitter_window = None;
