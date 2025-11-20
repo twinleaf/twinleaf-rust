@@ -183,7 +183,17 @@ impl DeviceTree {
         arg: &[u8],
     ) -> Result<Vec<u8>, tio::proxy::RpcError> {
         let mut req = util::PacketBuilder::make_rpc_request(name, arg, 0, DeviceRoute::root());
-        req.routing = route.clone();
+        let relative_routing = match self.root_route.relative_route(&route) {
+            Ok(r) => r,
+            Err(_) => {
+                req.routing = route; 
+                return Err(tio::proxy::RpcError::SendFailed(
+                    tio::proxy::SendError::InvalidRoute(req),
+                ));
+            }
+        };
+
+        req.routing = relative_routing;
 
         if let Err(err) = self.port.send(req) {
             return Err(tio::proxy::RpcError::SendFailed(err));
