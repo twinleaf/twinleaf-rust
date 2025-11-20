@@ -30,7 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use toml_edit::{DocumentMut, InlineTable, Value};
-use tui_prompts::{Prompt, State, TextPrompt, TextState};
+use tui_prompts::{State, TextState};
 use twinleaf::{
     data,
     device::{self, buffer::AlignedWindow, buffer::ColumnBatch, Buffer, BufferEvent, ColumnSpec, DeviceTree, StreamId},
@@ -250,6 +250,9 @@ pub struct App {
     pub plot_width_percent: u16,
 
     pub window_aligned: Option<AlignedWindow>,
+
+    pub blink_state: bool,
+    pub last_blink: Instant,
 }
 
 impl App {
@@ -271,6 +274,8 @@ impl App {
             show_routes: false,
             window_aligned: None,
             color_bounds: None,
+            blink_state: true,
+            last_blink: Instant::now(),
 
             // Command Mode Defaults
             show_cmd: false,
@@ -483,6 +488,13 @@ pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
             item.column_id + 1,
             sample.columns.len(),
         ))
+    }
+
+    pub fn tick_blink(&mut self) {
+        if self.last_blink.elapsed() >= Duration::from_millis(500) {
+            self.blink_state = !self.blink_state;
+            self.last_blink = Instant::now();
+        }
     }
 }
 
@@ -932,15 +944,43 @@ fn render_footer(
             .map(|i| i.route.clone())
             .unwrap_or(app.parent_route.clone());
 
-        let prompt_str = format!("[{}]", target_route);
+        let prompt_text = format!("[{}] ", target_route);
+        let input_val = app.input_state.value();
+        
+        let cursor_idx = app.input_state.position();
 
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .title(" Command Mode ");
+        let chars: Vec<char> = input_val.chars().collect();
+        let safe_idx = cursor_idx.min(chars.len());
 
-        TextPrompt::from(prompt_str)
-            .with_block(block)
-            .draw(f, chunks[1], &mut app.input_state);
+        let mut spans = Vec::new();
+        spans.push(Span::styled(prompt_text, Style::default().fg(Color::Blue)));
+
+        let left: String = chars[0..safe_idx].iter().collect();
+        spans.push(Span::raw(left));
+
+        let cursor_style = if app.blink_state {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        if safe_idx < chars.len() {
+            let char_at_cursor = chars[safe_idx];
+            spans.push(Span::styled(char_at_cursor.to_string(), cursor_style));
+            
+            if safe_idx + 1 < chars.len() {
+                let right: String = chars[safe_idx + 1..].iter().collect();
+                spans.push(Span::raw(right));
+            }
+        } else {
+            if app.blink_state {
+                spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+            }
+        }
+
+        let block = Block::default().borders(Borders::TOP).title(" Command Mode ");
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), chunks[1]);
+        
         return;
     }
 
@@ -1559,9 +1599,11 @@ fn main() {
     }
 
     let mut terminal: Terminal<_> = ratatui::init();
-    let frame_dt = Duration::from_millis(1_000 / cli.fps as u64);
+    let target_frame_time = Duration::from_millis(1_000 / cli.fps as u64);
+    let _ = terminal.hide_cursor();
 
     'main: loop {
+        let frame_start = Instant::now();
         while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
             match event::read() {
                 Ok(ev) => {
@@ -1619,11 +1661,16 @@ fn main() {
         }
         app.window_aligned = resp.window;
         app.rebuild_nav_items();
+        app.tick_blink();
 
         if draw_ui(&mut terminal, &mut app).is_err() {
             break 'main;
         }
-        std::thread::sleep(frame_dt);
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < target_frame_time {
+            std::thread::sleep(target_frame_time - elapsed);
+        }
     }
 
     ratatui::restore();
