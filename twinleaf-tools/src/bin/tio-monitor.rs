@@ -33,7 +33,7 @@ use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{Prompt, State, TextPrompt, TextState};
 use twinleaf::{
     data,
-    device::{self, buffer::AlignedWindow, Buffer, BufferEvent, ColumnSpec, DeviceTree, StreamId},
+    device::{self, buffer::AlignedWindow, buffer::ColumnBatch, Buffer, BufferEvent, ColumnSpec, DeviceTree, StreamId},
     tio::{self, proto::DeviceRoute},
 };
 use twinleaf_tools::TioOpts;
@@ -398,28 +398,33 @@ impl App {
         self.plot_width_percent = (self.plot_width_percent.saturating_sub(5)).max(20);
     }
 
-    pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
+pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
         let spec = self.current_selection()?;
         let win = self.window_aligned.as_ref()?;
-        let col = win.columns.get(&spec)?;
-        if col.is_empty() || win.timestamps.is_empty() {
+        let batch = win.columns.get(&spec)?;
+        if win.timestamps.is_empty() {
             return None;
         }
 
-        let mut data = Vec::with_capacity(col.len());
-        for (i, cd) in col.iter().enumerate() {
-            let t = *win.timestamps.get(i)?;
-            let v = match cd {
-                data::ColumnData::Float(x) => *x,
-                data::ColumnData::Int(x) => *x as f64,
-                data::ColumnData::UInt(x) => *x as f64,
-                _ => continue,
-            };
-            data.push((t, v));
-        }
+        let data: Vec<(f64, f64)> = match batch {
+            ColumnBatch::F64(vec) => {
+                if vec.is_empty() { return None; }
+                win.timestamps.iter().copied().zip(vec.iter().copied()).collect()
+            }
+            ColumnBatch::I64(vec) => {
+                if vec.is_empty() { return None; }
+                win.timestamps.iter().copied().zip(vec.iter().map(|&x| x as f64)).collect()
+            }
+            ColumnBatch::U64(vec) => {
+                if vec.is_empty() { return None; }
+                win.timestamps.iter().copied().zip(vec.iter().map(|&x| x as f64)).collect()
+            }
+        };
+
         if data.is_empty() {
             return None;
         }
+        
         let (cur_t, cur_v) = *data.last().unwrap();
         Some((data, cur_v, cur_t))
     }
@@ -430,20 +435,14 @@ impl App {
         let stream_key = spec.stream_key();
         let md = win.segment_metadata.get(&stream_key)?;
         let sampling_hz = (md.sampling_rate / md.decimation) as f64;
-        let col = win.columns.get(&spec)?;
-        if col.len() < 128 {
-            return None;
-        }
+        let batch = win.columns.get(&spec)?;
 
-        let signal: Vec<f64> = col
-            .iter()
-            .filter_map(|cd| match cd {
-                data::ColumnData::Float(x) => Some(*x),
-                data::ColumnData::Int(x) => Some(*x as f64),
-                data::ColumnData::UInt(x) => Some(*x as f64),
-                _ => None,
-            })
-            .collect();
+        let signal: Vec<f64> = match batch {
+            ColumnBatch::F64(vec) => vec.clone(),
+            ColumnBatch::I64(vec) => vec.iter().map(|&x| x as f64).collect(),
+            ColumnBatch::U64(vec) => vec.iter().map(|&x| x as f64).collect(),
+        };
+
         if signal.len() < 128 {
             return None;
         }

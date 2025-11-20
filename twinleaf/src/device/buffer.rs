@@ -9,14 +9,12 @@
 use crate::{
     data::{ColumnData, Sample},
     device::{
-        util, ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId,
-        StreamId, StreamKey,
+        ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId, StreamId, StreamKey, util
     },
     tio::{
         proto::{
-            meta::{ColumnMetadata, SegmentMetadata},
-            DeviceRoute,
-        },
+            BufferType, DeviceRoute, meta::{ColumnMetadata, SegmentMetadata}
+        }
     },
 };
 use std::{
@@ -25,10 +23,17 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
+pub enum ColumnBatch {
+    F64(Vec<f64>),
+    I64(Vec<i64>),
+    U64(Vec<u64>),
+}
+
+#[derive(Debug, Clone)]
 pub struct AlignedWindow {
     pub sample_numbers: Vec<SampleNumber>,
     pub timestamps: Vec<f64>,
-    pub columns: HashMap<ColumnSpec, Vec<ColumnData>>,
+    pub columns: HashMap<ColumnSpec, ColumnBatch>,
     pub segment_metadata: HashMap<StreamKey, Arc<SegmentMetadata>>,
     pub session_ids: HashMap<StreamKey, SessionId>,
 }
@@ -36,7 +41,7 @@ pub struct AlignedWindow {
 pub struct SegmentWindow {
     pub sample_numbers: Vec<SampleNumber>,
     pub timestamps: Vec<f64>,
-    pub columns: HashMap<ColumnId, Vec<ColumnData>>,
+    pub columns: HashMap<ColumnId, ColumnBatch>,
 }
 
 pub struct ActiveSegment {
@@ -129,9 +134,42 @@ pub struct SegmentBuffer {
     pub capacity: usize,
 }
 
-pub struct ColumnBuffer {
-    pub metadata: Arc<ColumnMetadata>,
-    pub data: VecDeque<ColumnData>,
+#[derive(Debug)]
+pub enum ColumnBuffer {
+    F64 {
+        metadata: Arc<ColumnMetadata>,
+        data: VecDeque<f64>,
+    },
+    I64 {
+        metadata: Arc<ColumnMetadata>,
+        data: VecDeque<i64>,
+    },
+    U64 {
+        metadata: Arc<ColumnMetadata>,
+        data: VecDeque<u64>,
+    },
+}
+
+impl ColumnBuffer {
+    pub fn metadata(&self) -> &Arc<ColumnMetadata> {
+        match self {
+            Self::F64 { metadata, .. } => metadata,
+            Self::I64 { metadata, .. } => metadata,
+            Self::U64 { metadata, .. } => metadata,
+        }
+    }
+
+    pub fn push(&mut self, value: ColumnData) {
+        match (self, value) {
+            (Self::F64 { data, .. }, ColumnData::Float(v)) => data.push_back(v),
+            (Self::F64 { data, .. }, ColumnData::Int(v)) => data.push_back(v as f64),
+            
+            (Self::I64 { data, .. }, ColumnData::Int(v)) => data.push_back(v),
+            (Self::U64 { data, .. }, ColumnData::UInt(v)) => data.push_back(v),
+            
+            (s, v) => eprintln!("Type mismatch: Buffer is {:?} but got {:?}", s, v),
+        }
+    }
 }
 
 impl SegmentBuffer {
@@ -149,21 +187,39 @@ impl SegmentBuffer {
         self.sample_numbers.push_back(sample.n);
 
         for column in sample.columns {
-            let col_buffer =
-                self.columns
-                    .entry(column.desc.index)
-                    .or_insert_with(|| ColumnBuffer {
-                        metadata: column.desc.clone(),
-                        data: VecDeque::with_capacity(self.capacity),
-                    });
-            col_buffer.data.push_back(column.value);
-        }
+            let col_index = column.desc.index;
 
-        // Enforce capacity
+            let col_buffer = self.columns
+                .entry(col_index)
+                .or_insert_with(|| {
+                    let capacity = self.capacity;
+                    let meta = column.desc.clone();
+                    
+                    match meta.data_type.buffer_type() {
+                        BufferType::Float => ColumnBuffer::F64 { 
+                            metadata: meta, 
+                            data: VecDeque::with_capacity(capacity) 
+                        },
+                        BufferType::Int => ColumnBuffer::I64 { 
+                            metadata: meta, 
+                            data: VecDeque::with_capacity(capacity) 
+                        },
+                        BufferType::UInt => ColumnBuffer::U64 { 
+                            metadata: meta, 
+                            data: VecDeque::with_capacity(capacity) 
+                        },
+                    }
+                });
+            col_buffer.push(column.value);
+        }
         if self.sample_numbers.len() > self.capacity {
             self.sample_numbers.pop_front();
             for col_buffer in self.columns.values_mut() {
-                col_buffer.data.pop_front();
+                match col_buffer {
+                    ColumnBuffer::F64 { data, .. } => { data.pop_front(); },
+                    ColumnBuffer::I64 { data, .. } => { data.pop_front(); },
+                    ColumnBuffer::U64 { data, .. } => { data.pop_front(); },
+                }
             }
         }
     }
@@ -173,7 +229,7 @@ impl SegmentBuffer {
 
         if available == 0 {
             return Err(ReadError::InsufficientData {
-                stream_key: (DeviceRoute::root(), 0), // Will be overwritten by caller
+                stream_key: (DeviceRoute::root(), 0),
                 requested: n,
                 available: 0,
             });
@@ -198,19 +254,27 @@ impl SegmentBuffer {
             .collect();
 
         let mut columns_data = HashMap::new();
+        
         for &col_id in column_ids {
             if let Some(col_buffer) = self.columns.get(&col_id) {
-                let data: Vec<_> = col_buffer
-                    .data
-                    .iter()
-                    .skip(start_idx)
-                    .take(n)
-                    .cloned()
-                    .collect();
-                columns_data.insert(col_id, data);
+                let batch = match col_buffer {
+                    ColumnBuffer::F64 { data, .. } => {
+                        let vec = data.iter().skip(start_idx).take(n).copied().collect();
+                        ColumnBatch::F64(vec)
+                    },
+                    ColumnBuffer::I64 { data, .. } => {
+                        let vec = data.iter().skip(start_idx).take(n).copied().collect();
+                        ColumnBatch::I64(vec)
+                    },
+                    ColumnBuffer::U64 { data, .. } => {
+                        let vec = data.iter().skip(start_idx).take(n).copied().collect();
+                        ColumnBatch::U64(vec)
+                    },
+                };
+                columns_data.insert(col_id, batch);
             } else {
                 return Err(ReadError::ColumnNotFound {
-                    stream_key: (DeviceRoute::root(), 0), // Will be overwritten by caller
+                    stream_key: (DeviceRoute::root(), 0),
                     column_id: col_id,
                 });
             }
@@ -266,20 +330,28 @@ impl SegmentBuffer {
             .collect();
 
         let mut columns_data = HashMap::new();
+        
         for &col_id in column_ids {
             let col_buffer = self.columns.get(&col_id).ok_or(ReadError::ColumnNotFound {
                 stream_key: (DeviceRoute::root(), 0),
                 column_id: col_id,
             })?;
 
-            let data: Vec<_> = col_buffer
-                .data
-                .iter()
-                .skip(read_start)
-                .take(count)
-                .cloned()
-                .collect();
-            columns_data.insert(col_id, data);
+            let batch = match col_buffer {
+                ColumnBuffer::F64 { data, .. } => {
+                    let vec = data.iter().skip(read_start).take(count).copied().collect();
+                    ColumnBatch::F64(vec)
+                },
+                ColumnBuffer::I64 { data, .. } => {
+                    let vec = data.iter().skip(read_start).take(count).copied().collect();
+                    ColumnBatch::I64(vec)
+                },
+                ColumnBuffer::U64 { data, .. } => {
+                    let vec = data.iter().skip(read_start).take(count).copied().collect();
+                    ColumnBatch::U64(vec)
+                },
+            };
+            columns_data.insert(col_id, batch);
         }
 
         Ok(SegmentWindow {
@@ -503,20 +575,20 @@ impl Buffer {
             });
         }
 
-        let column_ids: Vec<_> = columns.iter().map(|c| c.column_id).collect();
+        let column_ids: Vec<_> = columns.iter().map(|c| c.column_id).collect();        
         let window = active
             .buffer
             .get_range(cursor.last_sample_number, n_samples, &column_ids)
             .map_err(|e| Self::contextualize_error(e, &stream_key))?;
 
         // Map columns directly using the requested column specs
-        let columns_map: HashMap<ColumnSpec, Vec<ColumnData>> = columns
+        let columns_map: HashMap<ColumnSpec, ColumnBatch> = columns
             .iter()
             .filter_map(|col_spec| {
                 window
                     .columns
                     .get(&col_spec.column_id)
-                    .map(|data| (col_spec.clone(), data.clone()))
+                    .map(|batch| (col_spec.clone(), batch.clone()))
             })
             .collect();
 
