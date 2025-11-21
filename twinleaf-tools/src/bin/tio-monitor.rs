@@ -478,16 +478,12 @@ pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
         Some((pts, noise))
     }
 
-    pub fn get_focused_channel_info(&self) -> Option<(String, String, usize, usize)> {
-        let item = self.current_item()?;
-        let (sample, _) = self.last.get(&(item.route.clone(), item.stream_id))?;
-        let col = sample.columns.get(item.column_id)?;
-        Some((
-            col.desc.description.clone(),
-            col.desc.units.clone(),
-            item.column_id + 1,
-            sample.columns.len(),
-        ))
+    pub fn get_focused_channel_info(&self) -> Option<(String, String)> {
+        let spec = self.current_selection()?;
+        let win = self.window_aligned.as_ref()?;        
+        let meta = win.column_metadata.get(&spec)?;
+        
+        Some((meta.description.clone(), meta.units.clone()))
     }
 
     pub fn tick_blink(&mut self) {
@@ -1414,8 +1410,8 @@ fn auto_scroll_to_selected(
 }
 
 fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
-    if let Some((desc, units, _cur_col, _total_cols)) = app.get_focused_channel_info() {
-        let item = app.current_item().unwrap();
+    if let (Some(item), Some((desc, units))) = (app.current_item(), app.get_focused_channel_info()) {
+        
         if app.show_fft {
             if let Some((sd_data, noise_floor)) = app.get_spectral_density_data() {
                 let title = format!(
