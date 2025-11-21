@@ -11,11 +11,9 @@ use crate::{
     device::{
         ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId, StreamId, StreamKey, util
     },
-    tio::{
-        proto::{
-            BufferType, DeviceRoute, meta::{ColumnMetadata, SegmentMetadata}
-        }
-    },
+    tio::proto::{
+            BufferType, DeviceRoute, meta::{ColumnMetadata, SegmentMetadata, StreamMetadata}
+        },
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -34,7 +32,9 @@ pub struct AlignedWindow {
     pub sample_numbers: Vec<SampleNumber>,
     pub timestamps: Vec<f64>,
     pub columns: HashMap<ColumnSpec, ColumnBatch>,
+    pub stream_metadata: HashMap<StreamKey, Arc<StreamMetadata>>,
     pub segment_metadata: HashMap<StreamKey, Arc<SegmentMetadata>>,
+    pub column_metadata: HashMap<ColumnSpec, Arc<ColumnMetadata>>,
     pub session_ids: HashMap<StreamKey, SessionId>,
 }
 
@@ -128,6 +128,7 @@ pub enum ReadError {
 
 pub struct SegmentBuffer {
     pub session_id: SessionId,
+    pub stream_metadata: Arc<StreamMetadata>, 
     pub segment_metadata: Arc<SegmentMetadata>,
     pub sample_numbers: VecDeque<SampleNumber>,
     pub columns: HashMap<ColumnId, ColumnBuffer>,
@@ -173,9 +174,15 @@ impl ColumnBuffer {
 }
 
 impl SegmentBuffer {
-    fn new(session_id: SessionId, segment_metadata: Arc<SegmentMetadata>, capacity: usize) -> Self {
+    fn new(
+        session_id: SessionId, 
+        stream_metadata: Arc<StreamMetadata>, 
+        segment_metadata: Arc<SegmentMetadata>, 
+        capacity: usize
+    ) -> Self {
         Self {
             session_id,
+            stream_metadata,
             segment_metadata,
             sample_numbers: VecDeque::with_capacity(capacity),
             columns: HashMap::new(),
@@ -293,31 +300,41 @@ impl SegmentBuffer {
         count: usize,
         column_ids: &[ColumnId],
     ) -> Result<SegmentWindow, ReadError> {
-        let start_idx = self
-            .sample_numbers
-            .iter()
-            .position(|&n| n == start_sample)
-            .ok_or(ReadError::CursorOutOfBuffer {
-                stream_key: (DeviceRoute::root(), 0),
-                cursor_sample: start_sample,
-                earliest_available: self.sample_numbers.front().copied().unwrap_or(0),
-            })?;
-
-        let available_after = self.sample_numbers.len().saturating_sub(start_idx + 1);
-        if available_after < count {
+        if self.sample_numbers.is_empty() {
             return Err(ReadError::InsufficientData {
                 stream_key: (DeviceRoute::root(), 0),
                 requested: count,
-                available: available_after,
+                available: 0,
             });
         }
 
-        let read_start = start_idx + 1;
+        let start_idx = match self.sample_numbers.binary_search(&start_sample) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+
+        let earliest_sample = self.sample_numbers.front().copied().unwrap();
+        if start_sample < earliest_sample {
+            return Err(ReadError::CursorOutOfBuffer {
+                stream_key: (DeviceRoute::root(), 0),
+                cursor_sample: start_sample,
+                earliest_available: earliest_sample,
+            });
+        }
+
+        if start_idx + count > self.sample_numbers.len() {
+            let available = self.sample_numbers.len().saturating_sub(start_idx);
+            return Err(ReadError::InsufficientData {
+                stream_key: (DeviceRoute::root(), 0),
+                requested: count,
+                available: available,
+            });
+        }
 
         let sample_numbers: Vec<_> = self
             .sample_numbers
             .iter()
-            .skip(read_start)
+            .skip(start_idx)
             .take(count)
             .copied()
             .collect();
@@ -330,7 +347,7 @@ impl SegmentBuffer {
             .collect();
 
         let mut columns_data = HashMap::new();
-        
+
         for &col_id in column_ids {
             let col_buffer = self.columns.get(&col_id).ok_or(ReadError::ColumnNotFound {
                 stream_key: (DeviceRoute::root(), 0),
@@ -339,17 +356,17 @@ impl SegmentBuffer {
 
             let batch = match col_buffer {
                 ColumnBuffer::F64 { data, .. } => {
-                    let vec = data.iter().skip(read_start).take(count).copied().collect();
+                    let vec = data.iter().skip(start_idx).take(count).copied().collect();
                     ColumnBatch::F64(vec)
-                },
+                }
                 ColumnBuffer::I64 { data, .. } => {
-                    let vec = data.iter().skip(read_start).take(count).copied().collect();
+                    let vec = data.iter().skip(start_idx).take(count).copied().collect();
                     ColumnBatch::I64(vec)
-                },
+                }
                 ColumnBuffer::U64 { data, .. } => {
-                    let vec = data.iter().skip(read_start).take(count).copied().collect();
+                    let vec = data.iter().skip(start_idx).take(count).copied().collect();
                     ColumnBatch::U64(vec)
-                },
+                }
             };
             columns_data.insert(col_id, batch);
         }
@@ -440,7 +457,12 @@ impl Buffer {
         let new_segment = ActiveSegment {
             session_id,
             segment_id,
-            buffer: SegmentBuffer::new(session_id, sample.segment.clone(), self.capacity), // PASS session_id
+            buffer: SegmentBuffer::new(
+                session_id, 
+                sample.stream.clone(), 
+                sample.segment.clone(), 
+                self.capacity
+            ),
             last_sample_number: sample.n,
             last_timestamp: sample.timestamp_end(),
         };
@@ -505,7 +527,6 @@ impl Buffer {
             return Err(ReadError::NoColumnsRequested);
         }
 
-        // Group columns by stream
         let mut by_stream: HashMap<StreamKey, Vec<&ColumnSpec>> = HashMap::new();
         for col_spec in columns {
             by_stream
@@ -514,22 +535,30 @@ impl Buffer {
                 .push(col_spec);
         }
 
-        // Fetch window for each stream
         let mut stream_windows = HashMap::new();
+        let mut stream_metadata = HashMap::new();
+        let mut column_metadata = HashMap::new();
 
         for (stream_key, col_specs) in &by_stream {
-            let active =
-                self.active_segments
-                    .get(stream_key)
-                    .ok_or_else(|| ReadError::NoActiveSegment {
-                        stream_key: stream_key.clone(),
-                    })?;
+            let active = self.active_segments.get(stream_key)
+                .ok_or_else(|| ReadError::NoActiveSegment {
+                    stream_key: stream_key.clone(),
+                })?;
 
             let column_ids: Vec<_> = col_specs.iter().map(|cs| cs.column_id).collect();
+            
             let window = active
                 .buffer
                 .get_latest_n(n_samples, &column_ids)
                 .map_err(|e| Self::contextualize_error(e, stream_key))?;
+
+            stream_metadata.insert(stream_key.clone(), active.buffer.stream_metadata.clone());
+
+            for col_spec in col_specs {
+                 if let Some(col_buffer) = active.buffer.columns.get(&col_spec.column_id) {
+                     column_metadata.insert((*col_spec).clone(), col_buffer.metadata().clone());
+                 }
+            }
 
             stream_windows.insert(stream_key.clone(), (window, active));
         }
@@ -539,7 +568,12 @@ impl Buffer {
             util::validate_stream_alignment(&stream_windows)?;
         }
 
-        util::merge_windows(stream_windows, by_stream)
+        let mut aligned = util::merge_windows(stream_windows, by_stream)?;
+        
+        aligned.stream_metadata = stream_metadata;
+        aligned.column_metadata = column_metadata;
+
+        Ok(aligned)
     }
 
     pub fn read_from_cursor(
@@ -576,27 +610,31 @@ impl Buffer {
         }
 
         let column_ids: Vec<_> = columns.iter().map(|c| c.column_id).collect();        
-        let window = active
-            .buffer
+        let window = active.buffer
             .get_range(cursor.last_sample_number, n_samples, &column_ids)
             .map_err(|e| Self::contextualize_error(e, &stream_key))?;
 
-        // Map columns directly using the requested column specs
-        let columns_map: HashMap<ColumnSpec, ColumnBatch> = columns
-            .iter()
-            .filter_map(|col_spec| {
-                window
-                    .columns
-                    .get(&col_spec.column_id)
-                    .map(|batch| (col_spec.clone(), batch.clone()))
-            })
-            .collect();
+        let mut columns_map = HashMap::new();
+        let mut column_metadata_map = HashMap::new();
+
+        for col_spec in columns {
+             if let Some(batch) = window.columns.get(&col_spec.column_id) {
+                 columns_map.insert(col_spec.clone(), batch.clone());
+                 
+                 // Fetch column metadata from buffer
+                 if let Some(col_buf) = active.buffer.columns.get(&col_spec.column_id) {
+                     column_metadata_map.insert(col_spec.clone(), col_buf.metadata().clone());
+                 }
+             }
+        }
 
         Ok(AlignedWindow {
             sample_numbers: window.sample_numbers,
             timestamps: window.timestamps,
             columns: columns_map,
             segment_metadata: [(stream_key.clone(), active.buffer.segment_metadata.clone())].into(),
+            stream_metadata: [(stream_key.clone(), active.buffer.stream_metadata.clone())].into(),
+            column_metadata: column_metadata_map,
             session_ids: [(stream_key, active.session_id)].into(),
         })
     }

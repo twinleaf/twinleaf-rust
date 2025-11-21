@@ -67,33 +67,42 @@ pub fn merge_windows(
     by_stream: HashMap<StreamKey, Vec<&ColumnSpec>>,
 ) -> Result<AlignedWindow, ReadError> {
     let (first_window, _) = stream_windows.values().next().unwrap();
+    
     let sample_numbers = first_window.sample_numbers.clone();
     let timestamps = first_window.timestamps.clone();
 
-    // Build columns, metadata, and session_ids maps
     let mut columns = HashMap::new();
+    let mut stream_metadata = HashMap::new();
     let mut segment_metadata = HashMap::new();
+    let mut column_metadata = HashMap::new();
     let mut session_ids = HashMap::new();
 
     for (stream_key, (window, active)) in stream_windows {
         let requested_specs = by_stream.get(&stream_key).unwrap();
 
-        // Direct mapping: for each requested spec, find its data
+
+        stream_metadata.insert(stream_key.clone(), active.buffer.stream_metadata.clone());
+        segment_metadata.insert(stream_key.clone(), active.buffer.segment_metadata.clone());
+        session_ids.insert(stream_key.clone(), active.session_id);
+
         for &col_spec in requested_specs {
             if let Some(data) = window.columns.get(&col_spec.column_id) {
                 columns.insert(col_spec.clone(), data.clone());
             }
-        }
 
-        segment_metadata.insert(stream_key.clone(), active.buffer.segment_metadata.clone());
-        session_ids.insert(stream_key, active.session_id);
+            if let Some(col_buffer) = active.buffer.columns.get(&col_spec.column_id) {
+                column_metadata.insert(col_spec.clone(), col_buffer.metadata().clone());
+            }
+        }
     }
 
     Ok(AlignedWindow {
         sample_numbers,
         timestamps,
         columns,
+        stream_metadata,
         segment_metadata,
+        column_metadata,
         session_ids,
     })
 }
