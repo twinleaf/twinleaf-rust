@@ -1617,12 +1617,13 @@ fn main() {
             selection: app.current_selection(),
             seconds: app.plot_window_seconds,
         };
-        if req_tx.send(req).is_err() {
+        if let Err(channel::TrySendError::Disconnected(_)) = req_tx.try_send(req) {
             break 'main;
         }
-        let resp = match resp_rx.recv() {
-            Ok(r) => r,
-            Err(_) => break 'main,
+        let resp_opt = match resp_rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(channel::TryRecvError::Empty) => None,
+            Err(channel::TryRecvError::Disconnected) => break 'main,
         };
 
         while let Ok(rpc_res) = rpc_resp_rx.try_recv() {
@@ -1633,30 +1634,32 @@ fn main() {
             app.last_rpc_result = Some((msg, color));
         }
 
-        let now = Instant::now();
-        for (route, sid, sample) in resp.last {
-            if !app.all && route != app.parent_route {
-                continue;
-            }
-            let key = (route.clone(), sid);
-            let mut seen = now;
-            if let Some((prev_sample, prev_seen)) = app.last.get(&key) {
-                if prev_sample.n == sample.n {
-                    seen = *prev_seen;
+        if let Some(resp) = resp_opt {
+            let now = Instant::now();
+            for (route, sid, sample) in resp.last {
+                if !app.all && route != app.parent_route {
+                    continue;
                 }
+                let key = (route.clone(), sid);
+                let mut seen = now;
+                if let Some((prev_sample, prev_seen)) = app.last.get(&key) {
+                    if prev_sample.n == sample.n {
+                        seen = *prev_seen;
+                    }
+                }
+                app.desc_width = app.desc_width.max(
+                    sample
+                        .columns
+                        .iter()
+                        .map(|c| c.desc.description.len())
+                        .max()
+                        .unwrap_or(0),
+                );
+                app.last.insert(key, (sample, seen));
             }
-            app.desc_width = app.desc_width.max(
-                sample
-                    .columns
-                    .iter()
-                    .map(|c| c.desc.description.len())
-                    .max()
-                    .unwrap_or(0),
-            );
-            app.last.insert(key, (sample, seen));
+            app.window_aligned = resp.window;
+            app.rebuild_nav_items();
         }
-        app.window_aligned = resp.window;
-        app.rebuild_nav_items();
         app.tick_blink();
 
         if draw_ui(&mut terminal, &mut app).is_err() {
