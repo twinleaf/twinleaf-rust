@@ -180,11 +180,12 @@ impl SegmentBuffer {
         segment_metadata: Arc<SegmentMetadata>, 
         capacity: usize
     ) -> Self {
+        let initial_alloc = std::cmp::min(capacity, 65_536);
         Self {
             session_id,
             stream_metadata,
             segment_metadata,
-            sample_numbers: VecDeque::with_capacity(capacity),
+            sample_numbers: VecDeque::with_capacity(initial_alloc),
             columns: HashMap::new(),
             capacity,
         }
@@ -199,21 +200,21 @@ impl SegmentBuffer {
             let col_buffer = self.columns
                 .entry(col_index)
                 .or_insert_with(|| {
-                    let capacity = self.capacity;
                     let meta = column.desc.clone();
+                    let initial_alloc = std::cmp::min(self.capacity, 65_536);
                     
                     match meta.data_type.buffer_type() {
                         BufferType::Float => ColumnBuffer::F64 { 
                             metadata: meta, 
-                            data: VecDeque::with_capacity(capacity) 
+                            data: VecDeque::with_capacity(initial_alloc) 
                         },
                         BufferType::Int => ColumnBuffer::I64 { 
                             metadata: meta, 
-                            data: VecDeque::with_capacity(capacity) 
+                            data: VecDeque::with_capacity(initial_alloc) 
                         },
                         BufferType::UInt => ColumnBuffer::U64 { 
                             metadata: meta, 
-                            data: VecDeque::with_capacity(capacity) 
+                            data: VecDeque::with_capacity(initial_alloc) 
                         },
                     }
                 });
@@ -637,6 +638,83 @@ impl Buffer {
             column_metadata: column_metadata_map,
             session_ids: [(stream_key, active.session_id)].into(),
         })
+    }
+
+    pub fn read_aligned_tail(
+        &self,
+        columns: &[ColumnSpec],
+    ) -> Result<AlignedWindow, ReadError> {
+        if columns.is_empty() { return Err(ReadError::NoColumnsRequested); }
+
+        let mut by_stream: HashMap<StreamKey, Vec<&ColumnSpec>> = HashMap::new();
+        for col in columns {
+            by_stream.entry(col.stream_key()).or_default().push(col);
+        }
+
+        let mut global_start = f64::MIN;
+        let mut global_end = f64::MAX;
+        let mut rate = 0.0;
+
+        for key in by_stream.keys() {
+            let seg = self.active_segments.get(key).ok_or(ReadError::NoActiveSegment { stream_key: key.clone() })?;
+            let meta = &seg.buffer.segment_metadata;
+            let r = (meta.sampling_rate as f64) / (meta.decimation as f64);
+            
+            if rate != 0.0 && (r - rate).abs() > 0.001 {
+                return Err(ReadError::SamplingRateMismatch { streams: vec![], rates: vec![] });
+            }
+            rate = r;
+
+            let samples = &seg.buffer.sample_numbers;
+            if samples.is_empty() { return Err(ReadError::InsufficientData { stream_key: key.clone(), requested: 0, available: 0 }); }
+
+            let last_idx = samples.len() - 1;
+            let last_val = samples[last_idx];
+            let target_offset = (last_val as i64) - (last_idx as i64);
+            let mut low = 0;
+            let mut high = last_idx;
+
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let mid_offset = (samples[mid] as i64) - (mid as i64);
+                if mid_offset < target_offset {
+                    low = mid + 1;
+                } else {
+                    high = mid; // We are in the tail
+                }
+            }            
+            let tail_start_time = meta.start_time as f64 + (samples[low] as f64 / rate);
+            let tail_end_time = meta.start_time as f64 + (last_val as f64 / rate);
+
+            if tail_start_time > global_start { global_start = tail_start_time; }
+            if tail_end_time < global_end { global_end = tail_end_time; }
+        }
+
+        if global_start >= global_end {
+             return Err(ReadError::InsufficientData { 
+                 stream_key: (crate::tio::proto::DeviceRoute::root(), 0), 
+                 requested: 0, available: 0 
+             });
+        }
+
+        let mut stream_windows = HashMap::new();
+        let samples_to_read = ((global_end - global_start) * rate + 0.5) as usize;
+
+        for key in by_stream.keys() {
+            let seg = self.active_segments.get(key).unwrap();
+            let start_time = seg.buffer.segment_metadata.start_time as f64;
+            
+            let start_n = ((global_start - start_time) * rate + 0.5) as u32;
+            let col_ids: Vec<_> = by_stream.get(key).unwrap().iter().map(|c| c.column_id).collect();
+
+            let window = seg.buffer.get_range(start_n, samples_to_read, &col_ids)
+                .map_err(|e| Self::contextualize_error(e, key))?;
+            
+            stream_windows.insert((*key).clone(), (window, seg));
+        }
+
+        util::validate_sampling_rates(&stream_windows)?;
+        util::merge_windows(stream_windows, by_stream)
     }
 
     fn contextualize_error(err: ReadError, stream_key: &StreamKey) -> ReadError {
