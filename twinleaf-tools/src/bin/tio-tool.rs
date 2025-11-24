@@ -164,6 +164,10 @@ enum Commands {
         /// Filter streams using a glob pattern (e.g. "/*/vector")
         #[arg(short = 'g', long = "glob")]
         filter: Option<String>,
+
+        /// Enable debug output for glob matching
+        #[arg(short = 'd', long)]
+        debug: bool,
     },
 
     /// Upgrade device firmware
@@ -786,7 +790,7 @@ fn log_csv(
 }
 
 #[cfg(feature = "hdf5")]
-fn log_hdf(files: Vec<String>, output: String, filter: Option<String>) -> Result<(), ()> {
+fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, debug: bool) -> Result<(), ()> {
     use std::collections::HashMap;
     use std::path::Path;
     use twinleaf::device::{ColumnSpec};
@@ -850,8 +854,11 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>) -> Result
             let include = match &col_filter {
                 Some(f) => {
                     let is_match = f.matches(route, stream_name, col_name);
-                    let path_checked = f.get_path_string(route, stream_name, col_name);
-                    println!("Checked '{}' vs Glob -> {}", path_checked, is_match);
+                    
+                    if debug {
+                        let path_checked = f.get_path_string(route, stream_name, col_name);
+                        println!("Checked '{}' vs Glob -> {}", path_checked, is_match);
+                    }
                     
                     is_match
                 },
@@ -904,7 +911,7 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>) -> Result
 }
 
 #[cfg(not(feature = "hdf5"))]
-fn log_hdf(_files: Vec<String>, _output: String, _filter: Option<String>) -> Result<(), ()> {
+fn log_hdf(_files: Vec<String>, _output: String, _filter: Option<String>, _debug: bool) -> Result<(), ()> {
     eprintln!("Error: This version of tio-tool was compiled without HDF5 support.");
     eprintln!("To enable it, recompile with:");
     eprintln!("  cargo install --path . --features hdf5 --force");
@@ -1048,7 +1055,7 @@ fn main() -> ExitCode {
             output,
         } => log_csv(stream, files, sensor, metadata, output),
         #[cfg(feature = "hdf5")]
-        Commands::LogHdf { files, output , filter} => log_hdf(files, output, filter),
+        Commands::LogHdf { files, output, filter, debug } => log_hdf(files, output, filter, debug),
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
         Commands::DataDump { tio } => data_dump(&tio),
         Commands::DataDumpAll { tio } => data_dump_all(&tio),
