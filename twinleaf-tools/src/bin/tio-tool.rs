@@ -789,8 +789,8 @@ fn log_csv(
 fn log_hdf(files: Vec<String>, output: String, filter: Option<String>) -> Result<(), ()> {
     use std::collections::HashMap;
     use std::path::Path;
-    use twinleaf::device::{Buffer, ColumnSpec};
-    use twinleaf::data::{export, ColumnFilter, DeviceDataParser};
+    use twinleaf::device::{ColumnSpec};
+    use twinleaf::data::{Buffer, export, ColumnFilter, DeviceDataParser};
     use twinleaf::tio;
 
     let col_filter = if let Some(p) = filter {

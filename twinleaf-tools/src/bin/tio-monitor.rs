@@ -28,11 +28,8 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
-    data,
-    device::{
-        buffer::{AlignedWindow, ColumnBatch},
-        Buffer, BufferEvent, ColumnSpec, DeviceTree, StreamId,
-    },
+    data::{Sample, ColumnData, Buffer, BufferEvent, AlignedWindow, ColumnBatch},
+    device::{ColumnSpec, DeviceTree, StreamId},
     tio::{self, proto::DeviceRoute},
 };
 use twinleaf_tools::TioOpts;
@@ -326,7 +323,7 @@ pub struct App {
     pub nav: Nav,
     pub nav_items: Vec<NavItem>,
 
-    pub last: BTreeMap<(DeviceRoute, StreamId), (data::Sample, Instant)>,
+    pub last: BTreeMap<(DeviceRoute, StreamId), (Sample, Instant)>,
     pub window_aligned: Option<AlignedWindow>,
     pub input_state: TextState<'static>,
     pub cmd_history: Vec<String>,
@@ -742,7 +739,7 @@ struct DataReq {
 }
 #[derive(Debug, Clone)]
 struct DataResp {
-    last: Vec<(DeviceRoute, StreamId, data::Sample)>,
+    last: Vec<(DeviceRoute, StreamId, Sample)>,
     window: Option<AlignedWindow>,
 }
 #[derive(Debug)]
@@ -837,7 +834,7 @@ fn run_data_thread(
 ) {
     let (evt_tx, _evt_rx) = channel::unbounded::<BufferEvent>();
     let mut buffer = Buffer::new(evt_tx, capacity, false);
-    let mut last: BTreeMap<(DeviceRoute, StreamId), data::Sample> = BTreeMap::new();
+    let mut last: BTreeMap<(DeviceRoute, StreamId), Sample> = BTreeMap::new();
 
     loop {
         while let Ok(req) = rpc_rx.try_recv() {
@@ -1409,11 +1406,11 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn fmt_value(v: &data::ColumnData) -> (String, f64) {
+fn fmt_value(v: &ColumnData) -> (String, f64) {
     match v {
-        data::ColumnData::Float(x) => (format!("{:15.4}", x), *x as f64),
-        data::ColumnData::Int(x) => (format!("{:15}", x), *x as f64),
-        data::ColumnData::UInt(x) => (format!("{:15}", x), *x as f64),
+        ColumnData::Float(x) => (format!("{:15.4}", x), *x as f64),
+        ColumnData::Int(x) => (format!("{:15}", x), *x as f64),
+        ColumnData::UInt(x) => (format!("{:15}", x), *x as f64),
         _ => ("           type?".to_string(), f64::NAN),
     }
 }
