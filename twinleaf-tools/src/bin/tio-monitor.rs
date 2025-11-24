@@ -1,10 +1,6 @@
 // tio-monitor
-//
-// Live monitoring with basic scope and periodogram + RPC Command Interface
-//
-// Build: cargo run --release -- <tio-url> [route] [options]
-// Quit:  q / Esc / Ctrl-C
-// Cmd:   : (to enter command mode)
+// Full implementation with Action/Mode architecture, Styling System, and Macro-based RPC
+// Build: cargo run --release -- <tio-url> [options]
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,11 +12,11 @@ use std::{
 
 use clap::Parser;
 use crossbeam::channel::{self, Receiver, Sender};
-use ratatui::crossterm::{
-    self,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-};
 use ratatui::{
+    crossterm::{
+        self,
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    },
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Backend,
     style::{Color, Modifier, Style},
@@ -33,7 +29,10 @@ use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
     data,
-    device::{self, buffer::AlignedWindow, buffer::ColumnBatch, Buffer, BufferEvent, ColumnSpec, DeviceTree, StreamId},
+    device::{
+        buffer::{AlignedWindow, ColumnBatch},
+        Buffer, BufferEvent, ColumnSpec, DeviceTree, StreamId,
+    },
     tio::{self, proto::DeviceRoute},
 };
 use twinleaf_tools::TioOpts;
@@ -45,21 +44,11 @@ use welch_sde::{Build, SpectralDensity};
 struct Cli {
     #[command(flatten)]
     tio: TioOpts,
-
-    /// Show multiple devices under the route
     #[arg(short = 'a', long = "all")]
     all: bool,
-
-    /// Target frames per second for UI rendering
-    #[arg(
-        long = "fps",
-        default_value_t = 20,
-        value_parser = clap::value_parser!(u32).range(1..=240)
-    )]
+    #[arg(long = "fps", default_value_t = 20)]
     fps: u32,
-
-    /// Configuration file for colorizing stream column values
-    #[arg(short = 'c', long = "colors", value_name = "CONF.toml")]
+    #[arg(short = 'c', long = "colors")]
     colors: Option<String>,
 }
 
@@ -69,11 +58,9 @@ pub struct NavItem {
     pub device_idx: usize,
     pub stream_idx: usize,
     pub column_idx: usize,
-
     pub route: DeviceRoute,
     pub stream_id: StreamId,
     pub column_id: usize,
-
     pub spec: ColumnSpec,
 }
 
@@ -192,65 +179,159 @@ impl Nav {
     }
 }
 
-/// ---------- Communication Structs ----------
-#[derive(Debug, Clone)]
-struct DataReq {
-    all: bool,
-    parent_route: DeviceRoute,
-    selection: Option<ColumnSpec>,
-    seconds: f64,
+
+/// ---------- Styling System ----------
+#[derive(Debug, Clone, Default)]
+pub struct Theme {
+    pub value_bounds: HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
+}
+
+impl Theme {
+    pub fn get_value_color(&self, stream: &str, col: &str, val: f64) -> Option<Color> {
+        if val.is_nan() {
+            return Some(Color::Yellow);
+        }
+        let key = format!("{}.{}", stream, col);
+        if let Some((range, is_temp)) = self.value_bounds.get(&key) {
+            if val < *range.start() {
+                Some(if *is_temp { Color::Blue } else { Color::Red })
+            } else if val > *range.end() {
+                Some(Color::Red)
+            } else {
+                Some(Color::Green)
+            }
+        } else {
+            None
+        }
+    }
+}
+
+pub struct StyleContext {
+    pub is_selected: bool,
+    pub is_stale: bool,
+    pub in_plot_mode: bool,
+    pub base_color: Color,
+}
+
+impl Default for StyleContext {
+    fn default() -> Self {
+        Self {
+            is_selected: false,
+            is_stale: false,
+            in_plot_mode: false,
+            base_color: Color::Reset,
+        }
+    }
+}
+
+impl StyleContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn selected(mut self, yes: bool) -> Self {
+        self.is_selected = yes;
+        self
+    }
+    pub fn stale(mut self, yes: bool) -> Self {
+        self.is_stale = yes;
+        self
+    }
+    pub fn plot_mode(mut self, yes: bool) -> Self {
+        self.in_plot_mode = yes;
+        self
+    }
+    pub fn color(mut self, c: Color) -> Self {
+        self.base_color = c;
+        self
+    }
+
+    pub fn resolve(&self) -> Style {
+        let mut s = Style::default().fg(self.base_color);
+        if self.is_stale {
+            s = s.add_modifier(Modifier::DIM);
+        }
+        if self.is_selected {
+            s = s.add_modifier(Modifier::BOLD);
+            if !self.in_plot_mode {
+                s = s.add_modifier(Modifier::RAPID_BLINK);
+            }
+        }
+        s
+    }
+}
+
+/// ---------- Core Application State ----------
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    Normal,
+    Command,
 }
 
 #[derive(Debug, Clone)]
-struct DataResp {
-    last: Vec<(DeviceRoute, StreamId, data::Sample)>,
-    window: Option<AlignedWindow>,
-}
-
-#[derive(Debug)]
-pub struct RpcReq {
-    pub route: DeviceRoute,
-    pub method: String,
-    pub arg: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct RpcResp {
-    // Ok(SuccessString), Err(ErrorString)
-    pub result: Result<String, String>,
-}
-
-/// ---------- App State ----------
-pub struct App {
-    pub all: bool,
-    pub parent_route: DeviceRoute,
-
-    pub last: BTreeMap<(DeviceRoute, StreamId), (data::Sample, Instant)>,
-    pub nav: Nav,
-    pub nav_items: Vec<NavItem>,
-
+pub struct ViewConfig {
     pub show_plot: bool,
     pub show_footer: bool,
     pub show_routes: bool,
     pub show_fft: bool,
+    pub plot_window_seconds: f64,
+    pub plot_width_percent: u16,
+    pub follow_selection: bool,
+    pub scroll: u16,
+    pub desc_width: usize,
+    pub theme: Theme,
+}
 
-    // RPC / Command Mode
-    pub show_cmd: bool,
+impl Default for ViewConfig {
+    fn default() -> Self {
+        Self {
+            show_plot: false,
+            show_footer: true,
+            show_routes: false,
+            show_fft: false,
+            plot_window_seconds: 5.0,
+            plot_width_percent: 70,
+            follow_selection: true,
+            scroll: 0,
+            desc_width: 0,
+            theme: Theme::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    Quit,
+    SetMode(Mode),
+    SubmitCommand,
+    NavMove(NavScope, bool),
+    NavScroll(i16),
+    NavHome,
+    NavEnd,
+    TogglePlot,
+    ToggleFft,
+    ToggleFooter,
+    ToggleRoutes,
+    AdjustWindow(f64),
+    AdjustPlotWidth(i16),
+    HistoryNavigate(i8),
+}
+
+pub struct App {
+    pub all: bool,
+    pub parent_route: DeviceRoute,
+
+    pub mode: Mode,
+    pub view: ViewConfig,
+
+    pub nav: Nav,
+    pub nav_items: Vec<NavItem>,
+
+    pub last: BTreeMap<(DeviceRoute, StreamId), (data::Sample, Instant)>,
+    pub window_aligned: Option<AlignedWindow>,
     pub input_state: TextState<'static>,
     pub cmd_history: Vec<String>,
     pub history_ptr: Option<usize>,
     pub last_rpc_result: Option<(String, Color)>,
-
-    pub scroll: u16,
-    pub desc_width: usize,
-    pub follow_selection: bool,
-
-    pub color_bounds: Option<HashMap<String, (std::ops::RangeInclusive<f64>, bool)>>,
-    pub plot_window_seconds: f64,
-    pub plot_width_percent: u16,
-
-    pub window_aligned: Option<AlignedWindow>,
-
     pub blink_state: bool,
     pub last_blink: Instant,
 }
@@ -260,42 +341,140 @@ impl App {
         Self {
             all,
             parent_route: parent_route.clone(),
-            last: BTreeMap::new(),
+            mode: Mode::Normal,
+            view: ViewConfig::default(),
             nav: Nav::default(),
             nav_items: Vec::new(),
-            show_plot: false,
-            show_fft: false,
-            scroll: 0,
-            desc_width: 0,
-            plot_window_seconds: 5.0,
-            show_footer: true,
-            plot_width_percent: 70,
-            follow_selection: true,
-            show_routes: false,
+            last: BTreeMap::new(),
             window_aligned: None,
-            color_bounds: None,
-            blink_state: true,
-            last_blink: Instant::now(),
-
-            // Command Mode Defaults
-            show_cmd: false,
             input_state: TextState::default(),
             cmd_history: Vec::new(),
             history_ptr: None,
             last_rpc_result: None,
+            blink_state: true,
+            last_blink: Instant::now(),
         }
     }
 
-    pub fn enter_cmd(&mut self) {
-        self.show_cmd = true;
-        self.input_state = TextState::default();
-        self.input_state.focus();
-        self.history_ptr = None;
+    pub fn update(&mut self, action: Action, rpc_tx: &Sender<RpcReq>) -> bool {
+        match action {
+            Action::Quit => return true,
+            Action::SetMode(Mode::Command) => {
+                self.mode = Mode::Command;
+                self.input_state = TextState::default();
+                self.input_state.focus();
+                self.history_ptr = None;
+            }
+            Action::SetMode(Mode::Normal) => {
+                self.mode = Mode::Normal;
+                self.input_state.blur();
+                if self.view.show_plot {
+                    self.view.show_plot = false;
+                }
+            }
+            Action::SubmitCommand => self.submit_command(rpc_tx),
+            Action::HistoryNavigate(dir) => self.navigate_history(dir),
+            Action::NavMove(scope, back) => {
+                self.view.follow_selection = true;
+                self.nav.step(&self.nav_items, scope, back);
+            }
+            Action::NavScroll(delta) => {
+                self.view.follow_selection = false;
+                self.view.scroll = if delta < 0 {
+                    self.view.scroll.saturating_sub(delta.abs() as u16)
+                } else {
+                    self.view.scroll.saturating_add(delta as u16)
+                };
+            }
+            Action::NavHome => {
+                self.view.follow_selection = true;
+                self.nav.home(&self.nav_items);
+            }
+            Action::NavEnd => {
+                self.view.follow_selection = true;
+                self.nav.end(&self.nav_items);
+            }
+            Action::TogglePlot => {
+                if self.current_selection().is_some() {
+                    self.view.show_plot = !self.view.show_plot;
+                }
+            }
+            Action::ToggleFft => {
+                if self.view.show_plot {
+                    self.view.show_fft = !self.view.show_fft;
+                }
+            }
+            Action::ToggleFooter => self.view.show_footer = !self.view.show_footer,
+            Action::ToggleRoutes => self.view.show_routes = !self.view.show_routes,
+            Action::AdjustWindow(d) => {
+                self.view.plot_window_seconds = (self.view.plot_window_seconds + d).clamp(0.5, 10.0)
+            }
+            Action::AdjustPlotWidth(d) => {
+                self.view.plot_width_percent =
+                    (self.view.plot_width_percent as i16 + d).clamp(20, 90) as u16
+            }
+        }
+        false
     }
 
-    pub fn exit_cmd(&mut self) {
-        self.show_cmd = false;
-        self.input_state.blur();
+    fn submit_command(&mut self, rpc_tx: &Sender<RpcReq>) {
+        let line = self.input_state.value().to_string();
+        if line.trim().is_empty() {
+            return;
+        }
+        if self.cmd_history.last() != Some(&line) {
+            self.cmd_history.push(line.clone());
+        }
+        self.history_ptr = None;
+
+        let mut parts = line.split_whitespace();
+        if let Some(method) = parts.next() {
+            let remainder: Vec<&str> = parts.collect();
+            let arg = if remainder.is_empty() {
+                None
+            } else {
+                Some(remainder.join(" "))
+            };
+            let route = self
+                .current_item()
+                .map(|i| i.route.clone())
+                .unwrap_or(self.parent_route.clone());
+            let _ = rpc_tx.send(RpcReq {
+                route: route.clone(),
+                method: method.to_string(),
+                arg,
+            });
+            self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
+            self.input_state = TextState::default();
+            self.input_state.focus();
+        }
+    }
+
+    fn navigate_history(&mut self, dir: i8) {
+        if self.cmd_history.is_empty() {
+            return;
+        }
+        let new_ptr = match (self.history_ptr, dir) {
+            (None, -1) => Some(self.cmd_history.len() - 1),
+            (Some(i), -1) => Some(i.saturating_sub(1)),
+            (Some(i), 1) => {
+                if i + 1 >= self.cmd_history.len() {
+                    None
+                } else {
+                    Some(i + 1)
+                }
+            }
+            _ => self.history_ptr,
+        };
+        self.history_ptr = new_ptr;
+        if let Some(i) = new_ptr {
+            self.input_state = TextState::new().with_value(self.cmd_history[i].clone());
+            self.input_state.focus();
+            self.input_state.move_end();
+        } else {
+            self.input_state = TextState::default();
+            self.input_state.focus();
+        }
     }
 
     pub fn visible_routes(&self) -> Vec<DeviceRoute> {
@@ -311,7 +490,6 @@ impl App {
 
     pub fn rebuild_nav_items(&mut self) {
         self.nav_items.clear();
-
         let routes = self.visible_routes();
         if routes.is_empty() || self.last.is_empty() {
             self.nav.idx = None;
@@ -319,24 +497,17 @@ impl App {
         }
 
         let mut new_items = Vec::new();
-
         for (dev_idx, route) in routes.iter().enumerate() {
             let mut stream_ids: Vec<_> = self
                 .last
                 .keys()
-                .filter(|(r, _sid)| r == route)
+                .filter(|(r, _)| r == route)
                 .map(|(_, sid)| *sid)
                 .collect();
             stream_ids.sort();
-
             for (stream_idx, sid) in stream_ids.iter().enumerate() {
-                if let Some((sample, _seen)) = self.last.get(&(route.clone(), *sid)) {
-                    for (column_idx, _col) in sample.columns.iter().enumerate() {
-                        let spec = ColumnSpec {
-                            route: route.clone(),
-                            stream_id: *sid,
-                            column_id: column_idx,
-                        };
+                if let Some((sample, _)) = self.last.get(&(route.clone(), *sid)) {
+                    for (column_idx, _) in sample.columns.iter().enumerate() {
                         new_items.push(NavItem {
                             device_idx: dev_idx,
                             stream_idx,
@@ -344,13 +515,16 @@ impl App {
                             route: route.clone(),
                             stream_id: *sid,
                             column_id: column_idx,
-                            spec,
+                            spec: ColumnSpec {
+                                route: route.clone(),
+                                stream_id: *sid,
+                                column_id: column_idx,
+                            },
                         });
                     }
                 }
             }
         }
-
         self.nav_items = new_items;
         if let Some(idx) = self.nav.idx {
             if idx >= self.nav_items.len() {
@@ -368,68 +542,46 @@ impl App {
     pub fn current_item(&self) -> Option<&NavItem> {
         self.nav.idx.and_then(|i| self.nav_items.get(i))
     }
-
     pub fn current_selection(&self) -> Option<ColumnSpec> {
         self.current_item().map(|it| it.spec.clone())
     }
-
     pub fn current_device_index(&self) -> usize {
         self.current_item().map(|it| it.device_idx).unwrap_or(0)
     }
-
     pub fn device_count(&self) -> usize {
         self.visible_routes().len()
     }
 
-    pub fn cycle(&mut self, backward: bool, device: bool, stream: bool, column: bool) {
-        let scope = NavScope {
-            device,
-            stream,
-            column,
-        };
-        self.nav.step(&self.nav_items, scope, backward);
-    }
-
-    pub fn increase_window(&mut self) {
-        self.plot_window_seconds = (self.plot_window_seconds + 0.5).min(10.0);
-    }
-    pub fn decrease_window(&mut self) {
-        self.plot_window_seconds = (self.plot_window_seconds - 0.5).max(0.5);
-    }
-    pub fn increase_plot_width(&mut self) {
-        self.plot_width_percent = (self.plot_width_percent + 5).min(90);
-    }
-    pub fn decrease_plot_width(&mut self) {
-        self.plot_width_percent = (self.plot_width_percent.saturating_sub(5)).max(20);
-    }
-
-pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
+    pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
         let spec = self.current_selection()?;
         let win = self.window_aligned.as_ref()?;
         let batch = win.columns.get(&spec)?;
         if win.timestamps.is_empty() {
             return None;
         }
-
         let data: Vec<(f64, f64)> = match batch {
-            ColumnBatch::F64(vec) => {
-                if vec.is_empty() { return None; }
-                win.timestamps.iter().copied().zip(vec.iter().copied()).collect()
-            }
-            ColumnBatch::I64(vec) => {
-                if vec.is_empty() { return None; }
-                win.timestamps.iter().copied().zip(vec.iter().map(|&x| x as f64)).collect()
-            }
-            ColumnBatch::U64(vec) => {
-                if vec.is_empty() { return None; }
-                win.timestamps.iter().copied().zip(vec.iter().map(|&x| x as f64)).collect()
-            }
+            ColumnBatch::F64(v) => win
+                .timestamps
+                .iter()
+                .copied()
+                .zip(v.iter().copied())
+                .collect(),
+            ColumnBatch::I64(v) => win
+                .timestamps
+                .iter()
+                .copied()
+                .zip(v.iter().map(|&x| x as f64))
+                .collect(),
+            ColumnBatch::U64(v) => win
+                .timestamps
+                .iter()
+                .copied()
+                .zip(v.iter().map(|&x| x as f64))
+                .collect(),
         };
-
         if data.is_empty() {
             return None;
         }
-        
         let (cur_t, cur_v) = *data.last().unwrap();
         Some((data, cur_v, cur_t))
     }
@@ -441,17 +593,14 @@ pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
         let md = win.segment_metadata.get(&stream_key)?;
         let sampling_hz = (md.sampling_rate / md.decimation) as f64;
         let batch = win.columns.get(&spec)?;
-
         let signal: Vec<f64> = match batch {
-            ColumnBatch::F64(vec) => vec.clone(),
-            ColumnBatch::I64(vec) => vec.iter().map(|&x| x as f64).collect(),
-            ColumnBatch::U64(vec) => vec.iter().map(|&x| x as f64).collect(),
+            ColumnBatch::F64(v) => v.clone(),
+            ColumnBatch::I64(v) => v.iter().map(|&x| x as f64).collect(),
+            ColumnBatch::U64(v) => v.iter().map(|&x| x as f64).collect(),
         };
-
         if signal.len() < 128 {
             return None;
         }
-
         let welch: SpectralDensity<f64> = SpectralDensity::builder(&signal, sampling_hz).build();
         let sd = welch.periodogram();
         let raw: Vec<f64> = sd.iter().copied().collect();
@@ -464,25 +613,19 @@ pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
             return None;
         }
         let noise = vals.iter().sum::<f64>() / vals.len() as f64;
-        if !noise.is_finite() || noise <= 0.0 {
-            return None;
-        }
-
         let pts: Vec<(f64, f64)> = sd
             .frequency()
             .into_iter()
             .zip(raw.into_iter())
             .filter(|(_, d)| d.is_finite() && *d > 0.0)
             .collect();
-
         Some((pts, noise))
     }
 
     pub fn get_focused_channel_info(&self) -> Option<(String, String)> {
         let spec = self.current_selection()?;
-        let win = self.window_aligned.as_ref()?;        
+        let win = self.window_aligned.as_ref()?;
         let meta = win.column_metadata.get(&spec)?;
-        
         Some((meta.description.clone(), meta.units.clone()))
     }
 
@@ -494,198 +637,123 @@ pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
     }
 }
 
-/// ---------- Main Logic ----------
-pub fn handle_input_event(ev: Event, app: &mut App, rpc_tx: &Sender<RpcReq>) -> bool {
-    match ev {
-        Event::Key(k) => {
-            if k.kind != KeyEventKind::Press {
-                return false;
-            }
-
-            // --- Command Mode Handling ---
-            if app.show_cmd {
-                match k.code {
-                    KeyCode::Esc => app.exit_cmd(),
-
-                    // History Up
-                    KeyCode::Up => {
-                        if !app.cmd_history.is_empty() {
-                            let idx = app
-                                .history_ptr
-                                .map(|i| i.saturating_sub(1))
-                                .unwrap_or(app.cmd_history.len() - 1);
-                            app.history_ptr = Some(idx);
-                            app.input_state =
-                                TextState::new().with_value(app.cmd_history[idx].clone());
-                            app.input_state.focus();
-                            app.input_state.move_end();
-                        }
-                    }
-
-                    // History Down
-                    KeyCode::Down => {
-                        if let Some(idx) = app.history_ptr {
-                            if idx + 1 < app.cmd_history.len() {
-                                let new_idx = idx + 1;
-                                app.history_ptr = Some(new_idx);
-                                app.input_state =
-                                    TextState::new().with_value(app.cmd_history[new_idx].clone());
-                                app.input_state.focus();
-                                app.input_state.move_end();
-                            } else {
-                                app.history_ptr = None;
-                                app.input_state = TextState::default();
-                                app.input_state.focus();
-                            }
-                        }
-                    }
-
-                    // Submit Command
-                    KeyCode::Enter => {
-                        let line = app.input_state.value().to_string();
-                        if !line.trim().is_empty() {
-                            // 1. Save History
-                            if app.cmd_history.last() != Some(&line) {
-                                app.cmd_history.push(line.clone());
-                            }
-                            app.history_ptr = None;
-
-                            // 2. Parse "method arg"
-                            let mut parts = line.split_whitespace();
-                            if let Some(method) = parts.next() {
-                                let remainder: Vec<&str> = parts.collect();
-                                let arg = if remainder.is_empty() {
-                                    None
-                                } else {
-                                    Some(remainder.join(" "))
-                                };
-
-                                // 3. Determine Target
-                                let route = app
-                                    .current_item()
-                                    .map(|i| i.route.clone())
-                                    .unwrap_or(app.parent_route.clone());
-
-                                // 4. Send to Data Thread
-                                let _ = rpc_tx.send(RpcReq {
-                                    route: route.clone(),
-                                    method: method.to_string(),
-                                    arg,
-                                });
-
-                                app.last_rpc_result =
-                                    Some((format!("Sent to {}...", route), Color::Yellow));
-
-                                // Reset Input, keep focus
-                                app.input_state = TextState::default();
-                                app.input_state.focus();
-                            }
-                        }
-                    }
-                    _ => {
-                        app.input_state.handle_key_event(k);
-                    }
-                }
-                return false;
-            }
-
-            // --- Normal Mode Handling ---
-            if k.code == KeyCode::Char(':') {
-                app.enter_cmd();
-                return false;
-            }
-
-            if k.code == KeyCode::Esc {
-                if app.show_plot {
-                    app.show_plot = false;
-                } else {
-                    return true;
-                } // Quit if no plot
-                return false;
-            }
-
-            let quit = matches!(k.code, KeyCode::Char('q'))
-                || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL);
-            if quit {
-                return true;
-            }
-
-            match k.code {
-                KeyCode::Up => {
-                    app.follow_selection = true;
-                    app.cycle(true, true, true, true);
-                }
-                KeyCode::Down => {
-                    app.follow_selection = true;
-                    app.cycle(false, true, true, true);
-                }
-                KeyCode::Left => {
-                    app.follow_selection = true;
-                    app.cycle(true, false, false, true);
-                }
-                KeyCode::Right => {
-                    app.follow_selection = true;
-                    app.cycle(false, false, false, true);
-                }
-                KeyCode::BackTab => {
-                    app.follow_selection = true;
-                    app.cycle(true, true, false, false);
-                }
-                KeyCode::Tab => {
-                    app.follow_selection = true;
-                    app.cycle(false, true, false, false);
-                }
-                KeyCode::PageUp => {
-                    app.follow_selection = false;
-                    app.scroll = app.scroll.saturating_sub(10);
-                }
-                KeyCode::PageDown => {
-                    app.follow_selection = false;
-                    app.scroll = app.scroll.saturating_add(10);
-                }
-                KeyCode::Home => {
-                    app.follow_selection = true;
-                    app.nav.home(&app.nav_items);
-                }
-                KeyCode::End => {
-                    app.follow_selection = true;
-                    app.nav.end(&app.nav_items);
-                }
-                KeyCode::Enter => {
-                    if app.current_selection().is_some() {
-                        app.show_plot = !app.show_plot;
-                    }
-                }
-                KeyCode::Char('+') | KeyCode::Char('=') => {
-                    app.increase_window();
-                }
-                KeyCode::Char('-') | KeyCode::Char('_') => {
-                    app.decrease_window();
-                }
-                KeyCode::Char('[') => {
-                    app.increase_plot_width();
-                }
-                KeyCode::Char(']') => {
-                    app.decrease_plot_width();
-                }
-                KeyCode::Char('f') => {
-                    if app.show_plot {
-                        app.show_fft = !app.show_fft;
-                    }
-                }
-                KeyCode::Char('h') => {
-                    app.show_footer = !app.show_footer;
-                }
-                KeyCode::Char('r') => {
-                    app.show_routes = !app.show_routes;
-                }
-                _ => {}
-            }
-            false
+fn get_action(ev: Event, app: &mut App) -> Option<Action> {
+    if let Event::Key(k) = ev {
+        if k.kind != KeyEventKind::Press {
+            return None;
         }
-        Event::Resize(_, _) => false,
-        _ => false,
+        match app.mode {
+            Mode::Command => match k.code {
+                KeyCode::Esc => Some(Action::SetMode(Mode::Normal)),
+                KeyCode::Up => Some(Action::HistoryNavigate(-1)),
+                KeyCode::Down => Some(Action::HistoryNavigate(1)),
+                KeyCode::Enter => Some(Action::SubmitCommand),
+                _ => {
+                    app.input_state.handle_key_event(k);
+                    None
+                }
+            },
+            Mode::Normal => match k.code {
+                KeyCode::Char(':') => Some(Action::SetMode(Mode::Command)),
+                KeyCode::Char('q') => Some(Action::Quit),
+                KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
+                KeyCode::Esc => {
+                    if app.view.show_plot {
+                        Some(Action::SetMode(Mode::Normal))
+                    } else {
+                        Some(Action::Quit)
+                    }
+                }
+                KeyCode::Up => Some(Action::NavMove(
+                    NavScope {
+                        device: true,
+                        stream: true,
+                        column: true,
+                    },
+                    true,
+                )),
+                KeyCode::Down => Some(Action::NavMove(
+                    NavScope {
+                        device: true,
+                        stream: true,
+                        column: true,
+                    },
+                    false,
+                )),
+                KeyCode::Left => Some(Action::NavMove(
+                    NavScope {
+                        device: false,
+                        stream: false,
+                        column: true,
+                    },
+                    true,
+                )),
+                KeyCode::Right => Some(Action::NavMove(
+                    NavScope {
+                        device: false,
+                        stream: false,
+                        column: true,
+                    },
+                    false,
+                )),
+                KeyCode::BackTab => Some(Action::NavMove(
+                    NavScope {
+                        device: true,
+                        stream: false,
+                        column: false,
+                    },
+                    true,
+                )),
+                KeyCode::Tab => Some(Action::NavMove(
+                    NavScope {
+                        device: true,
+                        stream: false,
+                        column: false,
+                    },
+                    false,
+                )),
+                KeyCode::PageUp => Some(Action::NavScroll(-10)),
+                KeyCode::PageDown => Some(Action::NavScroll(10)),
+                KeyCode::Home => Some(Action::NavHome),
+                KeyCode::End => Some(Action::NavEnd),
+                KeyCode::Enter => Some(Action::TogglePlot),
+                KeyCode::Char('f') => Some(Action::ToggleFft),
+                KeyCode::Char('h') => Some(Action::ToggleFooter),
+                KeyCode::Char('r') => Some(Action::ToggleRoutes),
+                KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::AdjustWindow(0.5)),
+                KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::AdjustWindow(-0.5)),
+                KeyCode::Char('[') => Some(Action::AdjustPlotWidth(5)),
+                KeyCode::Char(']') => Some(Action::AdjustPlotWidth(-5)),
+                _ => None,
+            },
+        }
+    } else {
+        None
     }
+}
+
+/// ---------- Communication Threads ----------
+#[derive(Debug, Clone)]
+struct DataReq {
+    all: bool,
+    parent_route: DeviceRoute,
+    selection: Option<ColumnSpec>,
+    seconds: f64,
+}
+#[derive(Debug, Clone)]
+struct DataResp {
+    last: Vec<(DeviceRoute, StreamId, data::Sample)>,
+    window: Option<AlignedWindow>,
+}
+#[derive(Debug)]
+pub struct RpcReq {
+    pub route: DeviceRoute,
+    pub method: String,
+    pub arg: Option<String>,
+}
+#[derive(Debug)]
+pub struct RpcResp {
+    pub result: Result<String, String>,
 }
 
 fn exec_rpc(
@@ -694,100 +762,67 @@ fn exec_rpc(
     method: String,
     arg_str: Option<String>,
 ) -> Result<String, String> {
+    // Macro to parse input string -> Vec<u8> (Little Endian)
+    macro_rules! parse_arg {
+        ($type_str:expr, $input:expr, { $($str_val:literal => $ty:ty),+ }) => {
+            match $type_str.as_str() {
+                $( $str_val => $input.parse::<$ty>()
+                    .map_err(|_| format!("Invalid {} argument", $str_val))?
+                    .to_le_bytes().to_vec(), )+
+                "string" | "" => $input.as_bytes().to_vec(),
+                t => return Err(format!("Unsupported type: {}", t)),
+            }
+        }
+    }
+
+    // Macro to format reply Vec<u8> -> String
+    macro_rules! fmt_reply {
+        ($type_str:expr, $bytes:expr, { $($str_val:literal => $ty:ty),+ }) => {
+            match $type_str.as_str() {
+                $( $str_val => {
+                    let sz = std::mem::size_of::<$ty>();
+                    if $bytes.len() < sz { "Error: Short Read".to_string() }
+                    else {
+                        let arr = $bytes[0..sz].try_into().unwrap_or_default();
+                        <$ty>::from_le_bytes(arr).to_string()
+                    }
+                }, )+
+                "string" | "" => String::from_utf8_lossy($bytes).to_string(),
+                _ => format!("Hex: {:02X?}", $bytes),
+            }
+        }
+    }
+
     let meta: u16 = tree
         .rpc(route.clone(), "rpc.info", &method)
-        .map_err(|_| "Unknown RPC name".to_string())?;
+        .map_err(|_| "Unknown RPC".to_string())?;
 
-    let spec = device::util::parse_rpc_spec(meta, method.clone());
+    let spec = twinleaf::device::util::parse_rpc_spec(meta, method.clone());
     let type_str = spec.type_str();
 
     let payload = if let Some(s) = arg_str {
-        match type_str.as_str() {
-            "u8" => s
-                .parse::<u8>()
-                .map_err(|_| "Invalid u8")?
-                .to_le_bytes()
-                .to_vec(),
-            "u16" => s
-                .parse::<u16>()
-                .map_err(|_| "Invalid u16")?
-                .to_le_bytes()
-                .to_vec(),
-            "u32" => s
-                .parse::<u32>()
-                .map_err(|_| "Invalid u32")?
-                .to_le_bytes()
-                .to_vec(),
-            "u64" => s
-                .parse::<u64>()
-                .map_err(|_| "Invalid u64")?
-                .to_le_bytes()
-                .to_vec(),
-            "i8" => s
-                .parse::<i8>()
-                .map_err(|_| "Invalid i8")?
-                .to_le_bytes()
-                .to_vec(),
-            "i16" => s
-                .parse::<i16>()
-                .map_err(|_| "Invalid i16")?
-                .to_le_bytes()
-                .to_vec(),
-            "i32" => s
-                .parse::<i32>()
-                .map_err(|_| "Invalid i32")?
-                .to_le_bytes()
-                .to_vec(),
-            "i64" => s
-                .parse::<i64>()
-                .map_err(|_| "Invalid i64")?
-                .to_le_bytes()
-                .to_vec(),
-            "f32" => s
-                .parse::<f32>()
-                .map_err(|_| "Invalid f32")?
-                .to_le_bytes()
-                .to_vec(),
-            "f64" => s
-                .parse::<f64>()
-                .map_err(|_| "Invalid f64")?
-                .to_le_bytes()
-                .to_vec(),
-            "string" | "" => s.as_bytes().to_vec(),
-            t => return Err(format!("Unsupported type: {}", t)),
-        }
+        parse_arg!(type_str, s, {
+            "u8" => u8, "u16" => u16, "u32" => u32, "u64" => u64,
+            "i8" => i8, "i16" => i16, "i32" => i32, "i64" => i64,
+            "f32" => f32, "f64" => f64
+        })
     } else {
         Vec::new()
     };
 
     let reply_bytes = tree
         .raw_rpc(route, &method, &payload)
-        .map_err(|e| format!("RPC Exec Failed: {:?}", e))?;
+        .map_err(|e| format!("{:?}", e))?;
 
     if reply_bytes.is_empty() {
         return Ok("OK".to_string());
     }
 
-    let reply_str = match type_str.as_str() {
-        "u8" => u8::from_le_bytes(reply_bytes[0..1].try_into().unwrap()).to_string(),
-        "u16" => u16::from_le_bytes(reply_bytes[0..2].try_into().unwrap()).to_string(),
-        "u32" => u32::from_le_bytes(reply_bytes[0..4].try_into().unwrap()).to_string(),
-        "u64" => u64::from_le_bytes(reply_bytes[0..8].try_into().unwrap()).to_string(),
-        "i8" => i8::from_le_bytes(reply_bytes[0..1].try_into().unwrap()).to_string(),
-        "i16" => i16::from_le_bytes(reply_bytes[0..2].try_into().unwrap()).to_string(),
-        "i32" => i32::from_le_bytes(reply_bytes[0..4].try_into().unwrap()).to_string(),
-        "i64" => i64::from_le_bytes(reply_bytes[0..8].try_into().unwrap()).to_string(),
-        "f32" => f32::from_le_bytes(reply_bytes[0..4].try_into().unwrap()).to_string(),
-        "f64" => f64::from_le_bytes(reply_bytes[0..8].try_into().unwrap()).to_string(),
-        "string" | "" => {
-            if let Ok(s) = std::str::from_utf8(&reply_bytes) {
-                format!("\"{}\"", s)
-            } else {
-                format!("Hex: {:02X?}", reply_bytes)
-            }
-        }
-        _ => format!("{:02X?}", reply_bytes),
-    };
+    let reply_str = fmt_reply!(type_str, &reply_bytes, {
+        "u8" => u8, "u16" => u16, "u32" => u32, "u64" => u64,
+        "i8" => i8, "i16" => i16, "i32" => i32, "i64" => i64,
+        "f32" => f32, "f64" => f64
+    });
 
     Ok(reply_str)
 }
@@ -809,58 +844,45 @@ fn run_data_thread(
             let res = exec_rpc(&mut tree, req.route, req.method, req.arg);
             rpc_resp_tx.send(RpcResp { result: res }).ok();
         }
-
         let (sample, route) = match tree.next() {
             Ok(x) => x,
             Err(_) => break,
         };
-
         let stream_id = sample.stream.stream_id;
         buffer.process_sample(sample.clone(), route.clone());
         last.insert((route.clone(), stream_id), sample);
 
         while let Ok(q) = req_rx.try_recv() {
-            let resp = make_response(&buffer, &last, q);
-            if resp_tx.send(resp).is_err() {
+            let last_vec: Vec<_> = if q.all {
+                last.iter()
+                    .map(|((r, sid), s)| (r.clone(), *sid, s.clone()))
+                    .collect()
+            } else {
+                last.iter()
+                    .filter(|((r, _), _)| *r == q.parent_route)
+                    .map(|((r, sid), s)| (r.clone(), *sid, s.clone()))
+                    .collect()
+            };
+
+            let window = q.selection.and_then(|spec| {
+                let stream_key = spec.stream_key();
+                let active = buffer.active_segments.get(&stream_key)?;
+                let sampling_hz = (active.buffer.segment_metadata.sampling_rate
+                    / active.buffer.segment_metadata.decimation)
+                    as f64;
+                let n_samples = (q.seconds * sampling_hz).ceil().max(10.0) as usize;
+                buffer.read_aligned_window(&[spec], n_samples).ok()
+            });
+            if resp_tx
+                .send(DataResp {
+                    last: last_vec,
+                    window,
+                })
+                .is_err()
+            {
                 return;
             }
         }
-    }
-
-    while let Ok(q) = req_rx.try_recv() {
-        let _ = resp_tx.send(make_response(&buffer, &last, q));
-    }
-}
-
-fn make_response(
-    buffer: &Buffer,
-    last: &BTreeMap<(DeviceRoute, StreamId), data::Sample>,
-    q: DataReq,
-) -> DataResp {
-    let last_vec: Vec<(DeviceRoute, StreamId, data::Sample)> = if q.all {
-        last.iter()
-            .map(|((r, sid), s)| (r.clone(), *sid, s.clone()))
-            .collect()
-    } else {
-        last.iter()
-            .filter(|((r, _), _)| *r == q.parent_route)
-            .map(|((r, sid), s)| (r.clone(), *sid, s.clone()))
-            .collect()
-    };
-
-    let window = q.selection.and_then(|spec| {
-        let stream_key = spec.stream_key();
-        let active = buffer.active_segments.get(&stream_key)?;
-        let sampling_hz = (active.buffer.segment_metadata.sampling_rate
-            / active.buffer.segment_metadata.decimation) as f64;
-        let mut n_samples = (q.seconds * sampling_hz).ceil() as usize;
-        n_samples = n_samples.max(10);
-        buffer.read_aligned_window(&[spec], n_samples).ok()
-    });
-
-    DataResp {
-        last: last_vec,
-        window,
     }
 }
 
@@ -868,31 +890,27 @@ fn make_response(
 fn draw_ui<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     terminal.draw(|f| {
         let size = f.area();
-        let estimated_footer_height = 6;
-        let available_height = size.height.saturating_sub(estimated_footer_height);
-        let show_scrollbar = will_need_scrollbar(app, available_height);
-
         let (main_area, footer_area) = {
-            let footer_height = if app.show_cmd {
+            let footer_h = if app.mode == Mode::Command {
                 4
-            } else if app.show_footer {
+            } else if app.view.show_footer {
                 6
             } else {
                 2
             };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(10), Constraint::Length(footer_height)])
+                .constraints([Constraint::Min(10), Constraint::Length(footer_h)])
                 .split(size);
             (chunks[0], Some(chunks[1]))
         };
 
-        let (left_area, right_opt): (Rect, Option<Rect>) = if app.show_plot {
+        let (left, right) = if app.view.show_plot {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(100 - app.plot_width_percent),
-                    Constraint::Percentage(app.plot_width_percent),
+                    Constraint::Percentage(100 - app.view.plot_width_percent),
+                    Constraint::Percentage(app.view.plot_width_percent),
                 ])
                 .split(main_area);
             (chunks[0], Some(chunks[1]))
@@ -900,33 +918,182 @@ fn draw_ui<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             (main_area, None)
         };
 
-        render_monitor_panel(f, app, left_area, Instant::now());
-
-        if let Some(r) = right_opt {
+        render_monitor_panel(f, app, left, Instant::now());
+        if let Some(r) = right {
             render_graphics_panel(f, app, r);
         }
-
-        if let Some(footer) = footer_area {
-            render_footer(f, show_scrollbar, app.device_count(), footer, app);
+        if let Some(foot) = footer_area {
+            render_footer(f, app, foot);
         }
     })?;
     Ok(())
 }
 
-fn render_footer(
-    f: &mut Frame,
-    _show_scroll: bool,
-    device_count: usize,
-    area: Rect,
-    app: &mut App,
-) {
-    // --- Command Mode Render ---
-    if app.show_cmd {
+fn render_monitor_panel(f: &mut Frame, app: &mut App, area: Rect, now: Instant) {
+    let inner = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(1),
+        height: area.height,
+    };
+    let (lines, col_map) = build_left_lines(app, now);
+    let total = lines.len();
+    let view_h = inner.height as usize;
+
+    if app.view.follow_selection {
+        if let Some(idx) = app.nav.idx {
+            if let Some(&line_idx) = col_map.get(&idx) {
+                if view_h > 0 && total > view_h {
+                    let cur = app.view.scroll as usize;
+                    if line_idx < cur || line_idx >= cur + view_h {
+                        app.view.scroll = line_idx
+                            .saturating_sub(view_h / 2)
+                            .min(total.saturating_sub(view_h))
+                            as u16;
+                    }
+                } else {
+                    app.view.scroll = 0;
+                }
+            }
+        }
+    }
+    app.view.scroll = (app.view.scroll as usize).min(total.saturating_sub(view_h)) as u16;
+    f.render_widget(Paragraph::new(lines).scroll((app.view.scroll, 0)), inner);
+
+    // Scrollbar
+    if total > view_h {
+        let sb_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        let track_len = view_h;
+        let thumb_len = (track_len * track_len / total).max(1);
+        let max_thumb_pos = track_len - thumb_len;
+        let scroll_max = total - track_len;
+        let thumb_pos = (app.view.scroll as usize * max_thumb_pos) / scroll_max;
+
+        for i in 0..track_len {
+            let ch = if i >= thumb_pos && i < thumb_pos + thumb_len {
+                "█"
+            } else {
+                "│"
+            };
+            f.render_widget(
+                Paragraph::new(ch).style(Style::default().fg(Color::DarkGray)),
+                Rect {
+                    x: sb_area.x,
+                    y: sb_area.y + i as u16,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap<usize, usize>) {
+    let mut lines = Vec::new();
+    let mut map = HashMap::new();
+
+    let routes = app.visible_routes();
+    if routes.is_empty() || app.last.is_empty() {
+        lines.push(Line::from("Waiting..."));
+        return (lines, map);
+    }
+
+    let mut global_idx = 0;
+    app.view.desc_width = app
+        .last
+        .values()
+        .flat_map(|(s, _)| s.columns.iter())
+        .map(|c| c.desc.description.len())
+        .max()
+        .unwrap_or(0);
+
+    for (dev_idx, route) in routes.iter().enumerate() {
+        let dev = app
+            .last
+            .iter()
+            .find(|((r, _), _)| r == route)
+            .map(|(_, (s, _))| s.device.as_ref());
+        let head_style = if dev_idx == app.current_device_index() {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                dev.map(|d| d.name.clone()).unwrap_or("<dev>".into()),
+                head_style,
+            ),
+            if app.view.show_routes {
+                Span::raw(format!(" [{}]", route))
+            } else {
+                Span::raw("")
+            },
+        ]));
+
+        let mut stream_ids: Vec<_> = app
+            .last
+            .keys()
+            .filter(|(r, _)| r == route)
+            .map(|(_, s)| *s)
+            .collect();
+        stream_ids.sort();
+
+        for sid in stream_ids {
+            if let Some((sample, seen)) = app.last.get(&(route.clone(), sid)) {
+                let is_stale = now.saturating_duration_since(*seen) > Duration::from_millis(1200);
+                for col in &sample.columns {
+                    let nav_idx = global_idx;
+                    global_idx += 1;
+                    map.insert(nav_idx, lines.len());
+
+                    let is_sel = app.nav.idx == Some(nav_idx);
+                    let ctx = StyleContext::new()
+                        .stale(is_stale)
+                        .selected(is_sel)
+                        .plot_mode(app.view.show_plot);
+
+                    let label_style = ctx.resolve();
+                    let (val_str, val_f64) = fmt_value(&col.value);
+                    let val_col = app
+                        .view
+                        .theme
+                        .get_value_color(&sample.stream.name, &col.desc.name, val_f64)
+                        .unwrap_or(Color::Reset);
+                    let val_style = ctx.color(val_col).resolve();
+
+                    let mut desc = col.desc.description.clone();
+                    if desc.len() < app.view.desc_width {
+                        desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
+                    }
+
+                    lines.push(Line::from(vec![
+                        Span::styled(desc, label_style),
+                        Span::raw("  "),
+                        Span::styled(val_str, val_style),
+                        Span::styled(col.desc.units.clone(), val_style),
+                    ]));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    (lines, map)
+}
+
+fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
+    // Command Mode
+    if app.mode == Mode::Command {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(area);
 
+        // RPC Result
         if let Some((msg, color)) = &app.last_rpc_result {
             f.render_widget(
                 Paragraph::new(msg.as_str())
@@ -935,62 +1102,57 @@ fn render_footer(
             );
         }
 
+        // Input Line
         let target_route = app
             .current_item()
             .map(|i| i.route.clone())
             .unwrap_or(app.parent_route.clone());
+        let val = app.input_state.value();
+        let cursor_idx = app.input_state.position().min(val.len());
 
-        let prompt_text = format!("[{}] ", target_route);
-        let input_val = app.input_state.value();
-        
-        let cursor_idx = app.input_state.position();
+        let mut spans = vec![
+            Span::styled(
+                format!("[{}] ", target_route),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw(&val[0..cursor_idx]),
+        ];
 
-        let chars: Vec<char> = input_val.chars().collect();
-        let safe_idx = cursor_idx.min(chars.len());
-
-        let mut spans = Vec::new();
-        spans.push(Span::styled(prompt_text, Style::default().fg(Color::Blue)));
-
-        let left: String = chars[0..safe_idx].iter().collect();
-        spans.push(Span::raw(left));
-
-        let cursor_style = if app.blink_state {
-            Style::default().fg(Color::Black).bg(Color::White)
-        } else {
-            Style::default()
-        };
-
-        if safe_idx < chars.len() {
-            let char_at_cursor = chars[safe_idx];
-            spans.push(Span::styled(char_at_cursor.to_string(), cursor_style));
-            
-            if safe_idx + 1 < chars.len() {
-                let right: String = chars[safe_idx + 1..].iter().collect();
-                spans.push(Span::raw(right));
-            }
-        } else {
-            if app.blink_state {
-                spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            }
+        if cursor_idx < val.len() {
+            spans.push(Span::styled(
+                &val[cursor_idx..cursor_idx + 1],
+                if app.blink_state {
+                    Style::default().bg(Color::White).fg(Color::Black)
+                } else {
+                    Style::default()
+                },
+            ));
+            spans.push(Span::raw(&val[cursor_idx + 1..]));
+        } else if app.blink_state {
+            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
         }
 
-        let block = Block::default().borders(Borders::TOP).title(" Command Mode ");
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .title(" Command Mode ");
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), chunks[1]);
-        
         return;
     }
 
-    // --- Standard Footer Render ---
-    if !app.show_footer {
-        let minimal_line = Line::from(vec![
+    if !app.view.show_footer {
+        let minimal = Line::from(vec![
             Span::raw("  "),
             key_span("h"),
             Span::raw(" Toggle Footer"),
         ]);
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray));
-        f.render_widget(Paragraph::new(vec![minimal_line]).block(block), area);
+        f.render_widget(
+            Paragraph::new(vec![minimal]).block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            area,
+        );
         return;
     }
 
@@ -1011,14 +1173,13 @@ fn render_footer(
         Span::raw(" Columns"),
     ];
 
-    if device_count > 1 {
+    if app.device_count() > 1 {
         navigation_spans.push(Span::raw("  "));
         navigation_spans.push(key_span("Tab"));
         navigation_spans.push(key_sep());
         navigation_spans.push(key_span("Shift+Tab"));
         navigation_spans.push(Span::raw(" Devices"));
     }
-
     let navigation_line = Line::from(navigation_spans);
 
     let toggle_line = Line::from(vec![
@@ -1091,6 +1252,7 @@ fn render_footer(
         scroll_line,
         quit_line,
     ];
+
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -1111,314 +1273,22 @@ fn key_span(text: &str) -> Span<'static> {
             .add_modifier(Modifier::BOLD),
     )
 }
+
 fn key_sep() -> Span<'static> {
     Span::raw(" ")
 }
 
-fn fmt_value(v: &data::ColumnData) -> (String, f64) {
-    use data::ColumnData::*;
-    match v {
-        Int(x) => (format!("{:10}      ", x), *x as f64),
-        UInt(x) => (format!("{:10}      ", x), *x as f64),
-        Float(x) => {
-            if x.is_nan() {
-                (format!("{:10}      ", x), f64::NAN)
-            } else {
-                (format!("{:15.4} ", x), *x)
-            }
-        }
-        Unknown => (format!("{:>15} ", "unsupported"), f64::NAN),
-    }
-}
-
-fn load_color_bounds(
-    path: &str,
-) -> io::Result<HashMap<String, (std::ops::RangeInclusive<f64>, bool)>> {
-    let mut f = File::open(path)?;
-    let mut contents = String::new();
-    f.read_to_string(&mut contents)?;
-
-    let doc = DocumentMut::from_str(&contents)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let mut bounds = HashMap::new();
-    for (keys, value) in doc.get_values() {
-        let column_name = keys.iter().map(|k| k.get()).collect::<Vec<_>>().join(".");
-        let Value::InlineTable(it) = value else {
-            continue;
-        };
-
-        let (is_temp, lower) = if let Some(min) = get_toml_number(it, "cold", &column_name)? {
-            (true, min)
-        } else if let Some(min) = get_toml_number(it, "min", &column_name)? {
-            (false, min)
-        } else {
-            (false, f64::NEG_INFINITY)
-        };
-
-        let (is_temp, upper) = if let Some(max) = get_toml_number(it, "hot", &column_name)? {
-            (true, max)
-        } else if let Some(max) = get_toml_number(it, "max", &column_name)? {
-            (is_temp, max)
-        } else {
-            (is_temp, f64::INFINITY)
-        };
-
-        bounds.insert(column_name, (lower..=upper, is_temp));
-    }
-    Ok(bounds)
-}
-
-fn get_toml_number(it: &InlineTable, key: &str, _col: &str) -> io::Result<Option<f64>> {
-    let Some(value) = it.get(key) else {
-        return Ok(None);
-    };
-    match value {
-        Value::Float(x) => Ok(if x.clone().into_value().is_nan() {
-            None
-        } else {
-            Some(x.clone().into_value())
-        }),
-        Value::Integer(x) => Ok(Some(x.clone().into_value() as f64)),
-        _ => Ok(None),
-    }
-}
-
-fn bounds_color(
-    bounds: &HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
-    s: &str,
-    c: &str,
-    v: f64,
-) -> Color {
-    if v.is_nan() {
-        return Color::Yellow;
-    }
-    let key = format!("{}.{}", s, c);
-    let Some((range, is_temp)) = bounds.get(&key) else {
-        return Color::Reset;
-    };
-    if v < *range.start() {
-        if *is_temp {
-            Color::Blue
-        } else {
-            Color::Red
-        }
-    } else if v > *range.end() {
-        Color::Red
-    } else {
-        Color::Green
-    }
-}
-
-fn render_monitor_panel(f: &mut Frame, app: &mut App, area: Rect, now: Instant) {
-    let left_inner = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width.saturating_sub(1),
-        height: area.height,
-    };
-    let (lines, col_line_idx) = build_left_lines(app, now);
-    let total_lines = lines.len();
-    let view_h = left_inner.height as usize;
-
-    if app.follow_selection {
-        auto_scroll_to_selected(app, &col_line_idx, left_inner.height, total_lines);
-    }
-    let max_scroll = total_lines.saturating_sub(view_h);
-    app.scroll = (app.scroll as usize).min(max_scroll) as u16;
-
-    let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::NONE))
-        .scroll((app.scroll, 0));
-    f.render_widget(para, left_inner);
-    draw_scrollbar(f, area, total_lines, view_h, app.scroll as usize);
-}
-
-fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap<usize, usize>) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut col_line_idx: HashMap<usize, usize> = HashMap::new();
-
-    app.desc_width = app.desc_width.max(
-        app.last
-            .values()
-            .flat_map(|(s, _)| s.columns.iter())
-            .map(|c| c.desc.description.len())
-            .max()
-            .unwrap_or(0),
-    );
-
-    let routes = app.visible_routes();
-    if routes.is_empty() || app.last.is_empty() {
-        lines.push(Line::from("Waiting for data..."));
-        return (lines, col_line_idx);
-    }
-
-    let focused_device = app.current_device_index();
-    let mut global_idx = 0;
-
-    for (dev_idx, route) in routes.iter().enumerate() {
-        let dev_meta = app
-            .last
-            .iter()
-            .find(|((r, _), _)| r == route)
-            .map(|(_, (s, _))| s.device.as_ref());
-        let mut header_style = Style::default().add_modifier(Modifier::BOLD);
-        if dev_idx == focused_device {
-            header_style = header_style.add_modifier(Modifier::UNDERLINED);
-        }
-
-        let mut spans = Vec::new();
-        if let Some(d) = dev_meta {
-            spans.push(Span::styled(d.name.clone(), header_style));
-            if app.show_routes {
-                spans.push(Span::raw(format!(" [{}]", route)));
-            }
-            spans.push(Span::raw(format!(" Serial: {}", d.serial_number)));
-        } else {
-            spans.push(Span::styled("<device>", header_style));
-        }
-        lines.push(Line::from(spans));
-        lines.push(Line::from(""));
-
-        let mut stream_ids: Vec<_> = app
-            .last
-            .iter()
-            .filter(|((r, _), _)| r == route)
-            .map(|((_, sid), _)| *sid)
-            .collect();
-        stream_ids.sort();
-
-        for sid in stream_ids {
-            if let Some((sample, seen)) = app.last.get(&(route.clone(), sid)) {
-                let age = now.saturating_duration_since(*seen);
-                let base_style = if age > Duration::from_millis(1200) {
-                    Style::default().add_modifier(Modifier::DIM)
-                } else {
-                    Style::default()
-                };
-
-                for (_, col) in sample.columns.iter().enumerate() {
-                    let nav_idx = global_idx;
-                    col_line_idx.insert(nav_idx, lines.len());
-                    global_idx += 1;
-
-                    let (value_str, fval) = fmt_value(&col.value);
-                    let mut desc = col.desc.description.clone();
-                    if desc.len() < app.desc_width {
-                        desc.push_str(&" ".repeat(app.desc_width - desc.len()));
-                    }
-
-                    let is_selected = app.nav.idx == Some(nav_idx);
-                    let name_style = if is_selected {
-                        if app.show_plot {
-                            base_style.add_modifier(Modifier::BOLD)
-                        } else {
-                            base_style.add_modifier(Modifier::BOLD | Modifier::RAPID_BLINK)
-                        }
-                    } else {
-                        base_style
-                    };
-
-                    let mut value_style = base_style.add_modifier(Modifier::BOLD);
-                    let mut units_style = base_style.add_modifier(Modifier::BOLD);
-
-                    if let Some(bounds) = app.color_bounds.as_ref() {
-                        let stream_name = sample.stream.as_ref().name.as_str();
-                        let c = bounds_color(bounds, stream_name, col.desc.name.as_str(), fval);
-                        if c != Color::Reset {
-                            value_style = value_style.fg(c);
-                            units_style = units_style.fg(c);
-                        }
-                    }
-
-                    lines.push(Line::from(vec![
-                        Span::styled(desc, name_style),
-                        Span::raw("  "),
-                        Span::styled(value_str, value_style),
-                        Span::styled(col.desc.units.clone(), units_style),
-                    ]));
-                }
-            }
-        }
-        if dev_idx + 1 < routes.len() {
-            lines.push(Line::from(""));
-        }
-    }
-    (lines, col_line_idx)
-}
-
-fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, view_h: usize, pos: usize) {
-    if view_h == 0 || total <= view_h {
-        return;
-    }
-    let handle_h = (view_h * view_h / total).max(1);
-    let scrollable = total.saturating_sub(view_h).max(1);
-    let max_top = view_h.saturating_sub(handle_h);
-    let top = (pos * max_top) / scrollable;
-
-    let sb_area = Rect {
-        x: area.x + area.width.saturating_sub(1),
-        y: area.y,
-        width: 1,
-        height: area.height,
-    };
-    let mut lines = Vec::with_capacity(view_h);
-    for i in 0..view_h {
-        let ch = if i >= top && i < top + handle_h {
-            "█"
-        } else {
-            "│"
-        };
-        lines.push(Line::from(Span::styled(
-            ch,
-            Style::default().fg(Color::Gray),
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines), sb_area);
-}
-
-fn auto_scroll_to_selected(
-    app: &mut App,
-    col_line_idx: &HashMap<usize, usize>,
-    view_h: u16,
-    total_lines: usize,
-) {
-    let sel = match app.nav.idx {
-        Some(i) => i,
-        None => return,
-    };
-    let line = match col_line_idx.get(&sel) {
-        Some(&l) => l,
-        None => return,
-    };
-    let view_h = view_h as usize;
-    if view_h == 0 || total_lines <= view_h {
-        app.scroll = 0;
-        return;
-    }
-
-    let current = app.scroll as usize;
-    let bottom = current.saturating_add(view_h);
-    if line >= current && line < bottom {
-        return;
-    }
-
-    let half = view_h / 2;
-    let target = line.saturating_sub(half);
-    let max = total_lines.saturating_sub(view_h);
-    app.scroll = target.min(max) as u16;
-}
-
 fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
-    if let (Some(item), Some((desc, units))) = (app.current_item(), app.get_focused_channel_info()) {
-        
-        if app.show_fft {
+    if let (Some(item), Some((desc, units))) = (app.current_item(), app.get_focused_channel_info())
+    {
+        if app.view.show_fft {
             if let Some((sd_data, noise_floor)) = app.get_spectral_density_data() {
                 let title = format!(
                     "{} — {} (DC detrend {:.1}s) | Mean: {:.3e} {}/√Hz",
-                    item.route, desc, app.plot_window_seconds, noise_floor, units
+                    item.route, desc, app.view.plot_window_seconds, noise_floor, units
                 );
                 let block = Block::default().title(title).borders(Borders::ALL);
+
                 if !sd_data.is_empty() {
                     let log_data: Vec<(f64, f64)> = sd_data
                         .iter()
@@ -1439,6 +1309,7 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                     let ds: Vec<f64> = log_data.iter().map(|(_, d)| *d).collect();
                     let min_d = ds.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                     let max_d = ds.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+
                     let y_pad = if (max_d - min_d) > 0.1 {
                         (max_d - min_d) * 0.1
                     } else {
@@ -1448,9 +1319,10 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                     let dataset = Dataset::default()
                         .name(desc.as_str())
                         .marker(symbols::Marker::Braille)
-                        .style(Style::default().fg(Color::Red))
+                        .style(Style::default().fg(Color::Cyan))
                         .graph_type(GraphType::Line)
                         .data(&log_data);
+
                     let chart = Chart::new(vec![dataset])
                         .block(block)
                         .x_axis(
@@ -1484,15 +1356,17 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
         } else {
             let title = format!(
                 "{} — {} ({:.1}s)",
-                item.route, desc, app.plot_window_seconds
+                item.route, desc, app.view.plot_window_seconds
             );
             let block = Block::default().title(title).borders(Borders::ALL);
+
             if let Some((data, _, _)) = app.get_plot_data() {
                 let min_t = data.first().map(|(t, _)| *t).unwrap_or(0.0);
                 let max_t = data.last().map(|(t, _)| *t).unwrap_or(1.0);
                 let vs: Vec<f64> = data.iter().map(|(_, v)| *v).collect();
                 let min_v = vs.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                 let max_v = vs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+
                 let pad = if (max_v - min_v).abs() > 1e-10 {
                     (max_v - min_v) * 0.4
                 } else {
@@ -1505,6 +1379,7 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                     .style(Style::default().fg(Color::Green))
                     .graph_type(GraphType::Line)
                     .data(&data);
+
                 let chart = Chart::new(vec![dataset])
                     .block(block)
                     .x_axis(
@@ -1534,46 +1409,51 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn will_need_scrollbar(app: &App, viewport_height: u16) -> bool {
-    let routes = app.visible_routes();
-    if routes.is_empty() || app.last.is_empty() {
-        return false;
+fn fmt_value(v: &data::ColumnData) -> (String, f64) {
+    match v {
+        data::ColumnData::Float(x) => (format!("{:15.4}", x), *x as f64),
+        data::ColumnData::Int(x) => (format!("{:15}", x), *x as f64),
+        data::ColumnData::UInt(x) => (format!("{:15}", x), *x as f64),
+        _ => ("           type?".to_string(), f64::NAN),
     }
-    let mut line_count = 0;
-    for (idx, route) in routes.iter().enumerate() {
-        line_count += 2;
-        if app.show_routes {
-            line_count += 1;
-        }
-        let mut stream_ids: Vec<_> = app
-            .last
-            .iter()
-            .filter(|((r, _), _)| r == route)
-            .map(|((_, sid), _)| *sid)
-            .collect();
-        stream_ids.sort();
-        stream_ids.dedup();
-        for sid in stream_ids {
-            if let Some((sample, _)) = app.last.get(&(route.clone(), sid)) {
-                line_count += sample.columns.len();
-            }
-        }
-        if idx + 1 < routes.len() {
-            line_count += 1;
+}
+
+fn load_theme(path: &str) -> io::Result<Theme> {
+    let mut s = String::new();
+    File::open(path)?.read_to_string(&mut s)?;
+    let doc =
+        DocumentMut::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut bounds = HashMap::new();
+    for (k, v) in doc.get_values() {
+        let col = k.iter().map(|k| k.get()).collect::<Vec<_>>().join(".");
+        if let Value::InlineTable(it) = v {
+            let (t, min) = if let Some(v) = get_num(it, "cold") {
+                (true, v)
+            } else {
+                (false, get_num(it, "min").unwrap_or(f64::NEG_INFINITY))
+            };
+            let max = if let Some(v) = get_num(it, "hot") {
+                v
+            } else {
+                get_num(it, "max").unwrap_or(f64::INFINITY)
+            };
+            bounds.insert(col, (min..=max, t));
         }
     }
-    line_count > viewport_height as usize
+    Ok(Theme {
+        value_bounds: bounds,
+    })
+}
+fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
+    it.get(k)
+        .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
 }
 
 fn main() {
     let cli = Cli::parse();
     let proxy = tio::proxy::Interface::new(&cli.tio.root);
     let parent_route: DeviceRoute = cli.tio.parse_route();
-    let tree = DeviceTree::open(&proxy, parent_route.clone()).unwrap_or_else(|e| {
-        ratatui::restore();
-        eprintln!("Failed to open device tree: {e:?}");
-        std::process::exit(1);
-    });
+    let tree = DeviceTree::open(&proxy, parent_route.clone()).expect("Failed to open device tree");
 
     let (req_tx, req_rx) = channel::bounded::<DataReq>(1);
     let (resp_tx, resp_rx) = channel::bounded::<DataResp>(1);
@@ -1583,31 +1463,27 @@ fn main() {
     std::thread::spawn(move || run_data_thread(tree, req_rx, resp_tx, rpc_rx, rpc_resp_tx, 100000));
 
     let mut app = App::new(cli.all, &parent_route);
-
     if let Some(path) = &cli.colors {
-        match load_color_bounds(path) {
-            Ok(b) => app.color_bounds = Some(b),
-            Err(e) => {
-                eprintln!("Failed to load color config {}: {e}", path);
-                app.color_bounds = None;
-            }
+        if let Ok(theme) = load_theme(path) {
+            app.view.theme = theme;
+        } else {
+            eprintln!("Failed to load theme");
         }
     }
 
-    let mut terminal: Terminal<_> = ratatui::init();
-    let target_frame_time = Duration::from_millis(1_000 / cli.fps as u64);
-    let _ = terminal.hide_cursor();
+    let mut term = ratatui::init();
+    let frame_dur = Duration::from_millis(1000 / cli.fps as u64);
+    let _ = term.hide_cursor();
 
     'main: loop {
-        let frame_start = Instant::now();
-        while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
-            match event::read() {
-                Ok(ev) => {
-                    if handle_input_event(ev, &mut app, &rpc_tx) {
+        let start = Instant::now();
+        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            if let Ok(ev) = event::read() {
+                if let Some(act) = get_action(ev, &mut app) {
+                    if app.update(act, &rpc_tx) {
                         break 'main;
                     }
                 }
-                Err(_) => break 'main,
             }
         }
 
@@ -1615,62 +1491,47 @@ fn main() {
             all: app.all,
             parent_route: app.parent_route.clone(),
             selection: app.current_selection(),
-            seconds: app.plot_window_seconds,
+            seconds: app.view.plot_window_seconds,
         };
-        if let Err(channel::TrySendError::Disconnected(_)) = req_tx.try_send(req) {
+        if req_tx.try_send(req).is_err() {
             break 'main;
         }
-        let resp_opt = match resp_rx.try_recv() {
-            Ok(r) => Some(r),
-            Err(channel::TryRecvError::Empty) => None,
-            Err(channel::TryRecvError::Disconnected) => break 'main,
-        };
 
-        while let Ok(rpc_res) = rpc_resp_rx.try_recv() {
-            let (msg, color) = match rpc_res.result {
+        while let Ok(r) = resp_rx.try_recv() {
+            let now = Instant::now();
+            for (route, sid, sample) in r.last {
+                let key = (route, sid);
+                let seen = if let Some((prev, prev_seen)) = app.last.get(&key) {
+                    if prev.n == sample.n {
+                        *prev_seen
+                    } else {
+                        now
+                    }
+                } else {
+                    now
+                };
+                app.last.insert(key, (sample, seen));
+            }
+            app.window_aligned = r.window;
+            app.rebuild_nav_items();
+        }
+        while let Ok(res) = rpc_resp_rx.try_recv() {
+            let (msg, col) = match res.result {
                 Ok(s) => (format!("OK: {}", s), Color::Green),
                 Err(s) => (format!("ERR: {}", s), Color::Red),
             };
-            app.last_rpc_result = Some((msg, color));
+            app.last_rpc_result = Some((msg, col));
         }
 
-        if let Some(resp) = resp_opt {
-            let now = Instant::now();
-            for (route, sid, sample) in resp.last {
-                if !app.all && route != app.parent_route {
-                    continue;
-                }
-                let key = (route.clone(), sid);
-                let mut seen = now;
-                if let Some((prev_sample, prev_seen)) = app.last.get(&key) {
-                    if prev_sample.n == sample.n {
-                        seen = *prev_seen;
-                    }
-                }
-                app.desc_width = app.desc_width.max(
-                    sample
-                        .columns
-                        .iter()
-                        .map(|c| c.desc.description.len())
-                        .max()
-                        .unwrap_or(0),
-                );
-                app.last.insert(key, (sample, seen));
-            }
-            app.window_aligned = resp.window;
-            app.rebuild_nav_items();
-        }
         app.tick_blink();
-
-        if draw_ui(&mut terminal, &mut app).is_err() {
+        if draw_ui(&mut term, &mut app).is_err() {
             break 'main;
         }
 
-        let elapsed = frame_start.elapsed();
-        if elapsed < target_frame_time {
-            std::thread::sleep(target_frame_time - elapsed);
+        let elapsed = start.elapsed();
+        if elapsed < frame_dur {
+            std::thread::sleep(frame_dur - elapsed);
         }
     }
-
     ratatui::restore();
 }
