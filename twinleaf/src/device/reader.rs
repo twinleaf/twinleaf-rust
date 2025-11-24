@@ -14,10 +14,8 @@ use std::{
     time::Duration,
 };
 
-use crate::device::{
-    buffer::{AlignedWindow, Buffer, ReadError},
-    ColumnSpec, CursorPosition, StreamKey,
-};
+use crate::device::{ColumnSpec, CursorPosition, StreamKey};
+use crate::data::{AlignedWindow, Buffer, ReadError}; 
 
 pub struct Reader {
     buffer: Arc<RwLock<Buffer>>,

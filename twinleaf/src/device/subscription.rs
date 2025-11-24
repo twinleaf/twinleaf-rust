@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
 };
 
-use crate::device::{buffer::AlignedWindow, Buffer, ColumnSpec, SubscriptionId};
+use crate::device::{ColumnSpec, SubscriptionId};
+use crate::data::{AlignedWindow, Buffer}; 
 
 pub struct SubscriptionManager {
     pub buffer: Buffer,

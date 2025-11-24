@@ -1,4 +1,4 @@
-use crate::device::buffer::{AlignedWindow, ColumnBatch};
+use crate::data::buffer::{AlignedWindow, ColumnBatch};
 use crate::device::{ColumnSpec, StreamKey};
 use crate::tio::proto::meta::{ColumnMetadata, SegmentMetadata};
 use hdf5::{File, Result, H5Type};

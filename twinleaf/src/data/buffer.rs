@@ -7,9 +7,9 @@
 //! 3. Sample numbers are independent between `Device`s
 
 use crate::{
-    data::{ColumnData, Sample},
+    data::{ColumnData, Sample, util},
     device::{
-        ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId, StreamId, StreamKey, util
+        ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId, StreamId, StreamKey
     },
     tio::proto::{
             BufferType, DeviceRoute, meta::{ColumnMetadata, SegmentMetadata, StreamMetadata}

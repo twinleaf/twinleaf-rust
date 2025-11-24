@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::num::ParseFloatError;
 use std::time::{Duration, Instant, SystemTime};
-use twinleaf::device::{Buffer, BufferEvent, DeviceTree, StreamKey};
+use twinleaf::device::{DeviceTree, StreamKey};
+use twinleaf::data::{Buffer, BufferEvent};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
 
