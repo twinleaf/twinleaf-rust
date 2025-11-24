@@ -8,6 +8,10 @@ homepage = "https://twinleaf.com"
 repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
+[features]
+default = []
+hdf5 = ["twinleaf/hdf5"]
+
 [dependencies]
 chrono = "0.4.38"
 crossbeam = "0.8.4"
@@ -17,5 +21,5 @@ twinleaf = {version = "1.3.4", path = "../twinleaf" }
 time = {version = "0.3.44", features = ["local-offset", "macros", "formatting"]}
 clap = { version = "4.5.51", features = ["derive"] }
 ratatui = "0.29.0"
-welch-sde = "0.1.0"
 tui-prompts = "0.5.2"
+welch-sde = "0.1.0"
