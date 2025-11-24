@@ -33,6 +33,7 @@ enum Commands {
         #[command(flatten)]
         tio: TioOpts,
     },
+
     /// Execute an RPC on the device
     Rpc {
         #[command(flatten)]
@@ -70,7 +71,7 @@ enum Commands {
         /// RPC name to dump
         rpc_name: String,
 
-        /// Trigger and dump a capture buffer
+        /// Trigger a capture before dumping
         #[arg(long)]
         capture: bool,
     },
@@ -85,13 +86,12 @@ enum Commands {
         depth: Option<usize>,
     },
 
-    /// Log samples to a file, by default including metadata.
-    /// Use --raw to skip metadata request and dump raw packets.
+    /// Log samples to a file (includes metadata by default)
     Log {
         #[command(flatten)]
         tio: TioOpts,
 
-        /// Path of file where to log the data
+        /// Output log file path
         #[arg(short = 'f', default_value_t = default_log_path())]
         file: String,
 
@@ -99,7 +99,7 @@ enum Commands {
         #[arg(short = 'u')]
         unbuffered: bool,
 
-        /// Raw mode: Dumps all packets read
+        /// Raw mode: skip metadata request and dump all packets
         #[arg(long)]
         raw: bool,
 
@@ -113,42 +113,57 @@ enum Commands {
         #[command(flatten)]
         tio: TioOpts,
 
-        /// Path of file where to store the metadata
+        /// Output metadata file path
         #[arg(short = 'f', default_value = "meta.tio")]
         file: String,
     },
 
-    /// Dump logged packets from file(s)
+    /// Dump packets from binary log file(s)
     LogDump {
-        /// Log file paths
+        /// Input log file(s)
         files: Vec<String>,
     },
 
-    /// Dump logged data from file(s)
+    /// Dump parsed data from binary log file(s)
     LogDataDump {
-        /// Log file paths
+        /// Input log file(s)
         files: Vec<String>,
     },
 
-    /// Convert logged data to CSV
+    /// Convert binary log data to CSV
     LogCsv {
         /// Stream ID (e.g., 1) or Name (e.g., "vector", "field")
         stream: String,
 
-        /// Log file paths (first file after stream_id)
+        /// Input log file(s)
         files: Vec<String>,
 
-        /// Sensor path in the sensor tree (default /)
+        /// Sensor route in the device tree (default: /)
         #[arg(short = 's')]
         sensor: Option<String>,
 
-        /// Metadata file (if separate)
+        /// External metadata file path (optional)
         #[arg(short = 'm')]
         metadata: Option<String>,
 
-        /// Output file prefix
+        /// Output filename prefix
         #[arg(short = 'o')]
         output: Option<String>,
+    },
+
+    /// Convert binary log files to HDF5 format
+    #[cfg(feature = "hdf5")]
+    LogHdf {
+        /// Input log file(s)
+        files: Vec<String>,
+
+        /// Output file path
+        #[arg(short = 'o', default_value = "output.h5")]
+        output: String,
+
+        /// Filter streams using a glob pattern (e.g. "/*/vector")
+        #[arg(short = 'g', long = "glob")]
+        filter: Option<String>,
     },
 
     /// Upgrade device firmware
@@ -156,7 +171,7 @@ enum Commands {
         #[command(flatten)]
         tio: TioOpts,
 
-        /// Firmware image path
+        /// Input firmware image path
         firmware_path: String,
     },
 
@@ -166,7 +181,7 @@ enum Commands {
         tio: TioOpts,
     },
 
-    /// Dump data samples from all devices in tree
+    /// Dump data samples from all devices in the tree
     DataDumpAll {
         #[command(flatten)]
         tio: TioOpts,
@@ -770,6 +785,132 @@ fn log_csv(
     Ok(())
 }
 
+#[cfg(feature = "hdf5")]
+fn log_hdf(files: Vec<String>, output: String, filter: Option<String>) -> Result<(), ()> {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use twinleaf::device::{Buffer, ColumnSpec};
+    use twinleaf::data::{export, ColumnFilter, DeviceDataParser};
+    use twinleaf::tio;
+
+    let col_filter = if let Some(p) = filter {
+        match ColumnFilter::new(&p) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("{}", e);
+                return Err(());
+            }
+        }
+    } else {
+        None
+    };
+
+    let (tx, _rx) = crossbeam::channel::unbounded();
+    let mut buffer = Buffer::new(tx, usize::MAX, false); 
+
+    let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
+    let ignore_session = files.len() > 1;
+    {
+        println!("Loading {} file(s) into memory...", files.len());
+
+        for path in files {
+            let mut rest: &[u8] = &std::fs::read(&path).map_err(|e| {
+                eprintln!("Failed to read file '{}': {:?}", path, e);
+            })?;
+
+            while rest.len() > 0 {
+                let (pkt, len) = match tio::Packet::deserialize(rest) {
+                    Ok(res) => res,
+                    Err(_) => break, // Stop on EOF/Corruption
+                };
+                rest = &rest[len..];
+
+                let parser = parsers
+                    .entry(pkt.routing.clone())
+                    .or_insert_with(|| DeviceDataParser::new(ignore_session));
+
+                for sample in parser.process_packet(&pkt) {
+                    buffer.process_sample(sample, pkt.routing.clone());
+                }
+            }
+        }
+    }
+
+    let mut columns_to_export = Vec::new();
+    
+    for (stream_key, segment) in &buffer.active_segments {
+        let (route, stream_id) = stream_key;
+        let stream_name = &segment.buffer.stream_metadata.name;
+
+        for (&col_id, col_buffer) in &segment.buffer.columns {
+            
+            let meta = col_buffer.metadata();
+            let col_name = &meta.name;
+
+            let include = match &col_filter {
+                Some(f) => {
+                    let is_match = f.matches(route, stream_name, col_name);
+                    let path_checked = f.get_path_string(route, stream_name, col_name);
+                    println!("Checked '{}' vs Glob -> {}", path_checked, is_match);
+                    
+                    is_match
+                },
+                None => true,
+            };
+
+            if include {
+                columns_to_export.push(ColumnSpec {
+                    route: route.clone(),
+                    stream_id: *stream_id,
+                    column_id: col_id,
+                });
+            }
+        }
+    }
+
+    if columns_to_export.is_empty() {
+        eprintln!("No data matched the filter (or log file is empty).");
+        return Err(());
+    }
+
+    println!("Aligning {} columns (scanning for gaps)...", columns_to_export.len());
+
+    match buffer.read_aligned_tail(&columns_to_export) {
+        Ok(window) => {
+            let start = window.timestamps.first().unwrap_or(&0.0);
+            let end = window.timestamps.last().unwrap_or(&0.0);
+            let duration = end - start;
+            
+            println!(
+                "Exporting {:.2}s of data ({} samples) to '{}'", 
+                duration, 
+                window.timestamps.len(), 
+                output
+            );
+
+            if let Err(e) = export::export_window(Path::new(&output), &window) {
+                eprintln!("HDF5 Write Failed: {:?}", e);
+                return Err(());
+            }
+            
+            println!("Success.");
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("Alignment Failed: {:?}", e);
+            Err(())
+        }
+    }
+}
+
+#[cfg(not(feature = "hdf5"))]
+fn log_hdf(_files: Vec<String>, _output: String, _filter: Option<String>) -> Result<(), ()> {
+    eprintln!("Error: This version of tio-tool was compiled without HDF5 support.");
+    eprintln!("To enable it, recompile with:");
+    eprintln!("  cargo install --path . --features hdf5 --force");
+    Err(())
+}
+
 fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> {
     let firmware_data = std::fs::read(firmware_path).unwrap();
 
@@ -906,6 +1047,8 @@ fn main() -> ExitCode {
             metadata,
             output,
         } => log_csv(stream, files, sensor, metadata, output),
+        #[cfg(feature = "hdf5")]
+        Commands::LogHdf { files, output , filter} => log_hdf(files, output, filter),
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
         Commands::DataDump { tio } => data_dump(&tio),
         Commands::DataDumpAll { tio } => data_dump_all(&tio),
