@@ -2,6 +2,7 @@ use crate::tio;
 
 use std::sync::Arc;
 use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
+use tio::proto::identifiers::SampleNumber;
 
 #[derive(Debug, Clone)]
 pub enum ColumnData {
@@ -90,7 +91,7 @@ impl Column {
 
 #[derive(Debug, Clone)]
 pub struct Sample {
-    pub n: u32,
+    pub n: SampleNumber,
     pub columns: Vec<Column>,
     pub segment: Arc<SegmentMetadata>,
     pub stream: Arc<StreamMetadata>,

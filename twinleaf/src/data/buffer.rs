@@ -6,15 +6,14 @@
 //! 2. Sample rates of columns sharing the same name are the same
 //! 3. Sample numbers are independent between `Device`s
 
-use crate::{
-    data::{ColumnData, Sample, util},
-    device::{
-        ColumnId, ColumnSpec, CursorPosition, SampleNumber, SegmentId, SessionId, StreamId, StreamKey
-    },
-    tio::proto::{
-            BufferType, DeviceRoute, meta::{ColumnMetadata, SegmentMetadata, StreamMetadata}
-        },
+use crate::data::{ColumnData, Sample, util};
+use crate::device::CursorPosition;
+use crate::tio::proto::identifiers::*;
+use crate::tio::proto::{
+    BufferType, DeviceRoute, 
+    StreamMetadata, SegmentMetadata, ColumnMetadata
 };
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -31,10 +30,10 @@ pub enum ColumnBatch {
 pub struct AlignedWindow {
     pub sample_numbers: Vec<SampleNumber>,
     pub timestamps: Vec<f64>,
-    pub columns: HashMap<ColumnSpec, ColumnBatch>,
+    pub columns: HashMap<ColumnKey, ColumnBatch>,
     pub stream_metadata: HashMap<StreamKey, Arc<StreamMetadata>>,
     pub segment_metadata: HashMap<StreamKey, Arc<SegmentMetadata>>,
-    pub column_metadata: HashMap<ColumnSpec, Arc<ColumnMetadata>>,
+    pub column_metadata: HashMap<ColumnKey, Arc<ColumnMetadata>>,
     pub session_ids: HashMap<StreamKey, SessionId>,
 }
 
@@ -111,7 +110,7 @@ pub enum ReadError {
         rates: Vec<f64>,
     },
     SegmentMismatch {
-        column_specs: Vec<ColumnSpec>,
+        column_specs: Vec<ColumnKey>,
         segments: Vec<(SessionId, SegmentId)>,
     },
     SegmentChanged {
@@ -237,7 +236,7 @@ impl SegmentBuffer {
 
         if available == 0 {
             return Err(ReadError::InsufficientData {
-                stream_key: (DeviceRoute::root(), 0),
+                stream_key: StreamKey::new(DeviceRoute::root(), 0),
                 requested: n,
                 available: 0,
             });
@@ -282,7 +281,7 @@ impl SegmentBuffer {
                 columns_data.insert(col_id, batch);
             } else {
                 return Err(ReadError::ColumnNotFound {
-                    stream_key: (DeviceRoute::root(), 0),
+                    stream_key: StreamKey::new(DeviceRoute::root(), 0),
                     column_id: col_id,
                 });
             }
@@ -303,7 +302,7 @@ impl SegmentBuffer {
     ) -> Result<SegmentWindow, ReadError> {
         if self.sample_numbers.is_empty() {
             return Err(ReadError::InsufficientData {
-                stream_key: (DeviceRoute::root(), 0),
+                stream_key: StreamKey::new(DeviceRoute::root(), 0),
                 requested: count,
                 available: 0,
             });
@@ -317,7 +316,7 @@ impl SegmentBuffer {
         let earliest_sample = self.sample_numbers.front().copied().unwrap();
         if start_sample < earliest_sample {
             return Err(ReadError::CursorOutOfBuffer {
-                stream_key: (DeviceRoute::root(), 0),
+                stream_key: StreamKey::new(DeviceRoute::root(), 0),
                 cursor_sample: start_sample,
                 earliest_available: earliest_sample,
             });
@@ -326,7 +325,7 @@ impl SegmentBuffer {
         if start_idx + count > self.sample_numbers.len() {
             let available = self.sample_numbers.len().saturating_sub(start_idx);
             return Err(ReadError::InsufficientData {
-                stream_key: (DeviceRoute::root(), 0),
+                stream_key: StreamKey::new(DeviceRoute::root(), 0),
                 requested: count,
                 available: available,
             });
@@ -351,7 +350,7 @@ impl SegmentBuffer {
 
         for &col_id in column_ids {
             let col_buffer = self.columns.get(&col_id).ok_or(ReadError::ColumnNotFound {
-                stream_key: (DeviceRoute::root(), 0),
+                stream_key: StreamKey::new(DeviceRoute::root(), 0),
                 column_id: col_id,
             })?;
 
@@ -425,7 +424,7 @@ impl Buffer {
         let stream_id = sample.stream.stream_id;
         let session_id = sample.device.session_id;
         let segment_id = sample.segment.segment_id;
-        let stream_key = (route.clone(), stream_id);
+        let stream_key = StreamKey::new(route.clone(), stream_id);
 
         let needs_new_segment = match self.active_segments.get(&stream_key) {
             None => true,
@@ -521,14 +520,14 @@ impl Buffer {
 
     pub fn read_aligned_window(
         &self,
-        columns: &[ColumnSpec],
+        columns: &[ColumnKey],
         n_samples: usize,
     ) -> Result<AlignedWindow, ReadError> {
         if columns.is_empty() {
             return Err(ReadError::NoColumnsRequested);
         }
 
-        let mut by_stream: HashMap<StreamKey, Vec<&ColumnSpec>> = HashMap::new();
+        let mut by_stream: HashMap<StreamKey, Vec<&ColumnKey>> = HashMap::new();
         for col_spec in columns {
             by_stream
                 .entry(col_spec.stream_key())
@@ -551,7 +550,7 @@ impl Buffer {
             let window = active
                 .buffer
                 .get_latest_n(n_samples, &column_ids)
-                .map_err(|e| Self::contextualize_error(e, stream_key))?;
+                .map_err(|e| Self::contextualize_error(e, &stream_key))?;
 
             stream_metadata.insert(stream_key.clone(), active.buffer.stream_metadata.clone());
 
@@ -579,7 +578,7 @@ impl Buffer {
 
     pub fn read_from_cursor(
         &self,
-        columns: &[ColumnSpec],
+        columns: &[ColumnKey],
         cursors: &HashMap<StreamKey, CursorPosition>,
         n_samples: usize,
     ) -> Result<AlignedWindow, ReadError> {
@@ -642,11 +641,11 @@ impl Buffer {
 
     pub fn read_aligned_tail(
         &self,
-        columns: &[ColumnSpec],
+        columns: &[ColumnKey],
     ) -> Result<AlignedWindow, ReadError> {
         if columns.is_empty() { return Err(ReadError::NoColumnsRequested); }
 
-        let mut by_stream: HashMap<StreamKey, Vec<&ColumnSpec>> = HashMap::new();
+        let mut by_stream: HashMap<StreamKey, Vec<&ColumnKey>> = HashMap::new();
         for col in columns {
             by_stream.entry(col.stream_key()).or_default().push(col);
         }
@@ -692,7 +691,7 @@ impl Buffer {
 
         if global_start >= global_end {
              return Err(ReadError::InsufficientData { 
-                 stream_key: (crate::tio::proto::DeviceRoute::root(), 0), 
+                 stream_key: StreamKey::new(DeviceRoute::root(), 0),
                  requested: 0, available: 0 
              });
         }

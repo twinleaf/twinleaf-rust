@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::{data::{AlignedWindow, ReadError, buffer::{ActiveSegment, SegmentWindow}}, device::{ColumnSpec, StreamKey}};
+use crate::data::buffer::{AlignedWindow, ReadError, ActiveSegment, SegmentWindow};
+use crate::tio::proto::identifiers::{ColumnKey, StreamKey};
 
 pub fn validate_sampling_rates(
     stream_windows: &HashMap<StreamKey, (SegmentWindow, &ActiveSegment)>,
@@ -62,7 +63,7 @@ pub fn validate_stream_alignment(
 
 pub fn merge_windows(
     stream_windows: HashMap<StreamKey, (SegmentWindow, &ActiveSegment)>,
-    by_stream: HashMap<StreamKey, Vec<&ColumnSpec>>,
+    by_stream: HashMap<StreamKey, Vec<&ColumnKey>>,
 ) -> Result<AlignedWindow, ReadError> {
     let (first_window, _) = stream_windows.values().next().unwrap();
     

@@ -1,5 +1,5 @@
 use crate::data::buffer::{AlignedWindow, ColumnBatch};
-use crate::device::{ColumnSpec, StreamKey};
+use crate::tio::proto::identifiers::{ColumnKey, StreamKey};
 use crate::tio::proto::meta::{ColumnMetadata, SegmentMetadata};
 use hdf5::{File, Result, H5Type};
 use hdf5::types::VarLenUnicode;
@@ -9,20 +9,19 @@ use std::path::Path;
 pub fn export_window(path: &Path, window: &AlignedWindow) -> Result<()> {
     let file = File::create(path)?;
 
-    let mut columns_by_stream: HashMap<StreamKey, Vec<&ColumnSpec>> = HashMap::new();
+    let mut columns_by_stream: HashMap<StreamKey, Vec<&ColumnKey>> = HashMap::new();
+
     for spec in window.columns.keys() {
         columns_by_stream.entry(spec.stream_key()).or_default().push(spec);
     }
 
     for (stream_key, col_specs) in columns_by_stream {
-        let (route, stream_id) = &stream_key;
-
-        let raw_route = route.to_string();
+        let raw_route = stream_key.route.to_string();
         let route_str = raw_route.trim_start_matches('/');
         
         let stream_name = window.stream_metadata.get(&stream_key)
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("stream_{}", stream_id));
+            .unwrap_or_else(|| format!("stream_{}", stream_key.stream_id));
 
         let group_path = format!("/{}/{}", route_str, stream_name);
         let group = file.create_group(&group_path)?;
