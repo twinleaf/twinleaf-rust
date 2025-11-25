@@ -10,4 +10,4 @@ pub mod export;
 pub use filter::ColumnFilter;
 pub use parser::{DeviceDataParser, DeviceFullMetadata};
 pub use sample::{Column, ColumnData, Sample};
-pub use buffer::{Buffer, BufferEvent, AlignedWindow, ColumnBatch, ReadError};
+pub use buffer::{Buffer, BufferEvent, AlignedWindow, ColumnBatch, ReadError, OverflowPolicy};
