@@ -23,3 +23,5 @@ clap = { version = "4.5.51", features = ["derive"] }
 ratatui = "0.29.0"
 tui-prompts = "0.5.2"
 welch-sde = "0.1.0"
+memmap2 = "0.9.9"
+indicatif = "0.18.3"

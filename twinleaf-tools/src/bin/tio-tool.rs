@@ -164,6 +164,10 @@ enum Commands {
         #[arg(short = 'g', long = "glob")]
         filter: Option<String>,
 
+        /// Enable deflate compression (saves space, slows down write significantly)
+        #[arg(short = 'c', long = "compress")]
+        compress: bool,
+
         /// Enable debug output for glob matching
         #[arg(short = 'd', long)]
         debug: bool,
@@ -789,125 +793,126 @@ fn log_csv(
 }
 
 #[cfg(feature = "hdf5")]
-fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, debug: bool) -> Result<(), ()> {
+fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress: bool, debug: bool) -> Result<(), ()> {
     use std::collections::HashMap;
     use std::path::Path;
-    use twinleaf::tio::proto::identifiers::ColumnKey;
-    use twinleaf::data::{Buffer, export, ColumnFilter, DeviceDataParser};
+    use std::fs::File;
+    use memmap2::Mmap;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use twinleaf::data::{Buffer, BufferEvent, export, ColumnFilter, DeviceDataParser, OverflowPolicy};
     use twinleaf::tio;
 
-    let col_filter = if let Some(p) = filter {
-        match ColumnFilter::new(&p) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                eprintln!("{}", e);
-                return Err(());
+    let (tx, rx) = crossbeam::channel::bounded(100);
+    let output_for_thread = output.clone();
+
+    // Spawn the Writer Thread
+    let writer_handle = std::thread::spawn(move || {
+        let mut writer = export::Hdf5Appender::new(Path::new(&output_for_thread), compress, debug)
+            .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))
+            .expect("Writer init failed");
+
+        let col_filter = if let Some(p) = filter {
+            match ColumnFilter::new(&p) {
+                Ok(f) => Some(f),
+                Err(e) => { eprintln!("Filter error: {}", e); return writer.stats; }
             }
-        }
-    } else {
-        None
-    };
+        } else { None };
 
-    let (tx, _rx) = crossbeam::channel::unbounded();
-    let mut buffer = Buffer::new(tx, usize::MAX, false); 
-
-    let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
-    let ignore_session = files.len() > 1;
-    {
-        println!("Loading {} file(s) into memory...", files.len());
-
-        for path in files {
-            let mut rest: &[u8] = &std::fs::read(&path).map_err(|e| {
-                eprintln!("Failed to read file '{}': {:?}", path, e);
-            })?;
-
-            while rest.len() > 0 {
-                let (pkt, len) = match tio::Packet::deserialize(rest) {
-                    Ok(res) => res,
-                    Err(_) => break, // Stop on EOF/Corruption
-                };
-                rest = &rest[len..];
-
-                let parser = parsers
-                    .entry(pkt.routing.clone())
-                    .or_insert_with(|| DeviceDataParser::new(ignore_session));
-
-                for sample in parser.process_packet(&pkt) {
-                    buffer.process_sample(sample, pkt.routing.clone());
-                }
-            }
-        }
-    }
-
-    let mut columns_to_export = Vec::new();
-    
-    for (stream_key, segment) in &buffer.active_segments {
-        let route = &stream_key.route;
-        let stream_id = stream_key.stream_id;
-        let stream_name = &segment.buffer.stream_metadata.name;
-
-        for (&col_id, col_buffer) in &segment.buffer.columns {
-            
-            let meta = col_buffer.metadata();
-            let col_name = &meta.name;
-
-            let include = match &col_filter {
-                Some(f) => {
-                    let is_match = f.matches(route, stream_name, col_name);
-                    
+        while let Ok(event) = rx.recv() {
+            match event {
+                BufferEvent::DataChunk { slice, is_first_chunk: _ } => {
                     if debug {
-                        let path_checked = f.get_path_string(route, stream_name, col_name);
-                        println!("Checked '{}' vs Glob -> {}", path_checked, is_match);
+                        println!("[DEBUG] Writing chunk: {} samples", slice.len());
                     }
                     
-                    is_match
+                    if let Err(e) = writer.write_slice(&slice, &col_filter) {
+                        eprintln!("HDF5 Write Error: {:?}", e);
+                        break; 
+                    }
                 },
-                None => true,
+                _ => {} 
+            }
+        }
+        writer.stats
+    });
+
+    let mut buffer = Buffer::new(tx, 65_536, false, OverflowPolicy::Flush); 
+    let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
+    let ignore_session = files.len() > 1;
+
+    println!("Processing {} files...", files.len());
+
+    for path in &files {
+        let file = File::open(&path).map_err(|e| eprintln!("Open failed: {:?}", e)).unwrap();
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| eprintln!("Mmap failed: {:?}", e)).unwrap();
+        
+        let total_bytes = mmap.len() as u64;
+        let pb = ProgressBar::new(total_bytes);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})").unwrap()
+            .progress_chars("#>-"));
+        pb.set_message(path.clone());
+
+        let mut rest: &[u8] = &mmap[..];
+        let mut iteration = 0;
+
+        while !rest.is_empty() {
+            iteration += 1;
+            if iteration % 1000 == 0 {
+                if writer_handle.is_finished() {
+                    writer_handle.join().expect("Writer thread crashed");
+                    return Err(());
+                }
+            }
+
+            let (pkt, len) = match tio::Packet::deserialize(rest) {
+                Ok(res) => res,
+                Err(_) => break,
             };
+            rest = &rest[len..];                
+            pb.set_position(total_bytes - rest.len() as u64);
 
-            if include {
-                columns_to_export.push(ColumnKey {
-                    route: route.clone(),
-                    stream_id: stream_id,
-                    column_id: col_id,
-                });
+            let parser = parsers
+                .entry(pkt.routing.clone())
+                .or_insert_with(|| DeviceDataParser::new(ignore_session));
+
+            for sample in parser.process_packet(&pkt) {
+                buffer.process_sample(sample, pkt.routing.clone());
             }
         }
+        pb.finish_with_message("Completed");
     }
 
-    if columns_to_export.is_empty() {
-        eprintln!("No data matched the filter (or log file is empty).");
-        return Err(());
-    }
+    println!("Flushing buffer and waiting for writer...");
+    buffer.flush_all(); 
+    drop(buffer);
 
-    println!("Aligning {} columns (scanning for gaps)...", columns_to_export.len());
+    let stats = writer_handle.join().unwrap();
+    
+    let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+    let duration = stats.end_time.unwrap_or(0.0) - stats.start_time.unwrap_or(0.0);
+    let size_mb = file_size as f64 / 1_048_576.0;
 
-    match buffer.read_aligned_tail(&columns_to_export) {
-        Ok(window) => {
-            let start = window.timestamps.first().unwrap_or(&0.0);
-            let end = window.timestamps.last().unwrap_or(&0.0);
-            let duration = end - start;
-            
-            println!(
-                "Exporting {:.2}s of data ({} samples) to '{}'", 
-                duration, 
-                window.timestamps.len(), 
-                output
-            );
-
-            if let Err(e) = export::export_window(Path::new(&output), &window) {
-                eprintln!("HDF5 Write Failed: {:?}", e);
-                return Err(());
-            }
-            
-            println!("Success.");
-            Ok(())
-        },
-        Err(e) => {
-            eprintln!("Alignment Failed: {:?}", e);
-            Err(())
+    println!("\n--------------------------------------------------");
+    println!(" Export Summary");
+    println!("--------------------------------------------------");
+    println!(" Output File:     {}", output);
+    println!(" File Size:       {:.2} MB", size_mb);
+    println!(" Duration:        {:.3} s", duration);
+    println!(" Total Samples:   {}", stats.total_samples);
+    println!(" Streams Written: {}", stats.streams_written.len());
+    
+    if !stats.streams_written.is_empty() {
+        println!("\n Active Streams:");
+        let mut streams: Vec<_> = stats.streams_written.into_iter().collect();
+        streams.sort();
+        for stream in streams {
+            println!("  • {}", stream);
         }
     }
+    println!("--------------------------------------------------");
+    
+    Ok(())
 }
 
 #[cfg(not(feature = "hdf5"))]
@@ -1055,7 +1060,9 @@ fn main() -> ExitCode {
             output,
         } => log_csv(stream, files, sensor, metadata, output),
         #[cfg(feature = "hdf5")]
-        Commands::LogHdf { files, output, filter, debug } => log_hdf(files, output, filter, debug),
+        Commands::LogHdf { files, output, filter, compress, debug } => {
+            log_hdf(files, output, filter, compress, debug)
+        },
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
         Commands::DataDump { tio } => data_dump(&tio),
         Commands::DataDumpAll { tio } => data_dump_all(&tio),
