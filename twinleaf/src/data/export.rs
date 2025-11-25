@@ -1,88 +1,249 @@
-use crate::data::buffer::{AlignedWindow, ColumnBatch};
-use crate::tio::proto::identifiers::{ColumnKey, StreamKey};
-use crate::tio::proto::meta::{ColumnMetadata, SegmentMetadata};
-use hdf5::{File, Result, H5Type};
-use hdf5::types::VarLenUnicode;
-use std::collections::HashMap;
+use crate::data::buffer::{DataSlice, ColumnBatch};
+use crate::data::ColumnFilter;
+use hdf5::{File, Result, H5Type, Dataset, SimpleExtents, Group, Location};
+use hdf5::filters::{Blosc, BloscShuffle};
+use hdf5::types::VarLenUnicode; 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-pub fn export_window(path: &Path, window: &AlignedWindow) -> Result<()> {
-    let file = File::create(path)?;
+#[derive(Debug, Clone)]
+pub struct ExportStats {
+    pub total_samples: u64,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+    pub streams_written: HashSet<String>,
+}
 
-    let mut columns_by_stream: HashMap<StreamKey, Vec<&ColumnKey>> = HashMap::new();
-
-    for spec in window.columns.keys() {
-        columns_by_stream.entry(spec.stream_key()).or_default().push(spec);
+impl Default for ExportStats {
+    fn default() -> Self {
+        Self {
+            total_samples: 0,
+            start_time: None,
+            end_time: None,
+            streams_written: HashSet::new(),
+        }
     }
+}
 
-    for (stream_key, col_specs) in columns_by_stream {
-        let raw_route = stream_key.route.to_string();
-        let route_str = raw_route.trim_start_matches('/');
-        
-        let stream_name = window.stream_metadata.get(&stream_key)
-            .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("stream_{}", stream_key.stream_id));
+pub struct Hdf5Appender {
+    file: File,
+    datasets: HashMap<String, Dataset>,
+    compress: bool,
+    debug: bool,
+    seen_debug: HashSet<String>,
+    pub stats: ExportStats,
+}
 
-        let group_path = format!("/{}/{}", route_str, stream_name);
-        let group = file.create_group(&group_path)?;
-
-        if let Some(seg_meta) = window.segment_metadata.get(&stream_key) {
-            write_segment_attributes(&group, seg_meta)?;
+impl Hdf5Appender {
+    pub fn new(path: &Path, compress: bool, debug: bool) -> Result<Self> {
+        if path.exists() {
+            panic!("Refusing to overwrite existing file: {:?}", path);
         }
 
-        let time_ds = group.new_dataset::<f64>()
-            .shape((window.timestamps.len(),))
-            .chunk((window.timestamps.len(),)) 
-            .deflate(3)
-            .create("time")?;
-        time_ds.write(&window.timestamps)?;
+        let file = File::create(path)?;
+        
+        Ok(Self {
+            file,
+            datasets: HashMap::new(),
+            compress,
+            debug,
+            seen_debug: HashSet::new(),
+            stats: ExportStats::default(),
+        })
+    }
 
-        for spec in col_specs {
-            if let Some(batch) = window.columns.get(spec) {
-                let col_meta = window.column_metadata.get(spec);
-                let dataset_name = col_meta
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| format!("col_{}", spec.column_id));
+    pub fn write_slice(&mut self, slice: &DataSlice, filter: &Option<ColumnFilter>) -> Result<()> {
+        if slice.is_empty() {
+            return Ok(());
+        }
 
-                match batch {
-                    ColumnBatch::F64(data) => write_ds(&group, &dataset_name, data, col_meta)?,
-                    ColumnBatch::I64(data) => write_ds(&group, &dataset_name, data, col_meta)?,
-                    ColumnBatch::U64(data) => write_ds(&group, &dataset_name, data, col_meta)?,
+        let route_str = slice.stream_key.route.to_string().trim_start_matches('/').to_string();
+        let stream_name = &slice.stream_metadata.name; 
+
+        // 1. Identify valid columns BEFORE writing anything to disk.
+        //    This prevents empty groups or timestamps for filtered-out streams (like IMUs).
+        let mut valid_columns = Vec::new();
+
+        for (col_id, batch) in &slice.columns {
+            // Extract metadata if available
+            let (name, units, desc) = if let Some(meta) = slice.column_metadata.get(col_id) {
+                (meta.name.clone(), Some(meta.units.clone()), Some(meta.description.clone()))
+            } else {
+                (format!("col_{}", col_id), None, None)
+            };
+
+            // Apply Filter
+            if let Some(f) = filter {
+                let path_check = f.get_path_string(&slice.stream_key.route, stream_name, &name);
+                
+                if self.debug && !self.seen_debug.contains(&path_check) {
+                    let is_match = f.matches(&slice.stream_key.route, stream_name, &name);
+                    println!("[DEBUG] Filter Check: '{}' -> {}", path_check, is_match);
+                    self.seen_debug.insert(path_check);
+                }
+
+                if !f.matches(&slice.stream_key.route, stream_name, &name) {
+                    continue; 
                 }
             }
+            valid_columns.push((col_id, batch, name, units, desc));
         }
+
+        // 2. If no columns matched the filter, abort immediately.
+        if valid_columns.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Create Group and Write Metadata (Only runs if we have data)
+        let group_path = format!("/{}/{}_{}/{}", 
+            route_str, 
+            slice.session_id, 
+            slice.segment_id, 
+            stream_name
+        );
+
+        self.ensure_group(&group_path)?;
+
+        let group = self.file.group(&group_path)?;
+        
+        // Write segment attributes once per group creation
+        if group.attr("sampling_rate").is_err() {
+            self.write_metadata_attributes(&group, slice)?;
+        }
+
+        // 4. Write Time and Data
+        self.append_dataset(&group_path, "time", &slice.timestamps, None, Some("Time in seconds"))?;
+        
+        for (_col_id, batch, name, units, desc) in valid_columns {
+            let units_opt = units.as_ref().filter(|u| !u.is_empty());
+            let desc_opt = desc.as_deref();
+
+            match batch {
+                ColumnBatch::F64(data) => self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?,
+                ColumnBatch::I64(data) => self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?,
+                ColumnBatch::U64(data) => self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?,
+            }
+        }
+
+        // 5. Update Statistics
+        self.update_stats(slice, &route_str, stream_name);
+
+        Ok(())
     }
-    Ok(())
-}
 
-fn write_segment_attributes(group: &hdf5::Group, meta: &SegmentMetadata) -> Result<()> {
-    group.new_attr::<u32>().create("sampling_rate")?.write_scalar(&meta.sampling_rate)?;
-    group.new_attr::<u32>().create("decimation")?.write_scalar(&meta.decimation)?;
-    Ok(())
-}
+    fn update_stats(&mut self, slice: &DataSlice, route_str: &str, stream_name: &str) {
+        let count = slice.len() as u64;
+        self.stats.total_samples += count;
+        
+        let t_start = slice.timestamps.first().copied().unwrap_or(0.0);
+        let t_end = slice.timestamps.last().copied().unwrap_or(0.0);
 
-fn write_ds<T: H5Type + Clone>(
-    group: &hdf5::Group,
-    name: &str,
-    data: &[T],
-    meta: Option<&std::sync::Arc<ColumnMetadata>>,
-) -> Result<()> {
-    let ds = group.new_dataset::<T>()
-        .shape((data.len(),))
-        .chunk((data.len(),))
-        .deflate(3)
-        .create(name)?;
-    ds.write(data)?;
-
-    if let Some(m) = meta {
-        if !m.units.is_empty() {
-            let attr = ds.new_attr::<VarLenUnicode>().create("unit")?;
-            attr.write_scalar(&m.units.parse::<VarLenUnicode>().unwrap())?;
-        }
-        if !m.description.is_empty() {
-            let attr = ds.new_attr::<VarLenUnicode>().create("description")?;
-            attr.write_scalar(&m.description.parse::<VarLenUnicode>().unwrap())?;
-        }
+        self.stats.start_time = Some(self.stats.start_time.map_or(t_start, |t| t.min(t_start)));
+        self.stats.end_time = Some(self.stats.end_time.map_or(t_end, |t| t.max(t_end)));
+        
+        self.stats.streams_written.insert(format!("/{}/{}", route_str, stream_name));
     }
-    Ok(())
+
+    fn write_metadata_attributes(&self, group: &Group, slice: &DataSlice) -> Result<()> {
+        let meta = &slice.segment_metadata;
+
+        self.write_attr_scalar(group, "sampling_rate", &meta.sampling_rate)?;
+        self.write_attr_scalar(group, "decimation", &meta.decimation)?;
+        self.write_attr_scalar(group, "start_time", &meta.start_time)?;
+        self.write_attr_scalar(group, "filter_cutoff", &meta.filter_cutoff)?;
+        self.write_attr_scalar(group, "session_id", &slice.session_id)?;
+
+        let epoch_u8: u8 = meta.time_ref_epoch.clone().into();
+        self.write_attr_scalar(group, "time_ref_epoch", &epoch_u8)?;
+        
+        let filter_type_u8: u8 = meta.filter_type.clone().into();
+        self.write_attr_scalar(group, "filter_type", &filter_type_u8)?;
+
+        if !meta.time_ref_serial.is_empty() {
+            self.write_attr_string(group, "time_ref_serial", &meta.time_ref_serial)?;
+        }
+        
+        Ok(())
+    }
+
+    fn append_dataset<T: H5Type + Clone>(
+        &mut self, 
+        group_path: &str, 
+        name: &str, 
+        data: &[T],
+        units: Option<&String>,
+        description: Option<&str>
+    ) -> Result<()> {
+        let full_path = format!("{}/{}", group_path, name);
+        
+        if !self.datasets.contains_key(&full_path) {
+            let group = self.file.group(group_path)?;
+            
+            let ds = if let Ok(existing) = group.dataset(name) {
+                existing
+            } else {
+                let builder = group.new_dataset::<T>()
+                    .chunk((65_536,))
+                    .shape(SimpleExtents::resizable([0usize]));
+                
+                let builder = if self.compress {
+                    builder.blosc(Blosc::BloscLZ, 5, BloscShuffle::Byte)
+                } else {
+                    builder
+                };
+                
+                let ds = builder.create(name)?;
+
+                if let Some(u_str) = units {
+                    self.write_attr_string(&ds, "units", u_str)?;
+                }
+                if let Some(d_str) = description {
+                    if !d_str.is_empty() {
+                        self.write_attr_string(&ds, "description", d_str)?;
+                    }
+                }
+
+                ds
+            };
+            self.datasets.insert(full_path.clone(), ds);
+        }
+        
+        let ds = self.datasets.get(&full_path).unwrap();
+        let current_size = ds.shape()[0];
+        let new_data_len = data.len();
+        
+        ds.resize((current_size + new_data_len,))?;
+        ds.write_slice(data, current_size..)?;
+        Ok(())
+    }
+
+    fn ensure_group(&self, path: &str) -> Result<()> {
+        if self.file.group(path).is_ok() {
+            return Ok(());
+        }
+        
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current_path = String::new();
+        
+        for part in parts {
+            current_path.push('/');
+            current_path.push_str(part);
+            
+            if self.file.group(&current_path).is_err() {
+                self.file.create_group(&current_path)?;
+            }
+        }
+        Ok(())
+    }
+    
+    fn write_attr_scalar<T: H5Type>(&self, loc: &Location, name: &str, val: &T) -> Result<()> {
+        let attr = loc.new_attr::<T>().create(name)?;
+        attr.write_scalar(val)
+    }
+
+    fn write_attr_string(&self, loc: &Location, name: &str, val: &str) -> Result<()> {
+        let attr = loc.new_attr::<VarLenUnicode>().create(name)?;
+        let vlu = val.parse::<VarLenUnicode>().unwrap();
+        attr.write_scalar(&vlu)
+    }
 }
