@@ -2,9 +2,10 @@ use std::{
     collections::HashMap,
 };
 
-use crate::device::{ColumnSpec, SubscriptionId};
+use crate::tio::proto::identifiers::ColumnKey;
 use crate::data::{AlignedWindow, Buffer}; 
 
+pub type SubscriptionId = usize;
 pub struct SubscriptionManager {
     pub buffer: Buffer,
     subscriptions: HashMap<SubscriptionId, Subscription>,
@@ -12,7 +13,7 @@ pub struct SubscriptionManager {
 }
 
 pub struct Subscription {
-    columns: Vec<ColumnSpec>,
+    columns: Vec<ColumnKey>,
     n_samples: usize,
     tx: crossbeam::channel::Sender<AlignedWindow>,
 }
@@ -28,7 +29,7 @@ impl SubscriptionManager {
 
     pub fn subscribe(
         &mut self,
-        columns: Vec<ColumnSpec>,
+        columns: Vec<ColumnKey>,
         n_samples: usize,
     ) -> (SubscriptionId, crossbeam::channel::Receiver<AlignedWindow>) {
         let (tx, rx) = crossbeam::channel::bounded(10); // bounded to allow drops

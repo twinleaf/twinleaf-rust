@@ -13,13 +13,19 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
-
-use crate::device::{ColumnSpec, CursorPosition, StreamKey};
+use crate::tio::proto::identifiers::{ColumnKey, StreamKey};
 use crate::data::{AlignedWindow, Buffer, ReadError}; 
+use crate::tio::proto::identifiers::{SessionId, SegmentId, SampleNumber};
+
+pub struct CursorPosition {
+    pub session_id: SessionId,
+    pub segment_id: SegmentId,
+    pub last_sample_number: SampleNumber,
+}
 
 pub struct Reader {
     buffer: Arc<RwLock<Buffer>>,
-    columns: Vec<ColumnSpec>,
+    columns: Vec<ColumnKey>,
     cursor: ReaderCursor,
 }
 
@@ -36,7 +42,7 @@ impl ReaderCursor {
 }
 
 impl Reader {
-    pub fn new(buffer: Arc<RwLock<Buffer>>, columns: Vec<ColumnSpec>) -> Self {
+    pub fn new(buffer: Arc<RwLock<Buffer>>, columns: Vec<ColumnKey>) -> Self {
         Self {
             buffer,
             columns,
