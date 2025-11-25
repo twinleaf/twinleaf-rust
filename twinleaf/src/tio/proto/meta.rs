@@ -2,6 +2,7 @@ use super::{
     too_small, vararg, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE,
 };
 use super::{DeviceRoute, Packet, Payload};
+use super::identifiers::{StreamId, ColumnId, SegmentId, SessionId};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone)]
@@ -9,13 +10,13 @@ pub struct DeviceMetadata {
     pub serial_number: String,
     pub firmware_hash: String,
     pub n_streams: usize,
-    pub session_id: u32,
+    pub session_id: SessionId,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamMetadata {
-    pub stream_id: u8,
+    pub stream_id: StreamId,
     pub name: String,
     pub n_columns: usize,
     pub n_segments: usize,
@@ -51,8 +52,8 @@ static TL_METADATA_SEGMENT_ACTIVE: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentMetadata {
-    pub stream_id: u8,
-    pub segment_id: u8,
+    pub stream_id: StreamId,
+    pub segment_id: SegmentId,
     pub flags: u8,
     pub time_ref_epoch: MetadataEpoch,
     pub time_ref_serial: String,
@@ -66,8 +67,8 @@ pub struct SegmentMetadata {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMetadata {
-    pub stream_id: u8,
-    pub index: usize,
+    pub stream_id: StreamId,
+    pub index: ColumnId,
     pub data_type: DataType,
     pub name: String,
     pub units: String,

@@ -1,5 +1,6 @@
 pub mod legacy;
 pub mod meta;
+pub mod identifiers;
 pub mod route;
 pub mod rpc;
 pub mod vararg;
@@ -8,7 +9,10 @@ pub use legacy::{
     LegacySourceInfoPayload, LegacyStreamDataPayload, LegacyStreamInfoPayload,
     LegacyTimebaseInfoPayload,
 };
-pub use meta::{MetadataPayload, MetadataType};
+pub use meta::{
+    DeviceMetadata, StreamMetadata, SegmentMetadata, ColumnMetadata,
+    MetadataPayload, MetadataType,
+};
 use num_enum::{FromPrimitive, IntoPrimitive};
 pub use route::DeviceRoute;
 pub use rpc::{RpcErrorCode, RpcErrorPayload, RpcMethod, RpcReplyPayload, RpcRequestPayload};
