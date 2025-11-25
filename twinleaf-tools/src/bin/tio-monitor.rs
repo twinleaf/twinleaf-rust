@@ -28,9 +28,15 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
-    data::{Sample, ColumnData, Buffer, BufferEvent, AlignedWindow, ColumnBatch},
-    device::{ColumnSpec, DeviceTree, StreamId},
-    tio::{self, proto::DeviceRoute},
+    data::{AlignedWindow, Buffer, BufferEvent, ColumnBatch, ColumnData, Sample},
+    device::DeviceTree,
+    tio::{
+        self,
+        proto::{
+            identifiers::{ColumnKey, StreamKey, StreamId},
+            DeviceRoute,
+        },
+    },
 };
 use twinleaf_tools::TioOpts;
 use welch_sde::{Build, SpectralDensity};
@@ -58,7 +64,7 @@ pub struct NavItem {
     pub route: DeviceRoute,
     pub stream_id: StreamId,
     pub column_id: usize,
-    pub spec: ColumnSpec,
+    pub spec: ColumnKey,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -323,7 +329,7 @@ pub struct App {
     pub nav: Nav,
     pub nav_items: Vec<NavItem>,
 
-    pub last: BTreeMap<(DeviceRoute, StreamId), (Sample, Instant)>,
+    pub last: BTreeMap<StreamKey, (Sample, Instant)>,
     pub window_aligned: Option<AlignedWindow>,
     pub input_state: TextState<'static>,
     pub cmd_history: Vec<String>,
@@ -476,7 +482,7 @@ impl App {
 
     pub fn visible_routes(&self) -> Vec<DeviceRoute> {
         if self.all {
-            let mut routes: Vec<_> = self.last.keys().map(|(route, _)| route.clone()).collect();
+            let mut routes: Vec<_> = self.last.keys().map(|k| k.route.clone()).collect();
             routes.sort();
             routes.dedup();
             routes
@@ -498,12 +504,14 @@ impl App {
             let mut stream_ids: Vec<_> = self
                 .last
                 .keys()
-                .filter(|(r, _)| r == route)
-                .map(|(_, sid)| *sid)
+                .filter(|k| &k.route == route)
+                .map(|k| k.stream_id)
                 .collect();
             stream_ids.sort();
+            stream_ids.dedup();
             for (stream_idx, sid) in stream_ids.iter().enumerate() {
-                if let Some((sample, _)) = self.last.get(&(route.clone(), *sid)) {
+                let key = StreamKey::new(route.clone(), *sid);
+                if let Some((sample, _)) = self.last.get(&key) {
                     for (column_idx, _) in sample.columns.iter().enumerate() {
                         new_items.push(NavItem {
                             device_idx: dev_idx,
@@ -512,7 +520,7 @@ impl App {
                             route: route.clone(),
                             stream_id: *sid,
                             column_id: column_idx,
-                            spec: ColumnSpec {
+                            spec: ColumnKey {
                                 route: route.clone(),
                                 stream_id: *sid,
                                 column_id: column_idx,
@@ -539,7 +547,7 @@ impl App {
     pub fn current_item(&self) -> Option<&NavItem> {
         self.nav.idx.and_then(|i| self.nav_items.get(i))
     }
-    pub fn current_selection(&self) -> Option<ColumnSpec> {
+    pub fn current_selection(&self) -> Option<ColumnKey> {
         self.current_item().map(|it| it.spec.clone())
     }
     pub fn current_device_index(&self) -> usize {
@@ -734,7 +742,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
 struct DataReq {
     all: bool,
     parent_route: DeviceRoute,
-    selection: Option<ColumnSpec>,
+    selection: Option<ColumnKey>,
     seconds: f64,
 }
 #[derive(Debug, Clone)]
@@ -834,7 +842,7 @@ fn run_data_thread(
 ) {
     let (evt_tx, _evt_rx) = channel::unbounded::<BufferEvent>();
     let mut buffer = Buffer::new(evt_tx, capacity, false);
-    let mut last: BTreeMap<(DeviceRoute, StreamId), Sample> = BTreeMap::new();
+    let mut last: BTreeMap<StreamKey, Sample> = BTreeMap::new();
 
     loop {
         while let Ok(req) = rpc_rx.try_recv() {
@@ -847,17 +855,17 @@ fn run_data_thread(
         };
         let stream_id = sample.stream.stream_id;
         buffer.process_sample(sample.clone(), route.clone());
-        last.insert((route.clone(), stream_id), sample);
+        last.insert(StreamKey::new(route.clone(), stream_id), sample);
 
         while let Ok(q) = req_rx.try_recv() {
             let last_vec: Vec<_> = if q.all {
                 last.iter()
-                    .map(|((r, sid), s)| (r.clone(), *sid, s.clone()))
+                    .map(|(k, s)| (k.route.clone(), k.stream_id, s.clone()))
                     .collect()
             } else {
                 last.iter()
-                    .filter(|((r, _), _)| *r == q.parent_route)
-                    .map(|((r, sid), s)| (r.clone(), *sid, s.clone()))
+                    .filter(|(k, _)| k.route == q.parent_route)
+                    .map(|(k, s)| (k.route.clone(), k.stream_id, s.clone()))
                     .collect()
             };
 
@@ -1013,7 +1021,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         let dev = app
             .last
             .iter()
-            .find(|((r, _), _)| r == route)
+            .find(|(k, _)| &k.route == route) 
             .map(|(_, (s, _))| s.device.as_ref());
         let head_style = if dev_idx == app.current_device_index() {
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -1035,13 +1043,14 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         let mut stream_ids: Vec<_> = app
             .last
             .keys()
-            .filter(|(r, _)| r == route)
-            .map(|(_, s)| *s)
+            .filter(|k| &k.route == route)
+            .map(|k| k.stream_id)          
             .collect();
         stream_ids.sort();
 
         for sid in stream_ids {
-            if let Some((sample, seen)) = app.last.get(&(route.clone(), sid)) {
+            let key = StreamKey::new(route.clone(), sid);
+            if let Some((sample, seen)) = app.last.get(&key) {
                 let is_stale = now.saturating_duration_since(*seen) > Duration::from_millis(1200);
                 for col in &sample.columns {
                     let nav_idx = global_idx;
@@ -1497,7 +1506,7 @@ fn main() {
         while let Ok(r) = resp_rx.try_recv() {
             let now = Instant::now();
             for (route, sid, sample) in r.last {
-                let key = (route, sid);
+                let key = StreamKey::new(route, sid);
                 let seen = if let Some((prev, prev_seen)) = app.last.get(&key) {
                     if prev.n == sample.n {
                         *prev_seen

@@ -3,7 +3,6 @@ use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device;
 use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
@@ -209,7 +208,7 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    let specs = device::util::load_rpc_specs(&device).map_err(|e| {
+    let specs = twinleaf::device::util::load_rpc_specs(&device).map_err(|e| {
         eprintln!("Failed to load RPC specs: {:?}", e);
     })?;
 
@@ -227,7 +226,7 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
 
 fn get_rpctype(name: &String, device: &proxy::Port) -> String {
     if let Ok(meta) = device.rpc("rpc.info", name) {
-        let spec = device::util::parse_rpc_spec(meta, name.clone());
+        let spec = twinleaf::device::util::parse_rpc_spec(meta, name.clone());
         spec.type_str()
     } else {
         "".to_string()
@@ -793,7 +792,7 @@ fn log_csv(
 fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, debug: bool) -> Result<(), ()> {
     use std::collections::HashMap;
     use std::path::Path;
-    use twinleaf::device::{ColumnSpec};
+    use twinleaf::tio::proto::identifiers::ColumnKey;
     use twinleaf::data::{Buffer, export, ColumnFilter, DeviceDataParser};
     use twinleaf::tio;
 
@@ -843,7 +842,8 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, debug: bo
     let mut columns_to_export = Vec::new();
     
     for (stream_key, segment) in &buffer.active_segments {
-        let (route, stream_id) = stream_key;
+        let route = &stream_key.route;
+        let stream_id = stream_key.stream_id;
         let stream_name = &segment.buffer.stream_metadata.name;
 
         for (&col_id, col_buffer) in &segment.buffer.columns {
@@ -866,9 +866,9 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, debug: bo
             };
 
             if include {
-                columns_to_export.push(ColumnSpec {
+                columns_to_export.push(ColumnKey {
                     route: route.clone(),
-                    stream_id: *stream_id,
+                    stream_id: stream_id,
                     column_id: col_id,
                 });
             }

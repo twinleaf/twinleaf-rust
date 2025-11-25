@@ -9,19 +9,30 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
 use crossbeam::channel;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use ratatui::Terminal;
-use std::collections::{BTreeMap, VecDeque};
-use std::io;
-use std::num::ParseFloatError;
-use std::time::{Duration, Instant, SystemTime};
-use twinleaf::device::{DeviceTree, StreamKey};
-use twinleaf::data::{Buffer, BufferEvent};
-use twinleaf::tio;
+use ratatui::{
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    Terminal,
+};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    io,
+    num::ParseFloatError,
+    time::{Duration, Instant, SystemTime},
+};
+use twinleaf::{
+    data::{Buffer, BufferEvent},
+    device::DeviceTree,
+    tio::{
+        self,
+        proto::{
+            identifiers::StreamKey,
+        },
+    },
+};
 use twinleaf_tools::TioOpts;
 
 #[derive(Parser, Debug, Clone)]
@@ -554,10 +565,11 @@ fn format_event(
             count,
             ..
         } => {
+            let key = StreamKey::new(route.clone(), *stream_id);
             let stream_name = stats
-                .get(&(route.clone(), *stream_id))
-                .map(|s| s.name.as_str())
-                .unwrap_or("unknown");
+                            .get(&key)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("unknown");
             Some((
                 format!(
                     "[{}/{}] SAMPLES DROPPED: {} samples (session: {})",
@@ -573,8 +585,9 @@ fn format_event(
             previous,
             current,
         } => {
+            let key = StreamKey::new(route.clone(), *stream_id);
             let stream_name = stats
-                .get(&(route.clone(), *stream_id))
+                .get(&key)
                 .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
             Some((
@@ -591,8 +604,9 @@ fn format_event(
             new_id,
             old_id,
         } => {
+            let key = StreamKey::new(route.clone(), *stream_id);
             let stream_name = stats
-                .get(&(route.clone(), *stream_id))
+                .get(&key)
                 .map(|s| s.name.as_str())
                 .unwrap_or("unknown");
             Some((
@@ -628,7 +642,7 @@ fn handle_samples_event(
     let now = Instant::now();
 
     for (sample, route) in samples {
-        let sid = sample.stream.stream_id as u8;
+        let sid = sample.stream.stream_id;
 
         if let Some(filter) = streams_filter {
             if !filter.contains(&sid) {
@@ -636,7 +650,7 @@ fn handle_samples_event(
             }
         }
 
-        let key = (route.clone(), sid);
+        let key = StreamKey::new(route.clone(), sid);
         let st = stats.entry(key).or_insert_with(|| StreamStats {
             name: sample.stream.name.clone(),
             current_session_id: Some(sample.device.session_id),
@@ -665,7 +679,7 @@ fn handle_session_changed(
     new_id: u32,
     stats: &mut BTreeMap<StreamKey, StreamStats>,
 ) {
-    let key = (route, stream_id);
+    let key = StreamKey::new(route, stream_id);
     if let Some(st) = stats.get_mut(&key) {
         st.reset_for_new_session(new_id);
     }
@@ -677,7 +691,7 @@ fn handle_samples_skipped(
     count: u32,
     stats: &mut BTreeMap<StreamKey, StreamStats>,
 ) {
-    let key = (route, stream_id);
+    let key = StreamKey::new(route, stream_id);
     if let Some(st) = stats.get_mut(&key) {
         st.samples_dropped += count as u64;
     }
@@ -782,14 +796,14 @@ fn main() {
 
                             let mut rows: Vec<DisplayRow> = stats
                                 .iter_mut()
-                                .map(|((route, stream_id), st)| {
+                                .map(|(key, st)| {
                                     st.compute_rate(now, rate_window);
                                     if st.is_stale(now, stale_dur) && st.t0_host.is_some() {
                                         st.reset_timing();
                                     }
                                     st.to_display_row(
-                                        route.to_string(),
-                                        *stream_id,
+                                        key.route.to_string(),
+                                        key.stream_id,
                                         now,
                                         stale_dur,
                                         ppm_warn,
