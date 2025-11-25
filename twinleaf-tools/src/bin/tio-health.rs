@@ -24,13 +24,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{Buffer, BufferEvent},
+    data::{Buffer, BufferEvent, OverflowPolicy},
     device::DeviceTree,
     tio::{
         self,
-        proto::{
-            identifiers::StreamKey,
-        },
+        proto::identifiers::StreamKey,
     },
 };
 use twinleaf_tools::TioOpts;
@@ -714,7 +712,7 @@ fn main() {
     };
 
     let (event_tx, event_rx) = channel::unbounded();
-    let buffer = Buffer::new(event_tx, 100_000, true);
+    let buffer = Buffer::new(event_tx, 100_000, true, OverflowPolicy::DropOldest);
 
     let (req_tx, req_rx) = channel::unbounded::<HealthReq>();
     let (state_tx, state_rx) = channel::bounded::<UiState>(1);

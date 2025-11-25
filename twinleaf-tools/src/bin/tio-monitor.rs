@@ -28,13 +28,12 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
-    data::{AlignedWindow, Buffer, BufferEvent, ColumnBatch, ColumnData, Sample},
+    data::{AlignedWindow, Buffer, BufferEvent, ColumnBatch, ColumnData, OverflowPolicy, Sample},
     device::DeviceTree,
     tio::{
         self,
         proto::{
-            identifiers::{ColumnKey, StreamKey, StreamId},
-            DeviceRoute,
+            DeviceRoute, identifiers::{ColumnKey, StreamId, StreamKey}
         },
     },
 };
@@ -871,7 +870,7 @@ fn run_data_thread(
     capacity: usize,
 ) {
     let (evt_tx, _evt_rx) = channel::unbounded::<BufferEvent>();
-    let mut buffer = Buffer::new(evt_tx, capacity, false);
+    let mut buffer = Buffer::new(evt_tx, capacity, false, OverflowPolicy::DropOldest);
     let mut last: BTreeMap<StreamKey, Sample> = BTreeMap::new();
 
     loop {
