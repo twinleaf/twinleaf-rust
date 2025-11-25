@@ -278,6 +278,7 @@ pub struct ViewConfig {
     pub show_fft: bool,
     pub plot_window_seconds: f64,
     pub plot_width_percent: u16,
+    pub axis_precision: usize,
     pub follow_selection: bool,
     pub scroll: u16,
     pub desc_width: usize,
@@ -293,6 +294,7 @@ impl Default for ViewConfig {
             show_fft: false,
             plot_window_seconds: 5.0,
             plot_width_percent: 70,
+            axis_precision: 1,
             follow_selection: true,
             scroll: 0,
             desc_width: 0,
@@ -316,6 +318,7 @@ pub enum Action {
     ToggleRoutes,
     AdjustWindow(f64),
     AdjustPlotWidth(i16),
+    AdjustPrecision(i8),
     HistoryNavigate(i8),
 }
 
@@ -415,6 +418,10 @@ impl App {
             Action::AdjustPlotWidth(d) => {
                 self.view.plot_width_percent =
                     (self.view.plot_width_percent as i16 + d).clamp(20, 90) as u16
+            }
+            Action::AdjustPrecision(delta) => {
+                let new_p = self.view.axis_precision as i16 + delta as i16;
+                self.view.axis_precision = new_p.clamp(0, 5) as usize;
             }
         }
         false
@@ -598,33 +605,54 @@ impl App {
         let md = win.segment_metadata.get(&stream_key)?;
         let sampling_hz = (md.sampling_rate / md.decimation) as f64;
         let batch = win.columns.get(&spec)?;
+
         let signal: Vec<f64> = match batch {
             ColumnBatch::F64(v) => v.clone(),
             ColumnBatch::I64(v) => v.iter().map(|&x| x as f64).collect(),
             ColumnBatch::U64(v) => v.iter().map(|&x| x as f64).collect(),
         };
+
         if signal.len() < 128 {
             return None;
         }
-        let welch: SpectralDensity<f64> = SpectralDensity::builder(&signal, sampling_hz).build();
+
+        let mean_val = signal.iter().sum::<f64>() / signal.len() as f64;
+        let detrended: Vec<f64> = signal.iter().map(|x| x - mean_val).collect();
+
+        let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
         let sd = welch.periodogram();
         let raw: Vec<f64> = sd.iter().copied().collect();
-        let vals: Vec<f64> = raw
+
+        let valid_vals: Vec<f64> = raw
             .iter()
             .copied()
             .filter(|v| v.is_finite() && *v > 0.0)
             .collect();
-        if vals.is_empty() {
+
+        if valid_vals.is_empty() {
             return None;
         }
-        let noise = vals.iter().sum::<f64>() / vals.len() as f64;
+
+        let split_idx = valid_vals.len() / 2;
+        let mut high_freq_vals = valid_vals[split_idx..].to_vec();
+        
+        high_freq_vals.sort_by(|a, b| a.total_cmp(b));
+        let noise_floor = if high_freq_vals.is_empty() {
+            let mut all = valid_vals.clone();
+            all.sort_by(|a, b| a.total_cmp(b));
+            all[all.len() / 2]
+        } else {
+            high_freq_vals[high_freq_vals.len() / 2]
+        };
+
         let pts: Vec<(f64, f64)> = sd
             .frequency()
             .into_iter()
             .zip(raw.into_iter())
             .filter(|(_, d)| d.is_finite() && *d > 0.0)
             .collect();
-        Some((pts, noise))
+
+        Some((pts, noise_floor))
     }
 
     pub fn get_focused_channel_info(&self) -> Option<(String, String)> {
@@ -729,6 +757,8 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::AdjustWindow(-0.5)),
                 KeyCode::Char('[') => Some(Action::AdjustPlotWidth(5)),
                 KeyCode::Char(']') => Some(Action::AdjustPlotWidth(-5)),
+                KeyCode::Char(',') | KeyCode::Char('<') => Some(Action::AdjustPrecision(-1)),
+                KeyCode::Char('.') | KeyCode::Char('>') => Some(Action::AdjustPrecision(1)),
                 _ => None,
             },
         }
@@ -1209,7 +1239,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     let window_line = Line::from(vec![
         Span::styled(
-            "  Window     ",
+            "  Plot     ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1221,7 +1251,11 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
         key_span("["),
         key_sep(),
         key_span("]"),
-        Span::raw(" Plot Width"),
+        Span::raw(" Plot Width  "),
+        key_span("<"),
+        key_sep(),
+        key_span(">"),
+        Span::raw(" Plot Precision"),
     ]);
 
     let scroll_line = Line::from(vec![
@@ -1290,7 +1324,7 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
         if app.view.show_fft {
             if let Some((sd_data, noise_floor)) = app.get_spectral_density_data() {
                 let title = format!(
-                    "{} — {} (DC detrend {:.1}s) | Mean: {:.3e} {}/√Hz",
+                    "{} — {} (DC detrend {:.1}s) | High Freq Median: {:.3e} {}/√Hz",
                     item.route, desc, app.view.plot_window_seconds, noise_floor, units
                 );
                 let block = Block::default().title(title).borders(Borders::ALL);
@@ -1335,19 +1369,13 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                             Axis::default()
                                 .title("Freq [Hz] (log)")
                                 .bounds([min_f, max_f])
-                                .labels(vec![
-                                    format!("{:.1e}", 10f64.powf(min_f)),
-                                    format!("{:.1e}", 10f64.powf(max_f)),
-                                ]),
+                                .labels(generate_log_labels(min_f, max_f, 5, app.view.axis_precision)),
                         )
                         .y_axis(
                             Axis::default()
                                 .title(format!("Val [{}/√Hz]", units))
                                 .bounds([min_d - y_pad, max_d + y_pad])
-                                .labels(vec![
-                                    format!("{:.1e}", 10f64.powf(min_d)),
-                                    format!("{:.1e}", 10f64.powf(max_d)),
-                                ]),
+                                .labels(generate_log_labels(min_d - y_pad, max_d + y_pad, 5, app.view.axis_precision)),
                         );
                     f.render_widget(chart, area);
                 } else {
@@ -1392,13 +1420,13 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                         Axis::default()
                             .title("Time [s]")
                             .bounds([min_t, max_t])
-                            .labels(vec![format!("{:.1}", min_t), format!("{:.1}", max_t)]),
+                            .labels(generate_linear_labels(min_t, max_t, 3, app.view.axis_precision)),
                     )
                     .y_axis(
                         Axis::default()
                             .title(format!("Value [{}]", units))
                             .bounds([min_v - pad, max_v + pad])
-                            .labels(vec![format!("{:.3}", min_v), format!("{:.3}", max_v)]),
+                            .labels(generate_linear_labels(min_v - pad, max_v + pad, 5, app.view.axis_precision)),
                     );
                 f.render_widget(chart, area);
             } else {
@@ -1413,6 +1441,34 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
             area,
         );
     }
+}
+
+fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
+    if count < 2 { return vec![]; }
+    let step = (max - min) / ((count - 1) as f64);
+    (0..count)
+        .map(|i| {
+            let v = min + (i as f64 * step);
+            Span::from(format!("{:.p$}", v, p = precision))
+        })
+        .collect()
+}
+
+fn generate_log_labels(min_log: f64, max_log: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
+    if count < 2 { return vec![]; }
+    let step = (max_log - min_log) / ((count - 1) as f64);
+    (0..count)
+        .map(|i| {
+            let log_val = min_log + (i as f64 * step);
+            let real_val = 10f64.powf(log_val);
+
+            if real_val.abs() < 1000.0 && real_val.abs() > 0.01 {
+                Span::from(format!("{:.p$}", real_val, p = precision))
+            } else {
+                Span::from(format!("{:.p$e}", real_val, p = precision))
+            }
+        })
+        .collect()
 }
 
 fn fmt_value(v: &ColumnData) -> (String, f64) {
