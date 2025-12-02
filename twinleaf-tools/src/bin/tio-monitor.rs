@@ -293,7 +293,7 @@ impl Default for ViewConfig {
             show_fft: false,
             plot_window_seconds: 5.0,
             plot_width_percent: 70,
-            axis_precision: 1,
+            axis_precision: 3,
             follow_selection: true,
             scroll: 0,
             desc_width: 0,
@@ -1449,7 +1449,7 @@ fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) ->
     (0..count)
         .map(|i| {
             let v = min + (i as f64 * step);
-            Span::from(format!("{:.p$}", v, p = precision))
+            Span::from(format!("{:>10.p$}", v, p = precision))
         })
         .collect()
 }
@@ -1457,16 +1457,20 @@ fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) ->
 fn generate_log_labels(min_log: f64, max_log: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
     if count < 2 { return vec![]; }
     let step = (max_log - min_log) / ((count - 1) as f64);
+    let max_val = 10f64.powf(max_log.max(min_log)).abs();
+    let use_scientific = max_val < 0.01 || max_val >= 1000.0;
+
     (0..count)
         .map(|i| {
             let log_val = min_log + (i as f64 * step);
             let real_val = 10f64.powf(log_val);
 
-            if real_val.abs() < 1000.0 && real_val.abs() > 0.01 {
-                Span::from(format!("{:.p$}", real_val, p = precision))
+            let s = if use_scientific {
+                format!("{:.p$e}", real_val, p = precision)
             } else {
-                Span::from(format!("{:.p$e}", real_val, p = precision))
-            }
+                format!("{:.p$}", real_val, p = precision)
+            };
+            Span::from(format!("{:>10}", s)) 
         })
         .collect()
 }
