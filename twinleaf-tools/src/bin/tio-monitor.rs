@@ -312,6 +312,7 @@ pub enum Action {
     NavHome,
     NavEnd,
     TogglePlot,
+    ClosePlot,
     ToggleFft,
     ToggleFooter,
     ToggleRoutes,
@@ -373,9 +374,6 @@ impl App {
             Action::SetMode(Mode::Normal) => {
                 self.mode = Mode::Normal;
                 self.input_state.blur();
-                if self.view.show_plot {
-                    self.view.show_plot = false;
-                }
             }
             Action::SubmitCommand => self.submit_command(rpc_tx),
             Action::HistoryNavigate(dir) => self.navigate_history(dir),
@@ -403,6 +401,9 @@ impl App {
                 if self.current_selection().is_some() {
                     self.view.show_plot = !self.view.show_plot;
                 }
+            }
+            Action::ClosePlot => {
+                self.view.show_plot = false;
             }
             Action::ToggleFft => {
                 if self.view.show_plot {
@@ -691,7 +692,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
                 KeyCode::Esc => {
                     if app.view.show_plot {
-                        Some(Action::SetMode(Mode::Normal))
+                        Some(Action::ClosePlot)
                     } else {
                         Some(Action::Quit)
                     }
