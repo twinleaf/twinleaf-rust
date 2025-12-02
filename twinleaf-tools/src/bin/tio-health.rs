@@ -618,8 +618,24 @@ fn format_event(
         BufferEvent::MetadataChanged(route) => {
             Some((format!("[{}] METADATA CHANGED", route), Color::Green))
         }
-        BufferEvent::SegmentChanged(route) => {
-            Some((format!("[{}] SEGMENT CHANGED", route), Color::Green))
+        BufferEvent::SegmentChanged {
+            route,
+            stream_id,
+            old_segment_id,
+            new_segment_id,
+        } => {
+            let key = StreamKey::new(route.clone(), *stream_id);
+            let stream_name = stats
+                .get(&key)
+                .map(|s| s.name.as_str())
+                .unwrap_or("unknown");
+            Some((
+                format!(
+                    "[{}/{}] SEGMENT CHANGED: {} → {}",
+                    route, stream_name, old_segment_id, new_segment_id
+                ),
+                Color::Green,
+            ))
         }
         BufferEvent::RouteDiscovered(route) => {
             Some((format!("[{}] ROUTE DISCOVERED", route), Color::Green))

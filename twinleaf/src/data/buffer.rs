@@ -10,26 +10,32 @@ use crate::data::{ColumnData, Sample, util};
 use crate::device::CursorPosition;
 use crate::tio::proto::identifiers::*;
 use crate::tio::proto::{
-    BufferType, DeviceRoute, 
-    StreamMetadata, SegmentMetadata, ColumnMetadata
+    BufferType, DeviceRoute,
+    StreamMetadata, SegmentMetadata, ColumnMetadata,
 };
+use crate::tio::proto::meta::MetadataEpoch;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
-/// Defines how the Buffer handles data when it reaches capacity.
+pub type RunId = u64;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OverflowPolicy {
-    /// Ring Buffer Mode: Drops the oldest sample to make room for the new one.
-    /// Use this for real-time monitoring (Oscilloscopes) where only recent history matters.
     DropOldest,
-
-    /// Streaming Mode: Flushes the current buffer contents as a `DataChunk` event,
-    /// then clears the buffer to make room. 
-    /// Use this for logging to disk (HDF5) to keep memory usage constant.
     Flush,
+}
+
+#[derive(Debug, Clone)]
+pub enum RunBoundary {
+    Initial,
+    SessionChanged { old: SessionId, new: SessionId },
+    RateChanged { old_rate: f64, new_rate: f64 },
+    EpochChanged { old: MetadataEpoch, new: MetadataEpoch },
+    SamplesSkipped { expected: SampleNumber, received: SampleNumber },
+    BackwardJump { previous_ts: f64, current_ts: f64 },
 }
 
 #[derive(Debug, Clone)]
@@ -56,13 +62,12 @@ impl ColumnBatch {
 #[derive(Debug, Clone)]
 pub struct DataSlice {
     pub stream_key: StreamKey,
+    pub run_id: RunId,
     pub session_id: SessionId,
     pub segment_id: SegmentId,
-    
     pub sample_numbers: Vec<SampleNumber>,
     pub timestamps: Vec<f64>,
     pub columns: HashMap<ColumnId, ColumnBatch>,
-    
     pub stream_metadata: Arc<StreamMetadata>,
     pub segment_metadata: Arc<SegmentMetadata>,
     pub column_metadata: HashMap<ColumnId, Arc<ColumnMetadata>>,
@@ -78,8 +83,6 @@ impl DataSlice {
     }
 }
 
-/// Multiple streams aligned by sample number.
-/// Columns keyed globally since multiple streams are merged.
 #[derive(Debug, Clone)]
 pub struct AlignedWindow {
     pub sample_numbers: Vec<SampleNumber>,
@@ -89,30 +92,25 @@ pub struct AlignedWindow {
     pub segment_metadata: HashMap<StreamKey, Arc<SegmentMetadata>>,
     pub column_metadata: HashMap<ColumnKey, Arc<ColumnMetadata>>,
     pub session_ids: HashMap<StreamKey, SessionId>,
+    pub run_ids: HashMap<StreamKey, RunId>,
 }
 
-pub struct ActiveSegment {
-    pub session_id: SessionId,
-    pub segment_id: SegmentId,
-    pub buffer: SegmentBuffer,
-
-    pub last_sample_number: SampleNumber,
-    pub last_timestamp: f64,
-    
-    pub has_emitted_chunk: bool,
-}
-
-// Insertion-time events (things that happened in the sample stream)
 pub enum BufferEvent {
     Samples(Vec<(Sample, DeviceRoute)>),
     MetadataChanged(DeviceRoute),
-    SegmentChanged(DeviceRoute),
     RouteDiscovered(DeviceRoute),
+
     SessionChanged {
         route: DeviceRoute,
         stream_id: StreamId,
         old_id: SessionId,
         new_id: SessionId,
+    },
+    SegmentChanged {
+        route: DeviceRoute,
+        stream_id: StreamId,
+        old_segment_id: SegmentId,
+        new_segment_id: SegmentId,
     },
     SamplesSkipped {
         route: DeviceRoute,
@@ -129,78 +127,40 @@ pub enum BufferEvent {
         previous: SampleNumber,
         current: SampleNumber,
     },
+
+    RunChanged {
+        route: DeviceRoute,
+        stream_id: StreamId,
+        old_run_id: Option<RunId>,
+        new_run_id: RunId,
+        reason: RunBoundary,
+    },
+
     DataChunk {
         slice: DataSlice,
         is_first_chunk: bool,
     },
 }
 
-// Read-time errors (problems when trying to access buffer data)
 #[derive(Debug)]
 pub enum ReadError {
     NoColumnsRequested,
-    NoCursorForStream {
-        stream_key: StreamKey,
-    },
-    NoActiveSegment {
-        stream_key: StreamKey,
-    },
-    InsufficientData {
-        stream_key: StreamKey,
-        requested: usize,
-        available: usize,
-    },
-    ColumnNotFound {
-        stream_key: StreamKey,
-        column_id: ColumnId,
-    },
-    SampleNumberMismatch {
-        streams: Vec<StreamKey>,
-        reason: String,
-    },
-    SamplingRateMismatch {
-        streams: Vec<StreamKey>,
-        rates: Vec<f64>,
-    },
-    SegmentMismatch {
-        column_specs: Vec<ColumnKey>,
-        segments: Vec<(SessionId, SegmentId)>,
-    },
-    SegmentChanged {
-        stream_key: StreamKey,
-        cursor_segment: (SessionId, SegmentId),
-        current_segment: (SessionId, SegmentId),
-    },
-    CursorOutOfBuffer {
-        stream_key: StreamKey,
-        cursor_sample: SampleNumber,
-        earliest_available: SampleNumber,
-    },
-}
-
-pub struct SegmentBuffer {
-    pub session_id: SessionId,
-    pub stream_metadata: Arc<StreamMetadata>, 
-    pub segment_metadata: Arc<SegmentMetadata>,
-    pub sample_numbers: VecDeque<SampleNumber>,
-    pub columns: HashMap<ColumnId, ColumnBuffer>,
-    pub capacity: usize,
+    NoCursorForStream { stream_key: StreamKey },
+    NoActiveRun { stream_key: StreamKey },
+    InsufficientData { stream_key: StreamKey, requested: usize, available: usize },
+    ColumnNotFound { stream_key: StreamKey, column_id: ColumnId },
+    SampleNumberMismatch { streams: Vec<StreamKey>, reason: String },
+    SamplingRateMismatch { streams: Vec<StreamKey>, rates: Vec<f64> },
+    RunMismatch { column_specs: Vec<ColumnKey>, runs: Vec<RunId> },
+    CursorInvalidated { stream_key: StreamKey, cursor_run: RunId, current_run: RunId },
+    CursorOutOfBuffer { stream_key: StreamKey, cursor_sample: SampleNumber, earliest_available: SampleNumber },
 }
 
 #[derive(Debug)]
 pub enum ColumnBuffer {
-    F64 {
-        metadata: Arc<ColumnMetadata>,
-        data: VecDeque<f64>,
-    },
-    I64 {
-        metadata: Arc<ColumnMetadata>,
-        data: VecDeque<i64>,
-    },
-    U64 {
-        metadata: Arc<ColumnMetadata>,
-        data: VecDeque<u64>,
-    },
+    F64 { metadata: Arc<ColumnMetadata>, data: VecDeque<f64> },
+    I64 { metadata: Arc<ColumnMetadata>, data: VecDeque<i64> },
+    U64 { metadata: Arc<ColumnMetadata>, data: VecDeque<u64> },
 }
 
 impl ColumnBuffer {
@@ -216,19 +176,17 @@ impl ColumnBuffer {
         match (self, value) {
             (Self::F64 { data, .. }, ColumnData::Float(v)) => data.push_back(v),
             (Self::F64 { data, .. }, ColumnData::Int(v)) => data.push_back(v as f64),
-            
             (Self::I64 { data, .. }, ColumnData::Int(v)) => data.push_back(v),
             (Self::U64 { data, .. }, ColumnData::UInt(v)) => data.push_back(v),
-            
             (s, v) => eprintln!("Type mismatch: Buffer is {:?} but got {:?}", s, v),
         }
     }
 
     pub fn pop_front(&mut self) {
         match self {
-            Self::F64 { data, .. } => { data.pop_front(); },
-            Self::I64 { data, .. } => { data.pop_front(); },
-            Self::U64 { data, .. } => { data.pop_front(); },
+            Self::F64 { data, .. } => { data.pop_front(); }
+            Self::I64 { data, .. } => { data.pop_front(); }
+            Self::U64 { data, .. } => { data.pop_front(); }
         }
     }
 
@@ -255,21 +213,40 @@ impl ColumnBuffer {
     }
 }
 
-impl SegmentBuffer {
+pub struct RunBuffer {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub stream_metadata: Arc<StreamMetadata>,
+    pub segment_metadata: Arc<SegmentMetadata>,
+    pub sample_numbers: VecDeque<SampleNumber>,
+    pub columns: HashMap<ColumnId, ColumnBuffer>,
+    pub capacity: usize,
+    effective_rate: f64,
+    start_time: f64,
+}
+
+impl RunBuffer {
     fn new(
-        session_id: SessionId, 
-        stream_metadata: Arc<StreamMetadata>, 
-        segment_metadata: Arc<SegmentMetadata>, 
-        capacity: usize
+        run_id: RunId,
+        session_id: SessionId,
+        stream_metadata: Arc<StreamMetadata>,
+        segment_metadata: Arc<SegmentMetadata>,
+        capacity: usize,
     ) -> Self {
         let initial_alloc = std::cmp::min(capacity, 65_536);
+        let effective_rate = segment_metadata.sampling_rate as f64 / segment_metadata.decimation as f64;
+        let start_time = segment_metadata.start_time as f64;
+
         Self {
+            run_id,
             session_id,
             stream_metadata,
             segment_metadata,
             sample_numbers: VecDeque::with_capacity(initial_alloc),
             columns: HashMap::new(),
             capacity,
+            effective_rate,
+            start_time,
         }
     }
 
@@ -277,30 +254,35 @@ impl SegmentBuffer {
         self.sample_numbers.len()
     }
 
+    fn update_segment(&mut self, segment_metadata: Arc<SegmentMetadata>) {
+        self.effective_rate = segment_metadata.sampling_rate as f64 / segment_metadata.decimation as f64;
+        self.start_time = segment_metadata.start_time as f64;
+        self.segment_metadata = segment_metadata;
+    }
+
     fn push_sample(&mut self, sample: Sample) {
         self.sample_numbers.push_back(sample.n);
 
         for column in sample.columns {
             let col_index = column.desc.index;
-
             let col_buffer = self.columns
                 .entry(col_index)
                 .or_insert_with(|| {
                     let meta = column.desc.clone();
                     let initial_alloc = std::cmp::min(self.capacity, 65_536);
-                    
+
                     match meta.data_type.buffer_type() {
-                        BufferType::Float => ColumnBuffer::F64 { 
-                            metadata: meta, 
-                            data: VecDeque::with_capacity(initial_alloc) 
+                        BufferType::Float => ColumnBuffer::F64 {
+                            metadata: meta,
+                            data: VecDeque::with_capacity(initial_alloc),
                         },
-                        BufferType::Int => ColumnBuffer::I64 { 
-                            metadata: meta, 
-                            data: VecDeque::with_capacity(initial_alloc) 
+                        BufferType::Int => ColumnBuffer::I64 {
+                            metadata: meta,
+                            data: VecDeque::with_capacity(initial_alloc),
                         },
-                        BufferType::UInt => ColumnBuffer::U64 { 
-                            metadata: meta, 
-                            data: VecDeque::with_capacity(initial_alloc) 
+                        BufferType::UInt => ColumnBuffer::U64 {
+                            metadata: meta,
+                            data: VecDeque::with_capacity(initial_alloc),
                         },
                     }
                 });
@@ -316,10 +298,8 @@ impl SegmentBuffer {
     }
 
     fn compute_timestamps(&self, sample_numbers: &[SampleNumber]) -> Vec<f64> {
-        let rate = (self.segment_metadata.sampling_rate / self.segment_metadata.decimation) as f64;
-        let start_time = self.segment_metadata.start_time as f64;
         sample_numbers.iter()
-            .map(|&n| start_time + (n as f64) / rate)
+            .map(|&n| self.start_time + (n as f64) / self.effective_rate)
             .collect()
     }
 
@@ -341,7 +321,7 @@ impl SegmentBuffer {
 
         let mut columns = HashMap::new();
         let mut column_metadata = HashMap::new();
-        
+
         for (id, buf) in &mut self.columns {
             column_metadata.insert(*id, buf.metadata().clone());
             columns.insert(*id, buf.drain());
@@ -349,6 +329,7 @@ impl SegmentBuffer {
 
         Some(DataSlice {
             stream_key: stream_key.clone(),
+            run_id: self.run_id,
             session_id: self.session_id,
             segment_id: self.segment_metadata.segment_id,
             sample_numbers,
@@ -379,8 +360,7 @@ impl SegmentBuffer {
         let n = n.min(available);
         let start_idx = available.saturating_sub(n);
 
-        let sample_numbers: Vec<_> = self
-            .sample_numbers
+        let sample_numbers: Vec<_> = self.sample_numbers
             .iter()
             .skip(start_idx)
             .take(n)
@@ -403,6 +383,7 @@ impl SegmentBuffer {
 
         Ok(DataSlice {
             stream_key: stream_key.clone(),
+            run_id: self.run_id,
             session_id: self.session_id,
             segment_id: self.segment_metadata.segment_id,
             sample_numbers,
@@ -452,8 +433,7 @@ impl SegmentBuffer {
             });
         }
 
-        let sample_numbers: Vec<_> = self
-            .sample_numbers
+        let sample_numbers: Vec<_> = self.sample_numbers
             .iter()
             .skip(start_idx)
             .take(count)
@@ -476,6 +456,7 @@ impl SegmentBuffer {
 
         Ok(DataSlice {
             stream_key: stream_key.clone(),
+            run_id: self.run_id,
             session_id: self.session_id,
             segment_id: self.segment_metadata.segment_id,
             sample_numbers,
@@ -488,9 +469,60 @@ impl SegmentBuffer {
     }
 }
 
+pub struct ActiveRun {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub current_segment_id: SegmentId,
+    pub effective_rate: f64,
+    pub time_ref_epoch: MetadataEpoch,
+    pub last_sample_number: SampleNumber,
+    pub last_timestamp: f64,
+    pub buffer: RunBuffer,
+    pub has_emitted_chunk: bool,
+}
+
+impl ActiveRun {
+    fn new(run_id: RunId, sample: &Sample, capacity: usize) -> Self {
+        let segment = &sample.segment;
+        let effective_rate = segment.sampling_rate as f64 / segment.decimation as f64;
+
+        Self {
+            run_id,
+            session_id: sample.device.session_id,
+            current_segment_id: segment.segment_id,
+            effective_rate,
+            time_ref_epoch: segment.time_ref_epoch.clone(),
+            last_sample_number: sample.n,
+            last_timestamp: sample.timestamp_end(),
+            buffer: RunBuffer::new(
+                run_id,
+                sample.device.session_id,
+                sample.stream.clone(),
+                sample.segment.clone(),
+                capacity,
+            ),
+            has_emitted_chunk: false,
+        }
+    }
+
+    fn update_tracking(&mut self, sample: &Sample) -> Option<SegmentId> {
+        self.last_sample_number = sample.n;
+        self.last_timestamp = sample.timestamp_end();
+
+        if sample.segment.segment_id != self.current_segment_id {
+            let old_segment_id = self.current_segment_id;
+            self.current_segment_id = sample.segment.segment_id;
+            self.buffer.update_segment(sample.segment.clone());
+            return Some(old_segment_id);
+        }
+        None
+    }
+}
+
 pub struct Buffer {
     routes_seen: HashSet<DeviceRoute>,
-    pub active_segments: HashMap<StreamKey, ActiveSegment>,
+    pub active_runs: HashMap<StreamKey, ActiveRun>,
+    next_run_id: RunId,
     event_tx: crossbeam::channel::Sender<BufferEvent>,
     pub forward_samples: bool,
     pub overflow_policy: OverflowPolicy,
@@ -506,7 +538,8 @@ impl Buffer {
     ) -> Self {
         Buffer {
             routes_seen: HashSet::new(),
-            active_segments: HashMap::new(),
+            active_runs: HashMap::new(),
+            next_run_id: 0,
             event_tx,
             forward_samples,
             overflow_policy,
@@ -516,138 +549,187 @@ impl Buffer {
 
     pub fn process_sample(&mut self, sample: Sample, route: DeviceRoute) {
         if self.routes_seen.insert(route.clone()) {
-            let _ = self
-                .event_tx
-                .try_send(BufferEvent::RouteDiscovered(route.clone()));
+            let _ = self.event_tx.try_send(BufferEvent::RouteDiscovered(route.clone()));
         }
         if sample.meta_changed {
-            let _ = self
-                .event_tx
-                .try_send(BufferEvent::MetadataChanged(route.clone()));
-        }
-        if sample.segment_changed {
-            let _ = self
-                .event_tx
-                .try_send(BufferEvent::SegmentChanged(route.clone()));
+            let _ = self.event_tx.try_send(BufferEvent::MetadataChanged(route.clone()));
         }
         if self.forward_samples {
             let _ = self.event_tx.try_send(BufferEvent::Samples(vec![(sample.clone(), route.clone())]));
         }
 
         let stream_id = sample.stream.stream_id;
-        let session_id = sample.device.session_id;
-        let segment_id = sample.segment.segment_id;
         let stream_key = StreamKey::new(route.clone(), stream_id);
 
-        let needs_new_segment = match self.active_segments.get(&stream_key) {
-            None => true,
-            Some(active) => active.session_id != session_id || active.segment_id != segment_id,
-        };
+        let run_boundary = self.check_run_continuity(&stream_key, &sample);
 
-        if needs_new_segment {
-            self.handle_segment_change(sample, route, stream_key);
-        } else {
-            self.check_continuity_and_push(sample, route, stream_key);
+        if let Some(reason) = run_boundary {
+            self.emit_diagnostic_event(&route, &sample, &reason);
+
+            if self.overflow_policy == OverflowPolicy::Flush {
+                self.flush_active_run(&stream_key);
+            }
+
+            self.start_new_run(&stream_key, &sample, &route, reason);
         }
+
+        self.push_sample_to_run(&stream_key, sample);
     }
 
-    fn handle_segment_change(&mut self, sample: Sample, route: DeviceRoute, stream_key: StreamKey) {
-        let session_id = sample.device.session_id;
-        let segment_id = sample.segment.segment_id;
-        let stream_id = sample.stream.stream_id;
+    fn check_run_continuity(&self, key: &StreamKey, sample: &Sample) -> Option<RunBoundary> {
+        let active = match self.active_runs.get(key) {
+            None => return Some(RunBoundary::Initial),
+            Some(a) => a,
+        };
 
-        if self.overflow_policy == OverflowPolicy::Flush {
-            self.flush_active_segment(&stream_key);
+        if sample.device.session_id != active.session_id {
+            return Some(RunBoundary::SessionChanged {
+                old: active.session_id,
+                new: sample.device.session_id,
+            });
         }
 
-        if let Some(active) = self.active_segments.get(&stream_key) {
-            if active.session_id != session_id {
-                let _ = self.event_tx.try_send(BufferEvent::SessionChanged {
-                    route: route.clone(),
-                    stream_id,
-                    old_id: active.session_id,
-                    new_id: session_id,
+        let new_rate = sample.segment.sampling_rate as f64 / sample.segment.decimation as f64;
+        if (new_rate - active.effective_rate).abs() > 1e-9 {
+            return Some(RunBoundary::RateChanged {
+                old_rate: active.effective_rate,
+                new_rate,
+            });
+        }
+
+        if sample.segment.time_ref_epoch != active.time_ref_epoch {
+            return Some(RunBoundary::EpochChanged {
+                old: active.time_ref_epoch.clone(),
+                new: sample.segment.time_ref_epoch.clone(),
+            });
+        }
+
+        let sample_ts = sample.timestamp_begin();
+
+        if sample_ts < active.last_timestamp - (1.0 / active.effective_rate * 0.5) {
+            return Some(RunBoundary::BackwardJump {
+                previous_ts: active.last_timestamp,
+                current_ts: sample_ts,
+            });
+        }
+
+        if sample.n > active.last_sample_number.wrapping_add(1) {
+            let expected_ts = active.last_timestamp + (1.0 / active.effective_rate);
+            let ts_gap = (sample_ts - expected_ts).abs();
+
+            if ts_gap > (1.0 / active.effective_rate * 0.5) {
+                return Some(RunBoundary::SamplesSkipped {
+                    expected: active.last_sample_number.wrapping_add(1),
+                    received: sample.n,
                 });
             }
         }
 
-        let new_segment = ActiveSegment {
-            session_id,
-            segment_id,
-            buffer: SegmentBuffer::new(
-                session_id, 
-                sample.stream.clone(), 
-                sample.segment.clone(), 
-                self.capacity
-            ),
-            last_sample_number: sample.n,
-            last_timestamp: sample.timestamp_end(),
-            has_emitted_chunk: false,
-        };
-
-        self.active_segments.insert(stream_key.clone(), new_segment);
-
-        let active = self.active_segments.get_mut(&stream_key).unwrap();
-        active.buffer.push_sample(sample);
-    }
-
-    fn check_continuity_and_push(
-        &mut self,
-        sample: Sample,
-        route: DeviceRoute,
-        stream_key: StreamKey,
-    ) {
-        let stream_id = sample.stream.stream_id;
-        let session_id = sample.device.session_id;
-
-        let active = self.active_segments.get_mut(&stream_key).unwrap();
-
-        let last_n = active.last_sample_number;
-
-        // Sample number continuity
-        if sample.n < last_n {
-            let _ = self.event_tx.try_send(BufferEvent::SamplesBackward {
-                route: route.clone(),
-                stream_id,
-                session_id,
-                previous: last_n,
-                current: sample.n,
-            });
-        } else if sample.n > last_n + 1 {
-            let skipped_count = sample.n.saturating_sub(last_n + 1);
-            let _ = self.event_tx.try_send(BufferEvent::SamplesSkipped {
-                route: route.clone(),
-                stream_id,
-                session_id,
-                expected: last_n + 1,
-                received: sample.n,
-                count: skipped_count,
+        if sample.n < active.last_sample_number &&
+           active.last_sample_number - sample.n < 0x800000 {
+            return Some(RunBoundary::BackwardJump {
+                previous_ts: active.last_timestamp,
+                current_ts: sample_ts,
             });
         }
 
-        // Update tracking
-        active.last_sample_number = sample.n;
-        active.last_timestamp = sample.timestamp_end();
+        None
+    }
 
-        // Push to buffer
-        active.buffer.push_sample(sample);
+    fn emit_diagnostic_event(&self, route: &DeviceRoute, sample: &Sample, reason: &RunBoundary) {
+        match reason {
+            RunBoundary::SessionChanged { old, new } => {
+                let _ = self.event_tx.try_send(BufferEvent::SessionChanged {
+                    route: route.clone(),
+                    stream_id: sample.stream.stream_id,
+                    old_id: *old,
+                    new_id: *new,
+                });
+            }
+            RunBoundary::SamplesSkipped { expected, received } => {
+                let count = received.saturating_sub(*expected);
+                let _ = self.event_tx.try_send(BufferEvent::SamplesSkipped {
+                    route: route.clone(),
+                    stream_id: sample.stream.stream_id,
+                    session_id: sample.device.session_id,
+                    expected: *expected,
+                    received: *received,
+                    count,
+                });
+            }
+            RunBoundary::BackwardJump { .. } => {
+                if let Some(active) = self.active_runs.get(&StreamKey::new(route.clone(), sample.stream.stream_id)) {
+                    let _ = self.event_tx.try_send(BufferEvent::SamplesBackward {
+                        route: route.clone(),
+                        stream_id: sample.stream.stream_id,
+                        session_id: sample.device.session_id,
+                        previous: active.last_sample_number,
+                        current: sample.n,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_new_run(
+        &mut self,
+        stream_key: &StreamKey,
+        sample: &Sample,
+        route: &DeviceRoute,
+        reason: RunBoundary,
+    ) {
+        let old_run_id = self.active_runs.get(stream_key).map(|r| r.run_id);
+
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+
+        let _ = self.event_tx.try_send(BufferEvent::RunChanged {
+            route: route.clone(),
+            stream_id: sample.stream.stream_id,
+            old_run_id,
+            new_run_id: run_id,
+            reason,
+        });
+
+        let new_run = ActiveRun::new(run_id, sample, self.capacity);
+        self.active_runs.insert(stream_key.clone(), new_run);
+    }
+
+    fn push_sample_to_run(&mut self, stream_key: &StreamKey, sample: Sample) {
+        let active = self.active_runs.get_mut(stream_key).unwrap();
+
+        let route = stream_key.route.clone();
+        let stream_id = sample.stream.stream_id;
+        let new_segment_id = sample.segment.segment_id;
+
+        active.buffer.push_sample(sample.clone());
+        
+        if let Some(old_segment_id) = active.update_tracking(&sample) {
+            let _ = self.event_tx.try_send(BufferEvent::SegmentChanged {
+                route,
+                stream_id,
+                old_segment_id,
+                new_segment_id,
+            });
+        }
 
         if active.buffer.len() > self.capacity {
             match self.overflow_policy {
                 OverflowPolicy::DropOldest => {
                     active.buffer.pop_front();
-                },
+                }
                 OverflowPolicy::Flush => {
-                    self.flush_active_segment(&stream_key);
+                    self.flush_active_run(stream_key);
                 }
             }
         }
     }
 
-    fn flush_active_segment(&mut self, stream_key: &StreamKey) {
-        if let Some(active) = self.active_segments.get_mut(stream_key) {
+    fn flush_active_run(&mut self, stream_key: &StreamKey) {
+        if let Some(active) = self.active_runs.get_mut(stream_key) {
             let is_first = !active.has_emitted_chunk;
-            
+
             if let Some(slice) = active.buffer.drain_to_slice(stream_key) {
                 active.has_emitted_chunk = true;
                 let _ = self.event_tx.try_send(BufferEvent::DataChunk {
@@ -659,9 +741,9 @@ impl Buffer {
     }
 
     pub fn flush_all(&mut self) {
-        let keys: Vec<StreamKey> = self.active_segments.keys().cloned().collect();
+        let keys: Vec<StreamKey> = self.active_runs.keys().cloned().collect();
         for key in keys {
-            self.flush_active_segment(&key);
+            self.flush_active_run(&key);
         }
     }
 
@@ -685,13 +767,12 @@ impl Buffer {
         let mut slices = Vec::new();
 
         for (stream_key, col_specs) in &by_stream {
-            let active = self.active_segments.get(stream_key)
-                .ok_or_else(|| ReadError::NoActiveSegment {
+            let active = self.active_runs.get(stream_key)
+                .ok_or_else(|| ReadError::NoActiveRun {
                     stream_key: stream_key.clone(),
                 })?;
 
             let column_ids: Vec<_> = col_specs.iter().map(|cs| cs.column_id).collect();
-            
             let slice = active.buffer.get_latest_n(stream_key, n_samples, &column_ids)?;
             slices.push(slice);
         }
@@ -720,25 +801,21 @@ impl Buffer {
         let mut slices = Vec::new();
 
         for (stream_key, column_ids) in &by_stream {
-            let active = self
-                .active_segments
-                .get(stream_key)
-                .ok_or(ReadError::NoActiveSegment {
+            let active = self.active_runs.get(stream_key)
+                .ok_or(ReadError::NoActiveRun {
                     stream_key: stream_key.clone(),
                 })?;
 
-            let cursor = cursors
-                .get(stream_key)
+            let cursor = cursors.get(stream_key)
                 .ok_or(ReadError::NoCursorForStream {
                     stream_key: stream_key.clone(),
                 })?;
 
-            // Validate cursor matches current segment
-            if cursor.session_id != active.session_id || cursor.segment_id != active.segment_id {
-                return Err(ReadError::SegmentChanged {
+            if cursor.run_id != active.run_id {
+                return Err(ReadError::CursorInvalidated {
                     stream_key: stream_key.clone(),
-                    cursor_segment: (cursor.session_id, cursor.segment_id),
-                    current_segment: (active.session_id, active.segment_id),
+                    cursor_run: cursor.run_id,
+                    current_run: active.run_id,
                 });
             }
 
@@ -746,19 +823,16 @@ impl Buffer {
                 stream_key,
                 cursor.last_sample_number,
                 n_samples,
-                column_ids,
+                &column_ids,
             )?;
-            
+
             slices.push(slice);
         }
 
         util::merge_slices(slices)
     }
 
-    pub fn read_aligned_tail(
-        &self,
-        columns: &[ColumnKey],
-    ) -> Result<AlignedWindow, ReadError> {
+    pub fn read_aligned_tail(&self, columns: &[ColumnKey]) -> Result<AlignedWindow, ReadError> {
         if columns.is_empty() {
             return Err(ReadError::NoColumnsRequested);
         }
@@ -772,14 +846,12 @@ impl Buffer {
         let mut global_end = f64::MAX;
         let mut rate = 0.0;
 
-        // First pass: find overlapping time window
         for stream_key in by_stream.keys() {
-            let seg = self.active_segments.get(stream_key)
-                .ok_or(ReadError::NoActiveSegment { stream_key: stream_key.clone() })?;
-            
-            let meta = &seg.buffer.segment_metadata;
-            let r = (meta.sampling_rate as f64) / (meta.decimation as f64);
-            
+            let run = self.active_runs.get(stream_key)
+                .ok_or(ReadError::NoActiveRun { stream_key: stream_key.clone() })?;
+
+            let r = run.effective_rate;
+
             if rate != 0.0 && (r - rate).abs() > 0.001 {
                 return Err(ReadError::SamplingRateMismatch {
                     streams: by_stream.keys().cloned().collect(),
@@ -788,7 +860,7 @@ impl Buffer {
             }
             rate = r;
 
-            let samples = &seg.buffer.sample_numbers;
+            let samples = &run.buffer.sample_numbers;
             if samples.is_empty() {
                 return Err(ReadError::InsufficientData {
                     stream_key: stream_key.clone(),
@@ -797,7 +869,6 @@ impl Buffer {
                 });
             }
 
-            // Find the start of the contiguous tail
             let last_idx = samples.len() - 1;
             let last_val = samples[last_idx];
             let target_offset = (last_val as i64) - (last_idx as i64);
@@ -813,9 +884,9 @@ impl Buffer {
                     high = mid;
                 }
             }
-            
-            let tail_start_time = meta.start_time as f64 + (samples[low] as f64 / rate);
-            let tail_end_time = meta.start_time as f64 + (last_val as f64 / rate);
+
+            let tail_start_time = run.buffer.start_time + (samples[low] as f64 / rate);
+            let tail_end_time = run.buffer.start_time + (last_val as f64 / rate);
 
             if tail_start_time > global_start { global_start = tail_start_time; }
             if tail_end_time < global_end { global_end = tail_end_time; }
@@ -833,12 +904,10 @@ impl Buffer {
         let mut slices = Vec::new();
 
         for (stream_key, column_ids) in &by_stream {
-            let seg = self.active_segments.get(stream_key).unwrap();
-            let start_time = seg.buffer.segment_metadata.start_time as f64;
-            
-            let start_n = ((global_start - start_time) * rate + 0.5) as u32;
+            let run = self.active_runs.get(stream_key).unwrap();
+            let start_n = ((global_start - run.buffer.start_time) * rate + 0.5) as u32;
 
-            let slice = seg.buffer.get_range(stream_key, start_n, samples_to_read, column_ids)?;
+            let slice = run.buffer.get_range(stream_key, start_n, samples_to_read, &column_ids)?;
             slices.push(slice);
         }
 

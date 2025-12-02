@@ -901,10 +901,8 @@ fn run_data_thread(
 
             let window = q.selection.and_then(|spec| {
                 let stream_key = spec.stream_key();
-                let active = buffer.active_segments.get(&stream_key)?;
-                let sampling_hz = (active.buffer.segment_metadata.sampling_rate
-                    / active.buffer.segment_metadata.decimation)
-                    as f64;
+                let active = buffer.active_runs.get(&stream_key)?;
+                let sampling_hz = active.effective_rate;
                 let n_samples = (q.seconds * sampling_hz).ceil().max(10.0) as usize;
                 buffer.read_aligned_window(&[spec], n_samples).ok()
             });

@@ -9,7 +9,9 @@ pub fn validate_sampling_rates(slices: &[DataSlice]) -> Result<(), ReadError> {
 
     let rates: Vec<f64> = slices
         .iter()
-        .map(|s| (s.segment_metadata.sampling_rate as f64) / (s.segment_metadata.decimation as f64))
+        .map(|s| {
+            s.segment_metadata.sampling_rate as f64 / s.segment_metadata.decimation as f64
+        })
         .collect();
 
     let first_rate = rates[0];
@@ -32,7 +34,7 @@ pub fn validate_stream_alignment(slices: &[DataSlice]) -> Result<(), ReadError> 
 
     let first_slice = &slices[0];
     let expected_len = first_slice.sample_numbers.len();
-    
+
     if expected_len == 0 {
         return Ok(());
     }
@@ -65,7 +67,6 @@ pub fn validate_stream_alignment(slices: &[DataSlice]) -> Result<(), ReadError> 
     Ok(())
 }
 
-
 pub fn merge_slices(slices: Vec<DataSlice>) -> Result<AlignedWindow, ReadError> {
     if slices.is_empty() {
         return Err(ReadError::NoColumnsRequested);
@@ -83,6 +84,7 @@ pub fn merge_slices(slices: Vec<DataSlice>) -> Result<AlignedWindow, ReadError> 
     let mut segment_metadata = HashMap::new();
     let mut column_metadata = HashMap::new();
     let mut session_ids = HashMap::new();
+    let mut run_ids = HashMap::new();
 
     for slice in slices {
         let sk = slice.stream_key;
@@ -90,22 +92,15 @@ pub fn merge_slices(slices: Vec<DataSlice>) -> Result<AlignedWindow, ReadError> 
         stream_metadata.insert(sk.clone(), slice.stream_metadata);
         segment_metadata.insert(sk.clone(), slice.segment_metadata);
         session_ids.insert(sk.clone(), slice.session_id);
+        run_ids.insert(sk.clone(), slice.run_id);
 
         for (col_id, batch) in slice.columns {
-            let key = ColumnKey::new(
-                sk.route.clone(), 
-                sk.stream_id, 
-                col_id
-            );
+            let key = ColumnKey::new(sk.route.clone(), sk.stream_id, col_id);
             columns.insert(key, batch);
         }
 
         for (col_id, meta) in slice.column_metadata {
-            let key = ColumnKey::new(
-                sk.route.clone(), 
-                sk.stream_id, 
-                col_id
-            );
+            let key = ColumnKey::new(sk.route.clone(), sk.stream_id, col_id);
             column_metadata.insert(key, meta);
         }
     }
@@ -118,5 +113,6 @@ pub fn merge_slices(slices: Vec<DataSlice>) -> Result<AlignedWindow, ReadError> 
         segment_metadata,
         column_metadata,
         session_ids,
+        run_ids,
     })
 }

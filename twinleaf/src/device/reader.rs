@@ -13,13 +13,12 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
-use crate::tio::proto::identifiers::{ColumnKey, StreamKey};
-use crate::data::{AlignedWindow, Buffer, ReadError}; 
-use crate::tio::proto::identifiers::{SessionId, SegmentId, SampleNumber};
+
+use crate::tio::proto::identifiers::{ColumnKey, StreamKey, SampleNumber};
+use crate::data::{AlignedWindow, Buffer, ReadError, RunId};
 
 pub struct CursorPosition {
-    pub session_id: SessionId,
-    pub segment_id: SegmentId,
+    pub run_id: RunId,
     pub last_sample_number: SampleNumber,
 }
 
@@ -39,6 +38,10 @@ impl ReaderCursor {
             positions: HashMap::new(),
         }
     }
+
+    fn clear(&mut self) {
+        self.positions.clear();
+    }
 }
 
 impl Reader {
@@ -53,6 +56,7 @@ impl Reader {
     pub fn next(&mut self, n_samples: usize) -> Result<AlignedWindow, ReadError> {
         loop {
             let buffer = self.buffer.read().unwrap();
+
             match self.try_read_from_cursor(&buffer, n_samples) {
                 Ok(window) => {
                     drop(buffer);
@@ -61,7 +65,12 @@ impl Reader {
                 }
                 Err(ReadError::InsufficientData { .. }) => {
                     drop(buffer);
-                    std::thread::sleep(Duration::from_millis(1)); // didn't do: find actual blocking implementaiton
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(ReadError::CursorInvalidated { .. }) => {
+                    drop(buffer);
+                    self.cursor.clear();
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -78,6 +87,11 @@ impl Reader {
                 Ok(Some(window))
             }
             Err(ReadError::InsufficientData { .. }) => Ok(None),
+            Err(ReadError::CursorInvalidated { .. }) => {
+                drop(buffer);
+                self.cursor.clear();
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
@@ -99,15 +113,11 @@ impl Reader {
             return;
         };
 
-        for (stream_key, segment_meta) in &window.segment_metadata {
-            let session_id = *window.session_ids.get(stream_key).unwrap();
-            let segment_id = segment_meta.segment_id;
-
+        for (stream_key, &run_id) in &window.run_ids {
             self.cursor.positions.insert(
                 stream_key.clone(),
                 CursorPosition {
-                    session_id,
-                    segment_id,
+                    run_id,
                     last_sample_number,
                 },
             );
