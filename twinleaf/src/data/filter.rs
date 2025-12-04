@@ -13,18 +13,13 @@ impl ColumnFilter {
             format!("{}/*", pattern_str) // e.g. "/0/vector" -> "/0/vector/*"
         };
 
-        let pattern = Pattern::new(&corrected)
-            .map_err(|e| format!("Invalid glob pattern: {}", e))?;
-        
+        let pattern =
+            Pattern::new(&corrected).map_err(|e| format!("Invalid glob pattern: {}", e))?;
+
         Ok(Self { pattern })
     }
 
-    pub fn matches(
-        &self, 
-        route: &DeviceRoute, 
-        stream_name: &str, 
-        col_name: &str
-    ) -> bool {
+    pub fn matches(&self, route: &DeviceRoute, stream_name: &str, col_name: &str) -> bool {
         let route_str = route.to_string();
         let clean_route = route_str.trim_start_matches('/');
         let stream_path = if clean_route.is_empty() {
@@ -37,10 +32,15 @@ impl ColumnFilter {
         self.pattern.matches(&stream_path) || self.pattern.matches(&full_path)
     }
 
-    pub fn get_path_string(&self, route: &DeviceRoute, stream_name: &str, col_name: &str) -> String {
+    pub fn get_path_string(
+        &self,
+        route: &DeviceRoute,
+        stream_name: &str,
+        col_name: &str,
+    ) -> String {
         let route_str = route.to_string();
         let clean_route = route_str.trim_start_matches('/');
-        
+
         if clean_route.is_empty() {
             format!("/{}/{}", stream_name, col_name)
         } else {

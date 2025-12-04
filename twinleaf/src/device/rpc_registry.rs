@@ -23,10 +23,14 @@ pub enum EncodeError {
 }
 
 impl From<std::num::ParseIntError> for EncodeError {
-    fn from(e: std::num::ParseIntError) -> Self { EncodeError::ParseInt(e) }
+    fn from(e: std::num::ParseIntError) -> Self {
+        EncodeError::ParseInt(e)
+    }
 }
 impl From<std::num::ParseFloatError> for EncodeError {
-    fn from(e: std::num::ParseFloatError) -> Self { EncodeError::ParseFloat(e) }
+    fn from(e: std::num::ParseFloatError) -> Self {
+        EncodeError::ParseFloat(e)
+    }
 }
 
 #[derive(Debug)]
@@ -38,7 +42,9 @@ pub enum DecodeError {
 }
 
 impl From<std::str::Utf8Error> for DecodeError {
-    fn from(e: std::str::Utf8Error) -> Self { DecodeError::Utf8(e) }
+    fn from(e: std::str::Utf8Error) -> Self {
+        DecodeError::Utf8(e)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +56,10 @@ pub enum RpcDataKind {
     Raw { meta: u16 },
 }
 
-
 #[derive(Debug, Clone)]
 pub struct RpcMeta {
-    pub full_name: String,      // "dev.port.rate.min"
-    pub segments: Vec<String>,  // ["dev", "port", "rate", "min"]
+    pub full_name: String,     // "dev.port.rate.min"
+    pub segments: Vec<String>, // ["dev", "port", "rate", "min"]
     pub data_kind: RpcDataKind,
     pub readable: bool,
     pub writable: bool,
@@ -73,8 +78,8 @@ impl RpcMeta {
         } else {
             format!(
                 "{}{}{}",
-                if self.readable   { "R" } else { "-" },
-                if self.writable   { "W" } else { "-" },
+                if self.readable { "R" } else { "-" },
+                if self.writable { "W" } else { "-" },
                 if self.persistent { "P" } else { "-" },
             )
         }
@@ -137,23 +142,25 @@ impl RpcNode {
         if let Some((first, rest)) = prefix_segments.split_first() {
             if let Some(child) = self.children.get(first) {
                 return child.completions(rest);
-            } 
-            
+            }
+
             if rest.is_empty() {
-               return self.children.keys()
-                   .filter(|k| k.starts_with(first))
-                   .cloned()
-                   .collect();
+                return self
+                    .children
+                    .keys()
+                    .filter(|k| k.starts_with(first))
+                    .cloned()
+                    .collect();
             }
             return vec![];
         }
-        
+
         self.children.keys().cloned().collect()
     }
-    
+
     fn find(&self, segments: &[String]) -> Option<&RpcMeta> {
         if let Some((first, rest)) = segments.split_first() {
-             self.children.get(first)?.find(rest)
+            self.children.get(first)?.find(rest)
         } else {
             self.rpc.as_ref()
         }
@@ -183,7 +190,8 @@ impl RpcRegistry {
 
     pub fn suggest(&self, query: &str) -> Vec<String> {
         let parts: Vec<String> = query.split('.').map(|s| s.to_string()).collect();
-        self.flat.keys()
+        self.flat
+            .keys()
             .filter(|k| k.starts_with(query))
             .take(10)
             .cloned()
@@ -192,25 +200,33 @@ impl RpcRegistry {
 
     pub fn prepare_request(&self, input_line: &str) -> Result<(String, Vec<u8>), String> {
         let parts: Vec<&str> = input_line.split_whitespace().collect();
-        if parts.is_empty() { return Err("Empty command".into()); }
+        if parts.is_empty() {
+            return Err("Empty command".into());
+        }
 
         let name = parts[0];
         let arg_str = parts.get(1).unwrap_or(&"");
 
-        let meta = self.flat.get(name).ok_or_else(|| format!("Unknown RPC: {}", name))?;
-        
+        let meta = self
+            .flat
+            .get(name)
+            .ok_or_else(|| format!("Unknown RPC: {}", name))?;
+
         let payload = util::rpc_encode_arg(arg_str, &meta.data_kind)
             .map_err(|e| format!("Encoding error: {:?}", e))?;
 
         Ok((name.to_string(), payload))
     }
-    
+
     pub fn decode_response(&self, name: &str, data: &[u8]) -> Result<String, String> {
-         let meta = self.flat.get(name).ok_or_else(|| format!("Unknown RPC: {}", name))?;
-         
-         let val = util::rpc_decode_reply(data, &meta.data_kind)
-             .map_err(|e| format!("Decode error: {:?}", e))?;
-             
-         Ok(util::format_rpc_value_for_cli(&val, &meta.data_kind))
+        let meta = self
+            .flat
+            .get(name)
+            .ok_or_else(|| format!("Unknown RPC: {}", name))?;
+
+        let val = util::rpc_decode_reply(data, &meta.data_kind)
+            .map_err(|e| format!("Decode error: {:?}", e))?;
+
+        Ok(util::format_rpc_value_for_cli(&val, &meta.data_kind))
     }
 }

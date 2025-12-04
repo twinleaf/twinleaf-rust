@@ -1,8 +1,8 @@
 use crate::tio;
 
 use std::sync::Arc;
-use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
 use tio::proto::identifiers::SampleNumber;
+use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
 
 #[derive(Debug, Clone)]
 pub enum ColumnData {

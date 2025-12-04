@@ -1,8 +1,8 @@
-use crate::data::buffer::{DataSlice, ColumnBatch};
+use crate::data::buffer::{ColumnBatch, DataSlice};
 use crate::data::ColumnFilter;
-use hdf5::{File, Result, H5Type, Dataset, SimpleExtents, Group, Location};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::VarLenUnicode;
+use hdf5::{Dataset, File, Group, H5Type, Location, Result, SimpleExtents};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -57,14 +57,23 @@ impl Hdf5Appender {
             return Ok(());
         }
 
-        let route_str = slice.stream_key.route.to_string().trim_start_matches('/').to_string();
+        let route_str = slice
+            .stream_key
+            .route
+            .to_string()
+            .trim_start_matches('/')
+            .to_string();
         let stream_name = &slice.stream_metadata.name;
 
         let mut valid_columns = Vec::new();
 
         for (col_id, batch) in &slice.columns {
             let (name, units, desc) = if let Some(meta) = slice.column_metadata.get(col_id) {
-                (meta.name.clone(), Some(meta.units.clone()), Some(meta.description.clone()))
+                (
+                    meta.name.clone(),
+                    Some(meta.units.clone()),
+                    Some(meta.description.clone()),
+                )
             } else {
                 (format!("col_{}", col_id), None, None)
             };
@@ -89,11 +98,7 @@ impl Hdf5Appender {
             return Ok(());
         }
 
-        let group_path = format!("/{}/run_{:06}/{}",
-            route_str,
-            slice.run_id,
-            stream_name
-        );
+        let group_path = format!("/{}/run_{:06}/{}", route_str, slice.run_id, stream_name);
 
         self.ensure_group(&group_path)?;
 
@@ -103,16 +108,28 @@ impl Hdf5Appender {
             self.write_metadata_attributes(&group, slice)?;
         }
 
-        self.append_dataset(&group_path, "time", &slice.timestamps, None, Some("Time in seconds"))?;
+        self.append_dataset(
+            &group_path,
+            "time",
+            &slice.timestamps,
+            None,
+            Some("Time in seconds"),
+        )?;
 
         for (_col_id, batch, name, units, desc) in valid_columns {
             let units_opt = units.as_ref().filter(|u| !u.is_empty());
             let desc_opt = desc.as_deref();
 
             match batch {
-                ColumnBatch::F64(data) => self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?,
-                ColumnBatch::I64(data) => self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?,
-                ColumnBatch::U64(data) => self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?,
+                ColumnBatch::F64(data) => {
+                    self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?
+                }
+                ColumnBatch::I64(data) => {
+                    self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?
+                }
+                ColumnBatch::U64(data) => {
+                    self.append_dataset(&group_path, &name, data, units_opt, desc_opt)?
+                }
             }
         }
 
@@ -131,7 +148,9 @@ impl Hdf5Appender {
         self.stats.start_time = Some(self.stats.start_time.map_or(t_start, |t| t.min(t_start)));
         self.stats.end_time = Some(self.stats.end_time.map_or(t_end, |t| t.max(t_end)));
 
-        self.stats.streams_written.insert(format!("/{}/{}", route_str, stream_name));
+        self.stats
+            .streams_written
+            .insert(format!("/{}/{}", route_str, stream_name));
     }
 
     fn write_metadata_attributes(&self, group: &Group, slice: &DataSlice) -> Result<()> {
@@ -163,7 +182,7 @@ impl Hdf5Appender {
         name: &str,
         data: &[T],
         units: Option<&String>,
-        description: Option<&str>
+        description: Option<&str>,
     ) -> Result<()> {
         let full_path = format!("{}/{}", group_path, name);
 
@@ -173,7 +192,8 @@ impl Hdf5Appender {
             let ds = if let Ok(existing) = group.dataset(name) {
                 existing
             } else {
-                let builder = group.new_dataset::<T>()
+                let builder = group
+                    .new_dataset::<T>()
                     .chunk((65_536,))
                     .shape(SimpleExtents::resizable([0usize]));
 

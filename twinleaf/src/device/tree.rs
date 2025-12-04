@@ -64,7 +64,6 @@ impl DeviceTree {
         Ok(())
     }
 
-
     fn process_packet(&mut self, pkt: &tio::Packet) {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
 
@@ -186,7 +185,7 @@ impl DeviceTree {
         let relative_routing = match self.root_route.relative_route(&route) {
             Ok(r) => r,
             Err(_) => {
-                req.routing = route; 
+                req.routing = route;
                 return Err(tio::proxy::RpcError::SendFailed(
                     tio::proxy::SendError::InvalidRoute(req),
                 ));

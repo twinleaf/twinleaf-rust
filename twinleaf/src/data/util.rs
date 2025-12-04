@@ -9,9 +9,7 @@ pub fn validate_sampling_rates(slices: &[DataSlice]) -> Result<(), ReadError> {
 
     let rates: Vec<f64> = slices
         .iter()
-        .map(|s| {
-            s.segment_metadata.sampling_rate as f64 / s.segment_metadata.decimation as f64
-        })
+        .map(|s| s.segment_metadata.sampling_rate as f64 / s.segment_metadata.decimation as f64)
         .collect();
 
     let first_rate = rates[0];

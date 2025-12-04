@@ -8,7 +8,6 @@ pub type SegmentId = u8;
 pub type StreamId = u8;
 pub type ColumnId = usize;
 
-
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct StreamKey {
     pub route: DeviceRoute,
@@ -19,7 +18,7 @@ impl StreamKey {
     pub fn new(route: DeviceRoute, stream_id: StreamId) -> Self {
         Self { route, stream_id }
     }
-    
+
     pub fn device_route(&self) -> DeviceRoute {
         self.route.clone()
     }
@@ -40,7 +39,11 @@ pub struct ColumnKey {
 
 impl ColumnKey {
     pub fn new(route: DeviceRoute, stream_id: StreamId, column_id: ColumnId) -> Self {
-        Self { route, stream_id, column_id }
+        Self {
+            route,
+            stream_id,
+            column_id,
+        }
     }
 
     pub fn stream_key(&self) -> StreamKey {
@@ -49,7 +52,7 @@ impl ColumnKey {
             stream_id: self.stream_id,
         }
     }
-    
+
     pub fn device_route(&self) -> DeviceRoute {
         self.route.clone()
     }

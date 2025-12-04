@@ -14,8 +14,8 @@ use std::{
     time::Duration,
 };
 
-use crate::tio::proto::identifiers::{ColumnKey, StreamKey, SampleNumber};
 use crate::data::{AlignedWindow, Buffer, ReadError, RunId};
+use crate::tio::proto::identifiers::{ColumnKey, SampleNumber, StreamKey};
 
 pub struct CursorPosition {
     pub run_id: RunId,

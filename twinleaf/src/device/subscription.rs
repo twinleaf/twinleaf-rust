@@ -1,9 +1,7 @@
-use std::{
-    collections::HashMap,
-};
+use std::collections::HashMap;
 
+use crate::data::{AlignedWindow, Buffer};
 use crate::tio::proto::identifiers::ColumnKey;
-use crate::data::{AlignedWindow, Buffer}; 
 
 pub type SubscriptionId = usize;
 pub struct SubscriptionManager {
@@ -62,8 +60,7 @@ impl SubscriptionManager {
                 Ok(window) => {
                     let _ = sub.tx.try_send(window);
                 }
-                Err(_) => {
-                }
+                Err(_) => {}
             }
         }
     }

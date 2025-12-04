@@ -1,6 +1,6 @@
+pub mod identifiers;
 pub mod legacy;
 pub mod meta;
-pub mod identifiers;
 pub mod route;
 pub mod rpc;
 pub mod vararg;
@@ -10,8 +10,7 @@ pub use legacy::{
     LegacyTimebaseInfoPayload,
 };
 pub use meta::{
-    DeviceMetadata, StreamMetadata, SegmentMetadata, ColumnMetadata,
-    MetadataPayload, MetadataType,
+    ColumnMetadata, DeviceMetadata, MetadataPayload, MetadataType, SegmentMetadata, StreamMetadata,
 };
 use num_enum::{FromPrimitive, IntoPrimitive};
 pub use route::DeviceRoute;
@@ -77,19 +76,29 @@ impl DataType {
     pub fn buffer_type(&self) -> BufferType {
         match self {
             DataType::Float32 | DataType::Float64 => BufferType::Float,
-            
-            DataType::Int8  | DataType::Int16 | 
-            DataType::Int24 | DataType::Int32 | DataType::Int64 => BufferType::Int,
-            
-            DataType::UInt8  | DataType::UInt16 | 
-            DataType::UInt24 | DataType::UInt32 | DataType::UInt64 => BufferType::UInt,
-            
+
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int24
+            | DataType::Int32
+            | DataType::Int64 => BufferType::Int,
+
+            DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt24
+            | DataType::UInt32
+            | DataType::UInt64 => BufferType::UInt,
+
             DataType::Unknown(_) => BufferType::Float,
         }
     }
 }
 
-pub enum BufferType { Float, Int, UInt }
+pub enum BufferType {
+    Float,
+    Int,
+    UInt,
+}
 
 #[derive(Debug, Clone)]
 pub struct StreamDataPayload {

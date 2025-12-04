@@ -1,8 +1,8 @@
+use super::identifiers::{ColumnId, SegmentId, SessionId, StreamId};
 use super::{
     too_small, vararg, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE,
 };
 use super::{DeviceRoute, Packet, Payload};
-use super::identifiers::{StreamId, ColumnId, SegmentId, SessionId};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone)]
