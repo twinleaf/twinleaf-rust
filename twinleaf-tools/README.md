@@ -5,7 +5,7 @@ This repository contains a set of tools that are useful for working with Twinlea
 
 ## Proxy
 
-The proxy makes the device's serial port available via ethernet, and supports multiple simultaneous client connections to a single device:
+The proxy makes the device's serial port available via Ethernet, and supports multiple simultaneous client connections to a single device:
 
 		tio-proxy --auto
 
@@ -25,9 +25,14 @@ Log data to a raw binary file:
 
 		tio-tool log
 
-Parse that log data for stream id 1 to a csv file:
+Parse that log data for stream id 1 to a `.csv` file. Assumes root route if unspecified.
 
 		tio-tool log-csv 1 logfile.tio
+
+Parse that log data to an HDF5 file (requires --features hdf5 on crate installation)
+
+		tio-tool log-hdf logfile.tio -g "[device_route]/[stream_name]/[column_name]"
+		tio-tool log-hdf logfile.tio -g "*/vector"
 
 Issue commands:
 
@@ -45,18 +50,26 @@ Monitoring the data stream:
 
 		tio-tool data-dump
 
-A TUI data monitor:
+A TUI device data monitor:
 
 		tio-monitor
 
-And a variety of additional functions for use with Twinleaf sensors.
+A TUI device health monitor:
+
+		tio-health
+
+And a variety of additional functions for use with Twinleaf sensors. Each tool can be called with the `--help` argument for more information.
 
 
 ## Installation
 
 The tools can be installed using
 
-	cargo install twinleaf-tools
+		cargo install twinleaf-tools
+
+It can be installed with the ability to convert to HDF5 using
+
+		cargo install twinleaf-tools --features hdf5
 
 It is convenient to add the cargo binary directory to the default search paths. Cargo will report where the binaries and installed and which path to add to your environment, if necessary.
 
