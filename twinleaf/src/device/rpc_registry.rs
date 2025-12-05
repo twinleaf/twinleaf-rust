@@ -185,16 +185,23 @@ impl RpcRegistry {
     }
 
     pub fn find(&self, name: &str) -> Option<&RpcMeta> {
-        self.flat.get(name)
+        let parts: Vec<String> = name.split('.').map(|s| s.to_string()).collect();
+        self.root.find(&parts)
     }
 
     pub fn suggest(&self, query: &str) -> Vec<String> {
         let parts: Vec<String> = query.split('.').map(|s| s.to_string()).collect();
-        self.flat
-            .keys()
-            .filter(|k| k.starts_with(query))
-            .take(10)
-            .cloned()
+        let suffixes = self.root.completions(&parts);
+
+        if parts.is_empty() {
+            return suffixes;
+        }
+
+        let prefix = parts.join(".");
+
+        suffixes
+            .into_iter()
+            .map(|s| format!("{prefix}.{s}"))
             .collect()
     }
 
