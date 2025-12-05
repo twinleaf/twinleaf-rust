@@ -1557,8 +1557,13 @@ fn main() {
             selection: app.current_selection(),
             seconds: app.view.plot_window_seconds,
         };
-        if req_tx.try_send(req).is_err() {
-            break 'main;
+        match req_tx.try_send(req) {
+            Ok(_) => {}
+            Err(crossbeam::channel::TrySendError::Full(_)) => {
+            }
+            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                break 'main;
+            }
         }
 
         while let Ok(r) = resp_rx.try_recv() {
