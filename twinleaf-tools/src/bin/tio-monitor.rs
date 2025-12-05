@@ -1034,7 +1034,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
 
     let routes = app.visible_routes();
     if routes.is_empty() || app.last.is_empty() {
-        lines.push(Line::from("Waiting..."));
+        lines.push(Line::from("Waiting for data..."));
         return (lines, map);
     }
 
@@ -1065,17 +1065,23 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                dev.map(|d| d.name.clone()).unwrap_or("<dev>".into()),
-                head_style,
-            ),
-            if app.view.show_routes {
-                Span::raw(format!(" [{}]", route))
+
+        let header_text = if let Some(d) = dev {
+            if d.serial_number.is_empty() {
+                d.name.clone()
             } else {
-                Span::raw("")
-            },
-        ]));
+                format!("{}  Serial: {}", d.name, d.serial_number)
+            }
+        } else {
+            "<dev>".to_string()
+        };
+
+        let mut header_spans = vec![Span::styled(header_text, head_style)];
+        if app.view.show_routes {
+            header_spans.push(Span::raw(format!(" [{}]", route)));
+        }
+
+        lines.push(Line::from(header_spans));
 
         let mut stream_ids: Vec<_> = app
             .last
