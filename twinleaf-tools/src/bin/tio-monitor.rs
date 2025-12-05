@@ -281,6 +281,7 @@ pub struct ViewConfig {
     pub follow_selection: bool,
     pub scroll: u16,
     pub desc_width: usize,
+    pub units_width: usize,
     pub theme: Theme,
 }
 
@@ -297,6 +298,7 @@ impl Default for ViewConfig {
             follow_selection: true,
             scroll: 0,
             desc_width: 0,
+            units_width: 0,
             theme: Theme::default(),
         }
     }
@@ -1044,6 +1046,13 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         .map(|c| c.desc.description.len())
         .max()
         .unwrap_or(0);
+    app.view.units_width = app
+        .last
+        .values()
+        .flat_map(|(s, _)| s.columns.iter())
+        .map(|c| c.desc.units.len())
+        .max()
+        .unwrap_or(0);
 
     for (dev_idx, route) in routes.iter().enumerate() {
         let dev = app
@@ -1105,11 +1114,21 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
+                    let units = col.desc.units.clone();
+                    let padded_units = if app.view.units_width > 0 && !units.is_empty() {
+                        format!("{:>width$}", units, width = app.view.units_width)
+                    } else if app.view.units_width > 0 {
+                        " ".repeat(app.view.units_width)
+                    } else {
+                        String::new()
+                    };
+
                     lines.push(Line::from(vec![
                         Span::styled(desc, label_style),
                         Span::raw("  "),
                         Span::styled(val_str, val_style),
-                        Span::styled(col.desc.units.clone(), val_style),
+                        Span::raw(" "),
+                        Span::styled(padded_units, val_style),
                     ]));
                 }
             }
