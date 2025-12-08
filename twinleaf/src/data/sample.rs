@@ -1,6 +1,7 @@
 use crate::tio;
 
 use std::sync::Arc;
+use tio::proto::identifiers::SampleNumber;
 use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
 
 #[derive(Debug, Clone)]
@@ -90,13 +91,14 @@ impl Column {
 
 #[derive(Debug, Clone)]
 pub struct Sample {
-    pub n: u32,
+    pub n: SampleNumber,
     pub columns: Vec<Column>,
     pub segment: Arc<SegmentMetadata>,
     pub stream: Arc<StreamMetadata>,
     pub device: Arc<DeviceMetadata>,
     pub segment_changed: bool,
     pub meta_changed: bool,
+    pub source: tio::proto::StreamDataPayload,
 }
 
 impl Sample {
@@ -116,7 +118,8 @@ impl std::fmt::Display for Sample {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SAMPLE({}:{}) {:.6}",
+            "SAMPLE({}:{}:{}) {:.6}",
+            self.device.session_id,
             self.stream.stream_id,
             self.segment.segment_id,
             self.timestamp_end()

@@ -3,14 +3,77 @@
 //! Multiplexes access to a sensor, exposing the functionality of tio::proxy
 //! via TCP.
 
-use getopts::Options;
-use std::env;
+use clap::Parser;
 use std::io;
 use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::tio;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-proxy",
+    version,
+    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP"
+)]
+struct Cli {
+    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0)
+    /// Required unless --auto or --enum is specified
+    sensor_url: Option<String>,
+
+    /// TCP port to listen on for clients
+    #[arg(short = 'p', long = "port", default_value = "7855")]
+    port: u16,
+
+    /// Kick off slow clients instead of dropping traffic
+    #[arg(short = 'k', long)]
+    kick_slow: bool,
+
+    /// Sensor subtree to look at
+    #[arg(short = 's', long = "subtree", default_value = "/")]
+    subtree: String,
+
+    /// Verbose output
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Debugging output
+    #[arg(short = 'd', long)]
+    debug: bool,
+
+    /// Timestamp format
+    #[arg(short = 't', long = "timestamp", default_value = "%T%.3f ")]
+    timestamp_format: String,
+
+    /// Time limit for sensor reconnection attempts (seconds)
+    #[arg(short = 'T', long = "timeout", default_value = "30")]
+    reconnect_timeout: u64,
+
+    /// Dump packet traffic except sample data/metadata or heartbeats
+    #[arg(long)]
+    dump: bool,
+
+    /// Dump sample data traffic
+    #[arg(long)]
+    dump_data: bool,
+
+    /// Dump sample metadata traffic
+    #[arg(long)]
+    dump_meta: bool,
+
+    /// Dump heartbeat traffic
+    #[arg(long)]
+    dump_hb: bool,
+
+    /// Automatically connect to a USB sensor if there is a single device
+    #[arg(short = 'a', long = "auto")]
+    auto: bool,
+
+    /// Enumerate all serial devices, then quit
+    #[arg(short = 'e', long = "enumerate", name = "enum")]
+    enumerate: bool,
+}
 
 // Unfortunately we cannot access USB details via the serialport module, so
 // we are stuck guessing based on VID/PID. This returns a vector of possible
@@ -91,74 +154,20 @@ fn create_listener_thread(
 }
 
 fn main() -> ExitCode {
-    let mut opts = Options::new();
-    opts.optopt(
-        "p",
-        "",
-        "TCP port to listen on for clients (default 7855)",
-        "port",
-    );
-    opts.optflag(
-        "k",
-        "",
-        "Kick off slow clients, instead of dropping traffic.",
-    );
-    opts.optopt("s", "", "Sensor subtree to look at (default /)", "path");
-    opts.optflag("v", "", "Verbose output");
-    opts.optflag("d", "", "Debugging output");
-    opts.optopt("t", "", "Timestamp format (default '%T%.3f ')", "fmt");
-    opts.optopt(
-        "T",
-        "",
-        "Time limit for sensor reconnection attempts (default: 30)",
-        "seconds",
-    );
-    opts.optflag(
-        "",
-        "dump",
-        "Dump packet traffic except sample data/metadata or heartbeats",
-    );
-    opts.optflag("", "dump-data", "Dump sample data traffic");
-    opts.optflag("", "dump-meta", "Dump sample metadata traffic");
-    opts.optflag("", "dump-hb", "Dump heartbeat traffic");
-    opts.optflag("", "auto", "Automatically connect to a USB sensor if there is a single device on the system that could be a Twinleaf device");
-    opts.optflag("", "enum", "Enumerate all serial devices, then quit");
+    let cli = Cli::parse();
 
-    let mut args: Vec<String> = env::args().collect();
-
-    macro_rules! die{
-        ($f:expr,$($a:tt)*)=>{
-        {
+    macro_rules! die {
+        ($f:expr,$($a:tt)*) => {
             die!(format!($f, $($a)*));
-        }
         };
-        ($msg:expr)=>{
-        {
+        ($msg:expr) => {{
             eprintln!("ERROR: {}", $msg);
             return ExitCode::FAILURE;
-        }
-        };
-    }
-    macro_rules! die_usage{
-        ($f:expr,$($a:tt)*)=>{
-        {
-            die_usage!(format!($f, $($a)*));
-        }
-        };
-        ($msg:expr)=>{
-        {
-            let usage = format!("Usage: {} [-p port] [-v] [-d] [-t fmt] (--auto | sensor_url)  or {} --enum", &args[0], &args[0]);
-            die!("{}\n{}", $msg, opts.usage(&usage));
-        }
-        };
+        }};
     }
 
-    let matches = match opts.parse(&mut args[1..]) {
-        Ok(m) => m,
-        Err(f) => die_usage!("{}", f.to_string()),
-    };
-
-    if matches.opt_present("enum") {
+    // Handle --enum mode
+    if cli.enumerate {
         let mut unknown_devices = vec![];
         let mut found_any = false;
         for dev in enum_devices(true) {
@@ -184,48 +193,33 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let tcp_port = matches.opt_str("p").unwrap_or("7855".to_string());
-    let tcp_port = if let Ok(port) = tcp_port.parse::<u16>() {
-        port
-    } else {
-        die_usage!("Invalid port '{}'", tcp_port);
-    };
-
-    let auto_sensor = matches.opt_present("auto");
-
-    let reconnect_timeout = matches.opt_str("T").unwrap_or("30".to_string());
-    let reconnect_timeout = if let Ok(t) = reconnect_timeout.parse::<u64>() {
-        std::time::Duration::from_secs(t)
-    } else {
-        die_usage!("Invalid reconnection_timeout '{}'", reconnect_timeout);
-    };
-
-    let disconnect_slow = matches.opt_present("k");
-
-    let verbose = matches.opt_present("v");
-    let debugging = matches.opt_present("d");
-    let dump_traffic = matches.opt_present("dump");
-    let dump_data = matches.opt_present("dump-data");
-    let dump_meta = matches.opt_present("dump-meta");
-    let dump_hb = matches.opt_present("dump-hb");
-    let tf = matches.opt_str("t").unwrap_or("%T%.3f ".to_string());
-
-    if (matches.free.len() == 0) && !auto_sensor {
-        die_usage!("need sensor url or --auto");
-    }
-    if matches.free.len() > 1 {
-        die_usage!("This program supports only a single sensor")
-    }
-    if (matches.free.len() == 1) && auto_sensor {
-        die_usage!(
+    // Validate sensor_url / --auto combination
+    if cli.auto && cli.sensor_url.is_some() {
+        die!(
             "both --auto and explicit sensor '{}' given",
-            matches.free[0]
+            cli.sensor_url.unwrap()
         );
     }
+    if !cli.auto && cli.sensor_url.is_none() {
+        die!("need sensor url or --auto");
+    }
 
-    let sensor_url = if matches.free.len() == 1 {
-        matches.free[0].clone()
+    let tcp_port = cli.port;
+    let reconnect_timeout = Duration::from_secs(cli.reconnect_timeout);
+    let disconnect_slow = cli.kick_slow;
+    let verbose = cli.verbose;
+    let debugging = cli.debug;
+    let dump_traffic = cli.dump;
+    let dump_data = cli.dump_data;
+    let dump_meta = cli.dump_meta;
+    let dump_hb = cli.dump_hb;
+    let tf = cli.timestamp_format;
+
+    // Determine sensor URL
+    let sensor_url = if let Some(url) = cli.sensor_url {
+        url
     } else {
+        // --auto mode
         let devices = enum_devices(false);
         let mut valid_urls = Vec::new();
         for dev in devices {
@@ -245,15 +239,42 @@ fn main() -> ExitCode {
         valid_urls[0].clone()
     };
 
-    if verbose || auto_sensor {
-        log!(tf, "Using sensor url: {}", sensor_url);
-    }
+    let subtree = tio::proto::DeviceRoute::from_str(&cli.subtree).expect("Invalid sensor subtree");
 
-    let subtree = if let Some(path) = matches.opt_str("s") {
-        tio::proto::DeviceRoute::from_str(&path).expect("Invalid sensor subtree")
-    } else {
-        tio::proto::DeviceRoute::root()
-    };
+    println!("tio-proxy starting:");
+    println!(
+        "  Sensor: {} {}",
+        sensor_url,
+        if cli.auto { "(auto-detected)" } else { "" }
+    );
+    println!("  TCP port: {}", tcp_port);
+    println!("  Subtree: {}", subtree);
+    if verbose || debugging || dump_traffic || dump_data || dump_meta || dump_hb {
+        print!("  Flags:");
+        if verbose {
+            print!(" verbose");
+        }
+        if debugging {
+            print!(" debug");
+        }
+        if disconnect_slow {
+            print!(" kick-slow");
+        }
+        if dump_traffic {
+            print!(" dump");
+        }
+        if dump_data {
+            print!(" dump-data");
+        }
+        if dump_meta {
+            print!(" dump-meta");
+        }
+        if dump_hb {
+            print!(" dump-hb");
+        }
+        println!();
+    }
+    println!();
 
     let new_client = {
         let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);

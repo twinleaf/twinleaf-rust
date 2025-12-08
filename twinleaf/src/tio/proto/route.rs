@@ -1,7 +1,7 @@
 use super::TioPktHdr;
 use super::TIO_PACKET_MAX_ROUTING_SIZE;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceRoute {
     route: Vec<u8>,
 }

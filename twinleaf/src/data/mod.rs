@@ -1,7 +1,15 @@
+mod buffer;
+mod filter;
 mod parser;
 mod sample;
+mod util;
 
-#[deprecated(note = "please use `twinleaf::device::Device` instead")]
-pub use crate::device::Device;
+#[cfg(feature = "hdf5")]
+pub mod export;
+
+pub use buffer::{
+    AlignedWindow, Buffer, BufferEvent, ColumnBatch, OverflowPolicy, ReadError, RunId,
+};
+pub use filter::ColumnFilter;
 pub use parser::{DeviceDataParser, DeviceFullMetadata};
 pub use sample::{Column, ColumnData, Sample};

@@ -1,8 +1,29 @@
+use clap::Parser;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::{env, thread};
+use std::thread;
+use twinleaf::device::Device;
 use twinleaf::tio;
-use twinleaf_tools::{tio_opts, tio_parseopts};
+use twinleaf_tools::TioOpts;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-text-proxy",
+    version,
+    about = "Bridge Twinleaf sensor data to NMEA TCP stream"
+)]
+struct Cli {
+    #[command(flatten)]
+    tio: TioOpts,
+
+    #[arg(
+        short = 'p',
+        long = "port",
+        default_value = "7800",
+        help = "TCP port to listen on"
+    )]
+    tcp_port: u16,
+}
 
 fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String]) -> String {
     let mut sentence = format!("${}{}", talker_id, sentence_type);
@@ -17,7 +38,6 @@ fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String])
 }
 
 fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
-    use twinleaf::data::Device;
     let mut device = Device::new(port);
     let peer_addr = stream.peer_addr().unwrap();
     println!("Connection from: {}", peer_addr);
@@ -66,13 +86,17 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
 }
 
 fn main() {
-    let opts = tio_opts();
-    let args: Vec<String> = env::args().collect();
-    let (_matches, root, route) = tio_parseopts(&opts, &args);
+    let cli = Cli::parse();
 
-    let proxy = tio::proxy::Interface::new(&root);
+    let proxy = tio::proxy::Interface::new(&cli.tio.root);
+    let route = cli.tio.parse_route();
 
-    let listener = TcpListener::bind("0.0.0.0:7800").unwrap();
+    let bind_addr = format!("0.0.0.0:{}", cli.tcp_port);
+    let listener = TcpListener::bind(&bind_addr)
+        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", bind_addr, e));
+
+    println!("Listening on {}", bind_addr);
+
     for connection in listener.incoming() {
         if let Ok(stream) = connection {
             let device = proxy.device_full(route.clone()).unwrap();

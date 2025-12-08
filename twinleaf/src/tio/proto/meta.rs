@@ -1,3 +1,4 @@
+use super::identifiers::{ColumnId, SegmentId, SessionId, StreamId};
 use super::{
     too_small, vararg, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE,
 };
@@ -9,13 +10,13 @@ pub struct DeviceMetadata {
     pub serial_number: String,
     pub firmware_hash: String,
     pub n_streams: usize,
-    pub session_id: u32,
+    pub session_id: SessionId,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamMetadata {
-    pub stream_id: u8,
+    pub stream_id: StreamId,
     pub name: String,
     pub n_columns: usize,
     pub n_segments: usize,
@@ -51,8 +52,8 @@ static TL_METADATA_SEGMENT_ACTIVE: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentMetadata {
-    pub stream_id: u8,
-    pub segment_id: u8,
+    pub stream_id: StreamId,
+    pub segment_id: SegmentId,
     pub flags: u8,
     pub time_ref_epoch: MetadataEpoch,
     pub time_ref_serial: String,
@@ -66,8 +67,8 @@ pub struct SegmentMetadata {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMetadata {
-    pub stream_id: u8,
-    pub index: usize,
+    pub stream_id: StreamId,
+    pub index: ColumnId,
     pub data_type: DataType,
     pub name: String,
     pub units: String,
@@ -152,7 +153,7 @@ impl DeviceMetadata {
         fixed.push(vararg::checked_u8_size(self.n_streams)?);
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
-    pub fn make_update(&self) -> Packet {
+    pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
             payload: Payload::Metadata(MetadataPayload {
                 content: MetadataContent::Device(self.clone()),
@@ -160,9 +161,12 @@ impl DeviceMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: DeviceRoute::root(),
+            routing: routing,
             ttl: 0,
         }
+    }
+    pub fn make_update(&self) -> Packet {
+        self.make_update_with_route(DeviceRoute::root())
     }
 }
 
@@ -209,7 +213,7 @@ impl StreamMetadata {
         fixed.push(vararg::append_string(&mut varlen, &self.name)?);
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
-    pub fn make_update(&self) -> Packet {
+    pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
             payload: Payload::Metadata(MetadataPayload {
                 content: MetadataContent::Stream(self.clone()),
@@ -217,9 +221,12 @@ impl StreamMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: DeviceRoute::root(),
+            routing: routing,
             ttl: 0,
         }
+    }
+    pub fn make_update(&self) -> Packet {
+        self.make_update_with_route(DeviceRoute::root())
     }
 }
 
@@ -282,7 +289,7 @@ impl SegmentMetadata {
         fixed.push(self.filter_type.clone().into());
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
-    pub fn make_update(&self) -> Packet {
+    pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
             payload: Payload::Metadata(MetadataPayload {
                 content: MetadataContent::Segment(self.clone()),
@@ -290,9 +297,12 @@ impl SegmentMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: DeviceRoute::root(),
+            routing: routing,
             ttl: 0,
         }
+    }
+    pub fn make_update(&self) -> Packet {
+        self.make_update_with_route(DeviceRoute::root())
     }
 }
 
@@ -341,7 +351,7 @@ impl ColumnMetadata {
         fixed.push(vararg::append_string(&mut varlen, &self.description)?);
         Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
     }
-    pub fn make_update(&self) -> Packet {
+    pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
             payload: Payload::Metadata(MetadataPayload {
                 content: MetadataContent::Column(self.clone()),
@@ -349,9 +359,12 @@ impl ColumnMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: DeviceRoute::root(),
+            routing: routing,
             ttl: 0,
         }
+    }
+    pub fn make_update(&self) -> Packet {
+        self.make_update_with_route(DeviceRoute::root())
     }
 }
 

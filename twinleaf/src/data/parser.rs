@@ -243,6 +243,7 @@ impl DeviceStream {
                 device: dev.clone(),
                 segment_changed: self.segment_changed,
                 meta_changed: self.meta_changed,
+                source: data.clone(),
             });
             self.segment_changed = false;
             self.meta_changed = false;
