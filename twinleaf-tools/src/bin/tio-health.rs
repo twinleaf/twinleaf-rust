@@ -314,9 +314,20 @@ impl StreamStats {
             }
         }
 
-        let count = self.arrivals.len() as f64;
-        let win_secs = window.as_secs_f64().max(1e-6);
-        self.rate_smps = count / win_secs;
+        self.rate_smps = if let (Some(from_time), Some(to_time)) =
+            (self.arrivals.front(), self.arrivals.back())
+        {
+            // Count fence sections, not fence posts: two data points one second
+            // apart are sent at a rate of 1 sps, not 2sps
+            let count = (self.arrivals.len() - 1) as f64;
+            if from_time >= to_time {
+                0.0
+            } else {
+                count / (to_time.duration_since(*from_time)).as_secs_f64()
+            }
+        } else {
+            0.0
+        };
         self.rate_smps
     }
 
@@ -745,7 +756,16 @@ fn main() {
     std::thread::spawn(move || {
         let mut tree = tree;
         let mut buffer = buffer;
+        let start_time = Instant::now()
+            .checked_add(Duration::from_millis(500))
+            .expect("now() near end of time");
 
+        while Instant::now() < start_time {
+            if let Err(e) = tree.next() {
+                eprintln!("Device error: {:?}", e);
+                return;
+            }
+        }
         loop {
             match tree.next() {
                 Ok((sample, route)) => {
