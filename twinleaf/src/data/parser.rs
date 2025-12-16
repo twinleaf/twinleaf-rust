@@ -10,6 +10,7 @@ use tio::proto::meta::{
 use tio::{proto, util};
 
 static TL_STREAMRPC_MAX_META: usize = 16;
+const META_RPC_ID: u16 = 7855;
 
 #[derive(Debug, Clone)]
 struct StreamRpcMetaReq {
@@ -89,7 +90,7 @@ fn metareqs_to_rpcs(metareqs: &Vec<StreamRpcMetaReq>) -> Vec<tio::Packet> {
         ret.push(util::PacketBuilder::make_rpc_request(
             "dev.metadata",
             &make_metareq((&reqs[0..n_reqs]).to_vec()),
-            7855,
+            META_RPC_ID,
             DeviceRoute::root(),
         ));
         reqs = &reqs[n_reqs..];
