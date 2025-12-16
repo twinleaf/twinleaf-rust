@@ -205,6 +205,24 @@ impl RpcRegistry {
             .collect()
     }
 
+    pub fn children_of(&self, prefix: &str) -> Vec<String> {
+        if prefix.is_empty() {
+            return self.root.children.keys().cloned().collect();
+        }
+        
+        let parts: Vec<String> = prefix.split('.').map(|s| s.to_string()).collect();
+        
+        let mut current = &self.root;
+        for part in &parts {
+            match current.children.get(part) {
+                Some(node) => current = node,
+                None => return vec![],
+            }
+        }
+        
+        current.children.keys().cloned().collect()
+    }
+
     pub fn prepare_request(&self, input_line: &str) -> Result<(String, Vec<u8>), String> {
         let parts: Vec<&str> = input_line.split_whitespace().collect();
         if parts.is_empty() {
