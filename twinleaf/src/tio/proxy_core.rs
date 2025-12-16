@@ -229,6 +229,7 @@ struct RpcMapEntry {
     client: u64,
     route: DeviceRoute,
     timeout: Instant,
+    method: proto::RpcMethod,
 }
 
 pub struct ProxyCore {
@@ -319,7 +320,7 @@ impl ProxyCore {
         }
     }
 
-    fn rpc_restore(&mut self, wire_id: u16, route: &DeviceRoute) -> Option<(u64, u16)> {
+    fn rpc_restore(&mut self, wire_id: u16, route: &DeviceRoute) -> Option<(u64, u16, proto::RpcMethod)> {
         let remap = match self.rpc_map.remove(&wire_id) {
             None => {
                 return None;
@@ -339,7 +340,7 @@ impl ProxyCore {
             #[cfg(debug_assertions)]
             eprintln!("Failed to find RPC timeout in map");
         }
-        Some((remap.client, remap.id))
+        Some((remap.client, remap.id, remap.method))
     }
 
     // Ok: successful. Err: packet should be sent back to client
@@ -371,6 +372,7 @@ impl ProxyCore {
                     client: client_id,
                     route: pkt.routing.clone(),
                     timeout: timeout,
+                    method: req.method.clone(),
                 },
             );
             self.status_queue
@@ -406,6 +408,34 @@ impl ProxyCore {
                 .rpc_error(remap.id, proto::RpcErrorCode::Undefined));
         } else {
             Ok(())
+        }
+    }
+
+    fn broadcast_status(&self, status: proto::ProxyStatus) {
+        let pkt = Packet {
+            payload: proto::Payload::ProxyEvent(proto::ProxyEventPayload::Status(status)),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        };
+        for (_client_id, client) in self.clients.iter() {
+            if let Err(_) = client.send(&pkt) {
+                // Don't drop clients here. Let the normal error handling do it
+            }
+        }
+    }
+
+    fn broadcast_rpc_update(&self, method: &proto::RpcMethod, route: &DeviceRoute, exclude_client: u64) {
+        let pkt = Packet {
+            payload: proto::Payload::ProxyEvent(
+                proto::ProxyEventPayload::RpcUpdate(method.clone())
+            ),
+            routing: route.clone(),
+            ttl: 0,
+        };
+        for (client_id, client) in self.clients.iter() {
+            if *client_id != exclude_client {
+                let _ = client.tx.try_send(pkt.clone());
+            }
         }
     }
 
@@ -646,9 +676,11 @@ impl ProxyCore {
 
         if !self.try_setup_device() {
             self.status_queue.send(Event::FailedToConnect);
+            self.broadcast_status(proto::ProxyStatus::FailedToConnect);
             return;
         } else {
             self.status_queue.send(Event::SensorConnected);
+            self.broadcast_status(proto::ProxyStatus::SensorReconnected);
         }
         let mut device_timeout = Instant::now();
 
@@ -660,11 +692,13 @@ impl ProxyCore {
                 if !self.try_setup_device() {
                     if Instant::now() > device_timeout {
                         self.status_queue.send(Event::FailedToReconnect);
+                        self.broadcast_status(proto::ProxyStatus::FailedToReconnect);
                         break;
                     }
                     timeout = std::cmp::min(timeout, Duration::from_secs(1));
                 } else {
                     self.status_queue.send(Event::SensorReconnected);
+                    self.broadcast_status(proto::ProxyStatus::SensorReconnected);
                 }
             }
 
@@ -824,19 +858,16 @@ impl ProxyCore {
                                 _ => None,
                             } {
                                 // Remap RPC reply or error ID to client + ID
-                                let (client, client_id, original_id) =
-                                    if let Some((client_id, rpc_id)) =
+                                let (client, client_id, original_id, method) =
+                                    if let Some((client_id, rpc_id, method)) =
                                         self.rpc_restore(wire_id, &pkt.routing)
                                     {
                                         if client_id == 0 {
                                             // internal reply
-                                            (None, 0, rpc_id)
+                                            (None, 0, rpc_id, method)
                                         } else if let Some(client) = self.clients.get(&client_id) {
-                                            self.status_queue.send(Event::RpcRestore(
-                                                wire_id,
-                                                (client_id, rpc_id),
-                                            ));
-                                            (Some(client), client_id, rpc_id)
+                                                self.status_queue.send(Event::RpcRestore(wire_id, (client_id, rpc_id)));
+                                                (Some(client), client_id, rpc_id, method)
                                         } else {
                                             // If we cannot find the client which originally sent the
                                             // request, just drop the packet and send an event.
@@ -856,6 +887,7 @@ impl ProxyCore {
                                             self.internal_rpc_reply(rep);
                                             continue;
                                         }
+                                        self.broadcast_rpc_update(&method, &pkt.routing, client_id);
                                     }
                                     proto::Payload::RpcError(err) => {
                                         err.id = original_id;
@@ -911,6 +943,7 @@ impl ProxyCore {
                                     None => Duration::from_secs(0),
                                 };
                             self.status_queue.send(Event::SensorDisconnected);
+                            self.broadcast_status(proto::ProxyStatus::SensorDisconnected);
                             break;
                         }
                     }
