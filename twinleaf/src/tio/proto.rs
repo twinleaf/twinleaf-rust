@@ -383,6 +383,87 @@ impl StreamDataPayload {
     }
 }
 
+const PROXY_EVENT_TYPE_STATUS: u8 = 0;
+const PROXY_EVENT_TYPE_RPC_UPDATE: u8 = 1;
+
+const RPC_METHOD_TYPE_ID: u8 = 0;
+const RPC_METHOD_TYPE_NAME: u8 = 1;
+impl ProxyEventPayload {
+    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<ProxyEventPayload, Error> {
+        if raw.is_empty() {
+            return Err(too_small(full_data));
+        }
+
+        match raw[0] {
+            PROXY_EVENT_TYPE_STATUS => {
+                if raw.len() < 2 {
+                    return Err(too_small(full_data));
+                }
+                Ok(ProxyEventPayload::Status(ProxyStatus::from(raw[1])))
+            }
+            PROXY_EVENT_TYPE_RPC_UPDATE => {
+                if raw.len() < 2 {
+                    return Err(too_small(full_data));
+                }
+                let method = match raw[1] {
+                    RPC_METHOD_TYPE_ID => {
+                        if raw.len() < 4 {
+                            return Err(too_small(full_data));
+                        }
+                        RpcMethod::Id(u16::from_le_bytes([raw[2], raw[3]]))
+                    }
+                    RPC_METHOD_TYPE_NAME => {
+                        if raw.len() < 4 {
+                            return Err(too_small(full_data));
+                        }
+                        let name_len = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+                        if raw.len() < 4 + name_len {
+                            return Err(too_small(full_data));
+                        }
+                        RpcMethod::Name(
+                            String::from_utf8_lossy(&raw[4..4 + name_len]).to_string()
+                        )
+                    }
+                    _ => return Err(Error::InvalidPayload(full_data.to_vec())),
+                };
+                Ok(ProxyEventPayload::RpcUpdate(method))
+            }
+            _ => Err(Error::InvalidPayload(full_data.to_vec())),
+        }
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let (event_type, payload_bytes): (u8, Vec<u8>) = match self {
+            ProxyEventPayload::Status(status) => {
+                (PROXY_EVENT_TYPE_STATUS, vec![u8::from(*status)])
+            }
+            ProxyEventPayload::RpcUpdate(method) => {
+                let method_bytes = match method {
+                    RpcMethod::Id(id) => {
+                        let mut v = vec![RPC_METHOD_TYPE_ID];
+                        v.extend(id.to_le_bytes());
+                        v
+                    }
+                    RpcMethod::Name(name) => {
+                        let name_bytes = name.as_bytes();
+                        let mut v = vec![RPC_METHOD_TYPE_NAME];
+                        v.extend((name_bytes.len() as u16).to_le_bytes());
+                        v.extend(name_bytes);
+                        v
+                    }
+                };
+                (PROXY_EVENT_TYPE_RPC_UPDATE, method_bytes)
+            }
+        };
+
+        let payload_size = 1 + payload_bytes.len();
+        let mut ret = TioPktHdr::serialize_new(TioPktType::ProxyEvent, 0, payload_size as u16);
+        ret.push(event_type);
+        ret.extend(payload_bytes);
+        Ok(ret)
+    }
+}
+
 impl GenericPayload {
     fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<GenericPayload, Error> {
         Ok(GenericPayload {
@@ -411,6 +492,7 @@ impl Payload {
             Payload::Metadata(p) => p.serialize(),
             Payload::LegacyStreamData(p) => p.serialize(),
             Payload::StreamData(p) => p.serialize(),
+            Payload::ProxyEvent(p) => p.serialize(),
             Payload::Unknown(p) => p.serialize(),
             _ => Err(()),
         }
@@ -469,6 +551,9 @@ impl Payload {
                 raw_payload,
                 full_data,
             )?)),
+            TioPktType::ProxyEvent => Ok(Payload::ProxyEvent(
+                ProxyEventPayload::deserialize(raw_payload, full_data)?
+            )),
             TioPktType::UnknownOrStream(_) => {
                 if let Some(_) = hdr.stream_id() {
                     Ok(Payload::StreamData(StreamDataPayload::deserialize(
