@@ -793,13 +793,21 @@ fn log_csv(
 }
 
 #[cfg(feature = "hdf5")]
-fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress: bool, debug: bool) -> Result<(), ()> {
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::fs::File;
-    use memmap2::Mmap;
+fn log_hdf(
+    files: Vec<String>,
+    output: String,
+    filter: Option<String>,
+    compress: bool,
+    debug: bool,
+) -> Result<(), ()> {
     use indicatif::{ProgressBar, ProgressStyle};
-    use twinleaf::data::{Buffer, BufferEvent, export, ColumnFilter, DeviceDataParser, OverflowPolicy};
+    use memmap2::Mmap;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::path::Path;
+    use twinleaf::data::{
+        export, Buffer, BufferEvent, ColumnFilter, DeviceDataParser, OverflowPolicy,
+    };
     use twinleaf::tio;
 
     let (tx, rx) = crossbeam::channel::bounded(100);
@@ -814,38 +822,50 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
         let col_filter = if let Some(p) = filter {
             match ColumnFilter::new(&p) {
                 Ok(f) => Some(f),
-                Err(e) => { eprintln!("Filter error: {}", e); return writer.stats; }
+                Err(e) => {
+                    eprintln!("Filter error: {}", e);
+                    return writer.stats;
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
 
         while let Ok(event) = rx.recv() {
             match event {
-                BufferEvent::DataChunk { slice, is_first_chunk: _ } => {
+                BufferEvent::DataChunk {
+                    slice,
+                    is_first_chunk: _,
+                } => {
                     if debug {
                         println!("[DEBUG] Writing chunk: {} samples", slice.len());
                     }
-                    
+
                     if let Err(e) = writer.write_slice(&slice, &col_filter) {
                         eprintln!("HDF5 Write Error: {:?}", e);
-                        break; 
+                        break;
                     }
-                },
-                _ => {} 
+                }
+                _ => {}
             }
         }
         writer.stats
     });
 
-    let mut buffer = Buffer::new(tx, 65_536, false, OverflowPolicy::Flush); 
+    let mut buffer = Buffer::new(tx, 65_536, false, OverflowPolicy::Flush);
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
 
     println!("Processing {} files...", files.len());
 
     for path in &files {
-        let file = File::open(&path).map_err(|e| eprintln!("Open failed: {:?}", e)).unwrap();
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| eprintln!("Mmap failed: {:?}", e)).unwrap();
-        
+        let file = File::open(&path)
+            .map_err(|e| eprintln!("Open failed: {:?}", e))
+            .unwrap();
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| eprintln!("Mmap failed: {:?}", e))
+            .unwrap();
+
         let total_bytes = mmap.len() as u64;
         let pb = ProgressBar::new(total_bytes);
         pb.set_style(ProgressStyle::default_bar()
@@ -869,7 +889,7 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
                 Ok(res) => res,
                 Err(_) => break,
             };
-            rest = &rest[len..];                
+            rest = &rest[len..];
             pb.set_position(total_bytes - rest.len() as u64);
 
             let parser = parsers
@@ -884,11 +904,11 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
     }
 
     println!("Flushing buffer and waiting for writer...");
-    buffer.flush_all(); 
+    buffer.flush_all();
     drop(buffer);
 
     let stats = writer_handle.join().unwrap();
-    
+
     let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     let duration = stats.end_time.unwrap_or(0.0) - stats.start_time.unwrap_or(0.0);
     let size_mb = file_size as f64 / 1_048_576.0;
@@ -901,7 +921,7 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
     println!(" Duration:        {:.3} s", duration);
     println!(" Total Samples:   {}", stats.total_samples);
     println!(" Streams Written: {}", stats.streams_written.len());
-    
+
     if !stats.streams_written.is_empty() {
         println!("\n Active Streams:");
         let mut streams: Vec<_> = stats.streams_written.into_iter().collect();
@@ -911,12 +931,17 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
         }
     }
     println!("--------------------------------------------------");
-    
+
     Ok(())
 }
 
 #[cfg(not(feature = "hdf5"))]
-fn log_hdf(_files: Vec<String>, _output: String, _filter: Option<String>, _debug: bool) -> Result<(), ()> {
+fn log_hdf(
+    _files: Vec<String>,
+    _output: String,
+    _filter: Option<String>,
+    _debug: bool,
+) -> Result<(), ()> {
     eprintln!("Error: This version of tio-tool was compiled without HDF5 support.");
     eprintln!("To enable it, recompile with:");
     eprintln!("  cargo install --path . --features hdf5 --force");
@@ -1060,9 +1085,13 @@ fn main() -> ExitCode {
             output,
         } => log_csv(stream, files, sensor, metadata, output),
         #[cfg(feature = "hdf5")]
-        Commands::LogHdf { files, output, filter, compress, debug } => {
-            log_hdf(files, output, filter, compress, debug)
-        },
+        Commands::LogHdf {
+            files,
+            output,
+            filter,
+            compress,
+            debug,
+        } => log_hdf(files, output, filter, compress, debug),
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
         Commands::DataDump { tio } => data_dump(&tio),
         Commands::DataDumpAll { tio } => data_dump_all(&tio),

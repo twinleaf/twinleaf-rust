@@ -26,10 +26,7 @@ use std::{
 use twinleaf::{
     data::{Buffer, BufferEvent, OverflowPolicy},
     device::DeviceTree,
-    tio::{
-        self,
-        proto::identifiers::StreamKey,
-    },
+    tio::{self, proto::identifiers::StreamKey},
 };
 use twinleaf_tools::TioOpts;
 
@@ -576,9 +573,9 @@ fn format_event(
         } => {
             let key = StreamKey::new(route.clone(), *stream_id);
             let stream_name = stats
-                            .get(&key)
-                            .map(|s| s.name.as_str())
-                            .unwrap_or("unknown");
+                .get(&key)
+                .map(|s| s.name.as_str())
+                .unwrap_or("unknown");
             Some((
                 format!(
                     "[{}/{}] SAMPLES DROPPED: {} samples (session: {})",

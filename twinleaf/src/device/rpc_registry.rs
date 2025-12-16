@@ -209,9 +209,9 @@ impl RpcRegistry {
         if prefix.is_empty() {
             return self.root.children.keys().cloned().collect();
         }
-        
+
         let parts: Vec<String> = prefix.split('.').map(|s| s.to_string()).collect();
-        
+
         let mut current = &self.root;
         for part in &parts {
             match current.children.get(part) {
@@ -219,7 +219,7 @@ impl RpcRegistry {
                 None => return vec![],
             }
         }
-        
+
         current.children.keys().cloned().collect()
     }
 

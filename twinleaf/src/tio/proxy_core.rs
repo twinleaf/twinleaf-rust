@@ -320,7 +320,11 @@ impl ProxyCore {
         }
     }
 
-    fn rpc_restore(&mut self, wire_id: u16, route: &DeviceRoute) -> Option<(u64, u16, proto::RpcMethod)> {
+    fn rpc_restore(
+        &mut self,
+        wire_id: u16,
+        route: &DeviceRoute,
+    ) -> Option<(u64, u16, proto::RpcMethod)> {
         let remap = match self.rpc_map.remove(&wire_id) {
             None => {
                 return None;
@@ -424,11 +428,16 @@ impl ProxyCore {
         }
     }
 
-    fn broadcast_rpc_update(&self, method: &proto::RpcMethod, route: &DeviceRoute, exclude_client: u64) {
+    fn broadcast_rpc_update(
+        &self,
+        method: &proto::RpcMethod,
+        route: &DeviceRoute,
+        exclude_client: u64,
+    ) {
         let pkt = Packet {
-            payload: proto::Payload::ProxyEvent(
-                proto::ProxyEventPayload::RpcUpdate(method.clone())
-            ),
+            payload: proto::Payload::ProxyEvent(proto::ProxyEventPayload::RpcUpdate(
+                method.clone(),
+            )),
             routing: route.clone(),
             ttl: 0,
         };
@@ -866,8 +875,11 @@ impl ProxyCore {
                                             // internal reply
                                             (None, 0, rpc_id, method)
                                         } else if let Some(client) = self.clients.get(&client_id) {
-                                                self.status_queue.send(Event::RpcRestore(wire_id, (client_id, rpc_id)));
-                                                (Some(client), client_id, rpc_id, method)
+                                            self.status_queue.send(Event::RpcRestore(
+                                                wire_id,
+                                                (client_id, rpc_id),
+                                            ));
+                                            (Some(client), client_id, rpc_id, method)
                                         } else {
                                             // If we cannot find the client which originally sent the
                                             // request, just drop the packet and send an event.

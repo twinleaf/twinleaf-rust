@@ -11,7 +11,7 @@ pub struct DeviceTree {
     parsers: HashMap<DeviceRoute, DeviceDataParser>,
     n_reqs: HashMap<DeviceRoute, usize>,
     sample_queue: VecDeque<(Sample, DeviceRoute)>,
-    status_queue: VecDeque<(proto::ProxyEventPayload, DeviceRoute)>
+    status_queue: VecDeque<(proto::ProxyEventPayload, DeviceRoute)>,
 }
 
 impl DeviceTree {
@@ -22,7 +22,7 @@ impl DeviceTree {
             parsers: HashMap::new(),
             n_reqs: HashMap::new(),
             sample_queue: VecDeque::new(),
-            status_queue: VecDeque::new()
+            status_queue: VecDeque::new(),
         }
     }
 

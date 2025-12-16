@@ -420,9 +420,7 @@ impl ProxyEventPayload {
                         if raw.len() < 4 + name_len {
                             return Err(too_small(full_data));
                         }
-                        RpcMethod::Name(
-                            String::from_utf8_lossy(&raw[4..4 + name_len]).to_string()
-                        )
+                        RpcMethod::Name(String::from_utf8_lossy(&raw[4..4 + name_len]).to_string())
                     }
                     _ => return Err(Error::InvalidPayload(full_data.to_vec())),
                 };
@@ -434,9 +432,7 @@ impl ProxyEventPayload {
 
     pub fn serialize(&self) -> Result<Vec<u8>, ()> {
         let (event_type, payload_bytes): (u8, Vec<u8>) = match self {
-            ProxyEventPayload::Status(status) => {
-                (PROXY_EVENT_TYPE_STATUS, vec![u8::from(*status)])
-            }
+            ProxyEventPayload::Status(status) => (PROXY_EVENT_TYPE_STATUS, vec![u8::from(*status)]),
             ProxyEventPayload::RpcUpdate(method) => {
                 let method_bytes = match method {
                     RpcMethod::Id(id) => {
@@ -551,9 +547,10 @@ impl Payload {
                 raw_payload,
                 full_data,
             )?)),
-            TioPktType::ProxyEvent => Ok(Payload::ProxyEvent(
-                ProxyEventPayload::deserialize(raw_payload, full_data)?
-            )),
+            TioPktType::ProxyEvent => Ok(Payload::ProxyEvent(ProxyEventPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
             TioPktType::UnknownOrStream(_) => {
                 if let Some(_) = hdr.stream_id() {
                     Ok(Payload::StreamData(StreamDataPayload::deserialize(

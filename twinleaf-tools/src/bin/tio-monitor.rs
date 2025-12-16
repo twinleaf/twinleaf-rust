@@ -33,7 +33,8 @@ use twinleaf::{
     tio::{
         self,
         proto::{
-            DeviceRoute, identifiers::{ColumnKey, StreamId, StreamKey}
+            identifiers::{ColumnKey, StreamId, StreamKey},
+            DeviceRoute,
         },
     },
 };
@@ -180,7 +181,6 @@ impl Nav {
         }
     }
 }
-
 
 /// ---------- Styling System ----------
 #[derive(Debug, Clone, Default)]
@@ -637,7 +637,7 @@ impl App {
 
         let split_idx = valid_vals.len() / 2;
         let mut high_freq_vals = valid_vals[split_idx..].to_vec();
-        
+
         high_freq_vals.sort_by(|a, b| a.total_cmp(b));
         let noise_floor = if high_freq_vals.is_empty() {
             let mut all = valid_vals.clone();
@@ -1058,7 +1058,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         let dev = app
             .last
             .iter()
-            .find(|(k, _)| &k.route == route) 
+            .find(|(k, _)| &k.route == route)
             .map(|(_, (s, _))| s.device.as_ref());
         let head_style = if dev_idx == app.current_device_index() {
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -1087,7 +1087,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
             .last
             .keys()
             .filter(|k| &k.route == route)
-            .map(|k| k.stream_id)          
+            .map(|k| k.stream_id)
             .collect();
         stream_ids.sort();
 
@@ -1392,13 +1392,23 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                             Axis::default()
                                 .title("Freq [Hz] (log)")
                                 .bounds([min_f, max_f])
-                                .labels(generate_log_labels(min_f, max_f, 5, app.view.axis_precision)),
+                                .labels(generate_log_labels(
+                                    min_f,
+                                    max_f,
+                                    5,
+                                    app.view.axis_precision,
+                                )),
                         )
                         .y_axis(
                             Axis::default()
                                 .title(format!("Val [{}/√Hz]", units))
                                 .bounds([min_d - y_pad, max_d + y_pad])
-                                .labels(generate_log_labels(min_d - y_pad, max_d + y_pad, 5, app.view.axis_precision)),
+                                .labels(generate_log_labels(
+                                    min_d - y_pad,
+                                    max_d + y_pad,
+                                    5,
+                                    app.view.axis_precision,
+                                )),
                         );
                     f.render_widget(chart, area);
                 } else {
@@ -1443,13 +1453,23 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
                         Axis::default()
                             .title("Time [s]")
                             .bounds([min_t, max_t])
-                            .labels(generate_linear_labels(min_t, max_t, 3, app.view.axis_precision)),
+                            .labels(generate_linear_labels(
+                                min_t,
+                                max_t,
+                                3,
+                                app.view.axis_precision,
+                            )),
                     )
                     .y_axis(
                         Axis::default()
                             .title(format!("Value [{}]", units))
                             .bounds([min_v - pad, max_v + pad])
-                            .labels(generate_linear_labels(min_v - pad, max_v + pad, 5, app.view.axis_precision)),
+                            .labels(generate_linear_labels(
+                                min_v - pad,
+                                max_v + pad,
+                                5,
+                                app.view.axis_precision,
+                            )),
                     );
                 f.render_widget(chart, area);
             } else {
@@ -1466,8 +1486,15 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
-    if count < 2 { return vec![]; }
+fn generate_linear_labels(
+    min: f64,
+    max: f64,
+    count: usize,
+    precision: usize,
+) -> Vec<Span<'static>> {
+    if count < 2 {
+        return vec![];
+    }
     let step = (max - min) / ((count - 1) as f64);
     (0..count)
         .map(|i| {
@@ -1477,8 +1504,15 @@ fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) ->
         .collect()
 }
 
-fn generate_log_labels(min_log: f64, max_log: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
-    if count < 2 { return vec![]; }
+fn generate_log_labels(
+    min_log: f64,
+    max_log: f64,
+    count: usize,
+    precision: usize,
+) -> Vec<Span<'static>> {
+    if count < 2 {
+        return vec![];
+    }
     let step = (max_log - min_log) / ((count - 1) as f64);
     let max_val = 10f64.powf(max_log.max(min_log)).abs();
     let use_scientific = max_val < 0.01 || max_val >= 1000.0;
@@ -1493,7 +1527,7 @@ fn generate_log_labels(min_log: f64, max_log: f64, count: usize, precision: usiz
             } else {
                 format!("{:.p$}", real_val, p = precision)
             };
-            Span::from(format!("{:>10}", s)) 
+            Span::from(format!("{:>10}", s))
         })
         .collect()
 }
@@ -1584,8 +1618,7 @@ fn main() {
         };
         match req_tx.try_send(req) {
             Ok(_) => {}
-            Err(crossbeam::channel::TrySendError::Full(_)) => {
-            }
+            Err(crossbeam::channel::TrySendError::Full(_)) => {}
             Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
                 break 'main;
             }

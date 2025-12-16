@@ -10,7 +10,7 @@ pub struct Device {
     parser: DeviceDataParser,
     n_reqs: usize,
     sample_queue: VecDeque<Sample>,
-    status_queue: VecDeque<proto::ProxyEventPayload>
+    status_queue: VecDeque<proto::ProxyEventPayload>,
 }
 
 impl Device {
