@@ -51,6 +51,24 @@ pub enum HeartbeatPayload {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
+pub enum ProxyStatus {
+    SensorDisconnected = 0,
+    SensorReconnected = 1,
+    FailedToReconnect = 2,
+    FailedToConnect = 3,
+    #[num_enum(catch_all)]
+    Unknown(u8),
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyEventPayload {
+    Status(ProxyStatus),
+    RpcUpdate(RpcMethod),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+#[derive(FromPrimitive, IntoPrimitive)]
 pub enum DataType {
     UInt8 = 0x10,
     Int8 = 0x11,
@@ -121,6 +139,7 @@ pub enum Payload {
     LegacyStreamData(LegacyStreamDataPayload),
     Metadata(MetadataPayload),
     StreamData(StreamDataPayload),
+    ProxyEvent(ProxyEventPayload),
     Unknown(GenericPayload),
 }
 
@@ -160,6 +179,7 @@ enum TioPktType {
     Reserved0 = 9,
     Reserved1 = 10,
     Metadata = 11,
+    ProxyEvent = 12,
     Reserved2 = 13,
     LegacyStreamData = 128,
     #[num_enum(catch_all)]
