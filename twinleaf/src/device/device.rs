@@ -10,6 +10,7 @@ pub struct Device {
     parser: DeviceDataParser,
     n_reqs: usize,
     sample_queue: VecDeque<Sample>,
+    status_queue: VecDeque<proto::ProxyEventPayload>
 }
 
 impl Device {
@@ -19,6 +20,7 @@ impl Device {
             parser: DeviceDataParser::new(false),
             n_reqs: 0,
             sample_queue: VecDeque::new(),
+            status_queue: VecDeque::new(),
         }
     }
 
@@ -43,6 +45,10 @@ impl Device {
 
     fn process_packet(&mut self, pkt: &tio::Packet) {
         match &pkt.payload {
+            tio::proto::Payload::ProxyEvent(pe) => {
+                self.status_queue.push_back(pe.clone());
+                return;
+            }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     self.n_reqs -= 1
@@ -135,6 +141,14 @@ impl Device {
         }
 
         Ok(self.sample_queue.drain(0..).collect())
+    }
+
+    pub fn try_next_status(&mut self) -> Option<proto::ProxyEventPayload> {
+        self.status_queue.pop_front()
+    }
+
+    pub fn drain_status(&mut self) -> Vec<proto::ProxyEventPayload> {
+        self.status_queue.drain(..).collect()
     }
 
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, tio::proxy::RpcError> {

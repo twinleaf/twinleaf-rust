@@ -11,6 +11,7 @@ pub struct DeviceTree {
     parsers: HashMap<DeviceRoute, DeviceDataParser>,
     n_reqs: HashMap<DeviceRoute, usize>,
     sample_queue: VecDeque<(Sample, DeviceRoute)>,
+    status_queue: VecDeque<(proto::ProxyEventPayload, DeviceRoute)>
 }
 
 impl DeviceTree {
@@ -21,6 +22,7 @@ impl DeviceTree {
             parsers: HashMap::new(),
             n_reqs: HashMap::new(),
             sample_queue: VecDeque::new(),
+            status_queue: VecDeque::new()
         }
     }
 
@@ -68,6 +70,10 @@ impl DeviceTree {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
 
         match &pkt.payload {
+            tio::proto::Payload::ProxyEvent(pe) => {
+                self.status_queue.push_back((pe.clone(), absolute_route));
+                return;
+            }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     if let Some(count) = self.n_reqs.get_mut(&absolute_route) {
@@ -173,6 +179,14 @@ impl DeviceTree {
         }
 
         Ok(self.sample_queue.drain(..).collect())
+    }
+
+    pub fn try_next_status(&mut self) -> Option<(proto::ProxyEventPayload, DeviceRoute)> {
+        self.status_queue.pop_front()
+    }
+
+    pub fn drain_status(&mut self) -> Vec<(proto::ProxyEventPayload, DeviceRoute)> {
+        self.status_queue.drain(..).collect()
     }
 
     pub fn raw_rpc(
