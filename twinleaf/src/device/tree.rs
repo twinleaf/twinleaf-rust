@@ -3,15 +3,29 @@ use crate::tio;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Events from a DeviceTree (multi-device monitoring).
+#[derive(Debug, Clone)]
+pub enum TreeEvent {
+    /// First packet received from this route.
+    RouteDiscovered(DeviceRoute),
+    
+    /// Event from a specific device.
+    Device {
+        route: DeviceRoute,
+        event: super::device::DeviceEvent,
+    },
+}
 
 pub struct DeviceTree {
     port: proxy::Port,
     root_route: DeviceRoute,
     parsers: HashMap<DeviceRoute, DeviceDataParser>,
     n_reqs: HashMap<DeviceRoute, usize>,
+    known_routes: HashSet<DeviceRoute>,
     sample_queue: VecDeque<(Sample, DeviceRoute)>,
-    status_queue: VecDeque<(proto::ProxyEventPayload, DeviceRoute)>,
+    event_queue: VecDeque<TreeEvent>,
 }
 
 impl DeviceTree {
@@ -21,8 +35,9 @@ impl DeviceTree {
             root_route,
             parsers: HashMap::new(),
             n_reqs: HashMap::new(),
+            known_routes: HashSet::new(),
             sample_queue: VecDeque::new(),
-            status_queue: VecDeque::new(),
+            event_queue: VecDeque::new(),
         }
     }
 
@@ -70,8 +85,18 @@ impl DeviceTree {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
 
         match &pkt.payload {
-            tio::proto::Payload::ProxyEvent(pe) => {
-                self.status_queue.push_back((pe.clone(), absolute_route));
+            tio::proto::Payload::ProxyStatus(ps) => {
+                self.event_queue.push_back(TreeEvent::Device {
+                    route: absolute_route,
+                    event: super::device::DeviceEvent::Status(ps.0),
+                });
+                return;
+            }
+            tio::proto::Payload::RpcUpdate(ru) => {
+                self.event_queue.push_back(TreeEvent::Device {
+                    route: absolute_route,
+                    event: super::device::DeviceEvent::RpcInvalidated(ru.0.clone()),
+                });
                 return;
             }
             tio::proto::Payload::RpcReply(rep) => {
@@ -95,6 +120,10 @@ impl DeviceTree {
         let samples: Vec<Sample> = parser.process_packet(&pkt);
 
         for sample in samples {
+            if self.known_routes.insert(absolute_route.clone()) {
+                self.event_queue
+                    .push_back(TreeEvent::RouteDiscovered(absolute_route.clone()));
+            }
             self.sample_queue
                 .push_back((sample, absolute_route.clone()));
         }
@@ -181,12 +210,12 @@ impl DeviceTree {
         Ok(self.sample_queue.drain(..).collect())
     }
 
-    pub fn try_next_status(&mut self) -> Option<(proto::ProxyEventPayload, DeviceRoute)> {
-        self.status_queue.pop_front()
+    pub fn try_next_event(&mut self) -> Option<TreeEvent> {
+        self.event_queue.pop_front()
     }
 
-    pub fn drain_status(&mut self) -> Vec<(proto::ProxyEventPayload, DeviceRoute)> {
-        self.status_queue.drain(..).collect()
+    pub fn drain_events(&mut self) -> Vec<TreeEvent> {
+        self.event_queue.drain(..).collect()
     }
 
     pub fn raw_rpc(

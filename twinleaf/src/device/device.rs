@@ -5,12 +5,43 @@ use tio::{proto, proxy, util};
 
 use std::collections::VecDeque;
 
+/// Device-level events (transport/connection layer).
+/// 
+/// These events arrive via both direct serial and tio-proxy connections.
+/// 
+/// **Important distinction:**
+/// - **Direct serial**: After `Status(SensorDisconnected)`, the channel closes
+///   and `next()` returns `Err(ProxyDisconnected)`.
+/// - **Via tio-proxy**: After `Status(SensorDisconnected)`, the TCP connection
+///   to tio-proxy remains open. `next()` will block indefinitely and 
+///   `try_next()` will return `None`. The event is your only signal that 
+///   the sensor is gone.
+/// 
+/// For robust handling across both connection types, always check for
+/// `Status(SensorDisconnected)` rather than relying on channel errors.
+#[derive(Debug, Clone)]
+pub enum DeviceEvent {
+    /// Connection status changed.
+    /// 
+    /// - `SensorDisconnected`: Sensor connection lost. Through tio-proxy,
+    ///   this is your only notification - the channel won't error out.
+    /// - `SensorReconnected`: Connection restored, samples will resume.
+    ///   The first sample after reconnect will have a `Boundary`.
+    /// - `FailedToReconnect`: Gave up reconnection attempts (direct only).
+    /// - `FailedToConnect`: Initial connection failed (direct only).
+    Status(proto::ProxyStatus),
+
+    /// An RPC with arguments completed from another client.
+    /// If you're caching RPC values, invalidate this one.
+    RpcInvalidated(proto::RpcMethod),
+}
+
 pub struct Device {
     dev_port: proxy::Port,
     parser: DeviceDataParser,
     n_reqs: usize,
     sample_queue: VecDeque<Sample>,
-    status_queue: VecDeque<proto::ProxyEventPayload>,
+    event_queue: VecDeque<DeviceEvent>,
 }
 
 impl Device {
@@ -20,7 +51,7 @@ impl Device {
             parser: DeviceDataParser::new(false),
             n_reqs: 0,
             sample_queue: VecDeque::new(),
-            status_queue: VecDeque::new(),
+            event_queue: VecDeque::new(),
         }
     }
 
@@ -45,8 +76,12 @@ impl Device {
 
     fn process_packet(&mut self, pkt: &tio::Packet) {
         match &pkt.payload {
-            tio::proto::Payload::ProxyEvent(pe) => {
-                self.status_queue.push_back(pe.clone());
+            tio::proto::Payload::ProxyStatus(ps) => {
+                self.event_queue.push_back(DeviceEvent::Status(ps.0));
+                return;
+            }
+            tio::proto::Payload::RpcUpdate(ru) => {
+                self.event_queue.push_back(DeviceEvent::RpcInvalidated(ru.0.clone()));
                 return;
             }
             tio::proto::Payload::RpcReply(rep) => {
@@ -143,12 +178,12 @@ impl Device {
         Ok(self.sample_queue.drain(0..).collect())
     }
 
-    pub fn try_next_status(&mut self) -> Option<proto::ProxyEventPayload> {
-        self.status_queue.pop_front()
-    }
+    pub fn try_next_event(&mut self) -> Option<DeviceEvent> {
+            self.event_queue.pop_front()
+        }
 
-    pub fn drain_status(&mut self) -> Vec<proto::ProxyEventPayload> {
-        self.status_queue.drain(..).collect()
+    pub fn drain_events(&mut self) -> Vec<DeviceEvent> {
+        self.event_queue.drain(..).collect()
     }
 
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, tio::proxy::RpcError> {
