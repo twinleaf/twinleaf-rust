@@ -6,14 +6,14 @@
 //! 2. Sample rates of columns sharing the same name are the same
 //! 3. Sample numbers are independent between `Device`s
 
-use crate::data::{util, ColumnData, Sample};
+use crate::data::{util, ColumnData, Sample, Boundary, BoundaryReason};
 use crate::device::CursorPosition;
 use crate::tio::proto::identifiers::*;
 use crate::tio::proto::meta::MetadataEpoch;
 use crate::tio::proto::{BufferType, ColumnMetadata, DeviceRoute, SegmentMetadata, StreamMetadata};
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -23,31 +23,6 @@ pub type RunId = u64;
 pub enum OverflowPolicy {
     DropOldest,
     Flush,
-}
-
-#[derive(Debug, Clone)]
-pub enum RunBoundary {
-    Initial,
-    SessionChanged {
-        old: SessionId,
-        new: SessionId,
-    },
-    RateChanged {
-        old_rate: f64,
-        new_rate: f64,
-    },
-    EpochChanged {
-        old: MetadataEpoch,
-        new: MetadataEpoch,
-    },
-    SamplesSkipped {
-        expected: SampleNumber,
-        received: SampleNumber,
-    },
-    BackwardJump {
-        previous_ts: f64,
-        current_ts: f64,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -107,44 +82,17 @@ pub struct AlignedWindow {
     pub run_ids: HashMap<StreamKey, RunId>,
 }
 
+/// Events emitted by the buffer.
 pub enum BufferEvent {
-    Samples(Vec<(Sample, DeviceRoute)>),
-    MetadataChanged(DeviceRoute),
-    RouteDiscovered(DeviceRoute),
-    SessionChanged {
-        route: DeviceRoute,
-        stream_id: StreamId,
-        old_id: SessionId,
-        new_id: SessionId,
-    },
-    SegmentChanged {
-        route: DeviceRoute,
-        stream_id: StreamId,
-        old_segment_id: SegmentId,
-        new_segment_id: SegmentId,
-    },
-    SamplesSkipped {
-        route: DeviceRoute,
-        stream_id: StreamId,
-        session_id: SessionId,
-        expected: SampleNumber,
-        received: SampleNumber,
-        count: u32,
-    },
-    SamplesBackward {
-        route: DeviceRoute,
-        stream_id: StreamId,
-        session_id: SessionId,
-        previous: SampleNumber,
-        current: SampleNumber,
-    },
+    /// A new run started due to a discontinuity.
     RunChanged {
-        route: DeviceRoute,
-        stream_id: StreamId,
+        stream_key: StreamKey,
         old_run_id: Option<RunId>,
         new_run_id: RunId,
-        reason: RunBoundary,
+        boundary: Boundary,
     },
+
+    /// A chunk of data is ready (Flush overflow policy).
     DataChunk {
         slice: DataSlice,
         is_first_chunk: bool,
@@ -442,10 +390,8 @@ impl ActiveRun {
 
 pub struct Buffer {
     capacity: usize,
-    pub forward_samples: bool,
-    pub overflow_policy: OverflowPolicy,
-    routes_seen: HashSet<DeviceRoute>,
-    pub active_runs: HashMap<StreamKey, ActiveRun>,
+    overflow_policy: OverflowPolicy,
+    active_runs: HashMap<StreamKey, ActiveRun>,
     next_run_id: RunId,
     event_tx: crossbeam::channel::Sender<BufferEvent>,
 }
@@ -454,14 +400,11 @@ impl Buffer {
     pub fn new(
         event_tx: crossbeam::channel::Sender<BufferEvent>,
         capacity: usize,
-        forward_samples: bool,
         overflow_policy: OverflowPolicy,
     ) -> Self {
         Self {
             capacity,
-            forward_samples,
             overflow_policy,
-            routes_seen: HashSet::new(),
             active_runs: HashMap::new(),
             next_run_id: 0,
             event_tx,
@@ -472,68 +415,14 @@ impl Buffer {
         let _ = self.event_tx.try_send(event);
     }
 
-    pub fn process_sample(&mut self, sample: Sample, route: DeviceRoute) {
-        let stream_key = StreamKey::new(route.clone(), sample.stream.stream_id);
-        let stream_id = sample.stream.stream_id;
+    pub fn process_sample(&mut self, sample: Sample, stream_key: StreamKey) {
+        // Check if sample has a discontinuity that requires a new run
+        let needs_new_run = match &sample.boundary {
+            Some(boundary) => boundary.is_discontinuity(),
+            None => !self.active_runs.contains_key(&stream_key),
+        };
 
-        if self.routes_seen.insert(route.clone()) {
-            self.emit(BufferEvent::RouteDiscovered(route.clone()));
-        }
-        if sample.meta_changed {
-            self.emit(BufferEvent::MetadataChanged(route.clone()));
-        }
-        if sample.segment_changed {
-            if let Some(active) = self.active_runs.get(&stream_key) {
-                if sample.segment.segment_id != active.segment_id {
-                    self.emit(BufferEvent::SegmentChanged {
-                        route: route.clone(),
-                        stream_id,
-                        old_segment_id: active.segment_id,
-                        new_segment_id: sample.segment.segment_id,
-                    });
-                }
-            }
-        }
-        if self.forward_samples {
-            self.emit(BufferEvent::Samples(vec![(sample.clone(), route.clone())]));
-        }
-
-        let boundary = self.detect_boundary(&stream_key, &sample);
-
-        if let Some(reason) = &boundary {
-            match reason {
-                RunBoundary::SessionChanged { old, new } => {
-                    self.emit(BufferEvent::SessionChanged {
-                        route: route.clone(),
-                        stream_id,
-                        old_id: *old,
-                        new_id: *new,
-                    });
-                }
-                RunBoundary::SamplesSkipped { expected, received } => {
-                    self.emit(BufferEvent::SamplesSkipped {
-                        route: route.clone(),
-                        stream_id,
-                        session_id: sample.device.session_id,
-                        expected: *expected,
-                        received: *received,
-                        count: received.saturating_sub(*expected),
-                    });
-                }
-                RunBoundary::BackwardJump { .. } => {
-                    if let Some(active) = self.active_runs.get(&stream_key) {
-                        self.emit(BufferEvent::SamplesBackward {
-                            route: route.clone(),
-                            stream_id,
-                            session_id: sample.device.session_id,
-                            previous: active.last_sample_number,
-                            current: sample.n,
-                        });
-                    }
-                }
-                _ => {}
-            }
-
+        if needs_new_run {
             if self.overflow_policy == OverflowPolicy::Flush {
                 self.flush_run(&stream_key);
             }
@@ -542,12 +431,16 @@ impl Buffer {
             let new_run_id = self.next_run_id;
             self.next_run_id += 1;
 
+            let boundary = sample.boundary.clone().unwrap_or(Boundary {
+                reason: BoundaryReason::Initial,
+                prior: None,
+            });
+
             self.emit(BufferEvent::RunChanged {
-                route: route.clone(),
-                stream_id,
+                stream_key: stream_key.clone(),
                 old_run_id,
                 new_run_id,
-                reason: reason.clone(),
+                boundary,
             });
 
             self.active_runs.insert(
@@ -557,10 +450,10 @@ impl Buffer {
         }
 
         let active = self.active_runs.get_mut(&stream_key).unwrap();
-
         active.buffer.push(&sample);
         active.last_sample_number = sample.n;
         active.last_timestamp = sample.timestamp_end();
+        active.segment_id = sample.segment.segment_id;
 
         if active.buffer.len() > self.capacity {
             match self.overflow_policy {
@@ -569,78 +462,17 @@ impl Buffer {
                 }
                 OverflowPolicy::Flush => {
                     if let Some((slice, is_first)) = active.drain_chunk(&stream_key) {
-                        self.emit(BufferEvent::DataChunk {
-                            slice,
-                            is_first_chunk: is_first,
-                        });
+                        self.emit(BufferEvent::DataChunk { slice, is_first_chunk: is_first });
                     }
                 }
             }
         }
     }
 
-    fn detect_boundary(&self, stream_key: &StreamKey, sample: &Sample) -> Option<RunBoundary> {
-        let active = match self.active_runs.get(stream_key) {
-            Some(a) => a,
-            None => return Some(RunBoundary::Initial),
-        };
-
-        if sample.device.session_id != active.session_id {
-            return Some(RunBoundary::SessionChanged {
-                old: active.session_id,
-                new: sample.device.session_id,
-            });
-        }
-
-        let new_rate = sample.segment.sampling_rate as f64 / sample.segment.decimation as f64;
-        if (new_rate - active.effective_rate).abs() > 1e-9 {
-            return Some(RunBoundary::RateChanged {
-                old_rate: active.effective_rate,
-                new_rate,
-            });
-        }
-
-        if sample.segment.time_ref_epoch != active.time_ref_epoch {
-            return Some(RunBoundary::EpochChanged {
-                old: active.time_ref_epoch.clone(),
-                new: sample.segment.time_ref_epoch.clone(),
-            });
-        }
-
-        let sample_ts = sample.timestamp_begin();
-        let half_period = 0.5 / active.effective_rate;
-
-        if sample_ts < active.last_timestamp - half_period {
-            return Some(RunBoundary::BackwardJump {
-                previous_ts: active.last_timestamp,
-                current_ts: sample_ts,
-            });
-        }
-
-        if sample.n != active.last_sample_number.wrapping_add(1) {
-            let ts_gap = (sample_ts - active.last_timestamp).abs();
-            if ts_gap > half_period {
-                let is_rollover = sample.n < active.last_sample_number
-                    && sample_ts >= active.last_timestamp - half_period;
-                if !is_rollover {
-                    return Some(RunBoundary::SamplesSkipped {
-                        expected: active.last_sample_number.wrapping_add(1),
-                        received: sample.n,
-                    });
-                }
-            }
-        }
-
-        None
-    }
-
     fn flush_run(&mut self, stream_key: &StreamKey) {
         if let Some(active) = self.active_runs.get_mut(stream_key) {
             if let Some((slice, is_first)) = active.drain_chunk(stream_key) {
-                self.emit(BufferEvent::DataChunk {
-                    slice,
-                    is_first_chunk: is_first,
-                });
+                self.emit(BufferEvent::DataChunk { slice, is_first_chunk: is_first });
             }
         }
     }
@@ -650,6 +482,10 @@ impl Buffer {
         for key in keys {
             self.flush_run(&key);
         }
+    }
+
+    pub fn get_run(&self, stream_key: &StreamKey) -> Option<&ActiveRun> {
+        self.active_runs.get(stream_key)
     }
 
     pub fn read_aligned_window(
