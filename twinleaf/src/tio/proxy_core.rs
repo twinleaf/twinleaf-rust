@@ -229,6 +229,7 @@ struct RpcMapEntry {
     client: u64,
     route: DeviceRoute,
     timeout: Instant,
+    has_arg: bool,
     method: proto::RpcMethod,
 }
 
@@ -324,7 +325,7 @@ impl ProxyCore {
         &mut self,
         wire_id: u16,
         route: &DeviceRoute,
-    ) -> Option<(u64, u16, proto::RpcMethod)> {
+    ) -> Option<(u64, u16, proto::RpcMethod, bool)> {
         let remap = match self.rpc_map.remove(&wire_id) {
             None => {
                 return None;
@@ -344,7 +345,7 @@ impl ProxyCore {
             #[cfg(debug_assertions)]
             eprintln!("Failed to find RPC timeout in map");
         }
-        Some((remap.client, remap.id, remap.method))
+        Some((remap.client, remap.id, remap.method, remap.has_arg))
     }
 
     // Ok: successful. Err: packet should be sent back to client
@@ -377,6 +378,7 @@ impl ProxyCore {
                     route: pkt.routing.clone(),
                     timeout: timeout,
                     method: req.method.clone(),
+                    has_arg: !req.arg.is_empty(),
                 },
             );
             self.status_queue
@@ -417,14 +419,12 @@ impl ProxyCore {
 
     fn broadcast_status(&self, status: proto::ProxyStatus) {
         let pkt = Packet {
-            payload: proto::Payload::ProxyEvent(proto::ProxyEventPayload::Status(status)),
+            payload: proto::Payload::ProxyStatus(proto::ProxyStatusPayload(status)),
             routing: DeviceRoute::root(),
             ttl: 0,
         };
         for (_client_id, client) in self.clients.iter() {
-            if let Err(_) = client.send(&pkt) {
-                // Don't drop clients here. Let the normal error handling do it
-            }
+            let _ = client.send(&pkt);
         }
     }
 
@@ -435,9 +435,7 @@ impl ProxyCore {
         exclude_client: u64,
     ) {
         let pkt = Packet {
-            payload: proto::Payload::ProxyEvent(proto::ProxyEventPayload::RpcUpdate(
-                method.clone(),
-            )),
+            payload: proto::Payload::RpcUpdate(proto::RpcUpdatePayload(method.clone())),
             routing: route.clone(),
             ttl: 0,
         };
@@ -867,19 +865,19 @@ impl ProxyCore {
                                 _ => None,
                             } {
                                 // Remap RPC reply or error ID to client + ID
-                                let (client, client_id, original_id, method) =
-                                    if let Some((client_id, rpc_id, method)) =
+                                let (client, client_id, original_id, method, has_arg) =
+                                    if let Some((client_id, rpc_id, method, has_arg)) =
                                         self.rpc_restore(wire_id, &pkt.routing)
                                     {
                                         if client_id == 0 {
                                             // internal reply
-                                            (None, 0, rpc_id, method)
+                                            (None, 0, rpc_id, method, has_arg)
                                         } else if let Some(client) = self.clients.get(&client_id) {
                                             self.status_queue.send(Event::RpcRestore(
                                                 wire_id,
                                                 (client_id, rpc_id),
                                             ));
-                                            (Some(client), client_id, rpc_id, method)
+                                            (Some(client), client_id, rpc_id, method, has_arg)
                                         } else {
                                             // If we cannot find the client which originally sent the
                                             // request, just drop the packet and send an event.
@@ -899,7 +897,13 @@ impl ProxyCore {
                                             self.internal_rpc_reply(rep);
                                             continue;
                                         }
-                                        self.broadcast_rpc_update(&method, &pkt.routing, client_id);
+                                        if has_arg {
+                                            self.broadcast_rpc_update(
+                                                &method,
+                                                &pkt.routing,
+                                                client_id,
+                                            );
+                                        }
                                     }
                                     proto::Payload::RpcError(err) => {
                                         err.id = original_id;
