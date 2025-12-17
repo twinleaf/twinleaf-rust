@@ -151,7 +151,6 @@ enum Commands {
     },
 
     /// Convert binary log files to HDF5 format
-    #[cfg(feature = "hdf5")]
     LogHdf {
         /// Input log file(s)
         files: Vec<String>,
@@ -940,11 +939,12 @@ fn log_hdf(
     _files: Vec<String>,
     _output: String,
     _filter: Option<String>,
+    _compress: bool,
     _debug: bool,
 ) -> Result<(), ()> {
     eprintln!("Error: This version of tio-tool was compiled without HDF5 support.");
-    eprintln!("To enable it, recompile with:");
-    eprintln!("  cargo install --path . --features hdf5 --force");
+    eprintln!("To enable it, reinstall with:");
+    eprintln!("  cargo install twinleaf-tools --features hdf5");
     Err(())
 }
 
@@ -1084,7 +1084,6 @@ fn main() -> ExitCode {
             metadata,
             output,
         } => log_csv(stream, files, sensor, metadata, output),
-        #[cfg(feature = "hdf5")]
         Commands::LogHdf {
             files,
             output,
