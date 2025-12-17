@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
-use twinleaf::data::DeviceDataParser;
+use twinleaf::data::{DeviceDataParser};
 use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
@@ -446,16 +446,20 @@ fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
     } else {
         "".to_string()
     };
-    if sample.meta_changed {
-        println!("# {}DEVICE {:?}", route_str, sample.device);
-        println!("# {}STREAM {:?}", route_str, sample.stream);
-        for col in &sample.columns {
-            println!("# {}COLUMN {:?}", route_str, col.desc);
+    
+    if let Some(boundary) = &sample.boundary {
+        eprintln!("[DEBUG] Boundary reason: {:?}", boundary.reason);
+        
+        if boundary.is_discontinuity() {
+            println!("# {}DEVICE {:?}", route_str, sample.device);
+            println!("# {}STREAM {:?}", route_str, sample.stream);
+            for col in &sample.columns {
+                println!("# {}COLUMN {:?}", route_str, col.desc);
+            }
         }
-    }
-    if sample.segment_changed {
         println!("# {}SEGMENT {:?}", route_str, sample.segment);
     }
+    
     println!("{}{}", route_str, sample);
 }
 
@@ -581,7 +585,13 @@ fn log(
                     let is_new_device = seen_routes.insert(sample_route.clone());
                     let force_header = is_new_device;
 
-                    if sample.meta_changed || force_header {
+                    let is_discontinuity = sample
+                        .boundary
+                        .as_ref()
+                        .map_or(false, |b| b.is_discontinuity());
+                    let has_boundary = sample.boundary.is_some();
+
+                    if is_discontinuity || force_header {
                         let _ = write_packet(
                             sample.device.make_update_with_route(sample_route.clone()),
                             &mut file,
@@ -594,13 +604,13 @@ fn log(
                             sample.segment.make_update_with_route(sample_route.clone()),
                             &mut file,
                         );
-                        for col in sample.columns {
+                        for col in &sample.columns {
                             let _ = write_packet(
                                 col.desc.make_update_with_route(sample_route.clone()),
                                 &mut file,
                             );
                         }
-                    } else if sample.segment_changed {
+                    } else if has_boundary {
                         let _ = write_packet(
                             sample.segment.make_update_with_route(sample_route.clone()),
                             &mut file,
@@ -630,7 +640,6 @@ fn log(
     }
     Ok(())
 }
-
 fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
@@ -851,7 +860,7 @@ fn log_hdf(
         writer.stats
     });
 
-    let mut buffer = Buffer::new(tx, 65_536, false, OverflowPolicy::Flush);
+    let mut buffer = Buffer::new(tx, 65_536, OverflowPolicy::Flush);
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
 
@@ -896,7 +905,10 @@ fn log_hdf(
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
             for sample in parser.process_packet(&pkt) {
-                buffer.process_sample(sample, pkt.routing.clone());
+                use twinleaf::tio::proto::identifiers::StreamKey;
+
+                let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
+                buffer.process_sample(sample, key);
             }
         }
         pb.finish_with_message("Completed");
