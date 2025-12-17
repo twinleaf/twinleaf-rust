@@ -7,6 +7,7 @@ pub type SessionId = u32;
 pub type SegmentId = u8;
 pub type StreamId = u8;
 pub type ColumnId = usize;
+pub type TimeRefSessionId = u32;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct StreamKey {
