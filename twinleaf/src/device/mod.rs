@@ -5,7 +5,7 @@ mod subscription;
 mod tree;
 pub mod util;
 
-pub use device::Device;
+pub use device::{Device, DeviceEvent};
 pub use reader::{CursorPosition, Reader};
 pub use subscription::SubscriptionManager;
-pub use tree::DeviceTree;
+pub use tree::{DeviceTree, TreeEvent};
