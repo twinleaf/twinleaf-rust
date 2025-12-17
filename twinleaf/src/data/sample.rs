@@ -1,7 +1,7 @@
 use crate::tio;
 
 use std::sync::Arc;
-use tio::proto::identifiers::SampleNumber;
+use tio::proto::identifiers::{SampleNumber, SessionId, SegmentId, TimeRefSessionId};
 use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
 
 #[derive(Debug, Clone)]
@@ -96,9 +96,52 @@ pub struct Sample {
     pub segment: Arc<SegmentMetadata>,
     pub stream: Arc<StreamMetadata>,
     pub device: Arc<DeviceMetadata>,
-    pub segment_changed: bool,
-    pub meta_changed: bool,
     pub source: tio::proto::StreamDataPayload,
+
+    pub boundary: Option<Boundary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Boundary {
+    pub reason: BoundaryReason,
+    /// State before the discontinuity, if we had established state
+    pub prior: Option<PriorState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PriorState {
+    pub session_id: SessionId,
+    pub segment_id: SegmentId,
+    pub time_ref_session_id: TimeRefSessionId,
+    pub sample_number: SampleNumber,
+    pub timestamp: f64,
+    pub effective_rate: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum BoundaryReason {
+    /// First sample from this stream
+    Initial,
+    /// Device session changed
+    SessionChanged { old: SessionId, new: SessionId },
+    /// Samples were lost (gap in sequence)
+    SamplesLost { expected: SampleNumber, received: SampleNumber },
+    /// Time jumped backward unexpectedly
+    TimeBackward { gap_seconds: f64 },
+    /// Sampling rate changed
+    RateChanged { old_rate: f64, new_rate: f64 },
+    /// Time reference epoch changed
+    TimeRefSessionChanged { old: TimeRefSessionId, new: TimeRefSessionId },
+    /// Segment rolled over (continuous, but new segment)
+    SegmentRollover { old_id: SegmentId, new_id: SegmentId },
+}
+
+
+impl Boundary {
+    /// True if this represents a real discontinuity (not just segment rollover)
+    pub fn is_discontinuity(&self) -> bool {
+        !matches!(self.reason, BoundaryReason::SegmentRollover { .. })
+    }
 }
 
 impl Sample {

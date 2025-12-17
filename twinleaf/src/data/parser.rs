@@ -1,4 +1,4 @@
-use super::sample::{Column, Sample};
+use super::sample::{Column, Sample, Boundary, BoundaryReason, PriorState};
 use crate::tio;
 use proto::meta::MetadataType;
 use proto::DeviceRoute;
@@ -150,13 +150,34 @@ struct DeviceStream {
     columns: Vec<DeviceColumn>,
 
     id: u8,
+    
+    // State tracking for boundary detection
+    established: bool,
     last_seg: u8,
     last_sample_number: u32,
-    segment_changed: bool,
-    meta_changed: bool,
+    last_timestamp: f64,
+    last_session_id: u32,
+    last_time_ref_session_id: u32,
+    effective_rate: f64,
 }
 
 impl DeviceStream {
+    fn new(id: u8) -> Self {
+        DeviceStream {
+            stream: None,
+            segment: None,
+            columns: vec![],
+            id,
+            established: false,
+            last_seg: 0,
+            last_sample_number: 0,
+            last_timestamp: 0.0,
+            last_session_id: 0,
+            last_time_ref_session_id: 0,
+            effective_rate: 0.0,
+        }
+    }
+
     fn requests(&self) -> Vec<StreamRpcMetaReq> {
         let mut ret = vec![];
         match self.stream.as_ref() {
@@ -190,6 +211,118 @@ impl DeviceStream {
         ret
     }
 
+    fn capture_prior_state(&self) -> Option<PriorState> {
+        if !self.established {
+            return None;
+        }
+        Some(PriorState {
+            session_id: self.last_session_id,
+            segment_id: self.last_seg,
+            time_ref_session_id: self.last_time_ref_session_id,
+            sample_number: self.last_sample_number,
+            timestamp: self.last_timestamp,
+            effective_rate: self.effective_rate,
+        })
+    }
+
+    fn detect_boundary(
+        &self,
+        first_sample_n: u32,
+        first_timestamp: f64,
+        dev: &Arc<DeviceMetadata>,
+        segment: &Arc<SegmentMetadata>,
+        new_rate: f64,
+        is_segment_rollover: bool,
+    ) -> Option<Boundary> {
+        let prior = self.capture_prior_state();
+
+        // First sample ever from this stream?
+        if !self.established {
+            return Some(Boundary {
+                reason: BoundaryReason::Initial,
+                prior: None,
+            });
+        }
+
+        // Session changed?
+        if dev.session_id != self.last_session_id {
+            return Some(Boundary {
+                reason: BoundaryReason::SessionChanged {
+                    old: self.last_session_id,
+                    new: dev.session_id,
+                },
+                prior,
+            });
+        }
+
+        // Time reference session changed?
+        if segment.time_ref_session_id != self.last_time_ref_session_id {
+            return Some(Boundary {
+                reason: BoundaryReason::TimeRefSessionChanged {
+                    old: self.last_time_ref_session_id,
+                    new: segment.time_ref_session_id,
+                },
+                prior,
+            });
+        }
+
+        // Rate changed?
+        if (new_rate - self.effective_rate).abs() > 1e-9 {
+            return Some(Boundary {
+                reason: BoundaryReason::RateChanged {
+                    old_rate: self.effective_rate,
+                    new_rate,
+                },
+                prior,
+            });
+        }
+
+        let half_period = 0.5 / new_rate;
+
+        // Time went backward?
+        if first_timestamp < self.last_timestamp - half_period {
+            return Some(Boundary {
+                reason: BoundaryReason::TimeBackward {
+                    gap_seconds: self.last_timestamp - first_timestamp,
+                },
+                prior,
+            });
+        }
+
+        // Samples skipped?
+        let expected_sample = self.last_sample_number.wrapping_add(1);
+        if first_sample_n != expected_sample {
+            let ts_gap = (first_timestamp - self.last_timestamp).abs();
+            // Check if this is just a sample number rollover with continuous time
+            let is_benign_rollover = first_sample_n < self.last_sample_number
+                && ts_gap < half_period;
+
+            if !is_benign_rollover && ts_gap > half_period {
+                return Some(Boundary {
+                    reason: BoundaryReason::SamplesLost {
+                        expected: expected_sample,
+                        received: first_sample_n,
+                    },
+                    prior,
+                });
+            }
+        }
+
+        // Segment rolled over? (benign, but we note it)
+        if is_segment_rollover {
+            return Some(Boundary {
+                reason: BoundaryReason::SegmentRollover {
+                    old_id: self.last_seg,
+                    new_id: segment.segment_id,
+                },
+                prior,
+            });
+        }
+
+        // No boundary - continuous with previous samples
+        None
+    }
+
     fn process_samples(
         &mut self,
         data: &tio::proto::StreamDataPayload,
@@ -209,48 +342,76 @@ impl DeviceStream {
         }
 
         let segment = self.segment.as_ref().unwrap().clone();
-        if segment.segment_id != data.segment_id {
-            // Here, generate proactively a new segment if this looks like
-            // a sample number rollover
-            let next_sample = self.last_sample_number + 1;
+        let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
+
+        let (segment, is_segment_rollover) = if segment.segment_id != data.segment_id {
+            let next_sample = self.last_sample_number.wrapping_add(1);
             let next_segment = (segment.segment_id + 1).rem_euclid(stream.n_segments as u8);
             let rate = segment.sampling_rate / segment.decimation;
+
             if (data.first_sample_n == 0)
                 && ((next_sample % rate) == 0)
                 && (data.segment_id == next_segment)
             {
+                // Benign rollover - synthesize updated segment metadata
                 let mut new_seg = (*segment).clone();
+                new_seg.segment_id = data.segment_id;
                 new_seg.start_time += next_sample / rate;
-                self.segment = Some(Arc::new(new_seg));
+                (Arc::new(new_seg), true)
             } else {
+                // Real segment mismatch - wait for metadata
                 return vec![];
             }
-        }
+        } else {
+            (segment, false)
+        };
 
-        let segment = self.segment.as_ref().unwrap().clone();
+        // Calculate timestamp of first sample in this batch
+        let period = 1.0 / new_rate;
+        let first_timestamp = f64::from(segment.start_time) + period * f64::from(data.first_sample_n);
 
+        // Detect boundary for the first sample
+        let boundary = self.detect_boundary(
+            data.first_sample_n,
+            first_timestamp,
+            &dev,
+            &segment,
+            new_rate,
+            is_segment_rollover,
+        );
+
+        // Parse all samples in the packet
         let mut ret = vec![];
         let mut sample_n = data.first_sample_n;
         let mut offset = 0;
+        let mut is_first = true;
 
-        // TODO: validate size
         while offset < data.data.len() {
             let raw_sample = &data.data[offset..(offset + stream.sample_size)];
-            ret.push(Sample {
+
+            let sample = Sample {
                 n: sample_n,
                 columns: self.parse_sample(raw_sample),
                 segment: segment.clone(),
                 stream: stream.clone(),
                 device: dev.clone(),
-                segment_changed: self.segment_changed,
-                meta_changed: self.meta_changed,
                 source: data.clone(),
-            });
-            self.segment_changed = false;
-            self.meta_changed = false;
-            offset += stream.sample_size;
+                // Only first sample gets the boundary marker
+                boundary: if is_first { boundary.clone() } else { None },
+            };
+
+            // Update tracking state after each sample
             self.last_sample_number = sample_n;
-            sample_n += 1;
+            self.last_timestamp = sample.timestamp_end();
+            self.last_session_id = dev.session_id;
+            self.last_seg = segment.segment_id;
+            self.effective_rate = new_rate;
+            self.established = true;
+
+            ret.push(sample);
+            offset += stream.sample_size;
+            sample_n = sample_n.wrapping_add(1);
+            is_first = false;
         }
 
         ret
@@ -287,25 +448,13 @@ impl DeviceDataParser {
         DeviceDataParser {
             device: None,
             streams: HashMap::new(),
-            ignore_session: ignore_session,
+            ignore_session,
         }
     }
 
-    fn get_stream<'a>(&'a mut self, stream_id: u8) -> &'a mut DeviceStream {
+    fn get_stream(&mut self, stream_id: u8) -> &mut DeviceStream {
         if !self.streams.contains_key(&stream_id) {
-            self.streams.insert(
-                stream_id,
-                DeviceStream {
-                    stream: None,
-                    segment: None,
-                    columns: vec![],
-                    id: stream_id,
-                    last_seg: 0,
-                    last_sample_number: 0,
-                    segment_changed: true,
-                    meta_changed: true,
-                },
-            );
+            self.streams.insert(stream_id, DeviceStream::new(stream_id));
         }
         self.streams.get_mut(&stream_id).unwrap()
     }
@@ -345,7 +494,6 @@ impl DeviceDataParser {
                     }
                 } else {
                     dstream.stream.replace(Arc::new(sm.clone()));
-                    dstream.meta_changed = true;
                 }
             }
             MetadataContent::Segment(sm) => {
@@ -360,15 +508,12 @@ impl DeviceDataParser {
                 if let Some(segment) = &dstream.segment {
                     if segment.as_ref() != sm {
                         dstream.segment.replace(Arc::new(sm.clone()));
-                        dstream.segment_changed = true;
                         if from_update {
                             dstream.last_seg = sm.segment_id;
                         }
                     }
                 } else {
-                    let dstream = self.get_stream(sm.stream_id);
                     dstream.segment.replace(Arc::new(sm.clone()));
-                    dstream.segment_changed = true;
                     if from_update {
                         dstream.last_seg = sm.segment_id;
                     }

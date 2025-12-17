@@ -12,4 +12,4 @@ pub use buffer::{
 };
 pub use filter::ColumnFilter;
 pub use parser::{DeviceDataParser, DeviceFullMetadata};
-pub use sample::{Column, ColumnData, Sample};
+pub use sample::{Column, ColumnData, Sample, Boundary, BoundaryReason};
