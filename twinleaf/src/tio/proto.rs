@@ -61,10 +61,10 @@ pub enum ProxyStatus {
 }
 
 #[derive(Debug, Clone)]
-pub enum ProxyEventPayload {
-    Status(ProxyStatus),
-    RpcUpdate(RpcMethod),
-}
+pub struct ProxyStatusPayload(pub ProxyStatus);
+
+#[derive(Debug, Clone)]
+pub struct RpcUpdatePayload(pub RpcMethod);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -139,7 +139,8 @@ pub enum Payload {
     LegacyStreamData(LegacyStreamDataPayload),
     Metadata(MetadataPayload),
     StreamData(StreamDataPayload),
-    ProxyEvent(ProxyEventPayload),
+    ProxyStatus(ProxyStatusPayload),
+    RpcUpdate(RpcUpdatePayload),
     Unknown(GenericPayload),
 }
 
@@ -176,11 +177,11 @@ enum TioPktType {
     LegacyTimebaseUpdate = 6,
     LegacySourceUpdate = 7,
     LegacyStreamUpdate = 8,
-    Reserved0 = 9,
-    Reserved1 = 10,
+    ProxyStatus = 9,
+    RpcUpdate = 10,
     Metadata = 11,
-    ProxyEvent = 12,
-    Reserved2 = 13,
+    Reserved0 = 12,
+    Reserved1 = 13,
     LegacyStreamData = 128,
     #[num_enum(catch_all)]
     UnknownOrStream(u8),
@@ -211,10 +212,7 @@ impl TioPktHdr {
         // a known type, as long as it's not one of the reserved values
         let packet_type = TioPktType::from(raw[0]);
         let packet_type_valid = match packet_type {
-            TioPktType::Invalid
-            | TioPktType::Reserved0
-            | TioPktType::Reserved1
-            | TioPktType::Reserved2 => false,
+            TioPktType::Invalid | TioPktType::Reserved0 | TioPktType::Reserved1 => false,
             _ => true,
         };
         if !packet_type_valid {
@@ -383,78 +381,67 @@ impl StreamDataPayload {
     }
 }
 
-const PROXY_EVENT_TYPE_STATUS: u8 = 0;
-const PROXY_EVENT_TYPE_RPC_UPDATE: u8 = 1;
-
-const RPC_METHOD_TYPE_ID: u8 = 0;
-const RPC_METHOD_TYPE_NAME: u8 = 1;
-impl ProxyEventPayload {
-    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<ProxyEventPayload, Error> {
+impl ProxyStatusPayload {
+    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<ProxyStatusPayload, Error> {
         if raw.is_empty() {
             return Err(too_small(full_data));
         }
-
-        match raw[0] {
-            PROXY_EVENT_TYPE_STATUS => {
-                if raw.len() < 2 {
-                    return Err(too_small(full_data));
-                }
-                Ok(ProxyEventPayload::Status(ProxyStatus::from(raw[1])))
-            }
-            PROXY_EVENT_TYPE_RPC_UPDATE => {
-                if raw.len() < 2 {
-                    return Err(too_small(full_data));
-                }
-                let method = match raw[1] {
-                    RPC_METHOD_TYPE_ID => {
-                        if raw.len() < 4 {
-                            return Err(too_small(full_data));
-                        }
-                        RpcMethod::Id(u16::from_le_bytes([raw[2], raw[3]]))
-                    }
-                    RPC_METHOD_TYPE_NAME => {
-                        if raw.len() < 4 {
-                            return Err(too_small(full_data));
-                        }
-                        let name_len = u16::from_le_bytes([raw[2], raw[3]]) as usize;
-                        if raw.len() < 4 + name_len {
-                            return Err(too_small(full_data));
-                        }
-                        RpcMethod::Name(String::from_utf8_lossy(&raw[4..4 + name_len]).to_string())
-                    }
-                    _ => return Err(Error::InvalidPayload(full_data.to_vec())),
-                };
-                Ok(ProxyEventPayload::RpcUpdate(method))
-            }
-            _ => Err(Error::InvalidPayload(full_data.to_vec())),
-        }
+        Ok(ProxyStatusPayload(ProxyStatus::from(raw[0])))
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let (event_type, payload_bytes): (u8, Vec<u8>) = match self {
-            ProxyEventPayload::Status(status) => (PROXY_EVENT_TYPE_STATUS, vec![u8::from(*status)]),
-            ProxyEventPayload::RpcUpdate(method) => {
-                let method_bytes = match method {
-                    RpcMethod::Id(id) => {
-                        let mut v = vec![RPC_METHOD_TYPE_ID];
-                        v.extend(id.to_le_bytes());
-                        v
-                    }
-                    RpcMethod::Name(name) => {
-                        let name_bytes = name.as_bytes();
-                        let mut v = vec![RPC_METHOD_TYPE_NAME];
-                        v.extend((name_bytes.len() as u16).to_le_bytes());
-                        v.extend(name_bytes);
-                        v
-                    }
-                };
-                (PROXY_EVENT_TYPE_RPC_UPDATE, method_bytes)
+        let mut ret = TioPktHdr::serialize_new(TioPktType::ProxyStatus, 0, 1);
+        ret.push(u8::from(self.0));
+        Ok(ret)
+    }
+}
+
+const RPC_METHOD_TYPE_ID: u8 = 0;
+const RPC_METHOD_TYPE_NAME: u8 = 1;
+impl RpcUpdatePayload {
+    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcUpdatePayload, Error> {
+        if raw.is_empty() {
+            return Err(too_small(full_data));
+        }
+        let method = match raw[0] {
+            RPC_METHOD_TYPE_ID => {
+                if raw.len() < 3 {
+                    return Err(too_small(full_data));
+                }
+                RpcMethod::Id(u16::from_le_bytes([raw[1], raw[2]]))
+            }
+            RPC_METHOD_TYPE_NAME => {
+                if raw.len() < 3 {
+                    return Err(too_small(full_data));
+                }
+                let name_len = u16::from_le_bytes([raw[1], raw[2]]) as usize;
+                if raw.len() < 3 + name_len {
+                    return Err(too_small(full_data));
+                }
+                RpcMethod::Name(String::from_utf8_lossy(&raw[3..3 + name_len]).to_string())
+            }
+            _ => return Err(Error::InvalidPayload(full_data.to_vec())),
+        };
+        Ok(RpcUpdatePayload(method))
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let payload_bytes: Vec<u8> = match &self.0 {
+            RpcMethod::Id(id) => {
+                let mut v = vec![RPC_METHOD_TYPE_ID];
+                v.extend(id.to_le_bytes());
+                v
+            }
+            RpcMethod::Name(name) => {
+                let name_bytes = name.as_bytes();
+                let mut v = vec![RPC_METHOD_TYPE_NAME];
+                v.extend((name_bytes.len() as u16).to_le_bytes());
+                v.extend(name_bytes);
+                v
             }
         };
-
-        let payload_size = 1 + payload_bytes.len();
-        let mut ret = TioPktHdr::serialize_new(TioPktType::ProxyEvent, 0, payload_size as u16);
-        ret.push(event_type);
+        let mut ret =
+            TioPktHdr::serialize_new(TioPktType::RpcUpdate, 0, payload_bytes.len() as u16);
         ret.extend(payload_bytes);
         Ok(ret)
     }
@@ -488,7 +475,8 @@ impl Payload {
             Payload::Metadata(p) => p.serialize(),
             Payload::LegacyStreamData(p) => p.serialize(),
             Payload::StreamData(p) => p.serialize(),
-            Payload::ProxyEvent(p) => p.serialize(),
+            Payload::ProxyStatus(p) => p.serialize(),
+            Payload::RpcUpdate(p) => p.serialize(),
             Payload::Unknown(p) => p.serialize(),
             _ => Err(()),
         }
@@ -499,10 +487,7 @@ impl Payload {
         full_data: &[u8],
     ) -> Result<Payload, Error> {
         match hdr.ptype() {
-            TioPktType::Invalid
-            | TioPktType::Reserved0
-            | TioPktType::Reserved1
-            | TioPktType::Reserved2 => {
+            TioPktType::Invalid | TioPktType::Reserved0 | TioPktType::Reserved1 => {
                 // This should never happen for how the code is organized, since
                 // it should be ruled out by parsing the header first, but handle
                 // this case anyway.
@@ -547,7 +532,11 @@ impl Payload {
                 raw_payload,
                 full_data,
             )?)),
-            TioPktType::ProxyEvent => Ok(Payload::ProxyEvent(ProxyEventPayload::deserialize(
+            TioPktType::ProxyStatus => Ok(Payload::ProxyStatus(ProxyStatusPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            TioPktType::RpcUpdate => Ok(Payload::RpcUpdate(RpcUpdatePayload::deserialize(
                 raw_payload,
                 full_data,
             )?)),
