@@ -134,6 +134,8 @@ pub enum BoundaryReason {
     TimeRefSessionChanged { old: TimeRefSessionId, new: TimeRefSessionId },
     /// Segment rolled over (continuous, but new segment)
     SegmentRollover { old_id: SegmentId, new_id: SegmentId },
+    /// Segment changed unexpectedly (not a natural rollover)
+    SegmentChanged { old_id: SegmentId, new_id: SegmentId },
 }
 
 

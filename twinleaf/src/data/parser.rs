@@ -150,6 +150,7 @@ struct DeviceStream {
     columns: Vec<DeviceColumn>,
 
     id: u8,
+    current_data_seg: u8,
     
     // State tracking for boundary detection
     established: bool,
@@ -168,6 +169,7 @@ impl DeviceStream {
             segment: None,
             columns: vec![],
             id,
+            current_data_seg: 0,
             established: false,
             last_seg: 0,
             last_sample_number: 0,
@@ -192,10 +194,10 @@ impl DeviceStream {
             }
         }
         if match self.segment.as_ref() {
-            Some(seg) => seg.segment_id != self.last_seg,
+            Some(seg) => seg.segment_id != self.current_data_seg,
             None => true,
         } {
-            ret.push(StreamRpcMetaReq::segment(self.last_seg, self.id));
+            ret.push(StreamRpcMetaReq::segment(self.current_data_seg, self.id));
         }
         ret
     }
@@ -289,6 +291,25 @@ impl DeviceStream {
             });
         }
 
+        // Segment changed?
+        if segment.segment_id != self.last_seg {
+            return Some(Boundary {
+                reason: if is_segment_rollover {
+                    BoundaryReason::SegmentRollover {
+                        old_id: self.last_seg,
+                        new_id: segment.segment_id,
+                    }
+                } else {
+                    BoundaryReason::SegmentChanged {
+                        old_id: self.last_seg,
+                        new_id: segment.segment_id,
+                    }
+                },
+                prior,
+            });
+        }
+
+
         // Samples skipped?
         let expected_sample = self.last_sample_number.wrapping_add(1);
         if first_sample_n != expected_sample {
@@ -308,17 +329,6 @@ impl DeviceStream {
             }
         }
 
-        // Segment rolled over? (benign, but we note it)
-        if is_segment_rollover {
-            return Some(Boundary {
-                reason: BoundaryReason::SegmentRollover {
-                    old_id: self.last_seg,
-                    new_id: segment.segment_id,
-                },
-                prior,
-            });
-        }
-
         // No boundary - continuous with previous samples
         None
     }
@@ -328,9 +338,7 @@ impl DeviceStream {
         data: &tio::proto::StreamDataPayload,
         dev: Arc<DeviceMetadata>,
     ) -> Vec<Sample> {
-        // Update this first, so even if we can't parse the sample, the right
-        // request will be sent out next
-        self.last_seg = data.segment_id;
+        self.current_data_seg = data.segment_id;
 
         if self.stream.is_none() || self.segment.is_none() {
             return vec![];
@@ -359,7 +367,6 @@ impl DeviceStream {
                 new_seg.start_time += next_sample / rate;
                 (Arc::new(new_seg), true)
             } else {
-                // Real segment mismatch - wait for metadata
                 return vec![];
             }
         } else {
@@ -377,7 +384,7 @@ impl DeviceStream {
             &dev,
             &segment,
             new_rate,
-            is_segment_rollover,
+            is_segment_rollover
         );
 
         // Parse all samples in the packet
@@ -510,13 +517,13 @@ impl DeviceDataParser {
                     if segment.as_ref() != sm {
                         dstream.segment.replace(Arc::new(sm.clone()));
                         if from_update {
-                            dstream.last_seg = sm.segment_id;
+                            dstream.current_data_seg = sm.segment_id;
                         }
                     }
                 } else {
                     dstream.segment.replace(Arc::new(sm.clone()));
                     if from_update {
-                        dstream.last_seg = sm.segment_id;
+                        dstream.current_data_seg = sm.segment_id;
                     }
                 }
             }
