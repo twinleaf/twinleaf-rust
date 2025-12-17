@@ -404,6 +404,7 @@ impl DeviceStream {
             self.last_sample_number = sample_n;
             self.last_timestamp = sample.timestamp_end();
             self.last_session_id = dev.session_id;
+            self.last_time_ref_session_id = segment.time_ref_session_id;
             self.last_seg = segment.segment_id;
             self.effective_rate = new_rate;
             self.established = true;
