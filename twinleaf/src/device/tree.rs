@@ -99,6 +99,16 @@ impl DeviceTree {
                 });
                 return;
             }
+            tio::proto::Payload::Heartbeat(hb) => {
+                let session_id = match hb {
+                    tio::proto::HeartbeatPayload::Session(sid) => Some(*sid),
+                    tio::proto::HeartbeatPayload::Any(_) => None,
+                };
+                self.event_queue.push_back(TreeEvent::Device {
+                    route: absolute_route.clone(),
+                    event: super::device::DeviceEvent::Heartbeat { session_id },
+                });
+            }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     if let Some(count) = self.n_reqs.get_mut(&absolute_route) {

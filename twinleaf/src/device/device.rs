@@ -34,6 +34,15 @@ pub enum DeviceEvent {
     /// An RPC with arguments completed from another client.
     /// If you're caching RPC values, invalidate this one.
     RpcInvalidated(proto::RpcMethod),
+    /// Heartbeat received from device.
+    /// 
+    /// Heartbeats are sent periodically to indicate
+    /// the device is alive. The session_id changes when the device restarts.
+    Heartbeat { 
+        /// Session ID if this is a standard session heartbeat.
+        /// None for non-standard/legacy heartbeat formats.
+        session_id: Option<proto::identifiers::SessionId>, 
+    },
 }
 
 pub struct Device {
@@ -83,6 +92,13 @@ impl Device {
             tio::proto::Payload::RpcUpdate(ru) => {
                 self.event_queue.push_back(DeviceEvent::RpcInvalidated(ru.0.clone()));
                 return;
+            }
+            tio::proto::Payload::Heartbeat(hb) => {
+                let session_id = match hb {
+                    tio::proto::HeartbeatPayload::Session(sid) => Some(*sid),
+                    tio::proto::HeartbeatPayload::Any(_) => None,
+                };
+                self.event_queue.push_back(DeviceEvent::Heartbeat { session_id });
             }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
