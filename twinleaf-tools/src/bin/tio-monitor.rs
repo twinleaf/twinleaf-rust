@@ -873,7 +873,7 @@ fn run_data_thread(
     capacity: usize,
 ) {
     let (evt_tx, _evt_rx) = channel::unbounded::<BufferEvent>();
-    let mut buffer = Buffer::new(evt_tx, capacity, false, OverflowPolicy::DropOldest);
+    let mut buffer = Buffer::new(evt_tx, capacity, OverflowPolicy::DropOldest);
     let mut last: BTreeMap<StreamKey, Sample> = BTreeMap::new();
 
     loop {
@@ -885,9 +885,9 @@ fn run_data_thread(
             Ok(x) => x,
             Err(_) => break,
         };
-        let stream_id = sample.stream.stream_id;
-        buffer.process_sample(sample.clone(), route.clone());
-        last.insert(StreamKey::new(route.clone(), stream_id), sample);
+        let stream_key = StreamKey::new(route.clone(), sample.stream.stream_id);
+        buffer.process_sample(sample.clone(), stream_key.clone());
+        last.insert(stream_key, sample);
 
         while let Ok(q) = req_rx.try_recv() {
             let last_vec: Vec<_> = if q.all {
@@ -903,7 +903,7 @@ fn run_data_thread(
 
             let window = q.selection.and_then(|spec| {
                 let stream_key = spec.stream_key();
-                let active = buffer.active_runs.get(&stream_key)?;
+                let active = buffer.get_run(&stream_key)?;
                 let sampling_hz = active.effective_rate;
                 let n_samples = (q.seconds * sampling_hz).ceil().max(10.0) as usize;
                 buffer.read_aligned_window(&[spec], n_samples).ok()
