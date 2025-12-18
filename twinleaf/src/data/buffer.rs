@@ -416,11 +416,8 @@ impl Buffer {
     }
 
     pub fn process_sample(&mut self, sample: Sample, stream_key: StreamKey) {
-        // Check if sample has a discontinuity that requires a new run
-        let needs_new_run = match &sample.boundary {
-            Some(boundary) => boundary.is_discontinuity(),
-            None => !self.active_runs.contains_key(&stream_key),
-        };
+
+        let needs_new_run = !sample.is_continuous() || !self.active_runs.contains_key(&stream_key);
 
         if needs_new_run {
             if self.overflow_policy == OverflowPolicy::Flush {

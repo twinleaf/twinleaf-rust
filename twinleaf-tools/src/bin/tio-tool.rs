@@ -449,8 +449,8 @@ fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
     
     if let Some(boundary) = &sample.boundary {
         eprintln!("[DEBUG] Boundary reason: {:?}", boundary.reason);
-        
-        if boundary.is_discontinuity() {
+
+        if !boundary.is_continuous() {
             println!("# {}DEVICE {:?}", route_str, sample.device);
             println!("# {}STREAM {:?}", route_str, sample.stream);
             for col in &sample.columns {
@@ -585,10 +585,7 @@ fn log(
                     let is_new_device = seen_routes.insert(sample_route.clone());
                     let force_header = is_new_device;
 
-                    let is_discontinuity = sample
-                        .boundary
-                        .as_ref()
-                        .map_or(false, |b| b.is_discontinuity());
+                    let is_discontinuity = !sample.is_continuous();
                     let has_boundary = sample.boundary.is_some();
 
                     if is_discontinuity || force_header {
@@ -640,6 +637,7 @@ fn log(
     }
     Ok(())
 }
+
 fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
