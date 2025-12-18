@@ -101,10 +101,19 @@ pub struct Sample {
     pub boundary: Option<Boundary>,
 }
 
+impl Sample {
+    pub fn is_continuous(&self) -> bool {
+        self.boundary.as_ref().map_or(true, |b| b.is_continuous())
+    }
+
+    pub fn is_monotonic(&self) -> bool {
+        self.boundary.as_ref().map_or(true, |b| b.is_monotonic())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Boundary {
     pub reason: BoundaryReason,
-    /// State before the discontinuity, if we had established state
     pub prior: Option<PriorState>,
 }
 
@@ -124,25 +133,37 @@ pub enum BoundaryReason {
     Initial,
     /// Device session changed
     SessionChanged { old: SessionId, new: SessionId },
-    /// Samples were lost (gap in sequence)
-    SamplesLost { expected: SampleNumber, received: SampleNumber },
-    /// Time jumped backward unexpectedly
+    /// Time reference epoch changed
+    TimeRefSessionChanged { old: TimeRefSessionId, new: TimeRefSessionId },
+     /// Time jumped backward unexpectedly
     TimeBackward { gap_seconds: f64 },
     /// Sampling rate changed
     RateChanged { old_rate: f64, new_rate: f64 },
-    /// Time reference epoch changed
-    TimeRefSessionChanged { old: TimeRefSessionId, new: TimeRefSessionId },
+
     /// Segment rolled over (continuous, but new segment)
     SegmentRollover { old_id: SegmentId, new_id: SegmentId },
     /// Segment changed unexpectedly (not a natural rollover)
     SegmentChanged { old_id: SegmentId, new_id: SegmentId },
+    /// Samples were lost (gap in sequence)
+    SamplesLost { expected: SampleNumber, received: SampleNumber },
 }
 
 
 impl Boundary {
-    /// True if this represents a real discontinuity (not just segment rollover)
-    pub fn is_discontinuity(&self) -> bool {
-        !matches!(self.reason, BoundaryReason::SegmentRollover { .. })
+    /// Only boundary where continuity is preserved
+    pub fn is_continuous(&self) -> bool {
+        matches!(self.reason, BoundaryReason::SegmentRollover { .. })
+    }
+
+    /// Boundaries where there may be a gap but time is still monotonic
+    pub fn is_monotonic(&self) -> bool {
+        matches!(
+            self.reason,
+            BoundaryReason::SamplesLost { .. }
+                | BoundaryReason::RateChanged { .. }
+                | BoundaryReason::SegmentRollover { .. }
+                | BoundaryReason::SegmentChanged { .. }
+        )
     }
 }
 

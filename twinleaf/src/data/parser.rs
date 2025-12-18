@@ -268,17 +268,6 @@ impl DeviceStream {
             });
         }
 
-        // Rate changed?
-        if (new_rate - self.effective_rate).abs() > 1e-9 {
-            return Some(Boundary {
-                reason: BoundaryReason::RateChanged {
-                    old_rate: self.effective_rate,
-                    new_rate,
-                },
-                prior,
-            });
-        }
-
         let half_period = 0.5 / new_rate;
 
         // Time went backward?
@@ -286,6 +275,17 @@ impl DeviceStream {
             return Some(Boundary {
                 reason: BoundaryReason::TimeBackward {
                     gap_seconds: self.last_timestamp - first_timestamp,
+                },
+                prior,
+            });
+        }
+
+        // Rate changed?
+        if (new_rate - self.effective_rate).abs() > 1e-9 {
+            return Some(Boundary {
+                reason: BoundaryReason::RateChanged {
+                    old_rate: self.effective_rate,
+                    new_rate,
                 },
                 prior,
             });
@@ -425,6 +425,12 @@ impl DeviceStream {
         ret
     }
 
+    fn invalidate_metadata(&mut self) {
+        self.stream = None;
+        self.segment = None;
+        self.columns.clear();
+    }
+
     fn get_metadata(&self) -> Result<DeviceStreamMetadata, Vec<StreamRpcMetaReq>> {
         let reqs = self.requests();
         if reqs.is_empty() {
@@ -471,18 +477,17 @@ impl DeviceDataParser {
         match metadata {
             MetadataContent::Device(dm) => {
                 if let Some(cur) = &self.device {
-                    if (cur.serial_number != dm.serial_number)
-                        || (cur.session_id != dm.session_id)
+                    if cur.serial_number != dm.serial_number {
+                        self.streams.clear();
+                    } else if (cur.session_id != dm.session_id)
                         || (cur.firmware_hash != dm.firmware_hash)
                     {
-                        self.device.replace(Arc::new(dm.clone()));
-                        self.streams.clear();
-                    } else if cur.n_streams != dm.n_streams {
-                        self.device.replace(Arc::new(dm.clone()));
+                        for stream in self.streams.values_mut() {
+                            stream.invalidate_metadata();
+                        }
                     }
-                } else {
-                    self.device.replace(Arc::new(dm.clone()));
                 }
+                self.device.replace(Arc::new(dm.clone()));
             }
             MetadataContent::Stream(sm) => {
                 if let Some(dev) = &self.device {
@@ -574,8 +579,10 @@ impl DeviceDataParser {
                 if let tio::proto::HeartbeatPayload::Session(session_id) = hb {
                     if let Some(dev) = &self.device {
                         if (dev.session_id != *session_id) && !self.ignore_session {
+                            for stream in self.streams.values_mut() {
+                                stream.invalidate_metadata();
+                            }
                             self.device.take();
-                            self.streams.clear();
                         }
                     }
                 }
