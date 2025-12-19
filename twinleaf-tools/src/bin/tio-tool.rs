@@ -811,54 +811,33 @@ fn log_hdf(
     use std::collections::HashMap;
     use std::fs::File;
     use std::path::Path;
-    use twinleaf::data::{
-        export, Buffer, BufferEvent, ColumnFilter, DeviceDataParser, OverflowPolicy,
-    };
+    use twinleaf::data::{export, ColumnFilter, DeviceDataParser};
     use twinleaf::tio;
+    use twinleaf::tio::proto::identifiers::StreamKey;
 
-    let (tx, rx) = crossbeam::channel::bounded(100);
-    let output_for_thread = output.clone();
-
-    // Spawn the Writer Thread
-    let writer_handle = std::thread::spawn(move || {
-        let mut writer = export::Hdf5Appender::new(Path::new(&output_for_thread), compress, debug)
-            .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))
-            .expect("Writer init failed");
-
-        let col_filter = if let Some(p) = filter {
-            match ColumnFilter::new(&p) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    eprintln!("Filter error: {}", e);
-                    return writer.stats;
-                }
-            }
-        } else {
-            None
-        };
-
-        while let Ok(event) = rx.recv() {
-            match event {
-                BufferEvent::DataChunk {
-                    slice,
-                    is_first_chunk: _,
-                } => {
-                    if debug {
-                        println!("[DEBUG] Writing chunk: {} samples", slice.len());
-                    }
-
-                    if let Err(e) = writer.write_slice(&slice, &col_filter) {
-                        eprintln!("HDF5 Write Error: {:?}", e);
-                        break;
-                    }
-                }
-                _ => {}
+    // Parse filter upfront
+    let col_filter = if let Some(p) = filter {
+        match ColumnFilter::new(&p) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("Filter error: {}", e);
+                return Err(());
             }
         }
-        writer.stats
-    });
+    } else {
+        None
+    };
 
-    let mut buffer = Buffer::new(tx, 65_536, OverflowPolicy::Flush);
+    // Create writer with filter baked in
+    let mut writer = export::Hdf5Appender::new(
+        Path::new(&output),
+        compress,
+        debug,
+        col_filter,
+        65_536,
+    )
+    .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))?;
+
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
 
@@ -866,31 +845,23 @@ fn log_hdf(
 
     for path in &files {
         let file = File::open(&path)
-            .map_err(|e| eprintln!("Open failed: {:?}", e))
-            .unwrap();
+            .map_err(|e| eprintln!("Open failed: {:?}", e))?;
         let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| eprintln!("Mmap failed: {:?}", e))
-            .unwrap();
+            .map_err(|e| eprintln!("Mmap failed: {:?}", e))?;
 
         let total_bytes = mmap.len() as u64;
         let pb = ProgressBar::new(total_bytes);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})").unwrap()
-            .progress_chars("#>-"));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
         pb.set_message(path.clone());
 
         let mut rest: &[u8] = &mmap[..];
-        let mut iteration = 0;
 
         while !rest.is_empty() {
-            iteration += 1;
-            if iteration % 1000 == 0 {
-                if writer_handle.is_finished() {
-                    writer_handle.join().expect("Writer thread crashed");
-                    return Err(());
-                }
-            }
-
             let (pkt, len) = match tio::Packet::deserialize(rest) {
                 Ok(res) => res,
                 Err(_) => break,
@@ -903,20 +874,21 @@ fn log_hdf(
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
             for sample in parser.process_packet(&pkt) {
-                use twinleaf::tio::proto::identifiers::StreamKey;
-
                 let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
-                buffer.process_sample(sample, key);
+                
+                if let Err(e) = writer.write_sample(sample, key) {
+                    eprintln!("HDF5 Write Error: {:?}", e);
+                    return Err(());
+                }
             }
         }
+
         pb.finish_with_message("Completed");
     }
 
-    println!("Flushing buffer and waiting for writer...");
-    buffer.flush_all();
-    drop(buffer);
-
-    let stats = writer_handle.join().unwrap();
+    // Finish flushes all pending data and returns stats
+    let stats = writer.finish()
+        .map_err(|e| eprintln!("Failed to finalize HDF5: {:?}", e))?;
 
     let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     let duration = stats.end_time.unwrap_or(0.0) - stats.start_time.unwrap_or(0.0);
