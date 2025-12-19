@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
-use twinleaf::data::{DeviceDataParser};
+use twinleaf::data::DeviceDataParser;
 use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
 use twinleaf_tools::TioOpts;
@@ -219,7 +219,7 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
         let (meta, name): (u16, String) = device.rpc("rpc.listinfo", id).map_err(|e| {
             eprintln!("Failed to get RPC {}: {:?}", id, e);
         })?;
-        
+
         let spec = twinleaf::device::util::parse_rpc_spec(meta, name);
         println!(
             "{} {}({})",
@@ -451,7 +451,7 @@ fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
     } else {
         "".to_string()
     };
-    
+
     if let Some(boundary) = &sample.boundary {
         eprintln!("[DEBUG] Boundary reason: {:?}", boundary.reason);
 
@@ -464,7 +464,7 @@ fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
         }
         println!("# {}SEGMENT {:?}", route_str, sample.segment);
     }
-    
+
     println!("{}{}", route_str, sample);
 }
 
@@ -834,14 +834,9 @@ fn log_hdf(
     };
 
     // Create writer with filter baked in
-    let mut writer = export::Hdf5Appender::new(
-        Path::new(&output),
-        compress,
-        debug,
-        col_filter,
-        65_536,
-    )
-    .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))?;
+    let mut writer =
+        export::Hdf5Appender::new(Path::new(&output), compress, debug, col_filter, 65_536)
+            .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))?;
 
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
@@ -849,10 +844,8 @@ fn log_hdf(
     println!("Processing {} files...", files.len());
 
     for path in &files {
-        let file = File::open(&path)
-            .map_err(|e| eprintln!("Open failed: {:?}", e))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| eprintln!("Mmap failed: {:?}", e))?;
+        let file = File::open(&path).map_err(|e| eprintln!("Open failed: {:?}", e))?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| eprintln!("Mmap failed: {:?}", e))?;
 
         let total_bytes = mmap.len() as u64;
         let pb = ProgressBar::new(total_bytes);
@@ -880,7 +873,7 @@ fn log_hdf(
 
             for sample in parser.process_packet(&pkt) {
                 let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
-                
+
                 if let Err(e) = writer.write_sample(sample, key) {
                     eprintln!("HDF5 Write Error: {:?}", e);
                     return Err(());
@@ -892,7 +885,8 @@ fn log_hdf(
     }
 
     // Finish flushes all pending data and returns stats
-    let stats = writer.finish()
+    let stats = writer
+        .finish()
         .map_err(|e| eprintln!("Failed to finalize HDF5: {:?}", e))?;
 
     let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);

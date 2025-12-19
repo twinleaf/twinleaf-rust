@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub enum TreeEvent {
     /// First packet received from this route.
     RouteDiscovered(DeviceRoute),
-    
+
     /// Event from a specific device.
     Device {
         route: DeviceRoute,

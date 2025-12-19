@@ -1,4 +1,4 @@
-use super::sample::{Column, Sample, Boundary, BoundaryReason, PriorState};
+use super::sample::{Boundary, BoundaryReason, Column, PriorState, Sample};
 use crate::tio;
 use proto::meta::MetadataType;
 use proto::DeviceRoute;
@@ -151,7 +151,7 @@ struct DeviceStream {
 
     id: u8,
     current_data_seg: u8,
-    
+
     // State tracking for boundary detection
     established: bool,
     last_seg: u8,
@@ -309,14 +309,13 @@ impl DeviceStream {
             });
         }
 
-
         // Samples skipped?
         let expected_sample = self.last_sample_number.wrapping_add(1);
         if first_sample_n != expected_sample {
             let ts_gap = (first_timestamp - self.last_timestamp).abs();
             // Check if this is just a sample number rollover with continuous time
-            let is_benign_rollover = first_sample_n < self.last_sample_number
-                && ts_gap < half_period;
+            let is_benign_rollover =
+                first_sample_n < self.last_sample_number && ts_gap < half_period;
 
             if !is_benign_rollover && ts_gap > half_period {
                 return Some(Boundary {
@@ -375,7 +374,8 @@ impl DeviceStream {
 
         // Calculate timestamp of first sample in this batch
         let period = 1.0 / new_rate;
-        let first_timestamp = f64::from(segment.start_time) + period * f64::from(data.first_sample_n);
+        let first_timestamp =
+            f64::from(segment.start_time) + period * f64::from(data.first_sample_n);
 
         // Detect boundary for the first sample
         let boundary = self.detect_boundary(
@@ -384,7 +384,7 @@ impl DeviceStream {
             &dev,
             &segment,
             new_rate,
-            is_segment_rollover
+            is_segment_rollover,
         );
 
         // Parse all samples in the packet

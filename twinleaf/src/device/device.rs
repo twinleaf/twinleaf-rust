@@ -6,23 +6,23 @@ use tio::{proto, proxy, util};
 use std::collections::VecDeque;
 
 /// Device-level events (transport/connection layer).
-/// 
+///
 /// These events arrive via both direct serial and tio-proxy connections.
-/// 
+///
 /// **Important distinction:**
 /// - **Direct serial**: After `Status(SensorDisconnected)`, the channel closes
 ///   and `next()` returns `Err(ProxyDisconnected)`.
 /// - **Via tio-proxy**: After `Status(SensorDisconnected)`, the TCP connection
-///   to tio-proxy remains open. `next()` will block indefinitely and 
-///   `try_next()` will return `None`. The event is your only signal that 
+///   to tio-proxy remains open. `next()` will block indefinitely and
+///   `try_next()` will return `None`. The event is your only signal that
 ///   the sensor is gone.
-/// 
+///
 /// For robust handling across both connection types, always check for
 /// `Status(SensorDisconnected)` rather than relying on channel errors.
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
     /// Connection status changed.
-    /// 
+    ///
     /// - `SensorDisconnected`: Sensor connection lost. Through tio-proxy,
     ///   this is your only notification - the channel won't error out.
     /// - `SensorReconnected`: Connection restored, samples will resume.
@@ -35,13 +35,13 @@ pub enum DeviceEvent {
     /// If you're caching RPC values, invalidate this one.
     RpcInvalidated(proto::RpcMethod),
     /// Heartbeat received from device.
-    /// 
+    ///
     /// Heartbeats are sent periodically to indicate
     /// the device is alive. The session_id changes when the device restarts.
-    Heartbeat { 
+    Heartbeat {
         /// Session ID if this is a standard session heartbeat.
         /// None for non-standard/legacy heartbeat formats.
-        session_id: Option<proto::identifiers::SessionId>, 
+        session_id: Option<proto::identifiers::SessionId>,
     },
 }
 
@@ -90,7 +90,8 @@ impl Device {
                 return;
             }
             tio::proto::Payload::RpcUpdate(ru) => {
-                self.event_queue.push_back(DeviceEvent::RpcInvalidated(ru.0.clone()));
+                self.event_queue
+                    .push_back(DeviceEvent::RpcInvalidated(ru.0.clone()));
                 return;
             }
             tio::proto::Payload::Heartbeat(hb) => {
@@ -98,7 +99,8 @@ impl Device {
                     tio::proto::HeartbeatPayload::Session(sid) => Some(*sid),
                     tio::proto::HeartbeatPayload::Any(_) => None,
                 };
-                self.event_queue.push_back(DeviceEvent::Heartbeat { session_id });
+                self.event_queue
+                    .push_back(DeviceEvent::Heartbeat { session_id });
             }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
@@ -195,8 +197,8 @@ impl Device {
     }
 
     pub fn try_next_event(&mut self) -> Option<DeviceEvent> {
-            self.event_queue.pop_front()
-        }
+        self.event_queue.pop_front()
+    }
 
     pub fn drain_events(&mut self) -> Vec<DeviceEvent> {
         self.event_queue.drain(..).collect()

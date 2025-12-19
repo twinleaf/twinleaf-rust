@@ -140,7 +140,14 @@ impl Hdf5Appender {
         filter: Option<ColumnFilter>,
         batch_size: usize,
     ) -> Result<Self> {
-        Self::with_policy(path, compress, debug, filter, batch_size, SplitPolicy::default())
+        Self::with_policy(
+            path,
+            compress,
+            debug,
+            filter,
+            batch_size,
+            SplitPolicy::default(),
+        )
     }
 
     pub fn with_policy(
@@ -180,7 +187,8 @@ impl Hdf5Appender {
         }
 
         if !self.pending.contains_key(&key) {
-            self.pending.insert(key.clone(), PendingBatch::new(&sample, 0));
+            self.pending
+                .insert(key.clone(), PendingBatch::new(&sample, 0));
         }
 
         self.pending.get_mut(&key).unwrap().push(&sample);

@@ -24,7 +24,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryReason, Sample}, device::{DeviceEvent, DeviceTree, TreeEvent}, tio::{self, proto::{DeviceRoute, identifiers::StreamKey}}
+    data::{BoundaryReason, Sample},
+    device::{DeviceEvent, DeviceTree, TreeEvent},
+    tio::{
+        self,
+        proto::{identifiers::StreamKey, DeviceRoute},
+    },
 };
 use twinleaf_tools::TioOpts;
 
@@ -148,7 +153,11 @@ impl Cli {
 
 fn nonneg_f64(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|e: ParseFloatError| e.to_string())?;
-    if v < 0.0 { Err("must be ≥ 0".into()) } else { Ok(v) }
+    if v < 0.0 {
+        Err("must be ≥ 0".into())
+    } else {
+        Ok(v)
+    }
 }
 
 #[derive(Default)]
@@ -159,7 +168,8 @@ struct DeviceState {
 
 impl DeviceState {
     fn heartbeat_char(&self, now: Instant) -> char {
-        let fresh = self.last_heartbeat
+        let fresh = self
+            .last_heartbeat
             .map(|t| now.duration_since(t) < Duration::from_millis(500))
             .unwrap_or(false);
 
@@ -187,20 +197,33 @@ struct TimeWindow {
 impl TimeWindow {
     fn new(seconds: u64, hz_guess: f64) -> Self {
         let cap = ((seconds as f64 * hz_guess).round() as usize).max(16);
-        Self { buf: vec![0.0; cap], cap, idx: 0, filled: false }
+        Self {
+            buf: vec![0.0; cap],
+            cap,
+            idx: 0,
+            filled: false,
+        }
     }
 
     fn push(&mut self, v: f64) {
         self.buf[self.idx] = v;
         self.idx = (self.idx + 1) % self.cap;
-        if self.idx == 0 { self.filled = true; }
+        if self.idx == 0 {
+            self.filled = true;
+        }
     }
 
     fn std_ms(&self) -> f64 {
         let n = if self.filled { self.cap } else { self.idx };
-        if n == 0 { return 0.0; }
+        if n == 0 {
+            return 0.0;
+        }
         let mean: f64 = self.buf[..n].iter().sum::<f64>() / (n as f64);
-        let var: f64 = self.buf[..n].iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64);
+        let var: f64 = self.buf[..n]
+            .iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>()
+            / (n as f64);
         var.sqrt()
     }
 }
@@ -229,8 +252,12 @@ struct StreamStats {
 
 impl StreamStats {
     fn on_sample(&mut self, sample_n: u32, t_data: f64, now: Instant, jitter_window_s: u64) {
-        if self.t0_host.is_none() { self.t0_host = Some(now); }
-        if self.t0_data.is_none() { self.t0_data = Some(t_data); }
+        if self.t0_host.is_none() {
+            self.t0_host = Some(now);
+        }
+        if self.t0_data.is_none() {
+            self.t0_data = Some(t_data);
+        }
 
         // Jitter
         if self.jitter_window.is_none() {
@@ -297,7 +324,9 @@ impl StreamStats {
     }
 
     fn is_stale(&self, now: Instant, stale_dur: Duration) -> bool {
-        self.last_seen.map(|t| now.duration_since(t) > stale_dur).unwrap_or(true)
+        self.last_seen
+            .map(|t| now.duration_since(t) > stale_dur)
+            .unwrap_or(true)
     }
 }
 
@@ -309,8 +338,14 @@ struct LoggedEvent {
 }
 
 fn log_event(log: &mut VecDeque<LoggedEvent>, msg: String, color: Color, cap: usize) {
-    log.push_front(LoggedEvent { timestamp: SystemTime::now(), event: msg, color });
-    if log.len() > cap { log.pop_back(); }
+    log.push_front(LoggedEvent {
+        timestamp: SystemTime::now(),
+        event: msg,
+        color,
+    });
+    if log.len() > cap {
+        log.pop_back();
+    }
 }
 
 fn handle_boundary(
@@ -323,33 +358,85 @@ fn handle_boundary(
 ) {
     match reason {
         BoundaryReason::Initial => {
-            log_event(event_log, format!("[{}/{}] STREAM STARTED", route, stream_name), Color::Green, cap);
+            log_event(
+                event_log,
+                format!("[{}/{}] STREAM STARTED", route, stream_name),
+                Color::Green,
+                cap,
+            );
         }
         BoundaryReason::SessionChanged { old, new } => {
-            log_event(event_log, format!("[{}/{}] SESSION: {} → {}", route, stream_name, old, new), Color::Green, cap);
+            log_event(
+                event_log,
+                format!("[{}/{}] SESSION: {} → {}", route, stream_name, old, new),
+                Color::Green,
+                cap,
+            );
             st.reset_for_new_session(*new);
         }
         BoundaryReason::SamplesLost { expected, received } => {
             let count = received.wrapping_sub(*expected);
-            log_event(event_log, format!("[{}/{}] DROPPED: {} samples", route, stream_name, count), Color::Red, cap);
+            log_event(
+                event_log,
+                format!("[{}/{}] DROPPED: {} samples", route, stream_name, count),
+                Color::Red,
+                cap,
+            );
             st.samples_dropped += count as u64;
         }
         BoundaryReason::TimeBackward { gap_seconds } => {
-            log_event(event_log, format!("[{}/{}] TIME BACKWARD: {:.3}s", route, stream_name, gap_seconds), Color::Yellow, cap);
+            log_event(
+                event_log,
+                format!(
+                    "[{}/{}] TIME BACKWARD: {:.3}s",
+                    route, stream_name, gap_seconds
+                ),
+                Color::Yellow,
+                cap,
+            );
         }
         BoundaryReason::RateChanged { old_rate, new_rate } => {
-            log_event(event_log, format!("[{}/{}] RATE: {:.1} → {:.1} Hz", route, stream_name, old_rate, new_rate), Color::Yellow, cap);
+            log_event(
+                event_log,
+                format!(
+                    "[{}/{}] RATE: {:.1} → {:.1} Hz",
+                    route, stream_name, old_rate, new_rate
+                ),
+                Color::Yellow,
+                cap,
+            );
             st.reset_timing();
         }
         BoundaryReason::TimeRefSessionChanged { old, new } => {
-            log_event(event_log, format!("[{}/{}] TIME REF: {} → {}", route, stream_name, old, new), Color::Yellow, cap);
+            log_event(
+                event_log,
+                format!("[{}/{}] TIME REF: {} → {}", route, stream_name, old, new),
+                Color::Yellow,
+                cap,
+            );
             st.reset_timing();
         }
         BoundaryReason::SegmentRollover { old_id, new_id } => {
-            log_event(event_log, format!("[{}/{}] SEGMENT: {} → {}", route, stream_name, old_id, new_id), Color::Green, cap);
+            log_event(
+                event_log,
+                format!(
+                    "[{}/{}] SEGMENT: {} → {}",
+                    route, stream_name, old_id, new_id
+                ),
+                Color::Green,
+                cap,
+            );
         }
         BoundaryReason::SegmentChanged { old_id, new_id } => {
-            log_event(event_log, format!("[{}/{}] SEGMENT CHANGED: {} → {}", route, stream_name, old_id, new_id), Color::Yellow, cap);
+            log_event(
+                event_log,
+                format!(
+                    "[{}/{}] SEGMENT CHANGED: {} → {}",
+                    route, stream_name, old_id, new_id
+                ),
+                Color::Yellow,
+                cap,
+            );
             st.reset_timing();
         }
     }
@@ -472,7 +559,11 @@ fn draw_ui(
 
     terminal.draw(|f| {
         let size = f.area();
-        let event_block_height = if event_log.is_empty() { 0 } else { cli.event_display_lines + 2 };
+        let event_block_height = if event_log.is_empty() {
+            0
+        } else {
+            cli.event_display_lines + 2
+        };
         let footer_height = if cli.quiet { 0 } else { 1 };
         let heartbeat_height = if show_heartbeat { 1 } else { 0 };
 
@@ -506,20 +597,42 @@ fn draw_ui(
         }
 
         // Table
-        let header_cells = ["route", "sid", "stream", "smps/s", "drift(s)", "ppm", "jitter(ms)", "dropped", "last_n", "last_time", "status"]
-            .iter()
-            .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+        let header_cells = [
+            "route",
+            "sid",
+            "stream",
+            "smps/s",
+            "drift(s)",
+            "ppm",
+            "jitter(ms)",
+            "dropped",
+            "last_n",
+            "last_time",
+            "status",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
 
         let widths = [
-            Constraint::Length(10), Constraint::Length(4), Constraint::Length(20),
-            Constraint::Length(9), Constraint::Length(9), Constraint::Length(8),
-            Constraint::Length(11), Constraint::Length(8), Constraint::Length(10),
-            Constraint::Length(12), Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(4),
+            Constraint::Length(20),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(11),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(8),
         ];
 
-        let table = Table::new(rows.iter().map(|r| r.to_table_row()).collect::<Vec<_>>(), widths)
-            .header(Row::new(header_cells).height(1))
-            .column_spacing(2);
+        let table = Table::new(
+            rows.iter().map(|r| r.to_table_row()).collect::<Vec<_>>(),
+            widths,
+        )
+        .header(Row::new(header_cells).height(1))
+        .column_spacing(2);
 
         f.render_stateful_widget(table, chunks[2], &mut TableState::default());
 
@@ -540,7 +653,10 @@ fn draw_ui(
                 .map(|e| {
                     let dt: DateTime<Local> = e.timestamp.into();
                     Line::from(vec![
-                        Span::styled(format!("[{}] ", dt.format("%H:%M:%S%.3f")), Style::default().fg(e.color)),
+                        Span::styled(
+                            format!("[{}] ", dt.format("%H:%M:%S%.3f")),
+                            Style::default().fg(e.color),
+                        ),
                         Span::styled(e.event.clone(), Style::default().fg(e.color)),
                     ])
                 })
@@ -554,7 +670,10 @@ fn draw_ui(
 
             f.render_widget(
                 Paragraph::new(visible).block(
-                    Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Gray))
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Gray)),
                 ),
                 chunks[3],
             );
@@ -562,10 +681,17 @@ fn draw_ui(
 
         // Footer
         if !cli.quiet {
-            let heartbeat_hint = if show_heartbeat { "h:hide heartbeat" } else { "h:show heartbeat" };
+            let heartbeat_hint = if show_heartbeat {
+                "h:hide heartbeat"
+            } else {
+                "h:show heartbeat"
+            };
             f.render_widget(
-                Paragraph::new(format!("q/Esc to quit  |  {}  |  ↑/↓/PgUp/PgDn to scroll", heartbeat_hint))
-                    .style(Style::default().fg(Color::Gray)),
+                Paragraph::new(format!(
+                    "q/Esc to quit  |  {}  |  ↑/↓/PgUp/PgDn to scroll",
+                    heartbeat_hint
+                ))
+                .style(Style::default().fg(Color::Gray)),
                 chunks[4],
             );
         }
@@ -601,9 +727,11 @@ fn main() {
         let warmup_end = Instant::now() + Duration::from_millis(500);
         while Instant::now() < warmup_end {
             while let Some(event) = tree.try_next_event() {
-                if data_tx.send(DataItem::Event(event)).is_err() { return; }
+                if data_tx.send(DataItem::Event(event)).is_err() {
+                    return;
+                }
             }
-            
+
             if let Err(e) = tree.next() {
                 let _ = data_tx.send(DataItem::Error(format!("{:?}", e)));
                 return;
@@ -613,13 +741,17 @@ fn main() {
         loop {
             // Drain pending events first
             while let Some(event) = tree.try_next_event() {
-                if data_tx.send(DataItem::Event(event)).is_err() { return; }
+                if data_tx.send(DataItem::Event(event)).is_err() {
+                    return;
+                }
             }
 
             // Block for next sample
             match tree.next() {
                 Ok((sample, route)) => {
-                    if data_tx.send(DataItem::Sample(sample, route)).is_err() { return; }
+                    if data_tx.send(DataItem::Sample(sample, route)).is_err() {
+                        return;
+                    }
                 }
                 Err(e) => {
                     let _ = data_tx.send(DataItem::Error(format!("{:?}", e)));
@@ -631,10 +763,10 @@ fn main() {
 
     // Key reading thread
     let (key_tx, key_rx) = channel::unbounded();
-    std::thread::spawn(move || {
-        loop {
-            if let Ok(ev) = event::read() {
-                if key_tx.send(ev).is_err() { break; }
+    std::thread::spawn(move || loop {
+        if let Ok(ev) = event::read() {
+            if key_tx.send(ev).is_err() {
+                break;
             }
         }
     });
@@ -653,7 +785,7 @@ fn main() {
 
     'main: loop {
         let mut needs_redraw = false;
-        
+
         crossbeam::select! {
             recv(data_rx) -> msg => {
                 let now = Instant::now();
@@ -736,8 +868,8 @@ fn main() {
                     let display_count = cli.event_display_lines as usize;
 
                     match k.code {
-                        KeyCode::Char('h') => { 
-                            show_heartbeat = !show_heartbeat; 
+                        KeyCode::Char('h') => {
+                            show_heartbeat = !show_heartbeat;
                             continue;
                         }
                         KeyCode::Up => { event_scroll_offset = event_scroll_offset.saturating_sub(1); }
@@ -771,7 +903,17 @@ fn main() {
 
         // Only draw when needed (tick, key, or important events)
         if needs_redraw {
-            if draw_ui(&mut terminal, &mut stats, &device_states, &event_log, event_scroll_offset, show_heartbeat, &cli).is_err() {
+            if draw_ui(
+                &mut terminal,
+                &mut stats,
+                &device_states,
+                &event_log,
+                event_scroll_offset,
+                show_heartbeat,
+                &cli,
+            )
+            .is_err()
+            {
                 break 'main;
             }
         }

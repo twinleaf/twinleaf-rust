@@ -47,35 +47,77 @@ pub struct AlignedWindow {
 #[derive(Debug)]
 pub enum ReadError {
     NoColumnsRequested,
-    NoCursorForStream { stream_key: StreamKey },
-    NoActiveRun { stream_key: StreamKey },
-    InsufficientData { stream_key: StreamKey, requested: usize, available: usize },
-    ColumnNotFound { stream_key: StreamKey, column_id: ColumnId },
-    SamplingRateMismatch { streams: Vec<StreamKey>, rates: Vec<f64> },
-    CursorInvalidated { stream_key: StreamKey, cursor_run: RunId, current_run: RunId },
-    CursorOutOfBuffer { stream_key: StreamKey, cursor_sample: SampleNumber, earliest_available: SampleNumber },
+    NoCursorForStream {
+        stream_key: StreamKey,
+    },
+    NoActiveRun {
+        stream_key: StreamKey,
+    },
+    InsufficientData {
+        stream_key: StreamKey,
+        requested: usize,
+        available: usize,
+    },
+    ColumnNotFound {
+        stream_key: StreamKey,
+        column_id: ColumnId,
+    },
+    SamplingRateMismatch {
+        streams: Vec<StreamKey>,
+        rates: Vec<f64>,
+    },
+    CursorInvalidated {
+        stream_key: StreamKey,
+        cursor_run: RunId,
+        current_run: RunId,
+    },
+    CursorOutOfBuffer {
+        stream_key: StreamKey,
+        cursor_sample: SampleNumber,
+        earliest_available: SampleNumber,
+    },
 }
 
 #[derive(Debug)]
 enum ColumnBuffer {
-    F64 { metadata: Arc<ColumnMetadata>, data: VecDeque<f64> },
-    I64 { metadata: Arc<ColumnMetadata>, data: VecDeque<i64> },
-    U64 { metadata: Arc<ColumnMetadata>, data: VecDeque<u64> },
+    F64 {
+        metadata: Arc<ColumnMetadata>,
+        data: VecDeque<f64>,
+    },
+    I64 {
+        metadata: Arc<ColumnMetadata>,
+        data: VecDeque<i64>,
+    },
+    U64 {
+        metadata: Arc<ColumnMetadata>,
+        data: VecDeque<u64>,
+    },
 }
 
 impl ColumnBuffer {
     fn new(metadata: Arc<ColumnMetadata>, capacity: usize) -> Self {
         let alloc = capacity.min(65_536);
         match metadata.data_type.buffer_type() {
-            BufferType::Float => Self::F64 { metadata, data: VecDeque::with_capacity(alloc) },
-            BufferType::Int => Self::I64 { metadata, data: VecDeque::with_capacity(alloc) },
-            BufferType::UInt => Self::U64 { metadata, data: VecDeque::with_capacity(alloc) },
+            BufferType::Float => Self::F64 {
+                metadata,
+                data: VecDeque::with_capacity(alloc),
+            },
+            BufferType::Int => Self::I64 {
+                metadata,
+                data: VecDeque::with_capacity(alloc),
+            },
+            BufferType::UInt => Self::U64 {
+                metadata,
+                data: VecDeque::with_capacity(alloc),
+            },
         }
     }
 
     fn metadata(&self) -> &Arc<ColumnMetadata> {
         match self {
-            Self::F64 { metadata, .. } | Self::I64 { metadata, .. } | Self::U64 { metadata, .. } => metadata,
+            Self::F64 { metadata, .. }
+            | Self::I64 { metadata, .. }
+            | Self::U64 { metadata, .. } => metadata,
         }
     }
 
@@ -91,17 +133,29 @@ impl ColumnBuffer {
 
     fn pop_front(&mut self) {
         match self {
-            Self::F64 { data, .. } => { data.pop_front(); }
-            Self::I64 { data, .. } => { data.pop_front(); }
-            Self::U64 { data, .. } => { data.pop_front(); }
+            Self::F64 { data, .. } => {
+                data.pop_front();
+            }
+            Self::I64 { data, .. } => {
+                data.pop_front();
+            }
+            Self::U64 { data, .. } => {
+                data.pop_front();
+            }
         }
     }
 
     fn get_range(&self, start: usize, count: usize) -> ColumnBatch {
         match self {
-            Self::F64 { data, .. } => ColumnBatch::F64(data.iter().skip(start).take(count).copied().collect()),
-            Self::I64 { data, .. } => ColumnBatch::I64(data.iter().skip(start).take(count).copied().collect()),
-            Self::U64 { data, .. } => ColumnBatch::U64(data.iter().skip(start).take(count).copied().collect()),
+            Self::F64 { data, .. } => {
+                ColumnBatch::F64(data.iter().skip(start).take(count).copied().collect())
+            }
+            Self::I64 { data, .. } => {
+                ColumnBatch::I64(data.iter().skip(start).take(count).copied().collect())
+            }
+            Self::U64 { data, .. } => {
+                ColumnBatch::U64(data.iter().skip(start).take(count).copied().collect())
+            }
         }
     }
 }
@@ -240,9 +294,12 @@ impl Buffer {
         self.validate_rates(&by_stream)?;
 
         let reference_stream = by_stream.keys().next().unwrap();
-        let reference = self.active_runs.get(reference_stream).ok_or(ReadError::NoActiveRun {
-            stream_key: reference_stream.clone(),
-        })?;
+        let reference = self
+            .active_runs
+            .get(reference_stream)
+            .ok_or(ReadError::NoActiveRun {
+                stream_key: reference_stream.clone(),
+            })?;
 
         let available = reference.buffer.len();
         if available == 0 {
@@ -256,8 +313,22 @@ impl Buffer {
         let count = n.min(available);
         let start = available.saturating_sub(count);
 
-        let sample_numbers: Vec<_> = reference.buffer.sample_numbers.iter().skip(start).take(count).copied().collect();
-        let timestamps: Vec<_> = reference.buffer.timestamps.iter().skip(start).take(count).copied().collect();
+        let sample_numbers: Vec<_> = reference
+            .buffer
+            .sample_numbers
+            .iter()
+            .skip(start)
+            .take(count)
+            .copied()
+            .collect();
+        let timestamps: Vec<_> = reference
+            .buffer
+            .timestamps
+            .iter()
+            .skip(start)
+            .take(count)
+            .copied()
+            .collect();
 
         self.build_window(&by_stream, start, count, sample_numbers, timestamps)
     }
@@ -279,13 +350,18 @@ impl Buffer {
         let mut reference_key: Option<StreamKey> = None;
 
         for stream_key in by_stream.keys() {
-            let active = self.active_runs.get(stream_key).ok_or(ReadError::NoActiveRun {
-                stream_key: stream_key.clone(),
-            })?;
+            let active = self
+                .active_runs
+                .get(stream_key)
+                .ok_or(ReadError::NoActiveRun {
+                    stream_key: stream_key.clone(),
+                })?;
 
-            let cursor = cursors.get(stream_key).ok_or(ReadError::NoCursorForStream {
-                stream_key: stream_key.clone(),
-            })?;
+            let cursor = cursors
+                .get(stream_key)
+                .ok_or(ReadError::NoCursorForStream {
+                    stream_key: stream_key.clone(),
+                })?;
 
             if cursor.run_id != active.run_id {
                 return Err(ReadError::CursorInvalidated {
@@ -313,7 +389,10 @@ impl Buffer {
                 });
             }
 
-            let s = buf.sample_numbers.binary_search(&cursor.last_sample_number).unwrap_or_else(|i| i);
+            let s = buf
+                .sample_numbers
+                .binary_search(&cursor.last_sample_number)
+                .unwrap_or_else(|i| i);
             if s + n > buf.len() {
                 return Err(ReadError::InsufficientData {
                     stream_key: stream_key.clone(),
@@ -331,8 +410,20 @@ impl Buffer {
         let reference_key = reference_key.unwrap();
         let reference = &self.active_runs.get(&reference_key).unwrap().buffer;
 
-        let sample_numbers: Vec<_> = reference.sample_numbers.iter().skip(start).take(n).copied().collect();
-        let timestamps: Vec<_> = reference.timestamps.iter().skip(start).take(n).copied().collect();
+        let sample_numbers: Vec<_> = reference
+            .sample_numbers
+            .iter()
+            .skip(start)
+            .take(n)
+            .copied()
+            .collect();
+        let timestamps: Vec<_> = reference
+            .timestamps
+            .iter()
+            .skip(start)
+            .take(n)
+            .copied()
+            .collect();
 
         self.build_window(&by_stream, start, n, sample_numbers, timestamps)
     }
@@ -349,9 +440,12 @@ impl Buffer {
         let mut global_end = f64::MAX;
 
         for stream_key in by_stream.keys() {
-            let active = self.active_runs.get(stream_key).ok_or(ReadError::NoActiveRun {
-                stream_key: stream_key.clone(),
-            })?;
+            let active = self
+                .active_runs
+                .get(stream_key)
+                .ok_or(ReadError::NoActiveRun {
+                    stream_key: stream_key.clone(),
+                })?;
 
             let buf = &active.buffer;
             if buf.timestamps.is_empty() {
@@ -379,24 +473,50 @@ impl Buffer {
         let reference_key = by_stream.keys().next().unwrap();
         let reference = &self.active_runs.get(reference_key).unwrap().buffer;
 
-        let start = reference.timestamps.iter().position(|&t| t >= global_start).unwrap_or(0);
-        let end = reference.timestamps.iter().rposition(|&t| t <= global_end).unwrap_or(reference.len().saturating_sub(1));
+        let start = reference
+            .timestamps
+            .iter()
+            .position(|&t| t >= global_start)
+            .unwrap_or(0);
+        let end = reference
+            .timestamps
+            .iter()
+            .rposition(|&t| t <= global_end)
+            .unwrap_or(reference.len().saturating_sub(1));
         let count = end.saturating_sub(start) + 1;
 
-        let sample_numbers: Vec<_> = reference.sample_numbers.iter().skip(start).take(count).copied().collect();
-        let timestamps: Vec<_> = reference.timestamps.iter().skip(start).take(count).copied().collect();
+        let sample_numbers: Vec<_> = reference
+            .sample_numbers
+            .iter()
+            .skip(start)
+            .take(count)
+            .copied()
+            .collect();
+        let timestamps: Vec<_> = reference
+            .timestamps
+            .iter()
+            .skip(start)
+            .take(count)
+            .copied()
+            .collect();
 
         self.build_window(&by_stream, start, count, sample_numbers, timestamps)
     }
 
-    fn validate_rates(&self, by_stream: &HashMap<StreamKey, Vec<ColumnId>>) -> Result<(), ReadError> {
+    fn validate_rates(
+        &self,
+        by_stream: &HashMap<StreamKey, Vec<ColumnId>>,
+    ) -> Result<(), ReadError> {
         let mut rate: Option<f64> = None;
         let mut rates = Vec::new();
 
         for stream_key in by_stream.keys() {
-            let active = self.active_runs.get(stream_key).ok_or(ReadError::NoActiveRun {
-                stream_key: stream_key.clone(),
-            })?;
+            let active = self
+                .active_runs
+                .get(stream_key)
+                .ok_or(ReadError::NoActiveRun {
+                    stream_key: stream_key.clone(),
+                })?;
 
             let r = active.effective_rate;
             rates.push(r);
@@ -468,7 +588,10 @@ impl Buffer {
 fn group_columns_by_stream(columns: &[ColumnKey]) -> HashMap<StreamKey, Vec<ColumnId>> {
     let mut by_stream: HashMap<StreamKey, Vec<ColumnId>> = HashMap::new();
     for col in columns {
-        by_stream.entry(col.stream_key()).or_default().push(col.column_id);
+        by_stream
+            .entry(col.stream_key())
+            .or_default()
+            .push(col.column_id);
     }
     by_stream
 }

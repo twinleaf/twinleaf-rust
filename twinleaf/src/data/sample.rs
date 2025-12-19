@@ -1,7 +1,7 @@
 use crate::tio;
 
 use std::sync::Arc;
-use tio::proto::identifiers::{SampleNumber, SessionId, SegmentId, TimeRefSessionId};
+use tio::proto::identifiers::{SampleNumber, SegmentId, SessionId, TimeRefSessionId};
 use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
 
 #[derive(Debug, Clone)]
@@ -134,20 +134,31 @@ pub enum BoundaryReason {
     /// Device session changed
     SessionChanged { old: SessionId, new: SessionId },
     /// Time reference epoch changed
-    TimeRefSessionChanged { old: TimeRefSessionId, new: TimeRefSessionId },
-     /// Time jumped backward unexpectedly
+    TimeRefSessionChanged {
+        old: TimeRefSessionId,
+        new: TimeRefSessionId,
+    },
+    /// Time jumped backward unexpectedly
     TimeBackward { gap_seconds: f64 },
     /// Sampling rate changed
     RateChanged { old_rate: f64, new_rate: f64 },
 
     /// Segment rolled over (continuous, but new segment)
-    SegmentRollover { old_id: SegmentId, new_id: SegmentId },
+    SegmentRollover {
+        old_id: SegmentId,
+        new_id: SegmentId,
+    },
     /// Segment changed unexpectedly (not a natural rollover)
-    SegmentChanged { old_id: SegmentId, new_id: SegmentId },
+    SegmentChanged {
+        old_id: SegmentId,
+        new_id: SegmentId,
+    },
     /// Samples were lost (gap in sequence)
-    SamplesLost { expected: SampleNumber, received: SampleNumber },
+    SamplesLost {
+        expected: SampleNumber,
+        received: SampleNumber,
+    },
 }
-
 
 impl Boundary {
     /// Only boundary where continuity is preserved
