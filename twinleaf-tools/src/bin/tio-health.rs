@@ -286,6 +286,7 @@ impl StreamStats {
         self.jitter_ms = 0.0;
         self.jitter_window = None;
         self.last_n = None;
+        self.arrivals.clear();
     }
 
     fn reset_for_new_session(&mut self, session_id: u32) {
@@ -597,6 +598,18 @@ fn main() {
     let (data_tx, data_rx) = channel::unbounded();
     std::thread::spawn(move || {
         let mut tree = tree;
+        let warmup_end = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < warmup_end {
+            while let Some(event) = tree.try_next_event() {
+                if data_tx.send(DataItem::Event(event)).is_err() { return; }
+            }
+            
+            if let Err(e) = tree.next() {
+                let _ = data_tx.send(DataItem::Error(format!("{:?}", e)));
+                return;
+            }
+        }
+
         loop {
             // Drain pending events first
             while let Some(event) = tree.try_next_event() {
@@ -672,7 +685,6 @@ fn main() {
                         }
 
                         st.on_sample(sample.n, sample.timestamp_end(), now, jitter_window_s);
-                        // Don't redraw on every sample - wait for tick
                     }
                     Ok(DataItem::Event(event)) => {
                         match event {
