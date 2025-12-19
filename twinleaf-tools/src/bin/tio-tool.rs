@@ -211,11 +211,16 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    let specs = twinleaf::device::util::load_rpc_specs(&device).map_err(|e| {
-        eprintln!("Failed to load RPC specs: {:?}", e);
+    let nrpcs: u16 = device.get("rpc.listinfo").map_err(|e| {
+        eprintln!("Failed to get RPC count: {:?}", e);
     })?;
 
-    for spec in specs {
+    for id in 0..nrpcs {
+        let (meta, name): (u16, String) = device.rpc("rpc.listinfo", id).map_err(|e| {
+            eprintln!("Failed to get RPC {}: {:?}", id, e);
+        })?;
+        
+        let spec = twinleaf::device::util::parse_rpc_spec(meta, name);
         println!(
             "{} {}({})",
             spec.perm_str(),
