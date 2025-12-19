@@ -28,7 +28,7 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
-    data::{AlignedWindow, Buffer, BufferEvent, ColumnBatch, ColumnData, OverflowPolicy, Sample},
+    data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, Sample},
     device::DeviceTree,
     tio::{
         self,
@@ -872,8 +872,7 @@ fn run_data_thread(
     rpc_resp_tx: Sender<RpcResp>,
     capacity: usize,
 ) {
-    let (evt_tx, _evt_rx) = channel::unbounded::<BufferEvent>();
-    let mut buffer = Buffer::new(evt_tx, capacity, OverflowPolicy::DropOldest);
+    let mut buffer = Buffer::new(capacity);
     let mut last: BTreeMap<StreamKey, Sample> = BTreeMap::new();
 
     loop {
