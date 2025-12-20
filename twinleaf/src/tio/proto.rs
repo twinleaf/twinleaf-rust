@@ -177,11 +177,12 @@ enum TioPktType {
     LegacyTimebaseUpdate = 6,
     LegacySourceUpdate = 7,
     LegacyStreamUpdate = 8,
-    ProxyStatus = 9,
-    RpcUpdate = 10,
+    Reserved0 = 9,
+    Reserved1 = 10,
     Metadata = 11,
-    Reserved0 = 12,
-    Reserved1 = 13,
+    Reserved2 = 13,
+    ProxyStatus = 64,
+    RpcUpdate = 65
     LegacyStreamData = 128,
     #[num_enum(catch_all)]
     UnknownOrStream(u8),
