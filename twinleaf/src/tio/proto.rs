@@ -488,7 +488,10 @@ impl Payload {
         full_data: &[u8],
     ) -> Result<Payload, Error> {
         match hdr.ptype() {
-            TioPktType::Invalid | TioPktType::Reserved0 | TioPktType::Reserved1 | TioPktType::Reserved2 => {
+            TioPktType::Invalid
+            | TioPktType::Reserved0
+            | TioPktType::Reserved1
+            | TioPktType::Reserved2 => {
                 // This should never happen for how the code is organized, since
                 // it should be ruled out by parsing the header first, but handle
                 // this case anyway.

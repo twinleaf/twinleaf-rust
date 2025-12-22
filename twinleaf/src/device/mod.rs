@@ -1,8 +1,8 @@
 mod device;
-mod tree;
 mod rpc;
+mod tree;
 pub mod util;
 
 pub use device::{Device, DeviceEvent, DeviceItem};
+pub use rpc::{RpcClient, RpcDataKind, RpcMeta, RpcRegistry, RpcValue};
 pub use tree::{DeviceTree, TreeEvent, TreeItem};
-pub use rpc::{RpcClient, RpcRegistry, RpcMeta, RpcDataKind, RpcValue};

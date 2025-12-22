@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryReason},
+    data::BoundaryReason,
     device::{DeviceEvent, DeviceTree, TreeEvent, TreeItem},
     tio::{
         self,

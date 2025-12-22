@@ -1,7 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
 use crate::device::util;
 use crate::tio::{proto::DeviceRoute, proxy, util as tio_util};
-
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub enum RpcValue {
@@ -267,10 +266,7 @@ impl RpcClient {
         Self { port, root_route }
     }
 
-    pub fn open(
-        proxy: &proxy::Interface,
-        route: DeviceRoute,
-    ) -> Result<Self, proxy::PortError> {
+    pub fn open(proxy: &proxy::Interface, route: DeviceRoute) -> Result<Self, proxy::PortError> {
         let port = proxy.subtree_rpc(route.clone())?;
         Ok(Self::new(port, route))
     }

@@ -52,7 +52,6 @@ pub enum DeviceItem {
     Event(DeviceEvent),
 }
 
-
 pub struct Device {
     dev_port: proxy::Port,
     parser: DeviceDataParser,
@@ -74,10 +73,7 @@ impl Device {
         }
     }
 
-    pub fn open(
-        proxy: &proxy::Interface,
-        route: DeviceRoute,
-    ) -> Result<Device, proxy::PortError> {
+    pub fn open(proxy: &proxy::Interface, route: DeviceRoute) -> Result<Device, proxy::PortError> {
         let port = proxy.device_full(route)?;
         Ok(Self::new(port))
     }
@@ -130,7 +126,8 @@ impl Device {
         if !self.metadata_announced {
             if let Ok(full_metadata) = self.parser.get_metadata() {
                 self.metadata_announced = true;
-                self.event_queue.push_back(DeviceEvent::MetadataReady(full_metadata));
+                self.event_queue
+                    .push_back(DeviceEvent::MetadataReady(full_metadata));
             }
         }
     }
@@ -150,10 +147,7 @@ impl Device {
                     }
                 }
             }
-            let pkt = self
-                .dev_port
-                .recv()
-                .map_err(proxy::RpcError::RecvFailed)?;
+            let pkt = self.dev_port.recv().map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(&pkt);
         }
     }
@@ -164,13 +158,9 @@ impl Device {
                 return Ok(sample);
             }
 
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
 
-            let pkt = self
-                .dev_port
-                .recv()
-                .map_err(proxy::RpcError::RecvFailed)?;
+            let pkt = self.dev_port.recv().map_err(proxy::RpcError::RecvFailed)?;
             self.process_packet(&pkt);
         }
     }
@@ -181,8 +171,7 @@ impl Device {
                 return Ok(Some(sample));
             }
 
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
 
             let pkt = match self.dev_port.try_recv() {
                 Ok(pkt) => pkt,
@@ -195,8 +184,7 @@ impl Device {
 
     pub fn drain(&mut self) -> Result<Vec<Sample>, proxy::RpcError> {
         loop {
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
                 Ok(pkt) => {
                     self.process_packet(&pkt);
@@ -229,7 +217,7 @@ impl Device {
             if let Some(event) = self.event_queue.pop_front() {
                 return Ok(DeviceItem::Event(event));
             }
-            
+
             self.internal_rpcs()?;
             let pkt = self.dev_port.recv()?;
             self.process_packet(&pkt);
@@ -241,11 +229,11 @@ impl Device {
             if let Some(sample) = self.sample_queue.pop_front() {
                 return Ok(Some(DeviceItem::Sample(sample)));
             }
-            
+
             if let Some(event) = self.event_queue.pop_front() {
                 return Ok(Some(DeviceItem::Event(event)));
             }
-            
+
             self.internal_rpcs()?;
             match self.dev_port.try_recv() {
                 Ok(pkt) => self.process_packet(&pkt),
@@ -265,8 +253,7 @@ impl Device {
             return Err(proxy::RpcError::SendFailed(err));
         }
         loop {
-            self.internal_rpcs()
-                .map_err(proxy::RpcError::SendFailed)?;
+            self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             let pkt = match self.dev_port.recv() {
                 Ok(packet) => packet,
                 Err(e) => return Err(proxy::RpcError::RecvFailed(e)),

@@ -253,11 +253,11 @@ impl DeviceTree {
             if let Some((sample, route)) = self.sample_queue.pop_front() {
                 return Ok(TreeItem::Sample(sample, route));
             }
-            
+
             if let Some(event) = self.event_queue.pop_front() {
                 return Ok(TreeItem::Event(event));
             }
-            
+
             self.internal_rpcs()?;
             let pkt = self.port.recv()?;
             self.process_packet(&pkt);
@@ -269,11 +269,11 @@ impl DeviceTree {
             if let Some((sample, route)) = self.sample_queue.pop_front() {
                 return Ok(Some(TreeItem::Sample(sample, route)));
             }
-            
+
             if let Some(event) = self.event_queue.pop_front() {
                 return Ok(Some(TreeItem::Event(event)));
             }
-            
+
             self.internal_rpcs()?;
             match self.port.try_recv() {
                 Ok(pkt) => self.process_packet(&pkt),

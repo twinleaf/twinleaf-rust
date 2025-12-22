@@ -26,11 +26,12 @@ use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{DeviceEvent, DeviceTree, TreeEvent, TreeItem, RpcClient, util},
+    device::{util, DeviceEvent, DeviceTree, RpcClient, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{
-            DeviceRoute, ProxyStatus, identifiers::{ColumnKey, StreamKey}
+            identifiers::{ColumnKey, StreamKey},
+            DeviceRoute, ProxyStatus,
         },
     },
 };
@@ -127,15 +128,22 @@ impl Nav {
         let cur = &items[self.idx];
         let (dev, stream) = match cur {
             NavPos::EmptyDevice { .. } => return,
-            NavPos::Column { device_idx, stream_idx, .. } => (*device_idx, *stream_idx),
+            NavPos::Column {
+                device_idx,
+                stream_idx,
+                ..
+            } => (*device_idx, *stream_idx),
         };
 
         let siblings: Vec<usize> = items
             .iter()
             .enumerate()
             .filter_map(|(i, pos)| match pos {
-                NavPos::Column { device_idx, stream_idx, .. }
-                    if *device_idx == dev && *stream_idx == stream => Some(i),
+                NavPos::Column {
+                    device_idx,
+                    stream_idx,
+                    ..
+                } if *device_idx == dev && *stream_idx == stream => Some(i),
                 _ => None,
             })
             .collect();
@@ -172,7 +180,10 @@ impl Nav {
         }
 
         // Find current device position and move to next/prev
-        let dev_pos = device_indices.iter().position(|&d| d == cur_device).unwrap_or(0);
+        let dev_pos = device_indices
+            .iter()
+            .position(|&d| d == cur_device)
+            .unwrap_or(0);
         let len = device_indices.len();
         let new_dev_pos = if backward {
             (dev_pos + len - 1) % len
@@ -189,7 +200,9 @@ impl Nav {
             .map(|(i, pos)| {
                 let dist = match pos {
                     NavPos::EmptyDevice { .. } => (0, 0),
-                    NavPos::Column { stream_idx, spec, .. } => {
+                    NavPos::Column {
+                        stream_idx, spec, ..
+                    } => {
                         let s = (*stream_idx as isize - cur_stream as isize).abs();
                         let c = (spec.column_id as isize - cur_column as isize).abs();
                         (s, c)
@@ -412,8 +425,8 @@ fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
         return Ok("OK".to_string());
     }
 
-    let value = util::rpc_decode_reply(&reply_bytes, &spec.data_kind)
-        .map_err(|e| format!("{:?}", e))?;
+    let value =
+        util::rpc_decode_reply(&reply_bytes, &spec.data_kind).map_err(|e| format!("{:?}", e))?;
 
     Ok(util::format_rpc_value_for_cli(&value, &spec.data_kind))
 }
@@ -1063,7 +1076,11 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         };
 
         let status_indicator = if is_alive { "●" } else { "○" };
-        let status_color = if is_alive { Color::Green } else { Color::DarkGray };
+        let status_color = if is_alive {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
 
         let mut header_spans = vec![
             Span::styled(
@@ -1597,8 +1614,8 @@ fn main() {
     // RPC thread
     let (rpc_tx, rpc_rx) = channel::bounded::<RpcReq>(1);
     let (rpc_resp_tx, rpc_resp_rx) = channel::bounded::<RpcResp>(1);
-    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
-        .expect("Failed to open RPC client");
+    let rpc_client =
+        RpcClient::open(&proxy, parent_route.clone()).expect("Failed to open RPC client");
     std::thread::spawn(move || {
         while let Ok(req) = rpc_rx.recv() {
             let result = exec_rpc(&rpc_client, &req);
