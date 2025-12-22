@@ -130,7 +130,7 @@ fn parse_metarep(rep: Vec<u8>) -> Vec<tio::proto::meta::MetadataContent> {
     ret
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeviceStreamMetadata {
     pub stream: Arc<StreamMetadata>,
     pub segment: Arc<SegmentMetadata>,
@@ -445,7 +445,7 @@ impl DeviceStream {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeviceFullMetadata {
     pub device: Arc<DeviceMetadata>,
     pub streams: HashMap<u8, DeviceStreamMetadata>,
