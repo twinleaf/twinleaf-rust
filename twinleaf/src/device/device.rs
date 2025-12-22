@@ -43,6 +43,8 @@ pub enum DeviceEvent {
         /// None for non-standard/legacy heartbeat formats.
         session_id: Option<proto::identifiers::SessionId>,
     },
+
+    MetadataReady(DeviceFullMetadata),
 }
 
 pub enum DeviceItem {
@@ -55,6 +57,7 @@ pub struct Device {
     dev_port: proxy::Port,
     parser: DeviceDataParser,
     n_reqs: usize,
+    metadata_announced: bool,
     sample_queue: VecDeque<Sample>,
     event_queue: VecDeque<DeviceEvent>,
 }
@@ -65,6 +68,7 @@ impl Device {
             dev_port: dev_port,
             parser: DeviceDataParser::new(false),
             n_reqs: 0,
+            metadata_announced: false,
             sample_queue: VecDeque::new(),
             event_queue: VecDeque::new(),
         }
@@ -122,6 +126,13 @@ impl Device {
         }
         self.sample_queue
             .append(&mut VecDeque::from(self.parser.process_packet(&pkt)));
+
+        if !self.metadata_announced {
+            if let Ok(full_metadata) = self.parser.get_metadata() {
+                self.metadata_announced = true;
+                self.event_queue.push_back(DeviceEvent::MetadataReady(full_metadata));
+            }
+        }
     }
 
     pub fn get_metadata(&mut self) -> Result<DeviceFullMetadata, proxy::RpcError> {

@@ -30,6 +30,7 @@ pub struct DeviceTree {
     parsers: HashMap<DeviceRoute, DeviceDataParser>,
     n_reqs: HashMap<DeviceRoute, usize>,
     known_routes: HashSet<DeviceRoute>,
+    metadata_announced: HashSet<DeviceRoute>,
     sample_queue: VecDeque<(Sample, DeviceRoute)>,
     event_queue: VecDeque<TreeEvent>,
 }
@@ -42,6 +43,7 @@ impl DeviceTree {
             parsers: HashMap::new(),
             n_reqs: HashMap::new(),
             known_routes: HashSet::new(),
+            metadata_announced: HashSet::new(),
             sample_queue: VecDeque::new(),
             event_queue: VecDeque::new(),
         }
@@ -143,6 +145,17 @@ impl DeviceTree {
         for sample in samples {
             self.sample_queue
                 .push_back((sample, absolute_route.clone()));
+        }
+        if !self.metadata_announced.contains(&absolute_route) {
+            if let Some(parser) = self.parsers.get(&absolute_route) {
+                if let Ok(full_metadata) = parser.get_metadata() {
+                    self.metadata_announced.insert(absolute_route.clone());
+                    self.event_queue.push_back(TreeEvent::Device {
+                        route: absolute_route,
+                        event: super::device::DeviceEvent::MetadataReady(full_metadata),
+                    });
+                }
+            }
         }
     }
 
