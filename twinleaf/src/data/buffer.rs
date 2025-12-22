@@ -1,5 +1,4 @@
-use crate::data::{ColumnData, Sample};
-use crate::device::CursorPosition;
+use crate::data::{ColumnData, Sample, CursorPosition};
 use crate::tio::proto::identifiers::*;
 use crate::tio::proto::meta::MetadataEpoch;
 use crate::tio::proto::{BufferType, ColumnMetadata, DeviceRoute, SegmentMetadata, StreamMetadata};
