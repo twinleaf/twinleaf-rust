@@ -90,6 +90,11 @@ impl DeviceTree {
     fn process_packet(&mut self, pkt: &tio::Packet) {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
 
+        if self.known_routes.insert(absolute_route.clone()) {
+            self.event_queue
+                .push_back(TreeEvent::RouteDiscovered(absolute_route.clone()));
+        }
+
         match &pkt.payload {
             tio::proto::Payload::ProxyStatus(ps) => {
                 self.event_queue.push_back(TreeEvent::Device {
@@ -136,10 +141,6 @@ impl DeviceTree {
         let samples: Vec<Sample> = parser.process_packet(&pkt);
 
         for sample in samples {
-            if self.known_routes.insert(absolute_route.clone()) {
-                self.event_queue
-                    .push_back(TreeEvent::RouteDiscovered(absolute_route.clone()));
-            }
             self.sample_queue
                 .push_back((sample, absolute_route.clone()));
         }
