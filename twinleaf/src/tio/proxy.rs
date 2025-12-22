@@ -9,7 +9,7 @@
 //! Note: the proxy runs in a dedicated thread.
 
 use super::port;
-use super::proto::{self, DeviceRoute, Packet};
+use super::proto::{self, DeviceRoute, Packet, ProxyStatus};
 use super::proxy_core::{ProxyClient, ProxyCore};
 use super::util;
 use super::util::{TioRpcReplyable, TioRpcRequestable};
@@ -54,6 +54,18 @@ pub enum Event {
     NoData,
 }
 
+impl From<ProxyStatus> for super::proxy::Event {
+    fn from(status: ProxyStatus) -> Self {
+        match status {
+            ProxyStatus::SensorDisconnected => Event::SensorDisconnected,
+            ProxyStatus::SensorReconnected => Event::SensorReconnected,
+            ProxyStatus::FailedToReconnect => Event::FailedToReconnect,
+            ProxyStatus::FailedToConnect => Event::FailedToConnect,
+            ProxyStatus::Unknown(_) => Event::SensorDisconnected,
+        }
+    }
+}
+
 /// A port which communicates with a proxy via `crossbeam::channel`s
 pub struct Port {
     tx: channel::Sender<Packet>,
@@ -73,6 +85,18 @@ pub enum SendError {
 pub enum RecvError {
     WouldBlock,
     ProxyDisconnected,
+}
+
+impl From<SendError> for RpcError {
+    fn from(e: SendError) -> Self {
+        RpcError::SendFailed(e)
+    }
+}
+
+impl From<RecvError> for RpcError {
+    fn from(e: RecvError) -> Self {
+        RpcError::RecvFailed(e)
+    }
 }
 
 #[derive(Debug, Clone)]

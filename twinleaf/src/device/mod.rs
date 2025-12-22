@@ -1,11 +1,8 @@
 mod device;
-mod reader;
-pub mod rpc_registry;
-mod subscription;
+mod rpc;
 mod tree;
 pub mod util;
 
-pub use device::Device;
-pub use reader::{CursorPosition, Reader};
-pub use subscription::SubscriptionManager;
-pub use tree::DeviceTree;
+pub use device::{Device, DeviceEvent, DeviceItem};
+pub use rpc::{RpcClient, RpcDataKind, RpcMeta, RpcRegistry, RpcValue};
+pub use tree::{DeviceTree, TreeEvent, TreeItem};

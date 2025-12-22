@@ -13,7 +13,7 @@ pub mod macos_helpers {
                 | NSActivityOptions::IdleSystemSleepDisabled;
             let pi = NSProcessInfo::processInfo();
             let reason = NSString::from_str(reason);
-            let token = unsafe { pi.beginActivityWithOptions_reason(opts, &reason) };
+            let token = pi.beginActivityWithOptions_reason(opts, &reason);
             Some(ActivityGuard(token))
         }
     }

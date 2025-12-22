@@ -132,6 +132,9 @@ struct ProxyDevice {
     last_rx: Instant,
     last_session: Option<u32>,
     restarted: bool,
+    rpc_meta: HashMap<String, u16>,
+    pending_broadcasts: Vec<(String, DeviceRoute, u64)>,
+    pending_lookup: Option<(String, DeviceRoute)>,
 }
 
 impl ProxyDevice {
@@ -229,6 +232,8 @@ struct RpcMapEntry {
     client: u64,
     route: DeviceRoute,
     timeout: Instant,
+    has_arg: bool,
+    method: proto::RpcMethod,
 }
 
 pub struct ProxyCore {
@@ -252,6 +257,7 @@ pub struct ProxyCore {
 
 static QUERY_RATE_RPC_ID: u16 = 0x101;
 static SET_RATE_RPC_ID: u16 = 0x102;
+static RPC_INFO_LOOKUP_ID: u16 = 0x103;
 
 impl ProxyCore {
     pub fn new(
@@ -306,6 +312,9 @@ impl ProxyCore {
             last_rx: Instant::now(),
             last_session: None,
             restarted: false,
+            rpc_meta: HashMap::new(),
+            pending_broadcasts: Vec::new(),
+            pending_lookup: None,
         });
         true
     }
@@ -319,7 +328,11 @@ impl ProxyCore {
         }
     }
 
-    fn rpc_restore(&mut self, wire_id: u16, route: &DeviceRoute) -> Option<(u64, u16)> {
+    fn rpc_restore(
+        &mut self,
+        wire_id: u16,
+        route: &DeviceRoute,
+    ) -> Option<(u64, u16, proto::RpcMethod, bool)> {
         let remap = match self.rpc_map.remove(&wire_id) {
             None => {
                 return None;
@@ -339,7 +352,7 @@ impl ProxyCore {
             #[cfg(debug_assertions)]
             eprintln!("Failed to find RPC timeout in map");
         }
-        Some((remap.client, remap.id))
+        Some((remap.client, remap.id, remap.method, remap.has_arg))
     }
 
     // Ok: successful. Err: packet should be sent back to client
@@ -371,6 +384,8 @@ impl ProxyCore {
                     client: client_id,
                     route: pkt.routing.clone(),
                     timeout: timeout,
+                    method: req.method.clone(),
+                    has_arg: !req.arg.is_empty(),
                 },
             );
             self.status_queue
@@ -406,6 +421,35 @@ impl ProxyCore {
                 .rpc_error(remap.id, proto::RpcErrorCode::Undefined));
         } else {
             Ok(())
+        }
+    }
+
+    fn broadcast_status(&self, status: proto::ProxyStatus) {
+        let pkt = Packet {
+            payload: proto::Payload::ProxyStatus(proto::ProxyStatusPayload(status)),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        };
+        for (_client_id, client) in self.clients.iter() {
+            let _ = client.send(&pkt);
+        }
+    }
+
+    fn broadcast_rpc_update(
+        &self,
+        method: &proto::RpcMethod,
+        route: &DeviceRoute,
+        exclude_client: u64,
+    ) {
+        let pkt = Packet {
+            payload: proto::Payload::RpcUpdate(proto::RpcUpdatePayload(method.clone())),
+            routing: route.clone(),
+            ttl: 0,
+        };
+        for (client_id, client) in self.clients.iter() {
+            if *client_id != exclude_client {
+                let _ = client.tx.try_send(pkt.clone());
+            }
         }
     }
 
@@ -542,6 +586,57 @@ impl ProxyCore {
                 self.device.as_mut().expect("").rate_change_state = next_state;
                 return;
             }
+        } else if rep.id == RPC_INFO_LOOKUP_ID {
+            let broadcast_info = self.device.as_mut().and_then(|dev| {
+                let (name, _) = dev.pending_lookup.take()?;
+                if rep.reply.len() < 2 {
+                    return None;
+                }
+
+                let meta = u16::from_le_bytes([rep.reply[0], rep.reply[1]]);
+                dev.rpc_meta.insert(name.clone(), meta);
+
+                let readable = (meta & 0x0100) != 0;
+                let writable = (meta & 0x0200) != 0;
+
+                let pending = std::mem::take(&mut dev.pending_broadcasts);
+                let (matching, remaining): (Vec<_>, Vec<_>) =
+                    pending.into_iter().partition(|(n, _, _)| *n == name);
+                dev.pending_broadcasts = remaining;
+
+                let next = dev
+                    .pending_broadcasts
+                    .first()
+                    .map(|(n, r, _)| (n.clone(), r.clone()));
+
+                if let Some((next_name, next_route)) = &next {
+                    dev.pending_lookup = Some((next_name.clone(), next_route.clone()));
+                }
+
+                Some((matching, readable && writable, next))
+            });
+
+            if let Some((matching, should_broadcast, next_lookup)) = broadcast_info {
+                if should_broadcast {
+                    for (name, route, exclude_client) in matching {
+                        self.broadcast_rpc_update(
+                            &proto::RpcMethod::Name(name),
+                            &route,
+                            exclude_client,
+                        );
+                    }
+                }
+
+                if let Some((next_name, next_route)) = next_lookup {
+                    let _ = self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
+                        "rpc.info",
+                        next_name.as_bytes(),
+                        RPC_INFO_LOOKUP_ID,
+                        next_route,
+                    ));
+                }
+            }
+            return;
         } else {
             // Note: internal RPCs still get remapped with all other RPCs,
             // so this ID does not come from the device itself, but from the
@@ -558,6 +653,30 @@ impl ProxyCore {
     }
 
     fn internal_rpc_error(&mut self, err: &proto::RpcErrorPayload) {
+        if err.id == RPC_INFO_LOOKUP_ID {
+            if let Some(dev) = self.device.as_mut() {
+                // Clear current lookup
+                let failed_name = dev.pending_lookup.take().map(|(n, _)| n);
+
+                // Remove any pending broadcasts for the failed lookup
+                if let Some(name) = failed_name {
+                    dev.pending_broadcasts.retain(|(n, _, _)| *n != name);
+                }
+
+                // Start next lookup if there are more pending
+                if let Some((next_name, next_route, _)) = dev.pending_broadcasts.first().cloned() {
+                    dev.pending_lookup = Some((next_name.clone(), next_route.clone()));
+                    let _ = self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
+                        "rpc.info",
+                        next_name.as_bytes(),
+                        RPC_INFO_LOOKUP_ID,
+                        next_route,
+                    ));
+                }
+            }
+            return;
+        }
+
         // We could handle this better, but just keep the device to the default speed until the port is reset
         self.status_queue
             .send(Event::AutoRateRpcError(err.error.clone()));
@@ -646,9 +765,11 @@ impl ProxyCore {
 
         if !self.try_setup_device() {
             self.status_queue.send(Event::FailedToConnect);
+            self.broadcast_status(proto::ProxyStatus::FailedToConnect);
             return;
         } else {
             self.status_queue.send(Event::SensorConnected);
+            self.broadcast_status(proto::ProxyStatus::SensorReconnected);
         }
         let mut device_timeout = Instant::now();
 
@@ -660,11 +781,13 @@ impl ProxyCore {
                 if !self.try_setup_device() {
                     if Instant::now() > device_timeout {
                         self.status_queue.send(Event::FailedToReconnect);
+                        self.broadcast_status(proto::ProxyStatus::FailedToReconnect);
                         break;
                     }
                     timeout = std::cmp::min(timeout, Duration::from_secs(1));
                 } else {
                     self.status_queue.send(Event::SensorReconnected);
+                    self.broadcast_status(proto::ProxyStatus::SensorReconnected);
                 }
             }
 
@@ -824,19 +947,19 @@ impl ProxyCore {
                                 _ => None,
                             } {
                                 // Remap RPC reply or error ID to client + ID
-                                let (client, client_id, original_id) =
-                                    if let Some((client_id, rpc_id)) =
+                                let (client_id, original_id, method, has_arg) =
+                                    if let Some((client_id, rpc_id, method, has_arg)) =
                                         self.rpc_restore(wire_id, &pkt.routing)
                                     {
                                         if client_id == 0 {
                                             // internal reply
-                                            (None, 0, rpc_id)
-                                        } else if let Some(client) = self.clients.get(&client_id) {
+                                            (0, rpc_id, method, has_arg)
+                                        } else if self.clients.contains_key(&client_id) {
                                             self.status_queue.send(Event::RpcRestore(
                                                 wire_id,
                                                 (client_id, rpc_id),
                                             ));
-                                            (Some(client), client_id, rpc_id)
+                                            (client_id, rpc_id, method, has_arg)
                                         } else {
                                             // If we cannot find the client which originally sent the
                                             // request, just drop the packet and send an event.
@@ -856,6 +979,70 @@ impl ProxyCore {
                                             self.internal_rpc_reply(rep);
                                             continue;
                                         }
+                                        if has_arg {
+                                            if let proto::RpcMethod::Name(ref name) = method {
+                                                let should_broadcast = self
+                                                    .device
+                                                    .as_ref()
+                                                    .and_then(|dev| dev.rpc_meta.get(name))
+                                                    .map(|&meta| {
+                                                        let readable = (meta & 0x0100) != 0;
+                                                        let writable = (meta & 0x0200) != 0;
+                                                        readable && writable
+                                                    });
+
+                                                match should_broadcast {
+                                                    Some(true) => {
+                                                        self.broadcast_rpc_update(
+                                                            &method,
+                                                            &pkt.routing,
+                                                            client_id,
+                                                        );
+                                                    }
+                                                    Some(false) => {
+                                                        // Not readable+writable, don't broadcast
+                                                    }
+                                                    None => {
+                                                        // Not cached - queue and start lookup with rpc.info directly
+                                                        let should_send = if let Some(dev) =
+                                                            self.device.as_mut()
+                                                        {
+                                                            dev.pending_broadcasts.push((
+                                                                name.clone(),
+                                                                pkt.routing.clone(),
+                                                                client_id,
+                                                            ));
+                                                            if dev.pending_lookup.is_none() {
+                                                                dev.pending_lookup = Some((
+                                                                    name.clone(),
+                                                                    pkt.routing.clone(),
+                                                                ));
+                                                                Some((
+                                                                    name.clone(),
+                                                                    pkt.routing.clone(),
+                                                                ))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        } else {
+                                                            None
+                                                        };
+
+                                                        // Call rpc.info directly with the name
+                                                        if let Some((name, route)) = should_send {
+                                                            let _ = self.send_internal_rpc(
+                                                                util::PacketBuilder::make_rpc_request(
+                                                                    "rpc.info",
+                                                                    name.as_bytes(),
+                                                                    RPC_INFO_LOOKUP_ID,
+                                                                    route,
+                                                                )
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     proto::Payload::RpcError(err) => {
                                         err.id = original_id;
@@ -870,9 +1057,11 @@ impl ProxyCore {
                                     }
                                 }
                                 // Forward with correct request id to the requestor
-                                if let Err(_) = client.expect("unexpected client").send(&pkt) {
-                                    self.status_queue.send(Event::ClientSendFailed(client_id));
-                                    self.drop_client(client_id);
+                                if let Some(client) = self.clients.get(&client_id) {
+                                    if let Err(_) = client.send(&pkt) {
+                                        self.status_queue.send(Event::ClientSendFailed(client_id));
+                                        self.drop_client(client_id);
+                                    }
                                 }
                             } else {
                                 let mut to_drop = vec![];
@@ -911,6 +1100,7 @@ impl ProxyCore {
                                     None => Duration::from_secs(0),
                                 };
                             self.status_queue.send(Event::SensorDisconnected);
+                            self.broadcast_status(proto::ProxyStatus::SensorDisconnected);
                             break;
                         }
                     }

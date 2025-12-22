@@ -1,4 +1,4 @@
-use crate::device::rpc_registry::{DecodeError, EncodeError, RpcDataKind, RpcMeta, RpcValue};
+use crate::device::rpc::{DecodeError, EncodeError, RpcDataKind, RpcMeta, RpcValue};
 use crate::tio::proxy;
 
 pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcMeta>, proxy::RpcError> {

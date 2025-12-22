@@ -151,7 +151,6 @@ enum Commands {
     },
 
     /// Convert binary log files to HDF5 format
-    #[cfg(feature = "hdf5")]
     LogHdf {
         /// Input log file(s)
         files: Vec<String>,
@@ -212,11 +211,16 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    let specs = twinleaf::device::util::load_rpc_specs(&device).map_err(|e| {
-        eprintln!("Failed to load RPC specs: {:?}", e);
+    let nrpcs: u16 = device.get("rpc.listinfo").map_err(|e| {
+        eprintln!("Failed to get RPC count: {:?}", e);
     })?;
 
-    for spec in specs {
+    for id in 0..nrpcs {
+        let (meta, name): (u16, String) = device.rpc("rpc.listinfo", id).map_err(|e| {
+            eprintln!("Failed to get RPC {}: {:?}", id, e);
+        })?;
+
+        let spec = twinleaf::device::util::parse_rpc_spec(meta, name);
         println!(
             "{} {}({})",
             spec.perm_str(),
@@ -447,16 +451,20 @@ fn print_sample(sample: &twinleaf::data::Sample, route: Option<&DeviceRoute>) {
     } else {
         "".to_string()
     };
-    if sample.meta_changed {
-        println!("# {}DEVICE {:?}", route_str, sample.device);
-        println!("# {}STREAM {:?}", route_str, sample.stream);
-        for col in &sample.columns {
-            println!("# {}COLUMN {:?}", route_str, col.desc);
+
+    if let Some(boundary) = &sample.boundary {
+        eprintln!("[DEBUG] Boundary reason: {:?}", boundary.reason);
+
+        if !boundary.is_continuous() {
+            println!("# {}DEVICE {:?}", route_str, sample.device);
+            println!("# {}STREAM {:?}", route_str, sample.stream);
+            for col in &sample.columns {
+                println!("# {}COLUMN {:?}", route_str, col.desc);
+            }
         }
-    }
-    if sample.segment_changed {
         println!("# {}SEGMENT {:?}", route_str, sample.segment);
     }
+
     println!("{}{}", route_str, sample);
 }
 
@@ -582,7 +590,10 @@ fn log(
                     let is_new_device = seen_routes.insert(sample_route.clone());
                     let force_header = is_new_device;
 
-                    if sample.meta_changed || force_header {
+                    let is_discontinuity = !sample.is_continuous();
+                    let has_boundary = sample.boundary.is_some();
+
+                    if is_discontinuity || force_header {
                         let _ = write_packet(
                             sample.device.make_update_with_route(sample_route.clone()),
                             &mut file,
@@ -595,13 +606,13 @@ fn log(
                             sample.segment.make_update_with_route(sample_route.clone()),
                             &mut file,
                         );
-                        for col in sample.columns {
+                        for col in &sample.columns {
                             let _ = write_packet(
                                 col.desc.make_update_with_route(sample_route.clone()),
                                 &mut file,
                             );
                         }
-                    } else if sample.segment_changed {
+                    } else if has_boundary {
                         let _ = write_packet(
                             sample.segment.make_update_with_route(sample_route.clone()),
                             &mut file,
@@ -793,83 +804,67 @@ fn log_csv(
 }
 
 #[cfg(feature = "hdf5")]
-fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress: bool, debug: bool) -> Result<(), ()> {
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::fs::File;
-    use memmap2::Mmap;
+fn log_hdf(
+    files: Vec<String>,
+    output: String,
+    filter: Option<String>,
+    compress: bool,
+    debug: bool,
+) -> Result<(), ()> {
     use indicatif::{ProgressBar, ProgressStyle};
-    use twinleaf::data::{Buffer, BufferEvent, export, ColumnFilter, DeviceDataParser, OverflowPolicy};
+    use memmap2::Mmap;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::path::Path;
+    use twinleaf::data::{export, ColumnFilter, DeviceDataParser};
     use twinleaf::tio;
+    use twinleaf::tio::proto::identifiers::StreamKey;
 
-    let (tx, rx) = crossbeam::channel::bounded(100);
-    let output_for_thread = output.clone();
-
-    // Spawn the Writer Thread
-    let writer_handle = std::thread::spawn(move || {
-        let mut writer = export::Hdf5Appender::new(Path::new(&output_for_thread), compress, debug)
-            .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))
-            .expect("Writer init failed");
-
-        let col_filter = if let Some(p) = filter {
-            match ColumnFilter::new(&p) {
-                Ok(f) => Some(f),
-                Err(e) => { eprintln!("Filter error: {}", e); return writer.stats; }
-            }
-        } else { None };
-
-        while let Ok(event) = rx.recv() {
-            match event {
-                BufferEvent::DataChunk { slice, is_first_chunk: _ } => {
-                    if debug {
-                        println!("[DEBUG] Writing chunk: {} samples", slice.len());
-                    }
-                    
-                    if let Err(e) = writer.write_slice(&slice, &col_filter) {
-                        eprintln!("HDF5 Write Error: {:?}", e);
-                        break; 
-                    }
-                },
-                _ => {} 
+    // Parse filter upfront
+    let col_filter = if let Some(p) = filter {
+        match ColumnFilter::new(&p) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("Filter error: {}", e);
+                return Err(());
             }
         }
-        writer.stats
-    });
+    } else {
+        None
+    };
 
-    let mut buffer = Buffer::new(tx, 65_536, false, OverflowPolicy::Flush); 
+    // Create writer with filter baked in
+    let mut writer =
+        export::Hdf5Appender::new(Path::new(&output), compress, debug, col_filter, 65_536)
+            .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))?;
+
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
 
     println!("Processing {} files...", files.len());
 
     for path in &files {
-        let file = File::open(&path).map_err(|e| eprintln!("Open failed: {:?}", e)).unwrap();
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| eprintln!("Mmap failed: {:?}", e)).unwrap();
-        
+        let file = File::open(&path).map_err(|e| eprintln!("Open failed: {:?}", e))?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| eprintln!("Mmap failed: {:?}", e))?;
+
         let total_bytes = mmap.len() as u64;
         let pb = ProgressBar::new(total_bytes);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})").unwrap()
-            .progress_chars("#>-"));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
         pb.set_message(path.clone());
 
         let mut rest: &[u8] = &mmap[..];
-        let mut iteration = 0;
 
         while !rest.is_empty() {
-            iteration += 1;
-            if iteration % 1000 == 0 {
-                if writer_handle.is_finished() {
-                    writer_handle.join().expect("Writer thread crashed");
-                    return Err(());
-                }
-            }
-
             let (pkt, len) = match tio::Packet::deserialize(rest) {
                 Ok(res) => res,
                 Err(_) => break,
             };
-            rest = &rest[len..];                
+            rest = &rest[len..];
             pb.set_position(total_bytes - rest.len() as u64);
 
             let parser = parsers
@@ -877,18 +872,23 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
             for sample in parser.process_packet(&pkt) {
-                buffer.process_sample(sample, pkt.routing.clone());
+                let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
+
+                if let Err(e) = writer.write_sample(sample, key) {
+                    eprintln!("HDF5 Write Error: {:?}", e);
+                    return Err(());
+                }
             }
         }
+
         pb.finish_with_message("Completed");
     }
 
-    println!("Flushing buffer and waiting for writer...");
-    buffer.flush_all(); 
-    drop(buffer);
+    // Finish flushes all pending data and returns stats
+    let stats = writer
+        .finish()
+        .map_err(|e| eprintln!("Failed to finalize HDF5: {:?}", e))?;
 
-    let stats = writer_handle.join().unwrap();
-    
     let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     let duration = stats.end_time.unwrap_or(0.0) - stats.start_time.unwrap_or(0.0);
     let size_mb = file_size as f64 / 1_048_576.0;
@@ -901,7 +901,7 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
     println!(" Duration:        {:.3} s", duration);
     println!(" Total Samples:   {}", stats.total_samples);
     println!(" Streams Written: {}", stats.streams_written.len());
-    
+
     if !stats.streams_written.is_empty() {
         println!("\n Active Streams:");
         let mut streams: Vec<_> = stats.streams_written.into_iter().collect();
@@ -911,15 +911,21 @@ fn log_hdf(files: Vec<String>, output: String, filter: Option<String>, compress:
         }
     }
     println!("--------------------------------------------------");
-    
+
     Ok(())
 }
 
 #[cfg(not(feature = "hdf5"))]
-fn log_hdf(_files: Vec<String>, _output: String, _filter: Option<String>, _debug: bool) -> Result<(), ()> {
+fn log_hdf(
+    _files: Vec<String>,
+    _output: String,
+    _filter: Option<String>,
+    _compress: bool,
+    _debug: bool,
+) -> Result<(), ()> {
     eprintln!("Error: This version of tio-tool was compiled without HDF5 support.");
-    eprintln!("To enable it, recompile with:");
-    eprintln!("  cargo install --path . --features hdf5 --force");
+    eprintln!("To enable it, reinstall with:");
+    eprintln!("  cargo install twinleaf-tools --features hdf5");
     Err(())
 }
 
@@ -1059,10 +1065,13 @@ fn main() -> ExitCode {
             metadata,
             output,
         } => log_csv(stream, files, sensor, metadata, output),
-        #[cfg(feature = "hdf5")]
-        Commands::LogHdf { files, output, filter, compress, debug } => {
-            log_hdf(files, output, filter, compress, debug)
-        },
+        Commands::LogHdf {
+            files,
+            output,
+            filter,
+            compress,
+            debug,
+        } => log_hdf(files, output, filter, compress, debug),
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
         Commands::DataDump { tio } => data_dump(&tio),
         Commands::DataDumpAll { tio } => data_dump_all(&tio),

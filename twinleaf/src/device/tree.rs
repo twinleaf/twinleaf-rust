@@ -3,14 +3,36 @@ use crate::tio;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Events from a DeviceTree (multi-device monitoring).
+#[derive(Debug, Clone)]
+pub enum TreeEvent {
+    /// First packet received from this route.
+    RouteDiscovered(DeviceRoute),
+
+    /// Event from a specific device.
+    Device {
+        route: DeviceRoute,
+        event: super::device::DeviceEvent,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum TreeItem {
+    Sample(Sample, DeviceRoute),
+    Event(TreeEvent),
+}
 
 pub struct DeviceTree {
     port: proxy::Port,
     root_route: DeviceRoute,
     parsers: HashMap<DeviceRoute, DeviceDataParser>,
     n_reqs: HashMap<DeviceRoute, usize>,
+    known_routes: HashSet<DeviceRoute>,
+    metadata_announced: HashSet<DeviceRoute>,
     sample_queue: VecDeque<(Sample, DeviceRoute)>,
+    event_queue: VecDeque<TreeEvent>,
 }
 
 impl DeviceTree {
@@ -20,7 +42,10 @@ impl DeviceTree {
             root_route,
             parsers: HashMap::new(),
             n_reqs: HashMap::new(),
+            known_routes: HashSet::new(),
+            metadata_announced: HashSet::new(),
             sample_queue: VecDeque::new(),
+            event_queue: VecDeque::new(),
         }
     }
 
@@ -67,7 +92,36 @@ impl DeviceTree {
     fn process_packet(&mut self, pkt: &tio::Packet) {
         let absolute_route = self.root_route.absolute_route(&pkt.routing);
 
+        if self.known_routes.insert(absolute_route.clone()) {
+            self.event_queue
+                .push_back(TreeEvent::RouteDiscovered(absolute_route.clone()));
+        }
+
         match &pkt.payload {
+            tio::proto::Payload::ProxyStatus(ps) => {
+                self.event_queue.push_back(TreeEvent::Device {
+                    route: absolute_route,
+                    event: super::device::DeviceEvent::Status(ps.0),
+                });
+                return;
+            }
+            tio::proto::Payload::RpcUpdate(ru) => {
+                self.event_queue.push_back(TreeEvent::Device {
+                    route: absolute_route,
+                    event: super::device::DeviceEvent::RpcInvalidated(ru.0.clone()),
+                });
+                return;
+            }
+            tio::proto::Payload::Heartbeat(hb) => {
+                let session_id = match hb {
+                    tio::proto::HeartbeatPayload::Session(sid) => Some(*sid),
+                    tio::proto::HeartbeatPayload::Any(_) => None,
+                };
+                self.event_queue.push_back(TreeEvent::Device {
+                    route: absolute_route.clone(),
+                    event: super::device::DeviceEvent::Heartbeat { session_id },
+                });
+            }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     if let Some(count) = self.n_reqs.get_mut(&absolute_route) {
@@ -91,6 +145,17 @@ impl DeviceTree {
         for sample in samples {
             self.sample_queue
                 .push_back((sample, absolute_route.clone()));
+        }
+        if !self.metadata_announced.contains(&absolute_route) {
+            if let Some(parser) = self.parsers.get(&absolute_route) {
+                if let Ok(full_metadata) = parser.get_metadata() {
+                    self.metadata_announced.insert(absolute_route.clone());
+                    self.event_queue.push_back(TreeEvent::Device {
+                        route: absolute_route,
+                        event: super::device::DeviceEvent::MetadataReady(full_metadata),
+                    });
+                }
+            }
         }
     }
 
@@ -173,6 +238,49 @@ impl DeviceTree {
         }
 
         Ok(self.sample_queue.drain(..).collect())
+    }
+
+    pub fn try_next_event(&mut self) -> Option<TreeEvent> {
+        self.event_queue.pop_front()
+    }
+
+    pub fn drain_events(&mut self) -> Vec<TreeEvent> {
+        self.event_queue.drain(..).collect()
+    }
+
+    pub fn next_item(&mut self) -> Result<TreeItem, proxy::RpcError> {
+        loop {
+            if let Some((sample, route)) = self.sample_queue.pop_front() {
+                return Ok(TreeItem::Sample(sample, route));
+            }
+
+            if let Some(event) = self.event_queue.pop_front() {
+                return Ok(TreeItem::Event(event));
+            }
+
+            self.internal_rpcs()?;
+            let pkt = self.port.recv()?;
+            self.process_packet(&pkt);
+        }
+    }
+
+    pub fn try_next_item(&mut self) -> Result<Option<TreeItem>, proxy::RpcError> {
+        loop {
+            if let Some((sample, route)) = self.sample_queue.pop_front() {
+                return Ok(Some(TreeItem::Sample(sample, route)));
+            }
+
+            if let Some(event) = self.event_queue.pop_front() {
+                return Ok(Some(TreeItem::Event(event)));
+            }
+
+            self.internal_rpcs()?;
+            match self.port.try_recv() {
+                Ok(pkt) => self.process_packet(&pkt),
+                Err(proxy::RecvError::WouldBlock) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub fn raw_rpc(

@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
-
 use crate::device::util;
+use crate::tio::{proto::DeviceRoute, proxy, util as tio_util};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub enum RpcValue {
@@ -205,6 +205,24 @@ impl RpcRegistry {
             .collect()
     }
 
+    pub fn children_of(&self, prefix: &str) -> Vec<String> {
+        if prefix.is_empty() {
+            return self.root.children.keys().cloned().collect();
+        }
+
+        let parts: Vec<String> = prefix.split('.').map(|s| s.to_string()).collect();
+
+        let mut current = &self.root;
+        for part in &parts {
+            match current.children.get(part) {
+                Some(node) => current = node,
+                None => return vec![],
+            }
+        }
+
+        current.children.keys().cloned().collect()
+    }
+
     pub fn prepare_request(&self, input_line: &str) -> Result<(String, Vec<u8>), String> {
         let parts: Vec<&str> = input_line.split_whitespace().collect();
         if parts.is_empty() {
@@ -235,5 +253,77 @@ impl RpcRegistry {
             .map_err(|e| format!("Decode error: {:?}", e))?;
 
         Ok(util::format_rpc_value_for_cli(&val, &meta.data_kind))
+    }
+}
+
+pub struct RpcClient {
+    port: proxy::Port,
+    root_route: DeviceRoute,
+}
+
+impl RpcClient {
+    pub fn new(port: proxy::Port, root_route: DeviceRoute) -> Self {
+        Self { port, root_route }
+    }
+
+    pub fn open(proxy: &proxy::Interface, route: DeviceRoute) -> Result<Self, proxy::PortError> {
+        let port = proxy.subtree_rpc(route.clone())?;
+        Ok(Self::new(port, route))
+    }
+
+    pub fn root_route(&self) -> &DeviceRoute {
+        &self.root_route
+    }
+
+    pub fn raw_rpc(
+        &self,
+        route: &DeviceRoute,
+        name: &str,
+        arg: &[u8],
+    ) -> Result<Vec<u8>, proxy::RpcError> {
+        let relative = self
+            .root_route
+            .relative_route(route)
+            .unwrap_or_else(|_| route.clone());
+
+        let req = tio_util::PacketBuilder::make_rpc_request(name, arg, 0, relative);
+        self.port.send(req)?;
+
+        loop {
+            let pkt = self.port.recv()?;
+            match pkt.payload {
+                crate::tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
+                crate::tio::proto::Payload::RpcError(err) => {
+                    return Err(proxy::RpcError::ExecError(err))
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    pub fn rpc<Req, Rep>(
+        &self,
+        route: &DeviceRoute,
+        name: &str,
+        arg: Req,
+    ) -> Result<Rep, proxy::RpcError>
+    where
+        Req: tio_util::TioRpcRequestable<Req>,
+        Rep: tio_util::TioRpcReplyable<Rep>,
+    {
+        let ret = self.raw_rpc(route, name, &arg.to_request())?;
+        Rep::from_reply(&ret).map_err(|_| proxy::RpcError::TypeError)
+    }
+
+    pub fn action(&self, route: &DeviceRoute, name: &str) -> Result<(), proxy::RpcError> {
+        self.rpc(route, name, ())
+    }
+
+    pub fn get<T: tio_util::TioRpcReplyable<T>>(
+        &self,
+        route: &DeviceRoute,
+        name: &str,
+    ) -> Result<T, proxy::RpcError> {
+        self.rpc(route, name, ())
     }
 }
