@@ -210,6 +210,40 @@ impl Device {
         self.event_queue.drain(..).collect()
     }
 
+    pub fn next_item(&mut self) -> Result<DeviceItem, proxy::RpcError> {
+        loop {
+            if let Some(sample) = self.sample_queue.pop_front() {
+                return Ok(DeviceItem::Sample(sample));
+            }
+            if let Some(event) = self.event_queue.pop_front() {
+                return Ok(DeviceItem::Event(event));
+            }
+            
+            self.internal_rpcs()?;
+            let pkt = self.dev_port.recv()?;
+            self.process_packet(&pkt);
+        }
+    }
+
+    pub fn try_next_item(&mut self) -> Result<Option<DeviceItem>, proxy::RpcError> {
+        loop {
+            if let Some(sample) = self.sample_queue.pop_front() {
+                return Ok(Some(DeviceItem::Sample(sample)));
+            }
+            
+            if let Some(event) = self.event_queue.pop_front() {
+                return Ok(Some(DeviceItem::Event(event)));
+            }
+            
+            self.internal_rpcs()?;
+            match self.dev_port.try_recv() {
+                Ok(pkt) => self.process_packet(&pkt),
+                Err(proxy::RecvError::WouldBlock) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     pub fn raw_rpc(&mut self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
         if let Err(err) = self.dev_port.send(util::PacketBuilder::make_rpc_request(
             name,
