@@ -1,9 +1,9 @@
 // tio-monitor
-// Full implementation with Action/Mode architecture, Styling System, and Macro-based RPC
+// Live sensor data display with plot and FFT capabilities
 // Build: cargo run --release -- <tio-url> [options]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{self, Read},
     str::FromStr,
@@ -11,12 +11,9 @@ use std::{
 };
 
 use clap::Parser;
-use crossbeam::channel::{self, Receiver, Sender};
+use crossbeam::channel::{self, Sender};
 use ratatui::{
-    crossterm::{
-        self,
-        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    },
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Backend,
     style::{Color, Modifier, Style},
@@ -28,20 +25,18 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
-    data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, Sample},
-    device::DeviceTree,
+    data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
+    device::{DeviceEvent, DeviceTree, TreeEvent, TreeItem, RpcClient, util},
     tio::{
         self,
         proto::{
-            identifiers::{ColumnKey, StreamId, StreamKey},
-            DeviceRoute,
+            DeviceRoute, ProxyStatus, identifiers::{ColumnKey, StreamKey}
         },
     },
 };
 use twinleaf_tools::TioOpts;
 use welch_sde::{Build, SpectralDensity};
 
-/// ---------- CLI ----------
 #[derive(Parser, Debug)]
 #[command(name = "tio-monitor", version, about = "Display live sensor data")]
 struct Cli {
@@ -55,134 +50,171 @@ struct Cli {
     colors: Option<String>,
 }
 
-/// ---------- Navigation ----------
 #[derive(Debug, Clone)]
-pub struct NavItem {
-    pub device_idx: usize,
-    pub stream_idx: usize,
-    pub column_idx: usize,
-    pub route: DeviceRoute,
-    pub stream_id: StreamId,
-    pub column_id: usize,
-    pub spec: ColumnKey,
+pub enum NavPos {
+    EmptyDevice {
+        device_idx: usize,
+        route: DeviceRoute,
+    },
+    Column {
+        device_idx: usize,
+        stream_idx: usize,
+        spec: ColumnKey,
+    },
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct NavScope {
-    pub device: bool,
-    pub stream: bool,
-    pub column: bool,
+impl NavPos {
+    pub fn device_idx(&self) -> usize {
+        match self {
+            NavPos::EmptyDevice { device_idx, .. } => *device_idx,
+            NavPos::Column { device_idx, .. } => *device_idx,
+        }
+    }
+
+    pub fn route(&self) -> &DeviceRoute {
+        match self {
+            NavPos::EmptyDevice { route, .. } => route,
+            NavPos::Column { spec, .. } => &spec.route,
+        }
+    }
+
+    pub fn stream_idx(&self) -> Option<usize> {
+        match self {
+            NavPos::EmptyDevice { .. } => None,
+            NavPos::Column { stream_idx, .. } => Some(*stream_idx),
+        }
+    }
+
+    pub fn column_idx(&self) -> Option<usize> {
+        match self {
+            NavPos::EmptyDevice { .. } => None,
+            NavPos::Column { spec, .. } => Some(spec.column_id),
+        }
+    }
+
+    pub fn spec(&self) -> Option<&ColumnKey> {
+        match self {
+            NavPos::EmptyDevice { .. } => None,
+            NavPos::Column { spec, .. } => Some(spec),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Nav {
-    pub idx: Option<usize>,
+    pub idx: usize,
 }
 
 impl Nav {
-    fn step_device_axis(&mut self, items: &[NavItem], cur_item: &NavItem, backward: bool) {
-        let mut all_device_indices: Vec<usize> = items.iter().map(|it| it.device_idx).collect();
-        all_device_indices.sort();
-        all_device_indices.dedup();
-
-        let axis_len = all_device_indices.len();
-        if axis_len == 0 {
+    /// Up/Down: linear traversal through flattened tree
+    pub fn step_linear(&mut self, items: &[NavPos], backward: bool) {
+        if items.is_empty() {
             return;
         }
-
-        let axis_pos = all_device_indices
-            .iter()
-            .position(|&d| d == cur_item.device_idx)
-            .unwrap_or(0);
-        let new_axis_pos = if backward {
-            (axis_pos + axis_len - 1) % axis_len
+        let len = items.len();
+        self.idx = if backward {
+            (self.idx + len - 1) % len
         } else {
-            (axis_pos + 1) % axis_len
+            (self.idx + 1) % len
         };
-        let new_target_device_idx = all_device_indices[new_axis_pos];
-
-        let (best_match_idx, _) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.device_idx == new_target_device_idx)
-            .map(|(idx, it)| {
-                let stream_dist = (it.stream_idx as isize - cur_item.stream_idx as isize).abs();
-                let col_dist = (it.column_idx as isize - cur_item.column_idx as isize).abs();
-                (idx, (stream_dist, col_dist))
-            })
-            .min_by_key(|&(_, dist)| dist)
-            .unwrap();
-
-        self.idx = Some(best_match_idx);
     }
 
-    fn step_contiguous(
-        &mut self,
-        items: &[NavItem],
-        cur_item: &NavItem,
-        cur_idx: usize,
-        scope: NavScope,
-        backward: bool,
-    ) {
-        let candidates: Vec<usize> = items
+    /// Left/Right: cycle within current stream's columns
+    pub fn step_within_stream(&mut self, items: &[NavPos], backward: bool) {
+        if items.is_empty() {
+            return;
+        }
+        let cur = &items[self.idx];
+        let (dev, stream) = match cur {
+            NavPos::EmptyDevice { .. } => return,
+            NavPos::Column { device_idx, stream_idx, .. } => (*device_idx, *stream_idx),
+        };
+
+        let siblings: Vec<usize> = items
             .iter()
             .enumerate()
-            .filter(|(_, it)| {
-                (scope.device || it.device_idx == cur_item.device_idx)
-                    && (scope.stream || it.stream_idx == cur_item.stream_idx)
-                    && (scope.column || it.column_idx == cur_item.column_idx)
+            .filter_map(|(i, pos)| match pos {
+                NavPos::Column { device_idx, stream_idx, .. }
+                    if *device_idx == dev && *stream_idx == stream => Some(i),
+                _ => None,
             })
-            .map(|(i, _)| i)
             .collect();
 
-        if candidates.is_empty() {
-            self.idx = Some(cur_idx);
-            return;
-        }
-
-        let pos_in_sub = candidates.iter().position(|&i| i == cur_idx).unwrap_or(0);
-        let len = candidates.len();
-        let new_pos_in_sub = if backward {
-            if pos_in_sub == 0 {
-                len - 1
+        if let Some(pos) = siblings.iter().position(|&i| i == self.idx) {
+            let len = siblings.len();
+            let new_pos = if backward {
+                (pos + len - 1) % len
             } else {
-                pos_in_sub - 1
-            }
-        } else {
-            (pos_in_sub + 1) % len
-        };
-        self.idx = Some(candidates[new_pos_in_sub]);
+                (pos + 1) % len
+            };
+            self.idx = siblings[new_pos];
+        }
     }
 
-    pub fn step(&mut self, items: &[NavItem], scope: NavScope, backward: bool) {
+    /// Tab: jump to next/prev device, find best matching position
+    pub fn step_device(&mut self, items: &[NavPos], backward: bool) {
         if items.is_empty() {
-            self.idx = None;
             return;
         }
-        let cur_idx = self.idx.unwrap_or(0).min(items.len() - 1);
-        let cur_item = &items[cur_idx];
 
-        if scope.device && !scope.stream && !scope.column {
-            self.step_device_axis(items, cur_item, backward);
+        let cur = &items[self.idx];
+        let cur_device = cur.device_idx();
+        let cur_stream = cur.stream_idx().unwrap_or(0);
+        let cur_column = cur.column_idx().unwrap_or(0);
+
+        // Find all unique device indices
+        let mut device_indices: Vec<usize> = items.iter().map(|p| p.device_idx()).collect();
+        device_indices.sort();
+        device_indices.dedup();
+
+        if device_indices.len() <= 1 {
+            return;
+        }
+
+        // Find current device position and move to next/prev
+        let dev_pos = device_indices.iter().position(|&d| d == cur_device).unwrap_or(0);
+        let len = device_indices.len();
+        let new_dev_pos = if backward {
+            (dev_pos + len - 1) % len
         } else {
-            self.step_contiguous(items, cur_item, cur_idx, scope, backward);
+            (dev_pos + 1) % len
+        };
+        let target_device = device_indices[new_dev_pos];
+
+        // Find best match on target device
+        self.idx = items
+            .iter()
+            .enumerate()
+            .filter(|(_, pos)| pos.device_idx() == target_device)
+            .map(|(i, pos)| {
+                let dist = match pos {
+                    NavPos::EmptyDevice { .. } => (0, 0),
+                    NavPos::Column { stream_idx, spec, .. } => {
+                        let s = (*stream_idx as isize - cur_stream as isize).abs();
+                        let c = (spec.column_id as isize - cur_column as isize).abs();
+                        (s, c)
+                    }
+                };
+                (i, dist)
+            })
+            .min_by_key(|&(_, dist)| dist)
+            .map(|(i, _)| i)
+            .unwrap_or(self.idx);
+    }
+
+    pub fn home(&mut self, items: &[NavPos]) {
+        if !items.is_empty() {
+            self.idx = 0;
         }
     }
 
-    pub fn home(&mut self, items: &[NavItem]) {
+    pub fn end(&mut self, items: &[NavPos]) {
         if !items.is_empty() {
-            self.idx = Some(0);
-        }
-    }
-
-    pub fn end(&mut self, items: &[NavItem]) {
-        if !items.is_empty() {
-            self.idx = Some(items.len() - 1);
+            self.idx = items.len() - 1;
         }
     }
 }
 
-/// ---------- Styling System ----------
 #[derive(Debug, Clone, Default)]
 pub struct Theme {
     pub value_bounds: HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
@@ -262,11 +294,54 @@ impl StyleContext {
     }
 }
 
-/// ---------- Core Application State ----------
+#[derive(Debug, Clone, Default)]
+pub struct DeviceStatus {
+    pub last_heartbeat: Option<Instant>,
+    pub connected: bool,
+}
+
+impl DeviceStatus {
+    pub fn on_heartbeat(&mut self) {
+        self.last_heartbeat = Some(Instant::now());
+        self.connected = true;
+    }
+
+    pub fn is_alive(&self, timeout: Duration) -> bool {
+        self.last_heartbeat
+            .map(|t| t.elapsed() < timeout)
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Normal,
     Command,
+}
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    Quit,
+    SetMode(Mode),
+    SubmitCommand,
+    NavUp,
+    NavDown,
+    NavLeft,
+    NavRight,
+    NavTabNext,
+    NavTabPrev,
+    NavScroll(i16),
+    NavHome,
+    NavEnd,
+    TogglePlot,
+    ClosePlot,
+    ToggleFft,
+    ToggleFooter,
+    ToggleRoutes,
+    AdjustWindow(f64),
+    AdjustPlotWidth(i16),
+    AdjustPrecision(i8),
+    HistoryNavigate(i8),
 }
 
 #[derive(Debug, Clone)]
@@ -304,24 +379,43 @@ impl Default for ViewConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Action {
-    Quit,
-    SetMode(Mode),
-    SubmitCommand,
-    NavMove(NavScope, bool),
-    NavScroll(i16),
-    NavHome,
-    NavEnd,
-    TogglePlot,
-    ClosePlot,
-    ToggleFft,
-    ToggleFooter,
-    ToggleRoutes,
-    AdjustWindow(f64),
-    AdjustPlotWidth(i16),
-    AdjustPrecision(i8),
-    HistoryNavigate(i8),
+#[derive(Debug)]
+pub struct RpcReq {
+    pub route: DeviceRoute,
+    pub method: String,
+    pub arg: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RpcResp {
+    pub result: Result<String, String>,
+}
+
+fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
+    let meta: u16 = client
+        .rpc(&req.route, "rpc.info", &req.method)
+        .map_err(|_| format!("Unknown RPC: {}", req.method))?;
+
+    let spec = util::parse_rpc_spec(meta, req.method.clone());
+
+    let payload = if let Some(ref s) = req.arg {
+        util::rpc_encode_arg(s, &spec.data_kind).map_err(|e| format!("{:?}", e))?
+    } else {
+        Vec::new()
+    };
+
+    let reply_bytes = client
+        .raw_rpc(&req.route, &req.method, &payload)
+        .map_err(|e| format!("{:?}", e))?;
+
+    if reply_bytes.is_empty() {
+        return Ok("OK".to_string());
+    }
+
+    let value = util::rpc_decode_reply(&reply_bytes, &spec.data_kind)
+        .map_err(|e| format!("{:?}", e))?;
+
+    Ok(util::format_rpc_value_for_cli(&value, &spec.data_kind))
 }
 
 pub struct App {
@@ -332,10 +426,14 @@ pub struct App {
     pub view: ViewConfig,
 
     pub nav: Nav,
-    pub nav_items: Vec<NavItem>,
+    pub nav_items: Vec<NavPos>,
 
+    pub discovered_routes: HashSet<DeviceRoute>,
+    pub device_status: HashMap<DeviceRoute, DeviceStatus>,
     pub last: BTreeMap<StreamKey, (Sample, Instant)>,
+    pub device_metadata: HashMap<DeviceRoute, DeviceFullMetadata>,
     pub window_aligned: Option<AlignedWindow>,
+
     pub input_state: TextState<'static>,
     pub cmd_history: Vec<String>,
     pub history_ptr: Option<usize>,
@@ -353,7 +451,10 @@ impl App {
             view: ViewConfig::default(),
             nav: Nav::default(),
             nav_items: Vec::new(),
+            discovered_routes: HashSet::new(),
+            device_status: HashMap::new(),
             last: BTreeMap::new(),
+            device_metadata: HashMap::new(),
             window_aligned: None,
             input_state: TextState::default(),
             cmd_history: Vec::new(),
@@ -379,9 +480,29 @@ impl App {
             }
             Action::SubmitCommand => self.submit_command(rpc_tx),
             Action::HistoryNavigate(dir) => self.navigate_history(dir),
-            Action::NavMove(scope, back) => {
+            Action::NavUp => {
                 self.view.follow_selection = true;
-                self.nav.step(&self.nav_items, scope, back);
+                self.nav.step_linear(&self.nav_items, true);
+            }
+            Action::NavDown => {
+                self.view.follow_selection = true;
+                self.nav.step_linear(&self.nav_items, false);
+            }
+            Action::NavLeft => {
+                self.view.follow_selection = true;
+                self.nav.step_within_stream(&self.nav_items, true);
+            }
+            Action::NavRight => {
+                self.view.follow_selection = true;
+                self.nav.step_within_stream(&self.nav_items, false);
+            }
+            Action::NavTabNext => {
+                self.view.follow_selection = true;
+                self.nav.step_device(&self.nav_items, false);
+            }
+            Action::NavTabPrev => {
+                self.view.follow_selection = true;
+                self.nav.step_device(&self.nav_items, true);
             }
             Action::NavScroll(delta) => {
                 self.view.follow_selection = false;
@@ -447,10 +568,7 @@ impl App {
             } else {
                 Some(remainder.join(" "))
             };
-            let route = self
-                .current_item()
-                .map(|i| i.route.clone())
-                .unwrap_or(self.parent_route.clone());
+            let route = self.current_route();
             let _ = rpc_tx.send(RpcReq {
                 route: route.clone(),
                 method: method.to_string(),
@@ -491,9 +609,8 @@ impl App {
 
     pub fn visible_routes(&self) -> Vec<DeviceRoute> {
         if self.all {
-            let mut routes: Vec<_> = self.last.keys().map(|k| k.route.clone()).collect();
+            let mut routes: Vec<_> = self.discovered_routes.iter().cloned().collect();
             routes.sort();
-            routes.dedup();
             routes
         } else {
             vec![self.parent_route.clone()]
@@ -501,14 +618,9 @@ impl App {
     }
 
     pub fn rebuild_nav_items(&mut self) {
-        self.nav_items.clear();
         let routes = self.visible_routes();
-        if routes.is_empty() || self.last.is_empty() {
-            self.nav.idx = None;
-            return;
-        }
-
         let mut new_items = Vec::new();
+
         for (dev_idx, route) in routes.iter().enumerate() {
             let mut stream_ids: Vec<_> = self
                 .last
@@ -518,52 +630,121 @@ impl App {
                 .collect();
             stream_ids.sort();
             stream_ids.dedup();
-            for (stream_idx, sid) in stream_ids.iter().enumerate() {
-                let key = StreamKey::new(route.clone(), *sid);
-                if let Some((sample, _)) = self.last.get(&key) {
-                    for (column_idx, _) in sample.columns.iter().enumerate() {
-                        new_items.push(NavItem {
-                            device_idx: dev_idx,
-                            stream_idx,
-                            column_idx,
-                            route: route.clone(),
-                            stream_id: *sid,
-                            column_id: column_idx,
-                            spec: ColumnKey {
-                                route: route.clone(),
-                                stream_id: *sid,
-                                column_id: column_idx,
-                            },
-                        });
+
+            if stream_ids.is_empty() {
+                // Device with no streams is still a stop
+                new_items.push(NavPos::EmptyDevice {
+                    device_idx: dev_idx,
+                    route: route.clone(),
+                });
+            } else {
+                for (stream_idx, sid) in stream_ids.iter().enumerate() {
+                    let key = StreamKey::new(route.clone(), *sid);
+                    if let Some((sample, _)) = self.last.get(&key) {
+                        for (column_idx, _) in sample.columns.iter().enumerate() {
+                            new_items.push(NavPos::Column {
+                                device_idx: dev_idx,
+                                stream_idx,
+                                spec: ColumnKey {
+                                    route: route.clone(),
+                                    stream_id: *sid,
+                                    column_id: column_idx,
+                                },
+                            });
+                        }
                     }
                 }
             }
         }
+
         self.nav_items = new_items;
-        if let Some(idx) = self.nav.idx {
-            if idx >= self.nav_items.len() {
-                self.nav.idx = if self.nav_items.is_empty() {
-                    None
-                } else {
-                    Some(self.nav_items.len() - 1)
-                };
-            }
-        } else if !self.nav_items.is_empty() {
-            self.nav.idx = Some(0);
+
+        // Clamp index
+        if self.nav_items.is_empty() {
+            self.nav.idx = 0;
+        } else {
+            self.nav.idx = self.nav.idx.min(self.nav_items.len() - 1);
         }
     }
 
-    pub fn current_item(&self) -> Option<&NavItem> {
-        self.nav.idx.and_then(|i| self.nav_items.get(i))
+    pub fn current_pos(&self) -> Option<&NavPos> {
+        self.nav_items.get(self.nav.idx)
     }
+
     pub fn current_selection(&self) -> Option<ColumnKey> {
-        self.current_item().map(|it| it.spec.clone())
+        self.current_pos().and_then(|p| p.spec().cloned())
     }
+
+    pub fn current_route(&self) -> DeviceRoute {
+        self.current_pos()
+            .map(|p| p.route().clone())
+            .unwrap_or_else(|| self.parent_route.clone())
+    }
+
     pub fn current_device_index(&self) -> usize {
-        self.current_item().map(|it| it.device_idx).unwrap_or(0)
+        self.current_pos().map(|p| p.device_idx()).unwrap_or(0)
     }
+
     pub fn device_count(&self) -> usize {
         self.visible_routes().len()
+    }
+
+    pub fn handle_event(&mut self, event: TreeEvent) {
+        match event {
+            TreeEvent::RouteDiscovered(route) => {
+                self.discovered_routes.insert(route.clone());
+                self.device_status.entry(route).or_default();
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::Heartbeat { .. },
+            } => {
+                self.device_status.entry(route).or_default().on_heartbeat();
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::Status(status),
+            } => {
+                let dev_status = self.device_status.entry(route).or_default();
+                match status {
+                    ProxyStatus::SensorDisconnected => dev_status.connected = false,
+                    ProxyStatus::SensorReconnected => dev_status.connected = true,
+                    _ => {}
+                }
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::MetadataReady(metadata),
+            } => {
+                self.device_metadata.insert(route, metadata);
+            }
+            TreeEvent::Device {
+                event: DeviceEvent::RpcInvalidated(_),
+                ..
+            } => {}
+        }
+    }
+
+    pub fn handle_sample(&mut self, sample: Sample, route: DeviceRoute, buffer: &mut Buffer) {
+        let stream_key = StreamKey::new(route.clone(), sample.stream.stream_id);
+        buffer.process_sample(sample.clone(), stream_key.clone());
+        self.last.insert(stream_key, (sample, Instant::now()));
+    }
+
+    pub fn update_plot_window(&mut self, buffer: &Buffer) {
+        if !self.view.show_plot {
+            self.window_aligned = None;
+            return;
+        }
+
+        self.window_aligned = self.current_selection().and_then(|col| {
+            let stream_key = col.stream_key();
+            let run = buffer.get_run(&stream_key)?;
+            let n_samples = (self.view.plot_window_seconds * run.effective_rate)
+                .ceil()
+                .max(10.0) as usize;
+            buffer.read_aligned_window(&[col], n_samples).ok()
+        });
     }
 
     pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
@@ -637,8 +818,8 @@ impl App {
 
         let split_idx = valid_vals.len() / 2;
         let mut high_freq_vals = valid_vals[split_idx..].to_vec();
-
         high_freq_vals.sort_by(|a, b| a.total_cmp(b));
+
         let noise_floor = if high_freq_vals.is_empty() {
             let mut all = valid_vals.clone();
             all.sort_by(|a, b| a.total_cmp(b));
@@ -699,54 +880,12 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                         Some(Action::Quit)
                     }
                 }
-                KeyCode::Up => Some(Action::NavMove(
-                    NavScope {
-                        device: true,
-                        stream: true,
-                        column: true,
-                    },
-                    true,
-                )),
-                KeyCode::Down => Some(Action::NavMove(
-                    NavScope {
-                        device: true,
-                        stream: true,
-                        column: true,
-                    },
-                    false,
-                )),
-                KeyCode::Left => Some(Action::NavMove(
-                    NavScope {
-                        device: false,
-                        stream: false,
-                        column: true,
-                    },
-                    true,
-                )),
-                KeyCode::Right => Some(Action::NavMove(
-                    NavScope {
-                        device: false,
-                        stream: false,
-                        column: true,
-                    },
-                    false,
-                )),
-                KeyCode::BackTab => Some(Action::NavMove(
-                    NavScope {
-                        device: true,
-                        stream: false,
-                        column: false,
-                    },
-                    true,
-                )),
-                KeyCode::Tab => Some(Action::NavMove(
-                    NavScope {
-                        device: true,
-                        stream: false,
-                        column: false,
-                    },
-                    false,
-                )),
+                KeyCode::Up => Some(Action::NavUp),
+                KeyCode::Down => Some(Action::NavDown),
+                KeyCode::Left => Some(Action::NavLeft),
+                KeyCode::Right => Some(Action::NavRight),
+                KeyCode::BackTab => Some(Action::NavTabPrev),
+                KeyCode::Tab => Some(Action::NavTabNext),
                 KeyCode::PageUp => Some(Action::NavScroll(-10)),
                 KeyCode::PageDown => Some(Action::NavScroll(10)),
                 KeyCode::Home => Some(Action::NavHome),
@@ -769,158 +908,6 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
     }
 }
 
-/// ---------- Communication Threads ----------
-#[derive(Debug, Clone)]
-struct DataReq {
-    all: bool,
-    parent_route: DeviceRoute,
-    selection: Option<ColumnKey>,
-    seconds: f64,
-}
-#[derive(Debug, Clone)]
-struct DataResp {
-    last: Vec<(DeviceRoute, StreamId, Sample)>,
-    window: Option<AlignedWindow>,
-}
-#[derive(Debug)]
-pub struct RpcReq {
-    pub route: DeviceRoute,
-    pub method: String,
-    pub arg: Option<String>,
-}
-#[derive(Debug)]
-pub struct RpcResp {
-    pub result: Result<String, String>,
-}
-
-fn exec_rpc(
-    tree: &mut DeviceTree,
-    route: DeviceRoute,
-    method: String,
-    arg_str: Option<String>,
-) -> Result<String, String> {
-    // Macro to parse input string -> Vec<u8> (Little Endian)
-    macro_rules! parse_arg {
-        ($type_str:expr, $input:expr, { $($str_val:literal => $ty:ty),+ }) => {
-            match $type_str.as_str() {
-                $( $str_val => $input.parse::<$ty>()
-                    .map_err(|_| format!("Invalid {} argument", $str_val))?
-                    .to_le_bytes().to_vec(), )+
-                "string" | "" => $input.as_bytes().to_vec(),
-                t => return Err(format!("Unsupported type: {}", t)),
-            }
-        }
-    }
-
-    // Macro to format reply Vec<u8> -> String
-    macro_rules! fmt_reply {
-        ($type_str:expr, $bytes:expr, { $($str_val:literal => $ty:ty),+ }) => {
-            match $type_str.as_str() {
-                $( $str_val => {
-                    let sz = std::mem::size_of::<$ty>();
-                    if $bytes.len() < sz { "Error: Short Read".to_string() }
-                    else {
-                        let arr = $bytes[0..sz].try_into().unwrap_or_default();
-                        <$ty>::from_le_bytes(arr).to_string()
-                    }
-                }, )+
-                "string" | "" => String::from_utf8_lossy($bytes).to_string(),
-                _ => format!("Hex: {:02X?}", $bytes),
-            }
-        }
-    }
-
-    let meta: u16 = tree
-        .rpc(route.clone(), "rpc.info", &method)
-        .map_err(|_| "Unknown RPC".to_string())?;
-
-    let spec = twinleaf::device::util::parse_rpc_spec(meta, method.clone());
-    let type_str = spec.type_str();
-
-    let payload = if let Some(s) = arg_str {
-        parse_arg!(type_str, s, {
-            "u8" => u8, "u16" => u16, "u32" => u32, "u64" => u64,
-            "i8" => i8, "i16" => i16, "i32" => i32, "i64" => i64,
-            "f32" => f32, "f64" => f64
-        })
-    } else {
-        Vec::new()
-    };
-
-    let reply_bytes = tree
-        .raw_rpc(route, &method, &payload)
-        .map_err(|e| format!("{:?}", e))?;
-
-    if reply_bytes.is_empty() {
-        return Ok("OK".to_string());
-    }
-
-    let reply_str = fmt_reply!(type_str, &reply_bytes, {
-        "u8" => u8, "u16" => u16, "u32" => u32, "u64" => u64,
-        "i8" => i8, "i16" => i16, "i32" => i32, "i64" => i64,
-        "f32" => f32, "f64" => f64
-    });
-
-    Ok(reply_str)
-}
-
-fn run_data_thread(
-    mut tree: DeviceTree,
-    req_rx: Receiver<DataReq>,
-    resp_tx: Sender<DataResp>,
-    rpc_rx: Receiver<RpcReq>,
-    rpc_resp_tx: Sender<RpcResp>,
-    capacity: usize,
-) {
-    let mut buffer = Buffer::new(capacity);
-    let mut last: BTreeMap<StreamKey, Sample> = BTreeMap::new();
-
-    loop {
-        while let Ok(req) = rpc_rx.try_recv() {
-            let res = exec_rpc(&mut tree, req.route, req.method, req.arg);
-            rpc_resp_tx.send(RpcResp { result: res }).ok();
-        }
-        let (sample, route) = match tree.next() {
-            Ok(x) => x,
-            Err(_) => break,
-        };
-        let stream_key = StreamKey::new(route.clone(), sample.stream.stream_id);
-        buffer.process_sample(sample.clone(), stream_key.clone());
-        last.insert(stream_key, sample);
-
-        while let Ok(q) = req_rx.try_recv() {
-            let last_vec: Vec<_> = if q.all {
-                last.iter()
-                    .map(|(k, s)| (k.route.clone(), k.stream_id, s.clone()))
-                    .collect()
-            } else {
-                last.iter()
-                    .filter(|(k, _)| k.route == q.parent_route)
-                    .map(|(k, s)| (k.route.clone(), k.stream_id, s.clone()))
-                    .collect()
-            };
-
-            let window = q.selection.and_then(|spec| {
-                let stream_key = spec.stream_key();
-                let active = buffer.get_run(&stream_key)?;
-                let sampling_hz = active.effective_rate;
-                let n_samples = (q.seconds * sampling_hz).ceil().max(10.0) as usize;
-                buffer.read_aligned_window(&[spec], n_samples).ok()
-            });
-            if resp_tx
-                .send(DataResp {
-                    last: last_vec,
-                    window,
-                })
-                .is_err()
-            {
-                return;
-            }
-        }
-    }
-}
-
-/// ---------- Rendering ----------
 fn draw_ui<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     terminal.draw(|f| {
         let size = f.area();
@@ -975,26 +962,23 @@ fn render_monitor_panel(f: &mut Frame, app: &mut App, area: Rect, now: Instant) 
     let view_h = inner.height as usize;
 
     if app.view.follow_selection {
-        if let Some(idx) = app.nav.idx {
-            if let Some(&line_idx) = col_map.get(&idx) {
-                if view_h > 0 && total > view_h {
-                    let cur = app.view.scroll as usize;
-                    if line_idx < cur || line_idx >= cur + view_h {
-                        app.view.scroll = line_idx
-                            .saturating_sub(view_h / 2)
-                            .min(total.saturating_sub(view_h))
-                            as u16;
-                    }
-                } else {
-                    app.view.scroll = 0;
+        if let Some(&line_idx) = col_map.get(&app.nav.idx) {
+            if view_h > 0 && total > view_h {
+                let cur = app.view.scroll as usize;
+                if line_idx < cur || line_idx >= cur + view_h {
+                    app.view.scroll = line_idx
+                        .saturating_sub(view_h / 2)
+                        .min(total.saturating_sub(view_h))
+                        as u16;
                 }
+            } else {
+                app.view.scroll = 0;
             }
         }
     }
     app.view.scroll = (app.view.scroll as usize).min(total.saturating_sub(view_h)) as u16;
     f.render_widget(Paragraph::new(lines).scroll((app.view.scroll, 0)), inner);
 
-    // Scrollbar
     if total > view_h {
         let sb_area = Rect {
             x: area.x + area.width - 1,
@@ -1032,7 +1016,8 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
     let mut map = HashMap::new();
 
     let routes = app.visible_routes();
-    if routes.is_empty() || app.last.is_empty() {
+
+    if routes.is_empty() {
         lines.push(Line::from("Waiting for data..."));
         return (lines, map);
     }
@@ -1054,11 +1039,13 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         .unwrap_or(0);
 
     for (dev_idx, route) in routes.iter().enumerate() {
-        let dev = app
-            .last
-            .iter()
-            .find(|(k, _)| &k.route == route)
-            .map(|(_, (s, _))| s.device.as_ref());
+        let dev = app.device_metadata.get(route).map(|m| m.device.as_ref());
+
+        let status = app.device_status.get(route);
+        let is_alive = status
+            .map(|s| s.is_alive(Duration::from_millis(300)))
+            .unwrap_or(false);
+
         let head_style = if dev_idx == app.current_device_index() {
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
@@ -1072,10 +1059,19 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
                 format!("{}  Serial: {}", d.name, d.serial_number)
             }
         } else {
-            "<dev>".to_string()
+            format!("<{}>", route)
         };
 
-        let mut header_spans = vec![Span::styled(header_text, head_style)];
+        let status_indicator = if is_alive { "●" } else { "○" };
+        let status_color = if is_alive { Color::Green } else { Color::DarkGray };
+
+        let mut header_spans = vec![
+            Span::styled(
+                format!("{} ", status_indicator),
+                Style::default().fg(status_color),
+            ),
+            Span::styled(header_text, head_style),
+        ];
         if app.view.show_routes {
             header_spans.push(Span::raw(format!(" [{}]", route)));
         }
@@ -1090,6 +1086,16 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
             .collect();
         stream_ids.sort();
 
+        if stream_ids.is_empty() {
+            map.insert(global_idx, lines.len());
+            global_idx += 1;
+
+            lines.push(Line::from(Span::styled(
+                "  (no streams yet)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
         for sid in stream_ids {
             let key = StreamKey::new(route.clone(), sid);
             if let Some((sample, seen)) = app.last.get(&key) {
@@ -1099,7 +1105,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
 
-                    let is_sel = app.nav.idx == Some(nav_idx);
+                    let is_sel = app.nav.idx == nav_idx;
                     let ctx = StyleContext::new()
                         .stale(is_stale)
                         .selected(is_sel)
@@ -1144,14 +1150,12 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
 }
 
 fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    // Command Mode
     if app.mode == Mode::Command {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(area);
 
-        // RPC Result
         if let Some((msg, color)) = &app.last_rpc_result {
             f.render_widget(
                 Paragraph::new(msg.as_str())
@@ -1160,11 +1164,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             );
         }
 
-        // Input Line
-        let target_route = app
-            .current_item()
-            .map(|i| i.route.clone())
-            .unwrap_or(app.parent_route.clone());
+        let target_route = app.current_route();
         let val = app.input_state.value();
         let cursor_idx = app.input_state.position().min(val.len());
 
@@ -1216,7 +1216,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut navigation_spans = vec![
         Span::styled(
-            "  Navigation ",
+            "  Navigation  ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1242,7 +1242,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     let toggle_line = Line::from(vec![
         Span::styled(
-            "  Toggle     ",
+            "  Toggle      ",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -1261,7 +1261,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     let window_line = Line::from(vec![
         Span::styled(
-            "  Plot     ",
+            "  Plot        ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1282,7 +1282,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     let scroll_line = Line::from(vec![
         Span::styled(
-            "  Scroll     ",
+            "  Scroll      ",
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
@@ -1298,7 +1298,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     let quit_line = Line::from(vec![
         Span::styled(
-            "  Quit       ",
+            "  Quit        ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         key_span("q"),
@@ -1341,13 +1341,13 @@ fn key_sep() -> Span<'static> {
 }
 
 fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
-    if let (Some(item), Some((desc, units))) = (app.current_item(), app.get_focused_channel_info())
-    {
+    if let (Some(pos), Some((desc, units))) = (app.current_pos(), app.get_focused_channel_info()) {
+        let route = pos.route();
         if app.view.show_fft {
             if let Some((sd_data, noise_floor)) = app.get_spectral_density_data() {
                 let title = format!(
                     "{} — {} (DC detrend {:.1}s) | High Freq Median: {:.3e} {}/√Hz",
-                    item.route, desc, app.view.plot_window_seconds, noise_floor, units
+                    route, desc, app.view.plot_window_seconds, noise_floor, units
                 );
                 let block = Block::default().title(title).borders(Borders::ALL);
 
@@ -1422,7 +1422,7 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
         } else {
             let title = format!(
                 "{} — {} ({:.1}s)",
-                item.route, desc, app.view.plot_window_seconds
+                route, desc, app.view.plot_window_seconds
             );
             let block = Block::default().title(title).borders(Borders::ALL);
 
@@ -1566,24 +1566,59 @@ fn load_theme(path: &str) -> io::Result<Theme> {
         value_bounds: bounds,
     })
 }
+
 fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
     it.get(k)
         .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
 }
-
 fn main() {
     let cli = Cli::parse();
     let proxy = tio::proxy::Interface::new(&cli.tio.root);
     let parent_route: DeviceRoute = cli.tio.parse_route();
-    let tree = DeviceTree::open(&proxy, parent_route.clone()).expect("Failed to open device tree");
 
-    let (req_tx, req_rx) = channel::bounded::<DataReq>(1);
-    let (resp_tx, resp_rx) = channel::bounded::<DataResp>(1);
+    // Data thread
+    let (data_tx, data_rx) = channel::unbounded::<TreeItem>();
+    let tree_for_data =
+        DeviceTree::open(&proxy, parent_route.clone()).expect("Failed to open device tree");
+    std::thread::spawn(move || {
+        let mut tree = tree_for_data;
+        loop {
+            match tree.next_item() {
+                Ok(item) => {
+                    if data_tx.send(item).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    // RPC thread
     let (rpc_tx, rpc_rx) = channel::bounded::<RpcReq>(1);
     let (rpc_resp_tx, rpc_resp_rx) = channel::bounded::<RpcResp>(1);
+    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
+        .expect("Failed to open RPC client");
+    std::thread::spawn(move || {
+        while let Ok(req) = rpc_rx.recv() {
+            let result = exec_rpc(&rpc_client, &req);
+            if rpc_resp_tx.send(RpcResp { result }).is_err() {
+                return;
+            }
+        }
+    });
 
-    std::thread::spawn(move || run_data_thread(tree, req_rx, resp_tx, rpc_rx, rpc_resp_tx, 100000));
+    // Key thread
+    let (key_tx, key_rx) = channel::unbounded();
+    std::thread::spawn(move || loop {
+        if let Ok(ev) = event::read() {
+            if key_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
 
+    // App state
     let mut app = App::new(cli.all, &parent_route);
     if let Some(path) = &cli.colors {
         if let Ok(theme) = load_theme(path) {
@@ -1593,71 +1628,58 @@ fn main() {
         }
     }
 
+    let mut buffer = Buffer::new(100_000);
+
+    // UI
     let mut term = ratatui::init();
-    let frame_dur = Duration::from_millis(1000 / cli.fps as u64);
     let _ = term.hide_cursor();
+    let ui_tick = channel::tick(Duration::from_millis(1000 / cli.fps as u64));
 
     'main: loop {
-        let start = Instant::now();
-        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-            if let Ok(ev) = event::read() {
-                if let Some(act) = get_action(ev, &mut app) {
-                    if app.update(act, &rpc_tx) {
-                        break 'main;
+        crossbeam::select! {
+            recv(data_rx) -> item => {
+                match item {
+                    Ok(TreeItem::Sample(sample, route)) => {
+                        app.handle_sample(sample, route, &mut buffer);
+                    }
+                    Ok(TreeItem::Event(event)) => {
+                        app.handle_event(event);
+                    }
+                    Err(_) => break 'main,
+                }
+            }
+
+            recv(key_rx) -> ev => {
+                if let Ok(ev) = ev {
+                    if let Some(act) = get_action(ev, &mut app) {
+                        if app.update(act, &rpc_tx) {
+                            break 'main;
+                        }
                     }
                 }
             }
-        }
 
-        let req = DataReq {
-            all: app.all,
-            parent_route: app.parent_route.clone(),
-            selection: app.current_selection(),
-            seconds: app.view.plot_window_seconds,
-        };
-        match req_tx.try_send(req) {
-            Ok(_) => {}
-            Err(crossbeam::channel::TrySendError::Full(_)) => {}
-            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                break 'main;
+            recv(rpc_resp_rx) -> res => {
+                if let Ok(res) = res {
+                    let (msg, col) = match res.result {
+                        Ok(s) => (format!("OK: {}", s), Color::Green),
+                        Err(s) => (format!("ERR: {}", s), Color::Red),
+                    };
+                    app.last_rpc_result = Some((msg, col));
+                }
             }
-        }
 
-        while let Ok(r) = resp_rx.try_recv() {
-            let now = Instant::now();
-            for (route, sid, sample) in r.last {
-                let key = StreamKey::new(route, sid);
-                let seen = if let Some((prev, prev_seen)) = app.last.get(&key) {
-                    if prev.n == sample.n {
-                        *prev_seen
-                    } else {
-                        now
-                    }
-                } else {
-                    now
-                };
-                app.last.insert(key, (sample, seen));
+            recv(ui_tick) -> _ => {
+                app.update_plot_window(&buffer);
+                app.rebuild_nav_items();
+                app.tick_blink();
+
+                if draw_ui(&mut term, &mut app).is_err() {
+                    break 'main;
+                }
             }
-            app.window_aligned = r.window;
-            app.rebuild_nav_items();
-        }
-        while let Ok(res) = rpc_resp_rx.try_recv() {
-            let (msg, col) = match res.result {
-                Ok(s) => (format!("OK: {}", s), Color::Green),
-                Err(s) => (format!("ERR: {}", s), Color::Red),
-            };
-            app.last_rpc_result = Some((msg, col));
-        }
-
-        app.tick_blink();
-        if draw_ui(&mut term, &mut app).is_err() {
-            break 'main;
-        }
-
-        let elapsed = start.elapsed();
-        if elapsed < frame_dur {
-            std::thread::sleep(frame_dur - elapsed);
         }
     }
+
     ratatui::restore();
 }
