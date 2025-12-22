@@ -87,6 +87,18 @@ pub enum RecvError {
     ProxyDisconnected,
 }
 
+impl From<SendError> for RpcError {
+    fn from(e: SendError) -> Self {
+        RpcError::SendFailed(e)
+    }
+}
+
+impl From<RecvError> for RpcError {
+    fn from(e: RecvError) -> Self {
+        RpcError::RecvFailed(e)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RpcError {
     SendFailed(SendError),
