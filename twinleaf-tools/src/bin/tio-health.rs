@@ -24,8 +24,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryReason, Sample},
-    device::{DeviceEvent, DeviceTree, TreeEvent},
+    data::{BoundaryReason},
+    device::{DeviceEvent, DeviceTree, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{identifiers::StreamKey, DeviceRoute},
@@ -187,6 +187,7 @@ impl DeviceState {
         self.heartbeat_toggle = !self.heartbeat_toggle;
     }
 }
+
 struct TimeWindow {
     buf: Vec<f64>,
     cap: usize,
@@ -699,6 +700,12 @@ fn draw_ui(
     Ok(())
 }
 
+/// Message type for communication from data thread to main thread
+enum DataMsg {
+    Item(TreeItem),
+    Error(String),
+}
+
 fn main() {
     let cli = Cli::parse();
     let mut terminal = ratatui::init();
@@ -715,46 +722,40 @@ fn main() {
         }
     };
 
-    enum DataItem {
-        Sample(Sample, DeviceRoute),
-        Event(TreeEvent),
-        Error(String),
-    }
-
     let (data_tx, data_rx) = channel::unbounded();
+
     std::thread::spawn(move || {
         let mut tree = tree;
+
+        // Warmup period
         let warmup_end = Instant::now() + Duration::from_millis(500);
         while Instant::now() < warmup_end {
-            while let Some(event) = tree.try_next_event() {
-                if data_tx.send(DataItem::Event(event)).is_err() {
+            match tree.try_next_item() {
+                Ok(Some(item)) => {
+                    if data_tx.send(DataMsg::Item(item)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => {
+                    let _ = data_tx.send(DataMsg::Error(format!("{:?}", e)));
                     return;
                 }
-            }
-
-            if let Err(e) = tree.next() {
-                let _ = data_tx.send(DataItem::Error(format!("{:?}", e)));
-                return;
             }
         }
 
+        // Main loop - blocking on next_item()
         loop {
-            // Drain pending events first
-            while let Some(event) = tree.try_next_event() {
-                if data_tx.send(DataItem::Event(event)).is_err() {
-                    return;
-                }
-            }
-
-            // Block for next sample
-            match tree.next() {
-                Ok((sample, route)) => {
-                    if data_tx.send(DataItem::Sample(sample, route)).is_err() {
+            match tree.next_item() {
+                Ok(item) => {
+                    if data_tx.send(DataMsg::Item(item)).is_err() {
                         return;
                     }
                 }
                 Err(e) => {
-                    let _ = data_tx.send(DataItem::Error(format!("{:?}", e)));
+                    let _ = data_tx.send(DataMsg::Error(format!("{:?}", e)));
                     return;
                 }
             }
@@ -791,7 +792,7 @@ fn main() {
                 let now = Instant::now();
 
                 match msg {
-                    Ok(DataItem::Sample(sample, route)) => {
+                    Ok(DataMsg::Item(TreeItem::Sample(sample, route))) => {
                         let sid = sample.stream.stream_id;
 
                         if let Some(filter) = &streams_filter {
@@ -808,8 +809,15 @@ fn main() {
                         st.name = sample.stream.name.clone();
 
                         if let Some(boundary) = &sample.boundary {
-                            handle_boundary(&boundary.reason, &route, &sample.stream.name, st, &mut event_log, event_log_cap);
-                            needs_redraw = true; // Redraw on boundary events
+                            handle_boundary(
+                                &boundary.reason,
+                                &route,
+                                &sample.stream.name,
+                                st,
+                                &mut event_log,
+                                event_log_cap,
+                            );
+                            needs_redraw = true;
                         }
 
                         if st.last_n.map(|n| sample.n != n).unwrap_or(true) {
@@ -818,11 +826,17 @@ fn main() {
 
                         st.on_sample(sample.n, sample.timestamp_end(), now, jitter_window_s);
                     }
-                    Ok(DataItem::Event(event)) => {
+
+                    Ok(DataMsg::Item(TreeItem::Event(event))) => {
                         match event {
                             TreeEvent::RouteDiscovered(route) => {
                                 device_states.entry(route.clone()).or_default();
-                                log_event(&mut event_log, format!("[{}] ROUTE DISCOVERED", route), Color::Green, event_log_cap);
+                                log_event(
+                                    &mut event_log,
+                                    format!("[{}] ROUTE DISCOVERED", route),
+                                    Color::Green,
+                                    event_log_cap,
+                                );
                                 needs_redraw = true;
                             }
                             TreeEvent::Device { route, event: DeviceEvent::Heartbeat { .. } } => {
@@ -830,19 +844,45 @@ fn main() {
                                 // Heartbeat visual update handled by tick
                             }
                             TreeEvent::Device { route, event: DeviceEvent::Status(status) } => {
-                                log_event(&mut event_log, format!("[{}] STATUS: {:?}", route, status), Color::Yellow, event_log_cap);
+                                log_event(
+                                    &mut event_log,
+                                    format!("[{}] STATUS: {:?}", route, status),
+                                    Color::Yellow,
+                                    event_log_cap,
+                                );
                                 needs_redraw = true;
                             }
                             TreeEvent::Device { route, event: DeviceEvent::RpcInvalidated(method) } => {
-                                log_event(&mut event_log, format!("[{}] RPC INVALIDATED: {:?}", route, method), Color::Cyan, event_log_cap);
+                                log_event(
+                                    &mut event_log,
+                                    format!("[{}] RPC INVALIDATED: {:?}", route, method),
+                                    Color::Cyan,
+                                    event_log_cap,
+                                );
+                                needs_redraw = true;
+                            }
+                            TreeEvent::Device { route, event: DeviceEvent::MetadataReady(metadata) } => {
+                                log_event(
+                                    &mut event_log,
+                                    format!("[{}] METADATA READY: {}", route, metadata.device.name),
+                                    Color::Green,
+                                    event_log_cap,
+                                );
                                 needs_redraw = true;
                             }
                         }
                     }
-                    Ok(DataItem::Error(e)) => {
-                        log_event(&mut event_log, format!("DATA ERROR: {}", e), Color::Red, event_log_cap);
+
+                    Ok(DataMsg::Error(e)) => {
+                        log_event(
+                            &mut event_log,
+                            format!("DATA ERROR: {}", e),
+                            Color::Red,
+                            event_log_cap,
+                        );
                         break 'main;
                     }
+
                     Err(_) => {
                         // Channel closed
                         break 'main;
@@ -870,29 +910,42 @@ fn main() {
                     match k.code {
                         KeyCode::Char('h') => {
                             show_heartbeat = !show_heartbeat;
-                            continue;
+                            needs_redraw = true;
                         }
-                        KeyCode::Up => { event_scroll_offset = event_scroll_offset.saturating_sub(1); }
+                        KeyCode::Up => {
+                            event_scroll_offset = event_scroll_offset.saturating_sub(1);
+                            needs_redraw = true;
+                        }
                         KeyCode::Down => {
                             if total > display_count {
-                                event_scroll_offset = (event_scroll_offset + 1).min(total.saturating_sub(display_count));
+                                event_scroll_offset = (event_scroll_offset + 1)
+                                    .min(total.saturating_sub(display_count));
                             }
+                            needs_redraw = true;
                         }
-                        KeyCode::PageUp => { event_scroll_offset = event_scroll_offset.saturating_sub(display_count); }
+                        KeyCode::PageUp => {
+                            event_scroll_offset = event_scroll_offset.saturating_sub(display_count);
+                            needs_redraw = true;
+                        }
                         KeyCode::PageDown => {
                             if total > display_count {
-                                event_scroll_offset = (event_scroll_offset + display_count).min(total.saturating_sub(display_count));
+                                event_scroll_offset = (event_scroll_offset + display_count)
+                                    .min(total.saturating_sub(display_count));
                             }
+                            needs_redraw = true;
                         }
-                        KeyCode::Home => { event_scroll_offset = 0; }
+                        KeyCode::Home => {
+                            event_scroll_offset = 0;
+                            needs_redraw = true;
+                        }
                         KeyCode::End => {
                             if total > display_count {
                                 event_scroll_offset = total.saturating_sub(display_count);
                             }
+                            needs_redraw = true;
                         }
                         _ => {}
                     }
-                    needs_redraw = true; // Always redraw on key press for responsive scrolling
                 }
             }
 
@@ -901,7 +954,6 @@ fn main() {
             }
         }
 
-        // Only draw when needed (tick, key, or important events)
         if needs_redraw {
             if draw_ui(
                 &mut terminal,
