@@ -18,6 +18,12 @@ pub enum TreeEvent {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum TreeItem {
+    Sample(Sample, DeviceRoute),
+    Event(TreeEvent),
+}
+
 pub struct DeviceTree {
     port: proxy::Port,
     root_route: DeviceRoute,
@@ -226,6 +232,41 @@ impl DeviceTree {
 
     pub fn drain_events(&mut self) -> Vec<TreeEvent> {
         self.event_queue.drain(..).collect()
+    }
+
+    pub fn next_item(&mut self) -> Result<TreeItem, proxy::RpcError> {
+        loop {
+            if let Some((sample, route)) = self.sample_queue.pop_front() {
+                return Ok(TreeItem::Sample(sample, route));
+            }
+            
+            if let Some(event) = self.event_queue.pop_front() {
+                return Ok(TreeItem::Event(event));
+            }
+            
+            self.internal_rpcs()?;
+            let pkt = self.port.recv()?;
+            self.process_packet(&pkt);
+        }
+    }
+
+    pub fn try_next_item(&mut self) -> Result<Option<TreeItem>, proxy::RpcError> {
+        loop {
+            if let Some((sample, route)) = self.sample_queue.pop_front() {
+                return Ok(Some(TreeItem::Sample(sample, route)));
+            }
+            
+            if let Some(event) = self.event_queue.pop_front() {
+                return Ok(Some(TreeItem::Event(event)));
+            }
+            
+            self.internal_rpcs()?;
+            match self.port.try_recv() {
+                Ok(pkt) => self.process_packet(&pkt),
+                Err(proxy::RecvError::WouldBlock) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub fn raw_rpc(
