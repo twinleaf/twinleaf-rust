@@ -332,7 +332,7 @@ fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
             eprintln!("  ... and {} more", routes.len() - 5);
         }
     }
-    eprintln!("Hint: ensure the log includes metadata or capture it with `tio-tool log-meta`.");
+    eprintln!("Hint: ensure the log includes metadata or capture it with `tio-tool log-meta`, including it as an argument before the log.");
 }
 
 fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
