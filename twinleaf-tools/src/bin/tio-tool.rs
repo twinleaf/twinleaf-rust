@@ -1172,7 +1172,7 @@ fn log_hdf(
     let output = match output {
         Some(o) => o,
         None => {
-            let input_path = Path::new(&files[0]);
+            let input_path = Path::new(files.last().unwrap_or(&files[0]));
             let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
             let base = format!("{}.h5", stem);
             if !Path::new(&base).exists() {
