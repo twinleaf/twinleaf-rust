@@ -169,19 +169,12 @@ enum Commands {
 
     /// Convert binary log data to CSV
     LogCsv {
-        /// Stream ID (e.g., 1) or Name (e.g., "vector", "field")
-        stream: String,
-
-        /// Input log file(s)
-        files: Vec<String>,
+        /// Stream ID/name and input .tio files (order-independent)
+        args: Vec<String>,
 
         /// Sensor route in the device tree (default: /)
         #[arg(short = 's')]
         sensor: Option<String>,
-
-        /// External metadata file path (optional)
-        #[arg(short = 'm')]
-        metadata: Option<String>,
 
         /// Output filename prefix
         #[arg(short = 'o')]
@@ -1022,15 +1015,40 @@ fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
     log_dump(files, true, true, "/".to_string(), None)
 }
 
-fn log_csv(
-    stream_arg: String,
-    files: Vec<String>,
-    sensor: Option<String>,
-    metadata: Option<String>,
-    output: Option<String>,
-) -> Result<(), ()> {
+fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>) -> Result<(), ()> {
+    if args.is_empty() {
+        eprintln!("Invalid invocation: missing stream name and log files");
+        eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+        return Err(());
+    }
+
+    let mut stream_arg: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+    for arg in args {
+        if arg.ends_with(".tio") {
+            files.push(arg);
+        } else if stream_arg.is_none() {
+            stream_arg = Some(arg);
+        } else {
+            eprintln!("Invalid invocation: multiple stream arguments provided");
+            eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+            eprintln!("Hint: log files should end with .tio");
+            return Err(());
+        }
+    }
+
+    let stream_arg = if let Some(stream) = stream_arg {
+        stream
+    } else {
+        eprintln!("Invalid invocation: missing stream name or id");
+        eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+        eprintln!("Hint: log files should end with .tio");
+        return Err(());
+    };
+
     if files.is_empty() {
         eprintln!("Invalid invocation: missing log file");
+        eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
         return Err(());
     }
 
@@ -1043,40 +1061,29 @@ fn log_csv(
     };
 
     let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
-    let ignore_session = files.len() > 1 || metadata.is_some();
+    let ignore_session = files.len() > 1;
     let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
-
-    if let Some(path) = metadata {
-        let mut meta: &[u8] = &std::fs::read(path).unwrap();
-        while meta.len() > 0 {
-            let (pkt, len) = tio::Packet::deserialize(meta).unwrap();
-            meta = &meta[len..];
-
-            let parser = parsers
-                .entry(pkt.routing.clone())
-                .or_insert_with(|| DeviceDataParser::new(ignore_session));
-            for _ in parser.process_packet(&pkt) {}
-        }
-    }
 
     let output_path = format!(
         "{}.{}.csv",
-        output.unwrap_or_else(|| files[0].clone()),
+        output.unwrap_or_else(|| files.last().cloned().unwrap_or_default()),
         stream_arg
     );
 
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&output_path)
-        .or(Err(()))?;
-
+    let mut file: Option<File> = None;
+    let mut created_output = false;
     let mut header_written: bool = false;
 
     for path in &files {
-        let mut rest: &[u8] = &std::fs::read(path).unwrap();
+        let file_data = std::fs::read(path).map_err(|e| {
+            eprintln!("Failed to read log file {}: {}", path, e);
+            eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+        })?;
+        let mut rest: &[u8] = &file_data;
         while rest.len() > 0 {
-            let (pkt, len) = tio::Packet::deserialize(rest).unwrap();
+            let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
+                eprintln!("Failed to parse packet in {}", path);
+            })?;
             rest = &rest[len..];
 
             let parser = parsers
@@ -1107,7 +1114,17 @@ fn log_csv(
                     let mut headers: Vec<String> = vec!["time".to_string()];
                     headers.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
 
-                    writeln!(file, "{}", headers.join(",")).or(Err(()))?;
+                    if file.is_none() {
+                        let existed = std::path::Path::new(&output_path).exists();
+                        let opened = OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&output_path)
+                            .or(Err(()))?;
+                        created_output = !existed;
+                        file = Some(opened);
+                    }
+                    writeln!(file.as_mut().unwrap(), "{}", headers.join(",")).or(Err(()))?;
                     header_written = true;
                 }
 
@@ -1116,14 +1133,16 @@ fn log_csv(
 
                 values.extend(sample.columns.iter().map(|col| col.value.to_string()));
 
-                writeln!(file, "{}", values.join(",")).or(Err(()))?;
+                writeln!(file.as_mut().unwrap(), "{}", values.join(",")).or(Err(()))?;
             }
         }
     }
 
     if !header_written {
         drop(file);
-        std::fs::remove_file(&output_path).ok();
+        if created_output {
+            std::fs::remove_file(&output_path).ok();
+        }
         if missing_metadata_routes.contains(&target_route) {
             report_missing_metadata(vec![target_route.clone()], true);
             return Err(());
@@ -1465,12 +1484,10 @@ fn main() -> ExitCode {
         } => log_dump(files, data, meta, sensor, depth),
         Commands::LogDataDump { files } => log_data_dump_deprecated(files),
         Commands::LogCsv {
-            stream,
-            files,
+            args,
             sensor,
-            metadata,
             output,
-        } => log_csv(stream, files, sensor, metadata, output),
+        } => log_csv(args, sensor, output),
         Commands::LogHdf {
             files,
             output,
