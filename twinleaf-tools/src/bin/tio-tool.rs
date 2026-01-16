@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
@@ -122,6 +122,20 @@ enum Commands {
         /// Output metadata file path
         #[arg(short = 'f', default_value = "meta.tio")]
         file: String,
+    },
+
+    /// Reroute metadata packets in a metadata file
+    MetaReroute {
+        /// Input metadata file path
+        input: String,
+
+        /// New device route (e.g., /0/1)
+        #[arg(short = 's', long = "sensor")]
+        route: String,
+
+        /// Output metadata file path (defaults to <input>_rerouted.tio)
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
     },
 
     /// Dump data from binary log file(s)
@@ -713,6 +727,84 @@ fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     Ok(())
 }
 
+fn meta_reroute(input: String, route: String, output: Option<String>) -> Result<(), ()> {
+    let data = std::fs::read(&input).map_err(|e| {
+        eprintln!("Failed to read {}: {}", input, e);
+    })?;
+
+    let mut rest: &[u8] = &data;
+    let mut routes: HashSet<DeviceRoute> = HashSet::new();
+    let mut packet_count = 0usize;
+
+    while !rest.is_empty() {
+        let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
+            eprintln!("Failed to parse packet in {}", input);
+        })?;
+        rest = &rest[len..];
+        packet_count += 1;
+
+        if !matches!(pkt.payload, tio::proto::Payload::Metadata(_)) {
+            eprintln!(
+                "Error: {} does not look like a metadata file (found non-metadata packet)",
+                input
+            );
+            return Err(());
+        }
+        routes.insert(pkt.routing.clone());
+    }
+
+    if packet_count == 0 {
+        eprintln!("Error: {} contains no packets", input);
+        return Err(());
+    }
+
+    if routes.len() > 1 {
+        let mut routes: Vec<_> = routes.into_iter().collect();
+        routes.sort();
+        eprintln!("Error: {} contains multiple routes:", input);
+        for route in routes.iter().take(5) {
+            eprintln!("  {}", route);
+        }
+        if routes.len() > 5 {
+            eprintln!("  ... and {} more", routes.len() - 5);
+        }
+        return Err(());
+    }
+
+    let new_route = DeviceRoute::from_str(&route).map_err(|_| {
+        eprintln!("Invalid route: {}", route);
+    })?;
+    let output_path = output.unwrap_or_else(|| {
+        let base = input.strip_suffix(".tio").unwrap_or(&input);
+        format!("{}_rerouted.tio", base)
+    });
+    if output_path == input {
+        eprintln!("Error: output path must be different from input");
+        return Err(());
+    }
+
+    let mut file = File::create(&output_path).map_err(|e| {
+        eprintln!("Failed to create {}: {}", output_path, e);
+    })?;
+
+    rest = &data;
+    while !rest.is_empty() {
+        let (mut pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
+            eprintln!("Failed to parse packet in {}", input);
+        })?;
+        rest = &rest[len..];
+        pkt.routing = new_route.clone();
+        let raw = pkt.serialize().map_err(|_| {
+            eprintln!("Failed to serialize packet for {}", output_path);
+        })?;
+        file.write_all(&raw).map_err(|e| {
+            eprintln!("Failed to write {}: {}", output_path, e);
+        })?;
+    }
+
+    Ok(())
+}
+
 fn log_dump(
     files: Vec<String>,
     data: bool,
@@ -1234,6 +1326,11 @@ fn main() -> ExitCode {
             depth,
         } => log(&tio, file, unbuffered, raw, depth),
         Commands::LogMetadata { tio, file } => log_metadata(&tio, file),
+        Commands::MetaReroute {
+            input,
+            route,
+            output,
+        } => meta_reroute(input, route, output),
         Commands::LogDump {
             files,
             data,
