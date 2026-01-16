@@ -301,6 +301,47 @@ impl From<SplitLevel> for twinleaf::data::export::RunSplitLevel {
     }
 }
 
+fn record_missing_metadata(
+    missing_routes: &mut HashSet<DeviceRoute>,
+    pkt: &tio::Packet,
+    samples_len: usize,
+) {
+    if samples_len != 0 {
+        return;
+    }
+    if let tio::proto::Payload::StreamData(data) = &pkt.payload {
+        if !data.data.is_empty() {
+            missing_routes.insert(pkt.routing.clone());
+        }
+    }
+}
+
+fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
+    if routes.is_empty() {
+        return;
+    }
+    routes.sort();
+    let prefix = if is_error { "Error" } else { "Warning" };
+    if routes.len() == 1 {
+        eprintln!(
+            "{}: stream data at route {} could not be parsed because metadata is missing or incompatible.",
+            prefix, routes[0]
+        );
+    } else {
+        eprintln!(
+            "{}: stream data at these routes could not be parsed because metadata is missing or incompatible:",
+            prefix
+        );
+        for route in routes.iter().take(5) {
+            eprintln!("  {}", route);
+        }
+        if routes.len() > 5 {
+            eprintln!("  ... and {} more", routes.len() - 5);
+        }
+    }
+    eprintln!("Hint: ensure the log includes metadata or capture it with `tio-tool log-meta`.");
+}
+
 fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
@@ -584,6 +625,27 @@ fn print_sample(
     }
 }
 
+fn print_metadata_payload(route: &DeviceRoute, payload: &tio::proto::MetadataPayload) {
+    let route_str = format!("{} ", route);
+    match &payload.content {
+        tio::proto::meta::MetadataContent::Device(dm) => {
+            println!("# {}DEVICE {:?}", route_str, dm);
+        }
+        tio::proto::meta::MetadataContent::Stream(sm) => {
+            println!("# {}STREAM {:?}", route_str, sm);
+        }
+        tio::proto::meta::MetadataContent::Segment(sm) => {
+            println!("# {}SEGMENT {:?}", route_str, sm);
+        }
+        tio::proto::meta::MetadataContent::Column(cm) => {
+            println!("# {}COLUMN {:?}", route_str, cm);
+        }
+        tio::proto::meta::MetadataContent::Unknown(mtype) => {
+            println!("# {}METADATA Unknown({})", route_str, mtype);
+        }
+    }
+}
+
 // Deprecated wrappers
 fn data_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
     eprintln!("Warning: data-dump is deprecated, use 'dump -d -m --depth 0' instead");
@@ -702,7 +764,7 @@ fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
 
-    let mut device = Device::open(&proxy, route).map_err(|e| {
+    let mut device = Device::open(&proxy, route.clone()).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
     })?;
 
@@ -712,16 +774,38 @@ fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
 
     let mut file = File::create(file).unwrap();
 
-    file.write_all(&meta.device.make_update().serialize().unwrap())
-        .unwrap();
+    file.write_all(
+        &meta
+            .device
+            .make_update_with_route(route.clone())
+            .serialize()
+            .unwrap(),
+    )
+    .unwrap();
     for (_id, stream) in meta.streams {
-        file.write_all(&stream.stream.make_update().serialize().unwrap())
-            .unwrap();
-        file.write_all(&stream.segment.make_update().serialize().unwrap())
-            .unwrap();
+        file.write_all(
+            &stream
+                .stream
+                .make_update_with_route(route.clone())
+                .serialize()
+                .unwrap(),
+        )
+        .unwrap();
+        file.write_all(
+            &stream
+                .segment
+                .make_update_with_route(route.clone())
+                .serialize()
+                .unwrap(),
+        )
+        .unwrap();
         for col in stream.columns {
-            file.write_all(&col.make_update().serialize().unwrap())
-                .unwrap();
+            file.write_all(
+                &col.make_update_with_route(route.clone())
+                    .serialize()
+                    .unwrap(),
+            )
+            .unwrap();
         }
     }
     Ok(())
@@ -812,8 +896,6 @@ fn log_dump(
     sensor: String,
     depth: Option<usize>,
 ) -> Result<(), ()> {
-    use std::collections::HashSet;
-
     if files.is_empty() {
         eprintln!("No input files specified");
         return Err(());
@@ -859,6 +941,7 @@ fn log_dump(
         // Parsed mode (-d and/or -m): stream samples with print_sample
         let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
         let ignore_session = files.len() > 1;
+        let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
 
         for path in files {
             let file_data =
@@ -871,20 +954,47 @@ fn log_dump(
                 };
                 rest = &rest[len..];
 
+                if meta {
+                    if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
+                        if route_matches(&pkt.routing) {
+                            print_metadata_payload(&pkt.routing, mp);
+                            printed_any = true;
+                        } else if in_subtree(&pkt.routing) {
+                            deeper_routes.insert(pkt.routing.clone());
+                        }
+                    }
+                }
+
                 // Always process packet (for metadata building), but only print if route matches
                 let parser = parsers
                     .entry(pkt.routing.clone())
                     .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
-                for sample in parser.process_packet(&pkt) {
+                let samples = parser.process_packet(&pkt);
+                if data {
+                    record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+                }
+
+                for sample in samples {
                     if route_matches(&pkt.routing) {
-                        print_sample(&sample, Some(&pkt.routing), meta, data);
-                        printed_any = true;
-                    } else if in_subtree(&pkt.routing) {
+                        if data {
+                            print_sample(&sample, Some(&pkt.routing), meta, true);
+                            printed_any = true;
+                        }
+                    } else if data && in_subtree(&pkt.routing) {
                         deeper_routes.insert(pkt.routing.clone());
                     }
                 }
             }
+        }
+
+        if data {
+            let missing_routes: Vec<_> = missing_metadata_routes
+                .iter()
+                .filter(|route| route_matches(route))
+                .cloned()
+                .collect();
+            report_missing_metadata(missing_routes, false);
         }
     }
 
@@ -934,6 +1044,7 @@ fn log_csv(
 
     let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1 || metadata.is_some();
+    let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
 
     if let Some(path) = metadata {
         let mut meta: &[u8] = &std::fs::read(path).unwrap();
@@ -973,6 +1084,10 @@ fn log_csv(
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
             let samples = parser.process_packet(&pkt);
 
+            if pkt.routing == target_route {
+                record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+            }
+
             if pkt.routing != target_route {
                 continue;
             }
@@ -1009,6 +1124,10 @@ fn log_csv(
     if !header_written {
         drop(file);
         std::fs::remove_file(&output_path).ok();
+        if missing_metadata_routes.contains(&target_route) {
+            report_missing_metadata(vec![target_route.clone()], true);
+            return Err(());
+        }
         eprintln!(
             "Error: No data found for stream '{}' at route {}",
             stream_arg, target_route
@@ -1094,6 +1213,7 @@ fn log_hdf(
 
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
+    let mut missing_metadata_routes: HashSet<tio::proto::DeviceRoute> = HashSet::new();
 
     println!("Processing {} files...", files.len());
 
@@ -1125,7 +1245,10 @@ fn log_hdf(
                 .entry(pkt.routing.clone())
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
-            for sample in parser.process_packet(&pkt) {
+            let samples = parser.process_packet(&pkt);
+            record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+
+            for sample in samples {
                 let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
 
                 if debug {
@@ -1151,6 +1274,8 @@ fn log_hdf(
     let stats = writer
         .finish()
         .map_err(|e| eprintln!("Failed to finalize HDF5: {:?}", e))?;
+
+    report_missing_metadata(missing_metadata_routes.into_iter().collect(), false);
 
     let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     let duration = stats.end_time.unwrap_or(0.0) - stats.start_time.unwrap_or(0.0);
