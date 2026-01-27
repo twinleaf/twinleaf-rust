@@ -537,53 +537,76 @@ fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Result<(
     // max_depth: None means unlimited (default), Some(n) limits to n levels
     let max_depth = depth;
 
-    let route_matches = |sample_route: &DeviceRoute| -> bool {
-        match route.relative_route(sample_route) {
+    let route_matches = |pkt_route: &DeviceRoute| -> bool {
+        match route.relative_route(pkt_route) {
             Ok(rel) => max_depth.map_or(true, |max| rel.len() <= max),
             Err(_) => false,
         }
     };
 
-    // Raw mode (no flags): use raw port for packet dump
-    if !data && !meta {
-        let port_depth = max_depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
-        let port = proxy
-            .new_port(None, route, port_depth, true, true)
-            .map_err(|e| {
-                eprintln!("Failed to initialize proxy port: {:?}", e);
+    match (data, meta) {
+        // Raw mode (no flags): dump all packets
+        (false, false) => {
+            let port_depth = max_depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
+            let port = proxy
+                .new_port(None, route.clone(), port_depth, true, true)
+                .map_err(|e| {
+                    eprintln!("Failed to initialize proxy port: {:?}", e);
+                })?;
+
+            for pkt in port.iter() {
+                // Convert relative route to absolute
+                let abs_route = route.absolute_route(&pkt.routing);
+                let abs_pkt = tio::Packet {
+                    routing: abs_route,
+                    ..pkt
+                };
+                println!("{:?}", abs_pkt);
+            }
+        }
+
+        // Metadata-only mode (-m): filter to metadata packets
+        (false, true) => {
+            let port_depth = max_depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
+            let port = proxy
+                .new_port(None, route.clone(), port_depth, true, true)
+                .map_err(|e| {
+                    eprintln!("Failed to initialize proxy port: {:?}", e);
+                })?;
+
+            for pkt in port.iter() {
+                if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
+                    if route_matches(&pkt.routing) {
+                        let abs_route = route.absolute_route(&pkt.routing);
+                        print_metadata_payload(&abs_route, mp);
+                    }
+                }
+            }
+        }
+
+        // Sample mode (-d or -d -m): use DeviceTree for parsed samples
+        (true, _) => {
+            let mut tree = DeviceTree::open(&proxy, route.clone()).map_err(|e| {
+                eprintln!("Failed to open device tree: {:?}", e);
             })?;
 
-        for pkt in port.iter() {
-            println!("{:?}", pkt);
-        }
-        return Ok(());
-    }
-
-    // Parsed mode (-d and/or -m): use DeviceTree for proper metadata handling
-    let mut tree = DeviceTree::open(&proxy, route.clone()).map_err(|e| {
-        eprintln!("Failed to open device tree: {:?}", e);
-    })?;
-
-    loop {
-        match tree.next() {
-            Ok((sample, sample_route)) => {
-                if !route_matches(&sample_route) {
-                    continue;
+            loop {
+                match tree.next() {
+                    Ok((sample, sample_route)) => {
+                        if !route_matches(&sample_route) {
+                            continue;
+                        }
+                        print_sample(&sample, Some(&sample_route), meta, true);
+                    }
+                    Err(e) => {
+                        eprintln!("Device error: {:?}", e);
+                        break;
+                    }
                 }
-
-                let route_opt = if max_depth.map_or(true, |d| d > 0) {
-                    Some(&sample_route)
-                } else {
-                    None
-                };
-                print_sample(&sample, route_opt, meta, data);
-            }
-            Err(e) => {
-                eprintln!("Device error: {:?}", e);
-                break;
             }
         }
     }
+
     Ok(())
 }
 
@@ -671,7 +694,7 @@ fn log(
     if raw {
         let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
         let port = proxy
-            .new_port(None, route, depth, true, true)
+            .new_port(None, route.clone(), depth, true, true)
             .map_err(|e| {
                 eprintln!("Failed to initialize proxy port: {:?}", e);
             })?;
@@ -680,7 +703,12 @@ fn log(
         println!("Logging raw packets...");
 
         for pkt in port.iter() {
-            let raw = pkt.serialize().unwrap();
+            // Convert relative route to absolute before logging
+            let abs_pkt = tio::Packet {
+                routing: route.absolute_route(&pkt.routing),
+                ..pkt
+            };
+            let raw = abs_pkt.serialize().unwrap();
             file.write_all(&raw).unwrap();
             if unbuffered {
                 file.flush().unwrap();
@@ -895,8 +923,6 @@ fn log_dump(
     }
 
     let target_route = DeviceRoute::from_str(&sensor).unwrap_or_else(|_| DeviceRoute::root());
-
-    // max_depth: None means unlimited (default), Some(n) limits to n levels
     let max_depth = depth;
 
     let route_matches = |route: &DeviceRoute| -> bool {
@@ -911,43 +937,50 @@ fn log_dump(
     let mut printed_any = false;
     let mut deeper_routes: HashSet<DeviceRoute> = HashSet::new();
 
-    // Raw mode (no -d or -m): dump raw packets
-    if !data && !meta {
-        for path in files {
-            let file_data =
-                std::fs::read(&path).map_err(|e| eprintln!("Failed to read {}: {}", path, e))?;
-            let mut rest: &[u8] = &file_data;
-            while !rest.is_empty() {
-                let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
-                    eprintln!("Failed to parse packet");
-                })?;
-                rest = &rest[len..];
-                if route_matches(&pkt.routing) {
-                    println!("{:?}", pkt);
-                    printed_any = true;
-                } else if in_subtree(&pkt.routing) {
-                    deeper_routes.insert(pkt.routing.clone());
+    // Helper to iterate packets from files
+    let iter_packets = |files: &[String]| -> Result<Vec<(String, Vec<u8>)>, ()> {
+        files
+            .iter()
+            .map(|path| {
+                std::fs::read(path)
+                    .map(|data| (path.clone(), data))
+                    .map_err(|e| eprintln!("Failed to read {}: {}", path, e))
+            })
+            .collect()
+    };
+
+    match (data, meta) {
+        // Raw mode (no flags): dump all packets
+        (false, false) => {
+            for (path, file_data) in iter_packets(&files)? {
+                let mut rest: &[u8] = &file_data;
+                while !rest.is_empty() {
+                    let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
+                        eprintln!("Failed to parse packet in {}", path);
+                    })?;
+                    rest = &rest[len..];
+
+                    if route_matches(&pkt.routing) {
+                        println!("{:?}", pkt);
+                        printed_any = true;
+                    } else if in_subtree(&pkt.routing) {
+                        deeper_routes.insert(pkt.routing.clone());
+                    }
                 }
             }
         }
-    } else {
-        // Parsed mode (-d and/or -m): stream samples with print_sample
-        let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
-        let ignore_session = files.len() > 1;
-        let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
 
-        for path in files {
-            let file_data =
-                std::fs::read(&path).map_err(|e| eprintln!("Failed to read {}: {}", path, e))?;
-            let mut rest: &[u8] = &file_data;
-            while !rest.is_empty() {
-                let (pkt, len) = match tio::Packet::deserialize(rest) {
-                    Ok(res) => res,
-                    Err(_) => break,
-                };
-                rest = &rest[len..];
+        // Metadata-only mode (-m): filter to metadata packets
+        (false, true) => {
+            for (_path, file_data) in iter_packets(&files)? {
+                let mut rest: &[u8] = &file_data;
+                while !rest.is_empty() {
+                    let (pkt, len) = match tio::Packet::deserialize(rest) {
+                        Ok(res) => res,
+                        Err(_) => break,
+                    };
+                    rest = &rest[len..];
 
-                if meta {
                     if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
                         if route_matches(&pkt.routing) {
                             print_metadata_payload(&pkt.routing, mp);
@@ -957,31 +990,42 @@ fn log_dump(
                         }
                     }
                 }
-
-                // Always process packet (for metadata building), but only print if route matches
-                let parser = parsers
-                    .entry(pkt.routing.clone())
-                    .or_insert_with(|| DeviceDataParser::new(ignore_session));
-
-                let samples = parser.process_packet(&pkt);
-                if data {
-                    record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
-                }
-
-                for sample in samples {
-                    if route_matches(&pkt.routing) {
-                        if data {
-                            print_sample(&sample, Some(&pkt.routing), meta, true);
-                            printed_any = true;
-                        }
-                    } else if data && in_subtree(&pkt.routing) {
-                        deeper_routes.insert(pkt.routing.clone());
-                    }
-                }
             }
         }
 
-        if data {
+        // Sample mode (-d or -d -m): parse and print samples
+        (true, _) => {
+            let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
+            let ignore_session = files.len() > 1;
+            let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
+
+            for (_path, file_data) in iter_packets(&files)? {
+                let mut rest: &[u8] = &file_data;
+                while !rest.is_empty() {
+                    let (pkt, len) = match tio::Packet::deserialize(rest) {
+                        Ok(res) => res,
+                        Err(_) => break,
+                    };
+                    rest = &rest[len..];
+
+                    let parser = parsers
+                        .entry(pkt.routing.clone())
+                        .or_insert_with(|| DeviceDataParser::new(ignore_session));
+
+                    let samples = parser.process_packet(&pkt);
+                    record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+
+                    for sample in samples {
+                        if route_matches(&pkt.routing) {
+                            print_sample(&sample, Some(&pkt.routing), meta, true);
+                            printed_any = true;
+                        } else if in_subtree(&pkt.routing) {
+                            deeper_routes.insert(pkt.routing.clone());
+                        }
+                    }
+                }
+            }
+
             let missing_routes: Vec<_> = missing_metadata_routes
                 .iter()
                 .filter(|route| route_matches(route))
