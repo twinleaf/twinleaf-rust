@@ -993,36 +993,26 @@ impl App {
         let sd = welch.periodogram();
         let raw: Vec<f64> = sd.iter().copied().collect();
 
-        let valid_vals: Vec<f64> = raw
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .collect();
-
-        if valid_vals.is_empty() {
-            return None;
-        }
-
-        let split_idx = valid_vals.len() / 2;
-        let mut high_freq_vals = valid_vals[split_idx..].to_vec();
-        high_freq_vals.sort_by(|a, b| a.total_cmp(b));
-
-        let noise_floor = if high_freq_vals.is_empty() {
-            let mut all = valid_vals.clone();
-            all.sort_by(|a, b| a.total_cmp(b));
-            all[all.len() / 2]
-        } else {
-            high_freq_vals[high_freq_vals.len() / 2]
-        };
-
         let pts: Vec<(f64, f64)> = sd
             .frequency()
             .into_iter()
             .zip(raw.into_iter())
-            .filter(|(_, d)| d.is_finite() && *d > 0.0)
+            .filter(|(f, d)| *f > 0.0 && d.is_finite() && *d > 0.0)
             .collect();
 
-        Some((pts, noise_floor))
+        if pts.is_empty() {
+            return None;
+        }
+
+        let mut densities: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
+        densities.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_asd = if densities.len() % 2 == 0 {
+            (densities[densities.len() / 2 - 1] + densities[densities.len() / 2]) / 2.0
+        } else {
+            densities[densities.len() / 2]
+        };
+
+        Some((pts, median_asd))
     }
 
     pub fn get_focused_channel_info(&self) -> Option<(String, String)> {
@@ -1617,26 +1607,17 @@ fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
     if let (Some(pos), Some((desc, units))) = (app.current_pos(), app.get_focused_channel_info()) {
         let route = pos.route();
         if app.view.show_fft {
-            if let Some((sd_data, noise_floor)) = app.get_spectral_density_data() {
+            if let Some((sd_data, median_asd)) = app.get_spectral_density_data() {
                 let title = format!(
-                    "{} — {} (DC detrend {:.1}s) | High Freq Median: {:.3e} {}/√Hz",
-                    route, desc, app.view.plot_window_seconds, noise_floor, units
+                    "{} — {} (linear detrend {:.1}s) | Median ASD: {:.3e} {}/√Hz",
+                    route, desc, app.view.plot_window_seconds, median_asd, units
                 );
                 let block = Block::default().title(title).borders(Borders::ALL);
 
                 if !sd_data.is_empty() {
                     let log_data: Vec<(f64, f64)> = sd_data
                         .iter()
-                        .filter_map(|(freq, val)| {
-                            if *freq <= 0.0 || *val <= 0.0 {
-                                return None;
-                            }
-                            let norm = val / noise_floor;
-                            if !norm.is_finite() || norm <= 0.0 {
-                                return None;
-                            }
-                            Some((freq.log10(), norm.log10()))
-                        })
+                        .map(|(freq, val)| (freq.log10(), val.log10()))
                         .collect();
 
                     let min_f = log_data.first().map(|(f, _)| *f).unwrap_or(0.0);
