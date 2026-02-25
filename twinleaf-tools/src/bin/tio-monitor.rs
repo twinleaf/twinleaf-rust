@@ -504,12 +504,11 @@ impl App {
         match action {
             Action::Quit => return true,
             Action::SetMode(Mode::Command) => {
-                self.mode = Mode::Command;
                 self.input_state = TextState::default();
                 self.input_state.focus();
-                self.current_completion = String::new();
                 self.history_ptr = None;
-                self.suggested_rpcs = VecDeque::from(vec![String::new()]);
+                self.update_command_list();
+                self.mode = Mode::Command;
             }
             Action::SetMode(Mode::Normal) => {
                 self.mode = Mode::Normal;
