@@ -290,7 +290,8 @@ pub enum RpcListError {
 pub struct RpcList {
     pub route: DeviceRoute,
     pub hash: u32,
-    pub list: Vec<(u16, String)>,
+    pub list: Vec<(String, u16)>,
+    pub map: HashMap<String, u16>,
 }
 
 pub struct RpcClient {
@@ -362,8 +363,9 @@ impl RpcClient {
         self.rpc(route, name, ())
     }
 
-    fn read_rpc_cache(&self, file: fs::File) -> Result<Vec<(u16, String)>, RpcListError> {
-        let mut list: Vec<(u16, String)> = Vec::new();
+    fn read_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
+        let mut list: Vec<(String, u16)> = Vec::new();
+        let mut map: HashMap<String, u16> = HashMap::new();
         let reader = io::BufReader::new(file);
 
         for line in reader.lines() {
@@ -372,14 +374,16 @@ impl RpcClient {
             let meta_hex = u16::from_str_radix(meta, 16).map_err(|_|
                 RpcListError::InvalidCacheError)?;
             let name_string = name.trim().to_string();
-            list.push((meta_hex, name_string));
+            list.push((name_string.clone(), meta_hex));
+            map.insert(name_string, meta_hex);
         }
 
-        return Ok(list);
+        return Ok(RpcList { route: route.clone(), hash, list, map });
     }
 
-    fn write_rpc_cache(&self, route: &DeviceRoute, file: fs::File) -> Result<Vec<(u16, String)>, RpcListError> {
-        let mut list: Vec<(u16, String)> = Vec::new();
+    fn write_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
+        let mut list: Vec<(String, u16)> = Vec::new();
+        let mut map: HashMap<String, u16> = HashMap::new();
         let mut writer = io::BufWriter::new(file);
 
         let nrpcs: u16 = self.get(route, "rpc.listinfo").map_err(|_| RpcListError::NumRpcsError)?;
@@ -389,10 +393,11 @@ impl RpcClient {
                 RpcListError::RpcListError)?;
             writeln!(writer, "{:04x} {}", meta, name).map_err(|_|
                 RpcListError::CacheWriteError)?;
-            list.push((meta, name));
+            list.push((name.clone(), meta));
+            map.insert(name, meta);
         }
 
-        return Ok(list);
+        return Ok(RpcList { route: route.clone(), hash, list, map });
     }
 
     pub fn rpc_list(&self, route: &DeviceRoute) -> Result<RpcList, RpcListError> {
@@ -415,8 +420,7 @@ impl RpcClient {
 
         match cache_file {
             Ok(file) => {
-                let list = self.read_rpc_cache(file)?;
-                Ok(RpcList { route: route.clone(), hash, list } )
+                self.read_rpc_cache(route, hash, file)
             }
 
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -424,13 +428,12 @@ impl RpcClient {
                     RpcListError::CacheCreateError)?;
 
                 // Try to write, and if we fail, remove the file we created
-                let list = self.write_rpc_cache(route, cache_file).map_err(|orig_error| {
+                self.write_rpc_cache(route, hash, cache_file).map_err(|orig_error| {
                     match fs::remove_file(file_path) {
                         Ok(_) => orig_error,
                         Err(_) => RpcListError::RemoveBadCacheError,
                     }
-                })?;
-                Ok(RpcList{ route: route.clone(), hash, list} )
+                })
             },
 
             // TODO: what other io errors to handle?

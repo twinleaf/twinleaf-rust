@@ -399,6 +399,7 @@ impl Default for ViewConfig {
 #[derive(Debug)]
 pub struct RpcReq {
     pub route: DeviceRoute,
+    pub meta: Option<u16>,
     pub method: String,
     pub arg: Option<String>,
 }
@@ -409,9 +410,12 @@ pub struct RpcResp {
 }
 
 fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
-    let meta: u16 = client
-        .rpc(&req.route, "rpc.info", &req.method)
-        .map_err(|_| format!("Unknown RPC: {}", req.method))?;
+    let meta = match req.meta {
+        Some(m) => m,
+        None => client
+            .rpc(&req.route, "rpc.info", &req.method)
+            .map_err(|_| format!("Unknown RPC: {}", req.method))?
+    };
 
     let spec = util::parse_rpc_spec(meta, req.method.clone());
 
@@ -636,8 +640,8 @@ impl App {
         let mut rpc_cache = Vec::new();
         if !line.is_empty() {
             if let Some(l) = self.rpcs.get(&self.current_route()) {
-                for (_, name) in l.list.clone() {
-                    rpc_cache.push(name);
+                for (name, _) in &l.list {
+                    rpc_cache.push(name.to_string());
                 }
             }
         }
@@ -686,8 +690,13 @@ impl App {
                 Some(remainder.join(" "))
             };
             let route = self.current_route();
+            let meta = match self.rpcs.get(&route) {
+                Some(l) => l.map.get(method),
+                None => None,
+            };
             let _ = rpc_tx.send(RpcReq {
                 route: route.clone(),
+                meta: meta.copied(),
                 method: method.to_string(),
                 arg,
             });
