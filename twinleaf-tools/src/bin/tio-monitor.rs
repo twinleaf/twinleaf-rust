@@ -1010,6 +1010,15 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 KeyCode::Right if !app.current_completion.is_empty() => {
                     Some(Action::AcceptCompletion)
                 },
+                KeyCode::Right => {
+                    app.input_state.handle_key_event(k);
+                    None
+                },
+                KeyCode::Left => {
+                    app.current_completion = String::new();
+                    app.input_state.handle_key_event(k);
+                    None
+                },
                 KeyCode::Enter => Some(Action::SubmitCommand),
                 _ => {
                     app.input_state.handle_key_event(k);
