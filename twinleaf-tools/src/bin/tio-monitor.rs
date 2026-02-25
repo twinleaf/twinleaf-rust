@@ -26,7 +26,7 @@ use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{util, DeviceEvent, DeviceTree, RpcClient, TreeEvent, TreeItem},
+    device::{util, DeviceEvent, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{
@@ -451,7 +451,7 @@ pub struct App {
     pub window_aligned: Option<AlignedWindow>,
 
     pub footer_height: u16,
-    pub rpcs: Vec<(u16, String)>,
+    pub rpcs: HashMap<DeviceRoute, RpcList>,
     pub suggested_rpcs: VecDeque<String>,
     pub suggested_rpcs_len: usize,
     pub suggested_rpcs_ind: usize,
@@ -484,7 +484,7 @@ impl App {
             device_metadata: HashMap::new(),
             window_aligned: None,
             footer_height: 0,
-            rpcs: Vec::new(),
+            rpcs: HashMap::new(),
             suggested_rpcs: VecDeque::from(vec![String::new()]),
             suggested_rpcs_len: 1,
             suggested_rpcs_ind: 0,
@@ -636,8 +636,10 @@ impl App {
         let line = self.input_state.value().to_string();
         let mut rpc_cache = Vec::new();
         if !line.is_empty() {
-            for (_, name) in self.rpcs.clone() {
-                rpc_cache.push(name);
+            if let Some(l) = self.rpcs.get(&self.current_route()) {
+                for (_, name) in l.list.clone() {
+                    rpc_cache.push(name);
+                }
             }
         }
 
@@ -696,7 +698,11 @@ impl App {
             self.update_command_list();
             self.present_command = String::new();
         }
-}
+    }
+
+    fn update_rpclists(&mut self, list: RpcList) {
+        self.rpcs.insert(list.route.clone(), list);
+    }
 
     fn navigate_history(&mut self, dir: i8) {
         if self.cmd_history.is_empty() {
@@ -816,10 +822,11 @@ impl App {
         self.visible_routes().len()
     }
 
-    pub fn handle_event(&mut self, event: TreeEvent) {
+    pub fn handle_event(&mut self, event: TreeEvent, cache_req_tx: &Sender<DeviceRoute>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.discovered_routes.insert(route.clone());
+                let _ = cache_req_tx.send(route.clone());
                 self.device_status.entry(route).or_default();
             }
             TreeEvent::Device {
@@ -1769,13 +1776,15 @@ fn main() {
 
 
     // Cache thread
-    let (cache_tx, cache_rx) = channel::unbounded();
-    let cache_route = parent_route.clone();
-    let cache_client = RpcClient::open(&proxy, cache_route)
+    let (cache_req_tx, cache_req_rx) = channel::bounded::<DeviceRoute>(1);
+    let (cache_resp_tx, cache_resp_rx) = channel::bounded::<RpcList>(1);
+    let cache_client = RpcClient::open(&proxy, parent_route.clone())
         .expect("Failed to open RPC client");
     std::thread::spawn(move || {
-        let Ok(list) = cache_client.rpc_list(cache_client.root_route()) else { return };
-        if cache_tx.send(list).is_err() { return };
+        while let Ok(req) = cache_req_rx.recv() {
+            let Ok(list) = cache_client.rpc_list(&req) else { return };
+            if cache_resp_tx.send(list).is_err() { return };
+        }
     });
 
     // RPC thread
@@ -1828,7 +1837,7 @@ fn main() {
                         app.handle_sample(sample, route, &mut buffer);
                     }
                     Ok(TreeItem::Event(event)) => {
-                        app.handle_event(event);
+                        app.handle_event(event, &cache_req_tx);
                     }
                     Err(_) => break 'main,
                 }
@@ -1844,9 +1853,9 @@ fn main() {
                 }
             }
 
-            recv(cache_rx) -> list => {
+            recv(cache_resp_rx) -> list => {
                 if let Ok(list) = list {
-                    app.rpcs = list;
+                    app.update_rpclists(list);
                 }
             }
 

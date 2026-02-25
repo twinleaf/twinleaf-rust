@@ -261,11 +261,6 @@ impl RpcRegistry {
     }
 }
 
-pub struct RpcClient {
-    port: proxy::Port,
-    root_route: DeviceRoute,
-}
-
 impl From<io::Error> for RpcListError {
     fn from(e: io::Error) -> Self {
         RpcListError::CacheFileError(e)
@@ -291,11 +286,21 @@ pub enum RpcListError {
     CacheFileError(io::Error),
 }
 
-type RpcList = Vec<(u16, String)>;
+#[derive(Debug)]
+pub struct RpcList {
+    pub route: DeviceRoute,
+    pub hash: u32,
+    pub list: Vec<(u16, String)>,
+}
+
+pub struct RpcClient {
+    port: proxy::Port,
+    root_route: DeviceRoute,
+}
 
 impl RpcClient {
     pub fn new(port: proxy::Port, root_route: DeviceRoute) -> Self {
-        Self { port, root_route }
+        Self { port, root_route, }
     }
 
     pub fn open(proxy: &proxy::Interface, route: DeviceRoute) -> Result<Self, proxy::PortError> {
@@ -357,7 +362,7 @@ impl RpcClient {
         self.rpc(route, name, ())
     }
 
-    fn read_rpc_cache(&self, file: fs::File) -> Result<RpcList, RpcListError> {
+    fn read_rpc_cache(&self, file: fs::File) -> Result<Vec<(u16, String)>, RpcListError> {
         let mut list: Vec<(u16, String)> = Vec::new();
         let reader = io::BufReader::new(file);
 
@@ -373,7 +378,7 @@ impl RpcClient {
         return Ok(list);
     }
 
-    fn write_rpc_cache(&self, route: &DeviceRoute, file: fs::File) -> Result<RpcList, RpcListError> {
+    fn write_rpc_cache(&self, route: &DeviceRoute, file: fs::File) -> Result<Vec<(u16, String)>, RpcListError> {
         let mut list: Vec<(u16, String)> = Vec::new();
         let mut writer = io::BufWriter::new(file);
 
@@ -396,20 +401,23 @@ impl RpcClient {
         let tl_cache_dir = cache_parent_dir.join("twinleaf");
         fs::create_dir_all(&tl_cache_dir).map_err(|_| RpcListError::CacheDirError)?;
 
-        // Get what cache name
+        // Get cache file path
         let dev_name: String = self.get(route, "dev.name").map_err(|_| RpcListError::DevNameRpcError)?;
-        let rpc_hash: u32 = self.get(route, "rpc.hash").map_err(|_| RpcListError::RpcHashError)?;
-        let base_name = format!("{}.{:x}.rpcs", dev_name, rpc_hash);
+        let hash: u32 = self.get(route, "rpc.hash").map_err(|_| RpcListError::RpcHashError)?;
+        let base_name = format!("{}.{:x}.rpcs", dev_name, hash);
         let file_path = tl_cache_dir.join(&base_name);
 
         let cache_file = fs::File::open(&file_path);
 
         // TODO: write more identifying info to cache file?
-        // Date created, firmware version, etc.
+        // Date created, firmware version, validation hash, etc.
         // Maybe on an ignored line at the top
 
         match cache_file {
-            Ok(file) => self.read_rpc_cache(file),
+            Ok(file) => {
+                let list = self.read_rpc_cache(file)?;
+                Ok(RpcList { route: route.clone(), hash, list } )
+            }
 
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let cache_file = fs::File::create(&file_path).map_err(|_|
@@ -422,7 +430,7 @@ impl RpcClient {
                         Err(_) => RpcListError::RemoveBadCacheError,
                     }
                 })?;
-                Ok(list)
+                Ok(RpcList{ route: route.clone(), hash, list} )
             },
 
             // TODO: what other io errors to handle?
@@ -430,3 +438,4 @@ impl RpcClient {
         }
     }
 }
+

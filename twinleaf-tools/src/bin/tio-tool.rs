@@ -295,7 +295,7 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
         eprintln!("RPC list failed: {:?}", e);
     })?;
 
-    for (meta, name) in &rpcs {
+    for (meta, name) in &rpcs.list {
         let spec = twinleaf::device::util::parse_rpc_spec(*meta, name.to_string());
         println!(
             "{} {}({})",
