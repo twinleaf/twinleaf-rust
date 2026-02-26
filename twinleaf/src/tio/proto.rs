@@ -48,6 +48,14 @@ pub enum HeartbeatPayload {
     Any(Vec<u8>),
 }
 
+#[derive(Debug, Clone)]
+pub struct SettingsPayload {
+    pub name_len: u8,
+    pub flags: u8,
+    pub name: String,
+    pub reply: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
@@ -138,6 +146,7 @@ pub enum Payload {
     LegacyStreamUpdate(LegacyStreamInfoPayload),
     LegacyStreamData(LegacyStreamDataPayload),
     Metadata(MetadataPayload),
+    Settings(SettingsPayload),
     StreamData(StreamDataPayload),
     ProxyStatus(ProxyStatusPayload),
     RpcUpdate(RpcUpdatePayload),
@@ -154,6 +163,7 @@ pub struct Packet {
 #[derive(Debug)]
 pub enum Error {
     NeedMore,
+    BadName,
     Text(String),
     CRC32(Vec<u8>),
     PacketTooBig(Vec<u8>),
@@ -180,6 +190,7 @@ enum TioPktType {
     Reserved0 = 9,
     Reserved1 = 10,
     Metadata = 11,
+    Settings = 12,
     Reserved2 = 13,
     ProxyStatus = 64,
     RpcUpdate = 65,
@@ -347,6 +358,37 @@ impl HeartbeatPayload {
     }
 }
 
+impl SettingsPayload {
+    fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<SettingsPayload, Error> {
+        if raw.len() < 2 {
+            return Err(too_small(full_data));
+        }
+        let name_len = raw[0];
+        let flags = raw[1];
+        let content = &raw[2..];
+
+        if content.len() < name_len.into() {
+            return Err(too_small(full_data));
+        }
+        let name = String::from_utf8(content[..name_len.into()].to_vec()).map_err(|_| Error::BadName)?;
+        let reply = (&content[name_len.into()..]).to_vec();
+        let pl = SettingsPayload { name_len, flags, name, reply };
+        Ok(pl)
+    }
+    fn serialize(&self) -> Result<Vec<u8>, ()> {
+        let payload_size: usize = 2 + self.name_len as usize + self.reply.len();
+        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+            return Err(());
+        }
+        let mut ret = TioPktHdr::serialize_new(TioPktType::Settings, 0, payload_size as u16);
+        ret.extend(self.name_len.to_le_bytes());
+        ret.extend(self.flags.to_le_bytes());
+        ret.extend(self.name.clone().into_bytes());
+        ret.extend(self.reply.clone());
+        Ok(ret)
+    }
+}
+
 impl StreamDataPayload {
     fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<StreamDataPayload, Error> {
         if raw.len() < 5 {
@@ -474,6 +516,7 @@ impl Payload {
             Payload::RpcError(p) => p.serialize(),
             Payload::Heartbeat(p) => p.serialize(),
             Payload::Metadata(p) => p.serialize(),
+            Payload::Settings(p) => p.serialize(),
             Payload::LegacyStreamData(p) => p.serialize(),
             Payload::StreamData(p) => p.serialize(),
             Payload::ProxyStatus(p) => p.serialize(),
@@ -533,6 +576,10 @@ impl Payload {
                 LegacyStreamDataPayload::deserialize(raw_payload, full_data)?,
             )),
             TioPktType::Metadata => Ok(Payload::Metadata(MetadataPayload::deserialize(
+                raw_payload,
+                full_data,
+            )?)),
+            TioPktType::Settings => Ok(Payload::Settings(SettingsPayload::deserialize(
                 raw_payload,
                 full_data,
             )?)),
