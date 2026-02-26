@@ -378,7 +378,7 @@ impl RpcClient {
             map.insert(name_string, meta_hex);
         }
 
-        return Ok(RpcList { route: route.clone(), hash, list, map });
+        Ok(RpcList { route: route.clone(), hash, list, map })
     }
 
     fn write_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
@@ -397,7 +397,7 @@ impl RpcClient {
             map.insert(name, meta);
         }
 
-        return Ok(RpcList { route: route.clone(), hash, list, map });
+        Ok(RpcList { route: route.clone(), hash, list, map })
     }
 
     pub fn rpc_list(&self, route: &DeviceRoute) -> Result<RpcList, RpcListError> {
@@ -411,6 +411,10 @@ impl RpcClient {
         let hash: u32 = self.get(route, "rpc.hash").map_err(|_| RpcListError::RpcHashError)?;
         let base_name = format!("{}.{:x}.rpcs", dev_name, hash);
         let file_path = tl_cache_dir.join(&base_name);
+        let metadata = fs::metadata(&file_path).map_err(|e| RpcListError::CacheFileError(e))?;
+        if metadata.len() == 0 {
+            fs::remove_file(&file_path)?
+        };
 
         let cache_file = fs::File::open(&file_path);
 
@@ -437,6 +441,7 @@ impl RpcClient {
             },
 
             // TODO: what other io errors to handle?
+            //
             Err(other_err) => Err(RpcListError::CacheFileError(other_err)),
         }
     }
