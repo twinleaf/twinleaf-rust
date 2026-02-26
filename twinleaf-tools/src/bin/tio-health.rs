@@ -870,6 +870,9 @@ fn main() {
                                 );
                                 needs_redraw = true;
                             }
+                            TreeEvent::Device { route: _, event: DeviceEvent::NewHash(_) } => {
+                                ();
+                            }
                         }
                     }
 

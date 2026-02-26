@@ -839,6 +839,12 @@ impl App {
             }
             TreeEvent::Device {
                 route,
+                event: DeviceEvent::NewHash(_hash),
+            } => {
+                let _ = cache_req_tx.send(route);
+            }
+            TreeEvent::Device {
+                route,
                 event: DeviceEvent::Heartbeat { .. },
             } => {
                 self.device_status.entry(route).or_default().on_heartbeat();
@@ -847,10 +853,13 @@ impl App {
                 route,
                 event: DeviceEvent::Status(status),
             } => {
-                let dev_status = self.device_status.entry(route).or_default();
+                let dev_status = self.device_status.entry(route.clone()).or_default();
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
-                    ProxyStatus::SensorReconnected => dev_status.connected = true,
+                    ProxyStatus::SensorReconnected => {
+                        //let _ = cache_req_tx.send(route);
+                        dev_status.connected = true;
+                    }
                     _ => {}
                 }
             }
