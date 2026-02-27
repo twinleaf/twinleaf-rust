@@ -11,7 +11,6 @@ use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::tio;
 use twinleaf_tools::ProxyCli;
-
 // Unfortunately we cannot access USB details via the serialport module, so
 // we are stuck guessing based on VID/PID. This returns a vector of possible
 // serial ports.
