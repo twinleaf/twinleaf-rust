@@ -20,7 +20,6 @@ use ratatui::{
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io,
-    num::ParseFloatError,
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
@@ -31,134 +30,7 @@ use twinleaf::{
         proto::{identifiers::StreamKey, DeviceRoute},
     },
 };
-use twinleaf_tools::TioOpts;
-
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "tio-health",
-    version,
-    about = "Live timing & rate diagnostics for TIO (Twinleaf) devices"
-)]
-struct Cli {
-    #[command(flatten)]
-    tio: TioOpts,
-
-    /// Time window in seconds for calculating sample rate
-    #[arg(
-        long = "rate-window",
-        default_value = "5",
-        value_name = "SECONDS",
-        value_parser = clap::value_parser!(u64).range(1..),
-    )]
-    rate_window: u64,
-
-    /// Time window in seconds for calculating jitter statistics
-    #[arg(
-        long = "jitter-window",
-        default_value = "10",
-        value_name = "SECONDS",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Seconds for jitter calculation window (>= 1)"
-    )]
-    jitter_window: u64,
-
-    /// PPM threshold for yellow warning indicators
-    #[arg(
-        long = "ppm-warn",
-        default_value = "100",
-        value_name = "PPM",
-        value_parser = nonneg_f64,
-        help = "Warning threshold in parts per million (>= 0)"
-    )]
-    ppm_warn: f64,
-
-    /// PPM threshold for red error indicators
-    #[arg(
-        long = "ppm-err",
-        default_value = "200",
-        value_name = "PPM",
-        value_parser = nonneg_f64,
-        help = "Error threshold in parts per million (>= 0)"
-    )]
-    ppm_err: f64,
-
-    /// Filter to only show specific stream IDs (comma-separated)
-    #[arg(
-        long = "streams",
-        value_delimiter = ',',
-        value_name = "IDS",
-        value_parser = clap::value_parser!(u8),
-        help = "Comma-separated stream IDs to monitor (e.g., 0,1,5)"
-    )]
-    streams: Option<Vec<u8>>,
-
-    /// Suppress the footer help text
-    #[arg(short = 'q', long = "quiet")]
-    quiet: bool,
-
-    /// UI refresh rate for animations and stale detection (data updates are immediate)
-    #[arg(
-        long = "fps",
-        default_value = "30",
-        value_name = "FPS",
-        value_parser = clap::value_parser!(u64).range(1..=60),
-        help = "UI refresh rate for heartbeat animation and stale detection (1–60)"
-    )]
-    fps: u64,
-
-    /// Time in milliseconds before marking a stream as stale
-    #[arg(
-        long = "stale-ms",
-        default_value = "2000",
-        value_name = "MS",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Mark streams as stale after this many milliseconds without data (>= 1)"
-    )]
-    stale_ms: u64,
-
-    /// Maximum number of events to keep in the event log
-    #[arg(
-        short = 'n',
-        long = "event-log-size",
-        default_value = "100",
-        value_name = "N",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Maximum number of events to keep in history (>= 1)"
-    )]
-    event_log_size: u64,
-
-    /// Number of event lines to display on screen
-    #[arg(
-        long = "event-display-lines",
-        default_value = "8",
-        value_name = "LINES",
-        value_parser = clap::value_parser!(u16).range(3..),
-        help = "Number of event lines to show (>= 3)"
-    )]
-    event_display_lines: u16,
-
-    /// Only show warning and error events in the log
-    #[arg(short = 'w', long = "warnings-only")]
-    warnings_only: bool,
-}
-
-impl Cli {
-    fn rate_window_dur(&self) -> Duration {
-        Duration::from_secs(self.rate_window)
-    }
-    fn stale_dur(&self) -> Duration {
-        Duration::from_millis(self.stale_ms)
-    }
-}
-
-fn nonneg_f64(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|e: ParseFloatError| e.to_string())?;
-    if v < 0.0 {
-        Err("must be ≥ 0".into())
-    } else {
-        Ok(v)
-    }
-}
+use twinleaf_tools::HealthCli;
 
 #[derive(Default)]
 struct DeviceState {
@@ -520,7 +392,7 @@ fn draw_ui(
     event_log: &VecDeque<LoggedEvent>,
     event_scroll_offset: usize,
     show_heartbeat: bool,
-    cli: &Cli,
+    cli: &HealthCli,
 ) -> io::Result<()> {
     let now = Instant::now();
     let rate_window = cli.rate_window_dur();
@@ -707,7 +579,7 @@ enum DataMsg {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = HealthCli::parse();
     let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&cli.tio.root);
