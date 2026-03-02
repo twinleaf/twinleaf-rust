@@ -742,8 +742,14 @@ fn main() {
                                 );
                                 needs_redraw = true;
                             }
-                            TreeEvent::Device { route: _, event: DeviceEvent::NewHash(_) } => {
-                                ();
+                            TreeEvent::Device { route, event: DeviceEvent::NewHash(hash) } => {
+                                log_event(
+                                    &mut event_log,
+                                    format!("[{}] NEW HASH: {}", route, hash),
+                                    Color::Green,
+                                    event_log_cap,
+                                );
+                                needs_redraw = true;
                             }
                         }
                     }

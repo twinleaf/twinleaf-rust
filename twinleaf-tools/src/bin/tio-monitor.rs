@@ -857,7 +857,7 @@ impl App {
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
                     ProxyStatus::SensorReconnected => {
-                        //let _ = cache_req_tx.send(route);
+                        let _ = cache_req_tx.send(route);
                         dev_status.connected = true;
                     }
                     _ => {}
