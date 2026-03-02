@@ -857,7 +857,9 @@ impl App {
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
                     ProxyStatus::SensorReconnected => {
-                        let _ = cache_req_tx.send(route);
+                        for r in self.discovered_routes.iter() {
+                            let _ = cache_req_tx.send(r.clone());
+                        }
                         dev_status.connected = true;
                     }
                     _ => {}
