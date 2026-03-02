@@ -394,11 +394,16 @@ impl DeviceStream {
         let mut is_first = true;
 
         while offset < data.data.len() {
-            let raw_sample = &data.data[offset..(offset + stream.sample_size)];
+            let raw_sample = &data.data.get(offset..(offset + stream.sample_size));
+            let columns = if let Some(r) = raw_sample {
+                self.parse_sample(r)
+            } else {
+                return Vec::new();
+            };
 
             let sample = Sample {
                 n: sample_n,
-                columns: self.parse_sample(raw_sample),
+                columns: columns,
                 segment: segment.clone(),
                 stream: stream.clone(),
                 device: dev.clone(),
