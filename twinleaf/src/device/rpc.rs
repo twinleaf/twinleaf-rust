@@ -269,20 +269,15 @@ impl From<io::Error> for RpcListError {
 
 #[derive(Debug)]
 pub enum RpcListError {
-    CacheDirError,
-    CacheCreateError,
+    CacheDirError, // error with dirs_next
+    CacheCreateError, // error with filesystem write
+    CacheReadError, // error with filesystem read
 
-    DevNameRpcError,
-    RpcHashError,
-
-    NumRpcsError,
-    RpcListError,
-    CacheWriteError,
     RemoveBadCacheError,
 
-    CacheReadError,
     InvalidCacheError,
 
+    DeviceRpcError(proxy::RpcError),
     CacheFileError(io::Error),
 }
 
@@ -370,6 +365,8 @@ impl RpcClient {
 
         for line in reader.lines() {
             let line = line.map_err(|_| RpcListError::CacheReadError)?;
+
+            // TODO: How to ensure file integrity?
             let (meta, name) = line.split_once(' ').ok_or(RpcListError::InvalidCacheError)?;
             let meta_hex = u16::from_str_radix(meta, 16).map_err(|_|
                 RpcListError::InvalidCacheError)?;
@@ -386,13 +383,12 @@ impl RpcClient {
         let mut map: HashMap<String, u16> = HashMap::new();
         let mut writer = io::BufWriter::new(file);
 
-        let nrpcs: u16 = self.get(route, "rpc.listinfo").map_err(|_| RpcListError::NumRpcsError)?;
+        let nrpcs: u16 = self.get(route, "rpc.listinfo").map_err(|e| RpcListError::DeviceRpcError(e))?;
 
         for id in 0..nrpcs {
-            let (meta, name): (u16, String) = self.rpc(route, "rpc.listinfo", id).map_err(|_|
-                RpcListError::RpcListError)?;
+            let (meta, name): (u16, String) = self.rpc(route, "rpc.listinfo", id).map_err(|e| RpcListError::DeviceRpcError(e))?;
             writeln!(writer, "{:04x} {}", meta, name).map_err(|_|
-                RpcListError::CacheWriteError)?;
+                RpcListError::CacheCreateError)?;
             list.push((name.clone(), meta));
             map.insert(name, meta);
         }
@@ -407,14 +403,22 @@ impl RpcClient {
         fs::create_dir_all(&tl_cache_dir).map_err(|_| RpcListError::CacheDirError)?;
 
         // Get cache file path
-        let dev_name: String = self.get(route, "dev.name").map_err(|_| RpcListError::DevNameRpcError)?;
-        let hash: u32 = self.get(route, "rpc.hash").map_err(|_| RpcListError::RpcHashError)?;
+        let dev_name: String = self.get(route, "dev.name").map_err(|e| RpcListError::DeviceRpcError(e))?;
+        let hash: u32 = self.get(route, "rpc.hash").map_err(|e| RpcListError::DeviceRpcError(e))?;
         let base_name = format!("{}.{:x}.rpcs", dev_name, hash);
         let file_path = tl_cache_dir.join(&base_name);
-        let metadata = fs::metadata(&file_path).map_err(|e| RpcListError::CacheFileError(e))?;
-        if metadata.len() == 0 {
-            fs::remove_file(&file_path)?
-        };
+        match fs::metadata(&file_path) {
+            Ok(metadata) => {
+                match metadata.len() {
+                    0 => fs::remove_file(&file_path).map_err(|e| {
+                        RpcListError::CacheFileError(e)
+                    }),
+                    _ => Ok(()),
+                }
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(other_err) => Err(RpcListError::CacheFileError(other_err)),
+        }?;
 
         let cache_file = fs::File::open(&file_path);
 
