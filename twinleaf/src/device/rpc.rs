@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 // File I/O for cacheing
 use std::io::{self, BufRead, Write};
 use std::fs;
+use std::hash::{Hasher, DefaultHasher, Hash};
 use dirs_next::cache_dir;
 
 #[derive(Debug, Clone)]
@@ -353,43 +354,71 @@ impl RpcClient {
     }
 
     fn read_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
+        let reader = io::BufReader::new(file);
         let mut list: Vec<(String, u16)> = Vec::new();
         let mut map: HashMap<String, u16> = HashMap::new();
-        let reader = io::BufReader::new(file);
+        let mut hasher = DefaultHasher::new();
+        let mut hash_line: Option<String> = None;
 
         for line in reader.lines() {
             let line = line?;
 
-            // TODO: How to ensure file integrity?
-            let (meta, name) = line.split_once(' ').ok_or(
-                RpcListError::InvalidCacheError)?;
-            let meta_hex = u16::from_str_radix(meta, 16).map_err(|_|
-                RpcListError::InvalidCacheError)?;
+            // Try to read rpc from line
+            let Some((meta, name)) = line.split_once(' ') else {
+                // If it doesn't have a space, it might be our hash, which signals EOF
+                hash_line = Some(line);
+                break;
+            };
 
-            let name_string = name.trim().to_string();
-            list.push((name_string.clone(), meta_hex));
-            map.insert(name_string, meta_hex);
+            // Convert to what we want in our list
+            let meta = u16::from_str_radix(meta, 16).map_err(|_|
+                RpcListError::InvalidCacheError)?;
+            let name = name.trim().to_string();
+
+            // Push to list, map, and hasher
+            list.push((name.clone(), meta));
+            map.insert(name.clone(), meta);
+            (name, meta).hash(&mut hasher);
         }
 
-        Ok(RpcList { route: route.clone(), hash, list, map })
+        // If we didn't get a hash or it doesn't match hasher's, cache is invalid
+        match hash_line {
+            Some(line) => {
+                let cached_hash = u64::from_str_radix(&line, 16).map_err(|_|
+                    RpcListError::InvalidCacheError)?;
+                if cached_hash == hasher.finish() {
+                    Ok(RpcList { route: route.clone(), hash, list, map })
+                } else {
+                    Err(RpcListError::InvalidCacheError)
+                }
+            },
+            None => Err(RpcListError::InvalidCacheError)
+        }
     }
 
     fn write_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
+        let mut writer = io::BufWriter::new(file);
         let mut list: Vec<(String, u16)> = Vec::new();
         let mut map: HashMap<String, u16> = HashMap::new();
-        let mut writer = io::BufWriter::new(file);
+        let mut hasher = DefaultHasher::new();
 
         let nrpcs: u16 = self.get(route, "rpc.listinfo").map_err(|e|
             RpcListError::DeviceRpcError(e))?;
 
+        // Get each rpc and write their meta and name to cache
         for id in 0..nrpcs {
             let (meta, name): (u16, String) = self.rpc(route, "rpc.listinfo", id).map_err(|e|
                 RpcListError::DeviceRpcError(e))?;
             writeln!(writer, "{:04x} {}", meta, name)?;
+
+            // Also push to list, map, and hasher
             list.push((name.clone(), meta));
-            map.insert(name, meta);
+            map.insert(name.clone(), meta);
+            (name, meta).hash(&mut hasher);
         }
 
+        // Write our hash for integrity validation
+        writeln!(writer, "{:04x}", hasher.finish())?;
         Ok(RpcList { route: route.clone(), hash, list, map })
     }
 
@@ -409,7 +438,7 @@ impl RpcClient {
         let base_name = format!("{}.{:x}.rpcs", dev_name, hash);
         let file_path = tl_cache_dir.join(&base_name);
 
-        // Check for empty file (previous aborted write) and remove
+        // Check for empty file (previous aborted write perhaps) and remove
         match fs::metadata(&file_path) {
             Ok(metadata) => {
                 match metadata.len() {
@@ -421,20 +450,19 @@ impl RpcClient {
             Err(other_err) => Err(other_err),
         }?;
 
-        let cache_file = fs::File::open(&file_path);
-
         // TODO: write more identifying info to cache file?
         // Date created, firmware version, validation hash, etc.
         // Maybe on an ignored line at the top
 
+        let cache_file = fs::File::open(&file_path);
         match cache_file {
-            Ok(file) => { // We have a file, read from it
+            Ok(file) => {
+                // We have a file, read from it
                 match self.read_rpc_cache(route, hash, file) {
                     Ok(rpclist) => Ok(rpclist),
 
-                    // Something was wrong in the file
+                    // Something was wrong in the cache, remove it
                     Err(RpcListError::InvalidCacheError) => {
-                        // It's a bad cache, try to remove it
                         fs::remove_file(file_path)?;
                         Err(RpcListError::InvalidCacheError)
                     },
@@ -444,17 +472,14 @@ impl RpcClient {
                 }
             }
 
-            Err(err) if err.kind() == io::ErrorKind::NotFound => { // No cache file
-                // Try to make one
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // No cache file, try to make one and write to it
                 let cache_file = fs::File::create(&file_path)?;
-
-                // Try to write
                 match self.write_rpc_cache(route, hash, cache_file) {
                     Ok(rpclist) => Ok(rpclist),
 
-                    // We failed to write
+                    // We failed to write, remove bad cache
                     Err(orig_error) => {
-                        // It's a bad cache, try to remove it
                         fs::remove_file(file_path)?;
                         Err(orig_error)
                     },
