@@ -95,6 +95,15 @@ impl Device {
         match &pkt.payload {
             tio::proto::Payload::ProxyStatus(ps) => {
                 self.event_queue.push_back(DeviceEvent::Status(ps.0));
+                // We might have new metadata on reconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
+                    self.parser.invalidate_device();
+                    if let Ok(full_metadata) = self.get_metadata() {
+                        self.metadata_announced = true;
+                        self.event_queue
+                            .push_back(DeviceEvent::MetadataReady(full_metadata));
+                    }
+                }
                 return;
             }
             tio::proto::Payload::RpcUpdate(ru) => {

@@ -635,6 +635,10 @@ impl DeviceDataParser {
         metareqs_to_rpcs(&reqs)
     }
 
+    pub fn invalidate_device(& mut self) {
+        self.device = None;
+    }
+
     pub fn get_metadata(&self) -> Result<DeviceFullMetadata, Vec<tio::Packet>> {
         let reqs = self.requests();
         if !reqs.is_empty() {

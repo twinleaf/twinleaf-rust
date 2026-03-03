@@ -100,9 +100,22 @@ impl DeviceTree {
         match &pkt.payload {
             tio::proto::Payload::ProxyStatus(ps) => {
                 self.event_queue.push_back(TreeEvent::Device {
-                    route: absolute_route,
+                    route: absolute_route.clone(),
                     event: super::device::DeviceEvent::Status(ps.0),
                 });
+                // We might have new metadata on reconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
+                    if let Some(parser) = self.parsers.get_mut(&absolute_route) {
+                        parser.invalidate_device();
+                        if let Ok(full_metadata) = self.get_metadata(absolute_route.clone()) {
+                            self.metadata_announced.insert(absolute_route.clone());
+                            self.event_queue.push_back(TreeEvent::Device {
+                                route: absolute_route,
+                                event: super::device::DeviceEvent::MetadataReady(full_metadata),
+                            });
+                        }
+                    }
+                }
                 return;
             }
             tio::proto::Payload::RpcUpdate(ru) => {
