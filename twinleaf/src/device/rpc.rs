@@ -463,8 +463,11 @@ impl RpcClient {
 
                     // Something was wrong in the cache, remove it
                     Err(RpcListError::InvalidCacheError) => {
-                        fs::remove_file(file_path)?;
-                        Err(RpcListError::InvalidCacheError)
+                        fs::remove_file(&file_path)?;
+
+                        // Write a new cache now
+                        let cache_file = fs::File::create(&file_path)?;
+                        self.write_rpc_cache(route, hash, cache_file)
                     },
 
                     // Something else went wrong
@@ -475,15 +478,7 @@ impl RpcClient {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // No cache file, try to make one and write to it
                 let cache_file = fs::File::create(&file_path)?;
-                match self.write_rpc_cache(route, hash, cache_file) {
-                    Ok(rpclist) => Ok(rpclist),
-
-                    // We failed to write, remove bad cache
-                    Err(orig_error) => {
-                        fs::remove_file(file_path)?;
-                        Err(orig_error)
-                    },
-                }
+                self.write_rpc_cache(route, hash, cache_file)
             },
 
             // Something weird happened, bubble up
