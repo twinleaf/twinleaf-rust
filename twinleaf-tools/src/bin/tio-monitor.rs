@@ -8,6 +8,7 @@ use std::{
     io::{self, Read},
     str::FromStr,
     time::{Duration, Instant},
+    cmp::min,
 };
 
 use clap::Parser;
@@ -358,7 +359,12 @@ pub enum Action {
     AdjustWindow(f64),
     AdjustPlotWidth(i16),
     AdjustPrecision(i8),
-    HistoryNavigate(i8),
+    HistoryNavigate(HistDir),
+}
+
+#[derive(Debug, Clone)]
+pub enum HistDir {
+    Up, Down
 }
 
 #[derive(Debug, Clone)]
@@ -463,7 +469,7 @@ pub struct App {
     pub input_state: TextState<'static>,
     pub current_completion: String,
     pub cmd_history: Vec<String>,
-    pub history_ptr: Option<usize>,
+    pub history_ptr: usize,
     pub present_command: String,
     pub last_rpc_result: Option<(String, Color)>,
     pub last_rpc_command: String,
@@ -495,7 +501,7 @@ impl App {
             input_state: TextState::default(),
             current_completion: String::new(),
             cmd_history: Vec::new(),
-            history_ptr: None,
+            history_ptr: 0,
             present_command: String::new(),
             last_rpc_result: None,
             last_rpc_command: String::new(),
@@ -510,7 +516,7 @@ impl App {
             Action::SetMode(Mode::Command) => {
                 self.input_state = TextState::default();
                 self.input_state.focus();
-                self.history_ptr = None;
+                self.history_ptr = 0;
                 self.update_command_list();
                 self.mode = Mode::Command;
             }
@@ -678,7 +684,7 @@ impl App {
         if self.cmd_history.last() != Some(&line) {
             self.cmd_history.push(line.clone());
         }
-        self.history_ptr = None;
+        self.history_ptr = self.cmd_history.len();
 
         let mut parts = line.split_whitespace();
         if let Some(method) = parts.next() {
@@ -712,34 +718,20 @@ impl App {
         self.rpcs.insert(list.route.clone(), list);
     }
 
-    fn navigate_history(&mut self, dir: i8) {
-        if self.cmd_history.is_empty() {
-            return;
-        }
-        let new_ptr = match (self.history_ptr, dir) {
-            (None, -1) => {
-                self.present_command = self.input_state.value().to_string();
-                Some(self.cmd_history.len() - 1)
-            },
-            (Some(i), -1) => Some(i.saturating_sub(1)),
-            (Some(i), 1) => {
-                if i + 1 >= self.cmd_history.len() {
-                    None
-                } else {
-                    Some(i + 1)
-                }
-            }
-            _ => self.history_ptr,
+    fn navigate_history(&mut self, dir: HistDir) {
+        if self.history_ptr == self.cmd_history.len() {
+            self.present_command = self.input_state.value().to_string();
         };
-        self.history_ptr = new_ptr;
-        if let Some(i) = new_ptr {
-            self.input_state = TextState::new().with_value(self.cmd_history[i].clone());
-            self.input_state.focus();
-            self.input_state.move_end();
-        } else {
-            self.input_state = TextState::new().with_value(self.present_command.clone());
-            self.input_state.focus();
-        }
+        self.history_ptr = match dir {
+            HistDir::Up => self.history_ptr.saturating_sub(1),
+            HistDir::Down => min(self.cmd_history.len(), self.history_ptr + 1),
+        };
+
+        self.input_state = TextState::new().with_value(
+            self.cmd_history.get(self.history_ptr).unwrap_or(&self.present_command).clone()
+        );
+        self.input_state.focus();
+        self.input_state.move_end();
         self.update_command_list();
     }
 
@@ -1016,8 +1008,8 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 KeyCode::Esc => Some(Action::SetMode(Mode::Normal)),
                 KeyCode::Tab => Some(Action::AutoCompleteTab),
                 KeyCode::BackTab => Some(Action::AutoCompleteBack),
-                KeyCode::Up => Some(Action::HistoryNavigate(-1)),
-                KeyCode::Down => Some(Action::HistoryNavigate(1)),
+                KeyCode::Up => Some(Action::HistoryNavigate(HistDir::Up)),
+                KeyCode::Down => Some(Action::HistoryNavigate(HistDir::Down)),
                 KeyCode::Right if !app.current_completion.is_empty() => {
                     Some(Action::AcceptCompletion)
                 },
