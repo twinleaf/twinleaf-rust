@@ -1024,6 +1024,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 },
                 KeyCode::Enter => Some(Action::SubmitCommand),
                 KeyCode::Char('a') if k.modifiers == KeyModifiers::CONTROL => {
+                    app.current_completion = String::new();
                     app.input_state.handle_key_event(k);
                     None
                 },
