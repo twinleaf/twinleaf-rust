@@ -831,9 +831,15 @@ impl App {
             }
             TreeEvent::Device {
                 route,
-                event: DeviceEvent::NewHash(_hash),
+                event: DeviceEvent::NewHash(hash),
             } => {
-                let _ = cache_req_tx.send(route);
+                match (self.rpc_lists.get(&route), hash) {
+                    (Some(list), Some(hash)) if list.hash == hash => {},
+                    _ => {
+                        self.rpc_lists.remove(&route);
+                        let _ = cache_req_tx.send(route);
+                    }
+                };
             }
             TreeEvent::Device {
                 route,
@@ -1327,11 +1333,15 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             .split(area);
 
         if app.footer_height > 3 {
-            let rpcs: Vec<Span> = app.suggested_rpcs.iter()
-                .map(|v| Span::raw(v.clone()))
-                .enumerate()
-                .map(|(i, v)| if i == app.suggested_rpcs_ind {v.bold()} else {v})
-                .collect();
+            let rpcs: Vec<Span> = if app.rpc_lists.get(&app.current_route()).is_some() {
+                app.suggested_rpcs.iter()
+                    .map(|v| Span::raw(v.clone()))
+                    .enumerate()
+                    .map(|(i, v)| if i == app.suggested_rpcs_ind {v.bold()} else {v})
+                    .collect()
+            } else {
+                vec![Span::from("Generating RPC list...")]
+            };
 
             let rpc_block = Block::default()
                 .borders(Borders::ALL)
@@ -1796,14 +1806,17 @@ fn main() {
 
 
     // Cache thread
-    let (cache_req_tx, cache_req_rx) = channel::bounded::<DeviceRoute>(1);
+    let (cache_req_tx, cache_req_rx) = channel::unbounded::<DeviceRoute>();
     let (cache_resp_tx, cache_resp_rx) = channel::bounded::<RpcList>(1);
     let cache_client = RpcClient::open(&proxy, parent_route.clone())
         .expect("Failed to open RPC client");
     std::thread::spawn(move || {
         while let Ok(req) = cache_req_rx.recv() {
-            let Ok(list) = cache_client.rpc_list(&req) else { return };
-            if cache_resp_tx.send(list).is_err() { return };
+            if let Ok(list) = cache_client.rpc_list(&req) {
+                if cache_resp_tx.send(list).is_err() {
+                    return
+                };
+            }
         }
     });
 

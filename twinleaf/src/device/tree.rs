@@ -110,6 +110,16 @@ impl DeviceTree {
                     self.parsers = HashMap::new();
                 }
 
+                // We might have new hash(es) on reconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
+                    for route in self.known_routes.iter() {
+                        self.event_queue.push_back(TreeEvent::Device {
+                            route: route.clone(),
+                            event: super::device::DeviceEvent::NewHash(None)
+                        });
+                    }
+                }
+
                 return;
             }
             tio::proto::Payload::RpcUpdate(ru) => {
@@ -135,7 +145,7 @@ impl DeviceTree {
                         let hash = u32::from_le_bytes(set.reply.clone().try_into().unwrap());
                         self.event_queue.push_back(TreeEvent::Device {
                             route: absolute_route.clone(),
-                            event: super::device::DeviceEvent::NewHash(hash),
+                            event: super::device::DeviceEvent::NewHash(Some(hash)),
                         });
                     },
                     _ => {},

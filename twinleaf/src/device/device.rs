@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 ///
 /// For robust handling across both connection types, always check for
 /// `Status(SensorDisconnected)` rather than relying on channel errors.
+
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
     /// Connection status changed.
@@ -46,7 +47,9 @@ pub enum DeviceEvent {
 
     MetadataReady(DeviceFullMetadata),
 
-    NewHash(u32),
+    /// Some(hash): we got a Settings packet from the device
+    /// None: we had a sensor reconnect and think there might be a new hash
+    NewHash(Option<u32>),
 }
 
 pub enum DeviceItem {
@@ -102,6 +105,10 @@ impl Device {
                     self.parser = DeviceDataParser::new(false);
                 }
 
+                // We might have a new hash on reconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
+                    self.event_queue.push_back(DeviceEvent::NewHash(None));
+                }
 
                 return;
             }
@@ -122,7 +129,7 @@ impl Device {
                 match set.name.as_str() {
                     "rpc.hash" => {
                         let hash = u32::from_le_bytes(set.reply.clone().try_into().unwrap());
-                        self.event_queue.push_back(DeviceEvent::NewHash(hash));
+                        self.event_queue.push_back(DeviceEvent::NewHash(Some(hash)));
                     },
                     _ => {},
                 }

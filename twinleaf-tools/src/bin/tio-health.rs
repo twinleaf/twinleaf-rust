@@ -745,7 +745,7 @@ fn main() {
                             TreeEvent::Device { route, event: DeviceEvent::NewHash(hash) } => {
                                 log_event(
                                     &mut event_log,
-                                    format!("[{}] NEW HASH: {}", route, hash),
+                                    format!("[{}] NEW HASH: {:?}", route, hash),
                                     Color::Green,
                                     event_log_cap,
                                 );
