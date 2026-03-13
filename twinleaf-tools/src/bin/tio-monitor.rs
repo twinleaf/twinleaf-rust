@@ -461,7 +461,7 @@ pub struct App {
     pub window_aligned: Option<AlignedWindow>,
 
     pub footer_height: u16,
-    pub rpcs: HashMap<DeviceRoute, RpcList>,
+    pub rpc_lists: HashMap<DeviceRoute, RpcList>,
     pub suggested_rpcs: VecDeque<String>,
     pub suggested_rpcs_len: usize,
     pub suggested_rpcs_ind: usize,
@@ -494,7 +494,7 @@ impl App {
             device_metadata: HashMap::new(),
             window_aligned: None,
             footer_height: 0,
-            rpcs: HashMap::new(),
+            rpc_lists: HashMap::new(),
             suggested_rpcs: VecDeque::from(vec![String::new()]),
             suggested_rpcs_len: 1,
             suggested_rpcs_ind: 0,
@@ -645,7 +645,7 @@ impl App {
         let line = self.input_state.value().to_string();
         let mut rpc_cache = Vec::new();
         if !line.is_empty() {
-            if let Some(l) = self.rpcs.get(&self.current_route()) {
+            if let Some(l) = self.rpc_lists.get(&self.current_route()) {
                 for (name, _) in &l.list {
                     rpc_cache.push(name.to_string());
                 }
@@ -696,7 +696,7 @@ impl App {
                 Some(remainder.join(" "))
             };
             let route = self.current_route();
-            let meta = match self.rpcs.get(&route) {
+            let meta = match self.rpc_lists.get(&route) {
                 Some(l) => l.map.get(method),
                 None => None,
             };
@@ -715,7 +715,7 @@ impl App {
     }
 
     fn update_rpclists(&mut self, list: RpcList) {
-        self.rpcs.insert(list.route.clone(), list);
+        self.rpc_lists.insert(list.route.clone(), list);
     }
 
     fn navigate_history(&mut self, dir: HistDir) {
@@ -848,12 +848,7 @@ impl App {
                 let dev_status = self.device_status.entry(route.clone()).or_default();
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
-                    ProxyStatus::SensorReconnected => {
-                        for r in self.discovered_routes.iter() {
-                            let _ = cache_req_tx.send(r.clone());
-                        }
-                        dev_status.connected = true;
-                    }
+                    ProxyStatus::SensorReconnected => dev_status.connected = true,
                     _ => {}
                 }
             }
