@@ -643,16 +643,26 @@ impl App {
         self.suggested_rpcs_ind = 0;
         self.current_completion = String::new();
         let line = self.input_state.value().to_string();
-        let mut rpc_cache = Vec::new();
-        if !line.is_empty() {
-            if let Some(l) = self.rpc_lists.get(&self.current_route()) {
+        let mut suggestions = Vec::new();
+        if let Some(l) = self.rpc_lists.get(&self.current_route()) {
+            if line.is_empty() {
+                // Get top-level names
                 for (name, _) in &l.list {
-                    rpc_cache.push(name.to_string());
+                    if let Some((first, _rest)) = name.split_once('.') {
+                        let prefix = first.to_string() + "...";
+                        if suggestions.iter().all(|s| *s != prefix) {
+                            suggestions.push(prefix);
+                        }
+                    }
+                }
+            } else {
+                for (name, _) in &l.list {
+                    suggestions.push(name.to_string());
                 }
             }
         }
 
-        self.suggested_rpcs = rpc_cache
+        self.suggested_rpcs = suggestions
             .iter()
             .filter(|word: &&String| word.to_string().starts_with(&line))
             .map(String::clone)
@@ -667,6 +677,7 @@ impl App {
 
     fn accept_completion(&mut self) {
         let complete_command = format!("{}{}", self.input_state.value().to_string(), self.current_completion);
+        let complete_command = complete_command.replace("...", ".");
         self.input_state = TextState::new().with_value(complete_command);
         self.input_state.focus();
         self.input_state.move_end();
