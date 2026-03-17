@@ -603,7 +603,13 @@ impl App {
     fn complete_command(&mut self) {
         let rpc = self.suggested_rpcs[self.suggested_rpcs_ind].clone();
         self.current_completion = match rpc.get(self.input_state.value().len()..) {
-            Some(s) => s.to_string(),
+            Some(s) => {
+                if self.input_state.value().is_empty() {
+                    rpc.clone()
+                } else if rpc.starts_with(self.input_state.value()) {
+                    s.to_string()
+                } else {String::new()}
+            }
             None => String::new(),
         };
         self.input_state.focus();
@@ -645,9 +651,11 @@ impl App {
         let line = self.input_state.value().to_string();
         let mut suggestions = Vec::new();
         if let Some(l) = self.rpc_lists.get(&self.current_route()) {
+            let mut sort_list = l.list.clone();
             if line.is_empty() {
                 // Get top-level names
-                for (name, _) in &l.list {
+                sort_list.sort_by_key(|(x, _y)| x.clone());
+                for (name, _) in sort_list {
                     if let Some((first, _rest)) = name.split_once('.') {
                         let prefix = first.to_string() + "...";
                         if suggestions.iter().all(|s| *s != prefix) {
@@ -656,7 +664,20 @@ impl App {
                     }
                 }
             } else {
-                for (name, _) in &l.list {
+                let mut sorted_rpcs: Vec<String> = sort_list
+                    .iter()
+                    .filter(|(word, _)| word.starts_with(&line))
+                    .map(|(word, _)| word.clone())
+                    .collect(); 
+
+                let mut contains_rpc: Vec<String> = sort_list
+                    .iter()
+                    .filter(|(word, _)| word.contains(&line) && !word.starts_with(&line))
+                    .map(|(word, _)| word.clone())
+                    .collect();
+                sorted_rpcs.append(&mut contains_rpc);
+
+                for name in sorted_rpcs {
                     suggestions.push(name.to_string());
                 }
             }
@@ -664,9 +685,10 @@ impl App {
 
         self.suggested_rpcs = suggestions
             .iter()
-            .filter(|word: &&String| word.to_string().starts_with(&line))
+            .filter(|word: &&String| word.to_string().contains(&line))
             .map(String::clone)
-            .collect();
+            .collect(); 
+        
         self.suggested_rpcs_len = self.suggested_rpcs.len();
         if !(1..=RPCLIST_MAX_LEN).contains(&self.suggested_rpcs_len) {
             self.suggested_rpcs.push_back(String::new());
@@ -676,8 +698,13 @@ impl App {
     }
 
     fn accept_completion(&mut self) {
-        let complete_command = format!("{}{}", self.input_state.value().to_string(), self.current_completion);
-        let complete_command = complete_command.replace("...", ".");
+        let mut complete_command: String;
+        if self.current_completion.is_empty() {
+            complete_command = self.suggested_rpcs[self.suggested_rpcs_ind].clone();
+        } else {
+            complete_command = format!("{}{}", self.input_state.value().to_string(), self.current_completion);
+            complete_command = complete_command.replace("...", ".");
+        }
         self.input_state = TextState::new().with_value(complete_command);
         self.input_state.focus();
         self.input_state.move_end();
@@ -686,7 +713,7 @@ impl App {
 
     fn submit_command(&mut self, rpc_tx: &Sender<RpcReq>) {
         // Completion mode: accept completion, don't submit
-        if !self.current_completion.is_empty() {
+        if self.input_state.value() != self.suggested_rpcs[self.suggested_rpcs_ind] {
             return self.accept_completion();
         }
         // No completion: enter command
@@ -1018,6 +1045,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
         match app.mode {
             Mode::Command => match k.code {
                 KeyCode::Esc => Some(Action::SetMode(Mode::Normal)),
+                KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => Some(Action::SetMode(Mode::Normal)),
                 KeyCode::Tab => Some(Action::AutoCompleteTab),
                 KeyCode::BackTab => Some(Action::AutoCompleteBack),
                 KeyCode::Up => Some(Action::HistoryNavigate(HistDir::Up)),
@@ -1348,7 +1376,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
                 app.suggested_rpcs.iter()
                     .map(|v| Span::raw(v.clone()))
                     .enumerate()
-                    .map(|(i, v)| if i == app.suggested_rpcs_ind {v.bold()} else {v})
+                    .map(|(i, v)| if i == app.suggested_rpcs_ind {v.bold()} else {v.dim()})
                     .collect()
             } else {
                 vec![Span::from("Generating RPC list...")]
@@ -1411,7 +1439,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Block::default().borders(Borders::TOP)
                             .title(Line::from(" Command Mode ").left_aligned())
-                            .title(Line::from(" <Esc> ").right_aligned())
+                            .title(Line::from(" <Esc/Ctrl+C> ").right_aligned())
         };
 
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), chunks[2]);
