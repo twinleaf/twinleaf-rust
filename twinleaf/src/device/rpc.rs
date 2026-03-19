@@ -280,7 +280,7 @@ pub enum RpcListError {
 pub struct RpcList {
     pub route: DeviceRoute,
     pub hash: u32,
-    pub list: Vec<(String, u16)>,
+    pub vec: Vec<(String, u16)>,
     pub map: HashMap<String, u16>,
 }
 
@@ -355,7 +355,7 @@ impl RpcClient {
 
     fn read_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
         let reader = io::BufReader::new(file);
-        let mut list: Vec<(String, u16)> = Vec::new();
+        let mut vec: Vec<(String, u16)> = Vec::new();
         let mut map: HashMap<String, u16> = HashMap::new();
         let mut hasher = DefaultHasher::new();
         let mut hash_line: Option<String> = None;
@@ -370,13 +370,13 @@ impl RpcClient {
                 break;
             };
 
-            // Convert to what we want in our list
+            // Convert to what we want in our vec
             let meta = u16::from_str_radix(meta, 16).map_err(|_|
                 RpcListError::InvalidCacheError)?;
             let name = name.trim().to_string();
 
-            // Push to list, map, and hasher
-            list.push((name.clone(), meta));
+            // Push to vec, map, and hasher
+            vec.push((name.clone(), meta));
             map.insert(name.clone(), meta);
             (name, meta).hash(&mut hasher);
         }
@@ -387,7 +387,7 @@ impl RpcClient {
                 let cached_hash = u64::from_str_radix(&line, 16).map_err(|_|
                     RpcListError::InvalidCacheError)?;
                 if cached_hash == hasher.finish() {
-                    Ok(RpcList { route: route.clone(), hash, list, map })
+                    Ok(RpcList { route: route.clone(), hash, vec, map })
                 } else {
                     Err(RpcListError::InvalidCacheError)
                 }
@@ -398,7 +398,7 @@ impl RpcClient {
 
     fn write_rpc_cache(&self, route: &DeviceRoute, hash: u32, file: fs::File) -> Result<RpcList, RpcListError> {
         let mut writer = io::BufWriter::new(file);
-        let mut list: Vec<(String, u16)> = Vec::new();
+        let mut vec: Vec<(String, u16)> = Vec::new();
         let mut map: HashMap<String, u16> = HashMap::new();
         let mut hasher = DefaultHasher::new();
 
@@ -411,15 +411,15 @@ impl RpcClient {
                 RpcListError::DeviceRpcError(e))?;
             writeln!(writer, "{:04x} {}", meta, name)?;
 
-            // Also push to list, map, and hasher
-            list.push((name.clone(), meta));
+            // Also push to vec, map, and hasher
+            vec.push((name.clone(), meta));
             map.insert(name.clone(), meta);
             (name, meta).hash(&mut hasher);
         }
 
         // Write our hash for integrity validation
         writeln!(writer, "{:04x}", hasher.finish())?;
-        Ok(RpcList { route: route.clone(), hash, list, map })
+        Ok(RpcList { route: route.clone(), hash, vec, map })
     }
 
     pub fn rpc_list(&self, route: &DeviceRoute) -> Result<RpcList, RpcListError> {
@@ -451,7 +451,7 @@ impl RpcClient {
         }?;
 
         // TODO: write more identifying info to cache file?
-        // Date created, firmware version, validation hash, etc.
+        // Date created, firmware version
         // Maybe on an ignored line at the top
 
         let cache_file = fs::File::open(&file_path);
@@ -486,4 +486,3 @@ impl RpcClient {
         }
     }
 }
-

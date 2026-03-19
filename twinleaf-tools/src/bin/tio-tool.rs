@@ -22,7 +22,7 @@ fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
         eprintln!("RPC list failed: {:?}", e);
     })?;
 
-    for (name, _) in rpcs.list {
+    for (name, _) in rpcs.vec {
         let spec = twinleaf::device::util::parse_rpc_spec(
             *rpcs.map.get(&name).unwrap(),
             name.to_string()

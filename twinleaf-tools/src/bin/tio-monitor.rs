@@ -651,7 +651,7 @@ impl App {
         let line = self.input_state.value().to_string();
         let mut suggestions = Vec::new();
         if let Some(l) = self.rpc_lists.get(&self.current_route()) {
-            let mut sort_list = l.list.clone();
+            let mut sort_list = l.vec.clone();
             if line.is_empty() {
                 // Get top-level names
                 sort_list.sort_by_key(|(x, _y)| x.clone());
