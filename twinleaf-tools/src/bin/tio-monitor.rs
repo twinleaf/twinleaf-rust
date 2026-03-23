@@ -416,6 +416,16 @@ pub struct RpcResp {
     pub result: Result<String, String>,
 }
 
+enum RpcWorkerReq {
+    FetchList(DeviceRoute),
+    Execute(RpcReq),
+}
+
+enum RpcWorkerResp {
+    List(RpcList),
+    RpcResult(RpcResp),
+}
+
 fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
     let meta = match req.meta {
         Some(m) => m,
@@ -462,7 +472,6 @@ pub struct App {
     pub window_aligned: Option<AlignedWindow>,
 
     pub footer_height: u16,
-    pub rpc_lists: HashMap<DeviceRoute, RpcList>,
     pub rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
     pub suggested_rpcs: VecDeque<String>,
     pub suggested_rpcs_len: usize,
@@ -496,7 +505,6 @@ impl App {
             device_metadata: HashMap::new(),
             window_aligned: None,
             footer_height: 0,
-            rpc_lists: HashMap::new(),
             rpc_registries: HashMap::new(),
             suggested_rpcs: VecDeque::from(vec![String::new()]),
             suggested_rpcs_len: 1,
@@ -513,13 +521,13 @@ impl App {
         }
     }
 
-    pub fn update(&mut self, action: Action, rpc_tx: &Sender<RpcReq>) -> bool {
+    fn update(&mut self, action: Action, rpc_tx: &Sender<RpcWorkerReq>) -> bool {
         match action {
             Action::Quit => return true,
             Action::SetMode(Mode::Command) => {
                 self.input_state = TextState::default();
                 self.input_state.focus();
-                self.history_ptr = 0;
+                self.history_ptr = self.cmd_history.len();
                 self.update_command_list();
                 self.mode = Mode::Command;
             }
@@ -656,17 +664,18 @@ impl App {
         self.suggested_rpcs_ind = 0;
         self.current_completion = String::new();
         let line = self.input_state.value().to_string();
+        let query = line.split_whitespace().next().unwrap_or("");
 
         let suggestions: Vec<String> =
             if let Some(registry) = self.rpc_registries.get(&self.current_route()) {
-                if line.is_empty() {
+                if query.is_empty() {
                     registry
                         .children_of("")
                         .into_iter()
                         .map(|s| s + "...")
                         .collect()
                 } else {
-                    registry.search(&line)
+                    registry.search(query)
                 }
             } else {
                 Vec::new()
@@ -699,13 +708,12 @@ impl App {
         self.update_command_list();
     }
 
-    fn submit_command(&mut self, rpc_tx: &Sender<RpcReq>) {
-        // Completion mode: accept completion, don't submit
-        if self.input_state.value() != self.suggested_rpcs[self.suggested_rpcs_ind] {
+    fn submit_command(&mut self, rpc_tx: &Sender<RpcWorkerReq>) {
+        let line = self.input_state.value().to_string();
+        // Accept completion if no argument provided and input doesn't match suggestion
+        if !line.contains(' ') && self.suggested_rpcs.get(self.suggested_rpcs_ind) != Some(&line) {
             return self.accept_completion();
         }
-        // No completion: enter command
-        let line = self.input_state.value().to_string();
         if line.trim().is_empty() {
             return;
         }
@@ -724,16 +732,17 @@ impl App {
                 Some(remainder.join(" "))
             };
             let route = self.current_route();
-            let meta = match self.rpc_lists.get(&route) {
-                Some(l) => l.map.get(method),
-                None => None,
-            };
-            let _ = rpc_tx.send(RpcReq {
+            let meta = self
+                .rpc_registries
+                .get(&route)
+                .and_then(|r| r.find(method))
+                .map(|d| d.meta_raw);
+            let _ = rpc_tx.send(RpcWorkerReq::Execute(RpcReq {
                 route: route.clone(),
-                meta: meta.copied(),
+                meta,
                 method: method.to_string(),
                 arg,
-            });
+            }));
             self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
             self.input_state = TextState::default();
             self.input_state.focus();
@@ -745,7 +754,6 @@ impl App {
     fn update_rpclists(&mut self, list: RpcList) {
         let registry = RpcRegistry::from(&list);
         self.rpc_registries.insert(list.route.clone(), registry);
-        self.rpc_lists.insert(list.route.clone(), list);
     }
 
     fn navigate_history(&mut self, dir: HistDir) {
@@ -855,23 +863,22 @@ impl App {
         self.visible_routes().len()
     }
 
-    pub fn handle_event(&mut self, event: TreeEvent, cache_req_tx: &Sender<DeviceRoute>) {
+    fn handle_event(&mut self, event: TreeEvent, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.discovered_routes.insert(route.clone());
-                let _ = cache_req_tx.send(route.clone());
+                let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
                 self.device_status.entry(route).or_default();
             }
             TreeEvent::Device {
                 route,
                 event: DeviceEvent::NewHash(hash),
             } => {
-                match (self.rpc_lists.get(&route), hash) {
-                    (Some(list), Some(hash)) if list.hash == hash => {}
+                match (self.rpc_registries.get(&route), hash) {
+                    (Some(reg), Some(hash)) if reg.hash == Some(hash) => {}
                     _ => {
-                        self.rpc_lists.remove(&route);
                         self.rpc_registries.remove(&route);
-                        let _ = cache_req_tx.send(route);
+                        let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                     }
                 };
             }
@@ -1860,32 +1867,28 @@ fn main() {
         }
     });
 
-    // Cache thread
-    let (cache_req_tx, cache_req_rx) = channel::unbounded::<DeviceRoute>();
-    let (cache_resp_tx, cache_resp_rx) = channel::bounded::<RpcList>(1);
-    let cache_client =
-        RpcClient::open(&proxy, parent_route.clone()).expect("Failed to open RPC client");
-    std::thread::spawn(move || {
-        while let Ok(req) = cache_req_rx.recv() {
-            if let Ok(list) = cache_client.rpc_list(&req) {
-                if cache_resp_tx.send(list).is_err() {
-                    return;
-                };
-            }
-        }
-    });
-
-    // RPC thread
+    // RPC worker thread
     let rpc_client =
         RpcClient::open(&proxy, parent_route.clone()).expect("Failed to open RPC client");
-    let (rpc_tx, rpc_rx) = channel::bounded::<RpcReq>(1);
-    let (rpc_resp_tx, rpc_resp_rx) = channel::bounded::<RpcResp>(1);
+    let (rpc_tx, rpc_rx) = channel::unbounded::<RpcWorkerReq>();
+    let (rpc_resp_tx, rpc_resp_rx) = channel::unbounded::<RpcWorkerResp>();
 
     std::thread::spawn(move || {
         while let Ok(req) = rpc_rx.recv() {
-            let result = exec_rpc(&rpc_client, &req);
-            if rpc_resp_tx.send(RpcResp { result }).is_err() {
-                return;
+            let resp = match req {
+                RpcWorkerReq::FetchList(route) => match rpc_client.rpc_list(&route) {
+                    Ok(list) => Some(RpcWorkerResp::List(list)),
+                    Err(_) => None,
+                },
+                RpcWorkerReq::Execute(rpc_req) => {
+                    let result = exec_rpc(&rpc_client, &rpc_req);
+                    Some(RpcWorkerResp::RpcResult(RpcResp { result }))
+                }
+            };
+            if let Some(resp) = resp {
+                if rpc_resp_tx.send(resp).is_err() {
+                    return;
+                }
             }
         }
     });
@@ -1925,7 +1928,7 @@ fn main() {
                         app.handle_sample(sample, route, &mut buffer);
                     }
                     Ok(TreeItem::Event(event)) => {
-                        app.handle_event(event, &cache_req_tx);
+                        app.handle_event(event, &rpc_tx);
                     }
                     Err(_) => break 'main,
                 }
@@ -1941,19 +1944,20 @@ fn main() {
                 }
             }
 
-            recv(cache_resp_rx) -> list => {
-                if let Ok(list) = list {
-                    app.update_rpclists(list);
-                }
-            }
-
-            recv(rpc_resp_rx) -> res => {
-                if let Ok(res) = res {
-                    let (msg, col) = match res.result {
-                        Ok(s) => (format!("{}: {}", app.last_rpc_command, s), Color::Green),
-                        Err(s) => (format!("ERR: {}", s), Color::Red),
-                    };
-                    app.last_rpc_result = Some((msg, col));
+            recv(rpc_resp_rx) -> resp => {
+                if let Ok(resp) = resp {
+                    match resp {
+                        RpcWorkerResp::List(list) => {
+                            app.update_rpclists(list);
+                        }
+                        RpcWorkerResp::RpcResult(res) => {
+                            let (msg, col) = match res.result {
+                                Ok(s) => (format!("{}: {}", app.last_rpc_command, s), Color::Green),
+                                Err(s) => (format!("ERR: {}", s), Color::Red),
+                            };
+                            app.last_rpc_result = Some((msg, col));
+                        }
+                    }
                 }
             }
 
