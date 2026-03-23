@@ -139,16 +139,18 @@ impl DeviceTree {
                     event: super::device::DeviceEvent::Heartbeat { session_id },
                 });
             }
-            tio::proto::Payload::Settings(set) => match set.name.as_str() {
-                "rpc.hash" => {
-                    let hash = u32::from_le_bytes(set.reply.clone().try_into().unwrap());
+            tio::proto::Payload::Settings(set) => {
+                let hash = match set {
+                    tio::proto::SettingsPayload::RpcHash(h) => Some(*h),
+                    tio::proto::SettingsPayload::Unknown { .. } => None,
+                };
+                if let Some(hash) = hash {
                     self.event_queue.push_back(TreeEvent::Device {
                         route: absolute_route.clone(),
                         event: super::device::DeviceEvent::NewHash(Some(hash)),
                     });
                 }
-                _ => {}
-            },
+            }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
                     if let Some(count) = self.n_reqs.get_mut(&absolute_route) {

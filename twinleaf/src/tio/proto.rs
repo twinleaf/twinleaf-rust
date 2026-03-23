@@ -49,11 +49,13 @@ pub enum HeartbeatPayload {
 }
 
 #[derive(Debug, Clone)]
-pub struct SettingsPayload {
-    pub name_len: u8,
-    pub flags: u8,
-    pub name: String,
-    pub reply: Vec<u8>,
+pub enum SettingsPayload {
+    RpcHash(u32),
+    Unknown {
+        name: String,
+        flags: u8,
+        reply: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -363,35 +365,57 @@ impl SettingsPayload {
         if raw.len() < 2 {
             return Err(too_small(full_data));
         }
-        let name_len = raw[0];
+        let name_len = raw[0] as usize;
         let flags = raw[1];
         let content = &raw[2..];
 
-        if content.len() < name_len.into() {
+        if content.len() < name_len {
             return Err(too_small(full_data));
         }
-        let name =
-            String::from_utf8(content[..name_len.into()].to_vec()).map_err(|_| Error::BadName)?;
-        let reply = (&content[name_len.into()..]).to_vec();
-        let pl = SettingsPayload {
-            name_len,
-            flags,
-            name,
-            reply,
-        };
-        Ok(pl)
+        let name = String::from_utf8(content[..name_len].to_vec()).map_err(|_| Error::BadName)?;
+        let reply = content[name_len..].to_vec();
+
+        match name.as_str() {
+            "rpc.hash" => {
+                if reply.len() < 4 {
+                    return Err(too_small(full_data));
+                }
+                let hash = u32::from_le_bytes(reply[..4].try_into().unwrap());
+                Ok(SettingsPayload::RpcHash(hash))
+            }
+            _ => Ok(SettingsPayload::Unknown { name, flags, reply }),
+        }
     }
     fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size: usize = 2 + self.name_len as usize + self.reply.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
+        match self {
+            SettingsPayload::RpcHash(hash) => {
+                let name = b"rpc.hash";
+                let payload_size = 2 + name.len() + 4;
+                if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+                    return Err(());
+                }
+                let mut ret =
+                    TioPktHdr::serialize_new(TioPktType::Settings, 0, payload_size as u16);
+                ret.push(name.len() as u8);
+                ret.push(0); // flags
+                ret.extend(name);
+                ret.extend(hash.to_le_bytes());
+                Ok(ret)
+            }
+            SettingsPayload::Unknown { name, flags, reply } => {
+                let payload_size = 2 + name.len() + reply.len();
+                if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
+                    return Err(());
+                }
+                let mut ret =
+                    TioPktHdr::serialize_new(TioPktType::Settings, 0, payload_size as u16);
+                ret.push(name.len() as u8);
+                ret.push(*flags);
+                ret.extend(name.as_bytes());
+                ret.extend(reply);
+                Ok(ret)
+            }
         }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::Settings, 0, payload_size as u16);
-        ret.extend(self.name_len.to_le_bytes());
-        ret.extend(self.flags.to_le_bytes());
-        ret.extend(self.name.clone().into_bytes());
-        ret.extend(self.reply.clone());
-        Ok(ret)
     }
 }
 
