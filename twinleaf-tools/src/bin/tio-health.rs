@@ -4,7 +4,7 @@
 // Uses DeviceTree for automatic metadata handling.
 //
 // Build: cargo run --release -- <tio-url> [route] [options]
-// Quit:  q / Esc / Ctrl-C
+// Quit:  q / Ctrl-C
 
 use chrono::{DateTime, Local};
 use clap::Parser;
@@ -690,7 +690,7 @@ fn draw_ui(
             };
             f.render_widget(
                 Paragraph::new(format!(
-                    "q/Esc to quit  |  {}  |  ↑/↓/PgUp/PgDn to scroll",
+                    "q/Ctrl+C to quit  |  {}  |  ↑/↓/PgUp/PgDn to scroll",
                     heartbeat_hint
                 ))
                 .style(Style::default().fg(Color::Gray)),
@@ -904,7 +904,7 @@ fn main() {
                 if let Ok(Event::Key(k)) = ev {
                     if k.kind != KeyEventKind::Press { continue; }
 
-                    if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+                    if matches!(k.code, KeyCode::Char('q'))
                         || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL)
                     {
                         break 'main;
