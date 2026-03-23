@@ -187,6 +187,8 @@ impl RpcRegistry {
                 substring.push(name.clone());
             }
         }
+        prefix.sort();
+        substring.sort();
         prefix.extend(substring);
         prefix
     }
