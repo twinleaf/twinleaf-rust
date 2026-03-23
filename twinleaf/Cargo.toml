@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 license = "MIT"
 description = "Library for working with the Twinleaf I/O protocol and Twinleaf quantum sensors."
@@ -17,17 +17,17 @@ crossbeam = "0.8"
 mio-serial = "5.0"
 crc = "3.2"
 num_enum = "0.7"
-glob = "0.3.2"
-hdf5 = { package = "hdf5-metno", version = "0.12.4", features = ["static", "zlib", "blosc"], optional = true}
-dirs-next = "2.0.0"
+glob = "0.3"
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
+dirs-next = "2.0"
 
 [dependencies.mio]
 version = "1.0"
 features = ["os-poll", "net"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-foundation = "0.3.1"
-objc2 = "0.6.2"
+objc2-foundation = "0.3"
+objc2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
