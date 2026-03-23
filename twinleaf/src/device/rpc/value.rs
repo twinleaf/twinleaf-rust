@@ -8,6 +8,15 @@ pub enum RpcValue {
     Bytes(Vec<u8>),
 }
 
+#[derive(Debug, Clone)]
+pub enum RpcDataKind {
+    Unit,
+    Int { signed: bool, size: u8 },
+    Float { size: u8 },
+    String { max_len: Option<u16> },
+    Raw { meta: u16 },
+}
+
 #[derive(Debug)]
 pub enum EncodeError {
     ParseInt(std::num::ParseIntError),

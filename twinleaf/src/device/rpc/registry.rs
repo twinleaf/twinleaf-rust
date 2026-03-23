@@ -1,14 +1,7 @@
+use super::client::RpcList;
+use super::value::RpcDataKind;
 use crate::device::util;
-use std::collections::{BTreeMap, HashMap};
-
-#[derive(Debug, Clone)]
-pub enum RpcDataKind {
-    Unit,
-    Int { signed: bool, size: u8 },
-    Float { size: u8 },
-    String { max_len: Option<u16> },
-    Raw { meta: u16 },
-}
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct RpcMeta {
@@ -123,19 +116,16 @@ impl RpcNode {
 
 pub struct RpcRegistry {
     root: RpcNode,
-    flat: HashMap<String, RpcMeta>,
 }
 
 impl RpcRegistry {
     pub fn new(specs: Vec<RpcMeta>) -> Self {
         let mut root = RpcNode::default();
-        let mut flat = HashMap::new();
-
         for spec in specs {
-            flat.insert(spec.full_name.clone(), spec.clone());
-            root.insert(&spec.segments, spec.clone());
+            let segments = spec.segments.clone();
+            root.insert(&segments, spec);
         }
-        Self { root, flat }
+        Self { root }
     }
 
     pub fn find(&self, name: &str) -> Option<&RpcMeta> {
@@ -176,36 +166,15 @@ impl RpcRegistry {
 
         current.children.keys().cloned().collect()
     }
+}
 
-    pub fn prepare_request(&self, input_line: &str) -> Result<(String, Vec<u8>), String> {
-        let parts: Vec<&str> = input_line.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err("Empty command".into());
-        }
-
-        let name = parts[0];
-        let arg_str = parts.get(1).unwrap_or(&"");
-
-        let meta = self
-            .flat
-            .get(name)
-            .ok_or_else(|| format!("Unknown RPC: {}", name))?;
-
-        let payload = util::rpc_encode_arg(arg_str, &meta.data_kind)
-            .map_err(|e| format!("Encoding error: {:?}", e))?;
-
-        Ok((name.to_string(), payload))
-    }
-
-    pub fn decode_response(&self, name: &str, data: &[u8]) -> Result<String, String> {
-        let meta = self
-            .flat
-            .get(name)
-            .ok_or_else(|| format!("Unknown RPC: {}", name))?;
-
-        let val = util::rpc_decode_reply(data, &meta.data_kind)
-            .map_err(|e| format!("Decode error: {:?}", e))?;
-
-        Ok(util::format_rpc_value_for_cli(&val, &meta.data_kind))
+impl From<&RpcList> for RpcRegistry {
+    fn from(list: &RpcList) -> Self {
+        let specs: Vec<RpcMeta> = list
+            .vec
+            .iter()
+            .map(|(name, meta)| util::parse_rpc_spec(*meta, name.clone()))
+            .collect();
+        Self::new(specs)
     }
 }
