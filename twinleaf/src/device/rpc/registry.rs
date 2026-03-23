@@ -1,20 +1,20 @@
 use super::client::RpcList;
-use super::value::RpcDataKind;
+use super::value::RpcValueType;
 use crate::device::util;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
-pub struct RpcMeta {
+pub struct RpcDescriptor {
     pub full_name: String,
     pub segments: Vec<String>,
-    pub data_kind: RpcDataKind,
+    pub data_kind: RpcValueType,
     pub readable: bool,
     pub writable: bool,
     pub persistent: bool,
     pub meta_raw: u16,
 }
 
-impl RpcMeta {
+impl RpcDescriptor {
     pub fn is_unknown(&self) -> bool {
         self.meta_raw == 0
     }
@@ -34,8 +34,8 @@ impl RpcMeta {
 
     pub fn type_str(&self) -> String {
         match self.data_kind {
-            RpcDataKind::Unit => "".to_string(),
-            RpcDataKind::Int { signed, size } => {
+            RpcValueType::Unit => "".to_string(),
+            RpcValueType::Int { signed, size } => {
                 let bits = (size as usize) * 8;
                 if signed {
                     format!("i{bits}")
@@ -43,28 +43,28 @@ impl RpcMeta {
                     format!("u{bits}")
                 }
             }
-            RpcDataKind::Float { size } => {
+            RpcValueType::Float { size } => {
                 let bits = (size as usize) * 8;
                 format!("f{bits}")
             }
-            RpcDataKind::String { max_len } => {
+            RpcValueType::String { max_len } => {
                 if let Some(n) = max_len {
                     format!("string<{n}>")
                 } else {
                     "string".to_string()
                 }
             }
-            RpcDataKind::Raw { .. } => "".to_string(),
+            RpcValueType::Raw { .. } => "".to_string(),
         }
     }
 
     pub fn size_bytes(&self) -> Option<usize> {
         match self.data_kind {
-            RpcDataKind::Unit => Some(0),
-            RpcDataKind::Int { size, .. } => Some(size as usize),
-            RpcDataKind::Float { size } => Some(size as usize),
-            RpcDataKind::String { .. } => None,
-            RpcDataKind::Raw { .. } => None,
+            RpcValueType::Unit => Some(0),
+            RpcValueType::Int { size, .. } => Some(size as usize),
+            RpcValueType::Float { size } => Some(size as usize),
+            RpcValueType::String { .. } => None,
+            RpcValueType::Raw { .. } => None,
         }
     }
 }
@@ -72,11 +72,11 @@ impl RpcMeta {
 #[derive(Default)]
 struct RpcNode {
     children: BTreeMap<String, RpcNode>,
-    rpc: Option<RpcMeta>,
+    rpc: Option<RpcDescriptor>,
 }
 
 impl RpcNode {
-    fn insert(&mut self, segments: &[String], spec: RpcMeta) {
+    fn insert(&mut self, segments: &[String], spec: RpcDescriptor) {
         if let Some((first, rest)) = segments.split_first() {
             let child = self.children.entry(first.clone()).or_default();
             child.insert(rest, spec);
@@ -105,7 +105,7 @@ impl RpcNode {
         self.children.keys().cloned().collect()
     }
 
-    fn find(&self, segments: &[String]) -> Option<&RpcMeta> {
+    fn find(&self, segments: &[String]) -> Option<&RpcDescriptor> {
         if let Some((first, rest)) = segments.split_first() {
             self.children.get(first)?.find(rest)
         } else {
@@ -119,7 +119,7 @@ pub struct RpcRegistry {
 }
 
 impl RpcRegistry {
-    pub fn new(specs: Vec<RpcMeta>) -> Self {
+    pub fn new(specs: Vec<RpcDescriptor>) -> Self {
         let mut root = RpcNode::default();
         for spec in specs {
             let segments = spec.segments.clone();
@@ -128,7 +128,7 @@ impl RpcRegistry {
         Self { root }
     }
 
-    pub fn find(&self, name: &str) -> Option<&RpcMeta> {
+    pub fn find(&self, name: &str) -> Option<&RpcDescriptor> {
         let parts: Vec<String> = name.split('.').map(|s| s.to_string()).collect();
         self.root.find(&parts)
     }
@@ -170,7 +170,7 @@ impl RpcRegistry {
 
 impl From<&RpcList> for RpcRegistry {
     fn from(list: &RpcList) -> Self {
-        let specs: Vec<RpcMeta> = list
+        let specs: Vec<RpcDescriptor> = list
             .vec
             .iter()
             .map(|(name, meta)| util::parse_rpc_spec(*meta, name.clone()))

@@ -9,7 +9,7 @@ pub enum RpcValue {
 }
 
 #[derive(Debug, Clone)]
-pub enum RpcDataKind {
+pub enum RpcValueType {
     Unit,
     Int { signed: bool, size: u8 },
     Float { size: u8 },
