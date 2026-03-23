@@ -13,7 +13,6 @@ default = []
 hdf5 = ["twinleaf/hdf5"]
 
 [dependencies]
-chrono = "0.4.38"
 crossbeam = "0.8.4"
 serialport = "4.5.1"
 toml_edit = {version = "0.22.24", features = ["parse"]}
@@ -25,3 +24,11 @@ tui-prompts = "0.5.2"
 welch-sde = "0.1.0"
 memmap2 = "0.9.9"
 indicatif = "0.18.3"
+clap_complete = "4.5.66"
+chrono = "0.4.44"
+
+[build-dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
+clap_complete = "4.5.66"
+twinleaf = {version = "1.3.4", path = "../twinleaf" }
+chrono = "0.4.44"

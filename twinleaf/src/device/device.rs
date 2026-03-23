@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 ///
 /// For robust handling across both connection types, always check for
 /// `Status(SensorDisconnected)` rather than relying on channel errors.
+
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
     /// Connection status changed.
@@ -45,6 +46,10 @@ pub enum DeviceEvent {
     },
 
     MetadataReady(DeviceFullMetadata),
+
+    /// Some(hash): we got a Settings packet from the device
+    /// None: we had a sensor reconnect and think there might be a new hash
+    NewHash(Option<u32>),
 }
 
 pub enum DeviceItem {
@@ -93,6 +98,18 @@ impl Device {
         match &pkt.payload {
             tio::proto::Payload::ProxyStatus(ps) => {
                 self.event_queue.push_back(DeviceEvent::Status(ps.0));
+
+                // Forget our metadata on disconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorDisconnected) {
+                    self.metadata_announced = false;
+                    self.parser = DeviceDataParser::new(false);
+                }
+
+                // We might have a new hash on reconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
+                    self.event_queue.push_back(DeviceEvent::NewHash(None));
+                }
+
                 return;
             }
             tio::proto::Payload::RpcUpdate(ru) => {
@@ -107,6 +124,15 @@ impl Device {
                 };
                 self.event_queue
                     .push_back(DeviceEvent::Heartbeat { session_id });
+            }
+            tio::proto::Payload::Settings(set) => {
+                match set.name.as_str() {
+                    "rpc.hash" => {
+                        let hash = u32::from_le_bytes(set.reply.clone().try_into().unwrap());
+                        self.event_queue.push_back(DeviceEvent::NewHash(Some(hash)));
+                    },
+                    _ => {},
+                }
             }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {

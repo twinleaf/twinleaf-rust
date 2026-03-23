@@ -31,6 +31,7 @@ impl StatusQueue {
 }
 
 /// Internal proxy state per client
+#[derive(Debug)]
 pub struct ProxyClient {
     /// Used to send packets to the client
     tx: channel::Sender<Packet>,
@@ -78,6 +79,11 @@ impl ProxyClient {
     }
 
     fn send(&self, pkt: &Packet) -> Result<(), channel::TrySendError<Packet>> {
+        // ProxyStatus should be route-agnostic
+        if matches!(pkt.payload, proto::Payload::ProxyStatus(_)) {
+            return self.tx.try_send(pkt.clone());
+        }
+
         let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.routing) {
             if r.len() <= self.depth {
                 r

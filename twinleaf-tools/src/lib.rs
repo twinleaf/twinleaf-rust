@@ -1,8 +1,12 @@
-use clap::Parser;
 use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
+use clap::Parser;
 
+include!("proxy_cli.rs");
+include!("tool_cli.rs");
+include!("monitor_cli.rs");
+include!("health_cli.rs");
 #[derive(Parser, Debug, Clone)]
 pub struct TioOpts {
     /// Sensor root address (e.g., tcp://localhost, serial:///dev/ttyUSB0)

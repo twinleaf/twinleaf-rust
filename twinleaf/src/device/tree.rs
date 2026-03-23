@@ -100,9 +100,26 @@ impl DeviceTree {
         match &pkt.payload {
             tio::proto::Payload::ProxyStatus(ps) => {
                 self.event_queue.push_back(TreeEvent::Device {
-                    route: absolute_route,
+                    route: absolute_route.clone(),
                     event: super::device::DeviceEvent::Status(ps.0),
                 });
+
+                // Forget our metadata on disconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorDisconnected) {
+                    self.metadata_announced = HashSet::new();
+                    self.parsers = HashMap::new();
+                }
+
+                // We might have new hash(es) on reconnect
+                if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
+                    for route in self.known_routes.iter() {
+                        self.event_queue.push_back(TreeEvent::Device {
+                            route: route.clone(),
+                            event: super::device::DeviceEvent::NewHash(None)
+                        });
+                    }
+                }
+
                 return;
             }
             tio::proto::Payload::RpcUpdate(ru) => {
@@ -121,6 +138,19 @@ impl DeviceTree {
                     route: absolute_route.clone(),
                     event: super::device::DeviceEvent::Heartbeat { session_id },
                 });
+            }
+            tio::proto::Payload::Settings(set) => {
+                match set.name.as_str() {
+                    "rpc.hash" => {
+                        let hash = u32::from_le_bytes(set.reply.clone().try_into().unwrap());
+                        self.event_queue.push_back(TreeEvent::Device {
+                            route: absolute_route.clone(),
+                            event: super::device::DeviceEvent::NewHash(Some(hash)),
+                        });
+                    },
+                    _ => {},
+                }
+
             }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {
