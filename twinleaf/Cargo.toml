@@ -18,7 +18,7 @@ mio-serial = "5.0"
 crc = "3.2"
 num_enum = "0.7"
 glob = "0.3.2"
-hdf5 = { package = "hdf5-metno", version = "0.11.0", features = ["static", "zlib", "blosc"], optional = true}
+hdf5 = { package = "hdf5-metno", version = "0.12.4", features = ["static", "zlib", "blosc"], optional = true}
 dirs-next = "2.0.0"
 
 [dependencies.mio]

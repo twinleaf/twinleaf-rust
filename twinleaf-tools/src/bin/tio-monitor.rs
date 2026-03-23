@@ -16,12 +16,12 @@ use crossbeam::channel::{self, Sender};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
-    prelude::{Backend, Stylize},
+    prelude::Stylize,
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, Paragraph},
-    Frame, Terminal,
+    DefaultTerminal, Frame,
 };
 use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
@@ -1101,7 +1101,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
     }
 }
 
-fn draw_ui<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+fn draw_ui(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), io::Error> {
     terminal.draw(|f| {
         let size = f.area();
         let height = size.height;
