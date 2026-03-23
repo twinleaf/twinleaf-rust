@@ -116,16 +116,19 @@ impl RpcNode {
 
 pub struct RpcRegistry {
     root: RpcNode,
+    names: Vec<String>,
 }
 
 impl RpcRegistry {
     pub fn new(specs: Vec<RpcDescriptor>) -> Self {
         let mut root = RpcNode::default();
+        let mut names = Vec::with_capacity(specs.len());
         for spec in specs {
+            names.push(spec.full_name.clone());
             let segments = spec.segments.clone();
             root.insert(&segments, spec);
         }
-        Self { root }
+        Self { root, names }
     }
 
     pub fn find(&self, name: &str) -> Option<&RpcDescriptor> {
@@ -165,6 +168,22 @@ impl RpcRegistry {
         }
 
         current.children.keys().cloned().collect()
+    }
+
+    /// Substring search across all RPC names. Returns prefix matches first,
+    /// then non-prefix substring matches.
+    pub fn search(&self, query: &str) -> Vec<String> {
+        let mut prefix = Vec::new();
+        let mut substring = Vec::new();
+        for name in &self.names {
+            if name.starts_with(query) {
+                prefix.push(name.clone());
+            } else if name.contains(query) {
+                substring.push(name.clone());
+            }
+        }
+        prefix.extend(substring);
+        prefix
     }
 }
 

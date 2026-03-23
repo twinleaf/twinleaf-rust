@@ -27,7 +27,7 @@ use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{util, DeviceEvent, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
+    device::{util, DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{
@@ -463,6 +463,7 @@ pub struct App {
 
     pub footer_height: u16,
     pub rpc_lists: HashMap<DeviceRoute, RpcList>,
+    pub rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
     pub suggested_rpcs: VecDeque<String>,
     pub suggested_rpcs_len: usize,
     pub suggested_rpcs_ind: usize,
@@ -496,6 +497,7 @@ impl App {
             window_aligned: None,
             footer_height: 0,
             rpc_lists: HashMap::new(),
+            rpc_registries: HashMap::new(),
             suggested_rpcs: VecDeque::from(vec![String::new()]),
             suggested_rpcs_len: 1,
             suggested_rpcs_ind: 0,
@@ -654,46 +656,23 @@ impl App {
         self.suggested_rpcs_ind = 0;
         self.current_completion = String::new();
         let line = self.input_state.value().to_string();
-        let mut suggestions = Vec::new();
-        if let Some(l) = self.rpc_lists.get(&self.current_route()) {
-            let mut sort_list = l.vec.clone();
-            if line.is_empty() {
-                // Get top-level names
-                sort_list.sort_by_key(|(x, _y)| x.clone());
-                for (name, _) in sort_list {
-                    if let Some((first, _rest)) = name.split_once('.') {
-                        let prefix = first.to_string() + "...";
-                        if suggestions.iter().all(|s| *s != prefix) {
-                            suggestions.push(prefix);
-                        }
-                    }
+
+        let suggestions: Vec<String> =
+            if let Some(registry) = self.rpc_registries.get(&self.current_route()) {
+                if line.is_empty() {
+                    registry
+                        .children_of("")
+                        .into_iter()
+                        .map(|s| s + "...")
+                        .collect()
+                } else {
+                    registry.search(&line)
                 }
             } else {
-                let mut sorted_rpcs: Vec<String> = sort_list
-                    .iter()
-                    .filter(|(word, _)| word.starts_with(&line))
-                    .map(|(word, _)| word.clone())
-                    .collect();
+                Vec::new()
+            };
 
-                let mut contains_rpc: Vec<String> = sort_list
-                    .iter()
-                    .filter(|(word, _)| word.contains(&line) && !word.starts_with(&line))
-                    .map(|(word, _)| word.clone())
-                    .collect();
-                sorted_rpcs.append(&mut contains_rpc);
-
-                for name in sorted_rpcs {
-                    suggestions.push(name.to_string());
-                }
-            }
-        }
-
-        self.suggested_rpcs = suggestions
-            .iter()
-            .filter(|word: &&String| word.to_string().contains(&line))
-            .map(String::clone)
-            .collect();
-
+        self.suggested_rpcs = VecDeque::from(suggestions);
         self.suggested_rpcs_len = self.suggested_rpcs.len();
         if !(1..=RPCLIST_MAX_LEN).contains(&self.suggested_rpcs_len) {
             self.suggested_rpcs.push_back(String::new());
@@ -764,6 +743,8 @@ impl App {
     }
 
     fn update_rpclists(&mut self, list: RpcList) {
+        let registry = RpcRegistry::from(&list);
+        self.rpc_registries.insert(list.route.clone(), registry);
         self.rpc_lists.insert(list.route.clone(), list);
     }
 
@@ -889,6 +870,7 @@ impl App {
                     (Some(list), Some(hash)) if list.hash == hash => {}
                     _ => {
                         self.rpc_lists.remove(&route);
+                        self.rpc_registries.remove(&route);
                         let _ = cache_req_tx.send(route);
                     }
                 };
@@ -1397,7 +1379,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             .split(area);
 
         if app.footer_height > 3 {
-            let rpcs: Vec<Span> = if app.rpc_lists.get(&app.current_route()).is_some() {
+            let rpcs: Vec<Span> = if app.rpc_registries.get(&app.current_route()).is_some() {
                 app.suggested_rpcs
                     .iter()
                     .map(|v| Span::raw(v.clone()))
