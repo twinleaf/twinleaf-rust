@@ -3,12 +3,12 @@
 // Build: cargo run --release -- <tio-url> [options]
 
 use std::{
+    cmp::min,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::File,
     io::{self, Read},
     str::FromStr,
     time::{Duration, Instant},
-    cmp::min,
 };
 
 use clap::Parser;
@@ -364,7 +364,8 @@ pub enum Action {
 
 #[derive(Debug, Clone)]
 pub enum HistDir {
-    Up, Down
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +421,7 @@ fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
         Some(m) => m,
         None => client
             .rpc(&req.route, "rpc.info", &req.method)
-            .map_err(|_| format!("Unknown RPC: {}", req.method))?
+            .map_err(|_| format!("Unknown RPC: {}", req.method))?,
     };
 
     let spec = util::parse_rpc_spec(meta, req.method.clone());
@@ -523,10 +524,10 @@ impl App {
             Action::SetMode(Mode::Normal) => {
                 self.mode = Mode::Normal;
                 self.input_state.blur();
-            },
-            Action::AutoCompleteTab=> {self.tab_complete()},
-            Action::AutoCompleteBack => {self.tab_back_complete()},
-            Action::NewCommandString => {self.update_command_list()}
+            }
+            Action::AutoCompleteTab => self.tab_complete(),
+            Action::AutoCompleteBack => self.tab_back_complete(),
+            Action::NewCommandString => self.update_command_list(),
             Action::SubmitCommand => self.submit_command(rpc_tx),
             Action::AcceptCompletion => self.accept_completion(),
             Action::HistoryNavigate(dir) => self.navigate_history(dir),
@@ -608,7 +609,9 @@ impl App {
                     rpc.clone()
                 } else if rpc.starts_with(self.input_state.value()) {
                     s.to_string()
-                } else {String::new()}
+                } else {
+                    String::new()
+                }
             }
             None => String::new(),
         };
@@ -619,14 +622,15 @@ impl App {
     fn tab_complete(&mut self) {
         let max = std::cmp::min(RPCLIST_MAX_LEN, (self.footer_height - 5).into());
         self.suggested_rpcs_ind = match (self.suggested_rpcs_ind, self.suggested_rpcs_len) {
-            (i, l) if i == l-1 => 0,
-            (i, l) if l <= max => i+1,
-            (i, _) if i < max / 2 => i+1,
-            (i, _) => { // middle of wrapped list, move list instead of index
+            (i, l) if i == l - 1 => 0,
+            (i, l) if l <= max => i + 1,
+            (i, _) if i < max / 2 => i + 1,
+            (i, _) => {
+                // middle of wrapped list, move list instead of index
                 let front = self.suggested_rpcs.pop_front().unwrap();
                 self.suggested_rpcs.push_back(front);
                 i
-            },
+            }
         };
         self.complete_command();
     }
@@ -634,13 +638,14 @@ impl App {
     fn tab_back_complete(&mut self) {
         let max = std::cmp::min(RPCLIST_MAX_LEN, (self.footer_height - 5).into());
         self.suggested_rpcs_ind = match (self.suggested_rpcs_ind, self.suggested_rpcs_len) {
-            (0, l) if l <= max => l-1,
-            (0, _) => { // 0, move list instead of index
+            (0, l) if l <= max => l - 1,
+            (0, _) => {
+                // 0, move list instead of index
                 let back = self.suggested_rpcs.pop_back().unwrap();
                 self.suggested_rpcs.push_front(back);
                 0
-            },
-            (i, _) => i-1,
+            }
+            (i, _) => i - 1,
         };
         self.complete_command();
     }
@@ -668,7 +673,7 @@ impl App {
                     .iter()
                     .filter(|(word, _)| word.starts_with(&line))
                     .map(|(word, _)| word.clone())
-                    .collect(); 
+                    .collect();
 
                 let mut contains_rpc: Vec<String> = sort_list
                     .iter()
@@ -687,8 +692,8 @@ impl App {
             .iter()
             .filter(|word: &&String| word.to_string().contains(&line))
             .map(String::clone)
-            .collect(); 
-        
+            .collect();
+
         self.suggested_rpcs_len = self.suggested_rpcs.len();
         if !(1..=RPCLIST_MAX_LEN).contains(&self.suggested_rpcs_len) {
             self.suggested_rpcs.push_back(String::new());
@@ -702,7 +707,11 @@ impl App {
         if self.current_completion.is_empty() {
             complete_command = self.suggested_rpcs[self.suggested_rpcs_ind].clone();
         } else {
-            complete_command = format!("{}{}", self.input_state.value().to_string(), self.current_completion);
+            complete_command = format!(
+                "{}{}",
+                self.input_state.value().to_string(),
+                self.current_completion
+            );
             complete_command = complete_command.replace("...", ".");
         }
         self.input_state = TextState::new().with_value(complete_command);
@@ -718,7 +727,9 @@ impl App {
         }
         // No completion: enter command
         let line = self.input_state.value().to_string();
-        if line.trim().is_empty() { return; }
+        if line.trim().is_empty() {
+            return;
+        }
         if self.cmd_history.last() != Some(&line) {
             self.cmd_history.push(line.clone());
         }
@@ -766,7 +777,10 @@ impl App {
         };
 
         self.input_state = TextState::new().with_value(
-            self.cmd_history.get(self.history_ptr).unwrap_or(&self.present_command).clone()
+            self.cmd_history
+                .get(self.history_ptr)
+                .unwrap_or(&self.present_command)
+                .clone(),
         );
         self.input_state.focus();
         self.input_state.move_end();
@@ -872,7 +886,7 @@ impl App {
                 event: DeviceEvent::NewHash(hash),
             } => {
                 match (self.rpc_lists.get(&route), hash) {
-                    (Some(list), Some(hash)) if list.hash == hash => {},
+                    (Some(list), Some(hash)) if list.hash == hash => {}
                     _ => {
                         self.rpc_lists.remove(&route);
                         let _ = cache_req_tx.send(route);
@@ -1045,29 +1059,31 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
         match app.mode {
             Mode::Command => match k.code {
                 KeyCode::Esc => Some(Action::SetMode(Mode::Normal)),
-                KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => Some(Action::SetMode(Mode::Normal)),
+                KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
+                    Some(Action::SetMode(Mode::Normal))
+                }
                 KeyCode::Tab => Some(Action::AutoCompleteTab),
                 KeyCode::BackTab => Some(Action::AutoCompleteBack),
                 KeyCode::Up => Some(Action::HistoryNavigate(HistDir::Up)),
                 KeyCode::Down => Some(Action::HistoryNavigate(HistDir::Down)),
                 KeyCode::Right if !app.current_completion.is_empty() => {
                     Some(Action::AcceptCompletion)
-                },
+                }
                 KeyCode::Right => {
                     app.input_state.handle_key_event(k);
                     None
-                },
+                }
                 KeyCode::Left => {
                     app.current_completion = String::new();
                     app.input_state.handle_key_event(k);
                     None
-                },
+                }
                 KeyCode::Enter => Some(Action::SubmitCommand),
                 KeyCode::Char('a') if k.modifiers == KeyModifiers::CONTROL => {
                     app.current_completion = String::new();
                     app.input_state.handle_key_event(k);
                     None
-                },
+                }
                 _ => {
                     app.input_state.handle_key_event(k);
                     Some(Action::NewCommandString)
@@ -1114,7 +1130,10 @@ fn draw_ui<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
         let (main_area, footer_area) = {
             let (main_constraint, footer_constraint) = if app.mode == Mode::Command {
                 if height >= 18 {
-                    (Constraint::Min(10), Constraint::Length(5 + app.rpc_list_len()))
+                    (
+                        Constraint::Min(10),
+                        Constraint::Length(5 + app.rpc_list_len()),
+                    )
                 } else if height >= 12 {
                     (Constraint::Min(2), Constraint::Length(8))
                 } else if height >= 5 {
@@ -1149,9 +1168,15 @@ fn draw_ui<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             (Some(main_area), None)
         };
 
-        if let Some(l) = left { render_monitor_panel(f, app, l, Instant::now()); }
-        if let Some(r) = right { render_graphics_panel(f, app, r); }
-        if let Some(foot) = footer_area { render_footer(f, app, foot); }
+        if let Some(l) = left {
+            render_monitor_panel(f, app, l, Instant::now());
+        }
+        if let Some(r) = right {
+            render_graphics_panel(f, app, r);
+        }
+        if let Some(foot) = footer_area {
+            render_footer(f, app, foot);
+        }
     })?;
     Ok(())
 }
@@ -1367,16 +1392,23 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             .constraints([
                 Constraint::Max(app.rpc_list_len() + 2),
                 Constraint::Length(std::cmp::min(1, app.footer_height - 1)),
-                Constraint::Length(if app.footer_height > 2 {2} else {1}),
+                Constraint::Length(if app.footer_height > 2 { 2 } else { 1 }),
             ])
             .split(area);
 
         if app.footer_height > 3 {
             let rpcs: Vec<Span> = if app.rpc_lists.get(&app.current_route()).is_some() {
-                app.suggested_rpcs.iter()
+                app.suggested_rpcs
+                    .iter()
                     .map(|v| Span::raw(v.clone()))
                     .enumerate()
-                    .map(|(i, v)| if i == app.suggested_rpcs_ind {v.bold()} else {v.dim()})
+                    .map(|(i, v)| {
+                        if i == app.suggested_rpcs_ind {
+                            v.bold()
+                        } else {
+                            v.dim()
+                        }
+                    })
                     .collect()
             } else {
                 vec![Span::from("Generating RPC list...")]
@@ -1386,9 +1418,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .title(Line::from(" RPCs ").left_aligned())
                 .title(Line::from(" ↑ Shift+Tab | Tab ↓ ").right_aligned());
-            f.render_widget(
-                List::new(rpcs).block(rpc_block), chunks[0],
-            );
+            f.render_widget(List::new(rpcs).block(rpc_block), chunks[0]);
         }
 
         if app.footer_height > 1 {
@@ -1426,20 +1456,25 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
         } else if app.blink_state {
             spans.push(Span::styled(" ", Style::default().bg(Color::White)));
             if !app.current_completion.is_empty() {
-                spans.push(Span::styled(&app.current_completion[1..],
-                        Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    &app.current_completion[1..],
+                    Style::default().fg(Color::Gray),
+                ));
             }
         } else {
-            spans.push(Span::styled(&app.current_completion,
-                    Style::default().fg(Color::Gray)));
+            spans.push(Span::styled(
+                &app.current_completion,
+                Style::default().fg(Color::Gray),
+            ));
         }
 
         let block = if app.footer_height < 3 {
             Block::default()
         } else {
-            Block::default().borders(Borders::TOP)
-                            .title(Line::from(" Command Mode ").left_aligned())
-                            .title(Line::from(" <Esc/Ctrl+C> ").right_aligned())
+            Block::default()
+                .borders(Borders::TOP)
+                .title(Line::from(" Command Mode ").left_aligned())
+                .title(Line::from(" <Esc/Ctrl+C> ").right_aligned())
         };
 
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), chunks[2]);
@@ -1843,25 +1878,24 @@ fn main() {
         }
     });
 
-
     // Cache thread
     let (cache_req_tx, cache_req_rx) = channel::unbounded::<DeviceRoute>();
     let (cache_resp_tx, cache_resp_rx) = channel::bounded::<RpcList>(1);
-    let cache_client = RpcClient::open(&proxy, parent_route.clone())
-        .expect("Failed to open RPC client");
+    let cache_client =
+        RpcClient::open(&proxy, parent_route.clone()).expect("Failed to open RPC client");
     std::thread::spawn(move || {
         while let Ok(req) = cache_req_rx.recv() {
             if let Ok(list) = cache_client.rpc_list(&req) {
                 if cache_resp_tx.send(list).is_err() {
-                    return
+                    return;
                 };
             }
         }
     });
 
     // RPC thread
-    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
-        .expect("Failed to open RPC client");
+    let rpc_client =
+        RpcClient::open(&proxy, parent_route.clone()).expect("Failed to open RPC client");
     let (rpc_tx, rpc_rx) = channel::bounded::<RpcReq>(1);
     let (rpc_resp_tx, rpc_resp_rx) = channel::bounded::<RpcResp>(1);
 

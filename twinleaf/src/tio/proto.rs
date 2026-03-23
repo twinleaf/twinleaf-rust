@@ -370,9 +370,15 @@ impl SettingsPayload {
         if content.len() < name_len.into() {
             return Err(too_small(full_data));
         }
-        let name = String::from_utf8(content[..name_len.into()].to_vec()).map_err(|_| Error::BadName)?;
+        let name =
+            String::from_utf8(content[..name_len.into()].to_vec()).map_err(|_| Error::BadName)?;
         let reply = (&content[name_len.into()..]).to_vec();
-        let pl = SettingsPayload { name_len, flags, name, reply };
+        let pl = SettingsPayload {
+            name_len,
+            flags,
+            name,
+            reply,
+        };
         Ok(pl)
     }
     fn serialize(&self) -> Result<Vec<u8>, ()> {
