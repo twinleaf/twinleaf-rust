@@ -115,7 +115,7 @@ impl DeviceTree {
                     for route in self.known_routes.iter() {
                         self.event_queue.push_back(TreeEvent::Device {
                             route: route.clone(),
-                            event: super::device::DeviceEvent::NewHash(None)
+                            event: super::device::DeviceEvent::NewHash(None),
                         });
                     }
                 }
@@ -140,17 +140,16 @@ impl DeviceTree {
                 });
             }
             tio::proto::Payload::Settings(set) => {
-                match set.name.as_str() {
-                    "rpc.hash" => {
-                        let hash = u32::from_le_bytes(set.reply.clone().try_into().unwrap());
-                        self.event_queue.push_back(TreeEvent::Device {
-                            route: absolute_route.clone(),
-                            event: super::device::DeviceEvent::NewHash(Some(hash)),
-                        });
-                    },
-                    _ => {},
+                let hash = match set {
+                    tio::proto::SettingsPayload::RpcHash(h) => Some(*h),
+                    tio::proto::SettingsPayload::Unknown { .. } => None,
+                };
+                if let Some(hash) = hash {
+                    self.event_queue.push_back(TreeEvent::Device {
+                        route: absolute_route.clone(),
+                        event: super::device::DeviceEvent::NewHash(Some(hash)),
+                    });
                 }
-
             }
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id == 7855 {

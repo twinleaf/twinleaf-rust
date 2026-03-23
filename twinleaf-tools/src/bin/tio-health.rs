@@ -4,7 +4,7 @@
 // Uses DeviceTree for automatic metadata handling.
 //
 // Build: cargo run --release -- <tio-url> [route] [options]
-// Quit:  q / Esc / Ctrl-C
+// Quit:  q / Ctrl-C
 
 use chrono::{DateTime, Local};
 use clap::Parser;
@@ -30,7 +30,124 @@ use twinleaf::{
         proto::{identifiers::StreamKey, DeviceRoute},
     },
 };
-use twinleaf_tools::HealthCli;
+use twinleaf_tools::TioOpts;
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "tio-health",
+    version,
+    about = "Live timing & rate diagnostics for TIO (Twinleaf) devices"
+)]
+struct HealthCli {
+    #[command(flatten)]
+    tio: TioOpts,
+
+    /// Time window in seconds for calculating jitter statistics
+    #[arg(
+        long = "jitter-window",
+        default_value = "10",
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Seconds for jitter calculation window (>= 1)"
+    )]
+    jitter_window: u64,
+
+    /// PPM threshold for yellow warning indicators
+    #[arg(
+        long = "ppm-warn",
+        default_value = "100",
+        value_name = "PPM",
+        value_parser = nonneg_f64,
+        help = "Warning threshold in parts per million (>= 0)"
+    )]
+    ppm_warn: f64,
+
+    /// PPM threshold for red error indicators
+    #[arg(
+        long = "ppm-err",
+        default_value = "200",
+        value_name = "PPM",
+        value_parser = nonneg_f64,
+        help = "Error threshold in parts per million (>= 0)"
+    )]
+    ppm_err: f64,
+
+    /// Filter to only show specific stream IDs (comma-separated)
+    #[arg(
+        long = "streams",
+        value_delimiter = ',',
+        value_name = "IDS",
+        value_parser = clap::value_parser!(u8),
+        help = "Comma-separated stream IDs to monitor (e.g., 0,1,5)"
+    )]
+    streams: Option<Vec<u8>>,
+
+    /// Suppress the footer help text
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
+
+    /// UI refresh rate for animations and stale detection (data updates are immediate)
+    #[arg(
+        long = "fps",
+        default_value = "30",
+        value_name = "FPS",
+        value_parser = clap::value_parser!(u64).range(1..=60),
+        help = "UI refresh rate for heartbeat animation and stale detection (1–60)"
+    )]
+    fps: u64,
+
+    /// Time in milliseconds before marking a stream as stale
+    #[arg(
+        long = "stale-ms",
+        default_value = "2000",
+        value_name = "MS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Mark streams as stale after this many milliseconds without data (>= 1)"
+    )]
+    stale_ms: u64,
+
+    /// Maximum number of events to keep in the event log
+    #[arg(
+        short = 'n',
+        long = "event-log-size",
+        default_value = "100",
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Maximum number of events to keep in history (>= 1)"
+    )]
+    event_log_size: u64,
+
+    /// Number of event lines to display on screen
+    #[arg(
+        long = "event-display-lines",
+        default_value = "8",
+        value_name = "LINES",
+        value_parser = clap::value_parser!(u16).range(3..),
+        help = "Number of event lines to show (>= 3)"
+    )]
+    event_display_lines: u16,
+
+    /// Only show warning and error events in the log
+    #[arg(short = 'w', long = "warnings-only")]
+    warnings_only: bool,
+}
+
+impl HealthCli {
+    fn stale_dur(&self) -> Duration {
+        Duration::from_millis(self.stale_ms)
+    }
+}
+
+fn nonneg_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if v < 0.0 {
+        Err("must be ≥ 0".into())
+    } else {
+        Ok(v)
+    }
+}
 
 #[derive(Default)]
 struct DeviceState {
@@ -101,14 +218,73 @@ impl TimeWindow {
     }
 }
 
+struct OnlineSlope {
+    n: u64,
+    sum_x: f64,
+    sum_y: f64,
+    sum_xx: f64,
+    sum_xy: f64,
+    x0: f64,
+    y0: f64,
+}
+
+impl Default for OnlineSlope {
+    fn default() -> Self {
+        Self {
+            n: 0,
+            sum_x: 0.0,
+            sum_y: 0.0,
+            sum_xx: 0.0,
+            sum_xy: 0.0,
+            x0: 0.0,
+            y0: 0.0,
+        }
+    }
+}
+
+impl OnlineSlope {
+    fn push(&mut self, x: f64, y: f64) {
+        if self.n == 0 {
+            self.x0 = x;
+            self.y0 = y;
+        }
+        let dx = x - self.x0;
+        let dy = y - self.y0;
+        self.n += 1;
+        self.sum_x += dx;
+        self.sum_y += dy;
+        self.sum_xx += dx * dx;
+        self.sum_xy += dx * dy;
+    }
+
+    fn slope(&self) -> Option<f64> {
+        if self.n < 2 {
+            return None;
+        }
+        let denom = self.n as f64 * self.sum_xx - self.sum_x * self.sum_x;
+        if denom.abs() < f64::EPSILON {
+            return None;
+        }
+        Some((self.n as f64 * self.sum_xy - self.sum_x * self.sum_y) / denom)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+const MIN_DRIFT_SAMPLES: u64 = 50;
+
 #[derive(Default)]
 struct StreamStats {
-    t0_host: Option<Instant>,
-    t0_data: Option<f64>,
-    last_host: Option<Instant>,
-    last_data: Option<f64>,
+    host_epoch: Option<Instant>,
+
+    drift_slope: OnlineSlope,
     drift_s: f64,
     ppm: f64,
+
+    last_host: Option<Instant>,
+    last_data: Option<f64>,
     jitter_ms: f64,
     jitter_window: Option<TimeWindow>,
 
@@ -116,7 +292,8 @@ struct StreamStats {
     samples_dropped: u64,
     current_session_id: Option<u32>,
 
-    arrivals: VecDeque<Instant>,
+    rate_slope: OnlineSlope,
+    received_count: u64,
     rate_smps: f64,
 
     name: String,
@@ -125,14 +302,12 @@ struct StreamStats {
 
 impl StreamStats {
     fn on_sample(&mut self, sample_n: u32, t_data: f64, now: Instant, jitter_window_s: u64) {
-        if self.t0_host.is_none() {
-            self.t0_host = Some(now);
+        if self.host_epoch.is_none() {
+            self.host_epoch = Some(now);
         }
-        if self.t0_data.is_none() {
-            self.t0_data = Some(t_data);
-        }
+        let host_time = now.duration_since(self.host_epoch.unwrap()).as_secs_f64();
 
-        // Jitter
+        // Jitter (unchanged)
         if self.jitter_window.is_none() {
             self.jitter_window = Some(TimeWindow::new(jitter_window_s, 100.0));
         }
@@ -144,56 +319,44 @@ impl StreamStats {
                 self.jitter_ms = w.std_ms();
             }
         }
-
         self.last_host = Some(now);
         self.last_data = Some(t_data);
 
-        if let (Some(h0), Some(d0)) = (self.t0_host, self.t0_data) {
-            let host_elapsed = now.duration_since(h0).as_secs_f64();
-            let data_elapsed = t_data - d0;
-            self.drift_s = data_elapsed - host_elapsed;
-            // Only calculate PPM after 0.5 seconds to avoid startup noise
-            if host_elapsed >= 0.5 {
-                self.ppm = 1e6 * self.drift_s / host_elapsed;
+        // Drift / PPM via incremental OLS
+        self.drift_slope.push(host_time, t_data);
+        if self.drift_slope.n >= MIN_DRIFT_SAMPLES {
+            if let Some(beta) = self.drift_slope.slope() {
+                let host_elapsed = host_time - self.drift_slope.x0;
+                self.drift_s = (beta - 1.0) * host_elapsed;
+                self.ppm = (beta - 1.0) * 1e6;
             }
+        }
+
+        // Rate via incremental OLS
+        self.received_count += 1;
+        self.rate_slope.push(host_time, self.received_count as f64);
+        if let Some(slope) = self.rate_slope.slope() {
+            self.rate_smps = slope;
         }
 
         self.last_n = Some(sample_n);
-        self.arrivals.push_back(now);
-    }
-
-    fn compute_rate(&mut self, now: Instant, window: Duration) {
-        let cutoff = now.checked_sub(window).unwrap_or(now);
-        while self.arrivals.front().map(|&t| t < cutoff).unwrap_or(false) {
-            self.arrivals.pop_front();
-        }
-
-        self.rate_smps = match (self.arrivals.front(), self.arrivals.back()) {
-            (Some(from), Some(to)) if from < to => {
-                (self.arrivals.len() - 1) as f64 / to.duration_since(*from).as_secs_f64()
-            }
-            _ => 0.0,
-        };
     }
 
     fn reset_timing(&mut self) {
-        self.t0_host = None;
-        self.t0_data = None;
-        self.last_host = None;
-        self.last_data = None;
+        self.drift_slope.reset();
         self.drift_s = 0.0;
         self.ppm = 0.0;
+        self.last_host = None;
+        self.last_data = None;
         self.jitter_ms = 0.0;
         self.jitter_window = None;
         self.last_n = None;
-        self.arrivals.clear();
     }
 
     fn reset_for_new_session(&mut self, session_id: u32) {
         self.reset_timing();
         self.samples_dropped = 0;
         self.current_session_id = Some(session_id);
-        self.arrivals.clear();
     }
 
     fn is_stale(&self, now: Instant, stale_dur: Duration) -> bool {
@@ -279,6 +442,9 @@ fn handle_boundary(
                 cap,
             );
             st.reset_timing();
+            st.rate_slope.reset();
+            st.received_count = 0;
+            st.rate_smps = 0.0;
         }
         BoundaryReason::TimeRefSessionChanged { old, new } => {
             log_event(
@@ -326,6 +492,7 @@ struct DisplayRow {
     samples_dropped: u64,
     last_n: Option<u32>,
     last_data: Option<f64>,
+    elapsed_time: Option<f64>,
     status: &'static str,
     color: Color,
 }
@@ -351,6 +518,10 @@ impl DisplayRow {
             (Color::Green, "OK")
         };
 
+        let elapsed_time = st
+            .host_epoch
+            .map(|epoch| now.duration_since(epoch).as_secs_f64());
+
         DisplayRow {
             route,
             stream_id,
@@ -362,24 +533,34 @@ impl DisplayRow {
             samples_dropped: st.samples_dropped,
             last_n: st.last_n,
             last_data: st.last_data,
+            elapsed_time,
             status,
             color,
         }
     }
 
-    fn to_table_row(&self) -> Row<'static> {
+    fn to_table_row(&self, show_ppm: bool, show_sample_time: bool) -> Row<'static> {
         let style = Style::default().fg(self.color);
+        let drift_cell = if show_ppm {
+            Cell::from(format!("{:.2}", self.ppm))
+        } else {
+            Cell::from(format!("{:.4}", self.drift_s))
+        };
+        let time_cell = if show_sample_time {
+            Cell::from(format!("{:.3}", self.last_data.unwrap_or(0.0)))
+        } else {
+            Cell::from(format!("{:.1}", self.elapsed_time.unwrap_or(0.0)))
+        };
         Row::new(vec![
             Cell::from(self.route.clone()).style(style),
             Cell::from(format!("{}", self.stream_id)).style(style),
             Cell::from(self.name.clone()).style(style),
             Cell::from(format!("{:.1}", self.rate_smps)).style(style),
-            Cell::from(format!("{:.3}", self.drift_s)).style(style),
-            Cell::from(format!("{:.0}", self.ppm)).style(style),
+            drift_cell.style(style),
             Cell::from(format!("{:.2}", self.jitter_ms)).style(style),
             Cell::from(format!("{}", self.samples_dropped)).style(style),
             Cell::from(format!("{}", self.last_n.unwrap_or(0))).style(style),
-            Cell::from(format!("{:.3}", self.last_data.unwrap_or(0.0))).style(style),
+            time_cell.style(style),
             Cell::from(self.status).style(style),
         ])
     }
@@ -392,18 +573,22 @@ fn draw_ui(
     event_log: &VecDeque<LoggedEvent>,
     event_scroll_offset: usize,
     show_heartbeat: bool,
+    show_ppm: bool,
+    show_sample_time: bool,
     cli: &HealthCli,
 ) -> io::Result<()> {
     let now = Instant::now();
-    let rate_window = cli.rate_window_dur();
     let stale_dur = cli.stale_dur();
 
     let mut rows: Vec<DisplayRow> = stats
         .iter_mut()
         .map(|(key, st)| {
-            st.compute_rate(now, rate_window);
-            if st.is_stale(now, stale_dur) && st.t0_host.is_some() {
+            if st.is_stale(now, stale_dur) && st.drift_slope.n > 0 {
                 st.reset_timing();
+                st.rate_slope.reset();
+                st.received_count = 0;
+                st.rate_smps = 0.0;
+                st.host_epoch = None;
             }
             DisplayRow::from_stats(
                 key.route.to_string(),
@@ -453,8 +638,8 @@ fn draw_ui(
 
         // Header
         let header_text = format!(
-            "tio-health — rate={}s  jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
-            cli.rate_window, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
+            "tio-health — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
+            cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
         );
         f.render_widget(
             Paragraph::new(header_text).style(Style::default().add_modifier(Modifier::BOLD)),
@@ -470,21 +655,27 @@ fn draw_ui(
         }
 
         // Table
+        let drift_header = if show_ppm { "ppm" } else { "drift(s)" };
+        let time_header = if show_sample_time {
+            "sample_time"
+        } else {
+            "elapsed(s)"
+        };
+
         let header_cells = [
             "route",
             "sid",
             "stream",
             "smps/s",
-            "drift(s)",
-            "ppm",
+            drift_header,
             "jitter(ms)",
             "dropped",
             "last_n",
-            "last_time",
+            time_header,
             "status",
         ]
-        .iter()
-        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+        .into_iter()
+        .map(|h| Cell::from(h).style(Style::default().add_modifier(Modifier::BOLD)));
 
         let widths = [
             Constraint::Length(10),
@@ -492,7 +683,6 @@ fn draw_ui(
             Constraint::Length(20),
             Constraint::Length(9),
             Constraint::Length(9),
-            Constraint::Length(8),
             Constraint::Length(11),
             Constraint::Length(8),
             Constraint::Length(10),
@@ -501,7 +691,9 @@ fn draw_ui(
         ];
 
         let table = Table::new(
-            rows.iter().map(|r| r.to_table_row()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.to_table_row(show_ppm, show_sample_time))
+                .collect::<Vec<_>>(),
             widths,
         )
         .header(Row::new(header_cells).height(1))
@@ -559,10 +751,16 @@ fn draw_ui(
             } else {
                 "h:show heartbeat"
             };
+            let drift_hint = if show_ppm { "p:drift" } else { "p:ppm" };
+            let time_hint = if show_sample_time {
+                "s:elapsed"
+            } else {
+                "s:sample"
+            };
             f.render_widget(
                 Paragraph::new(format!(
-                    "q/Esc to quit  |  {}  |  ↑/↓/PgUp/PgDn to scroll",
-                    heartbeat_hint
+                    "q/Ctrl+C to quit  |  {}  {}  {}  |  ↑/↓/PgUp/PgDn to scroll",
+                    heartbeat_hint, drift_hint, time_hint
                 ))
                 .style(Style::default().fg(Color::Gray)),
                 chunks[4],
@@ -599,25 +797,6 @@ fn main() {
     std::thread::spawn(move || {
         let mut tree = tree;
 
-        // Warmup period
-        let warmup_end = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < warmup_end {
-            match tree.try_next_item() {
-                Ok(Some(item)) => {
-                    if data_tx.send(DataMsg::Item(item)).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => {
-                    let _ = data_tx.send(DataMsg::Error(format!("{:?}", e)));
-                    return;
-                }
-            }
-        }
-
         // Main loop - blocking on next_item()
         loop {
             match tree.next_item() {
@@ -649,6 +828,8 @@ fn main() {
     let mut event_log: VecDeque<LoggedEvent> = VecDeque::new();
     let mut event_scroll_offset: usize = 0;
     let mut show_heartbeat: bool = false;
+    let mut show_ppm: bool = true;
+    let mut show_sample_time: bool = true;
 
     let streams_filter = cli.streams.clone();
     let jitter_window_s = cli.jitter_window;
@@ -722,6 +903,19 @@ fn main() {
                                     Color::Yellow,
                                     event_log_cap,
                                 );
+                                // On disconnect, reset all timing state for streams on this route
+                                // so that rate/drift don't carry stale data into the next session.
+                                if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
+                                    for (key, st) in stats.iter_mut() {
+                                        if key.route == route {
+                                            st.reset_timing();
+                                            st.rate_slope.reset();
+                                            st.received_count = 0;
+                                            st.rate_smps = 0.0;
+                                            st.host_epoch = None;
+                                        }
+                                    }
+                                }
                                 needs_redraw = true;
                             }
                             TreeEvent::Device { route, event: DeviceEvent::RpcInvalidated(method) } => {
@@ -775,7 +969,7 @@ fn main() {
                 if let Ok(Event::Key(k)) = ev {
                     if k.kind != KeyEventKind::Press { continue; }
 
-                    if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+                    if matches!(k.code, KeyCode::Char('q'))
                         || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL)
                     {
                         break 'main;
@@ -791,6 +985,14 @@ fn main() {
                     match k.code {
                         KeyCode::Char('h') => {
                             show_heartbeat = !show_heartbeat;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('p') => {
+                            show_ppm = !show_ppm;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('s') => {
+                            show_sample_time = !show_sample_time;
                             needs_redraw = true;
                         }
                         KeyCode::Up => {
@@ -843,6 +1045,8 @@ fn main() {
                 &event_log,
                 event_scroll_offset,
                 show_heartbeat,
+                show_ppm,
+                show_sample_time,
                 &cli,
             )
             .is_err()

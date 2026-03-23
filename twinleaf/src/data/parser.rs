@@ -268,6 +268,17 @@ impl DeviceStream {
             });
         }
 
+        // Rate changed?
+        if (new_rate - self.effective_rate).abs() > 1e-9 {
+            return Some(Boundary {
+                reason: BoundaryReason::RateChanged {
+                    old_rate: self.effective_rate,
+                    new_rate,
+                },
+                prior,
+            });
+        }
+
         let half_period = 0.5 / new_rate;
 
         // Time went backward?
@@ -275,17 +286,6 @@ impl DeviceStream {
             return Some(Boundary {
                 reason: BoundaryReason::TimeBackward {
                     gap_seconds: self.last_timestamp - first_timestamp,
-                },
-                prior,
-            });
-        }
-
-        // Rate changed?
-        if (new_rate - self.effective_rate).abs() > 1e-9 {
-            return Some(Boundary {
-                reason: BoundaryReason::RateChanged {
-                    old_rate: self.effective_rate,
-                    new_rate,
                 },
                 prior,
             });
@@ -348,7 +348,28 @@ impl DeviceStream {
             return vec![];
         }
 
+        let expected_sample_size = self
+            .columns
+            .last()
+            .map(|col| col.offset + col.metadata.data_type.size())
+            .unwrap_or(0);
+        if expected_sample_size > stream.sample_size {
+            return vec![];
+        }
+        if stream.sample_size == 0 {
+            return vec![];
+        }
+        if data.data.len() % stream.sample_size != 0 {
+            return vec![];
+        }
+
         let segment = self.segment.as_ref().unwrap().clone();
+        if segment.decimation == 0 || segment.sampling_rate == 0 {
+            return vec![];
+        }
+        if stream.n_segments == 0 {
+            return vec![];
+        }
         let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
 
         let (segment, is_segment_rollover) = if segment.segment_id != data.segment_id {

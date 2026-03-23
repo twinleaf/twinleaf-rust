@@ -1,7 +1,7 @@
-use crate::device::rpc::{DecodeError, EncodeError, RpcDataKind, RpcMeta, RpcValue};
+use crate::device::rpc::{DecodeError, EncodeError, RpcDescriptor, RpcValue, RpcValueType};
 use crate::tio::proxy;
 
-pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcMeta>, proxy::RpcError> {
+pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcDescriptor>, proxy::RpcError> {
     let nrpcs: u16 = device.get("rpc.listinfo")?;
     let mut specs = Vec::with_capacity(nrpcs as usize);
 
@@ -13,7 +13,7 @@ pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcMeta>, proxy::RpcEr
     Ok(specs)
 }
 
-pub fn parse_rpc_spec(meta: u16, name: String) -> RpcMeta {
+pub fn parse_rpc_spec(meta: u16, name: String) -> RpcDescriptor {
     let data_type = meta & 0x000F; // low 4 bits
     let data_size = ((meta >> 4) & 0x000F) as u8; // next 4 bits
 
@@ -23,37 +23,37 @@ pub fn parse_rpc_spec(meta: u16, name: String) -> RpcMeta {
     let unknown = meta == 0;
 
     let data_kind = if unknown {
-        RpcDataKind::Raw { meta }
+        RpcValueType::Raw { meta }
     } else {
         match data_type {
             0 => {
                 // unsigned integer
                 match data_size {
-                    0 => RpcDataKind::Unit,
-                    1 | 2 | 4 | 8 => RpcDataKind::Int {
+                    0 => RpcValueType::Unit,
+                    1 | 2 | 4 | 8 => RpcValueType::Int {
                         signed: false,
                         size: data_size,
                     },
-                    _ => RpcDataKind::Raw { meta },
+                    _ => RpcValueType::Raw { meta },
                 }
             }
             1 => {
                 // signed integer
                 match data_size {
-                    0 => RpcDataKind::Unit,
-                    1 | 2 | 4 | 8 => RpcDataKind::Int {
+                    0 => RpcValueType::Unit,
+                    1 | 2 | 4 | 8 => RpcValueType::Int {
                         signed: true,
                         size: data_size,
                     },
-                    _ => RpcDataKind::Raw { meta },
+                    _ => RpcValueType::Raw { meta },
                 }
             }
             2 => {
                 // float
                 match data_size {
-                    4 | 8 => RpcDataKind::Float { size: data_size },
-                    0 => RpcDataKind::Unit,
-                    _ => RpcDataKind::Raw { meta },
+                    4 | 8 => RpcValueType::Float { size: data_size },
+                    0 => RpcValueType::Unit,
+                    _ => RpcValueType::Raw { meta },
                 }
             }
             3 => {
@@ -63,15 +63,15 @@ pub fn parse_rpc_spec(meta: u16, name: String) -> RpcMeta {
                 } else {
                     Some(data_size as u16)
                 };
-                RpcDataKind::String { max_len }
+                RpcValueType::String { max_len }
             }
-            _ => RpcDataKind::Raw { meta },
+            _ => RpcValueType::Raw { meta },
         }
     };
 
     let segments = name.split('.').map(|s| s.to_string()).collect();
 
-    RpcMeta {
+    RpcDescriptor {
         full_name: name,
         segments,
         data_kind,
@@ -82,9 +82,9 @@ pub fn parse_rpc_spec(meta: u16, name: String) -> RpcMeta {
     }
 }
 
-pub fn rpc_encode_arg(input: &str, kind: &RpcDataKind) -> Result<Vec<u8>, EncodeError> {
+pub fn rpc_encode_arg(input: &str, kind: &RpcValueType) -> Result<Vec<u8>, EncodeError> {
     match kind {
-        RpcDataKind::Unit => {
+        RpcValueType::Unit => {
             if input.is_empty() {
                 Ok(Vec::new())
             } else {
@@ -92,7 +92,7 @@ pub fn rpc_encode_arg(input: &str, kind: &RpcDataKind) -> Result<Vec<u8>, Encode
             }
         }
 
-        RpcDataKind::String { max_len } => {
+        RpcValueType::String { max_len } => {
             if let Some(max) = max_len {
                 if input.len() > *max as usize {
                     return Err(EncodeError::StringTooLong {
@@ -104,7 +104,7 @@ pub fn rpc_encode_arg(input: &str, kind: &RpcDataKind) -> Result<Vec<u8>, Encode
             Ok(input.as_bytes().to_vec())
         }
 
-        RpcDataKind::Int {
+        RpcValueType::Int {
             signed: false,
             size,
         } => match *size {
@@ -115,7 +115,7 @@ pub fn rpc_encode_arg(input: &str, kind: &RpcDataKind) -> Result<Vec<u8>, Encode
             s => Err(EncodeError::UnsupportedIntSize(s)),
         },
 
-        RpcDataKind::Int { signed: true, size } => match *size {
+        RpcValueType::Int { signed: true, size } => match *size {
             1 => Ok(input.parse::<i8>()?.to_le_bytes().to_vec()),
             2 => Ok(input.parse::<i16>()?.to_le_bytes().to_vec()),
             4 => Ok(input.parse::<i32>()?.to_le_bytes().to_vec()),
@@ -123,28 +123,28 @@ pub fn rpc_encode_arg(input: &str, kind: &RpcDataKind) -> Result<Vec<u8>, Encode
             s => Err(EncodeError::UnsupportedIntSize(s)),
         },
 
-        RpcDataKind::Float { size } => match *size {
+        RpcValueType::Float { size } => match *size {
             4 => Ok(input.parse::<f32>()?.to_le_bytes().to_vec()),
             8 => Ok(input.parse::<f64>()?.to_le_bytes().to_vec()),
             s => Err(EncodeError::UnsupportedFloatSize(s)),
         },
 
-        RpcDataKind::Raw { .. } => Ok(Vec::new()),
+        RpcValueType::Raw { .. } => Ok(Vec::new()),
     }
 }
 
-pub fn rpc_decode_reply(reply: &[u8], kind: &RpcDataKind) -> Result<RpcValue, DecodeError> {
+pub fn rpc_decode_reply(reply: &[u8], kind: &RpcValueType) -> Result<RpcValue, DecodeError> {
     match kind {
-        RpcDataKind::Unit => Ok(RpcValue::Unit),
+        RpcValueType::Unit => Ok(RpcValue::Unit),
 
-        RpcDataKind::String { .. } => {
+        RpcValueType::String { .. } => {
             match std::str::from_utf8(reply) {
                 Ok(s) => Ok(RpcValue::Str(s.to_owned())),
                 Err(_) => Ok(RpcValue::Bytes(reply.to_vec())), // keep bytes if not UTF-8
             }
         }
 
-        RpcDataKind::Int {
+        RpcValueType::Int {
             signed: false,
             size,
         } => match *size {
@@ -193,7 +193,7 @@ pub fn rpc_decode_reply(reply: &[u8], kind: &RpcDataKind) -> Result<RpcValue, De
             s => Err(DecodeError::UnsupportedIntSize(s)),
         },
 
-        RpcDataKind::Int { signed: true, size } => match *size {
+        RpcValueType::Int { signed: true, size } => match *size {
             1 => {
                 if reply.len() < 1 {
                     return Err(DecodeError::InsufficientBytes {
@@ -239,7 +239,7 @@ pub fn rpc_decode_reply(reply: &[u8], kind: &RpcDataKind) -> Result<RpcValue, De
             s => Err(DecodeError::UnsupportedIntSize(s)),
         },
 
-        RpcDataKind::Float { size } => match *size {
+        RpcValueType::Float { size } => match *size {
             4 => {
                 if reply.len() < 4 {
                     return Err(DecodeError::InsufficientBytes {
@@ -265,19 +265,19 @@ pub fn rpc_decode_reply(reply: &[u8], kind: &RpcDataKind) -> Result<RpcValue, De
             s => Err(DecodeError::UnsupportedFloatSize(s)),
         },
 
-        RpcDataKind::Raw { .. } => Ok(RpcValue::Bytes(reply.to_vec())),
+        RpcValueType::Raw { .. } => Ok(RpcValue::Bytes(reply.to_vec())),
     }
 }
 
-pub fn format_rpc_value_for_cli(v: &RpcValue, kind: &RpcDataKind) -> String {
+pub fn format_rpc_value_for_cli(v: &RpcValue, kind: &RpcValueType) -> String {
     match (v, kind) {
         (RpcValue::Unit, _) => "OK".to_string(),
 
         (RpcValue::Str(s), _) => format!("\"{}\" {:?}", s, s.as_bytes()),
 
-        (RpcValue::U64(n), RpcDataKind::Int { signed: false, .. }) => format!("{}", n),
-        (RpcValue::I64(n), RpcDataKind::Int { signed: true, .. }) => format!("{}", n),
-        (RpcValue::F64(x), RpcDataKind::Float { .. }) => format!("{}", x),
+        (RpcValue::U64(n), RpcValueType::Int { signed: false, .. }) => format!("{}", n),
+        (RpcValue::I64(n), RpcValueType::Int { signed: true, .. }) => format!("{}", n),
+        (RpcValue::F64(x), RpcValueType::Float { .. }) => format!("{}", x),
 
         (RpcValue::Bytes(b), _) => format!("{:?}", b),
         (other, _) => format!("{:?}", other),
