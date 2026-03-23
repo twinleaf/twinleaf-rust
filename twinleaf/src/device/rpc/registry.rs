@@ -117,6 +117,7 @@ impl RpcNode {
 pub struct RpcRegistry {
     root: RpcNode,
     names: Vec<String>,
+    pub hash: Option<u32>,
 }
 
 impl RpcRegistry {
@@ -128,7 +129,11 @@ impl RpcRegistry {
             let segments = spec.segments.clone();
             root.insert(&segments, spec);
         }
-        Self { root, names }
+        Self {
+            root,
+            names,
+            hash: None,
+        }
     }
 
     pub fn find(&self, name: &str) -> Option<&RpcDescriptor> {
@@ -194,6 +199,8 @@ impl From<&RpcList> for RpcRegistry {
             .iter()
             .map(|(name, meta)| util::parse_rpc_spec(*meta, name.clone()))
             .collect();
-        Self::new(specs)
+        let mut registry = Self::new(specs);
+        registry.hash = Some(list.hash);
+        registry
     }
 }
