@@ -268,6 +268,17 @@ impl DeviceStream {
             });
         }
 
+        // Rate changed?
+        if (new_rate - self.effective_rate).abs() > 1e-9 {
+            return Some(Boundary {
+                reason: BoundaryReason::RateChanged {
+                    old_rate: self.effective_rate,
+                    new_rate,
+                },
+                prior,
+            });
+        }
+
         let half_period = 0.5 / new_rate;
 
         // Time went backward?
@@ -275,17 +286,6 @@ impl DeviceStream {
             return Some(Boundary {
                 reason: BoundaryReason::TimeBackward {
                     gap_seconds: self.last_timestamp - first_timestamp,
-                },
-                prior,
-            });
-        }
-
-        // Rate changed?
-        if (new_rate - self.effective_rate).abs() > 1e-9 {
-            return Some(Boundary {
-                reason: BoundaryReason::RateChanged {
-                    old_rate: self.effective_rate,
-                    new_rate,
                 },
                 prior,
             });
