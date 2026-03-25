@@ -991,25 +991,29 @@ impl App {
 
         let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
         let sd = welch.periodogram();
-        let raw: Vec<f64> = sd.iter().copied().collect();
-
         let pts: Vec<(f64, f64)> = sd
             .frequency()
             .into_iter()
-            .zip(raw.into_iter())
-            .filter(|(f, d)| *f > 0.0 && d.is_finite() && *d > 0.0)
+            .zip(sd.iter().copied())
+            .filter_map(|(f, d)| {
+                if f > 0.0 && d.is_finite() && d > 0.0 {
+                    Some((f, d.sqrt()))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         if pts.is_empty() {
             return None;
         }
 
-        let mut densities: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
-        densities.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_asd = if densities.len() % 2 == 0 {
-            (densities[densities.len() / 2 - 1] + densities[densities.len() / 2]) / 2.0
+        let mut asd_values: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
+        asd_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_asd = if asd_values.len() % 2 == 0 {
+            (asd_values[asd_values.len() / 2 - 1] + asd_values[asd_values.len() / 2]) / 2.0
         } else {
-            densities[densities.len() / 2]
+            asd_values[asd_values.len() / 2]
         };
 
         Some((pts, median_asd))
