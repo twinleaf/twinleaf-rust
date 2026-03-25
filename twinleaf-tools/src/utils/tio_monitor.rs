@@ -36,7 +36,7 @@ use twinleaf::{
         },
     },
 };
-use twinleaf_tools::TioOpts;
+use crate::TioOpts;
 use welch_sde::{Build, SpectralDensity};
 
 #[derive(Parser, Debug)]
@@ -1825,10 +1825,9 @@ fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
     it.get(k)
         .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
 }
-fn main() {
-    let cli = Cli::parse();
-    let proxy = tio::proxy::Interface::new(&cli.tio.root);
-    let parent_route: DeviceRoute = cli.tio.parse_route();
+pub fn run_monitor(tio: TioOpts, all: bool, fps: u32, colors: Option<String>) -> Result<(), ()> {
+    let proxy = tio::proxy::Interface::new(&tio.root);
+    let parent_route: DeviceRoute = tio.parse_route();
 
     // Data thread
     let (data_tx, data_rx) = channel::unbounded::<TreeItem>();
@@ -1885,8 +1884,8 @@ fn main() {
     });
 
     // App state
-    let mut app = App::new(cli.all, &parent_route);
-    if let Some(path) = &cli.colors {
+    let mut app = App::new(all, &parent_route);
+    if let Some(path) = &colors {
         if let Ok(theme) = load_theme(path) {
             app.view.theme = theme;
         } else {
@@ -1899,7 +1898,7 @@ fn main() {
     // UI
     let mut term = ratatui::init();
     let _ = term.hide_cursor();
-    let ui_tick = channel::tick(Duration::from_millis(1000 / cli.fps as u64));
+    let ui_tick = channel::tick(Duration::from_millis(1000 / fps as u64));
 
     'main: loop {
         crossbeam::select! {
@@ -1955,4 +1954,5 @@ fn main() {
     }
 
     ratatui::restore();
+    Ok(())
 }

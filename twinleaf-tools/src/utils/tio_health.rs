@@ -7,7 +7,6 @@
 // Quit:  q / Ctrl-C
 
 use chrono::{DateTime, Local};
-use clap::Parser;
 use crossbeam::channel;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -30,124 +29,7 @@ use twinleaf::{
         proto::{identifiers::StreamKey, DeviceRoute},
     },
 };
-use twinleaf_tools::TioOpts;
-
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "tio-health",
-    version,
-    about = "Live timing & rate diagnostics for TIO (Twinleaf) devices"
-)]
-struct HealthCli {
-    #[command(flatten)]
-    tio: TioOpts,
-
-    /// Time window in seconds for calculating jitter statistics
-    #[arg(
-        long = "jitter-window",
-        default_value = "10",
-        value_name = "SECONDS",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Seconds for jitter calculation window (>= 1)"
-    )]
-    jitter_window: u64,
-
-    /// PPM threshold for yellow warning indicators
-    #[arg(
-        long = "ppm-warn",
-        default_value = "100",
-        value_name = "PPM",
-        value_parser = nonneg_f64,
-        help = "Warning threshold in parts per million (>= 0)"
-    )]
-    ppm_warn: f64,
-
-    /// PPM threshold for red error indicators
-    #[arg(
-        long = "ppm-err",
-        default_value = "200",
-        value_name = "PPM",
-        value_parser = nonneg_f64,
-        help = "Error threshold in parts per million (>= 0)"
-    )]
-    ppm_err: f64,
-
-    /// Filter to only show specific stream IDs (comma-separated)
-    #[arg(
-        long = "streams",
-        value_delimiter = ',',
-        value_name = "IDS",
-        value_parser = clap::value_parser!(u8),
-        help = "Comma-separated stream IDs to monitor (e.g., 0,1,5)"
-    )]
-    streams: Option<Vec<u8>>,
-
-    /// Suppress the footer help text
-    #[arg(short = 'q', long = "quiet")]
-    quiet: bool,
-
-    /// UI refresh rate for animations and stale detection (data updates are immediate)
-    #[arg(
-        long = "fps",
-        default_value = "30",
-        value_name = "FPS",
-        value_parser = clap::value_parser!(u64).range(1..=60),
-        help = "UI refresh rate for heartbeat animation and stale detection (1–60)"
-    )]
-    fps: u64,
-
-    /// Time in milliseconds before marking a stream as stale
-    #[arg(
-        long = "stale-ms",
-        default_value = "2000",
-        value_name = "MS",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Mark streams as stale after this many milliseconds without data (>= 1)"
-    )]
-    stale_ms: u64,
-
-    /// Maximum number of events to keep in the event log
-    #[arg(
-        short = 'n',
-        long = "event-log-size",
-        default_value = "100",
-        value_name = "N",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Maximum number of events to keep in history (>= 1)"
-    )]
-    event_log_size: u64,
-
-    /// Number of event lines to display on screen
-    #[arg(
-        long = "event-display-lines",
-        default_value = "8",
-        value_name = "LINES",
-        value_parser = clap::value_parser!(u16).range(3..),
-        help = "Number of event lines to show (>= 3)"
-    )]
-    event_display_lines: u16,
-
-    /// Only show warning and error events in the log
-    #[arg(short = 'w', long = "warnings-only")]
-    warnings_only: bool,
-}
-
-impl HealthCli {
-    fn stale_dur(&self) -> Duration {
-        Duration::from_millis(self.stale_ms)
-    }
-}
-
-fn nonneg_f64(s: &str) -> Result<f64, String> {
-    let v: f64 = s
-        .parse()
-        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
-    if v < 0.0 {
-        Err("must be ≥ 0".into())
-    } else {
-        Ok(v)
-    }
-}
+use crate::HealthCli;
 
 #[derive(Default)]
 struct DeviceState {
@@ -776,12 +658,11 @@ enum DataMsg {
     Error(String),
 }
 
-fn main() {
-    let cli = HealthCli::parse();
+pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
     let mut terminal = ratatui::init();
 
-    let proxy = tio::proxy::Interface::new(&cli.tio.root);
-    let root_route = cli.tio.parse_route();
+    let proxy = tio::proxy::Interface::new(&health_cli.tio.root);
+    let root_route = health_cli.tio.parse_route();
 
     let tree = match DeviceTree::open(&proxy, root_route) {
         Ok(t) => t,
@@ -831,11 +712,11 @@ fn main() {
     let mut show_ppm: bool = true;
     let mut show_sample_time: bool = true;
 
-    let streams_filter = cli.streams.clone();
-    let jitter_window_s = cli.jitter_window;
-    let event_log_cap = cli.event_log_size as usize;
+    let streams_filter = health_cli.streams.clone();
+    let jitter_window_s = health_cli.jitter_window;
+    let event_log_cap = health_cli.event_log_size as usize;
 
-    let ui_tick = channel::tick(Duration::from_millis(1000 / cli.fps));
+    let ui_tick = channel::tick(Duration::from_millis(1000 / health_cli.fps));
 
     'main: loop {
         let mut needs_redraw = false;
@@ -977,10 +858,10 @@ fn main() {
 
                     let events_to_show: Vec<&LoggedEvent> = event_log
                         .iter()
-                        .filter(|e| !cli.warnings_only || matches!(e.color, Color::Red | Color::Yellow))
+                        .filter(|e| !health_cli.warnings_only || matches!(e.color, Color::Red | Color::Yellow))
                         .collect();
                     let total = events_to_show.len();
-                    let display_count = cli.event_display_lines as usize;
+                    let display_count = health_cli.event_display_lines as usize;
 
                     match k.code {
                         KeyCode::Char('h') => {
@@ -1047,7 +928,7 @@ fn main() {
                 show_heartbeat,
                 show_ppm,
                 show_sample_time,
-                &cli,
+                &health_cli,
             )
             .is_err()
             {
@@ -1057,4 +938,5 @@ fn main() {
     }
 
     ratatui::restore();
+    Ok(())
 }

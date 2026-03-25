@@ -2,6 +2,9 @@ use clap::Parser;
 use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
+use std::time::Duration;
+pub mod utils;
+include!("tio_cli.rs");
 
 #[derive(Parser, Debug, Clone)]
 pub struct TioOpts {

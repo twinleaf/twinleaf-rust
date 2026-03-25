@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use twinleaf::device::Device;
 use twinleaf::tio;
-use twinleaf_tools::TioOpts;
+use crate::TioOpts;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -85,13 +85,11 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     println!("Disconnected: {}", peer_addr);
 }
 
-fn main() {
-    let cli = Cli::parse();
+pub fn run_text_proxy(tio: TioOpts, tcp_port: u16) -> Result<(), ()> {
+    let proxy = tio::proxy::Interface::new(&tio.root);
+    let route = tio.parse_route();
 
-    let proxy = tio::proxy::Interface::new(&cli.tio.root);
-    let route = cli.tio.parse_route();
-
-    let bind_addr = format!("0.0.0.0:{}", cli.tcp_port);
+    let bind_addr = format!("0.0.0.0:{}", tcp_port);
     let listener = TcpListener::bind(&bind_addr)
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", bind_addr, e));
 
@@ -103,4 +101,5 @@ fn main() {
             thread::spawn(move || broadcast_to_client(stream, device));
         }
     }
+    Ok(())
 }

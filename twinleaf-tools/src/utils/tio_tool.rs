@@ -2,297 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
-use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
 use twinleaf::device::{Device, DeviceTree, RpcClient};
 use twinleaf::tio;
-use twinleaf_tools::TioOpts;
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "tio-tool",
-    version,
-    about = "Twinleaf sensor management and data logging tool"
-)]
-struct TioToolCli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// List available RPCs on the device
-    RpcList {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
-
-    /// Execute an RPC on the device
-    Rpc {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// RPC name to execute
-        rpc_name: String,
-
-        /// RPC argument value
-        #[arg(
-            allow_negative_numbers = true,
-            value_name = "ARG",
-            help_heading = "RPC Arguments"
-        )]
-        rpc_arg: Option<String>,
-
-        /// RPC request type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
-        #[arg(short = 't', long = "req-type", help_heading = "Type Options")]
-        req_type: Option<String>,
-
-        /// RPC reply type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
-        #[arg(short = 'T', long = "rep-type", help_heading = "Type Options")]
-        rep_type: Option<String>,
-
-        /// Enable debug output
-        #[arg(short = 'd', long)]
-        debug: bool,
-    },
-
-    /// Dump RPC data from the device
-    RpcDump {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// RPC name to dump
-        rpc_name: String,
-
-        /// Trigger a capture before dumping
-        #[arg(long)]
-        capture: bool,
-    },
-
-    /// Dump data from a live device
-    Dump {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// Show parsed data samples
-        #[arg(short = 'd', long = "data")]
-        data: bool,
-
-        /// Show metadata on boundaries
-        #[arg(short = 'm', long = "meta")]
-        meta: bool,
-
-        /// Routing depth limit (default: unlimited)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
-    },
-
-    /// Log samples to a file (includes metadata by default)
-    Log {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// Output log file path
-        #[arg(short = 'f', default_value_t = default_log_path())]
-        file: String,
-
-        /// Unbuffered output (flush every packet)
-        #[arg(short = 'u')]
-        unbuffered: bool,
-
-        /// Raw mode: skip metadata request and dump all packets
-        #[arg(long)]
-        raw: bool,
-
-        /// Routing depth (only used in --raw mode)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
-    },
-
-    /// Log metadata to a file
-    LogMetadata {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// Output metadata file path
-        #[arg(short = 'f', default_value = "meta.tio")]
-        file: String,
-    },
-
-    /// Reroute metadata packets in a metadata file
-    MetaReroute {
-        /// Input metadata file path
-        input: String,
-
-        /// New device route (e.g., /0/1)
-        #[arg(short = 's', long = "sensor")]
-        route: String,
-
-        /// Output metadata file path (defaults to <input>_rerouted.tio)
-        #[arg(short = 'o', long = "output")]
-        output: Option<String>,
-    },
-
-    /// Dump data from binary log file(s)
-    LogDump {
-        /// Input log file(s)
-        files: Vec<String>,
-
-        /// Show parsed data samples
-        #[arg(short = 'd', long = "data")]
-        data: bool,
-
-        /// Show metadata on boundaries
-        #[arg(short = 'm', long = "meta")]
-        meta: bool,
-
-        /// Sensor path in the sensor tree (e.g., /, /0, /0/1)
-        #[arg(short = 's', long = "sensor", default_value = "/")]
-        sensor: String,
-
-        /// Routing depth limit (default: unlimited)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
-    },
-
-    /// Dump parsed data from binary log file(s) [DEPRECATED: use log-dump -d]
-    #[command(hide = true)]
-    LogDataDump {
-        /// Input log file(s)
-        files: Vec<String>,
-    },
-
-    /// Convert binary log data to CSV
-    LogCsv {
-        /// Stream ID/name and input .tio files (order-independent)
-        args: Vec<String>,
-
-        /// Sensor route in the device tree (default: /)
-        #[arg(short = 's')]
-        sensor: Option<String>,
-
-        /// Output filename prefix
-        #[arg(short = 'o')]
-        output: Option<String>,
-    },
-
-    /// Convert binary log files to HDF5 format
-    LogHdf {
-        /// Input log file(s)
-        files: Vec<String>,
-
-        /// Output file path (defaults to input filename with .h5 extension)
-        #[arg(short = 'o')]
-        output: Option<String>,
-
-        /// Filter streams using a glob pattern (e.g. "/*/vector")
-        #[arg(short = 'g', long = "glob")]
-        filter: Option<String>,
-
-        /// Enable deflate compression (saves space, slows down write significantly)
-        #[arg(short = 'c', long = "compress")]
-        compress: bool,
-
-        /// Enable debug output for glob matching
-        #[arg(short = 'd', long)]
-        debug: bool,
-
-        /// How to organize runs in the output (none=flat, stream=per-stream, device=per-device, global=all-shared)
-        #[arg(short = 'l', long = "split", default_value = "none")]
-        split_level: SplitLevel,
-
-        /// When to detect discontinuities (continuous=any gap, monotonic=only time backward)
-        #[arg(short = 'p', long = "policy", default_value = "continuous")]
-        split_policy: SplitPolicy,
-    },
-
-    /// Upgrade device firmware
-    FirmwareUpgrade {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// Input firmware image path
-        firmware_path: String,
-    },
-
-    /// Dump data samples from the device [DEPRECATED: use dump -d -s <ROUTE>]
-    #[command(hide = true)]
-    DataDump {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
-
-    /// Dump data samples from all devices in the tree [DEPRECATED: use dump -a -d]
-    #[command(hide = true)]
-    DataDumpAll {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
-
-    /// Dump device metadata [DEPRECATED: use dump -m -s <ROUTE>]
-    #[command(hide = true)]
-    MetaDump {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
-}
-
-fn default_log_path() -> String {
-    chrono::Local::now()
-        .format("log.%Y%m%d-%H%M%S.tio")
-        .to_string()
-}
-
-/// Controls when discontinuities trigger run splits
-#[derive(ValueEnum, Clone, Debug, Default)]
-enum SplitPolicy {
-    /// Split on any discontinuity (gaps, rate changes, etc.)
-    #[default]
-    Continuous,
-    /// Only split when time goes backward (allows gaps)
-    Monotonic,
-}
-
-#[cfg(feature = "hdf5")]
-impl From<SplitPolicy> for twinleaf::data::export::SplitPolicy {
-    fn from(policy: SplitPolicy) -> Self {
-        match policy {
-            SplitPolicy::Continuous => Self::Continuous,
-            SplitPolicy::Monotonic => Self::Monotonic,
-        }
-    }
-}
-
-/// Controls how runs are organized in the HDF5 output
-#[derive(ValueEnum, Clone, Debug, Default)]
-enum SplitLevel {
-    /// No run splitting - flat structure: /{route}/{stream}/{datasets}
-    #[default]
-    None,
-    /// Each stream has independent run counter
-    Stream,
-    /// All streams on a device share run counter
-    Device,
-    /// All streams globally share run counter
-    Global,
-}
-
-#[cfg(feature = "hdf5")]
-impl From<SplitLevel> for twinleaf::data::export::RunSplitLevel {
-    fn from(level: SplitLevel) -> Self {
-        match level {
-            SplitLevel::None => Self::None,
-            SplitLevel::Stream => Self::PerStream,
-            SplitLevel::Device => Self::PerDevice,
-            SplitLevel::Global => Self::Global,
-        }
-    }
-}
+use crate::TioOpts;
+use crate::{SplitLevel, SplitPolicy};
 
 fn record_missing_metadata(
     missing_routes: &mut HashSet<DeviceRoute>,
@@ -335,7 +53,7 @@ fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
     eprintln!("Hint: ensure the log includes metadata or capture it with `tio-tool log-meta`, including it as an argument before the log.");
 }
 
-fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
+pub fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
     let rpc_client = RpcClient::open(&proxy, route.clone()).expect("Failed to open RPC client");
@@ -366,7 +84,7 @@ fn get_rpctype(name: &String, device: &proxy::Port) -> String {
     }
 }
 
-fn rpc(
+pub fn rpc(
     tio: &TioOpts,
     rpc_name: String,
     rpc_arg: Option<String>,
@@ -488,7 +206,7 @@ fn rpc(
     Ok(())
 }
 
-fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(), ()> {
+pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(), ()> {
     let rpc_name = if is_capture {
         rpc_name.clone() + ".block"
     } else {
@@ -530,7 +248,7 @@ fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(), ()>
     Ok(())
 }
 
-fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Result<(), ()> {
+pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
 
@@ -661,27 +379,26 @@ fn print_metadata_payload(route: &DeviceRoute, payload: &tio::proto::MetadataPay
         }
     }
 }
-
 // Deprecated wrappers
-fn data_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
+pub fn data_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
     eprintln!("Warning: data-dump is deprecated, use 'dump -d -m --depth 0' instead");
     eprintln!();
     dump(tio, true, true, Some(0))
 }
 
-fn data_dump_all_deprecated(tio: &TioOpts) -> Result<(), ()> {
+pub fn data_dump_all_deprecated(tio: &TioOpts) -> Result<(), ()> {
     eprintln!("Warning: data-dump-all is deprecated, use 'dump -d -m' instead");
     eprintln!();
     dump(tio, true, true, None)
 }
 
-fn meta_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
+pub fn meta_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
     eprintln!("Warning: meta-dump is deprecated, use 'dump -m --depth 0' instead");
     eprintln!();
     dump(tio, false, true, Some(0))
 }
 
-fn log(
+pub fn log(
     tio: &TioOpts,
     file: String,
     unbuffered: bool,
@@ -781,7 +498,7 @@ fn log(
     Ok(())
 }
 
-fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
+pub fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
 
@@ -832,7 +549,7 @@ fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     Ok(())
 }
 
-fn meta_reroute(input: String, route: String, output: Option<String>) -> Result<(), ()> {
+pub fn meta_reroute(input: String, route: String, output: Option<String>) -> Result<(), ()> {
     let data = std::fs::read(&input).map_err(|e| {
         eprintln!("Failed to read {}: {}", input, e);
     })?;
@@ -910,7 +627,7 @@ fn meta_reroute(input: String, route: String, output: Option<String>) -> Result<
     Ok(())
 }
 
-fn log_dump(
+pub fn log_dump(
     files: Vec<String>,
     data: bool,
     meta: bool,
@@ -1053,13 +770,14 @@ fn log_dump(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
     eprintln!("Warning: log-data-dump is deprecated, use 'log-dump -d -m' instead");
     eprintln!();
     log_dump(files, true, true, "/".to_string(), None)
 }
 
-fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>) -> Result<(), ()> {
+pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>) -> Result<(), ()> {
     if args.is_empty() {
         eprintln!("Invalid invocation: missing stream name and log files");
         eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
@@ -1208,7 +926,7 @@ fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>) ->
 }
 
 #[cfg(feature = "hdf5")]
-fn log_hdf(
+pub fn log_hdf(
     files: Vec<String>,
     output: Option<String>,
     filter: Option<String>,
@@ -1367,7 +1085,7 @@ fn log_hdf(
 }
 
 #[cfg(not(feature = "hdf5"))]
-fn log_hdf(
+pub fn log_hdf(
     _files: Vec<String>,
     _output: Option<String>,
     _filter: Option<String>,
@@ -1382,7 +1100,7 @@ fn log_hdf(
     Err(())
 }
 
-fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> {
+pub fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> {
     let firmware_data = std::fs::read(firmware_path).unwrap();
 
     println!("Loaded {} bytes firmware", firmware_data.len());
@@ -1480,85 +1198,4 @@ fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> {
         panic!("upgrade failed");
     }
     Ok(())
-}
-
-fn main() -> ExitCode {
-    let cli = TioToolCli::parse();
-
-    let result = match cli.command {
-        Commands::RpcList { tio } => list_rpcs(&tio),
-        Commands::Rpc {
-            tio,
-            rpc_name,
-            rpc_arg,
-            req_type,
-            rep_type,
-            debug,
-        } => rpc(&tio, rpc_name, rpc_arg, req_type, rep_type, debug),
-        Commands::RpcDump {
-            tio,
-            rpc_name,
-            capture,
-        } => rpc_dump(&tio, rpc_name, capture),
-        Commands::Dump {
-            tio,
-            data,
-            meta,
-            depth,
-        } => dump(&tio, data, meta, depth),
-        Commands::Log {
-            tio,
-            file,
-            unbuffered,
-            raw,
-            depth,
-        } => log(&tio, file, unbuffered, raw, depth),
-        Commands::LogMetadata { tio, file } => log_metadata(&tio, file),
-        Commands::MetaReroute {
-            input,
-            route,
-            output,
-        } => meta_reroute(input, route, output),
-        Commands::LogDump {
-            files,
-            data,
-            meta,
-            sensor,
-            depth,
-        } => log_dump(files, data, meta, sensor, depth),
-        Commands::LogDataDump { files } => log_data_dump_deprecated(files),
-        Commands::LogCsv {
-            args,
-            sensor,
-            output,
-        } => log_csv(args, sensor, output),
-        Commands::LogHdf {
-            files,
-            output,
-            filter,
-            compress,
-            debug,
-            split_level,
-            split_policy,
-        } => log_hdf(
-            files,
-            output,
-            filter,
-            compress,
-            debug,
-            split_level,
-            split_policy,
-        ),
-        Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
-        Commands::DataDump { tio } => data_dump_deprecated(&tio),
-        Commands::DataDumpAll { tio } => data_dump_all_deprecated(&tio),
-        Commands::MetaDump { tio } => meta_dump_deprecated(&tio),
-    };
-
-    if result.is_ok() {
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("FAILED");
-        ExitCode::FAILURE
-    }
 }
