@@ -1,8 +1,5 @@
 use clap::{ValueEnum, Subcommand};
 
-include!("proxy_cli.rs");
-include!("health_cli.rs");
-
 #[derive(Parser, Debug)]
 #[command(
     name = "tio",
@@ -43,7 +40,7 @@ pub enum Commands {
         tcp_port: u16,
     },
 
-    /// Execute an RPC on the device
+    /// Execute an RPC on the device. See "tio rpc --help" for more options
     Rpc {
         #[command(flatten)]
         tio: TioOpts,
@@ -74,7 +71,7 @@ pub enum Commands {
         #[arg(short = 'd', long)]
         debug: bool,
     },
-    /// Log samples to a file (includes metadata by default)
+    /// Log samples to a file (includes metadata by default) See "tio log --help" for more options
     Log {
         #[command(flatten)]
         tio: TioOpts,
@@ -322,4 +319,185 @@ impl From<SplitLevel> for twinleaf::data::export::RunSplitLevel {
             SplitLevel::Global => Self::Global,
         }
     }
+}
+
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "tio-health",
+    version,
+    about = "Live timing & rate diagnostics for TIO (Twinleaf) devices"
+)]
+pub struct HealthCli {
+    #[command(flatten)]
+    tio: TioOpts,
+
+    /// Time window in seconds for calculating jitter statistics
+    #[arg(
+        long = "jitter-window",
+        default_value = "10",
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Seconds for jitter calculation window (>= 1)"
+    )]
+    jitter_window: u64,
+
+    /// PPM threshold for yellow warning indicators
+    #[arg(
+        long = "ppm-warn",
+        default_value = "100",
+        value_name = "PPM",
+        value_parser = nonneg_f64,
+        help = "Warning threshold in parts per million (>= 0)"
+    )]
+    ppm_warn: f64,
+
+    /// PPM threshold for red error indicators
+    #[arg(
+        long = "ppm-err",
+        default_value = "200",
+        value_name = "PPM",
+        value_parser = nonneg_f64,
+        help = "Error threshold in parts per million (>= 0)"
+    )]
+    ppm_err: f64,
+
+    /// Filter to only show specific stream IDs (comma-separated)
+    #[arg(
+        long = "streams",
+        value_delimiter = ',',
+        value_name = "IDS",
+        value_parser = clap::value_parser!(u8),
+        help = "Comma-separated stream IDs to monitor (e.g., 0,1,5)"
+    )]
+    streams: Option<Vec<u8>>,
+
+    /// Suppress the footer help text
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
+
+    /// UI refresh rate for animations and stale detection (data updates are immediate)
+    #[arg(
+        long = "fps",
+        default_value = "30",
+        value_name = "FPS",
+        value_parser = clap::value_parser!(u64).range(1..=60),
+        help = "UI refresh rate for heartbeat animation and stale detection (1–60)"
+    )]
+    fps: u64,
+
+    /// Time in milliseconds before marking a stream as stale
+    #[arg(
+        long = "stale-ms",
+        default_value = "2000",
+        value_name = "MS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Mark streams as stale after this many milliseconds without data (>= 1)"
+    )]
+    stale_ms: u64,
+
+    /// Maximum number of events to keep in the event log
+    #[arg(
+        short = 'n',
+        long = "event-log-size",
+        default_value = "100",
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Maximum number of events to keep in history (>= 1)"
+    )]
+    event_log_size: u64,
+
+    /// Number of event lines to display on screen
+    #[arg(
+        long = "event-display-lines",
+        default_value = "8",
+        value_name = "LINES",
+        value_parser = clap::value_parser!(u16).range(3..),
+        help = "Number of event lines to show (>= 3)"
+    )]
+    event_display_lines: u16,
+
+    /// Only show warning and error events in the log
+    #[arg(short = 'w', long = "warnings-only")]
+    warnings_only: bool,
+}
+
+impl HealthCli {
+    fn stale_dur(&self) -> Duration {
+        Duration::from_millis(self.stale_ms)
+    }
+}
+
+fn nonneg_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if v < 0.0 {
+        Err("must be ≥ 0".into())
+    } else {
+        Ok(v)
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-proxy",
+    version,
+    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP"
+)]
+pub struct ProxyCli {
+    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0)
+    /// Required unless --auto or --enum is specified
+    sensor_url: Option<String>,
+
+    /// TCP port to listen on for clients
+    #[arg(short = 'p', long = "port", default_value = "7855")]
+    port: u16,
+
+    /// Kick off slow clients instead of dropping traffic
+    #[arg(short = 'k', long)]
+    kick_slow: bool,
+
+    /// Sensor subtree to look at
+    #[arg(short = 's', long = "subtree", default_value = "/")]
+    subtree: String,
+
+    /// Verbose output
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Debugging output
+    #[arg(short = 'd', long)]
+    debug: bool,
+
+    /// Timestamp format
+    #[arg(short = 't', long = "timestamp", default_value = "%T%.3f ")]
+    timestamp_format: String,
+
+    /// Time limit for sensor reconnection attempts (seconds)
+    #[arg(short = 'T', long = "timeout", default_value = "30")]
+    reconnect_timeout: u64,
+
+    /// Dump packet traffic except sample data/metadata or heartbeats
+    #[arg(long)]
+    dump: bool,
+
+    /// Dump sample data traffic
+    #[arg(long)]
+    dump_data: bool,
+
+    /// Dump sample metadata traffic
+    #[arg(long)]
+    dump_meta: bool,
+
+    /// Dump heartbeat traffic
+    #[arg(long)]
+    dump_hb: bool,
+
+    #[arg(short = 'a', long = "auto")]
+    auto: bool,
+
+    /// Enumerate all serial devices, then quit
+    #[arg(short = 'e', long = "enumerate", name = "enum")]
+    enumerate: bool,
 }
