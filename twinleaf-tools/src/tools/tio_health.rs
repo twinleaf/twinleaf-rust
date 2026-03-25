@@ -255,111 +255,281 @@ struct LoggedEvent {
     color: Color,
 }
 
-fn log_event(log: &mut VecDeque<LoggedEvent>, msg: String, color: Color, cap: usize) {
-    log.push_front(LoggedEvent {
-        timestamp: SystemTime::now(),
-        event: msg,
-        color,
-    });
-    if log.len() > cap {
-        log.pop_back();
-    }
+enum Action {
+    Quit,
+    ToggleHeartbeat,
+    TogglePpm,
+    ToggleSampleTime,
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    ScrollHome,
+    ScrollEnd,
 }
 
-fn handle_boundary(
-    reason: &BoundaryReason,
-    route: &DeviceRoute,
-    stream_name: &str,
-    st: &mut StreamStats,
-    event_log: &mut VecDeque<LoggedEvent>,
-    cap: usize,
-) {
-    match reason {
-        BoundaryReason::Initial => {
-            log_event(
-                event_log,
-                format!("[{}/{}] STREAM STARTED", route, stream_name),
-                Color::Green,
-                cap,
-            );
+struct App {
+    stats: BTreeMap<StreamKey, StreamStats>,
+    device_states: HashMap<DeviceRoute, DeviceState>,
+    event_log: VecDeque<LoggedEvent>,
+    event_scroll_offset: usize,
+    show_heartbeat: bool,
+    show_ppm: bool,
+    show_sample_time: bool,
+    streams_filter: Option<Vec<u8>>,
+    jitter_window_s: u64,
+    event_log_cap: usize,
+}
+
+impl App {
+    fn new(cli: &HealthCli) -> Self {
+        Self {
+            stats: BTreeMap::new(),
+            device_states: HashMap::new(),
+            event_log: VecDeque::new(),
+            event_scroll_offset: 0,
+            show_heartbeat: false,
+            show_ppm: true,
+            show_sample_time: true,
+            streams_filter: cli.streams.clone(),
+            jitter_window_s: cli.jitter_window,
+            event_log_cap: cli.event_log_size as usize,
         }
-        BoundaryReason::SessionChanged { old, new } => {
-            log_event(
-                event_log,
-                format!("[{}/{}] SESSION: {} → {}", route, stream_name, old, new),
-                Color::Green,
-                cap,
-            );
-            st.reset_for_new_session(*new);
+    }
+
+    fn log_event(&mut self, msg: String, color: Color) {
+        self.event_log.push_front(LoggedEvent {
+            timestamp: SystemTime::now(),
+            event: msg,
+            color,
+        });
+        if self.event_log.len() > self.event_log_cap {
+            self.event_log.pop_back();
         }
-        BoundaryReason::SamplesLost { expected, received } => {
-            let count = received.wrapping_sub(*expected);
-            log_event(
-                event_log,
-                format!("[{}/{}] DROPPED: {} samples", route, stream_name, count),
-                Color::Red,
-                cap,
-            );
-            st.samples_dropped += count as u64;
+    }
+
+    fn filtered_event_count(&self, warnings_only: bool) -> usize {
+        self.event_log
+            .iter()
+            .filter(|e| !warnings_only || matches!(e.color, Color::Red | Color::Yellow))
+            .count()
+    }
+
+    fn handle_sample(&mut self, sample: twinleaf::data::Sample, route: DeviceRoute, now: Instant) {
+        let sid = sample.stream.stream_id;
+
+        if let Some(filter) = &self.streams_filter {
+            if !filter.contains(&sid) {
+                return;
+            }
         }
-        BoundaryReason::TimeBackward { gap_seconds } => {
-            log_event(
-                event_log,
-                format!(
-                    "[{}/{}] TIME BACKWARD: {:.3}s",
-                    route, stream_name, gap_seconds
-                ),
-                Color::Yellow,
-                cap,
-            );
+
+        let key = StreamKey::new(route.clone(), sid);
+        let st = self.stats.entry(key).or_insert_with(|| StreamStats {
+            name: sample.stream.name.clone(),
+            current_session_id: Some(sample.device.session_id),
+            ..Default::default()
+        });
+
+        st.name = sample.stream.name.clone();
+
+        if let Some(boundary) = &sample.boundary {
+            self.handle_boundary(&boundary.reason, &route, &sample.stream.name, sid);
         }
-        BoundaryReason::RateChanged { old_rate, new_rate } => {
-            log_event(
-                event_log,
-                format!(
-                    "[{}/{}] RATE: {:.1} → {:.1} Hz",
-                    route, stream_name, old_rate, new_rate
-                ),
-                Color::Yellow,
-                cap,
-            );
-            st.reset_timing();
-            st.rate_slope.reset();
-            st.received_count = 0;
-            st.rate_smps = 0.0;
+
+        let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();
+        if st.last_n.map(|n| sample.n != n).unwrap_or(true) {
+            st.last_seen = Some(now);
         }
-        BoundaryReason::TimeRefSessionChanged { old, new } => {
-            log_event(
-                event_log,
-                format!("[{}/{}] TIME REF: {} → {}", route, stream_name, old, new),
-                Color::Yellow,
-                cap,
-            );
-            st.reset_timing();
+
+        st.on_sample(sample.n, sample.timestamp_end(), now, self.jitter_window_s);
+    }
+
+    fn handle_boundary(
+        &mut self,
+        reason: &BoundaryReason,
+        route: &DeviceRoute,
+        stream_name: &str,
+        stream_id: u8,
+    ) {
+        let key = StreamKey::new(route.clone(), stream_id);
+        match reason {
+            BoundaryReason::Initial => {
+                self.log_event(
+                    format!("[{}/{}] STREAM STARTED", route, stream_name),
+                    Color::Green,
+                );
+            }
+            BoundaryReason::SessionChanged { old, new } => {
+                self.log_event(
+                    format!("[{}/{}] SESSION: {} → {}", route, stream_name, old, new),
+                    Color::Green,
+                );
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.reset_for_new_session(*new);
+                }
+            }
+            BoundaryReason::SamplesLost { expected, received } => {
+                let count = received.wrapping_sub(*expected);
+                self.log_event(
+                    format!("[{}/{}] DROPPED: {} samples", route, stream_name, count),
+                    Color::Red,
+                );
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.samples_dropped += count as u64;
+                }
+            }
+            BoundaryReason::TimeBackward { gap_seconds } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] TIME BACKWARD: {:.3}s",
+                        route, stream_name, gap_seconds
+                    ),
+                    Color::Yellow,
+                );
+            }
+            BoundaryReason::RateChanged { old_rate, new_rate } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] RATE: {:.1} → {:.1} Hz",
+                        route, stream_name, old_rate, new_rate
+                    ),
+                    Color::Yellow,
+                );
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.reset_timing();
+                    st.rate_slope.reset();
+                    st.received_count = 0;
+                    st.rate_smps = 0.0;
+                }
+            }
+            BoundaryReason::TimeRefSessionChanged { old, new } => {
+                self.log_event(
+                    format!("[{}/{}] TIME REF: {} → {}", route, stream_name, old, new),
+                    Color::Yellow,
+                );
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.reset_timing();
+                }
+            }
+            BoundaryReason::SegmentRollover { old_id, new_id } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] SEGMENT: {} → {}",
+                        route, stream_name, old_id, new_id
+                    ),
+                    Color::Green,
+                );
+            }
+            BoundaryReason::SegmentChanged { old_id, new_id } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] SEGMENT CHANGED: {} → {}",
+                        route, stream_name, old_id, new_id
+                    ),
+                    Color::Yellow,
+                );
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.reset_timing();
+                }
+            }
         }
-        BoundaryReason::SegmentRollover { old_id, new_id } => {
-            log_event(
-                event_log,
-                format!(
-                    "[{}/{}] SEGMENT: {} → {}",
-                    route, stream_name, old_id, new_id
-                ),
-                Color::Green,
-                cap,
-            );
+    }
+
+    fn handle_event(&mut self, event: TreeEvent, now: Instant) {
+        match event {
+            TreeEvent::RouteDiscovered(route) => {
+                self.device_states.entry(route.clone()).or_default();
+                self.log_event(format!("[{}] ROUTE DISCOVERED", route), Color::Green);
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::Heartbeat { .. },
+            } => {
+                self.device_states
+                    .entry(route)
+                    .or_default()
+                    .on_heartbeat(now);
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::Status(status),
+            } => {
+                self.log_event(format!("[{}] STATUS: {:?}", route, status), Color::Yellow);
+                if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
+                    for (key, st) in self.stats.iter_mut() {
+                        if key.route == route {
+                            st.reset_timing();
+                            st.rate_slope.reset();
+                            st.received_count = 0;
+                            st.rate_smps = 0.0;
+                            st.host_epoch = None;
+                        }
+                    }
+                }
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::RpcInvalidated(method),
+            } => {
+                self.log_event(
+                    format!("[{}] RPC INVALIDATED: {:?}", route, method),
+                    Color::Cyan,
+                );
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::MetadataReady(metadata),
+            } => {
+                self.log_event(
+                    format!("[{}] METADATA READY: {}", route, metadata.device.name),
+                    Color::Green,
+                );
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::NewHash(hash),
+            } => {
+                self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Color::Green);
+            }
         }
-        BoundaryReason::SegmentChanged { old_id, new_id } => {
-            log_event(
-                event_log,
-                format!(
-                    "[{}/{}] SEGMENT CHANGED: {} → {}",
-                    route, stream_name, old_id, new_id
-                ),
-                Color::Yellow,
-                cap,
-            );
-            st.reset_timing();
+    }
+
+    fn update(&mut self, action: Action, display_count: usize) -> bool {
+        let total = self.filtered_event_count(false);
+        match action {
+            Action::Quit => return true,
+            Action::ToggleHeartbeat => self.show_heartbeat = !self.show_heartbeat,
+            Action::TogglePpm => self.show_ppm = !self.show_ppm,
+            Action::ToggleSampleTime => self.show_sample_time = !self.show_sample_time,
+            Action::ScrollUp => {
+                self.event_scroll_offset = self.event_scroll_offset.saturating_sub(1);
+            }
+            Action::ScrollDown => {
+                if total > display_count {
+                    self.event_scroll_offset =
+                        (self.event_scroll_offset + 1).min(total.saturating_sub(display_count));
+                }
+            }
+            Action::PageUp => {
+                self.event_scroll_offset = self.event_scroll_offset.saturating_sub(display_count);
+            }
+            Action::PageDown => {
+                if total > display_count {
+                    self.event_scroll_offset = (self.event_scroll_offset + display_count)
+                        .min(total.saturating_sub(display_count));
+                }
+            }
+            Action::ScrollHome => {
+                self.event_scroll_offset = 0;
+            }
+            Action::ScrollEnd => {
+                if total > display_count {
+                    self.event_scroll_offset = total.saturating_sub(display_count);
+                }
+            }
         }
+        false
     }
 }
 
@@ -450,19 +620,14 @@ impl DisplayRow {
 
 fn draw_ui(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    stats: &mut BTreeMap<StreamKey, StreamStats>,
-    device_states: &HashMap<DeviceRoute, DeviceState>,
-    event_log: &VecDeque<LoggedEvent>,
-    event_scroll_offset: usize,
-    show_heartbeat: bool,
-    show_ppm: bool,
-    show_sample_time: bool,
+    app: &mut App,
     cli: &HealthCli,
 ) -> io::Result<()> {
     let now = Instant::now();
     let stale_dur = cli.stale_dur();
 
-    let mut rows: Vec<DisplayRow> = stats
+    let mut rows: Vec<DisplayRow> = app
+        .stats
         .iter_mut()
         .map(|(key, st)| {
             if st.is_stale(now, stale_dur) && st.drift_slope.n > 0 {
@@ -486,7 +651,8 @@ fn draw_ui(
 
     rows.sort_by(|a, b| a.route.cmp(&b.route).then(a.stream_id.cmp(&b.stream_id)));
 
-    let mut heartbeat_entries: Vec<_> = device_states
+    let mut heartbeat_entries: Vec<_> = app
+        .device_states
         .iter()
         .map(|(route, state)| (route.to_string(), state.heartbeat_char(now)))
         .collect();
@@ -497,9 +663,14 @@ fn draw_ui(
         .collect::<Vec<_>>()
         .join("  ");
 
+    let show_heartbeat = app.show_heartbeat;
+    let show_ppm = app.show_ppm;
+    let show_sample_time = app.show_sample_time;
+    let event_scroll_offset = app.event_scroll_offset;
+
     terminal.draw(|f| {
         let size = f.area();
-        let event_block_height = if event_log.is_empty() {
+        let event_block_height = if app.event_log.is_empty() {
             0
         } else {
             cli.event_display_lines + 2
@@ -584,8 +755,9 @@ fn draw_ui(
         f.render_stateful_widget(table, chunks[2], &mut TableState::default());
 
         // Event log
-        if !event_log.is_empty() {
-            let events_to_show: Vec<&LoggedEvent> = event_log
+        if !app.event_log.is_empty() {
+            let events_to_show: Vec<&LoggedEvent> = app
+                .event_log
                 .iter()
                 .filter(|e| !cli.warnings_only || matches!(e.color, Color::Red | Color::Yellow))
                 .collect();
@@ -652,10 +824,27 @@ fn draw_ui(
     Ok(())
 }
 
-/// Message type for communication from data thread to main thread
-enum DataMsg {
-    Item(TreeItem),
-    Error(String),
+fn get_action(ev: Event) -> Option<Action> {
+    let Event::Key(k) = ev else { return None };
+    if k.kind != KeyEventKind::Press {
+        return None;
+    }
+    if k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL {
+        return Some(Action::Quit);
+    }
+    match k.code {
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('h') => Some(Action::ToggleHeartbeat),
+        KeyCode::Char('p') => Some(Action::TogglePpm),
+        KeyCode::Char('s') => Some(Action::ToggleSampleTime),
+        KeyCode::Up => Some(Action::ScrollUp),
+        KeyCode::Down => Some(Action::ScrollDown),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::Home => Some(Action::ScrollHome),
+        KeyCode::End => Some(Action::ScrollEnd),
+        _ => None,
+    }
 }
 
 pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
@@ -673,266 +862,65 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
         }
     };
 
+    // Data thread
     let (data_tx, data_rx) = channel::unbounded();
-
     std::thread::spawn(move || {
         let mut tree = tree;
-
-        // Main loop - blocking on next_item()
         loop {
             match tree.next_item() {
                 Ok(item) => {
-                    if data_tx.send(DataMsg::Item(item)).is_err() {
+                    if data_tx.send(item).is_err() {
                         return;
                     }
                 }
-                Err(e) => {
-                    let _ = data_tx.send(DataMsg::Error(format!("{:?}", e)));
-                    return;
-                }
+                Err(_) => return,
             }
         }
     });
 
-    // Key reading thread
+    // Key thread
     let (key_tx, key_rx) = channel::unbounded();
     std::thread::spawn(move || loop {
         if let Ok(ev) = event::read() {
             if key_tx.send(ev).is_err() {
-                break;
+                return;
             }
         }
     });
 
-    let mut stats: BTreeMap<StreamKey, StreamStats> = BTreeMap::new();
-    let mut device_states: HashMap<DeviceRoute, DeviceState> = HashMap::new();
-    let mut event_log: VecDeque<LoggedEvent> = VecDeque::new();
-    let mut event_scroll_offset: usize = 0;
-    let mut show_heartbeat: bool = false;
-    let mut show_ppm: bool = true;
-    let mut show_sample_time: bool = true;
-
-    let streams_filter = health_cli.streams.clone();
-    let jitter_window_s = health_cli.jitter_window;
-    let event_log_cap = health_cli.event_log_size as usize;
-
+    let mut app = App::new(&health_cli);
+    let display_count = health_cli.event_display_lines as usize;
     let ui_tick = channel::tick(Duration::from_millis(1000 / health_cli.fps));
 
     'main: loop {
-        let mut needs_redraw = false;
-
         crossbeam::select! {
-            recv(data_rx) -> msg => {
+            recv(data_rx) -> item => {
                 let now = Instant::now();
-
-                match msg {
-                    Ok(DataMsg::Item(TreeItem::Sample(sample, route))) => {
-                        let sid = sample.stream.stream_id;
-
-                        if let Some(filter) = &streams_filter {
-                            if !filter.contains(&sid) { continue; }
-                        }
-
-                        let key = StreamKey::new(route.clone(), sid);
-                        let st = stats.entry(key).or_insert_with(|| StreamStats {
-                            name: sample.stream.name.clone(),
-                            current_session_id: Some(sample.device.session_id),
-                            ..Default::default()
-                        });
-
-                        st.name = sample.stream.name.clone();
-
-                        if let Some(boundary) = &sample.boundary {
-                            handle_boundary(
-                                &boundary.reason,
-                                &route,
-                                &sample.stream.name,
-                                st,
-                                &mut event_log,
-                                event_log_cap,
-                            );
-                            needs_redraw = true;
-                        }
-
-                        if st.last_n.map(|n| sample.n != n).unwrap_or(true) {
-                            st.last_seen = Some(now);
-                        }
-
-                        st.on_sample(sample.n, sample.timestamp_end(), now, jitter_window_s);
+                match item {
+                    Ok(TreeItem::Sample(sample, route)) => {
+                        app.handle_sample(sample, route, now);
                     }
-
-                    Ok(DataMsg::Item(TreeItem::Event(event))) => {
-                        match event {
-                            TreeEvent::RouteDiscovered(route) => {
-                                device_states.entry(route.clone()).or_default();
-                                log_event(
-                                    &mut event_log,
-                                    format!("[{}] ROUTE DISCOVERED", route),
-                                    Color::Green,
-                                    event_log_cap,
-                                );
-                                needs_redraw = true;
-                            }
-                            TreeEvent::Device { route, event: DeviceEvent::Heartbeat { .. } } => {
-                                device_states.entry(route).or_default().on_heartbeat(now);
-                                // Heartbeat visual update handled by tick
-                            }
-                            TreeEvent::Device { route, event: DeviceEvent::Status(status) } => {
-                                log_event(
-                                    &mut event_log,
-                                    format!("[{}] STATUS: {:?}", route, status),
-                                    Color::Yellow,
-                                    event_log_cap,
-                                );
-                                // On disconnect, reset all timing state for streams on this route
-                                // so that rate/drift don't carry stale data into the next session.
-                                if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
-                                    for (key, st) in stats.iter_mut() {
-                                        if key.route == route {
-                                            st.reset_timing();
-                                            st.rate_slope.reset();
-                                            st.received_count = 0;
-                                            st.rate_smps = 0.0;
-                                            st.host_epoch = None;
-                                        }
-                                    }
-                                }
-                                needs_redraw = true;
-                            }
-                            TreeEvent::Device { route, event: DeviceEvent::RpcInvalidated(method) } => {
-                                log_event(
-                                    &mut event_log,
-                                    format!("[{}] RPC INVALIDATED: {:?}", route, method),
-                                    Color::Cyan,
-                                    event_log_cap,
-                                );
-                                needs_redraw = true;
-                            }
-                            TreeEvent::Device { route, event: DeviceEvent::MetadataReady(metadata) } => {
-                                log_event(
-                                    &mut event_log,
-                                    format!("[{}] METADATA READY: {}", route, metadata.device.name),
-                                    Color::Green,
-                                    event_log_cap,
-                                );
-                                needs_redraw = true;
-                            }
-                            TreeEvent::Device { route, event: DeviceEvent::NewHash(hash) } => {
-                                log_event(
-                                    &mut event_log,
-                                    format!("[{}] NEW HASH: {:?}", route, hash),
-                                    Color::Green,
-                                    event_log_cap,
-                                );
-                                needs_redraw = true;
-                            }
-                        }
+                    Ok(TreeItem::Event(event)) => {
+                        app.handle_event(event, now);
                     }
-
-                    Ok(DataMsg::Error(e)) => {
-                        log_event(
-                            &mut event_log,
-                            format!("DATA ERROR: {}", e),
-                            Color::Red,
-                            event_log_cap,
-                        );
-                        break 'main;
-                    }
-
-                    Err(_) => {
-                        // Channel closed
-                        break 'main;
-                    }
+                    Err(_) => break 'main,
                 }
             }
 
             recv(key_rx) -> ev => {
-                if let Ok(Event::Key(k)) = ev {
-                    if k.kind != KeyEventKind::Press { continue; }
-
-                    if matches!(k.code, KeyCode::Char('q'))
-                        || (k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL)
-                    {
-                        break 'main;
-                    }
-
-                    let events_to_show: Vec<&LoggedEvent> = event_log
-                        .iter()
-                        .filter(|e| !health_cli.warnings_only || matches!(e.color, Color::Red | Color::Yellow))
-                        .collect();
-                    let total = events_to_show.len();
-                    let display_count = health_cli.event_display_lines as usize;
-
-                    match k.code {
-                        KeyCode::Char('h') => {
-                            show_heartbeat = !show_heartbeat;
-                            needs_redraw = true;
+                if let Ok(ev) = ev {
+                    if let Some(action) = get_action(ev) {
+                        if app.update(action, display_count) {
+                            break 'main;
                         }
-                        KeyCode::Char('p') => {
-                            show_ppm = !show_ppm;
-                            needs_redraw = true;
-                        }
-                        KeyCode::Char('s') => {
-                            show_sample_time = !show_sample_time;
-                            needs_redraw = true;
-                        }
-                        KeyCode::Up => {
-                            event_scroll_offset = event_scroll_offset.saturating_sub(1);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Down => {
-                            if total > display_count {
-                                event_scroll_offset = (event_scroll_offset + 1)
-                                    .min(total.saturating_sub(display_count));
-                            }
-                            needs_redraw = true;
-                        }
-                        KeyCode::PageUp => {
-                            event_scroll_offset = event_scroll_offset.saturating_sub(display_count);
-                            needs_redraw = true;
-                        }
-                        KeyCode::PageDown => {
-                            if total > display_count {
-                                event_scroll_offset = (event_scroll_offset + display_count)
-                                    .min(total.saturating_sub(display_count));
-                            }
-                            needs_redraw = true;
-                        }
-                        KeyCode::Home => {
-                            event_scroll_offset = 0;
-                            needs_redraw = true;
-                        }
-                        KeyCode::End => {
-                            if total > display_count {
-                                event_scroll_offset = total.saturating_sub(display_count);
-                            }
-                            needs_redraw = true;
-                        }
-                        _ => {}
                     }
                 }
             }
 
             recv(ui_tick) -> _ => {
-                needs_redraw = true; // Periodic refresh for heartbeat animation and stats display
-            }
-        }
-
-        if needs_redraw {
-            if draw_ui(
-                &mut terminal,
-                &mut stats,
-                &device_states,
-                &event_log,
-                event_scroll_offset,
-                show_heartbeat,
-                show_ppm,
-                show_sample_time,
-                &health_cli,
-            )
-            .is_err()
-            {
-                break 'main;
+                if draw_ui(&mut terminal, &mut app, &health_cli).is_err() {
+                    break 'main;
+                }
             }
         }
     }
