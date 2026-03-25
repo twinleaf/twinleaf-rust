@@ -4,7 +4,7 @@
 
 use std::{
     cmp::min,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{self, Read},
     str::FromStr,
@@ -416,6 +416,224 @@ pub struct RpcResp {
     pub result: Result<String, String>,
 }
 
+#[derive(Debug)]
+pub struct CommandState {
+    pub input_state: TextState<'static>,
+    pub suggestions: Vec<String>,
+    pub selected: Option<usize>,
+    pub scroll: usize,
+    pub current_completion: String,
+    pub history: Vec<String>,
+    pub history_ptr: usize,
+    pub draft: String,
+    pub last_rpc_result: Option<(String, Color)>,
+    pub last_rpc_command: String,
+}
+
+impl Default for CommandState {
+    fn default() -> Self {
+        Self {
+            input_state: TextState::default(),
+            suggestions: Vec::new(),
+            selected: None,
+            scroll: 0,
+            current_completion: String::new(),
+            history: Vec::new(),
+            history_ptr: 0,
+            draft: String::new(),
+            last_rpc_result: None,
+            last_rpc_command: String::new(),
+        }
+    }
+}
+
+impl CommandState {
+    fn enter(&mut self, registry: Option<&RpcRegistry>) {
+        self.input_state = TextState::default();
+        self.input_state.focus();
+        self.history_ptr = self.history.len();
+        self.draft.clear();
+        self.update_suggestions(registry);
+    }
+
+    fn exit(&mut self) {
+        self.input_state.blur();
+    }
+
+    fn rpc_list_len(&self) -> u16 {
+        let len = if self.suggestions.is_empty() {
+            1
+        } else {
+            self.suggestions.len().min(RPCLIST_MAX_LEN)
+        };
+        len.try_into().unwrap()
+    }
+
+    fn visible_rows(&self, footer_height: u16) -> usize {
+        min(RPCLIST_MAX_LEN, footer_height.saturating_sub(5) as usize)
+    }
+
+    fn selected_suggestion(&self) -> Option<&str> {
+        self.selected
+            .and_then(|idx| self.suggestions.get(idx))
+            .map(|s| s.as_str())
+    }
+
+    fn sync_completion(&mut self) {
+        let input = self.input_state.value();
+        self.current_completion = self
+            .selected_suggestion()
+            .filter(|rpc| input.is_empty() || rpc.starts_with(input))
+            .and_then(|rpc| rpc.get(input.len()..))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        self.input_state.focus();
+        self.input_state.move_end();
+    }
+
+    fn ensure_selection_visible(&mut self, footer_height: u16) {
+        let Some(selected) = self.selected else {
+            self.scroll = 0;
+            return;
+        };
+        let visible_rows = self.visible_rows(footer_height);
+        if visible_rows == 0 || self.suggestions.len() <= visible_rows {
+            self.scroll = 0;
+            return;
+        }
+        if selected < self.scroll {
+            self.scroll = selected;
+        } else if selected >= self.scroll + visible_rows {
+            self.scroll = selected + 1 - visible_rows;
+        }
+    }
+
+    fn tab_complete(&mut self, footer_height: u16) {
+        if self.suggestions.is_empty() {
+            self.sync_completion();
+            return;
+        }
+        let next = match self.selected {
+            Some(idx) => (idx + 1) % self.suggestions.len(),
+            None => 0,
+        };
+        self.selected = Some(next);
+        self.ensure_selection_visible(footer_height);
+        self.sync_completion();
+    }
+
+    fn tab_back_complete(&mut self, footer_height: u16) {
+        if self.suggestions.is_empty() {
+            self.sync_completion();
+            return;
+        }
+        let next = match self.selected {
+            Some(0) | None => self.suggestions.len() - 1,
+            Some(idx) => idx - 1,
+        };
+        self.selected = Some(next);
+        self.ensure_selection_visible(footer_height);
+        self.sync_completion();
+    }
+
+    fn update_suggestions(&mut self, registry: Option<&RpcRegistry>) {
+        let line = self.input_state.value().to_string();
+        let query = line.split_whitespace().next().unwrap_or("");
+
+        self.suggestions = if let Some(registry) = registry {
+            if query.is_empty() {
+                registry
+                    .children_of("")
+                    .into_iter()
+                    .map(|s| s + "...")
+                    .collect()
+            } else {
+                registry.search(query)
+            }
+        } else {
+            Vec::new()
+        };
+        self.selected = (!self.suggestions.is_empty()).then_some(0);
+        self.scroll = 0;
+        self.sync_completion();
+    }
+
+    fn accept_completion(&mut self, registry: Option<&RpcRegistry>) {
+        let mut complete_command = if self.current_completion.is_empty() {
+            self.selected_suggestion().unwrap_or_default().to_string()
+        } else {
+            format!("{}{}", self.input_state.value(), self.current_completion)
+        };
+        complete_command = complete_command.replace("...", ".");
+        self.input_state = TextState::new().with_value(complete_command);
+        self.input_state.focus();
+        self.input_state.move_end();
+        self.update_suggestions(registry);
+    }
+
+    fn submit_command(
+        &mut self,
+        route: &DeviceRoute,
+        registry: Option<&RpcRegistry>,
+    ) -> Option<RpcReq> {
+        let line = self.input_state.value().to_string();
+        if !line.contains(' ') && self.selected_suggestion() != Some(line.as_str()) {
+            self.accept_completion(registry);
+            return None;
+        }
+        if line.trim().is_empty() {
+            return None;
+        }
+        if self.history.last() != Some(&line) {
+            self.history.push(line.clone());
+        }
+        self.history_ptr = self.history.len();
+
+        let mut parts = line.split_whitespace();
+        let method = parts.next()?;
+        self.last_rpc_command = method.to_string();
+        let remainder: Vec<&str> = parts.collect();
+        let arg = if remainder.is_empty() {
+            None
+        } else {
+            Some(remainder.join(" "))
+        };
+        let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta_raw);
+        self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
+        self.input_state = TextState::default();
+        self.input_state.focus();
+        self.draft.clear();
+        self.update_suggestions(registry);
+
+        Some(RpcReq {
+            route: route.clone(),
+            meta,
+            method: method.to_string(),
+            arg,
+        })
+    }
+
+    fn navigate_history(&mut self, dir: HistDir, registry: Option<&RpcRegistry>) {
+        if self.history_ptr == self.history.len() {
+            self.draft = self.input_state.value().to_string();
+        };
+        self.history_ptr = match dir {
+            HistDir::Up => self.history_ptr.saturating_sub(1),
+            HistDir::Down => min(self.history.len(), self.history_ptr + 1),
+        };
+
+        self.input_state = TextState::new().with_value(
+            self.history
+                .get(self.history_ptr)
+                .unwrap_or(&self.draft)
+                .clone(),
+        );
+        self.input_state.focus();
+        self.input_state.move_end();
+        self.update_suggestions(registry);
+    }
+}
+
 enum RpcWorkerReq {
     FetchList(DeviceRoute),
     Execute(RpcReq),
@@ -473,17 +691,7 @@ pub struct App {
 
     pub footer_height: u16,
     pub rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
-    pub suggested_rpcs: VecDeque<String>,
-    pub suggested_rpcs_len: usize,
-    pub suggested_rpcs_ind: usize,
-
-    pub input_state: TextState<'static>,
-    pub current_completion: String,
-    pub cmd_history: Vec<String>,
-    pub history_ptr: usize,
-    pub present_command: String,
-    pub last_rpc_result: Option<(String, Color)>,
-    pub last_rpc_command: String,
+    pub command: CommandState,
     pub blink_state: bool,
     pub last_blink: Instant,
 }
@@ -506,16 +714,7 @@ impl App {
             window_aligned: None,
             footer_height: 0,
             rpc_registries: HashMap::new(),
-            suggested_rpcs: VecDeque::from(vec![String::new()]),
-            suggested_rpcs_len: 1,
-            suggested_rpcs_ind: 0,
-            input_state: TextState::default(),
-            current_completion: String::new(),
-            cmd_history: Vec::new(),
-            history_ptr: 0,
-            present_command: String::new(),
-            last_rpc_result: None,
-            last_rpc_command: String::new(),
+            command: CommandState::default(),
             blink_state: true,
             last_blink: Instant::now(),
         }
@@ -525,22 +724,39 @@ impl App {
         match action {
             Action::Quit => return true,
             Action::SetMode(Mode::Command) => {
-                self.input_state = TextState::default();
-                self.input_state.focus();
-                self.history_ptr = self.cmd_history.len();
-                self.update_command_list();
+                let route = self.current_route();
+                let registry = self.rpc_registries.get(&route);
+                self.command.enter(registry);
                 self.mode = Mode::Command;
             }
             Action::SetMode(Mode::Normal) => {
                 self.mode = Mode::Normal;
-                self.input_state.blur();
+                self.command.exit();
             }
-            Action::AutoCompleteTab => self.tab_complete(),
-            Action::AutoCompleteBack => self.tab_back_complete(),
-            Action::NewCommandString => self.update_command_list(),
-            Action::SubmitCommand => self.submit_command(rpc_tx),
-            Action::AcceptCompletion => self.accept_completion(),
-            Action::HistoryNavigate(dir) => self.navigate_history(dir),
+            Action::AutoCompleteTab => self.command.tab_complete(self.footer_height),
+            Action::AutoCompleteBack => self.command.tab_back_complete(self.footer_height),
+            Action::NewCommandString => {
+                let route = self.current_route();
+                let registry = self.rpc_registries.get(&route);
+                self.command.update_suggestions(registry);
+            }
+            Action::SubmitCommand => {
+                let route = self.current_route();
+                let registry = self.rpc_registries.get(&route);
+                if let Some(req) = self.command.submit_command(&route, registry) {
+                    let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
+                }
+            }
+            Action::AcceptCompletion => {
+                let route = self.current_route();
+                let registry = self.rpc_registries.get(&route);
+                self.command.accept_completion(registry);
+            }
+            Action::HistoryNavigate(dir) => {
+                let route = self.current_route();
+                let registry = self.rpc_registries.get(&route);
+                self.command.navigate_history(dir, registry);
+            }
             Action::NavUp => {
                 self.view.follow_selection = true;
                 self.nav.step_linear(&self.nav_items, true);
@@ -611,169 +827,14 @@ impl App {
         false
     }
 
-    fn complete_command(&mut self) {
-        let rpc = self.suggested_rpcs[self.suggested_rpcs_ind].clone();
-        self.current_completion = match rpc.get(self.input_state.value().len()..) {
-            Some(s) => {
-                if self.input_state.value().is_empty() {
-                    rpc.clone()
-                } else if rpc.starts_with(self.input_state.value()) {
-                    s.to_string()
-                } else {
-                    String::new()
-                }
-            }
-            None => String::new(),
-        };
-        self.input_state.focus();
-        self.input_state.move_end();
-    }
-
-    fn tab_complete(&mut self) {
-        let max = std::cmp::min(RPCLIST_MAX_LEN, (self.footer_height - 5).into());
-        self.suggested_rpcs_ind = match (self.suggested_rpcs_ind, self.suggested_rpcs_len) {
-            (i, l) if i == l - 1 => 0,
-            (i, l) if l <= max => i + 1,
-            (i, _) if i < max / 2 => i + 1,
-            (i, _) => {
-                // middle of wrapped list, move list instead of index
-                let front = self.suggested_rpcs.pop_front().unwrap();
-                self.suggested_rpcs.push_back(front);
-                i
-            }
-        };
-        self.complete_command();
-    }
-
-    fn tab_back_complete(&mut self) {
-        let max = std::cmp::min(RPCLIST_MAX_LEN, (self.footer_height - 5).into());
-        self.suggested_rpcs_ind = match (self.suggested_rpcs_ind, self.suggested_rpcs_len) {
-            (0, l) if l <= max => l - 1,
-            (0, _) => {
-                // 0, move list instead of index
-                let back = self.suggested_rpcs.pop_back().unwrap();
-                self.suggested_rpcs.push_front(back);
-                0
-            }
-            (i, _) => i - 1,
-        };
-        self.complete_command();
-    }
-
-    fn update_command_list(&mut self) {
-        self.suggested_rpcs_ind = 0;
-        self.current_completion = String::new();
-        let line = self.input_state.value().to_string();
-        let query = line.split_whitespace().next().unwrap_or("");
-
-        let suggestions: Vec<String> =
-            if let Some(registry) = self.rpc_registries.get(&self.current_route()) {
-                if query.is_empty() {
-                    registry
-                        .children_of("")
-                        .into_iter()
-                        .map(|s| s + "...")
-                        .collect()
-                } else {
-                    registry.search(query)
-                }
-            } else {
-                Vec::new()
-            };
-
-        self.suggested_rpcs = VecDeque::from(suggestions);
-        self.suggested_rpcs_len = self.suggested_rpcs.len();
-        if !(1..=RPCLIST_MAX_LEN).contains(&self.suggested_rpcs_len) {
-            self.suggested_rpcs.push_back(String::new());
-            self.suggested_rpcs_len += 1;
-        }
-        self.complete_command();
-    }
-
-    fn accept_completion(&mut self) {
-        let mut complete_command: String;
-        if self.current_completion.is_empty() {
-            complete_command = self.suggested_rpcs[self.suggested_rpcs_ind].clone();
-        } else {
-            complete_command = format!(
-                "{}{}",
-                self.input_state.value().to_string(),
-                self.current_completion
-            );
-            complete_command = complete_command.replace("...", ".");
-        }
-        self.input_state = TextState::new().with_value(complete_command);
-        self.input_state.focus();
-        self.input_state.move_end();
-        self.update_command_list();
-    }
-
-    fn submit_command(&mut self, rpc_tx: &Sender<RpcWorkerReq>) {
-        let line = self.input_state.value().to_string();
-        // Accept completion if no argument provided and input doesn't match suggestion
-        if !line.contains(' ') && self.suggested_rpcs.get(self.suggested_rpcs_ind) != Some(&line) {
-            return self.accept_completion();
-        }
-        if line.trim().is_empty() {
-            return;
-        }
-        if self.cmd_history.last() != Some(&line) {
-            self.cmd_history.push(line.clone());
-        }
-        self.history_ptr = self.cmd_history.len();
-
-        let mut parts = line.split_whitespace();
-        if let Some(method) = parts.next() {
-            self.last_rpc_command = method.to_string();
-            let remainder: Vec<&str> = parts.collect();
-            let arg = if remainder.is_empty() {
-                None
-            } else {
-                Some(remainder.join(" "))
-            };
-            let route = self.current_route();
-            let meta = self
-                .rpc_registries
-                .get(&route)
-                .and_then(|r| r.find(method))
-                .map(|d| d.meta_raw);
-            let _ = rpc_tx.send(RpcWorkerReq::Execute(RpcReq {
-                route: route.clone(),
-                meta,
-                method: method.to_string(),
-                arg,
-            }));
-            self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
-            self.input_state = TextState::default();
-            self.input_state.focus();
-            self.update_command_list();
-            self.present_command = String::new();
-        }
-    }
-
     fn update_rpclists(&mut self, list: RpcList) {
+        let route = list.route.clone();
         let registry = RpcRegistry::from(&list);
-        self.rpc_registries.insert(list.route.clone(), registry);
-    }
-
-    fn navigate_history(&mut self, dir: HistDir) {
-        if self.history_ptr == self.cmd_history.len() {
-            self.present_command = self.input_state.value().to_string();
-        };
-        self.history_ptr = match dir {
-            HistDir::Up => self.history_ptr.saturating_sub(1),
-            HistDir::Down => min(self.cmd_history.len(), self.history_ptr + 1),
-        };
-
-        self.input_state = TextState::new().with_value(
-            self.cmd_history
-                .get(self.history_ptr)
-                .unwrap_or(&self.present_command)
-                .clone(),
-        );
-        self.input_state.focus();
-        self.input_state.move_end();
-        self.update_command_list();
+        self.rpc_registries.insert(route.clone(), registry);
+        if self.mode == Mode::Command && self.current_route() == route {
+            let registry = self.rpc_registries.get(&route);
+            self.command.update_suggestions(registry);
+        }
     }
 
     pub fn visible_routes(&self) -> Vec<DeviceRoute> {
@@ -837,8 +898,7 @@ impl App {
     }
 
     pub fn rpc_list_len(&self) -> u16 {
-        let length: usize = self.suggested_rpcs_len;
-        std::cmp::min(length, RPCLIST_MAX_LEN).try_into().unwrap()
+        self.command.rpc_list_len()
     }
 
     pub fn current_pos(&self) -> Option<&NavPos> {
@@ -1049,26 +1109,26 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 KeyCode::BackTab => Some(Action::AutoCompleteBack),
                 KeyCode::Up => Some(Action::HistoryNavigate(HistDir::Up)),
                 KeyCode::Down => Some(Action::HistoryNavigate(HistDir::Down)),
-                KeyCode::Right if !app.current_completion.is_empty() => {
+                KeyCode::Right if !app.command.current_completion.is_empty() => {
                     Some(Action::AcceptCompletion)
                 }
                 KeyCode::Right => {
-                    app.input_state.handle_key_event(k);
+                    app.command.input_state.handle_key_event(k);
                     None
                 }
                 KeyCode::Left => {
-                    app.current_completion = String::new();
-                    app.input_state.handle_key_event(k);
+                    app.command.current_completion = String::new();
+                    app.command.input_state.handle_key_event(k);
                     None
                 }
                 KeyCode::Enter => Some(Action::SubmitCommand),
                 KeyCode::Char('a') if k.modifiers == KeyModifiers::CONTROL => {
-                    app.current_completion = String::new();
-                    app.input_state.handle_key_event(k);
+                    app.command.current_completion = String::new();
+                    app.command.input_state.handle_key_event(k);
                     None
                 }
                 _ => {
-                    app.input_state.handle_key_event(k);
+                    app.command.input_state.handle_key_event(k);
                     Some(Action::NewCommandString)
                 }
             },
@@ -1381,20 +1441,32 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
         if app.footer_height > 3 {
             let rpcs: Vec<Span> = if app.rpc_registries.get(&app.current_route()).is_some() {
-                app.suggested_rpcs
+                let visible_rows = app.command.visible_rows(app.footer_height);
+                let start = app.command.scroll.min(app.command.suggestions.len());
+                let end = if visible_rows == 0 {
+                    start
+                } else {
+                    (start + visible_rows).min(app.command.suggestions.len())
+                };
+                app.command.suggestions[start..end]
                     .iter()
                     .map(|v| Span::raw(v.clone()))
                     .enumerate()
                     .map(|(i, v)| {
-                        if i == app.suggested_rpcs_ind {
+                        if Some(start + i) == app.command.selected {
                             v.bold()
                         } else {
                             v.dim()
                         }
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             } else {
                 vec![Span::from("Generating RPC list...")]
+            };
+            let rpcs = if rpcs.is_empty() {
+                vec![Span::raw("")]
+            } else {
+                rpcs
             };
 
             let rpc_block = Block::default()
@@ -1405,7 +1477,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
         }
 
         if app.footer_height > 1 {
-            if let Some((msg, color)) = &app.last_rpc_result {
+            if let Some((msg, color)) = &app.command.last_rpc_result {
                 f.render_widget(
                     Paragraph::new(msg.as_str())
                         .style(Style::default().fg(*color).add_modifier(Modifier::BOLD)),
@@ -1415,8 +1487,8 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let target_route = app.current_route();
-        let user_input = app.input_state.value();
-        let cursor_idx = app.input_state.position().min(user_input.len());
+        let user_input = app.command.input_state.value();
+        let cursor_idx = app.command.input_state.position().min(user_input.len());
 
         let mut spans = vec![
             Span::styled(
@@ -1438,15 +1510,15 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::raw(&user_input[cursor_idx + 1..]));
         } else if app.blink_state {
             spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            if !app.current_completion.is_empty() {
+            if !app.command.current_completion.is_empty() {
                 spans.push(Span::styled(
-                    &app.current_completion[1..],
+                    &app.command.current_completion[1..],
                     Style::default().fg(Color::Gray),
                 ));
             }
         } else {
             spans.push(Span::styled(
-                &app.current_completion,
+                &app.command.current_completion,
                 Style::default().fg(Color::Gray),
             ));
         }
@@ -1936,10 +2008,13 @@ pub fn run_monitor(tio: TioOpts, all: bool, fps: u32, colors: Option<String>) ->
                         }
                         RpcWorkerResp::RpcResult(res) => {
                             let (msg, col) = match res.result {
-                                Ok(s) => (format!("{}: {}", app.last_rpc_command, s), Color::Green),
+                                Ok(s) => (
+                                    format!("{}: {}", app.command.last_rpc_command, s),
+                                    Color::Green,
+                                ),
                                 Err(s) => (format!("ERR: {}", s), Color::Red),
                             };
-                            app.last_rpc_result = Some((msg, col));
+                            app.command.last_rpc_result = Some((msg, col));
                         }
                     }
                 }
