@@ -279,6 +279,12 @@ struct App {
     streams_filter: Option<Vec<u8>>,
     jitter_window_s: u64,
     event_log_cap: usize,
+    event_display_lines: usize,
+    warnings_only: bool,
+    stale_dur: Duration,
+    ppm_warn: f64,
+    ppm_err: f64,
+    quiet: bool,
 }
 
 impl App {
@@ -294,6 +300,12 @@ impl App {
             streams_filter: cli.streams.clone(),
             jitter_window_s: cli.jitter_window,
             event_log_cap: cli.event_log_size as usize,
+            event_display_lines: cli.event_display_lines as usize,
+            warnings_only: cli.warnings_only,
+            stale_dur: cli.stale_dur(),
+            ppm_warn: cli.ppm_warn,
+            ppm_err: cli.ppm_err,
+            quiet: cli.quiet,
         }
     }
 
@@ -308,10 +320,10 @@ impl App {
         }
     }
 
-    fn filtered_event_count(&self, warnings_only: bool) -> usize {
+    fn filtered_event_count(&self) -> usize {
         self.event_log
             .iter()
-            .filter(|e| !warnings_only || matches!(e.color, Color::Red | Color::Yellow))
+            .filter(|e| !self.warnings_only || matches!(e.color, Color::Red | Color::Yellow))
             .count()
     }
 
@@ -495,8 +507,21 @@ impl App {
         }
     }
 
-    fn update(&mut self, action: Action, display_count: usize) -> bool {
-        let total = self.filtered_event_count(false);
+    fn tick(&mut self, now: Instant) {
+        for (_key, st) in self.stats.iter_mut() {
+            if st.is_stale(now, self.stale_dur) && st.drift_slope.n > 0 {
+                st.reset_timing();
+                st.rate_slope.reset();
+                st.received_count = 0;
+                st.rate_smps = 0.0;
+                st.host_epoch = None;
+            }
+        }
+    }
+
+    fn update(&mut self, action: Action) -> bool {
+        let total = self.filtered_event_count();
+        let display_count = self.event_display_lines;
         match action {
             Action::Quit => return true,
             Action::ToggleHeartbeat => self.show_heartbeat = !self.show_heartbeat,
@@ -620,31 +645,23 @@ impl DisplayRow {
 
 fn draw_ui(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    app: &mut App,
+    app: &App,
     cli: &HealthCli,
 ) -> io::Result<()> {
     let now = Instant::now();
-    let stale_dur = cli.stale_dur();
 
     let mut rows: Vec<DisplayRow> = app
         .stats
-        .iter_mut()
+        .iter()
         .map(|(key, st)| {
-            if st.is_stale(now, stale_dur) && st.drift_slope.n > 0 {
-                st.reset_timing();
-                st.rate_slope.reset();
-                st.received_count = 0;
-                st.rate_smps = 0.0;
-                st.host_epoch = None;
-            }
             DisplayRow::from_stats(
                 key.route.to_string(),
                 key.stream_id,
                 st,
                 now,
-                stale_dur,
-                cli.ppm_warn,
-                cli.ppm_err,
+                app.stale_dur,
+                app.ppm_warn,
+                app.ppm_err,
             )
         })
         .collect();
@@ -667,15 +684,18 @@ fn draw_ui(
     let show_ppm = app.show_ppm;
     let show_sample_time = app.show_sample_time;
     let event_scroll_offset = app.event_scroll_offset;
+    let warnings_only = app.warnings_only;
+    let event_display_lines = app.event_display_lines as u16;
+    let quiet = app.quiet;
 
     terminal.draw(|f| {
         let size = f.area();
         let event_block_height = if app.event_log.is_empty() {
             0
         } else {
-            cli.event_display_lines + 2
+            event_display_lines + 2
         };
-        let footer_height = if cli.quiet { 0 } else { 1 };
+        let footer_height = if quiet { 0 } else { 1 };
         let heartbeat_height = if show_heartbeat { 1 } else { 0 };
 
         let chunks = Layout::default()
@@ -759,11 +779,11 @@ fn draw_ui(
             let events_to_show: Vec<&LoggedEvent> = app
                 .event_log
                 .iter()
-                .filter(|e| !cli.warnings_only || matches!(e.color, Color::Red | Color::Yellow))
+                .filter(|e| !warnings_only || matches!(e.color, Color::Red | Color::Yellow))
                 .collect();
 
             let total = events_to_show.len();
-            let display_count = cli.event_display_lines as usize;
+            let display_count = event_display_lines as usize;
             let start = event_scroll_offset.min(total.saturating_sub(1));
             let end = (start + display_count).min(total);
 
@@ -799,7 +819,7 @@ fn draw_ui(
         }
 
         // Footer
-        if !cli.quiet {
+        if !quiet {
             let heartbeat_hint = if show_heartbeat {
                 "h:hide heartbeat"
             } else {
@@ -889,7 +909,6 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
     });
 
     let mut app = App::new(&health_cli);
-    let display_count = health_cli.event_display_lines as usize;
     let ui_tick = channel::tick(Duration::from_millis(1000 / health_cli.fps));
 
     'main: loop {
@@ -910,7 +929,7 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
             recv(key_rx) -> ev => {
                 if let Ok(ev) = ev {
                     if let Some(action) = get_action(ev) {
-                        if app.update(action, display_count) {
+                        if app.update(action) {
                             break 'main;
                         }
                     }
@@ -918,7 +937,8 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
             }
 
             recv(ui_tick) -> _ => {
-                if draw_ui(&mut terminal, &mut app, &health_cli).is_err() {
+                app.tick(Instant::now());
+                if draw_ui(&mut terminal, &app, &health_cli).is_err() {
                     break 'main;
                 }
             }
