@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use twinleaf_tools::{Commands, DumpSubcommands, LogSubcommands, RPCSubcommands, TioCli};
 use clap::Parser;
-use twinleaf_tools::utils::{
+use twinleaf_tools::tools::{
     tio_proxy::run_proxy,
     tio_text_proxy::run_text_proxy,
     tio_monitor::run_monitor, 
@@ -16,6 +16,7 @@ use twinleaf_tools::utils::{
         meta_dump_deprecated,
         log, 
         log_dump, 
+        log_data_dump_deprecated,
         log_metadata,
         meta_reroute,
         log_csv, 
@@ -37,7 +38,7 @@ fn main() -> ExitCode {
             colors
         } => run_monitor(tio, all, fps, colors), 
         Commands::Health(health_cli) => run_health(health_cli), 
-        Commands::TextProxy{tio, tcp_port} => run_text_proxy(tio, tcp_port),
+        Commands::NmeaProxy{tio, tcp_port} => run_text_proxy(tio, tcp_port),
         Commands::Rpc {
             tio, 
             subcommands,
@@ -83,7 +84,7 @@ fn main() -> ExitCode {
                 => log_metadata(&tio, file),
                 Some(LogSubcommands::Dump { files, data, meta, sensor, depth })
                 => log_dump(files, data, meta, sensor, depth), 
-                Some(LogSubcommands::DataDump { files: _ }) => Ok(()), 
+                Some(LogSubcommands::DataDump { files}) => log_data_dump_deprecated(files), 
                 Some(LogSubcommands::Csv { args, sensor, output})                
                 => log_csv( args, sensor, output), 
                 Some(LogSubcommands::Hdf { files, output, filter, compress, debug, split_level, split_policy })

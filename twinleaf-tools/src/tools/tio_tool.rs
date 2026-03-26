@@ -770,8 +770,7 @@ pub fn log_dump(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
+pub fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
     eprintln!("Warning: log-data-dump is deprecated, use 'log-dump -d -m' instead");
     eprintln!();
     log_dump(files, true, true, "/".to_string(), None)

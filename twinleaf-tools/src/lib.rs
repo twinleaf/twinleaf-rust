@@ -3,7 +3,7 @@ use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
 use std::time::Duration;
-pub mod utils;
+pub mod tools;
 include!("tio_cli.rs");
 
 #[derive(Parser, Debug, Clone)]

@@ -4,7 +4,7 @@ use clap::{ValueEnum, Subcommand};
 #[command(
     name = "tio",
     version,
-    about = "Twinleaf sensor management and data logging tool"
+    about = "Twinleaf sensor management and data logging tool", 
 )]
 pub struct TioCli {
     #[command(subcommand)]
@@ -27,7 +27,7 @@ pub enum Commands {
 	},
 	Health(HealthCli),
     ///Bridge Twinleaf sensor data to NMEA TCP stream
-    TextProxy{
+    NmeaProxy{
         #[command(flatten)]
         tio: TioOpts,
 
@@ -40,6 +40,7 @@ pub enum Commands {
         tcp_port: u16,
     },
 
+    #[command(args_conflicts_with_subcommands = true)]
     /// Execute an RPC on the device. See "tio rpc --help" for more options
     Rpc {
         #[command(flatten)]
@@ -71,6 +72,8 @@ pub enum Commands {
         #[arg(short = 'd', long)]
         debug: bool,
     },
+
+    #[command(args_conflicts_with_subcommands = true)]
     /// Log samples to a file (includes metadata by default) See "tio log --help" for more options
     Log {
         #[command(flatten)]
@@ -108,6 +111,7 @@ pub enum Commands {
         #[arg(short = 'o', long = "output")]
         output: Option<String>,
     },
+    #[command(args_conflicts_with_subcommands = true)]
     /// Dump data from a live device
     Dump {
         #[command(flatten)]
