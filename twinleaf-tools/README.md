@@ -1,65 +1,76 @@
 # Twinleaf I/O Tools in Rust
 
-This repository contains a set of tools that are useful for working with Twinleaf quantum sensors and accessories. The repository contains the twinleaf library and a set of command line tools: a proxy, a utility, and a data monitoring tool.
+Command-line tools for working with Twinleaf quantum sensors and accessories. Contains a proxy, terminal UIs, and command line utilities.
 
+**Note**: In versions <2.0.0, this crate contained binaries named `tio-proxy`, `tio-monitor`, `tio-health`, and `tio-tool`. These commands have been packaged into subcommands under the single binary `tio`. The former three original commands can be simply used without the `-`, while `tio-tool {toolname}` calls have largely been replaced with `tio {toolname}`.
 
-## Proxy
+## CLI Usage
+All the tools mentioned can have the `--help` argument added to display more information. The general workflow is to connect using `tio proxy` which allows all the CLI tools to work with the single device at the same time.
 
-The proxy makes the device's serial port available via Ethernet, and supports multiple simultaneous client connections to a single device:
+### Connecting to the device
 
-		tio-proxy --auto
+The proxy makes a device attached via serial port available via Ethernet. The following will automatically scan for a `twinleaf` serial device:
 
-When there are more than one serial port available, it is necessary to specify the port
+		tio proxy --auto
 
-		[linux]  > tio-proxy -r /dev/ttyACM0
-		[macOS]  > tio-proxy -r /dev/cu.usbserialXXXXXX
-		[windows]> tio-proxy.exe -r COM3
+When there are more than one serial port available, it is necessary to specify the port using:
+
+		[linux] tio proxy -r /dev/ttyACM0
+		[macOS] tio proxy -r /dev/cu.usbserialXXXXXX
+		[wsl1]  tio proxy -r COM3
+
+The proxy allows multiple tools to connect to the device over TCP simultaneously.
 
 When a sensor is attached to a hub at port `0`, it is possible to proxy the data directly to that port using the `-s` flag:
 
-		tio-proxy --auto -s /0
+		tio proxy --auto -s /0
 
-With the proxy running, a set of tools can be used on the data stream. 
+### Interacting with the device in terminal
 
-Log data to a raw binary file:
+Logging metadata:
 
-		tio-tool log
+		tio log meta 			# Write metadata to meta.tio
+		tio log dump meta.tio 	# Parse meta.tio and print to terminal
 
-Parse that log data for stream id 1 to a `.csv` file. Assumes root route if unspecified.
+Logging sample data:
 
-		tio-tool log-csv 1 logfile.tio
+		# Log samples and write to log.{date-time}.tio until quit (Ctrl+C)
+		tio log
 
-Parse that log data to an HDF5 file (requires --features hdf5 on crate installation)
+		# Parse a stream from .tio file and write to csv
+		tio log csv {stream name/id} {file}
 
-		tio-tool log-hdf logfile.tio -g "[device_route]/[stream_name]/[column_name]"
-		tio-tool log-hdf logfile.tio -g "*/vector"
+		# Write to HDF5 file (requires `--features hdf5` on install)
+		tio log hdf {file} -g "{route}/{stream}/{column}"
+		tio log hdf {file} -g "*/{stream or column}"
 
-Issue commands:
+Dump data to terminal:
 
-		tio-tool rpc dev.name
+		tio dump --data			# Continuously print parsed samples
+		tio dump --data --meta	# Same as above, with metadata header
 
-List available commands:
+Device commands:
 
-		tio-tool rpc-list
+		tio rpc list			# List of rpc commands with types
+		tio rpc {command} [arg] # Issue command with optional argument
 
-Firmware upgrade:
+## Terminal UIs
 
-		tio-tool firmware-upgrade <firmware.bin>
+### tio monitor
 
-Monitoring the data stream:
+Displays a live stream of incoming data with in-terminal graphs and command suggestions. Graph a stream by selecting it with the arrow keys and pressing Enter, and enter command mode by typing `:` (colon). Use `tio monitor -s {port}` to specify which port to open or `tio monitor -a` to open all ports.
 
-		tio-tool data-dump
+Run with:
 
-A TUI device data monitor:
+		tio monitor
 
-		tio-monitor
+### tio health
 
-A TUI device health monitor:
+Displays a live table of all incoming data with some statistics to verify the behavior of devices. It also outputs a history of events derived from the `Sample` protocol implemented in the `twinleaf` crate, derived within the `data/buffer.rs` file.
 
-		tio-health
+Run with:
 
-And a variety of additional functions for use with Twinleaf sensors. Each tool can be called with the `--help` argument for more information.
-
+		tio health
 
 ## Installation
 
@@ -67,7 +78,7 @@ The tools can be installed using
 
 		cargo install twinleaf-tools
 
-It can be installed with the ability to convert to HDF5 using
+They can be installed with the ability to convert to HDF5 using
 
 		cargo install twinleaf-tools --features hdf5
 
@@ -77,7 +88,7 @@ The `serialport` library depends on `libudev` that is not included on certain li
 
 		sudo apt install libudev-dev # debian linux
 
-## Cross compilation 
+## Cross compilation
 
 The tools can be compiled for other platforms by first adding those platform targets:
 
@@ -87,4 +98,3 @@ The tools can be compiled for other platforms by first adding those platform tar
 And then building for the new target:
 
 		cargo build --target x86_64-pc-windows-gnu
-
