@@ -1,4 +1,4 @@
-//! tio-proxy
+//! tio proxy
 //!
 //! Multiplexes access to a sensor, exposing the functionality of tio::proxy
 //! via TCP.
@@ -174,7 +174,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
 
     let subtree = tio::proto::DeviceRoute::from_str(&proxy_cli.subtree).expect("Invalid sensor subtree");
 
-    println!("tio-proxy starting:");
+    println!("tio proxy starting:");
     println!(
         "  Sensor: {} {}",
         sensor_url,

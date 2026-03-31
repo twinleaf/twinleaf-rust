@@ -50,7 +50,7 @@ fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
             eprintln!("  ... and {} more", routes.len() - 5);
         }
     }
-    eprintln!("Hint: ensure the log includes metadata or capture it with `tio-tool log-meta`, including it as an argument before the log.");
+    eprintln!("Hint: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.");
 }
 
 pub fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
@@ -779,7 +779,7 @@ pub fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
 pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>) -> Result<(), ()> {
     if args.is_empty() {
         eprintln!("Invalid invocation: missing stream name and log files");
-        eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+        eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
         return Err(());
     }
 
@@ -792,7 +792,7 @@ pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>
             stream_arg = Some(arg);
         } else {
             eprintln!("Invalid invocation: multiple stream arguments provided");
-            eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+            eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
             eprintln!("Hint: log files should end with .tio");
             return Err(());
         }
@@ -802,14 +802,14 @@ pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>
         stream
     } else {
         eprintln!("Invalid invocation: missing stream name or id");
-        eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+        eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
         eprintln!("Hint: log files should end with .tio");
         return Err(());
     };
 
     if files.is_empty() {
         eprintln!("Invalid invocation: missing log file");
-        eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+        eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
         return Err(());
     }
 
@@ -838,7 +838,7 @@ pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>
     for path in &files {
         let file_data = std::fs::read(path).map_err(|e| {
             eprintln!("Failed to read log file {}: {}", path, e);
-            eprintln!("Usage: tio-tool log-csv <stream> <log.tio>... [-s <route>]");
+            eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
         })?;
         let mut rest: &[u8] = &file_data;
         while rest.len() > 0 {
@@ -915,7 +915,7 @@ pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>
         eprintln!();
         eprintln!("To see available routes and streams, run:");
         eprintln!(
-            "  tio-tool log-dump -m {}",
+            "  tio log dump -m {}",
             files.first().unwrap_or(&"<file>".to_string())
         );
         return Err(());
@@ -1093,7 +1093,7 @@ pub fn log_hdf(
     _split_level: SplitLevel,
     _split_policy: SplitPolicy,
 ) -> Result<(), ()> {
-    eprintln!("Error: This version of tio-tool was compiled without HDF5 support.");
+    eprintln!("Error: This version of twinleaf-tools was compiled without HDF5 support.");
     eprintln!("To enable it, reinstall with:");
     eprintln!("  cargo install twinleaf-tools --features hdf5");
     Err(())
