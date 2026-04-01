@@ -38,6 +38,10 @@ fn main() -> ExitCode {
             colors
         } => run_monitor(tio, all, fps, colors), 
         Commands::Health(health_cli) => run_health(health_cli), 
+        #[cfg(feature = "aspn")]
+        Commands::AspnProxy{tio, mqtt_host, mqtt_port, client_id, topic_prefix, verbose}
+            => twinleaf_tools::tools::tio_aspn_proxy::run_aspn_proxy(
+                tio, mqtt_host, mqtt_port, client_id, topic_prefix, verbose),
         Commands::NmeaProxy{tio, tcp_port} => run_text_proxy(tio, tcp_port),
         Commands::Rpc {
             tio, 

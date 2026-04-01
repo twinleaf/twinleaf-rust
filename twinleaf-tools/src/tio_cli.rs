@@ -26,6 +26,49 @@ pub enum Commands {
 		colors: Option<String>,
 	},
 	Health(HealthCli),
+    /// Bridge Twinleaf sensor data to an ASPN MQTT broker
+    #[cfg(feature = "aspn")]
+    AspnProxy {
+        #[command(flatten)]
+        tio: TioOpts,
+
+        /// MQTT broker host
+        #[arg(
+            short = 'H',
+            long = "mqtt-host",
+            default_value = "localhost",
+            help = "MQTT broker hostname or IP"
+        )]
+        mqtt_host: String,
+
+        /// MQTT broker port
+        #[arg(
+            short = 'p',
+            long = "mqtt-port",
+            default_value = "1883",
+            help = "MQTT broker port"
+        )]
+        mqtt_port: u16,
+
+        /// MQTT client ID
+        #[arg(
+            long = "client-id",
+            default_value = "twinleaf-aspn",
+            help = "MQTT client identifier"
+        )]
+        client_id: String,
+
+        /// Topic prefix (ASPN measurement name is appended)
+        #[arg(
+            long = "topic-prefix",
+            help = "Optional MQTT topic prefix"
+        )]
+        topic_prefix: Option<String>,
+
+        /// Verbose output
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
     ///Bridge Twinleaf sensor data to NMEA TCP stream
     NmeaProxy{
         #[command(flatten)]
