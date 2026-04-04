@@ -1,4 +1,4 @@
-// tio-monitor
+// tio monitor
 // Live sensor data display with plot and FFT capabilities
 // Build: cargo run --release -- <tio-url> [options]
 
