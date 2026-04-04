@@ -1,4 +1,4 @@
-// tio-health
+// tio health
 //
 // Live timing & rate diagnostics by device route.
 // Uses DeviceTree for automatic metadata handling.
@@ -520,7 +520,7 @@ fn draw_ui(
 
         // Header
         let header_text = format!(
-            "tio-health — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
+            "tio health — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
             cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
         );
         f.render_widget(

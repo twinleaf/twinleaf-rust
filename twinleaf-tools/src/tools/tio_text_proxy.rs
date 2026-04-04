@@ -8,7 +8,7 @@ use crate::TioOpts;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "tio-text-proxy",
+    name = "tio-nmea-proxy",
     version,
     about = "Bridge Twinleaf sensor data to NMEA TCP stream"
 )]

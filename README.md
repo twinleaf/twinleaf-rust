@@ -1,52 +1,32 @@
 # Twinleaf I/O Tools in Rust
 
-This repository contains a library and a set of tools that are useful for working with Twinleaf quantum sensors and accessories. 
+This repository contains two Rust crates, a library (`twinleaf`) and a set of tools (`twinleaf-tools`) that are useful for working with Twinleaf quantum sensors and accessories.
 
-## CLI Usage
-All the tools mentioned can have the `--help` argument added to display more information. The general workflow is to connect using `tio-proxy` which allows all the CLI tools to work with the single device at the same time.
+**Note**: In versions <2.0.0, this crate contained binaries named `tio-proxy`, `tio-monitor`, `tio-health`, and `tio-tool`. These commands have been packaged into subcommands under the single binary `tio`. The former three original commands can be simply used without the `-`, while `tio-tool {toolname}` calls have largely been replaced with `tio {toolname}`.
 
-### tio-proxy
+## Basic Usage
+### See `twinleaf-tools/README.md` for more usage details
 
-The proxy makes a device attached via serial port available via Ethernet. The following will automatically scan for a `twinleaf` serial device:
+Connect a proxy to the device to communicate with the other tools:
 
-		tio-proxy --auto
+		tio proxy
 
-When there are more than one serial port available, it is necessary to specify the port using:
+Terminal interface (TUI) to monitor sample data and issue commands with tab completion:
 
-		[linux]> tio-proxy -r /dev/ttyACM0
-		[macOS]> tio-proxy -r /dev/cu.usbserialXXXXXX
-		[wsl1] > tio-proxy -r COM3
+		tio monitor
 
-The proxy allows multiple tools to connect to the device over TCP simultaneously.
+Dump data to terminal:
 
-### tio-tool
+		tio dump --data --meta
 
-Logging data:
-		
-		tio-tool log
+Issue commands from terminal:
 
-Issuing commands:
-		
-		tio-tool rpc dev.name
+		tio rpc {command name} [arg]
 
-### tio-monitor
+Log data to csv:
 
-Displays a live stream of incoming data with an optional color-coded threshold option.
-
-Running the tool:
-
-		tio-monitor [yaml_path]
-
-Yaml format to specify desired ranges:
-		field_name: {min: 0.0, max: 10000.0}
-
-### tio-health
-
-Displays a live table of all incoming data with some statistics to verify the behavior of devices. It also outputs a history of events derived from the `Sample` protocol implemented in the `twinleaf` crate, derived within the `data/buffer.rs` file.
-
-Running the tool:
-
-		tio-health
+		tio log -f {file.tio} # blocking
+		tio log csv {stream name} {file.tio}
 
 ## Installation
 
@@ -57,3 +37,9 @@ With rust language tools, install the tools using:
 It can be installed with the ability to convert to HDF5 using
 
 		cargo install twinleaf-tools --features hdf5
+
+It is convenient to add the cargo binary directory to the default search paths. Cargo will report where the binaries and installed and which path to add to your environment, if necessary.
+
+The `serialport` library depends on `libudev` that is not included on certain linux distributions. To install it use:
+
+		sudo apt install libudev-dev # debian linux
