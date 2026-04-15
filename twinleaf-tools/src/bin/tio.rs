@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::process::ExitCode;
 use twinleaf_tools::tools::{
     tio_health::run_health,
@@ -119,6 +119,10 @@ fn main() -> ExitCode {
             output,
         } => meta_reroute(input, route, output),
         Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut TioCli::command(), "tio", &mut std::io::stdout());
+            Ok(())
+        }
     };
 
     if result.is_ok() {

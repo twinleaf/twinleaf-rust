@@ -1,4 +1,5 @@
-use clap::{ValueEnum, Subcommand};
+use clap::{Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -139,6 +140,27 @@ pub enum Commands {
 
         /// Input firmware image path
         firmware_path: String,
+    },
+    /// Generate shell completions for tio
+    #[command(long_about = "\
+Generate shell completions for tio.
+
+Add one of these lines to your shell's config file:
+
+  Bash (~/.bashrc):
+    eval \"$(tio completions bash)\"
+
+  Zsh (~/.zshrc):
+    eval \"$(tio completions zsh)\"
+
+  Fish (~/.config/fish/config.fish):
+    tio completions fish | source
+
+  PowerShell ($PROFILE):
+    tio completions powershell | Invoke-Expression")]
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
