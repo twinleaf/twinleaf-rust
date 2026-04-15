@@ -3,14 +3,14 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
 
+use crate::TioOpts;
+use crate::{SplitLevel, SplitPolicy};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
 use twinleaf::device::{Device, DeviceTree, RpcClient};
 use twinleaf::tio;
-use crate::TioOpts;
-use crate::{SplitLevel, SplitPolicy};
 
 fn record_missing_metadata(
     missing_routes: &mut HashSet<DeviceRoute>,
@@ -776,7 +776,11 @@ pub fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
     log_dump(files, true, true, "/".to_string(), None)
 }
 
-pub fn log_csv(args: Vec<String>, sensor: Option<String>, output: Option<String>) -> Result<(), ()> {
+pub fn log_csv(
+    args: Vec<String>,
+    sensor: Option<String>,
+    output: Option<String>,
+) -> Result<(), ()> {
     if args.is_empty() {
         eprintln!("Invalid invocation: missing stream name and log files");
         eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");

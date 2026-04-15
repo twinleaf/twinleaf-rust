@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::TioOpts;
 use clap::Parser;
 use crossbeam::channel::{self, Sender};
 use ratatui::{
@@ -36,7 +37,6 @@ use twinleaf::{
         },
     },
 };
-use crate::TioOpts;
 use welch_sde::{Build, SpectralDensity};
 
 #[derive(Parser, Debug)]

@@ -3,12 +3,12 @@
 //! Multiplexes access to a sensor, exposing the functionality of tio::proxy
 //! via TCP.
 
+use crate::ProxyCli;
 use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::tio;
-use crate::ProxyCli;
 
 // Unfortunately we cannot access USB details via the serialport module, so
 // we are stuck guessing based on VID/PID. This returns a vector of possible
@@ -172,13 +172,18 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
         valid_urls[0].clone()
     };
 
-    let subtree = tio::proto::DeviceRoute::from_str(&proxy_cli.subtree).expect("Invalid sensor subtree");
+    let subtree =
+        tio::proto::DeviceRoute::from_str(&proxy_cli.subtree).expect("Invalid sensor subtree");
 
     println!("tio proxy starting:");
     println!(
         "  Sensor: {} {}",
         sensor_url,
-        if proxy_cli.auto { "(auto-detected)" } else { "" }
+        if proxy_cli.auto {
+            "(auto-detected)"
+        } else {
+            ""
+        }
     );
     println!("  TCP port: {}", tcp_port);
     println!("  Subtree: {}", subtree);

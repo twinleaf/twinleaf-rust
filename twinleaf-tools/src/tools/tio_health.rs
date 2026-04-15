@@ -6,6 +6,7 @@
 // Build: cargo run --release -- <tio-url> [route] [options]
 // Quit:  q / Ctrl-C
 
+use crate::HealthCli;
 use chrono::{DateTime, Local};
 use crossbeam::channel;
 use ratatui::{
@@ -29,7 +30,6 @@ use twinleaf::{
         proto::{identifiers::StreamKey, DeviceRoute},
     },
 };
-use crate::HealthCli;
 
 #[derive(Default)]
 struct DeviceState {

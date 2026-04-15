@@ -1,8 +1,8 @@
 use clap::Parser;
+use std::time::Duration;
 use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
-use std::time::Duration;
 pub mod tools;
 include!("tio_cli.rs");
 

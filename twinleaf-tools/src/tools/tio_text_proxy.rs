@@ -1,10 +1,10 @@
+use crate::TioOpts;
 use clap::Parser;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use twinleaf::device::Device;
 use twinleaf::tio;
-use crate::TioOpts;
 
 #[derive(Parser, Debug)]
 #[command(
