@@ -1,4 +1,4 @@
-use clap::{Subcommand, ValueEnum};
+use clap::{builder::ValueHint, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 #[derive(Parser, Debug)]
@@ -51,12 +51,14 @@ pub enum Commands {
         subcommands: Option<RPCSubcommands>,
 
         /// RPC name to execute
+        #[arg(value_hint = ValueHint::Other)]
         rpc_name: Option<String>,
 
         /// RPC argument value
         #[arg(
             allow_negative_numbers = true,
             value_name = "ARG",
+            value_hint = ValueHint::Other,
             help_heading = "RPC Arguments"
         )]
         rpc_arg: Option<String>,
@@ -139,6 +141,7 @@ pub enum Commands {
         tio: TioOpts,
 
         /// Input firmware image path
+        #[arg(value_hint = ValueHint::FilePath)]
         firmware_path: String,
 
         /// Skip confirmation prompt
@@ -181,6 +184,7 @@ pub enum RPCSubcommands{
         tio: TioOpts,
 
         /// RPC name to dump
+        #[arg(value_hint = ValueHint::Other)]
         rpc_name: String,
 
         /// Trigger a capture before dumping
