@@ -1103,7 +1103,13 @@ pub fn log_hdf(
     Err(())
 }
 
-pub fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> {
+pub fn firmware_upgrade(
+    tio: &TioOpts,
+    firmware_path: String,
+    skip_confirm: bool,
+) -> Result<(), ()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
     let firmware_data = std::fs::read(firmware_path).unwrap();
 
     println!("Loaded {} bytes firmware", firmware_data.len());
@@ -1112,11 +1118,46 @@ pub fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> 
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    if let Err(_) = device.action("dev.stop") {
-        // TODO: should ignore some errors, such as method not existing or if already stopped.
-        //panic!("Failed to stop device");
-        println!("Failed to stop device");
+    let dev_name: String = match device.rpc("dev.name", ()) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("Failed to query device name: {:?}", e);
+            return Err(());
+        }
+    };
+
+    if !skip_confirm {
+        print!("Upgrade firmware on '{}'? [y/N] ", dev_name);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
     }
+
+    match device.action("dev.stop") {
+        Ok(()) => {}
+        Err(proxy::RpcError::ExecError(ref e))
+            if matches!(
+                e.error,
+                tio::proto::RpcErrorCode::NotFound | tio::proto::RpcErrorCode::WrongDeviceState
+            ) => {}
+        Err(e) => {
+            eprintln!("Failed to stop device: {:?}", e);
+            return Err(());
+        }
+    }
+
+    let total_chunks = firmware_data.len().div_ceil(288);
+    let pb = ProgressBar::new(total_chunks as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent}%")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     let mut next_send_chunk: u16 = 0;
     let mut next_ack_chunk: u16 = 0;
@@ -1159,10 +1200,8 @@ pub fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> 
                 if rep.id != next_ack_chunk {
                     panic!("Upload failed");
                 }
-
-                let pct = 100.0 * ((next_ack_chunk as f64) * 288.0) / (firmware_data.len() as f64);
-                println!("Uploaded {:.1}%", pct);
                 next_ack_chunk += 1;
+                pb.set_position(next_ack_chunk as u64);
             }
             tio::proto::Payload::RpcError(err) => {
                 //if let RpcError::InvalidArgs = err.error {
@@ -1175,30 +1214,26 @@ pub fn firmware_upgrade(tio: &TioOpts, firmware_path: String) -> Result<(), ()> 
         }
     }
 
-    // The loop above conceptually does this, but allowing multiple
-    // RPCs in flight.
-    /*
-    let mut offset: usize = 0;
-    while offset < firmware_data.len() {
-        let chunk_end = if (offset + 288) > firmware_data.len() {
-            firmware_data.len()
-        } else {
-            offset + 288
-        };
-        match device.raw_rpc("dev.firmware.upload", &firmware_data[offset..chunk_end]) {
-            Ok(_reply) => {}
-            _ => {
-                panic!("upload failed");
-            }
-        };
-        offset = chunk_end;
-        let pct = 100.0 * (offset as f64) / (firmware_data.len() as f64);
-        println!("Uploaded {:.1}%", pct);
-    }
-    */
+    pb.finish_and_clear();
 
     if let Err(_) = device.action("dev.firmware.upgrade") {
         panic!("upgrade failed");
     }
+
+    // Wait 5 seconds before returning to ensure the device is not
+    // power-cycled while the firmware upgrade is being committed to flash.
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message("Finalizing upgrade...");
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        spinner.tick();
+    }
+    spinner.finish_with_message("Firmware upgrade complete.");
+
     Ok(())
 }

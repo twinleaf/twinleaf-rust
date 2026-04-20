@@ -118,7 +118,11 @@ fn main() -> ExitCode {
             route,
             output,
         } => meta_reroute(input, route, output),
-        Commands::FirmwareUpgrade { tio, firmware_path } => firmware_upgrade(&tio, firmware_path),
+        Commands::FirmwareUpgrade {
+            tio,
+            firmware_path,
+            yes,
+        } => firmware_upgrade(&tio, firmware_path, yes),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut TioCli::command(), "tio", &mut std::io::stdout());
             Ok(())

@@ -140,6 +140,10 @@ pub enum Commands {
 
         /// Input firmware image path
         firmware_path: String,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
     /// Generate shell completions for tio
     #[command(long_about = "\
