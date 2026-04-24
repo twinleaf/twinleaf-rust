@@ -63,10 +63,7 @@ fn main() -> ExitCode {
             data,
             meta,
             depth,
-        } => {
-            let _ = dump(&tio, data, meta, depth);
-            Ok(())
-        }
+        } => dump(&tio, data, meta, depth).map_err(|e| eprintln!("{:?}", e)),
         Commands::Log {
             tio,
             subcommands,
@@ -75,7 +72,7 @@ fn main() -> ExitCode {
             raw,
             depth,
         } => {
-            let _ = match subcommands {
+            let result: eyre::Result<()> = match subcommands {
                 Some(LogSubcommands::Meta {
                     tio,
                     subcommands,
@@ -119,7 +116,7 @@ fn main() -> ExitCode {
                 ),
                 None => log(&tio, file, unbuffered, raw, depth),
             };
-            Ok(())
+            result.map_err(|e| eprintln!("{:?}", e))
         }
         Commands::Upgrade {
             tio,

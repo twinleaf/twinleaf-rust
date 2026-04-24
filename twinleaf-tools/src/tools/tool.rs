@@ -208,16 +208,16 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
     Ok(())
 }
 
-pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Result<(), ()> {
+pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
     let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
 
     let port = proxy
         .new_port(None, route.clone(), port_depth, true, true)
-        .map_err(|e| {
-            eprintln!("Failed to initialize proxy port: {:?}", e);
-        })?;
+        .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
 
     match (data, meta) {
         // Raw mode (no flags): dump all packets
@@ -319,7 +319,9 @@ pub fn log(
     unbuffered: bool,
     raw: bool,
     depth: Option<usize>,
-) -> Result<(), ()> {
+) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
 
@@ -327,11 +329,10 @@ pub fn log(
         let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
         let port = proxy
             .new_port(None, route.clone(), depth, true, true)
-            .map_err(|e| {
-                eprintln!("Failed to initialize proxy port: {:?}", e);
-            })?;
+            .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
 
-        let mut file = File::create(file).unwrap();
+        let mut file_out = File::create(&file)
+            .wrap_err_with(|| format!("could not create log file {}", file))?;
         println!("Logging raw packets...");
 
         for pkt in port.iter() {
@@ -340,22 +341,26 @@ pub fn log(
                 routing: route.absolute_route(&pkt.routing),
                 ..pkt
             };
-            let raw = abs_pkt.serialize().unwrap();
-            file.write_all(&raw).unwrap();
+            let raw = abs_pkt
+                .serialize()
+                .map_err(|_| eyre::eyre!("failed to serialize packet for log"))?;
+            file_out
+                .write_all(&raw)
+                .wrap_err_with(|| format!("failed to write {}", file))?;
             if unbuffered {
-                file.flush().unwrap();
+                file_out
+                    .flush()
+                    .wrap_err_with(|| format!("failed to flush {}", file))?;
             }
         }
         return Ok(());
     }
 
-    let mut devs = DeviceTree::open(&proxy, route.clone()).map_err(|e| {
-        eprintln!("open failed: {:?}", e);
-    })?;
+    let mut devs = DeviceTree::open(&proxy, route.clone())
+        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
 
-    let mut file = File::create(file).map_err(|e| {
-        eprintln!("create failed: {e:?}");
-    })?;
+    let mut file = File::create(&file)
+        .wrap_err_with(|| format!("could not create log file {}", file))?;
 
     let write_packet = |pkt: tio::Packet, f: &mut File| {
         let _ = f.write_all(&pkt.serialize().unwrap());
@@ -413,130 +418,115 @@ pub fn log(
     Ok(())
 }
 
-pub fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
+pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
 
-    let mut device = Device::open(&proxy, route.clone()).map_err(|e| {
-        eprintln!("Failed to open device: {:?}", e);
-    })?;
+    let mut device = Device::open(&proxy, route.clone())
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
 
-    let meta = device.get_metadata().map_err(|e| {
-        eprintln!("Failed to get metadata: {:?}", e);
-    })?;
+    let meta = device
+        .get_metadata()
+        .wrap_err("failed to fetch device metadata")?;
 
-    let mut file = File::create(file).unwrap();
+    let mut file_out =
+        File::create(&file).wrap_err_with(|| format!("could not create {}", file))?;
 
-    file.write_all(
-        &meta
-            .device
-            .make_update_with_route(route.clone())
+    let write_packet = |f: &mut File, pkt: tio::Packet| -> eyre::Result<()> {
+        let raw = pkt
             .serialize()
-            .unwrap(),
-    )
-    .unwrap();
+            .map_err(|_| eyre::eyre!("failed to serialize metadata packet"))?;
+        f.write_all(&raw)
+            .wrap_err_with(|| format!("failed to write {}", file))
+    };
+
+    write_packet(
+        &mut file_out,
+        meta.device.make_update_with_route(route.clone()),
+    )?;
     for (_id, stream) in meta.streams {
-        file.write_all(
-            &stream
-                .stream
-                .make_update_with_route(route.clone())
-                .serialize()
-                .unwrap(),
-        )
-        .unwrap();
-        file.write_all(
-            &stream
-                .segment
-                .make_update_with_route(route.clone())
-                .serialize()
-                .unwrap(),
-        )
-        .unwrap();
+        write_packet(
+            &mut file_out,
+            stream.stream.make_update_with_route(route.clone()),
+        )?;
+        write_packet(
+            &mut file_out,
+            stream.segment.make_update_with_route(route.clone()),
+        )?;
         for col in stream.columns {
-            file.write_all(
-                &col.make_update_with_route(route.clone())
-                    .serialize()
-                    .unwrap(),
-            )
-            .unwrap();
+            write_packet(&mut file_out, col.make_update_with_route(route.clone()))?;
         }
     }
     Ok(())
 }
 
-pub fn meta_reroute(input: String, route: String, output: Option<String>) -> Result<(), ()> {
-    let data = std::fs::read(&input).map_err(|e| {
-        eprintln!("Failed to read {}: {}", input, e);
-    })?;
+pub fn meta_reroute(input: String, route: String, output: Option<String>) -> eyre::Result<()> {
+    use eyre::{bail, WrapErr};
+
+    let data = std::fs::read(&input).wrap_err_with(|| format!("could not read {}", input))?;
 
     let mut rest: &[u8] = &data;
     let mut routes: HashSet<DeviceRoute> = HashSet::new();
     let mut packet_count = 0usize;
 
     while !rest.is_empty() {
-        let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
-            eprintln!("Failed to parse packet in {}", input);
-        })?;
+        let (pkt, len) = tio::Packet::deserialize(rest)
+            .wrap_err_with(|| format!("could not parse packet in {}", input))?;
         rest = &rest[len..];
         packet_count += 1;
 
         if !matches!(pkt.payload, tio::proto::Payload::Metadata(_)) {
-            eprintln!(
-                "Error: {} does not look like a metadata file (found non-metadata packet)",
+            bail!(
+                "{} does not look like a metadata file (found non-metadata packet)",
                 input
             );
-            return Err(());
         }
         routes.insert(pkt.routing.clone());
     }
 
     if packet_count == 0 {
-        eprintln!("Error: {} contains no packets", input);
-        return Err(());
+        bail!("{} contains no packets", input);
     }
 
     if routes.len() > 1 {
         let mut routes: Vec<_> = routes.into_iter().collect();
         routes.sort();
-        eprintln!("Error: {} contains multiple routes:", input);
+        eprintln!("{} contains multiple routes:", input);
         for route in routes.iter().take(5) {
             eprintln!("  {}", route);
         }
         if routes.len() > 5 {
             eprintln!("  ... and {} more", routes.len() - 5);
         }
-        return Err(());
+        bail!("cannot reroute a file with multiple routes");
     }
 
-    let new_route = DeviceRoute::from_str(&route).map_err(|_| {
-        eprintln!("Invalid route: {}", route);
-    })?;
+    let new_route =
+        DeviceRoute::from_str(&route).map_err(|_| eyre::eyre!("invalid route: {}", route))?;
     let output_path = output.unwrap_or_else(|| {
         let base = input.strip_suffix(".tio").unwrap_or(&input);
         format!("{}_rerouted.tio", base)
     });
     if output_path == input {
-        eprintln!("Error: output path must be different from input");
-        return Err(());
+        bail!("output path must be different from input");
     }
 
-    let mut file = File::create(&output_path).map_err(|e| {
-        eprintln!("Failed to create {}: {}", output_path, e);
-    })?;
+    let mut file = File::create(&output_path)
+        .wrap_err_with(|| format!("could not create {}", output_path))?;
 
     rest = &data;
     while !rest.is_empty() {
-        let (mut pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
-            eprintln!("Failed to parse packet in {}", input);
-        })?;
+        let (mut pkt, len) = tio::Packet::deserialize(rest)
+            .wrap_err_with(|| format!("could not parse packet in {}", input))?;
         rest = &rest[len..];
         pkt.routing = new_route.clone();
-        let raw = pkt.serialize().map_err(|_| {
-            eprintln!("Failed to serialize packet for {}", output_path);
-        })?;
-        file.write_all(&raw).map_err(|e| {
-            eprintln!("Failed to write {}: {}", output_path, e);
-        })?;
+        let raw = pkt
+            .serialize()
+            .map_err(|_| eyre::eyre!("failed to serialize packet for {}", output_path))?;
+        file.write_all(&raw)
+            .wrap_err_with(|| format!("failed to write {}", output_path))?;
     }
 
     Ok(())
@@ -548,10 +538,11 @@ pub fn log_dump(
     meta: bool,
     sensor: String,
     depth: Option<usize>,
-) -> Result<(), ()> {
+) -> eyre::Result<()> {
+    use eyre::{bail, WrapErr};
+
     if files.is_empty() {
-        eprintln!("No input files specified");
-        return Err(());
+        bail!("no input files specified");
     }
 
     let target_route = DeviceRoute::from_str(&sensor).unwrap_or_else(|_| DeviceRoute::root());
@@ -570,13 +561,13 @@ pub fn log_dump(
     let mut deeper_routes: HashSet<DeviceRoute> = HashSet::new();
 
     // Helper to iterate packets from files
-    let iter_packets = |files: &[String]| -> Result<Vec<(String, Vec<u8>)>, ()> {
+    let iter_packets = |files: &[String]| -> eyre::Result<Vec<(String, Vec<u8>)>> {
         files
             .iter()
             .map(|path| {
                 std::fs::read(path)
                     .map(|data| (path.clone(), data))
-                    .map_err(|e| eprintln!("Failed to read {}: {}", path, e))
+                    .wrap_err_with(|| format!("could not read {}", path))
             })
             .collect()
     };
@@ -587,9 +578,8 @@ pub fn log_dump(
             for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
                 while !rest.is_empty() {
-                    let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
-                        eprintln!("Failed to parse packet in {}", path);
-                    })?;
+                    let (pkt, len) = tio::Packet::deserialize(rest)
+                        .wrap_err_with(|| format!("could not parse packet in {}", path))?;
                     rest = &rest[len..];
 
                     if route_matches(&pkt.routing) {
@@ -689,11 +679,14 @@ pub fn log_csv(
     args: Vec<String>,
     sensor: Option<String>,
     output: Option<String>,
-) -> Result<(), ()> {
+) -> eyre::Result<()> {
+    use color_eyre::Help;
+    use eyre::{bail, WrapErr};
+
+    let usage_hint = "tio log csv <stream> <log.tio>... [-s <route>]";
+
     if args.is_empty() {
-        eprintln!("Invalid invocation: missing stream name and log files");
-        eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
-        return Err(());
+        return Err(eyre::eyre!("missing stream name and log files").suggestion(usage_hint));
     }
 
     let mut stream_arg: Option<String> = None;
@@ -704,32 +697,26 @@ pub fn log_csv(
         } else if stream_arg.is_none() {
             stream_arg = Some(arg);
         } else {
-            eprintln!("Invalid invocation: multiple stream arguments provided");
-            eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
-            eprintln!("Hint: log files should end with .tio");
-            return Err(());
+            return Err(eyre::eyre!("multiple stream arguments provided")
+                .suggestion(usage_hint)
+                .suggestion("log files should end with .tio"));
         }
     }
 
-    let stream_arg = if let Some(stream) = stream_arg {
-        stream
-    } else {
-        eprintln!("Invalid invocation: missing stream name or id");
-        eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
-        eprintln!("Hint: log files should end with .tio");
-        return Err(());
-    };
+    let stream_arg = stream_arg.ok_or_else(|| {
+        eyre::eyre!("missing stream name or id")
+            .suggestion(usage_hint)
+            .suggestion("log files should end with .tio")
+    })?;
 
     if files.is_empty() {
-        eprintln!("Invalid invocation: missing log file");
-        eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
-        return Err(());
+        return Err(eyre::eyre!("missing log file").suggestion(usage_hint));
     }
 
     let target_id = stream_arg.parse::<u8>().ok();
 
     let target_route = if let Some(path) = sensor {
-        DeviceRoute::from_str(&path).unwrap()
+        DeviceRoute::from_str(&path).map_err(|_| eyre::eyre!("invalid route: {}", path))?
     } else {
         DeviceRoute::root()
     };
@@ -749,15 +736,13 @@ pub fn log_csv(
     let mut header_written: bool = false;
 
     for path in &files {
-        let file_data = std::fs::read(path).map_err(|e| {
-            eprintln!("Failed to read log file {}: {}", path, e);
-            eprintln!("Usage: tio log csv <stream> <log.tio>... [-s <route>]");
-        })?;
+        let file_data = std::fs::read(path)
+            .wrap_err_with(|| format!("could not read log file {}", path))
+            .suggestion(usage_hint)?;
         let mut rest: &[u8] = &file_data;
         while rest.len() > 0 {
-            let (pkt, len) = tio::Packet::deserialize(rest).map_err(|_| {
-                eprintln!("Failed to parse packet in {}", path);
-            })?;
+            let (pkt, len) = tio::Packet::deserialize(rest)
+                .wrap_err_with(|| format!("could not parse packet in {}", path))?;
             rest = &rest[len..];
 
             let parser = parsers
@@ -794,11 +779,12 @@ pub fn log_csv(
                             .append(true)
                             .create(true)
                             .open(&output_path)
-                            .or(Err(()))?;
+                            .wrap_err_with(|| format!("could not open {}", output_path))?;
                         created_output = !existed;
                         file = Some(opened);
                     }
-                    writeln!(file.as_mut().unwrap(), "{}", headers.join(",")).or(Err(()))?;
+                    writeln!(file.as_mut().unwrap(), "{}", headers.join(","))
+                        .wrap_err_with(|| format!("failed to write {}", output_path))?;
                     header_written = true;
                 }
 
@@ -807,7 +793,8 @@ pub fn log_csv(
 
                 values.extend(sample.columns.iter().map(|col| col.value.to_string()));
 
-                writeln!(file.as_mut().unwrap(), "{}", values.join(",")).or(Err(()))?;
+                writeln!(file.as_mut().unwrap(), "{}", values.join(","))
+                    .wrap_err_with(|| format!("failed to write {}", output_path))?;
             }
         }
     }
@@ -819,19 +806,17 @@ pub fn log_csv(
         }
         if missing_metadata_routes.contains(&target_route) {
             report_missing_metadata(vec![target_route.clone()], true);
-            return Err(());
+            bail!("no metadata found for target route");
         }
-        eprintln!(
-            "Error: No data found for stream '{}' at route {}",
-            stream_arg, target_route
-        );
-        eprintln!();
-        eprintln!("To see available routes and streams, run:");
-        eprintln!(
-            "  tio log dump -m {}",
+        return Err(eyre::eyre!(
+            "no data found for stream '{}' at route {}",
+            stream_arg,
+            target_route
+        )
+        .suggestion(format!(
+            "see available routes and streams with: tio log dump -m {}",
             files.first().unwrap_or(&"<file>".to_string())
-        );
-        return Err(());
+        )));
     }
 
     Ok(())
@@ -846,7 +831,8 @@ pub fn log_hdf(
     debug: bool,
     split_level: SplitLevel,
     split_policy: SplitPolicy,
-) -> Result<(), ()> {
+) -> eyre::Result<()> {
+    use eyre::{bail, WrapErr};
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
     use std::collections::HashMap;
@@ -857,8 +843,7 @@ pub fn log_hdf(
     use twinleaf::tio::proto::identifiers::StreamKey;
 
     if files.is_empty() {
-        eprintln!("No input files specified");
-        return Err(());
+        bail!("no input files specified");
     }
 
     // Determine output filename
@@ -874,20 +859,14 @@ pub fn log_hdf(
                 (1..=1000)
                     .map(|i| format!("{}_{}.h5", stem, i))
                     .find(|name| !Path::new(name).exists())
-                    .ok_or_else(|| eprintln!("Could not find available output filename"))?
+                    .ok_or_else(|| eyre::eyre!("could not find available output filename"))?
             }
         }
     };
 
     // Parse filter upfront
     let col_filter = if let Some(p) = filter {
-        match ColumnFilter::new(&p) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                eprintln!("Filter error: {}", e);
-                return Err(());
-            }
-        }
+        Some(ColumnFilter::new(&p).wrap_err("invalid column filter")?)
     } else {
         None
     };
@@ -902,7 +881,7 @@ pub fn log_hdf(
         split_policy.into(),
         split_level.into(),
     )
-    .map_err(|e| eprintln!("Failed to create HDF5 file: {:?}", e))?;
+    .wrap_err_with(|| format!("could not create HDF5 file {}", output))?;
 
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
@@ -911,8 +890,9 @@ pub fn log_hdf(
     println!("Processing {} files...", files.len());
 
     for path in &files {
-        let file = File::open(&path).map_err(|e| eprintln!("Open failed: {:?}", e))?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| eprintln!("Mmap failed: {:?}", e))?;
+        let file = File::open(&path).wrap_err_with(|| format!("could not open {}", path))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .wrap_err_with(|| format!("could not mmap {}", path))?;
 
         let total_bytes = mmap.len() as u64;
         let pb = ProgressBar::new(total_bytes);
@@ -953,10 +933,9 @@ pub fn log_hdf(
                     }
                 }
 
-                if let Err(e) = writer.write_sample(sample, key) {
-                    eprintln!("HDF5 Write Error: {:?}", e);
-                    return Err(());
-                }
+                writer
+                    .write_sample(sample, key)
+                    .wrap_err("failed to write sample to HDF5")?;
             }
         }
 
@@ -964,9 +943,7 @@ pub fn log_hdf(
     }
 
     // Finish flushes all pending data and returns stats
-    let stats = writer
-        .finish()
-        .map_err(|e| eprintln!("Failed to finalize HDF5: {:?}", e))?;
+    let stats = writer.finish().wrap_err("failed to finalize HDF5")?;
 
     report_missing_metadata(missing_metadata_routes.into_iter().collect(), false);
 
@@ -1005,11 +982,12 @@ pub fn log_hdf(
     _debug: bool,
     _split_level: SplitLevel,
     _split_policy: SplitPolicy,
-) -> Result<(), ()> {
-    eprintln!("Error: This version of twinleaf-tools was compiled without HDF5 support.");
-    eprintln!("To enable it, reinstall with:");
-    eprintln!("  cargo install twinleaf-tools --features hdf5");
-    Err(())
+) -> eyre::Result<()> {
+    use color_eyre::Help;
+    Err(eyre::eyre!(
+        "this version of twinleaf-tools was compiled without HDF5 support"
+    )
+    .suggestion("reinstall with: cargo install twinleaf-tools --features hdf5"))
 }
 
 pub fn firmware_upgrade(
