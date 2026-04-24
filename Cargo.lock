@@ -2198,6 +2198,7 @@ dependencies = [
  "num_enum",
  "objc2",
  "objc2-foundation",
+ "thiserror 1.0.69",
  "windows-sys 0.61.2",
 ]
 
