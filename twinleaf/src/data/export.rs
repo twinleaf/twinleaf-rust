@@ -41,6 +41,8 @@ pub struct ExportStats {
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub streams_written: HashSet<String>,
+    pub streams_seen: HashSet<String>,
+    pub discontinuities_detected: u64,
 }
 
 enum ColumnBatch {
@@ -236,6 +238,7 @@ impl Hdf5Appender {
     }
 
     fn handle_discontinuity(&mut self, key: &StreamKey) -> Result<()> {
+        self.stats.discontinuities_detected += 1;
         match self.split_level {
             RunSplitLevel::None => {
                 self.flush_stream(key)?;
@@ -347,6 +350,13 @@ impl Hdf5Appender {
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
         let stream_name = &batch.stream_metadata.name;
 
+        let stream_path = if route_str.is_empty() {
+            format!("/{}", stream_name)
+        } else {
+            format!("/{}/{}", route_str, stream_name)
+        };
+        self.stats.streams_seen.insert(stream_path.clone());
+
         let valid_columns: Vec<_> = batch
             .columns
             .iter()
@@ -423,11 +433,6 @@ impl Hdf5Appender {
             self.stats.start_time = Some(self.stats.start_time.map_or(first, |t| t.min(first)));
             self.stats.end_time = Some(self.stats.end_time.map_or(last, |t| t.max(last)));
         }
-        let stream_path = if route_str.is_empty() {
-            format!("/{}", stream_name)
-        } else {
-            format!("/{}/{}", route_str, stream_name)
-        };
         self.stats.streams_written.insert(stream_path);
 
         Ok(())
