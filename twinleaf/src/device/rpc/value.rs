@@ -8,6 +8,24 @@ pub enum RpcValue {
     Bytes(Vec<u8>),
 }
 
+impl std::fmt::Display for RpcValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcValue::Unit => Ok(()),
+            RpcValue::U64(n) => write!(f, "{}", n),
+            RpcValue::I64(n) => write!(f, "{}", n),
+            RpcValue::F64(x) => write!(f, "{}", x),
+            RpcValue::Str(s) => write!(f, "{}", s),
+            RpcValue::Bytes(b) => {
+                for byte in b {
+                    write!(f, "{:02x}", byte)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RpcValueType {
     Unit,

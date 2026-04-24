@@ -269,17 +269,3 @@ pub fn rpc_decode_reply(reply: &[u8], kind: &RpcValueType) -> Result<RpcValue, D
     }
 }
 
-pub fn format_rpc_value_for_cli(v: &RpcValue, kind: &RpcValueType) -> String {
-    match (v, kind) {
-        (RpcValue::Unit, _) => "OK".to_string(),
-
-        (RpcValue::Str(s), _) => format!("\"{}\" {:?}", s, s.as_bytes()),
-
-        (RpcValue::U64(n), RpcValueType::Int { signed: false, .. }) => format!("{}", n),
-        (RpcValue::I64(n), RpcValueType::Int { signed: true, .. }) => format!("{}", n),
-        (RpcValue::F64(x), RpcValueType::Float { .. }) => format!("{}", x),
-
-        (RpcValue::Bytes(b), _) => format!("{:?}", b),
-        (other, _) => format!("{:?}", other),
-    }
-}

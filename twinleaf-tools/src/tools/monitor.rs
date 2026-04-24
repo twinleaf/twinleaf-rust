@@ -28,7 +28,10 @@ use toml_edit::{DocumentMut, InlineTable, Value};
 use tui_prompts::{State, TextState};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{util, DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, TreeEvent, TreeItem},
+    device::{
+        util, DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, RpcValue, TreeEvent,
+        TreeItem,
+    },
     tio::{
         self,
         proto::{
@@ -671,7 +674,11 @@ fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
     let value =
         util::rpc_decode_reply(&reply_bytes, &spec.data_kind).map_err(|e| format!("{:?}", e))?;
 
-    Ok(util::format_rpc_value_for_cli(&value, &spec.data_kind))
+    Ok(match &value {
+        RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
+        RpcValue::Bytes(b) => format!("{:?}", b),
+        other => format!("{}", other),
+    })
 }
 
 pub struct App {

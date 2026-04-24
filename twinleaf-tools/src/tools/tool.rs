@@ -9,10 +9,8 @@ use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device::util::{
-    format_rpc_value_for_cli, parse_rpc_spec, rpc_decode_reply, rpc_encode_arg,
-};
-use twinleaf::device::{Device, DeviceTree, RpcClient, RpcValueType};
+use twinleaf::device::util::{parse_rpc_spec, rpc_decode_reply, rpc_encode_arg};
+use twinleaf::device::{Device, DeviceTree, RpcClient, RpcValue, RpcValueType};
 use twinleaf::tio;
 
 fn record_missing_metadata(
@@ -138,7 +136,12 @@ pub fn rpc(
             .or(req_type)
             .unwrap_or_else(|| infer_rpc_type(&rpc_name, &device, "ret"));
         let value = rpc_decode_reply(&reply, &rep_type).unwrap();
-        println!("Reply: {}", format_rpc_value_for_cli(&value, &rep_type));
+        let formatted = match &value {
+            RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
+            RpcValue::Bytes(b) => format!("{:?}", b),
+            other => format!("{}", other),
+        };
+        println!("Reply: {}", formatted);
     }
     println!("OK");
     drop(proxy);
