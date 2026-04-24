@@ -538,11 +538,7 @@ pub fn log_dump(
     sensor: String,
     depth: Option<usize>,
 ) -> eyre::Result<()> {
-    use eyre::{bail, WrapErr};
-
-    if files.is_empty() {
-        bail!("no input files specified");
-    }
+    use eyre::WrapErr;
 
     let target_route = DeviceRoute::from_str(&sensor).unwrap_or_else(|_| DeviceRoute::root());
     let max_depth = depth;
@@ -711,10 +707,6 @@ fn fmt_hms(secs: f64) -> String {
 }
 
 pub fn log_inspect(files: Vec<String>) -> eyre::Result<()> {
-    use eyre::bail;
-    if files.is_empty() {
-        bail!("no input files specified");
-    }
     for (i, path) in files.iter().enumerate() {
         if i > 0 {
             println!();
@@ -1116,10 +1108,6 @@ pub fn log_hdf(
     use twinleaf::data::{export, ColumnFilter, DeviceDataParser};
     use twinleaf::tio;
     use twinleaf::tio::proto::identifiers::StreamKey;
-
-    if files.is_empty() {
-        bail!("no input files specified");
-    }
 
     // Determine output filename
     let output = match output {

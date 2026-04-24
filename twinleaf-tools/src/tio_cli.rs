@@ -235,7 +235,7 @@ pub enum LogSubcommands{
     /// Dump data from binary log file(s)
     Dump {
         /// Input log file(s)
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
         files: Vec<String>,
 
         /// Show parsed data samples
@@ -258,7 +258,7 @@ pub enum LogSubcommands{
     /// Summarize the contents of binary log file(s)
     Inspect {
         /// Input log file(s)
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
         files: Vec<String>,
     },
 
@@ -280,7 +280,7 @@ pub enum LogSubcommands{
     /// Convert binary log files to HDF5 format
     Hdf {
         /// Input log file(s)
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
         files: Vec<String>,
 
         /// Output file path (defaults to input filename with .h5 extension)
