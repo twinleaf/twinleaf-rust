@@ -1,11 +1,11 @@
 use clap::{CommandFactory, Parser};
 use std::process::ExitCode;
 use twinleaf_tools::tools::{
-    tio_health::run_health,
-    tio_monitor::run_monitor,
-    tio_proxy::run_proxy,
-    tio_text_proxy::run_text_proxy,
-    tio_tool::{
+    health::run_health,
+    monitor::run_monitor,
+    proxy::run_proxy,
+    proxy_nmea::run_nmea_proxy,
+    tool::{
         data_dump_all_deprecated, data_dump_deprecated, dump, firmware_upgrade, list_rpcs, log,
         log_csv, log_data_dump_deprecated, log_dump, log_hdf, log_metadata, meta_dump_deprecated,
         meta_reroute, rpc, rpc_dump,
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
             colors,
         } => run_monitor(tio, all, fps, colors),
         Commands::Health(health_cli) => run_health(health_cli),
-        Commands::NmeaProxy { tio, tcp_port } => run_text_proxy(tio, tcp_port),
+        Commands::NmeaProxy { tio, tcp_port } => run_nmea_proxy(tio, tcp_port),
         Commands::Rpc {
             tio,
             subcommands,

@@ -85,7 +85,7 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     println!("Disconnected: {}", peer_addr);
 }
 
-pub fn run_text_proxy(tio: TioOpts, tcp_port: u16) -> Result<(), ()> {
+pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> Result<(), ()> {
     let proxy = tio::proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
 
