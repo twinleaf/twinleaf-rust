@@ -34,7 +34,13 @@ impl Port {
 
     /// Returns a new `tcp::Port` for communication with the given `address`.
     pub fn new(address: &SocketAddr) -> Result<Port, io::Error> {
-        let stream = TcpStream::connect(*address)?;
+        // mio::TcpStream::connect is non-blocking and returns Ok before the
+        // connection is established, which would let callers run as if
+        // connected to a dead address. Connect via std first so failures
+        // surface synchronously, then switch to mio for non-blocking I/O.
+        let std_stream = std::net::TcpStream::connect(*address)?;
+        std_stream.set_nonblocking(true)?;
+        let stream = TcpStream::from_std(std_stream);
         Port::from_stream(stream)
     }
 
