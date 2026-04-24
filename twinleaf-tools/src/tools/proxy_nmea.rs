@@ -85,19 +85,28 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     println!("Disconnected: {}", peer_addr);
 }
 
-pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> Result<(), ()> {
+pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
+    use color_eyre::Help;
+    use eyre::WrapErr;
+
     let proxy = tio::proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
 
     let bind_addr = format!("0.0.0.0:{}", tcp_port);
     let listener = TcpListener::bind(&bind_addr)
-        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", bind_addr, e));
+        .wrap_err_with(|| format!("could not bind to {}", bind_addr))
+        .suggestion(format!(
+            "port {} may be in use; try -p <N>",
+            tcp_port
+        ))?;
 
     println!("Listening on {}", bind_addr);
 
     for connection in listener.incoming() {
         if let Ok(stream) = connection {
-            let device = proxy.device_full(route.clone()).unwrap();
+            let device = proxy
+                .device_full(route.clone())
+                .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
             thread::spawn(move || broadcast_to_client(stream, device));
         }
     }

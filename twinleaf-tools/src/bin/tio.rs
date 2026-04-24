@@ -21,7 +21,9 @@ fn main() -> ExitCode {
     //TODO: Work on exit code logic
     let result = match cli.command {
         Commands::Proxy(mut proxy_cli) => match proxy_cli.subcommands.take() {
-            Some(ProxySubcommands::Nmea { tio, tcp_port }) => run_nmea_proxy(tio, tcp_port),
+            Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
+                run_nmea_proxy(tio, tcp_port).map_err(|e| eprintln!("{:?}", e))
+            }
             None => run_proxy(proxy_cli).map_err(|e| eprintln!("{:?}", e)),
         },
         Commands::Monitor {
