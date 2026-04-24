@@ -48,14 +48,12 @@ pub enum ReadError {
     #[error("no columns requested")]
     NoColumnsRequested,
     #[error("no cursor for stream {stream_key:?}")]
-    NoCursorForStream {
-        stream_key: StreamKey,
-    },
+    NoCursorForStream { stream_key: StreamKey },
     #[error("no active run for stream {stream_key:?}")]
-    NoActiveRun {
-        stream_key: StreamKey,
-    },
-    #[error("insufficient data for stream {stream_key:?}: requested {requested}, available {available}")]
+    NoActiveRun { stream_key: StreamKey },
+    #[error(
+        "insufficient data for stream {stream_key:?}: requested {requested}, available {available}"
+    )]
     InsufficientData {
         stream_key: StreamKey,
         requested: usize,

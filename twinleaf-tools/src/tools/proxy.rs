@@ -52,7 +52,9 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
     }
 
     if proxy_cli.auto {
-        eprintln!("warning: '--auto' is deprecated; running without -s <url> now auto-detects by default");
+        eprintln!(
+            "warning: '--auto' is deprecated; running without -s <url> now auto-detects by default"
+        );
     }
 
     let tcp_port = proxy_cli.port;
@@ -164,12 +166,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
         if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
             let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
                 || matches!(e2.kind(), io::ErrorKind::AddrInUse);
-            let err = eyre::eyre!(
-                "could not bind TCP port {}: v6={}, v4={}",
-                tcp_port,
-                e1,
-                e2
-            );
+            let err = eyre::eyre!("could not bind TCP port {}: v6={}, v4={}", tcp_port, e1, e2);
             return Err(if addr_in_use {
                 err.suggestion(format!(
                     "another 'tio proxy' is likely running on port {}; try --port <N>",
@@ -192,8 +189,8 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
         Ok(port) => port,
         Err(e) => {
             let last_status = port_status.iter().last();
-            let err = eyre::Report::new(e)
-                .wrap_err(format!("could not open port on {}", sensor_url));
+            let err =
+                eyre::Report::new(e).wrap_err(format!("could not open port on {}", sensor_url));
             return Err(if let Some(status) = last_status {
                 err.with_section(move || format!("{:?}", status).header("Last proxy event:"))
             } else {

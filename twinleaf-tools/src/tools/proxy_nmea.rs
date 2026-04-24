@@ -95,10 +95,7 @@ pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     let bind_addr = format!("0.0.0.0:{}", tcp_port);
     let listener = TcpListener::bind(&bind_addr)
         .wrap_err_with(|| format!("could not bind to {}", bind_addr))
-        .suggestion(format!(
-            "port {} may be in use; try -p <N>",
-            tcp_port
-        ))?;
+        .suggestion(format!("port {} may be in use; try -p <N>", tcp_port))?;
 
     println!("Listening on {}", bind_addr);
 

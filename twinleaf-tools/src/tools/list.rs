@@ -174,12 +174,7 @@ fn render_device(dev: &ListedDevice, url_width: usize) {
                 .map(|r| r.name.as_deref().unwrap_or("(no name)").to_string())
                 .unwrap_or_else(|| "(no root response)".to_string());
 
-            let root_label = format!(
-                "{:<width$}  {}",
-                dev.url,
-                root_name,
-                width = url_width
-            );
+            let root_label = format!("{:<width$}  {}", dev.url, root_name, width = url_width);
             let tree = build_tree(&DeviceRoute::root(), root_label, routes);
             for line in tree.to_string().lines() {
                 println!("  {}", line);
@@ -196,11 +191,7 @@ fn build_tree(
     let mut node = termtree::Tree::new(label);
     for r in routes {
         if is_direct_child(parent, &r.route) {
-            let child_label = format!(
-                "{}  {}",
-                r.route,
-                r.name.as_deref().unwrap_or("(no name)")
-            );
+            let child_label = format!("{}  {}", r.route, r.name.as_deref().unwrap_or("(no name)"));
             node.push(build_tree(&r.route, child_label, routes));
         }
     }

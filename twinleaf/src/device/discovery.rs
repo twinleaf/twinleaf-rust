@@ -71,4 +71,3 @@ pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
         .ok()?;
     port.rpc("dev.name", ()).ok()
 }
-
