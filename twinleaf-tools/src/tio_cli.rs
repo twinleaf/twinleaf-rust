@@ -41,29 +41,75 @@ pub struct TioCli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// List detected Twinleaf devices and verify liveness
+    /// List connected devices
     List {
         /// Include serial ports with unknown VID/PID
         #[arg(short = 'a', long = "all")]
         all: bool,
     },
-    Proxy(ProxyCli),
-    ///Live sensor data and plot display
-	Monitor {
-		#[command(flatten)]
-		tio: TioOpts,
-		#[arg(long = "fps", default_value_t = 20)]
-		fps: u32,
-		#[arg(short = 'c', long = "colors")]
-		colors: Option<String>,
-		/// Routing depth limit (default: unlimited)
-		#[arg(long = "depth")]
-		depth: Option<usize>,
-	},
-	Health(HealthCli),
 
+    /// Live sensor data display
+    Monitor {
+        #[command(flatten)]
+        tio: TioOpts,
+        #[arg(long = "fps", default_value_t = 20)]
+        fps: u32,
+        #[arg(short = 'c', long = "colors")]
+        colors: Option<String>,
+        /// Routing depth limit (default: unlimited)
+        #[arg(long = "depth")]
+        depth: Option<usize>,
+    },
+
+    /// Live timing and rate diagnostics
+    Health(HealthCli),
+
+    /// Dump raw packets from a device
+    Dump {
+        #[command(flatten)]
+        tio: TioOpts,
+
+        /// Show parsed data samples
+        #[arg(short = 'd', long = "data")]
+        data: bool,
+
+        /// Show metadata on boundaries
+        #[arg(short = 'm', long = "meta")]
+        meta: bool,
+
+        /// Routing depth limit (default: unlimited)
+        #[arg(long = "depth")]
+        depth: Option<usize>,
+    },
+
+    /// Log samples to a file
+    #[command(args_conflicts_with_subcommands = true)]
+    Log {
+        #[command(flatten)]
+        tio: TioOpts,
+
+        #[command(subcommand)]
+        subcommands: Option<LogSubcommands>,
+
+        /// Output log file path
+        #[arg(short = 'f', default_value_t = default_log_path())]
+        file: String,
+
+        /// Unbuffered output (flush every packet)
+        #[arg(short = 'u')]
+        unbuffered: bool,
+
+        /// Raw mode: skip metadata request and dump all packets
+        #[arg(long)]
+        raw: bool,
+
+        /// Routing depth (only used in --raw mode)
+        #[arg(long = "depth")]
+        depth: Option<usize>,
+    },
+
+    /// Execute a device RPC
     #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
-    /// Execute an RPC on the device. See "tio rpc --help" for more options
     Rpc {
         #[command(flatten)]
         tio: TioOpts,
@@ -107,48 +153,6 @@ pub enum Commands {
         debug: bool,
     },
 
-    #[command(args_conflicts_with_subcommands = true)]
-    /// Log samples to a file (includes metadata by default) See "tio log --help" for more options
-    Log {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        #[command(subcommand)]
-        subcommands: Option<LogSubcommands>,
-
-        /// Output log file path
-        #[arg(short = 'f', default_value_t = default_log_path())]
-        file: String,
-
-        /// Unbuffered output (flush every packet)
-        #[arg(short = 'u')]
-        unbuffered: bool,
-
-        /// Raw mode: skip metadata request and dump all packets
-        #[arg(long)]
-        raw: bool,
-
-        /// Routing depth (only used in --raw mode)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
-    },
-    /// Dump data from a live device
-    Dump {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        /// Show parsed data samples
-        #[arg(short = 'd', long = "data")]
-        data: bool,
-
-        /// Show metadata on boundaries
-        #[arg(short = 'm', long = "meta")]
-        meta: bool,
-
-        /// Routing depth limit (default: unlimited)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
-    },
     /// Upgrade device firmware
     #[command(alias = "firmware-upgrade")]
     Upgrade {
@@ -163,6 +167,10 @@ pub enum Commands {
         #[arg(short = 'y', long = "yes")]
         yes: bool,
     },
+
+    /// Multiplex a sensor over TCP
+    Proxy(ProxyCli),
+
     /// Generate shell completions for tio
     #[command(long_about = "\
 Generate shell completions for tio.
