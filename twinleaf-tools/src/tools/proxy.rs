@@ -35,23 +35,16 @@ fn create_listener_thread(
             for res in listener.incoming() {
                 match res {
                     Ok(stream) => client_send.send(stream).expect("New client queue full"),
-                    Err(err) => panic!("Error accepting client {:?}", err),
+                    Err(err) => eprintln!("error accepting client: {}", err),
                 };
             }
         })?;
     Ok(())
 }
 
-pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
-    macro_rules! die {
-        ($f:expr,$($a:tt)*) => {
-            die!(format!($f, $($a)*));
-        };
-        ($msg:expr) => {{
-            eprintln!("ERROR: {}", $msg);
-            return Err(());
-        }};
-    }
+pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
+    use color_eyre::{Help, SectionExt};
+    use eyre::bail;
 
     // Handle --enum mode
     if proxy_cli.enumerate {
@@ -111,10 +104,11 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
             }
         }
         if valid_urls.len() == 0 {
-            die!("Cannot find any sensor to connect to, specify URL manually")
+            return Err(eyre::eyre!("no sensors detected")
+                .suggestion("specify a URL with -s <url>, or run 'tio proxy --enumerate'"));
         }
         if valid_urls.len() > 1 {
-            eprintln!("ERROR: multiple sensors detected:");
+            eprintln!("multiple sensors detected:");
             let query_timeout = Duration::from_millis(500);
             for url in &valid_urls {
                 match discovery::query_name(url, query_timeout) {
@@ -122,8 +116,8 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
                     None => eprintln!("  {}  (no response)", url),
                 }
             }
-            eprintln!("Specify one with -s <url>.");
-            return Err(());
+            return Err(eyre::eyre!("multiple sensors detected, cannot auto-select")
+                .suggestion("specify one with -s <url>"));
         }
         valid_urls[0].clone()
     };
@@ -193,7 +187,22 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
             )
         };
         if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
-            die!("Failed to start up server: {:?}/{:?}", e1, e2);
+            let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
+                || matches!(e2.kind(), io::ErrorKind::AddrInUse);
+            let err = eyre::eyre!(
+                "could not bind TCP port {}: v6={}, v4={}",
+                tcp_port,
+                e1,
+                e2
+            );
+            return Err(if addr_in_use {
+                err.suggestion(format!(
+                    "another 'tio proxy' is likely running on port {}; try --port <N>",
+                    tcp_port
+                ))
+            } else {
+                err
+            });
         }
         new_client
     };
@@ -204,16 +213,18 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
 
     // This is used by the proxy itself to communicate with the device tree.
     // for now only used to receive log messages and dump traffic.
-    let proxy_port = if let Ok(port) = proxy.subtree_full(subtree.clone()) {
-        port
-    } else {
-        die!(
-            "Failed to open port{}",
-            match port_status.iter().last() {
-                Some(status) => format!(": {:?}", status),
-                _ => "".to_string(),
-            }
-        );
+    let proxy_port = match proxy.subtree_full(subtree.clone()) {
+        Ok(port) => port,
+        Err(e) => {
+            let last_status = port_status.iter().last();
+            let err = eyre::Report::new(e)
+                .wrap_err(format!("could not open port on {}", sensor_url));
+            return Err(if let Some(status) = last_status {
+                err.with_section(move || format!("{:?}", status).header("Last proxy event:"))
+            } else {
+                err
+            });
+        }
     };
 
     use crossbeam::select;
@@ -312,7 +323,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
                         }
                     });
                 } else {
-                    die!("Listener thread died unexpectedly");
+                    bail!("listener thread died unexpectedly");
                 }
             }
             recv(port_status) -> status => {

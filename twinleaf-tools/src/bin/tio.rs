@@ -22,7 +22,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Proxy(mut proxy_cli) => match proxy_cli.subcommands.take() {
             Some(ProxySubcommands::Nmea { tio, tcp_port }) => run_nmea_proxy(tio, tcp_port),
-            None => run_proxy(proxy_cli),
+            None => run_proxy(proxy_cli).map_err(|e| eprintln!("{:?}", e)),
         },
         Commands::Monitor {
             tio,
