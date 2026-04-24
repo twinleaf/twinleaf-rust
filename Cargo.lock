@@ -2391,6 +2391,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "color-eyre",
+ "console",
  "crossbeam",
  "eyre",
  "indicatif",

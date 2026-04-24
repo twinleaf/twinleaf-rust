@@ -864,9 +864,9 @@ pub fn log_hdf(
         }
     };
 
-    // Parse filter upfront
+    let filter_pattern = filter.clone();
     let col_filter = if let Some(p) = filter {
-        Some(ColumnFilter::new(&p).wrap_err("invalid column filter")?)
+        Some(ColumnFilter::new(&p).map_err(|e| eyre::eyre!("invalid column filter: {}", e))?)
     } else {
         None
     };
@@ -878,14 +878,15 @@ pub fn log_hdf(
         debug,
         col_filter,
         65_536,
-        split_policy.into(),
-        split_level.into(),
+        split_policy.clone().into(),
+        split_level.clone().into(),
     )
     .wrap_err_with(|| format!("could not create HDF5 file {}", output))?;
 
     let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
     let mut missing_metadata_routes: HashSet<tio::proto::DeviceRoute> = HashSet::new();
+    let mut total_input_bytes: u64 = 0;
 
     println!("Processing {} files...", files.len());
 
@@ -895,6 +896,7 @@ pub fn log_hdf(
             .wrap_err_with(|| format!("could not mmap {}", path))?;
 
         let total_bytes = mmap.len() as u64;
+        total_input_bytes += total_bytes;
         let pb = ProgressBar::new(total_bytes);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -947,28 +949,85 @@ pub fn log_hdf(
 
     report_missing_metadata(missing_metadata_routes.into_iter().collect(), false);
 
+    use console::style;
+
     let file_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
-    let duration = stats.end_time.unwrap_or(0.0) - stats.start_time.unwrap_or(0.0);
-    let size_mb = file_size as f64 / 1_048_576.0;
+    let size_mib = file_size as f64 / 1_048_576.0;
+    let input_mib = total_input_bytes as f64 / 1_048_576.0;
+    let written = stats.streams_written.len();
+    let seen = stats.streams_seen.len();
+    let rule = style("─".repeat(50)).dim();
+    let label = |s: &str| style(format!("{:10}", s)).bold().cyan();
+    let unit = |s: &str| style(s.to_string()).dim();
 
-    println!("\n--------------------------------------------------");
-    println!(" Export Summary");
-    println!("--------------------------------------------------");
-    println!(" Output File:     {}", output);
-    println!(" File Size:       {:.2} MB", size_mb);
-    println!(" Duration:        {:.3} s", duration);
-    println!(" Total Samples:   {}", stats.total_samples);
-    println!(" Streams Written: {}", stats.streams_written.len());
+    println!();
+    println!("{rule}");
+    println!(" {}", style("HDF5 Output Summary").bold());
+    println!("{rule}");
+    println!(" {} {}", label("Output:"), output);
 
-    if !stats.streams_written.is_empty() {
-        println!("\n Active Streams:");
-        let mut streams: Vec<_> = stats.streams_written.into_iter().collect();
-        streams.sort();
-        for stream in streams {
-            println!("  • {}", stream);
+    if compress && total_input_bytes > 0 {
+        let ratio = total_input_bytes as f64 / file_size.max(1) as f64;
+        println!(
+            " {} {:.2} {}  ({:.1}× smaller, from {:.2} {})",
+            label("Size:"),
+            size_mib,
+            unit("MiB"),
+            ratio,
+            input_mib,
+            unit("MiB"),
+        );
+    } else {
+        println!(" {} {:.2} {}", label("Size:"), size_mib, unit("MiB"));
+    }
+    println!(" {} {}", label("Samples:"), stats.total_samples);
+
+    match filter_pattern.as_deref() {
+        Some(pat) if written == 0 && seen > 0 => {
+            println!(
+                " {} {}",
+                label("Streams:"),
+                style(format!(
+                    "⚠ 0 of {} matching \"{}\" — none matched; check pattern",
+                    seen, pat
+                ))
+                .yellow(),
+            );
+        }
+        Some(pat) => {
+            println!(
+                " {} {} of {} matching \"{}\"",
+                label("Streams:"),
+                written,
+                seen,
+                pat
+            );
+        }
+        None => {
+            println!(" {} {}", label("Streams:"), written);
         }
     }
-    println!("--------------------------------------------------");
+
+    if !matches!(split_level, SplitLevel::None) {
+        let mode = match split_level {
+            SplitLevel::Stream => "per-stream",
+            SplitLevel::Device => "per-device",
+            SplitLevel::Global => "global",
+            SplitLevel::None => unreachable!(),
+        };
+        println!(
+            " {} {}  ({} discontinuities detected)",
+            label("Split:"),
+            mode,
+            stats.discontinuities_detected
+        );
+    }
+
+    if matches!(split_policy, SplitPolicy::Monotonic) {
+        println!(" {} monotonic", label("Policy:"));
+    }
+
+    println!("{rule}");
 
     Ok(())
 }
