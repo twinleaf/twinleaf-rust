@@ -55,6 +55,40 @@ pub struct RpcPalette {
     pub current_completion: String,
     pub last_rpc_result: Option<(String, Color)>,
     pub last_rpc_command: String,
+    history: Vec<String>,
+    picker: Option<HistoryPicker>,
+}
+
+/// Sub-mode: Ctrl+R opens a filterable list of past submitted commands.
+#[derive(Debug, Default)]
+struct HistoryPicker {
+    /// Query text typed into the picker's own filter line.
+    query: String,
+    /// Indices into `RpcPalette.history`, newest-first, matching `query`.
+    filtered: Vec<usize>,
+    /// Position within `filtered`.
+    selected: usize,
+}
+
+impl HistoryPicker {
+    fn refilter(&mut self, history: &[String]) {
+        let q = self.query.as_str();
+        self.filtered = history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, h)| q.is_empty() || h.contains(q))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+
+    fn selected_entry<'a>(&self, history: &'a [String]) -> Option<&'a str> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| history.get(i))
+            .map(|s| s.as_str())
+    }
 }
 
 impl RpcPalette {
@@ -73,9 +107,12 @@ impl RpcPalette {
         self.input_state.blur();
     }
 
-    /// Number of suggestion rows to display (without borders).
+    /// Number of suggestion rows to display (without borders). When the history
+    /// picker is open, reflects its filtered-row count instead.
     pub fn suggestion_rows(&self) -> u16 {
-        let len = if self.suggestions.is_empty() {
+        let len = if let Some(picker) = &self.picker {
+            picker.filtered.len().max(1).min(RPCLIST_MAX_LEN)
+        } else if self.suggestions.is_empty() {
             1
         } else {
             self.suggestions.len().min(RPCLIST_MAX_LEN)
@@ -104,8 +141,19 @@ impl RpcPalette {
         if key.kind != KeyEventKind::Press {
             return PaletteEvent::Consumed;
         }
+        // Ctrl+C exits the palette regardless of sub-mode.
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers == KeyModifiers::CONTROL {
+            return PaletteEvent::Exit;
+        }
+        if self.picker.is_some() {
+            self.handle_picker_key(key, registry);
+            return PaletteEvent::Consumed;
+        }
         match key.code {
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => PaletteEvent::Exit,
+            KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
+                self.open_picker();
+                PaletteEvent::Consumed
+            }
             KeyCode::Esc => {
                 if self.input_state.value().is_empty() {
                     PaletteEvent::Exit
@@ -152,6 +200,65 @@ impl RpcPalette {
         }
     }
 
+    fn open_picker(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let mut picker = HistoryPicker::default();
+        picker.refilter(&self.history);
+        self.picker = Some(picker);
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent, registry: Option<&RpcRegistry>) {
+        // Take the picker out so we can freely mutate other fields of self. If
+        // the key should keep the picker open, we re-install it at the end.
+        let mut picker = match self.picker.take() {
+            Some(p) => p,
+            None => return,
+        };
+        match key.code {
+            KeyCode::Esc => { /* drop picker */ }
+            KeyCode::Enter => {
+                if let Some(entry) = picker.selected_entry(&self.history) {
+                    let entry = entry.to_string();
+                    self.input_state = TextState::new().with_value(entry);
+                    self.input_state.focus();
+                    self.input_state.move_end();
+                    self.update_suggestions(registry);
+                    // user committed to a recall — drop picker
+                } else {
+                    // no matches; keep picker open so user can adjust query
+                    self.picker = Some(picker);
+                }
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.picker = Some(picker);
+            }
+            KeyCode::Down => {
+                let last = picker.filtered.len().saturating_sub(1);
+                picker.selected = (picker.selected + 1).min(last);
+                self.picker = Some(picker);
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter(&self.history);
+                self.picker = Some(picker);
+            }
+            KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE
+                || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                picker.query.push(c);
+                picker.refilter(&self.history);
+                self.picker = Some(picker);
+            }
+            _ => {
+                // unknown key; keep picker open
+                self.picker = Some(picker);
+            }
+        }
+    }
+
     /// Render the palette into `area`. Caller is responsible for reserving
     /// enough vertical space (see [`suggestion_block_height`]).
     pub fn render(
@@ -173,40 +280,76 @@ impl RpcPalette {
             .split(area);
 
         if footer_height > 3 {
-            let rpcs: Vec<Span> = if registry_ready {
-                let visible_rows = self.visible_rows(footer_height);
-                let start = self.scroll.min(self.suggestions.len());
-                let end = if visible_rows == 0 {
-                    start
+            let (rows, title_left, title_right): (Vec<Line>, Line, Line) =
+                if let Some(picker) = &self.picker {
+                    let visible_rows = self.visible_rows(footer_height);
+                    let start = 0usize;
+                    let end = visible_rows.min(picker.filtered.len());
+                    let items = picker.filtered[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &hist_idx)| {
+                            let text = self.history.get(hist_idx).map(|s| s.as_str()).unwrap_or("");
+                            let line = Line::from(Span::raw(text.to_string()));
+                            if i == picker.selected {
+                                line.bold()
+                            } else {
+                                line.dim()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let rows = if items.is_empty() {
+                        vec![Line::from(Span::raw("(no matches)"))]
+                    } else {
+                        items
+                    };
+                    let title = format!(" History: {}▏", picker.query);
+                    (
+                        rows,
+                        Line::from(title).left_aligned(),
+                        Line::from(" ↑ | ↓ | Esc ").right_aligned(),
+                    )
                 } else {
-                    (start + visible_rows).min(self.suggestions.len())
-                };
-                self.suggestions[start..end]
-                    .iter()
-                    .map(|v| Span::raw(v.clone()))
-                    .enumerate()
-                    .map(|(i, v)| {
-                        if Some(start + i) == self.selected {
-                            v.bold()
+                    let items: Vec<Line> = if registry_ready {
+                        let visible_rows = self.visible_rows(footer_height);
+                        let start = self.scroll.min(self.suggestions.len());
+                        let end = if visible_rows == 0 {
+                            start
                         } else {
-                            v.dim()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vec![Span::from("Generating RPC list...")]
-            };
-            let rpcs = if rpcs.is_empty() {
-                vec![Span::raw("")]
-            } else {
-                rpcs
-            };
+                            (start + visible_rows).min(self.suggestions.len())
+                        };
+                        self.suggestions[start..end]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                let line = Line::from(Span::raw(v.clone()));
+                                if Some(start + i) == self.selected {
+                                    line.bold()
+                                } else {
+                                    line.dim()
+                                }
+                            })
+                            .collect()
+                    } else {
+                        vec![Line::from(Span::from("Generating RPC list..."))]
+                    };
+                    let rows = if items.is_empty() {
+                        vec![Line::from(Span::raw(""))]
+                    } else {
+                        items
+                    };
+                    (
+                        rows,
+                        Line::from(" RPCs ").left_aligned(),
+                        Line::from(" ↑ | ↓ | ^R ").right_aligned(),
+                    )
+                };
 
             let rpc_block = Block::default()
                 .borders(Borders::ALL)
-                .title(Line::from(" RPCs ").left_aligned())
-                .title(Line::from(" ↑ | ↓ ").right_aligned());
-            f.render_widget(List::new(rpcs).block(rpc_block), chunks[0]);
+                .title(title_left)
+                .title(title_right);
+            f.render_widget(List::new(rows).block(rpc_block), chunks[0]);
         }
 
         if footer_height > 1 {
@@ -388,12 +531,16 @@ impl RpcPalette {
         let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta_raw);
         self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
 
-        Some(RpcReq {
+        let req = RpcReq {
             route: route.clone(),
             meta,
             method: method.to_string(),
             arg,
-        })
+        };
+        if self.history.last() != Some(&line) {
+            self.history.push(line);
+        }
+        Some(req)
     }
 
     fn clear_input(&mut self, registry: Option<&RpcRegistry>) {
