@@ -9,7 +9,10 @@ use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device::{Device, DeviceTree, RpcClient};
+use twinleaf::device::util::{
+    format_rpc_value_for_cli, parse_rpc_spec, rpc_decode_reply, rpc_encode_arg,
+};
+use twinleaf::device::{Device, DeviceTree, RpcClient, RpcValueType};
 use twinleaf::tio;
 
 fn record_missing_metadata(
@@ -75,12 +78,13 @@ pub fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     Ok(())
 }
 
-fn get_rpctype(name: &String, device: &proxy::Port) -> String {
-    if let Ok(meta) = device.rpc("rpc.info", name) {
-        let spec = twinleaf::device::util::parse_rpc_spec(meta, name.clone());
-        spec.type_str()
-    } else {
-        "".to_string()
+fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType {
+    match device.rpc("rpc.info", &name.to_string()) {
+        Ok(meta) => parse_rpc_spec(meta, name.to_string()).data_kind,
+        Err(_) => {
+            println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
+            RpcValueType::String { max_len: None }
+        }
     }
 }
 
@@ -88,8 +92,8 @@ pub fn rpc(
     tio: &TioOpts,
     rpc_name: String,
     rpc_arg: Option<String>,
-    req_type: Option<String>,
-    rep_type: Option<String>,
+    req_type: Option<RpcValueType>,
+    rep_type: Option<RpcValueType>,
     debug: bool,
 ) -> Result<(), ()> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
@@ -97,44 +101,19 @@ pub fn rpc(
     let route = tio.parse_route();
     let device = proxy.device_rpc(route).unwrap();
 
-    let req_type = if let Some(req_type) = req_type {
-        Some(req_type)
-    } else {
-        if rpc_arg.is_some() {
-            let t = get_rpctype(&rpc_name, &device);
-            Some(if t == "" {
-                println!("Unknown RPC arg type, assuming 'string'. Use -t/--req-type to override.");
-                "string".to_string()
-            } else {
-                t
-            })
-        } else {
-            None
-        }
+    let req_type = req_type.or_else(|| {
+        rpc_arg
+            .is_some()
+            .then(|| infer_rpc_type(&rpc_name, &device, "arg"))
+    });
+
+    let arg_bytes = match (rpc_arg.as_deref(), req_type.as_ref()) {
+        (None, _) => Vec::new(),
+        (Some(s), Some(t)) => rpc_encode_arg(s, t).unwrap(),
+        (Some(_), None) => unreachable!("req_type is set whenever rpc_arg is present"),
     };
 
-    let reply = match device.raw_rpc(
-        &rpc_name,
-        &if rpc_arg.is_none() {
-            vec![]
-        } else {
-            let s = rpc_arg.unwrap();
-            match &req_type.as_ref().unwrap()[..] {
-                "u8" => s.parse::<u8>().unwrap().to_le_bytes().to_vec(),
-                "u16" => s.parse::<u16>().unwrap().to_le_bytes().to_vec(),
-                "u32" => s.parse::<u32>().unwrap().to_le_bytes().to_vec(),
-                "u64" => s.parse::<u64>().unwrap().to_le_bytes().to_vec(),
-                "i8" => s.parse::<i8>().unwrap().to_le_bytes().to_vec(),
-                "i16" => s.parse::<i16>().unwrap().to_le_bytes().to_vec(),
-                "i32" => s.parse::<i32>().unwrap().to_le_bytes().to_vec(),
-                "i64" => s.parse::<i64>().unwrap().to_le_bytes().to_vec(),
-                "f32" => s.parse::<f32>().unwrap().to_le_bytes().to_vec(),
-                "f64" => s.parse::<f64>().unwrap().to_le_bytes().to_vec(),
-                "string" => s.as_bytes().to_vec(),
-                _ => panic!("Invalid type"),
-            }
-        },
-    ) {
+    let reply = match device.raw_rpc(&rpc_name, &arg_bytes) {
         Ok(rep) => rep,
         Err(err) => {
             drop(proxy);
@@ -154,47 +133,12 @@ pub fn rpc(
         }
     };
 
-    if reply.len() != 0 {
-        let rep_type = if let Some(rep_type) = rep_type {
-            Some(rep_type)
-        } else {
-            if let None = req_type {
-                let t = get_rpctype(&rpc_name, &device);
-                Some(if t == "" {
-                    println!(
-                        "Unknown RPC ret type, assuming 'string'. Use -T/--ret-type to override."
-                    );
-                    "string".to_string()
-                } else {
-                    t
-                })
-            } else {
-                req_type
-            }
-        };
-        let reply_str = match &rep_type.as_ref().unwrap()[..] {
-            "u8" => u8::from_le_bytes(reply[0..1].try_into().unwrap()).to_string(),
-            "u16" => u16::from_le_bytes(reply[0..2].try_into().unwrap()).to_string(),
-            "u32" => u32::from_le_bytes(reply[0..4].try_into().unwrap()).to_string(),
-            "u64" => u64::from_le_bytes(reply[0..8].try_into().unwrap()).to_string(),
-            "i8" => i8::from_le_bytes(reply[0..1].try_into().unwrap()).to_string(),
-            "i16" => i16::from_le_bytes(reply[0..2].try_into().unwrap()).to_string(),
-            "i32" => i32::from_le_bytes(reply[0..4].try_into().unwrap()).to_string(),
-            "i64" => i64::from_le_bytes(reply[0..8].try_into().unwrap()).to_string(),
-            "f32" => f32::from_le_bytes(reply[0..4].try_into().unwrap()).to_string(),
-            "f64" => f64::from_le_bytes(reply[0..8].try_into().unwrap()).to_string(),
-            "string" => format!(
-                "\"{}\" {:?}",
-                if let Ok(s) = std::str::from_utf8(&reply) {
-                    s
-                } else {
-                    ""
-                },
-                reply
-            ),
-            _ => panic!("Invalid type"),
-        };
-        println!("Reply: {}", reply_str);
+    if !reply.is_empty() {
+        let rep_type = rep_type
+            .or(req_type)
+            .unwrap_or_else(|| infer_rpc_type(&rpc_name, &device, "ret"));
+        let value = rpc_decode_reply(&reply, &rep_type).unwrap();
+        println!("Reply: {}", format_rpc_value_for_cli(&value, &rep_type));
     }
     println!("OK");
     drop(proxy);

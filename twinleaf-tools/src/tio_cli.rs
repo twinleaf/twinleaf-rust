@@ -1,5 +1,31 @@
-use clap::{builder::ValueHint, Subcommand, ValueEnum};
+use clap::{
+    builder::{PossibleValuesParser, TypedValueParser, ValueHint},
+    Subcommand, ValueEnum,
+};
 use clap_complete::Shell;
+use twinleaf::device::RpcValueType;
+
+const RPC_TYPE_NAMES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "string",
+];
+
+fn parse_rpc_type(s: &str) -> RpcValueType {
+    match s {
+        "u8" => RpcValueType::Int { signed: false, size: 1 },
+        "u16" => RpcValueType::Int { signed: false, size: 2 },
+        "u32" => RpcValueType::Int { signed: false, size: 4 },
+        "u64" => RpcValueType::Int { signed: false, size: 8 },
+        "i8" => RpcValueType::Int { signed: true, size: 1 },
+        "i16" => RpcValueType::Int { signed: true, size: 2 },
+        "i32" => RpcValueType::Int { signed: true, size: 4 },
+        "i64" => RpcValueType::Int { signed: true, size: 8 },
+        "f32" => RpcValueType::Float { size: 4 },
+        "f64" => RpcValueType::Float { size: 8 },
+        "string" => RpcValueType::String { max_len: None },
+        // PossibleValuesParser validates against RPC_TYPE_NAMES first.
+        _ => unreachable!("possible values already validated"),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,13 +77,23 @@ pub enum Commands {
         )]
         rpc_arg: Option<String>,
 
-        /// RPC request type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
-        #[arg(short = 't', long = "req-type", help_heading = "Type Options")]
-        req_type: Option<String>,
+        /// RPC request type
+        #[arg(
+            short = 't',
+            long = "req-type",
+            value_parser = PossibleValuesParser::new(RPC_TYPE_NAMES).map(|s: String| parse_rpc_type(&s)),
+            help_heading = "Type Options",
+        )]
+        req_type: Option<RpcValueType>,
 
-        /// RPC reply type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
-        #[arg(short = 'T', long = "rep-type", help_heading = "Type Options")]
-        rep_type: Option<String>,
+        /// RPC reply type
+        #[arg(
+            short = 'T',
+            long = "rep-type",
+            value_parser = PossibleValuesParser::new(RPC_TYPE_NAMES).map(|s: String| parse_rpc_type(&s)),
+            help_heading = "Type Options",
+        )]
+        rep_type: Option<RpcValueType>,
 
         /// Enable debug output
         #[arg(short = 'd', long)]
