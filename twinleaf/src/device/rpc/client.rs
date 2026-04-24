@@ -20,7 +20,7 @@ pub enum RpcListError {
     DeviceRpcError(proxy::RpcError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RpcList {
     pub route: DeviceRoute,
     pub hash: u32,
