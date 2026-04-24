@@ -54,13 +54,16 @@ fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
     eprintln!("Hint: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.");
 }
 
-pub fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
+pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
-    let rpc_client = RpcClient::open(&proxy, route.clone()).expect("Failed to open RPC client");
-    let rpcs = rpc_client.rpc_list(&route).map_err(|e| {
-        eprintln!("RPC list failed: {:?}", e);
-    })?;
+    let rpc_client = RpcClient::open(&proxy, route.clone())
+        .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))?;
+    let rpcs = rpc_client
+        .rpc_list(&route)
+        .wrap_err("failed to query RPC list")?;
 
     for (name, _) in rpcs.vec {
         let spec =
@@ -93,11 +96,15 @@ pub fn rpc(
     req_type: Option<RpcValueType>,
     rep_type: Option<RpcValueType>,
     debug: bool,
-) -> Result<(), ()> {
+) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
     let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
     let route = tio.route.clone();
-    let device = proxy.device_rpc(route).unwrap();
+    let device = proxy
+        .device_rpc(route)
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
 
     let req_type = req_type.or_else(|| {
         rpc_arg
@@ -107,7 +114,8 @@ pub fn rpc(
 
     let arg_bytes = match (rpc_arg.as_deref(), req_type.as_ref()) {
         (None, _) => Vec::new(),
-        (Some(s), Some(t)) => rpc_encode_arg(s, t).unwrap(),
+        (Some(s), Some(t)) => rpc_encode_arg(s, t)
+            .wrap_err_with(|| format!("could not encode argument for RPC {}", rpc_name))?,
         (Some(_), None) => unreachable!("req_type is set whenever rpc_arg is present"),
     };
 
@@ -116,18 +124,12 @@ pub fn rpc(
         Err(err) => {
             drop(proxy);
             if debug {
-                println!("RPC failed: {:?}", err);
                 for s in proxy_status.try_iter() {
                     println!("{:?}", s);
                 }
-            } else {
-                if let proxy::RpcError::ExecError(rpc_err) = err {
-                    println!("RPC failed: {:?}", rpc_err.error);
-                } else {
-                    println!("RPC failed, run with `-d` for more details.");
-                }
             }
-            return Err(());
+            return Err(eyre::Report::new(err)
+                .wrap_err(format!("RPC {} failed", rpc_name)));
         }
     };
 
@@ -135,7 +137,8 @@ pub fn rpc(
         let rep_type = rep_type
             .or(req_type)
             .unwrap_or_else(|| infer_rpc_type(&rpc_name, &device, "ret"));
-        let value = rpc_decode_reply(&reply, &rep_type).unwrap();
+        let value = rpc_decode_reply(&reply, &rep_type)
+            .wrap_err_with(|| format!("could not decode reply from RPC {}", rpc_name))?;
         let formatted = match &value {
             RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
             RpcValue::Bytes(b) => format!("{:?}", b),
@@ -153,7 +156,9 @@ pub fn rpc(
     Ok(())
 }
 
-pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(), ()> {
+pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let rpc_name = if is_capture {
         rpc_name.clone() + ".block"
     } else {
@@ -162,11 +167,15 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(),
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
-    let device = proxy.device_rpc(route).unwrap();
+    let device = proxy
+        .device_rpc(route)
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
 
     if is_capture {
         let trigger_rpc_name = rpc_name[..rpc_name.len() - 6].to_string() + ".trigger";
-        device.action(&trigger_rpc_name).unwrap();
+        device
+            .action(&trigger_rpc_name)
+            .wrap_err_with(|| format!("failed to trigger {}", trigger_rpc_name))?;
     }
 
     let mut full_reply = vec![];
@@ -178,11 +187,13 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(),
                 if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
                     break;
                 } else {
-                    panic!("RPC error");
+                    return Err(eyre::Report::new(proxy::RpcError::ExecError(err))
+                        .wrap_err(format!("RPC {} failed at chunk {}", rpc_name, i)));
                 }
             }
-            _ => {
-                panic!("RPC error")
+            Err(e) => {
+                return Err(eyre::Report::new(e)
+                    .wrap_err(format!("RPC {} failed at chunk {}", rpc_name, i)));
             }
         }
     }
@@ -190,7 +201,9 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(),
     if let Ok(s) = std::str::from_utf8(&full_reply) {
         println!("{}", s);
     } else {
-        std::io::stdout().write(&full_reply).or(Err(()))?;
+        std::io::stdout()
+            .write(&full_reply)
+            .wrap_err("failed to write dump to stdout")?;
     }
     Ok(())
 }

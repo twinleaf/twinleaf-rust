@@ -40,7 +40,7 @@ fn main() -> ExitCode {
             rep_type,
             debug,
         } => {
-            let _ = match subcommands {
+            let result: eyre::Result<()> = match subcommands {
                 Some(RPCSubcommands::List { tio }) => list_rpcs(&tio),
                 Some(RPCSubcommands::Dump {
                     tio,
@@ -56,7 +56,7 @@ fn main() -> ExitCode {
                     debug,
                 ),
             };
-            Ok(())
+            result.map_err(|e| eprintln!("{:?}", e))
         }
         Commands::Dump {
             tio,
