@@ -251,32 +251,20 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(),
 pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.parse_route();
+    let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
 
-    // max_depth: None means unlimited (default), Some(n) limits to n levels
-    let max_depth = depth;
-
-    let route_matches = |pkt_route: &DeviceRoute| -> bool {
-        match route.relative_route(pkt_route) {
-            Ok(rel) => max_depth.map_or(true, |max| rel.len() <= max),
-            Err(_) => false,
-        }
-    };
+    let port = proxy
+        .new_port(None, route.clone(), port_depth, true, true)
+        .map_err(|e| {
+            eprintln!("Failed to initialize proxy port: {:?}", e);
+        })?;
 
     match (data, meta) {
         // Raw mode (no flags): dump all packets
         (false, false) => {
-            let port_depth = max_depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
-            let port = proxy
-                .new_port(None, route.clone(), port_depth, true, true)
-                .map_err(|e| {
-                    eprintln!("Failed to initialize proxy port: {:?}", e);
-                })?;
-
             for pkt in port.iter() {
-                // Convert relative route to absolute
-                let abs_route = route.absolute_route(&pkt.routing);
                 let abs_pkt = tio::Packet {
-                    routing: abs_route,
+                    routing: route.absolute_route(&pkt.routing),
                     ..pkt
                 };
                 println!("{:?}", abs_pkt);
@@ -285,35 +273,21 @@ pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Resu
 
         // Metadata-only mode (-m): filter to metadata packets
         (false, true) => {
-            let port_depth = max_depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
-            let port = proxy
-                .new_port(None, route.clone(), port_depth, true, true)
-                .map_err(|e| {
-                    eprintln!("Failed to initialize proxy port: {:?}", e);
-                })?;
-
             for pkt in port.iter() {
                 if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
-                    if route_matches(&pkt.routing) {
-                        let abs_route = route.absolute_route(&pkt.routing);
-                        print_metadata_payload(&abs_route, mp);
-                    }
+                    let abs_route = route.absolute_route(&pkt.routing);
+                    print_metadata_payload(&abs_route, mp);
                 }
             }
         }
 
         // Sample mode (-d or -d -m): use DeviceTree for parsed samples
         (true, _) => {
-            let mut tree = DeviceTree::open(&proxy, route.clone()).map_err(|e| {
-                eprintln!("Failed to open device tree: {:?}", e);
-            })?;
+            let mut tree = DeviceTree::new(port, route.clone());
 
             loop {
                 match tree.next() {
                     Ok((sample, sample_route)) => {
-                        if !route_matches(&sample_route) {
-                            continue;
-                        }
                         print_sample(&sample, Some(&sample_route), meta, true);
                     }
                     Err(e) => {
