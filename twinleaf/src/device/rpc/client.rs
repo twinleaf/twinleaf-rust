@@ -6,17 +6,15 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, Write};
 
-impl From<io::Error> for RpcListError {
-    fn from(e: io::Error) -> Self {
-        RpcListError::CacheFileError(e)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RpcListError {
+    #[error("could not locate cache directory")]
     CacheDirError,
+    #[error("cached RPC list is corrupted or outdated")]
     InvalidCacheError,
-    CacheFileError(io::Error),
+    #[error("cache file I/O error: {0}")]
+    CacheFileError(#[from] io::Error),
+    #[error("RPC error: {0}")]
     DeviceRpcError(proxy::RpcError),
 }
 

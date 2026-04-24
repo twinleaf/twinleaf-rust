@@ -43,43 +43,53 @@ pub struct AlignedWindow {
     pub run_ids: HashMap<StreamKey, RunId>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReadError {
+    #[error("no columns requested")]
     NoColumnsRequested,
+    #[error("no cursor for stream {stream_key:?}")]
     NoCursorForStream {
         stream_key: StreamKey,
     },
+    #[error("no active run for stream {stream_key:?}")]
     NoActiveRun {
         stream_key: StreamKey,
     },
+    #[error("insufficient data for stream {stream_key:?}: requested {requested}, available {available}")]
     InsufficientData {
         stream_key: StreamKey,
         requested: usize,
         available: usize,
     },
+    #[error("no data in time range [{requested_start}, {requested_end}]")]
     NoDataInTimeRange {
         requested_start: f64,
         requested_end: f64,
     },
+    #[error("requested range [{requested_start}, {requested_end}] exceeds retention window [{available_start}, {available_end}]")]
     RequestedRangeExceedsRetention {
         requested_start: f64,
         requested_end: f64,
         available_start: f64,
         available_end: f64,
     },
+    #[error("column {column_id:?} not found in stream {stream_key:?}")]
     ColumnNotFound {
         stream_key: StreamKey,
         column_id: ColumnId,
     },
+    #[error("sampling rate mismatch across streams {streams:?} at rates {rates:?}")]
     SamplingRateMismatch {
         streams: Vec<StreamKey>,
         rates: Vec<f64>,
     },
+    #[error("cursor invalidated for stream {stream_key:?}: cursor at run {cursor_run:?}, current run is {current_run:?}")]
     CursorInvalidated {
         stream_key: StreamKey,
         cursor_run: RunId,
         current_run: RunId,
     },
+    #[error("cursor out of buffer for stream {stream_key:?}: at sample {cursor_sample:?}, earliest available is {earliest_available:?}")]
     CursorOutOfBuffer {
         stream_key: StreamKey,
         cursor_sample: SampleNumber,

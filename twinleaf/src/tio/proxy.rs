@@ -74,36 +74,33 @@ pub struct Port {
     scope: DeviceRoute,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SendError {
+    #[error("channel full")]
     WouldBlock(Packet),
+    #[error("proxy disconnected")]
     ProxyDisconnected(Packet),
+    #[error("route exceeds port scope")]
     InvalidRoute(Packet),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RecvError {
+    #[error("no packet available")]
     WouldBlock,
+    #[error("proxy disconnected")]
     ProxyDisconnected,
 }
 
-impl From<SendError> for RpcError {
-    fn from(e: SendError) -> Self {
-        RpcError::SendFailed(e)
-    }
-}
-
-impl From<RecvError> for RpcError {
-    fn from(e: RecvError) -> Self {
-        RpcError::RecvFailed(e)
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RpcError {
-    SendFailed(SendError),
+    #[error("failed to send RPC request: {0}")]
+    SendFailed(#[from] SendError),
+    #[error("device returned error: {0}")]
     ExecError(proto::RpcErrorPayload),
-    RecvFailed(RecvError),
+    #[error("failed to receive RPC reply: {0}")]
+    RecvFailed(#[from] RecvError),
+    #[error("RPC reply did not match expected type")]
     TypeError,
 }
 
@@ -230,10 +227,13 @@ impl Port {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PortError {
+    #[error("RPC timeout too short")]
     RpcTimeoutTooShort,
+    #[error("RPC timeout too long")]
     RpcTimeoutTooLong,
+    #[error("failed to set up new proxy client")]
     FailedNewClientSetup,
 }
 

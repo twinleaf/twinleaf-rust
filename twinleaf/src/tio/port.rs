@@ -28,40 +28,52 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Possible errors when receiving from a `Port`
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RecvError {
     /// No packets available at this time.
+    #[error("no packets available")]
     NotReady,
     /// This port got disconnected.
+    #[error("port disconnected")]
     Disconnected,
     /// Error in the data.
-    Protocol(proto::Error),
+    #[error("protocol error: {0}")]
+    Protocol(#[from] proto::Error),
     /// Low level IO error.
-    IO(io::Error),
+    #[error("I/O error: {0}")]
+    IO(#[from] io::Error),
 }
 
 /// Possible errors when sending to a `Port`
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SendError {
     /// This is used internally and should never happen for a `Port`.
     /// Low level RawPort
     /// This should never happen for a `Port`, only for the internal low level `RawPort`.
+    #[error("must drain before sending")]
     MustDrain,
     /// The port outgoing queue is full.
+    #[error("outgoing queue full")]
     Full,
     /// This port is not connected.
+    #[error("port disconnected")]
     Disconnected,
     /// Issue with the underlying IO operation.
-    IO(io::Error),
+    #[error("I/O error: {0}")]
+    IO(#[from] io::Error),
     /// Issue with serialization (packet would exceed protocol limits)
+    #[error("packet exceeds protocol size limits")]
     Serialization,
 }
 
 /// Possible errors when setting a custom data rate
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RateError {
+    #[error("rate changes not supported on this port")]
     Unsupported,
+    #[error("invalid rate")]
     InvalidRate,
+    #[error("failed to set rate")]
     Failed,
 }
 

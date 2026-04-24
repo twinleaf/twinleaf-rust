@@ -162,18 +162,29 @@ pub struct Packet {
     pub ttl: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("more data needed")]
     NeedMore,
+    #[error("bad name")]
     BadName,
+    #[error("{0}")]
     Text(String),
+    #[error("CRC32 mismatch")]
     CRC32(Vec<u8>),
+    #[error("packet too big")]
     PacketTooBig(Vec<u8>),
+    #[error("packet too small")]
     PacketTooSmall(Vec<u8>),
+    #[error("invalid packet type")]
     InvalidPacketType(Vec<u8>),
+    #[error("payload too big")]
     PayloadTooBig(Vec<u8>),
+    #[error("routing too big")]
     RoutingTooBig(Vec<u8>),
+    #[error("payload too small")]
     PayloadTooSmall(Vec<u8>),
+    #[error("invalid payload")]
     InvalidPayload(Vec<u8>),
 }
 
