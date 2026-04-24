@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
     health::run_health,
+    list::list_devices,
     monitor::run_monitor,
     proxy::run_proxy,
     proxy_nmea::run_nmea_proxy,
@@ -18,6 +19,7 @@ fn main() -> eyre::Result<()> {
     let cli = TioCli::parse();
 
     match cli.command {
+        Commands::List { all } => list_devices(all),
         Commands::Proxy(mut proxy_cli) => match proxy_cli.subcommands.take() {
             Some(ProxySubcommands::Nmea { tio, tcp_port }) => run_nmea_proxy(tio, tcp_port),
             None => run_proxy(proxy_cli),

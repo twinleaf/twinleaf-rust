@@ -46,35 +46,9 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
     use color_eyre::{Help, SectionExt};
     use eyre::bail;
 
-    // Handle --enum mode
+    // Handle --enum mode (deprecated; now delegates to `tio list`)
     if proxy_cli.enumerate {
-        let mut unknown_devices = vec![];
-        let mut found_any = false;
-        let query_timeout = Duration::from_millis(500);
-        for dev in discovery::enumerate_serial(true) {
-            if let PortInterface::Unknown(vid, pid) = dev.interface {
-                unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
-            } else {
-                if !found_any {
-                    println!("Possible tio ports:");
-                    found_any = true;
-                }
-                match discovery::query_name(&dev.url, query_timeout) {
-                    Some(name) => println!(" * {}  {}", dev.url, name),
-                    None => println!(" * {}  (no response)", dev.url),
-                }
-            }
-        }
-        if !found_any {
-            println!("No likely ports found")
-        }
-        if unknown_devices.len() > 0 {
-            println!("Also found these serial ports");
-            for dev in unknown_devices {
-                println!(" * {}", dev);
-            }
-        }
-        return Ok(());
+        return crate::tools::list::list_devices_deprecated(true);
     }
 
     let tcp_port = proxy_cli.port;

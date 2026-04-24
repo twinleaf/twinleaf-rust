@@ -41,7 +41,13 @@ pub struct TioCli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-	Proxy(ProxyCli),
+    /// List detected Twinleaf devices and verify liveness
+    List {
+        /// Include serial ports with unknown VID/PID
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+    },
+    Proxy(ProxyCli),
     ///Live sensor data and plot display
 	Monitor {
 		#[command(flatten)]
@@ -545,8 +551,8 @@ pub struct ProxyCli {
     #[arg(short = 'a', long = "auto")]
     auto: bool,
 
-    /// Enumerate all serial devices, then quit
-    #[arg(short = 'e', long = "enumerate", name = "enum")]
+    /// Deprecated; use `tio list` instead.
+    #[arg(short = 'e', long = "enumerate", name = "enum", hide = true)]
     enumerate: bool,
 }
 
