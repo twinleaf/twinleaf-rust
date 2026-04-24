@@ -1003,24 +1003,25 @@ pub fn firmware_upgrade(
     tio: &TioOpts,
     firmware_path: std::path::PathBuf,
     skip_confirm: bool,
-) -> Result<(), ()> {
+) -> eyre::Result<()> {
+    use color_eyre::Help;
+    use eyre::WrapErr;
     use indicatif::{ProgressBar, ProgressStyle};
 
-    let firmware_data = std::fs::read(firmware_path).unwrap();
+    let firmware_data = std::fs::read(&firmware_path)
+        .wrap_err_with(|| format!("could not read firmware file {:?}", firmware_path))?;
 
     println!("Loaded {} bytes firmware", firmware_data.len());
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
-    let device = proxy.device_rpc(route).unwrap();
+    let device = proxy
+        .device_rpc(route)
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
 
-    let dev_name: String = match device.rpc("dev.name", ()) {
-        Ok(name) => name,
-        Err(e) => {
-            eprintln!("Failed to query device name: {:?}", e);
-            return Err(());
-        }
-    };
+    let dev_name: String = device
+        .rpc("dev.name", ())
+        .wrap_err("failed to query device name")?;
 
     if !skip_confirm {
         print!("Upgrade firmware on '{}'? [y/N] ", dev_name);
@@ -1041,8 +1042,8 @@ pub fn firmware_upgrade(
                 tio::proto::RpcErrorCode::NotFound | tio::proto::RpcErrorCode::WrongDeviceState
             ) => {}
         Err(e) => {
-            eprintln!("Failed to stop device: {:?}", e);
-            return Err(());
+            return Err(eyre::Report::new(e)
+                .wrap_err("failed to stop device before firmware upgrade"));
         }
     }
 
@@ -1054,6 +1055,8 @@ pub fn firmware_upgrade(
             .unwrap()
             .progress_chars("#>-"),
     );
+
+    let power_cycle_hint = "power cycle the device before retrying";
 
     let mut next_send_chunk: u16 = 0;
     let mut next_ack_chunk: u16 = 0;
@@ -1069,14 +1072,21 @@ pub fn firmware_upgrade(
                 offset + 288
             };
 
-            if let Err(_) = device.send(util::PacketBuilder::make_rpc_request(
-                "dev.firmware.upload",
-                &firmware_data[offset..chunk_end],
-                next_send_chunk,
-                DeviceRoute::root(),
-            )) {
-                panic!("Upload failed");
-            }
+            device
+                .send(util::PacketBuilder::make_rpc_request(
+                    "dev.firmware.upload",
+                    &firmware_data[offset..chunk_end],
+                    next_send_chunk,
+                    DeviceRoute::root(),
+                ))
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to send firmware chunk {}/{}",
+                        next_send_chunk + 1,
+                        total_chunks
+                    )
+                })
+                .suggestion(power_cycle_hint)?;
             next_send_chunk += 1;
             more_to_send = chunk_end < firmware_data.len();
         }
@@ -1085,26 +1095,40 @@ pub fn firmware_upgrade(
             match device.try_recv() {
                 Ok(pkt) => pkt,
                 Err(proxy::RecvError::WouldBlock) => continue,
-                Err(_) => panic!("Upload failed"),
+                Err(e) => {
+                    return Err(eyre::Report::new(e)
+                        .wrap_err("failed to receive firmware upload ack")
+                        .suggestion(power_cycle_hint));
+                }
             }
         } else {
-            device.recv().expect("Upload failed")
+            device
+                .recv()
+                .wrap_err("failed to receive firmware upload ack")
+                .suggestion(power_cycle_hint)?
         };
 
         match pkt.payload {
             tio::proto::Payload::RpcReply(rep) => {
                 if rep.id != next_ack_chunk {
-                    panic!("Upload failed");
+                    return Err(eyre::eyre!(
+                        "firmware chunk ack out of order (expected {}, got {})",
+                        next_ack_chunk,
+                        rep.id
+                    )
+                    .suggestion(power_cycle_hint));
                 }
                 next_ack_chunk += 1;
                 pb.set_position(next_ack_chunk as u64);
             }
             tio::proto::Payload::RpcError(err) => {
-                //if let RpcError::InvalidArgs = err.error {
-                // TODO: we could handle this condition, likely caused by
-                // a packet dropped
-                //}
-                panic!("Upload failed: {:?}", err)
+                return Err(eyre::eyre!(
+                    "device rejected firmware chunk {}/{}: {}",
+                    next_ack_chunk + 1,
+                    total_chunks,
+                    err.error
+                )
+                .suggestion(power_cycle_hint));
             }
             _ => continue,
         }
@@ -1112,9 +1136,10 @@ pub fn firmware_upgrade(
 
     pb.finish_and_clear();
 
-    if let Err(_) = device.action("dev.firmware.upgrade") {
-        panic!("upgrade failed");
-    }
+    device
+        .action("dev.firmware.upgrade")
+        .wrap_err("device rejected firmware commit")
+        .suggestion(power_cycle_hint)?;
 
     // Wait 5 seconds before returning to ensure the device is not
     // power-cycled while the firmware upgrade is being committed to flash.

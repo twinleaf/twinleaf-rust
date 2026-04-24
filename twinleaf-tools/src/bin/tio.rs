@@ -125,7 +125,7 @@ fn main() -> ExitCode {
             tio,
             firmware_path,
             yes,
-        } => firmware_upgrade(&tio, firmware_path, yes),
+        } => firmware_upgrade(&tio, firmware_path, yes).map_err(|e| eprintln!("{:?}", e)),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut TioCli::command(), "tio", &mut std::io::stdout());
             Ok(())
