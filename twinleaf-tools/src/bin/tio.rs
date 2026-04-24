@@ -15,6 +15,7 @@ use twinleaf_tools::{
 };
 
 fn main() -> ExitCode {
+    color_eyre::install().expect("color-eyre panic handler should install once");
     let cli = TioCli::parse();
 
     //TODO: Work on exit code logic
