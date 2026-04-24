@@ -545,6 +545,8 @@ impl App {
     }
 
     pub fn rebuild_nav_items(&mut self) {
+        let prev_selection = self.nav_items.get(self.nav.idx).cloned();
+
         let routes = self.visible_routes();
         let mut new_items = Vec::new();
 
@@ -559,7 +561,6 @@ impl App {
             stream_ids.dedup();
 
             if stream_ids.is_empty() {
-                // Device with no streams is still a stop
                 new_items.push(NavPos::EmptyDevice {
                     device_idx: dev_idx,
                     route: route.clone(),
@@ -586,12 +587,24 @@ impl App {
 
         self.nav_items = new_items;
 
-        // Clamp index
         if self.nav_items.is_empty() {
             self.nav.idx = 0;
-        } else {
-            self.nav.idx = self.nav.idx.min(self.nav_items.len() - 1);
+            return;
         }
+
+        // Preserve the previous selection by identity when possible; positional
+        // idx shifts if new items appear in front of it on the next rebuild.
+        self.nav.idx = prev_selection
+            .and_then(|prev| {
+                let prev_spec = prev.spec().cloned();
+                let prev_route = prev.route().clone();
+                self.nav_items.iter().position(|pos| match (&prev_spec, pos.spec()) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, _) => pos.route() == &prev_route,
+                    _ => false,
+                })
+            })
+            .unwrap_or_else(|| self.nav.idx.min(self.nav_items.len() - 1));
     }
 
     pub fn current_pos(&self) -> Option<&NavPos> {
