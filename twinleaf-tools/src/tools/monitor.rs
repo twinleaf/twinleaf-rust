@@ -10,7 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq, RpcResp};
+use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq};
+use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
 use crate::TioOpts;
 use clap::Parser;
 use crossbeam::channel::{self, Sender};
@@ -26,10 +27,7 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{
-        util, DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, RpcValue, TreeEvent,
-        TreeItem,
-    },
+    device::{DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{
@@ -394,49 +392,6 @@ impl Default for ViewConfig {
 }
 
 
-enum RpcWorkerReq {
-    FetchList(DeviceRoute),
-    Execute(RpcReq),
-}
-
-enum RpcWorkerResp {
-    List(RpcList),
-    RpcResult(RpcResp),
-}
-
-fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
-    let meta = match req.meta {
-        Some(m) => m,
-        None => client
-            .rpc(&req.route, "rpc.info", &req.method)
-            .map_err(|_| format!("Unknown RPC: {}", req.method))?,
-    };
-
-    let spec = util::parse_rpc_spec(meta, req.method.clone());
-
-    let payload = if let Some(ref s) = req.arg {
-        util::rpc_encode_arg(s, &spec.data_kind).map_err(|e| format!("{:?}", e))?
-    } else {
-        Vec::new()
-    };
-
-    let reply_bytes = client
-        .raw_rpc(&req.route, &req.method, &payload)
-        .map_err(|e| format!("{:?}", e))?;
-
-    if reply_bytes.is_empty() {
-        return Ok("OK".to_string());
-    }
-
-    let value =
-        util::rpc_decode_reply(&reply_bytes, &spec.data_kind).map_err(|e| format!("{:?}", e))?;
-
-    Ok(match &value {
-        RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
-        RpcValue::Bytes(b) => format!("{:?}", b),
-        other => format!("{}", other),
-    })
-}
 
 pub struct App {
     pub all: bool,
@@ -1544,31 +1499,9 @@ pub fn run_monitor(
         }
     });
 
-    // RPC worker thread
     let rpc_client = RpcClient::open(&proxy, parent_route.clone())
         .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))?;
-    let (rpc_tx, rpc_rx) = channel::unbounded::<RpcWorkerReq>();
-    let (rpc_resp_tx, rpc_resp_rx) = channel::unbounded::<RpcWorkerResp>();
-
-    std::thread::spawn(move || {
-        while let Ok(req) = rpc_rx.recv() {
-            let resp = match req {
-                RpcWorkerReq::FetchList(route) => match rpc_client.rpc_list(&route) {
-                    Ok(list) => Some(RpcWorkerResp::List(list)),
-                    Err(_) => None,
-                },
-                RpcWorkerReq::Execute(rpc_req) => {
-                    let result = exec_rpc(&rpc_client, &rpc_req);
-                    Some(RpcWorkerResp::RpcResult(RpcResp { result }))
-                }
-            };
-            if let Some(resp) = resp {
-                if rpc_resp_tx.send(resp).is_err() {
-                    return;
-                }
-            }
-        }
-    });
+    let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
 
     // Key thread
     let (key_tx, key_rx) = channel::unbounded();
