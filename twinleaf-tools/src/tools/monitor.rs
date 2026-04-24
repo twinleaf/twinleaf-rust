@@ -340,9 +340,10 @@ pub enum Mode {
 pub enum Action {
     Quit,
     SetMode(Mode),
-    AutoCompleteTab,
-    AutoCompleteBack,
+    SelectNext,
+    SelectPrev,
     NewCommandString,
+    ClearCommand,
     SubmitCommand,
     AcceptCompletion,
     NavUp,
@@ -362,13 +363,6 @@ pub enum Action {
     AdjustWindow(f64),
     AdjustPlotWidth(i16),
     AdjustPrecision(i8),
-    HistoryNavigate(HistDir),
-}
-
-#[derive(Debug, Clone)]
-pub enum HistDir {
-    Up,
-    Down,
 }
 
 #[derive(Debug, Clone)]
@@ -426,9 +420,6 @@ pub struct CommandState {
     pub selected: Option<usize>,
     pub scroll: usize,
     pub current_completion: String,
-    pub history: Vec<String>,
-    pub history_ptr: usize,
-    pub draft: String,
     pub last_rpc_result: Option<(String, Color)>,
     pub last_rpc_command: String,
 }
@@ -441,9 +432,6 @@ impl Default for CommandState {
             selected: None,
             scroll: 0,
             current_completion: String::new(),
-            history: Vec::new(),
-            history_ptr: 0,
-            draft: String::new(),
             last_rpc_result: None,
             last_rpc_command: String::new(),
         }
@@ -452,10 +440,7 @@ impl Default for CommandState {
 
 impl CommandState {
     fn enter(&mut self, registry: Option<&RpcRegistry>) {
-        self.input_state = TextState::default();
         self.input_state.focus();
-        self.history_ptr = self.history.len();
-        self.draft.clear();
         self.update_suggestions(registry);
     }
 
@@ -511,7 +496,7 @@ impl CommandState {
         }
     }
 
-    fn tab_complete(&mut self, footer_height: u16) {
+    fn select_next(&mut self, footer_height: u16) {
         if self.suggestions.is_empty() {
             self.sync_completion();
             return;
@@ -525,7 +510,7 @@ impl CommandState {
         self.sync_completion();
     }
 
-    fn tab_back_complete(&mut self, footer_height: u16) {
+    fn select_prev(&mut self, footer_height: u16) {
         if self.suggestions.is_empty() {
             self.sync_completion();
             return;
@@ -580,17 +565,9 @@ impl CommandState {
         registry: Option<&RpcRegistry>,
     ) -> Option<RpcReq> {
         let line = self.input_state.value().to_string();
-        if !line.contains(' ') && self.selected_suggestion() != Some(line.as_str()) {
-            self.accept_completion(registry);
-            return None;
-        }
         if line.trim().is_empty() {
             return None;
         }
-        if self.history.last() != Some(&line) {
-            self.history.push(line.clone());
-        }
-        self.history_ptr = self.history.len();
 
         let mut parts = line.split_whitespace();
         let method = parts.next()?;
@@ -603,10 +580,6 @@ impl CommandState {
         };
         let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta_raw);
         self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
-        self.input_state = TextState::default();
-        self.input_state.focus();
-        self.draft.clear();
-        self.update_suggestions(registry);
 
         Some(RpcReq {
             route: route.clone(),
@@ -616,23 +589,9 @@ impl CommandState {
         })
     }
 
-    fn navigate_history(&mut self, dir: HistDir, registry: Option<&RpcRegistry>) {
-        if self.history_ptr == self.history.len() {
-            self.draft = self.input_state.value().to_string();
-        };
-        self.history_ptr = match dir {
-            HistDir::Up => self.history_ptr.saturating_sub(1),
-            HistDir::Down => min(self.history.len(), self.history_ptr + 1),
-        };
-
-        self.input_state = TextState::new().with_value(
-            self.history
-                .get(self.history_ptr)
-                .unwrap_or(&self.draft)
-                .clone(),
-        );
+    fn clear_input(&mut self, registry: Option<&RpcRegistry>) {
+        self.input_state = TextState::default();
         self.input_state.focus();
-        self.input_state.move_end();
         self.update_suggestions(registry);
     }
 }
@@ -740,12 +699,17 @@ impl App {
                 self.mode = Mode::Normal;
                 self.command.exit();
             }
-            Action::AutoCompleteTab => self.command.tab_complete(self.footer_height),
-            Action::AutoCompleteBack => self.command.tab_back_complete(self.footer_height),
+            Action::SelectNext => self.command.select_next(self.footer_height),
+            Action::SelectPrev => self.command.select_prev(self.footer_height),
             Action::NewCommandString => {
                 let route = self.current_route();
                 let registry = self.rpc_registries.get(&route);
                 self.command.update_suggestions(registry);
+            }
+            Action::ClearCommand => {
+                let route = self.current_route();
+                let registry = self.rpc_registries.get(&route);
+                self.command.clear_input(registry);
             }
             Action::SubmitCommand => {
                 let route = self.current_route();
@@ -758,11 +722,6 @@ impl App {
                 let route = self.current_route();
                 let registry = self.rpc_registries.get(&route);
                 self.command.accept_completion(registry);
-            }
-            Action::HistoryNavigate(dir) => {
-                let route = self.current_route();
-                let registry = self.rpc_registries.get(&route);
-                self.command.navigate_history(dir, registry);
             }
             Action::NavUp => {
                 self.view.follow_selection = true;
@@ -1108,32 +1067,33 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
         }
         match app.mode {
             Mode::Command => match k.code {
-                KeyCode::Esc => Some(Action::SetMode(Mode::Normal)),
                 KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
                     Some(Action::SetMode(Mode::Normal))
                 }
-                KeyCode::Tab => Some(Action::AutoCompleteTab),
-                KeyCode::BackTab => Some(Action::AutoCompleteBack),
-                KeyCode::Up => Some(Action::HistoryNavigate(HistDir::Up)),
-                KeyCode::Down => Some(Action::HistoryNavigate(HistDir::Down)),
+                KeyCode::Esc => {
+                    if app.command.input_state.value().is_empty() {
+                        Some(Action::SetMode(Mode::Normal))
+                    } else {
+                        Some(Action::ClearCommand)
+                    }
+                }
+                KeyCode::Up => Some(Action::SelectPrev),
+                KeyCode::Down => Some(Action::SelectNext),
+                KeyCode::Tab => Some(Action::AcceptCompletion),
                 KeyCode::Right if !app.command.current_completion.is_empty() => {
                     Some(Action::AcceptCompletion)
                 }
-                KeyCode::Right => {
-                    app.command.input_state.handle_key_event(k);
-                    None
-                }
-                KeyCode::Left => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Home => {
                     app.command.current_completion = String::new();
                     app.command.input_state.handle_key_event(k);
                     None
                 }
-                KeyCode::Enter => Some(Action::SubmitCommand),
                 KeyCode::Char('a') if k.modifiers == KeyModifiers::CONTROL => {
                     app.command.current_completion = String::new();
                     app.command.input_state.handle_key_event(k);
                     None
                 }
+                KeyCode::Enter => Some(Action::SubmitCommand),
                 _ => {
                     app.command.input_state.handle_key_event(k);
                     Some(Action::NewCommandString)
@@ -1479,7 +1439,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             let rpc_block = Block::default()
                 .borders(Borders::ALL)
                 .title(Line::from(" RPCs ").left_aligned())
-                .title(Line::from(" ↑ Shift+Tab | Tab ↓ ").right_aligned());
+                .title(Line::from(" ↑ | ↓ ").right_aligned());
             f.render_widget(List::new(rpcs).block(rpc_block), chunks[0]);
         }
 
