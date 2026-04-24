@@ -141,6 +141,10 @@ impl RpcRegistry {
         self.root.find(&parts)
     }
 
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
     pub fn suggest(&self, query: &str) -> Vec<String> {
         let parts: Vec<String> = query.split('.').map(|s| s.to_string()).collect();
         let suffixes = self.root.completions(&parts);
