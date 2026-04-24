@@ -675,6 +675,282 @@ pub fn log_dump(
     Ok(())
 }
 
+fn data_type_label(dt: &tio::proto::DataType) -> String {
+    use tio::proto::DataType;
+    match dt {
+        DataType::UInt8 => "u8".to_string(),
+        DataType::Int8 => "i8".to_string(),
+        DataType::UInt16 => "u16".to_string(),
+        DataType::Int16 => "i16".to_string(),
+        DataType::UInt24 => "u24".to_string(),
+        DataType::Int24 => "i24".to_string(),
+        DataType::UInt32 => "u32".to_string(),
+        DataType::Int32 => "i32".to_string(),
+        DataType::UInt64 => "u64".to_string(),
+        DataType::Int64 => "i64".to_string(),
+        DataType::Float32 => "f32".to_string(),
+        DataType::Float64 => "f64".to_string(),
+        DataType::Unknown(n) => format!("raw{}", n),
+    }
+}
+
+fn fmt_hms(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "0s".to_string();
+    }
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = secs - (h * 3600 + m * 60) as f64;
+    if h > 0 {
+        format!("{}h{:02}m{:04.1}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m{:04.1}s", m, s)
+    } else {
+        format!("{:.1}s", s)
+    }
+}
+
+pub fn log_inspect(files: Vec<String>) -> eyre::Result<()> {
+    use eyre::bail;
+    if files.is_empty() {
+        bail!("no input files specified");
+    }
+    for (i, path) in files.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        inspect_one_log(path)?;
+    }
+    Ok(())
+}
+
+fn inspect_one_log(path: &str) -> eyre::Result<()> {
+    use console::style;
+    use eyre::WrapErr;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use memmap2::Mmap;
+    use std::collections::BTreeMap;
+    use twinleaf::data::{BoundaryReason, DeviceDataParser};
+    use twinleaf::tio::proto::identifiers::StreamId;
+
+    let file = File::open(path).wrap_err_with(|| format!("could not open {}", path))?;
+    let mmap =
+        unsafe { Mmap::map(&file) }.wrap_err_with(|| format!("could not mmap {}", path))?;
+    let total_bytes = mmap.len() as u64;
+
+    let pb = if total_bytes > 10 * 1024 * 1024 {
+        let pb = ProgressBar::new(total_bytes);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    struct StreamAgg {
+        name: String,
+        rate_hz: f64,
+        sample_count: u64,
+        first_t: Option<f64>,
+        last_t: Option<f64>,
+        columns: Vec<(String, String, String)>,
+    }
+
+    struct DeviceAgg {
+        name: String,
+        firmware: String,
+        serial: String,
+    }
+
+    let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
+    let mut streams: BTreeMap<(tio::proto::DeviceRoute, StreamId), StreamAgg> = BTreeMap::new();
+    let mut devices: BTreeMap<tio::proto::DeviceRoute, DeviceAgg> = BTreeMap::new();
+    let mut packet_count: u64 = 0;
+    let mut session_changes: u64 = 0;
+    let mut segment_changes: u64 = 0;
+
+    let mut rest: &[u8] = &mmap[..];
+    while !rest.is_empty() {
+        let (pkt, len) = match tio::Packet::deserialize(rest) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        rest = &rest[len..];
+        packet_count += 1;
+        if let Some(pb) = &pb {
+            pb.set_position(total_bytes - rest.len() as u64);
+        }
+
+        let parser = parsers
+            .entry(pkt.routing.clone())
+            .or_insert_with(|| DeviceDataParser::new(false));
+        let samples = parser.process_packet(&pkt);
+
+        for sample in samples {
+            devices
+                .entry(pkt.routing.clone())
+                .or_insert_with(|| DeviceAgg {
+                    name: sample.device.name.clone(),
+                    firmware: sample.device.firmware_hash.clone(),
+                    serial: sample.device.serial_number.clone(),
+                });
+
+            let key = (pkt.routing.clone(), sample.stream.stream_id);
+            let entry = streams.entry(key).or_insert_with(|| {
+                let decim = sample.segment.decimation.max(1);
+                let rate = f64::from(sample.segment.sampling_rate) / f64::from(decim);
+                let cols = sample
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.desc.name.clone(),
+                            data_type_label(&c.desc.data_type),
+                            c.desc.units.clone(),
+                        )
+                    })
+                    .collect();
+                StreamAgg {
+                    name: sample.stream.name.clone(),
+                    rate_hz: rate,
+                    sample_count: 0,
+                    first_t: None,
+                    last_t: None,
+                    columns: cols,
+                }
+            });
+            entry.sample_count += 1;
+            let t = sample.timestamp_end();
+            entry.first_t = Some(entry.first_t.map_or(t, |p| p.min(t)));
+            entry.last_t = Some(entry.last_t.map_or(t, |p| p.max(t)));
+
+            if let Some(boundary) = &sample.boundary {
+                match boundary.reason {
+                    BoundaryReason::SessionChanged { .. } => session_changes += 1,
+                    BoundaryReason::SegmentChanged { .. } => segment_changes += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(pb) = &pb {
+        pb.finish_and_clear();
+    }
+
+    let size_mib = total_bytes as f64 / 1_048_576.0;
+    let rule = style("─".repeat(50)).dim();
+    let label = |s: &str| style(format!("{:12}", s)).bold().cyan();
+    let unit = |s: &str| style(s.to_string()).dim();
+
+    println!();
+    println!("{rule}");
+    println!(" {}", style("Log Inspection").bold());
+    println!("{rule}");
+    println!(" {} {}", label("File:"), path);
+    println!(" {} {:.2} {}", label("Size:"), size_mib, unit("MiB"));
+    println!(" {} {}", label("Packets:"), packet_count);
+
+    println!();
+    println!(" {}", style("Devices:").bold().cyan());
+    if devices.is_empty() {
+        println!("   (no device metadata seen)");
+    } else {
+        for (route, d) in &devices {
+            println!(
+                "   • {}  {}  {}  {}",
+                route,
+                d.name,
+                style(format!("fw {}", d.firmware)).dim(),
+                style(format!("serial {}", d.serial)).dim(),
+            );
+        }
+    }
+
+    println!();
+    println!(" {}", style("Streams:").bold().cyan());
+    if streams.is_empty() {
+        println!("   (no sample data seen)");
+    } else {
+        for ((route, sid), s) in &streams {
+            let declared = if s.rate_hz > 0.0 {
+                s.sample_count as f64 / s.rate_hz
+            } else {
+                0.0
+            };
+            let observed = match (s.first_t, s.last_t) {
+                (Some(a), Some(b)) => b - a,
+                _ => 0.0,
+            };
+            let skew = if declared > 0.0 {
+                (declared - observed).abs() / declared
+            } else {
+                0.0
+            };
+            let trailing = if skew > 0.05 && declared > 0.0 {
+                format!(
+                    "  {}",
+                    style(format!(
+                        "⚠ declared {} vs observed {}",
+                        fmt_hms(declared),
+                        fmt_hms(observed)
+                    ))
+                    .yellow()
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "   • {} {} {:<12} {:>6.0} {}  {:>4} {}  {:>10} {}{}",
+                route,
+                sid,
+                s.name,
+                s.rate_hz,
+                unit("Hz"),
+                s.columns.len(),
+                unit("cols"),
+                s.sample_count,
+                unit("samples"),
+                trailing,
+            );
+            if !s.columns.is_empty() {
+                let cols: Vec<String> = s
+                    .columns
+                    .iter()
+                    .map(|(n, t, u)| {
+                        if u.is_empty() {
+                            format!("{} {}", n, style(t).dim())
+                        } else {
+                            format!("{} {} {}", n, style(t).dim(), style(u).dim())
+                        }
+                    })
+                    .collect();
+                println!("        {}", cols.join(", "));
+            }
+        }
+    }
+
+    println!();
+    let boundary_text = format!(
+        "{} session changes, {} segment changes",
+        session_changes, segment_changes
+    );
+    let styled_boundaries = if session_changes > 0 || segment_changes > 0 {
+        style(boundary_text).yellow().to_string()
+    } else {
+        boundary_text
+    };
+    println!(" {} {}", label("Boundaries:"), styled_boundaries);
+    println!("{rule}");
+
+    Ok(())
+}
+
 pub fn log_csv(
     args: Vec<String>,
     sensor: Option<String>,

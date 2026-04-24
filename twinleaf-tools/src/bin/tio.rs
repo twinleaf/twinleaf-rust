@@ -6,8 +6,8 @@ use twinleaf_tools::tools::{
     proxy::run_proxy,
     proxy_nmea::run_nmea_proxy,
     tool::{
-        dump, firmware_upgrade, list_rpcs, log, log_csv, log_dump, log_hdf, log_metadata,
-        meta_reroute, rpc, rpc_dump,
+        dump, firmware_upgrade, list_rpcs, log, log_csv, log_dump, log_hdf, log_inspect,
+        log_metadata, meta_reroute, rpc, rpc_dump,
     },
 };
 use twinleaf_tools::{
@@ -88,6 +88,7 @@ fn main() -> eyre::Result<()> {
                 sensor,
                 depth,
             }) => log_dump(files, data, meta, sensor, depth),
+            Some(LogSubcommands::Inspect { files }) => log_inspect(files),
             Some(LogSubcommands::Csv {
                 args,
                 sensor,

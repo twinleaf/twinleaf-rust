@@ -246,6 +246,13 @@ pub enum LogSubcommands{
         depth: Option<usize>,
     },
 
+    /// Summarize the contents of binary log file(s)
+    Inspect {
+        /// Input log file(s)
+        #[arg(value_hint = ValueHint::FilePath)]
+        files: Vec<String>,
+    },
+
     /// Convert binary log data to CSV
     Csv {
         /// Stream ID/name and input .tio files (order-independent)
