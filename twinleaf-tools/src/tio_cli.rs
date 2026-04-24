@@ -220,6 +220,7 @@ pub enum LogSubcommands{
     /// Dump data from binary log file(s)
     Dump {
         /// Input log file(s)
+        #[arg(value_hint = ValueHint::FilePath)]
         files: Vec<String>,
 
         /// Show parsed data samples
@@ -242,6 +243,7 @@ pub enum LogSubcommands{
     /// Convert binary log data to CSV
     Csv {
         /// Stream ID/name and input .tio files (order-independent)
+        #[arg(value_hint = ValueHint::FilePath)]
         args: Vec<String>,
 
         /// Sensor route in the device tree (default: /)
@@ -256,6 +258,7 @@ pub enum LogSubcommands{
     /// Convert binary log files to HDF5 format
     Hdf {
         /// Input log file(s)
+        #[arg(value_hint = ValueHint::FilePath)]
         files: Vec<String>,
 
         /// Output file path (defaults to input filename with .h5 extension)
@@ -289,6 +292,7 @@ pub enum MetaSubcommands {
     /// Reroute metadata packets in a metadata file
     Reroute {
         /// Input metadata file path
+        #[arg(value_hint = ValueHint::FilePath)]
         input: String,
 
         /// New device route (e.g., /0/1)
@@ -486,6 +490,7 @@ pub struct ProxyCli {
 
     /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0)
     /// Required unless --auto or --enum is specified
+    #[arg(value_hint = ValueHint::Url)]
     sensor_url: Option<String>,
 
     /// TCP port to listen on for clients

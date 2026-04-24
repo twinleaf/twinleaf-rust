@@ -27,6 +27,7 @@ pub struct TioOpts {
         short = 'r',
         long = "root",
         default_value_t = util::default_proxy_url().to_string(),
+        value_hint = clap::ValueHint::Url,
         help = "Sensor root address"
     )]
     pub root: String,
