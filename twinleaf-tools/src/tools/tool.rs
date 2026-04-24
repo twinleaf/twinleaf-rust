@@ -9,7 +9,7 @@ use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device::util::{parse_rpc_spec, rpc_decode_reply, rpc_encode_arg};
+use twinleaf::device::util::{rpc_decode_reply, rpc_encode_arg};
 use twinleaf::device::{Device, DeviceTree, RpcClient, RpcValue, RpcValueType};
 use twinleaf::tio;
 
@@ -80,13 +80,11 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
 }
 
 fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType {
-    match device.rpc("rpc.info", &name.to_string()) {
-        Ok(meta) => parse_rpc_spec(meta, name.to_string()).data_kind,
-        Err(_) => {
-            println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
-            RpcValueType::String { max_len: None }
-        }
+    let meta: Option<u16> = device.rpc("rpc.info", &name.to_string()).ok();
+    if meta.is_none() {
+        println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
     }
+    twinleaf::device::util::resolve_arg_type(meta, name)
 }
 
 pub fn rpc(
@@ -128,8 +126,7 @@ pub fn rpc(
                     println!("{:?}", s);
                 }
             }
-            return Err(eyre::Report::new(err)
-                .wrap_err(format!("RPC {} failed", rpc_name)));
+            return Err(eyre::Report::new(err).wrap_err(format!("RPC {} failed", rpc_name)));
         }
     };
 
@@ -332,8 +329,8 @@ pub fn log(
             .new_port(None, route.clone(), depth, true, true)
             .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
 
-        let mut file_out = File::create(&file)
-            .wrap_err_with(|| format!("could not create log file {}", file))?;
+        let mut file_out =
+            File::create(&file).wrap_err_with(|| format!("could not create log file {}", file))?;
         println!("Logging raw packets...");
 
         for pkt in port.iter() {
@@ -360,8 +357,8 @@ pub fn log(
     let mut devs = DeviceTree::open(&proxy, route.clone())
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
 
-    let mut file = File::create(&file)
-        .wrap_err_with(|| format!("could not create log file {}", file))?;
+    let mut file =
+        File::create(&file).wrap_err_with(|| format!("could not create log file {}", file))?;
 
     let write_packet = |pkt: tio::Packet, f: &mut File| {
         let _ = f.write_all(&pkt.serialize().unwrap());
@@ -512,8 +509,8 @@ pub fn meta_reroute(input: String, route: String, output: Option<String>) -> eyr
         bail!("output path must be different from input");
     }
 
-    let mut file = File::create(&output_path)
-        .wrap_err_with(|| format!("could not create {}", output_path))?;
+    let mut file =
+        File::create(&output_path).wrap_err_with(|| format!("could not create {}", output_path))?;
 
     rest = &data;
     while !rest.is_empty() {
@@ -726,8 +723,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     use twinleaf::tio::proto::identifiers::StreamId;
 
     let file = File::open(path).wrap_err_with(|| format!("could not open {}", path))?;
-    let mmap =
-        unsafe { Mmap::map(&file) }.wrap_err_with(|| format!("could not mmap {}", path))?;
+    let mmap = unsafe { Mmap::map(&file) }.wrap_err_with(|| format!("could not mmap {}", path))?;
     let total_bytes = mmap.len() as u64;
 
     let pb = if total_bytes > 10 * 1024 * 1024 {
@@ -1155,8 +1151,8 @@ pub fn log_hdf(
 
     for path in &files {
         let file = File::open(&path).wrap_err_with(|| format!("could not open {}", path))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .wrap_err_with(|| format!("could not mmap {}", path))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.wrap_err_with(|| format!("could not mmap {}", path))?;
 
         let total_bytes = mmap.len() as u64;
         total_input_bytes += total_bytes;
@@ -1306,10 +1302,10 @@ pub fn log_hdf(
     _split_policy: SplitPolicy,
 ) -> eyre::Result<()> {
     use color_eyre::Help;
-    Err(eyre::eyre!(
-        "this version of twinleaf-tools was compiled without HDF5 support"
+    Err(
+        eyre::eyre!("this version of twinleaf-tools was compiled without HDF5 support")
+            .suggestion("reinstall with: cargo install twinleaf-tools --features hdf5"),
     )
-    .suggestion("reinstall with: cargo install twinleaf-tools --features hdf5"))
 }
 
 pub fn firmware_upgrade(
@@ -1355,8 +1351,9 @@ pub fn firmware_upgrade(
                 tio::proto::RpcErrorCode::NotFound | tio::proto::RpcErrorCode::WrongDeviceState
             ) => {}
         Err(e) => {
-            return Err(eyre::Report::new(e)
-                .wrap_err("failed to stop device before firmware upgrade"));
+            return Err(
+                eyre::Report::new(e).wrap_err("failed to stop device before firmware upgrade")
+            );
         }
     }
 
