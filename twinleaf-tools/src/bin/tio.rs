@@ -31,7 +31,7 @@ fn main() -> ExitCode {
             all,
             fps,
             colors,
-        } => run_monitor(tio, all, fps, colors),
+        } => run_monitor(tio, all, fps, colors).map_err(|e| eprintln!("{:?}", e)),
         Commands::Health(health_cli) => run_health(health_cli),
         Commands::Rpc {
             tio,

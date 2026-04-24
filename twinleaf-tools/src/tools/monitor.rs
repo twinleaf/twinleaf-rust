@@ -1908,14 +1908,21 @@ fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
     it.get(k)
         .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
 }
-pub fn run_monitor(tio: TioOpts, all: bool, fps: u32, colors: Option<String>) -> Result<(), ()> {
+pub fn run_monitor(
+    tio: TioOpts,
+    all: bool,
+    fps: u32,
+    colors: Option<String>,
+) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let proxy = tio::proxy::Interface::new(&tio.root);
     let parent_route: DeviceRoute = tio.route.clone();
 
     // Data thread
     let (data_tx, data_rx) = channel::unbounded::<TreeItem>();
-    let tree_for_data =
-        DeviceTree::open(&proxy, parent_route.clone()).expect("Failed to open device tree");
+    let tree_for_data = DeviceTree::open(&proxy, parent_route.clone())
+        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
     std::thread::spawn(move || {
         let mut tree = tree_for_data;
         loop {
@@ -1931,8 +1938,8 @@ pub fn run_monitor(tio: TioOpts, all: bool, fps: u32, colors: Option<String>) ->
     });
 
     // RPC worker thread
-    let rpc_client =
-        RpcClient::open(&proxy, parent_route.clone()).expect("Failed to open RPC client");
+    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
+        .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))?;
     let (rpc_tx, rpc_rx) = channel::unbounded::<RpcWorkerReq>();
     let (rpc_resp_tx, rpc_resp_rx) = channel::unbounded::<RpcWorkerResp>();
 
