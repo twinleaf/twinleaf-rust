@@ -12,6 +12,7 @@ use std::{
 
 use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq};
 use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
+use crate::tui::tree_worker::spawn_tree_worker;
 use crate::TioOpts;
 use clap::Parser;
 use crossbeam::channel::{self, Sender};
@@ -1481,23 +1482,9 @@ pub fn run_monitor(
     let proxy = tio::proxy::Interface::new(&tio.root);
     let parent_route: DeviceRoute = tio.route.clone();
 
-    // Data thread
-    let (data_tx, data_rx) = channel::unbounded::<TreeItem>();
-    let tree_for_data = DeviceTree::open(&proxy, parent_route.clone())
+    let tree = DeviceTree::open(&proxy, parent_route.clone())
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
-    std::thread::spawn(move || {
-        let mut tree = tree_for_data;
-        loop {
-            match tree.next_item() {
-                Ok(item) => {
-                    if data_tx.send(item).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
+    let data_rx = spawn_tree_worker(tree);
 
     let rpc_client = RpcClient::open(&proxy, parent_route.clone())
         .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))?;

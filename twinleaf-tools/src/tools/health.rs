@@ -8,6 +8,7 @@
 
 use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq};
 use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
+use crate::tui::tree_worker::spawn_tree_worker;
 use crate::HealthCli;
 use chrono::{DateTime, Local};
 use crossbeam::channel::{self, Sender};
@@ -972,21 +973,7 @@ pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
     };
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
 
-    // Data thread
-    let (data_tx, data_rx) = channel::unbounded();
-    std::thread::spawn(move || {
-        let mut tree = tree;
-        loop {
-            match tree.next_item() {
-                Ok(item) => {
-                    if data_tx.send(item).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
+    let data_rx = spawn_tree_worker(tree);
 
     // Key thread
     let (key_tx, key_rx) = channel::unbounded();
