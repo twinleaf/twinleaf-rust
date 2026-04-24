@@ -4,6 +4,9 @@
 //! local serial ports; future mechanisms (mDNS, UDP broadcast) will live
 //! alongside as additional entry points in this module.
 
+use crate::tio::{proto::DeviceRoute, proxy};
+use std::time::Duration;
+
 /// The USB interface a discovered device uses.
 #[derive(Debug, Clone)]
 pub enum PortInterface {
@@ -55,3 +58,17 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
 
     ports
 }
+
+/// Briefly connect to a device and query its `dev.name` RPC.
+///
+/// Returns `Some(name)` on success, `None` if the port is busy, times out,
+/// or the device otherwise fails to respond. Total wall-clock time is
+/// bounded by roughly twice `timeout` (reconnect budget + RPC budget).
+pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
+    let interface = proxy::Interface::new_proxy(url, Some(timeout), None);
+    let port = interface
+        .new_port(Some(timeout), DeviceRoute::root(), 0, false, false)
+        .ok()?;
+    port.rpc("dev.name", ()).ok()
+}
+

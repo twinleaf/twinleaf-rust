@@ -57,6 +57,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
     if proxy_cli.enumerate {
         let mut unknown_devices = vec![];
         let mut found_any = false;
+        let query_timeout = Duration::from_millis(500);
         for dev in discovery::enumerate_serial(true) {
             if let PortInterface::Unknown(vid, pid) = dev.interface {
                 unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
@@ -65,7 +66,10 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
                     println!("Possible tio ports:");
                     found_any = true;
                 }
-                println!(" * {}", dev.url);
+                match discovery::query_name(&dev.url, query_timeout) {
+                    Some(name) => println!(" * {}  {}", dev.url, name),
+                    None => println!(" * {}  (no response)", dev.url),
+                }
             }
         }
         if !found_any {
@@ -110,7 +114,16 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
             die!("Cannot find any sensor to connect to, specify URL manually")
         }
         if valid_urls.len() > 1 {
-            die!("Too many sensors detected, specify URL manually")
+            eprintln!("ERROR: multiple sensors detected:");
+            let query_timeout = Duration::from_millis(500);
+            for url in &valid_urls {
+                match discovery::query_name(url, query_timeout) {
+                    Some(name) => eprintln!("  {}  {}", url, name),
+                    None => eprintln!("  {}  (no response)", url),
+                }
+            }
+            eprintln!("Specify one with -s <url>.");
+            return Err(());
         }
         valid_urls[0].clone()
     };
