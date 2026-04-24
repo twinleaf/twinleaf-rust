@@ -26,31 +26,28 @@ pub enum RpcWorkerResp {
 }
 
 pub fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
-    let meta = match req.meta {
-        Some(m) => m,
-        None => client
-            .rpc(&req.route, "rpc.info", &req.method)
-            .map_err(|_| format!("Unknown RPC: {}", req.method))?,
-    };
-
-    let spec = util::parse_rpc_spec(meta, req.method.clone());
+    let meta = req.meta.or_else(|| {
+        client
+            .rpc::<&String, u16>(&req.route, "rpc.info", &req.method)
+            .ok()
+    });
+    let kind = util::resolve_arg_type(meta, &req.method);
 
     let payload = if let Some(ref s) = req.arg {
-        util::rpc_encode_arg(s, &spec.data_kind).map_err(|e| format!("{:?}", e))?
+        util::rpc_encode_arg(s, &kind).map_err(|e| e.to_string())?
     } else {
         Vec::new()
     };
 
     let reply_bytes = client
         .raw_rpc(&req.route, &req.method, &payload)
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| e.to_string())?;
 
     if reply_bytes.is_empty() {
         return Ok("OK".to_string());
     }
 
-    let value =
-        util::rpc_decode_reply(&reply_bytes, &spec.data_kind).map_err(|e| format!("{:?}", e))?;
+    let value = util::rpc_decode_reply(&reply_bytes, &kind).map_err(|e| e.to_string())?;
 
     Ok(match &value {
         RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
