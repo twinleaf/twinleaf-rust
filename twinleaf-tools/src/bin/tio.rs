@@ -129,7 +129,7 @@ fn main() -> ExitCode {
             };
             Ok(())
         }
-        Commands::FirmwareUpgrade {
+        Commands::Upgrade {
             tio,
             firmware_path,
             yes,

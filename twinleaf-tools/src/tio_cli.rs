@@ -111,7 +111,8 @@ pub enum Commands {
         depth: Option<usize>,
     },
     /// Upgrade device firmware
-    FirmwareUpgrade {
+    #[command(alias = "firmware-upgrade")]
+    Upgrade {
         #[command(flatten)]
         tio: TioOpts,
 
