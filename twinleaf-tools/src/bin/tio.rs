@@ -11,7 +11,9 @@ use twinleaf_tools::tools::{
         meta_reroute, rpc, rpc_dump,
     },
 };
-use twinleaf_tools::{Commands, DumpSubcommands, LogSubcommands, RPCSubcommands, TioCli};
+use twinleaf_tools::{
+    Commands, DumpSubcommands, LogSubcommands, MetaSubcommands, RPCSubcommands, TioCli,
+};
 
 fn main() -> ExitCode {
     let cli = TioCli::parse();
@@ -78,7 +80,18 @@ fn main() -> ExitCode {
             depth,
         } => {
             let _ = match subcommands {
-                Some(LogSubcommands::Metadata { tio, file }) => log_metadata(&tio, file),
+                Some(LogSubcommands::Meta {
+                    tio,
+                    subcommands,
+                    file,
+                }) => match subcommands {
+                    Some(MetaSubcommands::Reroute {
+                        input,
+                        route,
+                        output,
+                    }) => meta_reroute(input, route, output),
+                    None => log_metadata(&tio, file),
+                },
                 Some(LogSubcommands::Dump {
                     files,
                     data,
@@ -113,11 +126,6 @@ fn main() -> ExitCode {
             };
             Ok(())
         }
-        Commands::MetaReroute {
-            input,
-            route,
-            output,
-        } => meta_reroute(input, route, output),
         Commands::FirmwareUpgrade {
             tio,
             firmware_path,

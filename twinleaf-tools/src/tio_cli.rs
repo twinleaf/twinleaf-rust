@@ -5,7 +5,8 @@ use clap_complete::Shell;
 #[command(
     name = "tio",
     version,
-    about = "Twinleaf sensor management and data logging tool", 
+    about = "Twinleaf sensor management and data logging tool",
+    disable_help_subcommand = true,
 )]
 pub struct TioCli {
     #[command(subcommand)]
@@ -101,19 +102,6 @@ pub enum Commands {
         #[arg(long = "depth")]
         depth: Option<usize>,
     },
-    /// Reroute metadata packets in a metadata file
-    MetaReroute {
-        /// Input metadata file path
-        input: String,
-
-        /// New device route (e.g., /0/1)
-        #[arg(short = 's', long = "sensor")]
-        route: String,
-
-        /// Output metadata file path (defaults to <input>_rerouted.tio)
-        #[arg(short = 'o', long = "output")]
-        output: Option<String>,
-    },
     #[command(args_conflicts_with_subcommands = true)]
     /// Dump data from a live device
     Dump {
@@ -195,10 +183,14 @@ pub enum RPCSubcommands{
 
 #[derive(Subcommand, Debug)]
 pub enum LogSubcommands{
-    /// Log metadata to a file
-    Metadata {
+    /// Log metadata to a file. See "tio log meta --help" for more options
+    #[command(args_conflicts_with_subcommands = true)]
+    Meta {
         #[command(flatten)]
         tio: TioOpts,
+
+        #[command(subcommand)]
+        subcommands: Option<MetaSubcommands>,
 
         /// Output metadata file path
         #[arg(short = 'f', default_value = "meta.tio")]
@@ -276,6 +268,23 @@ pub enum LogSubcommands{
         /// When to detect discontinuities (continuous=any gap, monotonic=only time backward)
         #[arg(short = 'p', long = "policy", default_value = "continuous")]
         split_policy: SplitPolicy,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MetaSubcommands {
+    /// Reroute metadata packets in a metadata file
+    Reroute {
+        /// Input metadata file path
+        input: String,
+
+        /// New device route (e.g., /0/1)
+        #[arg(short = 's', long = "sensor")]
+        route: String,
+
+        /// Output metadata file path (defaults to <input>_rerouted.tio)
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
     },
 }
 
