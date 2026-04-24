@@ -89,14 +89,10 @@ pub enum Commands {
         #[arg(long = "depth")]
         depth: Option<usize>,
     },
-    #[command(args_conflicts_with_subcommands = true)]
     /// Dump data from a live device
     Dump {
         #[command(flatten)]
         tio: TioOpts,
-
-        #[command(subcommand)]
-        subcommands: Option<DumpSubcommands>,
 
         /// Show parsed data samples
         #[arg(short = 'd', long = "data")]
@@ -207,13 +203,6 @@ pub enum LogSubcommands{
         depth: Option<usize>,
     },
 
-    /// Dump parsed data from binary log file(s) [DEPRECATED: use log-dump -d]
-    #[command(hide = true)]
-    DataDump {
-        /// Input log file(s)
-        files: Vec<String>,
-    },
-
     /// Convert binary log data to CSV
     Csv {
         /// Stream ID/name and input .tio files (order-independent)
@@ -273,30 +262,6 @@ pub enum MetaSubcommands {
         /// Output metadata file path (defaults to <input>_rerouted.tio)
         #[arg(short = 'o', long = "output")]
         output: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum DumpSubcommands{
-    /// Dump data samples from the device [DEPRECATED: use dump -d -s <ROUTE>]
-    #[command(hide = true)]
-    Data {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
-
-    /// Dump data samples from all devices in the tree [DEPRECATED: use dump -a -d]
-    #[command(hide = true)]
-    DataAll {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
-
-    /// Dump device metadata [DEPRECATED: use dump -m -s <ROUTE>]
-    #[command(hide = true)]
-    Meta {
-        #[command(flatten)]
-        tio: TioOpts,
     },
 }
 

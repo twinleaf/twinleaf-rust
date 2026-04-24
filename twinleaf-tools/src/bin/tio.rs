@@ -6,14 +6,12 @@ use twinleaf_tools::tools::{
     proxy::run_proxy,
     proxy_nmea::run_nmea_proxy,
     tool::{
-        data_dump_all_deprecated, data_dump_deprecated, dump, firmware_upgrade, list_rpcs, log,
-        log_csv, log_data_dump_deprecated, log_dump, log_hdf, log_metadata, meta_dump_deprecated,
+        dump, firmware_upgrade, list_rpcs, log, log_csv, log_dump, log_hdf, log_metadata,
         meta_reroute, rpc, rpc_dump,
     },
 };
 use twinleaf_tools::{
-    Commands, DumpSubcommands, LogSubcommands, MetaSubcommands, ProxySubcommands, RPCSubcommands,
-    TioCli,
+    Commands, LogSubcommands, MetaSubcommands, ProxySubcommands, RPCSubcommands, TioCli,
 };
 
 fn main() -> ExitCode {
@@ -61,17 +59,11 @@ fn main() -> ExitCode {
         }
         Commands::Dump {
             tio,
-            subcommands,
             data,
             meta,
             depth,
         } => {
-            let _ = match subcommands {
-                Some(DumpSubcommands::Data { tio }) => data_dump_deprecated(&tio),
-                Some(DumpSubcommands::DataAll { tio }) => data_dump_all_deprecated(&tio),
-                Some(DumpSubcommands::Meta { tio }) => meta_dump_deprecated(&tio),
-                None => dump(&tio, data, meta, depth),
-            };
+            let _ = dump(&tio, data, meta, depth);
             Ok(())
         }
         Commands::Log {
@@ -102,7 +94,6 @@ fn main() -> ExitCode {
                     sensor,
                     depth,
                 }) => log_dump(files, data, meta, sensor, depth),
-                Some(LogSubcommands::DataDump { files }) => log_data_dump_deprecated(files),
                 Some(LogSubcommands::Csv {
                     args,
                     sensor,

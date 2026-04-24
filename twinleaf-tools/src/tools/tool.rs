@@ -353,25 +353,6 @@ fn print_metadata_payload(route: &DeviceRoute, payload: &tio::proto::MetadataPay
         }
     }
 }
-// Deprecated wrappers
-pub fn data_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
-    eprintln!("Warning: data-dump is deprecated, use 'dump -d -m --depth 0' instead");
-    eprintln!();
-    dump(tio, true, true, Some(0))
-}
-
-pub fn data_dump_all_deprecated(tio: &TioOpts) -> Result<(), ()> {
-    eprintln!("Warning: data-dump-all is deprecated, use 'dump -d -m' instead");
-    eprintln!();
-    dump(tio, true, true, None)
-}
-
-pub fn meta_dump_deprecated(tio: &TioOpts) -> Result<(), ()> {
-    eprintln!("Warning: meta-dump is deprecated, use 'dump -m --depth 0' instead");
-    eprintln!();
-    dump(tio, false, true, Some(0))
-}
-
 pub fn log(
     tio: &TioOpts,
     file: String,
@@ -742,12 +723,6 @@ pub fn log_dump(
     }
 
     Ok(())
-}
-
-pub fn log_data_dump_deprecated(files: Vec<String>) -> Result<(), ()> {
-    eprintln!("Warning: log-data-dump is deprecated, use 'log-dump -d -m' instead");
-    eprintln!();
-    log_dump(files, true, true, "/".to_string(), None)
 }
 
 pub fn log_csv(
