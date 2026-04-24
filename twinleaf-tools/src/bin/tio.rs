@@ -15,7 +15,10 @@ use twinleaf_tools::{
 };
 
 fn main() -> eyre::Result<()> {
-    color_eyre::install()?;
+    color_eyre::config::HookBuilder::default()
+        .display_env_section(false)
+        .display_location_section(false)
+        .install()?;
     let cli = TioCli::parse();
 
     match cli.command {
@@ -26,10 +29,10 @@ fn main() -> eyre::Result<()> {
         },
         Commands::Monitor {
             tio,
-            all,
             fps,
             colors,
-        } => run_monitor(tio, all, fps, colors),
+            depth,
+        } => run_monitor(tio, fps, colors, depth),
         Commands::Health(health_cli) => run_health(health_cli),
         Commands::Rpc {
             tio,

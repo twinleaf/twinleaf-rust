@@ -219,6 +219,8 @@ pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre
         .new_port(None, route.clone(), port_depth, true, true)
         .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
 
+    eprintln!("Dumping from {} (route {})...", tio.root, route);
+
     match (data, meta) {
         // Raw mode (no flags): dump all packets
         (false, false) => {
@@ -251,8 +253,7 @@ pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre
                         print_sample(&sample, Some(&sample_route), meta, true);
                     }
                     Err(e) => {
-                        eprintln!("Device error: {:?}", e);
-                        break;
+                        return Err(eyre::Report::new(e).wrap_err("device stream ended"));
                     }
                 }
             }
@@ -406,8 +407,7 @@ pub fn log(
                 }
             }
             Err(e) => {
-                eprintln!("Device error: {e:?}");
-                break;
+                return Err(eyre::Report::new(e).wrap_err("device stream ended"));
             }
         }
 
@@ -415,7 +415,6 @@ pub fn log(
             let _ = file.flush();
         }
     }
-    Ok(())
 }
 
 pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {

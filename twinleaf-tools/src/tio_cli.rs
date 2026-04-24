@@ -52,12 +52,13 @@ pub enum Commands {
 	Monitor {
 		#[command(flatten)]
 		tio: TioOpts,
-		#[arg(short = 'a', long = "all")]
-		all: bool,
 		#[arg(long = "fps", default_value_t = 20)]
 		fps: u32,
 		#[arg(short = 'c', long = "colors")]
 		colors: Option<String>,
+		/// Routing depth limit (default: unlimited)
+		#[arg(long = "depth")]
+		depth: Option<usize>,
 	},
 	Health(HealthCli),
 
@@ -494,15 +495,12 @@ fn nonneg_f64(s: &str) -> Result<f64, String> {
     version,
     about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP",
     args_conflicts_with_subcommands = true,
-    arg_required_else_help = true,
-    group = clap::ArgGroup::new("source").required(true).args(["sensor_url", "auto", "enum"]),
 )]
 pub struct ProxyCli {
     #[command(subcommand)]
     pub subcommands: Option<ProxySubcommands>,
 
-    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0)
-    /// Required unless --auto or --enum is specified
+    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single connected device
     #[arg(value_hint = ValueHint::Url)]
     sensor_url: Option<String>,
 
@@ -555,7 +553,8 @@ pub struct ProxyCli {
     #[arg(long)]
     dump_hb: bool,
 
-    #[arg(short = 'a', long = "auto")]
+    /// Deprecated; running without -s <url> now auto-detects by default.
+    #[arg(short = 'a', long = "auto", hide = true)]
     auto: bool,
 
     /// Deprecated; use `tio list` instead.

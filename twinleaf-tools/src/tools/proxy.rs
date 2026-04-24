@@ -51,6 +51,10 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
         return crate::tools::list::list_devices_deprecated(true);
     }
 
+    if proxy_cli.auto {
+        eprintln!("warning: '--auto' is deprecated; running without -s <url> now auto-detects by default");
+    }
+
     let tcp_port = proxy_cli.port;
     let reconnect_timeout = Duration::from_secs(proxy_cli.reconnect_timeout);
     let disconnect_slow = proxy_cli.kick_slow;
@@ -62,7 +66,8 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
     let dump_hb = proxy_cli.dump_hb;
     let tf = proxy_cli.timestamp_format;
 
-    // Determine sensor URL
+    // Determine sensor URL; if none given, auto-detect.
+    let auto_detected = proxy_cli.sensor_url.is_none();
     let sensor_url = if let Some(url) = proxy_cli.sensor_url {
         url
     } else {
@@ -79,7 +84,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
         }
         if valid_urls.len() == 0 {
             return Err(eyre::eyre!("no sensors detected")
-                .suggestion("specify a URL with -s <url>, or run 'tio proxy --enumerate'"));
+                .suggestion("specify a URL with -s <url>, or run 'tio list'"));
         }
         if valid_urls.len() > 1 {
             eprintln!("multiple sensors detected:");
@@ -102,11 +107,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
     println!(
         "  Sensor: {} {}",
         sensor_url,
-        if proxy_cli.auto {
-            "(auto-detected)"
-        } else {
-            ""
-        }
+        if auto_detected { "(auto-detected)" } else { "" }
     );
     println!("  TCP port: {}", tcp_port);
     println!("  Subtree: {}", subtree);

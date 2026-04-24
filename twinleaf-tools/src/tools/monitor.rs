@@ -395,7 +395,7 @@ impl Default for ViewConfig {
 
 
 pub struct App {
-    pub all: bool,
+    pub depth_limit: Option<usize>,
     pub parent_route: DeviceRoute,
     pub mode: Mode,
     pub view: ViewConfig,
@@ -417,9 +417,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(all: bool, parent_route: &DeviceRoute) -> Self {
+    pub fn new(depth_limit: Option<usize>, parent_route: &DeviceRoute) -> Self {
         Self {
-            all,
+            depth_limit,
             parent_route: parent_route.clone(),
             mode: Mode::Normal,
             view: ViewConfig::default(),
@@ -535,13 +535,17 @@ impl App {
     }
 
     pub fn visible_routes(&self) -> Vec<DeviceRoute> {
-        if self.all {
-            let mut routes: Vec<_> = self.discovered_routes.iter().cloned().collect();
-            routes.sort();
-            routes
-        } else {
-            vec![self.parent_route.clone()]
-        }
+        let mut routes: Vec<_> = self
+            .discovered_routes
+            .iter()
+            .filter(|r| match self.parent_route.relative_route(r) {
+                Ok(rel) => self.depth_limit.map_or(true, |max| rel.len() <= max),
+                Err(_) => false,
+            })
+            .cloned()
+            .collect();
+        routes.sort();
+        routes
     }
 
     pub fn rebuild_nav_items(&mut self) {
@@ -1486,9 +1490,9 @@ fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
 }
 pub fn run_monitor(
     tio: TioOpts,
-    all: bool,
     fps: u32,
     colors: Option<String>,
+    depth: Option<usize>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
 
@@ -1513,8 +1517,8 @@ pub fn run_monitor(
         }
     });
 
-    // App state
-    let mut app = App::new(all, &parent_route);
+    // App state — subtree visible by default; limit with --depth.
+    let mut app = App::new(depth, &parent_route);
     if let Some(path) = &colors {
         if let Ok(theme) = load_theme(path) {
             app.view.theme = theme;
