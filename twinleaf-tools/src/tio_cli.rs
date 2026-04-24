@@ -149,8 +149,8 @@ pub enum Commands {
         tio: TioOpts,
 
         /// Input firmware image path
-        #[arg(value_hint = ValueHint::FilePath)]
-        firmware_path: String,
+        #[arg(value_hint = ValueHint::FilePath, value_parser = parse_existing_file)]
+        firmware_path: PathBuf,
 
         /// Skip confirmation prompt
         #[arg(short = 'y', long = "yes")]
@@ -497,8 +497,13 @@ pub struct ProxyCli {
     kick_slow: bool,
 
     /// Sensor subtree to look at
-    #[arg(short = 's', long = "subtree", default_value = "/")]
-    subtree: String,
+    #[arg(
+        short = 's',
+        long = "subtree",
+        default_value = "/",
+        value_parser = parse_device_route,
+    )]
+    subtree: DeviceRoute,
 
     /// Verbose output
     #[arg(short = 'v', long)]

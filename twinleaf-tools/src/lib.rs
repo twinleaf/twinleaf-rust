@@ -1,10 +1,24 @@
 use clap::Parser;
+use std::path::PathBuf;
 use std::time::Duration;
 use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
 pub mod tools;
 include!("tio_cli.rs");
+
+fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
+    DeviceRoute::from_str(s).map_err(|_| format!("invalid sensor route: {s:?}"))
+}
+
+fn parse_existing_file(s: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(s);
+    match std::fs::metadata(&p) {
+        Ok(m) if m.is_file() => Ok(p),
+        Ok(_) => Err(format!("not a regular file: {s:?}")),
+        Err(e) => Err(format!("cannot read {s:?}: {e}")),
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 pub struct TioOpts {
@@ -22,13 +36,8 @@ pub struct TioOpts {
         short = 's',
         long = "sensor",
         default_value = "/",
+        value_parser = parse_device_route,
         help = "Sensor path in the sensor tree"
     )]
-    pub route_path: String,
-}
-
-impl TioOpts {
-    pub fn parse_route(&self) -> DeviceRoute {
-        DeviceRoute::from_str(&self.route_path).unwrap_or_else(|_| DeviceRoute::root())
-    }
+    pub route: DeviceRoute,
 }

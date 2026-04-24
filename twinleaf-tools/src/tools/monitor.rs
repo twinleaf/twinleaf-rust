@@ -1903,7 +1903,7 @@ fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
 }
 pub fn run_monitor(tio: TioOpts, all: bool, fps: u32, colors: Option<String>) -> Result<(), ()> {
     let proxy = tio::proxy::Interface::new(&tio.root);
-    let parent_route: DeviceRoute = tio.parse_route();
+    let parent_route: DeviceRoute = tio.route.clone();
 
     // Data thread
     let (data_tx, data_rx) = channel::unbounded::<TreeItem>();

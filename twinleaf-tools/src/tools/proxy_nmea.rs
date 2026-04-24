@@ -87,7 +87,7 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
 
 pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> Result<(), ()> {
     let proxy = tio::proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
 
     let bind_addr = format!("0.0.0.0:{}", tcp_port);
     let listener = TcpListener::bind(&bind_addr)

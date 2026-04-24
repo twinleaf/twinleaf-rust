@@ -161,8 +161,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
         valid_urls[0].clone()
     };
 
-    let subtree =
-        tio::proto::DeviceRoute::from_str(&proxy_cli.subtree).expect("Invalid sensor subtree");
+    let subtree = proxy_cli.subtree;
 
     println!("tio proxy starting:");
     println!(

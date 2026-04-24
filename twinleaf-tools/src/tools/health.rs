@@ -871,7 +871,7 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
     let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&health_cli.tio.root);
-    let root_route = health_cli.tio.parse_route();
+    let root_route = health_cli.tio.route.clone();
 
     let tree = match DeviceTree::open(&proxy, root_route) {
         Ok(t) => t,

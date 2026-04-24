@@ -58,7 +58,7 @@ fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
 
 pub fn list_rpcs(tio: &TioOpts) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
     let rpc_client = RpcClient::open(&proxy, route.clone()).expect("Failed to open RPC client");
     let rpcs = rpc_client.rpc_list(&route).map_err(|e| {
         eprintln!("RPC list failed: {:?}", e);
@@ -98,7 +98,7 @@ pub fn rpc(
 ) -> Result<(), ()> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
     let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
-    let route = tio.parse_route();
+    let route = tio.route.clone();
     let device = proxy.device_rpc(route).unwrap();
 
     let req_type = req_type.or_else(|| {
@@ -158,7 +158,7 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(),
     };
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
     let device = proxy.device_rpc(route).unwrap();
 
     if is_capture {
@@ -194,7 +194,7 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> Result<(),
 
 pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
     let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
 
     let port = proxy
@@ -305,7 +305,7 @@ pub fn log(
     depth: Option<usize>,
 ) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
 
     if raw {
         let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
@@ -399,7 +399,7 @@ pub fn log(
 
 pub fn log_metadata(tio: &TioOpts, file: String) -> Result<(), ()> {
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
 
     let mut device = Device::open(&proxy, route.clone()).map_err(|e| {
         eprintln!("Failed to open device: {:?}", e);
@@ -998,7 +998,7 @@ pub fn log_hdf(
 
 pub fn firmware_upgrade(
     tio: &TioOpts,
-    firmware_path: String,
+    firmware_path: std::path::PathBuf,
     skip_confirm: bool,
 ) -> Result<(), ()> {
     use indicatif::{ProgressBar, ProgressStyle};
@@ -1008,7 +1008,7 @@ pub fn firmware_upgrade(
     println!("Loaded {} bytes firmware", firmware_data.len());
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.parse_route();
+    let route = tio.route.clone();
     let device = proxy.device_rpc(route).unwrap();
 
     let dev_name: String = match device.rpc("dev.name", ()) {
