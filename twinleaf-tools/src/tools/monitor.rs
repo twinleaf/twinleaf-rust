@@ -392,8 +392,6 @@ impl Default for ViewConfig {
     }
 }
 
-
-
 pub struct App {
     pub depth_limit: Option<usize>,
     pub parent_route: DeviceRoute,
@@ -602,11 +600,13 @@ impl App {
             .and_then(|prev| {
                 let prev_spec = prev.spec().cloned();
                 let prev_route = prev.route().clone();
-                self.nav_items.iter().position(|pos| match (&prev_spec, pos.spec()) {
-                    (Some(a), Some(b)) => a == b,
-                    (None, _) => pos.route() == &prev_route,
-                    _ => false,
-                })
+                self.nav_items
+                    .iter()
+                    .position(|pos| match (&prev_spec, pos.spec()) {
+                        (Some(a), Some(b)) => a == b,
+                        (None, _) => pos.route() == &prev_route,
+                        _ => false,
+                    })
             })
             .unwrap_or_else(|| self.nav.idx.min(self.nav_items.len() - 1));
     }
@@ -813,7 +813,10 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
             Mode::Command => {
                 let route = app.current_route();
                 let registry = app.rpc_registries.get(&route);
-                match app.palette.handle_key(k, registry, &route, app.footer_height) {
+                match app
+                    .palette
+                    .handle_key(k, registry, &route, app.footer_height)
+                {
                     PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
                     PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
                     PaletteEvent::Consumed => None,
@@ -972,6 +975,13 @@ fn render_monitor_panel(f: &mut Frame, app: &mut App, area: Rect, now: Instant) 
     }
 }
 
+fn stale_threshold(sample: &Sample) -> Duration {
+    let rate = sample.segment.sampling_rate as f64 / sample.segment.decimation.max(1) as f64;
+    let period_ms = if rate > 0.0 { 1000.0 / rate } else { 0.0 };
+    // floor of 1200
+    Duration::from_millis((period_ms * 2.0).max(1200.0) as u64)
+}
+
 fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap<usize, usize>) {
     let mut lines = Vec::new();
     let mut map = HashMap::new();
@@ -1064,7 +1074,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
         for sid in stream_ids {
             let key = StreamKey::new(route.clone(), sid);
             if let Some((sample, seen)) = app.last.get(&key) {
-                let is_stale = now.saturating_duration_since(*seen) > Duration::from_millis(1200);
+                let is_stale = now.saturating_duration_since(*seen) > stale_threshold(sample);
                 for col in &sample.columns {
                     let nav_idx = global_idx;
                     global_idx += 1;
@@ -1119,7 +1129,8 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     if app.mode == Mode::Command {
         let route = app.current_route();
         let registry_ready = app.rpc_registries.contains_key(&route);
-        app.palette.render(f, area, &route, registry_ready, app.blink_state);
+        app.palette
+            .render(f, area, &route, registry_ready, app.blink_state);
         return;
     }
 
