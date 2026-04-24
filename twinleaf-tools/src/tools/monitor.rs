@@ -3,7 +3,6 @@
 // Build: cargo run --release -- <tio-url> [options]
 
 use std::{
-    cmp::min,
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{self, Read},
@@ -11,21 +10,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq, RpcResp};
 use crate::TioOpts;
 use clap::Parser;
 use crossbeam::channel::{self, Sender};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
-    prelude::Stylize,
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
     DefaultTerminal, Frame,
 };
 use toml_edit::{DocumentMut, InlineTable, Value};
-use tui_prompts::{State, TextState};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
     device::{
@@ -340,12 +338,7 @@ pub enum Mode {
 pub enum Action {
     Quit,
     SetMode(Mode),
-    SelectNext,
-    SelectPrev,
-    NewCommandString,
-    ClearCommand,
-    SubmitCommand,
-    AcceptCompletion,
+    ExecuteRpc(RpcReq),
     NavUp,
     NavDown,
     NavLeft,
@@ -400,201 +393,6 @@ impl Default for ViewConfig {
     }
 }
 
-#[derive(Debug)]
-pub struct RpcReq {
-    pub route: DeviceRoute,
-    pub meta: Option<u16>,
-    pub method: String,
-    pub arg: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct RpcResp {
-    pub result: Result<String, String>,
-}
-
-#[derive(Debug)]
-pub struct CommandState {
-    pub input_state: TextState<'static>,
-    pub suggestions: Vec<String>,
-    pub selected: Option<usize>,
-    pub scroll: usize,
-    pub current_completion: String,
-    pub last_rpc_result: Option<(String, Color)>,
-    pub last_rpc_command: String,
-}
-
-impl Default for CommandState {
-    fn default() -> Self {
-        Self {
-            input_state: TextState::default(),
-            suggestions: Vec::new(),
-            selected: None,
-            scroll: 0,
-            current_completion: String::new(),
-            last_rpc_result: None,
-            last_rpc_command: String::new(),
-        }
-    }
-}
-
-impl CommandState {
-    fn enter(&mut self, registry: Option<&RpcRegistry>) {
-        self.input_state.focus();
-        self.update_suggestions(registry);
-    }
-
-    fn exit(&mut self) {
-        self.input_state.blur();
-    }
-
-    fn rpc_list_len(&self) -> u16 {
-        let len = if self.suggestions.is_empty() {
-            1
-        } else {
-            self.suggestions.len().min(RPCLIST_MAX_LEN)
-        };
-        len.try_into().unwrap()
-    }
-
-    fn visible_rows(&self, footer_height: u16) -> usize {
-        min(RPCLIST_MAX_LEN, footer_height.saturating_sub(5) as usize)
-    }
-
-    fn selected_suggestion(&self) -> Option<&str> {
-        self.selected
-            .and_then(|idx| self.suggestions.get(idx))
-            .map(|s| s.as_str())
-    }
-
-    fn sync_completion(&mut self) {
-        let input = self.input_state.value();
-        self.current_completion = self
-            .selected_suggestion()
-            .filter(|rpc| input.is_empty() || rpc.starts_with(input))
-            .and_then(|rpc| rpc.get(input.len()..))
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        self.input_state.focus();
-        self.input_state.move_end();
-    }
-
-    fn ensure_selection_visible(&mut self, footer_height: u16) {
-        let Some(selected) = self.selected else {
-            self.scroll = 0;
-            return;
-        };
-        let visible_rows = self.visible_rows(footer_height);
-        if visible_rows == 0 || self.suggestions.len() <= visible_rows {
-            self.scroll = 0;
-            return;
-        }
-        if selected < self.scroll {
-            self.scroll = selected;
-        } else if selected >= self.scroll + visible_rows {
-            self.scroll = selected + 1 - visible_rows;
-        }
-    }
-
-    fn select_next(&mut self, footer_height: u16) {
-        if self.suggestions.is_empty() {
-            self.sync_completion();
-            return;
-        }
-        let next = match self.selected {
-            Some(idx) => (idx + 1) % self.suggestions.len(),
-            None => 0,
-        };
-        self.selected = Some(next);
-        self.ensure_selection_visible(footer_height);
-        self.sync_completion();
-    }
-
-    fn select_prev(&mut self, footer_height: u16) {
-        if self.suggestions.is_empty() {
-            self.sync_completion();
-            return;
-        }
-        let next = match self.selected {
-            Some(0) | None => self.suggestions.len() - 1,
-            Some(idx) => idx - 1,
-        };
-        self.selected = Some(next);
-        self.ensure_selection_visible(footer_height);
-        self.sync_completion();
-    }
-
-    fn update_suggestions(&mut self, registry: Option<&RpcRegistry>) {
-        let line = self.input_state.value().to_string();
-        let query = line.split_whitespace().next().unwrap_or("");
-
-        self.suggestions = if let Some(registry) = registry {
-            if query.is_empty() {
-                registry
-                    .children_of("")
-                    .into_iter()
-                    .map(|s| s + "...")
-                    .collect()
-            } else {
-                registry.search(query)
-            }
-        } else {
-            Vec::new()
-        };
-        self.selected = (!self.suggestions.is_empty()).then_some(0);
-        self.scroll = 0;
-        self.sync_completion();
-    }
-
-    fn accept_completion(&mut self, registry: Option<&RpcRegistry>) {
-        let mut complete_command = if self.current_completion.is_empty() {
-            self.selected_suggestion().unwrap_or_default().to_string()
-        } else {
-            format!("{}{}", self.input_state.value(), self.current_completion)
-        };
-        complete_command = complete_command.replace("...", ".");
-        self.input_state = TextState::new().with_value(complete_command);
-        self.input_state.focus();
-        self.input_state.move_end();
-        self.update_suggestions(registry);
-    }
-
-    fn submit_command(
-        &mut self,
-        route: &DeviceRoute,
-        registry: Option<&RpcRegistry>,
-    ) -> Option<RpcReq> {
-        let line = self.input_state.value().to_string();
-        if line.trim().is_empty() {
-            return None;
-        }
-
-        let mut parts = line.split_whitespace();
-        let method = parts.next()?;
-        self.last_rpc_command = method.to_string();
-        let remainder: Vec<&str> = parts.collect();
-        let arg = if remainder.is_empty() {
-            None
-        } else {
-            Some(remainder.join(" "))
-        };
-        let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta_raw);
-        self.last_rpc_result = Some((format!("Sent to {}...", route), Color::Yellow));
-
-        Some(RpcReq {
-            route: route.clone(),
-            meta,
-            method: method.to_string(),
-            arg,
-        })
-    }
-
-    fn clear_input(&mut self, registry: Option<&RpcRegistry>) {
-        self.input_state = TextState::default();
-        self.input_state.focus();
-        self.update_suggestions(registry);
-    }
-}
 
 enum RpcWorkerReq {
     FetchList(DeviceRoute),
@@ -657,12 +455,10 @@ pub struct App {
 
     pub footer_height: u16,
     pub rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
-    pub command: CommandState,
+    pub palette: RpcPalette,
     pub blink_state: bool,
     pub last_blink: Instant,
 }
-
-const RPCLIST_MAX_LEN: usize = 12;
 
 impl App {
     pub fn new(all: bool, parent_route: &DeviceRoute) -> Self {
@@ -680,7 +476,7 @@ impl App {
             window_aligned: None,
             footer_height: 0,
             rpc_registries: HashMap::new(),
-            command: CommandState::default(),
+            palette: RpcPalette::default(),
             blink_state: true,
             last_blink: Instant::now(),
         }
@@ -692,36 +488,15 @@ impl App {
             Action::SetMode(Mode::Command) => {
                 let route = self.current_route();
                 let registry = self.rpc_registries.get(&route);
-                self.command.enter(registry);
+                self.palette.enter(registry);
                 self.mode = Mode::Command;
             }
             Action::SetMode(Mode::Normal) => {
                 self.mode = Mode::Normal;
-                self.command.exit();
+                self.palette.exit();
             }
-            Action::SelectNext => self.command.select_next(self.footer_height),
-            Action::SelectPrev => self.command.select_prev(self.footer_height),
-            Action::NewCommandString => {
-                let route = self.current_route();
-                let registry = self.rpc_registries.get(&route);
-                self.command.update_suggestions(registry);
-            }
-            Action::ClearCommand => {
-                let route = self.current_route();
-                let registry = self.rpc_registries.get(&route);
-                self.command.clear_input(registry);
-            }
-            Action::SubmitCommand => {
-                let route = self.current_route();
-                let registry = self.rpc_registries.get(&route);
-                if let Some(req) = self.command.submit_command(&route, registry) {
-                    let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
-                }
-            }
-            Action::AcceptCompletion => {
-                let route = self.current_route();
-                let registry = self.rpc_registries.get(&route);
-                self.command.accept_completion(registry);
+            Action::ExecuteRpc(req) => {
+                let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
             }
             Action::NavUp => {
                 self.view.follow_selection = true;
@@ -799,7 +574,7 @@ impl App {
         self.rpc_registries.insert(route.clone(), registry);
         if self.mode == Mode::Command && self.current_route() == route {
             let registry = self.rpc_registries.get(&route);
-            self.command.update_suggestions(registry);
+            self.palette.update_suggestions(registry);
         }
     }
 
@@ -861,10 +636,6 @@ impl App {
         } else {
             self.nav.idx = self.nav.idx.min(self.nav_items.len() - 1);
         }
-    }
-
-    pub fn rpc_list_len(&self) -> u16 {
-        self.command.rpc_list_len()
     }
 
     pub fn current_pos(&self) -> Option<&NavPos> {
@@ -1066,39 +837,15 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
             return None;
         }
         match app.mode {
-            Mode::Command => match k.code {
-                KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
-                    Some(Action::SetMode(Mode::Normal))
+            Mode::Command => {
+                let route = app.current_route();
+                let registry = app.rpc_registries.get(&route);
+                match app.palette.handle_key(k, registry, &route, app.footer_height) {
+                    PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
+                    PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
+                    PaletteEvent::Consumed => None,
                 }
-                KeyCode::Esc => {
-                    if app.command.input_state.value().is_empty() {
-                        Some(Action::SetMode(Mode::Normal))
-                    } else {
-                        Some(Action::ClearCommand)
-                    }
-                }
-                KeyCode::Up => Some(Action::SelectPrev),
-                KeyCode::Down => Some(Action::SelectNext),
-                KeyCode::Tab => Some(Action::AcceptCompletion),
-                KeyCode::Right if !app.command.current_completion.is_empty() => {
-                    Some(Action::AcceptCompletion)
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Home => {
-                    app.command.current_completion = String::new();
-                    app.command.input_state.handle_key_event(k);
-                    None
-                }
-                KeyCode::Char('a') if k.modifiers == KeyModifiers::CONTROL => {
-                    app.command.current_completion = String::new();
-                    app.command.input_state.handle_key_event(k);
-                    None
-                }
-                KeyCode::Enter => Some(Action::SubmitCommand),
-                _ => {
-                    app.command.input_state.handle_key_event(k);
-                    Some(Action::NewCommandString)
-                }
-            },
+            }
             Mode::Normal => match k.code {
                 KeyCode::Char(':') => Some(Action::SetMode(Mode::Command)),
                 KeyCode::Char('q') => Some(Action::Quit),
@@ -1142,7 +889,7 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), io::Erro
                 if height >= 18 {
                     (
                         Constraint::Min(10),
-                        Constraint::Length(5 + app.rpc_list_len()),
+                        Constraint::Length(5 + app.palette.suggestion_rows()),
                     )
                 } else if height >= 12 {
                     (Constraint::Min(2), Constraint::Length(8))
@@ -1397,109 +1144,9 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
 fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     app.footer_height = area.height; // how many lines the footer has to work with
     if app.mode == Mode::Command {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Max(app.rpc_list_len() + 2),
-                Constraint::Length(std::cmp::min(1, app.footer_height - 1)),
-                Constraint::Length(if app.footer_height > 2 { 2 } else { 1 }),
-            ])
-            .split(area);
-
-        if app.footer_height > 3 {
-            let rpcs: Vec<Span> = if app.rpc_registries.get(&app.current_route()).is_some() {
-                let visible_rows = app.command.visible_rows(app.footer_height);
-                let start = app.command.scroll.min(app.command.suggestions.len());
-                let end = if visible_rows == 0 {
-                    start
-                } else {
-                    (start + visible_rows).min(app.command.suggestions.len())
-                };
-                app.command.suggestions[start..end]
-                    .iter()
-                    .map(|v| Span::raw(v.clone()))
-                    .enumerate()
-                    .map(|(i, v)| {
-                        if Some(start + i) == app.command.selected {
-                            v.bold()
-                        } else {
-                            v.dim()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vec![Span::from("Generating RPC list...")]
-            };
-            let rpcs = if rpcs.is_empty() {
-                vec![Span::raw("")]
-            } else {
-                rpcs
-            };
-
-            let rpc_block = Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(" RPCs ").left_aligned())
-                .title(Line::from(" ↑ | ↓ ").right_aligned());
-            f.render_widget(List::new(rpcs).block(rpc_block), chunks[0]);
-        }
-
-        if app.footer_height > 1 {
-            if let Some((msg, color)) = &app.command.last_rpc_result {
-                f.render_widget(
-                    Paragraph::new(msg.as_str())
-                        .style(Style::default().fg(*color).add_modifier(Modifier::BOLD)),
-                    chunks[1],
-                );
-            }
-        }
-
-        let target_route = app.current_route();
-        let user_input = app.command.input_state.value();
-        let cursor_idx = app.command.input_state.position().min(user_input.len());
-
-        let mut spans = vec![
-            Span::styled(
-                format!("[{}] ", target_route),
-                Style::default().fg(Color::Blue),
-            ),
-            Span::raw(&user_input[0..cursor_idx]),
-        ];
-
-        if cursor_idx < user_input.len() {
-            spans.push(Span::styled(
-                &user_input[cursor_idx..cursor_idx + 1],
-                if app.blink_state {
-                    Style::default().bg(Color::White).fg(Color::Black)
-                } else {
-                    Style::default()
-                },
-            ));
-            spans.push(Span::raw(&user_input[cursor_idx + 1..]));
-        } else if app.blink_state {
-            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            if !app.command.current_completion.is_empty() {
-                spans.push(Span::styled(
-                    &app.command.current_completion[1..],
-                    Style::default().fg(Color::Gray),
-                ));
-            }
-        } else {
-            spans.push(Span::styled(
-                &app.command.current_completion,
-                Style::default().fg(Color::Gray),
-            ));
-        }
-
-        let block = if app.footer_height < 3 {
-            Block::default()
-        } else {
-            Block::default()
-                .borders(Borders::TOP)
-                .title(Line::from(" Command Mode ").left_aligned())
-                .title(Line::from(" <Esc/Ctrl+C> ").right_aligned())
-        };
-
-        f.render_widget(Paragraph::new(Line::from(spans)).block(block), chunks[2]);
+        let route = app.current_route();
+        let registry_ready = app.rpc_registries.contains_key(&route);
+        app.palette.render(f, area, &route, registry_ready, app.blink_state);
         return;
     }
 
@@ -1983,12 +1630,12 @@ pub fn run_monitor(
                         RpcWorkerResp::RpcResult(res) => {
                             let (msg, col) = match res.result {
                                 Ok(s) => (
-                                    format!("{}: {}", app.command.last_rpc_command, s),
+                                    format!("{}: {}", app.palette.last_rpc_command(), s),
                                     Color::Green,
                                 ),
                                 Err(s) => (format!("ERR: {}", s), Color::Red),
                             };
-                            app.command.last_rpc_result = Some((msg, col));
+                            app.palette.set_rpc_result(msg, col);
                         }
                     }
                 }

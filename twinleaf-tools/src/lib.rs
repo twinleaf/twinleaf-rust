@@ -5,6 +5,7 @@ use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
 pub mod tools;
+pub mod tui;
 include!("tio_cli.rs");
 
 fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
