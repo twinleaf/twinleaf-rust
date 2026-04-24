@@ -244,9 +244,20 @@ impl StreamStats {
         self.current_session_id = Some(session_id);
     }
 
-    fn is_stale(&self, now: Instant, stale_dur: Duration) -> bool {
+    // floor of stale_dur
+    fn stale_threshold(&self, floor: Duration) -> Duration {
+        if self.rate_slope.n >= 2 && self.rate_smps > 0.0 {
+            let period = Duration::from_secs_f64(2.0 / self.rate_smps);
+            std::cmp::max(floor, period)
+        } else {
+            floor
+        }
+    }
+
+    fn is_stale(&self, now: Instant, floor: Duration) -> bool {
+        let threshold = self.stale_threshold(floor);
         self.last_seen
-            .map(|t| now.duration_since(t) > stale_dur)
+            .map(|t| now.duration_since(t) > threshold)
             .unwrap_or(true)
     }
 }
@@ -467,12 +478,7 @@ impl App {
         }
     }
 
-    fn handle_event(
-        &mut self,
-        event: TreeEvent,
-        now: Instant,
-        rpc_tx: &Sender<RpcWorkerReq>,
-    ) {
+    fn handle_event(&mut self, event: TreeEvent, now: Instant, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.device_states.entry(route.clone()).or_default();
@@ -534,7 +540,7 @@ impl App {
 
     fn tick(&mut self, now: Instant) {
         for (_key, st) in self.stats.iter_mut() {
-            if st.is_stale(now, self.stale_dur) && st.drift_slope.n > 0 {
+            if st.is_stale(now, self.stale_dur) && st.rate_slope.n >= 2 {
                 st.reset_timing();
                 st.rate_slope.reset();
                 st.received_count = 0;
@@ -544,7 +550,12 @@ impl App {
         }
     }
 
-    fn update(&mut self, action: Action, root_route: &DeviceRoute, rpc_tx: &Sender<RpcWorkerReq>) -> bool {
+    fn update(
+        &mut self,
+        action: Action,
+        root_route: &DeviceRoute,
+        rpc_tx: &Sender<RpcWorkerReq>,
+    ) -> bool {
         let total = self.filtered_event_count();
         let display_count = self.event_display_lines;
         match action {
@@ -912,7 +923,10 @@ fn get_action(ev: Event, app: &mut App, root_route: &DeviceRoute) -> Option<Acti
     if k.kind != KeyEventKind::Press {
         return None;
     }
-    if k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL && app.mode == Mode::Normal {
+    if k.code == KeyCode::Char('c')
+        && k.modifiers == KeyModifiers::CONTROL
+        && app.mode == Mode::Normal
+    {
         return Some(Action::Quit);
     }
     match app.mode {
