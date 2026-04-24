@@ -615,9 +615,10 @@ impl Port {
     }
 
     /// Creates a sender/receiver pair to be used with `rx_to_channel`:
-    /// ```
-    /// let (port_rx_send, port_rx) = rx_channels();
-    /// let port = Port::new(url, Port::rx_to_channel(port_rx_send)).unwrap();
+    /// ```no_run
+    /// use twinleaf::tio::port::Port;
+    /// let (port_rx_send, port_rx) = Port::rx_channel();
+    /// let port = Port::new("tcp://localhost:7855", Port::rx_to_channel(port_rx_send)).unwrap();
     /// ```
     /// In the example, `port.send()` can now be used to send and `port_rx.recv()`
     /// to receive.
