@@ -867,7 +867,7 @@ fn get_action(ev: Event) -> Option<Action> {
     }
 }
 
-pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
+pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
     let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&health_cli.tio.root);
@@ -877,8 +877,10 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
         Ok(t) => t,
         Err(e) => {
             ratatui::restore();
-            eprintln!("Failed to open device tree: {:?}", e);
-            std::process::exit(1);
+            return Err(eyre::Report::new(e).wrap_err(format!(
+                "could not open device tree on {}",
+                health_cli.tio.root
+            )));
         }
     };
 
