@@ -34,11 +34,13 @@ struct ListedDevice {
 }
 
 pub fn list_devices(all: bool) -> eyre::Result<()> {
+    use color_eyre::Help;
+
     let candidates = discovery::enumerate_serial(all);
 
     if candidates.is_empty() {
-        println!("No Twinleaf devices found.");
-        return Ok(());
+        return Err(eyre::eyre!("no sensors detected")
+            .suggestion("check that the device is plugged in and powered"));
     }
 
     let results: Vec<ListedDevice> = std::thread::scope(|s| {
