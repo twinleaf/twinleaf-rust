@@ -29,7 +29,7 @@ pub enum Commands {
 	},
 	Health(HealthCli),
 
-    #[command(args_conflicts_with_subcommands = true)]
+    #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
     /// Execute an RPC on the device. See "tio rpc --help" for more options
     Rpc {
         #[command(flatten)]
@@ -475,6 +475,8 @@ fn nonneg_f64(s: &str) -> Result<f64, String> {
     version,
     about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP",
     args_conflicts_with_subcommands = true,
+    arg_required_else_help = true,
+    group = clap::ArgGroup::new("source").required(true).args(["sensor_url", "auto", "enum"]),
 )]
 pub struct ProxyCli {
     #[command(subcommand)]

@@ -126,17 +126,6 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
         return Ok(());
     }
 
-    // Validate sensor_url / --auto combination
-    if proxy_cli.auto && proxy_cli.sensor_url.is_some() {
-        die!(
-            "both --auto and explicit sensor '{}' given",
-            proxy_cli.sensor_url.unwrap()
-        );
-    }
-    if !proxy_cli.auto && proxy_cli.sensor_url.is_none() {
-        die!("need sensor url or --auto");
-    }
-
     let tcp_port = proxy_cli.port;
     let reconnect_timeout = Duration::from_secs(proxy_cli.reconnect_timeout);
     let disconnect_slow = proxy_cli.kick_slow;
