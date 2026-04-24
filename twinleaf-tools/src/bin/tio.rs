@@ -12,7 +12,8 @@ use twinleaf_tools::tools::{
     },
 };
 use twinleaf_tools::{
-    Commands, DumpSubcommands, LogSubcommands, MetaSubcommands, RPCSubcommands, TioCli,
+    Commands, DumpSubcommands, LogSubcommands, MetaSubcommands, ProxySubcommands, RPCSubcommands,
+    TioCli,
 };
 
 fn main() -> ExitCode {
@@ -20,7 +21,10 @@ fn main() -> ExitCode {
 
     //TODO: Work on exit code logic
     let result = match cli.command {
-        Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
+        Commands::Proxy(mut proxy_cli) => match proxy_cli.subcommands.take() {
+            Some(ProxySubcommands::Nmea { tio, tcp_port }) => run_nmea_proxy(tio, tcp_port),
+            None => run_proxy(proxy_cli),
+        },
         Commands::Monitor {
             tio,
             all,
@@ -28,7 +32,6 @@ fn main() -> ExitCode {
             colors,
         } => run_monitor(tio, all, fps, colors),
         Commands::Health(health_cli) => run_health(health_cli),
-        Commands::NmeaProxy { tio, tcp_port } => run_nmea_proxy(tio, tcp_port),
         Commands::Rpc {
             tio,
             subcommands,

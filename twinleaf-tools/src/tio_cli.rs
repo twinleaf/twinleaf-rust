@@ -28,19 +28,6 @@ pub enum Commands {
 		colors: Option<String>,
 	},
 	Health(HealthCli),
-    ///Bridge Twinleaf sensor data to NMEA TCP stream
-    NmeaProxy{
-        #[command(flatten)]
-        tio: TioOpts,
-
-        #[arg(
-            short = 'p',
-            long = "port",
-            default_value = "7800",
-            help = "TCP port to listen on"
-        )]
-        tcp_port: u16,
-    },
 
     #[command(args_conflicts_with_subcommands = true)]
     /// Execute an RPC on the device. See "tio rpc --help" for more options
@@ -486,9 +473,13 @@ fn nonneg_f64(s: &str) -> Result<f64, String> {
 #[command(
     name = "tio-proxy",
     version,
-    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP"
+    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP",
+    args_conflicts_with_subcommands = true,
 )]
 pub struct ProxyCli {
+    #[command(subcommand)]
+    pub subcommands: Option<ProxySubcommands>,
+
     /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0)
     /// Required unless --auto or --enum is specified
     sensor_url: Option<String>,
@@ -543,4 +534,17 @@ pub struct ProxyCli {
     /// Enumerate all serial devices, then quit
     #[arg(short = 'e', long = "enumerate", name = "enum")]
     enumerate: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProxySubcommands {
+    /// Bridge Twinleaf sensor data to NMEA TCP stream
+    Nmea {
+        #[command(flatten)]
+        tio: TioOpts,
+
+        /// TCP port to listen on
+        #[arg(short = 'p', long = "port", default_value = "7800")]
+        tcp_port: u16,
+    },
 }
