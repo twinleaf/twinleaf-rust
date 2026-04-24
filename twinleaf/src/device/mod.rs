@@ -1,4 +1,5 @@
 mod device;
+pub mod discovery;
 mod rpc;
 mod tree;
 pub mod util;

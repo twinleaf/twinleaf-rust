@@ -21,6 +21,7 @@ glob = "0.3"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
 dirs-next = "2.0"
 thiserror = "1"
+serialport = "4.9"
 
 [dependencies.mio]
 version = "1.0"

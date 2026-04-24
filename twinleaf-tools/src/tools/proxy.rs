@@ -8,54 +8,8 @@ use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use tio::{proto, proxy};
+use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::tio;
-
-// Unfortunately we cannot access USB details via the serialport module, so
-// we are stuck guessing based on VID/PID. This returns a vector of possible
-// serial ports.
-
-#[derive(Debug)]
-enum TwinleafPortInterface {
-    FTDI,
-    STM32,
-    Unknown(u16, u16),
-}
-
-struct SerialDevice {
-    url: String,
-    ifc: TwinleafPortInterface,
-}
-
-fn enum_devices(all: bool) -> Vec<SerialDevice> {
-    let mut ports: Vec<SerialDevice> = Vec::new();
-
-    if let Ok(avail_ports) = serialport::available_ports() {
-        for p in avail_ports.iter() {
-            if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
-                let interface = match (info.vid, info.pid) {
-                    (0x0403, 0x6015) => TwinleafPortInterface::FTDI,
-                    (0x0483, 0x5740) => TwinleafPortInterface::STM32,
-                    (vid, pid) => {
-                        if !all {
-                            continue;
-                        };
-                        TwinleafPortInterface::Unknown(vid, pid)
-                    }
-                };
-                #[cfg(target_os = "macos")]
-                if p.port_name.starts_with("/dev/tty.") && !all {
-                    continue;
-                }
-                ports.push(SerialDevice {
-                    url: format!("serial://{}", p.port_name),
-                    ifc: interface,
-                });
-            } // else ignore other types for now: bluetooth, pci, unknown
-        }
-    }
-
-    ports
-}
 
 macro_rules! log{
     ($tf:expr, $msg:expr)=>{
@@ -103,8 +57,8 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
     if proxy_cli.enumerate {
         let mut unknown_devices = vec![];
         let mut found_any = false;
-        for dev in enum_devices(true) {
-            if let TwinleafPortInterface::Unknown(vid, pid) = dev.ifc {
+        for dev in discovery::enumerate_serial(true) {
+            if let PortInterface::Unknown(vid, pid) = dev.interface {
                 unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
             } else {
                 if !found_any {
@@ -142,11 +96,11 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
         url
     } else {
         // --auto mode
-        let devices = enum_devices(false);
+        let devices = discovery::enumerate_serial(false);
         let mut valid_urls = Vec::new();
         for dev in devices {
-            match dev.ifc {
-                TwinleafPortInterface::STM32 | TwinleafPortInterface::FTDI => {
+            match dev.interface {
+                PortInterface::STM32 | PortInterface::FTDI => {
                     valid_urls.push(dev.url.clone());
                 }
                 _ => {}
