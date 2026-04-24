@@ -338,6 +338,7 @@ pub enum Action {
     Quit,
     SetMode(Mode),
     ExecuteRpc(RpcReq),
+    SelectRoute(DeviceRoute),
     NavUp,
     NavDown,
     NavLeft,
@@ -451,6 +452,14 @@ impl App {
             }
             Action::ExecuteRpc(req) => {
                 let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
+            }
+            Action::SelectRoute(route) => {
+                self.view.follow_selection = true;
+                if let Some(idx) = self.nav_items.iter().position(|p| p.route() == &route) {
+                    self.nav.idx = idx;
+                }
+                let registry = self.rpc_registries.get(&route);
+                self.palette.update_suggestions(registry);
             }
             Action::NavUp => {
                 self.view.follow_selection = true;
@@ -813,11 +822,13 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
             Mode::Command => {
                 let route = app.current_route();
                 let registry = app.rpc_registries.get(&route);
+                let routes = app.visible_routes();
                 match app
                     .palette
-                    .handle_key(k, registry, &route, app.footer_height)
+                    .handle_key(k, registry, &route, &routes, app.footer_height)
                 {
                     PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
+                    PaletteEvent::SelectRoute(r) => Some(Action::SelectRoute(r)),
                     PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
                     PaletteEvent::Consumed => None,
                 }
@@ -1129,8 +1140,9 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     if app.mode == Mode::Command {
         let route = app.current_route();
         let registry_ready = app.rpc_registries.contains_key(&route);
+        let registry = app.rpc_registries.get(&route);
         app.palette
-            .render(f, area, &route, registry_ready, app.blink_state);
+            .render(f, area, &route, registry, registry_ready, app.blink_state);
         return;
     }
 

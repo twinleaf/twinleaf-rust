@@ -288,6 +288,7 @@ enum Action {
     ScrollEnd,
     SetMode(Mode),
     ExecuteRpc(RpcReq),
+    SelectRoute(DeviceRoute),
 }
 
 struct App {
@@ -309,6 +310,7 @@ struct App {
     quiet: bool,
     mode: Mode,
     palette: RpcPalette,
+    palette_route: Option<DeviceRoute>,
     rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
     footer_height: u16,
 }
@@ -334,9 +336,23 @@ impl App {
             quiet: cli.quiet,
             mode: Mode::Normal,
             palette: RpcPalette::default(),
+            palette_route: None,
             rpc_registries: HashMap::new(),
             footer_height: 0,
         }
+    }
+
+    fn active_route<'a>(&'a self, root_route: &'a DeviceRoute) -> &'a DeviceRoute {
+        self.palette_route.as_ref().unwrap_or(root_route)
+    }
+
+    fn available_routes(&self, root_route: &DeviceRoute) -> Vec<DeviceRoute> {
+        let mut routes: Vec<DeviceRoute> = self.device_states.keys().cloned().collect();
+        if !routes.contains(root_route) {
+            routes.push(root_route.clone());
+        }
+        routes.sort();
+        routes
     }
 
     fn log_event(&mut self, msg: String, color: Color) {
@@ -590,7 +606,8 @@ impl App {
                 }
             }
             Action::SetMode(Mode::Command) => {
-                let registry = self.rpc_registries.get(root_route);
+                let active = self.active_route(root_route).clone();
+                let registry = self.rpc_registries.get(&active);
                 self.palette.enter(registry);
                 self.mode = Mode::Command;
             }
@@ -600,6 +617,11 @@ impl App {
             }
             Action::ExecuteRpc(req) => {
                 let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
+            }
+            Action::SelectRoute(route) => {
+                self.palette_route = Some(route.clone());
+                let registry = self.rpc_registries.get(&route);
+                self.palette.update_suggestions(registry);
             }
         }
         false
@@ -749,7 +771,8 @@ fn draw_ui(
 
     let in_command = app.mode == Mode::Command;
     let palette_rows = app.palette.suggestion_rows();
-    let registry_ready = app.rpc_registries.contains_key(root_route);
+    let active_route = app.active_route(root_route).clone();
+    let registry_ready = app.rpc_registries.contains_key(&active_route);
 
     terminal.draw(|f| {
         let size = f.area();
@@ -891,8 +914,9 @@ fn draw_ui(
 
         // Footer: RPC palette when in Command mode, keybind hints otherwise
         if in_command {
+            let registry = app.rpc_registries.get(&active_route);
             app.palette
-                .render(f, chunks[4], root_route, registry_ready, false);
+                .render(f, chunks[4], &active_route, registry, registry_ready, false);
         } else if !quiet {
             let heartbeat_hint = if show_heartbeat {
                 "h:hide heartbeat"
@@ -931,12 +955,15 @@ fn get_action(ev: Event, app: &mut App, root_route: &DeviceRoute) -> Option<Acti
     }
     match app.mode {
         Mode::Command => {
-            let registry = app.rpc_registries.get(root_route);
+            let active = app.active_route(root_route).clone();
+            let registry = app.rpc_registries.get(&active);
+            let routes = app.available_routes(root_route);
             match app
                 .palette
-                .handle_key(k, registry, root_route, app.footer_height)
+                .handle_key(k, registry, &active, &routes, app.footer_height)
             {
                 PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
+                PaletteEvent::SelectRoute(r) => Some(Action::SelectRoute(r)),
                 PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
                 PaletteEvent::Consumed => None,
             }
