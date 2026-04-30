@@ -202,7 +202,7 @@ Add one of these lines to your shell's config file:
 }
 
 #[derive(Subcommand, Debug)]
-pub enum RPCSubcommands{
+pub enum RPCSubcommands {
     /// List available RPCs on the device
     List {
         #[command(flatten)]
@@ -224,7 +224,7 @@ pub enum RPCSubcommands{
 }
 
 #[derive(Subcommand, Debug)]
-pub enum LogSubcommands{
+pub enum LogSubcommands {
     /// Log metadata to a file. See "tio log meta --help" for more options
     #[command(args_conflicts_with_subcommands = true)]
     Meta {
@@ -386,7 +386,6 @@ impl From<SplitLevel> for twinleaf::data::export::RunSplitLevel {
         }
     }
 }
-
 
 #[derive(Parser, Debug, Clone)]
 #[command(
