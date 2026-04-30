@@ -175,6 +175,9 @@ pub enum Commands {
     /// Multiplex a sensor over TCP
     Proxy(ProxyCli),
 
+    /// Run a simulated sine wave Twinleaf device over UDP
+    Test(TestCli),
+
     /// Generate shell completions for tio
     #[command(long_about = "\
 Generate shell completions for tio.
@@ -500,6 +503,47 @@ fn nonneg_f64(s: &str) -> Result<f64, String> {
     } else {
         Ok(v)
     }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tio-test",
+    version,
+    about = "Run a simulated sine wave Twinleaf device over UDP"
+)]
+pub struct TestCli {
+    /// Sample rate in Hz
+    #[arg(
+        long = "samplerate",
+        alias = "sample-rate",
+        default_value = "1000",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    samplerate: u32,
+
+    /// Initial sine wave frequency in Hz
+    #[arg(long = "frequency", default_value = "10", value_parser = nonneg_f64)]
+    frequency: f64,
+
+    /// Initial sine wave amplitude in V
+    #[arg(long = "amplitude", default_value = "1", value_parser = nonneg_f64)]
+    amplitude: f64,
+
+    /// Initial white noise level in V/sqrt(Hz)
+    #[arg(long = "noise", default_value = ".01", value_parser = nonneg_f64)]
+    noise: f64,
+
+    /// Segment duration in seconds
+    #[arg(
+        long = "segment-seconds",
+        default_value = "10",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    segment_seconds: u32,
+
+    /// UDP port to listen on
+    #[arg(long = "port", default_value = "7855")]
+    port: u16,
 }
 
 #[derive(Parser, Debug)]

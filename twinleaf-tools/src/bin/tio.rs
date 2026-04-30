@@ -5,6 +5,7 @@ use twinleaf_tools::tools::{
     monitor::run_monitor,
     proxy::run_proxy,
     proxy_nmea::run_nmea_proxy,
+    tio_test::run_test,
     tool::{
         dump, firmware_upgrade, list_rpcs, log, log_csv, log_dump, log_hdf, log_inspect,
         log_metadata, meta_reroute, rpc, rpc_dump,
@@ -27,6 +28,7 @@ fn main() -> eyre::Result<()> {
             Some(ProxySubcommands::Nmea { tio, tcp_port }) => run_nmea_proxy(tio, tcp_port),
             None => run_proxy(proxy_cli),
         },
+        Commands::Test(test_cli) => run_test(test_cli),
         Commands::Monitor {
             tio,
             fps,
