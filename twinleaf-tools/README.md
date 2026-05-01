@@ -2,28 +2,43 @@
 
 Command-line tools for working with Twinleaf quantum sensors and accessories. Contains a proxy, terminal UIs, and command line utilities.
 
-**Note**: In versions <2.0.0, this crate contained binaries named `tio-proxy`, `tio-monitor`, `tio-health`, and `tio-tool`. These commands have been packaged into subcommands under the single binary `tio`. The former three original commands can be simply used without the `-`, while `tio-tool {toolname}` calls have largely been replaced with `tio {toolname}`.
+**Note**: In versions <2.0.0, this crate contained binaries named `tio-proxy`, `tio-monitor`, `tio-health`, and `tio-tool`. These commands are now packaged as subcommands under a singular binary `tio`. These commmands are now used without the `-`, with `tio-tool {toolname}` calls having been replaced with `tio {toolname}`.
 
-## CLI Usage
-All the tools mentioned can have the `--help` argument added to display more information. The general workflow is to connect using `tio proxy` which allows all the CLI tools to work with the single device at the same time.
+### Shell completions
+
+`tio` can generate completion scripts for bash, zsh, fish, and PowerShell. Add the matching line to your shell's config file:
+
+		# Bash (~/.bashrc)
+		eval "$(tio completions bash)"
+
+		# Zsh (~/.zshrc)
+		eval "$(tio completions zsh)"
+
+		# Fish (~/.config/fish/config.fish)
+		tio completions fish | source
+
+		# PowerShell ($PROFILE)
+		tio completions powershell | Invoke-Expression
+
+Run `tio completions --help` to see the full list of supported shells. Zsh users may need to prepend `autoload -Uz compinit && compinit`.
 
 ### Connecting to the device
 
-The proxy makes a device attached via serial port available via Ethernet. The following will automatically scan for a `twinleaf` serial device:
+The general workflow is to connect using `tio proxy` which allows all the CLI tools to work with the single device at the same time. The proxy makes a device attached via serial port available via Ethernet. With no arguments it automatically scans for a `twinleaf` serial device:
 
-		tio proxy --auto
+		tio proxy
 
-When there are more than one serial port available, it is necessary to specify the port using:
+When more than one serial port is available, specify the URL:
 
-		[linux] tio proxy -r /dev/ttyACM0
-		[macOS] tio proxy -r /dev/cu.usbserialXXXXXX
-		[wsl1]  tio proxy -r COM3
+		[linux] tio proxy serial:///dev/ttyACM0
+		[macOS] tio proxy serial:///dev/cu.usbserialXXXXXX
+		[wsl1]  tio proxy serial://COM3
 
 The proxy allows multiple tools to connect to the device over TCP simultaneously.
 
-When a sensor is attached to a hub at port `0`, it is possible to proxy the data directly to that port using the `-s` flag:
+When a sensor is attached to a hub at port `0`, restrict the proxy's subtree using the `-s` flag:
 
-		tio proxy --auto -s /0
+		tio proxy -s /0
 
 ### Interacting with the device in terminal
 
@@ -58,7 +73,7 @@ Device commands:
 
 ### tio monitor
 
-Displays a live stream of incoming data with in-terminal graphs and command suggestions. Graph a stream by selecting it with the arrow keys and pressing Enter, and enter command mode by typing `:` (colon). Use `tio monitor -s {port}` to specify which port to open or `tio monitor -a` to open all ports.
+Displays a live stream of incoming data with in-terminal graphs and command suggestions. Graph a stream by selecting it with the arrow keys and pressing Enter, and enter command mode by typing `:` (colon). Use `tio monitor -s {route}` to scope the view to a single device subtree (e.g. `-s /0/1`), or `--depth N` to limit how deep the device tree is traversed.
 
 Run with:
 
