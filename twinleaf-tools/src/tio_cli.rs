@@ -106,6 +106,10 @@ pub enum Commands {
         /// Routing depth (only used in --raw mode)
         #[arg(long = "depth")]
         depth: Option<usize>,
+
+        /// Stop after this wall-clock duration (e.g. 30s, 5m, 2h)
+        #[arg(long, value_parser = humantime::parse_duration)]
+        duration: Option<std::time::Duration>,
     },
 
     /// Execute a device RPC

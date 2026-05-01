@@ -317,101 +317,175 @@ pub fn log(
     unbuffered: bool,
     raw: bool,
     depth: Option<usize>,
+    duration: Option<std::time::Duration>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+    use twinleaf::data::BoundaryReason;
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
 
+    let file_name = Path::new(&file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&file)
+        .to_string();
+
+    let template = match duration {
+        Some(d) => {
+            let s = d.as_secs();
+            format!(
+                "{{spinner}} [{{elapsed_precise}}/{:02}:{:02}:{:02}] {{decimal_bytes}} → {{msg}}",
+                s / 3600,
+                (s / 60) % 60,
+                s % 60,
+            )
+        }
+        None => "{spinner} [{elapsed_precise}] {decimal_bytes} → {msg}".to_string(),
+    };
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template(&template)
+            .unwrap()
+            .tick_strings(&["←", "↖", "↑", "↗", "→", "↘", "↓", "↙", " "]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let mut bytes_written: u64 = 0;
+    let mut samples_dropped: u64 = 0;
+
+    let static_msg = {
+        let mut parts: Vec<String> = vec![file_name.clone()];
+        if raw {
+            parts.push("raw".into());
+        }
+        if unbuffered {
+            parts.push("unbuf".into());
+        }
+        parts.join(" · ")
+    };
+    let render_msg = |dropped: u64| -> String {
+        if dropped > 0 {
+            format!("{} · ({} dropped)", static_msg, dropped)
+        } else {
+            static_msg.clone()
+        }
+    };
+    pb.set_message(render_msg(0));
+
+    let duration_elapsed = || duration.is_some_and(|d| started.elapsed() >= d);
+
     if raw {
-        let depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
+        let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
         let port = proxy
-            .new_port(None, route.clone(), depth, true, true)
+            .new_port(None, route.clone(), port_depth, true, true)
             .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
 
         let mut file_out =
             File::create(&file).wrap_err_with(|| format!("could not create log file {}", file))?;
-        println!("Logging raw packets...");
 
         for pkt in port.iter() {
-            // Convert relative route to absolute before logging
+            if duration_elapsed() {
+                break;
+            }
             let abs_pkt = tio::Packet {
                 routing: route.absolute_route(&pkt.routing),
                 ..pkt
             };
-            let raw = abs_pkt
+            let serialized = abs_pkt
                 .serialize()
                 .map_err(|_| eyre::eyre!("failed to serialize packet for log"))?;
             file_out
-                .write_all(&raw)
+                .write_all(&serialized)
                 .wrap_err_with(|| format!("failed to write {}", file))?;
+            bytes_written += serialized.len() as u64;
+            pb.set_position(bytes_written);
+            pb.set_message(render_msg(samples_dropped));
             if unbuffered {
                 file_out
                     .flush()
                     .wrap_err_with(|| format!("failed to flush {}", file))?;
             }
         }
+        pb.finish_and_clear();
         return Ok(());
     }
 
     let mut devs = DeviceTree::open(&proxy, route.clone())
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
 
-    let mut file =
+    let mut file_out =
         File::create(&file).wrap_err_with(|| format!("could not create log file {}", file))?;
 
-    let write_packet = |pkt: tio::Packet, f: &mut File| {
-        let _ = f.write_all(&pkt.serialize().unwrap());
+    let write_packet = |pkt: tio::Packet, f: &mut File, b: &mut u64| {
+        let serialized = pkt.serialize().unwrap();
+        let _ = f.write_all(&serialized);
+        *b += serialized.len() as u64;
     };
 
-    println!("Logging data...");
-
     loop {
+        if duration_elapsed() {
+            break;
+        }
         match devs.drain() {
             Ok(batch) => {
                 for (sample, sample_route) in batch {
-                    // Write metadata on any boundary (Initial, SessionChanged, SegmentChanged, etc.)
-                    if sample.boundary.is_some() {
+                    if let Some(b) = &sample.boundary {
+                        if let BoundaryReason::SamplesLost { expected, received } = b.reason {
+                            samples_dropped += received.wrapping_sub(expected) as u64;
+                        }
                         write_packet(
                             sample.device.make_update_with_route(sample_route.clone()),
-                            &mut file,
+                            &mut file_out,
+                            &mut bytes_written,
                         );
                         write_packet(
                             sample.stream.make_update_with_route(sample_route.clone()),
-                            &mut file,
+                            &mut file_out,
+                            &mut bytes_written,
                         );
                         write_packet(
                             sample.segment.make_update_with_route(sample_route.clone()),
-                            &mut file,
+                            &mut file_out,
+                            &mut bytes_written,
                         );
                         for col in &sample.columns {
                             write_packet(
                                 col.desc.make_update_with_route(sample_route.clone()),
-                                &mut file,
+                                &mut file_out,
+                                &mut bytes_written,
                             );
                         }
                     }
 
-                    // Write data packet once (first sample from this packet)
                     if sample.n == sample.source.first_sample_n {
                         let data_pkt = tio::Packet {
                             payload: tio::proto::Payload::StreamData(sample.source),
                             routing: sample_route,
                             ttl: 0,
                         };
-                        write_packet(data_pkt, &mut file);
+                        write_packet(data_pkt, &mut file_out, &mut bytes_written);
                     }
                 }
+                pb.set_position(bytes_written);
+                pb.set_message(render_msg(samples_dropped));
             }
             Err(e) => {
+                pb.finish_and_clear();
                 return Err(eyre::Report::new(e).wrap_err("device stream ended"));
             }
         }
 
         if unbuffered {
-            let _ = file.flush();
+            let _ = file_out.flush();
         }
     }
+    pb.finish_and_clear();
+    Ok(())
 }
 
 pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {

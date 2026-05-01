@@ -71,6 +71,7 @@ fn main() -> eyre::Result<()> {
             unbuffered,
             raw,
             depth,
+            duration,
         } => match subcommands {
             Some(LogSubcommands::Meta {
                 tio,
@@ -114,7 +115,7 @@ fn main() -> eyre::Result<()> {
                 split_level,
                 split_policy,
             ),
-            None => log(&tio, file, unbuffered, raw, depth),
+            None => log(&tio, file, unbuffered, raw, depth, duration),
         },
         Commands::Upgrade {
             tio,
