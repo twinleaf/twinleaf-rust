@@ -39,6 +39,16 @@ use twinleaf::{
 };
 use welch_sde::{Build, SpectralDensity};
 
+const MIN_PLOT_WINDOW_SECONDS: f64 = 0.5;
+const MAX_PLOT_WINDOW_SECONDS: f64 = 60.0;
+const PLOT_WINDOW_FINE_STEP_SECONDS: f64 = 0.5;
+const PLOT_WINDOW_COARSE_STEP_SECONDS: f64 = 5.0;
+const MIN_FFT_SAMPLES: usize = 60;
+const MONITOR_BUFFER_CAPACITY_SAMPLES: usize = 2_000_000;
+const WELCH_DEFAULT_SEGMENTS: usize = 4;
+const WELCH_DEFAULT_OVERLAP: f64 = 0.5;
+const WELCH_DFT_MAX_SIZE: usize = 4096;
+
 #[derive(Parser, Debug)]
 #[command(name = "tio-monitor", version, about = "Display live sensor data")]
 struct Cli {
@@ -393,6 +403,36 @@ impl Default for ViewConfig {
     }
 }
 
+pub struct FftReadyData {
+    pub points: Vec<(f64, f64)>,
+    pub median_asd: f64,
+    pub sample_count: usize,
+    pub total_sample_count: usize,
+    pub sampling_hz: f64,
+    pub segment_size: usize,
+    pub hop_size: usize,
+}
+
+pub enum FftStatus {
+    Ready(FftReadyData),
+    WaitingForSelection,
+    WaitingForSamples,
+    InvalidSampleRate {
+        sampling_rate: u32,
+        decimation: u32,
+    },
+    TooFewSamples {
+        have: usize,
+        need: usize,
+        sampling_hz: f64,
+        window_seconds: f64,
+    },
+    NoValidFrequencyBins {
+        sample_count: usize,
+        sampling_hz: f64,
+    },
+}
+
 pub struct App {
     pub depth_limit: Option<usize>,
     pub parent_route: DeviceRoute,
@@ -517,7 +557,8 @@ impl App {
             Action::ToggleFooter => self.view.show_footer = !self.view.show_footer,
             Action::ToggleRoutes => self.view.show_routes = !self.view.show_routes,
             Action::AdjustWindow(d) => {
-                self.view.plot_window_seconds = (self.view.plot_window_seconds + d).clamp(0.5, 10.0)
+                self.view.plot_window_seconds = (self.view.plot_window_seconds + d)
+                    .clamp(MIN_PLOT_WINDOW_SECONDS, MAX_PLOT_WINDOW_SECONDS)
             }
             Action::AdjustPlotWidth(d) => {
                 self.view.plot_width_percent =
@@ -747,13 +788,33 @@ impl App {
         Some((data, cur_v, cur_t))
     }
 
-    pub fn get_spectral_density_data(&self) -> Option<(Vec<(f64, f64)>, f64)> {
-        let spec = self.current_selection()?;
-        let win = self.window_aligned.as_ref()?;
+    pub fn get_spectral_density_data(&self) -> FftStatus {
+        let Some(spec) = self.current_selection() else {
+            return FftStatus::WaitingForSelection;
+        };
+        let Some(win) = self.window_aligned.as_ref() else {
+            return FftStatus::WaitingForSamples;
+        };
         let stream_key = spec.stream_key();
-        let md = win.segment_metadata.get(&stream_key)?;
-        let sampling_hz = (md.sampling_rate / md.decimation) as f64;
-        let batch = win.columns.get(&spec)?;
+        let Some(md) = win.segment_metadata.get(&stream_key) else {
+            return FftStatus::WaitingForSamples;
+        };
+        if md.sampling_rate == 0 || md.decimation == 0 {
+            return FftStatus::InvalidSampleRate {
+                sampling_rate: md.sampling_rate,
+                decimation: md.decimation,
+            };
+        }
+        let sampling_hz = md.sampling_rate as f64 / md.decimation as f64;
+        if !sampling_hz.is_finite() || sampling_hz <= 0.0 {
+            return FftStatus::InvalidSampleRate {
+                sampling_rate: md.sampling_rate,
+                decimation: md.decimation,
+            };
+        }
+        let Some(batch) = win.columns.get(&spec) else {
+            return FftStatus::WaitingForSamples;
+        };
 
         let signal: Vec<f64> = match batch {
             ColumnBatch::F64(v) => v.clone(),
@@ -761,12 +822,19 @@ impl App {
             ColumnBatch::U64(v) => v.iter().map(|&x| x as f64).collect(),
         };
 
-        if signal.len() < 128 {
-            return None;
+        if signal.len() < MIN_FFT_SAMPLES {
+            return FftStatus::TooFewSamples {
+                have: signal.len(),
+                need: MIN_FFT_SAMPLES,
+                sampling_hz,
+                window_seconds: self.view.plot_window_seconds,
+            };
         }
 
-        let mean_val = signal.iter().sum::<f64>() / signal.len() as f64;
-        let detrended: Vec<f64> = signal.iter().map(|x| x - mean_val).collect();
+        let (fft_signal, segment_size, hop_size) = latest_complete_welch_signal(&signal);
+
+        let mean_val = fft_signal.iter().sum::<f64>() / fft_signal.len() as f64;
+        let detrended: Vec<f64> = fft_signal.iter().map(|x| x - mean_val).collect();
 
         let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
         let sd = welch.periodogram();
@@ -784,7 +852,10 @@ impl App {
             .collect();
 
         if pts.is_empty() {
-            return None;
+            return FftStatus::NoValidFrequencyBins {
+                sample_count: fft_signal.len(),
+                sampling_hz,
+            };
         }
 
         let mut asd_values: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
@@ -795,7 +866,15 @@ impl App {
             asd_values[asd_values.len() / 2]
         };
 
-        Some((pts, median_asd))
+        FftStatus::Ready(FftReadyData {
+            points: pts,
+            median_asd,
+            sample_count: fft_signal.len(),
+            total_sample_count: signal.len(),
+            sampling_hz,
+            segment_size,
+            hop_size,
+        })
     }
 
     pub fn get_focused_channel_info(&self) -> Option<(String, String)> {
@@ -852,8 +931,10 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
                 KeyCode::Char('f') => Some(Action::ToggleFft),
                 KeyCode::Char('h') => Some(Action::ToggleFooter),
                 KeyCode::Char('r') => Some(Action::ToggleRoutes),
-                KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::AdjustWindow(0.5)),
-                KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::AdjustWindow(-0.5)),
+                KeyCode::Char('=') => Some(Action::AdjustWindow(PLOT_WINDOW_FINE_STEP_SECONDS)),
+                KeyCode::Char('-') => Some(Action::AdjustWindow(-PLOT_WINDOW_FINE_STEP_SECONDS)),
+                KeyCode::Char('+') => Some(Action::AdjustWindow(PLOT_WINDOW_COARSE_STEP_SECONDS)),
+                KeyCode::Char('_') => Some(Action::AdjustWindow(-PLOT_WINDOW_COARSE_STEP_SECONDS)),
                 KeyCode::Char('[') => Some(Action::AdjustPlotWidth(5)),
                 KeyCode::Char(']') => Some(Action::AdjustPlotWidth(-5)),
                 KeyCode::Char(',') | KeyCode::Char('<') => Some(Action::AdjustPrecision(-1)),
@@ -1218,7 +1299,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
         key_span("+"),
         key_sep(),
         key_span("-"),
-        Span::raw(" Window (0.5s)  "),
+        Span::raw(" Window (0.5s, Shift 5.0s)  "),
         key_span("["),
         key_sep(),
         key_span("]"),
@@ -1289,75 +1370,163 @@ fn key_sep() -> Span<'static> {
     Span::raw(" ")
 }
 
+fn latest_complete_welch_signal(signal: &[f64]) -> (&[f64], usize, usize) {
+    let denominator =
+        WELCH_DEFAULT_SEGMENTS as f64 * (1.0 - WELCH_DEFAULT_OVERLAP) + WELCH_DEFAULT_OVERLAP;
+    let default_segment_size = (signal.len() as f64 / denominator).trunc().max(1.0) as usize;
+
+    if default_segment_size.next_power_of_two() <= WELCH_DFT_MAX_SIZE {
+        let hop_size = default_segment_size
+            - (default_segment_size as f64 * WELCH_DEFAULT_OVERLAP).round() as usize;
+        return (signal, default_segment_size, hop_size.max(1));
+    }
+
+    let segment_size = WELCH_DFT_MAX_SIZE;
+    let hop_size = segment_size - (segment_size as f64 * WELCH_DEFAULT_OVERLAP).round() as usize;
+    let segment_count = (signal.len() - segment_size) / hop_size + 1;
+    let used_len = (segment_count - 1) * hop_size + segment_size;
+
+    (
+        &signal[signal.len() - used_len..],
+        segment_size,
+        hop_size.max(1),
+    )
+}
+
 fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
     if let (Some(pos), Some((desc, units))) = (app.current_pos(), app.get_focused_channel_info()) {
         let route = pos.route();
         if app.view.show_fft {
-            if let Some((sd_data, median_asd)) = app.get_spectral_density_data() {
-                let title = format!(
-                    "{} — {} (linear detrend {:.1}s) | Median ASD: {:.3e} {}/√Hz",
-                    route, desc, app.view.plot_window_seconds, median_asd, units
-                );
-                let block = Block::default().title(title).borders(Borders::ALL);
+            match app.get_spectral_density_data() {
+                FftStatus::Ready(sd) => {
+                    let title = format!(
+                        "{} — {} ({:.1}s, FFT {} of {} samples, seg {}, hop {}) | Median ASD: {:.3e} {}/√Hz",
+                        route,
+                        desc,
+                        app.view.plot_window_seconds,
+                        sd.sample_count,
+                        sd.total_sample_count,
+                        sd.segment_size,
+                        sd.hop_size,
+                        sd.median_asd,
+                        units
+                    );
+                    let block = Block::default().title(title).borders(Borders::ALL);
 
-                if !sd_data.is_empty() {
-                    let log_data: Vec<(f64, f64)> = sd_data
-                        .iter()
-                        .map(|(freq, val)| (freq.log10(), val.log10()))
-                        .collect();
+                    if !sd.points.is_empty() {
+                        let log_data: Vec<(f64, f64)> = sd
+                            .points
+                            .iter()
+                            .map(|(freq, val)| (freq.log10(), val.log10()))
+                            .collect();
 
-                    let min_f = log_data.first().map(|(f, _)| *f).unwrap_or(0.0);
-                    let max_f = log_data.last().map(|(f, _)| *f).unwrap_or(1.0);
-                    let ds: Vec<f64> = log_data.iter().map(|(_, d)| *d).collect();
-                    let min_d = ds.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                    let max_d = ds.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                        let min_f = log_data.first().map(|(f, _)| *f).unwrap_or(0.0);
+                        let max_f = log_data.last().map(|(f, _)| *f).unwrap_or(1.0);
+                        let ds: Vec<f64> = log_data.iter().map(|(_, d)| *d).collect();
+                        let min_d = ds.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                        let max_d = ds.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
 
-                    let y_pad = if (max_d - min_d) > 0.1 {
-                        (max_d - min_d) * 0.1
+                        let y_pad = if (max_d - min_d) > 0.1 {
+                            (max_d - min_d) * 0.1
+                        } else {
+                            0.5
+                        };
+
+                        let dataset = Dataset::default()
+                            .name(desc.as_str())
+                            .marker(symbols::Marker::Braille)
+                            .style(Style::default().fg(Color::Cyan))
+                            .graph_type(GraphType::Line)
+                            .data(&log_data);
+
+                        let chart = Chart::new(vec![dataset])
+                            .block(block)
+                            .x_axis(
+                                Axis::default()
+                                    .title("Freq [Hz] (log)")
+                                    .bounds([min_f, max_f])
+                                    .labels(generate_log_labels(
+                                        min_f,
+                                        max_f,
+                                        5,
+                                        app.view.axis_precision,
+                                    )),
+                            )
+                            .y_axis(
+                                Axis::default()
+                                    .title(format!("Val [{}/√Hz]", units))
+                                    .bounds([min_d - y_pad, max_d + y_pad])
+                                    .labels(generate_log_labels(
+                                        min_d - y_pad,
+                                        max_d + y_pad,
+                                        5,
+                                        app.view.axis_precision,
+                                    )),
+                            );
+                        f.render_widget(chart, area);
                     } else {
-                        0.5
-                    };
-
-                    let dataset = Dataset::default()
-                        .name(desc.as_str())
-                        .marker(symbols::Marker::Braille)
-                        .style(Style::default().fg(Color::Cyan))
-                        .graph_type(GraphType::Line)
-                        .data(&log_data);
-
-                    let chart = Chart::new(vec![dataset])
-                        .block(block)
-                        .x_axis(
-                            Axis::default()
-                                .title("Freq [Hz] (log)")
-                                .bounds([min_f, max_f])
-                                .labels(generate_log_labels(
-                                    min_f,
-                                    max_f,
-                                    5,
-                                    app.view.axis_precision,
-                                )),
-                        )
-                        .y_axis(
-                            Axis::default()
-                                .title(format!("Val [{}/√Hz]", units))
-                                .bounds([min_d - y_pad, max_d + y_pad])
-                                .labels(generate_log_labels(
-                                    min_d - y_pad,
-                                    max_d + y_pad,
-                                    5,
-                                    app.view.axis_precision,
-                                )),
-                        );
-                    f.render_widget(chart, area);
-                } else {
-                    f.render_widget(Paragraph::new("No valid FFT data").block(block), area);
+                        f.render_widget(Paragraph::new("No valid FFT data").block(block), area);
+                    }
                 }
-            } else {
-                let block = Block::default()
-                    .title("Buffering FFT...")
-                    .borders(Borders::ALL);
-                f.render_widget(Paragraph::new("Need >128 samples").block(block), area);
+                FftStatus::TooFewSamples {
+                    have,
+                    need,
+                    sampling_hz,
+                    window_seconds,
+                } => {
+                    let block = Block::default()
+                        .title(format!("FFT unavailable - {} samples needed", need))
+                        .borders(Borders::ALL);
+                    let message = format!(
+                        "Current FFT buffer has {} of {} samples. At {:.3} Hz, current window is {:.1}s.",
+                        have, need, sampling_hz, window_seconds
+                    );
+                    f.render_widget(Paragraph::new(message).block(block), area);
+                }
+                FftStatus::InvalidSampleRate {
+                    sampling_rate,
+                    decimation,
+                } => {
+                    let block = Block::default()
+                        .title("FFT unavailable - invalid sample rate")
+                        .borders(Borders::ALL);
+                    let message = format!(
+                        "Stream metadata reports sampling_rate={} and decimation={}.",
+                        sampling_rate, decimation
+                    );
+                    f.render_widget(Paragraph::new(message).block(block), area);
+                }
+                FftStatus::NoValidFrequencyBins {
+                    sample_count,
+                    sampling_hz,
+                } => {
+                    let block = Block::default()
+                        .title("FFT unavailable - no valid frequency bins")
+                        .borders(Borders::ALL);
+                    let message = format!(
+                        "Welch produced no positive finite bins from {} samples at {:.3} Hz.",
+                        sample_count, sampling_hz
+                    );
+                    f.render_widget(Paragraph::new(message).block(block), area);
+                }
+                FftStatus::WaitingForSelection => {
+                    let block = Block::default()
+                        .title("FFT unavailable - no channel selected")
+                        .borders(Borders::ALL);
+                    f.render_widget(
+                        Paragraph::new("Select a stream column to plot FFT.").block(block),
+                        area,
+                    );
+                }
+                FftStatus::WaitingForSamples => {
+                    let block = Block::default()
+                        .title("Buffering FFT...")
+                        .borders(Borders::ALL);
+                    f.render_widget(
+                        Paragraph::new("Waiting for samples in the selected window.").block(block),
+                        area,
+                    );
+                }
             }
         } else {
             let title = format!(
@@ -1550,7 +1719,7 @@ pub fn run_monitor(
         }
     }
 
-    let mut buffer = Buffer::new(100_000);
+    let mut buffer = Buffer::new(MONITOR_BUFFER_CAPACITY_SAMPLES);
 
     // UI
     let mut term = ratatui::init();
