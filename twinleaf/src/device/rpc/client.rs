@@ -1,7 +1,7 @@
 use crate::tio::{proto::DeviceRoute, proxy, util as tio_util};
 use std::collections::HashMap;
 
-use dirs_next::cache_dir;
+use directories::BaseDirs;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, Write};
@@ -182,8 +182,9 @@ impl RpcClient {
     }
 
     pub fn rpc_list(&self, route: &DeviceRoute) -> Result<RpcList, RpcListError> {
-        let tl_cache_dir = cache_dir()
+        let tl_cache_dir = BaseDirs::new()
             .ok_or(RpcListError::CacheDirError)?
+            .cache_dir()
             .join("twinleaf");
         fs::create_dir_all(&tl_cache_dir).map_err(|_| RpcListError::CacheDirError)?;
 
