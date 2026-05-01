@@ -335,15 +335,10 @@ pub fn log(
         .to_string();
 
     let template = match duration {
-        Some(d) => {
-            let s = d.as_secs();
-            format!(
-                "{{spinner}} [{{elapsed_precise}}/{:02}:{:02}:{:02}] {{decimal_bytes}} → {{msg}}",
-                s / 3600,
-                (s / 60) % 60,
-                s % 60,
-            )
-        }
+        Some(d) => format!(
+            "{{spinner}} [{{elapsed_precise}}/{}] {{decimal_bytes}} → {{msg}}",
+            indicatif::FormattedDuration(d),
+        ),
         None => "{spinner} [{elapsed_precise}] {decimal_bytes} → {msg}".to_string(),
     };
     let pb = ProgressBar::new_spinner();

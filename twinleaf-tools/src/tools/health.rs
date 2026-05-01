@@ -244,6 +244,15 @@ impl StreamStats {
         self.current_session_id = Some(session_id);
     }
 
+    fn reset_all(&mut self) {
+        self.reset_timing();
+        self.rate_slope.reset();
+        self.received_count = 0;
+        self.rate_smps = 0.0;
+        self.host_epoch = None;
+        self.samples_dropped = 0;
+    }
+
     // floor of stale_dur
     fn stale_threshold(&self, floor: Duration) -> Duration {
         if self.rate_slope.n >= 2 && self.rate_smps > 0.0 {
@@ -289,6 +298,8 @@ enum Action {
     SetMode(Mode),
     ExecuteRpc(RpcReq),
     SelectRoute(DeviceRoute),
+    ResetStats,
+    ClearLog,
 }
 
 struct App {
@@ -313,6 +324,7 @@ struct App {
     palette_route: Option<DeviceRoute>,
     rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
     footer_height: u16,
+    session_start: Instant,
 }
 
 impl App {
@@ -339,6 +351,7 @@ impl App {
             palette_route: None,
             rpc_registries: HashMap::new(),
             footer_height: 0,
+            session_start: Instant::now(),
         }
     }
 
@@ -623,6 +636,15 @@ impl App {
                 let registry = self.rpc_registries.get(&route);
                 self.palette.update_suggestions(registry);
             }
+            Action::ResetStats => {
+                for st in self.stats.values_mut() {
+                    st.reset_all();
+                }
+            }
+            Action::ClearLog => {
+                self.event_log.clear();
+                self.event_scroll_offset = 0;
+            }
         }
         false
     }
@@ -773,6 +795,7 @@ fn draw_ui(
     let palette_rows = app.palette.suggestion_rows();
     let active_route = app.active_route(root_route).clone();
     let registry_ready = app.rpc_registries.contains_key(&active_route);
+    let session_str = indicatif::FormattedDuration(app.session_start.elapsed()).to_string();
 
     terminal.draw(|f| {
         let size = f.area();
@@ -805,8 +828,8 @@ fn draw_ui(
 
         // Header
         let header_text = format!(
-            "tio health — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
-            cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
+            "tio health ({}) — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
+            session_str, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
         );
         f.render_widget(
             Paragraph::new(header_text).style(Style::default().add_modifier(Modifier::BOLD)),
@@ -931,7 +954,7 @@ fn draw_ui(
             };
             f.render_widget(
                 Paragraph::new(format!(
-                    "q to quit  |  : RPC  |  {}  {}  {}  |  ↑/↓/PgUp/PgDn to scroll",
+                    "q to quit  |  : RPC  |  {}  {}  {}  |  r:reset  c:clear log  |  ↑/↓/PgUp/PgDn",
                     heartbeat_hint, drift_hint, time_hint
                 ))
                 .style(Style::default().fg(Color::Gray)),
@@ -974,6 +997,8 @@ fn get_action(ev: Event, app: &mut App, root_route: &DeviceRoute) -> Option<Acti
             KeyCode::Char('h') => Some(Action::ToggleHeartbeat),
             KeyCode::Char('p') => Some(Action::TogglePpm),
             KeyCode::Char('s') => Some(Action::ToggleSampleTime),
+            KeyCode::Char('r') => Some(Action::ResetStats),
+            KeyCode::Char('c') => Some(Action::ClearLog),
             KeyCode::Up => Some(Action::ScrollUp),
             KeyCode::Down => Some(Action::ScrollDown),
             KeyCode::PageUp => Some(Action::PageUp),
