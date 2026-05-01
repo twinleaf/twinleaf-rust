@@ -278,6 +278,7 @@ pub enum LogSubcommands{
     },
 
     /// Convert binary log files to HDF5 format
+    #[command(alias = "hdf5")]
     Hdf {
         /// Input log file(s)
         #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
