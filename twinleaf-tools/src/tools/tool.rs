@@ -342,11 +342,7 @@ pub fn log(
         None => "{spinner} [{elapsed_precise}] {decimal_bytes} → {msg}".to_string(),
     };
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template(&template)
-            .unwrap()
-            .tick_strings(&["←", "↖", "↑", "↗", "→", "↘", "↓", "↙", " "]),
-    );
+    pb.set_style(ProgressStyle::with_template(&template).unwrap());
     pb.enable_steady_tick(Duration::from_millis(100));
 
     let started = Instant::now();
