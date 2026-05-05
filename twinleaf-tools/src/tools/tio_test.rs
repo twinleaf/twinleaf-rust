@@ -3,11 +3,27 @@
 //! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1.
 
 use crate::TestCli;
-use std::io;
+use ratatui::crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
+use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use twinleaf::tio::proto;
 use twinleaf::tio::proto::meta;
+
+macro_rules! terminal_println {
+    ($($arg:tt)*) => {
+        terminal_print_line(format_args!($($arg)*))
+    };
+}
+
+macro_rules! terminal_eprintln {
+    ($($arg:tt)*) => {
+        terminal_error_line(format_args!($($arg)*))
+    };
+}
 
 const SINE_STREAM_ID: u8 = 1;
 const STATUS_STREAM_ID: u8 = 2;
@@ -20,6 +36,8 @@ const DEVICE_FIRMWARE: &str = "twinleaf-rust-test";
 const SIGNAL_LEVEL: u8 = 234;
 const AUX_SAMPLE_RATE: u32 = 25;
 const AUX_WAVE_FREQUENCY: f64 = 0.25;
+const SAMPLE_DROP_INTERVAL_SECONDS: f64 = 60.0;
+const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_SAMPLE_NUMBER: u32 = 0x00ff_ffff;
@@ -51,6 +69,33 @@ struct RpcSpec {
 struct Client {
     addr: SocketAddr,
     last_rx: Instant,
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn terminal_print_line(args: std::fmt::Arguments<'_>) {
+    let mut stdout = io::stdout().lock();
+    let _ = write!(stdout, "{args}\r\n");
+    let _ = stdout.flush();
+}
+
+fn terminal_error_line(args: std::fmt::Arguments<'_>) {
+    let mut stderr = io::stderr().lock();
+    let _ = write!(stderr, "{args}\r\n");
+    let _ = stderr.flush();
 }
 
 struct GaussianRng {
@@ -97,7 +142,9 @@ impl GaussianRng {
 struct TestDevice {
     socket: UdpSocket,
     client: Option<Client>,
+    initial_params: SineParams,
     params: SineParams,
+    initial_status: u8,
     status: u8,
     sample_rate: u32,
     segment_seconds: u32,
@@ -113,11 +160,13 @@ struct TestDevice {
     segment_id: u8,
     segment_start_time: u32,
     pending_segment_update: bool,
+    next_drop_sample: u64,
     aux_samples_generated: u64,
     aux_sample_number: u32,
     aux_segment_id: u8,
     aux_segment_start_time: u32,
     aux_pending_segment_update: bool,
+    next_aux_drop_sample: u64,
     last_heartbeat: Instant,
     rng: GaussianRng,
     rpcs: Vec<RpcSpec>,
@@ -168,16 +217,24 @@ impl TestDevice {
                 "aux stream sample is too large for a TIO packet",
             ));
         }
+        let mut rng = GaussianRng::new(seed | 1);
+        let next_drop_sample = next_drop_sample_after(&mut rng, 0, cli.samplerate);
+        let next_aux_drop_sample = next_drop_sample_after(&mut rng, 0, AUX_SAMPLE_RATE);
+
+        let initial_params = SineParams {
+            amplitude: cli.amplitude,
+            frequency: cli.frequency,
+            noise: cli.noise,
+        };
+        let initial_status = 0;
 
         Ok(Self {
             socket,
             client: None,
-            params: SineParams {
-                amplitude: cli.amplitude,
-                frequency: cli.frequency,
-                noise: cli.noise,
-            },
-            status: 0,
+            initial_params,
+            params: initial_params,
+            initial_status,
+            status: initial_status,
             sample_rate: cli.samplerate,
             segment_seconds: cli.segment_seconds,
             segment_samples,
@@ -192,13 +249,15 @@ impl TestDevice {
             segment_id: 0,
             segment_start_time: start_time,
             pending_segment_update: false,
+            next_drop_sample,
             aux_samples_generated: 0,
             aux_sample_number: 0,
             aux_segment_id: 0,
             aux_segment_start_time: start_time,
             aux_pending_segment_update: false,
+            next_aux_drop_sample,
             last_heartbeat: Instant::now(),
-            rng: GaussianRng::new(seed | 1),
+            rng,
             rpcs: vec![
                 RpcSpec {
                     name: "dev.name",
@@ -241,11 +300,19 @@ impl TestDevice {
     }
 
     fn run(&mut self) -> io::Result<()> {
-        println!(
+        let raw_mode = match RawModeGuard::enable() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                terminal_eprintln!("keyboard shortcuts disabled: {err}");
+                None
+            }
+        };
+
+        terminal_println!(
             "tio test listening on udp://0.0.0.0:{}",
             self.socket.local_addr()?.port()
         );
-        println!(
+        terminal_println!(
             "  stream 1: 2 waveform channels, amplitude={} V frequency={} Hz noise={} V/sqrt(Hz) samplerate={} Hz segment={} s",
             self.params.amplitude,
             self.params.frequency,
@@ -253,25 +320,56 @@ impl TestDevice {
             self.sample_rate,
             self.segment_seconds
         );
-        println!(
+        terminal_println!(
             "  stream 2: status={} signal_level={}",
-            self.status, SIGNAL_LEVEL
+            self.status,
+            SIGNAL_LEVEL
         );
-        println!(
+        terminal_println!(
             "  stream 3: aux triangle/sawtooth at {} Hz sampled at {} Hz",
-            AUX_WAVE_FREQUENCY, AUX_SAMPLE_RATE
+            AUX_WAVE_FREQUENCY,
+            AUX_SAMPLE_RATE
         );
-        println!(
+        terminal_println!(
+            "  randomly dropping one sample from each sample clock about once per minute"
+        );
+        if raw_mode.is_some() {
+            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
+        }
+        terminal_println!(
             "  connect with: tio proxy udp4://127.0.0.1:{}",
             self.socket.local_addr()?.port()
         );
 
         loop {
+            if raw_mode.is_some() && !self.handle_keyboard()? {
+                terminal_println!("stopping tio test");
+                return Ok(());
+            }
             self.receive_packets()?;
             self.expire_client();
             self.send_periodic_packets()?;
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn handle_keyboard(&mut self) -> io::Result<bool> {
+        while event::poll(Duration::from_millis(0))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('d') => self.drop_samples_now()?,
+                    KeyCode::Char('r') => self.reboot()?,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn receive_packets(&mut self) -> io::Result<()> {
@@ -287,10 +385,12 @@ impl TestDevice {
                             self.handle_packet(packet, addr)?;
                         }
                         Ok(_) => {
-                            eprintln!("Ignoring UDP datagram with trailing bytes from {addr}");
+                            terminal_eprintln!(
+                                "Ignoring UDP datagram with trailing bytes from {addr}"
+                            );
                         }
                         Err(err) => {
-                            eprintln!("Ignoring malformed packet from {addr}: {err:?}");
+                            terminal_eprintln!("Ignoring malformed packet from {addr}: {err:?}");
                         }
                     }
                 }
@@ -312,7 +412,7 @@ impl TestDevice {
             _ => {
                 self.client = Some(Client { addr, last_rx: now });
                 self.reset_run();
-                println!("client connected: {addr}");
+                terminal_println!("client connected: {addr}");
                 self.send_initial_packets(addr)?;
                 Ok(true)
             }
@@ -322,7 +422,7 @@ impl TestDevice {
     fn expire_client(&mut self) {
         if let Some(client) = self.client {
             if Instant::now().duration_since(client.last_rx) > CLIENT_TIMEOUT {
-                println!("client disconnected: {}", client.addr);
+                terminal_println!("client disconnected: {}", client.addr);
                 self.client = None;
             }
         }
@@ -336,14 +436,31 @@ impl TestDevice {
         self.segment_id = 0;
         self.segment_start_time = self.start_time;
         self.pending_segment_update = false;
+        let next_drop_sample = self.next_drop_sample_after(0, self.sample_rate);
+        self.next_drop_sample = next_drop_sample;
         self.aux_samples_generated = 0;
         self.aux_sample_number = 0;
         self.aux_segment_id = 0;
         self.aux_segment_start_time = self.start_time;
         self.aux_pending_segment_update = false;
+        let next_aux_drop_sample = self.next_drop_sample_after(0, AUX_SAMPLE_RATE);
+        self.next_aux_drop_sample = next_aux_drop_sample;
         self.last_heartbeat = Instant::now()
             .checked_sub(HEARTBEAT_INTERVAL)
             .unwrap_or_else(Instant::now);
+    }
+
+    fn reboot(&mut self) -> io::Result<()> {
+        self.session_id = self.next_session_id();
+        self.params = self.initial_params;
+        self.status = self.initial_status;
+        self.reset_run();
+        terminal_println!("rebooted test device; new session id {}", self.session_id);
+
+        if let Some(client) = self.client {
+            self.send_initial_packets(client.addr)?;
+        }
+        Ok(())
     }
 
     fn handle_packet(&mut self, packet: proto::Packet, addr: SocketAddr) -> io::Result<()> {
@@ -594,18 +711,20 @@ impl TestDevice {
             }
 
             let first_sample_n = self.sample_number;
+            let samples_until_drop = self.next_drop_sample.saturating_sub(self.samples_generated);
+            if samples_until_drop == 0 {
+                self.drop_sample();
+                self.send_sample_segment_updates_if_needed(first_sample_n, addr)?;
+                continue;
+            }
+
             let samples_left_in_segment = u64::from(self.segment_samples - self.sample_number);
             let batch_len = due
                 .min(self.max_samples_per_packet)
-                .min(samples_left_in_segment);
+                .min(samples_left_in_segment)
+                .min(samples_until_drop);
             self.send_sample_batches(batch_len, addr)?;
-
-            if self.pending_segment_update && first_sample_n == 0 {
-                for stream_id in [SINE_STREAM_ID, STATUS_STREAM_ID] {
-                    self.send_packet(&self.segment_metadata(stream_id).make_update(), addr)?;
-                }
-                self.pending_segment_update = false;
-            }
+            self.send_sample_segment_updates_if_needed(first_sample_n, addr)?;
         }
         Ok(())
     }
@@ -670,17 +789,23 @@ impl TestDevice {
             }
 
             let first_sample_n = self.aux_sample_number;
+            let samples_until_drop = self
+                .next_aux_drop_sample
+                .saturating_sub(self.aux_samples_generated);
+            if samples_until_drop == 0 {
+                self.drop_aux_sample();
+                self.send_aux_segment_update_if_needed(first_sample_n, addr)?;
+                continue;
+            }
+
             let samples_left_in_segment =
                 u64::from(self.aux_segment_samples - self.aux_sample_number);
             let batch_len = due
                 .min(self.aux_max_samples_per_packet)
-                .min(samples_left_in_segment);
+                .min(samples_left_in_segment)
+                .min(samples_until_drop);
             self.send_aux_sample_batch(batch_len, addr)?;
-
-            if self.aux_pending_segment_update && first_sample_n == 0 {
-                self.send_packet(&self.segment_metadata(AUX_STREAM_ID).make_update(), addr)?;
-                self.aux_pending_segment_update = false;
-            }
+            self.send_aux_segment_update_if_needed(first_sample_n, addr)?;
         }
         Ok(())
     }
@@ -753,6 +878,86 @@ impl TestDevice {
                 .saturating_add(self.segment_seconds);
             self.aux_pending_segment_update = true;
         }
+    }
+
+    fn drop_sample(&mut self) {
+        terminal_println!(
+            "dropped sample {} from streams {}/{}",
+            self.samples_generated,
+            SINE_STREAM_ID,
+            STATUS_STREAM_ID
+        );
+        self.advance_sample();
+        self.next_drop_sample =
+            self.next_drop_sample_after(self.samples_generated, self.sample_rate);
+    }
+
+    fn drop_aux_sample(&mut self) {
+        terminal_println!(
+            "dropped sample {} from stream {}",
+            self.aux_samples_generated,
+            AUX_STREAM_ID
+        );
+        self.advance_aux_sample();
+        self.next_aux_drop_sample =
+            self.next_drop_sample_after(self.aux_samples_generated, AUX_SAMPLE_RATE);
+    }
+
+    fn drop_samples_now(&mut self) -> io::Result<()> {
+        let addr = self.client.map(|client| client.addr);
+        let first_sample_n = self.sample_number;
+        self.drop_sample();
+        if let Some(addr) = addr {
+            self.send_sample_segment_updates_if_needed(first_sample_n, addr)?;
+        }
+
+        let first_aux_sample_n = self.aux_sample_number;
+        self.drop_aux_sample();
+        if let Some(addr) = addr {
+            self.send_aux_segment_update_if_needed(first_aux_sample_n, addr)?;
+        }
+
+        Ok(())
+    }
+
+    fn next_drop_sample_after(&mut self, current_sample: u64, sample_rate: u32) -> u64 {
+        next_drop_sample_after(&mut self.rng, current_sample, sample_rate)
+    }
+
+    fn next_session_id(&mut self) -> u32 {
+        let mut session_id = (self.rng.next_u64() as u32)
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        if session_id == self.session_id {
+            session_id = session_id.wrapping_add(1);
+        }
+        session_id
+    }
+
+    fn send_sample_segment_updates_if_needed(
+        &mut self,
+        first_sample_n: u32,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if self.pending_segment_update && first_sample_n == 0 {
+            for stream_id in [SINE_STREAM_ID, STATUS_STREAM_ID] {
+                self.send_packet(&self.segment_metadata(stream_id).make_update(), addr)?;
+            }
+            self.pending_segment_update = false;
+        }
+        Ok(())
+    }
+
+    fn send_aux_segment_update_if_needed(
+        &mut self,
+        first_sample_n: u32,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if self.aux_pending_segment_update && first_sample_n == 0 {
+            self.send_packet(&self.segment_metadata(AUX_STREAM_ID).make_update(), addr)?;
+            self.aux_pending_segment_update = false;
+        }
+        Ok(())
     }
 
     fn send_initial_packets(&self, addr: SocketAddr) -> io::Result<()> {
@@ -1105,6 +1310,13 @@ fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
         return 0;
     }
     (stream_data_max_data_bytes() / sample_bytes) as u64
+}
+
+fn next_drop_sample_after(rng: &mut GaussianRng, current_sample: u64, sample_rate: u32) -> u64 {
+    let min_seconds = SAMPLE_DROP_INTERVAL_SECONDS - SAMPLE_DROP_JITTER_SECONDS;
+    let seconds = min_seconds + rng.next_unit() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
+    let interval = (seconds * f64::from(sample_rate)).round().max(1.0) as u64;
+    current_sample.saturating_add(interval)
 }
 
 fn describe_packet(packet: &proto::Packet) -> String {
