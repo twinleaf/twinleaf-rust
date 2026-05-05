@@ -8,6 +8,24 @@ pub enum RpcValue {
     Bytes(Vec<u8>),
 }
 
+impl std::fmt::Display for RpcValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcValue::Unit => Ok(()),
+            RpcValue::U64(n) => write!(f, "{}", n),
+            RpcValue::I64(n) => write!(f, "{}", n),
+            RpcValue::F64(x) => write!(f, "{}", x),
+            RpcValue::Str(s) => write!(f, "{}", s),
+            RpcValue::Bytes(b) => {
+                for byte in b {
+                    write!(f, "{:02x}", byte)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RpcValueType {
     Unit,
@@ -17,37 +35,30 @@ pub enum RpcValueType {
     Raw { meta: u16 },
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
-    ParseInt(std::num::ParseIntError),
-    ParseFloat(std::num::ParseFloatError),
+    #[error("invalid integer: {0}")]
+    ParseInt(#[from] std::num::ParseIntError),
+    #[error("invalid float: {0}")]
+    ParseFloat(#[from] std::num::ParseFloatError),
+    #[error("string too long ({actual} bytes, max {max})")]
     StringTooLong { max: u16, actual: usize },
+    #[error("unsupported integer size: {0} bytes")]
     UnsupportedIntSize(u8),
+    #[error("unsupported float size: {0} bytes")]
     UnsupportedFloatSize(u8),
+    #[error("value not encodable for kind '{0}'")]
     NotEncodableForKind(&'static str),
 }
 
-impl From<std::num::ParseIntError> for EncodeError {
-    fn from(e: std::num::ParseIntError) -> Self {
-        EncodeError::ParseInt(e)
-    }
-}
-impl From<std::num::ParseFloatError> for EncodeError {
-    fn from(e: std::num::ParseFloatError) -> Self {
-        EncodeError::ParseFloat(e)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
+    #[error("expected {expected} bytes, got {got}")]
     InsufficientBytes { expected: usize, got: usize },
-    Utf8(std::str::Utf8Error),
+    #[error("invalid UTF-8: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
+    #[error("unsupported integer size: {0} bytes")]
     UnsupportedIntSize(u8),
+    #[error("unsupported float size: {0} bytes")]
     UnsupportedFloatSize(u8),
-}
-
-impl From<std::str::Utf8Error> for DecodeError {
-    fn from(e: std::str::Utf8Error) -> Self {
-        DecodeError::Utf8(e)
-    }
 }

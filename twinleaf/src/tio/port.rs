@@ -28,40 +28,52 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Possible errors when receiving from a `Port`
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RecvError {
     /// No packets available at this time.
+    #[error("no packets available")]
     NotReady,
     /// This port got disconnected.
+    #[error("port disconnected")]
     Disconnected,
     /// Error in the data.
-    Protocol(proto::Error),
+    #[error("protocol error: {0}")]
+    Protocol(#[from] proto::Error),
     /// Low level IO error.
-    IO(io::Error),
+    #[error("I/O error: {0}")]
+    IO(#[from] io::Error),
 }
 
 /// Possible errors when sending to a `Port`
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SendError {
     /// This is used internally and should never happen for a `Port`.
     /// Low level RawPort
     /// This should never happen for a `Port`, only for the internal low level `RawPort`.
+    #[error("must drain before sending")]
     MustDrain,
     /// The port outgoing queue is full.
+    #[error("outgoing queue full")]
     Full,
     /// This port is not connected.
+    #[error("port disconnected")]
     Disconnected,
     /// Issue with the underlying IO operation.
-    IO(io::Error),
+    #[error("I/O error: {0}")]
+    IO(#[from] io::Error),
     /// Issue with serialization (packet would exceed protocol limits)
+    #[error("packet exceeds protocol size limits")]
     Serialization,
 }
 
 /// Possible errors when setting a custom data rate
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RateError {
+    #[error("rate changes not supported on this port")]
     Unsupported,
+    #[error("invalid rate")]
     InvalidRate,
+    #[error("failed to set rate")]
     Failed,
 }
 
@@ -603,9 +615,10 @@ impl Port {
     }
 
     /// Creates a sender/receiver pair to be used with `rx_to_channel`:
-    /// ```
-    /// let (port_rx_send, port_rx) = rx_channels();
-    /// let port = Port::new(url, Port::rx_to_channel(port_rx_send)).unwrap();
+    /// ```no_run
+    /// use twinleaf::tio::port::Port;
+    /// let (port_rx_send, port_rx) = Port::rx_channel();
+    /// let port = Port::new("tcp://localhost:7855", Port::rx_to_channel(port_rx_send)).unwrap();
     /// ```
     /// In the example, `port.send()` can now be used to send and `port_rx.recv()`
     /// to receive.

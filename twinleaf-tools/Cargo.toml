@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf-tools"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 license = "MIT"
 description = "Tools for the Twinleaf I/O protocol for reading data from Twinleaf quantum sensors."
@@ -16,7 +16,7 @@ hdf5 = ["twinleaf/hdf5"]
 crossbeam = "0.8"
 serialport = "4.5"
 toml_edit = {version = "0.25", features = ["parse"]}
-twinleaf = {version = "1.7", path = "../twinleaf" }
+twinleaf = {version = "1.8", path = "../twinleaf" }
 time = {version = "0.3", features = ["local-offset", "macros", "formatting"]}
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
@@ -24,5 +24,11 @@ tui-prompts = "0.6"
 welch-sde = "0.1"
 memmap2 = "0.9"
 indicatif = "0.18"
+console = "0.16"
 chrono = "0.4"
 clap_complete = "4.5"
+eyre = "0.6"
+color-eyre = "0.6"
+termtree = "1"
+nucleo-matcher = "0.3"
+humantime = "2.2"

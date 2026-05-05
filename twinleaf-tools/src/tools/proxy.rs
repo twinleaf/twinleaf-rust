@@ -8,54 +8,8 @@ use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use tio::{proto, proxy};
+use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::tio;
-
-// Unfortunately we cannot access USB details via the serialport module, so
-// we are stuck guessing based on VID/PID. This returns a vector of possible
-// serial ports.
-
-#[derive(Debug)]
-enum TwinleafPortInterface {
-    FTDI,
-    STM32,
-    Unknown(u16, u16),
-}
-
-struct SerialDevice {
-    url: String,
-    ifc: TwinleafPortInterface,
-}
-
-fn enum_devices(all: bool) -> Vec<SerialDevice> {
-    let mut ports: Vec<SerialDevice> = Vec::new();
-
-    if let Ok(avail_ports) = serialport::available_ports() {
-        for p in avail_ports.iter() {
-            if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
-                let interface = match (info.vid, info.pid) {
-                    (0x0403, 0x6015) => TwinleafPortInterface::FTDI,
-                    (0x0483, 0x5740) => TwinleafPortInterface::STM32,
-                    (vid, pid) => {
-                        if !all {
-                            continue;
-                        };
-                        TwinleafPortInterface::Unknown(vid, pid)
-                    }
-                };
-                #[cfg(target_os = "macos")]
-                if p.port_name.starts_with("/dev/tty.") && !all {
-                    continue;
-                }
-                ports.push(SerialDevice {
-                    url: format!("serial://{}", p.port_name),
-                    ifc: interface,
-                });
-            } // else ignore other types for now: bluetooth, pci, unknown
-        }
-    }
-
-    ports
-}
 
 macro_rules! log{
     ($tf:expr, $msg:expr)=>{
@@ -81,60 +35,26 @@ fn create_listener_thread(
             for res in listener.incoming() {
                 match res {
                     Ok(stream) => client_send.send(stream).expect("New client queue full"),
-                    Err(err) => panic!("Error accepting client {:?}", err),
+                    Err(err) => eprintln!("error accepting client: {}", err),
                 };
             }
         })?;
     Ok(())
 }
 
-pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
-    macro_rules! die {
-        ($f:expr,$($a:tt)*) => {
-            die!(format!($f, $($a)*));
-        };
-        ($msg:expr) => {{
-            eprintln!("ERROR: {}", $msg);
-            return Err(());
-        }};
-    }
+pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
+    use color_eyre::{Help, SectionExt};
+    use eyre::bail;
 
-    // Handle --enum mode
+    // Handle --enum mode (deprecated; now delegates to `tio list`)
     if proxy_cli.enumerate {
-        let mut unknown_devices = vec![];
-        let mut found_any = false;
-        for dev in enum_devices(true) {
-            if let TwinleafPortInterface::Unknown(vid, pid) = dev.ifc {
-                unknown_devices.push(format!("{} (vid: {} pid:{})", dev.url, vid, pid));
-            } else {
-                if !found_any {
-                    println!("Possible tio ports:");
-                    found_any = true;
-                }
-                println!(" * {}", dev.url);
-            }
-        }
-        if !found_any {
-            println!("No likely ports found")
-        }
-        if unknown_devices.len() > 0 {
-            println!("Also found these serial ports");
-            for dev in unknown_devices {
-                println!(" * {}", dev);
-            }
-        }
-        return Ok(());
+        return crate::tools::list::list_devices_deprecated(true);
     }
 
-    // Validate sensor_url / --auto combination
-    if proxy_cli.auto && proxy_cli.sensor_url.is_some() {
-        die!(
-            "both --auto and explicit sensor '{}' given",
-            proxy_cli.sensor_url.unwrap()
+    if proxy_cli.auto {
+        eprintln!(
+            "warning: '--auto' is deprecated; running without -s <url> now auto-detects by default"
         );
-    }
-    if !proxy_cli.auto && proxy_cli.sensor_url.is_none() {
-        die!("need sensor url or --auto");
     }
 
     let tcp_port = proxy_cli.port;
@@ -148,42 +68,48 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
     let dump_hb = proxy_cli.dump_hb;
     let tf = proxy_cli.timestamp_format;
 
-    // Determine sensor URL
+    // Determine sensor URL; if none given, auto-detect.
+    let auto_detected = proxy_cli.sensor_url.is_none();
     let sensor_url = if let Some(url) = proxy_cli.sensor_url {
         url
     } else {
         // --auto mode
-        let devices = enum_devices(false);
+        let devices = discovery::enumerate_serial(false);
         let mut valid_urls = Vec::new();
         for dev in devices {
-            match dev.ifc {
-                TwinleafPortInterface::STM32 | TwinleafPortInterface::FTDI => {
+            match dev.interface {
+                PortInterface::STM32 | PortInterface::FTDI => {
                     valid_urls.push(dev.url.clone());
                 }
                 _ => {}
             }
         }
         if valid_urls.len() == 0 {
-            die!("Cannot find any sensor to connect to, specify URL manually")
+            return Err(eyre::eyre!("no sensors detected")
+                .suggestion("specify a URL with -s <url>, or run 'tio list'"));
         }
         if valid_urls.len() > 1 {
-            die!("Too many sensors detected, specify URL manually")
+            eprintln!("multiple sensors detected:");
+            let query_timeout = Duration::from_millis(500);
+            for url in &valid_urls {
+                match discovery::query_name(url, query_timeout) {
+                    Some(name) => eprintln!("  {}  {}", url, name),
+                    None => eprintln!("  {}  (no response)", url),
+                }
+            }
+            return Err(eyre::eyre!("multiple sensors detected, cannot auto-select")
+                .suggestion("specify one with -s <url>"));
         }
         valid_urls[0].clone()
     };
 
-    let subtree =
-        tio::proto::DeviceRoute::from_str(&proxy_cli.subtree).expect("Invalid sensor subtree");
+    let subtree = proxy_cli.subtree;
 
     println!("tio proxy starting:");
     println!(
         "  Sensor: {} {}",
         sensor_url,
-        if proxy_cli.auto {
-            "(auto-detected)"
-        } else {
-            ""
-        }
+        if auto_detected { "(auto-detected)" } else { "" }
     );
     println!("  TCP port: {}", tcp_port);
     println!("  Subtree: {}", subtree);
@@ -238,7 +164,17 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
             )
         };
         if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
-            die!("Failed to start up server: {:?}/{:?}", e1, e2);
+            let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
+                || matches!(e2.kind(), io::ErrorKind::AddrInUse);
+            let err = eyre::eyre!("could not bind TCP port {}: v6={}, v4={}", tcp_port, e1, e2);
+            return Err(if addr_in_use {
+                err.suggestion(format!(
+                    "another 'tio proxy' is likely running on port {}; try --port <N>",
+                    tcp_port
+                ))
+            } else {
+                err
+            });
         }
         new_client
     };
@@ -249,16 +185,18 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
 
     // This is used by the proxy itself to communicate with the device tree.
     // for now only used to receive log messages and dump traffic.
-    let proxy_port = if let Ok(port) = proxy.subtree_full(subtree.clone()) {
-        port
-    } else {
-        die!(
-            "Failed to open port{}",
-            match port_status.iter().last() {
-                Some(status) => format!(": {:?}", status),
-                _ => "".to_string(),
-            }
-        );
+    let proxy_port = match proxy.subtree_full(subtree.clone()) {
+        Ok(port) => port,
+        Err(e) => {
+            let last_status = port_status.iter().last();
+            let err =
+                eyre::Report::new(e).wrap_err(format!("could not open port on {}", sensor_url));
+            return Err(if let Some(status) = last_status {
+                err.with_section(move || format!("{:?}", status).header("Last proxy event:"))
+            } else {
+                err
+            });
+        }
     };
 
     use crossbeam::select;
@@ -357,7 +295,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> Result<(), ()> {
                         }
                     });
                 } else {
-                    die!("Listener thread died unexpectedly");
+                    bail!("listener thread died unexpectedly");
                 }
             }
             recv(port_status) -> status => {

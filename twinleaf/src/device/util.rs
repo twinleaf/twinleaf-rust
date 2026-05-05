@@ -82,6 +82,19 @@ pub fn parse_rpc_spec(meta: u16, name: String) -> RpcDescriptor {
     }
 }
 
+/// When `meta` is `None` (rpc.info failed, or the RPC isn't in any registry)
+/// or when the parsed kind is `Raw` (meta == 0, common for hidden RPCs),
+/// fall back to `String` so a typed arg still gets sent as bytes.
+pub fn resolve_arg_type(meta: Option<u16>, name: &str) -> RpcValueType {
+    let kind = meta
+        .map(|m| parse_rpc_spec(m, name.to_string()).data_kind)
+        .unwrap_or(RpcValueType::String { max_len: None });
+    match kind {
+        RpcValueType::Raw { .. } => RpcValueType::String { max_len: None },
+        other => other,
+    }
+}
+
 pub fn rpc_encode_arg(input: &str, kind: &RpcValueType) -> Result<Vec<u8>, EncodeError> {
     match kind {
         RpcValueType::Unit => {
@@ -266,20 +279,5 @@ pub fn rpc_decode_reply(reply: &[u8], kind: &RpcValueType) -> Result<RpcValue, D
         },
 
         RpcValueType::Raw { .. } => Ok(RpcValue::Bytes(reply.to_vec())),
-    }
-}
-
-pub fn format_rpc_value_for_cli(v: &RpcValue, kind: &RpcValueType) -> String {
-    match (v, kind) {
-        (RpcValue::Unit, _) => "OK".to_string(),
-
-        (RpcValue::Str(s), _) => format!("\"{}\" {:?}", s, s.as_bytes()),
-
-        (RpcValue::U64(n), RpcValueType::Int { signed: false, .. }) => format!("{}", n),
-        (RpcValue::I64(n), RpcValueType::Int { signed: true, .. }) => format!("{}", n),
-        (RpcValue::F64(x), RpcValueType::Float { .. }) => format!("{}", x),
-
-        (RpcValue::Bytes(b), _) => format!("{:?}", b),
-        (other, _) => format!("{:?}", other),
     }
 }

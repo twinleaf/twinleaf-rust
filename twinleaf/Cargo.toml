@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf"
-version = "1.7.1"
+version = "1.8.0"
 edition = "2021"
 license = "MIT"
 description = "Library for working with the Twinleaf I/O protocol and Twinleaf quantum sensors."
@@ -19,7 +19,9 @@ crc = "3.2"
 num_enum = "0.7"
 glob = "0.3"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
-dirs-next = "2.0"
+directories = "6.0"
+thiserror = "2"
+serialport = "4.9"
 
 [dependencies.mio]
 version = "1.0"

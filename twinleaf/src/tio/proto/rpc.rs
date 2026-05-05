@@ -20,33 +20,53 @@ pub struct RpcReplyPayload {
     pub reply: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 #[repr(u16)]
 #[derive(FromPrimitive, IntoPrimitive)]
 pub enum RpcErrorCode {
+    #[error("no error")]
     NoError = 0,
+    #[error("undefined error")]
     Undefined = 1,
+    #[error("RPC not found")]
     NotFound = 2,
+    #[error("malformed request")]
     MalformedRequest = 3,
+    #[error("wrong size args")]
     WrongSizeArgs = 4,
+    #[error("invalid arguments")]
     InvalidArgs = 5,
+    #[error("read-only")]
     ReadOnly = 6,
+    #[error("write-only")]
     WriteOnly = 7,
+    #[error("timeout")]
     Timeout = 8,
+    #[error("device busy")]
     Busy = 9,
+    #[error("wrong device state")]
     WrongDeviceState = 10,
+    #[error("load failed")]
     LoadFailed = 11,
+    #[error("load RPC failed")]
     LoadRpcFailed = 12,
+    #[error("save failed")]
     SaveFailed = 13,
+    #[error("save write failed")]
     SaveWriteFailed = 14,
+    #[error("internal error")]
     Internal = 15,
+    #[error("out of memory")]
     OutOfMemory = 16,
+    #[error("out of range")]
     OutOfRange = 17,
     #[num_enum(catch_all)]
+    #[error("unknown error code {0}")]
     Unknown(u16),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{error}")]
 pub struct RpcErrorPayload {
     pub id: u16,
     pub error: RpcErrorCode,

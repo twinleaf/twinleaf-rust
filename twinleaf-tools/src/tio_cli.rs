@@ -1,11 +1,38 @@
-use clap::{builder::ValueHint, Subcommand, ValueEnum};
+use clap::{
+    builder::{PossibleValuesParser, TypedValueParser, ValueHint},
+    Subcommand, ValueEnum,
+};
 use clap_complete::Shell;
+use twinleaf::device::RpcValueType;
+
+const RPC_TYPE_NAMES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "string",
+];
+
+fn parse_rpc_type(s: &str) -> RpcValueType {
+    match s {
+        "u8" => RpcValueType::Int { signed: false, size: 1 },
+        "u16" => RpcValueType::Int { signed: false, size: 2 },
+        "u32" => RpcValueType::Int { signed: false, size: 4 },
+        "u64" => RpcValueType::Int { signed: false, size: 8 },
+        "i8" => RpcValueType::Int { signed: true, size: 1 },
+        "i16" => RpcValueType::Int { signed: true, size: 2 },
+        "i32" => RpcValueType::Int { signed: true, size: 4 },
+        "i64" => RpcValueType::Int { signed: true, size: 8 },
+        "f32" => RpcValueType::Float { size: 4 },
+        "f64" => RpcValueType::Float { size: 8 },
+        "string" => RpcValueType::String { max_len: None },
+        // PossibleValuesParser validates against RPC_TYPE_NAMES first.
+        _ => unreachable!("possible values already validated"),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "tio",
     version,
-    about = "Twinleaf sensor management and data logging tool", 
+    about = "Twinleaf sensor management and data logging tool",
+    disable_help_subcommand = true,
 )]
 pub struct TioCli {
     #[command(subcommand)]
@@ -14,70 +41,49 @@ pub struct TioCli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-	Proxy(ProxyCli),
-    ///Live sensor data and plot display
-	Monitor {
-		#[command(flatten)]
-		tio: TioOpts,
-		#[arg(short = 'a', long = "all")]
-		all: bool,
-		#[arg(long = "fps", default_value_t = 20)]
-		fps: u32,
-		#[arg(short = 'c', long = "colors")]
-		colors: Option<String>,
-	},
-	Health(HealthCli),
-    ///Bridge Twinleaf sensor data to NMEA TCP stream
-    NmeaProxy{
+    /// List connected devices
+    List {
+        /// Include serial ports with unknown VID/PID
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+    },
+
+    /// Live sensor data display
+    Monitor {
+        #[command(flatten)]
+        tio: TioOpts,
+        #[arg(long = "fps", default_value_t = 20)]
+        fps: u32,
+        #[arg(short = 'c', long = "colors")]
+        colors: Option<String>,
+        /// Routing depth limit (default: unlimited)
+        #[arg(long = "depth")]
+        depth: Option<usize>,
+    },
+
+    /// Live timing and rate diagnostics
+    Health(HealthCli),
+
+    /// Dump raw packets from a device
+    Dump {
         #[command(flatten)]
         tio: TioOpts,
 
-        #[arg(
-            short = 'p',
-            long = "port",
-            default_value = "7800",
-            help = "TCP port to listen on"
-        )]
-        tcp_port: u16,
+        /// Show parsed data samples
+        #[arg(short = 'd', long = "data")]
+        data: bool,
+
+        /// Show metadata on boundaries
+        #[arg(short = 'm', long = "meta")]
+        meta: bool,
+
+        /// Routing depth limit (default: unlimited)
+        #[arg(long = "depth")]
+        depth: Option<usize>,
     },
 
+    /// Log samples to a file
     #[command(args_conflicts_with_subcommands = true)]
-    /// Execute an RPC on the device. See "tio rpc --help" for more options
-    Rpc {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        #[command(subcommand)]
-        subcommands: Option<RPCSubcommands>,
-
-        /// RPC name to execute
-        #[arg(value_hint = ValueHint::Other)]
-        rpc_name: Option<String>,
-
-        /// RPC argument value
-        #[arg(
-            allow_negative_numbers = true,
-            value_name = "ARG",
-            value_hint = ValueHint::Other,
-            help_heading = "RPC Arguments"
-        )]
-        rpc_arg: Option<String>,
-
-        /// RPC request type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
-        #[arg(short = 't', long = "req-type", help_heading = "Type Options")]
-        req_type: Option<String>,
-
-        /// RPC reply type (one of: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string)
-        #[arg(short = 'T', long = "rep-type", help_heading = "Type Options")]
-        rep_type: Option<String>,
-
-        /// Enable debug output
-        #[arg(short = 'd', long)]
-        debug: bool,
-    },
-
-    #[command(args_conflicts_with_subcommands = true)]
-    /// Log samples to a file (includes metadata by default) See "tio log --help" for more options
     Log {
         #[command(flatten)]
         tio: TioOpts,
@@ -100,54 +106,75 @@ pub enum Commands {
         /// Routing depth (only used in --raw mode)
         #[arg(long = "depth")]
         depth: Option<usize>,
-    },
-    /// Reroute metadata packets in a metadata file
-    MetaReroute {
-        /// Input metadata file path
-        input: String,
 
-        /// New device route (e.g., /0/1)
-        #[arg(short = 's', long = "sensor")]
-        route: String,
-
-        /// Output metadata file path (defaults to <input>_rerouted.tio)
-        #[arg(short = 'o', long = "output")]
-        output: Option<String>,
+        /// Stop after this wall-clock duration (e.g. 30s, 5m, 2h)
+        #[arg(long, value_parser = humantime::parse_duration)]
+        duration: Option<std::time::Duration>,
     },
-    #[command(args_conflicts_with_subcommands = true)]
-    /// Dump data from a live device
-    Dump {
+
+    /// Execute a device RPC
+    #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
+    Rpc {
         #[command(flatten)]
         tio: TioOpts,
 
         #[command(subcommand)]
-        subcommands: Option<DumpSubcommands>,
+        subcommands: Option<RPCSubcommands>,
 
-        /// Show parsed data samples
-        #[arg(short = 'd', long = "data")]
-        data: bool,
+        /// RPC name to execute
+        #[arg(value_hint = ValueHint::Other)]
+        rpc_name: Option<String>,
 
-        /// Show metadata on boundaries
-        #[arg(short = 'm', long = "meta")]
-        meta: bool,
+        /// RPC argument value
+        #[arg(
+            allow_negative_numbers = true,
+            value_name = "ARG",
+            value_hint = ValueHint::Other,
+            help_heading = "RPC Arguments"
+        )]
+        rpc_arg: Option<String>,
 
-        /// Routing depth limit (default: unlimited)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
+        /// RPC request type
+        #[arg(
+            short = 't',
+            long = "req-type",
+            value_parser = PossibleValuesParser::new(RPC_TYPE_NAMES).map(|s: String| parse_rpc_type(&s)),
+            help_heading = "Type Options",
+        )]
+        req_type: Option<RpcValueType>,
+
+        /// RPC reply type
+        #[arg(
+            short = 'T',
+            long = "rep-type",
+            value_parser = PossibleValuesParser::new(RPC_TYPE_NAMES).map(|s: String| parse_rpc_type(&s)),
+            help_heading = "Type Options",
+        )]
+        rep_type: Option<RpcValueType>,
+
+        /// Enable debug output
+        #[arg(short = 'd', long)]
+        debug: bool,
     },
+
     /// Upgrade device firmware
-    FirmwareUpgrade {
+    #[command(alias = "firmware-upgrade")]
+    Upgrade {
         #[command(flatten)]
         tio: TioOpts,
 
         /// Input firmware image path
-        #[arg(value_hint = ValueHint::FilePath)]
-        firmware_path: String,
+        #[arg(value_hint = ValueHint::FilePath, value_parser = parse_existing_file)]
+        firmware_path: PathBuf,
 
         /// Skip confirmation prompt
         #[arg(short = 'y', long = "yes")]
         yes: bool,
     },
+
+    /// Multiplex a sensor over TCP
+    Proxy(ProxyCli),
+
     /// Generate shell completions for tio
     #[command(long_about = "\
 Generate shell completions for tio.
@@ -195,10 +222,14 @@ pub enum RPCSubcommands{
 
 #[derive(Subcommand, Debug)]
 pub enum LogSubcommands{
-    /// Log metadata to a file
-    Metadata {
+    /// Log metadata to a file. See "tio log meta --help" for more options
+    #[command(args_conflicts_with_subcommands = true)]
+    Meta {
         #[command(flatten)]
         tio: TioOpts,
+
+        #[command(subcommand)]
+        subcommands: Option<MetaSubcommands>,
 
         /// Output metadata file path
         #[arg(short = 'f', default_value = "meta.tio")]
@@ -208,6 +239,7 @@ pub enum LogSubcommands{
     /// Dump data from binary log file(s)
     Dump {
         /// Input log file(s)
+        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
         files: Vec<String>,
 
         /// Show parsed data samples
@@ -227,16 +259,17 @@ pub enum LogSubcommands{
         depth: Option<usize>,
     },
 
-    /// Dump parsed data from binary log file(s) [DEPRECATED: use log-dump -d]
-    #[command(hide = true)]
-    DataDump {
+    /// Summarize the contents of binary log file(s)
+    Inspect {
         /// Input log file(s)
+        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
         files: Vec<String>,
     },
 
     /// Convert binary log data to CSV
     Csv {
         /// Stream ID/name and input .tio files (order-independent)
+        #[arg(value_hint = ValueHint::FilePath)]
         args: Vec<String>,
 
         /// Sensor route in the device tree (default: /)
@@ -249,8 +282,10 @@ pub enum LogSubcommands{
     },
 
     /// Convert binary log files to HDF5 format
+    #[command(alias = "hdf5")]
     Hdf {
         /// Input log file(s)
+        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
         files: Vec<String>,
 
         /// Output file path (defaults to input filename with .h5 extension)
@@ -280,26 +315,20 @@ pub enum LogSubcommands{
 }
 
 #[derive(Subcommand, Debug)]
-pub enum DumpSubcommands{
-    /// Dump data samples from the device [DEPRECATED: use dump -d -s <ROUTE>]
-    #[command(hide = true)]
-    Data {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
+pub enum MetaSubcommands {
+    /// Reroute metadata packets in a metadata file
+    Reroute {
+        /// Input metadata file path
+        #[arg(value_hint = ValueHint::FilePath)]
+        input: String,
 
-    /// Dump data samples from all devices in the tree [DEPRECATED: use dump -a -d]
-    #[command(hide = true)]
-    DataAll {
-        #[command(flatten)]
-        tio: TioOpts,
-    },
+        /// New device route (e.g., /0/1)
+        #[arg(short = 's', long = "sensor")]
+        route: String,
 
-    /// Dump device metadata [DEPRECATED: use dump -m -s <ROUTE>]
-    #[command(hide = true)]
-    Meta {
-        #[command(flatten)]
-        tio: TioOpts,
+        /// Output metadata file path (defaults to <input>_rerouted.tio)
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
     },
 }
 
@@ -477,11 +506,15 @@ fn nonneg_f64(s: &str) -> Result<f64, String> {
 #[command(
     name = "tio-proxy",
     version,
-    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP"
+    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP",
+    args_conflicts_with_subcommands = true,
 )]
 pub struct ProxyCli {
-    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0)
-    /// Required unless --auto or --enum is specified
+    #[command(subcommand)]
+    pub subcommands: Option<ProxySubcommands>,
+
+    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single connected device
+    #[arg(value_hint = ValueHint::Url)]
     sensor_url: Option<String>,
 
     /// TCP port to listen on for clients
@@ -493,8 +526,13 @@ pub struct ProxyCli {
     kick_slow: bool,
 
     /// Sensor subtree to look at
-    #[arg(short = 's', long = "subtree", default_value = "/")]
-    subtree: String,
+    #[arg(
+        short = 's',
+        long = "subtree",
+        default_value = "/",
+        value_parser = parse_device_route,
+    )]
+    subtree: DeviceRoute,
 
     /// Verbose output
     #[arg(short = 'v', long)]
@@ -528,10 +566,24 @@ pub struct ProxyCli {
     #[arg(long)]
     dump_hb: bool,
 
-    #[arg(short = 'a', long = "auto")]
+    /// Deprecated; running without -s <url> now auto-detects by default.
+    #[arg(short = 'a', long = "auto", hide = true)]
     auto: bool,
 
-    /// Enumerate all serial devices, then quit
-    #[arg(short = 'e', long = "enumerate", name = "enum")]
+    /// Deprecated; use `tio list` instead.
+    #[arg(short = 'e', long = "enumerate", name = "enum", hide = true)]
     enumerate: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProxySubcommands {
+    /// Bridge Twinleaf sensor data to NMEA TCP stream
+    Nmea {
+        #[command(flatten)]
+        tio: TioOpts,
+
+        /// TCP port to listen on
+        #[arg(short = 'p', long = "port", default_value = "7800")]
+        tcp_port: u16,
+    },
 }

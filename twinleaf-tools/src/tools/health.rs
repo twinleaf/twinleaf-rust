@@ -6,9 +6,12 @@
 // Build: cargo run --release -- <tio-url> [route] [options]
 // Quit:  q / Ctrl-C
 
+use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq};
+use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
+use crate::tui::tree_worker::spawn_tree_worker;
 use crate::HealthCli;
 use chrono::{DateTime, Local};
-use crossbeam::channel;
+use crossbeam::channel::{self, Sender};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout},
@@ -24,7 +27,7 @@ use std::{
 };
 use twinleaf::{
     data::BoundaryReason,
-    device::{DeviceEvent, DeviceTree, TreeEvent, TreeItem},
+    device::{DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{identifiers::StreamKey, DeviceRoute},
@@ -241,9 +244,29 @@ impl StreamStats {
         self.current_session_id = Some(session_id);
     }
 
-    fn is_stale(&self, now: Instant, stale_dur: Duration) -> bool {
+    fn reset_all(&mut self) {
+        self.reset_timing();
+        self.rate_slope.reset();
+        self.received_count = 0;
+        self.rate_smps = 0.0;
+        self.host_epoch = None;
+        self.samples_dropped = 0;
+    }
+
+    // floor of stale_dur
+    fn stale_threshold(&self, floor: Duration) -> Duration {
+        if self.rate_slope.n >= 2 && self.rate_smps > 0.0 {
+            let period = Duration::from_secs_f64(2.0 / self.rate_smps);
+            std::cmp::max(floor, period)
+        } else {
+            floor
+        }
+    }
+
+    fn is_stale(&self, now: Instant, floor: Duration) -> bool {
+        let threshold = self.stale_threshold(floor);
         self.last_seen
-            .map(|t| now.duration_since(t) > stale_dur)
+            .map(|t| now.duration_since(t) > threshold)
             .unwrap_or(true)
     }
 }
@@ -253,6 +276,12 @@ struct LoggedEvent {
     timestamp: SystemTime,
     event: String,
     color: Color,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Command,
 }
 
 enum Action {
@@ -266,6 +295,11 @@ enum Action {
     PageDown,
     ScrollHome,
     ScrollEnd,
+    SetMode(Mode),
+    ExecuteRpc(RpcReq),
+    SelectRoute(DeviceRoute),
+    ResetStats,
+    ClearLog,
 }
 
 struct App {
@@ -285,6 +319,12 @@ struct App {
     ppm_warn: f64,
     ppm_err: f64,
     quiet: bool,
+    mode: Mode,
+    palette: RpcPalette,
+    palette_route: Option<DeviceRoute>,
+    rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
+    footer_height: u16,
+    session_start: Instant,
 }
 
 impl App {
@@ -306,7 +346,26 @@ impl App {
             ppm_warn: cli.ppm_warn,
             ppm_err: cli.ppm_err,
             quiet: cli.quiet,
+            mode: Mode::Normal,
+            palette: RpcPalette::default(),
+            palette_route: None,
+            rpc_registries: HashMap::new(),
+            footer_height: 0,
+            session_start: Instant::now(),
         }
+    }
+
+    fn active_route<'a>(&'a self, root_route: &'a DeviceRoute) -> &'a DeviceRoute {
+        self.palette_route.as_ref().unwrap_or(root_route)
+    }
+
+    fn available_routes(&self, root_route: &DeviceRoute) -> Vec<DeviceRoute> {
+        let mut routes: Vec<DeviceRoute> = self.device_states.keys().cloned().collect();
+        if !routes.contains(root_route) {
+            routes.push(root_route.clone());
+        }
+        routes.sort();
+        routes
     }
 
     fn log_event(&mut self, msg: String, color: Color) {
@@ -448,11 +507,12 @@ impl App {
         }
     }
 
-    fn handle_event(&mut self, event: TreeEvent, now: Instant) {
+    fn handle_event(&mut self, event: TreeEvent, now: Instant, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.device_states.entry(route.clone()).or_default();
                 self.log_event(format!("[{}] ROUTE DISCOVERED", route), Color::Green);
+                let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
             }
             TreeEvent::Device {
                 route,
@@ -509,7 +569,7 @@ impl App {
 
     fn tick(&mut self, now: Instant) {
         for (_key, st) in self.stats.iter_mut() {
-            if st.is_stale(now, self.stale_dur) && st.drift_slope.n > 0 {
+            if st.is_stale(now, self.stale_dur) && st.rate_slope.n >= 2 {
                 st.reset_timing();
                 st.rate_slope.reset();
                 st.received_count = 0;
@@ -519,7 +579,12 @@ impl App {
         }
     }
 
-    fn update(&mut self, action: Action) -> bool {
+    fn update(
+        &mut self,
+        action: Action,
+        root_route: &DeviceRoute,
+        rpc_tx: &Sender<RpcWorkerReq>,
+    ) -> bool {
         let total = self.filtered_event_count();
         let display_count = self.event_display_lines;
         match action {
@@ -553,8 +618,45 @@ impl App {
                     self.event_scroll_offset = total.saturating_sub(display_count);
                 }
             }
+            Action::SetMode(Mode::Command) => {
+                let active = self.active_route(root_route).clone();
+                let registry = self.rpc_registries.get(&active);
+                self.palette.enter(registry);
+                self.mode = Mode::Command;
+            }
+            Action::SetMode(Mode::Normal) => {
+                self.mode = Mode::Normal;
+                self.palette.exit();
+            }
+            Action::ExecuteRpc(req) => {
+                let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
+            }
+            Action::SelectRoute(route) => {
+                self.palette_route = Some(route.clone());
+                let registry = self.rpc_registries.get(&route);
+                self.palette.update_suggestions(registry);
+            }
+            Action::ResetStats => {
+                for st in self.stats.values_mut() {
+                    st.reset_all();
+                }
+            }
+            Action::ClearLog => {
+                self.event_log.clear();
+                self.event_scroll_offset = 0;
+            }
         }
         false
+    }
+
+    fn update_rpclists(&mut self, list: RpcList) {
+        let route = list.route.clone();
+        let registry = RpcRegistry::from(&list);
+        self.rpc_registries.insert(route.clone(), registry);
+        if self.mode == Mode::Command {
+            let registry = self.rpc_registries.get(&route);
+            self.palette.update_suggestions(registry);
+        }
     }
 }
 
@@ -645,8 +747,9 @@ impl DisplayRow {
 
 fn draw_ui(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    app: &App,
+    app: &mut App,
     cli: &HealthCli,
+    root_route: &DeviceRoute,
 ) -> io::Result<()> {
     let now = Instant::now();
 
@@ -688,6 +791,12 @@ fn draw_ui(
     let event_display_lines = app.event_display_lines as u16;
     let quiet = app.quiet;
 
+    let in_command = app.mode == Mode::Command;
+    let palette_rows = app.palette.suggestion_rows();
+    let active_route = app.active_route(root_route).clone();
+    let registry_ready = app.rpc_registries.contains_key(&active_route);
+    let session_str = indicatif::FormattedDuration(app.session_start.elapsed()).to_string();
+
     terminal.draw(|f| {
         let size = f.area();
         let event_block_height = if app.event_log.is_empty() {
@@ -695,7 +804,15 @@ fn draw_ui(
         } else {
             event_display_lines + 2
         };
-        let footer_height = if quiet { 0 } else { 1 };
+        let footer_height = if in_command {
+            // palette footer: suggestion block (rows + 2 borders) + 1 result + 2 input
+            palette_rows + 5
+        } else if quiet {
+            0
+        } else {
+            1
+        };
+        app.footer_height = footer_height;
         let heartbeat_height = if show_heartbeat { 1 } else { 0 };
 
         let chunks = Layout::default()
@@ -711,8 +828,8 @@ fn draw_ui(
 
         // Header
         let header_text = format!(
-            "tio health — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
-            cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
+            "tio health ({}) — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
+            session_str, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
         );
         f.render_widget(
             Paragraph::new(header_text).style(Style::default().add_modifier(Modifier::BOLD)),
@@ -818,8 +935,12 @@ fn draw_ui(
             );
         }
 
-        // Footer
-        if !quiet {
+        // Footer: RPC palette when in Command mode, keybind hints otherwise
+        if in_command {
+            let registry = app.rpc_registries.get(&active_route);
+            app.palette
+                .render(f, chunks[4], &active_route, registry, registry_ready, false);
+        } else if !quiet {
             let heartbeat_hint = if show_heartbeat {
                 "h:hide heartbeat"
             } else {
@@ -833,7 +954,7 @@ fn draw_ui(
             };
             f.render_widget(
                 Paragraph::new(format!(
-                    "q/Ctrl+C to quit  |  {}  {}  {}  |  ↑/↓/PgUp/PgDn to scroll",
+                    "q to quit  |  : RPC  |  {}  {}  {}  |  r:reset  c:clear log  |  ↑/↓/PgUp/PgDn",
                     heartbeat_hint, drift_hint, time_hint
                 ))
                 .style(Style::default().fg(Color::Gray)),
@@ -844,59 +965,81 @@ fn draw_ui(
     Ok(())
 }
 
-fn get_action(ev: Event) -> Option<Action> {
+fn get_action(ev: Event, app: &mut App, root_route: &DeviceRoute) -> Option<Action> {
     let Event::Key(k) = ev else { return None };
     if k.kind != KeyEventKind::Press {
         return None;
     }
-    if k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL {
+    if k.code == KeyCode::Char('c')
+        && k.modifiers == KeyModifiers::CONTROL
+        && app.mode == Mode::Normal
+    {
         return Some(Action::Quit);
     }
-    match k.code {
-        KeyCode::Char('q') => Some(Action::Quit),
-        KeyCode::Char('h') => Some(Action::ToggleHeartbeat),
-        KeyCode::Char('p') => Some(Action::TogglePpm),
-        KeyCode::Char('s') => Some(Action::ToggleSampleTime),
-        KeyCode::Up => Some(Action::ScrollUp),
-        KeyCode::Down => Some(Action::ScrollDown),
-        KeyCode::PageUp => Some(Action::PageUp),
-        KeyCode::PageDown => Some(Action::PageDown),
-        KeyCode::Home => Some(Action::ScrollHome),
-        KeyCode::End => Some(Action::ScrollEnd),
-        _ => None,
+    match app.mode {
+        Mode::Command => {
+            let active = app.active_route(root_route).clone();
+            let registry = app.rpc_registries.get(&active);
+            let routes = app.available_routes(root_route);
+            match app
+                .palette
+                .handle_key(k, registry, &active, &routes, app.footer_height)
+            {
+                PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
+                PaletteEvent::SelectRoute(r) => Some(Action::SelectRoute(r)),
+                PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
+                PaletteEvent::Consumed => None,
+            }
+        }
+        Mode::Normal => match k.code {
+            KeyCode::Char(':') => Some(Action::SetMode(Mode::Command)),
+            KeyCode::Char('q') => Some(Action::Quit),
+            KeyCode::Char('h') => Some(Action::ToggleHeartbeat),
+            KeyCode::Char('p') => Some(Action::TogglePpm),
+            KeyCode::Char('s') => Some(Action::ToggleSampleTime),
+            KeyCode::Char('r') => Some(Action::ResetStats),
+            KeyCode::Char('c') => Some(Action::ClearLog),
+            KeyCode::Up => Some(Action::ScrollUp),
+            KeyCode::Down => Some(Action::ScrollDown),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Home => Some(Action::ScrollHome),
+            KeyCode::End => Some(Action::ScrollEnd),
+            _ => None,
+        },
     }
 }
 
-pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
+pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
     let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&health_cli.tio.root);
-    let root_route = health_cli.tio.parse_route();
+    let root_route = health_cli.tio.route.clone();
 
-    let tree = match DeviceTree::open(&proxy, root_route) {
+    let tree = match DeviceTree::open(&proxy, root_route.clone()) {
         Ok(t) => t,
         Err(e) => {
             ratatui::restore();
-            eprintln!("Failed to open device tree: {:?}", e);
-            std::process::exit(1);
+            return Err(eyre::Report::new(e).wrap_err(format!(
+                "could not open device tree on {}",
+                health_cli.tio.root
+            )));
         }
     };
 
-    // Data thread
-    let (data_tx, data_rx) = channel::unbounded();
-    std::thread::spawn(move || {
-        let mut tree = tree;
-        loop {
-            match tree.next_item() {
-                Ok(item) => {
-                    if data_tx.send(item).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
+    let rpc_client = match RpcClient::open(&proxy, root_route.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            ratatui::restore();
+            return Err(eyre::Report::new(e).wrap_err(format!(
+                "could not open RPC client on {}",
+                health_cli.tio.root
+            )));
         }
-    });
+    };
+    let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
+
+    let data_rx = spawn_tree_worker(tree);
 
     // Key thread
     let (key_tx, key_rx) = channel::unbounded();
@@ -920,7 +1063,7 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
                         app.handle_sample(sample, route, now);
                     }
                     Ok(TreeItem::Event(event)) => {
-                        app.handle_event(event, now);
+                        app.handle_event(event, now, &rpc_tx);
                     }
                     Err(_) => break 'main,
                 }
@@ -928,9 +1071,27 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
 
             recv(key_rx) -> ev => {
                 if let Ok(ev) = ev {
-                    if let Some(action) = get_action(ev) {
-                        if app.update(action) {
+                    if let Some(action) = get_action(ev, &mut app, &root_route) {
+                        if app.update(action, &root_route, &rpc_tx) {
                             break 'main;
+                        }
+                    }
+                }
+            }
+
+            recv(rpc_resp_rx) -> resp => {
+                if let Ok(resp) = resp {
+                    match resp {
+                        RpcWorkerResp::List(list) => app.update_rpclists(list),
+                        RpcWorkerResp::RpcResult(res) => {
+                            let (msg, col) = match res.result {
+                                Ok(s) => (
+                                    format!("{}: {}", app.palette.last_rpc_command(), s),
+                                    Color::Green,
+                                ),
+                                Err(s) => (format!("ERR: {}", s), Color::Red),
+                            };
+                            app.palette.set_rpc_result(msg, col);
                         }
                     }
                 }
@@ -938,7 +1099,7 @@ pub fn run_health(health_cli: HealthCli) -> Result<(), ()> {
 
             recv(ui_tick) -> _ => {
                 app.tick(Instant::now());
-                if draw_ui(&mut terminal, &app, &health_cli).is_err() {
+                if draw_ui(&mut terminal, &mut app, &health_cli, &root_route).is_err() {
                     break 'main;
                 }
             }
