@@ -10,7 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcReq};
+use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq};
+use crate::tui::rpc_state::RouteRpcState;
 use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
 use crate::tui::tree_worker::spawn_tree_worker;
 use crate::TioOpts;
@@ -28,7 +29,7 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{DeviceEvent, DeviceTree, RpcClient, RpcList, RpcRegistry, TreeEvent, TreeItem},
+    device::{DeviceEvent, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{
@@ -449,7 +450,7 @@ pub struct App {
     pub window_aligned: Option<AlignedWindow>,
 
     pub footer_height: u16,
-    pub rpc_registries: HashMap<DeviceRoute, RpcRegistry>,
+    pub rpc_routes: HashMap<DeviceRoute, RouteRpcState>,
     pub palette: RpcPalette,
     pub blink_state: bool,
     pub last_blink: Instant,
@@ -470,10 +471,24 @@ impl App {
             device_metadata: HashMap::new(),
             window_aligned: None,
             footer_height: 0,
-            rpc_registries: HashMap::new(),
+            rpc_routes: HashMap::new(),
             palette: RpcPalette::default(),
             blink_state: true,
             last_blink: Instant::now(),
+        }
+    }
+
+    fn rpc_palette_status(&self, route: &DeviceRoute) -> RpcPaletteStatus {
+        self.rpc_routes
+            .get(route)
+            .map(RouteRpcState::palette_status)
+            .unwrap_or(RpcPaletteStatus::WaitingForRpc)
+    }
+
+    fn update_palette_suggestions_for(&mut self, route: &DeviceRoute) {
+        if self.mode == Mode::Command && self.current_route() == *route {
+            let registry = self.rpc_routes.get(route).and_then(RouteRpcState::registry);
+            self.palette.update_suggestions(registry);
         }
     }
 
@@ -482,7 +497,10 @@ impl App {
             Action::Quit => return true,
             Action::SetMode(Mode::Command) => {
                 let route = self.current_route();
-                let registry = self.rpc_registries.get(&route);
+                let registry = self
+                    .rpc_routes
+                    .get(&route)
+                    .and_then(RouteRpcState::registry);
                 self.palette.enter(registry);
                 self.mode = Mode::Command;
             }
@@ -498,7 +516,10 @@ impl App {
                 if let Some(idx) = self.nav_items.iter().position(|p| p.route() == &route) {
                     self.nav.idx = idx;
                 }
-                let registry = self.rpc_registries.get(&route);
+                let registry = self
+                    .rpc_routes
+                    .get(&route)
+                    .and_then(RouteRpcState::registry);
                 self.palette.update_suggestions(registry);
             }
             Action::NavUp => {
@@ -574,12 +595,19 @@ impl App {
 
     fn update_rpclists(&mut self, list: RpcList) {
         let route = list.route.clone();
-        let registry = RpcRegistry::from(&list);
-        self.rpc_registries.insert(route.clone(), registry);
-        if self.mode == Mode::Command && self.current_route() == route {
-            let registry = self.rpc_registries.get(&route);
-            self.palette.update_suggestions(registry);
-        }
+        self.rpc_routes
+            .entry(route.clone())
+            .or_default()
+            .on_fetch_success(&list);
+        self.update_palette_suggestions_for(&route);
+    }
+
+    fn update_rpclist_error(&mut self, route: DeviceRoute, error: String) {
+        self.rpc_routes
+            .entry(route.clone())
+            .or_default()
+            .on_fetch_error(error);
+        self.update_palette_suggestions_for(&route);
     }
 
     pub fn visible_routes(&self) -> Vec<DeviceRoute> {
@@ -687,31 +715,55 @@ impl App {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.discovered_routes.insert(route.clone());
-                let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                if self
+                    .rpc_routes
+                    .entry(route.clone())
+                    .or_default()
+                    .on_route_discovered()
+                {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                }
                 self.device_status.entry(route).or_default();
             }
             TreeEvent::Device {
                 route,
                 event: DeviceEvent::NewHash(hash),
             } => {
-                match (self.rpc_registries.get(&route), hash) {
-                    (Some(reg), Some(hash)) if reg.hash == Some(hash) => {}
-                    _ => {
-                        self.rpc_registries.remove(&route);
-                        let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
-                    }
-                };
+                if self
+                    .rpc_routes
+                    .entry(route.clone())
+                    .or_default()
+                    .on_new_hash(hash)
+                {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
+                }
             }
             TreeEvent::Device {
                 route,
-                event: DeviceEvent::Heartbeat { .. },
+                event: DeviceEvent::Heartbeat { session_id },
             } => {
+                if self
+                    .rpc_routes
+                    .entry(route.clone())
+                    .or_default()
+                    .on_heartbeat(session_id)
+                {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                }
                 self.device_status.entry(route).or_default().on_heartbeat();
             }
             TreeEvent::Device {
                 route,
                 event: DeviceEvent::Status(status),
             } => {
+                if self
+                    .rpc_routes
+                    .entry(route.clone())
+                    .or_default()
+                    .on_status(status)
+                {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                }
                 let dev_status = self.device_status.entry(route.clone()).or_default();
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
@@ -900,7 +952,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
         match app.mode {
             Mode::Command => {
                 let route = app.current_route();
-                let registry = app.rpc_registries.get(&route);
+                let registry = app.rpc_routes.get(&route).and_then(RouteRpcState::registry);
                 let routes = app.visible_routes();
                 match app
                     .palette
@@ -1220,10 +1272,10 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     app.footer_height = area.height; // how many lines the footer has to work with
     if app.mode == Mode::Command {
         let route = app.current_route();
-        let registry_ready = app.rpc_registries.contains_key(&route);
-        let registry = app.rpc_registries.get(&route);
+        let status = app.rpc_palette_status(&route);
+        let registry = app.rpc_routes.get(&route).and_then(RouteRpcState::registry);
         app.palette
-            .render(f, area, &route, registry, registry_ready, app.blink_state);
+            .render(f, area, &route, registry, status, app.blink_state);
         return;
     }
 
@@ -1755,6 +1807,9 @@ pub fn run_monitor(
                     match resp {
                         RpcWorkerResp::List(list) => {
                             app.update_rpclists(list);
+                        }
+                        RpcWorkerResp::ListErr { route, error } => {
+                            app.update_rpclist_error(route, error);
                         }
                         RpcWorkerResp::RpcResult(res) => {
                             let (msg, col) = match res.result {

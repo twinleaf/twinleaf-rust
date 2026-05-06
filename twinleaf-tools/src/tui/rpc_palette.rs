@@ -40,6 +40,17 @@ pub struct RpcResp {
     pub result: Result<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcPaletteStatus {
+    Ready,
+    Fetching,
+    Refreshing,
+    Disconnected,
+    WaitingForRpc,
+    Failed,
+    FailedUsingPrevious,
+}
+
 /// Outcome of [`RpcPalette::handle_key`]. The host interprets this to decide
 /// whether to dispatch an RPC, switch routes, exit palette mode, or do nothing.
 pub enum PaletteEvent {
@@ -427,7 +438,7 @@ impl RpcPalette {
         area: Rect,
         route: &DeviceRoute,
         registry: Option<&RpcRegistry>,
-        registry_ready: bool,
+        status: RpcPaletteStatus,
         blink: bool,
     ) {
         let footer_height = area.height;
@@ -529,7 +540,7 @@ impl RpcPalette {
                         Line::from(" Enter | ← clear ").right_aligned(),
                     )
                 } else {
-                    let items: Vec<Line> = if registry_ready {
+                    let items: Vec<Line> = if registry.is_some() {
                         let visible_rows = self.visible_rows(footer_height);
                         let start = self.effective_scroll(visible_rows);
                         let end = if visible_rows == 0 {
@@ -548,7 +559,7 @@ impl RpcPalette {
                     } else {
                         vec![Line::from(vec![
                             Span::styled(spinner_frame(blink), Style::default().fg(Color::Cyan)),
-                            Span::raw(" Generating RPC list..."),
+                            Span::raw(format!(" {}", status.loading_message())),
                         ])]
                     };
                     let rows = if items.is_empty() {
@@ -559,7 +570,7 @@ impl RpcPalette {
                     (
                         rows,
                         Line::from(" RPCs ").left_aligned(),
-                        Line::from(" ↑ | ↓ | ^R ").right_aligned(),
+                        Line::from(status.title_right()).right_aligned(),
                     )
                 };
 
@@ -594,6 +605,7 @@ impl RpcPalette {
         let user_input = self.input_state.value();
         let cursor_idx = self.input_state.position().min(user_input.len());
         let zone = self.current_zone();
+        let picking_route = self.route_picker.is_some();
 
         // The first space acts as the rpc/arg boundary; render it as a visible
         // separator and style anything after it distinctly.
@@ -605,10 +617,19 @@ impl RpcPalette {
             .add_modifier(Modifier::BOLD);
 
         let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(
-            format!("[{}] ", route),
-            Style::default().fg(Color::Blue),
-        ));
+        let display_route = self
+            .route_picker
+            .as_ref()
+            .and_then(|picker| picker.routes.get(picker.selected))
+            .unwrap_or(route);
+        let route_style = if picking_route {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Blue)
+        };
+        spans.push(Span::styled(format!("[{}] ", display_route), route_style));
 
         // Cursor is REVERSED on, plain off — so it actually blinks.
         let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
@@ -625,14 +646,14 @@ impl RpcPalette {
                 };
                 (ch.to_string(), s)
             };
-            let style = if is_cursor && blink {
+            let style = if is_cursor && blink && !picking_route {
                 base.patch(cursor_style)
             } else {
                 base
             };
             spans.push(Span::styled(text, style));
         }
-        if cursor_idx >= user_input.len() {
+        if cursor_idx >= user_input.len() && !picking_route {
             let style = if blink {
                 cursor_style
             } else {
@@ -652,6 +673,7 @@ impl RpcPalette {
                     None => " Argument ".to_string(),
                 }
             }
+            _ if picking_route => " Route ".to_string(),
             _ => " RPC ".to_string(),
         };
 
@@ -920,6 +942,38 @@ impl RpcPalette {
         self.input_state.focus();
         self.undo_stack.clear();
         self.update_suggestions(registry);
+    }
+}
+
+impl RpcPaletteStatus {
+    fn loading_message(self) -> &'static str {
+        match self {
+            RpcPaletteStatus::Ready => "",
+            RpcPaletteStatus::Fetching => "Generating RPC list...",
+            RpcPaletteStatus::Refreshing => "Refreshing RPC list...",
+            RpcPaletteStatus::Disconnected => "Device disconnected",
+            RpcPaletteStatus::WaitingForRpc => "Waiting for RPCs...",
+            RpcPaletteStatus::Failed => "RPC list unavailable",
+            RpcPaletteStatus::FailedUsingPrevious => "RPC list failed; using previous list",
+        }
+    }
+
+    fn title_right(self) -> String {
+        let status = match self {
+            RpcPaletteStatus::Ready => "",
+            RpcPaletteStatus::Fetching => "Generating",
+            RpcPaletteStatus::Refreshing => "Refreshing",
+            RpcPaletteStatus::Disconnected => "Disconnected",
+            RpcPaletteStatus::WaitingForRpc => "Waiting",
+            RpcPaletteStatus::Failed => "Unavailable",
+            RpcPaletteStatus::FailedUsingPrevious => "Using previous",
+        };
+
+        if status.is_empty() {
+            " ↑ | ↓ | ^R ".to_string()
+        } else {
+            format!(" {} | ↑ | ↓ | ^R ", status)
+        }
     }
 }
 

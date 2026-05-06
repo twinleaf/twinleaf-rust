@@ -22,6 +22,7 @@ pub enum RpcWorkerReq {
 
 pub enum RpcWorkerResp {
     List(RpcList),
+    ListErr { route: DeviceRoute, error: String },
     RpcResult(RpcResp),
 }
 
@@ -67,7 +68,10 @@ pub fn spawn_rpc_worker(client: RpcClient) -> (Sender<RpcWorkerReq>, Receiver<Rp
             let resp = match req {
                 RpcWorkerReq::FetchList(route) => match client.rpc_list(&route) {
                     Ok(list) => Some(RpcWorkerResp::List(list)),
-                    Err(_) => None,
+                    Err(err) => Some(RpcWorkerResp::ListErr {
+                        route,
+                        error: err.to_string(),
+                    }),
                 },
                 RpcWorkerReq::Execute(rpc_req) => {
                     let result = exec_rpc(&client, &rpc_req);
