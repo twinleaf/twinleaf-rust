@@ -1,129 +1,28 @@
 use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
-    health::run_health,
+    health::{run_health, HealthConfig},
     list::list_devices,
-    monitor::run_monitor,
+    monitor::{run_monitor, MonitorConfig},
     proxy::run_proxy,
-    proxy_nmea::run_nmea_proxy,
     tio_test::run_test,
-    tool::{
-        dump, firmware_upgrade, list_rpcs, log, log_csv, log_dump, log_hdf, log_inspect,
-        log_metadata, meta_reroute, rpc, rpc_dump,
-    },
+    tool::{run_dump, run_log, run_rpc, run_upgrade},
 };
-use twinleaf_tools::{
-    Commands, LogSubcommands, MetaSubcommands, ProxySubcommands, RPCSubcommands, TioCli,
-};
+use twinleaf_tools::{Commands, TioCli};
 
 fn main() -> eyre::Result<()> {
-    color_eyre::config::HookBuilder::default()
-        .display_env_section(false)
-        .display_location_section(false)
-        .install()?;
+    twinleaf_tools::install_error_handler()?;
     let cli = TioCli::parse();
 
     match cli.command {
         Commands::List { all } => list_devices(all),
-        Commands::Proxy(mut proxy_cli) => match proxy_cli.subcommands.take() {
-            Some(ProxySubcommands::Nmea { tio, tcp_port }) => run_nmea_proxy(tio, tcp_port),
-            None => run_proxy(proxy_cli),
-        },
+        Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
         Commands::Test(test_cli) => run_test(test_cli),
-        Commands::Monitor {
-            tio,
-            fps,
-            colors,
-            depth,
-        } => run_monitor(tio, fps, colors, depth),
-        Commands::Health(health_cli) => run_health(health_cli),
-        Commands::Rpc {
-            tio,
-            subcommands,
-            rpc_name,
-            rpc_arg,
-            req_type,
-            rep_type,
-            debug,
-        } => match subcommands {
-            Some(RPCSubcommands::List { tio }) => list_rpcs(&tio),
-            Some(RPCSubcommands::Dump {
-                tio,
-                rpc_name,
-                capture,
-            }) => rpc_dump(&tio, rpc_name, capture),
-            None => rpc(
-                &tio,
-                rpc_name.unwrap_or("".to_string()),
-                rpc_arg,
-                req_type,
-                rep_type,
-                debug,
-            ),
-        },
-        Commands::Dump {
-            tio,
-            data,
-            meta,
-            depth,
-        } => dump(&tio, data, meta, depth),
-        Commands::Log {
-            tio,
-            subcommands,
-            file,
-            unbuffered,
-            raw,
-            depth,
-            duration,
-        } => match subcommands {
-            Some(LogSubcommands::Meta {
-                tio,
-                subcommands,
-                file,
-            }) => match subcommands {
-                Some(MetaSubcommands::Reroute {
-                    input,
-                    route,
-                    output,
-                }) => meta_reroute(input, route, output),
-                None => log_metadata(&tio, file),
-            },
-            Some(LogSubcommands::Dump {
-                files,
-                data,
-                meta,
-                sensor,
-                depth,
-            }) => log_dump(files, data, meta, sensor, depth),
-            Some(LogSubcommands::Inspect { files }) => log_inspect(files),
-            Some(LogSubcommands::Csv {
-                args,
-                sensor,
-                output,
-            }) => log_csv(args, sensor, output),
-            Some(LogSubcommands::Hdf {
-                files,
-                output,
-                filter,
-                compress,
-                debug,
-                split_level,
-                split_policy,
-            }) => log_hdf(
-                files,
-                output,
-                filter,
-                compress,
-                debug,
-                split_level,
-                split_policy,
-            ),
-            None => log(&tio, file, unbuffered, raw, depth, duration),
-        },
-        Commands::Upgrade {
-            tio,
-            firmware_path,
-            yes,
-        } => firmware_upgrade(&tio, firmware_path, yes),
+        Commands::Monitor(monitor_cli) => run_monitor(MonitorConfig::from(monitor_cli)),
+        Commands::Health(health_cli) => run_health(HealthConfig::from(health_cli)),
+        Commands::Rpc(rpc_cli) => run_rpc(rpc_cli),
+        Commands::Dump(dump_cli) => run_dump(dump_cli),
+        Commands::Log(log_cli) => run_log(log_cli),
+        Commands::Upgrade(upgrade_cli) => run_upgrade(upgrade_cli),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut TioCli::command(), "tio", &mut std::io::stdout());
             Ok(())

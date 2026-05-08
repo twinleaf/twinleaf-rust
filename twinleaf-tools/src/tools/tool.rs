@@ -3,8 +3,10 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
 
-use crate::TioOpts;
-use crate::{SplitLevel, SplitPolicy};
+use crate::{
+    DumpCli, LogCli, LogSubcommands, MetaSubcommands, RPCSubcommands, RpcCli, SplitLevel,
+    SplitPolicy, TioOpts, UpgradeCli,
+};
 use tio::proto::DeviceRoute;
 use tio::proxy;
 use tio::util;
@@ -52,6 +54,88 @@ fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
         }
     }
     eprintln!("Hint: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.");
+}
+
+pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
+    match rpc_cli.subcommands {
+        Some(RPCSubcommands::List { tio }) => list_rpcs(&tio),
+        Some(RPCSubcommands::Dump {
+            tio,
+            rpc_name,
+            capture,
+        }) => rpc_dump(&tio, rpc_name, capture),
+        None => rpc(
+            &rpc_cli.tio,
+            rpc_cli.rpc_name.unwrap_or("".to_string()),
+            rpc_cli.rpc_arg,
+            rpc_cli.req_type,
+            rpc_cli.rep_type,
+            rpc_cli.debug,
+        ),
+    }
+}
+
+pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
+    dump(&dump_cli.tio, dump_cli.data, dump_cli.meta, dump_cli.depth)
+}
+
+pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
+    match log_cli.subcommands {
+        Some(LogSubcommands::Meta {
+            tio,
+            subcommands,
+            file,
+        }) => match subcommands {
+            Some(MetaSubcommands::Reroute {
+                input,
+                route,
+                output,
+            }) => meta_reroute(input, route, output),
+            None => log_metadata(&tio, file),
+        },
+        Some(LogSubcommands::Dump {
+            files,
+            data,
+            meta,
+            sensor,
+            depth,
+        }) => log_dump(files, data, meta, sensor, depth),
+        Some(LogSubcommands::Inspect { files }) => log_inspect(files),
+        Some(LogSubcommands::Csv {
+            args,
+            sensor,
+            output,
+        }) => log_csv(args, sensor, output),
+        Some(LogSubcommands::Hdf {
+            files,
+            output,
+            filter,
+            compress,
+            debug,
+            split_level,
+            split_policy,
+        }) => log_hdf(
+            files,
+            output,
+            filter,
+            compress,
+            debug,
+            split_level,
+            split_policy,
+        ),
+        None => log(
+            &log_cli.tio,
+            log_cli.file,
+            log_cli.unbuffered,
+            log_cli.raw,
+            log_cli.depth,
+            log_cli.duration,
+        ),
+    }
+}
+
+pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
+    firmware_upgrade(&upgrade_cli.tio, upgrade_cli.firmware_path, upgrade_cli.yes)
 }
 
 pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
@@ -1160,7 +1244,7 @@ pub fn log_hdf(
     split_level: SplitLevel,
     split_policy: SplitPolicy,
 ) -> eyre::Result<()> {
-    use eyre::{bail, WrapErr};
+    use eyre::WrapErr;
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
     use std::collections::HashMap;

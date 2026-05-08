@@ -3,13 +3,57 @@
 //! Multiplexes access to a sensor, exposing the functionality of tio::proxy
 //! via TCP.
 
-use crate::ProxyCli;
+use crate::{ProxyCli, ProxySubcommands};
 use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use tio::{proto, proxy};
 use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::tio;
+
+pub struct ProxyConfig {
+    tcp_port: u16,
+    reconnect_timeout: Duration,
+    disconnect_slow: bool,
+    verbose: bool,
+    debugging: bool,
+    dump_traffic: bool,
+    dump_data: bool,
+    dump_meta: bool,
+    dump_hb: bool,
+    timestamp_format: String,
+    sensor_url: Option<String>,
+    subtree: proto::DeviceRoute,
+    auto: bool,
+    enumerate: bool,
+}
+
+impl From<ProxyCli> for ProxyConfig {
+    fn from(proxy_cli: ProxyCli) -> Self {
+        Self {
+            tcp_port: proxy_cli.port,
+            reconnect_timeout: Duration::from_secs(proxy_cli.reconnect_timeout),
+            disconnect_slow: proxy_cli.kick_slow,
+            verbose: proxy_cli.verbose,
+            debugging: proxy_cli.debug,
+            dump_traffic: proxy_cli.dump,
+            dump_data: proxy_cli.dump_data,
+            dump_meta: proxy_cli.dump_meta,
+            dump_hb: proxy_cli.dump_hb,
+            timestamp_format: proxy_cli.timestamp_format,
+            sensor_url: proxy_cli.sensor_url,
+            subtree: proxy_cli.subtree,
+            auto: proxy_cli.auto,
+            enumerate: proxy_cli.enumerate,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProxyState {
+    _clients: usize,
+    _dropped_packets: usize,
+}
 
 macro_rules! log{
     ($tf:expr, $msg:expr)=>{
@@ -42,35 +86,36 @@ fn create_listener_thread(
     Ok(())
 }
 
-pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
+pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
     use color_eyre::{Help, SectionExt};
     use eyre::bail;
 
     // Handle --enum mode (deprecated; now delegates to `tio list`)
-    if proxy_cli.enumerate {
+    if config.enumerate {
         return crate::tools::list::list_devices_deprecated(true);
     }
 
-    if proxy_cli.auto {
+    if config.auto {
         eprintln!(
             "warning: '--auto' is deprecated; running without -s <url> now auto-detects by default"
         );
     }
 
-    let tcp_port = proxy_cli.port;
-    let reconnect_timeout = Duration::from_secs(proxy_cli.reconnect_timeout);
-    let disconnect_slow = proxy_cli.kick_slow;
-    let verbose = proxy_cli.verbose;
-    let debugging = proxy_cli.debug;
-    let dump_traffic = proxy_cli.dump;
-    let dump_data = proxy_cli.dump_data;
-    let dump_meta = proxy_cli.dump_meta;
-    let dump_hb = proxy_cli.dump_hb;
-    let tf = proxy_cli.timestamp_format;
+    let tcp_port = config.tcp_port;
+    let reconnect_timeout = config.reconnect_timeout;
+    let disconnect_slow = config.disconnect_slow;
+    let verbose = config.verbose;
+    let debugging = config.debugging;
+    let dump_traffic = config.dump_traffic;
+    let dump_data = config.dump_data;
+    let dump_meta = config.dump_meta;
+    let dump_hb = config.dump_hb;
+    let tf = config.timestamp_format;
+    let mut _state = ProxyState::default();
 
     // Determine sensor URL; if none given, auto-detect.
-    let auto_detected = proxy_cli.sensor_url.is_none();
-    let sensor_url = if let Some(url) = proxy_cli.sensor_url {
+    let auto_detected = config.sensor_url.is_none();
+    let sensor_url = if let Some(url) = config.sensor_url {
         url
     } else {
         // --auto mode
@@ -103,7 +148,7 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
         valid_urls[0].clone()
     };
 
-    let subtree = proxy_cli.subtree;
+    let subtree = config.subtree;
 
     println!("tio proxy starting:");
     println!(
@@ -360,4 +405,13 @@ pub fn run_proxy(proxy_cli: ProxyCli) -> eyre::Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
+    match proxy_cli.subcommands.take() {
+        Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
+            crate::tools::proxy_nmea::run_nmea_proxy(tio, tcp_port)
+        }
+        None => run_proxy_server(ProxyConfig::from(proxy_cli)),
+    }
 }

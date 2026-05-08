@@ -14,8 +14,7 @@ use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq
 use crate::tui::rpc_state::RouteRpcState;
 use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
 use crate::tui::tree_worker::spawn_tree_worker;
-use crate::TioOpts;
-use clap::Parser;
+use crate::{MonitorCli, TioOpts};
 use crossbeam::channel::{self, Sender};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -49,19 +48,6 @@ const MONITOR_BUFFER_CAPACITY_SAMPLES: usize = 2_000_000;
 const WELCH_DEFAULT_SEGMENTS: usize = 4;
 const WELCH_DEFAULT_OVERLAP: f64 = 0.5;
 const WELCH_DFT_MAX_SIZE: usize = 4096;
-
-#[derive(Parser, Debug)]
-#[command(name = "tio-monitor", version, about = "Display live sensor data")]
-struct Cli {
-    #[command(flatten)]
-    tio: TioOpts,
-    #[arg(short = 'a', long = "all")]
-    all: bool,
-    #[arg(long = "fps", default_value_t = 20)]
-    fps: u32,
-    #[arg(short = 'c', long = "colors")]
-    colors: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 pub enum NavPos {
@@ -385,6 +371,25 @@ pub struct ViewConfig {
     pub theme: Theme,
 }
 
+#[derive(Debug, Clone)]
+pub struct MonitorConfig {
+    pub tio: TioOpts,
+    pub fps: u32,
+    pub colors: Option<String>,
+    pub depth: Option<usize>,
+}
+
+impl From<MonitorCli> for MonitorConfig {
+    fn from(cli: MonitorCli) -> Self {
+        Self {
+            tio: cli.tio,
+            fps: cli.fps,
+            colors: cli.colors,
+            depth: cli.depth,
+        }
+    }
+}
+
 impl Default for ViewConfig {
     fn default() -> Self {
         Self {
@@ -434,7 +439,7 @@ pub enum FftStatus {
     },
 }
 
-pub struct App {
+pub struct MonitorState {
     pub depth_limit: Option<usize>,
     pub parent_route: DeviceRoute,
     pub mode: Mode,
@@ -456,7 +461,7 @@ pub struct App {
     pub last_blink: Instant,
 }
 
-impl App {
+impl MonitorState {
     pub fn new(depth_limit: Option<usize>, parent_route: &DeviceRoute) -> Self {
         Self {
             depth_limit,
@@ -944,7 +949,7 @@ impl App {
     }
 }
 
-fn get_action(ev: Event, app: &mut App) -> Option<Action> {
+fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
     if let Event::Key(k) = ev {
         if k.kind != KeyEventKind::Press {
             return None;
@@ -999,7 +1004,7 @@ fn get_action(ev: Event, app: &mut App) -> Option<Action> {
     }
 }
 
-fn draw_ui(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), io::Error> {
+fn draw_ui(terminal: &mut DefaultTerminal, app: &mut MonitorState) -> Result<(), io::Error> {
     terminal.draw(|f| {
         let size = f.area();
         let height = size.height;
@@ -1058,7 +1063,7 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), io::Erro
     Ok(())
 }
 
-fn render_monitor_panel(f: &mut Frame, app: &mut App, area: Rect, now: Instant) {
+fn render_monitor_panel(f: &mut Frame, app: &mut MonitorState, area: Rect, now: Instant) {
     let inner = Rect {
         x: area.x,
         y: area.y,
@@ -1126,7 +1131,10 @@ fn stale_threshold(sample: &Sample) -> Duration {
     Duration::from_millis((period_ms * 2.0).max(1200.0) as u64)
 }
 
-fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap<usize, usize>) {
+fn build_left_lines(
+    app: &mut MonitorState,
+    now: Instant,
+) -> (Vec<Line<'static>>, HashMap<usize, usize>) {
     let mut lines = Vec::new();
     let mut map = HashMap::new();
 
@@ -1268,7 +1276,7 @@ fn build_left_lines(app: &mut App, now: Instant) -> (Vec<Line<'static>>, HashMap
     (lines, map)
 }
 
-fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_footer(f: &mut Frame, app: &mut MonitorState, area: Rect) {
     app.footer_height = area.height; // how many lines the footer has to work with
     if app.mode == Mode::Command {
         let route = app.current_route();
@@ -1445,7 +1453,7 @@ fn latest_complete_welch_signal(signal: &[f64]) -> (&[f64], usize, usize) {
     )
 }
 
-fn render_graphics_panel(f: &mut Frame, app: &App, area: Rect) {
+fn render_graphics_panel(f: &mut Frame, app: &MonitorState, area: Rect) {
     if let (Some(pos), Some((desc, units))) = (app.current_pos(), app.get_focused_channel_info()) {
         let route = pos.route();
         if app.view.show_fft {
@@ -1732,13 +1740,15 @@ fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
     it.get(k)
         .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
 }
-pub fn run_monitor(
-    tio: TioOpts,
-    fps: u32,
-    colors: Option<String>,
-    depth: Option<usize>,
-) -> eyre::Result<()> {
+pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
     use eyre::WrapErr;
+
+    let MonitorConfig {
+        tio,
+        fps,
+        colors,
+        depth,
+    } = config;
 
     let proxy = tio::proxy::Interface::new(&tio.root);
     let parent_route: DeviceRoute = tio.route.clone();
@@ -1761,8 +1771,8 @@ pub fn run_monitor(
         }
     });
 
-    // App state — subtree visible by default; limit with --depth.
-    let mut app = App::new(depth, &parent_route);
+    // Runtime state: subtree visible by default; limit with --depth.
+    let mut app = MonitorState::new(depth, &parent_route);
     if let Some(path) = &colors {
         if let Ok(theme) = load_theme(path) {
             app.view.theme = theme;

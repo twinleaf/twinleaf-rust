@@ -1,12 +1,20 @@
 use clap::Parser;
 use std::path::PathBuf;
-use std::time::Duration;
 use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
+pub mod cli;
 pub mod tools;
 pub mod tui;
-include!("tio_cli.rs");
+
+pub use cli::*;
+
+pub fn install_error_handler() -> eyre::Result<()> {
+    color_eyre::config::HookBuilder::default()
+        .display_env_section(false)
+        .display_location_section(false)
+        .install()
+}
 
 fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
     DeviceRoute::from_str(s).map_err(|_| format!("invalid sensor route: {s:?}"))

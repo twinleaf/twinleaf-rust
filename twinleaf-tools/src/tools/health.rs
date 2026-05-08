@@ -303,7 +303,41 @@ enum Action {
     ClearLog,
 }
 
-struct App {
+#[derive(Debug, Clone)]
+pub struct HealthConfig {
+    tio: crate::TioOpts,
+    jitter_window: u64,
+    event_log_size: usize,
+    event_display_lines: u16,
+    warnings_only: bool,
+    stale_dur: Duration,
+    ppm_warn: f64,
+    ppm_err: f64,
+    streams: Option<Vec<u8>>,
+    quiet: bool,
+    fps: u64,
+}
+
+impl From<HealthCli> for HealthConfig {
+    fn from(cli: HealthCli) -> Self {
+        let stale_dur = cli.stale_dur();
+        Self {
+            tio: cli.tio,
+            jitter_window: cli.jitter_window,
+            event_log_size: cli.event_log_size as usize,
+            event_display_lines: cli.event_display_lines,
+            warnings_only: cli.warnings_only,
+            stale_dur,
+            ppm_warn: cli.ppm_warn,
+            ppm_err: cli.ppm_err,
+            streams: cli.streams,
+            quiet: cli.quiet,
+            fps: cli.fps,
+        }
+    }
+}
+
+struct HealthState {
     stats: BTreeMap<StreamKey, StreamStats>,
     device_states: HashMap<DeviceRoute, DeviceState>,
     event_log: VecDeque<LoggedEvent>,
@@ -328,8 +362,8 @@ struct App {
     session_start: Instant,
 }
 
-impl App {
-    fn new(cli: &HealthCli) -> Self {
+impl HealthState {
+    fn new(config: &HealthConfig) -> Self {
         Self {
             stats: BTreeMap::new(),
             device_states: HashMap::new(),
@@ -338,15 +372,15 @@ impl App {
             show_heartbeat: false,
             show_ppm: true,
             show_sample_time: true,
-            streams_filter: cli.streams.clone(),
-            jitter_window_s: cli.jitter_window,
-            event_log_cap: cli.event_log_size as usize,
-            event_display_lines: cli.event_display_lines as usize,
-            warnings_only: cli.warnings_only,
-            stale_dur: cli.stale_dur(),
-            ppm_warn: cli.ppm_warn,
-            ppm_err: cli.ppm_err,
-            quiet: cli.quiet,
+            streams_filter: config.streams.clone(),
+            jitter_window_s: config.jitter_window,
+            event_log_cap: config.event_log_size,
+            event_display_lines: config.event_display_lines as usize,
+            warnings_only: config.warnings_only,
+            stale_dur: config.stale_dur,
+            ppm_warn: config.ppm_warn,
+            ppm_err: config.ppm_err,
+            quiet: config.quiet,
             mode: Mode::Normal,
             palette: RpcPalette::default(),
             palette_route: None,
@@ -811,8 +845,8 @@ impl DisplayRow {
 
 fn draw_ui(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    cli: &HealthCli,
+    app: &mut HealthState,
+    config: &HealthConfig,
     root_route: &DeviceRoute,
 ) -> io::Result<()> {
     let now = Instant::now();
@@ -893,7 +927,12 @@ fn draw_ui(
         // Header
         let header_text = format!(
             "tio health ({}) — jitter={}s  warn/err={}/{}ppm  fps={}  stale={}ms",
-            session_str, cli.jitter_window, cli.ppm_warn, cli.ppm_err, cli.fps, cli.stale_ms
+            session_str,
+            config.jitter_window,
+            config.ppm_warn,
+            config.ppm_err,
+            config.fps,
+            config.stale_dur.as_millis()
         );
         f.render_widget(
             Paragraph::new(header_text).style(Style::default().add_modifier(Modifier::BOLD)),
@@ -1032,7 +1071,7 @@ fn draw_ui(
     Ok(())
 }
 
-fn get_action(ev: Event, app: &mut App, root_route: &DeviceRoute) -> Option<Action> {
+fn get_action(ev: Event, app: &mut HealthState, root_route: &DeviceRoute) -> Option<Action> {
     let Event::Key(k) = ev else { return None };
     if k.kind != KeyEventKind::Press {
         return None;
@@ -1080,20 +1119,18 @@ fn get_action(ev: Event, app: &mut App, root_route: &DeviceRoute) -> Option<Acti
     }
 }
 
-pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
+pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
     let mut terminal = ratatui::init();
 
-    let proxy = tio::proxy::Interface::new(&health_cli.tio.root);
-    let root_route = health_cli.tio.route.clone();
+    let proxy = tio::proxy::Interface::new(&config.tio.root);
+    let root_route = config.tio.route.clone();
 
     let tree = match DeviceTree::open(&proxy, root_route.clone()) {
         Ok(t) => t,
         Err(e) => {
             ratatui::restore();
-            return Err(eyre::Report::new(e).wrap_err(format!(
-                "could not open device tree on {}",
-                health_cli.tio.root
-            )));
+            return Err(eyre::Report::new(e)
+                .wrap_err(format!("could not open device tree on {}", config.tio.root)));
         }
     };
 
@@ -1101,10 +1138,8 @@ pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
         Ok(c) => c,
         Err(e) => {
             ratatui::restore();
-            return Err(eyre::Report::new(e).wrap_err(format!(
-                "could not open RPC client on {}",
-                health_cli.tio.root
-            )));
+            return Err(eyre::Report::new(e)
+                .wrap_err(format!("could not open RPC client on {}", config.tio.root)));
         }
     };
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
@@ -1121,8 +1156,8 @@ pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
         }
     });
 
-    let mut app = App::new(&health_cli);
-    let ui_tick = channel::tick(Duration::from_millis(1000 / health_cli.fps));
+    let mut app = HealthState::new(&config);
+    let ui_tick = channel::tick(Duration::from_millis(1000 / config.fps));
 
     'main: loop {
         crossbeam::select! {
@@ -1172,7 +1207,7 @@ pub fn run_health(health_cli: HealthCli) -> eyre::Result<()> {
 
             recv(ui_tick) -> _ => {
                 app.tick(Instant::now());
-                if draw_ui(&mut terminal, &mut app, &health_cli, &root_route).is_err() {
+                if draw_ui(&mut terminal, &mut app, &config, &root_route).is_err() {
                     break 'main;
                 }
             }
