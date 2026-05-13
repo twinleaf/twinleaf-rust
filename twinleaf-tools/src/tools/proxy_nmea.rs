@@ -1,4 +1,4 @@
-use crate::TioOpts;
+use crate::{ProxyHelp, TioOpts};
 use clap::Parser;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -103,7 +103,8 @@ pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
         if let Ok(stream) = connection {
             let device = proxy
                 .device_full(route.clone())
-                .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
+                .wrap_err_with(|| format!("could not open device at {}", tio.root))
+                .with_proxy_help()?;
             thread::spawn(move || broadcast_to_client(stream, device));
         }
     }

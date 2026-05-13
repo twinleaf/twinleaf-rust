@@ -10,7 +10,7 @@ use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq
 use crate::tui::rpc_state::RouteRpcState;
 use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
 use crate::tui::tree_worker::spawn_tree_worker;
-use crate::HealthCli;
+use crate::{HealthCli, ProxyHelp};
 use chrono::{DateTime, Local};
 use crossbeam::channel::{self, Sender};
 use ratatui::{
@@ -1120,28 +1120,28 @@ fn get_action(ev: Event, app: &mut HealthState, root_route: &DeviceRoute) -> Opt
 }
 
 pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
+    use eyre::WrapErr;
+
     let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&config.tio.root);
     let root_route = config.tio.route.clone();
 
-    let tree = match DeviceTree::open(&proxy, root_route.clone()) {
-        Ok(t) => t,
-        Err(e) => {
+    let tree = DeviceTree::open(&proxy, root_route.clone())
+        .map_err(|e| {
             ratatui::restore();
-            return Err(eyre::Report::new(e)
-                .wrap_err(format!("could not open device tree on {}", config.tio.root)));
-        }
-    };
+            eyre::Report::new(e)
+        })
+        .wrap_err_with(|| format!("could not open device tree on {}", config.tio.root))
+        .with_proxy_help()?;
 
-    let rpc_client = match RpcClient::open(&proxy, root_route.clone()) {
-        Ok(c) => c,
-        Err(e) => {
+    let rpc_client = RpcClient::open(&proxy, root_route.clone())
+        .map_err(|e| {
             ratatui::restore();
-            return Err(eyre::Report::new(e)
-                .wrap_err(format!("could not open RPC client on {}", config.tio.root)));
-        }
-    };
+            eyre::Report::new(e)
+        })
+        .wrap_err_with(|| format!("could not open RPC client on {}", config.tio.root))
+        .with_proxy_help()?;
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
 
     let data_rx = spawn_tree_worker(tree);

@@ -14,7 +14,7 @@ use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq
 use crate::tui::rpc_state::RouteRpcState;
 use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
 use crate::tui::tree_worker::spawn_tree_worker;
-use crate::{MonitorCli, TioOpts};
+use crate::{MonitorCli, ProxyHelp, TioOpts};
 use crossbeam::channel::{self, Sender};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -1754,11 +1754,13 @@ pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
     let parent_route: DeviceRoute = tio.route.clone();
 
     let tree = DeviceTree::open(&proxy, parent_route.clone())
-        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
+        .with_proxy_help()?;
     let data_rx = spawn_tree_worker(tree);
 
     let rpc_client = RpcClient::open(&proxy, parent_route.clone())
-        .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))
+        .with_proxy_help()?;
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
 
     // Key thread

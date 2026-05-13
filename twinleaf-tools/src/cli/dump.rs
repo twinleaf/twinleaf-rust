@@ -1,4 +1,5 @@
 use clap::Args;
+use std::time::Duration;
 
 use crate::TioOpts;
 
@@ -18,4 +19,8 @@ pub struct DumpCli {
     /// Routing depth limit (default: unlimited)
     #[arg(long = "depth")]
     pub depth: Option<usize>,
+
+    /// Stop after this wall-clock duration (e.g. 30s, 5m, 2h)
+    #[arg(long, value_parser = humantime::parse_duration)]
+    pub duration: Option<Duration>,
 }

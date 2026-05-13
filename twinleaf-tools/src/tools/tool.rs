@@ -4,8 +4,8 @@ use std::fs::OpenOptions;
 use std::io::prelude::*;
 
 use crate::{
-    DumpCli, LogCli, LogSubcommands, MetaSubcommands, RPCSubcommands, RpcCli, SplitLevel,
-    SplitPolicy, TioOpts, UpgradeCli,
+    DumpCli, LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, RPCSubcommands, RpcCli,
+    SplitLevel, SplitPolicy, TioOpts, UpgradeCli,
 };
 use tio::proto::DeviceRoute;
 use tio::proxy;
@@ -30,30 +30,37 @@ fn record_missing_metadata(
     }
 }
 
-fn report_missing_metadata(mut routes: Vec<DeviceRoute>, is_error: bool) {
+fn report_missing_metadata(mut routes: Vec<DeviceRoute>) {
     if routes.is_empty() {
         return;
     }
     routes.sort();
-    let prefix = if is_error { "Error" } else { "Warning" };
-    if routes.len() == 1 {
-        eprintln!(
-            "{}: stream data at route {} could not be parsed because metadata is missing or incompatible.",
-            prefix, routes[0]
-        );
-    } else {
-        eprintln!(
-            "{}: stream data at these routes could not be parsed because metadata is missing or incompatible:",
-            prefix
-        );
-        for route in routes.iter().take(5) {
-            eprintln!("  {}", route);
+    crate::multi_progress().suspend(|| {
+        use console::style;
+        let warning = style("Warning").yellow().bold();
+        let suggestion = style("Suggestion").yellow().bold();
+        if routes.len() == 1 {
+            eprintln!(
+                "{}: stream data at route {} could not be parsed because metadata is missing or incompatible.",
+                warning, routes[0]
+            );
+        } else {
+            eprintln!(
+                "{}: stream data at these routes could not be parsed because metadata is missing or incompatible:",
+                warning
+            );
+            for route in routes.iter().take(5) {
+                eprintln!("  {}", route);
+            }
+            if routes.len() > 5 {
+                eprintln!("  ... and {} more", routes.len() - 5);
+            }
         }
-        if routes.len() > 5 {
-            eprintln!("  ... and {} more", routes.len() - 5);
-        }
-    }
-    eprintln!("Hint: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.");
+        eprintln!(
+            "{}: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.",
+            suggestion
+        );
+    });
 }
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
@@ -76,7 +83,13 @@ pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
 }
 
 pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
-    dump(&dump_cli.tio, dump_cli.data, dump_cli.meta, dump_cli.depth)
+    dump(
+        &dump_cli.tio,
+        dump_cli.data,
+        dump_cli.meta,
+        dump_cli.depth,
+        dump_cli.duration,
+    )
 }
 
 pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
@@ -144,7 +157,8 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
     let rpc_client = RpcClient::open(&proxy, route.clone())
-        .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))
+        .with_proxy_help()?;
     let rpcs = rpc_client
         .rpc_list(&route)
         .wrap_err("failed to query RPC list")?;
@@ -186,7 +200,8 @@ pub fn rpc(
     let route = tio.route.clone();
     let device = proxy
         .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))
+        .with_proxy_help()?;
 
     let req_type = req_type.or_else(|| {
         rpc_arg
@@ -250,7 +265,8 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
     let route = tio.route.clone();
     let device = proxy
         .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))
+        .with_proxy_help()?;
 
     if is_capture {
         let trigger_rpc_name = rpc_name[..rpc_name.len() - 6].to_string() + ".trigger";
@@ -289,8 +305,15 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
     Ok(())
 }
 
-pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre::Result<()> {
+pub fn dump(
+    tio: &TioOpts,
+    data: bool,
+    meta: bool,
+    depth: Option<usize>,
+    duration: Option<std::time::Duration>,
+) -> eyre::Result<()> {
     use eyre::WrapErr;
+    use std::time::Instant;
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
@@ -298,14 +321,21 @@ pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre
 
     let port = proxy
         .new_port(None, route.clone(), port_depth, true, true)
-        .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open port on {}", tio.root))
+        .with_proxy_help()?;
 
-    eprintln!("Dumping from {} (route {})...", tio.root, route);
+    let started = Instant::now();
+    let duration_elapsed = || duration.is_some_and(|d| started.elapsed() >= d);
+
+    log::info!("dumping from {} (route {})", tio.root, route);
 
     match (data, meta) {
         // Raw mode (no flags): dump all packets
         (false, false) => {
             for pkt in port.iter() {
+                if duration_elapsed() {
+                    break;
+                }
                 let abs_pkt = tio::Packet {
                     routing: route.absolute_route(&pkt.routing),
                     ..pkt
@@ -317,6 +347,9 @@ pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre
         // Metadata-only mode (-m): filter to metadata packets
         (false, true) => {
             for pkt in port.iter() {
+                if duration_elapsed() {
+                    break;
+                }
                 if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
                     let abs_route = route.absolute_route(&pkt.routing);
                     print_metadata_payload(&abs_route, mp);
@@ -328,20 +361,25 @@ pub fn dump(tio: &TioOpts, data: bool, meta: bool, depth: Option<usize>) -> eyre
         (true, _) => {
             let mut tree = DeviceTree::new(port, route.clone());
 
-            loop {
+            while !duration_elapsed() {
                 match tree.next() {
                     Ok((sample, sample_route)) => {
                         print_sample(&sample, Some(&sample_route), meta, true);
                     }
                     Err(e) => {
-                        return Err(eyre::Report::new(e).wrap_err("device stream ended"));
+                        return Err(eyre::Report::new(e).wrap_err("stream ended"));
                     }
                 }
             }
         }
     }
 
-    Ok(())
+    if duration_elapsed() {
+        log::info!("duration elapsed");
+        Ok(())
+    } else {
+        Err(eyre::eyre!("stream ended"))
+    }
 }
 
 fn print_sample(
@@ -395,6 +433,16 @@ fn print_metadata_payload(route: &DeviceRoute, payload: &tio::proto::MetadataPay
         }
     }
 }
+fn ensure_open<'a>(fo: &'a mut Option<File>, path: &str) -> eyre::Result<&'a mut File> {
+    use eyre::WrapErr;
+    if fo.is_none() {
+        *fo = Some(
+            File::create(path).wrap_err_with(|| format!("could not create log file {}", path))?,
+        );
+    }
+    Ok(fo.as_mut().unwrap())
+}
+
 pub fn log(
     tio: &TioOpts,
     file: String,
@@ -425,7 +473,7 @@ pub fn log(
         ),
         None => "{spinner} [{elapsed_precise}] {decimal_bytes} → {msg}".to_string(),
     };
-    let pb = ProgressBar::new_spinner();
+    let pb = crate::multi_progress().add(ProgressBar::new_spinner());
     pb.set_style(ProgressStyle::with_template(&template).unwrap());
     pb.enable_steady_tick(Duration::from_millis(100));
 
@@ -458,10 +506,10 @@ pub fn log(
         let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
         let port = proxy
             .new_port(None, route.clone(), port_depth, true, true)
-            .wrap_err_with(|| format!("could not open port on {}", tio.root))?;
+            .wrap_err_with(|| format!("could not open port on {}", tio.root))
+            .with_proxy_help()?;
 
-        let mut file_out =
-            File::create(&file).wrap_err_with(|| format!("could not create log file {}", file))?;
+        let mut file_out: Option<File> = None;
 
         for pkt in port.iter() {
             if duration_elapsed() {
@@ -474,32 +522,51 @@ pub fn log(
             let serialized = abs_pkt
                 .serialize()
                 .map_err(|_| eyre::eyre!("failed to serialize packet for log"))?;
-            file_out
-                .write_all(&serialized)
+            let f = ensure_open(&mut file_out, &file)?;
+            f.write_all(&serialized)
                 .wrap_err_with(|| format!("failed to write {}", file))?;
             bytes_written += serialized.len() as u64;
             pb.set_position(bytes_written);
             pb.set_message(render_msg(samples_dropped));
             if unbuffered {
-                file_out
-                    .flush()
+                f.flush()
                     .wrap_err_with(|| format!("failed to flush {}", file))?;
             }
         }
         pb.finish_and_clear();
-        return Ok(());
+        if duration_elapsed() {
+            if bytes_written == 0 {
+                log::info!("no data received");
+            } else {
+                log::info!("wrote {} bytes to {}", bytes_written, file);
+            }
+            return Ok(());
+        } else if bytes_written == 0 {
+            return Err(eyre::eyre!("stream ended; no data received"));
+        } else {
+            return Err(eyre::eyre!(
+                "stream ended after writing {} bytes to {}",
+                bytes_written,
+                file
+            ));
+        }
     }
 
     let mut devs = DeviceTree::open(&proxy, route.clone())
-        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
+        .with_proxy_help()?;
 
-    let mut file_out =
-        File::create(&file).wrap_err_with(|| format!("could not create log file {}", file))?;
+    let mut file_out: Option<File> = None;
 
-    let write_packet = |pkt: tio::Packet, f: &mut File, b: &mut u64| {
-        let serialized = pkt.serialize().unwrap();
-        let _ = f.write_all(&serialized);
+    let write_packet = |pkt: tio::Packet, fo: &mut Option<File>, b: &mut u64| -> eyre::Result<()> {
+        let serialized = pkt
+            .serialize()
+            .map_err(|_| eyre::eyre!("failed to serialize packet for log"))?;
+        let f = ensure_open(fo, &file)?;
+        f.write_all(&serialized)
+            .wrap_err_with(|| format!("failed to write {}", file))?;
         *b += serialized.len() as u64;
+        Ok(())
     };
 
     loop {
@@ -511,29 +578,36 @@ pub fn log(
                 for (sample, sample_route) in batch {
                     if let Some(b) = &sample.boundary {
                         if let BoundaryReason::SamplesLost { expected, received } = b.reason {
-                            samples_dropped += received.wrapping_sub(expected) as u64;
+                            let count = received.wrapping_sub(expected);
+                            samples_dropped += count as u64;
+                            log::warn!(
+                                "{}/{} dropped {} samples",
+                                sample_route,
+                                sample.stream.name,
+                                count
+                            );
                         }
                         write_packet(
                             sample.device.make_update_with_route(sample_route.clone()),
                             &mut file_out,
                             &mut bytes_written,
-                        );
+                        )?;
                         write_packet(
                             sample.stream.make_update_with_route(sample_route.clone()),
                             &mut file_out,
                             &mut bytes_written,
-                        );
+                        )?;
                         write_packet(
                             sample.segment.make_update_with_route(sample_route.clone()),
                             &mut file_out,
                             &mut bytes_written,
-                        );
+                        )?;
                         for col in &sample.columns {
                             write_packet(
                                 col.desc.make_update_with_route(sample_route.clone()),
                                 &mut file_out,
                                 &mut bytes_written,
-                            );
+                            )?;
                         }
                     }
 
@@ -543,7 +617,7 @@ pub fn log(
                             routing: sample_route,
                             ttl: 0,
                         };
-                        write_packet(data_pkt, &mut file_out, &mut bytes_written);
+                        write_packet(data_pkt, &mut file_out, &mut bytes_written)?;
                     }
                 }
                 pb.set_position(bytes_written);
@@ -551,15 +625,27 @@ pub fn log(
             }
             Err(e) => {
                 pb.finish_and_clear();
-                return Err(eyre::Report::new(e).wrap_err("device stream ended"));
+                return Err(eyre::Report::new(e).wrap_err("stream ended"));
             }
         }
 
         if unbuffered {
-            let _ = file_out.flush();
+            if let Some(f) = file_out.as_mut() {
+                let _ = f.flush();
+            }
         }
     }
     pb.finish_and_clear();
+    if bytes_written == 0 {
+        log::info!("no data received");
+    } else {
+        log::info!(
+            "wrote {} bytes to {} ({} samples dropped)",
+            bytes_written,
+            file,
+            samples_dropped
+        );
+    }
     Ok(())
 }
 
@@ -570,19 +656,20 @@ pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     let route = tio.route.clone();
 
     let mut device = Device::open(&proxy, route.clone())
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))
+        .with_proxy_help()?;
 
     let meta = device
         .get_metadata()
         .wrap_err("failed to fetch device metadata")?;
 
-    let mut file_out =
-        File::create(&file).wrap_err_with(|| format!("could not create {}", file))?;
+    let mut file_out: Option<File> = None;
 
-    let write_packet = |f: &mut File, pkt: tio::Packet| -> eyre::Result<()> {
+    let write_packet = |fo: &mut Option<File>, pkt: tio::Packet| -> eyre::Result<()> {
         let raw = pkt
             .serialize()
             .map_err(|_| eyre::eyre!("failed to serialize metadata packet"))?;
+        let f = ensure_open(fo, &file)?;
         f.write_all(&raw)
             .wrap_err_with(|| format!("failed to write {}", file))
     };
@@ -735,12 +822,20 @@ pub fn log_dump(
 
         // Metadata-only mode (-m): filter to metadata packets
         (false, true) => {
-            for (_path, file_data) in iter_packets(&files)? {
+            for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
                 while !rest.is_empty() {
                     let (pkt, len) = match tio::Packet::deserialize(rest) {
                         Ok(res) => res,
-                        Err(_) => break,
+                        Err(e) => {
+                            log::warn!(
+                                "{}: parse error at offset {} ({:?}); stopping",
+                                path,
+                                file_data.len() - rest.len(),
+                                e
+                            );
+                            break;
+                        }
                     };
                     rest = &rest[len..];
 
@@ -762,12 +857,20 @@ pub fn log_dump(
             let ignore_session = files.len() > 1;
             let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
 
-            for (_path, file_data) in iter_packets(&files)? {
+            for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
                 while !rest.is_empty() {
                     let (pkt, len) = match tio::Packet::deserialize(rest) {
                         Ok(res) => res,
-                        Err(_) => break,
+                        Err(e) => {
+                            log::warn!(
+                                "{}: parse error at offset {} ({:?}); stopping",
+                                path,
+                                file_data.len() - rest.len(),
+                                e
+                            );
+                            break;
+                        }
                     };
                     rest = &rest[len..];
 
@@ -794,7 +897,7 @@ pub fn log_dump(
                 .filter(|route| route_matches(route))
                 .cloned()
                 .collect();
-            report_missing_metadata(missing_routes, false);
+            report_missing_metadata(missing_routes);
         }
     }
 
@@ -876,7 +979,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     let total_bytes = mmap.len() as u64;
 
     let pb = if total_bytes > 10 * 1024 * 1024 {
-        let pb = ProgressBar::new(total_bytes);
+        let pb = crate::multi_progress().add(ProgressBar::new(total_bytes));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -914,7 +1017,15 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     while !rest.is_empty() {
         let (pkt, len) = match tio::Packet::deserialize(rest) {
             Ok(r) => r,
-            Err(_) => break,
+            Err(e) => {
+                log::warn!(
+                    "{}: parse error at offset {} ({:?}); stopping",
+                    path,
+                    total_bytes - rest.len() as u64,
+                    e
+                );
+                break;
+            }
         };
         rest = &rest[len..];
         packet_count += 1;
@@ -1093,7 +1204,7 @@ pub fn log_csv(
     output: Option<String>,
 ) -> eyre::Result<()> {
     use color_eyre::Help;
-    use eyre::{bail, WrapErr};
+    use eyre::WrapErr;
 
     let usage_hint = "tio log csv <stream> <log.tio>... [-s <route>]";
 
@@ -1144,7 +1255,6 @@ pub fn log_csv(
     );
 
     let mut file: Option<File> = None;
-    let mut created_output = false;
     let mut header_written: bool = false;
 
     for path in &files {
@@ -1186,14 +1296,13 @@ pub fn log_csv(
                     headers.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
 
                     if file.is_none() {
-                        let existed = std::path::Path::new(&output_path).exists();
-                        let opened = OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .open(&output_path)
-                            .wrap_err_with(|| format!("could not open {}", output_path))?;
-                        created_output = !existed;
-                        file = Some(opened);
+                        file = Some(
+                            OpenOptions::new()
+                                .append(true)
+                                .create(true)
+                                .open(&output_path)
+                                .wrap_err_with(|| format!("could not open {}", output_path))?,
+                        );
                     }
                     writeln!(file.as_mut().unwrap(), "{}", headers.join(","))
                         .wrap_err_with(|| format!("failed to write {}", output_path))?;
@@ -1212,13 +1321,15 @@ pub fn log_csv(
     }
 
     if !header_written {
-        drop(file);
-        if created_output {
-            std::fs::remove_file(&output_path).ok();
-        }
         if missing_metadata_routes.contains(&target_route) {
-            report_missing_metadata(vec![target_route.clone()], true);
-            bail!("no metadata found for target route");
+            return Err(eyre::eyre!(
+                "stream data at route {} could not be parsed because metadata is missing or incompatible",
+                target_route
+            )
+            .suggestion(
+                "ensure the log includes metadata or capture it with `tio log metadata`, \
+                 including it as an argument before the log",
+            ));
         }
         return Err(eyre::eyre!(
             "no data found for stream '{}' at route {}",
@@ -1305,7 +1416,7 @@ pub fn log_hdf(
 
         let total_bytes = mmap.len() as u64;
         total_input_bytes += total_bytes;
-        let pb = ProgressBar::new(total_bytes);
+        let pb = crate::multi_progress().add(ProgressBar::new(total_bytes));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -1336,9 +1447,11 @@ pub fn log_hdf(
 
                 if debug {
                     if let Some(ref boundary) = sample.boundary {
-                        eprintln!(
+                        log::info!(
                             "[{}] sample_n={} boundary={:?}",
-                            sample.stream.name, sample.n, boundary.reason
+                            sample.stream.name,
+                            sample.n,
+                            boundary.reason
                         );
                     }
                 }
@@ -1355,7 +1468,7 @@ pub fn log_hdf(
     // Finish flushes all pending data and returns stats
     let stats = writer.finish().wrap_err("failed to finalize HDF5")?;
 
-    report_missing_metadata(missing_metadata_routes.into_iter().collect(), false);
+    report_missing_metadata(missing_metadata_routes.into_iter().collect());
 
     use console::style;
 
@@ -1469,25 +1582,27 @@ pub fn firmware_upgrade(
     let firmware_data = std::fs::read(&firmware_path)
         .wrap_err_with(|| format!("could not read firmware file {:?}", firmware_path))?;
 
-    println!("Loaded {} bytes firmware", firmware_data.len());
+    log::info!("loaded {} bytes firmware", firmware_data.len());
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
     let device = proxy
         .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))?;
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))
+        .with_proxy_help()?;
 
     let dev_name: String = device
         .rpc("dev.name", ())
         .wrap_err("failed to query device name")?;
 
     if !skip_confirm {
-        print!("Upgrade firmware on '{}'? [y/N] ", dev_name);
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
+        let confirmed = dialoguer::Confirm::new()
+            .with_prompt(format!("Upgrade firmware on '{}'?", dev_name))
+            .default(false)
+            .interact()
+            .wrap_err("failed to read confirmation")?;
+        if !confirmed {
+            log::info!("aborted");
             return Ok(());
         }
     }
@@ -1507,7 +1622,7 @@ pub fn firmware_upgrade(
     }
 
     let total_chunks = firmware_data.len().div_ceil(288);
-    let pb = ProgressBar::new(total_chunks as u64);
+    let pb = crate::multi_progress().add(ProgressBar::new(total_chunks as u64));
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent}%")
@@ -1515,7 +1630,8 @@ pub fn firmware_upgrade(
             .progress_chars("#>-"),
     );
 
-    let power_cycle_hint = "power cycle the device before retrying";
+    let power_cycle_hint =
+        "power cycle the device before retrying and check if dev.stop exists as an rpc";
 
     let mut next_send_chunk: u16 = 0;
     let mut next_ack_chunk: u16 = 0;
@@ -1602,7 +1718,7 @@ pub fn firmware_upgrade(
 
     // Wait 5 seconds before returning to ensure the device is not
     // power-cycled while the firmware upgrade is being committed to flash.
-    let spinner = ProgressBar::new_spinner();
+    let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
