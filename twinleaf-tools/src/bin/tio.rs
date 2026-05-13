@@ -13,6 +13,10 @@ fn main() -> eyre::Result<()> {
     twinleaf_tools::install_error_handler()?;
     let cli = TioCli::parse();
 
+    if !matches!(cli.command, Commands::Health(_) | Commands::Monitor(_)) {
+        twinleaf_tools::init_logging();
+    }
+
     match cli.command {
         Commands::List { all } => list_devices(all),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),

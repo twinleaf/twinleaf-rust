@@ -1,5 +1,7 @@
 use clap::Parser;
+use indicatif::MultiProgress;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tio::proto::DeviceRoute;
 use tio::util;
 use twinleaf::tio;
@@ -14,6 +16,40 @@ pub fn install_error_handler() -> eyre::Result<()> {
         .display_env_section(false)
         .display_location_section(false)
         .install()
+}
+
+static MULTI_PROGRESS: OnceLock<MultiProgress> = OnceLock::new();
+
+pub fn init_logging() {
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format_target(false)
+            .build();
+    let max_level = logger.filter();
+    let mp = MultiProgress::new();
+    indicatif_log_bridge::LogWrapper::new(mp.clone(), logger)
+        .try_init()
+        .expect("logger already initialized");
+    log::set_max_level(max_level);
+    let _ = MULTI_PROGRESS.set(mp);
+}
+
+pub fn multi_progress() -> &'static MultiProgress {
+    MULTI_PROGRESS
+        .get()
+        .expect("init_logging() must be called before multi_progress()")
+}
+
+pub trait ProxyHelp<T> {
+    fn with_proxy_help(self) -> eyre::Result<T>;
+}
+
+impl<T> ProxyHelp<T> for eyre::Result<T> {
+    fn with_proxy_help(self) -> eyre::Result<T> {
+        use color_eyre::Help;
+        self.suggestion("start `tio proxy` first if using with multiple applications")
+            .suggestion("or specify a source with -r <url>")
+    }
 }
 
 fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
