@@ -1,11 +1,14 @@
 use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
+    dump::run_dump,
     health::{run_health, HealthConfig},
     list::list_devices,
+    log::run_log,
     monitor::{run_monitor, MonitorConfig},
     proxy::run_proxy,
-    tio_test::run_test,
-    tool::{run_dump, run_log, run_rpc, run_upgrade},
+    rpc::run_rpc,
+    simulate::run_simulate,
+    upgrade::run_upgrade,
 };
 use twinleaf_tools::{Commands, TioCli};
 
@@ -20,7 +23,11 @@ fn main() -> eyre::Result<()> {
     match cli.command {
         Commands::List { all } => list_devices(all),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
-        Commands::Test(test_cli) => run_test(test_cli),
+        Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
+        Commands::Test(simulate_cli) => {
+            eprintln!("warning: `tio test` is deprecated; use `tio simulate` instead");
+            run_simulate(simulate_cli)
+        }
         Commands::Monitor(monitor_cli) => run_monitor(MonitorConfig::from(monitor_cli)),
         Commands::Health(health_cli) => run_health(HealthConfig::from(health_cli)),
         Commands::Rpc(rpc_cli) => run_rpc(rpc_cli),

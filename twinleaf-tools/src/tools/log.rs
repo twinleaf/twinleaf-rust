@@ -1,96 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 
-use crate::{
-    DumpCli, LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, RPCSubcommands, RpcCli,
-    SplitLevel, SplitPolicy, TioOpts, UpgradeCli,
-};
+use crate::tools::dump::{print_metadata_payload, print_sample};
+use crate::{LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, SplitLevel, SplitPolicy, TioOpts};
 use tio::proto::DeviceRoute;
 use tio::proxy;
-use tio::util;
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device::util::{rpc_decode_reply, rpc_encode_arg};
-use twinleaf::device::{Device, DeviceTree, RpcClient, RpcValue, RpcValueType};
+use twinleaf::device::{Device, DeviceTree};
 use twinleaf::tio;
-
-fn record_missing_metadata(
-    missing_routes: &mut HashSet<DeviceRoute>,
-    pkt: &tio::Packet,
-    samples_len: usize,
-) {
-    if samples_len != 0 {
-        return;
-    }
-    if let tio::proto::Payload::StreamData(data) = &pkt.payload {
-        if !data.data.is_empty() {
-            missing_routes.insert(pkt.routing.clone());
-        }
-    }
-}
-
-fn report_missing_metadata(mut routes: Vec<DeviceRoute>) {
-    if routes.is_empty() {
-        return;
-    }
-    routes.sort();
-    crate::multi_progress().suspend(|| {
-        use console::style;
-        let warning = style("Warning").yellow().bold();
-        let suggestion = style("Suggestion").yellow().bold();
-        if routes.len() == 1 {
-            eprintln!(
-                "{}: stream data at route {} could not be parsed because metadata is missing or incompatible.",
-                warning, routes[0]
-            );
-        } else {
-            eprintln!(
-                "{}: stream data at these routes could not be parsed because metadata is missing or incompatible:",
-                warning
-            );
-            for route in routes.iter().take(5) {
-                eprintln!("  {}", route);
-            }
-            if routes.len() > 5 {
-                eprintln!("  ... and {} more", routes.len() - 5);
-            }
-        }
-        eprintln!(
-            "{}: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.",
-            suggestion
-        );
-    });
-}
-
-pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
-    match rpc_cli.subcommands {
-        Some(RPCSubcommands::List { tio }) => list_rpcs(&tio),
-        Some(RPCSubcommands::Dump {
-            tio,
-            rpc_name,
-            capture,
-        }) => rpc_dump(&tio, rpc_name, capture),
-        None => rpc(
-            &rpc_cli.tio,
-            rpc_cli.rpc_name.unwrap_or("".to_string()),
-            rpc_cli.rpc_arg,
-            rpc_cli.req_type,
-            rpc_cli.rep_type,
-            rpc_cli.debug,
-        ),
-    }
-}
-
-pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
-    dump(
-        &dump_cli.tio,
-        dump_cli.data,
-        dump_cli.meta,
-        dump_cli.depth,
-        dump_cli.duration,
-    )
-}
 
 pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
     match log_cli.subcommands {
@@ -147,292 +65,54 @@ pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
     }
 }
 
-pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
-    firmware_upgrade(&upgrade_cli.tio, upgrade_cli.firmware_path, upgrade_cli.yes)
-}
-
-pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
-    use eyre::WrapErr;
-
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-    let rpc_client = RpcClient::open(&proxy, route.clone())
-        .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))
-        .with_proxy_help()?;
-    let rpcs = rpc_client
-        .rpc_list(&route)
-        .wrap_err("failed to query RPC list")?;
-
-    for (name, _) in rpcs.vec {
-        let spec =
-            twinleaf::device::util::parse_rpc_spec(*rpcs.map.get(&name).unwrap(), name.to_string());
-        println!(
-            "{} {}({})",
-            spec.perm_str(),
-            spec.full_name,
-            spec.type_str()
-        );
-    }
-
-    Ok(())
-}
-
-fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType {
-    let meta: Option<u16> = device.rpc("rpc.info", &name.to_string()).ok();
-    if meta.is_none() {
-        println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
-    }
-    twinleaf::device::util::resolve_arg_type(meta, name)
-}
-
-pub fn rpc(
-    tio: &TioOpts,
-    rpc_name: String,
-    rpc_arg: Option<String>,
-    req_type: Option<RpcValueType>,
-    rep_type: Option<RpcValueType>,
-    debug: bool,
-) -> eyre::Result<()> {
-    use eyre::WrapErr;
-
-    let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
-    let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
-    let route = tio.route.clone();
-    let device = proxy
-        .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
-
-    let req_type = req_type.or_else(|| {
-        rpc_arg
-            .is_some()
-            .then(|| infer_rpc_type(&rpc_name, &device, "arg"))
-    });
-
-    let arg_bytes = match (rpc_arg.as_deref(), req_type.as_ref()) {
-        (None, _) => Vec::new(),
-        (Some(s), Some(t)) => rpc_encode_arg(s, t)
-            .wrap_err_with(|| format!("could not encode argument for RPC {}", rpc_name))?,
-        (Some(_), None) => unreachable!("req_type is set whenever rpc_arg is present"),
-    };
-
-    let reply = match device.raw_rpc(&rpc_name, &arg_bytes) {
-        Ok(rep) => rep,
-        Err(err) => {
-            drop(proxy);
-            if debug {
-                for s in proxy_status.try_iter() {
-                    println!("{:?}", s);
-                }
-            }
-            return Err(eyre::Report::new(err).wrap_err(format!("RPC {} failed", rpc_name)));
-        }
-    };
-
-    if !reply.is_empty() {
-        let rep_type = rep_type
-            .or(req_type)
-            .unwrap_or_else(|| infer_rpc_type(&rpc_name, &device, "ret"));
-        let value = rpc_decode_reply(&reply, &rep_type)
-            .wrap_err_with(|| format!("could not decode reply from RPC {}", rpc_name))?;
-        let formatted = match &value {
-            RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
-            RpcValue::Bytes(b) => format!("{:?}", b),
-            other => format!("{}", other),
-        };
-        println!("Reply: {}", formatted);
-    }
-    println!("OK");
-    drop(proxy);
-    for s in proxy_status.iter() {
-        if debug {
-            println!("{:?}", s);
-        }
-    }
-    Ok(())
-}
-
-pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Result<()> {
-    use eyre::WrapErr;
-
-    let rpc_name = if is_capture {
-        rpc_name.clone() + ".block"
-    } else {
-        rpc_name.clone()
-    };
-
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-    let device = proxy
-        .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
-
-    if is_capture {
-        let trigger_rpc_name = rpc_name[..rpc_name.len() - 6].to_string() + ".trigger";
-        device
-            .action(&trigger_rpc_name)
-            .wrap_err_with(|| format!("failed to trigger {}", trigger_rpc_name))?;
-    }
-
-    let mut full_reply = vec![];
-
-    for i in 0u16..=65535u16 {
-        match device.raw_rpc(&rpc_name, &i.to_le_bytes().to_vec()) {
-            Ok(mut rep) => full_reply.append(&mut rep),
-            Err(proxy::RpcError::ExecError(err)) => {
-                if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
-                    break;
-                } else {
-                    return Err(eyre::Report::new(proxy::RpcError::ExecError(err))
-                        .wrap_err(format!("RPC {} failed at chunk {}", rpc_name, i)));
-                }
-            }
-            Err(e) => {
-                return Err(eyre::Report::new(e)
-                    .wrap_err(format!("RPC {} failed at chunk {}", rpc_name, i)));
-            }
-        }
-    }
-
-    if let Ok(s) = std::str::from_utf8(&full_reply) {
-        println!("{}", s);
-    } else {
-        std::io::stdout()
-            .write(&full_reply)
-            .wrap_err("failed to write dump to stdout")?;
-    }
-    Ok(())
-}
-
-pub fn dump(
-    tio: &TioOpts,
-    data: bool,
-    meta: bool,
-    depth: Option<usize>,
-    duration: Option<std::time::Duration>,
-) -> eyre::Result<()> {
-    use eyre::WrapErr;
-    use std::time::Instant;
-
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-    let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
-
-    let port = proxy
-        .new_port(None, route.clone(), port_depth, true, true)
-        .wrap_err_with(|| format!("could not open port on {}", tio.root))
-        .with_proxy_help()?;
-
-    let started = Instant::now();
-    let duration_elapsed = || duration.is_some_and(|d| started.elapsed() >= d);
-
-    log::info!("dumping from {} (route {})", tio.root, route);
-
-    match (data, meta) {
-        // Raw mode (no flags): dump all packets
-        (false, false) => {
-            for pkt in port.iter() {
-                if duration_elapsed() {
-                    break;
-                }
-                let abs_pkt = tio::Packet {
-                    routing: route.absolute_route(&pkt.routing),
-                    ..pkt
-                };
-                println!("{:?}", abs_pkt);
-            }
-        }
-
-        // Metadata-only mode (-m): filter to metadata packets
-        (false, true) => {
-            for pkt in port.iter() {
-                if duration_elapsed() {
-                    break;
-                }
-                if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
-                    let abs_route = route.absolute_route(&pkt.routing);
-                    print_metadata_payload(&abs_route, mp);
-                }
-            }
-        }
-
-        // Sample mode (-d or -d -m): use DeviceTree for parsed samples
-        (true, _) => {
-            let mut tree = DeviceTree::new(port, route.clone());
-
-            while !duration_elapsed() {
-                match tree.next() {
-                    Ok((sample, sample_route)) => {
-                        print_sample(&sample, Some(&sample_route), meta, true);
-                    }
-                    Err(e) => {
-                        return Err(eyre::Report::new(e).wrap_err("stream ended"));
-                    }
-                }
-            }
-        }
-    }
-
-    if duration_elapsed() {
-        log::info!("duration elapsed");
-        Ok(())
-    } else {
-        Err(eyre::eyre!("stream ended"))
-    }
-}
-
-fn print_sample(
-    sample: &twinleaf::data::Sample,
-    route: Option<&DeviceRoute>,
-    print_meta: bool,
-    print_data: bool,
+fn record_missing_metadata(
+    missing_routes: &mut HashSet<DeviceRoute>,
+    pkt: &tio::Packet,
+    samples_len: usize,
 ) {
-    let route_str = if let Some(r) = route {
-        format!("{} ", r)
-    } else {
-        "".to_string()
-    };
+    if samples_len != 0 {
+        return;
+    }
+    if let tio::proto::Payload::StreamData(data) = &pkt.payload {
+        if !data.data.is_empty() {
+            missing_routes.insert(pkt.routing.clone());
+        }
+    }
+}
 
-    if print_meta {
-        if let Some(boundary) = &sample.boundary {
-            println!("# {}BOUNDARY {:?}", route_str, boundary.reason);
-            if !boundary.is_continuous() {
-                println!("# {}DEVICE {:?}", route_str, sample.device);
-                println!("# {}STREAM {:?}", route_str, sample.stream);
-                for col in &sample.columns {
-                    println!("# {}COLUMN {:?}", route_str, col.desc);
-                }
+fn report_missing_metadata(mut routes: Vec<DeviceRoute>) {
+    if routes.is_empty() {
+        return;
+    }
+    routes.sort();
+    crate::multi_progress().suspend(|| {
+        use console::style;
+        let warning = style("Warning").yellow().bold();
+        let suggestion = style("Suggestion").yellow().bold();
+        if routes.len() == 1 {
+            eprintln!(
+                "{}: stream data at route {} could not be parsed because metadata is missing or incompatible.",
+                warning, routes[0]
+            );
+        } else {
+            eprintln!(
+                "{}: stream data at these routes could not be parsed because metadata is missing or incompatible:",
+                warning
+            );
+            for route in routes.iter().take(5) {
+                eprintln!("  {}", route);
             }
-            println!("# {}SEGMENT {:?}", route_str, sample.segment);
+            if routes.len() > 5 {
+                eprintln!("  ... and {} more", routes.len() - 5);
+            }
         }
-    }
-
-    if print_data {
-        println!("{}{}", route_str, sample);
-    }
+        eprintln!(
+            "{}: ensure the log includes metadata or capture it with `tio log metadata`, including it as an argument before the log.",
+            suggestion
+        );
+    });
 }
 
-fn print_metadata_payload(route: &DeviceRoute, payload: &tio::proto::MetadataPayload) {
-    let route_str = format!("{} ", route);
-    match &payload.content {
-        tio::proto::meta::MetadataContent::Device(dm) => {
-            println!("# {}DEVICE {:?}", route_str, dm);
-        }
-        tio::proto::meta::MetadataContent::Stream(sm) => {
-            println!("# {}STREAM {:?}", route_str, sm);
-        }
-        tio::proto::meta::MetadataContent::Segment(sm) => {
-            println!("# {}SEGMENT {:?}", route_str, sm);
-        }
-        tio::proto::meta::MetadataContent::Column(cm) => {
-            println!("# {}COLUMN {:?}", route_str, cm);
-        }
-        tio::proto::meta::MetadataContent::Unknown(mtype) => {
-            println!("# {}METADATA Unknown({})", route_str, mtype);
-        }
-    }
-}
 fn ensure_open<'a>(fo: &'a mut Option<File>, path: &str) -> eyre::Result<&'a mut File> {
     use eyre::WrapErr;
     if fo.is_none() {
@@ -1358,11 +1038,8 @@ pub fn log_hdf(
     use eyre::WrapErr;
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
-    use std::collections::HashMap;
-    use std::fs::File;
     use std::path::Path;
-    use twinleaf::data::{export, ColumnFilter, DeviceDataParser};
-    use twinleaf::tio;
+    use twinleaf::data::{export, ColumnFilter};
     use twinleaf::tio::proto::identifiers::StreamKey;
 
     // Determine output filename
@@ -1568,168 +1245,4 @@ pub fn log_hdf(
         eyre::eyre!("this version of twinleaf-tools was compiled without HDF5 support")
             .suggestion("reinstall with: cargo install twinleaf-tools --features hdf5"),
     )
-}
-
-pub fn firmware_upgrade(
-    tio: &TioOpts,
-    firmware_path: std::path::PathBuf,
-    skip_confirm: bool,
-) -> eyre::Result<()> {
-    use color_eyre::Help;
-    use eyre::WrapErr;
-    use indicatif::{ProgressBar, ProgressStyle};
-
-    let firmware_data = std::fs::read(&firmware_path)
-        .wrap_err_with(|| format!("could not read firmware file {:?}", firmware_path))?;
-
-    log::info!("loaded {} bytes firmware", firmware_data.len());
-
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-    let device = proxy
-        .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
-
-    let dev_name: String = device
-        .rpc("dev.name", ())
-        .wrap_err("failed to query device name")?;
-
-    if !skip_confirm {
-        let confirmed = dialoguer::Confirm::new()
-            .with_prompt(format!("Upgrade firmware on '{}'?", dev_name))
-            .default(false)
-            .interact()
-            .wrap_err("failed to read confirmation")?;
-        if !confirmed {
-            log::info!("aborted");
-            return Ok(());
-        }
-    }
-
-    match device.action("dev.stop") {
-        Ok(()) => {}
-        Err(proxy::RpcError::ExecError(ref e))
-            if matches!(
-                e.error,
-                tio::proto::RpcErrorCode::NotFound | tio::proto::RpcErrorCode::WrongDeviceState
-            ) => {}
-        Err(e) => {
-            return Err(
-                eyre::Report::new(e).wrap_err("failed to stop device before firmware upgrade")
-            );
-        }
-    }
-
-    let total_chunks = firmware_data.len().div_ceil(288);
-    let pb = crate::multi_progress().add(ProgressBar::new(total_chunks as u64));
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent}%")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let power_cycle_hint =
-        "power cycle the device before retrying and check if dev.stop exists as an rpc";
-
-    let mut next_send_chunk: u16 = 0;
-    let mut next_ack_chunk: u16 = 0;
-    let mut more_to_send = true;
-    const MAX_CHUNKS_IN_FLIGHT: u16 = 2;
-
-    while more_to_send || (next_ack_chunk != next_send_chunk) {
-        if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
-            let offset = usize::from(next_send_chunk) * 288;
-            let chunk_end = if (offset + 288) > firmware_data.len() {
-                firmware_data.len()
-            } else {
-                offset + 288
-            };
-
-            device
-                .send(util::PacketBuilder::make_rpc_request(
-                    "dev.firmware.upload",
-                    &firmware_data[offset..chunk_end],
-                    next_send_chunk,
-                    DeviceRoute::root(),
-                ))
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to send firmware chunk {}/{}",
-                        next_send_chunk + 1,
-                        total_chunks
-                    )
-                })
-                .suggestion(power_cycle_hint)?;
-            next_send_chunk += 1;
-            more_to_send = chunk_end < firmware_data.len();
-        }
-
-        let pkt = if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
-            match device.try_recv() {
-                Ok(pkt) => pkt,
-                Err(proxy::RecvError::WouldBlock) => continue,
-                Err(e) => {
-                    return Err(eyre::Report::new(e)
-                        .wrap_err("failed to receive firmware upload ack")
-                        .suggestion(power_cycle_hint));
-                }
-            }
-        } else {
-            device
-                .recv()
-                .wrap_err("failed to receive firmware upload ack")
-                .suggestion(power_cycle_hint)?
-        };
-
-        match pkt.payload {
-            tio::proto::Payload::RpcReply(rep) => {
-                if rep.id != next_ack_chunk {
-                    return Err(eyre::eyre!(
-                        "firmware chunk ack out of order (expected {}, got {})",
-                        next_ack_chunk,
-                        rep.id
-                    )
-                    .suggestion(power_cycle_hint));
-                }
-                next_ack_chunk += 1;
-                pb.set_position(next_ack_chunk as u64);
-            }
-            tio::proto::Payload::RpcError(err) => {
-                return Err(eyre::eyre!(
-                    "device rejected firmware chunk {}/{}: {}",
-                    next_ack_chunk + 1,
-                    total_chunks,
-                    err.error
-                )
-                .suggestion(power_cycle_hint));
-            }
-            _ => continue,
-        }
-    }
-
-    pb.finish_and_clear();
-
-    device
-        .action("dev.firmware.upgrade")
-        .wrap_err("device rejected firmware commit")
-        .suggestion(power_cycle_hint)?;
-
-    // Wait 5 seconds before returning to ensure the device is not
-    // power-cycled while the firmware upgrade is being committed to flash.
-    let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Finalizing upgrade...");
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        spinner.tick();
-    }
-    spinner.finish_with_message("Firmware upgrade complete.");
-
-    Ok(())
 }

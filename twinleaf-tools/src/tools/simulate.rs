@@ -1,8 +1,8 @@
-//! tio test
+//! tio simulate
 //!
 //! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1.
 
-use crate::TestCli;
+use crate::SimulateCli;
 use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -180,7 +180,7 @@ struct TestDevice {
 }
 
 impl TestDevice {
-    fn new(cli: TestCli) -> io::Result<Self> {
+    fn new(cli: SimulateCli) -> io::Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
         socket.set_nonblocking(true)?;
 
@@ -1475,7 +1475,7 @@ fn unix_time_secs(now: Duration) -> u32 {
     u32::try_from(now.as_secs()).unwrap_or(u32::MAX)
 }
 
-pub fn run_test(cli: TestCli) -> eyre::Result<()> {
+pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;
     device.run()?;
     Ok(())

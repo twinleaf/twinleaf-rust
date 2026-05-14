@@ -3,12 +3,8 @@ use clap::Parser;
 use super::nonneg_f64;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "tio-test",
-    version,
-    about = "Run a simulated sine wave Twinleaf device over UDP"
-)]
-pub struct TestCli {
+#[command(version, about = "Simulate a Twinleaf device over UDP")]
+pub struct SimulateCli {
     /// Sample rate in Hz
     #[arg(
         long = "samplerate",

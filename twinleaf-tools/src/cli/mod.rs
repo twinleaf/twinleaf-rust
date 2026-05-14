@@ -4,7 +4,7 @@ mod log;
 mod monitor;
 mod proxy;
 mod rpc;
-mod test;
+mod simulate;
 mod upgrade;
 
 pub use dump::DumpCli;
@@ -13,7 +13,7 @@ pub use log::{LogCli, LogSubcommands, MetaSubcommands, SplitLevel, SplitPolicy};
 pub use monitor::MonitorCli;
 pub use proxy::{ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};
-pub use test::TestCli;
+pub use simulate::SimulateCli;
 pub use upgrade::UpgradeCli;
 
 use clap::{Parser, Subcommand};
@@ -74,7 +74,11 @@ pub enum Commands {
     Proxy(ProxyCli),
 
     /// Run a simulated sine wave Twinleaf device over UDP
-    Test(TestCli),
+    Simulate(SimulateCli),
+
+    /// (deprecated, use `simulate`) Run a simulated sine wave Twinleaf device over UDP
+    #[command(hide = true)]
+    Test(SimulateCli),
 
     /// Generate shell completions for tio
     #[command(long_about = "\
