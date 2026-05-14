@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use twinleaf::device::discovery::{self, PortInterface};
-use twinleaf::tio::proto::DeviceRoute;
+use twinleaf::device::DeviceRoute;
 use twinleaf::tio::proxy;
 
 /// Total time spent listening for heartbeats/data on a freshly opened

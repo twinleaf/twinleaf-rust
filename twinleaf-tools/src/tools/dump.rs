@@ -1,8 +1,6 @@
 use crate::{DumpCli, ProxyHelp, TioOpts};
-use tio::proto::DeviceRoute;
-use tio::proxy;
-use twinleaf::device::DeviceTree;
-use twinleaf::tio;
+use twinleaf::device::{DeviceRoute, DeviceTree};
+use twinleaf::tio::{self, proxy};
 
 pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
     dump(

@@ -18,12 +18,8 @@ use ratatui::{
     widgets::{Block, Borders, List, Paragraph},
     Frame,
 };
-use tio::proto::DeviceRoute;
 use tui_prompts::{State, TextState};
-use twinleaf::{
-    device::{RpcDescriptor, RpcRegistry},
-    tio,
-};
+use twinleaf::device::{DeviceRoute, RpcDescriptor, RpcRegistry};
 
 const RPCLIST_MAX_LEN: usize = 12;
 

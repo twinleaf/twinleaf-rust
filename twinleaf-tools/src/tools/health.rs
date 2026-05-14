@@ -27,12 +27,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::BoundaryReason,
-    device::{DeviceEvent, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
-    tio::{
-        self,
-        proto::{identifiers::StreamKey, DeviceRoute},
-    },
+    data::{BoundaryReason, StreamKey},
+    device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
+    tio,
 };
 
 #[derive(Default)]

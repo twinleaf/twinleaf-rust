@@ -1,8 +1,6 @@
 use crate::{ProxyHelp, TioOpts, UpgradeCli};
-use tio::proto::DeviceRoute;
-use tio::proxy;
-use tio::util;
-use twinleaf::tio;
+use twinleaf::device::DeviceRoute;
+use twinleaf::tio::{self, proxy, util};
 
 pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
     firmware_upgrade(&upgrade_cli.tio, upgrade_cli.firmware_path, upgrade_cli.yes)

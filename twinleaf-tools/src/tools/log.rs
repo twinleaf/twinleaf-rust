@@ -4,11 +4,9 @@ use std::io::prelude::*;
 
 use crate::tools::dump::{print_metadata_payload, print_sample};
 use crate::{LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, SplitLevel, SplitPolicy, TioOpts};
-use tio::proto::DeviceRoute;
-use tio::proxy;
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device::{Device, DeviceTree};
-use twinleaf::tio;
+use twinleaf::device::{Device, DeviceRoute, DeviceTree};
+use twinleaf::tio::{self, proxy};
 
 pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
     match log_cli.subcommands {
@@ -651,8 +649,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
     use std::collections::BTreeMap;
-    use twinleaf::data::{BoundaryReason, DeviceDataParser};
-    use twinleaf::tio::proto::identifiers::StreamId;
+    use twinleaf::data::{BoundaryReason, DeviceDataParser, StreamId};
 
     let file = File::open(path).wrap_err_with(|| format!("could not open {}", path))?;
     let mmap = unsafe { Mmap::map(&file) }.wrap_err_with(|| format!("could not mmap {}", path))?;
@@ -686,9 +683,9 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
         serial: String,
     }
 
-    let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
-    let mut streams: BTreeMap<(tio::proto::DeviceRoute, StreamId), StreamAgg> = BTreeMap::new();
-    let mut devices: BTreeMap<tio::proto::DeviceRoute, DeviceAgg> = BTreeMap::new();
+    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
+    let mut streams: BTreeMap<(DeviceRoute, StreamId), StreamAgg> = BTreeMap::new();
+    let mut devices: BTreeMap<DeviceRoute, DeviceAgg> = BTreeMap::new();
     let mut packet_count: u64 = 0;
     let mut session_changes: u64 = 0;
     let mut segment_changes: u64 = 0;
@@ -1039,8 +1036,7 @@ pub fn log_hdf(
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
     use std::path::Path;
-    use twinleaf::data::{export, ColumnFilter};
-    use twinleaf::tio::proto::identifiers::StreamKey;
+    use twinleaf::data::{export, ColumnFilter, StreamKey};
 
     // Determine output filename
     let output = match output {
@@ -1079,9 +1075,9 @@ pub fn log_hdf(
     )
     .wrap_err_with(|| format!("could not create HDF5 file {}", output))?;
 
-    let mut parsers: HashMap<tio::proto::DeviceRoute, DeviceDataParser> = HashMap::new();
+    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
-    let mut missing_metadata_routes: HashSet<tio::proto::DeviceRoute> = HashSet::new();
+    let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
     let mut total_input_bytes: u64 = 0;
 
     println!("Processing {} files...", files.len());

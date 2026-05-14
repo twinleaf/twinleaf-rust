@@ -27,15 +27,12 @@ use ratatui::{
 };
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
-    data::{AlignedWindow, Buffer, ColumnBatch, ColumnData, DeviceFullMetadata, Sample},
-    device::{DeviceEvent, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
-    tio::{
-        self,
-        proto::{
-            identifiers::{ColumnKey, StreamKey},
-            DeviceRoute, ProxyStatus,
-        },
+    data::{
+        AlignedWindow, Buffer, ColumnBatch, ColumnData, ColumnKey, DeviceFullMetadata, Sample,
+        StreamKey,
     },
+    device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
+    tio::{self, proto::ProxyStatus},
 };
 use welch_sde::{Build, SpectralDensity};
 

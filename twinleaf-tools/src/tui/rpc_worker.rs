@@ -7,11 +7,7 @@
 //! awareness of this module — hosts wire palette events to worker requests.
 
 use crossbeam::channel::{self, Receiver, Sender};
-use tio::proto::DeviceRoute;
-use twinleaf::{
-    device::{util, RpcClient, RpcList, RpcValue},
-    tio,
-};
+use twinleaf::device::{util, DeviceRoute, RpcClient, RpcList, RpcValue};
 
 use crate::tui::rpc_palette::{RpcReq, RpcResp};
 
