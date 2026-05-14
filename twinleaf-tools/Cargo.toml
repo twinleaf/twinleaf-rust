@@ -9,14 +9,15 @@ repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
 [features]
-default = []
+default = ["serial"]
+serial = ["dep:serialport", "twinleaf/serial"]
 hdf5 = ["twinleaf/hdf5"]
 
 [dependencies]
 crossbeam = "0.8"
-serialport = "4.5"
+serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}
-twinleaf = {version = "1.8", path = "../twinleaf" }
+twinleaf = {version = "1.8", path = "../twinleaf", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"

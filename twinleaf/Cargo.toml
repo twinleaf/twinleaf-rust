@@ -9,19 +9,20 @@ repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
 [features]
-default = []
+default = ["serial"]
+serial = ["dep:mio-serial", "dep:serialport"]
 hdf5 = ["dep:hdf5"]
 
 [dependencies]
 crossbeam = "0.8"
-mio-serial = "5.0"
 crc = "3.2"
 num_enum = "0.7"
 glob = "0.3"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
 directories = "6.0"
 thiserror = "2"
-serialport = "4.9"
+mio-serial = { version = "5.0", optional = true }
+serialport = { version = "4.9", optional = true }
 
 [dependencies.mio]
 version = "1.0"

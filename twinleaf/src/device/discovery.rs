@@ -29,34 +29,43 @@ pub struct DiscoveredDevice {
 /// `PortInterface::Unknown(vid, pid)` so callers can surface them as
 /// "also found these serial ports" style output.
 pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
-    let mut ports: Vec<DiscoveredDevice> = Vec::new();
-
-    if let Ok(avail_ports) = serialport::available_ports() {
-        for p in avail_ports.iter() {
-            if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
-                let interface = match (info.vid, info.pid) {
-                    (0x0403, 0x6015) => PortInterface::FTDI,
-                    (0x0483, 0x5740) => PortInterface::STM32,
-                    (vid, pid) => {
-                        if !include_unknown {
-                            continue;
-                        }
-                        PortInterface::Unknown(vid, pid)
-                    }
-                };
-                #[cfg(target_os = "macos")]
-                if p.port_name.starts_with("/dev/tty.") && !include_unknown {
-                    continue;
-                }
-                ports.push(DiscoveredDevice {
-                    url: format!("serial://{}", p.port_name),
-                    interface,
-                });
-            }
-        }
+    #[cfg(not(feature = "serial"))]
+    {
+        let _ = include_unknown;
+        return Vec::new();
     }
 
-    ports
+    #[cfg(feature = "serial")]
+    {
+        let mut ports: Vec<DiscoveredDevice> = Vec::new();
+
+        if let Ok(avail_ports) = serialport::available_ports() {
+            for p in avail_ports.iter() {
+                if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
+                    let interface = match (info.vid, info.pid) {
+                        (0x0403, 0x6015) => PortInterface::FTDI,
+                        (0x0483, 0x5740) => PortInterface::STM32,
+                        (vid, pid) => {
+                            if !include_unknown {
+                                continue;
+                            }
+                            PortInterface::Unknown(vid, pid)
+                        }
+                    };
+                    #[cfg(target_os = "macos")]
+                    if p.port_name.starts_with("/dev/tty.") && !include_unknown {
+                        continue;
+                    }
+                    ports.push(DiscoveredDevice {
+                        url: format!("serial://{}", p.port_name),
+                        interface,
+                    });
+                }
+            }
+        }
+
+        ports
+    }
 }
 
 /// Briefly connect to a device and query its `dev.name` RPC.

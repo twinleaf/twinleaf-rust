@@ -16,6 +16,7 @@
 //! Note: `Port` sets up a dedicated thread to perform the above.
 
 mod iobuf;
+#[cfg(feature = "serial")]
 mod serial;
 mod tcp;
 mod udp;
@@ -513,9 +514,10 @@ impl Port {
     /// data or errors to `rx`.
     ///
     /// A valid 'url' has one of the following formats:
-    /// - `serial://port[:target_bps[:default_bps]]`. `target_bps` and `default_bps`
-    ///   are optional and default to 115200. Note that it's possible to omit `serial://`
-    ///   if port starts with `COM` on windows or `/dev/` on unix.
+    /// - `serial://port[:target_bps[:default_bps]]`. Requires the `serial` feature.
+    ///   `target_bps` and `default_bps` are optional and default to 115200. Note
+    ///   that it's possible to omit `serial://` if port starts with `COM` on
+    ///   windows or `/dev/` on unix.
     /// - `tcp://address[:port]`. Note also that it's possible to use `tcp4` or `tcp6`
     ///   to force a specific version of the IP protocol should the default resolution
     ///   fail.
@@ -530,18 +532,24 @@ impl Port {
         rx: RXT,
     ) -> io::Result<Port> {
         // Special case: serial ports can be given directly
-        #[cfg(unix)]
+        #[cfg(all(feature = "serial", unix))]
         if url.starts_with("/dev/") {
             return Port::from_raw(serial::Port::new(url)?, rx);
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(all(feature = "serial", target_os = "windows"))]
         if url.starts_with("COM") {
             return Port::from_raw(serial::Port::new(url)?, rx);
         }
 
         let split_url: Vec<&str> = url.splitn(2, "://").collect();
         match split_url[..] {
+            #[cfg(feature = "serial")]
             ["serial", port] => Port::from_raw(serial::Port::new(port)?, rx),
+            #[cfg(not(feature = "serial"))]
+            ["serial", _] => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "serial support is disabled",
+            )),
             ["tcp", addr] => Port::from_raw(
                 tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::Either)?)?,
                 rx,

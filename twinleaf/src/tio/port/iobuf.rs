@@ -53,6 +53,7 @@ impl IOBuf {
     }
 
     /// Discard the entire content of the buffer.
+    #[allow(dead_code)]
     pub fn flush(&mut self) {
         self.start = 0;
         self.end = 0;
