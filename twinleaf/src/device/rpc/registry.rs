@@ -145,6 +145,10 @@ impl RpcRegistry {
         &self.names
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &RpcDescriptor> + '_ {
+        self.names.iter().filter_map(|n| self.find(n))
+    }
+
     pub fn suggest(&self, query: &str) -> Vec<String> {
         let parts: Vec<String> = query.split('.').map(|s| s.to_string()).collect();
         let suffixes = self.root.completions(&parts);

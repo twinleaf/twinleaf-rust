@@ -3,7 +3,7 @@ use std::io::Write;
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
 use twinleaf::device::util::{rpc_decode_reply, rpc_encode_arg};
-use twinleaf::device::{RpcClient, RpcValue, RpcValueType};
+use twinleaf::device::{RpcClient, RpcRegistry, RpcValue, RpcValueType};
 use twinleaf::tio;
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
@@ -36,15 +36,14 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     let rpcs = rpc_client
         .rpc_list(&route)
         .wrap_err("failed to query RPC list")?;
+    let registry = RpcRegistry::from(&rpcs);
 
-    for (name, _) in rpcs.vec {
-        let spec =
-            twinleaf::device::util::parse_rpc_spec(*rpcs.map.get(&name).unwrap(), name.to_string());
+    for desc in registry.iter() {
         println!(
             "{} {}({})",
-            spec.perm_str(),
-            spec.full_name,
-            spec.type_str()
+            desc.perm_str(),
+            desc.full_name,
+            desc.type_str()
         );
     }
 
