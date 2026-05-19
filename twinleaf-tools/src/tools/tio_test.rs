@@ -40,6 +40,8 @@ const SAMPLE_DROP_INTERVAL_SECONDS: f64 = 60.0;
 const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
 const MAX_SAMPLE_NUMBER: u32 = 0x00ff_ffff;
 const STREAM_DATA_HEADER_BYTES: usize = 4;
 const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
@@ -50,6 +52,7 @@ const META_F64_RW: u16 = 0x0100 | 0x0200 | (8 << 4) | 2;
 const META_U8_RW: u16 = 0x0100 | 0x0200 | (1 << 4);
 const META_U32_R: u16 = 0x0100 | (4 << 4) | 0;
 const META_STRING_R: u16 = 0x0100 | 3;
+const META_ACTION: u16 = 0x0200;
 const META_RAW: u16 = 0;
 
 #[derive(Clone, Copy)]
@@ -146,6 +149,8 @@ struct TestDevice {
     params: SineParams,
     initial_status: u8,
     status: u8,
+    initial_enable: u8,
+    enable: u8,
     sample_rate: u32,
     segment_seconds: u32,
     segment_samples: u32,
@@ -168,6 +173,8 @@ struct TestDevice {
     aux_pending_segment_update: bool,
     next_aux_drop_sample: u64,
     last_heartbeat: Instant,
+    next_log_message_at: Instant,
+    next_log_level: usize,
     rng: GaussianRng,
     rpcs: Vec<RpcSpec>,
 }
@@ -227,6 +234,7 @@ impl TestDevice {
             noise: cli.noise,
         };
         let initial_status = 0;
+        let initial_enable = 1;
 
         Ok(Self {
             socket,
@@ -235,6 +243,8 @@ impl TestDevice {
             params: initial_params,
             initial_status,
             status: initial_status,
+            initial_enable,
+            enable: initial_enable,
             sample_rate: cli.samplerate,
             segment_seconds: cli.segment_seconds,
             segment_samples,
@@ -257,6 +267,8 @@ impl TestDevice {
             aux_pending_segment_update: false,
             next_aux_drop_sample,
             last_heartbeat: Instant::now(),
+            next_log_message_at: Instant::now() + next_log_delay(&mut rng),
+            next_log_level: 0,
             rng,
             rpcs: vec![
                 RpcSpec {
@@ -294,6 +306,14 @@ impl TestDevice {
                 RpcSpec {
                     name: "test.status",
                     meta: META_U8_RW,
+                },
+                RpcSpec {
+                    name: "test.enable",
+                    meta: META_U8_RW,
+                },
+                RpcSpec {
+                    name: "test.go",
+                    meta: META_ACTION,
                 },
             ],
         })
@@ -448,12 +468,15 @@ impl TestDevice {
         self.last_heartbeat = Instant::now()
             .checked_sub(HEARTBEAT_INTERVAL)
             .unwrap_or_else(Instant::now);
+        self.next_log_message_at = Instant::now() + self.next_log_delay();
+        self.next_log_level = 0;
     }
 
     fn reboot(&mut self) -> io::Result<()> {
         self.session_id = self.next_session_id();
         self.params = self.initial_params;
         self.status = self.initial_status;
+        self.enable = self.initial_enable;
         self.reset_run();
         terminal_println!("rebooted test device; new session id {}", self.session_id);
 
@@ -528,6 +551,13 @@ impl TestDevice {
                 self.status = next;
                 Ok(())
             }
+            "test.enable" => {
+                let next =
+                    self.read_or_write_u8(req.id, &req.arg, self.enable, routing.clone(), addr)?;
+                self.enable = next;
+                Ok(())
+            }
+            "test.go" => self.rpc_action(req.id, &req.arg, routing, addr),
             _ => self.send_rpc_error(req.id, proto::RpcErrorCode::NotFound, routing, addr),
         };
 
@@ -689,6 +719,20 @@ impl TestDevice {
         Ok(value)
     }
 
+    fn rpc_action(
+        &self,
+        id: u16,
+        arg: &[u8],
+        routing: proto::DeviceRoute,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if !arg.is_empty() {
+            return self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr);
+        }
+        terminal_println!("test.go action invoked");
+        self.send_rpc_reply(id, Vec::new(), routing, addr)
+    }
+
     fn send_periodic_packets(&mut self) -> io::Result<()> {
         let Some(client) = self.client else {
             return Ok(());
@@ -699,8 +743,33 @@ impl TestDevice {
             self.last_heartbeat = Instant::now();
         }
 
+        self.send_log_message_if_due(client.addr)?;
         self.send_due_samples(client.addr)?;
         self.send_due_aux_samples(client.addr)
+    }
+
+    fn send_log_message_if_due(&mut self, addr: SocketAddr) -> io::Result<()> {
+        if Instant::now() < self.next_log_message_at {
+            return Ok(());
+        }
+
+        let level = self.next_log_level();
+        let lucky_number = (self.rng.next_u64() % 10_000) as u32;
+        let message = self.random_log_message(level, lucky_number);
+        self.send_packet(
+            &proto::Packet {
+                payload: proto::Payload::LogMessage(proto::LogMessagePayload {
+                    data: lucky_number,
+                    level,
+                    message,
+                }),
+                routing: proto::DeviceRoute::root(),
+                ttl: 0,
+            },
+            addr,
+        )?;
+        self.next_log_message_at = Instant::now() + self.next_log_delay();
+        Ok(())
     }
 
     fn send_due_samples(&mut self, addr: SocketAddr) -> io::Result<()> {
@@ -932,6 +1001,40 @@ impl TestDevice {
             session_id = session_id.wrapping_add(1);
         }
         session_id
+    }
+
+    fn next_log_delay(&mut self) -> Duration {
+        next_log_delay(&mut self.rng)
+    }
+
+    fn next_log_level(&mut self) -> proto::LogLevel {
+        let levels = [
+            proto::LogLevel::Critical,
+            proto::LogLevel::Error,
+            proto::LogLevel::Warning,
+            proto::LogLevel::Info,
+            proto::LogLevel::Debug,
+        ];
+        let level = levels[self.next_log_level % levels.len()];
+        self.next_log_level = self.next_log_level.wrapping_add(1);
+        level
+    }
+
+    fn random_log_message(&mut self, level: proto::LogLevel, lucky_number: u32) -> String {
+        let templates = [
+            "lucky number {lucky} nudged the simulated flux loop",
+            "telemetry monitor reported lucky number {lucky}",
+            "calibration check landed on lucky number {lucky}",
+            "simulated event counter reached lucky number {lucky}",
+            "operator marker recorded lucky number {lucky}",
+            "background diagnostic index settled at lucky number {lucky}",
+        ];
+        let template = templates[(self.rng.next_u64() as usize) % templates.len()];
+        format!(
+            "{}: {}",
+            log_level_name(level),
+            template.replace("{lucky}", &lucky_number.to_string())
+        )
     }
 
     fn send_sample_segment_updates_if_needed(
@@ -1317,6 +1420,22 @@ fn next_drop_sample_after(rng: &mut GaussianRng, current_sample: u64, sample_rat
     let seconds = min_seconds + rng.next_unit() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
     let interval = (seconds * f64::from(sample_rate)).round().max(1.0) as u64;
     current_sample.saturating_add(interval)
+}
+
+fn next_log_delay(rng: &mut GaussianRng) -> Duration {
+    let jitter = LOG_MESSAGE_JITTER.mul_f64(rng.next_unit());
+    LOG_MESSAGE_MIN_INTERVAL + jitter
+}
+
+fn log_level_name(level: proto::LogLevel) -> &'static str {
+    match level {
+        proto::LogLevel::Critical => "critical",
+        proto::LogLevel::Error => "error",
+        proto::LogLevel::Warning => "warning",
+        proto::LogLevel::Info => "info",
+        proto::LogLevel::Debug => "debug",
+        proto::LogLevel::Unknown(_) => "unknown",
+    }
 }
 
 fn describe_packet(packet: &proto::Packet) -> String {
