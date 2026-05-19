@@ -34,6 +34,18 @@ impl Port {
     }
 }
 
+fn is_disconnect_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
+}
+
 impl RawPort for Port {
     fn recv(&mut self) -> Result<Packet, RecvError> {
         let mut buf = [0u8; 1024];
@@ -42,6 +54,8 @@ impl RawPort for Port {
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     return Err(RecvError::NotReady);
+                } else if is_disconnect_error(&e) {
+                    return Err(RecvError::Disconnected);
                 } else {
                     return Err(RecvError::IO(e));
                 }
@@ -93,6 +107,7 @@ impl RawPort for Port {
                 // to buffer up the packet and use MustDrain/Full.
                 panic!("Unexpected UDP would block");
             }
+            Err(e) if is_disconnect_error(&e) => Err(SendError::Disconnected),
             Err(e) => Err(SendError::IO(e)),
         }
     }
