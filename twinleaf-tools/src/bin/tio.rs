@@ -2,7 +2,7 @@ use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
     dump::run_dump,
     health::{run_health, HealthConfig},
-    list::list_devices,
+    list::run_list,
     log::run_log,
     monitor::{run_monitor, MonitorConfig},
     proxy::run_proxy,
@@ -21,7 +21,7 @@ fn main() -> eyre::Result<()> {
     }
 
     match cli.command {
-        Commands::List { all } => list_devices(all),
+        Commands::List { all } => run_list(all),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
         Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
         Commands::Test(simulate_cli) => {

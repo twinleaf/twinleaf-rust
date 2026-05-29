@@ -7,10 +7,19 @@ use crate::{ProxyCli, ProxySubcommands};
 use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
-use tio::{proto, proxy};
 use twinleaf::device::discovery::{self, PortInterface};
-use twinleaf::tio;
+use twinleaf::tio::{self, proto, proxy};
 
+pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
+    match proxy_cli.subcommands.take() {
+        Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
+            crate::tools::proxy_nmea::run_nmea_proxy(tio, tcp_port)
+        }
+        None => run_proxy_server(ProxyConfig::from(proxy_cli)),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     tcp_port: u16,
     reconnect_timeout: Duration,
@@ -53,6 +62,58 @@ impl From<ProxyCli> for ProxyConfig {
 struct ProxyState {
     _clients: usize,
     _dropped_packets: usize,
+}
+
+struct ResolvedSensor {
+    url: String,
+    auto_detected: bool,
+}
+
+fn print_startup(sensor: &ResolvedSensor, config: &ProxyConfig) {
+    println!("tio proxy starting:");
+    println!(
+        "  Sensor: {} {}",
+        sensor.url,
+        if sensor.auto_detected {
+            "(auto-detected)"
+        } else {
+            ""
+        }
+    );
+    println!("  TCP port: {}", config.tcp_port);
+    println!("  Subtree: {}", config.subtree);
+
+    let flags = startup_flags(config);
+    if !flags.is_empty() {
+        println!("  Flags: {}", flags.join(" "));
+    }
+    println!();
+}
+
+fn startup_flags(config: &ProxyConfig) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if config.verbose {
+        flags.push("verbose");
+    }
+    if config.debugging {
+        flags.push("debug");
+    }
+    if config.disconnect_slow {
+        flags.push("kick-slow");
+    }
+    if config.dump_traffic {
+        flags.push("dump");
+    }
+    if config.dump_data {
+        flags.push("dump-data");
+    }
+    if config.dump_meta {
+        flags.push("dump-meta");
+    }
+    if config.dump_hb {
+        flags.push("dump-hb");
+    }
+    flags
 }
 
 macro_rules! log{
@@ -101,22 +162,12 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
         );
     }
 
-    let tcp_port = config.tcp_port;
-    let reconnect_timeout = config.reconnect_timeout;
-    let disconnect_slow = config.disconnect_slow;
-    let verbose = config.verbose;
-    let debugging = config.debugging;
-    let dump_traffic = config.dump_traffic;
-    let dump_data = config.dump_data;
-    let dump_meta = config.dump_meta;
-    let dump_hb = config.dump_hb;
-    let tf = config.timestamp_format;
     let mut _state = ProxyState::default();
 
     // Determine sensor URL; if none given, auto-detect.
     let auto_detected = config.sensor_url.is_none();
-    let sensor_url = if let Some(url) = config.sensor_url {
-        url
+    let sensor_url = if let Some(url) = &config.sensor_url {
+        url.clone()
     } else {
         // --auto mode
         let devices = discovery::enumerate_serial(false);
@@ -148,49 +199,19 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
         valid_urls[0].clone()
     };
 
-    let subtree = config.subtree;
-
-    println!("tio proxy starting:");
-    println!(
-        "  Sensor: {} {}",
-        sensor_url,
-        if auto_detected { "(auto-detected)" } else { "" }
-    );
-    println!("  TCP port: {}", tcp_port);
-    println!("  Subtree: {}", subtree);
-    if verbose || debugging || dump_traffic || dump_data || dump_meta || dump_hb {
-        print!("  Flags:");
-        if verbose {
-            print!(" verbose");
-        }
-        if debugging {
-            print!(" debug");
-        }
-        if disconnect_slow {
-            print!(" kick-slow");
-        }
-        if dump_traffic {
-            print!(" dump");
-        }
-        if dump_data {
-            print!(" dump-data");
-        }
-        if dump_meta {
-            print!(" dump-meta");
-        }
-        if dump_hb {
-            print!(" dump-hb");
-        }
-        println!();
-    }
-    println!();
+    let subtree = config.subtree.clone();
+    let sensor = ResolvedSensor {
+        url: sensor_url,
+        auto_detected,
+    };
+    print_startup(&sensor, &config);
 
     let new_client = {
         let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
         let started_v6 = create_listener_thread(
             std::net::SocketAddr::new(
                 std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                tcp_port,
+                config.tcp_port,
             ),
             client_send.clone(),
         );
@@ -203,7 +224,7 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
             create_listener_thread(
                 std::net::SocketAddr::new(
                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    tcp_port,
+                    config.tcp_port,
                 ),
                 client_send.clone(),
             )
@@ -211,11 +232,16 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
         if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
             let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
                 || matches!(e2.kind(), io::ErrorKind::AddrInUse);
-            let err = eyre::eyre!("could not bind TCP port {}: v6={}, v4={}", tcp_port, e1, e2);
+            let err = eyre::eyre!(
+                "could not bind TCP port {}: v6={}, v4={}",
+                config.tcp_port,
+                e1,
+                e2
+            );
             return Err(if addr_in_use {
                 err.suggestion(format!(
                     "another 'tio proxy' is likely running on port {}; try --port <N>",
-                    tcp_port
+                    config.tcp_port
                 ))
             } else {
                 err
@@ -225,8 +251,11 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
     };
 
     let (status_send, port_status) = crossbeam::channel::bounded::<proxy::Event>(100);
-    let proxy =
-        proxy::Interface::new_proxy(&sensor_url, Some(reconnect_timeout), Some(status_send));
+    let proxy = proxy::Interface::new_proxy(
+        &sensor.url,
+        Some(config.reconnect_timeout),
+        Some(status_send),
+    );
 
     // This is used by the proxy itself to communicate with the device tree.
     // for now only used to receive log messages and dump traffic.
@@ -235,7 +264,7 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
         Err(e) => {
             let last_status = port_status.iter().last();
             let err =
-                eyre::Report::new(e).wrap_err(format!("could not open port on {}", sensor_url));
+                eyre::Report::new(e).wrap_err(format!("could not open port on {}", sensor.url));
             return Err(if let Some(status) = last_status {
                 err.with_section(move || format!("{:?}", status).header("Last proxy event:"))
             } else {
@@ -252,7 +281,11 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                     let addr = match stream.peer_addr() {
                         Ok(addr) => addr.to_string(),
                         Err(err) => {
-                            log!(tf, "Failed to determine client address: {:?}", err);
+                            log!(
+                                config.timestamp_format,
+                                "Failed to determine client address: {:?}",
+                                err
+                            );
                             continue;
                         }
                     };
@@ -266,11 +299,11 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                         _ => continue,
                     };
 
-                    if verbose {
-                        log!(tf, "Accepted client from {}", addr);
+                    if config.verbose {
+                        log!(config.timestamp_format, "Accepted client from {}", addr);
                     }
                     let port = proxy.new_port(Some(Duration::from_millis(2000)), subtree.clone(), usize::MAX, true, true).expect("Failed to create new proxy port");
-                    let tf = tf.clone();
+                    let client_config = config.clone();
                     std::thread::spawn(move || {
                         let mut is_slow = false;
                         let mut dropped: usize = 0;
@@ -278,40 +311,40 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                             select! {
                                 recv(port.receiver()) -> res => {
                                     let pkt = if let Ok(pkt) = res { pkt } else {
-                                        log!(tf, "Disconnecting client {} due to internal error receiving tio data in thread", addr);
+                                        log!(client_config.timestamp_format, "Disconnecting client {} due to internal error receiving tio data in thread", addr);
                                             break;
                                     };
-                                    if dump_traffic {
+                                    if client_config.dump_traffic {
                                         if match pkt.payload {
                                             proto::Payload::RpcRequest(_) | proto::Payload::RpcReply(_) | proto::Payload::RpcError(_) => true,
                                             _ => false,
                                         } {
-                                            log!(tf, "{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
+                                            log!(client_config.timestamp_format, "{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
                                         }
                                     }
                                     match client.try_send(pkt) {
                                         Err(tio::SendError::Full) => {
-                                            if disconnect_slow {
-                                                log!(tf, "Disconnecting client {} due to slowness", addr);
+                                            if client_config.disconnect_slow {
+                                                log!(client_config.timestamp_format, "Disconnecting client {} due to slowness", addr);
                                                 break;
-                                            } else if verbose {
+                                            } else if client_config.verbose {
                                                 if !is_slow {
                                                     is_slow = true;
-                                                    log!(tf, "Client {} is not keeping up and is dropping packets", addr);
+                                                    log!(client_config.timestamp_format, "Client {} is not keeping up and is dropping packets", addr);
                                                 }
                                                 dropped += 1;
                                             }
                                         }
                                         Ok(()) => {
-                                            if verbose && is_slow {
-                                                log!(tf, "Client {} resuming after having dropped {} packets", addr, dropped);
+                                            if client_config.verbose && is_slow {
+                                                log!(client_config.timestamp_format, "Client {} resuming after having dropped {} packets", addr, dropped);
                                                 is_slow = false;
                                                 dropped = 0;
                                             }
                                         }
                                         _ => {
-                                            if verbose {
-                                                log!(tf, "Client {} exiting", addr);
+                                            if client_config.verbose {
+                                                log!(client_config.timestamp_format, "Client {} exiting", addr);
                                             }
                                             break;
                                         }
@@ -320,17 +353,17 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                                 recv(client_rx) -> res => {
                                     match res {
                                         Ok(Ok(pkt)) => {
-                                            if dump_traffic {
-                                                log!(tf, "{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
+                                            if client_config.dump_traffic {
+                                                log!(client_config.timestamp_format, "{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
                                             }
                                             if let Err(_) = port.try_send(pkt) {
-                                                log!(tf, "Disconnecting client {} due to internal error forwarding tio data in thread", addr);
+                                                log!(client_config.timestamp_format, "Disconnecting client {} due to internal error forwarding tio data in thread", addr);
                                                     break;
                                             }
                                         }
                                         _ => {
-                                            if verbose {
-                                                log!(tf, "Client {} exiting", addr);
+                                            if client_config.verbose {
+                                                log!(client_config.timestamp_format, "Client {} exiting", addr);
                                             }
                                             break;
                                         }
@@ -347,36 +380,46 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                 if let Ok(evt) = status {
                     match evt {
                         proxy::Event::SensorDisconnected => {
-                            log!(tf, "Sensor disconnected");
+                            log!(config.timestamp_format, "Sensor disconnected");
                         }
                         proxy::Event::SensorReconnected => {
-                            log!(tf, "Sensor reconnected");
+                            log!(config.timestamp_format, "Sensor reconnected");
                         }
                         proxy::Event::FailedToReconnect => {
-                            log!(tf, "Stopping reconnection attempts due to timeout");
+                            log!(
+                                config.timestamp_format,
+                                "Stopping reconnection attempts due to timeout"
+                            );
                         }
                         proxy::Event::FailedToConnect => {
-                            log!(tf, "Fatal proxy error: failed to connect to sensor");
+                            log!(
+                                config.timestamp_format,
+                                "Fatal proxy error: failed to connect to sensor"
+                            );
                         }
                         proxy::Event::FatalError(err) => {
-                            log!(tf, "Fatal proxy error: {:?}", err);
+                            log!(config.timestamp_format, "Fatal proxy error: {:?}", err);
                             // the proxy thread will exit and we'll detect it at the next iteration.
                         }
                         proxy::Event::ProtocolError(perr) => {
                             match perr {
                                 proto::Error::Text(txt) => {
-                                    log!(tf, "Text: {}", txt);
+                                    log!(config.timestamp_format, "Text: {}", txt);
                                 }
                                 other => {
-                                    if verbose || debugging {
-                                        log!(tf, "Protocol error: {:?}", other);
+                                    if config.verbose || config.debugging {
+                                        log!(
+                                            config.timestamp_format,
+                                            "Protocol error: {:?}",
+                                            other
+                                        );
                                     }
                                 }
                             }
                         }
                         evt => {
-                            if debugging {
-                                log!(tf, "Proxy event: {:?}", evt)
+                            if config.debugging {
+                                log!(config.timestamp_format, "Proxy event: {:?}", evt)
                             }
                         }
                     }
@@ -389,29 +432,26 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
             recv(proxy_port.receiver()) -> pkt_or_err => {
                 if let Ok(pkt) = pkt_or_err {
                     let dump = match pkt.payload {
-                        proto::Payload::Heartbeat(_) => dump_hb,
-                        proto::Payload::Metadata(_) => dump_meta,
-                        proto::Payload::StreamData(_) => dump_data,
-                        _ => dump_traffic
+                        proto::Payload::Heartbeat(_) => config.dump_hb,
+                        proto::Payload::Metadata(_) => config.dump_meta,
+                        proto::Payload::StreamData(_) => config.dump_data,
+                        _ => config.dump_traffic
                     };
                     if dump {
-                        log!(tf, "Packet from {} -- {:?}", pkt.routing, pkt.payload);
+                        log!(config.timestamp_format, "Packet from {} -- {:?}", pkt.routing, pkt.payload);
                     }
                     if let proto::Payload::LogMessage(log) = pkt.payload {
-                        log!(tf, "{} {:?}: {}", pkt.routing, log.level, log.message);
+                        log!(
+                            config.timestamp_format,
+                            "{} {:?}: {}",
+                            pkt.routing,
+                            log.level,
+                            log.message
+                        );
                     }
                 }
             }
         }
     }
     Ok(())
-}
-
-pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
-    match proxy_cli.subcommands.take() {
-        Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
-            crate::tools::proxy_nmea::run_nmea_proxy(tio, tcp_port)
-        }
-        None => run_proxy_server(ProxyConfig::from(proxy_cli)),
-    }
 }

@@ -1,28 +1,34 @@
 use crate::{ProxyHelp, TioOpts};
-use clap::Parser;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use twinleaf::device::Device;
 use twinleaf::tio;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "tio-nmea-proxy",
-    version,
-    about = "Bridge Twinleaf sensor data to NMEA TCP stream"
-)]
-struct Cli {
-    #[command(flatten)]
-    tio: TioOpts,
+pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
+    use color_eyre::Help;
+    use eyre::WrapErr;
 
-    #[arg(
-        short = 'p',
-        long = "port",
-        default_value = "7800",
-        help = "TCP port to listen on"
-    )]
-    tcp_port: u16,
+    let proxy = tio::proxy::Interface::new(&tio.root);
+    let route = tio.route.clone();
+
+    let bind_addr = format!("0.0.0.0:{}", tcp_port);
+    let listener = TcpListener::bind(&bind_addr)
+        .wrap_err_with(|| format!("could not bind to {}", bind_addr))
+        .suggestion(format!("port {} may be in use; try -p <N>", tcp_port))?;
+
+    println!("Listening on {}", bind_addr);
+
+    for connection in listener.incoming() {
+        if let Ok(stream) = connection {
+            let device = proxy
+                .device_full(route.clone())
+                .wrap_err_with(|| format!("could not open device at {}", tio.root))
+                .with_proxy_help()?;
+            thread::spawn(move || broadcast_to_client(stream, device));
+        }
+    }
+    Ok(())
 }
 
 fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String]) -> String {
@@ -83,30 +89,4 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
         }
     }
     println!("Disconnected: {}", peer_addr);
-}
-
-pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
-    use color_eyre::Help;
-    use eyre::WrapErr;
-
-    let proxy = tio::proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-
-    let bind_addr = format!("0.0.0.0:{}", tcp_port);
-    let listener = TcpListener::bind(&bind_addr)
-        .wrap_err_with(|| format!("could not bind to {}", bind_addr))
-        .suggestion(format!("port {} may be in use; try -p <N>", tcp_port))?;
-
-    println!("Listening on {}", bind_addr);
-
-    for connection in listener.incoming() {
-        if let Ok(stream) = connection {
-            let device = proxy
-                .device_full(route.clone())
-                .wrap_err_with(|| format!("could not open device at {}", tio.root))
-                .with_proxy_help()?;
-            thread::spawn(move || broadcast_to_client(stream, device));
-        }
-    }
-    Ok(())
 }

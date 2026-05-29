@@ -2,8 +2,10 @@ use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
-use twinleaf::device::util::{rpc_decode_reply, rpc_encode_arg};
-use twinleaf::device::{RpcClient, RpcRegistry, RpcValue, RpcValueType};
+use twinleaf::device::{
+    util::{rpc_decode_reply, rpc_encode_arg},
+    RpcClient, RpcRegistry, RpcValue, RpcValueType,
+};
 use twinleaf::tio;
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {

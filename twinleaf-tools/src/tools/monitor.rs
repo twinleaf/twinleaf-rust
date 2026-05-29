@@ -1,6 +1,4 @@
-// tio monitor
-// Live sensor data display with plot and FFT capabilities
-// Build: cargo run --release -- <tio-url> [options]
+//! Live sensor data display with plot and FFT capabilities.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -10,10 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq};
-use crate::tui::rpc_state::RouteRpcState;
-use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
-use crate::tui::tree_worker::spawn_tree_worker;
+use crate::tui::{
+    rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq},
+    rpc_state::RouteRpcState,
+    rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp},
+    tree_worker::spawn_tree_worker,
+};
 use crate::{MonitorCli, ProxyHelp, TioOpts};
 use crossbeam::channel::{self, Sender};
 use ratatui::{
@@ -35,6 +35,29 @@ use twinleaf::{
     tio::{self, proto::ProxyStatus},
 };
 use welch_sde::{Build, SpectralDensity};
+
+pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
+    run_monitor_app(config)
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorConfig {
+    pub tio: TioOpts,
+    pub fps: u32,
+    pub colors: Option<String>,
+    pub depth: Option<usize>,
+}
+
+impl From<MonitorCli> for MonitorConfig {
+    fn from(cli: MonitorCli) -> Self {
+        Self {
+            tio: cli.tio,
+            fps: cli.fps,
+            colors: cli.colors,
+            depth: cli.depth,
+        }
+    }
+}
 
 const MIN_PLOT_WINDOW_SECONDS: f64 = 0.5;
 const MAX_PLOT_WINDOW_SECONDS: f64 = 60.0;
@@ -366,25 +389,6 @@ pub struct ViewConfig {
     pub desc_width: usize,
     pub units_width: usize,
     pub theme: Theme,
-}
-
-#[derive(Debug, Clone)]
-pub struct MonitorConfig {
-    pub tio: TioOpts,
-    pub fps: u32,
-    pub colors: Option<String>,
-    pub depth: Option<usize>,
-}
-
-impl From<MonitorCli> for MonitorConfig {
-    fn from(cli: MonitorCli) -> Self {
-        Self {
-            tio: cli.tio,
-            fps: cli.fps,
-            colors: cli.colors,
-            depth: cli.depth,
-        }
-    }
 }
 
 impl Default for ViewConfig {
@@ -1737,7 +1741,7 @@ fn get_num(it: &InlineTable, k: &str) -> Option<f64> {
     it.get(k)
         .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
 }
-pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
+fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     use eyre::WrapErr;
 
     let MonitorConfig {

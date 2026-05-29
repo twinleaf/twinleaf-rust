@@ -8,6 +8,31 @@ use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::device::DeviceRoute;
 use twinleaf::tio::proxy;
 
+pub fn run_list(all: bool) -> eyre::Result<()> {
+    use color_eyre::Help;
+
+    let candidates = discovery::enumerate_serial(all);
+
+    if candidates.is_empty() {
+        return Err(eyre::eyre!("no sensors detected")
+            .suggestion("check that the device is plugged in and powered"));
+    }
+
+    let results: Vec<ListedDevice> = std::thread::scope(|s| {
+        let handles: Vec<_> = candidates
+            .into_iter()
+            .map(|dev| s.spawn(move || probe(dev.url, dev.interface)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("probe thread panicked"))
+            .collect()
+    });
+
+    render(&results);
+    Ok(())
+}
+
 /// Total time spent listening for heartbeats/data on a freshly opened
 /// port. Heartbeats fire at 5 Hz (200 ms), so 300 ms covers at least
 /// one guaranteed heartbeat per live route plus routing slack.
@@ -31,31 +56,6 @@ struct ListedDevice {
     url: String,
     interface: PortInterface,
     status: ListedStatus,
-}
-
-pub fn list_devices(all: bool) -> eyre::Result<()> {
-    use color_eyre::Help;
-
-    let candidates = discovery::enumerate_serial(all);
-
-    if candidates.is_empty() {
-        return Err(eyre::eyre!("no sensors detected")
-            .suggestion("check that the device is plugged in and powered"));
-    }
-
-    let results: Vec<ListedDevice> = std::thread::scope(|s| {
-        let handles: Vec<_> = candidates
-            .into_iter()
-            .map(|dev| s.spawn(move || probe(dev.url, dev.interface)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("probe thread panicked"))
-            .collect()
-    });
-
-    render(&results);
-    Ok(())
 }
 
 fn probe(url: String, interface: PortInterface) -> ListedDevice {
@@ -252,8 +252,8 @@ fn summary(devices: &[ListedDevice]) -> String {
 }
 
 // Called from `tio proxy --enumerate` for backward compatibility; emits a
-// deprecation warning and delegates to list_devices.
+// deprecation warning and delegates to run_list.
 pub fn list_devices_deprecated(all: bool) -> eyre::Result<()> {
     eprintln!("warning: 'tio proxy --enumerate' is deprecated; use 'tio list' instead");
-    list_devices(all)
+    run_list(all)
 }

@@ -10,9 +10,15 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::tio::proto;
-use twinleaf::tio::proto::meta;
+use twinleaf::tio::proto::{self, meta};
 
+pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
+    let mut device = TestDevice::new(cli)?;
+    device.run()?;
+    Ok(())
+}
+
+// In raw mode, '\n' does not reliably return the cursor to column 0.
 macro_rules! terminal_println {
     ($($arg:tt)*) => {
         terminal_print_line(format_args!($($arg)*))
@@ -1473,10 +1479,4 @@ fn unix_duration() -> Duration {
 
 fn unix_time_secs(now: Duration) -> u32 {
     u32::try_from(now.as_secs()).unwrap_or(u32::MAX)
-}
-
-pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
-    let mut device = TestDevice::new(cli)?;
-    device.run()?;
-    Ok(())
 }

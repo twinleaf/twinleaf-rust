@@ -32,6 +32,44 @@ use twinleaf::{
     tio,
 };
 
+pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
+    run_health_app(config)
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthConfig {
+    tio: crate::TioOpts,
+    jitter_window: u64,
+    event_log_size: usize,
+    event_display_lines: u16,
+    warnings_only: bool,
+    stale_dur: Duration,
+    ppm_warn: f64,
+    ppm_err: f64,
+    streams: Option<Vec<u8>>,
+    quiet: bool,
+    fps: u64,
+}
+
+impl From<HealthCli> for HealthConfig {
+    fn from(cli: HealthCli) -> Self {
+        let stale_dur = cli.stale_dur();
+        Self {
+            tio: cli.tio,
+            jitter_window: cli.jitter_window,
+            event_log_size: cli.event_log_size as usize,
+            event_display_lines: cli.event_display_lines,
+            warnings_only: cli.warnings_only,
+            stale_dur,
+            ppm_warn: cli.ppm_warn,
+            ppm_err: cli.ppm_err,
+            streams: cli.streams,
+            quiet: cli.quiet,
+            fps: cli.fps,
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeviceState {
     last_heartbeat: Option<Instant>,
@@ -298,40 +336,6 @@ enum Action {
     SelectRoute(DeviceRoute),
     ResetStats,
     ClearLog,
-}
-
-#[derive(Debug, Clone)]
-pub struct HealthConfig {
-    tio: crate::TioOpts,
-    jitter_window: u64,
-    event_log_size: usize,
-    event_display_lines: u16,
-    warnings_only: bool,
-    stale_dur: Duration,
-    ppm_warn: f64,
-    ppm_err: f64,
-    streams: Option<Vec<u8>>,
-    quiet: bool,
-    fps: u64,
-}
-
-impl From<HealthCli> for HealthConfig {
-    fn from(cli: HealthCli) -> Self {
-        let stale_dur = cli.stale_dur();
-        Self {
-            tio: cli.tio,
-            jitter_window: cli.jitter_window,
-            event_log_size: cli.event_log_size as usize,
-            event_display_lines: cli.event_display_lines,
-            warnings_only: cli.warnings_only,
-            stale_dur,
-            ppm_warn: cli.ppm_warn,
-            ppm_err: cli.ppm_err,
-            streams: cli.streams,
-            quiet: cli.quiet,
-            fps: cli.fps,
-        }
-    }
 }
 
 struct HealthState {
@@ -1116,7 +1120,7 @@ fn get_action(ev: Event, app: &mut HealthState, root_route: &DeviceRoute) -> Opt
     }
 }
 
-pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
+fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
     use eyre::WrapErr;
 
     let mut terminal = ratatui::init();
