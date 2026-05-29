@@ -266,8 +266,8 @@ impl RpcPalette {
                 Zone::Arg => {
                     if self.has_arg_content() {
                         self.clear_arg(registry);
-                    } else {
-                        self.pop_undo(registry);
+                    } else if !self.pop_undo(registry) {
+                        self.clear_arg(registry);
                     }
                     PaletteEvent::Consumed
                 }
