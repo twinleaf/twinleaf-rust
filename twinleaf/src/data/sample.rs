@@ -109,6 +109,10 @@ impl Sample {
     pub fn is_monotonic(&self) -> bool {
         self.boundary.as_ref().map_or(true, |b| b.is_monotonic())
     }
+
+    pub fn is_initial(&self) -> bool {
+        self.boundary.as_ref().is_some_and(|b| b.is_initial())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +179,10 @@ impl Boundary {
                 | BoundaryReason::SegmentRollover { .. }
                 | BoundaryReason::SegmentChanged { .. }
         )
+    }
+
+    pub fn is_initial(&self) -> bool {
+        matches!(self.reason, BoundaryReason::Initial)
     }
 }
 

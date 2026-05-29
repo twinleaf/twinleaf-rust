@@ -215,10 +215,11 @@ impl Hdf5Appender {
     }
 
     pub fn write_sample(&mut self, sample: Sample, key: StreamKey) -> Result<()> {
-        let should_split = match self.split_policy {
-            SplitPolicy::Continuous => !sample.is_continuous(),
-            SplitPolicy::Monotonic => !sample.is_monotonic(),
-        };
+        let should_split = !sample.is_initial()
+            && match self.split_policy {
+                SplitPolicy::Continuous => !sample.is_continuous(),
+                SplitPolicy::Monotonic => !sample.is_monotonic(),
+            };
 
         if should_split {
             self.handle_discontinuity(&key)?;
