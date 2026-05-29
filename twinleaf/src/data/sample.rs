@@ -89,18 +89,18 @@ impl Column {
     }
 }
 
-fn read_u24(raw: &[u8]) -> u32 {
-    u32::from(raw[0]) | (u32::from(raw[1]) << 8) | (u32::from(raw[2]) << 16)
-}
+// fn read_u24(raw: &[u8]) -> u32 {
+//     u32::from(raw[0]) | (u32::from(raw[1]) << 8) | (u32::from(raw[2]) << 16)
+// }
 
-fn read_i24(raw: &[u8]) -> i32 {
-    let value = read_u24(raw) as i32;
-    if value & 0x0080_0000 != 0 {
-        value | !0x00ff_ffff
-    } else {
-        value
-    }
-}
+// fn read_i24(raw: &[u8]) -> i32 {
+//     let value = read_u24(raw) as i32;
+//     if value & 0x0080_0000 != 0 {
+//         value | !0x00ff_ffff
+//     } else {
+//         value
+//     }
+// }
 
 #[derive(Debug, Clone)]
 pub struct Sample {

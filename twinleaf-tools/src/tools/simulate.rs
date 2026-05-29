@@ -53,14 +53,15 @@ const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
 const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
 const CAPTURE_TRIGGER_DELAY: Duration = Duration::from_millis(500);
 const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
-const CAPTURE_SAMPLE_COUNT: usize = 1024;
+const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
+const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
 const CAPTURE_SAMPLE_BYTES: usize = std::mem::size_of::<f32>();
 const CAPTURE_METADATA_VERSION: u8 = 1;
 const CAPTURE_METADATA_FIXED_LEN: u8 = 30;
 const CAPTURE_Y_CALIBRATION: f32 = 1.0;
-const CAPTURE_NAME: &str = "test.capture";
+const CAPTURE_NAME: &str = "Test Signal";
 const CAPTURE_UNITS: &str = "V";
-const CAPTURE_X_NAME: &str = "time";
+const CAPTURE_X_NAME: &str = "Time";
 const CAPTURE_X_UNITS: &str = "s";
 const CAPTURE_STATUS_IDLE: u8 = 0;
 const CAPTURE_STATUS_CAPTURING: u8 = 1;
@@ -507,8 +508,9 @@ impl TestDevice {
         );
         terminal_println!(
             "  capture buffer: test.capture(-1) trigger, test.capture(-2) status, \
-             test.capture(-3) metadata, {} f32 samples, ~{:.1}s delay",
-            CAPTURE_SAMPLE_COUNT,
+             test.capture(-3) metadata, {}-{} f32 samples, ~{:.1}s delay",
+            CAPTURE_SAMPLE_COUNT_MIN,
+            CAPTURE_SAMPLE_COUNT_MAX,
             CAPTURE_TRIGGER_DELAY.as_secs_f64()
         );
         if raw_mode.is_some() {
@@ -934,7 +936,8 @@ impl TestDevice {
         self.capture
             .begin_capture(data, info, Instant::now() + CAPTURE_TRIGGER_DELAY);
         terminal_println!(
-            "test.capture triggered; data available in ~{:.1}s",
+            "test.capture triggered ({} samples); data available in ~{:.1}s",
+            info.length,
             CAPTURE_TRIGGER_DELAY.as_secs_f64()
         );
         self.send_rpc_reply(id, Vec::new(), routing, addr)
@@ -990,11 +993,12 @@ impl TestDevice {
     }
 
     fn generate_capture_data(&mut self) -> (Vec<u8>, CaptureInfo) {
-        let mut data = Vec::with_capacity(CAPTURE_SAMPLE_COUNT * CAPTURE_SAMPLE_BYTES);
+        let sample_count = next_capture_sample_count(&mut self.rng);
+        let mut data = Vec::with_capacity(sample_count * CAPTURE_SAMPLE_BYTES);
 
         let noise_sigma = self.params.noise * (f64::from(self.sample_rate) / 2.0).sqrt();
         let start_sample = self.samples_generated;
-        for offset in 0..CAPTURE_SAMPLE_COUNT as u64 {
+        for offset in 0..sample_count as u64 {
             let t = (start_sample + offset) as f64 / f64::from(self.sample_rate);
             let phase = std::f64::consts::TAU * self.params.frequency * t;
             let value =
@@ -1003,7 +1007,7 @@ impl TestDevice {
         }
 
         let info = CaptureInfo {
-            length: CAPTURE_SAMPLE_COUNT as u32,
+            length: sample_count as u32,
             y_calibration: CAPTURE_Y_CALIBRATION,
             x_offset: start_sample as f32 / self.sample_rate as f32,
             x_stride: 1.0 / self.sample_rate as f32,
@@ -1722,6 +1726,11 @@ fn next_log_delay(rng: &mut GaussianRng) -> Duration {
     LOG_MESSAGE_MIN_INTERVAL + jitter
 }
 
+fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
+    let span = CAPTURE_SAMPLE_COUNT_MAX - CAPTURE_SAMPLE_COUNT_MIN + 1;
+    CAPTURE_SAMPLE_COUNT_MIN + (rng.next_u64() as usize % span)
+}
+
 fn log_level_name(level: proto::LogLevel) -> &'static str {
     match level {
         proto::LogLevel::Critical => "critical",
@@ -1832,8 +1841,9 @@ mod tests {
 
         let (data, info) = device.generate_capture_data();
 
-        assert_eq!(data.len(), CAPTURE_SAMPLE_COUNT * CAPTURE_SAMPLE_BYTES);
-        assert_eq!(info.length, CAPTURE_SAMPLE_COUNT as u32);
+        assert!((CAPTURE_SAMPLE_COUNT_MIN as u32..=CAPTURE_SAMPLE_COUNT_MAX as u32)
+            .contains(&info.length));
+        assert_eq!(data.len(), info.length as usize * CAPTURE_SAMPLE_BYTES);
         assert_eq!(info.y_calibration, 1.0);
         assert_eq!(info.x_offset, 0.0);
         assert_eq!(info.x_stride, 0.25);
@@ -1849,6 +1859,7 @@ mod tests {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
         let mut device = TestDevice::new(cli).unwrap();
         let (data, info) = device.generate_capture_data();
+        let data_len = data.len();
         device
             .capture
             .begin_capture(data, info, Instant::now() + Duration::from_millis(1));
@@ -1861,15 +1872,29 @@ mod tests {
         assert_eq!(metadata[2], u8::from(proto::DataType::Float32));
         assert_eq!(
             u32::from_le_bytes(metadata[4..8].try_into().unwrap()),
-            (CAPTURE_SAMPLE_COUNT * CAPTURE_SAMPLE_BYTES) as u32
+            u32::try_from(data_len).unwrap()
         );
         assert_eq!(
             u32::from_le_bytes(metadata[10..14].try_into().unwrap()),
-            CAPTURE_SAMPLE_COUNT as u32
+            info.length
         );
         assert_eq!(
             f32::from_le_bytes(metadata[14..18].try_into().unwrap()),
             CAPTURE_Y_CALIBRATION
         );
+    }
+
+    #[test]
+    fn capture_sample_count_varies_within_range() {
+        let mut rng = GaussianRng::new(1);
+        let mut counts = Vec::new();
+        for _ in 0..8 {
+            counts.push(next_capture_sample_count(&mut rng));
+        }
+
+        assert!(counts
+            .iter()
+            .all(|count| (CAPTURE_SAMPLE_COUNT_MIN..=CAPTURE_SAMPLE_COUNT_MAX).contains(count)));
+        assert!(counts.windows(2).any(|pair| pair[0] != pair[1]));
     }
 }
