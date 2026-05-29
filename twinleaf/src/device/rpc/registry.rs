@@ -3,6 +3,12 @@ use super::value::RpcValueType;
 use crate::device::util;
 use std::collections::BTreeMap;
 
+pub const RPC_META_READABLE: u16 = 0x0100;
+pub const RPC_META_WRITABLE: u16 = 0x0200;
+pub const RPC_META_PERSISTENT: u16 = 0x0400;
+pub const RPC_META_BOOL: u16 = 0x0800;
+pub const RPC_META_CAPTURE: u16 = 0x1000;
+
 #[derive(Debug, Clone)]
 pub struct RpcDescriptor {
     pub full_name: String,
@@ -11,6 +17,8 @@ pub struct RpcDescriptor {
     pub readable: bool,
     pub writable: bool,
     pub persistent: bool,
+    pub is_bool: bool,
+    pub is_capture: bool,
     pub meta_raw: u16,
 }
 
@@ -33,6 +41,13 @@ impl RpcDescriptor {
     }
 
     pub fn type_str(&self) -> String {
+        if self.is_capture {
+            return "capture".to_string();
+        }
+        if self.is_bool {
+            return "bool".to_string();
+        }
+
         match self.data_kind {
             RpcValueType::Unit => "".to_string(),
             RpcValueType::Int { signed, size } => {

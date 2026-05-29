@@ -10,6 +10,9 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use twinleaf::device::{
+    RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_READABLE, RPC_META_WRITABLE,
+};
 use twinleaf::tio::proto::{self, meta};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -68,11 +71,13 @@ const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 const STATUS_SAMPLE_BYTES: usize = 2;
 const AUX_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 
-const META_F64_RW: u16 = 0x0100 | 0x0200 | (8 << 4) | 2;
-const META_U8_RW: u16 = 0x0100 | 0x0200 | (1 << 4);
-const META_U32_R: u16 = 0x0100 | (4 << 4) | 0;
-const META_STRING_R: u16 = 0x0100 | 3;
-const META_ACTION: u16 = 0x0200;
+const META_F64_RW: u16 = RPC_META_READABLE | RPC_META_WRITABLE | (8 << 4) | 2;
+const META_U8_RW: u16 = RPC_META_READABLE | RPC_META_WRITABLE | (1 << 4);
+const META_BOOL_RW: u16 = META_U8_RW | RPC_META_BOOL;
+const META_U32_R: u16 = RPC_META_READABLE | (4 << 4) | 0;
+const META_STRING_R: u16 = RPC_META_READABLE | 3;
+const META_ACTION: u16 = RPC_META_WRITABLE;
+const META_CAPTURE: u16 = RPC_META_READABLE | RPC_META_CAPTURE;
 const META_RAW: u16 = 0;
 
 #[derive(Clone, Copy)]
@@ -452,7 +457,7 @@ impl TestDevice {
                 },
                 RpcSpec {
                     name: "test.enable",
-                    meta: META_U8_RW,
+                    meta: META_BOOL_RW,
                 },
                 RpcSpec {
                     name: "test.go",
@@ -460,7 +465,7 @@ impl TestDevice {
                 },
                 RpcSpec {
                     name: "test.capture",
-                    meta: META_RAW,
+                    meta: META_CAPTURE,
                 },
             ],
         })

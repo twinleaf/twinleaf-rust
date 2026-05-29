@@ -1,4 +1,7 @@
-use crate::device::rpc::{DecodeError, EncodeError, RpcDescriptor, RpcValue, RpcValueType};
+use crate::device::rpc::{
+    DecodeError, EncodeError, RpcDescriptor, RpcValue, RpcValueType, RPC_META_BOOL,
+    RPC_META_CAPTURE, RPC_META_PERSISTENT, RPC_META_READABLE, RPC_META_WRITABLE,
+};
 use crate::tio::proxy;
 
 pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcDescriptor>, proxy::RpcError> {
@@ -17,12 +20,14 @@ pub fn parse_rpc_spec(meta: u16, name: String) -> RpcDescriptor {
     let data_type = meta & 0x000F; // low 4 bits
     let data_size = ((meta >> 4) & 0x000F) as u8; // next 4 bits
 
-    let readable = (meta & 0x0100) != 0;
-    let writable = (meta & 0x0200) != 0;
-    let persistent = (meta & 0x0400) != 0;
+    let readable = (meta & RPC_META_READABLE) != 0;
+    let writable = (meta & RPC_META_WRITABLE) != 0;
+    let persistent = (meta & RPC_META_PERSISTENT) != 0;
+    let is_bool = (meta & RPC_META_BOOL) != 0;
+    let is_capture = (meta & RPC_META_CAPTURE) != 0;
     let unknown = meta == 0;
 
-    let data_kind = if unknown {
+    let data_kind = if unknown || is_capture {
         RpcValueType::Raw { meta }
     } else {
         match data_type {
@@ -78,6 +83,8 @@ pub fn parse_rpc_spec(meta: u16, name: String) -> RpcDescriptor {
         readable,
         writable,
         persistent,
+        is_bool,
+        is_capture,
         meta_raw: meta,
     }
 }
