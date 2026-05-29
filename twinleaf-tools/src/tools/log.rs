@@ -63,19 +63,32 @@ pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
     }
 }
 
-fn record_missing_metadata(
-    missing_routes: &mut HashSet<DeviceRoute>,
+// Track which routes ever produced a sample and which ever dropped a stream-data
+// packet. A route is only "missing metadata" if it dropped data but never parsed
+// anything; routes that parse fine but drop a few leading/boundary packets are
+// working as intended.
+fn record_parse_result(
+    parsed: &mut HashSet<DeviceRoute>,
+    unparsed: &mut HashSet<DeviceRoute>,
     pkt: &tio::Packet,
     samples_len: usize,
 ) {
     if samples_len != 0 {
+        parsed.insert(pkt.routing.clone());
         return;
     }
     if let tio::proto::Payload::StreamData(data) = &pkt.payload {
         if !data.data.is_empty() {
-            missing_routes.insert(pkt.routing.clone());
+            unparsed.insert(pkt.routing.clone());
         }
     }
+}
+
+fn unparseable_routes(
+    parsed: &HashSet<DeviceRoute>,
+    unparsed: &HashSet<DeviceRoute>,
+) -> Vec<DeviceRoute> {
+    unparsed.difference(parsed).cloned().collect()
 }
 
 fn report_missing_metadata(mut routes: Vec<DeviceRoute>) {
@@ -533,7 +546,8 @@ pub fn log_dump(
         (true, _) => {
             let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
             let ignore_session = files.len() > 1;
-            let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
+            let mut parsed_routes: HashSet<DeviceRoute> = HashSet::new();
+            let mut unparsed_routes: HashSet<DeviceRoute> = HashSet::new();
 
             for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
@@ -557,7 +571,12 @@ pub fn log_dump(
                         .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
                     let samples = parser.process_packet(&pkt);
-                    record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+                    record_parse_result(
+                        &mut parsed_routes,
+                        &mut unparsed_routes,
+                        &pkt,
+                        samples.len(),
+                    );
 
                     for sample in samples {
                         if route_matches(&pkt.routing) {
@@ -570,10 +589,9 @@ pub fn log_dump(
                 }
             }
 
-            let missing_routes: Vec<_> = missing_metadata_routes
-                .iter()
-                .filter(|route| route_matches(route))
-                .cloned()
+            let missing_routes: Vec<_> = unparseable_routes(&parsed_routes, &unparsed_routes)
+                .into_iter()
+                .filter(route_matches)
                 .collect();
             report_missing_metadata(missing_routes);
         }
@@ -923,7 +941,8 @@ pub fn log_csv(
 
     let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
-    let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
+    let mut parsed_routes: HashSet<DeviceRoute> = HashSet::new();
+    let mut unparsed_routes: HashSet<DeviceRoute> = HashSet::new();
 
     let output_path = format!(
         "{}.{}.csv",
@@ -950,7 +969,12 @@ pub fn log_csv(
             let samples = parser.process_packet(&pkt);
 
             if pkt.routing == target_route {
-                record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+                record_parse_result(
+                    &mut parsed_routes,
+                    &mut unparsed_routes,
+                    &pkt,
+                    samples.len(),
+                );
             }
 
             if pkt.routing != target_route {
@@ -998,7 +1022,7 @@ pub fn log_csv(
     }
 
     if !header_written {
-        if missing_metadata_routes.contains(&target_route) {
+        if unparsed_routes.contains(&target_route) && !parsed_routes.contains(&target_route) {
             return Err(eyre::eyre!(
                 "stream data at route {} could not be parsed because metadata is missing or incompatible",
                 target_route
@@ -1077,7 +1101,8 @@ pub fn log_hdf(
 
     let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
     let ignore_session = files.len() > 1;
-    let mut missing_metadata_routes: HashSet<DeviceRoute> = HashSet::new();
+    let mut parsed_routes: HashSet<DeviceRoute> = HashSet::new();
+    let mut unparsed_routes: HashSet<DeviceRoute> = HashSet::new();
     let mut total_input_bytes: u64 = 0;
 
     println!("Processing {} files...", files.len());
@@ -1113,7 +1138,12 @@ pub fn log_hdf(
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
             let samples = parser.process_packet(&pkt);
-            record_missing_metadata(&mut missing_metadata_routes, &pkt, samples.len());
+            record_parse_result(
+                &mut parsed_routes,
+                &mut unparsed_routes,
+                &pkt,
+                samples.len(),
+            );
 
             for sample in samples {
                 let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
@@ -1141,7 +1171,7 @@ pub fn log_hdf(
     // Finish flushes all pending data and returns stats
     let stats = writer.finish().wrap_err("failed to finalize HDF5")?;
 
-    report_missing_metadata(missing_metadata_routes.into_iter().collect());
+    report_missing_metadata(unparseable_routes(&parsed_routes, &unparsed_routes));
 
     use console::style;
 
