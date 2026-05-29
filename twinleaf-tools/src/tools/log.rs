@@ -900,6 +900,8 @@ pub fn log_csv(
 ) -> eyre::Result<()> {
     use color_eyre::Help;
     use eyre::WrapErr;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use memmap2::Mmap;
 
     let usage_hint = "tio log csv <stream> <log.tio>... [-s <route>]";
 
@@ -952,16 +954,41 @@ pub fn log_csv(
 
     let mut file: Option<File> = None;
     let mut header_written: bool = false;
+    let mut header_cols: Vec<String> = Vec::new();
+    let mut rows_written: u64 = 0;
 
     for path in &files {
-        let file_data = std::fs::read(path)
+        let f = File::open(path)
             .wrap_err_with(|| format!("could not read log file {}", path))
             .suggestion(usage_hint)?;
-        let mut rest: &[u8] = &file_data;
-        while rest.len() > 0 {
-            let (pkt, len) = tio::Packet::deserialize(rest)
-                .wrap_err_with(|| format!("could not parse packet in {}", path))?;
+        let mmap = unsafe { Mmap::map(&f) }.wrap_err_with(|| format!("could not mmap {}", path))?;
+        let total_bytes = mmap.len() as u64;
+
+        let pb = crate::multi_progress().add(ProgressBar::new(total_bytes));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message(path.clone());
+
+        let mut rest: &[u8] = &mmap[..];
+        while !rest.is_empty() {
+            let (pkt, len) = match tio::Packet::deserialize(rest) {
+                Ok(res) => res,
+                Err(e) => {
+                    log::warn!(
+                        "{}: parse error at offset {} ({:?}); stopping",
+                        path,
+                        total_bytes - rest.len() as u64,
+                        e
+                    );
+                    break;
+                }
+            };
             rest = &rest[len..];
+            pb.set_position(total_bytes - rest.len() as u64);
 
             let parser = parsers
                 .entry(pkt.routing.clone())
@@ -993,8 +1020,8 @@ pub fn log_csv(
                 }
 
                 if !header_written {
-                    let mut headers: Vec<String> = vec!["time".to_string()];
-                    headers.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
+                    header_cols = vec!["time".to_string()];
+                    header_cols.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
 
                     if file.is_none() {
                         file = Some(
@@ -1005,7 +1032,7 @@ pub fn log_csv(
                                 .wrap_err_with(|| format!("could not open {}", output_path))?,
                         );
                     }
-                    writeln!(file.as_mut().unwrap(), "{}", headers.join(","))
+                    writeln!(file.as_mut().unwrap(), "{}", header_cols.join(","))
                         .wrap_err_with(|| format!("failed to write {}", output_path))?;
                     header_written = true;
                 }
@@ -1017,8 +1044,11 @@ pub fn log_csv(
 
                 writeln!(file.as_mut().unwrap(), "{}", values.join(","))
                     .wrap_err_with(|| format!("failed to write {}", output_path))?;
+                rows_written += 1;
             }
         }
+
+        pb.finish_and_clear();
     }
 
     if !header_written {
@@ -1042,6 +1072,20 @@ pub fn log_csv(
             files.first().unwrap_or(&"<file>".to_string())
         )));
     }
+
+    use console::style;
+    let rule = style("─".repeat(50)).dim();
+    let label = |s: &str| style(format!("{:10}", s)).bold().cyan();
+
+    println!();
+    println!("{rule}");
+    println!(" {}", style("CSV Output Summary").bold());
+    println!("{rule}");
+    println!(" {} {}", label("Output:"), output_path);
+    println!(" {} {} @ {}", label("Stream:"), stream_arg, target_route);
+    println!(" {} {}", label("Rows:"), rows_written);
+    println!(" {} {}", label("Columns:"), header_cols.join(", "));
+    println!("{rule}");
 
     Ok(())
 }
