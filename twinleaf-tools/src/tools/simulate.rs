@@ -35,7 +35,7 @@ const SINE_STREAM_ID: u8 = 1;
 const STATUS_STREAM_ID: u8 = 2;
 const AUX_STREAM_ID: u8 = 3;
 const N_SEGMENTS: u8 = 16;
-const RPC_HASH: u32 = 0x7465_7375;
+const RPC_HASH: u32 = 0x7465_7377;
 const DEVICE_NAME: &str = "tio-test";
 const DEVICE_SERIAL: &str = "SIM0001";
 const DEVICE_FIRMWARE: &str = "twinleaf-rust-test";
@@ -48,6 +48,20 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
 const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
+const CAPTURE_TRIGGER_DELAY: Duration = Duration::from_millis(500);
+const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
+const CAPTURE_SAMPLE_COUNT: usize = 1024;
+const CAPTURE_SAMPLE_BYTES: usize = std::mem::size_of::<f32>();
+const CAPTURE_METADATA_VERSION: u8 = 1;
+const CAPTURE_METADATA_FIXED_LEN: u8 = 30;
+const CAPTURE_Y_CALIBRATION: f32 = 1.0;
+const CAPTURE_NAME: &str = "test.capture";
+const CAPTURE_UNITS: &str = "V";
+const CAPTURE_X_NAME: &str = "time";
+const CAPTURE_X_UNITS: &str = "s";
+const CAPTURE_STATUS_IDLE: u8 = 0;
+const CAPTURE_STATUS_CAPTURING: u8 = 1;
+const CAPTURE_STATUS_DONE: u8 = 2;
 const MAX_SAMPLE_NUMBER: u32 = 0x00ff_ffff;
 const STREAM_DATA_HEADER_BYTES: usize = 4;
 const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
@@ -78,6 +92,127 @@ struct RpcSpec {
 struct Client {
     addr: SocketAddr,
     last_rx: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureInfo {
+    length: u32,
+    y_calibration: f32,
+    x_offset: f32,
+    x_stride: f32,
+}
+
+impl Default for CaptureInfo {
+    fn default() -> Self {
+        Self {
+            length: 0,
+            y_calibration: CAPTURE_Y_CALIBRATION,
+            x_offset: 0.0,
+            x_stride: 0.0,
+        }
+    }
+}
+
+struct CapturingCapture {
+    ready_at: Instant,
+    data: Vec<u8>,
+    info: CaptureInfo,
+}
+
+struct CaptureBuffer {
+    data: Vec<u8>,
+    block_size: u16,
+    capturing: Option<CapturingCapture>,
+    info: CaptureInfo,
+}
+
+impl CaptureBuffer {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            block_size: CAPTURE_DEFAULT_BLOCK_SIZE,
+            capturing: None,
+            info: CaptureInfo::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.capturing = None;
+        self.block_size = CAPTURE_DEFAULT_BLOCK_SIZE;
+        self.info = CaptureInfo::default();
+    }
+
+    fn begin_capture(&mut self, data: Vec<u8>, info: CaptureInfo, ready_at: Instant) {
+        self.capturing = Some(CapturingCapture {
+            ready_at,
+            data,
+            info,
+        });
+    }
+
+    fn update(&mut self, now: Instant) {
+        let Some(capturing) = self.capturing.as_ref() else {
+            return;
+        };
+        if now < capturing.ready_at {
+            return;
+        }
+
+        let capturing = self.capturing.take().expect("capturing checked above");
+        self.data = capturing.data;
+        self.info = capturing.info;
+    }
+
+    fn locked(&self) -> bool {
+        self.capturing.is_some()
+    }
+
+    fn status(&self) -> u8 {
+        if self.capturing.is_some() {
+            CAPTURE_STATUS_CAPTURING
+        } else if self.data.is_empty() {
+            CAPTURE_STATUS_IDLE
+        } else {
+            CAPTURE_STATUS_DONE
+        }
+    }
+
+    fn info(&self) -> CaptureInfo {
+        self.capturing
+            .as_ref()
+            .map(|capturing| capturing.info)
+            .unwrap_or(self.info)
+    }
+
+    fn export_size(&self) -> usize {
+        self.capturing
+            .as_ref()
+            .map(|capturing| capturing.data.len())
+            .unwrap_or(self.data.len())
+    }
+
+    #[cfg(test)]
+    fn block_count(&self) -> u16 {
+        let size = self.export_size();
+        if size == 0 {
+            return 0;
+        }
+
+        let block_size = usize::from(self.block_size);
+        let blocks = size.div_ceil(block_size);
+        u16::try_from(blocks).unwrap_or(u16::MAX)
+    }
+
+    fn block(&self, index: u16) -> Option<&[u8]> {
+        let start = usize::from(index) * usize::from(self.block_size);
+        let end = (start + usize::from(self.block_size)).min(self.data.len());
+        if start >= end {
+            None
+        } else {
+            Some(&self.data[start..end])
+        }
+    }
 }
 
 struct RawModeGuard;
@@ -181,6 +316,7 @@ struct TestDevice {
     last_heartbeat: Instant,
     next_log_message_at: Instant,
     next_log_level: usize,
+    capture: CaptureBuffer,
     rng: GaussianRng,
     rpcs: Vec<RpcSpec>,
 }
@@ -275,6 +411,7 @@ impl TestDevice {
             last_heartbeat: Instant::now(),
             next_log_message_at: Instant::now() + next_log_delay(&mut rng),
             next_log_level: 0,
+            capture: CaptureBuffer::new(),
             rng,
             rpcs: vec![
                 RpcSpec {
@@ -321,6 +458,10 @@ impl TestDevice {
                     name: "test.go",
                     meta: META_ACTION,
                 },
+                RpcSpec {
+                    name: "test.capture",
+                    meta: META_RAW,
+                },
             ],
         })
     }
@@ -358,6 +499,12 @@ impl TestDevice {
         );
         terminal_println!(
             "  randomly dropping one sample from each sample clock about once per minute"
+        );
+        terminal_println!(
+            "  capture buffer: test.capture(-1) trigger, test.capture(-2) status, \
+             test.capture(-3) metadata, {} f32 samples, ~{:.1}s delay",
+            CAPTURE_SAMPLE_COUNT,
+            CAPTURE_TRIGGER_DELAY.as_secs_f64()
         );
         if raw_mode.is_some() {
             terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
@@ -476,6 +623,7 @@ impl TestDevice {
             .unwrap_or_else(Instant::now);
         self.next_log_message_at = Instant::now() + self.next_log_delay();
         self.next_log_level = 0;
+        self.capture.clear();
     }
 
     fn reboot(&mut self) -> io::Result<()> {
@@ -505,6 +653,8 @@ impl TestDevice {
         routing: proto::DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
+        self.update_capture();
+
         let method = match &req.method {
             proto::RpcMethod::Name(name) => name.as_str(),
             proto::RpcMethod::Id(_) => {
@@ -564,6 +714,7 @@ impl TestDevice {
                 Ok(())
             }
             "test.go" => self.rpc_action(req.id, &req.arg, routing, addr),
+            "test.capture" => self.rpc_capture(req.id, &req.arg, routing, addr),
             _ => self.send_rpc_error(req.id, proto::RpcErrorCode::NotFound, routing, addr),
         };
 
@@ -739,7 +890,125 @@ impl TestDevice {
         self.send_rpc_reply(id, Vec::new(), routing, addr)
     }
 
+    fn rpc_capture(
+        &mut self,
+        id: u16,
+        arg: &[u8],
+        routing: proto::DeviceRoute,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        let selector = match arg.len() {
+            0 => -2,
+            2 => i16::from_le_bytes([arg[0], arg[1]]),
+            _ => {
+                self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr)?;
+                return Ok(());
+            }
+        };
+
+        match selector {
+            -1 => self.rpc_capture_trigger(id, routing, addr),
+            -2 => self.send_rpc_reply(id, vec![self.capture.status()], routing, addr),
+            -3 => self.send_rpc_reply(id, self.capture_metadata_reply(), routing, addr),
+            index if index >= 0 => self.rpc_capture_block(id, index as u16, routing, addr),
+            _ => self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr),
+        }
+    }
+
+    fn rpc_capture_trigger(
+        &mut self,
+        id: u16,
+        routing: proto::DeviceRoute,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if self.capture.locked() {
+            return self.send_rpc_error(id, proto::RpcErrorCode::Busy, routing, addr);
+        }
+
+        let (data, info) = self.generate_capture_data();
+        self.capture
+            .begin_capture(data, info, Instant::now() + CAPTURE_TRIGGER_DELAY);
+        terminal_println!(
+            "test.capture triggered; data available in ~{:.1}s",
+            CAPTURE_TRIGGER_DELAY.as_secs_f64()
+        );
+        self.send_rpc_reply(id, Vec::new(), routing, addr)
+    }
+
+    fn rpc_capture_block(
+        &mut self,
+        id: u16,
+        index: u16,
+        routing: proto::DeviceRoute,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if self.capture.locked() {
+            return self.send_rpc_error(id, proto::RpcErrorCode::Busy, routing, addr);
+        }
+
+        let Some(block) = self.capture.block(index) else {
+            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+        };
+        self.send_rpc_reply(id, block.to_vec(), routing, addr)
+    }
+
+    fn capture_metadata_reply(&self) -> Vec<u8> {
+        let info = self.capture.info();
+        let mut fixed = Vec::with_capacity(usize::from(CAPTURE_METADATA_FIXED_LEN));
+        let mut varlen = Vec::new();
+
+        fixed.push(CAPTURE_METADATA_FIXED_LEN);
+        fixed.push(CAPTURE_METADATA_VERSION);
+        fixed.push(u8::from(proto::DataType::Float32));
+        fixed.push(0);
+        fixed.extend(u32::try_from(self.capture.export_size()).unwrap_or(u32::MAX).to_le_bytes());
+        fixed.extend(self.capture.block_size.to_le_bytes());
+        fixed.extend(info.length.to_le_bytes());
+        fixed.extend(info.y_calibration.to_le_bytes());
+        fixed.extend(info.x_offset.to_le_bytes());
+        fixed.extend(info.x_stride.to_le_bytes());
+        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_NAME));
+        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_UNITS));
+        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_X_NAME));
+        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_X_UNITS));
+        debug_assert_eq!(fixed.len(), usize::from(CAPTURE_METADATA_FIXED_LEN));
+        fixed.extend(varlen);
+        fixed
+    }
+
+    fn update_capture(&mut self) {
+        let was_locked = self.capture.locked();
+        self.capture.update(Instant::now());
+        if was_locked && !self.capture.locked() {
+            terminal_println!("test.capture done ({} bytes)", self.capture.export_size());
+        }
+    }
+
+    fn generate_capture_data(&mut self) -> (Vec<u8>, CaptureInfo) {
+        let mut data = Vec::with_capacity(CAPTURE_SAMPLE_COUNT * CAPTURE_SAMPLE_BYTES);
+
+        let noise_sigma = self.params.noise * (f64::from(self.sample_rate) / 2.0).sqrt();
+        let start_sample = self.samples_generated;
+        for offset in 0..CAPTURE_SAMPLE_COUNT as u64 {
+            let t = (start_sample + offset) as f64 / f64::from(self.sample_rate);
+            let phase = std::f64::consts::TAU * self.params.frequency * t;
+            let value =
+                self.params.amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
+            data.extend((value as f32).to_le_bytes());
+        }
+
+        let info = CaptureInfo {
+            length: CAPTURE_SAMPLE_COUNT as u32,
+            y_calibration: CAPTURE_Y_CALIBRATION,
+            x_offset: start_sample as f32 / self.sample_rate as f32,
+            x_stride: 1.0 / self.sample_rate as f32,
+        };
+
+        (data, info)
+    }
+
     fn send_periodic_packets(&mut self) -> io::Result<()> {
+        self.update_capture();
         let Some(client) = self.client else {
             return Ok(());
         };
@@ -1421,6 +1690,21 @@ fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
     (stream_data_max_data_bytes() / sample_bytes) as u64
 }
 
+#[cfg(test)]
+fn rpc_reply_max_reply_bytes() -> usize {
+    proto::TIO_PACKET_MAX_TOTAL_SIZE
+        .saturating_sub(proto::TIO_PACKET_HEADER_SIZE)
+        .saturating_sub(proto::TIO_PACKET_MAX_ROUTING_SIZE)
+        .saturating_sub(2)
+}
+
+fn append_capture_metadata_string(varlen: &mut Vec<u8>, value: &str) -> u8 {
+    let bytes = value.as_bytes();
+    let len = bytes.len().min(usize::from(u8::MAX));
+    varlen.extend(&bytes[..len]);
+    len as u8
+}
+
 fn next_drop_sample_after(rng: &mut GaussianRng, current_sample: u64, sample_rate: u32) -> u64 {
     let min_seconds = SAMPLE_DROP_INTERVAL_SECONDS - SAMPLE_DROP_JITTER_SECONDS;
     let seconds = min_seconds + rng.next_unit() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
@@ -1479,4 +1763,108 @@ fn unix_duration() -> Duration {
 
 fn unix_time_secs(now: Duration) -> u32 {
     u32::try_from(now.as_secs()).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn capture_buffer_exports_indexed_blocks_after_delay() {
+        let now = Instant::now();
+        let mut capture = CaptureBuffer::new();
+        capture.block_size = 4;
+        capture.begin_capture(
+            (0u8..10).collect(),
+            CaptureInfo {
+                length: 10,
+                ..CaptureInfo::default()
+            },
+            now + Duration::from_millis(500),
+        );
+
+        assert!(capture.locked());
+        assert_eq!(capture.status(), CAPTURE_STATUS_CAPTURING);
+        assert_eq!(capture.block_count(), 3);
+        assert!(capture.block(0).is_none());
+
+        capture.update(now + Duration::from_millis(499));
+        assert!(capture.locked());
+
+        capture.update(now + Duration::from_millis(500));
+        assert!(!capture.locked());
+        assert_eq!(capture.status(), CAPTURE_STATUS_DONE);
+        assert_eq!(capture.export_size(), 10);
+        assert_eq!(capture.info().length, 10);
+        assert_eq!(capture.block(0), Some(&[0, 1, 2, 3][..]));
+        assert_eq!(capture.block(1), Some(&[4, 5, 6, 7][..]));
+        assert_eq!(capture.block(2), Some(&[8, 9][..]));
+        assert!(capture.block(3).is_none());
+    }
+
+    #[test]
+    fn default_capture_block_size_fits_rpc_replies() {
+        assert!(usize::from(CAPTURE_DEFAULT_BLOCK_SIZE) <= rpc_reply_max_reply_bytes());
+    }
+
+    #[test]
+    fn capture_data_uses_current_sine_parameters() {
+        let cli = SimulateCli::parse_from([
+            "tio-simulate",
+            "--port",
+            "0",
+            "--samplerate",
+            "4",
+            "--frequency",
+            "1",
+            "--amplitude",
+            "2",
+            "--noise",
+            "0",
+        ]);
+        let mut device = TestDevice::new(cli).unwrap();
+
+        let (data, info) = device.generate_capture_data();
+
+        assert_eq!(data.len(), CAPTURE_SAMPLE_COUNT * CAPTURE_SAMPLE_BYTES);
+        assert_eq!(info.length, CAPTURE_SAMPLE_COUNT as u32);
+        assert_eq!(info.y_calibration, 1.0);
+        assert_eq!(info.x_offset, 0.0);
+        assert_eq!(info.x_stride, 0.25);
+
+        let first = f32::from_le_bytes(data[0..4].try_into().unwrap());
+        let second = f32::from_le_bytes(data[4..8].try_into().unwrap());
+        assert_eq!(first, 0.0);
+        assert!((second - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn capture_metadata_uses_tl_chibi_type_and_y_calibration() {
+        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
+        let mut device = TestDevice::new(cli).unwrap();
+        let (data, info) = device.generate_capture_data();
+        device
+            .capture
+            .begin_capture(data, info, Instant::now() + Duration::from_millis(1));
+        device.capture.update(Instant::now() + Duration::from_millis(1));
+
+        let metadata = device.capture_metadata_reply();
+
+        assert_eq!(metadata[0], CAPTURE_METADATA_FIXED_LEN);
+        assert_eq!(metadata[1], CAPTURE_METADATA_VERSION);
+        assert_eq!(metadata[2], u8::from(proto::DataType::Float32));
+        assert_eq!(
+            u32::from_le_bytes(metadata[4..8].try_into().unwrap()),
+            (CAPTURE_SAMPLE_COUNT * CAPTURE_SAMPLE_BYTES) as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(metadata[10..14].try_into().unwrap()),
+            CAPTURE_SAMPLE_COUNT as u32
+        );
+        assert_eq!(
+            f32::from_le_bytes(metadata[14..18].try_into().unwrap()),
+            CAPTURE_Y_CALIBRATION
+        );
+    }
 }

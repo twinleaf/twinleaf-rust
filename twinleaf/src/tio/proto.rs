@@ -97,6 +97,10 @@ pub enum DataType {
 }
 
 impl DataType {
+    pub fn type_name(&self) -> String {
+        self.to_string()
+    }
+
     pub fn size(&self) -> usize {
         let raw: u8 = (*self).into();
         (raw >> 4).into()
@@ -118,6 +122,26 @@ impl DataType {
             | DataType::UInt64 => BufferType::UInt,
 
             DataType::Unknown(_) => BufferType::Float,
+        }
+    }
+}
+
+impl std::fmt::Display for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::UInt8 => write!(f, "u8"),
+            DataType::Int8 => write!(f, "i8"),
+            DataType::UInt16 => write!(f, "u16"),
+            DataType::Int16 => write!(f, "i16"),
+            DataType::UInt24 => write!(f, "u24"),
+            DataType::Int24 => write!(f, "i24"),
+            DataType::UInt32 => write!(f, "u32"),
+            DataType::Int32 => write!(f, "i32"),
+            DataType::UInt64 => write!(f, "u64"),
+            DataType::Int64 => write!(f, "i64"),
+            DataType::Float32 => write!(f, "f32"),
+            DataType::Float64 => write!(f, "f64"),
+            DataType::Unknown(n) => write!(f, "raw{}", n),
         }
     }
 }

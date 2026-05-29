@@ -615,25 +615,6 @@ pub fn log_dump(
     Ok(())
 }
 
-fn data_type_label(dt: &tio::proto::DataType) -> String {
-    use tio::proto::DataType;
-    match dt {
-        DataType::UInt8 => "u8".to_string(),
-        DataType::Int8 => "i8".to_string(),
-        DataType::UInt16 => "u16".to_string(),
-        DataType::Int16 => "i16".to_string(),
-        DataType::UInt24 => "u24".to_string(),
-        DataType::Int24 => "i24".to_string(),
-        DataType::UInt32 => "u32".to_string(),
-        DataType::Int32 => "i32".to_string(),
-        DataType::UInt64 => "u64".to_string(),
-        DataType::Int64 => "i64".to_string(),
-        DataType::Float32 => "f32".to_string(),
-        DataType::Float64 => "f64".to_string(),
-        DataType::Unknown(n) => format!("raw{}", n),
-    }
-}
-
 fn fmt_hms(secs: f64) -> String {
     if !secs.is_finite() || secs <= 0.0 {
         return "0s".to_string();
@@ -752,7 +733,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                     .map(|c| {
                         (
                             c.desc.name.clone(),
-                            data_type_label(&c.desc.data_type),
+                            c.desc.data_type.type_name(),
                             c.desc.units.clone(),
                         )
                     })

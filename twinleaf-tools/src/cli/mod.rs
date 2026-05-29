@@ -1,3 +1,4 @@
+mod capture;
 mod dump;
 mod health;
 mod log;
@@ -7,6 +8,7 @@ mod rpc;
 mod simulate;
 mod upgrade;
 
+pub use capture::CaptureCli;
 pub use dump::DumpCli;
 pub use health::HealthCli;
 pub use log::{LogCli, LogSubcommands, MetaSubcommands, SplitLevel, SplitPolicy};
@@ -65,6 +67,9 @@ pub enum Commands {
 
     /// Execute a device RPC
     Rpc(RpcCli),
+
+    /// Trigger and read a capture RPC
+    Capture(CaptureCli),
 
     /// Upgrade device firmware
     #[command(alias = "firmware-upgrade")]
