@@ -11,7 +11,10 @@ mod upgrade;
 pub use capture::CaptureCli;
 pub use dump::DumpCli;
 pub use health::HealthCli;
-pub use log::{LogCli, LogSubcommands, MetaSubcommands, SplitLevel, SplitPolicy};
+pub use log::{
+    parse_csv_target, CsvTarget, LogCli, LogSubcommands, MetaSubcommands, SplitLevel, SplitPolicy,
+    StreamSel,
+};
 pub use monitor::MonitorCli;
 pub use proxy::{ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};

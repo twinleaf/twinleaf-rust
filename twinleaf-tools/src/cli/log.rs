@@ -1,7 +1,8 @@
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use std::time::Duration;
+use twinleaf::device::DeviceRoute;
 
-use crate::TioOpts;
+use crate::{parse_device_route, TioOpts};
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -64,8 +65,8 @@ pub enum LogSubcommands {
         meta: bool,
 
         /// Sensor path in the sensor tree (e.g., /, /0, /0/1)
-        #[arg(short = 's', long = "sensor", default_value = "/")]
-        sensor: String,
+        #[arg(short = 's', long = "sensor", default_value = "/", value_parser = parse_device_route)]
+        sensor: DeviceRoute,
 
         /// Routing depth limit (default: unlimited)
         #[arg(long = "depth")]
@@ -81,17 +82,23 @@ pub enum LogSubcommands {
 
     /// Convert binary log data to CSV
     Csv {
-        /// Stream ID/name and input .tio files (order-independent)
+        /// Stream selector (name or id, optionally with a route prefix like
+        /// /0/field) and input .tio files (order-independent)
         #[arg(value_hint = ValueHint::FilePath)]
         args: Vec<String>,
 
-        /// Sensor route in the device tree (default: /)
-        #[arg(short = 's')]
-        sensor: Option<String>,
+        /// Sensor route in the device tree (default: /); overridden by a route
+        /// prefix in the selector
+        #[arg(short = 's', value_parser = parse_device_route)]
+        sensor: Option<DeviceRoute>,
 
         /// Output filename prefix
         #[arg(short = 'o')]
         output: Option<String>,
+
+        /// Overwrite the output file if it already exists
+        #[arg(short = 'f', long)]
+        force: bool,
     },
 
     /// Convert binary log files to HDF5 format
@@ -136,13 +143,56 @@ pub enum MetaSubcommands {
         input: String,
 
         /// New device route (e.g., /0/1)
-        #[arg(short = 's', long = "sensor")]
-        route: String,
+        #[arg(short = 's', long = "sensor", value_parser = parse_device_route)]
+        route: DeviceRoute,
 
         /// Output metadata file path (defaults to <input>_rerouted.tio)
         #[arg(short = 'o', long = "output")]
         output: Option<String>,
     },
+}
+
+/// How the user referred to a stream on the `log csv` command line.
+#[derive(Clone, Debug)]
+pub enum StreamSel {
+    /// A numeric stream id, matched against `stream_id`.
+    Id(u8),
+    /// A stream name, matched against `name`.
+    Name(String),
+}
+
+/// A parsed `log csv` stream selector: an optional route prefix plus the stream.
+///
+/// The last `/`-separated segment is the stream (id or name); anything before it
+/// is the route. So `field` and `1` carry no route, while `/0/field` and `/0/1`
+/// pin the route to `/0`.
+#[derive(Clone, Debug)]
+pub struct CsvTarget {
+    pub route: Option<DeviceRoute>,
+    pub stream: StreamSel,
+}
+
+pub fn parse_csv_target(s: &str) -> Result<CsvTarget, String> {
+    if s.is_empty() {
+        return Err("empty stream selector".into());
+    }
+    // The stream is always the final path segment; the rest (if any) is route.
+    let last = s.rsplit('/').next().unwrap_or(s);
+    if last.is_empty() {
+        return Err(format!("missing stream name or id in {s:?}"));
+    }
+    let stream = match last.parse::<u8>() {
+        Ok(id) => StreamSel::Id(id),
+        Err(_) => StreamSel::Name(last.to_string()),
+    };
+    let route = if s.contains('/') {
+        // Strip the trailing stream segment (and its separator) to get the route.
+        let prefix = s[..s.len() - last.len()].trim_end_matches('/');
+        Some(parse_device_route(prefix)?)
+    } else {
+        None
+    };
+    Ok(CsvTarget { route, stream })
 }
 
 fn default_log_path() -> String {

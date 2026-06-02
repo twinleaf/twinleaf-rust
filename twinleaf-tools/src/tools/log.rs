@@ -3,7 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 
 use crate::tools::dump::{print_metadata_payload, print_sample};
-use crate::{LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, SplitLevel, SplitPolicy, TioOpts};
+use crate::{
+    parse_csv_target, LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, SplitLevel, SplitPolicy,
+    StreamSel, TioOpts,
+};
 use twinleaf::data::DeviceDataParser;
 use twinleaf::device::{Device, DeviceRoute, DeviceTree};
 use twinleaf::tio::{self, proxy};
@@ -34,7 +37,8 @@ pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
             args,
             sensor,
             output,
-        }) => log_csv(args, sensor, output),
+            force,
+        }) => log_csv(args, sensor, output, force),
         Some(LogSubcommands::Hdf {
             files,
             output,
@@ -385,7 +389,7 @@ pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     Ok(())
 }
 
-pub fn meta_reroute(input: String, route: String, output: Option<String>) -> eyre::Result<()> {
+pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -> eyre::Result<()> {
     use eyre::{bail, WrapErr};
 
     let data = std::fs::read(&input).wrap_err_with(|| format!("could not read {}", input))?;
@@ -426,8 +430,7 @@ pub fn meta_reroute(input: String, route: String, output: Option<String>) -> eyr
         bail!("cannot reroute a file with multiple routes");
     }
 
-    let new_route =
-        DeviceRoute::from_str(&route).map_err(|_| eyre::eyre!("invalid route: {}", route))?;
+    let new_route = route;
     let output_path = output.unwrap_or_else(|| {
         let base = input.strip_suffix(".tio").unwrap_or(&input);
         format!("{}_rerouted.tio", base)
@@ -459,12 +462,12 @@ pub fn log_dump(
     files: Vec<String>,
     data: bool,
     meta: bool,
-    sensor: String,
+    sensor: DeviceRoute,
     depth: Option<usize>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let target_route = DeviceRoute::from_str(&sensor).unwrap_or_else(|_| DeviceRoute::root());
+    let target_route = sensor;
     let max_depth = depth;
 
     let route_matches = |route: &DeviceRoute| -> bool {
@@ -601,7 +604,7 @@ pub fn log_dump(
     if !printed_any && !deeper_routes.is_empty() {
         let mut routes: Vec<_> = deeper_routes.into_iter().collect();
         routes.sort();
-        eprintln!("No data at route {}, but found data at:", sensor);
+        eprintln!("No data at route {}, but found data at:", target_route);
         for r in routes.iter().take(5) {
             eprintln!("  {}", r);
         }
@@ -876,8 +879,9 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
 
 pub fn log_csv(
     args: Vec<String>,
-    sensor: Option<String>,
+    sensor: Option<DeviceRoute>,
     output: Option<String>,
+    force: bool,
 ) -> eyre::Result<()> {
     use color_eyre::Help;
     use eyre::WrapErr;
@@ -914,12 +918,25 @@ pub fn log_csv(
         return Err(eyre::eyre!("missing log file").suggestion(usage_hint));
     }
 
-    let target_id = stream_arg.parse::<u8>().ok();
+    let target =
+        parse_csv_target(&stream_arg).map_err(|e| eyre::eyre!(e).suggestion(usage_hint))?;
 
-    let target_route = if let Some(path) = sensor {
-        DeviceRoute::from_str(&path).map_err(|_| eyre::eyre!("invalid route: {}", path))?
-    } else {
-        DeviceRoute::root()
+    // A route may come from the selector prefix (e.g. /0/field) or -s, but not both.
+    let target_route = match (target.route, sensor) {
+        (Some(_), Some(_)) => {
+            return Err(eyre::eyre!(
+                "route given both in the selector and with -s; specify it only once"
+            )
+            .suggestion(usage_hint));
+        }
+        (Some(r), None) | (None, Some(r)) => r,
+        (None, None) => DeviceRoute::root(),
+    };
+
+    // How the user referred to the stream, for error/summary messages.
+    let target_desc = match &target.stream {
+        StreamSel::Id(id) => id.to_string(),
+        StreamSel::Name(name) => name.clone(),
     };
 
     let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
@@ -927,11 +944,11 @@ pub fn log_csv(
     let mut parsed_routes: HashSet<DeviceRoute> = HashSet::new();
     let mut unparsed_routes: HashSet<DeviceRoute> = HashSet::new();
 
-    let output_path = format!(
-        "{}.{}.csv",
-        output.unwrap_or_else(|| files.last().cloned().unwrap_or_default()),
-        stream_arg
-    );
+    // The output path is built lazily on the first matching sample, once the
+    // stream's canonical name is known (so an id selector still names the file
+    // after the stream, and the route is part of the name to avoid collisions).
+    let mut output_path: Option<String> = None;
+    let mut resolved_name: Option<String> = None;
 
     let mut file: Option<File> = None;
     let mut header_written: bool = false;
@@ -990,10 +1007,9 @@ pub fn log_csv(
             }
 
             for sample in samples {
-                let is_match = if let Some(id) = target_id {
-                    sample.stream.stream_id == id
-                } else {
-                    sample.stream.name == stream_arg
+                let is_match = match &target.stream {
+                    StreamSel::Id(id) => sample.stream.stream_id == *id,
+                    StreamSel::Name(name) => &sample.stream.name == name,
                 };
 
                 if !is_match {
@@ -1005,16 +1021,30 @@ pub fn log_csv(
                     header_cols.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
 
                     if file.is_none() {
+                        let prefix = output
+                            .clone()
+                            .unwrap_or_else(|| files.last().cloned().unwrap_or_default());
+                        let route_label = route_filename_label(&target_route);
+                        let path = format!("{}.{}.{}.csv", prefix, route_label, sample.stream.name);
+                        if !force && std::path::Path::new(&path).exists() {
+                            return Err(eyre::eyre!("output {} already exists", path).suggestion(
+                                "pass --force to overwrite, or use -o for a different name",
+                            ));
+                        }
                         file = Some(
                             OpenOptions::new()
-                                .append(true)
+                                .write(true)
                                 .create(true)
-                                .open(&output_path)
-                                .wrap_err_with(|| format!("could not open {}", output_path))?,
+                                .truncate(true)
+                                .open(&path)
+                                .wrap_err_with(|| format!("could not open {}", path))?,
                         );
+                        resolved_name = Some(sample.stream.name.clone());
+                        output_path = Some(path);
                     }
+                    let path = output_path.as_deref().unwrap_or_default();
                     writeln!(file.as_mut().unwrap(), "{}", header_cols.join(","))
-                        .wrap_err_with(|| format!("failed to write {}", output_path))?;
+                        .wrap_err_with(|| format!("failed to write {}", path))?;
                     header_written = true;
                 }
 
@@ -1023,8 +1053,9 @@ pub fn log_csv(
 
                 values.extend(sample.columns.iter().map(|col| col.value.to_string()));
 
+                let path = output_path.as_deref().unwrap_or_default();
                 writeln!(file.as_mut().unwrap(), "{}", values.join(","))
-                    .wrap_err_with(|| format!("failed to write {}", output_path))?;
+                    .wrap_err_with(|| format!("failed to write {}", path))?;
                 rows_written += 1;
             }
         }
@@ -1045,7 +1076,7 @@ pub fn log_csv(
         }
         return Err(eyre::eyre!(
             "no data found for stream '{}' at route {}",
-            stream_arg,
+            target_desc,
             target_route
         )
         .suggestion(format!(
@@ -1057,18 +1088,37 @@ pub fn log_csv(
     use console::style;
     let rule = style("─".repeat(50)).dim();
     let label = |s: &str| style(format!("{:10}", s)).bold().cyan();
+    let stream_label = resolved_name.as_deref().unwrap_or(&target_desc);
 
     println!();
     println!("{rule}");
     println!(" {}", style("CSV Output Summary").bold());
     println!("{rule}");
-    println!(" {} {}", label("Output:"), output_path);
-    println!(" {} {} @ {}", label("Stream:"), stream_arg, target_route);
+    println!(
+        " {} {}",
+        label("Output:"),
+        output_path.as_deref().unwrap_or_default()
+    );
+    println!(" {} {} @ {}", label("Stream:"), stream_label, target_route);
     println!(" {} {}", label("Rows:"), rows_written);
     println!(" {} {}", label("Columns:"), header_cols.join(", "));
     println!("{rule}");
 
     Ok(())
+}
+
+/// Render a route as a filename-safe label: `root` for the device root, or the
+/// hop indices joined by `.` (e.g. `/0/1` -> `0.1`).
+fn route_filename_label(route: &DeviceRoute) -> String {
+    if route.len() == 0 {
+        "root".to_string()
+    } else {
+        route
+            .iter()
+            .map(|hop| hop.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
 }
 
 #[cfg(feature = "hdf5")]
