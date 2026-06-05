@@ -43,9 +43,9 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     for desc in registry.iter() {
         println!(
             "{} {}({})",
-            desc.perm_str(),
+            desc.meta.perm_str(),
             desc.full_name,
-            desc.type_str()
+            desc.meta.type_str()
         );
     }
 

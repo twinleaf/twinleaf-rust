@@ -26,13 +26,77 @@ impl std::fmt::Display for RpcValue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcValueType {
     Unit,
     Int { signed: bool, size: u8 },
     Float { size: u8 },
     String { max_len: Option<u16> },
     Raw { meta: u16 },
+}
+
+impl RpcValueType {
+    const TYPE_UINT: u8 = 0;
+    const TYPE_INT: u8 = 1;
+    const TYPE_FLOAT: u8 = 2;
+    const TYPE_STRING: u8 = 3;
+
+    pub const fn from_low_byte(byte: u8) -> Option<Self> {
+        let data_type = byte & 0x0F;
+        let data_size = (byte >> 4) & 0x0F;
+        let kind = match data_type {
+            Self::TYPE_UINT => match data_size {
+                0 => RpcValueType::Unit,
+                1 | 2 | 4 | 8 => RpcValueType::Int {
+                    signed: false,
+                    size: data_size,
+                },
+                _ => return None,
+            },
+            Self::TYPE_INT => match data_size {
+                0 => RpcValueType::Unit,
+                1 | 2 | 4 | 8 => RpcValueType::Int {
+                    signed: true,
+                    size: data_size,
+                },
+                _ => return None,
+            },
+            Self::TYPE_FLOAT => match data_size {
+                4 | 8 => RpcValueType::Float { size: data_size },
+                0 => RpcValueType::Unit,
+                _ => return None,
+            },
+            Self::TYPE_STRING => RpcValueType::String {
+                max_len: if data_size == 0 {
+                    None
+                } else {
+                    Some(data_size as u16)
+                },
+            },
+            _ => return None,
+        };
+        Some(kind)
+    }
+
+    pub const fn low_byte(self) -> u8 {
+        match self {
+            RpcValueType::Unit => 0,
+            RpcValueType::Int {
+                signed: false,
+                size,
+            } => (size << 4) | Self::TYPE_UINT,
+            RpcValueType::Int { signed: true, size } => (size << 4) | Self::TYPE_INT,
+            RpcValueType::Float { size } => (size << 4) | Self::TYPE_FLOAT,
+            RpcValueType::String { max_len } => {
+                let n = match max_len {
+                    Some(n) => n,
+                    None => 0,
+                };
+                (((n & 0x0F) as u8) << 4) | Self::TYPE_STRING
+            }
+            RpcValueType::Raw { meta } => (meta & 0x00FF) as u8,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

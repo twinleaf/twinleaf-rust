@@ -814,7 +814,7 @@ impl RpcPalette {
             let mut needle_buf = Vec::new();
             let needle = Utf32Str::new(&query, &mut needle_buf);
             let mut scored: Vec<(u16, Suggestion)> = Vec::new();
-            for name in names {
+            for name in &names {
                 let mut haystack_buf = Vec::new();
                 let haystack = Utf32Str::new(name, &mut haystack_buf);
                 let mut positions = Vec::new();
@@ -917,7 +917,7 @@ impl RpcPalette {
         } else {
             Some(remainder.join(" "))
         };
-        let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta_raw);
+        let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta.bits());
         self.last_rpc_result = Some((format!("Sent to {}", route), Color::Yellow));
         self.in_flight = true;
 
@@ -982,11 +982,11 @@ fn spinner_frame(blink: bool) -> &'static str {
 }
 
 fn rpc_signature(desc: &RpcDescriptor) -> String {
-    if desc.is_unknown() {
+    if desc.meta.is_unknown() {
         return String::new();
     }
-    let t = desc.type_str();
-    let perm = desc.perm_str();
+    let t = desc.meta.type_str();
+    let perm = desc.meta.perm_str();
     if t.is_empty() {
         format!("[{}]", perm)
     } else {

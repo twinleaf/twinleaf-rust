@@ -10,9 +10,7 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::device::{
-    RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_PERSISTENT, RPC_META_READABLE, RPC_META_WRITABLE,
-};
+use twinleaf::device::RpcMetaFlags;
 use twinleaf::tio::proto::{self, meta};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -181,13 +179,13 @@ impl RpcSpec {
         }
 
         if self.flags & TL_RPC_PUBLIC_READ != 0 {
-            meta |= RPC_META_READABLE;
+            meta |= RpcMetaFlags::READABLE.bits();
         }
         if self.flags & TL_RPC_PUBLIC_WRITE != 0 {
-            meta |= RPC_META_WRITABLE;
+            meta |= RpcMetaFlags::WRITABLE.bits();
         }
         if self.flags & TL_RPC_PERSISTENT != 0 {
-            meta |= RPC_META_PERSISTENT;
+            meta |= RpcMetaFlags::PERSISTENT.bits();
         }
 
         meta | self.extra_meta
@@ -571,7 +569,7 @@ impl TestDevice {
             RpcSpec::with_extra_meta(
                 "test.enable",
                 TL_RPC_METHOD_PROP | tl_rpc_mk_uint(1) | TL_RPC_PUBLIC_RW,
-                RPC_META_BOOL,
+                RpcMetaFlags::BOOL.bits(),
             ),
             RpcSpec::new(
                 "test.go",
@@ -580,7 +578,7 @@ impl TestDevice {
             RpcSpec::with_extra_meta(
                 "test.capture",
                 TL_RPC_METHOD_STD | TL_RPC_PUBLIC_READ,
-                RPC_META_READABLE | RPC_META_CAPTURE,
+                (RpcMetaFlags::READABLE | RpcMetaFlags::CAPTURE).bits(),
             ),
         ];
         let rpc_hash = rpc_table_hash(&rpcs);
@@ -2039,11 +2037,11 @@ mod tests {
         let spec = RpcSpec::with_extra_meta(
             "test.enable",
             TL_RPC_METHOD_PROP | tl_rpc_mk_uint(1) | TL_RPC_PUBLIC_RW,
-            RPC_META_BOOL,
+            RpcMetaFlags::BOOL.bits(),
         );
         assert_eq!(
             spec.legacy_metadata(),
-            0x8000 | (1 << 4) | 0x0100 | 0x0200 | RPC_META_BOOL
+            0x8000 | (1 << 4) | 0x0100 | 0x0200 | RpcMetaFlags::BOOL.bits()
         );
     }
 

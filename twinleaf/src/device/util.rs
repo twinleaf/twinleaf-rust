@@ -1,6 +1,5 @@
 use crate::device::rpc::{
-    DecodeError, EncodeError, RpcDescriptor, RpcValue, RpcValueType, RPC_META_BOOL,
-    RPC_META_CAPTURE, RPC_META_PERSISTENT, RPC_META_READABLE, RPC_META_WRITABLE,
+    DecodeError, EncodeError, RpcDescriptor, RpcMeta, RpcValue, RpcValueType,
 };
 use crate::tio::proxy;
 
@@ -10,91 +9,18 @@ pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcDescriptor>, proxy:
 
     for id in 0..nrpcs {
         let (meta, name): (u16, String) = device.rpc("rpc.listinfo", id)?;
-        specs.push(parse_rpc_spec(meta, name));
+        specs.push(RpcDescriptor::from_meta(meta, name));
     }
 
     Ok(specs)
 }
 
-pub fn parse_rpc_spec(meta: u16, name: String) -> RpcDescriptor {
-    let data_type = meta & 0x000F; // low 4 bits
-    let data_size = ((meta >> 4) & 0x000F) as u8; // next 4 bits
-
-    let readable = (meta & RPC_META_READABLE) != 0;
-    let writable = (meta & RPC_META_WRITABLE) != 0;
-    let persistent = (meta & RPC_META_PERSISTENT) != 0;
-    let is_bool = (meta & RPC_META_BOOL) != 0;
-    let is_capture = (meta & RPC_META_CAPTURE) != 0;
-    let unknown = meta == 0;
-
-    let data_kind = if unknown || is_capture {
-        RpcValueType::Raw { meta }
-    } else {
-        match data_type {
-            0 => {
-                // unsigned integer
-                match data_size {
-                    0 => RpcValueType::Unit,
-                    1 | 2 | 4 | 8 => RpcValueType::Int {
-                        signed: false,
-                        size: data_size,
-                    },
-                    _ => RpcValueType::Raw { meta },
-                }
-            }
-            1 => {
-                // signed integer
-                match data_size {
-                    0 => RpcValueType::Unit,
-                    1 | 2 | 4 | 8 => RpcValueType::Int {
-                        signed: true,
-                        size: data_size,
-                    },
-                    _ => RpcValueType::Raw { meta },
-                }
-            }
-            2 => {
-                // float
-                match data_size {
-                    4 | 8 => RpcValueType::Float { size: data_size },
-                    0 => RpcValueType::Unit,
-                    _ => RpcValueType::Raw { meta },
-                }
-            }
-            3 => {
-                // string; optional length from size field if nonzero
-                let max_len = if data_size == 0 {
-                    None
-                } else {
-                    Some(data_size as u16)
-                };
-                RpcValueType::String { max_len }
-            }
-            _ => RpcValueType::Raw { meta },
-        }
-    };
-
-    let segments = name.split('.').map(|s| s.to_string()).collect();
-
-    RpcDescriptor {
-        full_name: name,
-        segments,
-        data_kind,
-        readable,
-        writable,
-        persistent,
-        is_bool,
-        is_capture,
-        meta_raw: meta,
-    }
-}
-
 /// When `meta` is `None` (rpc.info failed, or the RPC isn't in any registry)
 /// or when the parsed kind is `Raw` (meta == 0, common for hidden RPCs),
 /// fall back to `String` so a typed arg still gets sent as bytes.
-pub fn resolve_arg_type(meta: Option<u16>, name: &str) -> RpcValueType {
+pub fn resolve_arg_type(meta: Option<u16>, _name: &str) -> RpcValueType {
     let kind = meta
-        .map(|m| parse_rpc_spec(m, name.to_string()).data_kind)
+        .map(|m| RpcMeta::from_bits(m).kind())
         .unwrap_or(RpcValueType::String { max_len: None });
     match kind {
         RpcValueType::Raw { .. } => RpcValueType::String { max_len: None },
