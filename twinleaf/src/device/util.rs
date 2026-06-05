@@ -28,6 +28,55 @@ pub fn resolve_arg_type(meta: Option<u16>, _name: &str) -> RpcValueType {
     }
 }
 
+/// Type names accepted by the `-t`/`-T` overrides, shared by the CLI's clap
+/// value-parser and the monitor RPC palette.
+pub const RPC_TYPE_NAMES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "string",
+];
+
+/// Parse one of [`RPC_TYPE_NAMES`] into an [`RpcValueType`]. Returns `None` for
+/// any unrecognized name so callers without clap validation can fail softly.
+pub fn parse_rpc_type(s: &str) -> Option<RpcValueType> {
+    Some(match s {
+        "u8" => RpcValueType::Int {
+            signed: false,
+            size: 1,
+        },
+        "u16" => RpcValueType::Int {
+            signed: false,
+            size: 2,
+        },
+        "u32" => RpcValueType::Int {
+            signed: false,
+            size: 4,
+        },
+        "u64" => RpcValueType::Int {
+            signed: false,
+            size: 8,
+        },
+        "i8" => RpcValueType::Int {
+            signed: true,
+            size: 1,
+        },
+        "i16" => RpcValueType::Int {
+            signed: true,
+            size: 2,
+        },
+        "i32" => RpcValueType::Int {
+            signed: true,
+            size: 4,
+        },
+        "i64" => RpcValueType::Int {
+            signed: true,
+            size: 8,
+        },
+        "f32" => RpcValueType::Float { size: 4 },
+        "f64" => RpcValueType::Float { size: 8 },
+        "string" => RpcValueType::String { max_len: None },
+        _ => return None,
+    })
+}
+
 pub fn rpc_encode_arg(input: &str, kind: &RpcValueType) -> Result<Vec<u8>, EncodeError> {
     match kind {
         RpcValueType::Unit => {

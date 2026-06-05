@@ -23,12 +23,15 @@ pub enum RpcWorkerResp {
 }
 
 pub fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
-    let meta = req.meta.or_else(|| {
-        client
-            .rpc::<&String, u16>(&req.route, "rpc.info", &req.method)
-            .ok()
+    // Honor an explicit `-t` override; otherwise infer from metadata.
+    let kind = req.req_type.unwrap_or_else(|| {
+        let meta = req.meta.or_else(|| {
+            client
+                .rpc::<&String, u16>(&req.route, "rpc.info", &req.method)
+                .ok()
+        });
+        util::resolve_arg_type(meta, &req.method)
     });
-    let kind = util::resolve_arg_type(meta, &req.method);
 
     let payload = if let Some(ref s) = req.arg {
         util::rpc_encode_arg(s, &kind).map_err(|e| e.to_string())?
@@ -44,7 +47,9 @@ pub fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
         return Ok("OK".to_string());
     }
 
-    let value = util::rpc_decode_reply(&reply_bytes, &kind).map_err(|e| e.to_string())?;
+    // `-T` overrides the reply type; default to decoding as the request type.
+    let reply_kind = req.rep_type.unwrap_or(kind);
+    let value = util::rpc_decode_reply(&reply_bytes, &reply_kind).map_err(|e| e.to_string())?;
 
     Ok(match &value {
         RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),

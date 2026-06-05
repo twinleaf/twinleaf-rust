@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 use tui_prompts::{State, TextState};
-use twinleaf::device::{DeviceRoute, RpcDescriptor, RpcRegistry};
+use twinleaf::device::{util, DeviceRoute, RpcDescriptor, RpcRegistry, RpcValueType};
 
 const RPCLIST_MAX_LEN: usize = 12;
 
@@ -29,6 +29,100 @@ pub struct RpcReq {
     pub meta: Option<u16>,
     pub method: String,
     pub arg: Option<String>,
+    pub req_type: Option<RpcValueType>,
+    pub rep_type: Option<RpcValueType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokRole {
+    Method,
+    Flag,
+    FlagVal,
+    Arg,
+}
+
+struct ParsedLine {
+    method: Option<String>,
+    arg: Option<String>,
+    req_type: Option<RpcValueType>,
+    rep_type: Option<RpcValueType>,
+    bad_type: Option<String>,
+    roles: Vec<(std::ops::Range<usize>, TokRole)>,
+}
+
+/// Split `line` into (byte-range, text) tokens on whitespace.
+fn tokenize(line: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                out.push((s..i, &line[s..i]));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        out.push((s..line.len(), &line[s..]));
+    }
+    out
+}
+
+fn parse_palette_line(line: &str) -> ParsedLine {
+    let toks = tokenize(line);
+    let mut method = None;
+    let mut arg_parts: Vec<&str> = Vec::new();
+    let mut req_type = None;
+    let mut rep_type = None;
+    let mut bad_type = None;
+    let mut roles = Vec::with_capacity(toks.len());
+
+    let mut i = 0;
+    while i < toks.len() {
+        let (range, tok) = (toks[i].0.clone(), toks[i].1);
+        if method.is_none() {
+            method = Some(tok.to_string());
+            roles.push((range, TokRole::Method));
+            i += 1;
+            continue;
+        }
+        match tok {
+            "-t" | "--req-type" | "-T" | "--rep-type" => {
+                roles.push((range, TokRole::Flag));
+                let is_req = matches!(tok, "-t" | "--req-type");
+                match toks.get(i + 1) {
+                    Some((vrange, vtok)) => {
+                        roles.push((vrange.clone(), TokRole::FlagVal));
+                        match util::parse_rpc_type(vtok) {
+                            Some(t) if is_req => req_type = Some(t),
+                            Some(t) => rep_type = Some(t),
+                            None => bad_type = Some((*vtok).to_string()),
+                        }
+                        i += 2;
+                    }
+                    None => {
+                        bad_type = Some(format!("{} needs a type", tok));
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                roles.push((range, TokRole::Arg));
+                arg_parts.push(tok);
+                i += 1;
+            }
+        }
+    }
+
+    ParsedLine {
+        method,
+        arg: (!arg_parts.is_empty()).then(|| arg_parts.join(" ")),
+        req_type,
+        rep_type,
+        bad_type,
+        roles,
+    }
 }
 
 #[derive(Debug)]
@@ -604,13 +698,26 @@ impl RpcPalette {
         let picking_route = self.route_picker.is_some();
 
         // The first space acts as the rpc/arg boundary; render it as a visible
-        // separator and style anything after it distinctly.
+        // separator. Each token is then styled by its parsed role so the colors
+        // match exactly what `submit_command` will send.
         let split_at = user_input.find(' ');
         let name_style = Style::default();
         let arg_style = Style::default().fg(Color::Green);
+        let flag_style = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::DIM);
+        let flagval_style = Style::default().fg(Color::Magenta);
         let sep_style = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
+
+        let roles = parse_palette_line(user_input).roles;
+        let role_at = |idx: usize| {
+            roles
+                .iter()
+                .find(|(r, _)| r.contains(&idx))
+                .map(|(_, t)| *t)
+        };
 
         let mut spans: Vec<Span> = Vec::new();
         let display_route = self
@@ -636,9 +743,11 @@ impl RpcPalette {
             let (text, base) = if is_sep {
                 ("│".to_string(), sep_style)
             } else {
-                let s = match split_at {
-                    Some(sp) if i > sp => arg_style,
-                    _ => name_style,
+                let s = match role_at(i) {
+                    Some(TokRole::Arg) => arg_style,
+                    Some(TokRole::Flag) => flag_style,
+                    Some(TokRole::FlagVal) => flagval_style,
+                    Some(TokRole::Method) | None => name_style,
                 };
                 (ch.to_string(), s)
             };
@@ -908,24 +1017,27 @@ impl RpcPalette {
             return None;
         }
 
-        let mut parts = line.split_whitespace();
-        let method = parts.next()?;
-        self.last_rpc_command = method.to_string();
-        let remainder: Vec<&str> = parts.collect();
-        let arg = if remainder.is_empty() {
-            None
-        } else {
-            Some(remainder.join(" "))
-        };
-        let meta = registry.and_then(|r| r.find(method)).map(|d| d.meta.bits());
+        let parsed = parse_palette_line(&line);
+        if let Some(bad) = parsed.bad_type {
+            self.last_rpc_result = Some((format!("bad type: {}", bad), Color::Red));
+            return None;
+        }
+        let method = parsed.method?;
+        self.last_rpc_command = method.clone();
+
+        let meta = registry
+            .and_then(|r| r.find(&method))
+            .map(|d| d.meta.bits());
         self.last_rpc_result = Some((format!("Sent to {}", route), Color::Yellow));
         self.in_flight = true;
 
         let req = RpcReq {
             route: route.clone(),
             meta,
-            method: method.to_string(),
-            arg,
+            method,
+            arg: parsed.arg,
+            req_type: parsed.req_type,
+            rep_type: parsed.rep_type,
         };
         if self.history.last() != Some(&line) {
             self.history.push(line);
