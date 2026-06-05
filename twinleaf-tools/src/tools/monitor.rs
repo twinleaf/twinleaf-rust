@@ -1790,16 +1790,21 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     let mut term = ratatui::init();
     let _ = term.hide_cursor();
     let ui_tick = channel::tick(Duration::from_millis(1000 / fps as u64));
+    let mut stream_error = None;
 
     'main: loop {
         crossbeam::select! {
             recv(data_rx) -> item => {
                 match item {
-                    Ok(TreeItem::Sample(sample, route)) => {
+                    Ok(Ok(TreeItem::Sample(sample, route))) => {
                         app.handle_sample(sample, route, &mut buffer);
                     }
-                    Ok(TreeItem::Event(event)) => {
+                    Ok(Ok(TreeItem::Event(event))) => {
                         app.handle_event(event, &rpc_tx);
+                    }
+                    Ok(Err(e)) => {
+                        stream_error = Some(e);
+                        break 'main;
                     }
                     Err(_) => break 'main,
                 }
@@ -1851,5 +1856,11 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     }
 
     ratatui::restore();
+    if let Some(e) = stream_error {
+        use color_eyre::Help;
+        return Err(eyre::Report::new(e))
+            .wrap_err("lost connection to data source")
+            .suggestion("the data source went away (proxy exited or device disconnected); restart it and re-run this command");
+    }
     Ok(())
 }
