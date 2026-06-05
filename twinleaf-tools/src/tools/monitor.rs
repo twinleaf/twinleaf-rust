@@ -138,43 +138,61 @@ impl Nav {
         };
     }
 
-    /// Left/Right: cycle within current stream's columns
-    pub fn step_within_stream(&mut self, items: &[NavPos], backward: bool) {
+    /// Left/Right: jump between streams on the current device, keeping column position
+    pub fn step_between_streams(&mut self, items: &[NavPos], backward: bool) {
         if items.is_empty() {
             return;
         }
         let cur = &items[self.idx];
-        let (dev, stream) = match cur {
+        let (cur_dev, cur_stream, cur_column) = match cur {
             NavPos::EmptyDevice { .. } => return,
             NavPos::Column {
                 device_idx,
                 stream_idx,
-                ..
-            } => (*device_idx, *stream_idx),
+                spec,
+            } => (*device_idx, *stream_idx, spec.column_id),
         };
 
-        let siblings: Vec<usize> = items
+        // Streams on this device, in display order (nav_items is already grouped)
+        let mut streams: Vec<usize> = items
             .iter()
-            .enumerate()
-            .filter_map(|(i, pos)| match pos {
+            .filter_map(|pos| match pos {
                 NavPos::Column {
                     device_idx,
                     stream_idx,
                     ..
-                } if *device_idx == dev && *stream_idx == stream => Some(i),
+                } if *device_idx == cur_dev => Some(*stream_idx),
                 _ => None,
             })
             .collect();
+        streams.dedup();
 
-        if let Some(pos) = siblings.iter().position(|&i| i == self.idx) {
-            let len = siblings.len();
-            let new_pos = if backward {
-                (pos + len - 1) % len
-            } else {
-                (pos + 1) % len
-            };
-            self.idx = siblings[new_pos];
+        if streams.len() <= 1 {
+            return;
         }
+
+        let pos = streams.iter().position(|&s| s == cur_stream).unwrap_or(0);
+        let len = streams.len();
+        let target_stream = streams[if backward {
+            (pos + len - 1) % len
+        } else {
+            (pos + 1) % len
+        }];
+
+        // Land on the column closest to the current one
+        self.idx = items
+            .iter()
+            .enumerate()
+            .filter(|(_, pos)| {
+                matches!(pos,
+                    NavPos::Column { device_idx, stream_idx, .. }
+                        if *device_idx == cur_dev && *stream_idx == target_stream)
+            })
+            .min_by_key(|(_, pos)| {
+                (pos.column_idx().unwrap_or(0) as isize - cur_column as isize).abs()
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(self.idx);
     }
 
     /// Tab: jump to next/prev device, find best matching position
@@ -538,11 +556,11 @@ impl MonitorState {
             }
             Action::NavLeft => {
                 self.view.follow_selection = true;
-                self.nav.step_within_stream(&self.nav_items, true);
+                self.nav.step_between_streams(&self.nav_items, true);
             }
             Action::NavRight => {
                 self.view.follow_selection = true;
-                self.nav.step_within_stream(&self.nav_items, false);
+                self.nav.step_between_streams(&self.nav_items, false);
             }
             Action::NavTabNext => {
                 self.view.follow_selection = true;
@@ -1319,7 +1337,7 @@ fn render_footer(f: &mut Frame, app: &mut MonitorState, area: Rect) {
         key_span("←"),
         key_sep(),
         key_span("→"),
-        Span::raw(" Columns"),
+        Span::raw(" Streams"),
     ];
 
     if app.device_count() > 1 {
