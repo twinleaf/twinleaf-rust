@@ -174,10 +174,10 @@ impl From<SplitPolicy> for twinleaf::data::export::SplitPolicy {
 /// Controls how runs are organized in the HDF5 output
 #[derive(ValueEnum, Clone, Debug, Default)]
 pub enum SplitLevel {
-    /// No run splitting - flat structure: /{route}/{stream}/{datasets}
+    /// No run splitting - one table per stream: /{route}/{stream}
     #[default]
     None,
-    /// Each stream has independent run counter
+    /// Each stream has independent run counter (separate table per run)
     Stream,
     /// All streams on a device share run counter
     Device,

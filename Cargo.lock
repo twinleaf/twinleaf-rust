@@ -2529,6 +2529,7 @@ dependencies = [
  "directories",
  "glob",
  "hdf5-metno",
+ "hdf5-metno-sys",
  "mio",
  "mio-serial",
  "num_enum",
