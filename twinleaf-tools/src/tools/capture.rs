@@ -6,11 +6,7 @@ use twinleaf::device::RpcClient;
 use twinleaf::tio::proxy;
 
 pub fn run_capture(capture_cli: CaptureCli) -> eyre::Result<()> {
-    capture(
-        &capture_cli.tio,
-        capture_cli.rpc_name,
-        capture_cli.timeout,
-    )
+    capture(&capture_cli.tio, capture_cli.rpc_name, capture_cli.timeout)
 }
 
 pub fn capture(tio: &TioOpts, rpc_name: String, timeout: Duration) -> eyre::Result<()> {

@@ -155,7 +155,9 @@ pub fn read_capture_status<R: CaptureRpc + ?Sized>(
 ) -> Result<CaptureStatus, CaptureError> {
     let reply = capture_rpc_i16(rpc, rpc_name, CAPTURE_STATUS_INDEX)?;
     if reply.len() != 1 {
-        return Err(CaptureError::InvalidStatusLength { actual: reply.len() });
+        return Err(CaptureError::InvalidStatusLength {
+            actual: reply.len(),
+        });
     }
     Ok(CaptureStatus::from_raw(reply[0]))
 }
@@ -315,10 +317,7 @@ fn peel_capture_string(raw: &mut &[u8], len: usize) -> Result<String, CaptureErr
     Ok(std::str::from_utf8(head)?.to_string())
 }
 
-pub fn decode_capture_values(
-    raw: &[u8],
-    meta: &CaptureMetadata,
-) -> Result<Vec<f64>, CaptureError> {
+pub fn decode_capture_values(raw: &[u8], meta: &CaptureMetadata) -> Result<Vec<f64>, CaptureError> {
     let entry_size = meta.data_type.size();
     if entry_size == 0 {
         return Err(CaptureError::ZeroSizeDataType);
@@ -377,11 +376,7 @@ mod tests {
     }
 
     impl CaptureRpc for MockCaptureRpc {
-        fn capture_raw_rpc(
-            &self,
-            name: &str,
-            arg: &[u8],
-        ) -> Result<Vec<u8>, proxy::RpcError> {
+        fn capture_raw_rpc(&self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
             assert_eq!(name, "test.capture");
             assert_eq!(arg, &CAPTURE_STATUS_INDEX.to_le_bytes());
             Ok(self.reply.clone())
@@ -402,8 +397,8 @@ mod tests {
     #[test]
     fn text_parse_metadata() {
         let mut raw = vec![
-            30, 1, 0x42, 0, 8, 0, 0, 0, 4, 0, 2, 0, 0, 0, 0, 0, 0, 64, 0, 0, 128, 63, 0, 0,
-            0, 63, 1, 1, 1, 1,
+            30, 1, 0x42, 0, 8, 0, 0, 0, 4, 0, 2, 0, 0, 0, 0, 0, 0, 64, 0, 0, 128, 63, 0, 0, 0, 63,
+            1, 1, 1, 1,
         ];
         raw.extend(b"yVsx");
 

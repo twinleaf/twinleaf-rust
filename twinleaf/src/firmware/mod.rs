@@ -212,8 +212,14 @@ fn parse_installed(desc: &str) -> InstalledFirmware {
     // Header is everything before the serial/build sections.
     let header_end = desc.find(|c| c == '(' || c == '[').unwrap_or(desc.len());
     let header_tokens: Vec<&str> = desc[..header_end].split_whitespace().collect();
-    let name = header_tokens.get(1).map(|s| s.to_string()).unwrap_or_default();
-    let revision = header_tokens.get(2).map(|s| s.to_string()).unwrap_or_default();
+    let name = header_tokens
+        .get(1)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let revision = header_tokens
+        .get(2)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     let serial = paren_content(desc)
         .map(|s| s.trim_matches(|c| c == '(' || c == ')'))
@@ -260,7 +266,11 @@ pub fn query_installed(device: &Port) -> Result<InstalledFirmware, FirmwareError
 /// Pick the newest release from a list (newest build date wins; filename breaks
 /// ties deterministically).
 pub fn latest_release(mut releases: Vec<FirmwareRelease>) -> Option<FirmwareRelease> {
-    releases.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.filename.cmp(&b.filename)));
+    releases.sort_by(|a, b| {
+        a.date
+            .cmp(&b.date)
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
     releases.pop()
 }
 
@@ -306,7 +316,11 @@ pub fn check_for_update(
     let mut releases = catalog.list_releases(&installed.name, &installed.revision)?;
     // Sort newest-first so `releases[0]` is the latest and a picker reads
     // naturally top-to-bottom.
-    releases.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.filename.cmp(&a.filename)));
+    releases.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| b.filename.cmp(&a.filename))
+    });
     let latest = releases.first().cloned();
 
     let status = match &latest {
@@ -510,9 +524,20 @@ mod tests {
 
     #[test]
     fn firmware_dates_order_chronologically() {
-        assert!(FirmwareDate::parse("2026-03-17").unwrap() > FirmwareDate::parse("2026-01-10").unwrap());
-        assert!(FirmwareDate::parse("2026-01-10").unwrap() > FirmwareDate::parse("2025-12-31").unwrap());
-        assert_eq!(FirmwareDate::parse("2026-3-7"), Some(FirmwareDate { year: 2026, month: 3, day: 7 }));
+        assert!(
+            FirmwareDate::parse("2026-03-17").unwrap() > FirmwareDate::parse("2026-01-10").unwrap()
+        );
+        assert!(
+            FirmwareDate::parse("2026-01-10").unwrap() > FirmwareDate::parse("2025-12-31").unwrap()
+        );
+        assert_eq!(
+            FirmwareDate::parse("2026-3-7"),
+            Some(FirmwareDate {
+                year: 2026,
+                month: 3,
+                day: 7
+            })
+        );
         assert_eq!(FirmwareDate::parse("not-a-date"), None);
         assert_eq!(FirmwareDate::parse("2026-03"), None);
     }
@@ -529,12 +554,17 @@ mod tests {
         assert!(!fw.is_development);
 
         // Hub form: single-token header, hex serial, build hash with -DEV.
-        let fw = parse_installed("HUB-USB-RS422 (010000003D003B001850453657353320) [2026-05-28/4b13b1-DEV]");
+        let fw = parse_installed(
+            "HUB-USB-RS422 (010000003D003B001850453657353320) [2026-05-28/4b13b1-DEV]",
+        );
         assert_eq!(fw.name, ""); // header is a single token; no name/revision
         assert_eq!(fw.revision, "");
         assert_eq!(fw.build_date, FirmwareDate::parse("2026-05-28"));
         assert_eq!(fw.hash.as_deref(), Some("4b13b1-DEV"));
-        assert_eq!(fw.serial.as_deref(), Some("010000003D003B001850453657353320"));
+        assert_eq!(
+            fw.serial.as_deref(),
+            Some("010000003D003B001850453657353320")
+        );
         assert!(fw.is_development); // hash contains DEV
 
         // A Twinleaf-style dev build is also detected.
@@ -612,17 +642,26 @@ mod tests {
     fn update_available_only_when_strictly_newer() {
         // Installed older than latest -> update.
         assert_eq!(
-            compare(&installed(Some("2026-01-10"), None), &release("2026-03-17", "5d1494")),
+            compare(
+                &installed(Some("2026-01-10"), None),
+                &release("2026-03-17", "5d1494")
+            ),
             UpdateStatus::UpdateAvailable
         );
         // Installed newer than latest -> up to date.
         assert_eq!(
-            compare(&installed(Some("2026-06-04"), None), &release("2026-03-17", "5d1494")),
+            compare(
+                &installed(Some("2026-06-04"), None),
+                &release("2026-03-17", "5d1494")
+            ),
             UpdateStatus::UpToDate
         );
         // Installed same date -> up to date.
         assert_eq!(
-            compare(&installed(Some("2026-03-17"), None), &release("2026-03-17", "5d1494")),
+            compare(
+                &installed(Some("2026-03-17"), None),
+                &release("2026-03-17", "5d1494")
+            ),
             UpdateStatus::UpToDate
         );
         // Unknown installed date -> unknown.
@@ -632,7 +671,10 @@ mod tests {
         );
         // Matching hash short-circuits to up to date even with an older parsed date.
         assert_eq!(
-            compare(&installed(Some("2026-01-10"), Some("5d1494")), &release("2026-03-17", "5d1494")),
+            compare(
+                &installed(Some("2026-01-10"), Some("5d1494")),
+                &release("2026-03-17", "5d1494")
+            ),
             UpdateStatus::UpToDate
         );
     }

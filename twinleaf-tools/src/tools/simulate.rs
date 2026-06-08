@@ -10,9 +10,7 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::device::{
-    RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_READABLE, RPC_META_WRITABLE,
-};
+use twinleaf::device::{RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_READABLE, RPC_META_WRITABLE};
 use twinleaf::tio::proto::{self, meta};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -682,9 +680,7 @@ impl TestDevice {
 
         let result = match method {
             "dev.name" => self.rpc_read_string(req.id, DEVICE_NAME, &req.arg, routing, addr),
-            "dev.desc" => {
-                self.rpc_read_string(req.id, &self.desc.clone(), &req.arg, routing, addr)
-            }
+            "dev.desc" => self.rpc_read_string(req.id, &self.desc.clone(), &req.arg, routing, addr),
             "dev.stop" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
             // Accept and acknowledge each firmware chunk (contents ignored).
             "dev.firmware.upload" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
@@ -991,7 +987,11 @@ impl TestDevice {
         fixed.push(CAPTURE_METADATA_VERSION);
         fixed.push(u8::from(proto::DataType::Float32));
         fixed.push(0);
-        fixed.extend(u32::try_from(self.capture.export_size()).unwrap_or(u32::MAX).to_le_bytes());
+        fixed.extend(
+            u32::try_from(self.capture.export_size())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
         fixed.extend(self.capture.block_size.to_le_bytes());
         fixed.extend(info.length.to_le_bytes());
         fixed.extend(info.y_calibration.to_le_bytes());
@@ -1863,8 +1863,10 @@ mod tests {
 
         let (data, info) = device.generate_capture_data();
 
-        assert!((CAPTURE_SAMPLE_COUNT_MIN as u32..=CAPTURE_SAMPLE_COUNT_MAX as u32)
-            .contains(&info.length));
+        assert!(
+            (CAPTURE_SAMPLE_COUNT_MIN as u32..=CAPTURE_SAMPLE_COUNT_MAX as u32)
+                .contains(&info.length)
+        );
         assert_eq!(data.len(), info.length as usize * CAPTURE_SAMPLE_BYTES);
         assert_eq!(info.y_calibration, 1.0);
         assert_eq!(info.x_offset, 0.0);
@@ -1885,7 +1887,9 @@ mod tests {
         device
             .capture
             .begin_capture(data, info, Instant::now() + Duration::from_millis(1));
-        device.capture.update(Instant::now() + Duration::from_millis(1));
+        device
+            .capture
+            .update(Instant::now() + Duration::from_millis(1));
 
         let metadata = device.capture_metadata_reply();
 

@@ -70,8 +70,8 @@ fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()
     let installed =
         firmware::query_installed(&device).wrap_err("could not read installed firmware info")?;
     let catalog = GithubCatalog::twinleaf();
-    let report = firmware::check_for_update(installed, &catalog)
-        .wrap_err("firmware update check failed")?;
+    let report =
+        firmware::check_for_update(installed, &catalog).wrap_err("firmware update check failed")?;
 
     let UpdateReport {
         installed,
@@ -92,43 +92,48 @@ fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()
     let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
     match &latest {
         Some(rel) => println!(" {} {}  {}", label("Available:"), rel.date, rel.short_hash),
-        None => println!(" {} {}", label("Available:"), style("none published").yellow()),
+        None => println!(
+            " {} {}",
+            label("Available:"),
+            style("none published").yellow()
+        ),
     }
     println!();
 
-    let release = match status {
-        UpdateStatus::DevelopmentBuild => unreachable!("handled above"),
-        UpdateStatus::NoPublishedFirmware => {
-            println!(
-                "{}",
-                style(format!(
-                    "No published firmware found for {} {}.",
-                    installed.name, installed.revision
-                ))
-                .yellow()
-            );
-            return Ok(());
-        }
-        UpdateStatus::UpToDate => {
-            println!(
-                "{}",
-                style("Firmware is up to date — no new firmware available.").green()
-            );
-            return Ok(());
-        }
-        UpdateStatus::Unknown => {
-            println!(
+    let release =
+        match status {
+            UpdateStatus::DevelopmentBuild => unreachable!("handled above"),
+            UpdateStatus::NoPublishedFirmware => {
+                println!(
+                    "{}",
+                    style(format!(
+                        "No published firmware found for {} {}.",
+                        installed.name, installed.revision
+                    ))
+                    .yellow()
+                );
+                return Ok(());
+            }
+            UpdateStatus::UpToDate => {
+                println!(
+                    "{}",
+                    style("Firmware is up to date — no new firmware available.").green()
+                );
+                return Ok(());
+            }
+            UpdateStatus::Unknown => {
+                println!(
                 "{}",
                 style("Could not determine the installed firmware date; comparing is not possible.")
                     .yellow()
             );
-            // `latest` is present whenever the status is not NoPublishedFirmware.
-            latest.expect("a latest release exists when status is Unknown")
-        }
-        UpdateStatus::UpdateAvailable => {
-            latest.expect("a latest release exists when an update is available")
-        }
-    };
+                // `latest` is present whenever the status is not NoPublishedFirmware.
+                latest.expect("a latest release exists when status is Unknown")
+            }
+            UpdateStatus::UpdateAvailable => {
+                latest.expect("a latest release exists when an update is available")
+            }
+        };
 
     if !confirm(
         &format!(
@@ -217,7 +222,12 @@ fn present_installed(installed: &firmware::InstalledFirmware) {
     if installed.name.is_empty() {
         println!(" {} {}", label("Device:"), installed.description);
     } else {
-        println!(" {} {} {}", label("Sensor:"), installed.name, installed.revision);
+        println!(
+            " {} {} {}",
+            label("Sensor:"),
+            installed.name,
+            installed.revision
+        );
     }
     println!(
         " {} {}  {}",
@@ -350,7 +360,11 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
             if let Some(bar) = upload.take() {
                 let chunks = bar.length().unwrap_or(0);
                 bar.finish_and_clear();
-                println!(" {} {} chunks uploaded", label("dev.firmware.upload"), chunks);
+                println!(
+                    " {} {} chunks uploaded",
+                    label("dev.firmware.upload"),
+                    chunks
+                );
             }
             println!(" {} committing...", label("dev.firmware.upgrade"));
         }
@@ -383,7 +397,11 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
         .wrap_err("firmware upgrade failed")
         .suggestion(power_cycle_hint)?;
 
-    println!(" {} {}", label("dev.firmware.upgrade"), style("complete").green());
+    println!(
+        " {} {}",
+        label("dev.firmware.upgrade"),
+        style("complete").green()
+    );
 
     verify_new_firmware(device);
     Ok(())

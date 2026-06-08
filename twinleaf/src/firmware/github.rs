@@ -17,7 +17,7 @@ impl GithubCatalog {
     pub fn twinleaf() -> Self {
         Self {
             owner: "twinleaf".into(),
-            repo: "twinleaf-published-firmware".into(),
+            repo: "twinleaf-firmware-updates".into(),
         }
     }
 }
@@ -64,7 +64,11 @@ impl FirmwareCatalog for GithubCatalog {
             Ok(r) => r,
             // A missing folder simply means nothing is published yet.
             Err(ureq::Error::Status(404, _)) => return Ok(Vec::new()),
-            Err(e) => return Err(FirmwareError::Catalog(format!("listing request failed: {e}"))),
+            Err(e) => {
+                return Err(FirmwareError::Catalog(format!(
+                    "listing request failed: {e}"
+                )))
+            }
         };
 
         let listing: serde_json::Value = response
@@ -138,7 +142,9 @@ mod tests {
     #[ignore]
     fn live_list_and_download_asm_r6() {
         let catalog = GithubCatalog::twinleaf();
-        let releases = catalog.list_releases("ASM", "R6").expect("listing should succeed");
+        let releases = catalog
+            .list_releases("ASM", "R6")
+            .expect("listing should succeed");
         assert!(!releases.is_empty(), "expected at least one ASM/R6 release");
         let latest = super::super::latest_release(releases).unwrap();
         let data = catalog.download(&latest).expect("download should succeed");
