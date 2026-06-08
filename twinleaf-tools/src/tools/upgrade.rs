@@ -1,171 +1,428 @@
+//! `tio upgrade` porcelain.
+//!
+//! All firmware logic (querying the device, checking the catalog, downloading,
+//! and flashing) lives in `twinleaf::firmware`. This module only handles user
+//! interaction: presenting the installed-vs-latest comparison, prompting, and
+//! rendering progress.
+
 use crate::{ProxyHelp, TioOpts, UpgradeCli};
-use twinleaf::device::DeviceRoute;
-use twinleaf::tio::{self, proxy, util};
+use color_eyre::Help;
+use console::style;
+use eyre::WrapErr;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::path::PathBuf;
+use std::time::Duration;
+use twinleaf::firmware::{
+    self, github::GithubCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
+};
+use twinleaf::tio::proxy;
 
 pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
-    firmware_upgrade(&upgrade_cli.tio, upgrade_cli.firmware_path, upgrade_cli.yes)
+    match (upgrade_cli.firmware_path, upgrade_cli.downgrade) {
+        (Some(path), _) => firmware_upgrade(&upgrade_cli.tio, path, upgrade_cli.yes),
+        (None, true) => firmware_select(&upgrade_cli.tio),
+        (None, false) => firmware_upgrade_latest(&upgrade_cli.tio, upgrade_cli.yes),
+    }
 }
 
+/// Flash a firmware image from a local file.
 pub fn firmware_upgrade(
     tio: &TioOpts,
-    firmware_path: std::path::PathBuf,
+    firmware_path: PathBuf,
     skip_confirm: bool,
 ) -> eyre::Result<()> {
-    use color_eyre::Help;
-    use eyre::WrapErr;
-    use indicatif::{ProgressBar, ProgressStyle};
-
     let firmware_data = std::fs::read(&firmware_path)
         .wrap_err_with(|| format!("could not read firmware file {:?}", firmware_path))?;
-
     log::info!("loaded {} bytes firmware", firmware_data.len());
 
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-    let device = proxy
-        .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
+    let label = firmware_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| firmware_path.display().to_string());
 
-    let dev_name: String = device
-        .rpc("dev.name", ())
-        .wrap_err("failed to query device name")?;
+    let (_proxy, device) = open_device(tio)?;
 
     if !skip_confirm {
-        let confirmed = dialoguer::Confirm::new()
-            .with_prompt(format!("Upgrade firmware on '{}'?", dev_name))
-            .default(false)
-            .interact()
-            .wrap_err("failed to read confirmation")?;
-        if !confirmed {
+        // Best-effort device label from dev.desc; flashing an explicit file
+        // should still work even if the description can't be read.
+        let target = firmware::query_installed(&device)
+            .ok()
+            .map(|fw| format!("{} {}", fw.name, fw.revision))
+            .unwrap_or_else(|| "the connected device".to_string());
+
+        if !confirm(
+            &format!("Upgrade firmware on {} with '{}'?", target, label),
+            false,
+        )? {
             log::info!("aborted");
             return Ok(());
         }
     }
 
-    match device.action("dev.stop") {
-        Ok(()) => {}
-        Err(proxy::RpcError::ExecError(ref e))
-            if matches!(
-                e.error,
-                tio::proto::RpcErrorCode::NotFound | tio::proto::RpcErrorCode::WrongDeviceState
-            ) => {}
-        Err(e) => {
-            return Err(
-                eyre::Report::new(e).wrap_err("failed to stop device before firmware upgrade")
-            );
-        }
+    flash_with_progress(&device, &firmware_data)
+}
+
+/// Detect the sensor, compare against the latest published firmware, and (if
+/// newer) download and flash it.
+fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
+    let (_proxy, device) = open_device(tio)?;
+
+    let installed =
+        firmware::query_installed(&device).wrap_err("could not read installed firmware info")?;
+    let catalog = GithubCatalog::twinleaf();
+    let report = firmware::check_for_update(installed, &catalog)
+        .wrap_err("firmware update check failed")?;
+
+    let UpdateReport {
+        installed,
+        latest,
+        status,
+        ..
+    } = report;
+
+    // Present the comparison.
+    present_installed(&installed);
+
+    // A development build cannot be replaced by a published release.
+    if status == UpdateStatus::DevelopmentBuild {
+        print_dev_build_notice();
+        return Ok(());
     }
 
-    let total_chunks = firmware_data.len().div_ceil(288);
-    let pb = crate::multi_progress().add(ProgressBar::new(total_chunks as u64));
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent}%")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
+    let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
+    match &latest {
+        Some(rel) => println!(" {} {}  {}", label("Available:"), rel.date, rel.short_hash),
+        None => println!(" {} {}", label("Available:"), style("none published").yellow()),
+    }
+    println!();
 
-    let power_cycle_hint =
-        "power cycle the device before retrying and check if dev.stop exists as an rpc";
-
-    let mut next_send_chunk: u16 = 0;
-    let mut next_ack_chunk: u16 = 0;
-    let mut more_to_send = true;
-    const MAX_CHUNKS_IN_FLIGHT: u16 = 2;
-
-    while more_to_send || (next_ack_chunk != next_send_chunk) {
-        if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
-            let offset = usize::from(next_send_chunk) * 288;
-            let chunk_end = if (offset + 288) > firmware_data.len() {
-                firmware_data.len()
-            } else {
-                offset + 288
-            };
-
-            device
-                .send(util::PacketBuilder::make_rpc_request(
-                    "dev.firmware.upload",
-                    &firmware_data[offset..chunk_end],
-                    next_send_chunk,
-                    DeviceRoute::root(),
+    let release = match status {
+        UpdateStatus::DevelopmentBuild => unreachable!("handled above"),
+        UpdateStatus::NoPublishedFirmware => {
+            println!(
+                "{}",
+                style(format!(
+                    "No published firmware found for {} {}.",
+                    installed.name, installed.revision
                 ))
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to send firmware chunk {}/{}",
-                        next_send_chunk + 1,
-                        total_chunks
-                    )
-                })
-                .suggestion(power_cycle_hint)?;
-            next_send_chunk += 1;
-            more_to_send = chunk_end < firmware_data.len();
+                .yellow()
+            );
+            return Ok(());
         }
-
-        let pkt = if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
-            match device.try_recv() {
-                Ok(pkt) => pkt,
-                Err(proxy::RecvError::WouldBlock) => continue,
-                Err(e) => {
-                    return Err(eyre::Report::new(e)
-                        .wrap_err("failed to receive firmware upload ack")
-                        .suggestion(power_cycle_hint));
-                }
-            }
-        } else {
-            device
-                .recv()
-                .wrap_err("failed to receive firmware upload ack")
-                .suggestion(power_cycle_hint)?
-        };
-
-        match pkt.payload {
-            tio::proto::Payload::RpcReply(rep) => {
-                if rep.id != next_ack_chunk {
-                    return Err(eyre::eyre!(
-                        "firmware chunk ack out of order (expected {}, got {})",
-                        next_ack_chunk,
-                        rep.id
-                    )
-                    .suggestion(power_cycle_hint));
-                }
-                next_ack_chunk += 1;
-                pb.set_position(next_ack_chunk as u64);
-            }
-            tio::proto::Payload::RpcError(err) => {
-                return Err(eyre::eyre!(
-                    "device rejected firmware chunk {}/{}: {}",
-                    next_ack_chunk + 1,
-                    total_chunks,
-                    err.error
-                )
-                .suggestion(power_cycle_hint));
-            }
-            _ => continue,
+        UpdateStatus::UpToDate => {
+            println!(
+                "{}",
+                style("Firmware is up to date — no new firmware available.").green()
+            );
+            return Ok(());
         }
+        UpdateStatus::Unknown => {
+            println!(
+                "{}",
+                style("Could not determine the installed firmware date; comparing is not possible.")
+                    .yellow()
+            );
+            // `latest` is present whenever the status is not NoPublishedFirmware.
+            latest.expect("a latest release exists when status is Unknown")
+        }
+        UpdateStatus::UpdateAvailable => {
+            latest.expect("a latest release exists when an update is available")
+        }
+    };
+
+    if !confirm(
+        &format!(
+            "Download and upgrade to {} ({})?",
+            release.date, release.short_hash
+        ),
+        skip_confirm,
+    )? {
+        log::info!("aborted");
+        return Ok(());
     }
 
-    pb.finish_and_clear();
+    download_and_flash(&device, &catalog, &release)
+}
 
-    device
-        .action("dev.firmware.upgrade")
-        .wrap_err("device rejected firmware commit")
-        .suggestion(power_cycle_hint)?;
+/// Detect the sensor, list every published firmware, and let the user pick one
+/// to install (including older releases than what is running).
+fn firmware_select(tio: &TioOpts) -> eyre::Result<()> {
+    let (_proxy, device) = open_device(tio)?;
 
-    // Wait 5 seconds before returning to ensure the device is not
-    // power-cycled while the firmware upgrade is being committed to flash.
+    let installed =
+        firmware::query_installed(&device).wrap_err("could not read installed firmware info")?;
+    let catalog = GithubCatalog::twinleaf();
+    let report =
+        firmware::check_for_update(installed, &catalog).wrap_err("firmware lookup failed")?;
+
+    let UpdateReport {
+        installed,
+        releases,
+        status,
+        ..
+    } = report;
+
+    present_installed(&installed);
+
+    if status == UpdateStatus::DevelopmentBuild {
+        print_dev_build_notice();
+        return Ok(());
+    }
+    if releases.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style(format!(
+                "No published firmware found for {} {}.",
+                installed.name, installed.revision
+            ))
+            .yellow()
+        );
+        return Ok(());
+    }
+    println!();
+
+    // Build picker labels, marking the currently-installed build.
+    let items: Vec<String> = releases
+        .iter()
+        .map(|rel| {
+            let installed_here = installed
+                .hash
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(&rel.short_hash));
+            format!(
+                "{}  {}{}",
+                rel.date,
+                rel.short_hash,
+                if installed_here { "  (installed)" } else { "" }
+            )
+        })
+        .collect();
+
+    let selection = dialoguer::Select::new()
+        .with_prompt("Select firmware to install")
+        .items(&items)
+        .default(0)
+        .interact()
+        .wrap_err("failed to read selection")?;
+    let release = &releases[selection];
+
+    download_and_flash(&device, &catalog, release)
+}
+
+/// Print the `Sensor`/`Device` and `Installed` header lines for a device.
+fn present_installed(installed: &firmware::InstalledFirmware) {
+    let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
+    println!();
+    if installed.name.is_empty() {
+        println!(" {} {}", label("Device:"), installed.description);
+    } else {
+        println!(" {} {} {}", label("Sensor:"), installed.name, installed.revision);
+    }
+    println!(
+        " {} {}  {}",
+        label("Installed:"),
+        installed
+            .build_date
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        installed.hash.as_deref().unwrap_or("-"),
+    );
+}
+
+fn print_dev_build_notice() {
+    println!();
+    println!(
+        "{}",
+        style(
+            "This device is running a development firmware build; \
+             it cannot be upgraded to a published release."
+        )
+        .yellow()
+    );
+}
+
+/// Download a release (using the cache) and flash it, with progress.
+fn download_and_flash(
+    device: &proxy::Port,
+    catalog: &GithubCatalog,
+    release: &firmware::FirmwareRelease,
+) -> eyre::Result<()> {
+    let cache_root = firmware::default_cache_dir()
+        .ok_or_else(|| eyre::eyre!("could not determine a cache directory"))?;
+    let firmware_data = download_with_progress(catalog, release, &cache_root)?;
+    log::info!("loaded {} bytes firmware", firmware_data.len());
+
+    flash_with_progress(device, &firmware_data)
+}
+
+/// Open a device RPC port. The returned [`proxy::Interface`] owns the
+/// connection and must be kept alive for as long as the [`proxy::Port`] is
+/// used, otherwise the proxy is torn down and the port disconnects.
+fn open_device(tio: &TioOpts) -> eyre::Result<(proxy::Interface, proxy::Port)> {
+    let proxy = proxy::Interface::new(&tio.root);
+    let device = proxy
+        .device_rpc(tio.route.clone())
+        .wrap_err_with(|| format!("could not open device at {}", tio.root))
+        .with_proxy_help()?;
+    Ok((proxy, device))
+}
+
+fn confirm(prompt: &str, skip_confirm: bool) -> eyre::Result<bool> {
+    if skip_confirm {
+        return Ok(true);
+    }
+    dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()
+        .wrap_err("failed to read confirmation")
+}
+
+fn download_with_progress(
+    catalog: &GithubCatalog,
+    release: &firmware::FirmwareRelease,
+    cache_root: &std::path::Path,
+) -> eyre::Result<Vec<u8>> {
     let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
             .unwrap(),
     );
-    spinner.set_message("Finalizing upgrade...");
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        spinner.tick();
-    }
-    spinner.finish_with_message("Firmware upgrade complete.");
+    spinner.set_message(format!("Downloading firmware {}...", release.filename));
+    spinner.enable_steady_tick(Duration::from_millis(100));
 
+    let result = firmware::download_cached(catalog, release, cache_root);
+    spinner.finish_and_clear();
+    let data = result.wrap_err("failed to download firmware")?;
+
+    // Report what was fetched and where it lives.
+    let path = firmware::cache_path(cache_root, release);
+    let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
+    println!(" {} {}", label("Downloaded:"), release.filename);
+    println!(" {} {}", label("Location:"), path.display());
+
+    Ok(data)
+}
+
+/// Drive [`firmware::flash`], rendering each phase, then re-read `dev.desc`.
+fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Result<()> {
+    let power_cycle_hint =
+        "power cycle the device before retrying and check if dev.stop exists as an rpc";
+    // Wide enough to align the longest RPC name (dev.firmware.upgrade).
+    let label = |s: &str| style(format!("{:20}", s)).bold().cyan();
+
+    // Bars are created lazily so the dev.stop lines print cleanly above them.
+    let mut upload: Option<ProgressBar> = None;
+    let mut finalize: Option<ProgressBar> = None;
+
+    let result = firmware::flash(device, firmware_data, |event| match event {
+        FlashEvent::Stopping => {
+            println!(" {} stopping device...", label("dev.stop"));
+        }
+        FlashEvent::Stopped(outcome) => {
+            let result = match outcome {
+                StopOutcome::Stopped => style("stopped").green(),
+                StopOutcome::AlreadyStopped => style("already stopped").green(),
+                StopOutcome::Unsupported => style("not supported (continuing)").yellow(),
+            };
+            println!(" {} {}", label("dev.stop"), result);
+        }
+        FlashEvent::Uploading { chunk, total } => {
+            let bar = upload.get_or_insert_with(|| {
+                let b = crate::multi_progress().add(ProgressBar::new(total as u64));
+                b.set_style(
+                    ProgressStyle::default_bar()
+                        .template(
+                            "{spinner:.green} dev.firmware.upload [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)",
+                        )
+                        .unwrap()
+                        .progress_chars("#>-"),
+                );
+                b
+            });
+            bar.set_length(total as u64);
+            bar.set_position(chunk as u64);
+        }
+        FlashEvent::Committing => {
+            // Persist the upload result (the bar above is transient).
+            if let Some(bar) = upload.take() {
+                let chunks = bar.length().unwrap_or(0);
+                bar.finish_and_clear();
+                println!(" {} {} chunks uploaded", label("dev.firmware.upload"), chunks);
+            }
+            println!(" {} committing...", label("dev.firmware.upgrade"));
+        }
+        FlashEvent::Finalizing => {
+            let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
+            spinner.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg}")
+                    .unwrap(),
+            );
+            spinner.set_message("Finalizing upgrade...");
+            spinner.enable_steady_tick(Duration::from_millis(100));
+            finalize = Some(spinner);
+        }
+        FlashEvent::Complete => {
+            if let Some(spinner) = finalize.take() {
+                spinner.finish_and_clear();
+            }
+        }
+    });
+
+    if let Some(bar) = upload.take() {
+        bar.finish_and_clear();
+    }
+    if let Some(spinner) = finalize.take() {
+        spinner.finish_and_clear();
+    }
+
+    result
+        .wrap_err("firmware upgrade failed")
+        .suggestion(power_cycle_hint)?;
+
+    println!(" {} {}", label("dev.firmware.upgrade"), style("complete").green());
+
+    verify_new_firmware(device);
     Ok(())
+}
+
+/// After a successful flash, re-read `dev.desc` (retrying while the device
+/// reboots) to confirm the new firmware booted. Best-effort: never fails.
+fn verify_new_firmware(device: &proxy::Port) {
+    const ATTEMPTS: usize = 6;
+    const INTERVAL: Duration = Duration::from_millis(1500);
+
+    let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message("Verifying new firmware (re-reading dev.desc)...");
+    spinner.enable_steady_tick(Duration::from_millis(100));
+
+    let mut installed = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(INTERVAL);
+        }
+        if let Ok(fw) = firmware::query_installed(device) {
+            installed = Some(fw);
+            break;
+        }
+    }
+    spinner.finish_and_clear();
+
+    let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
+    match installed {
+        Some(fw) => println!(" {} {}", label("Running:"), fw.description),
+        None => println!(
+            "{}",
+            style("Could not re-read dev.desc after upgrade (device may still be rebooting).")
+                .yellow()
+        ),
+    }
 }

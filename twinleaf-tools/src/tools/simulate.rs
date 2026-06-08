@@ -40,6 +40,9 @@ const AUX_STREAM_ID: u8 = 3;
 const N_SEGMENTS: u8 = 16;
 const RPC_HASH: u32 = 0x7465_7377;
 const DEVICE_NAME: &str = "tio-test";
+// The simulator is a development/test device, so its build version is marked
+// `DEV`. Format: `{vendor} {name} {revision} ({serial}) [{date}/{build}]`.
+const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]";
 const DEVICE_SERIAL: &str = "SIM0001";
 const DEVICE_FIRMWARE: &str = "twinleaf-rust-test";
 const SIGNAL_LEVEL: u8 = 234;
@@ -298,6 +301,9 @@ struct TestDevice {
     status: u8,
     initial_enable: u8,
     enable: u8,
+    // Mutable device description (dev.desc). A firmware upgrade rewrites it so
+    // a post-upgrade re-read shows a different build.
+    desc: String,
     sample_rate: u32,
     segment_seconds: u32,
     segment_samples: u32,
@@ -393,6 +399,7 @@ impl TestDevice {
             status: initial_status,
             initial_enable,
             enable: initial_enable,
+            desc: DEVICE_DESC.to_string(),
             sample_rate: cli.samplerate,
             segment_seconds: cli.segment_seconds,
             segment_samples,
@@ -422,6 +429,10 @@ impl TestDevice {
             rpcs: vec![
                 RpcSpec {
                     name: "dev.name",
+                    meta: META_STRING_R,
+                },
+                RpcSpec {
+                    name: "dev.desc",
                     meta: META_STRING_R,
                 },
                 RpcSpec {
@@ -671,6 +682,17 @@ impl TestDevice {
 
         let result = match method {
             "dev.name" => self.rpc_read_string(req.id, DEVICE_NAME, &req.arg, routing, addr),
+            "dev.desc" => {
+                self.rpc_read_string(req.id, &self.desc.clone(), &req.arg, routing, addr)
+            }
+            "dev.stop" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
+            // Accept and acknowledge each firmware chunk (contents ignored).
+            "dev.firmware.upload" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
+            // Commit: simulate a reboot into a new build by rewriting dev.desc.
+            "dev.firmware.upgrade" => {
+                self.desc = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]".to_string();
+                self.send_rpc_reply(req.id, Vec::new(), routing, addr)
+            }
             "rpc.hash" => self.rpc_read_u32(req.id, RPC_HASH, &req.arg, routing, addr),
             "rpc.info" => self.rpc_info(req.id, &req.arg, routing, addr),
             "rpc.listinfo" => self.rpc_listinfo(req.id, &req.arg, routing, addr),
