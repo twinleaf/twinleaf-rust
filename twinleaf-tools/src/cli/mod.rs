@@ -16,7 +16,7 @@ pub use log::{
     StreamSel,
 };
 pub use monitor::MonitorCli;
-pub use proxy::{ProxyCli, ProxySubcommands};
+pub use proxy::{MountArg, ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};
 pub use simulate::SimulateCli;
 pub use upgrade::UpgradeCli;

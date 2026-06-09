@@ -14,8 +14,12 @@ pub struct ProxyCli {
     pub subcommands: Option<ProxySubcommands>,
 
     /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single connected device
-    #[arg(value_hint = ValueHint::Url)]
+    #[arg(value_hint = ValueHint::Url, conflicts_with = "mounts")]
     pub(crate) sensor_url: Option<String>,
+
+    /// Mount a sensor at a route prefix to multiplex multiple devices (repeatable)
+    #[arg(long = "mount", value_name = "LOCATOR=/N", value_parser = parse_mount)]
+    pub(crate) mounts: Vec<MountArg>,
 
     /// TCP port to listen on for clients
     #[arg(short = 'p', long = "port", default_value = "7855")]
@@ -31,6 +35,7 @@ pub struct ProxyCli {
         long = "subtree",
         default_value = "/",
         value_parser = parse_device_route,
+        conflicts_with = "mounts",
     )]
     pub(crate) subtree: DeviceRoute,
 
@@ -73,6 +78,35 @@ pub struct ProxyCli {
     /// Deprecated; use `tio list` instead.
     #[arg(short = 'e', long = "enumerate", name = "enum", hide = true)]
     pub(crate) enumerate: bool,
+}
+
+/// A `--mount LOCATOR=/N` argument: a sensor URL bound to a route prefix.
+#[derive(Debug, Clone)]
+pub struct MountArg {
+    pub locator: String,
+    pub prefix: DeviceRoute,
+}
+
+fn parse_mount(s: &str) -> Result<MountArg, String> {
+    let Some((locator, prefix_str)) = s.split_once('=') else {
+        return Err(format!(
+            "expected LOCATOR=/N (e.g. serial:///dev/ttyUSB0=/1), got {s:?}"
+        ));
+    };
+    if locator.is_empty() {
+        return Err(format!("missing sensor locator before '=' in {s:?}"));
+    }
+    let prefix = DeviceRoute::from_str(prefix_str)
+        .map_err(|_| format!("invalid route prefix: {prefix_str:?}"))?;
+    if prefix.len() != 1 {
+        return Err(format!(
+            "mount prefix must be a single segment like /1, got {prefix_str:?}"
+        ));
+    }
+    Ok(MountArg {
+        locator: locator.to_string(),
+        prefix,
+    })
 }
 
 #[derive(Subcommand, Debug)]
