@@ -10,7 +10,9 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::device::{RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_READABLE, RPC_META_WRITABLE};
+use twinleaf::device::{
+    RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_PERSISTENT, RPC_META_READABLE, RPC_META_WRITABLE,
+};
 use twinleaf::tio::proto::{self, meta};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -36,7 +38,6 @@ const SINE_STREAM_ID: u8 = 1;
 const STATUS_STREAM_ID: u8 = 2;
 const AUX_STREAM_ID: u8 = 3;
 const N_SEGMENTS: u8 = 16;
-const RPC_HASH: u32 = 0x7465_7377;
 const DEVICE_NAME: &str = "tio-test";
 // The simulator is a development/test device, so its build version is marked
 // `DEV`. Format: `{vendor} {name} {revision} ({serial}) [{date}/{build}]`.
@@ -73,14 +74,40 @@ const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 const STATUS_SAMPLE_BYTES: usize = 2;
 const AUX_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 
-const META_F64_RW: u16 = RPC_META_READABLE | RPC_META_WRITABLE | (8 << 4) | 2;
-const META_U8_RW: u16 = RPC_META_READABLE | RPC_META_WRITABLE | (1 << 4);
-const META_BOOL_RW: u16 = META_U8_RW | RPC_META_BOOL;
-const META_U32_R: u16 = RPC_META_READABLE | (4 << 4) | 0;
-const META_STRING_R: u16 = RPC_META_READABLE | 3;
-const META_ACTION: u16 = RPC_META_WRITABLE;
-const META_CAPTURE: u16 = RPC_META_READABLE | RPC_META_CAPTURE;
-const META_RAW: u16 = 0;
+// RPC entry flags, ported from tl-chibi lib/core/tlrpc.h. The low bits encode
+// the method kind, the value type and the value size; the high byte holds the
+// access flags. The same flags word feeds both the legacy metadata replies
+// (rpc.info/rpc.listinfo) and the rpc.hash CRC, exactly like the firmware.
+const TL_RPC_METHOD_STD: u32 = 0x1;
+const TL_RPC_METHOD_ACTION: u32 = 0x2;
+const TL_RPC_METHOD_PROP: u32 = 0x3;
+
+const TL_RPC_TYPE_OFFSET: u32 = 4;
+const TL_RPC_TYPE_MASK: u32 = 0x7 << TL_RPC_TYPE_OFFSET;
+const TL_RPC_TYPE_ANY: u32 = 0x0 << TL_RPC_TYPE_OFFSET;
+const TL_RPC_TYPE_VOID: u32 = 0x1 << TL_RPC_TYPE_OFFSET;
+const TL_RPC_TYPE_UINT: u32 = 0x2 << TL_RPC_TYPE_OFFSET;
+#[allow(dead_code)]
+const TL_RPC_TYPE_INT: u32 = 0x3 << TL_RPC_TYPE_OFFSET;
+const TL_RPC_TYPE_FLOAT: u32 = 0x4 << TL_RPC_TYPE_OFFSET;
+const TL_RPC_TYPE_STRING: u32 = 0x5 << TL_RPC_TYPE_OFFSET;
+
+const TL_RPC_SIZE_OFFSET: u32 = 8;
+const TL_RPC_SIZE_MASK: u32 = 0x1FF << TL_RPC_SIZE_OFFSET;
+
+const TL_RPC_FLAGS_OFFSET: u32 = 24;
+const TL_RPC_PUBLIC_READ: u32 = 0x1 << TL_RPC_FLAGS_OFFSET;
+const TL_RPC_PUBLIC_WRITE: u32 = 0x2 << TL_RPC_FLAGS_OFFSET;
+const TL_RPC_PERSISTENT: u32 = 0x20 << TL_RPC_FLAGS_OFFSET;
+
+const TL_RPC_PUBLIC_RW: u32 = TL_RPC_PUBLIC_READ | TL_RPC_PUBLIC_WRITE;
+
+const fn tl_rpc_mk_uint(size: u32) -> u32 {
+    TL_RPC_TYPE_UINT | (size << TL_RPC_SIZE_OFFSET)
+}
+const fn tl_rpc_mk_float(size: u32) -> u32 {
+    TL_RPC_TYPE_FLOAT | (size << TL_RPC_SIZE_OFFSET)
+}
 
 #[derive(Clone, Copy)]
 struct SineParams {
@@ -89,10 +116,112 @@ struct SineParams {
     noise: f64,
 }
 
+/// One entry of the RPC table, mirroring tl-chibi's `struct tl_rpc_entry`
+/// fields that participate in introspection: name, flags, desc and signature.
 #[derive(Clone)]
 struct RpcSpec {
     name: &'static str,
-    meta: u16,
+    flags: u32,
+    desc: &'static str,
+    signature: &'static str,
+    /// Extra metadata bits the Rust client understands but the legacy
+    /// firmware encoding does not carry in `flags` (bool/capture markers).
+    extra_meta: u16,
+}
+
+impl RpcSpec {
+    const fn new(name: &'static str, flags: u32) -> Self {
+        Self {
+            name,
+            flags,
+            desc: "",
+            signature: "",
+            extra_meta: 0,
+        }
+    }
+
+    const fn with_extra_meta(name: &'static str, flags: u32, extra_meta: u16) -> Self {
+        Self {
+            name,
+            flags,
+            desc: "",
+            signature: "",
+            extra_meta,
+        }
+    }
+
+    fn rpc_type(&self) -> u32 {
+        self.flags & TL_RPC_TYPE_MASK
+    }
+
+    fn rpc_size(&self) -> u32 {
+        (self.flags & TL_RPC_SIZE_MASK) >> TL_RPC_SIZE_OFFSET
+    }
+
+    /// Convert flags to the u16 metadata reported by rpc.info/rpc.listinfo.
+    /// Port of tl-chibi's `legacy_rpc_metadata()` (public, non-privileged),
+    /// extended with the bool/capture bits used by the Rust tooling.
+    fn legacy_metadata(&self) -> u16 {
+        let rpc_type = self.rpc_type();
+        if rpc_type == TL_RPC_TYPE_ANY {
+            return self.extra_meta;
+        }
+        if rpc_type == TL_RPC_TYPE_VOID {
+            return 0x8000 | self.extra_meta;
+        }
+
+        let size = self.rpc_size();
+        if size > 0xF {
+            return self.extra_meta;
+        }
+
+        let mut meta: u16 = 0x8000 | ((size as u16) << 4);
+        if (TL_RPC_TYPE_UINT..=TL_RPC_TYPE_STRING).contains(&rpc_type) {
+            meta |= ((rpc_type - TL_RPC_TYPE_UINT) >> TL_RPC_TYPE_OFFSET) as u16;
+        }
+
+        if self.flags & TL_RPC_PUBLIC_READ != 0 {
+            meta |= RPC_META_READABLE;
+        }
+        if self.flags & TL_RPC_PUBLIC_WRITE != 0 {
+            meta |= RPC_META_WRITABLE;
+        }
+        if self.flags & TL_RPC_PERSISTENT != 0 {
+            meta |= RPC_META_PERSISTENT;
+        }
+
+        meta | self.extra_meta
+    }
+}
+
+/// CRC-32 (ISO-HDLC: init 0xFFFFFFFF, reflected polynomial 0xEDB88320, final
+/// inversion), matching tl-chibi's `tl_crc32_*` in libtio.
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// Hash of the RPC table, as computed by tl-chibi's `tl_rpc_finalize()` for
+/// the public table: CRC-32 over each entry's name, flags (4 bytes LE), desc
+/// and signature, in table order.
+fn rpc_table_hash(rpcs: &[RpcSpec]) -> u32 {
+    let mut crc = 0xFFFF_FFFF;
+    for spec in rpcs {
+        crc = crc32_update(crc, spec.name.as_bytes());
+        crc = crc32_update(crc, &spec.flags.to_le_bytes());
+        crc = crc32_update(crc, spec.desc.as_bytes());
+        crc = crc32_update(crc, spec.signature.as_bytes());
+    }
+    !crc
 }
 
 #[derive(Clone, Copy)]
@@ -329,6 +458,7 @@ struct TestDevice {
     capture: CaptureBuffer,
     rng: GaussianRng,
     rpcs: Vec<RpcSpec>,
+    rpc_hash: u32,
 }
 
 impl TestDevice {
@@ -388,6 +518,73 @@ impl TestDevice {
         let initial_status = 0;
         let initial_enable = 1;
 
+        // RPC table. Like tl-chibi's tl_rpc_finalize(), the introspection
+        // methods come first, and the table order determines both the ids
+        // reported by rpc.list/rpc.listinfo and the rpc.hash CRC.
+        let rpcs = vec![
+            RpcSpec::new("rpc.name", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW),
+            RpcSpec::new("rpc.id", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW),
+            RpcSpec::new("rpc.info", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW),
+            RpcSpec::new("rpc.list", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW),
+            RpcSpec::new("rpc.listinfo", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW),
+            RpcSpec::new(
+                "rpc.hash",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_uint(4) | TL_RPC_PUBLIC_READ,
+            ),
+            RpcSpec::new(
+                "dev.name",
+                TL_RPC_METHOD_PROP | TL_RPC_TYPE_STRING | TL_RPC_PUBLIC_READ,
+            ),
+            RpcSpec::new(
+                "dev.desc",
+                TL_RPC_METHOD_PROP | TL_RPC_TYPE_STRING | TL_RPC_PUBLIC_READ,
+            ),
+            RpcSpec::new(
+                "dev.stop",
+                TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE,
+            ),
+            RpcSpec::new(
+                "dev.firmware.upload",
+                TL_RPC_METHOD_STD | TL_RPC_PUBLIC_WRITE,
+            ),
+            RpcSpec::new(
+                "dev.firmware.upgrade",
+                TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE,
+            ),
+            RpcSpec::new("dev.metadata", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW),
+            RpcSpec::new(
+                "test.amplitude",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_float(8) | TL_RPC_PUBLIC_RW,
+            ),
+            RpcSpec::new(
+                "test.frequency",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_float(8) | TL_RPC_PUBLIC_RW,
+            ),
+            RpcSpec::new(
+                "test.noise",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_float(8) | TL_RPC_PUBLIC_RW,
+            ),
+            RpcSpec::new(
+                "test.status",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_uint(1) | TL_RPC_PUBLIC_RW,
+            ),
+            RpcSpec::with_extra_meta(
+                "test.enable",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_uint(1) | TL_RPC_PUBLIC_RW,
+                RPC_META_BOOL,
+            ),
+            RpcSpec::new(
+                "test.go",
+                TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE,
+            ),
+            RpcSpec::with_extra_meta(
+                "test.capture",
+                TL_RPC_METHOD_STD | TL_RPC_PUBLIC_READ,
+                RPC_META_READABLE | RPC_META_CAPTURE,
+            ),
+        ];
+        let rpc_hash = rpc_table_hash(&rpcs);
+
         Ok(Self {
             socket,
             client: None,
@@ -424,60 +621,8 @@ impl TestDevice {
             next_log_level: 0,
             capture: CaptureBuffer::new(),
             rng,
-            rpcs: vec![
-                RpcSpec {
-                    name: "dev.name",
-                    meta: META_STRING_R,
-                },
-                RpcSpec {
-                    name: "dev.desc",
-                    meta: META_STRING_R,
-                },
-                RpcSpec {
-                    name: "rpc.hash",
-                    meta: META_U32_R,
-                },
-                RpcSpec {
-                    name: "rpc.info",
-                    meta: META_RAW,
-                },
-                RpcSpec {
-                    name: "rpc.listinfo",
-                    meta: META_RAW,
-                },
-                RpcSpec {
-                    name: "dev.metadata",
-                    meta: META_RAW,
-                },
-                RpcSpec {
-                    name: "test.amplitude",
-                    meta: META_F64_RW,
-                },
-                RpcSpec {
-                    name: "test.frequency",
-                    meta: META_F64_RW,
-                },
-                RpcSpec {
-                    name: "test.noise",
-                    meta: META_F64_RW,
-                },
-                RpcSpec {
-                    name: "test.status",
-                    meta: META_U8_RW,
-                },
-                RpcSpec {
-                    name: "test.enable",
-                    meta: META_BOOL_RW,
-                },
-                RpcSpec {
-                    name: "test.go",
-                    meta: META_ACTION,
-                },
-                RpcSpec {
-                    name: "test.capture",
-                    meta: META_CAPTURE,
-                },
-            ],
+            rpcs,
+            rpc_hash,
         })
     }
 
@@ -689,9 +834,12 @@ impl TestDevice {
                 self.desc = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]".to_string();
                 self.send_rpc_reply(req.id, Vec::new(), routing, addr)
             }
-            "rpc.hash" => self.rpc_read_u32(req.id, RPC_HASH, &req.arg, routing, addr),
+            "rpc.hash" => self.rpc_read_u32(req.id, self.rpc_hash, &req.arg, routing, addr),
+            "rpc.name" => self.rpc_name(req.id, &req.arg, routing, addr),
+            "rpc.id" => self.rpc_id(req.id, &req.arg, routing, addr),
             "rpc.info" => self.rpc_info(req.id, &req.arg, routing, addr),
-            "rpc.listinfo" => self.rpc_listinfo(req.id, &req.arg, routing, addr),
+            "rpc.list" => self.rpc_list_and_info(req.id, &req.arg, false, routing, addr),
+            "rpc.listinfo" => self.rpc_list_and_info(req.id, &req.arg, true, routing, addr),
             "dev.metadata" => self.rpc_metadata(req.id, &req.arg, routing, addr),
             "test.amplitude" => {
                 let next = self.read_or_write_nonnegative_f64(
@@ -774,6 +922,48 @@ impl TestDevice {
         self.send_rpc_reply(id, value.to_le_bytes().to_vec(), routing, addr)
     }
 
+    /// `rpc.name`: index (u16) -> RPC name. Port of tl-chibi's `rpc_name()`.
+    fn rpc_name(
+        &self,
+        id: u16,
+        arg: &[u8],
+        routing: proto::DeviceRoute,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if arg.len() != 2 {
+            return self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr);
+        }
+        let index = u16::from_le_bytes([arg[0], arg[1]]) as usize;
+        let Some(spec) = self.rpcs.get(index) else {
+            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+        };
+        self.send_rpc_reply(id, spec.name.as_bytes().to_vec(), routing, addr)
+    }
+
+    /// `rpc.id`: RPC name -> index (u16). Port of tl-chibi's `rpc_id()`.
+    fn rpc_id(
+        &self,
+        id: u16,
+        arg: &[u8],
+        routing: proto::DeviceRoute,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        if arg.is_empty() {
+            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+        }
+        let index = self
+            .rpcs
+            .iter()
+            .position(|spec| spec.name.as_bytes() == arg);
+        match index {
+            Some(index) => {
+                self.send_rpc_reply(id, (index as u16).to_le_bytes().to_vec(), routing, addr)
+            }
+            None => self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr),
+        }
+    }
+
+    /// `rpc.info`: RPC name -> metadata (u16). Port of tl-chibi's `rpc_info()`.
     fn rpc_info(
         &self,
         id: u16,
@@ -781,22 +971,23 @@ impl TestDevice {
         routing: proto::DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        let name = match std::str::from_utf8(arg) {
-            Ok(name) => name,
-            Err(_) => {
-                return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr)
-            }
+        if arg.is_empty() {
+            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+        }
+        let Some(spec) = self.rpcs.iter().find(|spec| spec.name.as_bytes() == arg) else {
+            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
         };
-        let Some(spec) = self.rpcs.iter().find(|spec| spec.name == name) else {
-            return self.send_rpc_error(id, proto::RpcErrorCode::NotFound, routing, addr);
-        };
-        self.send_rpc_reply(id, spec.meta.to_le_bytes().to_vec(), routing, addr)
+        self.send_rpc_reply(id, spec.legacy_metadata().to_le_bytes().to_vec(), routing, addr)
     }
 
-    fn rpc_listinfo(
+    /// `rpc.list` / `rpc.listinfo`: with no argument, the number of RPCs (u16);
+    /// with an index (u16), the RPC's name, prepended with its metadata (u16)
+    /// for `rpc.listinfo`. Port of tl-chibi's `rpc_list_and_info()`.
+    fn rpc_list_and_info(
         &self,
         id: u16,
         arg: &[u8],
+        prepend_info: bool,
         routing: proto::DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
@@ -817,7 +1008,10 @@ impl TestDevice {
             return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
         };
 
-        let mut reply = spec.meta.to_le_bytes().to_vec();
+        let mut reply = Vec::new();
+        if prepend_info {
+            reply.extend(spec.legacy_metadata().to_le_bytes());
+        }
         reply.extend(spec.name.as_bytes());
         self.send_rpc_reply(id, reply, routing, addr)
     }
@@ -1695,7 +1889,7 @@ impl TestDevice {
 
     fn settings_packet(&self) -> proto::Packet {
         proto::Packet {
-            payload: proto::Payload::Settings(proto::SettingsPayload::RpcHash(RPC_HASH)),
+            payload: proto::Payload::Settings(proto::SettingsPayload::RpcHash(self.rpc_hash)),
             routing: proto::DeviceRoute::root(),
             ttl: 0,
         }
@@ -1805,6 +1999,85 @@ fn unix_time_secs(now: Duration) -> u32 {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn crc32_matches_standard_check_value() {
+        // CRC-32/ISO-HDLC check value for "123456789", the same algorithm as
+        // tl-chibi's tl_crc32().
+        let crc = !crc32_update(0xFFFF_FFFF, b"123456789");
+        assert_eq!(crc, 0xCBF4_3926);
+    }
+
+    #[test]
+    fn legacy_metadata_matches_firmware_encoding() {
+        // f64 read/write property: 0x8000 | size 8<<4 | type float(2) | RW.
+        let spec = RpcSpec::new(
+            "test.amplitude",
+            TL_RPC_METHOD_PROP | tl_rpc_mk_float(8) | TL_RPC_PUBLIC_RW,
+        );
+        assert_eq!(spec.legacy_metadata(), 0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200);
+
+        // u32 read-only property (rpc.hash).
+        let spec = RpcSpec::new(
+            "rpc.hash",
+            TL_RPC_METHOD_PROP | tl_rpc_mk_uint(4) | TL_RPC_PUBLIC_READ,
+        );
+        assert_eq!(spec.legacy_metadata(), 0x8000 | (4 << 4) | 0x0100);
+
+        // Void action reports bare 0x8000, like legacy_rpc_metadata().
+        let spec = RpcSpec::new(
+            "dev.stop",
+            TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE,
+        );
+        assert_eq!(spec.legacy_metadata(), 0x8000);
+
+        // Raw method (type ANY) reports 0 (unknown).
+        let spec = RpcSpec::new("rpc.list", TL_RPC_METHOD_STD | TL_RPC_PUBLIC_RW);
+        assert_eq!(spec.legacy_metadata(), 0);
+
+        // String read-only property; bool flag carried via extra meta.
+        let spec = RpcSpec::with_extra_meta(
+            "test.enable",
+            TL_RPC_METHOD_PROP | tl_rpc_mk_uint(1) | TL_RPC_PUBLIC_RW,
+            RPC_META_BOOL,
+        );
+        assert_eq!(
+            spec.legacy_metadata(),
+            0x8000 | (1 << 4) | 0x0100 | 0x0200 | RPC_META_BOOL
+        );
+    }
+
+    #[test]
+    fn rpc_table_hash_covers_name_flags_desc_signature() {
+        let table = vec![
+            RpcSpec::new("a.b", TL_RPC_METHOD_PROP | tl_rpc_mk_uint(4) | TL_RPC_PUBLIC_READ),
+            RpcSpec::new("c.d", TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE),
+        ];
+        let base = rpc_table_hash(&table);
+
+        // Hash is stable for an identical table.
+        assert_eq!(base, rpc_table_hash(&table.clone()));
+
+        // Renaming an entry changes the hash.
+        let mut renamed = table.clone();
+        renamed[0].name = "a.x";
+        assert_ne!(base, rpc_table_hash(&renamed));
+
+        // Changing flags changes the hash.
+        let mut reflagged = table.clone();
+        reflagged[1].flags |= TL_RPC_PERSISTENT;
+        assert_ne!(base, rpc_table_hash(&reflagged));
+
+        // Changing the description changes the hash.
+        let mut redesc = table.clone();
+        redesc[0].desc = "described";
+        assert_ne!(base, rpc_table_hash(&redesc));
+
+        // Changing the signature changes the hash.
+        let mut resig = table;
+        resig[0].signature = "u32";
+        assert_ne!(base, rpc_table_hash(&resig));
+    }
 
     #[test]
     fn capture_buffer_exports_indexed_blocks_after_delay() {
