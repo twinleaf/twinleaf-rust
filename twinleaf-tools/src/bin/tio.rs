@@ -17,7 +17,11 @@ fn main() -> eyre::Result<()> {
     twinleaf_tools::install_error_handler()?;
     let cli = TioCli::parse();
 
-    if !matches!(cli.command, Commands::Health(_) | Commands::Monitor(_)) {
+    // Health, Monitor, and Proxy manage their own logging (TUI / custom filter)
+    if !matches!(
+        cli.command,
+        Commands::Health(_) | Commands::Monitor(_) | Commands::Proxy(_)
+    ) {
         twinleaf_tools::init_logging();
     }
 

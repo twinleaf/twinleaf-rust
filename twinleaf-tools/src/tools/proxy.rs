@@ -10,12 +10,52 @@ use std::time::Duration;
 use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::tio::{self, proto, proxy};
 
+fn init_proxy_logging(verbose: bool, debug: bool) {
+    use std::io::Write;
+    let level_filter = if debug {
+        "trace"
+    } else if verbose {
+        "debug"
+    } else {
+        "info,device=debug"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level_filter))
+        .format(|buf, record| {
+            let level = record.level();
+            let level_style = buf.default_level_style(level);
+            let target = record.target();
+            let source = target
+                .strip_prefix("device::")
+                .unwrap_or_else(|| target.rsplit("::").next().unwrap_or(target));
+            let bold = env_logger::fmt::style::Style::new().bold();
+            let ts = chrono::Local::now().format("%T%.3f");
+            writeln!(
+                buf,
+                "{ts} {level_style}{level:5}{level_style:#} {bold}{source}:{bold:#} {}",
+                record.args()
+            )
+        })
+        .init();
+}
+
 pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
     match proxy_cli.subcommands.take() {
         Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
+            init_proxy_logging(false, false);
             crate::tools::proxy_nmea::run_nmea_proxy(tio, tcp_port)
         }
-        None => run_proxy_server(ProxyConfig::from(proxy_cli)),
+        None => {
+            let deprecated_timestamp = proxy_cli.timestamp_format != "%T%.3f ";
+            let config = ProxyConfig::from(proxy_cli);
+            init_proxy_logging(config.verbose, config.debugging);
+            if deprecated_timestamp {
+                log::warn!(
+                    "--timestamp is deprecated and no longer applied; \
+                     timestamps are emitted by the logger"
+                );
+            }
+            run_proxy_server(config)
+        }
     }
 }
 
@@ -30,7 +70,6 @@ pub struct ProxyConfig {
     dump_data: bool,
     dump_meta: bool,
     dump_hb: bool,
-    timestamp_format: String,
     sensor_url: Option<String>,
     subtree: proto::DeviceRoute,
     auto: bool,
@@ -49,7 +88,6 @@ impl From<ProxyCli> for ProxyConfig {
             dump_data: proxy_cli.dump_data,
             dump_meta: proxy_cli.dump_meta,
             dump_hb: proxy_cli.dump_hb,
-            timestamp_format: proxy_cli.timestamp_format,
             sensor_url: proxy_cli.sensor_url,
             subtree: proxy_cli.subtree,
             auto: proxy_cli.auto,
@@ -114,19 +152,6 @@ fn startup_flags(config: &ProxyConfig) -> Vec<&'static str> {
         flags.push("dump-hb");
     }
     flags
-}
-
-macro_rules! log{
-    ($tf:expr, $msg:expr)=>{
-    {
-        println!("{}{}", chrono::Local::now().format(&$tf), $msg);
-    }
-    };
-    ($tf:expr, $f:expr,$($a:tt)*)=>{
-    {
-        log!($tf, format!($f, $($a)*));
-    }
-    };
 }
 
 fn create_listener_thread(
@@ -281,11 +306,7 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                     let addr = match stream.peer_addr() {
                         Ok(addr) => addr.to_string(),
                         Err(err) => {
-                            log!(
-                                config.timestamp_format,
-                                "Failed to determine client address: {:?}",
-                                err
-                            );
+                            log::warn!("Failed to determine client address: {:?}", err);
                             continue;
                         }
                     };
@@ -299,9 +320,7 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                         _ => continue,
                     };
 
-                    if config.verbose {
-                        log!(config.timestamp_format, "Accepted client from {}", addr);
-                    }
+                    log::debug!("Accepted client from {}", addr);
                     let port = proxy.new_port(Some(Duration::from_millis(2000)), subtree.clone(), usize::MAX, true, true).expect("Failed to create new proxy port");
                     let client_config = config.clone();
                     std::thread::spawn(move || {
@@ -311,7 +330,7 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                             select! {
                                 recv(port.receiver()) -> res => {
                                     let pkt = if let Ok(pkt) = res { pkt } else {
-                                        log!(client_config.timestamp_format, "Disconnecting client {} due to internal error receiving tio data in thread", addr);
+                                        log::warn!("Disconnecting client {} due to internal error receiving tio data in thread", addr);
                                             break;
                                     };
                                     if client_config.dump_traffic {
@@ -319,33 +338,33 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                                             proto::Payload::RpcRequest(_) | proto::Payload::RpcReply(_) | proto::Payload::RpcError(_) => true,
                                             _ => false,
                                         } {
-                                            log!(client_config.timestamp_format, "{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
+                                            log::info!("{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
                                         }
                                     }
                                     match client.try_send(pkt) {
                                         Err(tio::SendError::Full) => {
                                             if client_config.disconnect_slow {
-                                                log!(client_config.timestamp_format, "Disconnecting client {} due to slowness", addr);
+                                                log::warn!("Disconnecting client {} due to slowness", addr);
                                                 break;
-                                            } else if client_config.verbose {
+                                            } else if log::log_enabled!(log::Level::Debug) {
                                                 if !is_slow {
                                                     is_slow = true;
-                                                    log!(client_config.timestamp_format, "Client {} is not keeping up and is dropping packets", addr);
+                                                    log::debug!("Client {} is not keeping up and is dropping packets", addr);
                                                 }
                                                 dropped += 1;
                                             }
                                         }
                                         Ok(()) => {
-                                            if client_config.verbose && is_slow {
-                                                log!(client_config.timestamp_format, "Client {} resuming after having dropped {} packets", addr, dropped);
+                                            // `is_slow` is only ever set under a Debug-enabled filter
+                                            // above, so this is implicitly debug-gated.
+                                            if is_slow {
+                                                log::debug!("Client {} resuming after having dropped {} packets", addr, dropped);
                                                 is_slow = false;
                                                 dropped = 0;
                                             }
                                         }
                                         _ => {
-                                            if client_config.verbose {
-                                                log!(client_config.timestamp_format, "Client {} exiting", addr);
-                                            }
+                                            log::debug!("Client {} exiting", addr);
                                             break;
                                         }
                                     }
@@ -354,17 +373,15 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                                     match res {
                                         Ok(Ok(pkt)) => {
                                             if client_config.dump_traffic {
-                                                log!(client_config.timestamp_format, "{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
+                                                log::info!("{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
                                             }
                                             if let Err(_) = port.try_send(pkt) {
-                                                log!(client_config.timestamp_format, "Disconnecting client {} due to internal error forwarding tio data in thread", addr);
+                                                log::warn!("Disconnecting client {} due to internal error forwarding tio data in thread", addr);
                                                     break;
                                             }
                                         }
                                         _ => {
-                                            if client_config.verbose {
-                                                log!(client_config.timestamp_format, "Client {} exiting", addr);
-                                            }
+                                            log::debug!("Client {} exiting", addr);
                                             break;
                                         }
                                     }
@@ -380,47 +397,33 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                 if let Ok(evt) = status {
                     match evt {
                         proxy::Event::SensorDisconnected => {
-                            log!(config.timestamp_format, "Sensor disconnected");
+                            log::warn!("Sensor disconnected");
                         }
                         proxy::Event::SensorReconnected => {
-                            log!(config.timestamp_format, "Sensor reconnected");
+                            log::info!("Sensor reconnected");
                         }
                         proxy::Event::FailedToReconnect => {
-                            log!(
-                                config.timestamp_format,
-                                "Stopping reconnection attempts due to timeout"
-                            );
+                            log::error!("Stopping reconnection attempts due to timeout");
                         }
                         proxy::Event::FailedToConnect => {
-                            log!(
-                                config.timestamp_format,
-                                "Fatal proxy error: failed to connect to sensor"
-                            );
+                            log::error!("Fatal proxy error: failed to connect to sensor");
                         }
                         proxy::Event::FatalError(err) => {
-                            log!(config.timestamp_format, "Fatal proxy error: {:?}", err);
+                            log::error!("Fatal proxy error: {:?}", err);
                             // the proxy thread will exit and we'll detect it at the next iteration.
                         }
                         proxy::Event::ProtocolError(perr) => {
                             match perr {
                                 proto::Error::Text(txt) => {
-                                    log!(config.timestamp_format, "Text: {}", txt);
+                                    log::info!("Text: {}", txt);
                                 }
                                 other => {
-                                    if config.verbose || config.debugging {
-                                        log!(
-                                            config.timestamp_format,
-                                            "Protocol error: {:?}",
-                                            other
-                                        );
-                                    }
+                                    log::debug!("Protocol error: {:?}", other);
                                 }
                             }
                         }
                         evt => {
-                            if config.debugging {
-                                log!(config.timestamp_format, "Proxy event: {:?}", evt)
-                            }
+                            log::trace!(target: "proxy::event", "{:?}", evt);
                         }
                     }
                 } else {
@@ -438,16 +441,19 @@ pub fn run_proxy_server(config: ProxyConfig) -> eyre::Result<()> {
                         _ => config.dump_traffic
                     };
                     if dump {
-                        log!(config.timestamp_format, "Packet from {} -- {:?}", pkt.routing, pkt.payload);
+                        log::info!("Packet from {} -- {:?}", pkt.routing, pkt.payload);
                     }
-                    if let proto::Payload::LogMessage(log) = pkt.payload {
-                        log!(
-                            config.timestamp_format,
-                            "{} {:?}: {}",
-                            pkt.routing,
-                            log.level,
-                            log.message
-                        );
+                    if let proto::Payload::LogMessage(log_msg) = pkt.payload {
+                        // Map the device-reported level onto the log crate's level
+                        // so the logger filter and prefix reflect it.
+                        let level = match &log_msg.level {
+                            proto::LogLevel::Critical | proto::LogLevel::Error => log::Level::Error,
+                            proto::LogLevel::Warning => log::Level::Warn,
+                            proto::LogLevel::Info => log::Level::Info,
+                            proto::LogLevel::Debug => log::Level::Debug,
+                            proto::LogLevel::Unknown(_) => log::Level::Info,
+                        };
+                        log::log!(target: &format!("device::{}", pkt.routing), level, "{}", log_msg.message);
                     }
                 }
             }

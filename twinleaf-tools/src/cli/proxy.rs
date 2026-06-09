@@ -42,8 +42,8 @@ pub struct ProxyCli {
     #[arg(short = 'd', long)]
     pub(crate) debug: bool,
 
-    /// Timestamp format
-    #[arg(short = 't', long = "timestamp", default_value = "%T%.3f ")]
+    /// Deprecated; timestamps are now emitted by the logger (set RUST_LOG to control verbosity)
+    #[arg(short = 't', long = "timestamp", default_value = "%T%.3f ", hide = true)]
     pub(crate) timestamp_format: String,
 
     /// Time limit for sensor reconnection attempts (seconds)
