@@ -975,7 +975,12 @@ impl TestDevice {
         let Some(spec) = self.rpcs.iter().find(|spec| spec.name.as_bytes() == arg) else {
             return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
         };
-        self.send_rpc_reply(id, spec.legacy_metadata().to_le_bytes().to_vec(), routing, addr)
+        self.send_rpc_reply(
+            id,
+            spec.legacy_metadata().to_le_bytes().to_vec(),
+            routing,
+            addr,
+        )
     }
 
     /// `rpc.list` / `rpc.listinfo`: with no argument, the number of RPCs (u16);
@@ -2013,7 +2018,10 @@ mod tests {
             "test.amplitude",
             TL_RPC_METHOD_PROP | tl_rpc_mk_float(8) | TL_RPC_PUBLIC_RW,
         );
-        assert_eq!(spec.legacy_metadata(), 0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200);
+        assert_eq!(
+            spec.legacy_metadata(),
+            0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200
+        );
 
         // u32 read-only property (rpc.hash).
         let spec = RpcSpec::new(
@@ -2048,8 +2056,14 @@ mod tests {
     #[test]
     fn rpc_table_hash_covers_name_flags_desc_signature() {
         let table = vec![
-            RpcSpec::new("a.b", TL_RPC_METHOD_PROP | tl_rpc_mk_uint(4) | TL_RPC_PUBLIC_READ),
-            RpcSpec::new("c.d", TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE),
+            RpcSpec::new(
+                "a.b",
+                TL_RPC_METHOD_PROP | tl_rpc_mk_uint(4) | TL_RPC_PUBLIC_READ,
+            ),
+            RpcSpec::new(
+                "c.d",
+                TL_RPC_METHOD_ACTION | TL_RPC_TYPE_VOID | TL_RPC_PUBLIC_WRITE,
+            ),
         ];
         let base = rpc_table_hash(&table);
 

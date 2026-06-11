@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 license = "MIT"
 description = "Library for working with the Twinleaf I/O protocol and Twinleaf quantum sensors."
@@ -9,7 +9,7 @@ repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
 [features]
-default = ["serial"]
+default = ["serial", "firmware-update"]
 serial = ["dep:mio-serial", "dep:serialport"]
 hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 # Built-in GitHub-backed firmware catalog (pulls in an HTTP client + TLS).
