@@ -1,4 +1,5 @@
 mod capture;
+mod completions;
 mod dump;
 mod health;
 mod log;
@@ -9,6 +10,7 @@ mod simulate;
 mod upgrade;
 
 pub use capture::CaptureCli;
+pub use completions::CompletionsCli;
 pub use dump::DumpCli;
 pub use health::HealthCli;
 pub use log::{
@@ -22,7 +24,6 @@ pub use simulate::SimulateCli;
 pub use upgrade::UpgradeCli;
 
 use clap::{Parser, Subcommand};
-use clap_complete::Shell;
 
 pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
     let v: f64 = s
@@ -89,24 +90,5 @@ pub enum Commands {
     Test(SimulateCli),
 
     /// Generate shell completions for tio
-    #[command(long_about = "\
-Generate shell completions for tio.
-
-Add one of these lines to your shell's config file:
-
-  Bash (~/.bashrc):
-    eval \"$(tio completions bash)\"
-
-  Zsh (~/.zshrc):
-    eval \"$(tio completions zsh)\"
-
-  Fish (~/.config/fish/config.fish):
-    tio completions fish | source
-
-  PowerShell ($PROFILE):
-    tio completions powershell | Invoke-Expression")]
-    Completions {
-        #[arg(value_enum)]
-        shell: Shell,
-    },
+    Completions(CompletionsCli),
 }

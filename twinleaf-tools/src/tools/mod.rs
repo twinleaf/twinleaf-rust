@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod completions;
 pub mod dump;
 pub mod health;
 pub mod list;

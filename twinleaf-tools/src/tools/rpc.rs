@@ -1,16 +1,22 @@
 use std::io::Write;
 
-use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
+use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioCli, TioOpts};
+use clap::CommandFactory;
+use clap_complete::engine::CompletionCandidate;
 use tio::proxy;
 use twinleaf::device::{
     util::{rpc_decode_reply, rpc_encode_arg},
-    RpcClient, RpcRegistry, RpcValue, RpcValueType,
+    DeviceRoute, RpcClient, RpcRegistry, RpcValue, RpcValueType,
 };
 use twinleaf::tio;
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     match rpc_cli.subcommands {
-        Some(RPCSubcommands::List { tio }) => list_rpcs(&tio),
+        Some(RPCSubcommands::List {
+            tio,
+            name_only,
+            capture_only,
+        }) => list_rpcs(&tio, name_only, capture_only),
         Some(RPCSubcommands::Dump {
             tio,
             rpc_name,
@@ -27,7 +33,8 @@ pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     }
 }
 
-pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
+/// Open an RPC client for `tio` and read the device's RPC registry.
+fn open_registry(tio: &TioOpts) -> eyre::Result<RpcRegistry> {
     use eyre::WrapErr;
 
     let proxy = proxy::Interface::new(&tio.root);
@@ -38,18 +45,74 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     let rpcs = rpc_client
         .rpc_list(&route)
         .wrap_err("failed to query RPC list")?;
-    let registry = RpcRegistry::from(&rpcs);
+    Ok(RpcRegistry::from(&rpcs))
+}
+
+pub fn list_rpcs(tio: &TioOpts, name_only: bool, capture_only: bool) -> eyre::Result<()> {
+    let registry = open_registry(tio)?;
 
     for desc in registry.iter() {
-        println!(
-            "{} {}({})",
-            desc.meta.perm_str(),
-            desc.full_name,
-            desc.meta.type_str()
-        );
+        if capture_only && desc.meta.type_str() != "capture" {
+            continue;
+        }
+        if name_only {
+            println!("{}", desc.full_name);
+        } else {
+            println!(
+                "{} {}({})",
+                desc.meta.perm_str(),
+                desc.full_name,
+                desc.meta.type_str()
+            );
+        }
     }
 
     Ok(())
+}
+
+fn completion_words() -> Vec<String> {
+    let mut args = std::env::args_os();
+    for arg in args.by_ref() {
+        if arg == "--" {
+            break;
+        }
+    }
+    args.map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+fn device_opts_from_words(words: &[String]) -> TioOpts {
+    let mut root = tio::util::default_proxy_url().to_string();
+    let mut route = DeviceRoute::root();
+
+    if let Ok(matches) = TioCli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(words)
+    {
+        let mut leaf = &matches;
+        while let Some((_, sub)) = leaf.subcommand() {
+            leaf = sub;
+        }
+        if let Ok(Some(value)) = leaf.try_get_one::<String>("root") {
+            root = value.clone();
+        }
+        if let Ok(Some(value)) = leaf.try_get_one::<DeviceRoute>("route") {
+            route = value.clone();
+        }
+    }
+
+    TioOpts { root, route }
+}
+
+pub fn rpc_name_candidates(capture_only: bool) -> Vec<CompletionCandidate> {
+    let tio = device_opts_from_words(&completion_words());
+    let Ok(registry) = open_registry(&tio) else {
+        return Vec::new();
+    };
+    registry
+        .iter()
+        .filter(|desc| !capture_only || desc.meta.type_str() == "capture")
+        .map(|desc| CompletionCandidate::new(&desc.full_name))
+        .collect()
 }
 
 fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType {

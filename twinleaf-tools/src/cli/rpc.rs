@@ -2,8 +2,10 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser, ValueHint},
     Args, Subcommand,
 };
+use clap_complete::engine::ArgValueCandidates;
 use twinleaf::device::{util, RpcValueType};
 
+use crate::tools::rpc::rpc_name_candidates;
 use crate::TioOpts;
 
 #[derive(Args, Debug)]
@@ -16,7 +18,10 @@ pub struct RpcCli {
     pub subcommands: Option<RPCSubcommands>,
 
     /// RPC name to execute
-    #[arg(value_hint = ValueHint::Other)]
+    #[arg(
+        value_hint = ValueHint::Other,
+        add = ArgValueCandidates::new(|| rpc_name_candidates(false)),
+    )]
     pub rpc_name: Option<String>,
 
     /// RPC argument value
@@ -59,6 +64,14 @@ pub enum RPCSubcommands {
     List {
         #[command(flatten)]
         tio: TioOpts,
+
+        /// List names without permissions and types
+        #[arg(long)]
+        name_only: bool,
+
+        /// List only rpcs that are `tio capture`able
+        #[arg(long)]
+        capture_only: bool,
     },
     /// Dump RPC data from the device
     Dump {
@@ -66,7 +79,10 @@ pub enum RPCSubcommands {
         tio: TioOpts,
 
         /// RPC name to dump
-        #[arg(value_hint = ValueHint::Other)]
+        #[arg(
+            value_hint = ValueHint::Other,
+            add = ArgValueCandidates::new(|| rpc_name_candidates(false)),
+        )]
         rpc_name: String,
 
         /// Trigger a capture before dumping

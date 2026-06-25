@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser};
 use twinleaf_tools::tools::{
     capture::run_capture,
+    completions::run_completions,
     dump::run_dump,
     health::{run_health, HealthConfig},
     list::run_list,
@@ -14,6 +15,8 @@ use twinleaf_tools::tools::{
 use twinleaf_tools::{Commands, TioCli};
 
 fn main() -> eyre::Result<()> {
+    clap_complete::CompleteEnv::with_factory(TioCli::command).complete();
+
     twinleaf_tools::install_error_handler()?;
     let cli = TioCli::parse();
 
@@ -40,9 +43,6 @@ fn main() -> eyre::Result<()> {
         Commands::Dump(dump_cli) => run_dump(dump_cli),
         Commands::Log(log_cli) => run_log(log_cli),
         Commands::Upgrade(upgrade_cli) => run_upgrade(upgrade_cli),
-        Commands::Completions { shell } => {
-            clap_complete::generate(shell, &mut TioCli::command(), "tio", &mut std::io::stdout());
-            Ok(())
-        }
+        Commands::Completions(completions_cli) => run_completions(completions_cli),
     }
 }
