@@ -6,7 +6,7 @@ Command-line tools for working with Twinleaf quantum sensors and accessories. Co
 
 ### Shell completions
 
-`tio` can generate completion scripts for bash, zsh, fish, and PowerShell. Add the matching line to your shell's config file:
+`tio` can generate completion scripts for bash, zsh, fish, and PowerShell. Bash and Zsh default to live RPC-name completion (pass `--static` / `-s` for clap-only scripts). Other shells are static-only for now. Add the matching line to your shell's config file:
 
 		# Bash (~/.bashrc)
 		eval "$(tio completions bash)"

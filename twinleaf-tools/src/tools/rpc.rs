@@ -10,7 +10,11 @@ use twinleaf::tio;
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     match rpc_cli.subcommands {
-        Some(RPCSubcommands::List { tio }) => list_rpcs(&tio),
+        Some(RPCSubcommands::List {
+            tio,
+            name_only,
+            capture_only,
+        }) => list_rpcs(&tio, name_only, capture_only),
         Some(RPCSubcommands::Dump {
             tio,
             rpc_name,
@@ -27,7 +31,7 @@ pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     }
 }
 
-pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
+pub fn list_rpcs(tio: &TioOpts, name_only: bool, capture_only: bool) -> eyre::Result<()> {
     use eyre::WrapErr;
 
     let proxy = proxy::Interface::new(&tio.root);
@@ -41,12 +45,18 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     let registry = RpcRegistry::from(&rpcs);
 
     for desc in registry.iter() {
-        println!(
-            "{} {}({})",
-            desc.meta.perm_str(),
-            desc.full_name,
-            desc.meta.type_str()
-        );
+        if !capture_only || desc.meta.type_str() == "capture" {
+            if name_only {
+                println!("{}", desc.full_name);
+            } else {
+                println!(
+                    "{} {}({})",
+                    desc.meta.perm_str(),
+                    desc.full_name,
+                    desc.meta.type_str()
+                );
+            }
+        }
     }
 
     Ok(())

@@ -59,6 +59,14 @@ pub enum RPCSubcommands {
     List {
         #[command(flatten)]
         tio: TioOpts,
+
+        /// List names without permissions and types
+        #[arg(long)]
+        name_only: bool,
+
+        /// List only rpcs that are `tio capture`able
+        #[arg(long)]
+        capture_only: bool,
     },
     /// Dump RPC data from the device
     Dump {

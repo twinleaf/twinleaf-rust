@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 use twinleaf_tools::tools::{
     capture::run_capture,
     dump::run_dump,
@@ -10,6 +10,7 @@ use twinleaf_tools::tools::{
     rpc::run_rpc,
     simulate::run_simulate,
     upgrade::run_upgrade,
+    completions::run_completions,
 };
 use twinleaf_tools::{Commands, TioCli};
 
@@ -40,9 +41,6 @@ fn main() -> eyre::Result<()> {
         Commands::Dump(dump_cli) => run_dump(dump_cli),
         Commands::Log(log_cli) => run_log(log_cli),
         Commands::Upgrade(upgrade_cli) => run_upgrade(upgrade_cli),
-        Commands::Completions { shell } => {
-            clap_complete::generate(shell, &mut TioCli::command(), "tio", &mut std::io::stdout());
-            Ok(())
-        }
+        Commands::Completions(completions_cli) => run_completions(completions_cli),
     }
 }

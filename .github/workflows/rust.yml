@@ -3,6 +3,8 @@ name: Rust
 on:
   push:
     branches: ["main", "dev"]
+  pull_request:
+    branches: ["main", "dev"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,3 +37,23 @@ jobs:
           path: |
             target/release/tio
             target/release/tio.exe
+
+  completions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev zsh bash-completion
+
+      - name: Generate and check completions
+        working-directory: twinleaf-tools
+        run: ./build-completions.sh
+
+      - name: Ensure new dynamic completions are committed
+        run: |
+          if ! git diff --quiet --exit-code -- twinleaf-tools/completion-scripts/; then
+            echo "::error::New dynamic completions are not committed. Run twinleaf-tools/build-completions.sh and commit"
+            exit 1
+          fi

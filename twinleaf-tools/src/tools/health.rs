@@ -1,10 +1,10 @@
-// tio health
-//
-// Live timing & rate diagnostics by device route.
-// Uses DeviceTree for automatic metadata handling.
-//
-// Build: cargo run --release -- <tio-url> [route] [options]
-// Quit:  q / Ctrl-C
+//! tio health
+//!
+//! Live timing & rate diagnostics by device route.
+//! Uses DeviceTree for automatic metadata handling.
+//!
+//! Build: cargo run --release -- <tio-url> [route] [options]
+//! Quit:  q / Ctrl-C
 
 use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq};
 use crate::tui::rpc_state::RouteRpcState;

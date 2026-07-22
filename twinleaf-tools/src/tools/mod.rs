@@ -9,3 +9,4 @@ pub mod proxy_nmea;
 pub mod rpc;
 pub mod simulate;
 pub mod upgrade;
+pub mod completions;
