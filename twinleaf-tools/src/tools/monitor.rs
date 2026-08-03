@@ -484,7 +484,7 @@ impl MonitorState {
     pub fn new(depth_limit: Option<usize>, parent_route: &DeviceRoute) -> Self {
         Self {
             depth_limit,
-            parent_route: parent_route.clone(),
+            parent_route: *parent_route,
             mode: Mode::Normal,
             view: ViewConfig::default(),
             nav: Nav::default(),
@@ -620,7 +620,7 @@ impl MonitorState {
     fn update_rpclists(&mut self, list: RpcList) {
         let route = list.route.clone();
         self.rpc_routes
-            .entry(route.clone())
+            .entry(route)
             .or_default()
             .on_fetch_success(&list);
         self.update_palette_suggestions_for(&route);
@@ -628,7 +628,7 @@ impl MonitorState {
 
     fn update_rpclist_error(&mut self, route: DeviceRoute, error: String) {
         self.rpc_routes
-            .entry(route.clone())
+            .entry(route)
             .or_default()
             .on_fetch_error(error);
         self.update_palette_suggestions_for(&route);
@@ -667,18 +667,18 @@ impl MonitorState {
             if stream_ids.is_empty() {
                 new_items.push(NavPos::EmptyDevice {
                     device_idx: dev_idx,
-                    route: route.clone(),
+                    route: *route,
                 });
             } else {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
-                    let key = StreamKey::new(route.clone(), *sid);
+                    let key = StreamKey::new(*route, *sid);
                     if let Some((batch, _)) = self.last.get(&key) {
                         for series in &batch.columns {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
                                 spec: ColumnKey {
-                                    route: route.clone(),
+                                    route: *route,
                                     stream_id: *sid,
                                     column_id: series.index,
                                 },
@@ -701,7 +701,7 @@ impl MonitorState {
         self.nav.idx = prev_selection
             .and_then(|prev| {
                 let prev_spec = prev.spec().cloned();
-                let prev_route = prev.route().clone();
+                let prev_route = *prev.route();
                 self.nav_items
                     .iter()
                     .position(|pos| match (&prev_spec, pos.spec()) {
@@ -723,8 +723,8 @@ impl MonitorState {
 
     pub fn current_route(&self) -> DeviceRoute {
         self.current_pos()
-            .map(|p| p.route().clone())
-            .unwrap_or_else(|| self.parent_route.clone())
+            .map(|p| *p.route())
+            .unwrap_or_else(|| self.parent_route)
     }
 
     pub fn current_device_index(&self) -> usize {
@@ -738,14 +738,14 @@ impl MonitorState {
     fn handle_event(&mut self, event: TreeEvent, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
-                self.discovered_routes.insert(route.clone());
+                self.discovered_routes.insert(route);
                 if self
                     .rpc_routes
-                    .entry(route.clone())
+                    .entry(route)
                     .or_default()
                     .on_route_discovered()
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
                 self.device_status.entry(route).or_default();
             }
@@ -753,12 +753,7 @@ impl MonitorState {
                 route,
                 event: DeviceEvent::NewHash(hash),
             } => {
-                if self
-                    .rpc_routes
-                    .entry(route.clone())
-                    .or_default()
-                    .on_new_hash(hash)
-                {
+                if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
                     let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
             }
@@ -768,11 +763,11 @@ impl MonitorState {
             } => {
                 if self
                     .rpc_routes
-                    .entry(route.clone())
+                    .entry(route)
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
                 self.device_status.entry(route).or_default().on_heartbeat();
             }
@@ -780,15 +775,10 @@ impl MonitorState {
                 route,
                 event: DeviceEvent::Status(status),
             } => {
-                if self
-                    .rpc_routes
-                    .entry(route.clone())
-                    .or_default()
-                    .on_status(status)
-                {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                if self.rpc_routes.entry(route).or_default().on_status(status) {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
-                let dev_status = self.device_status.entry(route.clone()).or_default();
+                let dev_status = self.device_status.entry(route).or_default();
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
                     ProxyStatus::SensorReconnected => dev_status.connected = true,
@@ -1243,7 +1233,7 @@ fn build_left_lines(
         }
 
         for sid in stream_ids {
-            let key = StreamKey::new(route.clone(), sid);
+            let key = StreamKey::new(*route, sid);
             if let Some((batch, seen)) = app.last.get(&key) {
                 let is_stale = now.saturating_duration_since(*seen) > stale_threshold(batch);
                 let last_row = batch.len().saturating_sub(1);
@@ -1771,14 +1761,14 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     } = config;
 
     let proxy = tio::proxy::Interface::new(&tio.root);
-    let parent_route: DeviceRoute = tio.route.clone();
+    let parent_route: DeviceRoute = tio.route;
 
-    let tree = DeviceTree::open(&proxy, parent_route.clone())
+    let tree = DeviceTree::open(&proxy, parent_route)
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
         .with_proxy_help()?;
     let data_rx = spawn_tree_worker(tree);
 
-    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
+    let rpc_client = RpcClient::open(&proxy, parent_route)
         .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))
         .with_proxy_help()?;
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);

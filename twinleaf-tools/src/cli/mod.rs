@@ -17,6 +17,7 @@ pub use log::{
 };
 pub use monitor::MonitorCli;
 pub use proxy::{MountArg, ProxyCli, ProxySubcommands};
+pub(crate) use rpc::parse_rpc_type;
 pub use rpc::{RPCSubcommands, RpcCli};
 pub use simulate::SimulateCli;
 pub use upgrade::UpgradeCli;

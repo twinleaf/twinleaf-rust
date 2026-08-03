@@ -1,4 +1,4 @@
-//! UDP Port
+//! UDP transport
 //!
 //! Implements a `RawPort` for a UDP socket, and an MIO event source.
 //! Tio packets are sent and received unchanged in individual UDP datagrams.
@@ -55,9 +55,7 @@ impl RawPort for Port {
         let size = match self.sock.recv(&mut buf) {
             Ok(s) => s,
             Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    return Err(RecvError::NotReady);
-                } else if is_advisory_network_error(&e) {
+                if e.kind() == io::ErrorKind::WouldBlock || is_advisory_network_error(&e) {
                     return Err(RecvError::NotReady);
                 } else {
                     return Err(RecvError::IO(e));
@@ -77,8 +75,8 @@ impl RawPort for Port {
             Err(e) => {
                 // Since here we should get the whole packet in a single datagram,
                 // if something is missing at the end we don't want to pass along NeedMore
-                if let proto::Error::NeedMore = e {
-                    Err(RecvError::Protocol(proto::Error::PacketTooSmall(
+                if let proto::DecodeError::NeedMore = e {
+                    Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall(
                         buf[..size].to_vec(),
                     )))
                 } else {
@@ -89,11 +87,7 @@ impl RawPort for Port {
     }
 
     fn send(&mut self, pkt: &Packet) -> Result<(), SendError> {
-        let raw = if let Ok(raw) = pkt.serialize() {
-            raw
-        } else {
-            return Err(SendError::Serialization);
-        };
+        let raw = pkt.serialize()?;
         match self.sock.send(&raw) {
             Ok(size) => {
                 if size == raw.len() {

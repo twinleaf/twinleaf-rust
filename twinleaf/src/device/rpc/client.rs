@@ -1,5 +1,6 @@
-use crate::tio::{proto::DeviceRoute, proxy, util as tio_util};
+use super::{RpcDescriptor, RpcRegistry};
 use std::collections::HashMap;
+use crate::tio::{proto, proto::DeviceRoute, proto::RpcArgs, proto::RpcReply, proxy};
 
 use directories::BaseDirs;
 use std::fs;
@@ -51,20 +52,20 @@ impl RpcClient {
         name: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>, proxy::RpcError> {
-        let relative = self
-            .root_route
-            .relative_route(route)
-            .unwrap_or_else(|_| route.clone());
+        let relative = self.root_route.relative_route(route).unwrap_or(*route);
 
-        let req = tio_util::PacketBuilder::make_rpc_request(name, arg, 0, relative);
+        let req = proto::Packet::rpc_request(name, arg, 0, relative);
         self.port.send(req)?;
 
         loop {
-            let pkt = self.port.recv()?;
+            let pkt = self
+                .port
+                .recv()
+                .map_err(|_| proxy::RpcError::ResponseLost)?;
             match pkt.payload {
                 crate::tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
                 crate::tio::proto::Payload::RpcError(err) => {
-                    return Err(proxy::RpcError::ExecError(err))
+                    return Err(proxy::RpcError::DeviceError(err))
                 }
                 _ => continue,
             }
@@ -78,22 +79,18 @@ impl RpcClient {
         arg: Req,
     ) -> Result<Rep, proxy::RpcError>
     where
-        Req: tio_util::TioRpcRequestable<Req>,
-        Rep: tio_util::TioRpcReplyable<Rep>,
+        Req: RpcArgs,
+        Rep: RpcReply,
     {
-        let ret = self.raw_rpc(route, name, &arg.to_request())?;
-        Rep::from_reply(&ret).map_err(|_| proxy::RpcError::TypeError)
+        let ret = self.raw_rpc(route, name, &arg.encode_args())?;
+        Rep::decode_reply(&ret).map_err(proxy::RpcError::InvalidReply)
     }
 
     pub fn action(&self, route: &DeviceRoute, name: &str) -> Result<(), proxy::RpcError> {
         self.rpc(route, name, ())
     }
 
-    pub fn get<T: tio_util::TioRpcReplyable<T>>(
-        &self,
-        route: &DeviceRoute,
-        name: &str,
-    ) -> Result<T, proxy::RpcError> {
+    pub fn get<T: RpcReply>(&self, route: &DeviceRoute, name: &str) -> Result<T, proxy::RpcError> {
         self.rpc(route, name, ())
     }
 

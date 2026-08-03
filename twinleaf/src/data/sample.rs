@@ -157,12 +157,12 @@ impl SampleBatch {
 
     /// True unless the boundary marks a break in continuity.
     pub fn is_continuous(&self) -> bool {
-        self.boundary.as_ref().map_or(true, |b| b.is_continuous())
+        self.boundary.as_ref().is_none_or(|b| b.is_continuous())
     }
 
     /// True unless the boundary marks a non-monotonic break.
     pub fn is_monotonic(&self) -> bool {
-        self.boundary.as_ref().map_or(true, |b| b.is_monotonic())
+        self.boundary.as_ref().is_none_or(|b| b.is_monotonic())
     }
 
     /// True only when the boundary is the stream's first sample.

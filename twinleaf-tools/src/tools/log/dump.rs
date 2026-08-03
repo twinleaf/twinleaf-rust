@@ -26,7 +26,7 @@ pub fn log_dump(
 
     let route_matches = |route: &DeviceRoute| -> bool {
         match target_route.relative_route(route) {
-            Ok(rel) => max_depth.map_or(true, |max| rel.len() <= max),
+            Ok(rel) => max_depth.is_none_or(|max| rel.len() <= max),
             Err(_) => false,
         }
     };
@@ -62,7 +62,7 @@ pub fn log_dump(
                         println!("{:?}", pkt);
                         printed_any = true;
                     } else if in_subtree(&pkt.routing) {
-                        deeper_routes.insert(pkt.routing.clone());
+                        deeper_routes.insert(pkt.routing);
                     }
                 }
             }
@@ -92,7 +92,7 @@ pub fn log_dump(
                             print_metadata_payload(&pkt.routing, mp);
                             printed_any = true;
                         } else if in_subtree(&pkt.routing) {
-                            deeper_routes.insert(pkt.routing.clone());
+                            deeper_routes.insert(pkt.routing);
                         }
                     }
                 }
@@ -136,7 +136,7 @@ pub fn log_dump(
                     };
                     if route_matches(&pkt.routing) {
                         // Schema questions are answered once per batch.
-                        let matched = filter.as_ref().map_or(true, |f| {
+                        let matched = filter.as_ref().is_none_or(|f| {
                             batch.schema().iter().any(|series| {
                                 f.matches(&pkt.routing, &batch.stream.name, &series.metadata.name)
                             })
@@ -152,7 +152,7 @@ pub fn log_dump(
                         }
                         printed_any = true;
                     } else if in_subtree(&pkt.routing) {
-                        deeper_routes.insert(pkt.routing.clone());
+                        deeper_routes.insert(pkt.routing);
                     }
                 }
             }

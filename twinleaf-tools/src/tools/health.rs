@@ -398,7 +398,7 @@ impl HealthState {
     fn available_routes(&self, root_route: &DeviceRoute) -> Vec<DeviceRoute> {
         let mut routes: Vec<DeviceRoute> = self.device_states.keys().cloned().collect();
         if !routes.contains(root_route) {
-            routes.push(root_route.clone());
+            routes.push(*root_route);
         }
         routes.sort();
         routes
@@ -437,7 +437,7 @@ impl HealthState {
     }
 
     fn handle_batch(&mut self, batch: twinleaf::data::SampleBatch, now: Instant) {
-        let route = batch.route.clone();
+        let route = batch.route;
         let sid = batch.stream.stream_id;
 
         if let Some(filter) = &self.streams_filter {
@@ -446,7 +446,7 @@ impl HealthState {
             }
         }
 
-        let key = StreamKey::new(route.clone(), sid);
+        let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
             name: batch.stream.name.clone(),
             current_session_id: Some(batch.device.session_id),
@@ -475,7 +475,7 @@ impl HealthState {
         stream_name: &str,
         stream_id: u8,
     ) {
-        let key = StreamKey::new(route.clone(), stream_id);
+        let key = StreamKey::new(*route, stream_id);
         match reason {
             BoundaryReason::Initial => {
                 self.log_event(
@@ -571,11 +571,11 @@ impl HealthState {
     fn handle_event(&mut self, event: TreeEvent, now: Instant, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
-                self.device_states.entry(route.clone()).or_default();
+                self.device_states.entry(route).or_default();
                 self.log_event(format!("[{}] ROUTE DISCOVERED", route), Color::Green);
                 if self
                     .rpc_routes
-                    .entry(route.clone())
+                    .entry(route)
                     .or_default()
                     .on_route_discovered()
                 {
@@ -588,11 +588,11 @@ impl HealthState {
             } => {
                 if self
                     .rpc_routes
-                    .entry(route.clone())
+                    .entry(route)
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
                 self.device_states
                     .entry(route)
@@ -604,13 +604,8 @@ impl HealthState {
                 event: DeviceEvent::Status(status),
             } => {
                 self.log_event(format!("[{}] STATUS: {:?}", route, status), Color::Yellow);
-                if self
-                    .rpc_routes
-                    .entry(route.clone())
-                    .or_default()
-                    .on_status(status)
-                {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                if self.rpc_routes.entry(route).or_default().on_status(status) {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
                 if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
                     for (key, st) in self.stats.iter_mut() {
@@ -647,12 +642,7 @@ impl HealthState {
                 event: DeviceEvent::NewHash(hash),
             } => {
                 self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Color::Green);
-                if self
-                    .rpc_routes
-                    .entry(route.clone())
-                    .or_default()
-                    .on_new_hash(hash)
-                {
+                if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
                     let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
             }
@@ -660,7 +650,7 @@ impl HealthState {
     }
 
     fn tick(&mut self, now: Instant) {
-        for (_key, st) in self.stats.iter_mut() {
+        for st in self.stats.values_mut() {
             if st.is_stale(now, self.stale_dur) && st.rate_slope.n >= 2 {
                 st.reset_timing();
                 st.rate_slope.reset();
@@ -711,7 +701,7 @@ impl HealthState {
                 }
             }
             Action::SetMode(Mode::Command) => {
-                let active = self.active_route(root_route).clone();
+                let active = *self.active_route(root_route);
                 let registry = self
                     .rpc_routes
                     .get(&active)
@@ -750,7 +740,7 @@ impl HealthState {
     fn update_rpclists(&mut self, list: RpcList, root_route: &DeviceRoute) {
         let route = list.route.clone();
         self.rpc_routes
-            .entry(route.clone())
+            .entry(route)
             .or_default()
             .on_fetch_success(&list);
         self.update_palette_suggestions_for(&route, root_route);
@@ -763,7 +753,7 @@ impl HealthState {
         root_route: &DeviceRoute,
     ) {
         self.rpc_routes
-            .entry(route.clone())
+            .entry(route)
             .or_default()
             .on_fetch_error(error);
         self.update_palette_suggestions_for(&route, root_route);
@@ -903,7 +893,7 @@ fn draw_ui(
 
     let in_command = app.mode == Mode::Command;
     let palette_rows = app.palette.suggestion_rows();
-    let active_route = app.active_route(root_route).clone();
+    let active_route = *app.active_route(root_route);
     let palette_status = app.rpc_palette_status(&active_route);
     let session_str = indicatif::FormattedDuration(app.session_start.elapsed()).to_string();
 
@@ -1096,7 +1086,7 @@ fn get_action(ev: Event, app: &mut HealthState, root_route: &DeviceRoute) -> Opt
     }
     match app.mode {
         Mode::Command => {
-            let active = app.active_route(root_route).clone();
+            let active = *app.active_route(root_route);
             let registry = app
                 .rpc_routes
                 .get(&active)
@@ -1137,9 +1127,9 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
     let mut terminal = ratatui::init();
 
     let proxy = tio::proxy::Interface::new(&config.tio.root);
-    let root_route = config.tio.route.clone();
+    let root_route = config.tio.route;
 
-    let tree = DeviceTree::open(&proxy, root_route.clone())
+    let tree = DeviceTree::open(&proxy, root_route)
         .map_err(|e| {
             ratatui::restore();
             eyre::Report::new(e)
@@ -1147,7 +1137,7 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
         .wrap_err_with(|| format!("could not open device tree on {}", config.tio.root))
         .with_proxy_help()?;
 
-    let rpc_client = RpcClient::open(&proxy, root_route.clone())
+    let rpc_client = RpcClient::open(&proxy, root_route)
         .map_err(|e| {
             ratatui::restore();
             eyre::Report::new(e)

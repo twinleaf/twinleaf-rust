@@ -1,11 +1,11 @@
-//! Serial Port
+//! Serial transport
 //!
 //! Implements a `RawPort` for a serial port, and an MIO event source.
 //! Tio packets have their CRC32 appended, and are then encoded on the
 //! serial stream using SLIP.
 //! When receiving, this implementation also attempts to parse newline
 //! delimited, plain text ascii, which is returned as a
-//! `RecvError::Protocol(proto::Error::Text(textual_data))`
+//! `RecvError::Text(textual_data)`
 
 use super::{iobuf::IOBuf, proto, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
 use crc::{Crc, CRC_32_ISO_HDLC};
@@ -13,6 +13,47 @@ use mio_serial::{SerialPort, SerialPortBuilderExt};
 use std::io;
 use std::io::Write;
 use std::time::{Duration, Instant};
+
+fn io_error(error: mio_serial::Error) -> io::Error {
+    let kind = match error.kind() {
+        mio_serial::ErrorKind::NoDevice => io::ErrorKind::NotFound,
+        mio_serial::ErrorKind::InvalidInput => io::ErrorKind::InvalidInput,
+        mio_serial::ErrorKind::Unknown => io::ErrorKind::Other,
+        mio_serial::ErrorKind::Io(kind) => kind,
+    };
+    io::Error::new(kind, error)
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn parse_rate(value: &str) -> io::Result<u32> {
+    value
+        .parse()
+        .map_err(|_| invalid_input(format!("invalid serial data rate: {value}")))
+}
+
+fn parse_config(url: &str) -> io::Result<(&str, u32, u32)> {
+    let mut fields = url.split(':');
+    let port = fields.next().unwrap_or_default();
+    let target_rate = fields
+        .next()
+        .map(parse_rate)
+        .transpose()?
+        .unwrap_or(DEFAULT_RATE);
+    let default_rate = fields
+        .next()
+        .map(parse_rate)
+        .transpose()?
+        .unwrap_or(DEFAULT_RATE);
+    if port.is_empty() || fields.next().is_some() {
+        return Err(invalid_input(format!(
+            "invalid serial configuration: {url}"
+        )));
+    }
+    Ok((port, target_rate, default_rate))
+}
 
 /// RawPort to communicate via a serial port
 pub struct Port {
@@ -43,7 +84,7 @@ static DEFAULT_RATE: u32 = 115200;
 static HOLDOFF_TIME: Duration = Duration::from_millis(50);
 
 impl Port {
-    /// Returns a new `tcp::Port`. The `url` should look like
+    /// Returns a new serial `Port`. The `url` should look like
     /// `serial_port[:target_rate[:default_rate]]``. It must start with a serial port,
     /// like `/dev/tty??` or `COMn`. The second parameter is optional, and it
     /// indicates the rate at which tio should try to configure the connected device.
@@ -54,31 +95,11 @@ impl Port {
     /// For example, `COM3:400000:115200` will start off at 115.2k and try to
     /// negotiate 400k. If it fails to do so, or at any point later, it will
     /// fall back to 115.2k.
-    pub fn new(url: &str) -> Result<Port, io::Error> {
-        let url_tokens: Vec<&str> = url.split(':').collect();
-        if (url_tokens.len() < 1) || (url_tokens.len() > 3) {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        }
-        let port_name = url_tokens[0];
-        let target_rate = if url_tokens.len() > 1 {
-            if let Ok(rate) = url_tokens[1].parse::<u32>() {
-                rate
-            } else {
-                return Err(io::Error::from(io::ErrorKind::InvalidInput));
-            }
-        } else {
-            DEFAULT_RATE
-        };
-        let default_rate = if url_tokens.len() > 2 {
-            if let Ok(rate) = url_tokens[2].parse::<u32>() {
-                rate
-            } else {
-                return Err(io::Error::from(io::ErrorKind::InvalidInput));
-            }
-        } else {
-            DEFAULT_RATE
-        };
-        let mio_port = mio_serial::new(port_name, default_rate).open_native_async()?;
+    pub fn new(url: &str) -> io::Result<Port> {
+        let (port_name, target_rate, default_rate) = parse_config(url)?;
+        let mio_port = mio_serial::new(port_name, default_rate)
+            .open_native_async()
+            .map_err(io_error)?;
         #[cfg(target_os = "windows")]
         {
             // Windows requires some custom settings to replicate the unix behavior.
@@ -126,7 +147,7 @@ impl Port {
             // we know it's too long.
             if pkt.len() >= (proto::TIO_PACKET_MAX_TOTAL_SIZE + std::mem::size_of::<u32>() + 1) {
                 self.rxbuf.consume(offset);
-                return Err(RecvError::Protocol(proto::Error::PacketTooBig(pkt)));
+                return Err(RecvError::Protocol(proto::DecodeError::PacketTooBig(pkt)));
             }
             // This will always succeed when converting an u8.
             let c = char::from_u32(data[offset].into()).expect("byte to char conversion");
@@ -134,11 +155,9 @@ impl Port {
                 // Newline character preceded by valid text characters (possibly none).
                 // By the way the tio wire protocol over serial is designed, this can
                 // only be a text packet.
-                if pkt.len() > 0 {
+                if !pkt.is_empty() {
                     self.rxbuf.consume(offset + 1);
-                    return Err(RecvError::Protocol(proto::Error::Text(
-                        String::from_utf8_lossy(&pkt).to_string(),
-                    )));
+                    return Err(RecvError::Text(String::from_utf8_lossy(&pkt).to_string()));
                 } else {
                     consume_to = offset + 1;
                 }
@@ -149,14 +168,14 @@ impl Port {
                 self.rxbuf.consume(offset + 1);
                 if pkt.len() < 4 + std::mem::size_of::<u32>() {
                     // A packet must fit at least the header and its final CRC32
-                    return Err(RecvError::Protocol(proto::Error::PacketTooSmall(pkt)));
+                    return Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall(pkt)));
                 }
                 let len = pkt.len() - std::mem::size_of::<u32>();
                 let expected_crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&pkt[..len]);
                 // This will always succeed, because the vec slice must be 4 bytes
                 let received_crc = u32::from_le_bytes(pkt[len..].try_into().expect("array size"));
                 if received_crc != expected_crc {
-                    return Err(RecvError::Protocol(proto::Error::CRC32(pkt)));
+                    return Err(RecvError::Protocol(proto::DecodeError::CRC32(pkt)));
                 }
                 // At this point the whole packet should be here, and there should not
                 // be any bytes left over.
@@ -168,8 +187,8 @@ impl Port {
                             Ok(tio_pkt)
                         }
                     }
-                    Err(proto::Error::NeedMore) => {
-                        Err(RecvError::Protocol(proto::Error::PacketTooSmall(pkt)))
+                    Err(proto::DecodeError::NeedMore) => {
+                        Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall(pkt)))
                     }
                     Err(perr) => Err(RecvError::Protocol(perr)),
                 };
@@ -243,11 +262,7 @@ impl RawPort for Port {
             return Err(SendError::Full);
         }
 
-        let raw = if let Ok(raw) = pkt.serialize() {
-            raw
-        } else {
-            return Err(SendError::Serialization);
-        };
+        let raw = pkt.serialize()?;
         let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
         let mut encoded = vec![0xC0u8];
         for byte in [&raw, &crc32.checksum(&raw).to_le_bytes()[..]].concat() {

@@ -32,11 +32,11 @@ pub fn dump(
     };
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
+    let route = tio.route;
     let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
 
     let port = proxy
-        .new_port(None, route.clone(), port_depth, true, true)
+        .new_port(None, route, port_depth, true, true)
         .wrap_err_with(|| format!("could not open port on {}", tio.root))
         .with_proxy_help()?;
 
@@ -75,14 +75,14 @@ pub fn dump(
 
         // Sample mode (-d or -d -m): use DeviceTree for parsed samples
         (true, _) => {
-            let mut tree = DeviceTree::new(port, route.clone());
+            let mut tree = DeviceTree::new(port, route);
 
             while !duration_elapsed() {
                 match tree.next_item() {
                     Ok(TreeItem::Batch(batch)) => {
-                        let sample_route = batch.route.clone();
+                        let sample_route = batch.route;
                         // Schema questions are answered once per batch.
-                        let matched = filter.as_ref().map_or(true, |f| {
+                        let matched = filter.as_ref().is_none_or(|f| {
                             batch.schema().iter().any(|series| {
                                 f.matches(&sample_route, &batch.stream.name, &series.metadata.name)
                             })

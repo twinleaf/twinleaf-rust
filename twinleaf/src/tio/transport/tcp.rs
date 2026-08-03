@@ -1,4 +1,4 @@
-//! TCP Port
+//! TCP transport
 //!
 //! Implements a `RawPort` for a TCP stream, and an MIO event source.
 //! TIO packets are sent unmodified to the TCP stream. The TIO protocol
@@ -26,7 +26,7 @@ impl Port {
     /// Takes ownership of a MIO `TcpStream` and constructs a `Port` over it.
     pub fn from_stream(stream: TcpStream) -> Result<Port, io::Error> {
         Ok(Port {
-            stream: stream,
+            stream,
             rxbuf: IOBuf::new(),
             txbuf: IOBuf::new(),
         })
@@ -52,7 +52,7 @@ impl Port {
                 self.rxbuf.consume(size);
                 Ok(pkt)
             }
-            Err(proto::Error::NeedMore) => Err(RecvError::NotReady),
+            Err(proto::DecodeError::NeedMore) => Err(RecvError::NotReady),
             Err(perr) => Err(RecvError::Protocol(perr)),
         }
     }
@@ -62,9 +62,7 @@ impl RawPort for Port {
     fn recv(&mut self) -> Result<Packet, RecvError> {
         let mut res = self.recv_buffered();
         if let Err(RecvError::NotReady) = res {
-            if let Err(e) = self.rxbuf.refill(&mut self.stream) {
-                return Err(e);
-            }
+            self.rxbuf.refill(&mut self.stream)?;
             res = self.recv_buffered();
         }
         res
@@ -75,11 +73,7 @@ impl RawPort for Port {
             return Err(SendError::Full);
         }
 
-        let raw = if let Ok(raw) = pkt.serialize() {
-            raw
-        } else {
-            return Err(SendError::Serialization);
-        };
+        let raw = pkt.serialize()?;
         match self.stream.write(&raw) {
             Ok(size) => {
                 if size == raw.len() {

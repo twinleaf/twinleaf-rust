@@ -1,5 +1,13 @@
-use super::{too_small, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE};
+use super::{DecodeError, EncodeError};
 use num_enum::{FromPrimitive, IntoPrimitive};
+
+mod meta;
+mod typed;
+mod value;
+
+pub use meta::{RpcAccess, RpcMeta, RpcMetaFlags, RpcStringLen, RpcValueType};
+pub use typed::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
+pub use value::{RpcValue, RpcValueDecodeError, RpcValueEncodeError};
 
 #[derive(Debug, Clone)]
 pub enum RpcMethod {
@@ -74,19 +82,22 @@ pub struct RpcErrorPayload {
 }
 
 impl RpcRequestPayload {
-    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcRequestPayload, Error> {
+    pub fn deserialize(raw: &[u8]) -> Result<RpcRequestPayload, DecodeError> {
         if raw.len() < 4 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 4,
+                actual: raw.len(),
+            });
         }
         let id = u16::from_le_bytes([raw[0], raw[1]]);
         let method = u16::from_le_bytes([raw[2], raw[3]]);
         let (method, arg_start) = if (method & 0x8000) != 0 {
             let arg_start = (method & 0x7FFF) as usize + 4;
-            if arg_start > TIO_PACKET_MAX_PAYLOAD_SIZE {
-                return Err(Error::InvalidPayload(full_data.to_vec()));
-            }
             if raw.len() < arg_start {
-                return Err(too_small(full_data));
+                return Err(DecodeError::PayloadTooShort {
+                    expected: arg_start,
+                    actual: raw.len(),
+                });
             }
             (
                 RpcMethod::Name(String::from_utf8_lossy(&raw[4..arg_start]).to_string()),
@@ -96,64 +107,60 @@ impl RpcRequestPayload {
             (RpcMethod::Id(method), 4)
         };
         Ok(RpcRequestPayload {
-            id: id,
-            method: method,
+            id,
+            method,
             arg: raw[arg_start..].to_vec(),
         })
     }
-    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
+    pub(super) fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
         let method_name_len = if let RpcMethod::Name(method_name) = &self.method {
-            method_name.as_bytes().len() as u16
+            method_name.len() as u16
         } else {
             0
         };
-        let payload_size = 4 + (method_name_len as usize) + self.arg.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcReq, 0, payload_size as u16);
-        ret.extend(self.id.to_le_bytes());
+        output.extend(self.id.to_le_bytes());
         match &self.method {
             RpcMethod::Id(method) => {
-                ret.extend(method.to_le_bytes());
+                output.extend(method.to_le_bytes());
             }
             RpcMethod::Name(method) => {
-                ret.extend((method_name_len | 0x8000).to_le_bytes());
-                ret.extend(method.as_bytes())
+                output.extend((method_name_len | 0x8000).to_le_bytes());
+                output.extend(method.as_bytes());
             }
         }
-        ret.extend_from_slice(&self.arg);
-        Ok(ret)
+        output.extend_from_slice(&self.arg);
+        Ok(())
     }
 }
 
 impl RpcReplyPayload {
-    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcReplyPayload, Error> {
+    pub fn deserialize(raw: &[u8]) -> Result<RpcReplyPayload, DecodeError> {
         if raw.len() < 2 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 2,
+                actual: raw.len(),
+            });
         }
         let id = u16::from_le_bytes([raw[0], raw[1]]);
         Ok(RpcReplyPayload {
-            id: id,
+            id,
             reply: raw[2..].to_vec(),
         })
     }
-    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size = 2 + self.reply.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcRep, 0, payload_size as u16);
-        ret.extend(self.id.to_le_bytes());
-        ret.extend_from_slice(&self.reply);
-        Ok(ret)
+    pub(super) fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
+        output.extend(self.id.to_le_bytes());
+        output.extend_from_slice(&self.reply);
+        Ok(())
     }
 }
 
 impl RpcErrorPayload {
-    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<RpcErrorPayload, Error> {
+    pub fn deserialize(raw: &[u8]) -> Result<RpcErrorPayload, DecodeError> {
         if raw.len() < 4 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 4,
+                actual: raw.len(),
+            });
         }
         Ok(RpcErrorPayload {
             id: u16::from_le_bytes([raw[0], raw[1]]),
@@ -161,15 +168,10 @@ impl RpcErrorPayload {
             extra: raw[4..].to_vec(),
         })
     }
-    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size = 4 + self.extra.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::RpcError, 0, payload_size as u16);
-        ret.extend(self.id.to_le_bytes());
-        ret.extend(u16::from(self.error).to_le_bytes());
-        ret.extend_from_slice(&self.extra);
-        Ok(ret)
+    pub(super) fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
+        output.extend(self.id.to_le_bytes());
+        output.extend(u16::from(self.error).to_le_bytes());
+        output.extend_from_slice(&self.extra);
+        Ok(())
     }
 }

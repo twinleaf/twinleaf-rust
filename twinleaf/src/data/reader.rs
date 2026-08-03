@@ -35,7 +35,7 @@ pub struct LogReader {
 pub struct LogScanError {
     offset: usize,
     #[source]
-    source: tio::proto::Error,
+    source: tio::proto::DecodeError,
 }
 
 impl LogScanError {
@@ -43,7 +43,7 @@ impl LogScanError {
         self.offset
     }
 
-    pub fn packet_error(&self) -> &tio::proto::Error {
+    pub fn packet_error(&self) -> &tio::proto::DecodeError {
         &self.source
     }
 }
@@ -210,7 +210,7 @@ impl LogIndex {
     pub fn batches(
         &self,
         batch_rows: usize,
-    ) -> impl Iterator<Item = Result<SampleBatch, tio::proto::Error>> + '_ {
+    ) -> impl Iterator<Item = Result<SampleBatch, tio::proto::DecodeError>> + '_ {
         assert!(batch_rows > 0, "batch row target must be nonzero");
         IndexedBatchIter {
             data: &self.data,
@@ -235,7 +235,7 @@ struct IndexedBatchIter<'a> {
 }
 
 impl Iterator for IndexedBatchIter<'_> {
-    type Item = Result<SampleBatch, tio::proto::Error>;
+    type Item = Result<SampleBatch, tio::proto::DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -261,7 +261,7 @@ fn decode_chunk(
     data: &Bytes,
     chunk: &IndexedChunk,
     batch_rows: usize,
-) -> Result<Vec<SampleBatch>, tio::proto::Error> {
+) -> Result<Vec<SampleBatch>, tio::proto::DecodeError> {
     let mut remaining = data.slice(chunk.bytes.clone());
     let mut parser = PacketParser::from_state(chunk.state.clone()).with_batch_rows(batch_rows);
     let mut batches = Vec::new();
@@ -313,7 +313,7 @@ impl LogReader {
     }
 
     /// Decode the next packet without copying its variable-length payload.
-    pub fn next_packet(&mut self) -> Result<Option<Packet>, tio::proto::Error> {
+    pub fn next_packet(&mut self) -> Result<Option<Packet>, tio::proto::DecodeError> {
         if self.remaining.is_empty() {
             return Ok(None);
         }

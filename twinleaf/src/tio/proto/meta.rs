@@ -1,7 +1,5 @@
 use super::identifiers::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
-use super::{
-    too_small, vararg, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE,
-};
+use super::{DataType, DecodeError, EncodeError};
 use super::{DeviceRoute, Packet, Payload};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
@@ -111,19 +109,19 @@ pub struct MetadataPayload {
 }
 
 impl DeviceMetadata {
-    pub fn deserialize(
-        raw: &[u8],
-        full_data: &[u8],
-    ) -> Result<(DeviceMetadata, Vec<u8>, Vec<u8>), Error> {
-        let (fixed, varlen) = vararg::split(raw, full_data)?;
+    pub fn deserialize(raw: &[u8]) -> Result<(DeviceMetadata, Vec<u8>, Vec<u8>), DecodeError> {
+        let (fixed, varlen) = split_fields(raw)?;
         if fixed.len() < 9 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 9,
+                actual: fixed.len(),
+            });
         }
-        let (name, varlen) = vararg::peel_string(varlen, fixed[1], full_data)?;
-        let (serial, varlen) = vararg::peel_string(varlen, fixed[6], full_data)?;
-        let (firmware, varlen) = vararg::peel_string(varlen, fixed[7], full_data)?;
-        if (fixed.len() > 9) && (varlen.len() > 0) {
-            return Err(Error::InvalidPayload(full_data.to_vec()));
+        let (name, varlen) = take_string(varlen, fixed[1])?;
+        let (serial, varlen) = take_string(varlen, fixed[6])?;
+        let (firmware, varlen) = take_string(varlen, fixed[7])?;
+        if (fixed.len() > 9) && (!varlen.is_empty()) {
+            return Err(DecodeError::InvalidPayload);
         }
         Ok((
             DeviceMetadata {
@@ -131,7 +129,7 @@ impl DeviceMetadata {
                 firmware_hash: firmware,
                 n_streams: fixed[8].into(),
                 session_id: u32::from_le_bytes([fixed[2], fixed[3], fixed[4], fixed[5]]),
-                name: name,
+                name,
             },
             fixed[9..].to_vec(),
             varlen.to_vec(),
@@ -141,17 +139,17 @@ impl DeviceMetadata {
         &self,
         extra_fixed: &[u8],
         extra_varlen: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    ) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
         fixed.push(9u8);
-        fixed.push(vararg::append_string(&mut varlen, &self.name)?);
+        fixed.push(append_string(&mut varlen, &self.name)?);
         fixed.extend(self.session_id.to_le_bytes());
-        fixed.push(vararg::append_string(&mut varlen, &self.serial_number)?);
-        fixed.push(vararg::append_string(&mut varlen, &self.firmware_hash)?);
-        fixed.push(vararg::checked_u8_size(self.n_streams)?);
-        Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
+        fixed.push(append_string(&mut varlen, &self.serial_number)?);
+        fixed.push(append_string(&mut varlen, &self.firmware_hash)?);
+        fixed.push(checked_u8_size(self.n_streams)?);
+        finish_fields(fixed, varlen, extra_fixed, extra_varlen)
     }
     pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
@@ -161,7 +159,7 @@ impl DeviceMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: routing,
+            routing,
             ttl: 0,
         }
     }
@@ -171,22 +169,22 @@ impl DeviceMetadata {
 }
 
 impl StreamMetadata {
-    pub fn deserialize(
-        raw: &[u8],
-        full_data: &[u8],
-    ) -> Result<(StreamMetadata, Vec<u8>, Vec<u8>), Error> {
-        let (fixed, varlen) = vararg::split(raw, full_data)?;
+    pub fn deserialize(raw: &[u8]) -> Result<(StreamMetadata, Vec<u8>, Vec<u8>), DecodeError> {
+        let (fixed, varlen) = split_fields(raw)?;
         if fixed.len() < 9 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 9,
+                actual: fixed.len(),
+            });
         }
-        let (name, varlen) = vararg::peel_string(varlen, fixed[8], full_data)?;
-        if (fixed.len() > 9) && (varlen.len() > 0) {
-            return Err(Error::InvalidPayload(full_data.to_vec()));
+        let (name, varlen) = take_string(varlen, fixed[8])?;
+        if (fixed.len() > 9) && (!varlen.is_empty()) {
+            return Err(DecodeError::InvalidPayload);
         }
         Ok((
             StreamMetadata {
                 stream_id: fixed[1],
-                name: name,
+                name,
                 n_columns: fixed[2].into(),
                 n_segments: fixed[3].into(),
                 sample_size: u16::from_le_bytes([fixed[4], fixed[5]]).into(),
@@ -200,18 +198,18 @@ impl StreamMetadata {
         &self,
         extra_fixed: &[u8],
         extra_varlen: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    ) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
         fixed.push(9u8);
         fixed.push(self.stream_id);
-        fixed.push(vararg::checked_u8_size(self.n_columns)?);
-        fixed.push(vararg::checked_u8_size(self.n_segments)?);
-        fixed.extend(vararg::checked_u16_size(self.sample_size)?.to_le_bytes());
-        fixed.extend(vararg::checked_u16_size(self.buf_samples)?.to_le_bytes());
-        fixed.push(vararg::append_string(&mut varlen, &self.name)?);
-        Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
+        fixed.push(checked_u8_size(self.n_columns)?);
+        fixed.push(checked_u8_size(self.n_segments)?);
+        fixed.extend(checked_u16_size(self.sample_size)?.to_le_bytes());
+        fixed.extend(checked_u16_size(self.buf_samples)?.to_le_bytes());
+        fixed.push(append_string(&mut varlen, &self.name)?);
+        finish_fields(fixed, varlen, extra_fixed, extra_varlen)
     }
     pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
@@ -221,7 +219,7 @@ impl StreamMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: routing,
+            routing,
             ttl: 0,
         }
     }
@@ -241,17 +239,17 @@ impl SegmentMetadata {
         let period = 1.0 / f64::from(self.sampling_rate) * f64::from(self.decimation);
         f64::from(self.start_time) + period * f64::from(n)
     }
-    pub fn deserialize(
-        raw: &[u8],
-        full_data: &[u8],
-    ) -> Result<(SegmentMetadata, Vec<u8>, Vec<u8>), Error> {
-        let (fixed, varlen) = vararg::split(raw, full_data)?;
+    pub fn deserialize(raw: &[u8]) -> Result<(SegmentMetadata, Vec<u8>, Vec<u8>), DecodeError> {
+        let (fixed, varlen) = split_fields(raw)?;
         if fixed.len() < 27 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 27,
+                actual: fixed.len(),
+            });
         }
-        let (timeref_serial, varlen) = vararg::peel_string(varlen, fixed[5], full_data)?;
-        if (fixed.len() > 27) && (varlen.len() > 0) {
-            return Err(Error::InvalidPayload(full_data.to_vec()));
+        let (timeref_serial, varlen) = take_string(varlen, fixed[5])?;
+        if (fixed.len() > 27) && (!varlen.is_empty()) {
+            return Err(DecodeError::InvalidPayload);
         }
         Ok((
             SegmentMetadata {
@@ -275,7 +273,7 @@ impl SegmentMetadata {
         &self,
         extra_fixed: &[u8],
         extra_varlen: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    ) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
@@ -284,14 +282,14 @@ impl SegmentMetadata {
         fixed.push(self.segment_id);
         fixed.push(self.flags);
         fixed.push(self.time_ref_epoch.clone().into());
-        fixed.push(vararg::append_string(&mut varlen, &self.time_ref_serial)?);
+        fixed.push(append_string(&mut varlen, &self.time_ref_serial)?);
         fixed.extend(self.time_ref_session_id.to_le_bytes());
         fixed.extend(self.start_time.to_le_bytes());
         fixed.extend(self.sampling_rate.to_le_bytes());
         fixed.extend(self.decimation.to_le_bytes());
         fixed.extend(self.filter_cutoff.to_le_bytes());
         fixed.push(self.filter_type.clone().into());
-        Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
+        finish_fields(fixed, varlen, extra_fixed, extra_varlen)
     }
     pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
@@ -301,7 +299,7 @@ impl SegmentMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: routing,
+            routing,
             ttl: 0,
         }
     }
@@ -311,27 +309,27 @@ impl SegmentMetadata {
 }
 
 impl ColumnMetadata {
-    pub fn deserialize(
-        raw: &[u8],
-        full_data: &[u8],
-    ) -> Result<(ColumnMetadata, Vec<u8>, Vec<u8>), Error> {
-        let (fixed, varlen) = vararg::split(raw, full_data)?;
+    pub fn deserialize(raw: &[u8]) -> Result<(ColumnMetadata, Vec<u8>, Vec<u8>), DecodeError> {
+        let (fixed, varlen) = split_fields(raw)?;
         if fixed.len() < 7 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 7,
+                actual: fixed.len(),
+            });
         }
-        let (name, varlen) = vararg::peel_string(varlen, fixed[4], full_data)?;
-        let (units, varlen) = vararg::peel_string(varlen, fixed[5], full_data)?;
-        let (desc, varlen) = vararg::peel_string(varlen, fixed[6], full_data)?;
-        if (fixed.len() > 7) && (varlen.len() > 0) {
-            return Err(Error::InvalidPayload(full_data.to_vec()));
+        let (name, varlen) = take_string(varlen, fixed[4])?;
+        let (units, varlen) = take_string(varlen, fixed[5])?;
+        let (desc, varlen) = take_string(varlen, fixed[6])?;
+        if (fixed.len() > 7) && (!varlen.is_empty()) {
+            return Err(DecodeError::InvalidPayload);
         }
         Ok((
             ColumnMetadata {
                 stream_id: fixed[1],
                 index: fixed[2].into(),
                 data_type: DataType::from(fixed[3]),
-                name: name,
-                units: units,
+                name,
+                units,
                 description: desc,
             },
             fixed[7..].to_vec(),
@@ -342,18 +340,18 @@ impl ColumnMetadata {
         &self,
         extra_fixed: &[u8],
         extra_varlen: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    ) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
         let mut fixed = vec![];
         let mut varlen = vec![];
 
         fixed.push(7u8);
         fixed.push(self.stream_id);
-        fixed.push(vararg::checked_u8_size(self.index)?);
-        fixed.push(self.data_type.clone().into());
-        fixed.push(vararg::append_string(&mut varlen, &self.name)?);
-        fixed.push(vararg::append_string(&mut varlen, &self.units)?);
-        fixed.push(vararg::append_string(&mut varlen, &self.description)?);
-        Ok(vararg::extend(fixed, varlen, extra_fixed, extra_varlen)?)
+        fixed.push(checked_u8_size(self.index)?);
+        fixed.push(self.data_type.into());
+        fixed.push(append_string(&mut varlen, &self.name)?);
+        fixed.push(append_string(&mut varlen, &self.units)?);
+        fixed.push(append_string(&mut varlen, &self.description)?);
+        finish_fields(fixed, varlen, extra_fixed, extra_varlen)
     }
     pub fn make_update_with_route(&self, routing: DeviceRoute) -> Packet {
         Packet {
@@ -363,7 +361,7 @@ impl ColumnMetadata {
                 unknown_fixed: vec![],
                 unknown_varlen: vec![],
             }),
-            routing: routing,
+            routing,
             ttl: 0,
         }
     }
@@ -382,56 +380,59 @@ impl MetadataPayload {
     pub fn last(&self) -> bool {
         (self.flags & TL_METADATA_LAST) != 0
     }
-    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<MetadataPayload, Error> {
+    pub fn deserialize(raw: &[u8]) -> Result<MetadataPayload, DecodeError> {
         if raw.len() < 2 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 2,
+                actual: raw.len(),
+            });
         }
         let (content, ufixed, uvarlen) = match MetadataType::from(raw[0]) {
             MetadataType::Device => {
-                let (dm, uf, uv) = DeviceMetadata::deserialize(&raw[2..], full_data)?;
+                let (dm, uf, uv) = DeviceMetadata::deserialize(&raw[2..])?;
                 (MetadataContent::Device(dm), uf, uv)
             }
             MetadataType::Stream => {
-                let (sm, uf, uv) = StreamMetadata::deserialize(&raw[2..], full_data)?;
+                let (sm, uf, uv) = StreamMetadata::deserialize(&raw[2..])?;
                 (MetadataContent::Stream(sm), uf, uv)
             }
             MetadataType::Segment => {
-                let (sm, uf, uv) = SegmentMetadata::deserialize(&raw[2..], full_data)?;
+                let (sm, uf, uv) = SegmentMetadata::deserialize(&raw[2..])?;
                 (MetadataContent::Segment(sm), uf, uv)
             }
             MetadataType::Column => {
-                let (cm, uf, uv) = ColumnMetadata::deserialize(&raw[2..], full_data)?;
+                let (cm, uf, uv) = ColumnMetadata::deserialize(&raw[2..])?;
                 (MetadataContent::Column(cm), uf, uv)
             }
             MetadataType::Unknown(mtype) => {
-                let (uf, uv) = vararg::split(&raw[2..], full_data)?;
+                let (uf, uv) = split_fields(&raw[2..])?;
                 (MetadataContent::Unknown(mtype), uf.to_vec(), uv.to_vec())
             }
         };
         Ok(MetadataPayload {
-            content: content,
+            content,
             flags: raw[1],
             unknown_fixed: ufixed,
             unknown_varlen: uvarlen,
         })
     }
-    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
+    pub(super) fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
         let (fixed, varlen, mtype) = match &self.content {
             MetadataContent::Device(dm) => {
                 let (f, v) = dm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Device.into())
+                (f, v, MetadataType::Device)
             }
             MetadataContent::Stream(sm) => {
                 let (f, v) = sm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Stream.into())
+                (f, v, MetadataType::Stream)
             }
             MetadataContent::Segment(sm) => {
                 let (f, v) = sm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Segment.into())
+                (f, v, MetadataType::Segment)
             }
             MetadataContent::Column(cm) => {
                 let (f, v) = cm.serialize(&self.unknown_fixed, &self.unknown_varlen)?;
-                (f, v, MetadataType::Column.into())
+                (f, v, MetadataType::Column)
             }
             MetadataContent::Unknown(mtype) => (
                 self.unknown_fixed.clone(),
@@ -439,15 +440,80 @@ impl MetadataPayload {
                 MetadataType::Unknown(*mtype),
             ),
         };
-        let payload_size = 2 + fixed.len() + varlen.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret = TioPktHdr::serialize_new(TioPktType::Metadata, 0, payload_size as u16);
-        ret.push(mtype.into());
-        ret.push(self.flags);
-        ret.extend(fixed);
-        ret.extend(varlen);
-        Ok(ret)
+        output.push(mtype.into());
+        output.push(self.flags);
+        output.extend(fixed);
+        output.extend(varlen);
+        Ok(())
     }
+}
+
+fn split_fields(raw: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {
+    let Some(&fixed_len) = raw.first() else {
+        return Err(DecodeError::PayloadTooShort {
+            expected: 1,
+            actual: 0,
+        });
+    };
+    let fixed_len = usize::from(fixed_len);
+    if fixed_len < 2 {
+        return Err(DecodeError::InvalidPayload);
+    }
+    if fixed_len > raw.len() {
+        return Err(DecodeError::PayloadTooShort {
+            expected: fixed_len,
+            actual: raw.len(),
+        });
+    }
+    Ok(raw.split_at(fixed_len))
+}
+
+fn take_string(varlen: &[u8], len: u8) -> Result<(String, &[u8]), DecodeError> {
+    let len = usize::from(len);
+    if len > varlen.len() {
+        return Err(DecodeError::PayloadTooShort {
+            expected: len,
+            actual: varlen.len(),
+        });
+    }
+    let (value, remaining) = varlen.split_at(len);
+    Ok((String::from_utf8_lossy(value).into_owned(), remaining))
+}
+
+fn checked_u8_size(size: usize) -> Result<u8, EncodeError> {
+    u8::try_from(size).map_err(|_| EncodeError::ValueTooLarge {
+        value: size,
+        maximum: usize::from(u8::MAX),
+    })
+}
+
+fn checked_u16_size(size: usize) -> Result<u16, EncodeError> {
+    u16::try_from(size).map_err(|_| EncodeError::ValueTooLarge {
+        value: size,
+        maximum: usize::from(u16::MAX),
+    })
+}
+
+fn append_string(varlen: &mut Vec<u8>, value: &str) -> Result<u8, EncodeError> {
+    let len = checked_u8_size(value.len())?;
+    varlen.extend(value.as_bytes());
+    Ok(len)
+}
+
+fn finish_fields(
+    mut fixed: Vec<u8>,
+    mut varlen: Vec<u8>,
+    extra_fixed: &[u8],
+    extra_varlen: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
+    if !extra_varlen.is_empty() && extra_fixed.is_empty() {
+        return Err(EncodeError::VariableExtensionWithoutFixed);
+    }
+    if fixed.is_empty() || usize::from(fixed[0]) != fixed.len() {
+        return Err(EncodeError::InvalidFixedExtension);
+    }
+    fixed[0] = checked_u8_size(fixed.len() + extra_fixed.len())?;
+    fixed.extend(extra_fixed);
+    varlen.extend(extra_varlen);
+    Ok((fixed, varlen))
 }

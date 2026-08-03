@@ -1,5 +1,5 @@
 use super::client::RpcList;
-use super::meta::RpcMeta;
+use crate::tio::proto::RpcMeta;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]

@@ -498,7 +498,7 @@ impl Buffer {
             let new_run_id = self.next_run_id;
             self.next_run_id += 1;
             self.active_runs.insert(
-                stream_key.clone(),
+                stream_key,
                 ActiveRun::new(new_run_id, batch, last_n, self.capacity),
             );
         }
@@ -614,9 +614,7 @@ impl Buffer {
         let run = self
             .active_runs
             .get(&stream_key)
-            .ok_or(ReadError::NoActiveRun {
-                stream_key: stream_key.clone(),
-            })?;
+            .ok_or(ReadError::NoActiveRun { stream_key })?;
         if run.run_id != run_id {
             return Err(ReadError::CursorInvalidated {
                 stream_key,
@@ -629,7 +627,7 @@ impl Buffer {
             .columns
             .get(&col.column_id)
             .ok_or(ReadError::ColumnNotFound {
-                stream_key: stream_key.clone(),
+                stream_key,
                 column_id: col.column_id,
             })?;
         let Some(start) = buf.find_start_after_sample(after) else {

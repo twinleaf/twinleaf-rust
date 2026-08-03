@@ -2,6 +2,7 @@
 name = "twinleaf-tools"
 version = "2.3.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "Tools for the Twinleaf I/O protocol for reading data from Twinleaf quantum sensors."
 homepage = "https://twinleaf.com"

@@ -9,9 +9,8 @@
 //! can plug in their own source. A ready-made GitHub-backed catalog is provided
 //! in [`github`] behind the `firmware-update` feature.
 
-use crate::tio::proto::{DeviceRoute, Payload, RpcErrorCode};
+use crate::tio::proto::{DeviceRoute, Packet, Payload, RpcErrorCode};
 use crate::tio::proxy::{Port, RecvError, RpcError};
-use crate::tio::util::PacketBuilder;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -210,7 +209,7 @@ fn bracket_content(desc: &str) -> Option<&str> {
 ///   `/` is the build version (which contains `DEV` for development builds).
 fn parse_installed(desc: &str) -> InstalledFirmware {
     // Header is everything before the serial/build sections.
-    let header_end = desc.find(|c| c == '(' || c == '[').unwrap_or(desc.len());
+    let header_end = desc.find(['(', '[']).unwrap_or(desc.len());
     let header_tokens: Vec<&str> = desc[..header_end].split_whitespace().collect();
     let name = header_tokens
         .get(1)
@@ -402,10 +401,10 @@ pub fn flash(
     on_event(FlashEvent::Stopping);
     let stop_outcome = match device.action("dev.stop") {
         Ok(()) => StopOutcome::Stopped,
-        Err(RpcError::ExecError(ref e)) if matches!(e.error, RpcErrorCode::NotFound) => {
+        Err(RpcError::DeviceError(ref e)) if matches!(e.error, RpcErrorCode::NotFound) => {
             StopOutcome::Unsupported
         }
-        Err(RpcError::ExecError(ref e)) if matches!(e.error, RpcErrorCode::WrongDeviceState) => {
+        Err(RpcError::DeviceError(ref e)) if matches!(e.error, RpcErrorCode::WrongDeviceState) => {
             StopOutcome::AlreadyStopped
         }
         Err(e) => return Err(e.into()),
@@ -424,7 +423,7 @@ pub fn flash(
             let chunk_end = (offset + UPLOAD_CHUNK_SIZE).min(firmware_data.len());
 
             device
-                .send(PacketBuilder::make_rpc_request(
+                .send(Packet::rpc_request(
                     "dev.firmware.upload",
                     &firmware_data[offset..chunk_end],
                     next_send_chunk,

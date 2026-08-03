@@ -10,7 +10,7 @@ pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     use eyre::WrapErr;
 
     let proxy = tio::proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
+    let route = tio.route;
 
     let bind_addr = format!("0.0.0.0:{}", tcp_port);
     let listener = TcpListener::bind(&bind_addr)
@@ -19,14 +19,12 @@ pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
 
     println!("Listening on {}", bind_addr);
 
-    for connection in listener.incoming() {
-        if let Ok(stream) = connection {
-            let device = proxy
-                .device_full(route.clone())
-                .wrap_err_with(|| format!("could not open device at {}", tio.root))
-                .with_proxy_help()?;
-            thread::spawn(move || broadcast_to_client(stream, device));
-        }
+    for stream in listener.incoming().flatten() {
+        let device = proxy
+            .device_full(route)
+            .wrap_err_with(|| format!("could not open device at {}", tio.root))
+            .with_proxy_help()?;
+        thread::spawn(move || broadcast_to_client(stream, device));
     }
     Ok(())
 }
@@ -49,7 +47,7 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     println!("Connection from: {}", peer_addr);
 
     'outer: loop {
-        let batch = match device.next() {
+        let batch = match device.next_batch() {
             Ok(batch) => batch,
             Err(_) => {
                 eprintln!("Failed to parse sample");

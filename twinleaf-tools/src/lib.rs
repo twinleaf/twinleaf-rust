@@ -3,7 +3,7 @@ use indicatif::MultiProgress;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use twinleaf::device::DeviceRoute;
-use twinleaf::tio::util;
+use twinleaf::tio::proxy;
 pub mod cli;
 pub mod tools;
 pub mod tui;
@@ -52,7 +52,8 @@ impl<T> ProxyHelp<T> for eyre::Result<T> {
 }
 
 fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
-    DeviceRoute::from_str(s).map_err(|_| format!("invalid sensor route: {s:?}"))
+    s.parse::<DeviceRoute>()
+        .map_err(|_| format!("invalid sensor route: {s:?}"))
 }
 
 fn parse_existing_file(s: &str) -> Result<PathBuf, String> {
@@ -70,7 +71,7 @@ pub struct TioOpts {
     #[arg(
         short = 'r',
         long = "root",
-        default_value_t = util::default_proxy_url().to_string(),
+        default_value_t = proxy::DEFAULT_URL.to_string(),
         value_hint = clap::ValueHint::Url,
         help = "Sensor root address"
     )]

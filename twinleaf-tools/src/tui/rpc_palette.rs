@@ -8,6 +8,8 @@
 
 use std::cmp::min;
 
+use crate::cli::parse_rpc_type;
+
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -19,7 +21,8 @@ use ratatui::{
     Frame,
 };
 use tui_prompts::{State, TextState};
-use twinleaf::device::{util, DeviceRoute, RpcDescriptor, RpcRegistry, RpcValueType};
+use twinleaf::device::{DeviceRoute, RpcDescriptor, RpcRegistry};
+use twinleaf::tio::proto::RpcValueType;
 
 const RPCLIST_MAX_LEN: usize = 12;
 
@@ -94,7 +97,7 @@ fn parse_palette_line(line: &str) -> ParsedLine {
                 match toks.get(i + 1) {
                     Some((vrange, vtok)) => {
                         roles.push((vrange.clone(), TokRole::FlagVal));
-                        match util::parse_rpc_type(vtok) {
+                        match parse_rpc_type(vtok) {
                             Some(t) if is_req => req_type = Some(t),
                             Some(t) => rep_type = Some(t),
                             None => bad_type = Some((*vtok).to_string()),
@@ -271,12 +274,10 @@ impl RpcPalette {
     /// active sub-picker if one is open.
     pub fn suggestion_rows(&self) -> u16 {
         let len = if let Some(picker) = &self.picker {
-            picker.filtered.len().max(1).min(RPCLIST_MAX_LEN)
+            picker.filtered.len().clamp(1, RPCLIST_MAX_LEN)
         } else if let Some(rp) = &self.route_picker {
-            rp.routes.len().max(1).min(RPCLIST_MAX_LEN)
-        } else if self.current_zone() == Zone::Arg {
-            1
-        } else if self.suggestions.is_empty() {
+            rp.routes.len().clamp(1, RPCLIST_MAX_LEN)
+        } else if self.current_zone() == Zone::Arg || self.suggestions.is_empty() {
             1
         } else {
             self.suggestions.len().min(RPCLIST_MAX_LEN)
@@ -358,9 +359,8 @@ impl RpcPalette {
                     PaletteEvent::Consumed
                 }
                 Zone::Arg => {
-                    if self.has_arg_content() {
-                        self.clear_arg(registry);
-                    } else if !self.pop_undo(registry) {
+                    let restored = !self.has_arg_content() && self.pop_undo(registry);
+                    if !restored {
                         self.clear_arg(registry);
                     }
                     PaletteEvent::Consumed
@@ -1032,7 +1032,7 @@ impl RpcPalette {
         self.in_flight = true;
 
         let req = RpcReq {
-            route: route.clone(),
+            route: *route,
             meta,
             method,
             arg: parsed.arg,

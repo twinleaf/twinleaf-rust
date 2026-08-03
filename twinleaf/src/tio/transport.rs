@@ -22,7 +22,6 @@ mod tcp;
 mod udp;
 
 use super::proto::{self, Packet};
-use super::util;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::thread;
@@ -39,11 +38,17 @@ pub enum RecvError {
     Disconnected,
     /// Error in the data.
     #[error("protocol error: {0}")]
-    Protocol(#[from] proto::Error),
+    Protocol(#[from] proto::DecodeError),
+    /// Plain text received outside the packet protocol.
+    #[error("{0}")]
+    Text(String),
     /// Low level IO error.
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
 }
+
+/// A packet, or the error encountered while receiving it from a [`Port`].
+pub type ReceiveResult = Result<Packet, RecvError>;
 
 /// Possible errors when sending to a `Port`
 #[derive(Debug, thiserror::Error)]
@@ -62,9 +67,9 @@ pub enum SendError {
     /// Issue with the underlying IO operation.
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
-    /// Issue with serialization (packet would exceed protocol limits)
-    #[error("packet exceeds protocol size limits")]
-    Serialization,
+    /// The packet could not be encoded for the wire.
+    #[error("could not encode packet: {0}")]
+    Encode(#[from] proto::EncodeError),
 }
 
 /// Possible errors when setting a custom data rate
@@ -124,7 +129,7 @@ trait RawPort {
     }
 
     /// If specified, a packet should be sent on this port at most this long after the last send.
-    /// `tio::port::Port` will automatically insert a Heartbeat to satisfy this requirement.
+    /// `tio::transport::Port` will automatically insert a Heartbeat to satisfy this requirement.
     fn max_send_interval(&self) -> Option<Duration> {
         None
     }
@@ -132,7 +137,7 @@ trait RawPort {
     /// Users of this port should discard anything received before, and refrain from sending
     /// anything until after this method returns false. Once it returns false once, it is not
     /// necessary to check again as it will always return false afterwards.
-    /// `tio::port::Port` will transparently enforce this policy.
+    /// `tio::transport::Port` will transparently enforce this policy.
     fn startup_holdoff(&self) -> bool {
         false
     }
@@ -191,10 +196,7 @@ fn find_addr(addr: &str, family: AddrFamilyRestrict) -> Result<SocketAddr, io::E
         }
         return Ok(sa);
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "address resolution failed",
-    ))
+    Err(io::Error::other("address resolution failed"))
 }
 
 /// The communication to the `Port` thread occurs over a single
@@ -228,12 +230,32 @@ pub static DEFAULT_RX_CHANNEL_SIZE: usize = 32768;
 pub static DEFAULT_TX_CHANNEL_SIZE: usize = 32768;
 
 impl Port {
+    #[cfg(feature = "serial")]
+    fn open_serial<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
+        serial_config: &str,
+        rx: RXT,
+    ) -> io::Result<Port> {
+        Port::from_raw(serial::Port::new(serial_config)?, rx)
+    }
+
+    fn open_network<
+        RawPortT: RawPort + mio::event::Source + Send + 'static,
+        RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static,
+    >(
+        address: &str,
+        family: AddrFamilyRestrict,
+        open: impl FnOnce(&SocketAddr) -> io::Result<RawPortT>,
+        rx: RXT,
+    ) -> io::Result<Port> {
+        Port::from_raw(open(&find_addr(address, family)?)?, rx)
+    }
+
     /// Method running the `Port` thread event loop. It bridges `mio` and
     /// `crossbeam::channel`, and it takes care of tx buffering/draining,
     /// heartbeats, and startup holdoff logic.
     fn poller_thread<
         RawPortT: RawPort + mio::event::Source,
-        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()>,
+        RxCallbackT: Fn(ReceiveResult) -> io::Result<()>,
     >(
         mut raw_port: RawPortT,
         mut poll: mio::Poll,
@@ -269,7 +291,9 @@ impl Port {
                 Some({
                     let mut until_hb = max_interval.saturating_sub(last_sent.elapsed());
                     if (until_hb == Duration::ZERO) | startup {
-                        match raw_port.send(&util::PacketBuilder::make_empty_heartbeat()) {
+                        match raw_port
+                            .send(&Packet::heartbeat(Vec::new(), proto::DeviceRoute::root()))
+                        {
                             Err(SendError::MustDrain) => {
                                 needs_draining = true;
                                 poll.registry()
@@ -355,7 +379,7 @@ impl Port {
                                 Ok(pkt) => {
                                     if startup {
                                         // Ignore this packet
-                                    } else if let Err(_) = rx(Ok(pkt)) {
+                                    } else if rx(Ok(pkt)).is_err() {
                                         // RX callback signaled an error, terminate.
                                         break 'ioloop;
                                     }
@@ -367,20 +391,11 @@ impl Port {
                                     // Pass error along. Rx callback will determine what to do.
                                     // if it returns an error, break out. No matter what it says
                                     // though, break out if disconnected.
-                                    let disconnect = if let RecvError::Disconnected = e {
-                                        true
-                                    } else {
-                                        false
-                                    };
+                                    let disconnect = matches!(e, RecvError::Disconnected);
                                     // We want to ignore errors in the startup phase, except for
                                     // receiving text, which can happen on sensor initialization
                                     // and we want to relay back.
-                                    let ignore =
-                                        if let RecvError::Protocol(proto::Error::Text(_)) = e {
-                                            false
-                                        } else {
-                                            startup
-                                        };
+                                    let ignore = !matches!(&e, RecvError::Text(_)) && startup;
                                     if (!ignore && rx(Err(e)).is_err()) || disconnect {
                                         break 'ioloop;
                                     }
@@ -430,10 +445,13 @@ impl Port {
                             }
                         }
                         Ok(PacketOrControl::SetRate(rate)) => {
-                            if let Err(_) = ctl_result.send(match raw_port.set_rate(rate) {
-                                Ok(_) => ControlResult::Success,
-                                Err(e) => ControlResult::SetRateError(e),
-                            }) {
+                            if ctl_result
+                                .send(match raw_port.set_rate(rate) {
+                                    Ok(_) => ControlResult::Success,
+                                    Err(e) => ControlResult::SetRateError(e),
+                                })
+                                .is_err()
+                            {
                                 break 'ioloop;
                             }
                         }
@@ -453,7 +471,7 @@ impl Port {
     /// tx channel size.
     fn from_raw_custom<
         RawPortT: RawPort + mio::event::Source + Send + 'static,
-        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RxCallbackT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static,
     >(
         raw_port: RawPortT,
         rx: RxCallbackT,
@@ -494,15 +512,15 @@ impl Port {
         io::Result::Ok(Port {
             tx: Some(Box::new(tx)),
             ctl_result: ctl_ret_receiver,
-            waker: waker,
-            rates: rates,
+            waker,
+            rates,
         })
     }
 
     /// Create a `Port` from a `RawPort` and a rx callback.
     fn from_raw<
         RawPortT: RawPort + mio::event::Source + Send + 'static,
-        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RxCallbackT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static,
     >(
         raw_port: RawPortT,
         rx: RxCallbackT,
@@ -527,61 +545,48 @@ impl Port {
     /// on the underlying raw port. If it returns an `Err()`, the port is closed.
     ///
     /// The most common use for a `Port` is to receive on a channel, see `rx_to_channel_cb`.
-    pub fn new<RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static>(
+    pub fn new<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
         url: &str,
         rx: RXT,
     ) -> io::Result<Port> {
         // Special case: serial ports can be given directly
         #[cfg(all(feature = "serial", unix))]
         if url.starts_with("/dev/") {
-            return Port::from_raw(serial::Port::new(url)?, rx);
+            return Self::open_serial(url, rx);
         }
         #[cfg(all(feature = "serial", target_os = "windows"))]
         if url.starts_with("COM") {
-            return Port::from_raw(serial::Port::new(url)?, rx);
+            return Self::open_serial(url, rx);
         }
 
         let split_url: Vec<&str> = url.splitn(2, "://").collect();
         match split_url[..] {
             #[cfg(feature = "serial")]
-            ["serial", port] => Port::from_raw(serial::Port::new(port)?, rx),
+            ["serial", port] => Self::open_serial(port, rx),
             #[cfg(not(feature = "serial"))]
             ["serial", _] => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "serial support is disabled",
             )),
-            ["tcp", addr] => Port::from_raw(
-                tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::Either)?)?,
-                rx,
-            ),
-            ["udp", addr] => Port::from_raw(
-                udp::Port::new(&find_addr(addr, AddrFamilyRestrict::Either)?)?,
-                rx,
-            ),
-            ["tcp4", addr] => Port::from_raw(
-                tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::V4)?)?,
-                rx,
-            ),
-            ["udp4", addr] => Port::from_raw(
-                udp::Port::new(&find_addr(addr, AddrFamilyRestrict::V4)?)?,
-                rx,
-            ),
-            ["tcp6", addr] => Port::from_raw(
-                tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::V6)?)?,
-                rx,
-            ),
-            ["udp6", addr] => Port::from_raw(
-                udp::Port::new(&find_addr(addr, AddrFamilyRestrict::V6)?)?,
-                rx,
-            ),
-            _ => io::Result::Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid url")),
+            ["tcp", addr] => {
+                Self::open_network(addr, AddrFamilyRestrict::Either, tcp::Port::new, rx)
+            }
+            ["udp", addr] => {
+                Self::open_network(addr, AddrFamilyRestrict::Either, udp::Port::new, rx)
+            }
+            ["tcp4", addr] => Self::open_network(addr, AddrFamilyRestrict::V4, tcp::Port::new, rx),
+            ["udp4", addr] => Self::open_network(addr, AddrFamilyRestrict::V4, udp::Port::new, rx),
+            ["tcp6", addr] => Self::open_network(addr, AddrFamilyRestrict::V6, tcp::Port::new, rx),
+            ["udp6", addr] => Self::open_network(addr, AddrFamilyRestrict::V6, udp::Port::new, rx),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid TIO transport locator: {url}"),
+            )),
         }
     }
 
     /// Create a new port from a `mio::net::TcpStream`. See `new()`.
-    pub fn from_mio_stream<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
-    >(
+    pub fn from_mio_stream<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
         stream: mio::net::TcpStream,
         rx: RXT,
     ) -> io::Result<Port> {
@@ -589,9 +594,7 @@ impl Port {
     }
 
     /// Create a new port from a `std::net::TcpStream`. See `new()`.
-    pub fn from_tcp_stream<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
-    >(
+    pub fn from_tcp_stream<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
         stream: std::net::TcpStream,
         rx: RXT,
     ) -> io::Result<Port> {
@@ -600,9 +603,7 @@ impl Port {
     }
 
     /// Same as `from_mio_stream`, but with configurable tx channel size.
-    pub fn from_mio_stream_custom<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
-    >(
+    pub fn from_mio_stream_custom<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
         stream: mio::net::TcpStream,
         rx: RXT,
         tx_size: usize,
@@ -611,9 +612,7 @@ impl Port {
     }
 
     /// Same as `from_tcp_stream`, but with configurable tx channel size.
-    pub fn from_tcp_stream_custom<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
-    >(
+    pub fn from_tcp_stream_custom<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
         stream: std::net::TcpStream,
         rx: RXT,
         tx_size: usize,
@@ -624,7 +623,7 @@ impl Port {
 
     /// Creates a sender/receiver pair to be used with `rx_to_channel`:
     /// ```no_run
-    /// use twinleaf::tio::port::Port;
+    /// use twinleaf::tio::transport::Port;
     ///
     /// let url = "tcp://localhost:7855";
     /// let (port_rx_send, port_rx) = Port::rx_channel();
@@ -633,8 +632,8 @@ impl Port {
     /// In the example, `port.send()` can now be used to send and `port_rx.recv()`
     /// to receive.
     pub fn rx_channel() -> (
-        crossbeam::channel::Sender<Result<Packet, RecvError>>,
-        crossbeam::channel::Receiver<Result<Packet, RecvError>>,
+        crossbeam::channel::Sender<ReceiveResult>,
+        crossbeam::channel::Receiver<ReceiveResult>,
     ) {
         Port::rx_channel_custom(DEFAULT_RX_CHANNEL_SIZE)
     }
@@ -643,8 +642,8 @@ impl Port {
     /// (see `rx_channel`) and silently drops results when the channel
     /// is full.
     pub fn rx_to_channel(
-        rx_send: crossbeam::channel::Sender<Result<Packet, RecvError>>,
-    ) -> impl Fn(Result<Packet, RecvError>) -> io::Result<()> {
+        rx_send: crossbeam::channel::Sender<ReceiveResult>,
+    ) -> impl Fn(ReceiveResult) -> io::Result<()> {
         Port::rx_to_channel_cb(rx_send, |_| {})
     }
 
@@ -652,18 +651,18 @@ impl Port {
     pub fn rx_channel_custom(
         size: usize,
     ) -> (
-        crossbeam::channel::Sender<Result<Packet, RecvError>>,
-        crossbeam::channel::Receiver<Result<Packet, RecvError>>,
+        crossbeam::channel::Sender<ReceiveResult>,
+        crossbeam::channel::Receiver<ReceiveResult>,
     ) {
-        crossbeam::channel::bounded::<Result<Packet, RecvError>>(size)
+        crossbeam::channel::bounded::<ReceiveResult>(size)
     }
 
     /// Same as `rx_to_channel`, but with a user specified callback for when
     /// the channel is full.
-    pub fn rx_to_channel_cb<FullCBT: Fn(Result<Packet, RecvError>) -> () + Send + 'static>(
-        rx_send: crossbeam::channel::Sender<Result<Packet, RecvError>>,
+    pub fn rx_to_channel_cb<FullCBT: Fn(ReceiveResult) + Send + 'static>(
+        rx_send: crossbeam::channel::Sender<ReceiveResult>,
         full_cb: FullCBT,
-    ) -> impl Fn(Result<Packet, RecvError>) -> io::Result<()> {
+    ) -> impl Fn(ReceiveResult) -> io::Result<()> {
         move |rxdata| -> io::Result<()> {
             if let Err(RecvError::Disconnected) = rxdata {
                 return Err(io::Error::from(io::ErrorKind::BrokenPipe));
@@ -690,9 +689,9 @@ impl Port {
     /// block if the port is backed up.
     pub fn send(&self, packet: Packet) -> Result<(), SendError> {
         let tx = self.tx.as_ref().expect("Tx channel invalid");
-        if let Err(_) = tx.send(PacketOrControl::Pkt(packet)) {
+        if tx.send(PacketOrControl::Pkt(packet)).is_err() {
             Err(SendError::Disconnected)
-        } else if let Err(_) = self.waker.wake() {
+        } else if self.waker.wake().is_err() {
             panic!("Wake failed");
         } else {
             Ok(())
@@ -705,7 +704,7 @@ impl Port {
         let tx = self.tx.as_ref().expect("Tx channel invalid");
         match tx.try_send(PacketOrControl::Pkt(packet)) {
             Ok(()) => {
-                if let Err(_) = self.waker.wake() {
+                if self.waker.wake().is_err() {
                     panic!("Wake failed");
                 } else {
                     Ok(())
@@ -724,9 +723,9 @@ impl Port {
     /// Set data rate for the underlying raw port (if supported).
     pub fn set_rate(&self, rate: u32) -> Result<(), RateError> {
         let tx = self.tx.as_ref().expect("Tx channel invalid");
-        if let Err(_) = tx.send(PacketOrControl::SetRate(rate)) {
+        if tx.send(PacketOrControl::SetRate(rate)).is_err() {
             return Err(RateError::Failed);
-        } else if let Err(_) = self.waker.wake() {
+        } else if self.waker.wake().is_err() {
             panic!("Wake failed");
         }
         match self.ctl_result.recv().expect("Missing control result") {

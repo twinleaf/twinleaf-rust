@@ -234,13 +234,13 @@ pub fn read_capture_block<R: CaptureRpc + ?Sized>(
     loop {
         match capture_rpc_i16(rpc, rpc_name, index) {
             Ok(reply) => return Ok(reply),
-            Err(proxy::RpcError::ExecError(err))
+            Err(proxy::RpcError::DeviceError(err))
                 if matches!(err.error, tio::proto::RpcErrorCode::Busy)
                     && started.elapsed() < timeout =>
             {
                 std::thread::sleep(CAPTURE_POLL_INTERVAL);
             }
-            Err(proxy::RpcError::ExecError(err))
+            Err(proxy::RpcError::DeviceError(err))
                 if matches!(err.error, tio::proto::RpcErrorCode::Busy) =>
             {
                 return Err(CaptureError::BlockTimeout { index });

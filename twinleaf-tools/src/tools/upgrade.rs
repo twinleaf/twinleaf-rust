@@ -272,7 +272,7 @@ fn download_and_flash(
 fn open_device(tio: &TioOpts) -> eyre::Result<(proxy::Interface, proxy::Port)> {
     let proxy = proxy::Interface::new(&tio.root);
     let device = proxy
-        .device_rpc(tio.route.clone())
+        .device_rpc(tio.route)
         .wrap_err_with(|| format!("could not open device at {}", tio.root))
         .with_proxy_help()?;
     Ok((proxy, device))

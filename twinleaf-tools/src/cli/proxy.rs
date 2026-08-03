@@ -101,7 +101,8 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
     if locator.is_empty() {
         return Err(format!("missing sensor locator before '=' in {s:?}"));
     }
-    let prefix = DeviceRoute::from_str(prefix_str)
+    let prefix = prefix_str
+        .parse::<DeviceRoute>()
         .map_err(|_| format!("invalid route prefix: {prefix_str:?}"))?;
     if prefix.len() != 1 {
         return Err(format!(

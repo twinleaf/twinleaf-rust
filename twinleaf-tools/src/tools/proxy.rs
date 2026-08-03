@@ -100,7 +100,7 @@ impl From<&ProxyCli> for ProxyConfig {
             disconnect_slow: cli.kick_slow,
             verbose: cli.verbose,
             debugging: cli.debug,
-            subtree: cli.subtree.clone(),
+            subtree: cli.subtree,
             dump_traffic: cli.dump,
             dump_data: cli.dump_data,
             dump_meta: cli.dump_meta,
@@ -132,7 +132,7 @@ impl Layout {
         }
         let mut prefixes = std::collections::HashSet::new();
         for arg in &mount_args {
-            if !prefixes.insert(arg.prefix.clone()) {
+            if !prefixes.insert(arg.prefix) {
                 return Err(eyre::eyre!("duplicate mount prefix {}", arg.prefix));
             }
         }
@@ -287,7 +287,7 @@ impl ProxyServer {
             );
             // This is used by the proxy itself to communicate with the device
             // tree, for now only to receive log messages and dump traffic.
-            let monitor_port = match interface.subtree_full(self.config.subtree.clone()) {
+            let monitor_port = match interface.subtree_full(self.config.subtree) {
                 Ok(port) => port,
                 Err(e) => {
                     let last_status = status_rx.iter().last();
@@ -449,10 +449,10 @@ impl ProxyServer {
         // for rx and tx are inverted. Also, we use the proxy port channel size setting
         // instead of the physical ports setting.
         let (rx_send, client_rx) =
-            tio::port::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
-        let client = match tio::port::Port::from_tcp_stream_custom(
+            tio::transport::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
+        let client = match tio::transport::Port::from_tcp_stream_custom(
             stream,
-            tio::port::Port::rx_to_channel(rx_send),
+            tio::transport::Port::rx_to_channel(rx_send),
             proxy::Interface::get_client_rx_channel_size(),
         ) {
             Ok(client_port) => client_port,
@@ -466,13 +466,13 @@ impl ProxyServer {
                 .interface
                 .new_port(
                     Some(Duration::from_millis(2000)),
-                    self.config.subtree.clone(),
+                    self.config.subtree,
                     usize::MAX,
                     true,
                     true,
                 )
                 .expect("Failed to create new proxy port");
-            ports.push((link.prefix.clone(), port));
+            ports.push((link.prefix, port));
         }
 
         let dump_traffic = self.config.dump_traffic;
@@ -536,10 +536,10 @@ impl ProxyServer {
                         }
                         match client.try_send(pkt) {
                             Ok(()) => slow.packet_delivered(&addr),
-                            Err(tio::SendError::Full) if !disconnect_slow => {
+                            Err(tio::transport::SendError::Full) if !disconnect_slow => {
                                 slow.packet_dropped(&addr)
                             }
-                            Err(tio::SendError::Full) => break Disconnect::TooSlow,
+                            Err(tio::transport::SendError::Full) => break Disconnect::TooSlow,
                             Err(_) => break Disconnect::ClientClosed,
                         }
                     }
@@ -631,14 +631,12 @@ fn log_proxy_event(evt: proxy::Event, prefix: &proto::DeviceRoute) {
             log::error!(target: target, "Fatal proxy error: {:?}", err);
             // the proxy thread will exit and we'll detect it at the next iteration.
         }
-        proxy::Event::ProtocolError(perr) => match perr {
-            proto::Error::Text(txt) => {
-                log::info!(target: target, "Text: {}", txt);
-            }
-            other => {
-                log::debug!(target: target, "Protocol error: {:?}", other);
-            }
-        },
+        proxy::Event::Text(txt) => {
+            log::info!(target: target, "Text: {}", txt);
+        }
+        proxy::Event::ProtocolError(perr) => {
+            log::debug!(target: target, "Protocol error: {:?}", perr);
+        }
         evt => {
             log::trace!(target: target, "{:?}", evt);
         }

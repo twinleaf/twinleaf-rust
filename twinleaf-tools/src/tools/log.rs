@@ -117,11 +117,11 @@ fn record_parse_result_parts(
     samples_len: usize,
 ) {
     if samples_len != 0 {
-        parsed.insert(route.clone());
+        parsed.insert(*route);
         return;
     }
     if has_stream_data {
-        unparsed.insert(route.clone());
+        unparsed.insert(*route);
     }
 }
 

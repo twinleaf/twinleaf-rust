@@ -2,11 +2,49 @@ use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
-use twinleaf::device::{
-    util::{rpc_decode_reply, rpc_encode_arg},
-    RpcClient, RpcRegistry, RpcValue, RpcValueType,
-};
+use twinleaf::device::{RpcClient, RpcRegistry};
 use twinleaf::tio;
+use twinleaf::tio::proto::{RpcMeta, RpcValue, RpcValueType};
+
+pub(crate) fn resolve_rpc_type(metadata: Option<u16>) -> RpcValueType {
+    let kind = metadata
+        .map(|metadata| RpcMeta::from_bits(metadata).kind())
+        .unwrap_or(RpcValueType::String { max_len: None });
+    match kind {
+        RpcValueType::Raw { .. } => RpcValueType::String { max_len: None },
+        other => other,
+    }
+}
+
+fn parse_rpc_value(input: &str, kind: RpcValueType) -> eyre::Result<RpcValue> {
+    Ok(match kind {
+        RpcValueType::Unit => {
+            if !input.is_empty() {
+                eyre::bail!("unit RPC arguments must be empty");
+            }
+            RpcValue::Unit
+        }
+        RpcValueType::String { .. } => RpcValue::Str(input.to_owned()),
+        RpcValueType::Int { signed: false, .. } => RpcValue::U64(input.parse()?),
+        RpcValueType::Int { signed: true, .. } => RpcValue::I64(input.parse()?),
+        RpcValueType::Float { size: 4 } => RpcValue::F64(f64::from(input.parse::<f32>()?)),
+        RpcValueType::Float { .. } => RpcValue::F64(input.parse()?),
+        RpcValueType::Raw { .. } => RpcValue::Bytes(input.as_bytes().to_vec()),
+    })
+}
+
+pub(crate) fn encode_rpc_argument(input: &str, kind: RpcValueType) -> eyre::Result<Vec<u8>> {
+    let value = parse_rpc_value(input, kind)?;
+    kind.encode(&value).map_err(eyre::Report::new)
+}
+
+pub(crate) fn format_rpc_value(value: &RpcValue) -> String {
+    match value {
+        RpcValue::Str(value) => format!("\"{}\" {:?}", value, value.as_bytes()),
+        RpcValue::Bytes(value) => format!("{:?}", value),
+        other => other.to_string(),
+    }
+}
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     match rpc_cli.subcommands {
@@ -31,8 +69,8 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     use eyre::WrapErr;
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
-    let rpc_client = RpcClient::open(&proxy, route.clone())
+    let route = tio.route;
+    let rpc_client = RpcClient::open(&proxy, route)
         .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))
         .with_proxy_help()?;
     let rpcs = rpc_client
@@ -53,11 +91,11 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
 }
 
 fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType {
-    let meta: Option<u16> = device.rpc("rpc.info", &name.to_string()).ok();
+    let meta: Option<u16> = device.rpc("rpc.info", name.to_string()).ok();
     if meta.is_none() {
         println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
     }
-    twinleaf::device::util::resolve_arg_type(meta, name)
+    resolve_rpc_type(meta)
 }
 
 pub fn rpc(
@@ -72,7 +110,7 @@ pub fn rpc(
 
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
     let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
-    let route = tio.route.clone();
+    let route = tio.route;
     let device = proxy
         .device_rpc(route)
         .wrap_err_with(|| format!("could not open device at {}", tio.root))
@@ -86,7 +124,7 @@ pub fn rpc(
 
     let arg_bytes = match (rpc_arg.as_deref(), req_type.as_ref()) {
         (None, _) => Vec::new(),
-        (Some(s), Some(t)) => rpc_encode_arg(s, t)
+        (Some(s), Some(t)) => encode_rpc_argument(s, *t)
             .wrap_err_with(|| format!("could not encode argument for RPC {}", rpc_name))?,
         (Some(_), None) => unreachable!("req_type is set whenever rpc_arg is present"),
     };
@@ -108,13 +146,10 @@ pub fn rpc(
         let rep_type = rep_type
             .or(req_type)
             .unwrap_or_else(|| infer_rpc_type(&rpc_name, &device, "ret"));
-        let value = rpc_decode_reply(&reply, &rep_type)
+        let value = rep_type
+            .decode(&reply)
             .wrap_err_with(|| format!("could not decode reply from RPC {}", rpc_name))?;
-        let formatted = match &value {
-            RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
-            RpcValue::Bytes(b) => format!("{:?}", b),
-            other => format!("{}", other),
-        };
+        let formatted = format_rpc_value(&value);
         println!("Reply: {}", formatted);
     }
     println!("OK");
@@ -137,7 +172,7 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
     };
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
+    let route = tio.route;
     let device = proxy
         .device_rpc(route)
         .wrap_err_with(|| format!("could not open device at {}", tio.root))
@@ -153,13 +188,13 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
     let mut full_reply = vec![];
 
     for i in 0u16..=65535u16 {
-        match device.raw_rpc(&rpc_name, &i.to_le_bytes().to_vec()) {
+        match device.raw_rpc(&rpc_name, i.to_le_bytes().as_ref()) {
             Ok(mut rep) => full_reply.append(&mut rep),
-            Err(proxy::RpcError::ExecError(err)) => {
+            Err(proxy::RpcError::DeviceError(err)) => {
                 if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
                     break;
                 } else {
-                    return Err(eyre::Report::new(proxy::RpcError::ExecError(err))
+                    return Err(eyre::Report::new(proxy::RpcError::DeviceError(err))
                         .wrap_err(format!("RPC {} failed at chunk {}", rpc_name, i)));
                 }
             }

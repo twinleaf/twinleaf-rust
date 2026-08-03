@@ -13,7 +13,7 @@ pub fn capture(tio: &TioOpts, rpc_name: String, timeout: Duration) -> eyre::Resu
     use eyre::WrapErr;
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
+    let route = tio.route;
     let device = RpcClient::open(&proxy, route)
         .wrap_err_with(|| format!("could not open RPC client at {}", tio.root))?;
 

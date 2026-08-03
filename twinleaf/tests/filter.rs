@@ -2,7 +2,7 @@ use twinleaf::data::ColumnFilter;
 use twinleaf::tio::proto::DeviceRoute;
 
 fn route(s: &str) -> DeviceRoute {
-    DeviceRoute::from_str(s).unwrap()
+    s.parse().unwrap()
 }
 
 #[test]

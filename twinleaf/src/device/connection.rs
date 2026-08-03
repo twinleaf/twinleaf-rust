@@ -1,7 +1,10 @@
+//! Stateful access to one device or a routed device tree.
+
 use crate::data::{DeviceMetadataSnapshot, PacketParser, SampleBatch};
 use crate::tio;
-use proto::DeviceRoute;
-use tio::{proto, proxy, util};
+use crate::tio::proto::DeviceRoute;
+use tio::proto::{RpcArgs, RpcReply};
+use tio::{proto, proxy};
 
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -87,11 +90,11 @@ impl DeviceTree {
         proxy: &tio::proxy::Interface,
         route: DeviceRoute,
     ) -> Result<DeviceTree, proxy::PortError> {
-        let port = proxy.subtree_full(route.clone())?;
+        let port = proxy.subtree_full(route)?;
         Ok(Self::new(port, route))
     }
 
-    fn internal_rpcs(&mut self) -> Result<(), proxy::SendError> {
+    fn internal_rpcs(&mut self) -> Result<(), proxy::RpcError> {
         for req in self.parser.take_requests() {
             self.port.send(req)?;
         }
@@ -108,15 +111,15 @@ impl DeviceTree {
             return;
         };
 
-        if self.known_routes.insert(absolute_route.clone()) {
+        if self.known_routes.insert(absolute_route) {
             self.event_queue
-                .push_back(TreeEvent::RouteDiscovered(absolute_route.clone()));
+                .push_back(TreeEvent::RouteDiscovered(absolute_route));
         }
 
         match &pkt.payload {
             tio::proto::Payload::ProxyStatus(ps) => {
                 self.event_queue.push_back(TreeEvent::Device {
-                    route: absolute_route.clone(),
+                    route: absolute_route,
                     event: DeviceEvent::Status(ps.0),
                 });
 
@@ -130,7 +133,7 @@ impl DeviceTree {
                 if matches!(ps.0, proto::ProxyStatus::SensorReconnected) {
                     for route in self.known_routes.iter() {
                         self.event_queue.push_back(TreeEvent::Device {
-                            route: route.clone(),
+                            route: *route,
                             event: DeviceEvent::NewHash(None),
                         });
                     }
@@ -151,7 +154,7 @@ impl DeviceTree {
                     tio::proto::HeartbeatPayload::Any(_) => None,
                 };
                 self.event_queue.push_back(TreeEvent::Device {
-                    route: absolute_route.clone(),
+                    route: absolute_route,
                     event: DeviceEvent::Heartbeat { session_id },
                 });
             }
@@ -162,7 +165,7 @@ impl DeviceTree {
                 };
                 if let Some(hash) = hash {
                     self.event_queue.push_back(TreeEvent::Device {
-                        route: absolute_route.clone(),
+                        route: absolute_route,
                         event: DeviceEvent::NewHash(Some(hash)),
                     });
                 }
@@ -170,7 +173,7 @@ impl DeviceTree {
             _ => {}
         }
 
-        if let Some(batch) = self.parser.process_packet(&pkt) {
+        if let Some(batch) = self.parser.process_packet(pkt) {
             self.batch_queue.push_back(batch);
         }
         if !self.metadata_announced.contains(&absolute_route) {
@@ -193,19 +196,19 @@ impl DeviceTree {
                 return Ok(full_meta);
             }
             for req in self.parser.take_requests_for(route) {
-                self.port
-                    .send(req)
-                    .map_err(tio::proxy::RpcError::SendFailed)?;
+                self.port.send(req)?;
             }
-            let pkt = self.port.recv().map_err(tio::proxy::RpcError::RecvFailed)?;
+            let pkt = self
+                .port
+                .recv()
+                .map_err(|_| tio::proxy::RpcError::ResponseLost)?;
             self.process_packet(&pkt);
         }
     }
 
     pub fn drain(&mut self) -> Result<Vec<SampleBatch>, tio::proxy::RpcError> {
         loop {
-            self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
+            self.internal_rpcs()?;
             match self.port.try_recv() {
                 Ok(pkt) => {
                     self.process_packet(&pkt);
@@ -213,8 +216,8 @@ impl DeviceTree {
                 Err(proxy::RecvError::WouldBlock) => {
                     break;
                 }
-                Err(e) => {
-                    return Err(tio::proxy::RpcError::RecvFailed(e));
+                Err(proxy::RecvError::ProxyDisconnected) => {
+                    return Err(tio::proxy::RpcError::ResponseLost);
                 }
             }
         }
@@ -245,7 +248,10 @@ impl DeviceTree {
             }
 
             self.internal_rpcs()?;
-            let pkt = self.port.recv()?;
+            let pkt = self
+                .port
+                .recv()
+                .map_err(|_| proxy::RpcError::ResponseLost)?;
             self.process_packet(&pkt);
         }
     }
@@ -264,7 +270,9 @@ impl DeviceTree {
             match self.port.try_recv() {
                 Ok(pkt) => self.process_packet(&pkt),
                 Err(proxy::RecvError::WouldBlock) => return Ok(None),
-                Err(e) => return Err(e.into()),
+                Err(proxy::RecvError::ProxyDisconnected) => {
+                    return Err(proxy::RpcError::ResponseLost)
+                }
             }
         }
     }
@@ -275,29 +283,18 @@ impl DeviceTree {
         name: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>, tio::proxy::RpcError> {
-        let mut req = util::PacketBuilder::make_rpc_request(name, arg, 0, DeviceRoute::root());
-        let relative_routing = match self.root_route.relative_route(&route) {
-            Ok(r) => r,
-            Err(_) => {
-                req.routing = route;
-                return Err(tio::proxy::RpcError::SendFailed(
-                    tio::proxy::SendError::InvalidRoute(req),
-                ));
-            }
-        };
-
-        req.routing = relative_routing;
-
-        if let Err(err) = self.port.send(req) {
-            return Err(tio::proxy::RpcError::SendFailed(err));
-        }
+        let relative_routing = self
+            .root_route
+            .relative_route(&route)
+            .map_err(|_| tio::proxy::RpcError::InvalidRoute)?;
+        let req = proto::Packet::rpc_request(name, arg, 0, relative_routing);
+        self.port.send(req)?;
 
         loop {
-            self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
+            self.internal_rpcs()?;
             let pkt = match self.port.recv() {
                 Ok(packet) => packet,
-                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
+                Err(_) => return Err(tio::proxy::RpcError::ResponseLost),
             };
 
             let Ok(absolute_route) = self.root_route.absolute_route(&pkt.routing) else {
@@ -312,7 +309,7 @@ impl DeviceTree {
                         return Ok(rep.reply.clone());
                     }
                     tio::proto::Payload::RpcError(err) if err.id == 0 => {
-                        return Err(tio::proxy::RpcError::ExecError(err.clone()));
+                        return Err(tio::proxy::RpcError::DeviceError(err.clone()));
                     }
                     _ => {}
                 }
@@ -322,25 +319,21 @@ impl DeviceTree {
         }
     }
 
-    pub fn rpc<ReqT: tio::util::TioRpcRequestable<ReqT>, RepT: tio::util::TioRpcReplyable<RepT>>(
+    pub fn rpc<ReqT: RpcArgs, RepT: RpcReply>(
         &mut self,
         route: DeviceRoute,
         name: &str,
         arg: ReqT,
     ) -> Result<RepT, tio::proxy::RpcError> {
-        let ret = self.raw_rpc(route, name, &arg.to_request())?;
-        if let Ok(val) = RepT::from_reply(&ret) {
-            Ok(val)
-        } else {
-            Err(tio::proxy::RpcError::TypeError)
-        }
+        let ret = self.raw_rpc(route, name, &arg.encode_args())?;
+        RepT::decode_reply(&ret).map_err(tio::proxy::RpcError::InvalidReply)
     }
 
     pub fn action(&mut self, route: DeviceRoute, name: &str) -> Result<(), tio::proxy::RpcError> {
         self.rpc(route, name, ())
     }
 
-    pub fn get<T: tio::util::TioRpcReplyable<T>>(
+    pub fn get<T: RpcReply>(
         &mut self,
         route: DeviceRoute,
         name: &str,
@@ -356,15 +349,13 @@ impl DeviceTree {
         let mut full_reply = vec![];
 
         for i in 0u16..=65535u16 {
-            match self.raw_rpc(route.clone(), &name, &i.to_le_bytes().to_vec()) {
+            match self.raw_rpc(route, name, i.to_le_bytes().as_ref()) {
                 Ok(mut rep) => full_reply.append(&mut rep),
-                Err(err @ proxy::RpcError::ExecError(_)) => {
-                    if let proxy::RpcError::ExecError(payload) = &err {
-                        if let tio::proto::RpcErrorCode::InvalidArgs = payload.error {
-                            break;
-                        }
+                Err(proxy::RpcError::DeviceError(payload)) => {
+                    if let tio::proto::RpcErrorCode::InvalidArgs = payload.error {
+                        break;
                     }
-                    return Err(err);
+                    return Err(proxy::RpcError::DeviceError(payload));
                 }
                 Err(e) => {
                     return Err(e);
@@ -412,7 +403,7 @@ impl DeviceTree {
             .into_iter()
             .map(|route| {
                 let name = self
-                    .get::<String>(route.clone(), "dev.name")
+                    .get::<String>(route, "dev.name")
                     .ok()
                     .map(|n| n.trim().to_string())
                     .filter(|n| !n.is_empty());
@@ -472,7 +463,8 @@ impl Device {
         self.tree.get_metadata(DeviceRoute::root())
     }
 
-    pub fn next(&mut self) -> Result<SampleBatch, proxy::RpcError> {
+    /// Wait for the next sample batch, retaining intervening device events.
+    pub fn next_batch(&mut self) -> Result<SampleBatch, proxy::RpcError> {
         loop {
             match self.tree.next_item()? {
                 TreeItem::Batch(batch) => return Ok(batch),
@@ -481,7 +473,10 @@ impl Device {
         }
     }
 
-    pub fn try_next(&mut self) -> Result<Option<SampleBatch>, proxy::RpcError> {
+    /// Return the next available sample batch without waiting.
+    ///
+    /// Intervening device events are retained and can be read separately.
+    pub fn try_next_batch(&mut self) -> Result<Option<SampleBatch>, proxy::RpcError> {
         loop {
             match self.tree.try_next_item()? {
                 Some(TreeItem::Batch(batch)) => return Ok(Some(batch)),
@@ -550,7 +545,7 @@ impl Device {
         self.tree.raw_rpc(DeviceRoute::root(), name, arg)
     }
 
-    pub fn rpc<ReqT: tio::util::TioRpcRequestable<ReqT>, RepT: tio::util::TioRpcReplyable<RepT>>(
+    pub fn rpc<ReqT: RpcArgs, RepT: RpcReply>(
         &mut self,
         name: &str,
         arg: ReqT,
@@ -562,10 +557,7 @@ impl Device {
         self.tree.action(DeviceRoute::root(), name)
     }
 
-    pub fn get<T: tio::util::TioRpcReplyable<T>>(
-        &mut self,
-        name: &str,
-    ) -> Result<T, proxy::RpcError> {
+    pub fn get<T: RpcReply>(&mut self, name: &str) -> Result<T, proxy::RpcError> {
         self.tree.get(DeviceRoute::root(), name)
     }
 

@@ -1,4 +1,4 @@
-use super::{TioPktHdr, TIO_PACKET_MAX_ROUTING_SIZE};
+use super::TIO_PACKET_MAX_ROUTING_SIZE;
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -44,20 +44,6 @@ impl DeviceRoute {
         Ok(route)
     }
 
-    pub fn from_str(route_str: &str) -> Result<Self, RouteError> {
-        let mut route = Self::root();
-        let stripped = route_str.strip_prefix('/').unwrap_or(route_str);
-        if stripped.is_empty() {
-            return Ok(route);
-        }
-
-        for segment in stripped.split('/') {
-            let hop = segment.parse::<u8>().map_err(|_| RouteError::InvalidHop)?;
-            route.push(hop)?;
-        }
-        Ok(route)
-    }
-
     fn from_hops(hops: &[u8]) -> Result<Self, RouteError> {
         if hops.len() > TIO_PACKET_MAX_ROUTING_SIZE {
             return Err(RouteError::TooLong);
@@ -95,16 +81,6 @@ impl DeviceRoute {
         self.as_slice().iter()
     }
 
-    pub fn serialize(&self, mut rest_of_packet: Vec<u8>) -> Result<Vec<u8>, ()> {
-        if rest_of_packet.len() < std::mem::size_of::<TioPktHdr>() {
-            return Err(());
-        }
-
-        rest_of_packet[1] |= self.len;
-        rest_of_packet.extend(self.iter().rev());
-        Ok(rest_of_packet)
-    }
-
     /// Strip `self` from the absolute `other_route`.
     pub fn relative_route(&self, other_route: &Self) -> Result<Self, RouteError> {
         let relative = other_route
@@ -124,6 +100,24 @@ impl DeviceRoute {
         let mut route = *self;
         route.hops[self.len()..combined_len].copy_from_slice(other_route.as_slice());
         route.len = combined_len as u8;
+        Ok(route)
+    }
+}
+
+impl std::str::FromStr for DeviceRoute {
+    type Err = RouteError;
+
+    fn from_str(route_str: &str) -> Result<Self, Self::Err> {
+        let mut route = Self::root();
+        let stripped = route_str.strip_prefix('/').unwrap_or(route_str);
+        if stripped.is_empty() {
+            return Ok(route);
+        }
+
+        for segment in stripped.split('/') {
+            let hop = segment.parse::<u8>().map_err(|_| RouteError::InvalidHop)?;
+            route.push(hop)?;
+        }
         Ok(route)
     }
 }

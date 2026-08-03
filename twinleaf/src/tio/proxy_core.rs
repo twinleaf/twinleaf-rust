@@ -1,11 +1,11 @@
-use super::port;
-use super::port::Port as HardwarePort;
-use super::port::RecvError;
+use super::proto::RpcReply;
 use super::proto::{self, DeviceRoute, Packet};
 use super::proxy::Event;
-use super::util;
-use super::util::TioRpcReplyable;
+use super::transport;
+use super::transport::Port as HardwarePort;
+use super::transport::{ReceiveResult, RecvError};
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -78,20 +78,20 @@ impl ProxyClient {
         }
     }
 
-    fn send(&self, pkt: &Packet) -> Result<(), channel::TrySendError<Packet>> {
+    fn try_send(&self, pkt: &Packet) -> bool {
         // ProxyStatus should be route-agnostic
         if matches!(pkt.payload, proto::Payload::ProxyStatus(_)) {
-            return self.tx.try_send(pkt.clone());
+            return self.tx.try_send(pkt.clone()).is_ok();
         }
 
         let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.routing) {
             if r.len() <= self.depth {
                 r
             } else {
-                return Ok(());
+                return true;
             }
         } else {
-            return Ok(());
+            return true;
         };
         if !match pkt.payload {
             proto::Payload::RpcRequest(_)
@@ -102,13 +102,15 @@ impl ProxyClient {
             }
             _ => self.forward_nonrpc,
         } {
-            return Ok(());
+            return true;
         }
-        self.tx.try_send(Packet {
-            payload: pkt.payload.clone(),
-            routing: scoped_route,
-            ttl: pkt.ttl,
-        })
+        self.tx
+            .try_send(Packet {
+                payload: pkt.payload.clone(),
+                routing: scoped_route,
+                ttl: pkt.ttl,
+            })
+            .is_ok()
     }
 
     fn recv(&self) -> Result<Packet, channel::TryRecvError> {
@@ -136,7 +138,7 @@ enum RateChange {
 
 struct ProxyDevice {
     tio_port: HardwarePort,
-    rx_channel: channel::Receiver<Result<Packet, RecvError>>,
+    rx_channel: channel::Receiver<ReceiveResult>,
     rate_change_state: RateChange,
     last_rx: Instant,
     seen_since_connect: bool,
@@ -150,10 +152,7 @@ struct ProxyDevice {
 impl ProxyDevice {
     /// True if this device does not have a settable data rate.
     fn has_static_rate(&self) -> bool {
-        match self.rate_change_state {
-            RateChange::DoNothing => true,
-            _ => false,
-        }
+        matches!(self.rate_change_state, RateChange::DoNothing)
     }
 
     /// True if this device needs to run the periodic rate negotiation task.
@@ -161,40 +160,39 @@ impl ProxyDevice {
     /// to deal with reverting back to the default rate after some time goes
     /// by without seeing data.
     fn needs_autonegotiation(&self) -> bool {
-        match self.rate_change_state {
-            RateChange::DoNothing | RateChange::GaveUp => false,
-            _ => true,
-        }
+        !matches!(
+            self.rate_change_state,
+            RateChange::DoNothing | RateChange::GaveUp
+        )
     }
 
     /// True if it's safe to forward packets to the device due to rate
     /// negotiation concerns. Specifically, packets might be lost around
     /// when the rate transitions, so we hold back on forwarding traffic then.
     fn safe_to_forward(&self) -> bool {
-        match self.rate_change_state {
-            RateChange::SetDeviceRate | RateChange::WaitingNewRate => false,
-            _ => true,
-        }
+        !matches!(
+            self.rate_change_state,
+            RateChange::SetDeviceRate | RateChange::WaitingNewRate
+        )
     }
 
     /// Convenience method to get the rate information for this device,
     /// when already known it has settable data rate.
-    fn rates(&self) -> port::RateInfo {
-        return self
-            .tio_port
+    fn rates(&self) -> transport::RateInfo {
+        self.tio_port
             .rate_info()
-            .expect("Rates requested for unsupported device");
+            .expect("Rates requested for unsupported device")
     }
 
     fn try_recv(
         &mut self,
         status_queue: &StatusQueue,
-    ) -> Result<Result<Packet, RecvError>, crossbeam::channel::TryRecvError> {
+    ) -> Result<ReceiveResult, crossbeam::channel::TryRecvError> {
         let res = self.rx_channel.try_recv()?;
         // Any received packet (text included) refreshes liveness, for every
         // device — the watchdog needs a timestamp regardless of rate state.
         match &res {
-            Ok(_) | Err(RecvError::Protocol(proto::Error::Text(_))) => {
+            Ok(_) | Err(RecvError::Text(_)) => {
                 self.last_rx = Instant::now();
             }
             _ => {}
@@ -204,7 +202,7 @@ impl ProxyDevice {
                 if let proto::Payload::Heartbeat(proto::HeartbeatPayload::Session(session)) =
                     pkt.payload
                 {
-                    if pkt.routing.len() == 0 {
+                    if pkt.routing.is_empty() {
                         // This is a heartbeat for the root sensor
                         let old_session = self.last_session.replace(session);
                         if let RateChange::WaitingForSession = self.rate_change_state {
@@ -272,9 +270,9 @@ impl ProxyCore {
         notify_new_client_only: bool,
     ) -> ProxyCore {
         ProxyCore {
-            url: url,
-            reconnect_timeout: reconnect_timeout,
-            new_client_queue: new_client_queue,
+            url,
+            reconnect_timeout,
+            new_client_queue,
             status_queue: StatusQueue {
                 dest: status_queue,
                 only_new_client: notify_new_client_only,
@@ -291,17 +289,12 @@ impl ProxyCore {
         }
     }
 
-    fn try_setup_device(&mut self) -> bool {
+    fn try_setup_device(&mut self) -> io::Result<()> {
         if self.device.is_some() {
-            return true;
+            return Ok(());
         }
         let (port_rx_send, port_rx) = HardwarePort::rx_channel();
-        let port = match HardwarePort::new(&self.url, HardwarePort::rx_to_channel(port_rx_send)) {
-            Ok(p) => p,
-            Err(_) => {
-                return false;
-            }
-        };
+        let port = HardwarePort::new(&self.url, HardwarePort::rx_to_channel(port_rx_send))?;
         // Kickstart rate autonegotiation only if the port supports
         // changing rates and the target rate differs from the default.
         let mut rate_change_state = RateChange::DoNothing;
@@ -313,7 +306,7 @@ impl ProxyCore {
         self.device = Some(ProxyDevice {
             tio_port: port,
             rx_channel: port_rx,
-            rate_change_state: rate_change_state,
+            rate_change_state,
             last_rx: Instant::now(),
             seen_since_connect: false,
             last_session: None,
@@ -322,7 +315,7 @@ impl ProxyCore {
             pending_broadcasts: Vec::new(),
             pending_lookup: None,
         });
-        true
+        Ok(())
     }
 
     /// Clients get dropped as part of the main loop. This function adds a
@@ -351,7 +344,7 @@ impl ProxyCore {
         }
         if let Some(ids) = self.rpc_timeouts.get_mut(&remap.timeout) {
             ids.remove(&wire_id);
-            if ids.len() == 0 {
+            if ids.is_empty() {
                 self.rpc_timeouts.remove(&remap.timeout);
             }
         } else {
@@ -360,8 +353,12 @@ impl ProxyCore {
         Some((remap.client, remap.id, remap.method, remap.has_arg))
     }
 
-    // Ok: successful. Err: packet should be sent back to client
-    fn forward_to_device(&mut self, mut pkt: Packet, client_id: u64) -> Result<(), Packet> {
+    // RPC failures are returned so the caller can notify the requesting client.
+    fn forward_to_device(
+        &mut self,
+        mut pkt: Packet,
+        client_id: u64,
+    ) -> Result<(), proto::RpcErrorCode> {
         let mut rpc_mapped_id: Option<u16> = None;
         let mut timeout = Instant::now();
         if let proto::Payload::RpcRequest(req) = &mut pkt.payload {
@@ -370,8 +367,7 @@ impl ProxyCore {
             // next time.
             self.next_rpc_id = self.next_rpc_id.wrapping_add(1);
             if self.rpc_map.contains_key(&wire_id) {
-                return Err(util::PacketBuilder::new(pkt.routing)
-                    .rpc_error(req.id, proto::RpcErrorCode::OutOfMemory));
+                return Err(proto::RpcErrorCode::OutOfMemory);
             }
             timeout += if client_id != 0 {
                 self.clients
@@ -387,8 +383,8 @@ impl ProxyCore {
                 RpcMapEntry {
                     id: req.id,
                     client: client_id,
-                    route: pkt.routing.clone(),
-                    timeout: timeout,
+                    route: pkt.routing,
+                    timeout,
                     method: req.method.clone(),
                     has_arg: !req.arg.is_empty(),
                 },
@@ -401,14 +397,7 @@ impl ProxyCore {
         if let Some(dev) = &self.device {
             if let Ok(()) = dev.tio_port.send(pkt) {
                 if let Some(rpc_id) = rpc_mapped_id {
-                    if !self.rpc_timeouts.contains_key(&timeout) {
-                        self.rpc_timeouts.insert(timeout, HashSet::new());
-                    }
-                    let timeout_ids = self
-                        .rpc_timeouts
-                        .get_mut(&timeout)
-                        .expect("Unexpected missing timeout set");
-                    timeout_ids.insert(rpc_id);
+                    self.rpc_timeouts.entry(timeout).or_default().insert(rpc_id);
                 }
                 return Ok(());
             }
@@ -418,12 +407,10 @@ impl ProxyCore {
         // loop soon but remove the rpc from the map and send back an error to
         // the client.
         if let Some(rpc_id) = rpc_mapped_id {
-            let remap = self
-                .rpc_map
+            self.rpc_map
                 .remove(&rpc_id)
                 .expect("Unexpected missing timeout set");
-            return Err(util::PacketBuilder::new(remap.route)
-                .rpc_error(remap.id, proto::RpcErrorCode::Undefined));
+            Err(proto::RpcErrorCode::Undefined)
         } else {
             Ok(())
         }
@@ -435,8 +422,8 @@ impl ProxyCore {
             routing: DeviceRoute::root(),
             ttl: 0,
         };
-        for (_client_id, client) in self.clients.iter() {
-            let _ = client.send(&pkt);
+        for client in self.clients.values() {
+            client.try_send(&pkt);
         }
     }
 
@@ -448,7 +435,7 @@ impl ProxyCore {
     ) {
         let pkt = Packet {
             payload: proto::Payload::RpcUpdate(proto::RpcUpdatePayload(method.clone())),
-            routing: route.clone(),
+            routing: *route,
             ttl: 0,
         };
         for (client_id, client) in self.clients.iter() {
@@ -481,7 +468,7 @@ impl ProxyCore {
                     });
                 let remap = self
                     .rpc_map
-                    .remove(&rpc_id)
+                    .remove(rpc_id)
                     .expect("RPC ID from timeout missing in main map");
                 let client = if let Some(c) = self.clients.get(&remap.client) {
                     c
@@ -489,11 +476,7 @@ impl ProxyCore {
                     // Client is gone.
                     continue;
                 };
-                if let Err(_) = client.send(&util::PacketBuilder::make_rpc_error(
-                    remap.id,
-                    error.clone(),
-                    remap.route,
-                )) {
+                if !client.try_send(&Packet::rpc_error(remap.id, error, remap.route)) {
                     to_drop.push(remap.client);
                     // This can happen without a problem per se, if e.g. a client
                     // issues an RPC which will time out, and disconnects before
@@ -524,29 +507,16 @@ impl ProxyCore {
     }
 
     fn send_internal_rpc(&mut self, pkt: Packet) -> Result<(), proto::RpcErrorCode> {
-        if let Err(epkt) = self.forward_to_device(pkt, 0) {
-            if let proto::Payload::RpcError(rpc_err) = epkt.payload {
-                Err(rpc_err.error)
-            } else {
-                panic!(
-                    "Unexpected error packet from sending interal RPC: {:?}",
-                    epkt
-                );
-            }
-        } else {
-            Ok(())
-        }
+        self.forward_to_device(pkt, 0)
     }
 
     /// Process a reply to an RPC issued by the ProxyCore.
     fn internal_rpc_reply(&mut self, rep: &proto::RpcReplyPayload) {
         fn get_rate_vars(proxy: &ProxyCore) -> Option<(RateChange, u32)> {
             if let Some(dev) = proxy.device.as_ref() {
-                if let Some(rate_info) = dev.tio_port.rate_info() {
-                    Some((dev.rate_change_state.clone(), rate_info.target_bps))
-                } else {
-                    None
-                }
+                dev.tio_port
+                    .rate_info()
+                    .map(|rate_info| (dev.rate_change_state.clone(), rate_info.target_bps))
             } else {
                 None
             }
@@ -554,7 +524,7 @@ impl ProxyCore {
 
         if rep.id == QUERY_RATE_RPC_ID {
             if let Some((RateChange::WaitingDeviceRate, target)) = get_rate_vars(self) {
-                let next_state = if let Ok(value) = u32::from_reply(&rep.reply) {
+                let next_state = if let Ok(value) = u32::decode_reply(&rep.reply) {
                     if value == 0 {
                         self.status_queue.send(Event::AutoRateIncompatible(0));
                         self.status_queue.send(Event::AutoRateGaveUp);
@@ -611,10 +581,10 @@ impl ProxyCore {
                 let next = dev
                     .pending_broadcasts
                     .first()
-                    .map(|(n, r, _)| (n.clone(), r.clone()));
+                    .map(|(n, r, _)| (n.clone(), *r));
 
                 if let Some((next_name, next_route)) = &next {
-                    dev.pending_lookup = Some((next_name.clone(), next_route.clone()));
+                    dev.pending_lookup = Some((next_name.clone(), *next_route));
                 }
 
                 Some((matching, readable && writable, next))
@@ -632,7 +602,7 @@ impl ProxyCore {
                 }
 
                 if let Some((next_name, next_route)) = next_lookup {
-                    let _ = self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
+                    let _ = self.send_internal_rpc(Packet::rpc_request(
                         "rpc.info",
                         next_name.as_bytes(),
                         RPC_INFO_LOOKUP_ID,
@@ -668,8 +638,8 @@ impl ProxyCore {
 
                 // Start next lookup if there are more pending
                 if let Some((next_name, next_route, _)) = dev.pending_broadcasts.first().cloned() {
-                    dev.pending_lookup = Some((next_name.clone(), next_route.clone()));
-                    let _ = self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
+                    dev.pending_lookup = Some((next_name.clone(), next_route));
+                    let _ = self.send_internal_rpc(Packet::rpc_request(
                         "rpc.info",
                         next_name.as_bytes(),
                         RPC_INFO_LOOKUP_ID,
@@ -681,8 +651,7 @@ impl ProxyCore {
         }
 
         // We could handle this better, but just keep the device to the default speed until the port is reset
-        self.status_queue
-            .send(Event::AutoRateRpcError(err.error.clone()));
+        self.status_queue.send(Event::AutoRateRpcError(err.error));
         if let Some(dev) = self.device.as_mut() {
             dev.rate_change_state = RateChange::GaveUp;
             self.status_queue.send(Event::AutoRateGaveUp);
@@ -701,14 +670,12 @@ impl ProxyCore {
         let next_state = match device(self).rate_change_state.clone() {
             RateChange::QueryDeviceRate => {
                 let target = device(self).rates().target_bps;
-                if let Err(rpc_error) =
-                    self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
-                        "dev.port.rate.near",
-                        &target.to_le_bytes(),
-                        QUERY_RATE_RPC_ID,
-                        DeviceRoute::root(),
-                    ))
-                {
+                if let Err(rpc_error) = self.send_internal_rpc(Packet::rpc_request(
+                    "dev.port.rate.near",
+                    &target.to_le_bytes(),
+                    QUERY_RATE_RPC_ID,
+                    DeviceRoute::root(),
+                )) {
                     self.status_queue.send(Event::AutoRateRpcError(rpc_error));
                     RateChange::GaveUp
                 } else {
@@ -717,16 +684,14 @@ impl ProxyCore {
                 }
             }
             RateChange::SetDeviceRate => {
-                if self.rpc_map.len() == 0 {
+                if self.rpc_map.is_empty() {
                     let target = device(self).rates().target_bps;
-                    if let Err(rpc_error) =
-                        self.send_internal_rpc(util::PacketBuilder::make_rpc_request(
-                            "dev.port.rate",
-                            &target.to_le_bytes(),
-                            SET_RATE_RPC_ID,
-                            DeviceRoute::root(),
-                        ))
-                    {
+                    if let Err(rpc_error) = self.send_internal_rpc(Packet::rpc_request(
+                        "dev.port.rate",
+                        &target.to_le_bytes(),
+                        SET_RATE_RPC_ID,
+                        DeviceRoute::root(),
+                    )) {
                         self.status_queue.send(Event::AutoRateRpcError(rpc_error));
                         RateChange::GaveUp
                     } else {
@@ -763,13 +728,24 @@ impl ProxyCore {
         self.dispatch_rpc_errors(proto::RpcErrorCode::Undefined, None);
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self, startup: Option<channel::Sender<io::Result<()>>>) {
         use channel::TryRecvError;
 
-        if !self.try_setup_device() {
+        if let Err(error) = self.try_setup_device() {
+            log::debug!("failed to open {}: {error}", self.url);
+            if let Some(startup) = startup {
+                let _ = startup.send(Err(error));
+            }
             self.status_queue.send(Event::FailedToConnect);
             self.broadcast_status(proto::ProxyStatus::FailedToConnect);
             return;
+        }
+        if let Some(startup) = startup {
+            // If the constructor stopped waiting, do not leave a detached worker
+            // holding the transport it was meant to acquire.
+            if startup.send(Ok(())).is_err() {
+                return;
+            }
         }
         let mut device_timeout = Instant::now();
 
@@ -778,7 +754,8 @@ impl ProxyCore {
 
             if self.device.is_none() {
                 self.cancel_active_rpcs();
-                if !self.try_setup_device() {
+                if let Err(error) = self.try_setup_device() {
+                    log::debug!("failed to reopen {}: {error}", self.url);
                     if Instant::now() > device_timeout {
                         self.status_queue.send(Event::FailedToReconnect);
                         self.broadcast_status(proto::ProxyStatus::FailedToReconnect);
@@ -900,8 +877,14 @@ impl ProxyCore {
                 // will be returned to send back.
                 let mut rpc_errors = vec![];
                 for pkt in packets {
-                    if let Err(rpkt) = self.forward_to_device(pkt, client_id) {
-                        rpc_errors.push(rpkt);
+                    let reply_target = match &pkt.payload {
+                        proto::Payload::RpcRequest(req) => Some((pkt.routing, req.id)),
+                        _ => None,
+                    };
+                    if let Err(error) = self.forward_to_device(pkt, client_id) {
+                        let (route, id) =
+                            reply_target.expect("only RPC requests produce forwarding errors");
+                        rpc_errors.push(Packet::rpc_error(id, error, route));
                     }
                 }
 
@@ -916,7 +899,7 @@ impl ProxyCore {
                         .expect("invalid client from Select");
                     let mut failed = false;
                     for pkt in rpc_errors {
-                        if let Err(_) = client.send(&pkt) {
+                        if !client.try_send(&pkt) {
                             failed = true;
                             break;
                         }
@@ -947,21 +930,12 @@ impl ProxyCore {
                 }
             } else {
                 // data from the device
-                loop {
-                    // This should always be true, but still check.
-                    let device = if let Some(x) = self.device.as_mut() {
-                        x
-                    } else {
-                        break;
-                    };
+                while let Some(device) = self.device.as_mut() {
                     match device.try_recv(&self.status_queue) {
                         Ok(Ok(mut pkt)) => {
                             // First packet since (re)connect: the device is live, announce it.
-                            let first_packet = self
-                                .device
-                                .as_mut()
-                                .map(|d| !std::mem::replace(&mut d.seen_since_connect, true))
-                                .unwrap_or(false);
+                            let first_packet =
+                                !std::mem::replace(&mut device.seen_since_connect, true);
                             if first_packet {
                                 if self.ever_connected {
                                     self.status_queue.send(Event::SensorReconnected);
@@ -1043,18 +1017,15 @@ impl ProxyCore {
                                                         {
                                                             dev.pending_broadcasts.push((
                                                                 name.clone(),
-                                                                pkt.routing.clone(),
+                                                                pkt.routing,
                                                                 client_id,
                                                             ));
                                                             if dev.pending_lookup.is_none() {
                                                                 dev.pending_lookup = Some((
                                                                     name.clone(),
-                                                                    pkt.routing.clone(),
+                                                                    pkt.routing,
                                                                 ));
-                                                                Some((
-                                                                    name.clone(),
-                                                                    pkt.routing.clone(),
-                                                                ))
+                                                                Some((name.clone(), pkt.routing))
                                                             } else {
                                                                 None
                                                             }
@@ -1065,12 +1036,12 @@ impl ProxyCore {
                                                         // Call rpc.info directly with the name
                                                         if let Some((name, route)) = should_send {
                                                             let _ = self.send_internal_rpc(
-                                                                util::PacketBuilder::make_rpc_request(
+                                                                Packet::rpc_request(
                                                                     "rpc.info",
                                                                     name.as_bytes(),
                                                                     RPC_INFO_LOOKUP_ID,
                                                                     route,
-                                                                )
+                                                                ),
                                                             );
                                                         }
                                                     }
@@ -1092,7 +1063,7 @@ impl ProxyCore {
                                 }
                                 // Forward with correct request id to the requestor
                                 if let Some(client) = self.clients.get(&client_id) {
-                                    if let Err(_) = client.send(&pkt) {
+                                    if !client.try_send(&pkt) {
                                         self.status_queue.send(Event::ClientSendFailed(client_id));
                                         self.drop_client(client_id);
                                     }
@@ -1100,7 +1071,7 @@ impl ProxyCore {
                             } else {
                                 let mut to_drop = vec![];
                                 for (client_id, client) in self.clients.iter() {
-                                    if let Err(_) = client.send(&pkt) {
+                                    if !client.try_send(&pkt) {
                                         self.status_queue.send(Event::ClientSendFailed(*client_id));
                                         to_drop.push(*client_id);
                                     }
@@ -1113,6 +1084,9 @@ impl ProxyCore {
                         // Got a RecvError
                         Ok(Err(err)) => {
                             match err {
+                                RecvError::Text(text) => {
+                                    self.status_queue.send(Event::Text(text));
+                                }
                                 RecvError::Protocol(perror) => {
                                     self.status_queue.send(Event::ProtocolError(perror));
                                 }

@@ -10,10 +10,10 @@ use proto::meta::MetadataType;
 use proto::DeviceRoute;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tio::proto;
 use tio::proto::meta::{
     ColumnMetadata, DeviceMetadata, MetadataContent, SegmentMetadata, StreamMetadata,
 };
-use tio::{proto, util};
 
 const MAX_METADATA_PER_RPC: usize = 16;
 const META_RPC_ID: u16 = 7855;
@@ -88,7 +88,7 @@ fn build_metadata_request_packets(requests: &[MetadataRequest]) -> Vec<tio::Pack
         } else {
             remaining.len()
         };
-        packets.push(util::PacketBuilder::make_rpc_request(
+        packets.push(tio::Packet::rpc_request(
             "dev.metadata",
             &encode_metadata_request(&remaining[..request_count]),
             META_RPC_ID,
@@ -112,16 +112,16 @@ fn decode_metadata_reply(reply: &[u8]) -> Vec<MetadataContent> {
         };
         remaining = &remaining[2 + record_len..];
         let content = match metadata_type {
-            MetadataType::Device => meta::DeviceMetadata::deserialize(record, &[])
+            MetadataType::Device => meta::DeviceMetadata::deserialize(record)
                 .ok()
                 .map(|(metadata, _, _)| MetadataContent::Device(metadata)),
-            MetadataType::Stream => meta::StreamMetadata::deserialize(record, &[])
+            MetadataType::Stream => meta::StreamMetadata::deserialize(record)
                 .ok()
                 .map(|(metadata, _, _)| MetadataContent::Stream(metadata)),
-            MetadataType::Segment => meta::SegmentMetadata::deserialize(record, &[])
+            MetadataType::Segment => meta::SegmentMetadata::deserialize(record)
                 .ok()
                 .map(|(metadata, _, _)| MetadataContent::Segment(metadata)),
-            MetadataType::Column => meta::ColumnMetadata::deserialize(record, &[])
+            MetadataType::Column => meta::ColumnMetadata::deserialize(record)
                 .ok()
                 .map(|(metadata, _, _)| MetadataContent::Column(metadata)),
             _ => None,
@@ -339,7 +339,7 @@ impl StreamState {
         if stream_metadata.sample_size == 0 {
             return None;
         }
-        if data.data.len() % stream_metadata.sample_size != 0 {
+        if !data.data.len().is_multiple_of(stream_metadata.sample_size) {
             return None;
         }
 
@@ -382,7 +382,7 @@ impl StreamState {
                 let forced_rollover = self.established
                     && data.first_sample_n == 0
                     && rate != 0
-                    && next_sample % rate == 0
+                    && next_sample.is_multiple_of(rate)
                     && data.segment_id == next_segment;
                 if !forced_rollover {
                     return None;

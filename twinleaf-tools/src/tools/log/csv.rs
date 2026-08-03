@@ -276,7 +276,7 @@ pub fn log_csv(
 /// Render a route as a filename-safe label: `root` for the device root, or the
 /// hop indices joined by `.` (e.g. `/0/1` -> `0.1`).
 fn route_filename_label(route: &DeviceRoute) -> String {
-    if route.len() == 0 {
+    if route.is_empty() {
         "root".to_string()
     } else {
         route

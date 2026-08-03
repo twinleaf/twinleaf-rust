@@ -162,7 +162,7 @@ mod tests {
     fn fixture() -> Fixture {
         let route = DeviceRoute::root();
         let stream_id = 1;
-        let stream_key = StreamKey::new(route.clone(), stream_id);
+        let stream_key = StreamKey::new(route, stream_id);
         let column_id: ColumnId = 0;
 
         let device = Arc::new(DeviceMetadata {
@@ -241,7 +241,7 @@ mod tests {
                 self.stream.clone(),
                 self.device.clone(),
             );
-            buffer.process_batch(&batch, self.stream_key.clone());
+            buffer.process_batch(&batch, self.stream_key);
         }
 
         /// Push a contiguous run of samples numbered `0..values.len()`.
@@ -259,7 +259,7 @@ mod tests {
     fn sync_feeds_each_sample_exactly_once_across_interleaved_batches() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key.clone(), Recorder::default());
+        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
 
         fx.push(&mut buffer, None, &[(0, 0.0), (1, 1.0)]);
         let out = derived.sync(&buffer).clone();
@@ -295,7 +295,7 @@ mod tests {
     fn run_restart_resets_and_rehydrates_with_only_new_run_samples() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key.clone(), Recorder::default());
+        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
 
         fx.push_contiguous(&mut buffer, &[0.0, 1.0, 2.0]);
         let out = derived.sync(&buffer).clone();
@@ -330,7 +330,7 @@ mod tests {
     fn invalidate_forces_a_rehydrate() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key.clone(), Recorder::default());
+        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
 
         fx.push_contiguous(&mut buffer, &[0.0, 1.0, 2.0]);
         derived.sync(&buffer);
@@ -347,7 +347,7 @@ mod tests {
     fn sync_with_no_new_data_pushes_nothing() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key.clone(), Recorder::default());
+        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
 
         fx.push_contiguous(&mut buffer, &[0.0, 1.0]);
         let out = derived.sync(&buffer).clone();
@@ -368,7 +368,7 @@ mod tests {
     fn sync_before_any_data_returns_default_output() {
         let fx = fixture();
         let buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key.clone(), Recorder::default());
+        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
         assert!(derived.sync(&buffer).is_empty());
     }
 }

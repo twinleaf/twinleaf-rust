@@ -10,7 +10,7 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::device::RpcMetaFlags;
+use twinleaf::tio::proto::RpcMetaFlags;
 use twinleaf::tio::proto::{self, meta};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -821,7 +821,7 @@ impl TestDevice {
             }
         };
 
-        let result = match method {
+        match method {
             "dev.name" => self.rpc_read_string(req.id, DEVICE_NAME, &req.arg, routing, addr),
             "dev.desc" => self.rpc_read_string(req.id, &self.desc.clone(), &req.arg, routing, addr),
             "dev.stop" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
@@ -844,7 +844,7 @@ impl TestDevice {
                     req.id,
                     &req.arg,
                     self.params.amplitude,
-                    routing.clone(),
+                    routing,
                     addr,
                 )?;
                 self.params.amplitude = next;
@@ -855,7 +855,7 @@ impl TestDevice {
                     req.id,
                     &req.arg,
                     self.params.frequency,
-                    routing.clone(),
+                    routing,
                     addr,
                 )?;
                 self.params.frequency = next;
@@ -866,30 +866,26 @@ impl TestDevice {
                     req.id,
                     &req.arg,
                     self.params.noise,
-                    routing.clone(),
+                    routing,
                     addr,
                 )?;
                 self.params.noise = next;
                 Ok(())
             }
             "test.status" => {
-                let next =
-                    self.read_or_write_u8(req.id, &req.arg, self.status, routing.clone(), addr)?;
+                let next = self.read_or_write_u8(req.id, &req.arg, self.status, routing, addr)?;
                 self.status = next;
                 Ok(())
             }
             "test.enable" => {
-                let next =
-                    self.read_or_write_u8(req.id, &req.arg, self.enable, routing.clone(), addr)?;
+                let next = self.read_or_write_u8(req.id, &req.arg, self.enable, routing, addr)?;
                 self.enable = next;
                 Ok(())
             }
             "test.go" => self.rpc_action(req.id, &req.arg, routing, addr),
             "test.capture" => self.rpc_capture(req.id, &req.arg, routing, addr),
             _ => self.send_rpc_error(req.id, proto::RpcErrorCode::NotFound, routing, addr),
-        };
-
-        result
+        }
     }
 
     fn rpc_read_string(
@@ -1028,7 +1024,7 @@ impl TestDevice {
     ) -> io::Result<()> {
         let reply = if arg.is_empty() {
             self.all_metadata_reply()?
-        } else if arg.len() % 3 == 0 {
+        } else if arg.len().is_multiple_of(3) {
             let mut reply = Vec::new();
             for req in arg.chunks_exact(3) {
                 if self
@@ -1631,10 +1627,10 @@ impl TestDevice {
     }
 
     fn send_packet(&self, packet: &proto::Packet, addr: SocketAddr) -> io::Result<()> {
-        let raw = packet.serialize().map_err(|_| {
+        let raw = packet.serialize().map_err(|source| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("packet too large or invalid: {}", describe_packet(packet)),
+                format!("could not encode {}: {source}", describe_packet(packet)),
             )
         })?;
         self.socket.send_to(&raw, addr)?;

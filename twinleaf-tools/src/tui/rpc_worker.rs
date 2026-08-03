@@ -7,8 +7,9 @@
 //! awareness of this module — hosts wire palette events to worker requests.
 
 use crossbeam::channel::{self, Receiver, Sender};
-use twinleaf::device::{util, DeviceRoute, RpcClient, RpcList, RpcValue};
+use twinleaf::device::{DeviceRoute, RpcClient, RpcList};
 
+use crate::tools::rpc::{encode_rpc_argument, format_rpc_value, resolve_rpc_type};
 use crate::tui::rpc_palette::{RpcReq, RpcResp};
 
 pub enum RpcWorkerReq {
@@ -30,11 +31,11 @@ pub fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
                 .rpc::<&String, u16>(&req.route, "rpc.info", &req.method)
                 .ok()
         });
-        util::resolve_arg_type(meta, &req.method)
+        resolve_rpc_type(meta)
     });
 
     let payload = if let Some(ref s) = req.arg {
-        util::rpc_encode_arg(s, &kind).map_err(|e| e.to_string())?
+        encode_rpc_argument(s, kind).map_err(|e| e.to_string())?
     } else {
         Vec::new()
     };
@@ -49,13 +50,9 @@ pub fn exec_rpc(client: &RpcClient, req: &RpcReq) -> Result<String, String> {
 
     // `-T` overrides the reply type; default to decoding as the request type.
     let reply_kind = req.rep_type.unwrap_or(kind);
-    let value = util::rpc_decode_reply(&reply_bytes, &reply_kind).map_err(|e| e.to_string())?;
+    let value = reply_kind.decode(&reply_bytes).map_err(|e| e.to_string())?;
 
-    Ok(match &value {
-        RpcValue::Str(s) => format!("\"{}\" {:?}", s, s.as_bytes()),
-        RpcValue::Bytes(b) => format!("{:?}", b),
-        other => format!("{}", other),
-    })
+    Ok(format_rpc_value(&value))
 }
 
 /// Spawn a worker thread that owns the given [`RpcClient`]. The returned

@@ -1,4 +1,4 @@
-use super::{too_small, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE};
+use super::{DataType, DecodeError, EncodeError};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone, Copy)]
@@ -76,24 +76,21 @@ pub struct LegacyStreamDataPayload {
 }
 
 impl LegacyStreamDataPayload {
-    pub fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<LegacyStreamDataPayload, Error> {
+    pub fn deserialize(raw: &[u8]) -> Result<LegacyStreamDataPayload, DecodeError> {
         if raw.len() < 5 {
-            return Err(too_small(full_data));
+            return Err(DecodeError::PayloadTooShort {
+                expected: 5,
+                actual: raw.len(),
+            });
         }
         Ok(LegacyStreamDataPayload {
             sample_n: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
             data: raw[4..].to_vec(),
         })
     }
-    pub fn serialize(&self) -> Result<Vec<u8>, ()> {
-        let payload_size = 4 + self.data.len();
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(());
-        }
-        let mut ret =
-            TioPktHdr::serialize_new(TioPktType::LegacyStreamData, 0, payload_size as u16);
-        ret.extend(self.sample_n.to_le_bytes());
-        ret.extend(&self.data);
-        Ok(ret)
+    pub(super) fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
+        output.extend(self.sample_n.to_le_bytes());
+        output.extend(&self.data);
+        Ok(())
     }
 }

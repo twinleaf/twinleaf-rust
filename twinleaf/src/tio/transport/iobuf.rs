@@ -1,4 +1,4 @@
-//! Internal buffer for stream-oriented ports.
+//! Internal buffer for stream-oriented transports.
 
 use super::{RecvError, SendError};
 use std::io;

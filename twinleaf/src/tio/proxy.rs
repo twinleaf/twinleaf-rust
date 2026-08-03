@@ -8,17 +8,19 @@
 //!
 //! Note: the proxy runs in a dedicated thread.
 
-use super::port;
 use super::proto::{self, DeviceRoute, Packet, ProxyStatus};
+use super::proto::{RpcArgs, RpcDecodeError, RpcReply};
 use super::proxy_core::{ProxyClient, ProxyCore};
-use super::util;
-use super::util::{TioRpcReplyable, TioRpcRequestable};
+use super::transport;
 
 use std::env;
+use std::io;
 use std::thread;
 use std::time::Duration;
 
 use crossbeam::channel;
+
+pub const DEFAULT_URL: &str = "tcp://localhost";
 
 /// Status event that ProxyCore sent back to an optional user specified channel
 #[derive(Debug)]
@@ -33,8 +35,9 @@ pub enum Event {
     FailedToConnect,
     FailedToReconnect,
     Exiting,
-    ProtocolError(proto::Error),
-    FatalError(port::RecvError),
+    Text(String),
+    ProtocolError(proto::DecodeError),
+    FatalError(transport::RecvError),
     NewClient(u64),
     RpcRemap((u64, u16), u16),
     RpcRestore(u16, (u64, u16)),
@@ -88,6 +91,17 @@ pub enum SendError {
     InvalidRoute(Packet),
 }
 
+impl SendError {
+    /// Recover the packet that was not submitted to the proxy.
+    pub fn into_packet(self) -> Packet {
+        match self {
+            Self::WouldBlock(packet)
+            | Self::ProxyDisconnected(packet)
+            | Self::InvalidRoute(packet) => packet,
+        }
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RecvError {
     #[error("no packet available")]
@@ -98,24 +112,36 @@ pub enum RecvError {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RpcError {
-    #[error("failed to send RPC request: {0}")]
-    SendFailed(#[from] SendError),
+    #[error("RPC request was not submitted to the proxy")]
+    RequestNotSubmitted,
+    #[error("RPC route exceeds port scope")]
+    InvalidRoute,
+    #[error("proxy disconnected while waiting for the RPC reply")]
+    ResponseLost,
     #[error("device returned error: {0}")]
-    ExecError(proto::RpcErrorPayload),
-    #[error("failed to receive RPC reply: {0}")]
-    RecvFailed(#[from] RecvError),
-    #[error("RPC reply did not match expected type")]
-    TypeError,
+    DeviceError(proto::RpcErrorPayload),
+    #[error("RPC reply did not match expected type: {0}")]
+    InvalidReply(#[source] RpcDecodeError),
+}
+
+impl From<SendError> for RpcError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::InvalidRoute(_) => Self::InvalidRoute,
+            SendError::WouldBlock(_) | SendError::ProxyDisconnected(_) => Self::RequestNotSubmitted,
+        }
+    }
 }
 
 impl Port {
     /// Get the scope for this port
     pub fn scope(&self) -> DeviceRoute {
-        self.scope.clone()
+        self.scope
     }
 
     /// Sends a TIO packet to this port synchronously. This call will
     /// block if the port is backed up.
+    #[allow(clippy::result_large_err)] // Preserve ownership when submission fails.
     pub fn send(&self, packet: Packet) -> Result<(), SendError> {
         if packet.routing.len() > self.depth || self.scope.absolute_route(&packet.routing).is_err()
         {
@@ -128,6 +154,7 @@ impl Port {
     }
 
     /// Attempts to send a TIO packet to this port without blocking.
+    #[allow(clippy::result_large_err)] // Preserve ownership when submission fails.
     pub fn try_send(&self, packet: Packet) -> Result<(), SendError> {
         if packet.routing.len() > self.depth || self.scope.absolute_route(&packet.routing).is_err()
         {
@@ -172,7 +199,7 @@ impl Port {
     }
 
     /// To use `crossbeam::channel::select!`.
-    pub fn receiver<'a>(&'a self) -> &'a crossbeam::channel::Receiver<Packet> {
+    pub fn receiver(&self) -> &crossbeam::channel::Receiver<Packet> {
         &self.rx
     }
 
@@ -188,39 +215,26 @@ impl Port {
 
     /// Generic any sized input/output RPC, blocking
     pub fn raw_rpc(&self, name: &str, arg: &[u8]) -> Result<Vec<u8>, RpcError> {
-        if let Err(err) = self.send(util::PacketBuilder::make_rpc_request(
-            name,
-            arg,
-            0,
-            DeviceRoute::root(),
-        )) {
-            return Err(RpcError::SendFailed(err));
-        }
+        self.send(Packet::rpc_request(name, arg, 0, DeviceRoute::root()))?;
         loop {
             match self.recv() {
                 Ok(pkt) => match pkt.payload {
                     proto::Payload::RpcReply(rep) => return Ok(rep.reply),
-                    proto::Payload::RpcError(err) => return Err(RpcError::ExecError(err)),
+                    proto::Payload::RpcError(err) => return Err(RpcError::DeviceError(err)),
                     _ => continue,
                 },
-                Err(err) => {
-                    return Err(RpcError::RecvFailed(err));
-                }
+                Err(_) => return Err(RpcError::ResponseLost),
             }
         }
     }
 
-    pub fn rpc<ReqT: TioRpcRequestable<ReqT>, RepT: TioRpcReplyable<RepT>>(
+    pub fn rpc<ReqT: RpcArgs, RepT: RpcReply>(
         &self,
         name: &str,
         arg: ReqT,
     ) -> Result<RepT, RpcError> {
-        let ret = self.raw_rpc(name, &arg.to_request())?;
-        if let Ok(val) = RepT::from_reply(&ret) {
-            Ok(val)
-        } else {
-            Err(RpcError::TypeError)
-        }
+        let ret = self.raw_rpc(name, &arg.encode_args())?;
+        RepT::decode_reply(&ret).map_err(RpcError::InvalidReply)
     }
 
     /// Action: rpc with no argument which returns nothing
@@ -228,7 +242,7 @@ impl Port {
         self.rpc(name, ())
     }
 
-    pub fn get<T: TioRpcReplyable<T>>(&self, name: &str) -> Result<T, RpcError> {
+    pub fn get<T: RpcReply>(&self, name: &str) -> Result<T, RpcError> {
         self.rpc(name, ())
     }
 }
@@ -243,6 +257,19 @@ pub enum PortError {
     FailedNewClientSetup,
 }
 
+/// Failure to establish the proxy's immediate transport.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    #[error("failed to open {locator}")]
+    Open {
+        locator: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("proxy worker for {locator} stopped during startup")]
+    WorkerStopped { locator: String },
+}
+
 /// Interface to a port proxy. Can create new ports.
 pub struct Interface {
     new_client_queue: channel::Sender<ProxyClient>,
@@ -252,11 +279,11 @@ pub struct Interface {
 }
 
 impl Interface {
-    /// Create a new Interface, and a new ProxyCore running in a separate thread.
-    pub fn new_proxy(
+    fn spawn_proxy(
         url: &str,
         reconnect_timeout: Option<Duration>,
         status_queue: Option<channel::Sender<Event>>,
+        startup: Option<channel::Sender<io::Result<()>>>,
     ) -> Interface {
         let (client_sender, client_receiver) = channel::bounded::<ProxyClient>(5);
         let (status_sender, status_receiver, only_clients) = {
@@ -285,7 +312,7 @@ impl Interface {
                 status_sender,
                 only_clients,
             );
-            proxy.run();
+            proxy.run(startup);
         });
         Interface {
             new_client_queue: client_sender,
@@ -295,19 +322,47 @@ impl Interface {
         }
     }
 
+    /// Create an Interface and start its ProxyCore without waiting for the
+    /// immediate transport to open.
+    pub fn new_proxy(
+        url: &str,
+        reconnect_timeout: Option<Duration>,
+        status_queue: Option<channel::Sender<Event>>,
+    ) -> Interface {
+        Self::spawn_proxy(url, reconnect_timeout, status_queue, None)
+    }
+
+    /// Create an Interface after its immediate serial, TCP, or UDP transport
+    /// has opened successfully.
+    ///
+    /// This does not wait for a sensor packet or for devices behind a remote
+    /// TCP proxy. Packet processing and reconnection remain asynchronous.
+    pub fn connect(
+        url: &str,
+        reconnect_timeout: Option<Duration>,
+        status_queue: Option<channel::Sender<Event>>,
+    ) -> Result<Interface, ConnectError> {
+        let (startup_tx, startup_rx) = channel::bounded::<io::Result<()>>(1);
+        let interface = Self::spawn_proxy(url, reconnect_timeout, status_queue, Some(startup_tx));
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(interface),
+            Ok(Err(source)) => Err(ConnectError::Open {
+                locator: url.to_string(),
+                source,
+            }),
+            Err(_) => Err(ConnectError::WorkerStopped {
+                locator: url.to_string(),
+            }),
+        }
+    }
+
     /// Create a new proxy which connects to a url with default parameters.
     pub fn new(url: &str) -> Interface {
         Self::new_proxy(url, None, None)
     }
 
-    /// Create a new proxy which connects to a standalone tio-proxy process at
-    /// the default address.
-    pub fn default() -> Interface {
-        Self::new(util::default_proxy_url())
-    }
-
     pub fn get_client_rx_channel_size() -> usize {
-        let min_size = port::DEFAULT_RX_CHANNEL_SIZE;
+        let min_size = transport::DEFAULT_RX_CHANNEL_SIZE;
         if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
             std::cmp::max(req.parse().unwrap_or(0), min_size)
         } else {
@@ -316,7 +371,7 @@ impl Interface {
     }
 
     pub fn get_client_tx_channel_size() -> usize {
-        let min_size = port::DEFAULT_TX_CHANNEL_SIZE;
+        let min_size = transport::DEFAULT_TX_CHANNEL_SIZE;
         if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
             std::cmp::max(req.parse().unwrap_or(0), min_size)
         } else {
@@ -346,27 +401,31 @@ impl Interface {
             channel::bounded::<Packet>(self.client_tx_channel_size);
         let (proxy_to_client_sender, client_from_proxy_receiver) =
             channel::bounded::<Packet>(self.client_rx_channel_size);
-        if let Err(_) = self.new_client_queue.send(ProxyClient::new(
-            proxy_to_client_sender,
-            proxy_from_client_receiver,
-            rpc_timeout,
-            scope.clone(),
-            depth,
-            forward_data,
-            forward_nonrpc,
-        )) {
+        if self
+            .new_client_queue
+            .send(ProxyClient::new(
+                proxy_to_client_sender,
+                proxy_from_client_receiver,
+                rpc_timeout,
+                scope,
+                depth,
+                forward_data,
+                forward_nonrpc,
+            ))
+            .is_err()
+        {
             return Err(PortError::FailedNewClientSetup);
         }
         if let Some(confirm) = &self.new_client_confirm {
-            if let Err(_) = confirm.recv() {
+            if confirm.recv().is_err() {
                 return Err(PortError::FailedNewClientSetup);
             }
         }
         Ok(Port {
             tx: client_to_proxy_sender,
             rx: client_from_proxy_receiver,
-            depth: depth,
-            scope: scope,
+            depth,
+            scope,
         })
     }
 
@@ -418,5 +477,11 @@ impl Interface {
     /// New port with default parameters for the root device, receiving only RPCs.
     pub fn root_rpc(&self) -> Result<Port, PortError> {
         self.device_rpc(DeviceRoute::root())
+    }
+}
+
+impl Default for Interface {
+    fn default() -> Self {
+        Self::new(DEFAULT_URL)
     }
 }

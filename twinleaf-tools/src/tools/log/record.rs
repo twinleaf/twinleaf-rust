@@ -2,6 +2,7 @@ use crate::{ProxyHelp, TioOpts};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
+use std::time::{Duration, Instant};
 use twinleaf::data::{PacketParser, SampleBatch};
 use twinleaf::device::{Device, DeviceRoute};
 use twinleaf::tio::{self, proxy};
@@ -26,10 +27,19 @@ struct Recorder {
     samples_dropped: u64,
     pb: indicatif::ProgressBar,
     static_msg: String,
+    unbuffered: bool,
+    duration: Option<Duration>,
+    started: Instant,
 }
 
 impl Recorder {
-    fn new(pb: indicatif::ProgressBar, path: String, static_msg: String) -> Recorder {
+    fn new(
+        pb: indicatif::ProgressBar,
+        path: String,
+        static_msg: String,
+        unbuffered: bool,
+        duration: Option<Duration>,
+    ) -> Recorder {
         Recorder {
             file_out: None,
             path,
@@ -37,7 +47,14 @@ impl Recorder {
             samples_dropped: 0,
             pb,
             static_msg,
+            unbuffered,
+            duration,
+            started: Instant::now(),
         }
+    }
+
+    fn duration_elapsed(&self) -> bool {
+        self.duration.is_some_and(|d| self.started.elapsed() >= d)
     }
 
     fn render_msg(&self) -> String {
@@ -52,7 +69,7 @@ impl Recorder {
         use eyre::WrapErr;
         let serialized = pkt
             .serialize()
-            .map_err(|_| eyre::eyre!("failed to serialize packet for log"))?;
+            .wrap_err("failed to serialize packet for log")?;
         let f = ensure_open(&mut self.file_out, &self.path)?;
         f.write_all(&serialized)
             .wrap_err_with(|| format!("failed to write {}", self.path))?;
@@ -65,9 +82,9 @@ impl Recorder {
         self.pb.set_message(self.render_msg());
     }
 
-    fn flush_if(&mut self, unbuffered: bool) -> eyre::Result<()> {
+    fn flush_if_needed(&mut self) -> eyre::Result<()> {
         use eyre::WrapErr;
-        if unbuffered {
+        if self.unbuffered {
             if let Some(f) = self.file_out.as_mut() {
                 f.flush()
                     .wrap_err_with(|| format!("failed to flush {}", self.path))?;
@@ -87,12 +104,12 @@ impl Drop for Recorder {
 /// updates followed by one column update per series, all stamped with the
 /// batch's absolute route.
 fn write_metadata_snapshot(rec: &mut Recorder, batch: &SampleBatch) -> eyre::Result<()> {
-    let abs_route = batch.route.clone();
-    rec.write(batch.device.make_update_with_route(abs_route.clone()))?;
-    rec.write(batch.stream.make_update_with_route(abs_route.clone()))?;
-    rec.write(batch.segment.make_update_with_route(abs_route.clone()))?;
+    let abs_route = batch.route;
+    rec.write(batch.device.make_update_with_route(abs_route))?;
+    rec.write(batch.stream.make_update_with_route(abs_route))?;
+    rec.write(batch.segment.make_update_with_route(abs_route))?;
     for series in batch.schema() {
-        rec.write(series.metadata.make_update_with_route(abs_route.clone()))?;
+        rec.write(series.metadata.make_update_with_route(abs_route))?;
     }
     Ok(())
 }
@@ -103,14 +120,13 @@ pub fn log(
     unbuffered: bool,
     raw: bool,
     depth: Option<usize>,
-    duration: Option<std::time::Duration>,
+    duration: Option<Duration>,
 ) -> eyre::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::path::Path;
-    use std::time::{Duration, Instant};
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
+    let route = tio.route;
 
     let file_name = Path::new(&file)
         .file_name()
@@ -140,18 +156,14 @@ pub fn log(
         parts.join(" · ")
     };
 
-    let rec = Recorder::new(pb, file, static_msg);
+    let rec = Recorder::new(pb, file, static_msg, unbuffered, duration);
     let initial_msg = rec.render_msg();
     rec.pb.set_message(initial_msg);
 
-    let started = Instant::now();
-
     if raw {
-        log_raw(
-            &proxy, &tio.root, route, depth, unbuffered, duration, started, rec,
-        )
+        log_raw(&proxy, &tio.root, route, depth, rec)
     } else {
-        log_parsed(&proxy, &tio.root, route, unbuffered, duration, started, rec)
+        log_parsed(&proxy, &tio.root, route, rec)
     }
 }
 
@@ -160,23 +172,18 @@ fn log_raw(
     root: &str,
     route: DeviceRoute,
     depth: Option<usize>,
-    unbuffered: bool,
-    duration: Option<std::time::Duration>,
-    started: std::time::Instant,
     mut rec: Recorder,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let duration_elapsed = || duration.is_some_and(|d| started.elapsed() >= d);
-
     let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
     let port = proxy
-        .new_port(None, route.clone(), port_depth, true, true)
+        .new_port(None, route, port_depth, true, true)
         .wrap_err_with(|| format!("could not open port on {}", root))
         .with_proxy_help()?;
 
     for pkt in port.iter() {
-        if duration_elapsed() {
+        if rec.duration_elapsed() {
             break;
         }
         let abs_pkt = tio::Packet {
@@ -185,10 +192,10 @@ fn log_raw(
         };
         rec.write(abs_pkt)?;
         rec.tick();
-        rec.flush_if(unbuffered)?;
+        rec.flush_if_needed()?;
     }
 
-    let elapsed = duration_elapsed();
+    let elapsed = rec.duration_elapsed();
     let bytes = rec.bytes_written;
     let path = rec.path.clone();
     drop(rec);
@@ -214,29 +221,24 @@ fn log_parsed(
     proxy: &proxy::Interface,
     root: &str,
     route: DeviceRoute,
-    unbuffered: bool,
-    duration: Option<std::time::Duration>,
-    started: std::time::Instant,
     mut rec: Recorder,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
     use twinleaf::data::BoundaryReason;
-
-    let duration_elapsed = || duration.is_some_and(|d| started.elapsed() >= d);
 
     // Byte-faithful recorder: receive packets directly from a subtree_full port
     // and maintain per-route parsers ourselves (what DeviceTree used to do), so
     // we can hold the raw stream-data packet instead of reconstructing it from
     // a parsed sample.
     let port = proxy
-        .new_port(None, route.clone(), usize::MAX, true, true)
+        .new_port(None, route, usize::MAX, true, true)
         .wrap_err_with(|| format!("could not open device tree on {}", root))
         .with_proxy_help()?;
 
     let mut parser = PacketParser::new(route, false);
 
     loop {
-        if duration_elapsed() {
+        if rec.duration_elapsed() {
             break;
         }
 
@@ -244,8 +246,7 @@ fn log_parsed(
         loop {
             for req in parser.take_requests() {
                 if let Err(e) = port.send(req) {
-                    return Err(eyre::Report::new(tio::proxy::RpcError::SendFailed(e))
-                        .wrap_err("stream ended"));
+                    return Err(eyre::Report::new(e).wrap_err("stream ended"));
                 }
             }
 
@@ -253,8 +254,7 @@ fn log_parsed(
                 Ok(pkt) => pkt,
                 Err(tio::proxy::RecvError::WouldBlock) => break,
                 Err(e) => {
-                    return Err(eyre::Report::new(tio::proxy::RpcError::RecvFailed(e))
-                        .wrap_err("stream ended"));
+                    return Err(eyre::Report::new(e).wrap_err("stream ended"));
                 }
             };
 
@@ -263,7 +263,7 @@ fn log_parsed(
             let parsed = parser.process_packet(&pkt);
 
             if let Some(batch) = &parsed {
-                let abs_route = batch.route.clone();
+                let abs_route = batch.route;
                 if let Some(b) = &batch.boundary {
                     if let BoundaryReason::SamplesLost { expected, received } = b.reason {
                         let count = received.wrapping_sub(expected);
@@ -293,7 +293,7 @@ fn log_parsed(
         }
 
         rec.tick();
-        let _ = rec.flush_if(unbuffered);
+        let _ = rec.flush_if_needed();
     }
 
     let bytes = rec.bytes_written;
@@ -317,9 +317,9 @@ pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     use eyre::WrapErr;
 
     let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route.clone();
+    let route = tio.route;
 
-    let mut device = Device::open(&proxy, route.clone())
+    let mut device = Device::open(&proxy, route)
         .wrap_err_with(|| format!("could not open device at {}", tio.root))
         .with_proxy_help()?;
 
@@ -332,27 +332,18 @@ pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     let write_packet = |fo: &mut Option<File>, pkt: tio::Packet| -> eyre::Result<()> {
         let raw = pkt
             .serialize()
-            .map_err(|_| eyre::eyre!("failed to serialize metadata packet"))?;
+            .wrap_err("failed to serialize metadata packet")?;
         let f = ensure_open(fo, &file)?;
         f.write_all(&raw)
             .wrap_err_with(|| format!("failed to write {}", file))
     };
 
-    write_packet(
-        &mut file_out,
-        meta.device.make_update_with_route(route.clone()),
-    )?;
+    write_packet(&mut file_out, meta.device.make_update_with_route(route))?;
     for (_id, stream) in meta.streams {
-        write_packet(
-            &mut file_out,
-            stream.stream.make_update_with_route(route.clone()),
-        )?;
-        write_packet(
-            &mut file_out,
-            stream.segment.make_update_with_route(route.clone()),
-        )?;
+        write_packet(&mut file_out, stream.stream.make_update_with_route(route))?;
+        write_packet(&mut file_out, stream.segment.make_update_with_route(route))?;
         for col in stream.columns {
-            write_packet(&mut file_out, col.make_update_with_route(route.clone()))?;
+            write_packet(&mut file_out, col.make_update_with_route(route))?;
         }
     }
     Ok(())
@@ -379,7 +370,7 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
                 input
             );
         }
-        routes.insert(pkt.routing.clone());
+        routes.insert(pkt.routing);
     }
 
     if packet_count == 0 {
@@ -416,10 +407,10 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
         let (mut pkt, len) = tio::Packet::deserialize(rest)
             .wrap_err_with(|| format!("could not parse packet in {}", input))?;
         rest = &rest[len..];
-        pkt.routing = new_route.clone();
+        pkt.routing = new_route;
         let raw = pkt
             .serialize()
-            .map_err(|_| eyre::eyre!("failed to serialize packet for {}", output_path))?;
+            .wrap_err_with(|| format!("failed to serialize packet for {}", output_path))?;
         file.write_all(&raw)
             .wrap_err_with(|| format!("failed to write {}", output_path))?;
     }
