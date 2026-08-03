@@ -18,6 +18,11 @@ pub struct UpgradeCli {
     #[arg(long, conflicts_with = "firmware_path")]
     pub downgrade: bool,
 
+    /// Check every device active on the hub (at -r, default localhost) for a
+    /// firmware update and upgrade each one that has a newer release.
+    #[arg(long = "all", conflicts_with_all = ["firmware_path", "downgrade"])]
+    pub all: bool,
+
     /// Skip confirmation prompt
     #[arg(short = 'y', long = "yes")]
     pub yes: bool,
