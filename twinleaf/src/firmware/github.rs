@@ -1,7 +1,6 @@
 //! GitHub-backed [`FirmwareCatalog`] (enabled by the `firmware-update` feature).
 
 use super::{FirmwareCatalog, FirmwareDate, FirmwareError, FirmwareRelease};
-use std::io::Read;
 
 const HTTP_USER_AGENT: &str = concat!("twinleaf/", env!("CARGO_PKG_VERSION"));
 
@@ -56,14 +55,14 @@ impl FirmwareCatalog for GithubCatalog {
             self.owner, self.repo, name, revision
         );
 
-        let response = match ureq::get(&api_url)
-            .set("User-Agent", HTTP_USER_AGENT)
-            .set("Accept", "application/vnd.github+json")
+        let mut response = match ureq::get(&api_url)
+            .header("User-Agent", HTTP_USER_AGENT)
+            .header("Accept", "application/vnd.github+json")
             .call()
         {
             Ok(r) => r,
             // A missing folder simply means nothing is published yet.
-            Err(ureq::Error::Status(404, _)) => return Ok(Vec::new()),
+            Err(ureq::Error::StatusCode(404)) => return Ok(Vec::new()),
             Err(e) => {
                 return Err(FirmwareError::Catalog(format!(
                     "listing request failed: {e}"
@@ -72,7 +71,8 @@ impl FirmwareCatalog for GithubCatalog {
         };
 
         let listing: serde_json::Value = response
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| FirmwareError::Catalog(format!("invalid listing response: {e}")))?;
         let entries = listing
             .as_array()
@@ -97,14 +97,14 @@ impl FirmwareCatalog for GithubCatalog {
     }
 
     fn download(&self, release: &FirmwareRelease) -> Result<Vec<u8>, FirmwareError> {
-        let response = ureq::get(&release.url)
-            .set("User-Agent", HTTP_USER_AGENT)
+        let data = ureq::get(&release.url)
+            .header("User-Agent", HTTP_USER_AGENT)
             .call()
-            .map_err(|e| FirmwareError::Catalog(format!("download request failed: {e}")))?;
-        let mut data = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut data)
+            .map_err(|e| FirmwareError::Catalog(format!("download request failed: {e}")))?
+            .into_body()
+            .into_with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_vec()
             .map_err(|e| FirmwareError::Catalog(format!("download read failed: {e}")))?;
         Ok(data)
     }

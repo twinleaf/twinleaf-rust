@@ -24,7 +24,7 @@ num_enum = "0.7"
 glob = "0.3"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true }
-ureq = { version = "2", features = ["json"], optional = true }
+ureq = { version = "3", features = ["json"], optional = true }
 serde_json = { version = "1", optional = true }
 directories = "6.0"
 thiserror = "2"
