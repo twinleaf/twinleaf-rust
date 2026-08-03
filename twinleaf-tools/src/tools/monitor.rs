@@ -1,7 +1,7 @@
 //! Live sensor data display with plot and FFT capabilities.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read},
     str::FromStr,
@@ -9,32 +9,46 @@ use std::{
 };
 
 use crate::tui::{
+    decimate::Fpcs,
     rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq},
     rpc_state::RouteRpcState,
     rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp},
+    scroll::{follow_scroll, NAV_MARGIN},
+    spectral::{FftReadyData, FftStatus, WelchOp},
     tree_worker::spawn_tree_worker,
 };
 use crate::{MonitorCli, ProxyHelp, TioOpts};
 use crossbeam::channel::{self, Sender};
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    crossterm::{
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            KeyModifiers, MouseButton, MouseEventKind,
+        },
+        execute,
+    },
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Modifier, Style, Stylize},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
+    widgets::{
+        Axis, Block, Borders, Chart, Dataset, GraphType, LegendPosition, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
+    },
     DefaultTerminal, Frame,
 };
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{
-        AlignedWindow, Buffer, ColumnData, ColumnKey, ColumnVec, DeviceMetadataSnapshot,
+        Buffer, ColumnData, ColumnKey, ColumnOp, DerivedColumn, DeviceMetadataSnapshot, LatestRow,
         SampleBatch, StreamKey,
     },
     device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
-    tio::{self, proto::ProxyStatus},
+    tio::{
+        self,
+        proto::{ProxyStatus, SegmentMetadata},
+    },
 };
-use welch_sde::{Build, SpectralDensity};
 
 pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
     run_monitor_app(config)
@@ -42,10 +56,10 @@ pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
 
 #[derive(Debug, Clone)]
 pub struct MonitorConfig {
-    pub tio: TioOpts,
-    pub fps: u32,
-    pub colors: Option<String>,
-    pub depth: Option<usize>,
+    tio: TioOpts,
+    fps: u32,
+    colors: Option<String>,
+    depth: Option<usize>,
 }
 
 impl From<MonitorCli> for MonitorConfig {
@@ -63,14 +77,41 @@ const MIN_PLOT_WINDOW_SECONDS: f64 = 0.5;
 const MAX_PLOT_WINDOW_SECONDS: f64 = 60.0;
 const PLOT_WINDOW_FINE_STEP_SECONDS: f64 = 0.5;
 const PLOT_WINDOW_COARSE_STEP_SECONDS: f64 = 5.0;
-const MIN_FFT_SAMPLES: usize = 60;
+const MIN_PLOT_BUCKETS: usize = 64;
+const PLOT_POINTS_PER_CELL: usize = 4;
 const MONITOR_BUFFER_CAPACITY_SAMPLES: usize = 2_000_000;
-const WELCH_DEFAULT_SEGMENTS: usize = 4;
-const WELCH_DEFAULT_OVERLAP: f64 = 0.5;
-const WELCH_DFT_MAX_SIZE: usize = 4096;
+
+/// Auto-hide the legend only when it can't fit in the graph area at all;
+/// otherwise long names (route suffixes) silently blank it. 'l' is the
+/// explicit toggle.
+const LEGEND_CONSTRAINTS: (Constraint, Constraint) =
+    (Constraint::Percentage(100), Constraint::Percentage(100));
+
+const SERIES_COLORS: [Color; 7] = [
+    Color::Green,
+    Color::Cyan,
+    Color::Yellow,
+    Color::Magenta,
+    Color::LightBlue,
+    Color::LightRed,
+    Color::LightGreen,
+];
+
+fn series_color(i: usize) -> Color {
+    SERIES_COLORS[i % SERIES_COLORS.len()]
+}
 
 #[derive(Debug, Clone)]
-pub enum NavPos {
+struct PlotSeries {
+    key: ColumnKey,
+    label: String,
+    units: String,
+    color_idx: usize,
+    points: Vec<(f64, f64)>,
+}
+
+#[derive(Debug, Clone)]
+enum NavPos {
     EmptyDevice {
         device_idx: usize,
         route: DeviceRoute,
@@ -83,35 +124,35 @@ pub enum NavPos {
 }
 
 impl NavPos {
-    pub fn device_idx(&self) -> usize {
+    fn device_idx(&self) -> usize {
         match self {
             NavPos::EmptyDevice { device_idx, .. } => *device_idx,
             NavPos::Column { device_idx, .. } => *device_idx,
         }
     }
 
-    pub fn route(&self) -> &DeviceRoute {
+    fn route(&self) -> &DeviceRoute {
         match self {
             NavPos::EmptyDevice { route, .. } => route,
             NavPos::Column { spec, .. } => &spec.route,
         }
     }
 
-    pub fn stream_idx(&self) -> Option<usize> {
+    fn stream_idx(&self) -> Option<usize> {
         match self {
             NavPos::EmptyDevice { .. } => None,
             NavPos::Column { stream_idx, .. } => Some(*stream_idx),
         }
     }
 
-    pub fn column_idx(&self) -> Option<usize> {
+    fn column_idx(&self) -> Option<usize> {
         match self {
             NavPos::EmptyDevice { .. } => None,
             NavPos::Column { spec, .. } => Some(spec.column_id),
         }
     }
 
-    pub fn spec(&self) -> Option<&ColumnKey> {
+    fn spec(&self) -> Option<&ColumnKey> {
         match self {
             NavPos::EmptyDevice { .. } => None,
             NavPos::Column { spec, .. } => Some(spec),
@@ -120,13 +161,13 @@ impl NavPos {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Nav {
-    pub idx: usize,
+struct Nav {
+    idx: usize,
 }
 
 impl Nav {
     /// Up/Down: linear traversal through flattened tree
-    pub fn step_linear(&mut self, items: &[NavPos], backward: bool) {
+    fn step_linear(&mut self, items: &[NavPos], backward: bool) {
         if items.is_empty() {
             return;
         }
@@ -138,8 +179,8 @@ impl Nav {
         };
     }
 
-    /// Left/Right: jump between streams on the current device, keeping column position
-    pub fn step_between_streams(&mut self, items: &[NavPos], backward: bool) {
+    /// Left/Right: jump between streams across all devices, keeping column position
+    fn step_between_streams(&mut self, items: &[NavPos], backward: bool) {
         if items.is_empty() {
             return;
         }
@@ -153,15 +194,14 @@ impl Nav {
             } => (*device_idx, *stream_idx, spec.column_id),
         };
 
-        // Streams on this device, in display order (nav_items is already grouped)
-        let mut streams: Vec<usize> = items
+        let mut streams: Vec<(usize, usize)> = items
             .iter()
             .filter_map(|pos| match pos {
                 NavPos::Column {
                     device_idx,
                     stream_idx,
                     ..
-                } if *device_idx == cur_dev => Some(*stream_idx),
+                } => Some((*device_idx, *stream_idx)),
                 _ => None,
             })
             .collect();
@@ -171,22 +211,24 @@ impl Nav {
             return;
         }
 
-        let pos = streams.iter().position(|&s| s == cur_stream).unwrap_or(0);
+        let pos = streams
+            .iter()
+            .position(|&s| s == (cur_dev, cur_stream))
+            .unwrap_or(0);
         let len = streams.len();
-        let target_stream = streams[if backward {
+        let (target_dev, target_stream) = streams[if backward {
             (pos + len - 1) % len
         } else {
             (pos + 1) % len
         }];
 
-        // Land on the column closest to the current one
         self.idx = items
             .iter()
             .enumerate()
             .filter(|(_, pos)| {
                 matches!(pos,
                     NavPos::Column { device_idx, stream_idx, .. }
-                        if *device_idx == cur_dev && *stream_idx == target_stream)
+                        if *device_idx == target_dev && *stream_idx == target_stream)
             })
             .min_by_key(|(_, pos)| {
                 (pos.column_idx().unwrap_or(0) as isize - cur_column as isize).abs()
@@ -196,7 +238,7 @@ impl Nav {
     }
 
     /// Tab: jump to next/prev device, find best matching position
-    pub fn step_device(&mut self, items: &[NavPos], backward: bool) {
+    fn step_device(&mut self, items: &[NavPos], backward: bool) {
         if items.is_empty() {
             return;
         }
@@ -206,7 +248,6 @@ impl Nav {
         let cur_stream = cur.stream_idx().unwrap_or(0);
         let cur_column = cur.column_idx().unwrap_or(0);
 
-        // Find all unique device indices
         let mut device_indices: Vec<usize> = items.iter().map(|p| p.device_idx()).collect();
         device_indices.sort();
         device_indices.dedup();
@@ -215,7 +256,6 @@ impl Nav {
             return;
         }
 
-        // Find current device position and move to next/prev
         let dev_pos = device_indices
             .iter()
             .position(|&d| d == cur_device)
@@ -228,7 +268,6 @@ impl Nav {
         };
         let target_device = device_indices[new_dev_pos];
 
-        // Find best match on target device
         self.idx = items
             .iter()
             .enumerate()
@@ -251,26 +290,56 @@ impl Nav {
             .unwrap_or(self.idx);
     }
 
-    pub fn home(&mut self, items: &[NavPos]) {
+    fn home(&mut self, items: &[NavPos]) {
         if !items.is_empty() {
             self.idx = 0;
         }
     }
 
-    pub fn end(&mut self, items: &[NavPos]) {
+    fn end(&mut self, items: &[NavPos]) {
         if !items.is_empty() {
             self.idx = items.len() - 1;
         }
     }
 }
 
+/// A drag over the left pane's nav rows: `anchor` stays at the press,
+/// `cursor` follows the pointer. The sweep pins every column in the range,
+/// or unpins when the anchor started out pinned (`unpin`).
+#[derive(Debug, Clone)]
+struct DragState {
+    anchor: usize,
+    cursor: usize,
+    unpin: bool,
+    /// Set once the cursor leaves the anchor row: sweep, not click.
+    moved: bool,
+    origin: DragOrigin,
+}
+
+/// What the press landed on; decides what a motionless release means.
+#[derive(Debug, Clone)]
+enum DragOrigin {
+    /// A column row: release click-selects it.
+    Column,
+    /// A device header: release opens the palette at this route.
+    Device(DeviceRoute),
+    /// The blank separator after a device block: release is inert.
+    Gap,
+}
+
+impl DragState {
+    fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct Theme {
-    pub value_bounds: HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
+struct Theme {
+    value_bounds: HashMap<String, (std::ops::RangeInclusive<f64>, bool)>,
 }
 
 impl Theme {
-    pub fn get_value_color(&self, stream: &str, col: &str, val: f64) -> Option<Color> {
+    fn get_value_color(&self, stream: &str, col: &str, val: f64) -> Option<Color> {
         if val.is_nan() {
             return Some(Color::Yellow);
         }
@@ -289,73 +358,33 @@ impl Theme {
     }
 }
 
-pub struct StyleContext {
-    pub is_selected: bool,
-    pub is_stale: bool,
-    pub in_plot_mode: bool,
-    pub base_color: Color,
-}
-
-impl Default for StyleContext {
-    fn default() -> Self {
-        Self {
-            is_selected: false,
-            is_stale: false,
-            in_plot_mode: false,
-            base_color: Color::Reset,
+fn row_style(color: Color, selected: bool, stale: bool, in_plot_mode: bool) -> Style {
+    let mut s = Style::default().fg(color);
+    if stale {
+        s = s.add_modifier(Modifier::DIM);
+    }
+    if selected {
+        s = s.add_modifier(Modifier::BOLD);
+        if !in_plot_mode {
+            s = s.add_modifier(Modifier::RAPID_BLINK);
         }
     }
-}
-
-impl StyleContext {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn selected(mut self, yes: bool) -> Self {
-        self.is_selected = yes;
-        self
-    }
-    pub fn stale(mut self, yes: bool) -> Self {
-        self.is_stale = yes;
-        self
-    }
-    pub fn plot_mode(mut self, yes: bool) -> Self {
-        self.in_plot_mode = yes;
-        self
-    }
-    pub fn color(mut self, c: Color) -> Self {
-        self.base_color = c;
-        self
-    }
-
-    pub fn resolve(&self) -> Style {
-        let mut s = Style::default().fg(self.base_color);
-        if self.is_stale {
-            s = s.add_modifier(Modifier::DIM);
-        }
-        if self.is_selected {
-            s = s.add_modifier(Modifier::BOLD);
-            if !self.in_plot_mode {
-                s = s.add_modifier(Modifier::RAPID_BLINK);
-            }
-        }
-        s
-    }
+    s
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct DeviceStatus {
-    pub last_heartbeat: Option<Instant>,
-    pub connected: bool,
+struct DeviceStatus {
+    last_heartbeat: Option<Instant>,
+    connected: bool,
 }
 
 impl DeviceStatus {
-    pub fn on_heartbeat(&mut self) {
+    fn on_heartbeat(&mut self) {
         self.last_heartbeat = Some(Instant::now());
         self.connected = true;
     }
 
-    pub fn is_alive(&self, timeout: Duration) -> bool {
+    fn is_alive(&self, timeout: Duration) -> bool {
         self.last_heartbeat
             .map(|t| t.elapsed() < timeout)
             .unwrap_or(false)
@@ -363,13 +392,13 @@ impl DeviceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Mode {
+enum Mode {
     Normal,
     Command,
 }
 
 #[derive(Debug, Clone)]
-pub enum Action {
+enum Action {
     Quit,
     SetMode(Mode),
     ExecuteRpc(RpcReq),
@@ -383,30 +412,38 @@ pub enum Action {
     NavScroll(i16),
     NavHome,
     NavEnd,
+    ClickNavIdx(usize),
+    DragStart(usize, DragOrigin),
+    DragTo(usize),
+    DragEnd,
+    OpenPaletteRoute(DeviceRoute),
     TogglePlot,
+    TogglePlotSeries,
     ClosePlot,
     ToggleFft,
     ToggleFooter,
     ToggleRoutes,
+    ToggleLegend,
     AdjustWindow(f64),
     AdjustPlotWidth(i16),
     AdjustPrecision(i8),
 }
 
 #[derive(Debug, Clone)]
-pub struct ViewConfig {
-    pub show_plot: bool,
-    pub show_footer: bool,
-    pub show_routes: bool,
-    pub show_fft: bool,
-    pub plot_window_seconds: f64,
-    pub plot_width_percent: u16,
-    pub axis_precision: usize,
-    pub follow_selection: bool,
-    pub scroll: u16,
-    pub desc_width: usize,
-    pub units_width: usize,
-    pub theme: Theme,
+struct ViewConfig {
+    show_plot: bool,
+    show_footer: bool,
+    show_routes: bool,
+    show_legend: bool,
+    show_fft: bool,
+    plot_window_seconds: f64,
+    plot_width_percent: u16,
+    axis_precision: usize,
+    follow_selection: bool,
+    scroll: u16,
+    desc_width: usize,
+    units_width: usize,
+    theme: Theme,
 }
 
 impl Default for ViewConfig {
@@ -415,6 +452,7 @@ impl Default for ViewConfig {
             show_plot: false,
             show_footer: true,
             show_routes: false,
+            show_legend: true,
             show_fft: false,
             plot_window_seconds: 5.0,
             plot_width_percent: 70,
@@ -428,77 +466,91 @@ impl Default for ViewConfig {
     }
 }
 
-pub struct FftReadyData {
-    pub points: Vec<(f64, f64)>,
-    pub median_asd: f64,
-    pub sample_count: usize,
-    pub total_sample_count: usize,
-    pub sampling_hz: f64,
-    pub segment_size: usize,
-    pub hop_size: usize,
+struct FftSeries {
+    key: ColumnKey,
+    label: String,
+    units: String,
+    color_idx: usize,
+    data: FftReadyData,
 }
 
-pub enum FftStatus {
-    Ready(FftReadyData),
-    WaitingForSelection,
-    WaitingForSamples,
-    InvalidSampleRate {
-        sampling_rate: u32,
-        decimation: u32,
-    },
-    TooFewSamples {
-        have: usize,
-        need: usize,
-        sampling_hz: f64,
-        window_seconds: f64,
-    },
-    NoValidFrequencyBins {
-        sample_count: usize,
-        sampling_hz: f64,
-    },
-}
+struct MonitorState {
+    depth_limit: Option<usize>,
+    parent_route: DeviceRoute,
+    mode: Mode,
+    view: ViewConfig,
 
-pub struct MonitorState {
-    pub depth_limit: Option<usize>,
-    pub parent_route: DeviceRoute,
-    pub mode: Mode,
-    pub view: ViewConfig,
+    nav: Nav,
+    nav_items: Vec<NavPos>,
+    /// RPC palette target override; cleared on leaving Command mode.
+    palette_route: Option<DeviceRoute>,
 
-    pub nav: Nav,
-    pub nav_items: Vec<NavPos>,
+    discovered_routes: HashSet<DeviceRoute>,
+    device_status: HashMap<DeviceRoute, DeviceStatus>,
+    device_metadata: HashMap<DeviceRoute, DeviceMetadataSnapshot>,
+    fft_series: Vec<FftSeries>,
+    fft_status: FftStatus,
+    plot_series: Vec<PlotSeries>,
+    plot_pipes: HashMap<ColumnKey, DerivedColumn<Fpcs>>,
+    fft_pipes: HashMap<ColumnKey, DerivedColumn<WelchOp>>,
+    /// Channels pinned via space, in selection order; empty follows the cursor.
+    plotted: Vec<ColumnKey>,
+    /// Color slot per pinned channel; never renumbered while pinned, so colors
+    /// and draw order stay stable as other channels pin and unpin.
+    plot_slots: HashMap<ColumnKey, usize>,
+    /// Shared wall-clock x-axis window `[t_start, t_end]` for all series.
+    plot_x_bounds: Option<[f64; 2]>,
 
-    pub discovered_routes: HashSet<DeviceRoute>,
-    pub device_status: HashMap<DeviceRoute, DeviceStatus>,
-    pub last: BTreeMap<StreamKey, (SampleBatch, Instant)>,
-    pub device_metadata: HashMap<DeviceRoute, DeviceMetadataSnapshot>,
-    pub window_aligned: Option<AlignedWindow>,
+    footer_height: u16,
+    rpc_routes: HashMap<DeviceRoute, RouteRpcState>,
+    palette: RpcPalette,
+    blink_state: bool,
+    last_blink: Instant,
 
-    pub footer_height: u16,
-    pub rpc_routes: HashMap<DeviceRoute, RouteRpcState>,
-    pub palette: RpcPalette,
-    pub blink_state: bool,
-    pub last_blink: Instant,
+    left_inner: Rect,
+    footer_area: Rect,
+    col_map: HashMap<usize, usize>,
+    device_map: HashMap<usize, DeviceRoute>,
+    /// Hit width of each left-pane line; a row's hitbox is its text.
+    line_widths: Vec<u16>,
+    drag: Option<DragState>,
+    /// Last mouse position, for deriving the hovered row at render time.
+    last_mouse: Option<(u16, u16)>,
 }
 
 impl MonitorState {
-    pub fn new(depth_limit: Option<usize>, parent_route: &DeviceRoute) -> Self {
+    fn new(depth_limit: Option<usize>, parent_route: &DeviceRoute) -> Self {
         Self {
             depth_limit,
-            parent_route: *parent_route,
+            parent_route: parent_route.clone(),
             mode: Mode::Normal,
             view: ViewConfig::default(),
             nav: Nav::default(),
             nav_items: Vec::new(),
+            palette_route: None,
             discovered_routes: HashSet::new(),
             device_status: HashMap::new(),
-            last: BTreeMap::new(),
             device_metadata: HashMap::new(),
-            window_aligned: None,
+            fft_series: Vec::new(),
+            fft_status: FftStatus::WaitingForSelection,
+            plot_series: Vec::new(),
+            plot_pipes: HashMap::new(),
+            fft_pipes: HashMap::new(),
+            plotted: Vec::new(),
+            plot_slots: HashMap::new(),
+            plot_x_bounds: None,
             footer_height: 0,
             rpc_routes: HashMap::new(),
             palette: RpcPalette::default(),
             blink_state: true,
             last_blink: Instant::now(),
+            left_inner: Rect::default(),
+            footer_area: Rect::default(),
+            col_map: HashMap::new(),
+            device_map: HashMap::new(),
+            line_widths: Vec::new(),
+            drag: None,
+            last_mouse: None,
         }
     }
 
@@ -510,7 +562,7 @@ impl MonitorState {
     }
 
     fn update_palette_suggestions_for(&mut self, route: &DeviceRoute) {
-        if self.mode == Mode::Command && self.current_route() == *route {
+        if self.mode == Mode::Command && self.palette_route() == *route {
             let registry = self.rpc_routes.get(route).and_then(RouteRpcState::registry);
             self.palette.update_suggestions(registry);
         }
@@ -520,7 +572,7 @@ impl MonitorState {
         match action {
             Action::Quit => return true,
             Action::SetMode(Mode::Command) => {
-                let route = self.current_route();
+                let route = self.palette_route();
                 let registry = self
                     .rpc_routes
                     .get(&route)
@@ -530,21 +582,37 @@ impl MonitorState {
             }
             Action::SetMode(Mode::Normal) => {
                 self.mode = Mode::Normal;
+                self.palette_route = None;
                 self.palette.exit();
             }
             Action::ExecuteRpc(req) => {
                 let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
             }
             Action::SelectRoute(route) => {
-                self.view.follow_selection = true;
-                if let Some(idx) = self.nav_items.iter().position(|p| p.route() == &route) {
-                    self.nav.idx = idx;
-                }
+                self.palette_route = Some(route.clone());
                 let registry = self
                     .rpc_routes
                     .get(&route)
                     .and_then(RouteRpcState::registry);
                 self.palette.update_suggestions(registry);
+            }
+            Action::OpenPaletteRoute(route) => {
+                if self.mode == Mode::Command {
+                    // Same device toggles the palette closed; another retargets it.
+                    if self.palette_route() == route {
+                        self.update(Action::SetMode(Mode::Normal), rpc_tx);
+                    } else {
+                        let registry = self
+                            .rpc_routes
+                            .get(&route)
+                            .and_then(RouteRpcState::registry);
+                        self.palette_route = Some(route);
+                        self.palette.update_suggestions(registry);
+                    }
+                } else {
+                    self.palette_route = Some(route);
+                    self.update(Action::SetMode(Mode::Command), rpc_tx);
+                }
             }
             Action::NavUp => {
                 self.view.follow_selection = true;
@@ -573,7 +641,7 @@ impl MonitorState {
             Action::NavScroll(delta) => {
                 self.view.follow_selection = false;
                 self.view.scroll = if delta < 0 {
-                    self.view.scroll.saturating_sub(delta.abs() as u16)
+                    self.view.scroll.saturating_sub(delta.unsigned_abs())
                 } else {
                     self.view.scroll.saturating_add(delta as u16)
                 };
@@ -586,13 +654,94 @@ impl MonitorState {
                 self.view.follow_selection = true;
                 self.nav.end(&self.nav_items);
             }
+            Action::ClickNavIdx(idx) => {
+                if idx < self.nav_items.len() {
+                    let was_selected = self.nav.idx == idx;
+                    // A clicked row is already visible; the view must not move.
+                    self.view.follow_selection = false;
+                    self.nav.idx = idx;
+
+                    let is_column = matches!(self.nav_items[idx], NavPos::Column { .. });
+                    if is_column && (was_selected || !self.plotted.is_empty()) {
+                        self.toggle_pin_current();
+                    }
+                    let route = self.palette_route();
+                    self.update_palette_suggestions_for(&route);
+                }
+            }
+            Action::DragStart(idx, origin) => {
+                if idx < self.nav_items.len() {
+                    let unpin = self.nav_items[idx]
+                        .spec()
+                        .is_some_and(|col| self.plotted.contains(col));
+                    self.drag = Some(DragState {
+                        anchor: idx,
+                        cursor: idx,
+                        unpin,
+                        moved: false,
+                        origin,
+                    });
+                }
+            }
+            Action::DragTo(idx) => {
+                if idx < self.nav_items.len() {
+                    // Same-row jitter isn't movement; a wobbly click stays a click.
+                    let cursor_changed = self.drag.as_ref().is_some_and(|d| d.cursor != idx);
+                    if cursor_changed {
+                        if let Some(drag) = &mut self.drag {
+                            drag.cursor = idx;
+                            drag.moved = true;
+                        }
+                        self.nav.idx = idx;
+                        self.view.follow_selection = false;
+
+                        // Advance the view one row when the drag reaches its edge.
+                        if let Some(&line) = self.col_map.get(&idx) {
+                            let scroll = self.view.scroll as usize;
+                            let view_h = self.left_inner.height as usize;
+                            if line + 1 >= scroll + view_h {
+                                self.view.scroll = self.view.scroll.saturating_add(1);
+                            } else if line == scroll && scroll > 0 {
+                                self.view.scroll -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Action::DragEnd => {
+                if let Some(drag) = self.drag.take() {
+                    if !self.nav_items.is_empty() {
+                        let max_idx = self.nav_items.len() - 1;
+                        if !drag.moved {
+                            let click = match drag.origin {
+                                DragOrigin::Device(route) => Some(Action::OpenPaletteRoute(route)),
+                                DragOrigin::Column => {
+                                    Some(Action::ClickNavIdx(drag.anchor.min(max_idx)))
+                                }
+                                DragOrigin::Gap => None,
+                            };
+                            if let Some(click) = click {
+                                self.update(click, rpc_tx);
+                            }
+                        } else {
+                            let (lo, hi) = drag.range();
+                            self.paint_range(lo.min(max_idx), hi.min(max_idx), drag.unpin);
+                            self.nav.idx = drag.cursor.min(max_idx);
+                            self.view.follow_selection = false;
+                        }
+                    }
+                }
+            }
             Action::TogglePlot => {
                 if self.current_selection().is_some() {
                     self.view.show_plot = !self.view.show_plot;
                 }
             }
+            Action::TogglePlotSeries => self.toggle_pin_current(),
             Action::ClosePlot => {
                 self.view.show_plot = false;
+                self.plotted.clear();
+                self.plot_slots.clear();
             }
             Action::ToggleFft => {
                 if self.view.show_plot {
@@ -601,6 +750,7 @@ impl MonitorState {
             }
             Action::ToggleFooter => self.view.show_footer = !self.view.show_footer,
             Action::ToggleRoutes => self.view.show_routes = !self.view.show_routes,
+            Action::ToggleLegend => self.view.show_legend = !self.view.show_legend,
             Action::AdjustWindow(d) => {
                 self.view.plot_window_seconds = (self.view.plot_window_seconds + d)
                     .clamp(MIN_PLOT_WINDOW_SECONDS, MAX_PLOT_WINDOW_SECONDS)
@@ -617,10 +767,55 @@ impl MonitorState {
         false
     }
 
+    fn toggle_pin_current(&mut self) {
+        if let Some(col) = self.current_selection() {
+            if self.plotted.contains(&col) {
+                self.unpin_column(&col);
+            } else {
+                self.pin_column(col);
+            }
+        }
+    }
+
+    /// Pins `col` if it isn't already, assigning the lowest free color slot.
+    fn pin_column(&mut self, col: ColumnKey) {
+        if self.plotted.contains(&col) {
+            return;
+        }
+        let lowest_free_slot = (0..)
+            .find(|slot| !self.plot_slots.values().any(|used| used == slot))
+            .unwrap();
+        self.plot_slots.insert(col.clone(), lowest_free_slot);
+        self.plotted.push(col);
+        self.view.show_plot = true;
+    }
+
+    fn unpin_column(&mut self, col: &ColumnKey) {
+        if let Some(pos) = self.plotted.iter().position(|k| k == col) {
+            self.plotted.remove(pos);
+            self.plot_slots.remove(col);
+        }
+    }
+
+    /// Pin (or unpin, when `unpin`) every column in nav range `[lo, hi]`.
+    fn paint_range(&mut self, lo: usize, hi: usize, unpin: bool) {
+        let cols: Vec<ColumnKey> = self.nav_items[lo..=hi]
+            .iter()
+            .filter_map(|p| p.spec().cloned())
+            .collect();
+        for col in cols {
+            if unpin {
+                self.unpin_column(&col);
+            } else {
+                self.pin_column(col);
+            }
+        }
+    }
+
     fn update_rpclists(&mut self, list: RpcList) {
         let route = list.route.clone();
         self.rpc_routes
-            .entry(route)
+            .entry(route.clone())
             .or_default()
             .on_fetch_success(&list);
         self.update_palette_suggestions_for(&route);
@@ -628,18 +823,18 @@ impl MonitorState {
 
     fn update_rpclist_error(&mut self, route: DeviceRoute, error: String) {
         self.rpc_routes
-            .entry(route)
+            .entry(route.clone())
             .or_default()
             .on_fetch_error(error);
         self.update_palette_suggestions_for(&route);
     }
 
-    pub fn visible_routes(&self) -> Vec<DeviceRoute> {
+    fn visible_routes(&self) -> Vec<DeviceRoute> {
         let mut routes: Vec<_> = self
             .discovered_routes
             .iter()
             .filter(|r| match self.parent_route.relative_route(r) {
-                Ok(rel) => self.depth_limit.map_or(true, |max| rel.len() <= max),
+                Ok(rel) => self.depth_limit.is_none_or(|max| rel.len() <= max),
                 Err(_) => false,
             })
             .cloned()
@@ -648,16 +843,15 @@ impl MonitorState {
         routes
     }
 
-    pub fn rebuild_nav_items(&mut self) {
+    fn rebuild_nav_items(&mut self, buffer: &Buffer) {
         let prev_selection = self.nav_items.get(self.nav.idx).cloned();
 
         let routes = self.visible_routes();
         let mut new_items = Vec::new();
 
         for (dev_idx, route) in routes.iter().enumerate() {
-            let mut stream_ids: Vec<_> = self
-                .last
-                .keys()
+            let mut stream_ids: Vec<_> = buffer
+                .stream_keys()
                 .filter(|k| &k.route == route)
                 .map(|k| k.stream_id)
                 .collect();
@@ -667,20 +861,20 @@ impl MonitorState {
             if stream_ids.is_empty() {
                 new_items.push(NavPos::EmptyDevice {
                     device_idx: dev_idx,
-                    route: *route,
+                    route: route.clone(),
                 });
             } else {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
-                    let key = StreamKey::new(*route, *sid);
-                    if let Some((batch, _)) = self.last.get(&key) {
-                        for series in &batch.columns {
+                    let key = StreamKey::new(route.clone(), *sid);
+                    if let Some(row) = buffer.latest_row(&key) {
+                        for (column_idx, _) in row.columns.iter().enumerate() {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
                                 spec: ColumnKey {
-                                    route: *route,
+                                    route: route.clone(),
                                     stream_id: *sid,
-                                    column_id: series.index,
+                                    column_id: column_idx,
                                 },
                             });
                         }
@@ -696,12 +890,11 @@ impl MonitorState {
             return;
         }
 
-        // Preserve the previous selection by identity when possible; positional
-        // idx shifts if new items appear in front of it on the next rebuild.
+        // Re-find the previous selection by identity, not position.
         self.nav.idx = prev_selection
             .and_then(|prev| {
                 let prev_spec = prev.spec().cloned();
-                let prev_route = *prev.route();
+                let prev_route = prev.route().clone();
                 self.nav_items
                     .iter()
                     .position(|pos| match (&prev_spec, pos.spec()) {
@@ -713,39 +906,46 @@ impl MonitorState {
             .unwrap_or_else(|| self.nav.idx.min(self.nav_items.len() - 1));
     }
 
-    pub fn current_pos(&self) -> Option<&NavPos> {
+    fn current_pos(&self) -> Option<&NavPos> {
         self.nav_items.get(self.nav.idx)
     }
 
-    pub fn current_selection(&self) -> Option<ColumnKey> {
+    fn current_selection(&self) -> Option<ColumnKey> {
         self.current_pos().and_then(|p| p.spec().cloned())
     }
 
-    pub fn current_route(&self) -> DeviceRoute {
+    fn current_route(&self) -> DeviceRoute {
         self.current_pos()
-            .map(|p| *p.route())
-            .unwrap_or_else(|| self.parent_route)
+            .map(|p| p.route().clone())
+            .unwrap_or_else(|| self.parent_route.clone())
     }
 
-    pub fn current_device_index(&self) -> usize {
+    /// Device the RPC palette targets: the override, or the nav-derived device.
+    fn palette_route(&self) -> DeviceRoute {
+        self.palette_route
+            .clone()
+            .unwrap_or_else(|| self.current_route())
+    }
+
+    fn current_device_index(&self) -> usize {
         self.current_pos().map(|p| p.device_idx()).unwrap_or(0)
     }
 
-    pub fn device_count(&self) -> usize {
+    fn device_count(&self) -> usize {
         self.visible_routes().len()
     }
 
     fn handle_event(&mut self, event: TreeEvent, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
-                self.discovered_routes.insert(route);
+                self.discovered_routes.insert(route.clone());
                 if self
                     .rpc_routes
-                    .entry(route)
+                    .entry(route.clone())
                     .or_default()
                     .on_route_discovered()
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
                 }
                 self.device_status.entry(route).or_default();
             }
@@ -753,7 +953,12 @@ impl MonitorState {
                 route,
                 event: DeviceEvent::NewHash(hash),
             } => {
-                if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
+                if self
+                    .rpc_routes
+                    .entry(route.clone())
+                    .or_default()
+                    .on_new_hash(hash)
+                {
                     let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
                 }
             }
@@ -763,11 +968,11 @@ impl MonitorState {
             } => {
                 if self
                     .rpc_routes
-                    .entry(route)
+                    .entry(route.clone())
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
                 }
                 self.device_status.entry(route).or_default().on_heartbeat();
             }
@@ -775,10 +980,15 @@ impl MonitorState {
                 route,
                 event: DeviceEvent::Status(status),
             } => {
-                if self.rpc_routes.entry(route).or_default().on_status(status) {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
+                if self
+                    .rpc_routes
+                    .entry(route.clone())
+                    .or_default()
+                    .on_status(status)
+                {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
                 }
-                let dev_status = self.device_status.entry(route).or_default();
+                let dev_status = self.device_status.entry(route.clone()).or_default();
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
                     ProxyStatus::SensorReconnected => dev_status.connected = true,
@@ -798,164 +1008,193 @@ impl MonitorState {
         }
     }
 
-    pub fn handle_batch(&mut self, batch: SampleBatch, buffer: &mut Buffer) {
+    fn handle_batch(&mut self, batch: SampleBatch, buffer: &mut Buffer) {
         let stream_key = StreamKey::new(batch.route.clone(), batch.stream.stream_id);
-        buffer.process_batch(&batch, stream_key.clone());
-        self.last.insert(stream_key, (batch, Instant::now()));
+        buffer.process_batch(&batch, stream_key);
     }
 
-    pub fn update_plot_window(&mut self, buffer: &Buffer) {
+    fn slot_of(&self, key: &ColumnKey) -> usize {
+        self.plot_slots.get(key).copied().unwrap_or(0)
+    }
+
+    fn window_samples(&self, buffer: &Buffer, col: &ColumnKey) -> Option<usize> {
+        let run = buffer.get_run(&col.stream_key())?;
+        Some(
+            (self.view.plot_window_seconds * run.effective_rate)
+                .ceil()
+                .max(10.0) as usize,
+        )
+    }
+
+    fn update_plot_window(&mut self, buffer: &Buffer, term_width: u16) {
+        self.plot_series = Vec::new();
+        self.fft_series = Vec::new();
+        self.fft_status = FftStatus::WaitingForSelection;
+        self.plot_x_bounds = None;
+
         if !self.view.show_plot {
-            self.window_aligned = None;
+            self.plot_pipes.clear();
+            self.fft_pipes.clear();
+        } else if self.view.show_fft {
+            self.plot_pipes.clear();
+            self.update_fft_series(buffer);
+        } else {
+            self.fft_pipes.clear();
+            self.update_time_series(buffer, term_width);
+        }
+    }
+
+    /// Channels to plot, in slot order (which is also draw order): the pinned
+    /// set, or the focused channel when nothing is pinned.
+    fn plotted_keys(&self) -> Vec<ColumnKey> {
+        let mut keys = if self.plotted.is_empty() {
+            self.current_selection().into_iter().collect()
+        } else {
+            self.plotted.clone()
+        };
+        keys.sort_by_key(|k| self.slot_of(k));
+        keys
+    }
+
+    fn update_fft_series(&mut self, buffer: &Buffer) {
+        let keys = self.plotted_keys();
+        let keys_set: HashSet<&ColumnKey> = keys.iter().collect();
+        self.fft_pipes.retain(|k, _| keys_set.contains(k));
+
+        for key in keys.into_iter() {
+            let color_idx = self.slot_of(&key);
+            let Some(window_samples) = self.window_samples(buffer, &key) else {
+                continue;
+            };
+            let Some(run) = buffer.get_run(&key.stream_key()) else {
+                self.fft_status = FftStatus::WaitingForSamples;
+                continue;
+            };
+            let segment = run.segment();
+            let sampling_hz = segment.sampling_rate as f64 / segment.decimation as f64;
+            if segment.sampling_rate == 0
+                || segment.decimation == 0
+                || !sampling_hz.is_finite()
+                || sampling_hz <= 0.0
+            {
+                self.fft_status = FftStatus::InvalidSampleRate {
+                    sampling_rate: segment.sampling_rate,
+                    decimation: segment.decimation,
+                };
+                continue;
+            }
+
+            let pipe = self.fft_pipes.entry(key.clone()).or_insert_with(|| {
+                DerivedColumn::new(
+                    key.clone(),
+                    WelchOp::new(window_samples, sampling_hz, self.view.plot_window_seconds),
+                )
+            });
+            let params_changed = pipe.op().window_samples() != window_samples
+                || pipe.op().sampling_hz() != sampling_hz;
+            if params_changed || pipe.op().plot_window_seconds() != self.view.plot_window_seconds {
+                pipe.op_mut()
+                    .configure(window_samples, sampling_hz, self.view.plot_window_seconds);
+            }
+            if params_changed {
+                pipe.invalidate();
+            }
+            pipe.sync(buffer);
+
+            match pipe.op().output() {
+                Ok(data) => {
+                    let Some((label, units)) = column_label_units(buffer, &key) else {
+                        continue;
+                    };
+                    self.fft_series.push(FftSeries {
+                        key,
+                        label,
+                        units,
+                        color_idx,
+                        data: data.clone(),
+                    });
+                }
+                Err(status) => self.fft_status = status.clone(),
+            }
+        }
+    }
+
+    /// Decimate every plotted channel over one shared wall-clock window
+    /// `[t_end - window, t_end]`, where `t_end` is the newest sample across
+    /// the plotted channels; a lagging channel stops short of the right edge
+    /// instead of stretching the axis.
+    fn update_time_series(&mut self, buffer: &Buffer, term_width: u16) {
+        let keys = self.plotted_keys();
+
+        let t_end = keys
+            .iter()
+            .filter_map(|k| buffer.get_run(&k.stream_key()).map(|r| r.last_timestamp))
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !t_end.is_finite() {
             return;
         }
+        let t_start = t_end - self.view.plot_window_seconds;
+        self.plot_x_bounds = Some([t_start, t_end]);
 
-        self.window_aligned = self.current_selection().and_then(|col| {
-            let stream_key = col.stream_key();
-            let run = buffer.get_run(&stream_key)?;
-            let n_samples = (self.view.plot_window_seconds * run.effective_rate)
-                .ceil()
-                .max(10.0) as usize;
-            buffer.read_aligned_window(&[col], n_samples).ok()
-        });
-    }
+        let buckets = (term_width as usize * PLOT_POINTS_PER_CELL).max(MIN_PLOT_BUCKETS);
 
-    pub fn get_plot_data(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
-        let spec = self.current_selection()?;
-        let win = self.window_aligned.as_ref()?;
-        let batch = win.columns.get(&spec)?;
-        if win.timestamps.is_empty() {
-            return None;
-        }
-        let data: Vec<(f64, f64)> = match batch {
-            ColumnVec::F64(v) => win
-                .timestamps
-                .iter()
-                .copied()
-                .zip(v.iter().copied())
-                .collect(),
-            ColumnVec::I64(v) => win
-                .timestamps
-                .iter()
-                .copied()
-                .zip(v.iter().map(|&x| x as f64))
-                .collect(),
-            ColumnVec::U64(v) => win
-                .timestamps
-                .iter()
-                .copied()
-                .zip(v.iter().map(|&x| x as f64))
-                .collect(),
-        };
-        if data.is_empty() {
-            return None;
-        }
-        let (cur_t, cur_v) = *data.last().unwrap();
-        Some((data, cur_v, cur_t))
-    }
+        let keys_set: HashSet<&ColumnKey> = keys.iter().collect();
+        self.plot_pipes.retain(|k, _| keys_set.contains(k));
 
-    pub fn get_spectral_density_data(&self) -> FftStatus {
-        let Some(spec) = self.current_selection() else {
-            return FftStatus::WaitingForSelection;
-        };
-        let Some(win) = self.window_aligned.as_ref() else {
-            return FftStatus::WaitingForSamples;
-        };
-        let stream_key = spec.stream_key();
-        let Some(md) = win.segment_metadata.get(&stream_key) else {
-            return FftStatus::WaitingForSamples;
-        };
-        if md.sampling_rate == 0 || md.decimation == 0 {
-            return FftStatus::InvalidSampleRate {
-                sampling_rate: md.sampling_rate,
-                decimation: md.decimation,
-            };
-        }
-        let sampling_hz = md.sampling_rate as f64 / md.decimation as f64;
-        if !sampling_hz.is_finite() || sampling_hz <= 0.0 {
-            return FftStatus::InvalidSampleRate {
-                sampling_rate: md.sampling_rate,
-                decimation: md.decimation,
-            };
-        }
-        let Some(batch) = win.columns.get(&spec) else {
-            return FftStatus::WaitingForSamples;
-        };
-
-        let signal: Vec<f64> = match batch {
-            ColumnVec::F64(v) => v.clone(),
-            ColumnVec::I64(v) => v.iter().map(|&x| x as f64).collect(),
-            ColumnVec::U64(v) => v.iter().map(|&x| x as f64).collect(),
-        };
-
-        if signal.len() < MIN_FFT_SAMPLES {
-            return FftStatus::TooFewSamples {
-                have: signal.len(),
-                need: MIN_FFT_SAMPLES,
-                sampling_hz,
-                window_seconds: self.view.plot_window_seconds,
-            };
-        }
-
-        let (fft_signal, segment_size, hop_size) = latest_complete_welch_signal(&signal);
-
-        let mean_val = fft_signal.iter().sum::<f64>() / fft_signal.len() as f64;
-        let detrended: Vec<f64> = fft_signal.iter().map(|x| x - mean_val).collect();
-
-        let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
-        let sd = welch.periodogram();
-        let pts: Vec<(f64, f64)> = sd
-            .frequency()
-            .into_iter()
-            .zip(sd.iter().copied())
-            .filter_map(|(f, d)| {
-                if f > 0.0 && d.is_finite() && d > 0.0 {
-                    Some((f, d.sqrt()))
-                } else {
-                    None
+        for key in &keys {
+            let window_samples = self.window_samples(buffer, key);
+            let pipe = self.plot_pipes.entry(key.clone()).or_insert_with(|| {
+                DerivedColumn::new(key.clone(), Fpcs::new(1, MAX_PLOT_WINDOW_SECONDS * 1.25))
+            });
+            if let Some(window_samples) = window_samples {
+                let ratio = ((window_samples as f64) / (buckets as f64)).ceil().max(1.0) as usize;
+                if ratio != pipe.op().ratio() {
+                    pipe.op_mut().set_ratio(ratio);
+                    pipe.invalidate();
                 }
-            })
-            .collect();
-
-        if pts.is_empty() {
-            return FftStatus::NoValidFrequencyBins {
-                sample_count: fft_signal.len(),
-                sampling_hz,
-            };
+            }
+            pipe.sync(buffer);
         }
 
-        let mut asd_values: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
-        asd_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_asd = if asd_values.len() % 2 == 0 {
-            (asd_values[asd_values.len() / 2 - 1] + asd_values[asd_values.len() / 2]) / 2.0
-        } else {
-            asd_values[asd_values.len() / 2]
-        };
-
-        FftStatus::Ready(FftReadyData {
-            points: pts,
-            median_asd,
-            sample_count: fft_signal.len(),
-            total_sample_count: signal.len(),
-            sampling_hz,
-            segment_size,
-            hop_size,
-        })
+        for key in keys.into_iter() {
+            let color_idx = self.slot_of(&key);
+            let Some(pipe) = self.plot_pipes.get(&key) else {
+                continue;
+            };
+            let out = pipe.op().output();
+            let start = out.partition_point(|&(t, _)| t < t_start);
+            let end = out.partition_point(|&(t, _)| t <= t_end);
+            if start >= end {
+                continue;
+            }
+            let Some((label, units)) = column_label_units(buffer, &key) else {
+                continue;
+            };
+            self.plot_series.push(PlotSeries {
+                label,
+                units,
+                key,
+                color_idx,
+                points: out[start..end].to_vec(),
+            });
+        }
     }
 
-    pub fn get_focused_channel_info(&self) -> Option<(String, String)> {
-        let spec = self.current_selection()?;
-        let win = self.window_aligned.as_ref()?;
-        let meta = win.column_metadata.get(&spec)?;
-        Some((meta.description.clone(), meta.units.clone()))
-    }
-
-    pub fn tick_blink(&mut self) {
+    fn tick_blink(&mut self) {
         if self.last_blink.elapsed() >= Duration::from_millis(500) {
             self.blink_state = !self.blink_state;
             self.last_blink = Instant::now();
         }
     }
+}
+
+fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
+    buffer.column_window_last_n(key, 1).map(|w| {
+        (
+            w.column_metadata.description.clone(),
+            w.column_metadata.units.clone(),
+        )
+    })
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -965,18 +1204,14 @@ fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
         }
         match app.mode {
             Mode::Command => {
-                let route = app.current_route();
+                let route = app.palette_route();
                 let registry = app.rpc_routes.get(&route).and_then(RouteRpcState::registry);
                 let routes = app.visible_routes();
-                match app
+                let footer_height = app.footer_height;
+                let event = app
                     .palette
-                    .handle_key(k, registry, &route, &routes, app.footer_height)
-                {
-                    PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
-                    PaletteEvent::SelectRoute(r) => Some(Action::SelectRoute(r)),
-                    PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
-                    PaletteEvent::Consumed => None,
-                }
+                    .handle_key(k, registry, &route, &routes, footer_height);
+                palette_event_to_action(event)
             }
             Mode::Normal => match k.code {
                 KeyCode::Char(':') => Some(Action::SetMode(Mode::Command)),
@@ -994,9 +1229,11 @@ fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
                 KeyCode::Home => Some(Action::NavHome),
                 KeyCode::End => Some(Action::NavEnd),
                 KeyCode::Enter => Some(Action::TogglePlot),
+                KeyCode::Char(' ') => Some(Action::TogglePlotSeries),
                 KeyCode::Char('f') => Some(Action::ToggleFft),
                 KeyCode::Char('h') => Some(Action::ToggleFooter),
                 KeyCode::Char('r') => Some(Action::ToggleRoutes),
+                KeyCode::Char('l') => Some(Action::ToggleLegend),
                 KeyCode::Char('=') => Some(Action::AdjustWindow(PLOT_WINDOW_FINE_STEP_SECONDS)),
                 KeyCode::Char('-') => Some(Action::AdjustWindow(-PLOT_WINDOW_FINE_STEP_SECONDS)),
                 KeyCode::Char('+') => Some(Action::AdjustWindow(PLOT_WINDOW_COARSE_STEP_SECONDS)),
@@ -1008,12 +1245,112 @@ fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
                 _ => None,
             },
         }
+    } else if let Event::Mouse(m) = ev {
+        app.last_mouse = Some((m.column, m.row));
+        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) && app.drag.is_some() {
+            return Some(Action::DragEnd);
+        }
+        let over_footer = app.footer_area.contains(Position::new(m.column, m.row));
+        if app.mode == Mode::Command && !over_footer {
+            app.palette.clear_hover();
+        }
+        if app.left_inner.contains(Position::new(m.column, m.row)) {
+            return match m.kind {
+                MouseEventKind::ScrollDown => Some(Action::NavScroll(3)),
+                MouseEventKind::ScrollUp => Some(Action::NavScroll(-3)),
+                MouseEventKind::Down(MouseButton::Left)
+                    if within_row_text(app, m.column, m.row) =>
+                {
+                    match nav_idx_at_row(app, m.row) {
+                        Some(idx) => Some(Action::DragStart(idx, DragOrigin::Column)),
+                        None => device_route_at_row(app, m.row).map(|route| {
+                            // Headers anchor at the device's first nav row so
+                            // a sweep can start from them.
+                            match app.nav_items.iter().position(|p| p.route() == &route) {
+                                Some(idx) => Action::DragStart(idx, DragOrigin::Device(route)),
+                                None => Action::OpenPaletteRoute(route),
+                            }
+                        }),
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => gap_nav_idx_at_row(app, m.row)
+                    .map(|idx| Action::DragStart(idx, DragOrigin::Gap)),
+                MouseEventKind::Drag(MouseButton::Left) if app.drag.is_some() => {
+                    nav_idx_at_row(app, m.row).map(Action::DragTo)
+                }
+                _ => None,
+            };
+        }
+        if app.mode == Mode::Command && over_footer {
+            let route = app.palette_route();
+            let registry = app.rpc_routes.get(&route).and_then(RouteRpcState::registry);
+            let routes = app.visible_routes();
+            let footer_height = app.footer_height;
+            let event = app
+                .palette
+                .handle_mouse(m, registry, &route, &routes, footer_height);
+            return palette_event_to_action(event);
+        }
+        None
     } else {
         None
     }
 }
 
-fn draw_ui(terminal: &mut DefaultTerminal, app: &mut MonitorState) -> Result<(), io::Error> {
+fn palette_event_to_action(event: PaletteEvent) -> Option<Action> {
+    match event {
+        PaletteEvent::Submit(req) => Some(Action::ExecuteRpc(req)),
+        PaletteEvent::SelectRoute(r) => Some(Action::SelectRoute(r)),
+        PaletteEvent::Exit => Some(Action::SetMode(Mode::Normal)),
+        PaletteEvent::Consumed => None,
+    }
+}
+
+/// Left-pane line index at screen row `row`.
+fn line_at_row(app: &MonitorState, row: u16) -> usize {
+    app.view.scroll as usize + row.saturating_sub(app.left_inner.y) as usize
+}
+
+/// Whether `col` falls within the rendered text of the line at `row`.
+fn within_row_text(app: &MonitorState, col: u16, row: u16) -> bool {
+    app.line_widths
+        .get(line_at_row(app, row))
+        .is_some_and(|&w| col < app.left_inner.x + w)
+}
+
+/// Nav index rendered at screen row `row`, if any.
+fn nav_idx_at_row(app: &MonitorState, row: u16) -> Option<usize> {
+    let line = line_at_row(app, row);
+    app.col_map
+        .iter()
+        .find(|(_, &mapped)| mapped == line)
+        .map(|(&nav_idx, _)| nav_idx)
+}
+
+/// Device header rendered at screen row `row`, if any.
+fn device_route_at_row(app: &MonitorState, row: u16) -> Option<DeviceRoute> {
+    app.device_map.get(&line_at_row(app, row)).cloned()
+}
+
+/// A press on the blank separator row after a device block anchors to the
+/// block's last column, mirroring how headers anchor to their first.
+fn gap_nav_idx_at_row(app: &MonitorState, row: u16) -> Option<usize> {
+    let line = line_at_row(app, row);
+    if app.line_widths.get(line).copied() != Some(0) {
+        return None;
+    }
+    let above = line.checked_sub(1)?;
+    app.col_map
+        .iter()
+        .find(|(_, &mapped)| mapped == above)
+        .map(|(&nav_idx, _)| nav_idx)
+}
+
+fn draw_ui(
+    terminal: &mut DefaultTerminal,
+    app: &mut MonitorState,
+    buffer: &Buffer,
+) -> Result<(), io::Error> {
     terminal.draw(|f| {
         let size = f.area();
         let height = size.height;
@@ -1060,7 +1397,7 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut MonitorState) -> Result<(),
         };
 
         if let Some(l) = left {
-            render_monitor_panel(f, app, l, Instant::now());
+            render_monitor_panel(f, app, l, Instant::now(), buffer);
         }
         if let Some(r) = right {
             render_graphics_panel(f, app, r);
@@ -1072,103 +1409,156 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut MonitorState) -> Result<(),
     Ok(())
 }
 
-fn render_monitor_panel(f: &mut Frame, app: &mut MonitorState, area: Rect, now: Instant) {
+fn render_monitor_panel(
+    f: &mut Frame,
+    app: &mut MonitorState,
+    area: Rect,
+    now: Instant,
+    buffer: &Buffer,
+) {
     let inner = Rect {
         x: area.x,
         y: area.y,
         width: area.width.saturating_sub(1),
         height: area.height,
     };
-    let (lines, col_map) = build_left_lines(app, now);
+    let (mut lines, col_map, device_map) = build_left_lines(app, now, buffer);
+    app.left_inner = inner;
+    app.col_map = col_map.clone();
+    app.device_map = device_map;
+    app.line_widths = row_hit_widths(&lines, &col_map);
     let total = lines.len();
     let view_h = inner.height as usize;
 
     if app.view.follow_selection {
         if let Some(&line_idx) = col_map.get(&app.nav.idx) {
-            if view_h > 0 && total > view_h {
-                let cur = app.view.scroll as usize;
-                if line_idx < cur || line_idx >= cur + view_h {
-                    app.view.scroll = line_idx
-                        .saturating_sub(view_h / 2)
-                        .min(total.saturating_sub(view_h))
-                        as u16;
-                }
-            } else {
-                app.view.scroll = 0;
-            }
+            app.view.scroll = follow_scroll(
+                app.view.scroll as usize,
+                line_idx,
+                view_h,
+                total,
+                NAV_MARGIN,
+            ) as u16;
         }
     }
     app.view.scroll = (app.view.scroll as usize).min(total.saturating_sub(view_h)) as u16;
+
+    // Hover tint under the cursor; drags paint their own selection instead.
+    if app.drag.is_none() {
+        let over_inner = |&(c, r): &(u16, u16)| inner.contains(Position::new(c, r));
+        if let Some((mc, mr)) = app.last_mouse.filter(over_inner) {
+            let line = app.view.scroll as usize + (mr - inner.y) as usize;
+            let hoverable = within_row_text(app, mc, mr)
+                && (app.device_map.contains_key(&line)
+                    || app.col_map.values().any(|&mapped| mapped == line));
+            if hoverable {
+                if let Some(l) = lines.get_mut(line) {
+                    *l = std::mem::take(l).bg(Color::DarkGray);
+                }
+            }
+        }
+    }
     f.render_widget(Paragraph::new(lines).scroll((app.view.scroll, 0)), inner);
 
     if total > view_h {
-        let sb_area = Rect {
-            x: area.x + area.width - 1,
-            y: area.y,
-            width: 1,
-            height: area.height,
-        };
-        let track_len = view_h;
-        let thumb_len = (track_len * track_len / total).max(1);
-        let max_thumb_pos = track_len - thumb_len;
-        let scroll_max = total - track_len;
-        let thumb_pos = (app.view.scroll as usize * max_thumb_pos) / scroll_max;
-
-        for i in 0..track_len {
-            let ch = if i >= thumb_pos && i < thumb_pos + thumb_len {
-                "█"
-            } else {
-                "│"
-            };
-            f.render_widget(
-                Paragraph::new(ch).style(Style::default().fg(Color::DarkGray)),
-                Rect {
-                    x: sb_area.x,
-                    y: sb_area.y + i as u16,
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
+        let mut sb_state = ScrollbarState::new(total - view_h + 1)
+            .viewport_content_length(view_h)
+            .position(app.view.scroll as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(Color::DarkGray))
+                .track_style(Style::default().fg(Color::DarkGray)),
+            area,
+            &mut sb_state,
+        );
     }
 }
 
-fn stale_threshold(batch: &SampleBatch) -> Duration {
-    let rate = batch.segment.sampling_rate as f64 / batch.segment.decimation.max(1) as f64;
+fn stale_threshold(segment: &SegmentMetadata) -> Duration {
+    let rate = segment.sampling_rate as f64 / segment.decimation.max(1) as f64;
     let period_ms = if rate > 0.0 { 1000.0 / rate } else { 0.0 };
-    // floor of 1200
     Duration::from_millis((period_ms * 2.0).max(1200.0) as u64)
+}
+
+fn stream_color(name: &str) -> Color {
+    use std::hash::{Hash, Hasher};
+    const PALETTE: [Color; 10] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+    ];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    PALETTE[(hasher.finish() % PALETTE.len() as u64) as usize]
+}
+
+/// Hit width per left-pane line: text rows extend to the widest column row
+/// (or their own text if longer); blank separators stay zero-width.
+fn row_hit_widths(lines: &[Line], col_map: &HashMap<usize, usize>) -> Vec<u16> {
+    let table_w = col_map
+        .values()
+        .filter_map(|&l| lines.get(l))
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| match l.width() as u16 {
+            0 => 0,
+            w => w.max(table_w),
+        })
+        .collect()
 }
 
 fn build_left_lines(
     app: &mut MonitorState,
     now: Instant,
-) -> (Vec<Line<'static>>, HashMap<usize, usize>) {
+    buffer: &Buffer,
+) -> (
+    Vec<Line<'static>>,
+    HashMap<usize, usize>,
+    HashMap<usize, DeviceRoute>,
+) {
     let mut lines = Vec::new();
     let mut map = HashMap::new();
+    let mut device_map = HashMap::new();
 
     let routes = app.visible_routes();
 
     if routes.is_empty() {
         lines.push(Line::from("Waiting for data..."));
-        return (lines, map);
+        return (lines, map, device_map);
     }
 
+    let latest: HashMap<StreamKey, LatestRow> = buffer
+        .stream_keys()
+        .filter_map(|k| buffer.latest_row(k).map(|row| (k.clone(), row)))
+        .collect();
+
     let mut global_idx = 0;
-    app.view.desc_width = app
-        .last
+    app.view.desc_width = latest
         .values()
-        .flat_map(|(s, _)| s.columns.iter())
-        .map(|c| c.metadata.description.len())
+        .flat_map(|row| row.columns.iter())
+        .map(|(metadata, _)| metadata.description.len())
         .max()
         .unwrap_or(0);
-    app.view.units_width = app
-        .last
+    app.view.units_width = latest
         .values()
-        .flat_map(|(s, _)| s.columns.iter())
-        .map(|c| c.metadata.units.len())
+        .flat_map(|row| row.columns.iter())
+        .map(|(metadata, _)| metadata.units.len())
         .max()
         .unwrap_or(0);
+
+    let selected_stream = app.current_selection();
 
     for (dev_idx, route) in routes.iter().enumerate() {
         let dev = app.device_metadata.get(route).map(|m| m.device.as_ref());
@@ -1178,7 +1568,12 @@ fn build_left_lines(
             .map(|s| s.is_alive(Duration::from_millis(300)))
             .unwrap_or(false);
 
-        let head_style = if dev_idx == app.current_device_index() {
+        let is_selected_header = if app.mode == Mode::Command {
+            *route == app.palette_route()
+        } else {
+            dev_idx == app.current_device_index()
+        };
+        let head_style = if is_selected_header {
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -1212,10 +1607,10 @@ fn build_left_lines(
             header_spans.push(Span::raw(format!(" [{}]", route)));
         }
 
+        device_map.insert(lines.len(), route.clone());
         lines.push(Line::from(header_spans));
 
-        let mut stream_ids: Vec<_> = app
-            .last
+        let mut stream_ids: Vec<_> = latest
             .keys()
             .filter(|k| &k.route == route)
             .map(|k| k.stream_id)
@@ -1233,36 +1628,45 @@ fn build_left_lines(
         }
 
         for sid in stream_ids {
-            let key = StreamKey::new(*route, sid);
-            if let Some((batch, seen)) = app.last.get(&key) {
-                let is_stale = now.saturating_duration_since(*seen) > stale_threshold(batch);
-                let last_row = batch.len().saturating_sub(1);
-                for col in &batch.columns {
+            let key = StreamKey::new(route.clone(), sid);
+            let is_current_stream = selected_stream
+                .as_ref()
+                .is_some_and(|s| s.route == *route && s.stream_id == sid);
+            if let Some(row) = latest.get(&key) {
+                let is_stale =
+                    now.saturating_duration_since(row.last_seen) > stale_threshold(&row.segment);
+                for (col_idx, (metadata, value)) in row.columns.iter().enumerate() {
                     let nav_idx = global_idx;
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
 
-                    let is_sel = app.nav.idx == nav_idx;
-                    let ctx = StyleContext::new()
-                        .stale(is_stale)
-                        .selected(is_sel)
-                        .plot_mode(app.view.show_plot);
-
-                    let label_style = ctx.resolve();
-                    let (val_str, val_f64) = fmt_value(&col.values.get(last_row));
+                    let is_sel = match &app.drag {
+                        Some(drag) if drag.moved => {
+                            let (lo, hi) = drag.range();
+                            (lo..=hi).contains(&nav_idx)
+                        }
+                        _ => app.nav.idx == nav_idx,
+                    };
+                    let plot_slot = app.plot_slots.get(&ColumnKey {
+                        route: route.clone(),
+                        stream_id: sid,
+                        column_id: col_idx,
+                    });
+                    let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
+                    let (val_str, val_f64) = fmt_value(value);
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(&batch.stream.name, &col.metadata.name, val_f64)
+                        .get_value_color(&row.stream.name, &metadata.name, val_f64)
                         .unwrap_or(Color::Reset);
-                    let val_style = ctx.color(val_col).resolve();
+                    let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
-                    let mut desc = col.metadata.description.clone();
+                    let mut desc = metadata.description.clone();
                     if desc.len() < app.view.desc_width {
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
-                    let units = col.metadata.units.clone();
+                    let units = metadata.units.clone();
                     let padded_units = if app.view.units_width > 0 && !units.is_empty() {
                         format!("{:>width$}", units, width = app.view.units_width)
                     } else if app.view.units_width > 0 {
@@ -1271,7 +1675,20 @@ fn build_left_lines(
                         String::new()
                     };
 
+                    let (pipe_glyph, pipe_style) = if is_current_stream {
+                        ("┃ ", Style::default().fg(stream_color(&row.stream.name)))
+                    } else {
+                        ("│ ", Style::default().fg(Color::DarkGray))
+                    };
+
+                    let plot_marker = match plot_slot {
+                        Some(&slot) => Span::styled("▆", Style::default().fg(series_color(slot))),
+                        None => Span::raw(" "),
+                    };
+
                     lines.push(Line::from(vec![
+                        plot_marker,
+                        Span::styled(pipe_glyph, pipe_style),
                         Span::styled(desc, label_style),
                         Span::raw("  "),
                         Span::styled(val_str, val_style),
@@ -1283,13 +1700,14 @@ fn build_left_lines(
         }
         lines.push(Line::from(""));
     }
-    (lines, map)
+    (lines, map, device_map)
 }
 
 fn render_footer(f: &mut Frame, app: &mut MonitorState, area: Rect) {
-    app.footer_height = area.height; // how many lines the footer has to work with
+    app.footer_height = area.height;
+    app.footer_area = area;
     if app.mode == Mode::Command {
-        let route = app.current_route();
+        let route = app.palette_route();
         let status = app.rpc_palette_status(&route);
         let registry = app.rpc_routes.get(&route).and_then(RouteRpcState::registry);
         app.palette
@@ -1349,12 +1767,16 @@ fn render_footer(f: &mut Frame, app: &mut MonitorState, area: Rect) {
         ),
         key_span("Enter"),
         Span::raw(" Plot  "),
+        key_span("Space"),
+        Span::raw(" Pin Series  "),
         key_span("f"),
         Span::raw(" FFT  "),
         key_span("h"),
         Span::raw(" Footer  "),
         key_span("r"),
-        Span::raw(" Routes "),
+        Span::raw(" Routes  "),
+        key_span("l"),
+        Span::raw(" Legend "),
         key_span(":"),
         Span::raw(" Cmd"),
     ]);
@@ -1440,228 +1862,286 @@ fn key_sep() -> Span<'static> {
     Span::raw(" ")
 }
 
-fn latest_complete_welch_signal(signal: &[f64]) -> (&[f64], usize, usize) {
-    let denominator =
-        WELCH_DEFAULT_SEGMENTS as f64 * (1.0 - WELCH_DEFAULT_OVERLAP) + WELCH_DEFAULT_OVERLAP;
-    let default_segment_size = (signal.len() as f64 / denominator).trunc().max(1.0) as usize;
-
-    if default_segment_size.next_power_of_two() <= WELCH_DFT_MAX_SIZE {
-        let hop_size = default_segment_size
-            - (default_segment_size as f64 * WELCH_DEFAULT_OVERLAP).round() as usize;
-        return (signal, default_segment_size, hop_size.max(1));
+fn render_graphics_panel(f: &mut Frame, app: &MonitorState, area: Rect) {
+    if !app.view.show_fft {
+        render_plot_series(f, app, area);
+        return;
     }
-
-    let segment_size = WELCH_DFT_MAX_SIZE;
-    let hop_size = segment_size - (segment_size as f64 * WELCH_DEFAULT_OVERLAP).round() as usize;
-    let segment_count = (signal.len() - segment_size) / hop_size + 1;
-    let used_len = (segment_count - 1) * hop_size + segment_size;
-
-    (
-        &signal[signal.len() - used_len..],
-        segment_size,
-        hop_size.max(1),
-    )
+    if app.fft_series.is_empty() {
+        render_fft_status(f, &app.fft_status, area);
+    } else {
+        render_fft_series(f, app, area);
+    }
 }
 
-fn render_graphics_panel(f: &mut Frame, app: &MonitorState, area: Rect) {
-    if let (Some(pos), Some((desc, units))) = (app.current_pos(), app.get_focused_channel_info()) {
-        let route = pos.route();
-        if app.view.show_fft {
-            match app.get_spectral_density_data() {
-                FftStatus::Ready(sd) => {
-                    let title = format!(
-                        "{} — {} ({:.1}s, FFT {} of {} samples, seg {}, hop {}) | Median ASD: {:.3e} {}/√Hz",
-                        route,
-                        desc,
-                        app.view.plot_window_seconds,
-                        sd.sample_count,
-                        sd.total_sample_count,
-                        sd.segment_size,
-                        sd.hop_size,
-                        sd.median_asd,
-                        units
-                    );
-                    let block = Block::default().title(title).borders(Borders::ALL);
-
-                    if !sd.points.is_empty() {
-                        let log_data: Vec<(f64, f64)> = sd
-                            .points
-                            .iter()
-                            .map(|(freq, val)| (freq.log10(), val.log10()))
-                            .collect();
-
-                        let min_f = log_data.first().map(|(f, _)| *f).unwrap_or(0.0);
-                        let max_f = log_data.last().map(|(f, _)| *f).unwrap_or(1.0);
-                        let ds: Vec<f64> = log_data.iter().map(|(_, d)| *d).collect();
-                        let min_d = ds.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                        let max_d = ds.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-
-                        let y_pad = if (max_d - min_d) > 0.1 {
-                            (max_d - min_d) * 0.1
-                        } else {
-                            0.5
-                        };
-
-                        let dataset = Dataset::default()
-                            .name(desc.as_str())
-                            .marker(symbols::Marker::Braille)
-                            .style(Style::default().fg(Color::Cyan))
-                            .graph_type(GraphType::Line)
-                            .data(&log_data);
-
-                        let chart = Chart::new(vec![dataset])
-                            .block(block)
-                            .x_axis(
-                                Axis::default()
-                                    .title("Freq [Hz] (log)")
-                                    .bounds([min_f, max_f])
-                                    .labels(generate_log_labels(
-                                        min_f,
-                                        max_f,
-                                        5,
-                                        app.view.axis_precision,
-                                    )),
-                            )
-                            .y_axis(
-                                Axis::default()
-                                    .title(format!("Val [{}/√Hz]", units))
-                                    .bounds([min_d - y_pad, max_d + y_pad])
-                                    .labels(generate_log_labels(
-                                        min_d - y_pad,
-                                        max_d + y_pad,
-                                        5,
-                                        app.view.axis_precision,
-                                    )),
-                            );
-                        f.render_widget(chart, area);
-                    } else {
-                        f.render_widget(Paragraph::new("No valid FFT data").block(block), area);
-                    }
-                }
-                FftStatus::TooFewSamples {
-                    have,
-                    need,
-                    sampling_hz,
-                    window_seconds,
-                } => {
-                    let block = Block::default()
-                        .title(format!("FFT unavailable - {} samples needed", need))
-                        .borders(Borders::ALL);
-                    let message = format!(
-                        "Current FFT buffer has {} of {} samples. At {:.3} Hz, current window is {:.1}s.",
-                        have, need, sampling_hz, window_seconds
-                    );
-                    f.render_widget(Paragraph::new(message).block(block), area);
-                }
-                FftStatus::InvalidSampleRate {
-                    sampling_rate,
-                    decimation,
-                } => {
-                    let block = Block::default()
-                        .title("FFT unavailable - invalid sample rate")
-                        .borders(Borders::ALL);
-                    let message = format!(
-                        "Stream metadata reports sampling_rate={} and decimation={}.",
-                        sampling_rate, decimation
-                    );
-                    f.render_widget(Paragraph::new(message).block(block), area);
-                }
-                FftStatus::NoValidFrequencyBins {
-                    sample_count,
-                    sampling_hz,
-                } => {
-                    let block = Block::default()
-                        .title("FFT unavailable - no valid frequency bins")
-                        .borders(Borders::ALL);
-                    let message = format!(
-                        "Welch produced no positive finite bins from {} samples at {:.3} Hz.",
-                        sample_count, sampling_hz
-                    );
-                    f.render_widget(Paragraph::new(message).block(block), area);
-                }
-                FftStatus::WaitingForSelection => {
-                    let block = Block::default()
-                        .title("FFT unavailable - no channel selected")
-                        .borders(Borders::ALL);
-                    f.render_widget(
-                        Paragraph::new("Select a stream column to plot FFT.").block(block),
-                        area,
-                    );
-                }
-                FftStatus::WaitingForSamples => {
-                    let block = Block::default()
-                        .title("Buffering FFT...")
-                        .borders(Borders::ALL);
-                    f.render_widget(
-                        Paragraph::new("Waiting for samples in the selected window.").block(block),
-                        area,
-                    );
-                }
-            }
-        } else {
-            let title = format!(
-                "{} — {} ({:.1}s)",
-                route, desc, app.view.plot_window_seconds
-            );
-            let block = Block::default().title(title).borders(Borders::ALL);
-
-            if let Some((data, _, _)) = app.get_plot_data() {
-                let min_t = data.first().map(|(t, _)| *t).unwrap_or(0.0);
-                let max_t = data.last().map(|(t, _)| *t).unwrap_or(1.0);
-                let vs: Vec<f64> = data.iter().map(|(_, v)| *v).collect();
-                let min_v = vs.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                let max_v = vs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-
-                let pad = if (max_v - min_v).abs() > 1e-10 {
-                    (max_v - min_v) * 0.4
-                } else {
-                    1.0
-                };
-
-                let dataset = Dataset::default()
-                    .name(desc.as_str())
-                    .marker(symbols::Marker::Braille)
-                    .style(Style::default().fg(Color::Green))
-                    .graph_type(GraphType::Line)
-                    .data(&data);
-
-                let chart = Chart::new(vec![dataset])
-                    .block(block)
-                    .x_axis(
-                        Axis::default()
-                            .title("Time [s]")
-                            .bounds([min_t, max_t])
-                            .labels(generate_linear_labels(
-                                min_t,
-                                max_t,
-                                3,
-                                app.view.axis_precision,
-                            )),
-                    )
-                    .y_axis(
-                        Axis::default()
-                            .title(format!("Value [{}]", units))
-                            .bounds([min_v - pad, max_v + pad])
-                            .labels(generate_linear_labels(
-                                min_v - pad,
-                                max_v + pad,
-                                5,
-                                app.view.axis_precision,
-                            )),
-                    );
-                f.render_widget(chart, area);
-            } else {
-                f.render_widget(Paragraph::new("Buffering...").block(block), area);
-            }
-        }
-    } else {
-        f.render_widget(
-            Block::default()
-                .title("Channel Detail")
-                .borders(Borders::ALL),
-            area,
-        );
+fn shared_units<'a>(mut units: impl Iterator<Item = &'a str>) -> String {
+    match units.next() {
+        Some(first) if units.all(|u| u == first) => first.to_string(),
+        Some(_) => "mixed".to_string(),
+        None => String::new(),
     }
+}
+
+fn series_legend_name(show_routes: bool, label: &str, route: &DeviceRoute) -> String {
+    if show_routes {
+        format!("{} [{}]", label, route)
+    } else {
+        label.to_string()
+    }
+}
+
+fn series_dataset<'a>(
+    label: &str,
+    route: &DeviceRoute,
+    show_routes: bool,
+    color_idx: usize,
+    data: &'a [(f64, f64)],
+) -> Dataset<'a> {
+    Dataset::default()
+        .name(series_legend_name(show_routes, label, route))
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(series_color(color_idx)))
+        .graph_type(GraphType::Line)
+        .data(data)
+}
+
+fn bounds_union<'a>(points: impl Iterator<Item = &'a (f64, f64)>) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(x, y) in points {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
+fn render_fft_series(f: &mut Frame, app: &MonitorState, area: Rect) {
+    let secs = app.view.plot_window_seconds;
+    let series = &app.fft_series;
+
+    let units = shared_units(series.iter().map(|s| s.units.as_str()));
+
+    let title = if series.len() == 1 {
+        let s = &series[0];
+        format!(
+            "{} — {} ({:.1}s, FFT {} of {} samples, seg {}, hop {}) | Median ASD: {:.3e} {}/√Hz",
+            s.key.route,
+            s.label,
+            secs,
+            s.data.sample_count,
+            s.data.total_sample_count,
+            s.data.segment_size,
+            s.data.hop_size,
+            s.data.median_asd,
+            units,
+        )
+    } else {
+        format!(
+            "{} channels FFT ({:.1}s) [{}/√Hz]",
+            series.len(),
+            secs,
+            units
+        )
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+
+    let log_series: Vec<Vec<(f64, f64)>> = series
+        .iter()
+        .map(|s| {
+            s.data
+                .points
+                .iter()
+                .map(|(freq, val)| (freq.log10(), val.log10()))
+                .collect()
+        })
+        .collect();
+    let (min_f, max_f, min_d, max_d) = bounds_union(log_series.iter().flatten());
+
+    if !(min_f.is_finite() && max_f.is_finite() && min_d.is_finite() && max_d.is_finite()) {
+        f.render_widget(Paragraph::new("No valid FFT data").block(block), area);
+        return;
+    }
+
+    let y_pad = if (max_d - min_d) > 0.1 {
+        (max_d - min_d) * 0.1
+    } else {
+        0.5
+    };
+
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .zip(log_series.iter())
+        .map(|(s, data)| {
+            series_dataset(
+                &s.label,
+                &s.key.route,
+                app.view.show_routes,
+                s.color_idx,
+                data,
+            )
+        })
+        .collect();
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .hidden_legend_constraints(LEGEND_CONSTRAINTS)
+        .legend_position(app.view.show_legend.then_some(LegendPosition::default()))
+        .x_axis(
+            Axis::default()
+                .title("Freq [Hz] (log)")
+                .bounds([min_f, max_f])
+                .labels(generate_log_labels(
+                    min_f,
+                    max_f,
+                    5,
+                    app.view.axis_precision,
+                )),
+        )
+        .y_axis(
+            Axis::default()
+                .title(format!("Val [{}/√Hz]", units))
+                .bounds([min_d - y_pad, max_d + y_pad])
+                .labels(generate_log_labels(
+                    min_d - y_pad,
+                    max_d + y_pad,
+                    5,
+                    app.view.axis_precision,
+                )),
+        );
+    f.render_widget(chart, area);
+}
+
+fn render_fft_status(f: &mut Frame, status: &FftStatus, area: Rect) {
+    let (title, message) = match status {
+        FftStatus::WaitingForSamples => (
+            "Buffering FFT...".to_string(),
+            "Waiting for samples in the selected window.".to_string(),
+        ),
+        FftStatus::TooFewSamples {
+            have,
+            need,
+            sampling_hz,
+            window_seconds,
+        } => (
+            format!("FFT unavailable - {} samples needed", need),
+            format!(
+                "Current FFT buffer has {} of {} samples. At {:.3} Hz, current window is {:.1}s.",
+                have, need, sampling_hz, window_seconds
+            ),
+        ),
+        FftStatus::InvalidSampleRate {
+            sampling_rate,
+            decimation,
+        } => (
+            "FFT unavailable - invalid sample rate".to_string(),
+            format!(
+                "Stream metadata reports sampling_rate={} and decimation={}.",
+                sampling_rate, decimation
+            ),
+        ),
+        FftStatus::NoValidFrequencyBins {
+            sample_count,
+            sampling_hz,
+        } => (
+            "FFT unavailable - no valid frequency bins".to_string(),
+            format!(
+                "Welch produced no positive finite bins from {} samples at {:.3} Hz.",
+                sample_count, sampling_hz
+            ),
+        ),
+        FftStatus::WaitingForSelection => (
+            "FFT unavailable - no channel selected".to_string(),
+            "Select a stream column to plot FFT.".to_string(),
+        ),
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+    f.render_widget(Paragraph::new(message).block(block), area);
+}
+
+fn render_plot_series(f: &mut Frame, app: &MonitorState, area: Rect) {
+    let secs = app.view.plot_window_seconds;
+    let series: Vec<&PlotSeries> = app
+        .plot_series
+        .iter()
+        .filter(|s| !s.points.is_empty())
+        .collect();
+
+    if series.is_empty() {
+        let block = Block::default()
+            .title(format!("Plot ({:.1}s)", secs))
+            .borders(Borders::ALL);
+        f.render_widget(Paragraph::new("Buffering...").block(block), area);
+        return;
+    }
+
+    let (min_t, max_t, min_v, max_v) = bounds_union(series.iter().flat_map(|s| s.points.iter()));
+    let (min_t, max_t) = match app.plot_x_bounds {
+        Some([a, b]) if a.is_finite() && b.is_finite() && a < b => (a, b),
+        _ if min_t.is_finite() && max_t.is_finite() && min_t < max_t => (min_t, max_t),
+        _ => (0.0, 1.0),
+    };
+    let pad = if (max_v - min_v).abs() > 1e-10 {
+        (max_v - min_v) * 0.4
+    } else {
+        1.0
+    };
+
+    let units = shared_units(series.iter().map(|s| s.units.as_str()));
+
+    let title = if series.len() == 1 {
+        format!(
+            "{} — {} ({:.1}s)",
+            series[0].key.route, series[0].label, secs
+        )
+    } else {
+        format!("{} channels ({:.1}s)", series.len(), secs)
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .map(|s| {
+            series_dataset(
+                &s.label,
+                &s.key.route,
+                app.view.show_routes,
+                s.color_idx,
+                &s.points,
+            )
+        })
+        .collect();
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .hidden_legend_constraints(LEGEND_CONSTRAINTS)
+        .legend_position(app.view.show_legend.then_some(LegendPosition::default()))
+        .x_axis(
+            Axis::default()
+                .title("Time [s]")
+                .bounds([min_t, max_t])
+                .labels(generate_linear_labels(
+                    min_t,
+                    max_t,
+                    3,
+                    app.view.axis_precision,
+                )),
+        )
+        .y_axis(
+            Axis::default()
+                .title(format!("Value [{}]", units))
+                .bounds([min_v - pad, max_v + pad])
+                .labels(generate_linear_labels(
+                    min_v - pad,
+                    max_v + pad,
+                    5,
+                    app.view.axis_precision,
+                )),
+        );
+    f.render_widget(chart, area);
 }
 
 fn generate_linear_labels(
@@ -1693,7 +2173,7 @@ fn generate_log_labels(
     }
     let step = (max_log - min_log) / ((count - 1) as f64);
     let max_val = 10f64.powf(max_log.max(min_log)).abs();
-    let use_scientific = max_val < 0.01 || max_val >= 1000.0;
+    let use_scientific = !(0.01..1000.0).contains(&max_val);
 
     (0..count)
         .map(|i| {
@@ -1712,7 +2192,7 @@ fn generate_log_labels(
 
 fn fmt_value(v: &ColumnData) -> (String, f64) {
     match v {
-        ColumnData::Float(x) => (format!("{:15.4}", x), *x as f64),
+        ColumnData::Float(x) => (format!("{:15.4}", x), *x),
         ColumnData::Int(x) => (format!("{:15}", x), *x as f64),
         ColumnData::UInt(x) => (format!("{:15}", x), *x as f64),
         _ => ("           type?".to_string(), f64::NAN),
@@ -1761,19 +2241,18 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     } = config;
 
     let proxy = tio::proxy::Interface::new(&tio.root);
-    let parent_route: DeviceRoute = tio.route;
+    let parent_route: DeviceRoute = tio.route.clone();
 
-    let tree = DeviceTree::open(&proxy, parent_route)
+    let tree = DeviceTree::open(&proxy, parent_route.clone())
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
         .with_proxy_help()?;
     let data_rx = spawn_tree_worker(tree);
 
-    let rpc_client = RpcClient::open(&proxy, parent_route)
+    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
         .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))
         .with_proxy_help()?;
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
 
-    // Key thread
     let (key_tx, key_rx) = channel::unbounded();
     std::thread::spawn(move || loop {
         if let Ok(ev) = event::read() {
@@ -1783,21 +2262,17 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
         }
     });
 
-    // Runtime state: subtree visible by default; limit with --depth.
     let mut app = MonitorState::new(depth, &parent_route);
     if let Some(path) = &colors {
-        if let Ok(theme) = load_theme(path) {
-            app.view.theme = theme;
-        } else {
-            eprintln!("Failed to load theme");
-        }
+        app.view.theme =
+            load_theme(path).wrap_err_with(|| format!("could not load theme file {}", path))?;
     }
 
     let mut buffer = Buffer::new(MONITOR_BUFFER_CAPACITY_SAMPLES);
 
-    // UI
     let mut term = ratatui::init();
     let _ = term.hide_cursor();
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let ui_tick = channel::tick(Duration::from_millis(1000 / fps as u64));
     let mut stream_error = None;
 
@@ -1853,17 +2328,19 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
             }
 
             recv(ui_tick) -> _ => {
-                app.update_plot_window(&buffer);
-                app.rebuild_nav_items();
+                let term_width = term.size().map(|s| s.width).unwrap_or(200);
+                app.update_plot_window(&buffer, term_width);
+                app.rebuild_nav_items(&buffer);
                 app.tick_blink();
 
-                if draw_ui(&mut term, &mut app).is_err() {
+                if draw_ui(&mut term, &mut app, &buffer).is_err() {
                     break 'main;
                 }
             }
         }
     }
 
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     if let Some(e) = stream_error {
         use color_eyre::Help;
