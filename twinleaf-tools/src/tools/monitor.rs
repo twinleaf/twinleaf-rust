@@ -28,8 +28,8 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{
-        AlignedWindow, Buffer, ColumnData, ColumnKey, ColumnVec, DeviceFullMetadata, SampleBatch,
-        StreamKey,
+        AlignedWindow, Buffer, ColumnData, ColumnKey, ColumnVec, DeviceMetadataSnapshot,
+        SampleBatch, StreamKey,
     },
     device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
     tio::{self, proto::ProxyStatus},
@@ -470,7 +470,7 @@ pub struct MonitorState {
     pub discovered_routes: HashSet<DeviceRoute>,
     pub device_status: HashMap<DeviceRoute, DeviceStatus>,
     pub last: BTreeMap<StreamKey, (SampleBatch, Instant)>,
-    pub device_metadata: HashMap<DeviceRoute, DeviceFullMetadata>,
+    pub device_metadata: HashMap<DeviceRoute, DeviceMetadataSnapshot>,
     pub window_aligned: Option<AlignedWindow>,
 
     pub footer_height: u16,

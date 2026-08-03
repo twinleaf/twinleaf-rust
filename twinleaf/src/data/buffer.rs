@@ -1,4 +1,4 @@
-use crate::data::{ColumnData, CursorPosition, SampleBatch};
+use crate::data::{ColumnData, SampleBatch};
 use crate::tio::proto::identifiers::*;
 use crate::tio::proto::meta::MetadataEpoch;
 use crate::tio::proto::{BufferType, ColumnMetadata, DeviceRoute, SegmentMetadata, StreamMetadata};
@@ -9,6 +9,17 @@ use std::{
 };
 
 pub type RunId = u64;
+
+/// A caller-held bookmark into a single stream's run: the run it was read
+/// from, plus the last sample number consumed. Reads keyed on a stale
+/// `run_id` (a new run started) or a `last_sample_number` that has aged out
+/// of the ring both surface as [`ReadError::CursorInvalidated`] /
+/// [`ReadError::CursorOutOfBuffer`], never a silent gap or replay.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorPosition {
+    pub run_id: RunId,
+    pub last_sample_number: SampleNumber,
+}
 
 #[derive(Debug, Clone)]
 pub enum ColumnVec {
@@ -22,10 +33,15 @@ impl ColumnVec {
     /// one place the `data_type -> buffer_type -> variant` choice lives on the
     /// write path, mirroring [`ColumnBuffer::new`].
     pub fn empty_for(bt: BufferType) -> Self {
+        Self::with_capacity_for(bt, 0)
+    }
+
+    /// Empty vec of the selected variant with room for `capacity` decoded values.
+    pub fn with_capacity_for(bt: BufferType, capacity: usize) -> Self {
         match bt {
-            BufferType::Float => Self::F64(Vec::new()),
-            BufferType::Int => Self::I64(Vec::new()),
-            BufferType::UInt => Self::U64(Vec::new()),
+            BufferType::Float => Self::F64(Vec::with_capacity(capacity)),
+            BufferType::Int => Self::I64(Vec::with_capacity(capacity)),
+            BufferType::UInt => Self::U64(Vec::with_capacity(capacity)),
         }
     }
 
@@ -569,6 +585,75 @@ impl Buffer {
             values,
             column_metadata: col_buf.metadata().clone(),
         })
+    }
+
+    /// Borrowing read of a single column's samples strictly after `after`
+    /// within run `run_id`, for driving incremental consumers (see
+    /// [`crate::data::DerivedColumn`]). Returns borrows into the ring (no
+    /// copy); reduce before the borrow ends.
+    ///
+    /// `Ok(None)` means the cursor is caught up: no samples past `after` have
+    /// arrived yet. The two error cases are distinguished so a caller can
+    /// tell a run restart from stale retention apart:
+    /// - [`ReadError::NoActiveRun`]: the stream has no active run (or the
+    ///   buffer holds no streams at all).
+    /// - [`ReadError::CursorInvalidated`]: the stream's active run is not
+    ///   `run_id` (it restarted since the cursor was taken).
+    /// - [`ReadError::ColumnNotFound`]: the run exists but this column has
+    ///   never been seen on it.
+    /// - [`ReadError::CursorOutOfBuffer`]: `after` is not in the run's
+    ///   sample-number sequence, i.e. it has aged out of the ring (or is
+    ///   otherwise not a sample this run ever produced).
+    pub fn column_window_after(
+        &self,
+        col: &ColumnKey,
+        run_id: RunId,
+        after: SampleNumber,
+    ) -> Result<Option<ColumnWindow<'_>>, ReadError> {
+        let stream_key = col.stream_key();
+        let run = self
+            .active_runs
+            .get(&stream_key)
+            .ok_or(ReadError::NoActiveRun {
+                stream_key: stream_key.clone(),
+            })?;
+        if run.run_id != run_id {
+            return Err(ReadError::CursorInvalidated {
+                stream_key,
+                cursor_run: run_id,
+                current_run: run.run_id,
+            });
+        }
+        let buf = &run.buffer;
+        let col_buf = buf
+            .columns
+            .get(&col.column_id)
+            .ok_or(ReadError::ColumnNotFound {
+                stream_key: stream_key.clone(),
+                column_id: col.column_id,
+            })?;
+        let Some(start) = buf.find_start_after_sample(after) else {
+            let earliest_available = buf.sample_numbers.front().copied().unwrap_or(after);
+            return Err(ReadError::CursorOutOfBuffer {
+                stream_key,
+                cursor_sample: after,
+                earliest_available,
+            });
+        };
+        let count = buf.len() - start;
+        if count == 0 {
+            return Ok(None);
+        }
+        let (ta, tb) = buf.timestamps.as_slices();
+        let timestamps = clip(ta, tb, start, count);
+        let values = col_buf.view(start, count);
+        Ok(Some(ColumnWindow {
+            run_id: run.run_id,
+            effective_rate: run.effective_rate,
+            timestamps,
+            values,
+            column_metadata: col_buf.metadata().clone(),
+        }))
     }
 
     pub fn read_aligned_window(

@@ -1,679 +1,263 @@
-use super::sample::{Boundary, BoundaryReason, ColumnData, PriorState, SampleBatch, Series};
+//! Incremental conversion from routed TIO packets to columnar sample batches.
+//!
+//! [`PacketParser`] applies packets in arrival order. Shared metadata and
+//! continuity state validates each stream payload, after which this module
+//! decodes its rows and accumulates them into [`SampleBatch`] values.
+//!
+//! Stream data can arrive before its metadata. Such packets produce no rows;
+//! [`PacketParser::take_requests`] returns the metadata RPCs needed to decode
+//! subsequent packets.
+
+use super::sample::{ColumnData, SampleBatch, Series};
+use super::state::{DeviceMetadataSnapshot, PacketEvent, ParseState, ValidatedRows};
 use crate::data::ColumnVec;
-use crate::tio;
-use proto::identifiers::ColumnId;
-use proto::meta::MetadataType;
+use crate::tio::{self, proto};
+use proto::identifiers::StreamKey;
 use proto::DeviceRoute;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tio::proto::meta::{
-    ColumnMetadata, DeviceMetadata, MetadataContent, SegmentMetadata, StreamMetadata,
-};
-use tio::{proto, util};
 
-static TL_STREAMRPC_MAX_META: usize = 16;
-const META_RPC_ID: u16 = 7855;
-
-#[derive(Debug, Clone)]
-struct StreamRpcMetaReq {
-    mtype: MetadataType,
-    stream_id: u8,
-    index: u8,
-}
-
-impl StreamRpcMetaReq {
-    pub fn device() -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Device,
-            stream_id: 0,
-            index: 0,
-        }
-    }
-    pub fn stream(id: u8) -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Stream,
-            stream_id: id,
-            index: 0,
-        }
-    }
-    pub fn segment(index: u8, stream_id: u8) -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Segment,
-            stream_id: stream_id,
-            index: index,
-        }
-    }
-    pub fn column(index: u8, stream_id: u8) -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Column,
-            stream_id: stream_id,
-            index: index,
-        }
-    }
-}
-
-fn make_metareq(reqs: Vec<StreamRpcMetaReq>) -> Vec<u8> {
-    let mut ret = vec![];
-    if reqs.len() > TL_STREAMRPC_MAX_META {
-        panic!("too many requests")
-    }
-    for req in reqs {
-        ret.push(req.mtype.clone().into());
-        ret.push(req.stream_id);
-        ret.push(req.index);
-    }
-    ret
-}
-
-// Convert a number of metadata requests to RPC request packets.
-fn metareqs_to_rpcs(metareqs: &Vec<StreamRpcMetaReq>) -> Vec<tio::Packet> {
-    let mut ret = vec![];
-    let mut reqs = &metareqs[..];
-    loop {
-        if reqs.len() == 0 {
-            break;
-        }
-        let n_reqs = if reqs.len() > TL_STREAMRPC_MAX_META {
-            TL_STREAMRPC_MAX_META
-        } else if reqs.len() == 1 {
-            // If we don't know anything about the device, send zero
-            // arguments to get an automatic reply fitting as many things
-            // as possible at the beginning, to bootstrap the process
-            // more efficiently
-            if let MetadataType::Device = reqs[0].mtype {
-                reqs = &reqs[1..];
-                0
-            } else {
-                1
-            }
-        } else {
-            reqs.len()
-        };
-        ret.push(util::PacketBuilder::make_rpc_request(
-            "dev.metadata",
-            &make_metareq((&reqs[0..n_reqs]).to_vec()),
-            META_RPC_ID,
-            DeviceRoute::root(),
-        ));
-        reqs = &reqs[n_reqs..];
-    }
-    ret
-}
-
-fn parse_metarep(rep: Vec<u8>) -> Vec<tio::proto::meta::MetadataContent> {
-    use tio::proto::meta;
-    let mut ret = vec![];
-    let mut offset: usize = 0;
-    while (offset + 2) <= rep.len() {
-        let mtype = MetadataType::from(rep[offset]);
-        let varlen = usize::from(rep[offset + 1]);
-        let metadata = &rep[offset + 2..offset + 2 + varlen];
-        offset += varlen + 2;
-        match mtype {
-            MetadataType::Device => {
-                let (dm, _, _) = meta::DeviceMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Device(dm));
-            }
-            MetadataType::Stream => {
-                let (sm, _, _) = meta::StreamMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Stream(sm));
-            }
-            MetadataType::Segment => {
-                let (sm, _, _) = meta::SegmentMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Segment(sm));
-            }
-            MetadataType::Column => {
-                let (cm, _, _) = meta::ColumnMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Column(cm));
-            }
-            _ => {}
-        }
-    }
-    ret
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceStreamMetadata {
-    pub stream: Arc<StreamMetadata>,
-    pub segment: Arc<SegmentMetadata>,
-    pub columns: Vec<Arc<ColumnMetadata>>,
-}
-
-#[derive(Debug)]
-struct DeviceColumn {
-    metadata: Arc<ColumnMetadata>,
-    offset: usize,
-}
-
-#[derive(Debug)]
-struct DeviceStream {
-    stream: Option<Arc<StreamMetadata>>,
-    segments: HashMap<u8, Arc<SegmentMetadata>>,
-    columns: Vec<DeviceColumn>,
-
-    id: u8,
-    current_data_seg: u8,
-
-    // State tracking for boundary detection
-    established: bool,
-    last_seg: u8,
-    last_sample_number: u32,
-    last_timestamp: f64,
-    last_session_id: u32,
-    last_time_ref_session_id: u32,
-    effective_rate: f64,
-}
-
-impl DeviceStream {
-    fn new(id: u8) -> Self {
-        DeviceStream {
-            stream: None,
-            segments: HashMap::new(),
-            columns: vec![],
-            id,
-            current_data_seg: 0,
-            established: false,
-            last_seg: 0,
-            last_sample_number: 0,
-            last_timestamp: 0.0,
-            last_session_id: 0,
-            last_time_ref_session_id: 0,
-            effective_rate: 0.0,
-        }
+impl ValidatedRows<'_> {
+    fn can_append_to(&self, batch: &SampleBatch) -> bool {
+        (Arc::ptr_eq(&batch.segment, &self.segment)
+            || batch.segment.as_ref() == self.segment.as_ref())
+            && batch.columns.len() == self.columns.len()
+            && batch
+                .columns
+                .iter()
+                .zip(self.columns)
+                .all(|(series, metadata)| {
+                    Arc::ptr_eq(&series.metadata, metadata)
+                        || series.metadata.as_ref() == metadata.as_ref()
+                })
     }
 
-    fn requests(&self) -> Vec<StreamRpcMetaReq> {
-        let mut ret = vec![];
-        match self.stream.as_ref() {
-            Some(stream) => {
-                let n_cols = stream.n_columns;
-                for i in self.columns.len()..n_cols {
-                    ret.push(StreamRpcMetaReq::column(i as u8, self.id))
-                }
-            }
-            None => {
-                ret.push(StreamRpcMetaReq::stream(self.id));
+    fn decode_into(&self, sample_numbers: &mut Vec<u32>, columns: &mut [Series]) {
+        for row in 0..self.row_count {
+            let start = row * self.sample_size;
+            let mut raw = &self.encoded[start..start + self.sample_size];
+            sample_numbers.push(self.first_sample_n.wrapping_add(row as u32));
+            for (series, metadata) in columns.iter_mut().zip(self.columns) {
+                series
+                    .values
+                    .push_data(&ColumnData::from_le_bytes(raw, metadata.data_type));
+                raw = &raw[metadata.data_type.size()..];
             }
         }
-        if !self.segments.contains_key(&self.current_data_seg) {
-            ret.push(StreamRpcMetaReq::segment(self.current_data_seg, self.id));
-        }
-        ret
     }
 
-    fn capture_prior_state(&self) -> Option<PriorState> {
-        if !self.established {
-            return None;
-        }
-        Some(PriorState {
-            session_id: self.last_session_id,
-            segment_id: self.last_seg,
-            time_ref_session_id: self.last_time_ref_session_id,
-            sample_number: self.last_sample_number,
-            timestamp: self.last_timestamp,
-            effective_rate: self.effective_rate,
-        })
+    fn append_to(&self, batch: &mut SampleBatch) {
+        debug_assert!(self.can_append_to(batch));
+        self.decode_into(&mut batch.sample_numbers, &mut batch.columns);
     }
 
-    fn detect_boundary(
-        &self,
-        first_sample_n: u32,
-        first_timestamp: f64,
-        dev: &Arc<DeviceMetadata>,
-        segment: &Arc<SegmentMetadata>,
-        new_rate: f64,
-        is_segment_rollover: bool,
-    ) -> Option<Boundary> {
-        let prior = self.capture_prior_state();
-
-        // First sample ever from this stream?
-        if !self.established {
-            return Some(Boundary {
-                reason: BoundaryReason::Initial,
-                prior: None,
-            });
-        }
-
-        // Session changed?
-        if dev.session_id != self.last_session_id {
-            return Some(Boundary {
-                reason: BoundaryReason::SessionChanged {
-                    old: self.last_session_id,
-                    new: dev.session_id,
-                },
-                prior,
-            });
-        }
-
-        // Time reference session changed?
-        if segment.time_ref_session_id != self.last_time_ref_session_id {
-            return Some(Boundary {
-                reason: BoundaryReason::TimeRefSessionChanged {
-                    old: self.last_time_ref_session_id,
-                    new: segment.time_ref_session_id,
-                },
-                prior,
-            });
-        }
-
-        // Rate changed?
-        if (new_rate - self.effective_rate).abs() > 1e-9 {
-            return Some(Boundary {
-                reason: BoundaryReason::RateChanged {
-                    old_rate: self.effective_rate,
-                    new_rate,
-                },
-                prior,
-            });
-        }
-
-        let half_period = 0.5 / new_rate;
-        let time_gap = first_timestamp - self.last_timestamp;
-
-        // Time went backward?
-        if time_gap < -half_period {
-            return Some(Boundary {
-                reason: BoundaryReason::TimeBackward {
-                    gap_seconds: -time_gap,
-                },
-                prior,
-            });
-        }
-
-        // Segment changed?
-        if segment.segment_id != self.last_seg {
-            // A benign rollover is time-continuous; a stream restart leaves a
-            // forward gap. Backward jumps already returned above.
-            let time_continuous = time_gap < half_period;
-            return Some(Boundary {
-                reason: if is_segment_rollover && time_continuous {
-                    BoundaryReason::SegmentRollover {
-                        old_id: self.last_seg,
-                        new_id: segment.segment_id,
-                    }
-                } else {
-                    BoundaryReason::SegmentChanged {
-                        old_id: self.last_seg,
-                        new_id: segment.segment_id,
-                    }
-                },
-                prior,
-            });
-        }
-
-        // Samples skipped?
-        let expected_sample = self.last_sample_number.wrapping_add(1);
-        if first_sample_n != expected_sample {
-            let ts_gap = time_gap.abs();
-            // Check if this is just a sample number rollover with continuous time
-            let is_benign_rollover =
-                first_sample_n < self.last_sample_number && ts_gap < half_period;
-
-            if !is_benign_rollover && ts_gap > half_period {
-                return Some(Boundary {
-                    reason: BoundaryReason::SamplesLost {
-                        expected: expected_sample,
-                        received: first_sample_n,
-                    },
-                    prior,
-                });
-            }
-        }
-
-        // No boundary - continuous with previous samples
-        None
-    }
-
-    fn process_samples(
-        &mut self,
-        data: &tio::proto::StreamDataPayload,
-        dev: Arc<DeviceMetadata>,
-        route: DeviceRoute,
-    ) -> Option<SampleBatch> {
-        self.current_data_seg = data.segment_id;
-
-        if self.stream.is_none() {
-            return None;
-        }
-
-        let stream = self.stream.as_ref().unwrap().clone();
-        if stream.n_columns != self.columns.len() {
-            return None;
-        }
-
-        let expected_sample_size = self
-            .columns
-            .last()
-            .map(|col| col.offset + col.metadata.data_type.size())
-            .unwrap_or(0);
-        if expected_sample_size > stream.sample_size {
-            return None;
-        }
-        if stream.sample_size == 0 {
-            return None;
-        }
-        if data.data.len() % stream.sample_size != 0 {
-            return None;
-        }
-
-        if stream.n_segments == 0 {
-            return None;
-        }
-
-        let next_sample = self.last_sample_number.wrapping_add(1);
-        let next_segment = (self.last_seg + 1).rem_euclid(stream.n_segments as u8);
-
-        let (segment, is_segment_rollover) = match (
-            self.segments.get(&data.segment_id).cloned(),
-            self.segments.get(&self.last_seg).cloned(),
-        ) {
-            // Real metadata for this segment
-            (Some(seg), _) => (seg, true),
-            // Data arrived before this segment's metadata: synthesize from the
-            // previous segment only if it matches a forced rollover, else drop
-            // and let requests() fetch the real metadata.
-            (None, Some(prev)) => {
-                let rate = prev.sampling_rate.checked_div(prev.decimation).unwrap_or(0);
-                let forced_rollover = self.established
-                    && data.first_sample_n == 0
-                    && rate != 0
-                    && next_sample % rate == 0
-                    && data.segment_id == next_segment;
-                if !forced_rollover {
-                    return None;
-                }
-                let mut new_seg = (*prev).clone();
-                new_seg.segment_id = data.segment_id;
-                new_seg.start_time += next_sample / rate;
-                (Arc::new(new_seg), true)
-            }
-            (None, None) => return None,
-        };
-
-        if segment.decimation == 0 || segment.sampling_rate == 0 {
-            return None;
-        }
-        let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
-
-        // Calculate timestamp of first sample in this batch
-        let period = 1.0 / new_rate;
-        let first_timestamp =
-            f64::from(segment.start_time) + period * f64::from(data.first_sample_n);
-
-        // Detect boundary for the first sample
-        let boundary = self.detect_boundary(
-            data.first_sample_n,
-            first_timestamp,
-            &dev,
-            &segment,
-            new_rate,
-            is_segment_rollover,
-        );
-
-        // Decode every row into columnar form, one ColumnVec per column.
-        let mut columns: Vec<Series> = self
+    fn into_batch(self, route: DeviceRoute, capacity: usize) -> SampleBatch {
+        let mut columns: Vec<_> = self
             .columns
             .iter()
-            .map(|col| Series {
-                index: col.metadata.index as ColumnId,
-                metadata: col.metadata.clone(),
-                values: ColumnVec::empty_for(col.metadata.data_type.buffer_type()),
+            .map(|metadata| Series {
+                index: metadata.index,
+                metadata: metadata.clone(),
+                values: ColumnVec::with_capacity_for(metadata.data_type.buffer_type(), capacity),
             })
             .collect();
-        let mut sample_numbers = Vec::new();
-        let mut sample_n = data.first_sample_n;
-        let mut offset = 0;
-
-        while offset < data.data.len() {
-            let Some(raw) = data.data.get(offset..(offset + stream.sample_size)) else {
-                return None;
-            };
-            for (batch_col, col) in columns.iter_mut().zip(&self.columns) {
-                batch_col.values.push_data(&ColumnData::from_le_bytes(
-                    &raw[col.offset..],
-                    col.metadata.data_type,
-                ));
-            }
-            sample_numbers.push(sample_n);
-
-            self.last_sample_number = sample_n;
-            self.last_timestamp = segment.time_at(sample_n + 1);
-            self.last_session_id = dev.session_id;
-            self.last_time_ref_session_id = segment.time_ref_session_id;
-            self.last_seg = segment.segment_id;
-            self.effective_rate = new_rate;
-            self.established = true;
-
-            offset += stream.sample_size;
-            sample_n = sample_n.wrapping_add(1);
-        }
-
-        // A batch is never empty by construction; an empty data payload
-        // decodes no rows and yields nothing to emit.
-        if sample_numbers.is_empty() {
-            return None;
-        }
-
-        Some(SampleBatch::new(
+        let mut sample_numbers = Vec::with_capacity(capacity);
+        self.decode_into(&mut sample_numbers, &mut columns);
+        SampleBatch::new(
             route,
-            boundary,
+            self.boundary,
             sample_numbers,
             columns,
-            segment,
-            stream,
-            dev,
-        ))
-    }
-
-    fn invalidate_metadata(&mut self) {
-        self.stream = None;
-        self.segments.clear();
-        self.columns.clear();
-    }
-
-    fn get_metadata(&self) -> Result<DeviceStreamMetadata, Vec<StreamRpcMetaReq>> {
-        let reqs = self.requests();
-        if reqs.is_empty() {
-            Ok(DeviceStreamMetadata {
-                stream: self.stream.as_ref().unwrap().clone(),
-                segment: self.segments.get(&self.current_data_seg).unwrap().clone(),
-                columns: self.columns.iter().map(|x| x.metadata.clone()).collect(),
-            })
-        } else {
-            Err(reqs)
-        }
+            self.segment,
+            self.stream,
+            self.device,
+        )
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DeviceFullMetadata {
-    pub device: Arc<DeviceMetadata>,
-    pub streams: HashMap<u8, DeviceStreamMetadata>,
+fn flush_pending_batches(
+    pending: &mut HashMap<StreamKey, SampleBatch>,
+    ready: &mut VecDeque<SampleBatch>,
+) {
+    let mut keys: Vec<_> = pending.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        ready.push_back(pending.remove(&key).unwrap());
+    }
 }
 
-pub struct DeviceDataParser {
-    device: Option<Arc<DeviceMetadata>>,
-    streams: HashMap<u8, DeviceStream>,
-    ignore_session: bool,
+/// Decode validated rows and either append, hold, or emit the resulting batch.
+fn queue_rows(
+    route: DeviceRoute,
+    stream_id: u8,
+    input: ValidatedRows<'_>,
+    target_rows: Option<usize>,
+    pending: &mut HashMap<StreamKey, SampleBatch>,
+    ready: &mut VecDeque<SampleBatch>,
+) -> usize {
+    let rows = input.row_count;
+    let key = StreamKey::new(route, stream_id);
+    let starts_boundary = input.boundary.is_some();
+
+    // Make a boundary observable immediately and preserve global ordering for
+    // exporters that split every stream at a discontinuity.
+    if starts_boundary {
+        flush_pending_batches(pending, ready);
+    }
+
+    match pending.entry(key) {
+        Entry::Occupied(mut entry) if !starts_boundary && input.can_append_to(entry.get()) => {
+            input.append_to(entry.get_mut());
+            if target_rows.is_none() || entry.get().len() >= target_rows.expect("checked above") {
+                ready.push_back(entry.remove());
+            }
+        }
+        Entry::Occupied(entry) => {
+            ready.push_back(entry.remove());
+            let capacity = target_rows.unwrap_or(rows).max(rows);
+            let batch = input.into_batch(route, capacity);
+            if starts_boundary || target_rows.is_none() || batch.len() >= capacity {
+                ready.push_back(batch);
+            } else {
+                pending.insert(key, batch);
+            }
+        }
+        Entry::Vacant(entry) => {
+            let capacity = target_rows.unwrap_or(rows).max(rows);
+            let batch = input.into_batch(route, capacity);
+            if starts_boundary || target_rows.is_none() || batch.len() >= capacity {
+                ready.push_back(batch);
+            } else {
+                entry.insert(batch);
+            }
+        }
+    }
+
+    rows
 }
 
-impl DeviceDataParser {
-    pub fn new(ignore_session: bool) -> DeviceDataParser {
-        DeviceDataParser {
-            device: None,
-            streams: HashMap::new(),
-            ignore_session,
+/// Incremental, route-aware parser for TIO packets.
+///
+/// The caller owns packet I/O and supplies packets in arrival order. By
+/// default each decodable stream-data packet emits one [`SampleBatch`].
+/// [`PacketParser::with_batch_rows`] instead accumulates compatible packets for
+/// bulk consumers. Boundaries and schema changes always end the current batch.
+pub struct PacketParser {
+    state: ParseState,
+    batch_target_rows: Option<usize>,
+    pending_batches: HashMap<StreamKey, SampleBatch>,
+    ready_batches: VecDeque<SampleBatch>,
+}
+
+impl PacketParser {
+    pub(super) fn from_state(state: ParseState) -> Self {
+        Self {
+            state,
+            batch_target_rows: None,
+            pending_batches: HashMap::new(),
+            ready_batches: VecDeque::new(),
         }
     }
 
-    fn get_stream(&mut self, stream_id: u8) -> &mut DeviceStream {
-        if !self.streams.contains_key(&stream_id) {
-            self.streams.insert(stream_id, DeviceStream::new(stream_id));
-        }
-        self.streams.get_mut(&stream_id).unwrap()
+    /// Create a parser for packets whose routes are relative to `root_route`.
+    ///
+    /// When `ignore_session` is false, a heartbeat session change invalidates
+    /// cached metadata and starts metadata discovery again.
+    pub fn new(root_route: DeviceRoute, ignore_session: bool) -> Self {
+        Self::from_state(ParseState::new(root_route, ignore_session))
     }
 
-    fn process_metadata(&mut self, metadata: &MetadataContent, from_update: bool) {
-        match metadata {
-            MetadataContent::Device(dm) => {
-                if let Some(cur) = &self.device {
-                    if cur.serial_number != dm.serial_number {
-                        self.streams.clear();
-                    } else if (cur.session_id != dm.session_id)
-                        || (cur.firmware_hash != dm.firmware_hash)
-                    {
-                        for stream in self.streams.values_mut() {
-                            stream.invalidate_metadata();
-                        }
-                    }
-                }
-                self.device.replace(Arc::new(dm.clone()));
+    /// Accumulate approximately `rows` decoded samples per stream before
+    /// emitting a batch. Boundaries and schema changes always end a batch.
+    pub fn with_batch_rows(mut self, rows: usize) -> Self {
+        assert!(rows > 0, "batch row target must be nonzero");
+        self.batch_target_rows = Some(rows);
+        self
+    }
+
+    /// Ingest one port-relative packet and return the number of rows decoded.
+    ///
+    /// Metadata and control packets update parser state and return zero. Stream
+    /// data also returns zero when its metadata is not ready; call
+    /// [`PacketParser::take_requests`] to obtain the required metadata RPCs.
+    /// Completed batches are available through [`PacketParser::next_batch`].
+    pub fn push_packet(&mut self, packet: &tio::Packet) -> usize {
+        match self.state.apply_packet(packet) {
+            PacketEvent::None => 0,
+            PacketEvent::Reset => {
+                self.flush();
+                0
             }
-            MetadataContent::Stream(sm) => {
-                if let Some(dev) = &self.device {
-                    if usize::from(sm.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                }
-                let dstream = self.get_stream(sm.stream_id);
-                if let Some(stream) = &dstream.stream {
-                    if stream.as_ref() != sm {
-                        // This should never happen: stream metadata is constant.
-                        // To be safe, reload the whole thing:
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                } else {
-                    dstream.stream.replace(Arc::new(sm.clone()));
-                }
-            }
-            MetadataContent::Segment(sm) => {
-                if let Some(dev) = &self.device {
-                    if usize::from(sm.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                }
-                let dstream = self.get_stream(sm.stream_id);
-                dstream.segments.insert(sm.segment_id, Arc::new(sm.clone()));
-                if from_update {
-                    dstream.current_data_seg = sm.segment_id;
-                }
-            }
-            MetadataContent::Column(cm) => {
-                if let Some(dev) = &self.device {
-                    if usize::from(cm.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                }
-                let dstream = self.get_stream(cm.stream_id);
-                if usize::from(cm.index) < dstream.columns.len() {
-                    if dstream.columns[cm.index].metadata.as_ref() != cm {
-                        // This should never happen: columns are constant.
-                        // To be safe, reload everything.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                } else if usize::from(cm.index) == dstream.columns.len() {
-                    // Next column to append
-                    // TODO: make sure it agrees with the rest of the metadata
-                    let offset = if cm.index == 0 {
-                        0
-                    } else {
-                        let prev_col = &dstream.columns[cm.index - 1];
-                        prev_col.offset + prev_col.metadata.data_type.size()
-                    };
-                    dstream.columns.push(DeviceColumn {
-                        metadata: Arc::new(cm.clone()),
-                        offset: offset,
-                    })
-                }
-            }
-            _ => {}
+            PacketEvent::Rows {
+                route,
+                stream_id,
+                rows,
+            } => queue_rows(
+                route,
+                stream_id,
+                rows,
+                self.batch_target_rows,
+                &mut self.pending_batches,
+                &mut self.ready_batches,
+            ),
         }
     }
 
-    pub fn process_packet(&mut self, pkt: &tio::Packet) -> Option<SampleBatch> {
-        match &pkt.payload {
-            tio::proto::Payload::RpcReply(rep) => {
-                for metadata in parse_metarep(rep.reply.clone()) {
-                    self.process_metadata(&metadata, false)
-                }
-            }
-            tio::proto::Payload::Metadata(mp) => self.process_metadata(&mp.content, true),
-            tio::proto::Payload::Heartbeat(hb) => {
-                if let tio::proto::HeartbeatPayload::Session(session_id) = hb {
-                    if let Some(dev) = &self.device {
-                        if (dev.session_id != *session_id) && !self.ignore_session {
-                            for stream in self.streams.values_mut() {
-                                stream.invalidate_metadata();
-                            }
-                            self.device.take();
-                        }
-                    }
-                }
-            }
-            tio::proto::Payload::StreamData(data) => {
-                // Attempt to parse samples
-                if let Some(dev) = &self.device {
-                    if usize::from(data.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    } else {
-                        let ndev = dev.clone();
-                        let route = pkt.routing.clone();
-                        let dstream = self.get_stream(data.stream_id);
-                        return dstream.process_samples(data, ndev, route);
-                    }
-                }
-            }
-            _ => {
-                // TODO: something about rpc errors? at least hold off to not
-                // issue too many requests.
-            }
-        }
-        None
+    /// Convenience for low-latency consumers: ingest a packet and pop the next
+    /// completed batch, if any. A previously queued batch may be returned.
+    pub fn process_packet(&mut self, packet: &tio::Packet) -> Option<SampleBatch> {
+        self.push_packet(packet);
+        self.next_batch()
     }
 
-    pub fn requests(&self) -> Vec<tio::Packet> {
-        // Determine all the metadata requests to issue.
-        let mut reqs = vec![];
-        match self.device.as_ref() {
-            Some(device) => {
-                for i in 0..device.n_streams {
-                    let stream_id = (i + 1) as u8;
-                    if let Some(stream) = self.streams.get(&stream_id) {
-                        reqs.extend(stream.requests())
-                    } else {
-                        reqs.push(StreamRpcMetaReq::stream(stream_id));
-                    }
-                }
-            }
-            None => {
-                reqs.push(StreamRpcMetaReq::device());
-            }
-        }
-        metareqs_to_rpcs(&reqs)
+    /// Pop the oldest completed batch.
+    pub fn next_batch(&mut self) -> Option<SampleBatch> {
+        self.ready_batches.pop_front()
     }
 
-    pub fn get_metadata(&self) -> Result<DeviceFullMetadata, Vec<tio::Packet>> {
-        let reqs = self.requests();
-        if !reqs.is_empty() {
-            return Err(reqs);
-        }
-        let mut streams = HashMap::new();
-        for (id, stream) in &self.streams {
-            streams.insert(*id, stream.get_metadata().unwrap());
-        }
-        Ok(DeviceFullMetadata {
-            device: self.device.as_ref().unwrap().clone(),
-            streams: streams,
-        })
+    /// End every partially accumulated stream batch without resetting metadata.
+    pub fn flush(&mut self) {
+        flush_pending_batches(&mut self.pending_batches, &mut self.ready_batches);
+    }
+
+    /// Drain batches that are already ready without flushing partial batches.
+    pub fn drain_batches(&mut self) -> Vec<SampleBatch> {
+        self.ready_batches.drain(..).collect()
+    }
+
+    /// Flush accumulated samples and return every completed batch.
+    pub fn finish(mut self) -> Vec<SampleBatch> {
+        self.flush();
+        self.drain_batches()
+    }
+
+    /// Forget device metadata. Any decoded rows already accumulated remain
+    /// available through `next_batch`.
+    pub fn reset(&mut self) {
+        self.flush();
+        self.state.reset();
+    }
+
+    /// Pending metadata requests across all routes. Each packet's routing is
+    /// stamped relative to this parser's root and can be sent directly on the
+    /// corresponding port.
+    pub fn take_requests(&mut self) -> Vec<tio::Packet> {
+        self.state.take_requests()
+    }
+
+    /// Ensure a route has parser state and take its pending metadata requests.
+    pub fn take_requests_for(&mut self, route: DeviceRoute) -> Vec<tio::Packet> {
+        self.state.take_requests_for(route)
+    }
+
+    /// Return complete metadata for an absolute route once it is available.
+    pub fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
+        self.state.metadata(route)
+    }
+
+    /// Absolute routes for which this parser has observed state.
+    pub fn routes(&self) -> Vec<DeviceRoute> {
+        self.state.routes()
     }
 }

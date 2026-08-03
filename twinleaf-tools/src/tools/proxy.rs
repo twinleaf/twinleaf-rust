@@ -4,7 +4,12 @@
 //! tio::proxy via TCP. With `--mount`, each sensor hangs off a route prefix
 //! and the proxy presents the set as a single virtual hub.
 
+pub mod list;
+mod nmea;
+
 use crate::{MountArg, ProxyCli, ProxySubcommands};
+
+pub use list::run_list;
 use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
@@ -43,7 +48,7 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
     match proxy_cli.subcommands.take() {
         Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
             init_proxy_logging(false, false);
-            crate::tools::proxy_nmea::run_nmea_proxy(tio, tcp_port)
+            nmea::run_nmea_proxy(tio, tcp_port)
         }
         None => {
             init_proxy_logging(proxy_cli.verbose, proxy_cli.debug);
@@ -54,7 +59,7 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
                 );
             }
             if proxy_cli.enumerate {
-                return crate::tools::list::list_devices_deprecated(true);
+                return list::list_devices_deprecated(true);
             }
             if proxy_cli.auto {
                 log::warn!(

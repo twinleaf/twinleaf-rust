@@ -661,7 +661,6 @@ fn discontinuous_boundary_starts_a_new_run() {
                 old_id: 0,
                 new_id: 1,
             },
-            prior: None,
         }),
         &[(3, vec![ColumnData::Float(3.0)])],
     );

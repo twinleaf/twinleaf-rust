@@ -1,4 +1,4 @@
-use crate::data::{ColumnFilter, ColumnVec, SampleBatch, Series};
+use crate::data::{Boundary, ColumnFilter, ColumnVec, SampleBatch, Series};
 use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, StreamKey};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
@@ -68,11 +68,9 @@ struct TableInfo {
 pub struct Hdf5Appender {
     file: File,
     tables: HashMap<String, TableInfo>,
-    pending: HashMap<StreamKey, Vec<SampleBatch>>,
     filter: Option<ColumnFilter>,
     compress: bool,
     debug: bool,
-    batch_size: usize,
     split_policy: SplitPolicy,
     split_level: RunSplitLevel,
     stream_runs: HashMap<StreamKey, RunId>,
@@ -83,60 +81,20 @@ pub struct Hdf5Appender {
 }
 
 impl Hdf5Appender {
-    pub fn new(
-        path: &Path,
-        compress: bool,
-        debug: bool,
-        filter: Option<ColumnFilter>,
-        batch_size: usize,
-    ) -> Result<Self> {
-        Self::with_options(
-            path,
-            compress,
-            debug,
-            filter,
-            batch_size,
-            SplitPolicy::default(),
-            RunSplitLevel::default(),
-        )
-    }
-
-    pub fn with_policy(
-        path: &Path,
-        compress: bool,
-        debug: bool,
-        filter: Option<ColumnFilter>,
-        batch_size: usize,
-        split_policy: SplitPolicy,
-    ) -> Result<Self> {
-        Self::with_options(
-            path,
-            compress,
-            debug,
-            filter,
-            batch_size,
-            split_policy,
-            RunSplitLevel::default(),
-        )
-    }
-
     pub fn with_options(
         path: &Path,
         compress: bool,
         debug: bool,
         filter: Option<ColumnFilter>,
-        batch_size: usize,
         split_policy: SplitPolicy,
         split_level: RunSplitLevel,
     ) -> Result<Self> {
         Ok(Self {
             file: File::create(path)?,
             tables: HashMap::new(),
-            pending: HashMap::new(),
             filter,
             compress,
             debug,
-            batch_size,
             split_policy,
             split_level,
             stream_runs: HashMap::new(),
@@ -147,69 +105,46 @@ impl Hdf5Appender {
         })
     }
 
+    /// Append an already-decoded batch.
     pub fn write_batch(&mut self, batch: SampleBatch, key: StreamKey) -> Result<()> {
-        let should_split = !batch.is_initial()
-            && match self.split_policy {
-                SplitPolicy::Continuous => !batch.is_continuous(),
-                SplitPolicy::Monotonic => !batch.is_monotonic(),
-            };
-
-        if should_split {
-            self.handle_discontinuity(&key)?;
+        if self.should_split(batch.boundary.as_ref()) {
+            self.handle_discontinuity(&key);
         }
-
-        let chunks = self.pending.entry(key.clone()).or_default();
-        chunks.push(batch);
-
-        let rows: usize = chunks.iter().map(|b| b.len()).sum();
-        if rows >= self.batch_size {
-            self.flush_stream(&key)?;
+        if self.debug {
+            if let Some(boundary) = &batch.boundary {
+                log::info!(
+                    "[{}] sample_n={} boundary={:?}",
+                    batch.stream.name,
+                    batch.first_sample().unwrap_or(0),
+                    boundary.reason
+                );
+            }
         }
-
-        Ok(())
+        self.write_chunks(&key, &[batch])
     }
 
-    fn handle_discontinuity(&mut self, key: &StreamKey) -> Result<()> {
+    fn should_split(&self, boundary: Option<&Boundary>) -> bool {
+        !boundary.is_some_and(Boundary::is_initial)
+            && match self.split_policy {
+                SplitPolicy::Continuous => boundary.is_some_and(|b| !b.is_continuous()),
+                SplitPolicy::Monotonic => boundary.is_some_and(|b| !b.is_monotonic()),
+            }
+    }
+
+    fn handle_discontinuity(&mut self, key: &StreamKey) {
         self.stats.discontinuities_detected += 1;
         match self.split_level {
-            RunSplitLevel::None => {
-                self.flush_stream(key)?;
-            }
+            RunSplitLevel::None => {}
             RunSplitLevel::PerStream => {
-                self.flush_stream(key)?;
-                *self.stream_runs.entry(key.clone()).or_insert(0) += 1;
+                *self.stream_runs.entry(*key).or_insert(0) += 1;
             }
             RunSplitLevel::PerDevice => {
-                self.flush_all_for_device(&key.route)?;
-                *self.device_runs.entry(key.route.clone()).or_insert(0) += 1;
+                *self.device_runs.entry(key.route).or_insert(0) += 1;
             }
             RunSplitLevel::Global => {
-                self.flush_all()?;
                 self.global_run += 1;
             }
         }
-        Ok(())
-    }
-
-    fn flush_all_for_device(&mut self, route: &DeviceRoute) -> Result<()> {
-        let keys: Vec<_> = self
-            .pending
-            .keys()
-            .filter(|k| &k.route == route)
-            .cloned()
-            .collect();
-        for key in keys {
-            self.flush_stream(&key)?;
-        }
-        Ok(())
-    }
-
-    fn flush_all(&mut self) -> Result<()> {
-        let keys: Vec<_> = self.pending.keys().cloned().collect();
-        for key in keys {
-            self.flush_stream(&key)?;
-        }
-        Ok(())
     }
 
     /// Name of the compound table for this stream's current run.
@@ -223,18 +158,7 @@ impl Hdf5Appender {
         }
     }
 
-    fn flush_stream(&mut self, key: &StreamKey) -> Result<()> {
-        match self.pending.remove(key) {
-            Some(chunks) if !chunks.is_empty() => self.write_chunks(key, &chunks),
-            _ => Ok(()),
-        }
-    }
-
-    pub fn finish(mut self) -> Result<ExportStats> {
-        let keys: Vec<_> = self.pending.keys().cloned().collect();
-        for key in keys {
-            self.flush_stream(&key)?;
-        }
+    pub fn finish(self) -> Result<ExportStats> {
         Ok(self.stats)
     }
 

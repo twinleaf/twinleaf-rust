@@ -13,7 +13,13 @@ default = ["serial"]
 serial = ["dep:serialport", "twinleaf/serial"]
 hdf5 = ["twinleaf/hdf5"]
 
+[[bench]]
+name = "log_workflows"
+harness = false
+required-features = ["hdf5"]
+
 [dependencies]
+bytes = "1"
 crossbeam = "0.8"
 serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}
@@ -22,7 +28,6 @@ clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"
 welch-sde = "0.1"
-memmap2 = "0.9"
 indicatif = "0.18"
 console = "0.16"
 chrono = "0.4"

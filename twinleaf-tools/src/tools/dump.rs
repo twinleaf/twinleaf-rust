@@ -1,5 +1,5 @@
 use crate::{DumpCli, ProxyHelp, TioOpts};
-use twinleaf::data::{ColumnFilter, SampleBatch, SampleRef};
+use twinleaf::data::{ColumnFilter, SampleBatch, SampleRow};
 use twinleaf::device::{DeviceRoute, DeviceTree, TreeItem};
 use twinleaf::tio::{self, proxy};
 
@@ -136,7 +136,7 @@ pub fn print_batch_meta(batch: &SampleBatch, route: Option<&DeviceRoute>) {
 }
 
 /// Prints one row's data line.
-pub fn print_sample(row: SampleRef, route: Option<&DeviceRoute>) {
+pub fn print_sample(row: SampleRow, route: Option<&DeviceRoute>) {
     let route_str = if let Some(r) = route {
         format!("{} ", r)
     } else {

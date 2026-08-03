@@ -511,6 +511,15 @@ impl HealthState {
                     Color::Yellow,
                 );
             }
+            BoundaryReason::TimeForward { gap_seconds } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] TIME FORWARD: {:.3}s",
+                        route, stream_name, gap_seconds
+                    ),
+                    Color::Yellow,
+                );
+            }
             BoundaryReason::RateChanged { old_rate, new_rate } => {
                 self.log_event(
                     format!(

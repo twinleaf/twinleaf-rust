@@ -5,7 +5,7 @@ use std::thread;
 use twinleaf::device::Device;
 use twinleaf::tio;
 
-pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
+pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     use color_eyre::Help;
     use eyre::WrapErr;
 

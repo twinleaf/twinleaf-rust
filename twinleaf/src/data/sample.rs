@@ -71,12 +71,12 @@ impl std::fmt::Display for ColumnData {
     }
 }
 
-/// One packet's samples in columnar (Structure-of-Arrays) form: metadata is held
-/// once, and each column's decoded values live in a contiguous [`ColumnVec`].
+/// Samples in columnar (Structure-of-Arrays) form: metadata is held once, and
+/// each column's decoded values live in a contiguous [`ColumnVec`].
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
     pub route: DeviceRoute,
-    /// At most one boundary per packet, anchored at the batch's first row.
+    /// At most one boundary per batch, anchored at its first row.
     pub boundary: Option<Boundary>,
     pub sample_numbers: Vec<SampleNumber>,
     /// Columns in index order.
@@ -147,12 +147,12 @@ impl SampleBatch {
         self.columns.iter().find(|c| c.index == id)
     }
 
-    pub fn row(&self, row: usize) -> Option<SampleRef<'_>> {
-        (row < self.len()).then_some(SampleRef { batch: self, row })
+    pub fn row(&self, row: usize) -> Option<SampleRow<'_>> {
+        (row < self.len()).then_some(SampleRow { batch: self, row })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = SampleRef<'_>> {
-        (0..self.len()).map(move |row| SampleRef { batch: self, row })
+    pub fn iter(&self) -> impl Iterator<Item = SampleRow<'_>> {
+        (0..self.len()).map(move |row| SampleRow { batch: self, row })
     }
 
     /// True unless the boundary marks a break in continuity.
@@ -173,12 +173,12 @@ impl SampleBatch {
 
 /// Borrowing view of one row of a [`SampleBatch`].
 #[derive(Clone, Copy)]
-pub struct SampleRef<'a> {
+pub struct SampleRow<'a> {
     batch: &'a SampleBatch,
     row: usize,
 }
 
-impl<'a> SampleRef<'a> {
+impl<'a> SampleRow<'a> {
     pub fn n(&self) -> SampleNumber {
         self.batch.sample_numbers[self.row]
     }
@@ -210,7 +210,7 @@ impl<'a> SampleRef<'a> {
     }
 }
 
-impl std::fmt::Display for SampleRef<'_> {
+impl std::fmt::Display for SampleRow<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -230,17 +230,6 @@ impl std::fmt::Display for SampleRef<'_> {
 #[derive(Debug, Clone)]
 pub struct Boundary {
     pub reason: BoundaryReason,
-    pub prior: Option<PriorState>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PriorState {
-    pub session_id: SessionId,
-    pub segment_id: SegmentId,
-    pub time_ref_session_id: TimeRefSessionId,
-    pub sample_number: SampleNumber,
-    pub timestamp: f64,
-    pub effective_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +245,9 @@ pub enum BoundaryReason {
     },
     /// Time jumped backward unexpectedly
     TimeBackward { gap_seconds: f64 },
+    /// Time jumped forward unexpectedly with no gap in sample numbers, e.g. a
+    /// segment's start time was corrected in place
+    TimeForward { gap_seconds: f64 },
     /// Sampling rate changed
     RateChanged { old_rate: f64, new_rate: f64 },
 
@@ -290,6 +282,7 @@ impl Boundary {
                 | BoundaryReason::RateChanged { .. }
                 | BoundaryReason::SegmentRollover { .. }
                 | BoundaryReason::SegmentChanged { .. }
+                | BoundaryReason::TimeForward { .. }
         )
     }
 
