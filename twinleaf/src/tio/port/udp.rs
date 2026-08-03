@@ -34,7 +34,10 @@ impl Port {
     }
 }
 
-fn is_disconnect_error(err: &io::Error) -> bool {
+/// ICMP-sourced errors on a connected UDP socket (port/host unreachable, etc.)
+/// are advisory, not a real disconnect: liveness is owned by the proxy_core
+/// watchdog, so callers treat these as transient instead of tearing down.
+fn is_advisory_network_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::ConnectionRefused
@@ -54,8 +57,8 @@ impl RawPort for Port {
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     return Err(RecvError::NotReady);
-                } else if is_disconnect_error(&e) {
-                    return Err(RecvError::Disconnected);
+                } else if is_advisory_network_error(&e) {
+                    return Err(RecvError::NotReady);
                 } else {
                     return Err(RecvError::IO(e));
                 }
@@ -107,7 +110,7 @@ impl RawPort for Port {
                 // to buffer up the packet and use MustDrain/Full.
                 panic!("Unexpected UDP would block");
             }
-            Err(e) if is_disconnect_error(&e) => Err(SendError::Disconnected),
+            Err(e) if is_advisory_network_error(&e) => Ok(()),
             Err(e) => Err(SendError::IO(e)),
         }
     }

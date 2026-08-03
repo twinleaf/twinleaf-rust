@@ -136,6 +136,7 @@ struct ProxyDevice {
     rx_channel: channel::Receiver<Result<Packet, RecvError>>,
     rate_change_state: RateChange,
     last_rx: Instant,
+    seen_since_connect: bool,
     last_session: Option<u32>,
     restarted: bool,
     rpc_meta: HashMap<String, u16>,
@@ -186,50 +187,40 @@ impl ProxyDevice {
         &mut self,
         status_queue: &StatusQueue,
     ) -> Result<Result<Packet, RecvError>, crossbeam::channel::TryRecvError> {
-        if self.has_static_rate() {
-            self.rx_channel.try_recv()
-        } else {
-            match self.rx_channel.try_recv() {
-                Ok(res) => {
-                    self.last_rx = match &res {
-                        Ok(pkt) => {
-                            if let proto::Payload::Heartbeat(proto::HeartbeatPayload::Session(
-                                session,
-                            )) = pkt.payload
-                            {
-                                if pkt.routing.len() == 0 {
-                                    // This is a heartbeat for the root sensor
-                                    let old_session = self.last_session.replace(session);
-                                    if let RateChange::WaitingForSession = self.rate_change_state {
-                                        self.rate_change_state = RateChange::QueryDeviceRate;
-                                    } else if (self.last_session != old_session)
-                                        && old_session.is_some()
-                                    {
-                                        status_queue.send(Event::RootDeviceRestarted);
-                                        // It has restarted, restart autonegotiation if needed.
-                                        self.rate_change_state = match self.rate_change_state {
-                                            RateChange::DoNothing => RateChange::DoNothing,
-                                            RateChange::WaitingForSession => {
-                                                RateChange::WaitingForSession
-                                            } // never happens
-                                            _ => RateChange::QueryDeviceRate,
-                                        };
-                                        self.restarted = true;
-                                    }
-                                }
-                            }
-                            Instant::now()
+        let res = self.rx_channel.try_recv()?;
+        // Any received packet (text included) refreshes liveness, for every
+        // device — the watchdog needs a timestamp regardless of rate state.
+        match &res {
+            Ok(_) | Err(RecvError::Protocol(proto::Error::Text(_))) => {
+                self.last_rx = Instant::now();
+            }
+            _ => {}
+        }
+        if !self.has_static_rate() {
+            if let Ok(pkt) = &res {
+                if let proto::Payload::Heartbeat(proto::HeartbeatPayload::Session(session)) =
+                    pkt.payload
+                {
+                    if pkt.routing.len() == 0 {
+                        // This is a heartbeat for the root sensor
+                        let old_session = self.last_session.replace(session);
+                        if let RateChange::WaitingForSession = self.rate_change_state {
+                            self.rate_change_state = RateChange::QueryDeviceRate;
+                        } else if (self.last_session != old_session) && old_session.is_some() {
+                            status_queue.send(Event::RootDeviceRestarted);
+                            // It has restarted, restart autonegotiation if needed.
+                            self.rate_change_state = match self.rate_change_state {
+                                RateChange::DoNothing => RateChange::DoNothing,
+                                RateChange::WaitingForSession => RateChange::WaitingForSession, // never happens
+                                _ => RateChange::QueryDeviceRate,
+                            };
+                            self.restarted = true;
                         }
-                        // Text means we are still getting data. Other protocol errors could mean we are getting
-                        // garbled bytes from running at the wrong rate
-                        Err(RecvError::Protocol(proto::Error::Text(_))) => Instant::now(),
-                        _ => self.last_rx,
-                    };
-                    Ok(res)
+                    }
                 }
-                err => err,
             }
         }
+        Ok(res)
     }
 }
 
@@ -250,6 +241,8 @@ pub struct ProxyCore {
 
     device: Option<ProxyDevice>,
 
+    ever_connected: bool,
+
     /// Id to assign to the next client, 64 bits.
     /// It is realistic to assume that it will never wrap around.
     next_client_id: u64,
@@ -260,6 +253,8 @@ pub struct ProxyCore {
     rpc_map: HashMap<u16, RpcMapEntry>,
     rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
 }
+
+const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1000);
 
 static QUERY_RATE_RPC_ID: u16 = 0x101;
 static SET_RATE_RPC_ID: u16 = 0x102;
@@ -282,6 +277,7 @@ impl ProxyCore {
                 only_new_client: notify_new_client_only,
             },
             device: None,
+            ever_connected: false,
             // Start from client 1, as 0 is reserved for internal RPCs.
             next_client_id: 1,
             clients: HashMap::new(),
@@ -316,6 +312,7 @@ impl ProxyCore {
             rx_channel: port_rx,
             rate_change_state: rate_change_state,
             last_rx: Instant::now(),
+            seen_since_connect: false,
             last_session: None,
             restarted: false,
             rpc_meta: HashMap::new(),
@@ -773,9 +770,6 @@ impl ProxyCore {
             self.status_queue.send(Event::FailedToConnect);
             self.broadcast_status(proto::ProxyStatus::FailedToConnect);
             return;
-        } else {
-            self.status_queue.send(Event::SensorConnected);
-            self.broadcast_status(proto::ProxyStatus::SensorReconnected);
         }
         let mut device_timeout = Instant::now();
 
@@ -791,14 +785,32 @@ impl ProxyCore {
                         break;
                     }
                     timeout = std::cmp::min(timeout, Duration::from_secs(1));
-                } else {
-                    self.status_queue.send(Event::SensorReconnected);
-                    self.broadcast_status(proto::ProxyStatus::SensorReconnected);
                 }
+            }
+
+            let liveness_expired = self
+                .device
+                .as_ref()
+                .map(|dev| dev.seen_since_connect && dev.last_rx.elapsed() > LIVENESS_TIMEOUT)
+                .unwrap_or(false);
+            if liveness_expired {
+                self.device = None;
+                device_timeout =
+                    Instant::now() + self.reconnect_timeout.unwrap_or(Duration::from_secs(0));
+                self.status_queue.send(Event::SensorDisconnected);
+                self.broadcast_status(proto::ProxyStatus::SensorDisconnected);
+                continue;
             }
 
             let (safe_to_forward, needs_autonegotiation, restarted) =
                 if let Some(dev) = &mut self.device {
+                    // Wake in time to run the watchdog even if the device goes silent.
+                    if dev.seen_since_connect {
+                        let until_stale = (dev.last_rx + LIVENESS_TIMEOUT)
+                            .saturating_duration_since(Instant::now());
+                        timeout =
+                            std::cmp::min(timeout, until_stale + Duration::from_millis(1));
+                    }
                     (
                         dev.safe_to_forward(),
                         if dev.needs_autonegotiation() {
@@ -944,6 +956,22 @@ impl ProxyCore {
                     };
                     match device.try_recv(&self.status_queue) {
                         Ok(Ok(mut pkt)) => {
+                            // First packet since (re)connect: the device is live, announce it.
+                            let first_packet = self
+                                .device
+                                .as_mut()
+                                .map(|d| !std::mem::replace(&mut d.seen_since_connect, true))
+                                .unwrap_or(false);
+                            if first_packet {
+                                if self.ever_connected {
+                                    self.status_queue.send(Event::SensorReconnected);
+                                    self.broadcast_status(proto::ProxyStatus::SensorReconnected);
+                                } else {
+                                    // Initial connect needs no wire status broadcast.
+                                    self.ever_connected = true;
+                                    self.status_queue.send(Event::SensorConnected);
+                                }
+                            }
                             // In general, packets get forwarded to all clients,
                             // except for RPCs which are directed only to the
                             // client which placed the request.

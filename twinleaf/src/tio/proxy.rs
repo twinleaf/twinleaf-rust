@@ -23,8 +23,12 @@ use crossbeam::channel;
 /// Status event that ProxyCore sent back to an optional user specified channel
 #[derive(Debug)]
 pub enum Event {
+    /// First packet received from the device, not merely a transport opened.
     SensorConnected,
+    /// The transport was torn down, either by an I/O failure or by the liveness
+    /// watchdog after the device went quiet for `LIVENESS_TIMEOUT`.
     SensorDisconnected,
+    /// First packet received after a disconnect.
     SensorReconnected,
     FailedToConnect,
     FailedToReconnect,
