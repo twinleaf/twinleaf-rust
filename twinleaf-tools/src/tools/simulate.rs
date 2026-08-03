@@ -47,8 +47,11 @@ const AUX_SAMPLE_RATE: u32 = 25;
 const AUX_WAVE_FREQUENCY: f64 = 0.25;
 const SAMPLE_DROP_INTERVAL_SECONDS: f64 = 60.0;
 const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
+/// "Never" sample-drop deadline used when random drops are disabled (`--no-drop`).
+/// `samples_generated` would need to run for billions of years to reach it.
+const NO_DROP_SENTINEL: u64 = u64::MAX;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
 const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
 const CAPTURE_TRIGGER_DELAY: Duration = Duration::from_millis(500);
@@ -444,6 +447,7 @@ struct TestDevice {
     segment_start_time: u32,
     pending_segment_update: bool,
     next_drop_sample: u64,
+    no_drop: bool,
     aux_samples_generated: u64,
     aux_sample_number: u32,
     aux_segment_id: u8,
@@ -505,8 +509,17 @@ impl TestDevice {
             ));
         }
         let mut rng = GaussianRng::new(seed | 1);
-        let next_drop_sample = next_drop_sample_after(&mut rng, 0, cli.samplerate);
-        let next_aux_drop_sample = next_drop_sample_after(&mut rng, 0, AUX_SAMPLE_RATE);
+        let no_drop = cli.no_drop;
+        let next_drop_sample = if no_drop {
+            NO_DROP_SENTINEL
+        } else {
+            next_drop_sample_after(&mut rng, 0, cli.samplerate)
+        };
+        let next_aux_drop_sample = if no_drop {
+            NO_DROP_SENTINEL
+        } else {
+            next_drop_sample_after(&mut rng, 0, AUX_SAMPLE_RATE)
+        };
 
         let initial_params = SineParams {
             amplitude: cli.amplitude,
@@ -608,6 +621,7 @@ impl TestDevice {
             segment_start_time: start_time,
             pending_segment_update: false,
             next_drop_sample,
+            no_drop,
             aux_samples_generated: 0,
             aux_sample_number: 0,
             aux_segment_id: 0,
@@ -655,9 +669,13 @@ impl TestDevice {
             AUX_WAVE_FREQUENCY,
             AUX_SAMPLE_RATE
         );
-        terminal_println!(
-            "  randomly dropping one sample from each sample clock about once per minute"
-        );
+        if self.no_drop {
+            terminal_println!("  random sample drops disabled (--no-drop)");
+        } else {
+            terminal_println!(
+                "  randomly dropping one sample from each sample clock about once per minute"
+            );
+        }
         terminal_println!(
             "  capture buffer: test.capture(-1) trigger, test.capture(-2) status, \
              test.capture(-3) metadata, {}-{} f32 samples, ~{:.1}s delay",
@@ -1254,7 +1272,7 @@ impl TestDevice {
 
         let level = self.next_log_level();
         let lucky_number = (self.rng.next_u64() % 10_000) as u32;
-        let message = self.random_log_message(level, lucky_number);
+        let message = self.random_log_message(lucky_number);
         self.send_packet(
             &proto::Packet {
                 payload: proto::Payload::LogMessage(proto::LogMessagePayload {
@@ -1278,11 +1296,11 @@ impl TestDevice {
                 break;
             }
 
-            let first_sample_n = self.sample_number;
+            self.send_sample_segment_updates_if_needed(addr)?;
+
             let samples_until_drop = self.next_drop_sample.saturating_sub(self.samples_generated);
             if samples_until_drop == 0 {
                 self.drop_sample();
-                self.send_sample_segment_updates_if_needed(first_sample_n, addr)?;
                 continue;
             }
 
@@ -1292,7 +1310,6 @@ impl TestDevice {
                 .min(samples_left_in_segment)
                 .min(samples_until_drop);
             self.send_sample_batches(batch_len, addr)?;
-            self.send_sample_segment_updates_if_needed(first_sample_n, addr)?;
         }
         Ok(())
     }
@@ -1356,13 +1373,13 @@ impl TestDevice {
                 break;
             }
 
-            let first_sample_n = self.aux_sample_number;
+            self.send_aux_segment_update_if_needed(addr)?;
+
             let samples_until_drop = self
                 .next_aux_drop_sample
                 .saturating_sub(self.aux_samples_generated);
             if samples_until_drop == 0 {
                 self.drop_aux_sample();
-                self.send_aux_segment_update_if_needed(first_sample_n, addr)?;
                 continue;
             }
 
@@ -1373,7 +1390,6 @@ impl TestDevice {
                 .min(samples_left_in_segment)
                 .min(samples_until_drop);
             self.send_aux_sample_batch(batch_len, addr)?;
-            self.send_aux_segment_update_if_needed(first_sample_n, addr)?;
         }
         Ok(())
     }
@@ -1473,22 +1489,23 @@ impl TestDevice {
 
     fn drop_samples_now(&mut self) -> io::Result<()> {
         let addr = self.client.map(|client| client.addr);
-        let first_sample_n = self.sample_number;
+        if let Some(addr) = addr {
+            self.send_sample_segment_updates_if_needed(addr)?;
+        }
         self.drop_sample();
-        if let Some(addr) = addr {
-            self.send_sample_segment_updates_if_needed(first_sample_n, addr)?;
-        }
 
-        let first_aux_sample_n = self.aux_sample_number;
-        self.drop_aux_sample();
         if let Some(addr) = addr {
-            self.send_aux_segment_update_if_needed(first_aux_sample_n, addr)?;
+            self.send_aux_segment_update_if_needed(addr)?;
         }
+        self.drop_aux_sample();
 
         Ok(())
     }
 
     fn next_drop_sample_after(&mut self, current_sample: u64, sample_rate: u32) -> u64 {
+        if self.no_drop {
+            return NO_DROP_SENTINEL;
+        }
         next_drop_sample_after(&mut self.rng, current_sample, sample_rate)
     }
 
@@ -1519,7 +1536,7 @@ impl TestDevice {
         level
     }
 
-    fn random_log_message(&mut self, level: proto::LogLevel, lucky_number: u32) -> String {
+    fn random_log_message(&mut self, lucky_number: u32) -> String {
         let templates = [
             "lucky number {lucky} nudged the simulated flux loop",
             "telemetry monitor reported lucky number {lucky}",
@@ -1529,19 +1546,11 @@ impl TestDevice {
             "background diagnostic index settled at lucky number {lucky}",
         ];
         let template = templates[(self.rng.next_u64() as usize) % templates.len()];
-        format!(
-            "{}: {}",
-            log_level_name(level),
-            template.replace("{lucky}", &lucky_number.to_string())
-        )
+        template.replace("{lucky}", &lucky_number.to_string())
     }
 
-    fn send_sample_segment_updates_if_needed(
-        &mut self,
-        first_sample_n: u32,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if self.pending_segment_update && first_sample_n == 0 {
+    fn send_sample_segment_updates_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
+        if self.pending_segment_update && self.sample_number == 0 {
             for stream_id in [SINE_STREAM_ID, STATUS_STREAM_ID] {
                 self.send_packet(&self.segment_metadata(stream_id).make_update(), addr)?;
             }
@@ -1550,12 +1559,8 @@ impl TestDevice {
         Ok(())
     }
 
-    fn send_aux_segment_update_if_needed(
-        &mut self,
-        first_sample_n: u32,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if self.aux_pending_segment_update && first_sample_n == 0 {
+    fn send_aux_segment_update_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
+        if self.aux_pending_segment_update && self.aux_sample_number == 0 {
             self.send_packet(&self.segment_metadata(AUX_STREAM_ID).make_update(), addr)?;
             self.aux_pending_segment_update = false;
         }
@@ -1944,17 +1949,6 @@ fn next_log_delay(rng: &mut GaussianRng) -> Duration {
 fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
     let span = CAPTURE_SAMPLE_COUNT_MAX - CAPTURE_SAMPLE_COUNT_MIN + 1;
     CAPTURE_SAMPLE_COUNT_MIN + (rng.next_u64() as usize % span)
-}
-
-fn log_level_name(level: proto::LogLevel) -> &'static str {
-    match level {
-        proto::LogLevel::Critical => "critical",
-        proto::LogLevel::Error => "error",
-        proto::LogLevel::Warning => "warning",
-        proto::LogLevel::Info => "info",
-        proto::LogLevel::Debug => "debug",
-        proto::LogLevel::Unknown(_) => "unknown",
-    }
 }
 
 fn describe_packet(packet: &proto::Packet) -> String {
