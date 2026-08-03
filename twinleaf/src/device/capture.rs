@@ -138,7 +138,7 @@ pub trait CaptureRpc {
 
 impl CaptureRpc for RpcClient {
     fn capture_raw_rpc(&self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
-        self.raw_rpc(self.root_route(), name, arg)
+        self.raw_rpc(&self.root_route(), name, arg)
     }
 }
 

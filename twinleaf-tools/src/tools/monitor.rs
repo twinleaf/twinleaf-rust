@@ -43,7 +43,7 @@ use twinleaf::{
         Buffer, ColumnData, ColumnKey, ColumnOp, DerivedColumn, DeviceMetadataSnapshot, LatestRow,
         SampleBatch, StreamKey,
     },
-    device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
+    device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcRegistry, TreeEvent, TreeItem},
     tio::{
         self,
         proto::{ProxyStatus, SegmentMetadata},
@@ -812,12 +812,11 @@ impl MonitorState {
         }
     }
 
-    fn update_rpclists(&mut self, list: RpcList) {
-        let route = list.route.clone();
+    fn update_rpc_registry(&mut self, route: DeviceRoute, registry: RpcRegistry) {
         self.rpc_routes
             .entry(route.clone())
             .or_default()
-            .on_fetch_success(&list);
+            .on_fetch_success(registry);
         self.update_palette_suggestions_for(&route);
     }
 
@@ -945,7 +944,7 @@ impl MonitorState {
                     .or_default()
                     .on_route_discovered()
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route.clone()));
                 }
                 self.device_status.entry(route).or_default();
             }
@@ -959,7 +958,7 @@ impl MonitorState {
                     .or_default()
                     .on_new_hash(hash)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
                 }
             }
             TreeEvent::Device {
@@ -972,7 +971,7 @@ impl MonitorState {
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route.clone()));
                 }
                 self.device_status.entry(route).or_default().on_heartbeat();
             }
@@ -986,7 +985,7 @@ impl MonitorState {
                     .or_default()
                     .on_status(status)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchList(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route.clone()));
                 }
                 let dev_status = self.device_status.entry(route.clone()).or_default();
                 match status {
@@ -2307,10 +2306,10 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
             recv(rpc_resp_rx) -> resp => {
                 if let Ok(resp) = resp {
                     match resp {
-                        RpcWorkerResp::List(list) => {
-                            app.update_rpclists(list);
+                        RpcWorkerResp::Registry { route, registry } => {
+                            app.update_rpc_registry(route, registry);
                         }
-                        RpcWorkerResp::ListErr { route, error } => {
+                        RpcWorkerResp::RegistryErr { route, error } => {
                             app.update_rpclist_error(route, error);
                         }
                         RpcWorkerResp::RpcResult(res) => {

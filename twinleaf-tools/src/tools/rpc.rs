@@ -2,7 +2,7 @@ use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
-use twinleaf::device::{RpcClient, RpcRegistry};
+use twinleaf::device::RpcClient;
 use twinleaf::tio;
 use twinleaf::tio::proto::{RpcMeta, RpcValue, RpcValueType};
 
@@ -73,10 +73,9 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     let rpc_client = RpcClient::open(&proxy, route)
         .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))
         .with_proxy_help()?;
-    let rpcs = rpc_client
-        .rpc_list(&route)
-        .wrap_err("failed to query RPC list")?;
-    let registry = RpcRegistry::from(&rpcs);
+    let registry = rpc_client
+        .registry(&route)
+        .wrap_err("failed to query RPC registry")?;
 
     for desc in registry.iter() {
         println!(
