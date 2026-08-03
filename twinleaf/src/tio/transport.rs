@@ -93,8 +93,19 @@ pub struct RateInfo {
     pub target_bps: u32,
 }
 
+/// The kind of link a [`Port`] talks over, for policies which depend on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportKind {
+    Serial,
+    Tcp,
+    Udp,
+}
+
 /// Generic interface for the low level part of a port.
 trait RawPort {
+    /// The kind of link this port talks over.
+    fn kind(&self) -> TransportKind;
+
     /// Returns a packet without blocking, or RecvError::NotReady if one is not available.
     /// For all the other error values, the port should be torn down, and possibly recreated.
     fn recv(&mut self) -> Result<Packet, RecvError>;
@@ -221,6 +232,7 @@ pub struct Port {
     waker: mio::Waker,
     ctl_result: crossbeam::channel::Receiver<ControlResult>,
     rates: Option<RateInfo>,
+    kind: TransportKind,
 }
 
 /// Default size of the rx channel when receiving to a crossbeam channel.
@@ -478,6 +490,7 @@ impl Port {
         tx_size: usize,
     ) -> io::Result<Port> {
         let rates = raw_port.rate_info();
+        let kind = raw_port.kind();
         let (tx, ttx) = crossbeam::channel::bounded::<PacketOrControl>(std::cmp::max(
             DEFAULT_RX_CHANNEL_SIZE,
             tx_size,
@@ -514,6 +527,7 @@ impl Port {
             ctl_result: ctl_ret_receiver,
             waker,
             rates,
+            kind,
         })
     }
 
@@ -713,6 +727,11 @@ impl Port {
             Err(TrySendError::Full(_data)) => Err(SendError::Full),
             Err(_) => Err(SendError::Disconnected),
         }
+    }
+
+    /// The kind of link this port talks over.
+    pub fn kind(&self) -> TransportKind {
+        self.kind
     }
 
     /// Get data rate information for the underlying raw port (if supported).

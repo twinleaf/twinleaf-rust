@@ -7,11 +7,12 @@
 //! [`enumerate_serial`] is a synchronous serial-only snapshot for callers that
 //! just want a one-shot list.
 
+use crate::device::{DeviceTree, NamedRoute};
 use crate::tio::{proto::DeviceRoute, proxy};
 use crossbeam::channel;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How a discovered device is reached.
 #[derive(Debug, Clone)]
@@ -40,8 +41,11 @@ pub struct DiscoveryConfig {
     pub include_unknown: bool,
     /// Browse the local network for mDNS-advertised devices.
     pub network: bool,
-    /// Briefly connect to each serial port to resolve its `dev.name`.
+    /// Briefly connect to each device to resolve its `dev.name` and enumerate
+    /// the subdevices routed behind it.
     pub probe_names: bool,
+    /// Prefer the UDP transport when a device advertises both TCP and UDP.
+    pub prefer_udp: bool,
 }
 
 impl Default for DiscoveryConfig {
@@ -50,6 +54,7 @@ impl Default for DiscoveryConfig {
             include_unknown: false,
             network: true,
             probe_names: true,
+            prefer_udp: false,
         }
     }
 }
@@ -59,9 +64,12 @@ pub enum DiscoveryEvent {
     /// A device appeared. `name` is set for mDNS instances (from the
     /// advertisement) and `None` for serial ports until a probe resolves it.
     Added(DiscoveredDevice),
-    /// A serial device's `dev.name` was resolved after it was added.
+    /// A device's `dev.name` was resolved after it was added.
     Named { url: String, name: String },
-    /// A previously-added mDNS device sent a goodbye or otherwise went away.
+    /// The subdevices currently alive behind a device, refreshed each probe
+    /// pass. Each event supersedes the previous one for `url`.
+    Subdevices { url: String, routes: Vec<NamedRoute> },
+    /// A previously-added device went away (mDNS goodbye or serial unplug).
     Removed { url: String },
 }
 
@@ -92,12 +100,18 @@ impl Discovery {
             let _ = tx.send(DiscoveryEvent::Added(dev));
         }
 
-        // Resolve serial dev.names off-thread so the list stays responsive.
-        if config.probe_names && !serial_urls.is_empty() {
+        // Probing runs off-thread: serial ports are queued up front, network
+        // devices by the mDNS browser as they resolve.
+        let (probe_tx, probe_rx) = channel::unbounded::<String>();
+        if config.probe_names {
+            for url in serial_urls {
+                let _ = probe_tx.send(url);
+            }
             let tx = tx.clone();
             let stop = stop.clone();
+            let include_unknown = config.include_unknown;
             workers.push(std::thread::spawn(move || {
-                probe_serial_names(serial_urls, &tx, &stop)
+                probe_devices(&probe_rx, include_unknown, &tx, &stop)
             }));
         }
 
@@ -105,7 +119,11 @@ impl Discovery {
         if config.network {
             let tx = tx.clone();
             let stop = stop.clone();
-            workers.push(std::thread::spawn(move || browse_network(&tx, &stop)));
+            let probe_tx = config.probe_names.then(|| probe_tx.clone());
+            let prefer_udp = config.prefer_udp;
+            workers.push(std::thread::spawn(move || {
+                browse_network(&tx, probe_tx, prefer_udp, &stop)
+            }));
         }
         #[cfg(not(feature = "mdns"))]
         let _ = config.network;
@@ -192,35 +210,146 @@ pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
     port.rpc("dev.name", ()).ok()
 }
 
-/// [`Discovery`]'s serial-name worker: resolve `dev.name` for each serial URL in
-/// turn, emitting a [`DiscoveryEvent::Named`] for any that respond. Bails
-/// promptly when `stop` is set, so dropping the [`Discovery`] doesn't block on a
-/// slow device.
-fn probe_serial_names(urls: Vec<String>, tx: &channel::Sender<DiscoveryEvent>, stop: &AtomicBool) {
-    for url in urls {
-        if stop.load(Ordering::Relaxed) {
-            return;
+/// RPC/reconnect budget for each probe connection.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Listen window per probe pass. Heartbeats fire at 5 Hz, so 300 ms sees
+/// every live route.
+const ROUTE_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
+
+/// Serial re-scan/re-probe cadence, catching hotplug and late-booting
+/// subdevices. Network devices are probed once: reconnecting repeatedly
+/// could disrupt a session another host has with them.
+const REPROBE_PERIOD: Duration = Duration::from_secs(2);
+
+/// [`Discovery`]'s probe worker: probe each queued URL, then keep re-scanning
+/// serial ports every [`REPROBE_PERIOD`]. Bails promptly when `stop` is set.
+fn probe_devices(
+    urls: &channel::Receiver<String>,
+    include_unknown: bool,
+    tx: &channel::Sender<DiscoveryEvent>,
+    stop: &AtomicBool,
+) {
+    let mut serial_urls: Vec<String> = Vec::new();
+    let mut queue_open = true;
+    let mut next_reprobe = Instant::now() + REPROBE_PERIOD;
+    while !stop.load(Ordering::Relaxed) {
+        if queue_open {
+            match urls.recv_timeout(Duration::from_millis(50)) {
+                Ok(url) => {
+                    if probe_device(&url, tx).is_err() {
+                        return;
+                    }
+                    if url.starts_with("serial://") {
+                        serial_urls.push(url);
+                    }
+                    continue;
+                }
+                Err(channel::RecvTimeoutError::Timeout) => {}
+                Err(channel::RecvTimeoutError::Disconnected) => queue_open = false,
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
         }
-        if let Some(name) = query_name(&url, Duration::from_millis(500)) {
-            let name = name.trim().to_string();
-            if !name.is_empty() && tx.send(DiscoveryEvent::Named { url, name }).is_err() {
+
+        if Instant::now() >= next_reprobe {
+            if reprobe_serial(&mut serial_urls, include_unknown, tx, stop).is_err() {
                 return;
             }
+            next_reprobe = Instant::now() + REPROBE_PERIOD;
         }
     }
 }
 
+/// One serial round: diff the current ports against `known` (emitting
+/// `Removed`/`Added`), then probe each. Errors when the event channel closed.
+fn reprobe_serial(
+    known: &mut Vec<String>,
+    include_unknown: bool,
+    tx: &channel::Sender<DiscoveryEvent>,
+    stop: &AtomicBool,
+) -> Result<(), ()> {
+    let current = enumerate_serial(include_unknown);
+    for url in known.iter().filter(|u| !current.iter().any(|d| &d.url == *u)) {
+        tx.send(DiscoveryEvent::Removed { url: url.clone() })
+            .map_err(|_| ())?;
+    }
+    known.retain(|u| current.iter().any(|d| &d.url == u));
+    for dev in current {
+        if !known.contains(&dev.url) {
+            known.push(dev.url.clone());
+            tx.send(DiscoveryEvent::Added(dev)).map_err(|_| ())?;
+        }
+    }
+    for url in known.iter() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        probe_device(url, tx)?;
+    }
+    Ok(())
+}
+
+/// One probe pass over `url`: resolve the root `dev.name` and snapshot the
+/// routes alive behind it. Errors when the event channel closed.
+fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), ()> {
+    let interface = proxy::Interface::new_proxy(url, Some(PROBE_TIMEOUT), None);
+    let Ok(port) = interface.new_port(
+        Some(PROBE_TIMEOUT),
+        DeviceRoute::root(),
+        usize::MAX,
+        true,
+        true,
+    ) else {
+        return Ok(());
+    };
+    let mut tree = DeviceTree::new(port, DeviceRoute::root());
+
+    let mut routes = Vec::new();
+    for named in tree.named_routes(ROUTE_DISCOVERY_WINDOW) {
+        if named.route.len() == 0 {
+            if let Some(name) = named.name {
+                let event = DiscoveryEvent::Named {
+                    url: url.to_string(),
+                    name,
+                };
+                tx.send(event).map_err(|_| ())?;
+            }
+        } else {
+            routes.push(named);
+        }
+    }
+    let event = DiscoveryEvent::Subdevices {
+        url: url.to_string(),
+        routes,
+    };
+    tx.send(event).map_err(|_| ())
+}
+
 /// mDNS/DNS-SD service types Twinleaf network devices advertise. A device may
-/// advertise both transports; TCP is preferred when it does.
+/// advertise both transports; TCP is preferred when it does. Firmware built
+/// before 2026-06-15 advertises `_tio` instead of `_twinleaf`.
 #[cfg(feature = "mdns")]
-const TWINLEAF_MDNS_SERVICES: [&str; 2] = ["_twinleaf._tcp.local.", "_twinleaf._udp.local."];
+const TWINLEAF_MDNS_SERVICES: [&str; 4] = [
+    "_twinleaf._tcp.local.",
+    "_twinleaf._udp.local.",
+    "_tio._tcp.local.",
+    "_tio._udp.local.",
+];
 
 /// [`Discovery`]'s network worker: browse `_twinleaf._tcp`/`_twinleaf._udp`
 /// continuously, emitting `Added` as instances resolve and `Removed` on goodbye,
-/// until `stop` is set. A TCP announcement supersedes a UDP one for the same
-/// instance.
+/// until `stop` is set. When an instance advertises both transports, the
+/// preferred one (TCP unless `prefer_udp`) supersedes the other. Resolved
+/// devices are queued on `probe_tx` (when set) so the probe worker can
+/// enumerate their subdevices.
 #[cfg(feature = "mdns")]
-fn browse_network(tx: &channel::Sender<DiscoveryEvent>, stop: &AtomicBool) {
+fn browse_network(
+    tx: &channel::Sender<DiscoveryEvent>,
+    probe_tx: Option<channel::Sender<String>>,
+    prefer_udp: bool,
+    stop: &AtomicBool,
+) {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
     use std::collections::HashMap;
 
@@ -247,7 +376,8 @@ fn browse_network(tx: &channel::Sender<DiscoveryEvent>, stop: &AtomicBool) {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let label = instance_label(info.get_fullname());
-                        if announced.get(&label).is_some_and(|u| u.starts_with("tcp")) {
+                        let preferred = if prefer_udp { "udp" } else { "tcp" };
+                        if announced.get(&label).is_some_and(|u| u.starts_with(preferred)) {
                             continue;
                         }
                         let Some(host) = url_host(&info) else {
@@ -262,15 +392,23 @@ fn browse_network(tx: &channel::Sender<DiscoveryEvent>, stop: &AtomicBool) {
                         if announced.get(&label) == Some(&url) {
                             continue;
                         }
-                        announced.insert(label.clone(), url.clone());
+                        if let Some(old) = announced.insert(label.clone(), url.clone()) {
+                            if tx.send(DiscoveryEvent::Removed { url: old }).is_err() {
+                                let _ = daemon.shutdown();
+                                return;
+                            }
+                        }
                         let device = DiscoveredDevice {
-                            url,
+                            url: url.clone(),
                             interface: PortInterface::Network,
                             name: Some(label),
                         };
                         if tx.send(DiscoveryEvent::Added(device)).is_err() {
                             let _ = daemon.shutdown();
                             return;
+                        }
+                        if let Some(probe_tx) = &probe_tx {
+                            let _ = probe_tx.send(url);
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {

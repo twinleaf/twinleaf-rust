@@ -13,6 +13,8 @@ use std::time::Duration;
 pub struct Port {
     /// Underlying socket
     sock: UdpSocket,
+    /// Datagram held back when the OS send buffer was full
+    pending: Option<Vec<u8>>,
 }
 
 impl Port {
@@ -30,7 +32,10 @@ impl Port {
         };
         let sock = UdpSocket::bind(bind_addr)?;
         sock.connect(*address)?;
-        Ok(Port { sock })
+        Ok(Port {
+            sock,
+            pending: None,
+        })
     }
 }
 
@@ -50,6 +55,10 @@ fn is_advisory_network_error(err: &io::Error) -> bool {
 }
 
 impl RawPort for Port {
+    fn kind(&self) -> super::TransportKind {
+        super::TransportKind::Udp
+    }
+
     fn recv(&mut self) -> Result<Packet, RecvError> {
         let mut buf = [0u8; 1024];
         let size = match self.sock.recv(&mut buf) {
@@ -87,6 +96,10 @@ impl RawPort for Port {
     }
 
     fn send(&mut self, pkt: &Packet) -> Result<(), SendError> {
+        if self.pending.is_some() {
+            return Err(SendError::Full);
+        }
+
         let raw = pkt.serialize()?;
         match self.sock.send(&raw) {
             Ok(size) => {
@@ -97,16 +110,35 @@ impl RawPort for Port {
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // This could potentially happen on some implementations if
-                // the os buffers are full. In practice, it should never
-                // happen, but we can re-evaluate if we bump into it.
-                // The correct way to handle it to be consistent would be
-                // to buffer up the packet and use MustDrain/Full.
-                panic!("Unexpected UDP would block");
+                // OS send buffer full; hold the datagram for drain().
+                self.pending = Some(raw);
+                Err(SendError::MustDrain)
             }
             Err(e) if is_advisory_network_error(&e) => Ok(()),
             Err(e) => Err(SendError::IO(e)),
         }
+    }
+
+    fn drain(&mut self) -> Result<(), SendError> {
+        let Some(raw) = &self.pending else {
+            return Ok(());
+        };
+        match self.sock.send(raw) {
+            Ok(_) => {
+                self.pending = None;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(SendError::MustDrain),
+            Err(e) if is_advisory_network_error(&e) => {
+                self.pending = None;
+                Ok(())
+            }
+            Err(e) => Err(SendError::IO(e)),
+        }
+    }
+
+    fn has_data_to_drain(&self) -> bool {
+        self.pending.is_some()
     }
 
     fn max_send_interval(&self) -> Option<Duration> {

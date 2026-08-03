@@ -1,24 +1,41 @@
-//! `tio list` — discover connected and networked Twinleaf devices, live.
+//! Device discovery frontend for `tio proxy list` and its `tio list` shortcut.
 //!
-//! Streams devices from the shared discovery engine into the inline selector
-//! view (see [`crate::tui::selector`]), then leaves a plain-text snapshot.
+//! On a terminal, opens the interactive picker (see [`crate::tui::selector`]):
+//! selecting a device starts a proxy on it, quitting prints the device tree.
+//! Without a TTY, prints the tree after the scan window.
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
+use crate::ListCli;
 use twinleaf::device::discovery::DiscoveryConfig;
 
-pub fn run_list(all: bool, local: bool, duration: Duration) -> eyre::Result<()> {
+pub fn run_list(cli: ListCli) -> eyre::Result<()> {
     let config = DiscoveryConfig {
-        include_unknown: all,
-        network: !local,
+        include_unknown: cli.all,
+        network: !cli.local,
         probe_names: true,
+        prefer_udp: cli.udp,
     };
-    crate::tui::selector::list_devices(config, duration)
+    if !std::io::stdout().is_terminal() {
+        crate::init_logging();
+    }
+    match crate::tui::selector::list_devices(config, cli.duration)? {
+        Some(mounts) => super::run_proxy_for(mounts),
+        None => Ok(()),
+    }
 }
 
 /// Called from `tio proxy --enumerate` for backward compatibility; emits a
-/// deprecation warning and delegates to `run_list`.
-pub fn list_devices_deprecated(all: bool) -> eyre::Result<()> {
-    eprintln!("warning: 'tio proxy --enumerate' is deprecated; use 'tio list' instead");
-    run_list(all, false, Duration::from_secs(3))
+/// deprecation warning and prints the device tree (never the picker).
+pub(super) fn list_devices_deprecated(all: bool) -> eyre::Result<()> {
+    eprintln!("warning: 'tio proxy --enumerate' is deprecated; use 'tio proxy list' instead");
+    let config = DiscoveryConfig {
+        include_unknown: all,
+        network: true,
+        probe_names: true,
+        prefer_udp: false,
+    };
+    crate::tui::selector::print_device_list(config, Duration::from_secs(3));
+    Ok(())
 }

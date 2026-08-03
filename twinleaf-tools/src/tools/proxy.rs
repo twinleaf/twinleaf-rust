@@ -4,18 +4,17 @@
 //! tio::proxy via TCP. With `--mount`, each sensor hangs off a route prefix
 //! and the proxy presents the set as a single virtual hub.
 
-pub mod list;
+mod list;
 mod nmea;
-
-use crate::{MountArg, ProxyCli, ProxySubcommands};
 
 pub use list::run_list;
 
+use crate::{MountArg, ProxyCli, ProxySubcommands};
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
-use twinleaf::device::discovery::{self, PortInterface};
+use twinleaf::device::discovery::{self, DiscoveredDevice, PortInterface};
 use twinleaf::device::DeviceTree;
 use twinleaf::tio::{self, proto, proxy};
 
@@ -49,11 +48,18 @@ fn init_proxy_logging(verbose: bool, debug: bool) {
 
 pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
     match proxy_cli.subcommands.take() {
+        Some(ProxySubcommands::List(cli)) => list::run_list(cli),
         Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
             init_proxy_logging(false, false);
             nmea::run_nmea_proxy(tio, tcp_port)
         }
         None => {
+            if proxy_cli.enumerate {
+                return list::list_devices_deprecated(true);
+            }
+            let mounts = std::mem::take(&mut proxy_cli.mounts);
+            let layout = Layout::from_cli(mounts, proxy_cli.sensor_url.take())?;
+
             init_proxy_logging(proxy_cli.verbose, proxy_cli.debug);
             if proxy_cli.timestamp_format != "%T%.3f " {
                 log::warn!(
@@ -61,20 +67,12 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
                      timestamps are emitted by the logger"
                 );
             }
-            if proxy_cli.enumerate {
-                return list::list_devices_deprecated(true);
-            }
             if proxy_cli.auto {
                 log::warn!(
                     "'--auto' is deprecated; running without a URL now auto-detects by default"
                 );
             }
-            let mounts = std::mem::take(&mut proxy_cli.mounts);
-            let layout = Layout::from_cli(
-                mounts,
-                proxy_cli.sensor_url.take(),
-                proxy_cli.discover_duration,
-            )?;
+
             let server = ProxyServer {
                 config: ProxyConfig::from(&proxy_cli),
                 layout,
@@ -82,6 +80,29 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
             server.run()
         }
     }
+}
+
+/// Start a proxy with default settings on devices picked in `tio proxy list`,
+/// each mounted at its chosen route prefix (a single device sits at root).
+pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyre::Result<()> {
+    use clap::Parser;
+    let cli = ProxyCli::parse_from(["tio-proxy"]);
+    init_proxy_logging(cli.verbose, cli.debug);
+    let server = ProxyServer {
+        config: ProxyConfig::from(&cli),
+        layout: Layout {
+            mounts: picked
+                .into_iter()
+                .map(|(device, prefix)| Mount {
+                    locator: device.url,
+                    prefix,
+                    auto_detected: false,
+                    picked_name: device.name,
+                })
+                .collect(),
+        },
+    };
+    server.run()
 }
 
 /// Server settings, fixed at startup.
@@ -127,6 +148,8 @@ struct Mount {
     locator: String,
     prefix: proto::DeviceRoute,
     auto_detected: bool,
+    /// Device name when chosen through the `tio proxy list` picker.
+    picked_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,14 +158,10 @@ struct Layout {
 }
 
 impl Layout {
-    fn from_cli(
-        mount_args: Vec<MountArg>,
-        sensor_url: Option<String>,
-        discover_duration: Duration,
-    ) -> eyre::Result<Layout> {
+    fn from_cli(mount_args: Vec<MountArg>, sensor_url: Option<String>) -> eyre::Result<Layout> {
         if mount_args.is_empty() {
             return Ok(Layout {
-                mounts: vec![resolve_root_mount(sensor_url, discover_duration)?],
+                mounts: vec![resolve_root_mount(sensor_url)?],
             });
         }
         let mut prefixes = std::collections::HashSet::new();
@@ -158,45 +177,32 @@ impl Layout {
                     locator: arg.locator,
                     prefix: arg.prefix,
                     auto_detected: false,
+                    picked_name: None,
                 })
                 .collect(),
         })
     }
 }
 
-/// Resolve the sensor URL into a root-prefix `Mount`. With no URL, opens the
-/// interactive device picker on a terminal, or falls back to serial-only
-/// auto-detection when output isn't a TTY.
-fn resolve_root_mount(
-    sensor_url: Option<String>,
-    discover_duration: Duration,
-) -> eyre::Result<Mount> {
-    let auto_detected = sensor_url.is_none();
-    let locator = match sensor_url {
-        Some(url) => url,
-        None if std::io::stdout().is_terminal() => {
-            let config = discovery::DiscoveryConfig {
-                include_unknown: false,
-                network: true,
-                probe_names: true,
-            };
-            match crate::tui::selector::pick_device(config, discover_duration)? {
-                Some(device) => device.url,
-                None => return Err(eyre::eyre!("no device selected")),
-            }
-        }
-        None => auto_detect_serial()?,
+/// Resolve the sensor URL into a root-prefix `Mount`. With no URL,
+/// instantly auto-detects a single hard-wired serial device; network and
+/// multi-device discovery live in `tio proxy list`.
+fn resolve_root_mount(sensor_url: Option<String>) -> eyre::Result<Mount> {
+    let (locator, auto_detected) = match sensor_url {
+        Some(url) => (url, false),
+        None => (auto_detect_serial()?, true),
     };
 
     Ok(Mount {
         locator,
         prefix: proto::DeviceRoute::root(),
         auto_detected,
+        picked_name: None,
     })
 }
 
-/// Serial-only auto-detection used when output isn't a TTY (so the interactive
-/// picker can't run). Errors with the list when the choice is ambiguous.
+/// Instant serial-only auto-detection for `tio proxy` with no URL. Errors
+/// with the list when the choice is ambiguous.
 fn auto_detect_serial() -> eyre::Result<String> {
     use color_eyre::Help;
 
@@ -207,8 +213,9 @@ fn auto_detect_serial() -> eyre::Result<String> {
         }
     }
     if valid_urls.is_empty() {
-        return Err(eyre::eyre!("no sensors detected")
-            .suggestion("specify a URL with -s <url>, or run 'tio list'"));
+        return Err(eyre::eyre!("no sensors detected").suggestion(
+            "specify a URL, or run 'tio proxy list' to discover devices on the network",
+        ));
     }
     if valid_urls.len() > 1 {
         eprintln!("multiple sensors detected:");
@@ -220,7 +227,7 @@ fn auto_detect_serial() -> eyre::Result<String> {
             }
         }
         return Err(eyre::eyre!("multiple sensors detected, cannot auto-select")
-            .suggestion("specify one with -s <url>")
+            .suggestion("pick one interactively with 'tio proxy list', or specify a URL")
             .suggestion("or mount each at a route prefix with --mount <url>=/N"));
     }
     Ok(valid_urls.swap_remove(0))
@@ -328,7 +335,7 @@ impl ProxyServer {
                 Some(status_send),
             );
             pending.push(PendingLink {
-                prefix: mount.prefix.clone(),
+                prefix: mount.prefix,
                 locator: mount.locator.clone(),
                 interface,
                 status_rx,
@@ -336,7 +343,7 @@ impl ProxyServer {
         }
 
         // Phase 2: advertise this proxy over mDNS so other hosts find it via
-        // `tio list`, naming it after the sensors discovered on the bare
+        // `tio proxy list`, naming it after the sensors discovered on the bare
         // interfaces (discovery's own ports are drained and dropped, so nothing
         // backs up). The guard lives until `run` returns, then sends goodbyes.
         #[cfg(feature = "mdns")]
@@ -350,7 +357,7 @@ impl ProxyServer {
         // loop below drains these immediately, so they never back up.
         let mut links = Vec::with_capacity(pending.len());
         for p in pending {
-            let monitor_port = match p.interface.subtree_full(self.config.subtree.clone()) {
+            let monitor_port = match p.interface.subtree_full(self.config.subtree) {
                 Ok(port) => port,
                 Err(e) => {
                     let last_status = p.status_rx.iter().last();
@@ -433,7 +440,7 @@ impl ProxyServer {
         }
     }
 
-    /// Name shown to other hosts in `tio list`, built from the sensors actually
+    /// Name shown to other hosts in `tio proxy list`, built from the sensors actually
     /// connected: discover every route on each upstream link, count the sensor
     /// models (ignoring COMM/HUB routing devices), and render e.g. `VMR (x2)`.
     /// Falls back to `tio-proxy (host)` when no sensors are found.
@@ -453,9 +460,15 @@ impl ProxyServer {
     }
 
     fn print_startup(&self) {
-        println!("tio proxy starting:");
         let mounts = &self.layout.mounts;
-        if mounts.len() == 1 && mounts[0].prefix.len() == 0 {
+        match mounts.as_slice() {
+            [single] => match single.picked_name.as_deref() {
+                Some(name) => println!("tio proxy starting (selected {name}):"),
+                None => println!("tio proxy starting:"),
+            },
+            _ => println!("tio proxy starting:"),
+        }
+        if mounts.len() == 1 && mounts[0].prefix.is_empty() {
             println!(
                 "  Sensor: {}{}",
                 mounts[0].locator,
@@ -468,7 +481,10 @@ impl ProxyServer {
         } else {
             println!("  Mounts:");
             for mount in mounts {
-                println!("    {}  {}", mount.prefix, mount.locator);
+                match mount.picked_name.as_deref() {
+                    Some(name) => println!("    {}  {}  ({})", mount.prefix, mount.locator, name),
+                    None => println!("    {}  {}", mount.prefix, mount.locator),
+                }
             }
         }
         println!("  TCP port: {}", self.config.tcp_port);
@@ -717,7 +733,7 @@ impl Drop for MdnsService {
 }
 
 /// Advertise a `_twinleaf._tcp` service on the local network so other hosts
-/// discover this proxy (e.g. via `tio list`).
+/// discover this proxy (e.g. via `tio proxy list`).
 ///
 /// `instance` is the human-readable name shown to browsers, `host_name` is the
 /// machine's name (a `.local.` suffix is added if missing), and `port` is the

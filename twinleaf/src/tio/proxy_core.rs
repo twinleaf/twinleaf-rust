@@ -176,6 +176,14 @@ impl ProxyDevice {
         )
     }
 
+    /// How long this device may stay silent before the watchdog tears it down.
+    fn liveness_timeout(&self) -> Duration {
+        match self.tio_port.kind() {
+            transport::TransportKind::Tcp => LIVENESS_TIMEOUT_TCP,
+            transport::TransportKind::Serial | transport::TransportKind::Udp => LIVENESS_TIMEOUT,
+        }
+    }
+
     /// Convenience method to get the rate information for this device,
     /// when already known it has settable data rate.
     fn rates(&self) -> transport::RateInfo {
@@ -255,7 +263,18 @@ pub struct ProxyCore {
     rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
 }
 
+/// How long a device that has already sent a packet may stay silent before
+/// its transport is torn down and reconnected.
 const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Allow one RTO plus slack
+const LIVENESS_TIMEOUT_TCP: Duration = Duration::from_millis(3000);
+
+/// Extra sleep so the mainloop wakes just after liveness expires, not just before.
+const LIVENESS_WAKE_SLACK: Duration = Duration::from_millis(1);
+
+/// Polling interval while retrying to reopen a device.
+const RECONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 static QUERY_RATE_RPC_ID: u16 = 0x101;
 static SET_RATE_RPC_ID: u16 = 0x102;
@@ -761,14 +780,14 @@ impl ProxyCore {
                         self.broadcast_status(proto::ProxyStatus::FailedToReconnect);
                         break;
                     }
-                    timeout = std::cmp::min(timeout, Duration::from_secs(1));
+                    timeout = std::cmp::min(timeout, RECONNECT_POLL_INTERVAL);
                 }
             }
 
             let liveness_expired = self
                 .device
                 .as_ref()
-                .map(|dev| dev.seen_since_connect && dev.last_rx.elapsed() > LIVENESS_TIMEOUT)
+                .map(|dev| dev.seen_since_connect && dev.last_rx.elapsed() > dev.liveness_timeout())
                 .unwrap_or(false);
             if liveness_expired {
                 self.device = None;
@@ -783,10 +802,9 @@ impl ProxyCore {
                 if let Some(dev) = &mut self.device {
                     // Wake in time to run the watchdog even if the device goes silent.
                     if dev.seen_since_connect {
-                        let until_stale = (dev.last_rx + LIVENESS_TIMEOUT)
+                        let until_stale = (dev.last_rx + dev.liveness_timeout())
                             .saturating_duration_since(Instant::now());
-                        timeout =
-                            std::cmp::min(timeout, until_stale + Duration::from_millis(1));
+                        timeout = std::cmp::min(timeout, until_stale + LIVENESS_WAKE_SLACK);
                     }
                     (
                         dev.safe_to_forward(),

@@ -219,6 +219,10 @@ impl Port {
 }
 
 impl RawPort for Port {
+    fn kind(&self) -> super::TransportKind {
+        super::TransportKind::Serial
+    }
+
     fn recv(&mut self) -> Result<Packet, RecvError> {
         let mut res = self.recv_buffered();
         if let Err(RecvError::NotReady) = res {
