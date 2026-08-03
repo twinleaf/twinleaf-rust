@@ -20,6 +20,29 @@ pub struct RpcClient {
     port: proxy::Port,
 }
 
+/// Cache filename stem for a device-supplied name. The name is untrusted — a
+/// network device could report `../..` — so keep it to a charset that cannot
+/// escape the cache directory; the hash still makes the filename unique.
+fn cache_stem(dev_name: &str) -> String {
+    dev_name
+        .chars()
+        .take(64)
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// Keeping the cache tidy is an optimization, never a reason to fail a registry
+/// the device already answered for — an unwritable cache directory only costs a
+/// round-trip next time.
+fn warn_cache(result: io::Result<()>, action: &str, path: &std::path::Path) {
+    if let Err(error) = result {
+        log::warn!("could not {action} RPC cache {}: {error}", path.display());
+    }
+}
+
 fn make_registry(entries: cache::Entries, hash: u32) -> RpcRegistry {
     let specs = entries
         .into_iter()
@@ -49,7 +72,11 @@ impl RpcClient {
         name: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>, proxy::RpcError> {
-        let relative = self.port.scope().relative_route(route).unwrap_or(*route);
+        let relative = self
+            .port
+            .scope()
+            .relative_route(route)
+            .map_err(|_| proxy::RpcError::InvalidRoute)?;
 
         let req = proto::Packet::rpc_request(name, arg, 0, relative);
         self.port.send(req)?;
@@ -123,19 +150,30 @@ impl RpcClient {
             .get(route, "rpc.hash")
             .map_err(RpcRegistryError::DeviceRpcError)?;
         // TODO: evict stale cache files from old firmware versions (<dev_name>.*.rpcs)
-        let cache_path = cache_dir.join(format!("{dev_name}.{hash:x}.rpcs"));
+        let cache_path = cache_dir.join(format!("{}.{hash:x}.rpcs", cache_stem(&dev_name)));
 
         match fs::File::open(&cache_path) {
             Ok(file) => match cache::read(file)? {
                 Some(entries) => return Ok(make_registry(entries, hash)),
-                None => fs::remove_file(&cache_path)?,
+                None => warn_cache(fs::remove_file(&cache_path), "discard stale", &cache_path),
             },
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(RpcRegistryError::CacheFileError(err)),
         }
 
         let entries = self.fetch_registry_entries(route)?;
-        cache::write(&cache_path, &entries)?;
+        warn_cache(cache::write(&cache_path, &entries), "write", &cache_path);
         Ok(make_registry(entries, hash))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_stem;
+
+    #[test]
+    fn cache_stem_cannot_escape_the_cache_directory() {
+        assert_eq!(cache_stem("../../etc/passwd"), "______etc_passwd");
+        assert_eq!(cache_stem("sync-v2"), "sync-v2");
     }
 }
