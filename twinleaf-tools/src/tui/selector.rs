@@ -38,6 +38,7 @@ fn mount_route(n: u8) -> DeviceRoute {
 struct DeviceList {
     entries: Vec<Entry>,
     selected: usize,
+    network_error: Option<String>,
 }
 
 impl DeviceList {
@@ -45,6 +46,7 @@ impl DeviceList {
         Self {
             entries: Vec::new(),
             selected: 0,
+            network_error: None,
         }
     }
 
@@ -79,6 +81,9 @@ impl DeviceList {
             }
             DiscoveryEvent::Removed { url } => {
                 self.entries.retain(|e| e.device.url != url);
+            }
+            DiscoveryEvent::NetworkUnavailable { reason } => {
+                self.network_error = Some(reason);
             }
         }
         if self.selected >= self.entries.len() {
@@ -193,11 +198,18 @@ fn render(frame: &mut Frame, list: &DeviceList, spin: usize) {
         SPINNER[spin % SPINNER.len()],
         list.entries.len()
     );
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled("tio list", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("   "),
         Span::styled(status, Style::new().fg(Color::DarkGray)),
-    ]);
+    ];
+    if let Some(reason) = &list.network_error {
+        title_spans.push(Span::styled(
+            format!("   network off: {reason}"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    let title = Line::from(title_spans);
     frame.render_widget(Paragraph::new(title), title_area);
 
     if list.entries.is_empty() {

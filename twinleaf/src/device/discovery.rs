@@ -10,6 +10,8 @@
 use crate::device::{DeviceTree, NamedRoute};
 use crate::tio::{proto::DeviceRoute, proxy};
 use crossbeam::channel;
+#[cfg(feature = "mdns")]
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,9 +70,15 @@ pub enum DiscoveryEvent {
     Named { url: String, name: String },
     /// The subdevices currently alive behind a device, refreshed each probe
     /// pass. Each event supersedes the previous one for `url`.
-    Subdevices { url: String, routes: Vec<NamedRoute> },
+    Subdevices {
+        url: String,
+        routes: Vec<NamedRoute>,
+    },
     /// A previously-added device went away (mDNS goodbye or serial unplug).
     Removed { url: String },
+    /// Network browsing could not start, so no network devices will ever be
+    /// reported. Serial discovery is unaffected.
+    NetworkUnavailable { reason: String },
 }
 
 /// A running discovery session that streams [`DiscoveryEvent`]s as devices are
@@ -270,7 +278,10 @@ fn reprobe_serial(
     stop: &AtomicBool,
 ) -> Result<(), ()> {
     let current = enumerate_serial(include_unknown);
-    for url in known.iter().filter(|u| !current.iter().any(|d| &d.url == *u)) {
+    for url in known
+        .iter()
+        .filter(|u| !current.iter().any(|d| &d.url == *u))
+    {
         tx.send(DiscoveryEvent::Removed { url: url.clone() })
             .map_err(|_| ())?;
     }
@@ -307,7 +318,7 @@ fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), (
 
     let mut routes = Vec::new();
     for named in tree.named_routes(ROUTE_DISCOVERY_WINDOW) {
-        if named.route.len() == 0 {
+        if named.route.is_empty() {
             if let Some(name) = named.name {
                 let event = DiscoveryEvent::Named {
                     url: url.to_string(),
@@ -337,12 +348,85 @@ const TWINLEAF_MDNS_SERVICES: [&str; 4] = [
     "_tio._udp.local.",
 ];
 
+/// The records currently advertised for one mDNS instance label, keyed by
+/// fullname — which carries the service type, so the same device showing up
+/// under several of [`TWINLEAF_MDNS_SERVICES`] stays distinguishable — plus the
+/// URL announced to callers.
+#[cfg(feature = "mdns")]
+#[derive(Default)]
+struct Instance {
+    urls: HashMap<String, String>,
+    announced: Option<String>,
+}
+
+#[cfg(feature = "mdns")]
+impl Instance {
+    /// The URL this instance should be reachable at: the preferred transport
+    /// when advertised, otherwise any, picked deterministically so repeated
+    /// resolutions of the same records settle on one answer.
+    fn preferred_url(&self, preferred: &str) -> Option<&str> {
+        let mut urls: Vec<&str> = self.urls.values().map(String::as_str).collect();
+        urls.sort_unstable();
+        urls.iter()
+            .find(|url| url.starts_with(preferred))
+            .or(urls.first())
+            .copied()
+    }
+}
+
+/// Report that network browsing never started, on the event stream and in the
+/// log for callers that don't consume events.
+#[cfg(feature = "mdns")]
+fn network_unavailable(tx: &channel::Sender<DiscoveryEvent>, reason: String) {
+    log::warn!("network discovery unavailable: {reason}");
+    let _ = tx.send(DiscoveryEvent::NetworkUnavailable { reason });
+}
+
+/// Reconcile the URL announced for `label` against the records now advertised
+/// for it, emitting `Removed`/`Added` when it changes — a device that moves to a
+/// new address or loses its preferred transport is re-announced — and queueing
+/// the new URL on `probe_tx`. Errors when the event channel closed.
+#[cfg(feature = "mdns")]
+fn sync_instance(
+    instances: &mut HashMap<String, Instance>,
+    label: &str,
+    preferred: &str,
+    tx: &channel::Sender<DiscoveryEvent>,
+    probe_tx: Option<&channel::Sender<String>>,
+) -> Result<(), ()> {
+    let Some(instance) = instances.get_mut(label) else {
+        return Ok(());
+    };
+    let wanted = instance.preferred_url(preferred).map(str::to_string);
+    if wanted == instance.announced {
+        return Ok(());
+    }
+    if let Some(url) = instance.announced.take() {
+        tx.send(DiscoveryEvent::Removed { url }).map_err(|_| ())?;
+    }
+    let Some(url) = wanted else {
+        instances.remove(label);
+        return Ok(());
+    };
+    instance.announced = Some(url.clone());
+    let device = DiscoveredDevice {
+        url: url.clone(),
+        interface: PortInterface::Network,
+        name: Some(label.to_string()),
+    };
+    tx.send(DiscoveryEvent::Added(device)).map_err(|_| ())?;
+    if let Some(probe_tx) = probe_tx {
+        let _ = probe_tx.send(url);
+    }
+    Ok(())
+}
+
 /// [`Discovery`]'s network worker: browse `_twinleaf._tcp`/`_twinleaf._udp`
-/// continuously, emitting `Added` as instances resolve and `Removed` on goodbye,
-/// until `stop` is set. When an instance advertises both transports, the
-/// preferred one (TCP unless `prefer_udp`) supersedes the other. Resolved
-/// devices are queued on `probe_tx` (when set) so the probe worker can
-/// enumerate their subdevices.
+/// continuously, emitting `Added` as instances resolve, re-announcing them when
+/// their address changes, and `Removed` on goodbye, until `stop` is set. When an
+/// instance advertises both transports, the preferred one (TCP unless
+/// `prefer_udp`) supersedes the other. Resolved devices are queued on `probe_tx`
+/// (when set) so the probe worker can enumerate their subdevices.
 #[cfg(feature = "mdns")]
 fn browse_network(
     tx: &channel::Sender<DiscoveryEvent>,
@@ -351,11 +435,10 @@ fn browse_network(
     stop: &AtomicBool,
 ) {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
-    use std::collections::HashMap;
 
     let daemon = match ServiceDaemon::new() {
         Ok(daemon) => daemon,
-        Err(_) => return,
+        Err(error) => return network_unavailable(tx, format!("mDNS daemon: {error}")),
     };
     let receivers: Vec<_> = TWINLEAF_MDNS_SERVICES
         .iter()
@@ -363,23 +446,19 @@ fn browse_network(
         .collect();
     if receivers.is_empty() {
         let _ = daemon.shutdown();
-        return;
+        return network_unavailable(tx, "no mDNS service type could be browsed".to_string());
     }
 
-    let mut announced: HashMap<String, String> = HashMap::new();
+    let mut instances: HashMap<String, Instance> = HashMap::new();
+    let preferred = if prefer_udp { "udp" } else { "tcp" };
 
-    while !stop.load(Ordering::Relaxed) {
+    'browse: while !stop.load(Ordering::Relaxed) {
         let mut idle = true;
         for receiver in &receivers {
             while let Ok(event) = receiver.try_recv() {
                 idle = false;
-                match event {
+                let label = match event {
                     ServiceEvent::ServiceResolved(info) => {
-                        let label = instance_label(info.get_fullname());
-                        let preferred = if prefer_udp { "udp" } else { "tcp" };
-                        if announced.get(&label).is_some_and(|u| u.starts_with(preferred)) {
-                            continue;
-                        }
                         let Some(host) = url_host(&info) else {
                             continue;
                         };
@@ -389,38 +468,26 @@ fn browse_network(
                             "tcp"
                         };
                         let url = format!("{}://{}:{}", scheme, host, info.get_port());
-                        if announced.get(&label) == Some(&url) {
-                            continue;
-                        }
-                        if let Some(old) = announced.insert(label.clone(), url.clone()) {
-                            if tx.send(DiscoveryEvent::Removed { url: old }).is_err() {
-                                let _ = daemon.shutdown();
-                                return;
-                            }
-                        }
-                        let device = DiscoveredDevice {
-                            url: url.clone(),
-                            interface: PortInterface::Network,
-                            name: Some(label),
-                        };
-                        if tx.send(DiscoveryEvent::Added(device)).is_err() {
-                            let _ = daemon.shutdown();
-                            return;
-                        }
-                        if let Some(probe_tx) = &probe_tx {
-                            let _ = probe_tx.send(url);
-                        }
+                        let label = instance_label(info.get_fullname());
+                        instances
+                            .entry(label.clone())
+                            .or_default()
+                            .urls
+                            .insert(info.get_fullname().to_string(), url);
+                        label
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
                         let label = instance_label(&fullname);
-                        if let Some(url) = announced.remove(&label) {
-                            if tx.send(DiscoveryEvent::Removed { url }).is_err() {
-                                let _ = daemon.shutdown();
-                                return;
-                            }
+                        if let Some(instance) = instances.get_mut(&label) {
+                            instance.urls.remove(&fullname);
                         }
+                        label
                     }
-                    _ => {}
+                    _ => continue,
+                };
+                if sync_instance(&mut instances, &label, preferred, tx, probe_tx.as_ref()).is_err()
+                {
+                    break 'browse;
                 }
             }
         }
