@@ -3021,6 +3021,7 @@ dependencies = [
  "indicatif",
  "indicatif-log-bridge",
  "log",
+ "mdns-sd",
  "memmap2",
  "nucleo-matcher",
  "ratatui",

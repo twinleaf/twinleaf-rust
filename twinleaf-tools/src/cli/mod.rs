@@ -55,6 +55,14 @@ pub enum Commands {
         /// Include serial ports with unknown VID/PID
         #[arg(short = 'a', long = "all")]
         all: bool,
+
+        /// Only search local serial ports; skip mDNS network discovery
+        #[arg(long = "local")]
+        local: bool,
+
+        /// How long to browse for devices (e.g. 3s, 500ms)
+        #[arg(long = "duration", default_value = "3s", value_parser = humantime::parse_duration)]
+        duration: std::time::Duration,
     },
 
     /// Live sensor data display

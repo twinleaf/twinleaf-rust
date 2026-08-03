@@ -25,7 +25,11 @@ fn main() -> eyre::Result<()> {
     }
 
     match cli.command {
-        Commands::List { all } => run_list(all),
+        Commands::List {
+            all,
+            local,
+            duration,
+        } => run_list(all, local, duration),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
         Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
         Commands::Test(simulate_cli) => {

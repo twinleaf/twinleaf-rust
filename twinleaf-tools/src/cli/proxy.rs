@@ -25,6 +25,14 @@ pub struct ProxyCli {
     #[arg(short = 'p', long = "port", default_value = "7855")]
     pub(crate) port: u16,
 
+    /// How long to browse for devices when none is specified (e.g. 3s, 500ms)
+    #[arg(long = "duration", default_value = "3s", value_parser = humantime::parse_duration)]
+    pub(crate) discover_duration: std::time::Duration,
+
+    /// Advertise this proxy over mDNS (off by default)
+    #[arg(long = "mdns")]
+    pub(crate) mdns: bool,
+
     /// Kick off slow clients instead of dropping traffic
     #[arg(short = 'k', long)]
     pub(crate) kick_slow: bool,
