@@ -21,11 +21,15 @@ pub fn log_hdf(
     use std::path::Path;
     use twinleaf::data::{export, ColumnFilter};
 
+    let last_input = files
+        .last()
+        .ok_or_else(|| eyre::eyre!("missing log file"))?;
+
     // Determine output filename
     let output = match output {
         Some(o) => o,
         None => {
-            let input_path = Path::new(files.last().unwrap_or(&files[0]));
+            let input_path = Path::new(last_input);
             let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
             let base = format!("{}.h5", stem);
             if !Path::new(&base).exists() {
@@ -63,6 +67,7 @@ pub fn log_hdf(
     let mut parsed_routes: HashSet<DeviceRoute> = HashSet::new();
     let mut unparsed_routes: HashSet<DeviceRoute> = HashSet::new();
     let mut total_input_bytes: u64 = 0;
+    let mut truncated = false;
 
     println!("Processing {} files...", files.len());
 
@@ -74,11 +79,21 @@ pub fn log_hdf(
         let mut progress = ByteProgress::new(total_bytes);
         progress.set_message(path.clone());
 
+        let mut stopped_early = false;
         loop {
             let pkt = match input.next_packet() {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
-                Err(_) => break,
+                Err(e) => {
+                    log::warn!(
+                        "{}: parse error at offset {} ({:?}); stopping",
+                        path,
+                        input.position(),
+                        e
+                    );
+                    stopped_early = true;
+                    break;
+                }
             };
             progress.update(input.position() as u64);
 
@@ -102,7 +117,15 @@ pub fn log_hdf(
             );
         }
 
-        progress.finish_with_message(input.position() as u64, "Completed");
+        progress.finish_with_message(
+            input.position() as u64,
+            if stopped_early {
+                "Stopped at parse error"
+            } else {
+                "Completed"
+            },
+        );
+        truncated |= stopped_early;
     }
 
     for batch in parser.finish() {
@@ -148,6 +171,14 @@ pub fn log_hdf(
         println!(" {} {:.2} {}", label("Size:"), size_mib, unit("MiB"));
     }
     println!(" {} {}", label("Samples:"), stats.total_samples);
+
+    if truncated {
+        println!(
+            " {} {}",
+            label("Input:"),
+            style("⚠ stopped at a parse error; output is incomplete").yellow(),
+        );
+    }
 
     match filter_pattern.as_deref() {
         Some(pat) if written == 0 && seen > 0 => {

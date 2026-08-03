@@ -104,7 +104,7 @@ impl SampleBatch {
         stream: Arc<StreamMetadata>,
         device: Arc<DeviceMetadata>,
     ) -> SampleBatch {
-        debug_assert!(
+        assert!(
             columns
                 .iter()
                 .all(|c| c.values.len() == sample_numbers.len()),

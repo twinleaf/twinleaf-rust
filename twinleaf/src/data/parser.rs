@@ -22,27 +22,27 @@ impl ValidatedRows<'_> {
     fn can_append_to(&self, batch: &SampleBatch) -> bool {
         (Arc::ptr_eq(&batch.segment, &self.segment)
             || batch.segment.as_ref() == self.segment.as_ref())
-            && batch.columns.len() == self.columns.len()
+            && batch.columns.len() == self.decodable_columns().count()
             && batch
                 .columns
                 .iter()
-                .zip(self.columns)
-                .all(|(series, metadata)| {
-                    Arc::ptr_eq(&series.metadata, metadata)
-                        || series.metadata.as_ref() == metadata.as_ref()
+                .zip(self.decodable_columns())
+                .all(|(series, column)| {
+                    Arc::ptr_eq(&series.metadata, column.metadata)
+                        || series.metadata.as_ref() == column.metadata.as_ref()
                 })
     }
 
     fn decode_into(&self, sample_numbers: &mut Vec<u32>, columns: &mut [Series]) {
         for row in 0..self.row_count {
             let start = row * self.sample_size;
-            let mut raw = &self.encoded[start..start + self.sample_size];
+            let raw = &self.encoded[start..start + self.sample_size];
             sample_numbers.push(self.first_sample_n.wrapping_add(row as u32));
-            for (series, metadata) in columns.iter_mut().zip(self.columns) {
-                series
-                    .values
-                    .push_data(&ColumnData::from_le_bytes(raw, metadata.data_type));
-                raw = &raw[metadata.data_type.size()..];
+            for (series, column) in columns.iter_mut().zip(self.decodable_columns()) {
+                series.values.push_data(&ColumnData::from_le_bytes(
+                    &raw[column.offset..],
+                    column.metadata.data_type,
+                ));
             }
         }
     }
@@ -54,12 +54,11 @@ impl ValidatedRows<'_> {
 
     fn into_batch(self, route: DeviceRoute, capacity: usize) -> SampleBatch {
         let mut columns: Vec<_> = self
-            .columns
-            .iter()
-            .map(|metadata| Series {
-                index: metadata.index,
-                metadata: metadata.clone(),
-                values: ColumnVec::with_capacity_for(metadata.data_type.buffer_type(), capacity),
+            .decodable_columns()
+            .map(|column| Series {
+                index: column.metadata.index,
+                metadata: column.metadata.clone(),
+                values: ColumnVec::with_capacity_for(column.buffer_type, capacity),
             })
             .collect();
         let mut sample_numbers = Vec::with_capacity(capacity);
@@ -259,5 +258,159 @@ impl PacketParser {
     /// Absolute routes for which this parser has observed state.
     pub fn routes(&self) -> Vec<DeviceRoute> {
         self.state.routes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::ColumnVec;
+    use bytes::Bytes;
+    use proto::meta::{
+        ColumnMetadata, DeviceMetadata, MetadataContent, MetadataEpoch, MetadataFilter,
+        MetadataPayload, SegmentMetadata, StreamMetadata,
+    };
+    use proto::{DataType, Payload, StreamDataPayload};
+
+    const STREAM_ID: u8 = 1;
+
+    fn metadata_packet(content: MetadataContent) -> tio::Packet {
+        tio::Packet {
+            payload: Payload::Metadata(MetadataPayload {
+                content,
+                flags: 0,
+                unknown_fixed: Vec::new(),
+                unknown_varlen: Vec::new(),
+            }),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        }
+    }
+
+    /// Announce a device with one stream whose columns have `column_types`, then
+    /// return a parser holding that metadata.
+    fn parser_with_schema(column_types: &[DataType], sample_size: usize) -> PacketParser {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        for content in [
+            MetadataContent::Device(DeviceMetadata {
+                serial_number: "SN123".to_string(),
+                firmware_hash: "fw".to_string(),
+                n_streams: 1,
+                session_id: 42,
+                name: "test-device".to_string(),
+            }),
+            MetadataContent::Stream(StreamMetadata {
+                stream_id: STREAM_ID,
+                name: "test-stream".to_string(),
+                n_columns: column_types.len(),
+                n_segments: 1,
+                sample_size,
+                buf_samples: 128,
+            }),
+            MetadataContent::Segment(SegmentMetadata {
+                stream_id: STREAM_ID,
+                segment_id: 0,
+                flags: 0,
+                time_ref_epoch: MetadataEpoch::Unix,
+                time_ref_serial: "clock".to_string(),
+                time_ref_session_id: 7,
+                start_time: 0,
+                sampling_rate: 1,
+                decimation: 1,
+                filter_cutoff: 0.0,
+                filter_type: MetadataFilter::Unfiltered,
+            }),
+        ] {
+            parser.push_packet(&metadata_packet(content));
+        }
+        for (index, data_type) in column_types.iter().enumerate() {
+            parser.push_packet(&metadata_packet(MetadataContent::Column(ColumnMetadata {
+                stream_id: STREAM_ID,
+                index,
+                data_type: *data_type,
+                name: format!("col_{index}"),
+                units: String::new(),
+                description: String::new(),
+            })));
+        }
+        parser
+    }
+
+    fn stream_data_packet_in_segment(
+        segment_id: u8,
+        first_sample_n: u32,
+        data: Vec<u8>,
+    ) -> tio::Packet {
+        tio::Packet {
+            payload: Payload::StreamData(StreamDataPayload {
+                stream_id: STREAM_ID,
+                first_sample_n,
+                segment_id,
+                data: Bytes::from(data),
+            }),
+            routing: DeviceRoute::root(),
+            ttl: 0,
+        }
+    }
+
+    fn stream_data_packet(first_sample_n: u32, data: Vec<u8>) -> tio::Packet {
+        stream_data_packet_in_segment(0, first_sample_n, data)
+    }
+
+    #[test]
+    fn unknown_column_type_is_absent_from_the_batch() {
+        // A newer firmware reports a type this build predates, between two
+        // columns it understands.
+        let unknown = DataType::Unknown(0x35);
+        assert_eq!(unknown.size(), 3);
+        let mut parser = parser_with_schema(&[DataType::Float32, unknown, DataType::Int16], 9);
+
+        let mut data = Vec::new();
+        for (value, raw) in [(1.0f32, -3i16), (2.0f32, -4i16)] {
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+            data.extend_from_slice(&raw.to_le_bytes());
+        }
+        let batch = parser
+            .process_packet(&stream_data_packet(0, data))
+            .expect("known columns still decode");
+
+        assert_eq!(batch.len(), 2);
+        let names: Vec<&str> = batch
+            .schema()
+            .iter()
+            .map(|series| series.metadata.name.as_str())
+            .collect();
+        assert_eq!(names, ["col_0", "col_2"]);
+        match (&batch.columns[0].values, &batch.columns[1].values) {
+            (ColumnVec::F64(floats), ColumnVec::I64(ints)) => {
+                assert_eq!(floats, &[1.0, 2.0]);
+                assert_eq!(ints, &[-3, -4]);
+            }
+            other => panic!("unexpected column buffers: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_id_outside_the_ring_is_rejected() {
+        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        // The stream advertises a single segment, so any other id is corrupt and
+        // must not become the state the next packet is validated against.
+        assert!(parser
+            .process_packet(&stream_data_packet_in_segment(255, 0, vec![0; 4]))
+            .is_none());
+        assert!(parser
+            .process_packet(&stream_data_packet(0, vec![0; 4]))
+            .is_some());
+    }
+
+    #[test]
+    fn all_columns_unknown_yields_rows_without_columns() {
+        let mut parser = parser_with_schema(&[DataType::Unknown(0x35)], 3);
+        let batch = parser
+            .process_packet(&stream_data_packet(7, vec![0; 6]))
+            .expect("rows are still counted");
+        assert!(batch.schema().is_empty());
+        assert_eq!(batch.sample_numbers, vec![7, 8]);
     }
 }

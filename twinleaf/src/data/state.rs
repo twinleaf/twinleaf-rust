@@ -321,9 +321,15 @@ impl StreamState {
         data: &'a tio::proto::StreamDataPayload,
         device_metadata: Arc<DeviceMetadata>,
     ) -> Option<ValidatedRows<'a>> {
+        let stream_metadata = self.metadata.as_ref()?.clone();
+
+        // Segment ids index a fixed ring, so a wire value outside it is corrupt.
+        let n_segments = u8::try_from(stream_metadata.n_segments).ok()?;
+        if n_segments == 0 || data.segment_id >= n_segments {
+            return None;
+        }
         self.current_segment_id = data.segment_id;
 
-        let stream_metadata = self.metadata.as_ref()?.clone();
         if stream_metadata.n_columns != self.columns.len() {
             return None;
         }
@@ -343,12 +349,8 @@ impl StreamState {
             return None;
         }
 
-        if stream_metadata.n_segments == 0 {
-            return None;
-        }
-
         let next_sample = self.last_sample_number.wrapping_add(1);
-        let next_segment = (self.last_segment_id + 1).rem_euclid(stream_metadata.n_segments as u8);
+        let next_segment = self.last_segment_id.wrapping_add(1) % n_segments;
 
         // A cached entry for a reused segment id can be a stale survivor from a
         // previous trip around the segment ring. If its timestamp for this data
@@ -775,4 +777,33 @@ pub(super) struct ValidatedRows<'a> {
     pub(super) sample_size: usize,
     pub(super) encoded: &'a [u8],
     pub(super) columns: &'a [Arc<ColumnMetadata>],
+}
+
+/// One column of a decoded batch: where its bytes start within a sample, the
+/// buffer its values land in, and its metadata.
+pub(super) struct DecodableColumn<'a> {
+    pub(super) offset: usize,
+    pub(super) buffer_type: proto::BufferType,
+    pub(super) metadata: &'a Arc<ColumnMetadata>,
+}
+
+impl ValidatedRows<'_> {
+    /// The columns a batch can hold, in schema order. Columns whose wire type
+    /// this build cannot decode are absent, so every batch stays rectangular.
+    pub(super) fn decodable_columns(&self) -> impl Iterator<Item = DecodableColumn<'_>> {
+        self.columns
+            .iter()
+            .scan(0usize, |offset, metadata| {
+                let at = *offset;
+                *offset += metadata.data_type.size();
+                Some((at, metadata))
+            })
+            .filter_map(|(offset, metadata)| {
+                Some(DecodableColumn {
+                    offset,
+                    buffer_type: metadata.data_type.decoded_buffer_type()?,
+                    metadata,
+                })
+            })
+    }
 }

@@ -128,6 +128,15 @@ impl DataType {
             DataType::Unknown(_) => BufferType::Float,
         }
     }
+
+    /// The buffer a decoded column of this type lands in, or `None` for a wire
+    /// type this build does not know how to decode.
+    pub fn decoded_buffer_type(&self) -> Option<BufferType> {
+        match self {
+            DataType::Unknown(_) => None,
+            known => Some(known.buffer_type()),
+        }
+    }
 }
 
 impl std::fmt::Display for DataType {
@@ -464,9 +473,6 @@ impl SettingsPayload {
 }
 
 impl StreamDataPayload {
-    fn deserialize(raw: &[u8], stream_id: u8) -> Result<StreamDataPayload, DecodeError> {
-        Self::deserialize_bytes(Bytes::copy_from_slice(raw), stream_id)
-    }
     fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
         let sample_ser = self.first_sample_n.to_le_bytes();
         if sample_ser[3] != 0 {
@@ -476,9 +482,7 @@ impl StreamDataPayload {
         output.extend(&self.data);
         Ok(())
     }
-}
 
-impl StreamDataPayload {
     fn deserialize_bytes(raw: Bytes, stream_id: u8) -> Result<Self, DecodeError> {
         if raw.len() < 5 {
             return Err(DecodeError::PayloadTooShort {
@@ -676,19 +680,11 @@ impl Payload {
             TioPktType::RpcUpdate => Ok(Payload::RpcUpdate(RpcUpdatePayload::deserialize(
                 raw_payload,
             )?)),
-            TioPktType::UnknownOrStream(_) => {
-                if let Some(stream_id) = hdr.stream_id() {
-                    Ok(Payload::StreamData(StreamDataPayload::deserialize(
-                        raw_payload,
-                        stream_id as u8,
-                    )?))
-                } else {
-                    Ok(Payload::Unknown(GenericPayload::deserialize(
-                        raw_payload,
-                        hdr.pkt_type,
-                    )?))
-                }
-            }
+            // Stream data is decoded by the caller, which owns the backing storage.
+            TioPktType::UnknownOrStream(_) => Ok(Payload::Unknown(GenericPayload::deserialize(
+                raw_payload,
+                hdr.pkt_type,
+            )?)),
         }
     }
 }
