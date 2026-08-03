@@ -113,7 +113,10 @@ impl ProxyClient {
 
     fn recv(&self) -> Result<Packet, channel::TryRecvError> {
         let mut pkt = self.rx.try_recv()?;
-        pkt.routing = self.scope.absolute_route(&pkt.routing);
+        pkt.routing = self
+            .scope
+            .absolute_route(&pkt.routing)
+            .expect("Port validates scoped routes before enqueueing them");
         Ok(pkt)
     }
 }
@@ -352,8 +355,7 @@ impl ProxyCore {
                 self.rpc_timeouts.remove(&remap.timeout);
             }
         } else {
-            #[cfg(debug_assertions)]
-            eprintln!("Failed to find RPC timeout in map");
+            log::warn!("Failed to find RPC timeout in map");
         }
         Some((remap.client, remap.id, remap.method, remap.has_arg))
     }
@@ -495,9 +497,8 @@ impl ProxyCore {
                     to_drop.push(remap.client);
                     // This can happen without a problem per se, if e.g. a client
                     // issues an RPC which will time out, and disconnects before
-                    // said timeout occurs, so only say something in debug mode.
-                    #[cfg(debug_assertions)]
-                    eprintln!(
+                    // said timeout occurs, so it's only a debug-level log.
+                    log::debug!(
                         "Failed to send generated RPC error to client {:?}",
                         remap.client
                     );
@@ -647,8 +648,7 @@ impl ProxyCore {
             panic!("Unexpected reply ID to internal RPC: {}", rep.id)
         }
 
-        #[cfg(debug_assertions)]
-        eprintln!(
+        log::debug!(
             "Unexpected internal rpc reply 0x{:x} in state {:?}",
             rep.id,
             get_rate_vars(self)

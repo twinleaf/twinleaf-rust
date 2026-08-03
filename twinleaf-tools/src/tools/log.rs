@@ -212,7 +212,7 @@ pub fn log(
                 break;
             }
             let abs_pkt = tio::Packet {
-                routing: route.absolute_route(&pkt.routing),
+                routing: route.absolute_route(&pkt.routing)?,
                 ..pkt
             };
             let serialized = abs_pkt
@@ -312,7 +312,7 @@ pub fn log(
                 }
             };
 
-            let abs_route = route.absolute_route(&pkt.routing);
+            let abs_route = route.absolute_route(&pkt.routing)?;
 
             match &pkt.payload {
                 tio::proto::Payload::ProxyStatus(ps) => {

@@ -5,6 +5,7 @@ pub mod route;
 pub mod rpc;
 pub mod vararg;
 
+use bytes::Bytes;
 pub use legacy::{
     LegacySourceInfoPayload, LegacyStreamDataPayload, LegacyStreamInfoPayload,
     LegacyTimebaseInfoPayload,
@@ -157,7 +158,7 @@ pub struct StreamDataPayload {
     pub stream_id: u8,
     pub first_sample_n: u32,
     pub segment_id: u8,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -245,10 +246,10 @@ struct TioPktHdr {
     payload_size: u16,
 }
 
-pub static TIO_PACKET_HEADER_SIZE: usize = 4;
-pub static TIO_PACKET_MAX_ROUTING_SIZE: usize = 8;
-pub static TIO_PACKET_MAX_TOTAL_SIZE: usize = 512;
-static TIO_PACKET_MAX_PAYLOAD_SIZE: usize =
+pub const TIO_PACKET_HEADER_SIZE: usize = 4;
+pub const TIO_PACKET_MAX_ROUTING_SIZE: usize = 8;
+pub const TIO_PACKET_MAX_TOTAL_SIZE: usize = 512;
+const TIO_PACKET_MAX_PAYLOAD_SIZE: usize =
     TIO_PACKET_MAX_TOTAL_SIZE - TIO_PACKET_HEADER_SIZE - TIO_PACKET_MAX_ROUTING_SIZE;
 
 impl TioPktHdr {
@@ -456,15 +457,11 @@ impl SettingsPayload {
 
 impl StreamDataPayload {
     fn deserialize(raw: &[u8], full_data: &[u8]) -> Result<StreamDataPayload, Error> {
-        if raw.len() < 5 {
-            return Err(too_small(full_data));
-        }
-        Ok(StreamDataPayload {
-            stream_id: full_data[0] - TIO_PTYPE_STREAM0,
-            first_sample_n: u32::from_le_bytes([raw[0], raw[1], raw[2], 0u8]),
-            segment_id: raw[3],
-            data: raw[4..].to_vec(),
-        })
+        Self::deserialize_bytes(
+            Bytes::copy_from_slice(raw),
+            full_data[0] - TIO_PTYPE_STREAM0,
+            full_data,
+        )
     }
     fn serialize(&self) -> Result<Vec<u8>, ()> {
         if (self.stream_id < 1) || (self.stream_id > 127) {
@@ -486,6 +483,20 @@ impl StreamDataPayload {
         ret.extend([sample_ser[0], sample_ser[1], sample_ser[2], self.segment_id]);
         ret.extend(&self.data);
         Ok(ret)
+    }
+}
+
+impl StreamDataPayload {
+    fn deserialize_bytes(raw: Bytes, stream_id: u8, full_data: &[u8]) -> Result<Self, Error> {
+        if raw.len() < 5 {
+            return Err(too_small(full_data));
+        }
+        Ok(Self {
+            stream_id,
+            first_sample_n: u32::from_le_bytes([raw[0], raw[1], raw[2], 0u8]),
+            segment_id: raw[3],
+            data: raw.slice(4..),
+        })
     }
 }
 
@@ -674,22 +685,40 @@ impl Payload {
 }
 
 impl Packet {
-    pub fn deserialize(raw: &[u8]) -> Result<(Packet, usize), Error> {
-        let pkt_hdr = TioPktHdr::deserialize(raw)?;
+    /// Deserialize from caller-owned shared storage. Stream sample bytes are a
+    /// zero-copy [`Bytes`] slice of `raw`.
+    pub fn deserialize_bytes(raw: &Bytes) -> Result<(Packet, usize), Error> {
+        let pkt_hdr = TioPktHdr::deserialize(raw.as_ref())?;
         let pkt_len = pkt_hdr.packet_size();
-        let payload_raw = &raw[pkt_hdr.payload_offset()..pkt_hdr.routing_offset()];
+        let payload_range = pkt_hdr.payload_offset()..pkt_hdr.routing_offset();
+        let payload_raw = &raw[payload_range.clone()];
         let routing_raw = &raw[pkt_hdr.routing_offset()..pkt_len];
-        let payload = Payload::deserialize(&pkt_hdr, payload_raw, raw)?;
+        let payload = match pkt_hdr.ptype() {
+            TioPktType::UnknownOrStream(_) => match pkt_hdr.stream_id() {
+                Some(stream_id) => Payload::StreamData(StreamDataPayload::deserialize_bytes(
+                    raw.slice(payload_range),
+                    stream_id as u8,
+                    raw.as_ref(),
+                )?),
+                None => Payload::deserialize(&pkt_hdr, payload_raw, raw.as_ref())?,
+            },
+            _ => Payload::deserialize(&pkt_hdr, payload_raw, raw.as_ref())?,
+        };
 
         Ok((
             Packet {
-                payload: payload,
+                payload,
                 routing: DeviceRoute::from_bytes(routing_raw)
                     .expect("routing should have been validated in header deserialization"),
                 ttl: pkt_hdr.ttl(),
             },
             pkt_len,
         ))
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<(Packet, usize), Error> {
+        let pkt_len = TioPktHdr::deserialize(raw)?.packet_size();
+        Self::deserialize_bytes(&Bytes::copy_from_slice(&raw[..pkt_len]))
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, ()> {

@@ -117,7 +117,8 @@ impl Port {
     /// Sends a TIO packet to this port synchronously. This call will
     /// block if the port is backed up.
     pub fn send(&self, packet: Packet) -> Result<(), SendError> {
-        if packet.routing.len() > self.depth {
+        if packet.routing.len() > self.depth || self.scope.absolute_route(&packet.routing).is_err()
+        {
             return Err(SendError::InvalidRoute(packet));
         }
         match self.tx.send(packet) {
@@ -128,7 +129,8 @@ impl Port {
 
     /// Attempts to send a TIO packet to this port without blocking.
     pub fn try_send(&self, packet: Packet) -> Result<(), SendError> {
-        if packet.routing.len() > self.depth {
+        if packet.routing.len() > self.depth || self.scope.absolute_route(&packet.routing).is_err()
+        {
             return Err(SendError::InvalidRoute(packet));
         }
         match self.tx.try_send(packet) {
@@ -269,7 +271,7 @@ impl Interface {
         thread::spawn(move || {
             #[cfg(target_os = "windows")]
             let _priority = super::os::windows_helpers::ActivityGuard::latency_critical()
-                .map_err(|e| eprintln!("proxy core: failed to raise thread priority: {e}"))
+                .map_err(|e| log::warn!("proxy core: failed to raise thread priority: {e}"))
                 .ok();
 
             #[cfg(target_os = "macos")]

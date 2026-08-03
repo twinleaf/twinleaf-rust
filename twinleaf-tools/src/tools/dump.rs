@@ -53,7 +53,7 @@ pub fn dump(
                     break;
                 }
                 let abs_pkt = tio::Packet {
-                    routing: route.absolute_route(&pkt.routing),
+                    routing: route.absolute_route(&pkt.routing)?,
                     ..pkt
                 };
                 println!("{:?}", abs_pkt);
@@ -67,7 +67,7 @@ pub fn dump(
                     break;
                 }
                 if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
-                    let abs_route = route.absolute_route(&pkt.routing);
+                    let abs_route = route.absolute_route(&pkt.routing)?;
                     print_metadata_payload(&abs_route, mp);
                 }
             }

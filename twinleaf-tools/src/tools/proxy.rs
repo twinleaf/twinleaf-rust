@@ -517,15 +517,15 @@ impl ProxyServer {
                         let Ok(mut pkt) = oper.recv(port.receiver()) else {
                             break Disconnect::PortReceiveFailed;
                         };
-                        pkt.routing = prefix.absolute_route(&pkt.routing);
-                        if pkt.routing.len() > proto::TIO_PACKET_MAX_ROUTING_SIZE {
+                        let Ok(routing) = prefix.absolute_route(&pkt.routing) else {
                             log::warn!(
                                 "Dropping packet for client {}: route {} exceeds max depth",
                                 addr,
                                 pkt.routing
                             );
                             continue;
-                        }
+                        };
+                        pkt.routing = routing;
                         if dump_traffic && is_rpc(&pkt.payload) {
                             log::info!("{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
                         }
@@ -559,7 +559,11 @@ impl ProxyServer {
     }
 
     fn log_device_packet(&self, mut pkt: proto::Packet, prefix: &proto::DeviceRoute) {
-        pkt.routing = prefix.absolute_route(&pkt.routing);
+        let Ok(routing) = prefix.absolute_route(&pkt.routing) else {
+            log::warn!("Dropping packet whose mounted route exceeds max depth");
+            return;
+        };
+        pkt.routing = routing;
         let dump = match pkt.payload {
             proto::Payload::Heartbeat(_) => self.config.dump_hb,
             proto::Payload::Metadata(_) => self.config.dump_meta,

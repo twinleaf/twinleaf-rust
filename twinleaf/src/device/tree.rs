@@ -90,7 +90,9 @@ impl DeviceTree {
     }
 
     fn process_packet(&mut self, pkt: &tio::Packet) {
-        let absolute_route = self.root_route.absolute_route(&pkt.routing);
+        let Ok(absolute_route) = self.root_route.absolute_route(&pkt.routing) else {
+            return;
+        };
 
         if self.known_routes.insert(absolute_route.clone()) {
             self.event_queue
@@ -309,7 +311,9 @@ impl DeviceTree {
                 Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
             };
 
-            let absolute_route = self.root_route.absolute_route(&pkt.routing);
+            let Ok(absolute_route) = self.root_route.absolute_route(&pkt.routing) else {
+                continue;
+            };
 
             if absolute_route == route {
                 match &pkt.payload {

@@ -470,7 +470,7 @@ impl Port {
         thread::spawn(move || {
             #[cfg(target_os = "windows")]
             let _priority = super::os::windows_helpers::ActivityGuard::latency_critical()
-                .map_err(|e| eprintln!("port poller: failed to raise thread priority: {e}"))
+                .map_err(|e| log::warn!("port poller: failed to raise thread priority: {e}"))
                 .ok();
 
             #[cfg(target_os = "macos")]

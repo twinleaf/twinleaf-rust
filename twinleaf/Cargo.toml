@@ -18,10 +18,12 @@ hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 firmware-update = ["dep:ureq", "dep:serde_json"]
 
 [dependencies]
+bytes = "1"
 crossbeam = "0.8"
 crc = "3.2"
 num_enum = "0.7"
 glob = "0.3"
+log = "0.4"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true }
 ureq = { version = "3", features = ["json"], optional = true }

@@ -2981,12 +2981,14 @@ dependencies = [
 name = "twinleaf"
 version = "1.9.0"
 dependencies = [
+ "bytes",
  "crc",
  "crossbeam",
  "directories",
  "glob",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "log",
  "mdns-sd",
  "mio",
  "mio-serial",

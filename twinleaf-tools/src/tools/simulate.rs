@@ -1419,7 +1419,7 @@ impl TestDevice {
                     stream_id,
                     first_sample_n,
                     segment_id,
-                    data,
+                    data: data.into(),
                 }),
                 routing: proto::DeviceRoute::root(),
                 ttl: 0,

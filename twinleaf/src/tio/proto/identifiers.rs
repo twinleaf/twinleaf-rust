@@ -9,7 +9,7 @@ pub type StreamId = u8;
 pub type ColumnId = usize;
 pub type TimeRefSessionId = u32;
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct StreamKey {
     pub route: DeviceRoute,
     pub stream_id: StreamId,
@@ -21,7 +21,7 @@ impl StreamKey {
     }
 
     pub fn device_route(&self) -> DeviceRoute {
-        self.route.clone()
+        self.route
     }
 }
 
@@ -31,7 +31,7 @@ impl std::fmt::Display for StreamKey {
     }
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct ColumnKey {
     pub route: DeviceRoute,
     pub stream_id: StreamId,
@@ -49,13 +49,13 @@ impl ColumnKey {
 
     pub fn stream_key(&self) -> StreamKey {
         StreamKey {
-            route: self.route.clone(),
+            route: self.route,
             stream_id: self.stream_id,
         }
     }
 
     pub fn device_route(&self) -> DeviceRoute {
-        self.route.clone()
+        self.route
     }
 }
 
