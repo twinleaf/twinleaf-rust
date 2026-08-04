@@ -1,4 +1,6 @@
+use crate::tools::recv_before;
 use crate::{DumpCli, ProxyHelp, TioOpts};
+use std::time::Instant;
 use twinleaf::data::{ColumnFilter, SampleBatch, SampleRow};
 use twinleaf::device::{DeviceRoute, DeviceTree, TreeItem};
 use twinleaf::tio::{self, proxy};
@@ -23,7 +25,6 @@ pub fn dump(
     duration: Option<std::time::Duration>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
-    use std::time::Instant;
 
     let filter = if let Some(p) = glob {
         Some(ColumnFilter::new(&p).map_err(|e| eyre::eyre!("invalid glob pattern: {}", e))?)
@@ -40,18 +41,16 @@ pub fn dump(
         .wrap_err_with(|| format!("could not open port on {}", tio.root))
         .with_proxy_help()?;
 
-    let started = Instant::now();
-    let duration_elapsed = || duration.is_some_and(|d| started.elapsed() >= d);
+    let deadline = duration.map(|duration| Instant::now() + duration);
 
     log::info!("dumping from {} (route {})", tio.root, route);
 
     match (data, meta) {
         // Raw mode (no flags): dump all packets
         (false, false) => {
-            for pkt in port.iter() {
-                if duration_elapsed() {
-                    break;
-                }
+            while let Some(pkt) = recv_before(&port, deadline)
+                .map_err(|error| eyre::Report::new(error).wrap_err("stream ended"))?
+            {
                 let abs_pkt = tio::Packet {
                     routing: route.absolute_route(&pkt.routing)?,
                     ..pkt
@@ -62,10 +61,9 @@ pub fn dump(
 
         // Metadata-only mode (-m): filter to metadata packets
         (false, true) => {
-            for pkt in port.iter() {
-                if duration_elapsed() {
-                    break;
-                }
+            while let Some(pkt) = recv_before(&port, deadline)
+                .map_err(|error| eyre::Report::new(error).wrap_err("stream ended"))?
+            {
                 if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
                     let abs_route = route.absolute_route(&pkt.routing)?;
                     print_metadata_payload(&abs_route, mp);
@@ -77,9 +75,20 @@ pub fn dump(
         (true, _) => {
             let mut tree = DeviceTree::new(port, route);
 
-            while !duration_elapsed() {
-                match tree.next_item() {
-                    Ok(TreeItem::Batch(batch)) => {
+            loop {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break;
+                }
+                let next: Result<Option<TreeItem>, eyre::Report> = match deadline {
+                    Some(deadline) => match tree.recv_deadline(deadline) {
+                        Ok(item) => Ok(Some(item)),
+                        Err(proxy::RecvTimeoutError::Timeout) => Ok(None),
+                        Err(error) => Err(eyre::Report::new(error)),
+                    },
+                    None => tree.recv().map(Some).map_err(eyre::Report::new),
+                };
+                match next {
+                    Ok(Some(TreeItem::Batch(batch))) => {
                         let sample_route = batch.route;
                         // Schema questions are answered once per batch.
                         let matched = filter.as_ref().is_none_or(|f| {
@@ -97,21 +106,20 @@ pub fn dump(
                             print_sample(row, Some(&sample_route));
                         }
                     }
-                    Ok(TreeItem::Event(_)) => {}
+                    Ok(Some(TreeItem::Event(_))) => {}
+                    Ok(None) => break,
                     Err(e) => {
-                        return Err(eyre::Report::new(e).wrap_err("stream ended"));
+                        return Err(e.wrap_err("stream ended"));
                     }
                 }
             }
         }
     }
 
-    if duration_elapsed() {
+    if deadline.is_some() {
         log::info!("duration elapsed");
-        Ok(())
-    } else {
-        Err(eyre::eyre!("stream ended"))
     }
+    Ok(())
 }
 
 /// Prints the boundary/metadata lines for a batch, once, from `batch.boundary`.

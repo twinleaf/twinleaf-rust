@@ -16,7 +16,7 @@ use super::transport;
 use std::env;
 use std::io;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel;
 
@@ -110,6 +110,15 @@ pub enum RecvError {
     ProxyDisconnected,
 }
 
+/// Error returned by a receive operation with a time bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RecvTimeoutError {
+    #[error("timed out waiting for a packet")]
+    Timeout,
+    #[error("proxy disconnected")]
+    ProxyDisconnected,
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RpcError {
     #[error("RPC request was not submitted to the proxy")]
@@ -118,6 +127,8 @@ pub enum RpcError {
     InvalidRoute,
     #[error("proxy disconnected while waiting for the RPC reply")]
     ResponseLost,
+    #[error("timed out waiting for the RPC reply")]
+    Timeout,
     #[error("device returned error: {0}")]
     DeviceError(proto::RpcErrorPayload),
     #[error("RPC reply did not match expected type: {0}")]
@@ -179,6 +190,31 @@ impl Port {
         match self.rx.recv() {
             Ok(pkt) => Ok(pkt),
             Err(crossbeam::channel::RecvError) => Err(RecvError::ProxyDisconnected),
+        }
+    }
+
+    /// Waits up to `timeout` for a packet to be available.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Packet, RecvTimeoutError> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(pkt) => Ok(pkt),
+            Err(channel::RecvTimeoutError::Timeout) => Err(RecvTimeoutError::Timeout),
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                Err(RecvTimeoutError::ProxyDisconnected)
+            }
+        }
+    }
+
+    /// Waits until `deadline` for a packet to be available.
+    ///
+    /// An absolute deadline can be reused across a loop without extending the
+    /// caller's overall time budget after unrelated packets are processed.
+    pub fn recv_deadline(&self, deadline: Instant) -> Result<Packet, RecvTimeoutError> {
+        match self.rx.recv_deadline(deadline) {
+            Ok(pkt) => Ok(pkt),
+            Err(channel::RecvTimeoutError::Timeout) => Err(RecvTimeoutError::Timeout),
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                Err(RecvTimeoutError::ProxyDisconnected)
+            }
         }
     }
 
@@ -483,5 +519,57 @@ impl Interface {
 impl Default for Interface {
     fn default() -> Self {
         Self::new(DEFAULT_URL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_port() -> (Port, channel::Sender<Packet>) {
+        let (client_tx, _proxy_rx) = channel::bounded(1);
+        let (proxy_tx, client_rx) = channel::bounded(1);
+        let port = Port {
+            tx: client_tx,
+            rx: client_rx,
+            depth: usize::MAX,
+            scope: DeviceRoute::root(),
+        };
+        (port, proxy_tx)
+    }
+
+    #[test]
+    fn recv_deadline_returns_a_queued_packet() {
+        let (port, proxy_tx) = test_port();
+        proxy_tx
+            .send(Packet::heartbeat(Vec::new(), DeviceRoute::root()))
+            .unwrap();
+
+        let packet = port
+            .recv_deadline(Instant::now() + Duration::from_millis(100))
+            .unwrap();
+
+        assert!(matches!(packet.payload, proto::Payload::Heartbeat(_)));
+    }
+
+    #[test]
+    fn recv_deadline_reports_timeout() {
+        let (port, _proxy_tx) = test_port();
+
+        assert!(matches!(
+            port.recv_deadline(Instant::now() + Duration::from_millis(5)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn recv_deadline_reports_disconnect() {
+        let (port, proxy_tx) = test_port();
+        drop(proxy_tx);
+
+        assert!(matches!(
+            port.recv_deadline(Instant::now() + Duration::from_millis(100)),
+            Err(RecvTimeoutError::ProxyDisconnected)
+        ));
     }
 }

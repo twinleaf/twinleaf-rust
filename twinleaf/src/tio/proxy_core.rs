@@ -1117,3 +1117,61 @@ impl ProxyCore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_timeout_is_delivered_with_the_client_request_id() {
+        let (_new_client_tx, new_client_rx) = channel::bounded(1);
+        let (status_tx, _status_rx) = channel::bounded(4);
+        let mut core = ProxyCore::new(String::new(), None, new_client_rx, status_tx, false);
+
+        let (to_client_tx, to_client_rx) = channel::bounded(1);
+        let (_from_client_tx, from_client_rx) = channel::bounded(1);
+        let client_id = 1;
+        core.clients.insert(
+            client_id,
+            ProxyClient::new(
+                to_client_tx,
+                from_client_rx,
+                Duration::from_secs(3),
+                DeviceRoute::root(),
+                usize::MAX,
+                true,
+                true,
+            ),
+        );
+
+        let wire_id = 12;
+        let client_request_id = 7855;
+        let timeout = Instant::now() - Duration::from_millis(1);
+        core.rpc_map.insert(
+            wire_id,
+            RpcMapEntry {
+                id: client_request_id,
+                client: client_id,
+                route: DeviceRoute::root(),
+                timeout,
+                has_arg: false,
+                method: proto::RpcMethod::Name("dev.metadata".into()),
+            },
+        );
+        core.rpc_timeouts
+            .entry(timeout)
+            .or_default()
+            .insert(wire_id);
+
+        core.process_rpc_timeouts();
+
+        let packet = to_client_rx.try_recv().unwrap();
+        let proto::Payload::RpcError(error) = packet.payload else {
+            panic!("expected an RPC timeout packet");
+        };
+        assert_eq!(error.id, client_request_id);
+        assert!(matches!(error.error, proto::RpcErrorCode::Timeout));
+        assert!(core.rpc_map.is_empty());
+        assert!(core.rpc_timeouts.is_empty());
+    }
+}

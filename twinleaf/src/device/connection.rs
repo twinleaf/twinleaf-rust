@@ -9,6 +9,10 @@ use tio::{proto, proxy};
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Overall budget for [`DeviceTree::get_metadata`] to finish discovery, which
+/// can take several `dev.metadata` round trips.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Device-level events produced by the live connection engine.
 ///
 /// These events arrive via both direct serial and tio-proxy connections. A
@@ -63,6 +67,11 @@ pub enum TreeItem {
     Event(TreeEvent),
 }
 
+/// The connection to the proxy closed.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("proxy disconnected")]
+pub struct ProxyDisconnected;
+
 pub struct DeviceTree {
     port: proxy::Port,
     root_route: DeviceRoute,
@@ -94,9 +103,12 @@ impl DeviceTree {
         Ok(Self::new(port, route))
     }
 
-    fn internal_rpcs(&mut self) -> Result<(), proxy::RpcError> {
+    fn internal_rpcs(&mut self) -> Result<(), ProxyDisconnected> {
         for req in self.parser.take_requests() {
-            self.port.send(req)?;
+            // Parser requests target routes we received packets from, which
+            // are in scope by construction; the only send failure is a dead
+            // link.
+            self.port.send(req).map_err(|_| ProxyDisconnected)?;
         }
         Ok(())
     }
@@ -187,93 +199,73 @@ impl DeviceTree {
         }
     }
 
+    /// Collect complete metadata for `route`, waiting up to `METADATA_TIMEOUT`
+    /// before returning [`proxy::RpcError::Timeout`].
     pub fn get_metadata(
         &mut self,
         route: DeviceRoute,
     ) -> Result<DeviceMetadataSnapshot, tio::proxy::RpcError> {
+        let deadline = Instant::now() + METADATA_TIMEOUT;
         loop {
             if let Some(full_meta) = self.parser.metadata(route) {
                 return Ok(full_meta);
+            }
+            if Instant::now() >= deadline {
+                return Err(tio::proxy::RpcError::Timeout);
             }
             for req in self.parser.take_requests_for(route) {
                 self.port.send(req)?;
             }
             let pkt = self
                 .port
-                .recv()
-                .map_err(|_| tio::proxy::RpcError::ResponseLost)?;
+                .recv_deadline(deadline)
+                .map_err(|error| match error {
+                    proxy::RecvTimeoutError::Timeout => tio::proxy::RpcError::Timeout,
+                    proxy::RecvTimeoutError::ProxyDisconnected => {
+                        tio::proxy::RpcError::ResponseLost
+                    }
+                })?;
             self.process_packet(&pkt);
         }
     }
 
-    pub fn drain(&mut self) -> Result<Vec<SampleBatch>, tio::proxy::RpcError> {
+    fn pop_item(&mut self) -> Option<TreeItem> {
+        self.batch_queue
+            .pop_front()
+            .map(TreeItem::Batch)
+            .or_else(|| self.event_queue.pop_front().map(TreeItem::Event))
+    }
+
+    /// Block until the next item.
+    ///
+    /// May transmit metadata requests to the proxy as part of receiving.
+    pub fn recv(&mut self) -> Result<TreeItem, ProxyDisconnected> {
         loop {
+            if let Some(item) = self.pop_item() {
+                return Ok(item);
+            }
             self.internal_rpcs()?;
-            match self.port.try_recv() {
-                Ok(pkt) => {
-                    self.process_packet(&pkt);
-                }
-                Err(proxy::RecvError::WouldBlock) => {
-                    break;
-                }
-                Err(proxy::RecvError::ProxyDisconnected) => {
-                    return Err(tio::proxy::RpcError::ResponseLost);
-                }
-            }
-        }
-
-        Ok(self.batch_queue.drain(..).collect())
-    }
-
-    fn pop_batch(&mut self) -> Option<SampleBatch> {
-        self.batch_queue.pop_front()
-    }
-
-    pub fn try_next_event(&mut self) -> Option<TreeEvent> {
-        self.event_queue.pop_front()
-    }
-
-    pub fn drain_events(&mut self) -> Vec<TreeEvent> {
-        self.event_queue.drain(..).collect()
-    }
-
-    pub fn next_item(&mut self) -> Result<TreeItem, proxy::RpcError> {
-        loop {
-            if let Some(parsed) = self.batch_queue.pop_front() {
-                return Ok(TreeItem::Batch(parsed));
-            }
-
-            if let Some(event) = self.event_queue.pop_front() {
-                return Ok(TreeItem::Event(event));
-            }
-
-            self.internal_rpcs()?;
-            let pkt = self
-                .port
-                .recv()
-                .map_err(|_| proxy::RpcError::ResponseLost)?;
+            let pkt = self.port.recv().map_err(|_| ProxyDisconnected)?;
             self.process_packet(&pkt);
         }
     }
 
-    pub fn try_next_item(&mut self) -> Result<Option<TreeItem>, proxy::RpcError> {
+    /// Like [`recv`](Self::recv), but gives up at `deadline`.
+    pub fn recv_deadline(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<TreeItem, proxy::RecvTimeoutError> {
         loop {
-            if let Some(parsed) = self.batch_queue.pop_front() {
-                return Ok(Some(TreeItem::Batch(parsed)));
+            if let Some(item) = self.pop_item() {
+                return Ok(item);
             }
-
-            if let Some(event) = self.event_queue.pop_front() {
-                return Ok(Some(TreeItem::Event(event)));
+            if Instant::now() >= deadline {
+                return Err(proxy::RecvTimeoutError::Timeout);
             }
-
-            self.internal_rpcs()?;
-            match self.port.try_recv() {
-                Ok(pkt) => self.process_packet(&pkt),
-                Err(proxy::RecvError::WouldBlock) => return Ok(None),
-                Err(proxy::RecvError::ProxyDisconnected) => {
-                    return Err(proxy::RpcError::ResponseLost)
-                }
-            }
+            self.internal_rpcs()
+                .map_err(|_| proxy::RecvTimeoutError::ProxyDisconnected)?;
+            let pkt = self.port.recv_deadline(deadline)?;
+            self.process_packet(&pkt);
         }
     }
 
@@ -291,7 +283,8 @@ impl DeviceTree {
         self.port.send(req)?;
 
         loop {
-            self.internal_rpcs()?;
+            self.internal_rpcs()
+                .map_err(|_| tio::proxy::RpcError::ResponseLost)?;
             let pkt = match self.port.recv() {
                 Ok(packet) => packet,
                 Err(_) => return Err(tio::proxy::RpcError::ResponseLost),
@@ -341,56 +334,16 @@ impl DeviceTree {
         self.rpc(route, name, ())
     }
 
-    pub fn get_multi(
-        &mut self,
-        route: DeviceRoute,
-        name: &str,
-    ) -> Result<Vec<u8>, tio::proxy::RpcError> {
-        let mut full_reply = vec![];
-
-        for i in 0u16..=65535u16 {
-            match self.raw_rpc(route, name, i.to_le_bytes().as_ref()) {
-                Ok(mut rep) => full_reply.append(&mut rep),
-                Err(proxy::RpcError::DeviceError(payload)) => {
-                    if let tio::proto::RpcErrorCode::InvalidArgs = payload.error {
-                        break;
-                    }
-                    return Err(proxy::RpcError::DeviceError(payload));
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(full_reply)
-    }
-
-    pub fn get_multi_str(
-        &mut self,
-        route: DeviceRoute,
-        name: &str,
-    ) -> Result<String, tio::proxy::RpcError> {
-        let reply_bytes = self.get_multi(route, name)?;
-        let result_string = String::from_utf8_lossy(&reply_bytes).to_string();
-        Ok(result_string)
-    }
-
-    pub fn known_routes(&self) -> Vec<DeviceRoute> {
-        self.parser.routes()
-    }
-
     /// Passively observe the subtree for `window` and return the routes seen, sorted.
     pub fn discover_routes(&mut self, window: Duration) -> Vec<DeviceRoute> {
         let deadline = Instant::now() + window;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            let received = self.port.receiver().recv_timeout(remaining);
-            match received {
+        while Instant::now() < deadline {
+            match self.port.recv_deadline(deadline) {
                 Ok(pkt) => self.process_packet(&pkt),
                 Err(_) => break,
             }
         }
-        let mut routes = self.known_routes();
+        let mut routes = self.parser.routes();
         routes.sort();
         routes
     }
@@ -413,33 +366,36 @@ impl DeviceTree {
     }
 }
 
-pub enum DeviceItem {
-    Batch(SampleBatch),
-    Event(DeviceEvent),
+/// Why [`Device::next_batch`] returned without a sample batch.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum BatchError {
+    /// Sensor connection lost; the proxy is reconnecting. Recoverable: call
+    /// `next_batch` again to wait, and expect a `Boundary` on the first batch
+    /// after reconnection.
+    #[error("sensor disconnected")]
+    SensorDisconnected,
+    /// The proxy gave up connecting to the sensor. Terminal.
+    #[error("sensor connection failed")]
+    ConnectionFailed,
+    /// The link to the proxy itself closed. Terminal.
+    #[error("proxy disconnected")]
+    ProxyClosed,
 }
 
 /// A route-free view of one exact device.
 ///
 /// The underlying port has depth zero, so the general [`DeviceTree`] engine can
-/// only observe its root route. This wrapper removes route arguments and hides
-/// subtree-discovery events while sharing packet, metadata, and RPC handling.
+/// only observe its root route. This wrapper removes route arguments and folds
+/// connection-level events into [`next_batch`](Self::next_batch)'s error type;
+/// use [`DeviceTree`] directly to observe the full event stream.
 pub struct Device {
     tree: DeviceTree,
-    event_queue: VecDeque<DeviceEvent>,
-}
-
-fn scoped_event(event: TreeEvent) -> Option<DeviceEvent> {
-    match event {
-        TreeEvent::Device { event, .. } => Some(event),
-        TreeEvent::RouteDiscovered(_) => None,
-    }
 }
 
 impl Device {
     pub fn new(dev_port: proxy::Port) -> Device {
         Device {
             tree: DeviceTree::new(dev_port, DeviceRoute::root()),
-            event_queue: VecDeque::new(),
         }
     }
 
@@ -447,96 +403,33 @@ impl Device {
         Ok(Self::new(proxy.device_full(route)?))
     }
 
-    fn capture_event(&mut self, event: TreeEvent) {
-        if let Some(event) = scoped_event(event) {
-            self.event_queue.push_back(event);
-        }
-    }
-
-    fn capture_queued_events(&mut self) {
-        while let Some(event) = self.tree.try_next_event() {
-            self.capture_event(event);
-        }
-    }
-
     pub fn get_metadata(&mut self) -> Result<DeviceMetadataSnapshot, proxy::RpcError> {
         self.tree.get_metadata(DeviceRoute::root())
     }
 
-    /// Wait for the next sample batch, retaining intervening device events.
-    pub fn next_batch(&mut self) -> Result<SampleBatch, proxy::RpcError> {
-        loop {
-            match self.tree.next_item()? {
-                TreeItem::Batch(batch) => return Ok(batch),
-                TreeItem::Event(event) => self.capture_event(event),
-            }
-        }
-    }
-
-    /// Return the next available sample batch without waiting.
+    /// Wait for the next sample batch.
     ///
-    /// Intervening device events are retained and can be read separately.
-    pub fn try_next_batch(&mut self) -> Result<Option<SampleBatch>, proxy::RpcError> {
+    /// Over tio-proxy a dead sensor does not error the underlying channel, so
+    /// the [`BatchError::SensorDisconnected`] result is the only disconnection
+    /// signal shared by both serial and proxy transports.
+    pub fn next_batch(&mut self) -> Result<SampleBatch, BatchError> {
         loop {
-            match self.tree.try_next_item()? {
-                Some(TreeItem::Batch(batch)) => return Ok(Some(batch)),
-                Some(TreeItem::Event(event)) => self.capture_event(event),
-                None => return Ok(None),
-            }
-        }
-    }
-
-    pub fn drain(&mut self) -> Result<Vec<SampleBatch>, proxy::RpcError> {
-        let batches = self.tree.drain()?;
-        self.capture_queued_events();
-        Ok(batches)
-    }
-
-    pub fn try_next_event(&mut self) -> Option<DeviceEvent> {
-        self.capture_queued_events();
-        self.event_queue.pop_front()
-    }
-
-    pub fn drain_events(&mut self) -> Vec<DeviceEvent> {
-        self.capture_queued_events();
-        self.event_queue.drain(..).collect()
-    }
-
-    pub fn next_item(&mut self) -> Result<DeviceItem, proxy::RpcError> {
-        if let Some(batch) = self.tree.pop_batch() {
-            return Ok(DeviceItem::Batch(batch));
-        }
-        if let Some(event) = self.event_queue.pop_front() {
-            return Ok(DeviceItem::Event(event));
-        }
-
-        loop {
-            match self.tree.next_item()? {
-                TreeItem::Batch(batch) => return Ok(DeviceItem::Batch(batch)),
-                TreeItem::Event(TreeEvent::Device { event, .. }) => {
-                    return Ok(DeviceItem::Event(event));
-                }
-                TreeItem::Event(TreeEvent::RouteDiscovered(_)) => {}
-            }
-        }
-    }
-
-    pub fn try_next_item(&mut self) -> Result<Option<DeviceItem>, proxy::RpcError> {
-        if let Some(batch) = self.tree.pop_batch() {
-            return Ok(Some(DeviceItem::Batch(batch)));
-        }
-        if let Some(event) = self.event_queue.pop_front() {
-            return Ok(Some(DeviceItem::Event(event)));
-        }
-
-        loop {
-            match self.tree.try_next_item()? {
-                Some(TreeItem::Batch(batch)) => return Ok(Some(DeviceItem::Batch(batch))),
-                Some(TreeItem::Event(TreeEvent::Device { event, .. })) => {
-                    return Ok(Some(DeviceItem::Event(event)));
-                }
-                Some(TreeItem::Event(TreeEvent::RouteDiscovered(_))) => {}
-                None => return Ok(None),
+            match self.tree.recv().map_err(|_| BatchError::ProxyClosed)? {
+                TreeItem::Batch(batch) => return Ok(batch),
+                TreeItem::Event(TreeEvent::Device {
+                    event: DeviceEvent::Status(status),
+                    ..
+                }) => match status {
+                    proto::ProxyStatus::SensorDisconnected => {
+                        return Err(BatchError::SensorDisconnected)
+                    }
+                    proto::ProxyStatus::FailedToReconnect | proto::ProxyStatus::FailedToConnect => {
+                        return Err(BatchError::ConnectionFailed)
+                    }
+                    // Reconnects surface as a Boundary on the next batch.
+                    _ => {}
+                },
+                TreeItem::Event(_) => {}
             }
         }
     }
@@ -559,13 +452,5 @@ impl Device {
 
     pub fn get<T: RpcReply>(&mut self, name: &str) -> Result<T, proxy::RpcError> {
         self.tree.get(DeviceRoute::root(), name)
-    }
-
-    pub fn get_multi(&mut self, name: &str) -> Result<Vec<u8>, proxy::RpcError> {
-        self.tree.get_multi(DeviceRoute::root(), name)
-    }
-
-    pub fn get_multi_str(&mut self, name: &str) -> Result<String, proxy::RpcError> {
-        self.tree.get_multi_str(DeviceRoute::root(), name)
     }
 }

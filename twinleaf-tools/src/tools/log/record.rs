@@ -1,3 +1,4 @@
+use crate::tools::recv_before;
 use crate::{ProxyHelp, TioOpts};
 use std::collections::HashSet;
 use std::fs::File;
@@ -28,8 +29,6 @@ struct Recorder {
     pb: indicatif::ProgressBar,
     static_msg: String,
     unbuffered: bool,
-    duration: Option<Duration>,
-    started: Instant,
 }
 
 impl Recorder {
@@ -38,7 +37,6 @@ impl Recorder {
         path: String,
         static_msg: String,
         unbuffered: bool,
-        duration: Option<Duration>,
     ) -> Recorder {
         Recorder {
             file_out: None,
@@ -48,13 +46,7 @@ impl Recorder {
             pb,
             static_msg,
             unbuffered,
-            duration,
-            started: Instant::now(),
         }
-    }
-
-    fn duration_elapsed(&self) -> bool {
-        self.duration.is_some_and(|d| self.started.elapsed() >= d)
     }
 
     fn render_msg(&self) -> String {
@@ -156,14 +148,15 @@ pub fn log(
         parts.join(" · ")
     };
 
-    let rec = Recorder::new(pb, file, static_msg, unbuffered, duration);
+    let deadline = duration.map(|duration| Instant::now() + duration);
+    let rec = Recorder::new(pb, file, static_msg, unbuffered);
     let initial_msg = rec.render_msg();
     rec.pb.set_message(initial_msg);
 
     if raw {
-        log_raw(&proxy, &tio.root, route, depth, rec)
+        log_raw(&proxy, &tio.root, route, depth, rec, deadline)
     } else {
-        log_parsed(&proxy, &tio.root, route, rec)
+        log_parsed(&proxy, &tio.root, route, rec, deadline)
     }
 }
 
@@ -173,6 +166,7 @@ fn log_raw(
     route: DeviceRoute,
     depth: Option<usize>,
     mut rec: Recorder,
+    deadline: Option<Instant>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
 
@@ -182,10 +176,22 @@ fn log_raw(
         .wrap_err_with(|| format!("could not open port on {}", root))
         .with_proxy_help()?;
 
-    for pkt in port.iter() {
-        if rec.duration_elapsed() {
-            break;
-        }
+    loop {
+        let pkt = match recv_before(&port, deadline) {
+            Ok(Some(pkt)) => pkt,
+            Ok(None) => break,
+            Err(error) => {
+                let context = if rec.bytes_written == 0 {
+                    "stream ended; no data received".to_string()
+                } else {
+                    format!(
+                        "stream ended after writing {} bytes to {}",
+                        rec.bytes_written, rec.path
+                    )
+                };
+                return Err(eyre::Report::new(error).wrap_err(context));
+            }
+        };
         let abs_pkt = tio::Packet {
             routing: route.absolute_route(&pkt.routing)?,
             ..pkt
@@ -195,26 +201,15 @@ fn log_raw(
         rec.flush_if_needed()?;
     }
 
-    let elapsed = rec.duration_elapsed();
     let bytes = rec.bytes_written;
     let path = rec.path.clone();
     drop(rec);
-    if elapsed {
-        if bytes == 0 {
-            log::info!("no data received");
-        } else {
-            log::info!("wrote {} bytes to {}", bytes, path);
-        }
-        Ok(())
-    } else if bytes == 0 {
-        Err(eyre::eyre!("stream ended; no data received"))
+    if bytes == 0 {
+        log::info!("no data received");
     } else {
-        Err(eyre::eyre!(
-            "stream ended after writing {} bytes to {}",
-            bytes,
-            path
-        ))
+        log::info!("wrote {} bytes to {}", bytes, path);
     }
+    Ok(())
 }
 
 fn log_parsed(
@@ -222,6 +217,7 @@ fn log_parsed(
     root: &str,
     route: DeviceRoute,
     mut rec: Recorder,
+    deadline: Option<Instant>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
     use twinleaf::data::BoundaryReason;
@@ -236,59 +232,51 @@ fn log_parsed(
         .with_proxy_help()?;
 
     let mut parser = PacketParser::new(route, false);
-
     loop {
-        if rec.duration_elapsed() {
-            break;
+        for req in parser.take_requests() {
+            if let Err(e) = port.send(req) {
+                return Err(eyre::Report::new(e).wrap_err("stream ended"));
+            }
         }
 
-        // Drain all currently-available packets, mirroring DeviceTree::process_packet.
-        loop {
-            for req in parser.take_requests() {
-                if let Err(e) = port.send(req) {
-                    return Err(eyre::Report::new(e).wrap_err("stream ended"));
+        let pkt = match recv_before(&port, deadline) {
+            Ok(Some(pkt)) => pkt,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(eyre::Report::new(e).wrap_err("stream ended"));
+            }
+        };
+
+        // The parser intercepts ProxyStatus (resetting on disconnect); RpcUpdate
+        // is a parser no-op. The batch carries the absolute route.
+        let parsed = parser.process_packet(&pkt);
+
+        if let Some(batch) = &parsed {
+            let abs_route = batch.route;
+            if let Some(b) = &batch.boundary {
+                if let BoundaryReason::SamplesLost { expected, received } = b.reason {
+                    let count = received.wrapping_sub(expected);
+                    rec.samples_dropped += count as u64;
+                    log::warn!(
+                        "{}/{} dropped {} samples",
+                        abs_route,
+                        batch.stream.name,
+                        count
+                    );
                 }
+                write_metadata_snapshot(&mut rec, batch)?;
             }
 
-            let pkt = match port.try_recv() {
-                Ok(pkt) => pkt,
-                Err(tio::proxy::RecvError::WouldBlock) => break,
-                Err(e) => {
-                    return Err(eyre::Report::new(e).wrap_err("stream ended"));
-                }
-            };
-
-            // The parser intercepts ProxyStatus (resetting on disconnect); RpcUpdate
-            // is a parser no-op. The batch carries the absolute route.
-            let parsed = parser.process_packet(&pkt);
-
-            if let Some(batch) = &parsed {
-                let abs_route = batch.route;
-                if let Some(b) = &batch.boundary {
-                    if let BoundaryReason::SamplesLost { expected, received } = b.reason {
-                        let count = received.wrapping_sub(expected);
-                        rec.samples_dropped += count as u64;
-                        log::warn!(
-                            "{}/{} dropped {} samples",
-                            abs_route,
-                            batch.stream.name,
-                            count
-                        );
-                    }
-                    write_metadata_snapshot(&mut rec, batch)?;
-                }
-
-                // Only record the raw stream-data packet when it actually parsed
-                // into a batch (parser established), matching the old
-                // reconstruction which wrote exactly once per parseable packet.
-                if matches!(pkt.payload, tio::proto::Payload::StreamData(_)) {
-                    let data_pkt = tio::Packet {
-                        payload: pkt.payload,
-                        routing: abs_route,
-                        ttl: 0,
-                    };
-                    rec.write(data_pkt)?;
-                }
+            // Only record the raw stream-data packet when it actually parsed
+            // into a batch (parser established), matching the old
+            // reconstruction which wrote exactly once per parseable packet.
+            if matches!(pkt.payload, tio::proto::Payload::StreamData(_)) {
+                let data_pkt = tio::Packet {
+                    payload: pkt.payload,
+                    routing: abs_route,
+                    ttl: 0,
+                };
+                rec.write(data_pkt)?;
             }
         }
 

@@ -6,6 +6,6 @@ mod rpc;
 pub use crate::tio::proto::DeviceRoute;
 pub use capture::CaptureRpc;
 pub use connection::{
-    Device, DeviceEvent, DeviceItem, DeviceTree, NamedRoute, TreeEvent, TreeItem,
+    BatchError, Device, DeviceEvent, DeviceTree, NamedRoute, ProxyDisconnected, TreeEvent, TreeItem,
 };
 pub use rpc::{RpcClient, RpcDescriptor, RpcList, RpcListError, RpcRegistry};

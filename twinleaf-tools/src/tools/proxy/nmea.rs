@@ -49,8 +49,8 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     'outer: loop {
         let batch = match device.next_batch() {
             Ok(batch) => batch,
-            Err(_) => {
-                eprintln!("Failed to parse sample");
+            Err(e) => {
+                eprintln!("stream ended: {e}");
                 break;
             }
         };
