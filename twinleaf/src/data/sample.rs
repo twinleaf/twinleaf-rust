@@ -1,8 +1,10 @@
 use crate::tio;
 
+use crate::data::ColumnVec;
 use std::sync::Arc;
-use tio::proto::identifiers::{SampleNumber, SegmentId, SessionId, TimeRefSessionId};
+use tio::proto::identifiers::{ColumnId, SampleNumber, SegmentId, SessionId, TimeRefSessionId};
 use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
+use tio::proto::DeviceRoute;
 
 #[derive(Debug, Clone)]
 pub enum ColumnData {
@@ -21,6 +23,41 @@ impl ColumnData {
             ColumnData::Unknown => None,
         }
     }
+
+    pub fn from_le_bytes(data: &[u8], data_type: tio::proto::DataType) -> ColumnData {
+        use tio::proto::DataType;
+        match data_type {
+            DataType::Int8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
+            DataType::UInt8 => ColumnData::UInt(data[0].into()),
+            DataType::Int16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
+            DataType::UInt16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
+            DataType::Int24 => {
+                ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], 0]).into())
+            }
+            DataType::UInt24 => {
+                ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], 0]).into())
+            }
+            DataType::Int32 => {
+                ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
+            }
+            DataType::UInt32 => {
+                ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
+            }
+            DataType::Int64 => ColumnData::Int(i64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ])),
+            DataType::UInt64 => ColumnData::UInt(u64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ])),
+            DataType::Float32 => {
+                ColumnData::Float(f32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
+            }
+            DataType::Float64 => ColumnData::Float(f64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ])),
+            DataType::Unknown(_) => ColumnData::Unknown,
+        }
+    }
 }
 
 impl std::fmt::Display for ColumnData {
@@ -34,97 +71,159 @@ impl std::fmt::Display for ColumnData {
     }
 }
 
+/// One packet's samples in columnar (Structure-of-Arrays) form: metadata is held
+/// once, and each column's decoded values live in a contiguous [`ColumnVec`].
 #[derive(Debug, Clone)]
-pub struct Column {
-    pub value: ColumnData,
-    pub desc: Arc<ColumnMetadata>,
-}
-
-impl Column {
-    pub fn from_le_bytes(data: &[u8], md: Arc<ColumnMetadata>) -> Column {
-        use tio::proto::DataType;
-        Column {
-            value: match md.data_type {
-                DataType::Int8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
-                DataType::UInt8 => ColumnData::UInt(data[0].into()),
-                DataType::Int16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
-                DataType::UInt16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
-                DataType::Int24 => {
-                    ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], 0]).into())
-                }
-                DataType::UInt24 => {
-                    ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], 0]).into())
-                }
-                DataType::Int32 => {
-                    ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
-                }
-                DataType::UInt32 => ColumnData::UInt(
-                    u32::from_le_bytes([data[0], data[1], data[2], data[3]]).into(),
-                ),
-                DataType::Int64 => ColumnData::Int(
-                    i64::from_le_bytes([
-                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                    ])
-                    .into(),
-                ),
-                DataType::UInt64 => ColumnData::UInt(
-                    u64::from_le_bytes([
-                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                    ])
-                    .into(),
-                ),
-                DataType::Float32 => ColumnData::Float(
-                    f32::from_le_bytes([data[0], data[1], data[2], data[3]]).into(),
-                ),
-                DataType::Float64 => ColumnData::Float(
-                    f64::from_le_bytes([
-                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                    ])
-                    .into(),
-                ),
-                DataType::Unknown(_) => ColumnData::Unknown,
-            },
-            desc: md,
-        }
-    }
-}
-
-// fn read_u24(raw: &[u8]) -> u32 {
-//     u32::from(raw[0]) | (u32::from(raw[1]) << 8) | (u32::from(raw[2]) << 16)
-// }
-
-// fn read_i24(raw: &[u8]) -> i32 {
-//     let value = read_u24(raw) as i32;
-//     if value & 0x0080_0000 != 0 {
-//         value | !0x00ff_ffff
-//     } else {
-//         value
-//     }
-// }
-
-#[derive(Debug, Clone)]
-pub struct Sample {
-    pub n: SampleNumber,
-    pub columns: Vec<Column>,
+pub struct SampleBatch {
+    pub route: DeviceRoute,
+    /// At most one boundary per packet, anchored at the batch's first row.
+    pub boundary: Option<Boundary>,
+    pub sample_numbers: Vec<SampleNumber>,
+    /// Columns in index order.
+    pub columns: Vec<Series>,
     pub segment: Arc<SegmentMetadata>,
     pub stream: Arc<StreamMetadata>,
     pub device: Arc<DeviceMetadata>,
-    pub source: tio::proto::StreamDataPayload,
-
-    pub boundary: Option<Boundary>,
 }
 
-impl Sample {
+#[derive(Debug, Clone)]
+pub struct Series {
+    pub index: ColumnId,
+    pub metadata: Arc<ColumnMetadata>,
+    pub values: ColumnVec,
+}
+
+impl SampleBatch {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        route: DeviceRoute,
+        boundary: Option<Boundary>,
+        sample_numbers: Vec<SampleNumber>,
+        columns: Vec<Series>,
+        segment: Arc<SegmentMetadata>,
+        stream: Arc<StreamMetadata>,
+        device: Arc<DeviceMetadata>,
+    ) -> SampleBatch {
+        debug_assert!(
+            columns
+                .iter()
+                .all(|c| c.values.len() == sample_numbers.len()),
+            "every column must hold exactly one value per sample"
+        );
+        SampleBatch {
+            route,
+            boundary,
+            sample_numbers,
+            columns,
+            segment,
+            stream,
+            device,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.sample_numbers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sample_numbers.is_empty()
+    }
+
+    pub fn first_sample(&self) -> Option<SampleNumber> {
+        self.sample_numbers.first().copied()
+    }
+
+    pub fn last_sample(&self) -> Option<SampleNumber> {
+        self.sample_numbers.last().copied()
+    }
+
+    /// The batch's columns, in index order. The blessed way to ask schema
+    /// questions (names, types, units) without touching row values.
+    pub fn schema(&self) -> &[Series] {
+        &self.columns
+    }
+
+    pub fn column(&self, id: ColumnId) -> Option<&Series> {
+        self.columns.iter().find(|c| c.index == id)
+    }
+
+    pub fn row(&self, row: usize) -> Option<SampleRef<'_>> {
+        (row < self.len()).then_some(SampleRef { batch: self, row })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SampleRef<'_>> {
+        (0..self.len()).map(move |row| SampleRef { batch: self, row })
+    }
+
+    /// True unless the boundary marks a break in continuity.
     pub fn is_continuous(&self) -> bool {
         self.boundary.as_ref().map_or(true, |b| b.is_continuous())
     }
 
+    /// True unless the boundary marks a non-monotonic break.
     pub fn is_monotonic(&self) -> bool {
         self.boundary.as_ref().map_or(true, |b| b.is_monotonic())
     }
 
+    /// True only when the boundary is the stream's first sample.
     pub fn is_initial(&self) -> bool {
         self.boundary.as_ref().is_some_and(|b| b.is_initial())
+    }
+}
+
+/// Borrowing view of one row of a [`SampleBatch`].
+#[derive(Clone, Copy)]
+pub struct SampleRef<'a> {
+    batch: &'a SampleBatch,
+    row: usize,
+}
+
+impl<'a> SampleRef<'a> {
+    pub fn n(&self) -> SampleNumber {
+        self.batch.sample_numbers[self.row]
+    }
+    pub fn stream(&self) -> &'a Arc<StreamMetadata> {
+        &self.batch.stream
+    }
+    pub fn segment(&self) -> &'a Arc<SegmentMetadata> {
+        &self.batch.segment
+    }
+    pub fn device(&self) -> &'a Arc<DeviceMetadata> {
+        &self.batch.device
+    }
+    pub fn timestamp_begin(&self) -> f64 {
+        self.batch.segment.time_at(self.n())
+    }
+    pub fn timestamp_end(&self) -> f64 {
+        self.batch.segment.time_at(self.n() + 1)
+    }
+
+    /// The row's column values in schema order.
+    pub fn values(&self) -> impl Iterator<Item = ColumnData> + '_ {
+        let row = self.row;
+        self.batch.columns.iter().map(move |c| c.values.get(row))
+    }
+
+    /// The row's value for a single column, by index.
+    pub fn value(&self, id: ColumnId) -> Option<ColumnData> {
+        self.batch.column(id).map(|c| c.values.get(self.row))
+    }
+}
+
+impl std::fmt::Display for SampleRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SAMPLE({}:{}:{}) {:.6}",
+            self.batch.device.session_id,
+            self.batch.stream.stream_id,
+            self.batch.segment.segment_id,
+            self.timestamp_end()
+        )?;
+        for (series, value) in self.batch.schema().iter().zip(self.values()) {
+            write!(f, " {}: {}", series.metadata.name, value)?;
+        }
+        write!(f, " [#{}]", self.n())
     }
 }
 
@@ -196,35 +295,5 @@ impl Boundary {
 
     pub fn is_initial(&self) -> bool {
         matches!(self.reason, BoundaryReason::Initial)
-    }
-}
-
-impl Sample {
-    pub fn timestamp_begin(&self) -> f64 {
-        let period =
-            1.0 / f64::from(self.segment.sampling_rate) * f64::from(self.segment.decimation);
-        f64::from(self.segment.start_time) + period * f64::from(self.n)
-    }
-    pub fn timestamp_end(&self) -> f64 {
-        let period =
-            1.0 / f64::from(self.segment.sampling_rate) * f64::from(self.segment.decimation);
-        f64::from(self.segment.start_time) + period * f64::from(self.n + 1)
-    }
-}
-
-impl std::fmt::Display for Sample {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SAMPLE({}:{}:{}) {:.6}",
-            self.device.session_id,
-            self.stream.stream_id,
-            self.segment.segment_id,
-            self.timestamp_end()
-        )?;
-        for col in &self.columns {
-            write!(f, " {}: {}", col.desc.name, col.value)?;
-        }
-        write!(f, " [#{}]", self.n)
     }
 }

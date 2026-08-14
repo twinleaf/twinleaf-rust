@@ -436,8 +436,9 @@ impl HealthState {
             .count()
     }
 
-    fn handle_sample(&mut self, sample: twinleaf::data::Sample, route: DeviceRoute, now: Instant) {
-        let sid = sample.stream.stream_id;
+    fn handle_batch(&mut self, batch: twinleaf::data::SampleBatch, now: Instant) {
+        let route = batch.route.clone();
+        let sid = batch.stream.stream_id;
 
         if let Some(filter) = &self.streams_filter {
             if !filter.contains(&sid) {
@@ -447,23 +448,24 @@ impl HealthState {
 
         let key = StreamKey::new(route.clone(), sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
-            name: sample.stream.name.clone(),
-            current_session_id: Some(sample.device.session_id),
+            name: batch.stream.name.clone(),
+            current_session_id: Some(batch.device.session_id),
             ..Default::default()
         });
 
-        st.name = sample.stream.name.clone();
+        st.name = batch.stream.name.clone();
 
-        if let Some(boundary) = &sample.boundary {
-            self.handle_boundary(&boundary.reason, &route, &sample.stream.name, sid);
+        if let Some(boundary) = &batch.boundary {
+            self.handle_boundary(&boundary.reason, &route, &batch.stream.name, sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();
-        if st.last_n.map(|n| sample.n != n).unwrap_or(true) {
-            st.last_seen = Some(now);
+        for row in batch.iter() {
+            if st.last_n.map(|n| row.n() != n).unwrap_or(true) {
+                st.last_seen = Some(now);
+            }
+            st.on_sample(row.n(), row.timestamp_end(), now, self.jitter_window_s);
         }
-
-        st.on_sample(sample.n, sample.timestamp_end(), now, self.jitter_window_s);
     }
 
     fn handle_boundary(
@@ -1166,8 +1168,8 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
             recv(data_rx) -> item => {
                 let now = Instant::now();
                 match item {
-                    Ok(Ok(TreeItem::Sample(sample, route))) => {
-                        app.handle_sample(sample, route, now);
+                    Ok(Ok(TreeItem::Batch(batch))) => {
+                        app.handle_batch(batch, now);
                     }
                     Ok(Ok(TreeItem::Event(event))) => {
                         app.handle_event(event, now, &rpc_tx);

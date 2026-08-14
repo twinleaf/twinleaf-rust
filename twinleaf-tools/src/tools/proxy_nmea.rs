@@ -48,9 +48,9 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     let peer_addr = stream.peer_addr().unwrap();
     println!("Connection from: {}", peer_addr);
 
-    loop {
-        let sample = match device.next() {
-            Ok(sample) => sample,
+    'outer: loop {
+        let batch = match device.next() {
+            Ok(batch) => batch,
             Err(_) => {
                 eprintln!("Failed to parse sample");
                 break;
@@ -58,34 +58,36 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
         };
 
         // Only process samples from stream ID 1
-        if sample.stream.stream_id != 1 {
+        if batch.stream.stream_id != 1 {
             continue;
         }
 
-        // Convert timestamp to NMEA format (HHMMSS.SS)
-        let timestamp = sample.timestamp_end();
-        let hours = (timestamp / 3600.0) as u32;
-        let minutes = ((timestamp % 3600.0) / 60.0) as u32;
-        let seconds = timestamp % 60.0;
-        let time_str = format!("{:02}{:02}{:05.2}", hours, minutes, seconds);
+        for row in batch.iter() {
+            // Convert timestamp to NMEA format (HHMMSS.SS)
+            let timestamp = row.timestamp_end();
+            let hours = (timestamp / 3600.0) as u32;
+            let minutes = ((timestamp % 3600.0) / 60.0) as u32;
+            let seconds = timestamp % 60.0;
+            let time_str = format!("{:02}{:02}{:05.2}", hours, minutes, seconds);
 
-        // Format data fields
-        let mut fields = vec![time_str];
-        for col in &sample.columns {
-            let value = match col.value {
-                twinleaf::data::ColumnData::Int(x) => format!("{}", x),
-                twinleaf::data::ColumnData::UInt(x) => format!("{}", x),
-                twinleaf::data::ColumnData::Float(x) => format!("{:.2}", x),
-                twinleaf::data::ColumnData::Unknown => "?".to_string(),
-            };
-            fields.push(value);
-        }
+            // Format data fields
+            let mut fields = vec![time_str];
+            for value in row.values() {
+                let value = match value {
+                    twinleaf::data::ColumnData::Int(x) => format!("{}", x),
+                    twinleaf::data::ColumnData::UInt(x) => format!("{}", x),
+                    twinleaf::data::ColumnData::Float(x) => format!("{:.2}", x),
+                    twinleaf::data::ColumnData::Unknown => "?".to_string(),
+                };
+                fields.push(value);
+            }
 
-        // Create NMEA sentence
-        let nmea = format_nmea_sentence("TL", "MAG", &fields);
+            // Create NMEA sentence
+            let nmea = format_nmea_sentence("TL", "MAG", &fields);
 
-        if let Err(_) = write!(stream, "{}", nmea) {
-            break;
+            if write!(stream, "{}", nmea).is_err() {
+                break 'outer;
+            }
         }
     }
     println!("Disconnected: {}", peer_addr);

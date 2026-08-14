@@ -1,5 +1,6 @@
 use crate::{DumpCli, ProxyHelp, TioOpts};
-use twinleaf::device::{DeviceRoute, DeviceTree};
+use twinleaf::data::{ColumnFilter, SampleBatch, SampleRef};
+use twinleaf::device::{DeviceRoute, DeviceTree, TreeItem};
 use twinleaf::tio::{self, proxy};
 
 pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
@@ -7,6 +8,7 @@ pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
         &dump_cli.tio,
         dump_cli.data,
         dump_cli.meta,
+        dump_cli.glob,
         dump_cli.depth,
         dump_cli.duration,
     )
@@ -16,11 +18,18 @@ pub fn dump(
     tio: &TioOpts,
     data: bool,
     meta: bool,
+    glob: Option<String>,
     depth: Option<usize>,
     duration: Option<std::time::Duration>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
     use std::time::Instant;
+
+    let filter = if let Some(p) = glob {
+        Some(ColumnFilter::new(&p).map_err(|e| eyre::eyre!("invalid glob pattern: {}", e))?)
+    } else {
+        None
+    };
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
@@ -69,10 +78,26 @@ pub fn dump(
             let mut tree = DeviceTree::new(port, route.clone());
 
             while !duration_elapsed() {
-                match tree.next() {
-                    Ok((sample, sample_route)) => {
-                        print_sample(&sample, Some(&sample_route), meta, true);
+                match tree.next_item() {
+                    Ok(TreeItem::Batch(batch)) => {
+                        let sample_route = batch.route.clone();
+                        // Schema questions are answered once per batch.
+                        let matched = filter.as_ref().map_or(true, |f| {
+                            batch.schema().iter().any(|series| {
+                                f.matches(&sample_route, &batch.stream.name, &series.metadata.name)
+                            })
+                        });
+                        if !matched {
+                            continue;
+                        }
+                        if meta {
+                            print_batch_meta(&batch, Some(&sample_route));
+                        }
+                        for row in batch.iter() {
+                            print_sample(row, Some(&sample_route));
+                        }
                     }
+                    Ok(TreeItem::Event(_)) => {}
                     Err(e) => {
                         return Err(eyre::Report::new(e).wrap_err("stream ended"));
                     }
@@ -89,35 +114,35 @@ pub fn dump(
     }
 }
 
-pub fn print_sample(
-    sample: &twinleaf::data::Sample,
-    route: Option<&DeviceRoute>,
-    print_meta: bool,
-    print_data: bool,
-) {
+/// Prints the boundary/metadata lines for a batch, once, from `batch.boundary`.
+pub fn print_batch_meta(batch: &SampleBatch, route: Option<&DeviceRoute>) {
     let route_str = if let Some(r) = route {
         format!("{} ", r)
     } else {
         "".to_string()
     };
 
-    if print_meta {
-        if let Some(boundary) = &sample.boundary {
-            println!("# {}BOUNDARY {:?}", route_str, boundary.reason);
-            if !boundary.is_continuous() {
-                println!("# {}DEVICE {:?}", route_str, sample.device);
-                println!("# {}STREAM {:?}", route_str, sample.stream);
-                for col in &sample.columns {
-                    println!("# {}COLUMN {:?}", route_str, col.desc);
-                }
+    if let Some(boundary) = &batch.boundary {
+        println!("# {}BOUNDARY {:?}", route_str, boundary.reason);
+        if !boundary.is_continuous() {
+            println!("# {}DEVICE {:?}", route_str, batch.device);
+            println!("# {}STREAM {:?}", route_str, batch.stream);
+            for series in batch.schema() {
+                println!("# {}COLUMN {:?}", route_str, series.metadata);
             }
-            println!("# {}SEGMENT {:?}", route_str, sample.segment);
         }
+        println!("# {}SEGMENT {:?}", route_str, batch.segment);
     }
+}
 
-    if print_data {
-        println!("{}{}", route_str, sample);
-    }
+/// Prints one row's data line.
+pub fn print_sample(row: SampleRef, route: Option<&DeviceRoute>) {
+    let route_str = if let Some(r) = route {
+        format!("{} ", r)
+    } else {
+        "".to_string()
+    };
+    println!("{}{}", route_str, row);
 }
 
 pub fn print_metadata_payload(route: &DeviceRoute, payload: &tio::proto::MetadataPayload) {

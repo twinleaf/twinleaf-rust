@@ -68,6 +68,11 @@ pub enum LogSubcommands {
         #[arg(short = 's', long = "sensor", default_value = "/", value_parser = parse_device_route)]
         sensor: DeviceRoute,
 
+        /// Filter streams/columns using a glob pattern (e.g. "sync", "/0/vector").
+        /// Requires -d.
+        #[arg(short = 'g', long = "glob", requires = "data")]
+        glob: Option<String>,
+
         /// Routing depth limit (default: unlimited)
         #[arg(long = "depth")]
         depth: Option<usize>,

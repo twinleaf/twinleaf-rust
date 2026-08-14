@@ -1,4 +1,4 @@
-use super::identifiers::{ColumnId, SegmentId, SessionId, StreamId};
+use super::identifiers::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 use super::{
     too_small, vararg, DataType, Error, TioPktHdr, TioPktType, TIO_PACKET_MAX_PAYLOAD_SIZE,
 };
@@ -236,6 +236,10 @@ impl SegmentMetadata {
     }
     pub fn active(&self) -> bool {
         (self.flags & TL_METADATA_SEGMENT_ACTIVE) != 0
+    }
+    pub fn time_at(&self, n: SampleNumber) -> f64 {
+        let period = 1.0 / f64::from(self.sampling_rate) * f64::from(self.decimation);
+        f64::from(self.start_time) + period * f64::from(n)
     }
     pub fn deserialize(
         raw: &[u8],

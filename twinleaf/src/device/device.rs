@@ -1,4 +1,4 @@
-use crate::data::{DeviceDataParser, DeviceFullMetadata, Sample};
+use crate::data::{DeviceDataParser, DeviceFullMetadata, SampleBatch};
 use crate::tio;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
@@ -53,7 +53,7 @@ pub enum DeviceEvent {
 }
 
 pub enum DeviceItem {
-    Sample(Sample),
+    Batch(SampleBatch),
     Event(DeviceEvent),
 }
 
@@ -62,7 +62,7 @@ pub struct Device {
     parser: DeviceDataParser,
     n_reqs: usize,
     metadata_announced: bool,
-    sample_queue: VecDeque<Sample>,
+    batch_queue: VecDeque<SampleBatch>,
     event_queue: VecDeque<DeviceEvent>,
 }
 
@@ -73,7 +73,7 @@ impl Device {
             parser: DeviceDataParser::new(false),
             n_reqs: 0,
             metadata_announced: false,
-            sample_queue: VecDeque::new(),
+            batch_queue: VecDeque::new(),
             event_queue: VecDeque::new(),
         }
     }
@@ -146,8 +146,9 @@ impl Device {
             }
             _ => {}
         }
-        self.sample_queue
-            .append(&mut VecDeque::from(self.parser.process_packet(&pkt)));
+        if let Some(batch) = self.parser.process_packet(&pkt) {
+            self.batch_queue.push_back(batch);
+        }
 
         if !self.metadata_announced {
             if let Ok(full_metadata) = self.parser.get_metadata() {
@@ -178,10 +179,10 @@ impl Device {
         }
     }
 
-    pub fn next(&mut self) -> Result<Sample, proxy::RpcError> {
+    pub fn next(&mut self) -> Result<SampleBatch, proxy::RpcError> {
         loop {
-            if let Some(sample) = self.sample_queue.pop_front() {
-                return Ok(sample);
+            if let Some(packet) = self.batch_queue.pop_front() {
+                return Ok(packet);
             }
 
             self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
@@ -191,10 +192,10 @@ impl Device {
         }
     }
 
-    pub fn try_next(&mut self) -> Result<Option<Sample>, proxy::RpcError> {
+    pub fn try_next(&mut self) -> Result<Option<SampleBatch>, proxy::RpcError> {
         loop {
-            if let Some(sample) = self.sample_queue.pop_front() {
-                return Ok(Some(sample));
+            if let Some(packet) = self.batch_queue.pop_front() {
+                return Ok(Some(packet));
             }
 
             self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
@@ -208,7 +209,7 @@ impl Device {
         }
     }
 
-    pub fn drain(&mut self) -> Result<Vec<Sample>, proxy::RpcError> {
+    pub fn drain(&mut self) -> Result<Vec<SampleBatch>, proxy::RpcError> {
         loop {
             self.internal_rpcs().map_err(proxy::RpcError::SendFailed)?;
             match self.dev_port.try_recv() {
@@ -224,7 +225,7 @@ impl Device {
             }
         }
 
-        Ok(self.sample_queue.drain(0..).collect())
+        Ok(self.batch_queue.drain(0..).collect())
     }
 
     pub fn try_next_event(&mut self) -> Option<DeviceEvent> {
@@ -237,8 +238,8 @@ impl Device {
 
     pub fn next_item(&mut self) -> Result<DeviceItem, proxy::RpcError> {
         loop {
-            if let Some(sample) = self.sample_queue.pop_front() {
-                return Ok(DeviceItem::Sample(sample));
+            if let Some(packet) = self.batch_queue.pop_front() {
+                return Ok(DeviceItem::Batch(packet));
             }
             if let Some(event) = self.event_queue.pop_front() {
                 return Ok(DeviceItem::Event(event));
@@ -252,8 +253,8 @@ impl Device {
 
     pub fn try_next_item(&mut self) -> Result<Option<DeviceItem>, proxy::RpcError> {
         loop {
-            if let Some(sample) = self.sample_queue.pop_front() {
-                return Ok(Some(DeviceItem::Sample(sample)));
+            if let Some(packet) = self.batch_queue.pop_front() {
+                return Ok(Some(DeviceItem::Batch(packet)));
             }
 
             if let Some(event) = self.event_queue.pop_front() {

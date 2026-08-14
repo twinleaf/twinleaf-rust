@@ -1,5 +1,7 @@
-use super::sample::{Boundary, BoundaryReason, Column, PriorState, Sample};
+use super::sample::{Boundary, BoundaryReason, ColumnData, PriorState, SampleBatch, Series};
+use crate::data::ColumnVec;
 use crate::tio;
+use proto::identifiers::ColumnId;
 use proto::meta::MetadataType;
 use proto::DeviceRoute;
 use std::collections::HashMap;
@@ -146,7 +148,7 @@ struct DeviceColumn {
 #[derive(Debug)]
 struct DeviceStream {
     stream: Option<Arc<StreamMetadata>>,
-    segment: Option<Arc<SegmentMetadata>>,
+    segments: HashMap<u8, Arc<SegmentMetadata>>,
     columns: Vec<DeviceColumn>,
 
     id: u8,
@@ -166,7 +168,7 @@ impl DeviceStream {
     fn new(id: u8) -> Self {
         DeviceStream {
             stream: None,
-            segment: None,
+            segments: HashMap::new(),
             columns: vec![],
             id,
             current_data_seg: 0,
@@ -193,22 +195,8 @@ impl DeviceStream {
                 ret.push(StreamRpcMetaReq::stream(self.id));
             }
         }
-        if match self.segment.as_ref() {
-            Some(seg) => seg.segment_id != self.current_data_seg,
-            None => true,
-        } {
+        if !self.segments.contains_key(&self.current_data_seg) {
             ret.push(StreamRpcMetaReq::segment(self.current_data_seg, self.id));
-        }
-        ret
-    }
-
-    fn parse_sample(&self, data: &[u8]) -> Vec<Column> {
-        let mut ret = vec![];
-        for col in &self.columns {
-            ret.push(Column::from_le_bytes(
-                &data[col.offset..],
-                col.metadata.clone(),
-            ));
         }
         ret
     }
@@ -280,12 +268,13 @@ impl DeviceStream {
         }
 
         let half_period = 0.5 / new_rate;
+        let time_gap = first_timestamp - self.last_timestamp;
 
         // Time went backward?
-        if first_timestamp < self.last_timestamp - half_period {
+        if time_gap < -half_period {
             return Some(Boundary {
                 reason: BoundaryReason::TimeBackward {
-                    gap_seconds: self.last_timestamp - first_timestamp,
+                    gap_seconds: -time_gap,
                 },
                 prior,
             });
@@ -293,8 +282,11 @@ impl DeviceStream {
 
         // Segment changed?
         if segment.segment_id != self.last_seg {
+            // A benign rollover is time-continuous; a stream restart leaves a
+            // forward gap. Backward jumps already returned above.
+            let time_continuous = time_gap < half_period;
             return Some(Boundary {
-                reason: if is_segment_rollover {
+                reason: if is_segment_rollover && time_continuous {
                     BoundaryReason::SegmentRollover {
                         old_id: self.last_seg,
                         new_id: segment.segment_id,
@@ -312,7 +304,7 @@ impl DeviceStream {
         // Samples skipped?
         let expected_sample = self.last_sample_number.wrapping_add(1);
         if first_sample_n != expected_sample {
-            let ts_gap = (first_timestamp - self.last_timestamp).abs();
+            let ts_gap = time_gap.abs();
             // Check if this is just a sample number rollover with continuous time
             let is_benign_rollover =
                 first_sample_n < self.last_sample_number && ts_gap < half_period;
@@ -336,16 +328,17 @@ impl DeviceStream {
         &mut self,
         data: &tio::proto::StreamDataPayload,
         dev: Arc<DeviceMetadata>,
-    ) -> Vec<Sample> {
+        route: DeviceRoute,
+    ) -> Option<SampleBatch> {
         self.current_data_seg = data.segment_id;
 
-        if self.stream.is_none() || self.segment.is_none() {
-            return vec![];
+        if self.stream.is_none() {
+            return None;
         }
 
         let stream = self.stream.as_ref().unwrap().clone();
         if stream.n_columns != self.columns.len() {
-            return vec![];
+            return None;
         }
 
         let expected_sample_size = self
@@ -354,44 +347,53 @@ impl DeviceStream {
             .map(|col| col.offset + col.metadata.data_type.size())
             .unwrap_or(0);
         if expected_sample_size > stream.sample_size {
-            return vec![];
+            return None;
         }
         if stream.sample_size == 0 {
-            return vec![];
+            return None;
         }
         if data.data.len() % stream.sample_size != 0 {
-            return vec![];
+            return None;
         }
 
-        let segment = self.segment.as_ref().unwrap().clone();
-        if segment.decimation == 0 || segment.sampling_rate == 0 {
-            return vec![];
-        }
         if stream.n_segments == 0 {
-            return vec![];
+            return None;
         }
-        let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
 
-        let (segment, is_segment_rollover) = if segment.segment_id != data.segment_id {
-            let next_sample = self.last_sample_number.wrapping_add(1);
-            let next_segment = (segment.segment_id + 1).rem_euclid(stream.n_segments as u8);
-            let rate = segment.sampling_rate / segment.decimation;
+        let next_sample = self.last_sample_number.wrapping_add(1);
+        let next_segment = (self.last_seg + 1).rem_euclid(stream.n_segments as u8);
 
-            if (data.first_sample_n == 0)
-                && ((next_sample % rate) == 0)
-                && (data.segment_id == next_segment)
-            {
-                // Benign rollover - synthesize updated segment metadata
-                let mut new_seg = (*segment).clone();
+        let (segment, is_segment_rollover) = match (
+            self.segments.get(&data.segment_id).cloned(),
+            self.segments.get(&self.last_seg).cloned(),
+        ) {
+            // Real metadata for this segment
+            (Some(seg), _) => (seg, true),
+            // Data arrived before this segment's metadata: synthesize from the
+            // previous segment only if it matches a forced rollover, else drop
+            // and let requests() fetch the real metadata.
+            (None, Some(prev)) => {
+                let rate = prev.sampling_rate.checked_div(prev.decimation).unwrap_or(0);
+                let forced_rollover = self.established
+                    && data.first_sample_n == 0
+                    && rate != 0
+                    && next_sample % rate == 0
+                    && data.segment_id == next_segment;
+                if !forced_rollover {
+                    return None;
+                }
+                let mut new_seg = (*prev).clone();
                 new_seg.segment_id = data.segment_id;
                 new_seg.start_time += next_sample / rate;
                 (Arc::new(new_seg), true)
-            } else {
-                return vec![];
             }
-        } else {
-            (segment, false)
+            (None, None) => return None,
         };
+
+        if segment.decimation == 0 || segment.sampling_rate == 0 {
+            return None;
+        }
+        let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
 
         // Calculate timestamp of first sample in this batch
         let period = 1.0 / new_rate;
@@ -408,52 +410,64 @@ impl DeviceStream {
             is_segment_rollover,
         );
 
-        // Parse all samples in the packet
-        let mut ret = vec![];
+        // Decode every row into columnar form, one ColumnVec per column.
+        let mut columns: Vec<Series> = self
+            .columns
+            .iter()
+            .map(|col| Series {
+                index: col.metadata.index as ColumnId,
+                metadata: col.metadata.clone(),
+                values: ColumnVec::empty_for(col.metadata.data_type.buffer_type()),
+            })
+            .collect();
+        let mut sample_numbers = Vec::new();
         let mut sample_n = data.first_sample_n;
         let mut offset = 0;
-        let mut is_first = true;
 
         while offset < data.data.len() {
-            let raw_sample = &data.data.get(offset..(offset + stream.sample_size));
-            let columns = if let Some(r) = raw_sample {
-                self.parse_sample(r)
-            } else {
-                return Vec::new();
+            let Some(raw) = data.data.get(offset..(offset + stream.sample_size)) else {
+                return None;
             };
+            for (batch_col, col) in columns.iter_mut().zip(&self.columns) {
+                batch_col.values.push_data(&ColumnData::from_le_bytes(
+                    &raw[col.offset..],
+                    col.metadata.data_type,
+                ));
+            }
+            sample_numbers.push(sample_n);
 
-            let sample = Sample {
-                n: sample_n,
-                columns: columns,
-                segment: segment.clone(),
-                stream: stream.clone(),
-                device: dev.clone(),
-                source: data.clone(),
-                // Only first sample gets the boundary marker
-                boundary: if is_first { boundary.clone() } else { None },
-            };
-
-            // Update tracking state after each sample
             self.last_sample_number = sample_n;
-            self.last_timestamp = sample.timestamp_end();
+            self.last_timestamp = segment.time_at(sample_n + 1);
             self.last_session_id = dev.session_id;
             self.last_time_ref_session_id = segment.time_ref_session_id;
             self.last_seg = segment.segment_id;
             self.effective_rate = new_rate;
             self.established = true;
 
-            ret.push(sample);
             offset += stream.sample_size;
             sample_n = sample_n.wrapping_add(1);
-            is_first = false;
         }
 
-        ret
+        // A batch is never empty by construction; an empty data payload
+        // decodes no rows and yields nothing to emit.
+        if sample_numbers.is_empty() {
+            return None;
+        }
+
+        Some(SampleBatch::new(
+            route,
+            boundary,
+            sample_numbers,
+            columns,
+            segment,
+            stream,
+            dev,
+        ))
     }
 
     fn invalidate_metadata(&mut self) {
         self.stream = None;
-        self.segment = None;
+        self.segments.clear();
         self.columns.clear();
     }
 
@@ -462,7 +476,7 @@ impl DeviceStream {
         if reqs.is_empty() {
             Ok(DeviceStreamMetadata {
                 stream: self.stream.as_ref().unwrap().clone(),
-                segment: self.segment.as_ref().unwrap().clone(),
+                segment: self.segments.get(&self.current_data_seg).unwrap().clone(),
                 columns: self.columns.iter().map(|x| x.metadata.clone()).collect(),
             })
         } else {
@@ -544,18 +558,9 @@ impl DeviceDataParser {
                     }
                 }
                 let dstream = self.get_stream(sm.stream_id);
-                if let Some(segment) = &dstream.segment {
-                    if segment.as_ref() != sm {
-                        dstream.segment.replace(Arc::new(sm.clone()));
-                        if from_update {
-                            dstream.current_data_seg = sm.segment_id;
-                        }
-                    }
-                } else {
-                    dstream.segment.replace(Arc::new(sm.clone()));
-                    if from_update {
-                        dstream.current_data_seg = sm.segment_id;
-                    }
+                dstream.segments.insert(sm.segment_id, Arc::new(sm.clone()));
+                if from_update {
+                    dstream.current_data_seg = sm.segment_id;
                 }
             }
             MetadataContent::Column(cm) => {
@@ -593,7 +598,7 @@ impl DeviceDataParser {
         }
     }
 
-    pub fn process_packet(&mut self, pkt: &tio::Packet) -> Vec<Sample> {
+    pub fn process_packet(&mut self, pkt: &tio::Packet) -> Option<SampleBatch> {
         match &pkt.payload {
             tio::proto::Payload::RpcReply(rep) => {
                 for metadata in parse_metarep(rep.reply.clone()) {
@@ -622,8 +627,9 @@ impl DeviceDataParser {
                         self.streams.clear();
                     } else {
                         let ndev = dev.clone();
+                        let route = pkt.routing.clone();
                         let dstream = self.get_stream(data.stream_id);
-                        return dstream.process_samples(data, ndev);
+                        return dstream.process_samples(data, ndev, route);
                     }
                 }
             }
@@ -632,7 +638,7 @@ impl DeviceDataParser {
                 // issue too many requests.
             }
         }
-        return vec![];
+        None
     }
 
     pub fn requests(&self) -> Vec<tio::Packet> {

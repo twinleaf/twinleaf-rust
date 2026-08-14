@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 
-use crate::tools::dump::{print_metadata_payload, print_sample};
+use crate::tools::dump::{print_batch_meta, print_metadata_payload, print_sample};
 use crate::{
     parse_csv_target, LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, SplitLevel, SplitPolicy,
     StreamSel, TioOpts,
 };
 use twinleaf::data::DeviceDataParser;
-use twinleaf::device::{Device, DeviceRoute, DeviceTree};
+use twinleaf::device::{Device, DeviceRoute};
 use twinleaf::tio::{self, proxy};
 
 pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
@@ -30,8 +30,9 @@ pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
             data,
             meta,
             sensor,
+            glob,
             depth,
-        }) => log_dump(files, data, meta, sensor, depth),
+        }) => log_dump(files, data, meta, sensor, glob, depth),
         Some(LogSubcommands::Inspect { files }) => log_inspect(files),
         Some(LogSubcommands::Csv {
             args,
@@ -247,11 +248,18 @@ pub fn log(
         }
     }
 
-    let mut devs = DeviceTree::open(&proxy, route.clone())
+    // Byte-faithful recorder: receive packets directly from a subtree_full port
+    // and maintain per-route parsers ourselves (what DeviceTree used to do), so
+    // we can hold the raw stream-data packet instead of reconstructing it from
+    // a parsed sample.
+    let port = proxy
+        .new_port(None, route.clone(), usize::MAX, true, true)
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
         .with_proxy_help()?;
 
     let mut file_out: Option<File> = None;
+    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
+    let mut n_reqs: HashMap<DeviceRoute, usize> = HashMap::new();
 
     let write_packet = |pkt: tio::Packet, fo: &mut Option<File>, b: &mut u64| -> eyre::Result<()> {
         let serialized = pkt
@@ -268,61 +276,129 @@ pub fn log(
         if duration_elapsed() {
             break;
         }
-        match devs.drain() {
-            Ok(batch) => {
-                for (sample, sample_route) in batch {
-                    if let Some(b) = &sample.boundary {
-                        if let BoundaryReason::SamplesLost { expected, received } = b.reason {
-                            let count = received.wrapping_sub(expected);
-                            samples_dropped += count as u64;
-                            log::warn!(
-                                "{}/{} dropped {} samples",
-                                sample_route,
-                                sample.stream.name,
-                                count
-                            );
-                        }
-                        write_packet(
-                            sample.device.make_update_with_route(sample_route.clone()),
-                            &mut file_out,
-                            &mut bytes_written,
-                        )?;
-                        write_packet(
-                            sample.stream.make_update_with_route(sample_route.clone()),
-                            &mut file_out,
-                            &mut bytes_written,
-                        )?;
-                        write_packet(
-                            sample.segment.make_update_with_route(sample_route.clone()),
-                            &mut file_out,
-                            &mut bytes_written,
-                        )?;
-                        for col in &sample.columns {
-                            write_packet(
-                                col.desc.make_update_with_route(sample_route.clone()),
-                                &mut file_out,
-                                &mut bytes_written,
-                            )?;
-                        }
-                    }
 
-                    if sample.n == sample.source.first_sample_n {
-                        let data_pkt = tio::Packet {
-                            payload: tio::proto::Payload::StreamData(sample.source),
-                            routing: sample_route,
-                            ttl: 0,
-                        };
-                        write_packet(data_pkt, &mut file_out, &mut bytes_written)?;
-                    }
-                }
-                pb.set_position(bytes_written);
-                pb.set_message(render_msg(samples_dropped));
+        // Mirror DeviceTree::internal_rpcs: for every known parser route with no
+        // outstanding metadata request, issue parser.requests() out the port,
+        // stamping each request with the port-relative routing.
+        let req_routes: Vec<DeviceRoute> = parsers.keys().cloned().collect();
+        for req_route in req_routes {
+            if n_reqs.get(&req_route).copied().unwrap_or(0) != 0 {
+                continue;
             }
-            Err(e) => {
-                pb.finish_and_clear();
-                return Err(eyre::Report::new(e).wrap_err("stream ended"));
+            let reqs = parsers.get(&req_route).unwrap().requests();
+            for mut req in reqs {
+                let rel = route
+                    .relative_route(&req_route)
+                    .expect("parser routes must be under root route");
+                req.routing = rel;
+                if let Err(e) = port.send(req) {
+                    pb.finish_and_clear();
+                    return Err(eyre::Report::new(tio::proxy::RpcError::SendFailed(e))
+                        .wrap_err("stream ended"));
+                }
+                *n_reqs.entry(req_route.clone()).or_insert(0) += 1;
             }
         }
+
+        // Drain all currently-available packets, mirroring DeviceTree::process_packet.
+        loop {
+            let pkt = match port.try_recv() {
+                Ok(pkt) => pkt,
+                Err(tio::proxy::RecvError::WouldBlock) => break,
+                Err(e) => {
+                    pb.finish_and_clear();
+                    return Err(eyre::Report::new(tio::proxy::RpcError::RecvFailed(e))
+                        .wrap_err("stream ended"));
+                }
+            };
+
+            let abs_route = route.absolute_route(&pkt.routing);
+
+            match &pkt.payload {
+                tio::proto::Payload::ProxyStatus(ps) => {
+                    // Forget our metadata on disconnect, as DeviceTree does.
+                    if matches!(ps.0, tio::proto::ProxyStatus::SensorDisconnected) {
+                        parsers = HashMap::new();
+                    }
+                    continue;
+                }
+                tio::proto::Payload::RpcUpdate(_) => continue,
+                tio::proto::Payload::RpcReply(rep) => {
+                    if rep.id == 7855 {
+                        if let Some(count) = n_reqs.get_mut(&abs_route) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                }
+                tio::proto::Payload::RpcError(err) => {
+                    if err.id == 7855 {
+                        if let Some(count) = n_reqs.get_mut(&abs_route) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            let parser = parsers
+                .entry(abs_route.clone())
+                .or_insert_with(|| DeviceDataParser::new(false));
+            let parsed = parser.process_packet(&pkt);
+
+            if let Some(batch) = &parsed {
+                if let Some(b) = &batch.boundary {
+                    if let BoundaryReason::SamplesLost { expected, received } = b.reason {
+                        let count = received.wrapping_sub(expected);
+                        samples_dropped += count as u64;
+                        log::warn!(
+                            "{}/{} dropped {} samples",
+                            abs_route,
+                            batch.stream.name,
+                            count
+                        );
+                    }
+                    write_packet(
+                        batch.device.make_update_with_route(abs_route.clone()),
+                        &mut file_out,
+                        &mut bytes_written,
+                    )?;
+                    write_packet(
+                        batch.stream.make_update_with_route(abs_route.clone()),
+                        &mut file_out,
+                        &mut bytes_written,
+                    )?;
+                    write_packet(
+                        batch.segment.make_update_with_route(abs_route.clone()),
+                        &mut file_out,
+                        &mut bytes_written,
+                    )?;
+                    for series in batch.schema() {
+                        write_packet(
+                            series.metadata.make_update_with_route(abs_route.clone()),
+                            &mut file_out,
+                            &mut bytes_written,
+                        )?;
+                    }
+                }
+            }
+
+            // Only record the raw stream-data packet when it actually parsed into
+            // a batch (parser established), matching the old reconstruction which
+            // wrote exactly once per parseable packet.
+            if parsed.is_some() {
+                if matches!(pkt.payload, tio::proto::Payload::StreamData(_)) {
+                    let data_pkt = tio::Packet {
+                        payload: pkt.payload,
+                        routing: abs_route,
+                        ttl: 0,
+                    };
+                    write_packet(data_pkt, &mut file_out, &mut bytes_written)?;
+                }
+            }
+        }
+
+        pb.set_position(bytes_written);
+        pb.set_message(render_msg(samples_dropped));
 
         if unbuffered {
             if let Some(f) = file_out.as_mut() {
@@ -463,10 +539,17 @@ pub fn log_dump(
     data: bool,
     meta: bool,
     sensor: DeviceRoute,
+    glob: Option<String>,
     depth: Option<usize>,
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
+    use twinleaf::data::ColumnFilter;
 
+    let filter = if let Some(p) = glob {
+        Some(ColumnFilter::new(&p).map_err(|e| eyre::eyre!("invalid glob pattern: {}", e))?)
+    } else {
+        None
+    };
     let target_route = sensor;
     let max_depth = depth;
 
@@ -573,21 +656,36 @@ pub fn log_dump(
                         .entry(pkt.routing.clone())
                         .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
-                    let samples = parser.process_packet(&pkt);
+                    let parsed = parser.process_packet(&pkt);
                     record_parse_result(
                         &mut parsed_routes,
                         &mut unparsed_routes,
                         &pkt,
-                        samples.len(),
+                        parsed.as_ref().map_or(0, |b| b.len()),
                     );
 
-                    for sample in samples {
-                        if route_matches(&pkt.routing) {
-                            print_sample(&sample, Some(&pkt.routing), meta, true);
-                            printed_any = true;
-                        } else if in_subtree(&pkt.routing) {
-                            deeper_routes.insert(pkt.routing.clone());
+                    let Some(batch) = parsed else {
+                        continue;
+                    };
+                    if route_matches(&pkt.routing) {
+                        // Schema questions are answered once per batch.
+                        let matched = filter.as_ref().map_or(true, |f| {
+                            batch.schema().iter().any(|series| {
+                                f.matches(&pkt.routing, &batch.stream.name, &series.metadata.name)
+                            })
+                        });
+                        if !matched {
+                            continue;
                         }
+                        if meta {
+                            print_batch_meta(&batch, Some(&pkt.routing));
+                        }
+                        for row in batch.iter() {
+                            print_sample(row, Some(&pkt.routing));
+                        }
+                        printed_any = true;
+                    } else if in_subtree(&pkt.routing) {
+                        deeper_routes.insert(pkt.routing.clone());
                     }
                 }
             }
@@ -715,52 +813,54 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
         let parser = parsers
             .entry(pkt.routing.clone())
             .or_insert_with(|| DeviceDataParser::new(false));
-        let samples = parser.process_packet(&pkt);
+        let Some(batch) = parser.process_packet(&pkt) else {
+            continue;
+        };
 
-        for sample in samples {
-            devices
-                .entry(pkt.routing.clone())
-                .or_insert_with(|| DeviceAgg {
-                    name: sample.device.name.clone(),
-                    firmware: sample.device.firmware_hash.clone(),
-                    serial: sample.device.serial_number.clone(),
-                });
-
-            let key = (pkt.routing.clone(), sample.stream.stream_id);
-            let entry = streams.entry(key).or_insert_with(|| {
-                let decim = sample.segment.decimation.max(1);
-                let rate = f64::from(sample.segment.sampling_rate) / f64::from(decim);
-                let cols = sample
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.desc.name.clone(),
-                            c.desc.data_type.type_name(),
-                            c.desc.units.clone(),
-                        )
-                    })
-                    .collect();
-                StreamAgg {
-                    name: sample.stream.name.clone(),
-                    rate_hz: rate,
-                    sample_count: 0,
-                    first_t: None,
-                    last_t: None,
-                    columns: cols,
-                }
+        devices
+            .entry(pkt.routing.clone())
+            .or_insert_with(|| DeviceAgg {
+                name: batch.device.name.clone(),
+                firmware: batch.device.firmware_hash.clone(),
+                serial: batch.device.serial_number.clone(),
             });
+
+        let key = (pkt.routing.clone(), batch.stream.stream_id);
+        let entry = streams.entry(key).or_insert_with(|| {
+            let decim = batch.segment.decimation.max(1);
+            let rate = f64::from(batch.segment.sampling_rate) / f64::from(decim);
+            let cols = batch
+                .schema()
+                .iter()
+                .map(|series| {
+                    (
+                        series.metadata.name.clone(),
+                        series.metadata.data_type.type_name(),
+                        series.metadata.units.clone(),
+                    )
+                })
+                .collect();
+            StreamAgg {
+                name: batch.stream.name.clone(),
+                rate_hz: rate,
+                sample_count: 0,
+                first_t: None,
+                last_t: None,
+                columns: cols,
+            }
+        });
+        for row in batch.iter() {
             entry.sample_count += 1;
-            let t = sample.timestamp_end();
+            let t = row.timestamp_end();
             entry.first_t = Some(entry.first_t.map_or(t, |p| p.min(t)));
             entry.last_t = Some(entry.last_t.map_or(t, |p| p.max(t)));
+        }
 
-            if let Some(boundary) = &sample.boundary {
-                match boundary.reason {
-                    BoundaryReason::SessionChanged { .. } => session_changes += 1,
-                    BoundaryReason::SegmentChanged { .. } => segment_changes += 1,
-                    _ => {}
-                }
+        if let Some(boundary) = &batch.boundary {
+            match boundary.reason {
+                BoundaryReason::SessionChanged { .. } => session_changes += 1,
+                BoundaryReason::SegmentChanged { .. } => segment_changes += 1,
+                _ => {}
             }
         }
     }
@@ -991,14 +1091,14 @@ pub fn log_csv(
             let parser = parsers
                 .entry(pkt.routing.clone())
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
-            let samples = parser.process_packet(&pkt);
+            let parsed = parser.process_packet(&pkt);
 
             if pkt.routing == target_route {
                 record_parse_result(
                     &mut parsed_routes,
                     &mut unparsed_routes,
                     &pkt,
-                    samples.len(),
+                    parsed.as_ref().map_or(0, |b| b.len()),
                 );
             }
 
@@ -1006,52 +1106,56 @@ pub fn log_csv(
                 continue;
             }
 
-            for sample in samples {
-                let is_match = match &target.stream {
-                    StreamSel::Id(id) => sample.stream.stream_id == *id,
-                    StreamSel::Name(name) => &sample.stream.name == name,
-                };
+            let Some(batch) = parsed else {
+                continue;
+            };
 
-                if !is_match {
-                    continue;
-                }
+            let is_match = match &target.stream {
+                StreamSel::Id(id) => batch.stream.stream_id == *id,
+                StreamSel::Name(name) => &batch.stream.name == name,
+            };
 
-                if !header_written {
-                    header_cols = vec!["time".to_string()];
-                    header_cols.extend(sample.columns.iter().map(|col| col.desc.name.clone()));
+            if !is_match {
+                continue;
+            }
 
-                    if file.is_none() {
-                        let prefix = output
-                            .clone()
-                            .unwrap_or_else(|| files.last().cloned().unwrap_or_default());
-                        let route_label = route_filename_label(&target_route);
-                        let path = format!("{}.{}.{}.csv", prefix, route_label, sample.stream.name);
-                        if !force && std::path::Path::new(&path).exists() {
-                            return Err(eyre::eyre!("output {} already exists", path).suggestion(
-                                "pass --force to overwrite, or use -o for a different name",
-                            ));
-                        }
-                        file = Some(
-                            OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .open(&path)
-                                .wrap_err_with(|| format!("could not open {}", path))?,
-                        );
-                        resolved_name = Some(sample.stream.name.clone());
-                        output_path = Some(path);
+            if !header_written {
+                header_cols = vec!["time".to_string()];
+                header_cols.extend(batch.schema().iter().map(|s| s.metadata.name.clone()));
+
+                if file.is_none() {
+                    let prefix = output
+                        .clone()
+                        .unwrap_or_else(|| files.last().cloned().unwrap_or_default());
+                    let route_label = route_filename_label(&target_route);
+                    let path = format!("{}.{}.{}.csv", prefix, route_label, batch.stream.name);
+                    if !force && std::path::Path::new(&path).exists() {
+                        return Err(eyre::eyre!("output {} already exists", path).suggestion(
+                            "pass --force to overwrite, or use -o for a different name",
+                        ));
                     }
-                    let path = output_path.as_deref().unwrap_or_default();
-                    writeln!(file.as_mut().unwrap(), "{}", header_cols.join(","))
-                        .wrap_err_with(|| format!("failed to write {}", path))?;
-                    header_written = true;
+                    file = Some(
+                        OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(&path)
+                            .wrap_err_with(|| format!("could not open {}", path))?,
+                    );
+                    resolved_name = Some(batch.stream.name.clone());
+                    output_path = Some(path);
                 }
+                let path = output_path.as_deref().unwrap_or_default();
+                writeln!(file.as_mut().unwrap(), "{}", header_cols.join(","))
+                    .wrap_err_with(|| format!("failed to write {}", path))?;
+                header_written = true;
+            }
 
+            for row in batch.iter() {
                 let mut values: Vec<String> = Vec::new();
-                values.push(format!("{:.6}", sample.timestamp_end()));
+                values.push(format!("{:.6}", row.timestamp_end()));
 
-                values.extend(sample.columns.iter().map(|col| col.value.to_string()));
+                values.extend(row.values().map(|v| v.to_string()));
 
                 let path = output_path.as_deref().unwrap_or_default();
                 writeln!(file.as_mut().unwrap(), "{}", values.join(","))
@@ -1212,32 +1316,34 @@ pub fn log_hdf(
                 .entry(pkt.routing.clone())
                 .or_insert_with(|| DeviceDataParser::new(ignore_session));
 
-            let samples = parser.process_packet(&pkt);
+            let parsed = parser.process_packet(&pkt);
             record_parse_result(
                 &mut parsed_routes,
                 &mut unparsed_routes,
                 &pkt,
-                samples.len(),
+                parsed.as_ref().map_or(0, |b| b.len()),
             );
 
-            for sample in samples {
-                let key = StreamKey::new(pkt.routing.clone(), sample.stream.stream_id);
+            let Some(batch) = parsed else {
+                continue;
+            };
 
-                if debug {
-                    if let Some(ref boundary) = sample.boundary {
-                        log::info!(
-                            "[{}] sample_n={} boundary={:?}",
-                            sample.stream.name,
-                            sample.n,
-                            boundary.reason
-                        );
-                    }
+            let key = StreamKey::new(pkt.routing.clone(), batch.stream.stream_id);
+
+            if debug {
+                if let Some(boundary) = &batch.boundary {
+                    log::info!(
+                        "[{}] sample_n={} boundary={:?}",
+                        batch.stream.name,
+                        batch.first_sample().unwrap_or(0),
+                        boundary.reason
+                    );
                 }
-
-                writer
-                    .write_sample(sample, key)
-                    .wrap_err("failed to write sample to HDF5")?;
             }
+
+            writer
+                .write_batch(batch, key)
+                .wrap_err("failed to write batch to HDF5")?;
         }
 
         pb.finish_with_message("Completed");

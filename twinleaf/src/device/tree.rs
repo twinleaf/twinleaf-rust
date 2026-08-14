@@ -1,4 +1,4 @@
-use crate::data::{DeviceDataParser, DeviceFullMetadata, Sample};
+use crate::data::{DeviceDataParser, DeviceFullMetadata, SampleBatch};
 use crate::tio;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
@@ -20,7 +20,7 @@ pub enum TreeEvent {
 
 #[derive(Debug, Clone)]
 pub enum TreeItem {
-    Sample(Sample, DeviceRoute),
+    Batch(SampleBatch),
     Event(TreeEvent),
 }
 
@@ -31,7 +31,7 @@ pub struct DeviceTree {
     n_reqs: HashMap<DeviceRoute, usize>,
     known_routes: HashSet<DeviceRoute>,
     metadata_announced: HashSet<DeviceRoute>,
-    sample_queue: VecDeque<(Sample, DeviceRoute)>,
+    batch_queue: VecDeque<SampleBatch>,
     event_queue: VecDeque<TreeEvent>,
 }
 
@@ -44,7 +44,7 @@ impl DeviceTree {
             n_reqs: HashMap::new(),
             known_routes: HashSet::new(),
             metadata_announced: HashSet::new(),
-            sample_queue: VecDeque::new(),
+            batch_queue: VecDeque::new(),
             event_queue: VecDeque::new(),
         }
     }
@@ -169,11 +169,9 @@ impl DeviceTree {
         }
 
         let parser = self.get_or_create_parser(&absolute_route);
-        let samples: Vec<Sample> = parser.process_packet(&pkt);
-
-        for sample in samples {
-            self.sample_queue
-                .push_back((sample, absolute_route.clone()));
+        if let Some(mut batch) = parser.process_packet(&pkt) {
+            batch.route = absolute_route.clone();
+            self.batch_queue.push_back(batch);
         }
         if !self.metadata_announced.contains(&absolute_route) {
             if let Some(parser) = self.parsers.get(&absolute_route) {
@@ -217,39 +215,7 @@ impl DeviceTree {
         }
     }
 
-    pub fn next(&mut self) -> Result<(Sample, DeviceRoute), tio::proxy::RpcError> {
-        loop {
-            if let Some(sample) = self.sample_queue.pop_front() {
-                return Ok(sample);
-            }
-            self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
-
-            let pkt = self.port.recv().map_err(tio::proxy::RpcError::RecvFailed)?;
-
-            self.process_packet(&pkt);
-        }
-    }
-
-    pub fn try_next(&mut self) -> Result<Option<(Sample, DeviceRoute)>, tio::proxy::RpcError> {
-        loop {
-            if let Some(sample) = self.sample_queue.pop_front() {
-                return Ok(Some(sample));
-            }
-            self.internal_rpcs()
-                .map_err(tio::proxy::RpcError::SendFailed)?;
-
-            let pkt = match self.port.try_recv() {
-                Ok(pkt) => pkt,
-                Err(proxy::RecvError::WouldBlock) => return Ok(None),
-                Err(e) => return Err(tio::proxy::RpcError::RecvFailed(e)),
-            };
-
-            self.process_packet(&pkt);
-        }
-    }
-
-    pub fn drain(&mut self) -> Result<Vec<(Sample, DeviceRoute)>, tio::proxy::RpcError> {
+    pub fn drain(&mut self) -> Result<Vec<SampleBatch>, tio::proxy::RpcError> {
         loop {
             self.internal_rpcs()
                 .map_err(tio::proxy::RpcError::SendFailed)?;
@@ -266,7 +232,7 @@ impl DeviceTree {
             }
         }
 
-        Ok(self.sample_queue.drain(..).collect())
+        Ok(self.batch_queue.drain(..).collect())
     }
 
     pub fn try_next_event(&mut self) -> Option<TreeEvent> {
@@ -279,8 +245,8 @@ impl DeviceTree {
 
     pub fn next_item(&mut self) -> Result<TreeItem, proxy::RpcError> {
         loop {
-            if let Some((sample, route)) = self.sample_queue.pop_front() {
-                return Ok(TreeItem::Sample(sample, route));
+            if let Some(parsed) = self.batch_queue.pop_front() {
+                return Ok(TreeItem::Batch(parsed));
             }
 
             if let Some(event) = self.event_queue.pop_front() {
@@ -295,8 +261,8 @@ impl DeviceTree {
 
     pub fn try_next_item(&mut self) -> Result<Option<TreeItem>, proxy::RpcError> {
         loop {
-            if let Some((sample, route)) = self.sample_queue.pop_front() {
-                return Ok(Some(TreeItem::Sample(sample, route)));
+            if let Some(parsed) = self.batch_queue.pop_front() {
+                return Ok(Some(TreeItem::Batch(parsed)));
             }
 
             if let Some(event) = self.event_queue.pop_front() {

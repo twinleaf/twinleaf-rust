@@ -1,7 +1,5 @@
-use crate::data::sample::Sample;
-use crate::data::ColumnFilter;
-use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, SampleNumber, StreamKey};
-use crate::tio::proto::{BufferType, ColumnMetadata, SegmentMetadata, StreamMetadata};
+use crate::data::{ColumnFilter, ColumnVec, SampleBatch, Series};
+use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, StreamKey};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
 use hdf5::{Dataset, Dataspace, File, H5Type, Location, Result, SimpleExtents};
@@ -9,7 +7,6 @@ use hdf5_sys::h5d::H5Dwrite;
 use hdf5_sys::h5p::H5P_DEFAULT;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 
 pub type RunId = u64;
 
@@ -52,88 +49,6 @@ pub struct ExportStats {
     pub discontinuities_detected: u64,
 }
 
-enum ColumnBatch {
-    F64(Vec<f64>),
-    I64(Vec<i64>),
-    U64(Vec<u64>),
-}
-
-struct PendingBatch {
-    sample_numbers: Vec<SampleNumber>,
-    timestamps: Vec<f64>,
-    columns: HashMap<ColumnId, ColumnBatch>,
-    stream_metadata: Arc<StreamMetadata>,
-    segment_metadata: Arc<SegmentMetadata>,
-    column_metadata: HashMap<ColumnId, Arc<ColumnMetadata>>,
-    session_id: u32,
-}
-
-impl PendingBatch {
-    fn new(sample: &Sample) -> Self {
-        Self {
-            sample_numbers: Vec::new(),
-            timestamps: Vec::new(),
-            columns: HashMap::new(),
-            stream_metadata: sample.stream.clone(),
-            segment_metadata: sample.segment.clone(),
-            column_metadata: HashMap::new(),
-            session_id: sample.device.session_id,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.timestamps.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.timestamps.is_empty()
-    }
-
-    fn push(&mut self, sample: &Sample) {
-        use crate::data::sample::ColumnData;
-
-        self.sample_numbers.push(sample.n);
-        self.timestamps.push(sample.timestamp_end());
-        self.segment_metadata = sample.segment.clone();
-
-        for col in &sample.columns {
-            let col_id = col.desc.index as ColumnId;
-
-            self.column_metadata
-                .entry(col_id)
-                .or_insert_with(|| col.desc.clone());
-
-            let batch = self.columns.entry(col_id).or_insert_with(|| {
-                match col.desc.data_type.buffer_type() {
-                    BufferType::Float => ColumnBatch::F64(Vec::new()),
-                    BufferType::Int => ColumnBatch::I64(Vec::new()),
-                    BufferType::UInt => ColumnBatch::U64(Vec::new()),
-                }
-            });
-
-            match (batch, &col.value) {
-                (ColumnBatch::F64(v), ColumnData::Float(val)) => v.push(*val),
-                (ColumnBatch::F64(v), ColumnData::Int(val)) => v.push(*val as f64),
-                (ColumnBatch::I64(v), ColumnData::Int(val)) => v.push(*val),
-                (ColumnBatch::U64(v), ColumnData::UInt(val)) => v.push(*val),
-                _ => {}
-            }
-        }
-    }
-
-    fn drain(&mut self) -> PendingBatch {
-        PendingBatch {
-            sample_numbers: std::mem::take(&mut self.sample_numbers),
-            timestamps: std::mem::take(&mut self.timestamps),
-            columns: std::mem::take(&mut self.columns),
-            stream_metadata: self.stream_metadata.clone(),
-            segment_metadata: self.segment_metadata.clone(),
-            column_metadata: std::mem::take(&mut self.column_metadata),
-            session_id: self.session_id,
-        }
-    }
-}
-
 /// Where each field of a compound table row gets its value.
 #[derive(Clone, Copy)]
 enum FieldSource {
@@ -153,7 +68,7 @@ struct TableInfo {
 pub struct Hdf5Appender {
     file: File,
     tables: HashMap<String, TableInfo>,
-    pending: HashMap<StreamKey, PendingBatch>,
+    pending: HashMap<StreamKey, Vec<SampleBatch>>,
     filter: Option<ColumnFilter>,
     compress: bool,
     debug: bool,
@@ -232,24 +147,22 @@ impl Hdf5Appender {
         })
     }
 
-    pub fn write_sample(&mut self, sample: Sample, key: StreamKey) -> Result<()> {
-        let should_split = !sample.is_initial()
+    pub fn write_batch(&mut self, batch: SampleBatch, key: StreamKey) -> Result<()> {
+        let should_split = !batch.is_initial()
             && match self.split_policy {
-                SplitPolicy::Continuous => !sample.is_continuous(),
-                SplitPolicy::Monotonic => !sample.is_monotonic(),
+                SplitPolicy::Continuous => !batch.is_continuous(),
+                SplitPolicy::Monotonic => !batch.is_monotonic(),
             };
 
         if should_split {
             self.handle_discontinuity(&key)?;
         }
 
-        if !self.pending.contains_key(&key) {
-            self.pending.insert(key.clone(), PendingBatch::new(&sample));
-        }
+        let chunks = self.pending.entry(key.clone()).or_default();
+        chunks.push(batch);
 
-        self.pending.get_mut(&key).unwrap().push(&sample);
-
-        if self.pending.get(&key).unwrap().len() >= self.batch_size {
+        let rows: usize = chunks.iter().map(|b| b.len()).sum();
+        if rows >= self.batch_size {
             self.flush_stream(&key)?;
         }
 
@@ -311,13 +224,10 @@ impl Hdf5Appender {
     }
 
     fn flush_stream(&mut self, key: &StreamKey) -> Result<()> {
-        if let Some(batch) = self.pending.get_mut(key) {
-            if !batch.is_empty() {
-                let drained = batch.drain();
-                self.write_batch(key, drained)?;
-            }
+        match self.pending.remove(key) {
+            Some(chunks) if !chunks.is_empty() => self.write_chunks(key, &chunks),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     pub fn finish(mut self) -> Result<ExportStats> {
@@ -328,13 +238,13 @@ impl Hdf5Appender {
         Ok(self.stats)
     }
 
-    fn write_batch(&mut self, key: &StreamKey, batch: PendingBatch) -> Result<()> {
-        if batch.is_empty() {
+    fn write_chunks(&mut self, key: &StreamKey, chunks: &[SampleBatch]) -> Result<()> {
+        let Some(first) = chunks.first() else {
             return Ok(());
-        }
+        };
 
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
-        let stream_name = batch.stream_metadata.name.clone();
+        let stream_name = first.stream.name.clone();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
@@ -344,35 +254,29 @@ impl Hdf5Appender {
         };
         self.stats.streams_seen.insert(stream_id_path.clone());
 
-        // Apply the column filter and order columns by index for a stable schema.
-        let mut valid: Vec<(ColumnId, &ColumnBatch, Arc<ColumnMetadata>)> = Vec::new();
-        for (col_id, col_batch) in &batch.columns {
-            let meta = match batch.column_metadata.get(col_id) {
-                Some(m) => m,
-                None => continue,
-            };
-
+        // Apply the column filter; the parser already emits columns index-ordered.
+        let mut valid: Vec<&Series> = Vec::new();
+        for col in &first.columns {
             if let Some(f) = &self.filter {
-                let path = f.get_path_string(&key.route, &stream_name, &meta.name);
+                let path = f.get_path_string(&key.route, &stream_name, &col.metadata.name);
                 if self.debug && self.seen_debug.insert(path.clone()) {
                     println!(
                         "[DEBUG] Filter: '{}' -> {}",
                         path,
-                        f.matches(&key.route, &stream_name, &meta.name)
+                        f.matches(&key.route, &stream_name, &col.metadata.name)
                     );
                 }
-                if !f.matches(&key.route, &stream_name, &meta.name) {
+                if !f.matches(&key.route, &stream_name, &col.metadata.name) {
                     continue;
                 }
             }
-
-            valid.push((*col_id, col_batch, meta.clone()));
+            valid.push(col);
         }
 
         if valid.is_empty() {
             return Ok(());
         }
-        valid.sort_by_key(|(col_id, _, _)| *col_id);
+        valid.sort_by_key(|c| c.index);
 
         let group_path = if route_str.is_empty() {
             "/".to_string()
@@ -403,13 +307,13 @@ impl Hdf5Appender {
                 0,
                 1,
             ));
-            for (i, (_, col_batch, meta)) in valid.iter().enumerate() {
-                let ty = match col_batch {
-                    ColumnBatch::F64(_) => TypeDescriptor::Float(FloatSize::U8),
-                    ColumnBatch::I64(_) => TypeDescriptor::Integer(IntSize::U8),
-                    ColumnBatch::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
+            for (i, col) in valid.iter().enumerate() {
+                let ty = match col.values {
+                    ColumnVec::F64(_) => TypeDescriptor::Float(FloatSize::U8),
+                    ColumnVec::I64(_) => TypeDescriptor::Integer(IntSize::U8),
+                    ColumnVec::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
                 };
-                fields.push(CompoundField::new(&meta.name, ty, 0, i + 2));
+                fields.push(CompoundField::new(&col.metadata.name, ty, 0, i + 2));
             }
 
             // `to_c_repr` assigns aligned byte offsets and the total row size.
@@ -432,7 +336,7 @@ impl Hdf5Appender {
             };
             let ds = builder.create(table_name.as_str())?;
 
-            self.write_metadata_attributes(&ds, &batch, key)?;
+            self.write_metadata_attributes(&ds, chunks.last().unwrap(), key)?;
             self.write_field_metadata(&ds, &valid)?;
 
             // Map each (already index-ordered) compound field to its data source.
@@ -443,7 +347,7 @@ impl Hdf5Appender {
                     let source = match f.index {
                         0 => FieldSource::Sample,
                         1 => FieldSource::Time,
-                        k => FieldSource::Column(valid[k - 2].0),
+                        k => FieldSource::Column(valid[k - 2].index),
                     };
                     (f.offset, source)
                 })
@@ -459,7 +363,7 @@ impl Hdf5Appender {
             );
         }
 
-        let n = batch.len();
+        let n: usize = chunks.iter().map(|c| c.len()).sum();
         {
             let info = self.tables.get(&table_path).unwrap();
             let row_size = info.row_size;
@@ -467,35 +371,42 @@ impl Hdf5Appender {
 
             for (offset, source) in &info.fields {
                 let offset = *offset;
-                match source {
-                    FieldSource::Sample => {
-                        for i in 0..n {
-                            let bytes = batch.sample_numbers[i].to_ne_bytes();
-                            let base = i * row_size + offset;
-                            buf[base..base + bytes.len()].copy_from_slice(&bytes);
+                let mut row = 0;
+                for chunk in chunks {
+                    let clen = chunk.len();
+                    match source {
+                        FieldSource::Sample => {
+                            for i in 0..clen {
+                                let bytes = chunk.sample_numbers[i].to_ne_bytes();
+                                let base = (row + i) * row_size + offset;
+                                buf[base..base + bytes.len()].copy_from_slice(&bytes);
+                            }
+                        }
+                        FieldSource::Time => {
+                            for i in 0..clen {
+                                let bytes = chunk
+                                    .segment
+                                    .time_at(chunk.sample_numbers[i] + 1)
+                                    .to_ne_bytes();
+                                let base = (row + i) * row_size + offset;
+                                buf[base..base + 8].copy_from_slice(&bytes);
+                            }
+                        }
+                        FieldSource::Column(col_id) => {
+                            if let Some(col) = chunk.columns.iter().find(|c| c.index == *col_id) {
+                                for i in 0..clen {
+                                    let bytes = match &col.values {
+                                        ColumnVec::F64(v) => v[i].to_ne_bytes(),
+                                        ColumnVec::I64(v) => v[i].to_ne_bytes(),
+                                        ColumnVec::U64(v) => v[i].to_ne_bytes(),
+                                    };
+                                    let base = (row + i) * row_size + offset;
+                                    buf[base..base + 8].copy_from_slice(&bytes);
+                                }
+                            }
                         }
                     }
-                    FieldSource::Time => {
-                        for i in 0..n {
-                            let bytes = batch.timestamps[i].to_ne_bytes();
-                            let base = i * row_size + offset;
-                            buf[base..base + 8].copy_from_slice(&bytes);
-                        }
-                    }
-                    FieldSource::Column(col_id) => {
-                        let Some(col_batch) = batch.columns.get(col_id) else {
-                            continue;
-                        };
-                        for i in 0..n {
-                            let bytes = match col_batch {
-                                ColumnBatch::F64(v) => v[i].to_ne_bytes(),
-                                ColumnBatch::I64(v) => v[i].to_ne_bytes(),
-                                ColumnBatch::U64(v) => v[i].to_ne_bytes(),
-                            };
-                            let base = i * row_size + offset;
-                            buf[base..base + 8].copy_from_slice(&bytes);
-                        }
-                    }
+                    row += clen;
                 }
             }
 
@@ -503,9 +414,12 @@ impl Hdf5Appender {
         }
 
         self.stats.total_samples += n as u64;
-        if let (Some(&first), Some(&last)) = (batch.timestamps.first(), batch.timestamps.last()) {
-            self.stats.start_time = Some(self.stats.start_time.map_or(first, |t| t.min(first)));
-            self.stats.end_time = Some(self.stats.end_time.map_or(last, |t| t.max(last)));
+        let last = chunks.last().unwrap();
+        if let (Some(first_n), Some(last_n)) = (first.first_sample(), last.last_sample()) {
+            let first_t = first.segment.time_at(first_n + 1);
+            let last_t = last.segment.time_at(last_n + 1);
+            self.stats.start_time = Some(self.stats.start_time.map_or(first_t, |t| t.min(first_t)));
+            self.stats.end_time = Some(self.stats.end_time.map_or(last_t, |t| t.max(last_t)));
         }
         self.stats.streams_written.insert(stream_id_path);
 
@@ -542,15 +456,15 @@ impl Hdf5Appender {
     fn write_metadata_attributes(
         &self,
         loc: &Location,
-        batch: &PendingBatch,
+        batch: &SampleBatch,
         key: &StreamKey,
     ) -> Result<()> {
-        let meta = &batch.segment_metadata;
+        let meta = &batch.segment;
         self.write_attr_scalar(loc, "sampling_rate", &meta.sampling_rate)?;
         self.write_attr_scalar(loc, "decimation", &meta.decimation)?;
         self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
         self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
-        self.write_attr_scalar(loc, "session_id", &batch.session_id)?;
+        self.write_attr_scalar(loc, "session_id", &batch.device.session_id)?;
 
         let run_id = self.get_run_id(key);
         if let Some(id) = run_id {
@@ -571,11 +485,7 @@ impl Hdf5Appender {
 
     /// Stores per-field `units` and `descriptions` as string arrays aligned with
     /// the compound fields (`sample`, `time`, then each column).
-    fn write_field_metadata(
-        &self,
-        loc: &Location,
-        valid: &[(ColumnId, &ColumnBatch, Arc<ColumnMetadata>)],
-    ) -> Result<()> {
+    fn write_field_metadata(&self, loc: &Location, valid: &[&Series]) -> Result<()> {
         let mut units: Vec<VarLenUnicode> = Vec::with_capacity(valid.len() + 2);
         let mut descriptions: Vec<VarLenUnicode> = Vec::with_capacity(valid.len() + 2);
 
@@ -583,9 +493,9 @@ impl Hdf5Appender {
         descriptions.push(to_vlu("Sample number from device"));
         units.push(to_vlu("s"));
         descriptions.push(to_vlu("Time in seconds"));
-        for (_, _, meta) in valid {
-            units.push(to_vlu(&meta.units));
-            descriptions.push(to_vlu(&meta.description));
+        for col in valid {
+            units.push(to_vlu(&col.metadata.units));
+            descriptions.push(to_vlu(&col.metadata.description));
         }
 
         self.write_attr_string_array(loc, "units", &units)?;

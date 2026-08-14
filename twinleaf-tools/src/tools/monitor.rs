@@ -28,7 +28,7 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{
-        AlignedWindow, Buffer, ColumnBatch, ColumnData, ColumnKey, DeviceFullMetadata, Sample,
+        AlignedWindow, Buffer, ColumnData, ColumnKey, ColumnVec, DeviceFullMetadata, SampleBatch,
         StreamKey,
     },
     device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
@@ -469,7 +469,7 @@ pub struct MonitorState {
 
     pub discovered_routes: HashSet<DeviceRoute>,
     pub device_status: HashMap<DeviceRoute, DeviceStatus>,
-    pub last: BTreeMap<StreamKey, (Sample, Instant)>,
+    pub last: BTreeMap<StreamKey, (SampleBatch, Instant)>,
     pub device_metadata: HashMap<DeviceRoute, DeviceFullMetadata>,
     pub window_aligned: Option<AlignedWindow>,
 
@@ -672,15 +672,15 @@ impl MonitorState {
             } else {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
                     let key = StreamKey::new(route.clone(), *sid);
-                    if let Some((sample, _)) = self.last.get(&key) {
-                        for (column_idx, _) in sample.columns.iter().enumerate() {
+                    if let Some((batch, _)) = self.last.get(&key) {
+                        for series in &batch.columns {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
                                 spec: ColumnKey {
                                     route: route.clone(),
                                     stream_id: *sid,
-                                    column_id: column_idx,
+                                    column_id: series.index,
                                 },
                             });
                         }
@@ -808,10 +808,10 @@ impl MonitorState {
         }
     }
 
-    pub fn handle_sample(&mut self, sample: Sample, route: DeviceRoute, buffer: &mut Buffer) {
-        let stream_key = StreamKey::new(route.clone(), sample.stream.stream_id);
-        buffer.process_sample(sample.clone(), stream_key.clone());
-        self.last.insert(stream_key, (sample, Instant::now()));
+    pub fn handle_batch(&mut self, batch: SampleBatch, buffer: &mut Buffer) {
+        let stream_key = StreamKey::new(batch.route.clone(), batch.stream.stream_id);
+        buffer.process_batch(&batch, stream_key.clone());
+        self.last.insert(stream_key, (batch, Instant::now()));
     }
 
     pub fn update_plot_window(&mut self, buffer: &Buffer) {
@@ -838,19 +838,19 @@ impl MonitorState {
             return None;
         }
         let data: Vec<(f64, f64)> = match batch {
-            ColumnBatch::F64(v) => win
+            ColumnVec::F64(v) => win
                 .timestamps
                 .iter()
                 .copied()
                 .zip(v.iter().copied())
                 .collect(),
-            ColumnBatch::I64(v) => win
+            ColumnVec::I64(v) => win
                 .timestamps
                 .iter()
                 .copied()
                 .zip(v.iter().map(|&x| x as f64))
                 .collect(),
-            ColumnBatch::U64(v) => win
+            ColumnVec::U64(v) => win
                 .timestamps
                 .iter()
                 .copied()
@@ -893,9 +893,9 @@ impl MonitorState {
         };
 
         let signal: Vec<f64> = match batch {
-            ColumnBatch::F64(v) => v.clone(),
-            ColumnBatch::I64(v) => v.iter().map(|&x| x as f64).collect(),
-            ColumnBatch::U64(v) => v.iter().map(|&x| x as f64).collect(),
+            ColumnVec::F64(v) => v.clone(),
+            ColumnVec::I64(v) => v.iter().map(|&x| x as f64).collect(),
+            ColumnVec::U64(v) => v.iter().map(|&x| x as f64).collect(),
         };
 
         if signal.len() < MIN_FFT_SAMPLES {
@@ -1143,8 +1143,8 @@ fn render_monitor_panel(f: &mut Frame, app: &mut MonitorState, area: Rect, now: 
     }
 }
 
-fn stale_threshold(sample: &Sample) -> Duration {
-    let rate = sample.segment.sampling_rate as f64 / sample.segment.decimation.max(1) as f64;
+fn stale_threshold(batch: &SampleBatch) -> Duration {
+    let rate = batch.segment.sampling_rate as f64 / batch.segment.decimation.max(1) as f64;
     let period_ms = if rate > 0.0 { 1000.0 / rate } else { 0.0 };
     // floor of 1200
     Duration::from_millis((period_ms * 2.0).max(1200.0) as u64)
@@ -1169,14 +1169,14 @@ fn build_left_lines(
         .last
         .values()
         .flat_map(|(s, _)| s.columns.iter())
-        .map(|c| c.desc.description.len())
+        .map(|c| c.metadata.description.len())
         .max()
         .unwrap_or(0);
     app.view.units_width = app
         .last
         .values()
         .flat_map(|(s, _)| s.columns.iter())
-        .map(|c| c.desc.units.len())
+        .map(|c| c.metadata.units.len())
         .max()
         .unwrap_or(0);
 
@@ -1244,9 +1244,10 @@ fn build_left_lines(
 
         for sid in stream_ids {
             let key = StreamKey::new(route.clone(), sid);
-            if let Some((sample, seen)) = app.last.get(&key) {
-                let is_stale = now.saturating_duration_since(*seen) > stale_threshold(sample);
-                for col in &sample.columns {
+            if let Some((batch, seen)) = app.last.get(&key) {
+                let is_stale = now.saturating_duration_since(*seen) > stale_threshold(batch);
+                let last_row = batch.len().saturating_sub(1);
+                for col in &batch.columns {
                     let nav_idx = global_idx;
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
@@ -1258,20 +1259,20 @@ fn build_left_lines(
                         .plot_mode(app.view.show_plot);
 
                     let label_style = ctx.resolve();
-                    let (val_str, val_f64) = fmt_value(&col.value);
+                    let (val_str, val_f64) = fmt_value(&col.values.get(last_row));
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(&sample.stream.name, &col.desc.name, val_f64)
+                        .get_value_color(&batch.stream.name, &col.metadata.name, val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = ctx.color(val_col).resolve();
 
-                    let mut desc = col.desc.description.clone();
+                    let mut desc = col.metadata.description.clone();
                     if desc.len() < app.view.desc_width {
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
-                    let units = col.desc.units.clone();
+                    let units = col.metadata.units.clone();
                     let padded_units = if app.view.units_width > 0 && !units.is_empty() {
                         format!("{:>width$}", units, width = app.view.units_width)
                     } else if app.view.units_width > 0 {
@@ -1814,8 +1815,8 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
         crossbeam::select! {
             recv(data_rx) -> item => {
                 match item {
-                    Ok(Ok(TreeItem::Sample(sample, route))) => {
-                        app.handle_sample(sample, route, &mut buffer);
+                    Ok(Ok(TreeItem::Batch(batch))) => {
+                        app.handle_batch(batch, &mut buffer);
                     }
                     Ok(Ok(TreeItem::Event(event))) => {
                         app.handle_event(event, &rpc_tx);

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use twinleaf::data::{Buffer, Column, ColumnBatch, ColumnData, CursorPosition, ReadError, Sample};
+use twinleaf::data::{
+    Boundary, BoundaryReason, Buffer, ColumnData, ColumnVec, ColumnWindow, CursorPosition,
+    ReadError, SampleBatch, Series,
+};
 use twinleaf::tio::proto::identifiers::{ColumnKey, SampleNumber, StreamKey};
 use twinleaf::tio::proto::meta::{
     ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata, StreamMetadata,
 };
-use twinleaf::tio::proto::{DataType, DeviceRoute, StreamDataPayload};
+use twinleaf::tio::proto::{DataType, DeviceRoute};
 
 fn test_fixture(
     column_types: &[DataType],
@@ -83,33 +86,17 @@ fn push_rows(
     segment: &Arc<SegmentMetadata>,
     rows: &[Vec<ColumnData>],
 ) {
-    for (sample_idx, row) in rows.iter().enumerate() {
-        assert_eq!(row.len(), columns.len());
-        let sample = Sample {
-            n: sample_idx as SampleNumber,
-            columns: columns
-                .iter()
-                .zip(row.iter())
-                .map(|(desc, value)| Column {
-                    value: value.clone(),
-                    desc: desc.clone(),
-                })
-                .collect(),
-            segment: segment.clone(),
-            stream: stream.clone(),
-            device: device.clone(),
-            source: StreamDataPayload {
-                stream_id: stream.stream_id,
-                first_sample_n: sample_idx as SampleNumber,
-                segment_id: segment.segment_id,
-                data: Vec::new(),
-            },
-            boundary: None,
-        };
-        buffer.process_sample(sample, stream_key.clone());
-    }
+    let numbered: Vec<(SampleNumber, Vec<ColumnData>)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (i as SampleNumber, row.clone()))
+        .collect();
+    push_rows_with_sample_numbers(
+        buffer, stream_key, columns, device, stream, segment, None, &numbered,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_rows_with_sample_numbers(
     buffer: &mut Buffer,
     stream_key: &StreamKey,
@@ -117,33 +104,41 @@ fn push_rows_with_sample_numbers(
     device: &Arc<DeviceMetadata>,
     stream: &Arc<StreamMetadata>,
     segment: &Arc<SegmentMetadata>,
+    boundary: Option<Boundary>,
     rows: &[(SampleNumber, Vec<ColumnData>)],
 ) {
-    for (sample_n, row) in rows.iter() {
+    let sample_numbers: Vec<SampleNumber> = rows.iter().map(|(n, _)| *n).collect();
+    let value_rows: Vec<&[ColumnData]> = rows.iter().map(|(_, row)| row.as_slice()).collect();
+    for row in &value_rows {
         assert_eq!(row.len(), columns.len());
-        let sample = Sample {
-            n: *sample_n,
-            columns: columns
-                .iter()
-                .zip(row.iter())
-                .map(|(desc, value)| Column {
-                    value: value.clone(),
-                    desc: desc.clone(),
-                })
-                .collect(),
-            segment: segment.clone(),
-            stream: stream.clone(),
-            device: device.clone(),
-            source: StreamDataPayload {
-                stream_id: stream.stream_id,
-                first_sample_n: *sample_n,
-                segment_id: segment.segment_id,
-                data: Vec::new(),
-            },
-            boundary: None,
-        };
-        buffer.process_sample(sample, stream_key.clone());
     }
+
+    let series = columns
+        .iter()
+        .enumerate()
+        .map(|(ci, meta)| {
+            let mut values = ColumnVec::empty_for(meta.data_type.buffer_type());
+            for row in &value_rows {
+                values.push_data(&row[ci]);
+            }
+            Series {
+                index: meta.index,
+                metadata: meta.clone(),
+                values,
+            }
+        })
+        .collect();
+
+    let batch = SampleBatch::new(
+        DeviceRoute::root(),
+        boundary,
+        sample_numbers,
+        series,
+        segment.clone(),
+        stream.clone(),
+        device.clone(),
+    );
+    buffer.process_batch(&batch, stream_key.clone());
 }
 
 #[test]
@@ -177,7 +172,7 @@ fn read_aligned_time_range_in_range() {
 
     let batch = &window.columns[&column_keys[0]];
     match batch {
-        ColumnBatch::F64(values) => assert_eq!(values, &vec![1.0, 2.0, 3.0]),
+        ColumnVec::F64(values) => assert_eq!(values, &vec![1.0, 2.0, 3.0]),
         _ => panic!("expected f64 column batch"),
     }
 
@@ -186,6 +181,53 @@ fn read_aligned_time_range_in_range() {
         window.sample_numbers[&stream_key].len()
     );
     assert_eq!(window.timestamps.len(), batch.len());
+}
+
+#[test]
+fn column_window_time_range_borrows_in_range() {
+    let mut buffer = Buffer::new(16);
+    let (stream_key, columns, column_keys, device, stream, segment) =
+        test_fixture(&[DataType::Float64]);
+    push_rows(
+        &mut buffer,
+        &stream_key,
+        &columns,
+        &device,
+        &stream,
+        &segment,
+        &[
+            vec![ColumnData::Float(0.0)],
+            vec![ColumnData::Float(1.0)],
+            vec![ColumnData::Float(2.0)],
+            vec![ColumnData::Float(3.0)],
+            vec![ColumnData::Float(4.0)],
+            vec![ColumnData::Float(5.0)],
+        ],
+    );
+
+    let w = buffer
+        .column_window_time_range(&column_keys[0], 2.0, 4.0)
+        .unwrap();
+    let (ta, tb) = w.timestamps;
+    let ts: Vec<f64> = ta.iter().chain(tb.iter()).copied().collect();
+    assert_eq!(ts, vec![2.0, 3.0, 4.0]);
+    match w.values.to_owned() {
+        ColumnVec::F64(v) => assert_eq!(v, vec![1.0, 2.0, 3.0]),
+        _ => panic!("expected f64 column batch"),
+    }
+
+    // Reversed bounds normalize to the same window.
+    let w2 = buffer
+        .column_window_time_range(&column_keys[0], 4.0, 2.0)
+        .unwrap();
+    let (ta2, tb2) = w2.timestamps;
+    let ts2: Vec<f64> = ta2.iter().chain(tb2.iter()).copied().collect();
+    assert_eq!(ts2, vec![2.0, 3.0, 4.0]);
+
+    // A range with no samples yields None (so the caller draws nothing).
+    assert!(buffer
+        .column_window_time_range(&column_keys[0], 100.0, 200.0)
+        .is_none());
 }
 
 #[test]
@@ -363,15 +405,15 @@ fn read_aligned_time_range_preserves_column_batch_types() {
     assert_eq!(window.sample_numbers[&stream_key], vec![0, 1, 2]);
 
     match &window.columns[&column_keys[0]] {
-        ColumnBatch::F64(values) => assert_eq!(values, &vec![0.5, 1.5, 2.5]),
+        ColumnVec::F64(values) => assert_eq!(values, &vec![0.5, 1.5, 2.5]),
         _ => panic!("expected f64 batch"),
     }
     match &window.columns[&column_keys[1]] {
-        ColumnBatch::I64(values) => assert_eq!(values, &vec![-1, -2, -3]),
+        ColumnVec::I64(values) => assert_eq!(values, &vec![-1, -2, -3]),
         _ => panic!("expected i64 batch"),
     }
     match &window.columns[&column_keys[2]] {
-        ColumnBatch::U64(values) => assert_eq!(values, &vec![10, 11, 12]),
+        ColumnVec::U64(values) => assert_eq!(values, &vec![10, 11, 12]),
         _ => panic!("expected u64 batch"),
     }
 }
@@ -412,7 +454,7 @@ fn read_from_cursor_returns_samples_after_cursor() {
     assert_eq!(window.sample_numbers[&stream_key], vec![3, 4]);
     assert_eq!(window.timestamps, vec![4.0, 5.0]);
     match &window.columns[&column_keys[0]] {
-        ColumnBatch::F64(values) => assert_eq!(values, &vec![3.0, 4.0]),
+        ColumnVec::F64(values) => assert_eq!(values, &vec![3.0, 4.0]),
         _ => panic!("expected f64 batch"),
     }
 }
@@ -429,6 +471,7 @@ fn read_from_cursor_handles_wrapped_sample_numbers() {
         &device,
         &stream,
         &segment,
+        None,
         &[
             (u32::MAX - 3, vec![ColumnData::Float(10.0)]),
             (u32::MAX - 2, vec![ColumnData::Float(11.0)]),
@@ -452,7 +495,179 @@ fn read_from_cursor_handles_wrapped_sample_numbers() {
     let window = buffer.read_from_cursor(&column_keys, &cursors, 2).unwrap();
     assert_eq!(window.sample_numbers[&stream_key], vec![0, 1]);
     match &window.columns[&column_keys[0]] {
-        ColumnBatch::F64(values) => assert_eq!(values, &vec![13.0, 14.0]),
+        ColumnVec::F64(values) => assert_eq!(values, &vec![13.0, 14.0]),
         _ => panic!("expected f64 batch"),
     }
+}
+
+fn window_owned(win: &ColumnWindow) -> (Vec<f64>, Vec<f64>) {
+    let (ta, tb) = win.timestamps;
+    let mut ts = Vec::with_capacity(ta.len() + tb.len());
+    ts.extend_from_slice(ta);
+    ts.extend_from_slice(tb);
+    let vals = match win.values.to_owned() {
+        ColumnVec::F64(v) => v,
+        other => panic!("expected f64 batch, got {other:?}"),
+    };
+    (ts, vals)
+}
+
+fn fill_floats(buffer: &mut Buffer, count: usize) -> (StreamKey, Vec<ColumnKey>) {
+    let (stream_key, columns, column_keys, device, stream, segment) =
+        test_fixture(&[DataType::Float64]);
+    let rows: Vec<_> = (0..count)
+        .map(|i| vec![ColumnData::Float(i as f64)])
+        .collect();
+    push_rows(
+        buffer,
+        &stream_key,
+        &columns,
+        &device,
+        &stream,
+        &segment,
+        &rows,
+    );
+    (stream_key, column_keys)
+}
+
+#[test]
+fn column_window_last_n_empty_returns_none() {
+    let buffer = Buffer::new(8);
+    let (_stream_key, _cols, column_keys, _d, _s, _seg) = test_fixture(&[DataType::Float64]);
+    assert!(buffer.column_window_last_n(&column_keys[0], 4).is_none());
+}
+
+#[test]
+fn column_window_last_n_across_ring_seam() {
+    let mut buffer = Buffer::new(5);
+    let (_stream_key, column_keys) = fill_floats(&mut buffer, 12);
+    let col = &column_keys[0];
+
+    // Values are the sample index; timestamps are the sample-period end (index + 1).
+
+    // Full window straddling the seam.
+    let win = buffer.column_window_last_n(col, 5).unwrap();
+    let (ts, vals) = window_owned(&win);
+    assert_eq!(vals, vec![7.0, 8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(ts, vec![8.0, 9.0, 10.0, 11.0, 12.0]);
+    assert_eq!(win.values.len(), 5);
+
+    // Window entirely within the second physical half (last two samples).
+    let win = buffer.column_window_last_n(col, 2).unwrap();
+    let (ts, vals) = window_owned(&win);
+    assert_eq!(vals, vec![10.0, 11.0]);
+    assert_eq!(ts, vec![11.0, 12.0]);
+
+    // Window straddling the seam with count < len (three samples).
+    let win = buffer.column_window_last_n(col, 3).unwrap();
+    let (ts, vals) = window_owned(&win);
+    assert_eq!(vals, vec![9.0, 10.0, 11.0]);
+    assert_eq!(ts, vec![10.0, 11.0, 12.0]);
+
+    // count < len, leaving a sample dropped from the front of the window.
+    let win = buffer.column_window_last_n(col, 4).unwrap();
+    let (ts, vals) = window_owned(&win);
+    assert_eq!(vals, vec![8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(ts, vec![9.0, 10.0, 11.0, 12.0]);
+
+    // n larger than retained length is clamped to len.
+    let win = buffer.column_window_last_n(col, 100).unwrap();
+    let (ts, vals) = window_owned(&win);
+    assert_eq!(vals, vec![7.0, 8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(ts, vec![8.0, 9.0, 10.0, 11.0, 12.0]);
+}
+
+#[test]
+fn column_window_last_n_seam_sweep() {
+    let cap = 5usize;
+    for total in 1..=30usize {
+        let mut buffer = Buffer::new(cap);
+        let (_stream_key, column_keys) = fill_floats(&mut buffer, total);
+        let col = &column_keys[0];
+
+        let len = total.min(cap);
+        for n in 1..=(cap + 2) {
+            let win = buffer.column_window_last_n(col, n).unwrap();
+            let (ts, vals) = window_owned(&win);
+            let count = n.min(len);
+            let expected_vals: Vec<f64> = ((total - count)..total).map(|i| i as f64).collect();
+            let expected_ts: Vec<f64> = ((total - count)..total).map(|i| (i + 1) as f64).collect();
+            assert_eq!(ts, expected_ts, "total={total} n={n} timestamps");
+            assert_eq!(vals, expected_vals, "total={total} n={n} values");
+            assert_eq!(win.values.len(), count);
+        }
+    }
+}
+
+#[test]
+fn aligned_window_matches_after_ring_seam() {
+    let mut buffer = Buffer::new(5);
+    let (stream_key, column_keys) = fill_floats(&mut buffer, 12);
+    let window = buffer.read_aligned_window(&column_keys, 5).unwrap();
+    assert_eq!(window.timestamps, vec![8.0, 9.0, 10.0, 11.0, 12.0]);
+    assert_eq!(window.sample_numbers[&stream_key], vec![7, 8, 9, 10, 11]);
+    match &window.columns[&column_keys[0]] {
+        ColumnVec::F64(v) => assert_eq!(v, &vec![7.0, 8.0, 9.0, 10.0, 11.0]),
+        _ => panic!("expected f64 batch"),
+    }
+}
+
+#[test]
+fn discontinuous_boundary_starts_a_new_run() {
+    let mut buffer = Buffer::new(16);
+    let (stream_key, columns, _column_keys, device, stream, segment) =
+        test_fixture(&[DataType::Float64]);
+
+    // First batch establishes the run. A `None` boundary is continuous, so the
+    // run id stays put across a following continuous batch.
+    push_rows(
+        &mut buffer,
+        &stream_key,
+        &columns,
+        &device,
+        &stream,
+        &segment,
+        &[vec![ColumnData::Float(0.0)], vec![ColumnData::Float(1.0)]],
+    );
+    let first_run = buffer.get_run(&stream_key).unwrap().run_id;
+
+    push_rows_with_sample_numbers(
+        &mut buffer,
+        &stream_key,
+        &columns,
+        &device,
+        &stream,
+        &segment,
+        None,
+        &[(2, vec![ColumnData::Float(2.0)])],
+    );
+    assert_eq!(
+        buffer.get_run(&stream_key).unwrap().run_id,
+        first_run,
+        "a continuous batch must not split the run"
+    );
+
+    // A discontinuous boundary forces a new run, replacing the old `continuous`
+    // argument that the pre-SoA API took explicitly.
+    push_rows_with_sample_numbers(
+        &mut buffer,
+        &stream_key,
+        &columns,
+        &device,
+        &stream,
+        &segment,
+        Some(Boundary {
+            reason: BoundaryReason::SegmentChanged {
+                old_id: 0,
+                new_id: 1,
+            },
+            prior: None,
+        }),
+        &[(3, vec![ColumnData::Float(3.0)])],
+    );
+    assert_ne!(
+        buffer.get_run(&stream_key).unwrap().run_id,
+        first_run,
+        "a discontinuous boundary must start a new run"
+    );
 }
