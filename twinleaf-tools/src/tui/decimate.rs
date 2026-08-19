@@ -212,6 +212,7 @@ impl ColumnOp for Fpcs {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use twinleaf::data::Generations;
     use twinleaf::tio::proto::{ColumnMetadata, DataType};
 
     fn meta() -> Arc<ColumnMetadata> {
@@ -227,7 +228,11 @@ mod tests {
 
     fn window<'a>(ts: &'a [f64], vals: &'a [f64]) -> ColumnWindow<'a> {
         ColumnWindow {
-            run_id: 0,
+            generations: Generations {
+                stream: 1,
+                device: 0,
+                global: 0,
+            },
             effective_rate: 1.0,
             timestamps: (ts, &[]),
             values: ColumnView::F64(vals, &[]),
@@ -242,7 +247,11 @@ mod tests {
         vb: &'a [f64],
     ) -> ColumnWindow<'a> {
         ColumnWindow {
-            run_id: 0,
+            generations: Generations {
+                stream: 1,
+                device: 0,
+                global: 0,
+            },
             effective_rate: 1.0,
             timestamps: (ta, tb),
             values: ColumnView::F64(va, vb),

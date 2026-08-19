@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use twinleaf::data::{
-    Boundary, BoundaryReason, Buffer, ColumnData, ColumnVec, ColumnWindow, SampleBatch, Series,
+    Buffer, ColumnData, ColumnVec, ColumnWindow, Generations, SampleBatch, Series,
 };
 use twinleaf::tio::proto::identifiers::{ColumnKey, SampleNumber, StreamKey};
 use twinleaf::tio::proto::meta::{
@@ -9,19 +9,74 @@ use twinleaf::tio::proto::meta::{
 };
 use twinleaf::tio::proto::{DataType, DeviceRoute};
 
-fn test_fixture(
-    column_types: &[DataType],
-) -> (
-    StreamKey,
-    Vec<Arc<ColumnMetadata>>,
-    Vec<ColumnKey>,
-    Arc<DeviceMetadata>,
-    Arc<StreamMetadata>,
-    Arc<SegmentMetadata>,
-) {
+struct Fixture {
+    stream_key: StreamKey,
+    columns: Vec<Arc<ColumnMetadata>>,
+    column_keys: Vec<ColumnKey>,
+    device: Arc<DeviceMetadata>,
+    stream: Arc<StreamMetadata>,
+    segment: Arc<SegmentMetadata>,
+}
+
+impl Fixture {
+    fn push_rows(&self, buffer: &mut Buffer, rows: &[Vec<ColumnData>]) {
+        let numbered: Vec<(SampleNumber, Vec<ColumnData>)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (i as SampleNumber, row.clone()))
+            .collect();
+        self.push_rows_with_sample_numbers(buffer, 1, &numbered);
+    }
+
+    /// Push a batch stamped with `stream_generation`; a change of generation is what
+    /// starts a new run.
+    fn push_rows_with_sample_numbers(
+        &self,
+        buffer: &mut Buffer,
+        stream_generation: u32,
+        rows: &[(SampleNumber, Vec<ColumnData>)],
+    ) {
+        let sample_numbers: Vec<SampleNumber> = rows.iter().map(|(n, _)| *n).collect();
+        let value_rows: Vec<&[ColumnData]> = rows.iter().map(|(_, row)| row.as_slice()).collect();
+        for row in &value_rows {
+            assert_eq!(row.len(), self.columns.len());
+        }
+
+        let series = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ci, meta)| {
+                let mut values = ColumnVec::empty_for(meta.data_type.buffer_type());
+                for row in &value_rows {
+                    values.push_data(&row[ci]);
+                }
+                Series::new(meta.index, meta.clone(), values)
+            })
+            .collect();
+
+        let batch = SampleBatch::new(
+            DeviceRoute::root(),
+            None,
+            Generations {
+                stream: stream_generation,
+                device: 0,
+                global: 0,
+            },
+            sample_numbers,
+            series,
+            self.segment.clone(),
+            self.stream.clone(),
+            self.device.clone(),
+        );
+        buffer.process_batch(&batch, self.stream_key);
+    }
+}
+
+fn test_fixture(column_types: &[DataType]) -> Fixture {
     let route = DeviceRoute::root();
     let stream_id = 1;
-    let stream_key = StreamKey::new(route.clone(), stream_id);
+    let stream_key = StreamKey::new(route, stream_id);
 
     let device = Arc::new(DeviceMetadata {
         serial_number: "SN123".to_string(),
@@ -69,88 +124,25 @@ fn test_fixture(
 
     let column_keys = columns
         .iter()
-        .map(|metadata| ColumnKey::new(route.clone(), stream_id, metadata.index))
+        .map(|metadata| ColumnKey::new(route, stream_id, metadata.index))
         .collect();
 
-    (stream_key, columns, column_keys, device, stream, segment)
-}
-
-fn push_rows(
-    buffer: &mut Buffer,
-    stream_key: &StreamKey,
-    columns: &[Arc<ColumnMetadata>],
-    device: &Arc<DeviceMetadata>,
-    stream: &Arc<StreamMetadata>,
-    segment: &Arc<SegmentMetadata>,
-    rows: &[Vec<ColumnData>],
-) {
-    let numbered: Vec<(SampleNumber, Vec<ColumnData>)> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| (i as SampleNumber, row.clone()))
-        .collect();
-    push_rows_with_sample_numbers(
-        buffer, stream_key, columns, device, stream, segment, None, &numbered,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_rows_with_sample_numbers(
-    buffer: &mut Buffer,
-    stream_key: &StreamKey,
-    columns: &[Arc<ColumnMetadata>],
-    device: &Arc<DeviceMetadata>,
-    stream: &Arc<StreamMetadata>,
-    segment: &Arc<SegmentMetadata>,
-    boundary: Option<Boundary>,
-    rows: &[(SampleNumber, Vec<ColumnData>)],
-) {
-    let sample_numbers: Vec<SampleNumber> = rows.iter().map(|(n, _)| *n).collect();
-    let value_rows: Vec<&[ColumnData]> = rows.iter().map(|(_, row)| row.as_slice()).collect();
-    for row in &value_rows {
-        assert_eq!(row.len(), columns.len());
+    Fixture {
+        stream_key,
+        columns,
+        column_keys,
+        device,
+        stream,
+        segment,
     }
-
-    let series = columns
-        .iter()
-        .enumerate()
-        .map(|(ci, meta)| {
-            let mut values = ColumnVec::empty_for(meta.data_type.buffer_type());
-            for row in &value_rows {
-                values.push_data(&row[ci]);
-            }
-            Series {
-                index: meta.index,
-                metadata: meta.clone(),
-                values,
-            }
-        })
-        .collect();
-
-    let batch = SampleBatch::new(
-        DeviceRoute::root(),
-        boundary,
-        sample_numbers,
-        series,
-        segment.clone(),
-        stream.clone(),
-        device.clone(),
-    );
-    buffer.process_batch(&batch, stream_key.clone());
 }
 
 #[test]
 fn column_window_time_range_borrows_in_range() {
     let mut buffer = Buffer::new(16);
-    let (stream_key, columns, column_keys, device, stream, segment) =
-        test_fixture(&[DataType::Float64]);
-    push_rows(
+    let fixture = test_fixture(&[DataType::Float64]);
+    fixture.push_rows(
         &mut buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
         &[
             vec![ColumnData::Float(0.0)],
             vec![ColumnData::Float(1.0)],
@@ -162,7 +154,7 @@ fn column_window_time_range_borrows_in_range() {
     );
 
     let w = buffer
-        .column_window_time_range(&column_keys[0], 2.0, 4.0)
+        .column_window_time_range(&fixture.column_keys[0], 2.0, 4.0)
         .unwrap();
     let (ta, tb) = w.timestamps;
     let ts: Vec<f64> = ta.iter().chain(tb.iter()).copied().collect();
@@ -174,7 +166,7 @@ fn column_window_time_range_borrows_in_range() {
 
     // Reversed bounds normalize to the same window.
     let w2 = buffer
-        .column_window_time_range(&column_keys[0], 4.0, 2.0)
+        .column_window_time_range(&fixture.column_keys[0], 4.0, 2.0)
         .unwrap();
     let (ta2, tb2) = w2.timestamps;
     let ts2: Vec<f64> = ta2.iter().chain(tb2.iter()).copied().collect();
@@ -182,7 +174,7 @@ fn column_window_time_range_borrows_in_range() {
 
     // A range with no samples yields None (so the caller draws nothing).
     assert!(buffer
-        .column_window_time_range(&column_keys[0], 100.0, 200.0)
+        .column_window_time_range(&fixture.column_keys[0], 100.0, 200.0)
         .is_none());
 }
 
@@ -199,28 +191,21 @@ fn window_owned(win: &ColumnWindow) -> (Vec<f64>, Vec<f64>) {
 }
 
 fn fill_floats(buffer: &mut Buffer, count: usize) -> (StreamKey, Vec<ColumnKey>) {
-    let (stream_key, columns, column_keys, device, stream, segment) =
-        test_fixture(&[DataType::Float64]);
+    let fixture = test_fixture(&[DataType::Float64]);
     let rows: Vec<_> = (0..count)
         .map(|i| vec![ColumnData::Float(i as f64)])
         .collect();
-    push_rows(
-        buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
-        &rows,
-    );
-    (stream_key, column_keys)
+    fixture.push_rows(buffer, &rows);
+    (fixture.stream_key, fixture.column_keys)
 }
 
 #[test]
 fn column_window_last_n_empty_returns_none() {
     let buffer = Buffer::new(8);
-    let (_stream_key, _cols, column_keys, _d, _s, _seg) = test_fixture(&[DataType::Float64]);
-    assert!(buffer.column_window_last_n(&column_keys[0], 4).is_none());
+    let fixture = test_fixture(&[DataType::Float64]);
+    assert!(buffer
+        .column_window_last_n(&fixture.column_keys[0], 4)
+        .is_none());
 }
 
 #[test]
@@ -288,16 +273,10 @@ fn column_window_last_n_seam_sweep() {
 #[test]
 fn latest_row_returns_newest_values_and_metadata() {
     let mut buffer = Buffer::new(16);
-    let (stream_key, columns, _column_keys, device, stream, segment) =
-        test_fixture(&[DataType::Float64, DataType::Int64, DataType::UInt64]);
+    let fixture = test_fixture(&[DataType::Float64, DataType::Int64, DataType::UInt64]);
 
-    push_rows(
+    fixture.push_rows(
         &mut buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
         &[
             vec![
                 ColumnData::Float(0.5),
@@ -313,14 +292,9 @@ fn latest_row_returns_newest_values_and_metadata() {
     );
 
     // A later, separate batch must overwrite the "latest" values.
-    push_rows_with_sample_numbers(
+    fixture.push_rows_with_sample_numbers(
         &mut buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
-        None,
+        1,
         &[(
             2,
             vec![
@@ -331,9 +305,9 @@ fn latest_row_returns_newest_values_and_metadata() {
         )],
     );
 
-    let row = buffer.latest_row(&stream_key).unwrap();
-    assert!(Arc::ptr_eq(&row.stream, &stream));
-    assert!(Arc::ptr_eq(&row.segment, &segment));
+    let row = buffer.latest_row(&fixture.stream_key).unwrap();
+    assert!(Arc::ptr_eq(&row.stream, &fixture.stream));
+    assert!(Arc::ptr_eq(&row.segment, &fixture.segment));
     assert!(row.last_seen.elapsed() < std::time::Duration::from_secs(5));
 
     // Ordered by column id, with the newest value on each column.
@@ -360,60 +334,102 @@ fn latest_row_returns_newest_values_and_metadata() {
 }
 
 #[test]
-fn discontinuous_boundary_starts_a_new_run() {
+fn stream_generation_change_starts_a_new_run() {
     let mut buffer = Buffer::new(16);
-    let (stream_key, columns, _column_keys, device, stream, segment) =
-        test_fixture(&[DataType::Float64]);
+    let fixture = test_fixture(&[DataType::Float64]);
 
-    // First batch establishes the run. A `None` boundary is continuous, so the
-    // run id stays put across a following continuous batch.
-    push_rows(
+    // First batch establishes the run; a batch stamped with the same stream
+    // generation appends to it.
+    fixture.push_rows(
         &mut buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
         &[vec![ColumnData::Float(0.0)], vec![ColumnData::Float(1.0)]],
     );
-    let first_run = buffer.get_run(&stream_key).unwrap().run_id;
-
-    push_rows_with_sample_numbers(
-        &mut buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
-        None,
-        &[(2, vec![ColumnData::Float(2.0)])],
-    );
     assert_eq!(
-        buffer.get_run(&stream_key).unwrap().run_id,
-        first_run,
-        "a continuous batch must not split the run"
+        buffer
+            .get_run(&fixture.stream_key)
+            .unwrap()
+            .generations
+            .stream,
+        1
     );
 
-    // A discontinuous boundary forces a new run, replacing the old `continuous`
-    // argument that the pre-SoA API took explicitly.
-    push_rows_with_sample_numbers(
+    fixture.push_rows_with_sample_numbers(&mut buffer, 1, &[(2, vec![ColumnData::Float(2.0)])]);
+    let window = buffer
+        .column_window_last_n(&fixture.column_keys[0], usize::MAX)
+        .unwrap();
+    assert_eq!(
+        window.generations.stream, 1,
+        "a same-generation batch must not split the run"
+    );
+    assert_eq!(window_owned(&window).1, [0.0, 1.0, 2.0]);
+
+    // A bumped stream generation replaces the active run, dropping its history.
+    fixture.push_rows_with_sample_numbers(&mut buffer, 2, &[(3, vec![ColumnData::Float(3.0)])]);
+    let window = buffer
+        .column_window_last_n(&fixture.column_keys[0], usize::MAX)
+        .unwrap();
+    assert_eq!(
+        window.generations.stream, 2,
+        "a new stream generation must start a new run"
+    );
+    assert_eq!(window_owned(&window).1, [3.0]);
+}
+
+#[test]
+fn schema_change_starts_an_aligned_new_run() {
+    let mut buffer = Buffer::new(16);
+    let first = test_fixture(&[DataType::Float64]);
+    first.push_rows(&mut buffer, &[vec![ColumnData::Float(1.0)]]);
+
+    // A schema change always rides a new stream generation: the parser splits the
+    // run, and the new run's columns follow the new schema.
+    let changed = test_fixture(&[DataType::Float64, DataType::Float64]);
+    changed.push_rows_with_sample_numbers(
         &mut buffer,
-        &stream_key,
-        &columns,
-        &device,
-        &stream,
-        &segment,
-        Some(Boundary {
-            reason: BoundaryReason::SegmentChanged {
-                old_id: 0,
-                new_id: 1,
-            },
-        }),
-        &[(3, vec![ColumnData::Float(3.0)])],
+        2,
+        &[(0, vec![ColumnData::Float(10.0), ColumnData::Float(20.0)])],
     );
-    assert_ne!(
-        buffer.get_run(&stream_key).unwrap().run_id,
-        first_run,
-        "a discontinuous boundary must start a new run"
+
+    assert_eq!(
+        buffer
+            .get_run(&changed.stream_key)
+            .unwrap()
+            .generations
+            .stream,
+        2
     );
+    let (_, first_values) = window_owned(
+        &buffer
+            .column_window_last_n(&changed.column_keys[0], usize::MAX)
+            .unwrap(),
+    );
+    let (_, second_values) = window_owned(
+        &buffer
+            .column_window_last_n(&changed.column_keys[1], usize::MAX)
+            .unwrap(),
+    );
+    assert_eq!(first_values, [10.0]);
+    assert_eq!(second_values, [20.0]);
+}
+
+#[test]
+fn every_column_stays_aligned_across_eviction() {
+    let mut buffer = Buffer::new(3);
+    let fixture = test_fixture(&[DataType::Float64, DataType::Float64, DataType::Float64]);
+    let rows: Vec<_> = (0..8)
+        .map(|row| {
+            vec![
+                ColumnData::Float(row as f64),
+                ColumnData::Float((row + 10) as f64),
+                ColumnData::Float((row + 20) as f64),
+            ]
+        })
+        .collect();
+    fixture.push_rows(&mut buffer, &rows);
+
+    for key in &fixture.column_keys {
+        let window = buffer.column_window_last_n(key, usize::MAX).unwrap();
+        assert_eq!(window.timestamps.0.len() + window.timestamps.1.len(), 3);
+        assert_eq!(window.values.len(), 3);
+    }
 }

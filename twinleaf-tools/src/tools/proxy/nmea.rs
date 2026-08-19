@@ -56,7 +56,7 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
         };
 
         // Only process samples from stream ID 1
-        if batch.stream.stream_id != 1 {
+        if batch.stream().stream_id != 1 {
             continue;
         }
 

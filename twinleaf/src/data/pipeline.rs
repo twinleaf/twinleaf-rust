@@ -1,13 +1,12 @@
 //! Incremental per-column computation driven by a [`Buffer`].
 //!
 //! [`ColumnOp`] is what app crates implement for stateful streaming
-//! computations (decimation, Welch, ...). [`DerivedColumn`] pairs an op with
-//! a cursor into a [`Buffer`]: [`DerivedColumn::sync`] feeds it exactly the
-//! samples it hasn't seen yet, and transparently resets + replays available
-//! history whenever the run restarts or the cursor falls out of the ring.
+//! computations (decimation, Welch, ...). [`ColumnProcessor`] pairs an op with
+//! one source column: [`ColumnProcessor::catch_up`] feeds it exactly the rows
+//! it has not seen yet, and transparently resets + replays retained history
+//! whenever the run restarts or the processor falls behind the ring.
 
-use crate::data::{Buffer, ColumnKey, ColumnWindow, RunId};
-use crate::tio::proto::identifiers::SampleNumber;
+use crate::data::{Buffer, ColumnKey, ColumnWindow, Generations};
 
 /// An incremental computation over one column's sample stream.
 /// Implementations are stateful; fed every sample exactly once, in order.
@@ -20,22 +19,24 @@ pub trait ColumnOp {
     fn output(&self) -> &Self::Output;
 }
 
-/// Drives a [`ColumnOp`] from a [`Buffer`]: tracks a `(RunId, SampleNumber)`
-/// cursor, feeds only new samples on sync, and hydrates (reset + replay
-/// available history) on run restart or when the cursor has fallen off the
-/// ring.
-pub struct DerivedColumn<O: ColumnOp> {
+/// Drives a [`ColumnOp`] from a [`Buffer`], feeding only new rows and replaying
+/// retained history after a run restart or retention overrun.
+pub struct ColumnProcessor<Op: ColumnOp> {
     key: ColumnKey,
-    op: O,
-    cursor: Option<(RunId, SampleNumber)>,
+    op: Op,
+    /// Stamps of the run being followed; a different `stream` generation is a
+    /// different run.
+    cursor: Option<Generations>,
+    next_row: u64,
 }
 
-impl<O: ColumnOp> DerivedColumn<O> {
-    pub fn new(key: ColumnKey, op: O) -> Self {
+impl<Op: ColumnOp> ColumnProcessor<Op> {
+    pub fn new(key: ColumnKey, op: Op) -> Self {
         Self {
             key,
             op,
             cursor: None,
+            next_row: 0,
         }
     }
 
@@ -43,74 +44,65 @@ impl<O: ColumnOp> DerivedColumn<O> {
         &self.key
     }
 
-    /// Catch up with the buffer. Idempotent: calling twice with no new data
-    /// pushes nothing. Returns the op output for convenience.
-    pub fn sync(&mut self, buffer: &Buffer) -> &O::Output {
+    /// Feed all retained rows this operation has not seen. Calling twice with
+    /// no new data pushes nothing.
+    pub fn catch_up(&mut self, buffer: &Buffer) -> &Op::Output {
         let Some(run) = buffer.get_run(&self.key.stream_key()) else {
             return self.op.output();
         };
-        let run_id = run.run_id;
-        let last_sample_number = run.last_sample_number;
+        let retained = run.retained_rows();
 
-        let needs_hydrate = match self.cursor {
-            None => true,
-            Some((cursor_run, _)) => cursor_run != run_id,
-        };
-
-        if needs_hydrate {
-            self.rehydrate(buffer, run_id, last_sample_number);
+        let needs_replay = self
+            .cursor
+            .is_none_or(|c| c.stream != run.generations.stream)
+            || self.next_row < retained.start
+            || self.next_row > retained.end;
+        if needs_replay {
+            self.op.reset();
+            if let Some(window) = run.column_window(self.key.column_id, retained.clone()) {
+                self.op.push(&window);
+            }
+            self.cursor = Some(run.generations);
+            self.next_row = retained.end;
             return self.op.output();
         }
 
-        let (_, after) = self.cursor.expect("checked by needs_hydrate above");
-        match buffer.column_window_after(&self.key, run_id, after) {
-            Ok(Some(chunk)) => {
-                self.op.push(&chunk);
-                self.cursor = Some((run_id, last_sample_number));
+        if self.next_row < retained.end {
+            if let Some(window) = run.column_window(self.key.column_id, self.next_row..retained.end)
+            {
+                self.op.push(&window);
             }
-            Ok(None) => {
-                // Already caught up; nothing to push.
-            }
-            Err(_) => {
-                // The cursor fell out of retention (or the run changed
-                // underneath us, in a race with a concurrent writer). Reset
-                // and replay whatever history is still available.
-                self.rehydrate(buffer, run_id, last_sample_number);
-            }
+            self.next_row = retained.end;
         }
 
         self.op.output()
     }
 
-    /// Force reset + rehydrate on next sync (e.g. op parameters changed).
+    /// Force reset + replay on the next catch-up (e.g. op parameters changed).
     pub fn invalidate(&mut self) {
         self.cursor = None;
     }
 
-    pub fn op(&self) -> &O {
+    pub fn op(&self) -> &Op {
         &self.op
     }
 
-    /// Caller must call [`Self::invalidate`] after mutating op parameters so
-    /// the next [`Self::sync`] rebuilds state from scratch.
-    pub fn op_mut(&mut self) -> &mut O {
-        &mut self.op
+    pub fn output(&self) -> &Op::Output {
+        self.op.output()
     }
 
-    fn rehydrate(&mut self, buffer: &Buffer, run_id: RunId, last_sample_number: SampleNumber) {
-        self.op.reset();
-        if let Some(window) = buffer.column_window_last_n(&self.key, usize::MAX) {
-            self.op.push(&window);
-        }
-        self.cursor = Some((run_id, last_sample_number));
+    /// Caller must call [`Self::invalidate`] after mutating op parameters so
+    /// the next [`Self::catch_up`] rebuilds state from scratch.
+    pub fn op_mut(&mut self) -> &mut Op {
+        &mut self.op
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{Boundary, BoundaryReason, ColumnData, ColumnVec, SampleBatch, Series};
-    use crate::tio::proto::identifiers::{ColumnId, StreamKey};
+    use crate::data::{ColumnData, ColumnVec, SampleBatch, Series};
+    use crate::tio::proto::identifiers::{ColumnId, SampleNumber, StreamKey};
     use crate::tio::proto::meta::{
         ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata,
         StreamMetadata,
@@ -120,7 +112,7 @@ mod tests {
 
     /// Records every `(timestamp, value)` it is pushed, in push order. The
     /// simplest possible [`ColumnOp`], used to assert exactly-once,
-    /// in-order delivery from [`DerivedColumn`].
+    /// in-order delivery from [`ColumnProcessor`].
     #[derive(Default)]
     struct Recorder {
         samples: Vec<(f64, f64)>,
@@ -214,12 +206,17 @@ mod tests {
     }
 
     impl Fixture {
-        /// Push one batch of `f64` rows, with an explicit boundary and
+        /// Push one batch of `f64` rows, with an explicit stream generation and
         /// explicit sample numbers so runs can be restarted deliberately.
-        fn push(
+        fn push(&self, buffer: &mut Buffer, stream_generation: u32, rows: &[(SampleNumber, f64)]) {
+            self.push_in_segment(buffer, stream_generation, self.segment.clone(), rows);
+        }
+
+        fn push_in_segment(
             &self,
             buffer: &mut Buffer,
-            boundary: Option<Boundary>,
+            stream_generation: u32,
+            segment: Arc<SegmentMetadata>,
             rows: &[(SampleNumber, f64)],
         ) {
             let sample_numbers: Vec<SampleNumber> = rows.iter().map(|(n, _)| *n).collect();
@@ -227,17 +224,22 @@ mod tests {
             for (_, v) in rows {
                 values.push_data(&ColumnData::Float(*v));
             }
-            let series = vec![Series {
-                index: self.column_key.column_id,
-                metadata: self.column_metadata.clone(),
+            let series = vec![Series::new(
+                self.column_key.column_id,
+                self.column_metadata.clone(),
                 values,
-            }];
+            )];
             let batch = SampleBatch::new(
                 DeviceRoute::root(),
-                boundary,
+                None,
+                Generations {
+                    stream: stream_generation,
+                    device: 0,
+                    global: 0,
+                },
                 sample_numbers,
                 series,
-                self.segment.clone(),
+                segment,
                 self.stream.clone(),
                 self.device.clone(),
             );
@@ -251,27 +253,27 @@ mod tests {
                 .enumerate()
                 .map(|(i, &v)| (i as SampleNumber, v))
                 .collect();
-            self.push(buffer, None, &rows);
+            self.push(buffer, 1, &rows);
         }
     }
 
     #[test]
-    fn sync_feeds_each_sample_exactly_once_across_interleaved_batches() {
+    fn catch_up_feeds_each_sample_exactly_once_across_interleaved_batches() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
 
-        fx.push(&mut buffer, None, &[(0, 0.0), (1, 1.0)]);
-        let out = derived.sync(&buffer).clone();
+        fx.push(&mut buffer, 1, &[(0, 0.0), (1, 1.0)]);
+        let out = processor.catch_up(&buffer).clone();
         assert_eq!(out, vec![(1.0, 0.0), (2.0, 1.0)]);
 
-        fx.push(&mut buffer, None, &[(2, 2.0), (3, 3.0)]);
-        let out = derived.sync(&buffer).clone();
+        fx.push(&mut buffer, 1, &[(2, 2.0), (3, 3.0)]);
+        let out = processor.catch_up(&buffer).clone();
         assert_eq!(out, vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0), (4.0, 3.0)]);
 
-        fx.push(&mut buffer, None, &[(4, 4.0)]);
-        fx.push(&mut buffer, None, &[(5, 5.0), (6, 6.0)]);
-        let out = derived.sync(&buffer).clone();
+        fx.push(&mut buffer, 1, &[(4, 4.0)]);
+        fx.push(&mut buffer, 1, &[(5, 5.0), (6, 6.0)]);
+        let out = processor.catch_up(&buffer).clone();
         assert_eq!(
             out,
             vec![
@@ -285,42 +287,88 @@ mod tests {
             ]
         );
         assert_eq!(
-            derived.op().reset_count,
+            processor.op().reset_count,
             1,
             "only the initial hydrate should reset"
         );
     }
 
     #[test]
+    fn catch_up_uses_row_order_across_reused_segment_sample_numbers() {
+        let fx = fixture();
+        let mut buffer = Buffer::new(64);
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
+
+        fx.push(&mut buffer, 1, &[(0, 0.0), (1, 1.0)]);
+        processor.catch_up(&buffer);
+
+        let mut second = (*fx.segment).clone();
+        second.segment_id = 1;
+        second.start_time = 2;
+        // A seamless rollover keeps the stream generation, so the run continues.
+        fx.push_in_segment(&mut buffer, 1, Arc::new(second), &[(0, 2.0), (1, 3.0)]);
+
+        let mut third = (*fx.segment).clone();
+        third.segment_id = 0;
+        third.start_time = 4;
+        fx.push_in_segment(&mut buffer, 1, Arc::new(third), &[(0, 4.0), (1, 5.0)]);
+
+        let out = processor.catch_up(&buffer).clone();
+        assert_eq!(
+            out,
+            vec![
+                (1.0, 0.0),
+                (2.0, 1.0),
+                (3.0, 2.0),
+                (4.0, 3.0),
+                (5.0, 4.0),
+                (6.0, 5.0),
+            ]
+        );
+        assert_eq!(
+            processor.op().reset_count,
+            1,
+            "continuous segment rollovers must not reset the operation"
+        );
+    }
+
+    #[test]
+    fn falling_behind_retention_resets_and_replays_retained_rows() {
+        let fx = fixture();
+        let mut buffer = Buffer::new(3);
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
+
+        fx.push(&mut buffer, 1, &[(0, 0.0), (1, 1.0)]);
+        processor.catch_up(&buffer);
+
+        fx.push(&mut buffer, 1, &[(2, 2.0), (3, 3.0), (4, 4.0), (5, 5.0)]);
+        let out = processor.catch_up(&buffer).clone();
+
+        assert_eq!(out, vec![(4.0, 3.0), (5.0, 4.0), (6.0, 5.0)]);
+        assert_eq!(processor.op().reset_count, 2);
+    }
+
+    #[test]
     fn run_restart_resets_and_rehydrates_with_only_new_run_samples() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
 
         fx.push_contiguous(&mut buffer, &[0.0, 1.0, 2.0]);
-        let out = derived.sync(&buffer).clone();
+        let out = processor.catch_up(&buffer).clone();
         assert_eq!(out, vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]);
 
-        // A discontinuous boundary starts a new run.
-        fx.push(
-            &mut buffer,
-            Some(Boundary {
-                reason: BoundaryReason::SegmentChanged {
-                    old_id: 0,
-                    new_id: 1,
-                },
-            }),
-            &[(0, 10.0), (1, 11.0)],
-        );
+        // A bumped stream generation starts a new run.
+        fx.push(&mut buffer, 2, &[(0, 10.0), (1, 11.0)]);
 
-        let out = derived.sync(&buffer).clone();
+        let out = processor.catch_up(&buffer).clone();
         assert_eq!(
             out,
             vec![(1.0, 10.0), (2.0, 11.0)],
             "rehydrate must discard the old run's samples entirely"
         );
         assert_eq!(
-            derived.op().reset_count,
+            processor.op().reset_count,
             2,
             "restart triggers a second reset"
         );
@@ -330,45 +378,49 @@ mod tests {
     fn invalidate_forces_a_rehydrate() {
         let fx = fixture();
         let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
 
         fx.push_contiguous(&mut buffer, &[0.0, 1.0, 2.0]);
-        derived.sync(&buffer);
-        assert_eq!(derived.op().reset_count, 1);
+        processor.catch_up(&buffer);
+        assert_eq!(processor.op().reset_count, 1);
 
         // No new data arrived, but the caller changed op parameters.
-        derived.invalidate();
-        let out = derived.sync(&buffer).clone();
+        processor.invalidate();
+        let out = processor.catch_up(&buffer).clone();
         assert_eq!(out, vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]);
-        assert_eq!(derived.op().reset_count, 2, "invalidate must force a reset");
-    }
-
-    #[test]
-    fn sync_with_no_new_data_pushes_nothing() {
-        let fx = fixture();
-        let mut buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
-
-        fx.push_contiguous(&mut buffer, &[0.0, 1.0]);
-        let out = derived.sync(&buffer).clone();
-        assert_eq!(out, vec![(1.0, 0.0), (2.0, 1.0)]);
-        let reset_count_before = derived.op().reset_count;
-
-        // Sync again with the buffer unchanged.
-        let out2 = derived.sync(&buffer).clone();
-        assert_eq!(out2, out, "no new samples means no new pushes");
         assert_eq!(
-            derived.op().reset_count,
-            reset_count_before,
-            "a no-op sync must not reset"
+            processor.op().reset_count,
+            2,
+            "invalidate must force a reset"
         );
     }
 
     #[test]
-    fn sync_before_any_data_returns_default_output() {
+    fn catch_up_with_no_new_data_pushes_nothing() {
+        let fx = fixture();
+        let mut buffer = Buffer::new(64);
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
+
+        fx.push_contiguous(&mut buffer, &[0.0, 1.0]);
+        let out = processor.catch_up(&buffer).clone();
+        assert_eq!(out, vec![(1.0, 0.0), (2.0, 1.0)]);
+        let reset_count_before = processor.op().reset_count;
+
+        // Catch up again with the buffer unchanged.
+        let out2 = processor.catch_up(&buffer).clone();
+        assert_eq!(out2, out, "no new samples means no new pushes");
+        assert_eq!(
+            processor.op().reset_count,
+            reset_count_before,
+            "a no-op catch-up must not reset"
+        );
+    }
+
+    #[test]
+    fn catch_up_before_any_data_returns_default_output() {
         let fx = fixture();
         let buffer = Buffer::new(64);
-        let mut derived = DerivedColumn::new(fx.column_key, Recorder::default());
-        assert!(derived.sync(&buffer).is_empty());
+        let mut processor = ColumnProcessor::new(fx.column_key, Recorder::default());
+        assert!(processor.catch_up(&buffer).is_empty());
     }
 }

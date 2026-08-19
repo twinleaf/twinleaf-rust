@@ -591,8 +591,8 @@ impl HealthState {
     }
 
     fn handle_batch(&mut self, batch: twinleaf::data::SampleBatch, now: Instant) {
-        let route = batch.route;
-        let sid = batch.stream.stream_id;
+        let route = batch.route();
+        let sid = batch.stream().stream_id;
 
         if let Some(filter) = &self.streams_filter {
             if !filter.contains(&sid) {
@@ -602,19 +602,19 @@ impl HealthState {
 
         let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
-            name: batch.stream.name.clone(),
-            current_session_id: Some(batch.device.session_id),
+            name: batch.stream().name.clone(),
+            current_session_id: Some(batch.device().session_id),
             ..Default::default()
         });
 
-        st.name = batch.stream.name.clone();
-        st.last_device = Some(batch.device.clone());
-        st.last_stream = Some(batch.stream.clone());
-        st.last_segment = Some(batch.segment.clone());
-        st.last_schema = batch.schema().iter().map(|s| s.metadata.clone()).collect();
+        st.name = batch.stream().name.clone();
+        st.last_device = Some(batch.device().clone());
+        st.last_stream = Some(batch.stream().clone());
+        st.last_segment = Some(batch.segment().clone());
+        st.last_schema = batch.schema().iter().map(|s| s.metadata().clone()).collect();
 
-        if let Some(boundary) = &batch.boundary {
-            self.handle_boundary(&boundary.reason, &route, &batch.stream.name, sid);
+        if let Some(boundary) = batch.boundary() {
+            self.handle_boundary(&boundary.reason, &route, &batch.stream().name, sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();

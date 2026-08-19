@@ -41,12 +41,12 @@ impl CsvOutput {
         use color_eyre::Help;
         use eyre::WrapErr;
 
-        if batch.route != self.route {
+        if batch.route() != self.route {
             return Ok(());
         }
         let is_match = match &self.stream {
-            StreamSel::Id(id) => batch.stream.stream_id == *id,
-            StreamSel::Name(name) => &batch.stream.name == name,
+            StreamSel::Id(id) => batch.stream().stream_id == *id,
+            StreamSel::Name(name) => &batch.stream().name == name,
         };
         if !is_match {
             return Ok(());
@@ -58,11 +58,11 @@ impl CsvOutput {
                 batch
                     .schema()
                     .iter()
-                    .map(|series| series.metadata.name.clone()),
+                    .map(|series| series.metadata().name.clone()),
             );
 
             let route_label = route_filename_label(&self.route);
-            let path = format!("{}.{}.{}.csv", self.prefix, route_label, batch.stream.name);
+            let path = format!("{}.{}.{}.csv", self.prefix, route_label, batch.stream().name);
             if !self.force && std::path::Path::new(&path).exists() {
                 return Err(eyre::eyre!("output {} already exists", path)
                     .suggestion("pass --force to overwrite, or use -o for a different name"));
@@ -74,7 +74,7 @@ impl CsvOutput {
                 .open(&path)
                 .wrap_err_with(|| format!("could not open {}", path))?;
             self.writer = Some(BufWriter::new(file));
-            self.stream_name = Some(batch.stream.name.clone());
+            self.stream_name = Some(batch.stream().name.clone());
             self.path = Some(path);
 
             let output_path = self.path.as_deref().unwrap_or_default();
@@ -209,14 +209,16 @@ pub fn log_csv(
 
             let samples_len = match &pkt.payload {
                 tio::proto::Payload::StreamData(_) if pkt.routing != target_route => 0,
-                _ => parser.push_packet(&pkt),
+                _ => parser
+                    .push_packet(&pkt)
+                    .map_or(0, |outcome| outcome.row_count()),
             };
 
             if pkt.routing == target_route {
                 record_parse_result(&mut parsed_routes, &mut unparsed_routes, &pkt, samples_len);
             }
 
-            while let Some(batch) = parser.next_batch() {
+            while let Some(batch) = parser.pop_batch() {
                 csv.write_batch(batch)?;
             }
         }

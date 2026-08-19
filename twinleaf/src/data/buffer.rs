@@ -1,15 +1,14 @@
-use crate::data::{ColumnData, SampleBatch};
+use crate::data::{ColumnData, Generations, SampleBatch};
 use crate::tio::proto::identifiers::*;
 use crate::tio::proto::meta::MetadataEpoch;
 use crate::tio::proto::{BufferType, ColumnMetadata, SegmentMetadata, StreamMetadata};
 
 use std::{
     collections::{HashMap, VecDeque},
+    ops::Range,
     sync::Arc,
     time::Instant,
 };
-
-pub type RunId = u64;
 
 #[derive(Debug, Clone)]
 pub enum ColumnVec {
@@ -19,9 +18,7 @@ pub enum ColumnVec {
 }
 
 impl ColumnVec {
-    /// Empty vec of the variant selected by a column's resolved buffer type. The
-    /// one place the `data_type -> buffer_type -> variant` choice lives on the
-    /// write path, mirroring [`ColumnBuffer::new`].
+    /// Empty vec of the variant selected by a column's resolved buffer type.
     pub fn empty_for(bt: BufferType) -> Self {
         Self::with_capacity_for(bt, 0)
     }
@@ -35,15 +32,27 @@ impl ColumnVec {
         }
     }
 
-    /// Append one decoded cell, widening `Int` into a `Float` column and dropping
-    /// variant mismatches (same tolerance as [`ColumnBuffer::extend`]).
+    /// The buffer type whose columns land in this variant.
+    pub fn buffer_type(&self) -> BufferType {
+        match self {
+            Self::F64(_) => BufferType::Float,
+            Self::I64(_) => BufferType::Int,
+            Self::U64(_) => BufferType::UInt,
+        }
+    }
+
+    /// Append one decoded cell, widening `Int` into a `Float` column.
+    ///
+    /// Panics on any other variant mismatch: the cell was decoded for a
+    /// different column type and dropping it would desync this column from
+    /// its batch's rows.
     pub fn push_data(&mut self, v: &ColumnData) {
         match (self, v) {
             (Self::F64(d), ColumnData::Float(x)) => d.push(*x),
             (Self::F64(d), ColumnData::Int(x)) => d.push(*x as f64),
             (Self::I64(d), ColumnData::Int(x)) => d.push(*x),
             (Self::U64(d), ColumnData::UInt(x)) => d.push(*x),
-            _ => {}
+            (this, v) => panic!("cannot push {v:?} into a {:?} column", this.buffer_type()),
         }
     }
 
@@ -97,21 +106,6 @@ pub fn clip<'a, T>(a: &'a [T], b: &'a [T], start: usize, count: usize) -> (&'a [
     }
 }
 
-/// Clamp `(start, count)` to a sequence of length `len` so the range stays in
-/// bounds (`start <= len` and `start + count <= len`).
-///
-/// Reads derive `(start, count)` from the stream's timestamp deque, but a column
-/// buffer can be shorter than that deque: `RunBuffer::push_batch` creates column
-/// buffers lazily, so a column first seen on a later sample stays permanently
-/// shorter. Clamping keeps `view()`/`get_range` graceful (a short batch that then
-/// hits the `InsufficientData` length check) instead of letting `clip` panic out
-/// of bounds, matching the old `skip().take()` truncation.
-fn clamp_range(len: usize, start: usize, count: usize) -> (usize, usize) {
-    let start = start.min(len);
-    let count = count.min(len - start);
-    (start, count)
-}
-
 /// Borrowed twin of [`ColumnVec`]. Each variant carries the two halves of the
 /// underlying ring buffer (`VecDeque::as_slices`), already clipped to a window.
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +156,7 @@ impl ColumnView<'_> {
 /// [`Buffer::column_window_last_n`]. Holds borrows into the ring buffer; reduce
 /// (e.g. decimate) before the borrow ends rather than storing it.
 pub struct ColumnWindow<'a> {
-    pub run_id: RunId,
+    pub generations: Generations,
     pub effective_rate: f64,
     pub timestamps: (&'a [f64], &'a [f64]),
     pub values: ColumnView<'a>,
@@ -177,29 +171,6 @@ pub struct LatestRow {
     pub last_seen: Instant,
     /// Ordered by column id.
     pub columns: Vec<(Arc<ColumnMetadata>, ColumnData)>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReadError {
-    #[error("no active run for stream {stream_key:?}")]
-    NoActiveRun { stream_key: StreamKey },
-    #[error("column {column_id:?} not found in stream {stream_key:?}")]
-    ColumnNotFound {
-        stream_key: StreamKey,
-        column_id: ColumnId,
-    },
-    #[error("cursor invalidated for stream {stream_key:?}: cursor at run {cursor_run:?}, current run is {current_run:?}")]
-    CursorInvalidated {
-        stream_key: StreamKey,
-        cursor_run: RunId,
-        current_run: RunId,
-    },
-    #[error("cursor out of buffer for stream {stream_key:?}: at sample {cursor_sample:?}, earliest available is {earliest_available:?}")]
-    CursorOutOfBuffer {
-        stream_key: StreamKey,
-        cursor_sample: SampleNumber,
-        earliest_available: SampleNumber,
-    },
 }
 
 #[derive(Debug)]
@@ -248,10 +219,17 @@ impl ColumnBuffer {
     fn extend(&mut self, values: &ColumnVec) {
         match (self, values) {
             (Self::F64 { data, .. }, ColumnVec::F64(v)) => data.extend(v.iter().copied()),
-            (Self::F64 { data, .. }, ColumnVec::I64(v)) => data.extend(v.iter().map(|&x| x as f64)),
             (Self::I64 { data, .. }, ColumnVec::I64(v)) => data.extend(v.iter().copied()),
             (Self::U64 { data, .. }, ColumnVec::U64(v)) => data.extend(v.iter().copied()),
-            _ => {}
+            _ => panic!("column value type changed within a run"),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::F64 { data, .. } => data.len(),
+            Self::I64 { data, .. } => data.len(),
+            Self::U64 { data, .. } => data.len(),
         }
     }
 
@@ -273,19 +251,16 @@ impl ColumnBuffer {
         match self {
             Self::F64 { data, .. } => {
                 let (a, b) = data.as_slices();
-                let (start, count) = clamp_range(a.len() + b.len(), start, count);
                 let (p, q) = clip(a, b, start, count);
                 ColumnView::F64(p, q)
             }
             Self::I64 { data, .. } => {
                 let (a, b) = data.as_slices();
-                let (start, count) = clamp_range(a.len() + b.len(), start, count);
                 let (p, q) = clip(a, b, start, count);
                 ColumnView::I64(p, q)
             }
             Self::U64 { data, .. } => {
                 let (a, b) = data.as_slices();
-                let (start, count) = clamp_range(a.len() + b.len(), start, count);
                 let (p, q) = clip(a, b, start, count);
                 ColumnView::U64(p, q)
             }
@@ -307,7 +282,8 @@ impl ColumnBuffer {
 struct RunBuffer {
     stream_metadata: Arc<StreamMetadata>,
     segment_metadata: Arc<SegmentMetadata>,
-    sample_numbers: VecDeque<SampleNumber>,
+    /// Exclusive logical position of the next row appended to this run.
+    next_row: u64,
     timestamps: VecDeque<f64>,
     columns: HashMap<ColumnId, ColumnBuffer>,
     capacity: usize,
@@ -316,78 +292,91 @@ struct RunBuffer {
 impl RunBuffer {
     fn new(batch: &SampleBatch, capacity: usize) -> Self {
         let alloc = capacity.min(65_536);
-        Self {
-            stream_metadata: batch.stream.clone(),
-            segment_metadata: batch.segment.clone(),
-            sample_numbers: VecDeque::with_capacity(alloc),
+        let columns: HashMap<_, _> = batch
+            .schema()
+            .iter()
+            .map(|column| {
+                (
+                    column.index(),
+                    ColumnBuffer::new(column.metadata().clone(), alloc),
+                )
+            })
+            .collect();
+        debug_assert_eq!(
+            columns.len(),
+            batch.schema().len(),
+            "batch construction guarantees unique column ids"
+        );
+
+        let mut buffer = Self {
+            stream_metadata: batch.stream().clone(),
+            segment_metadata: batch.segment().clone(),
+            next_row: 0,
             timestamps: VecDeque::with_capacity(alloc),
-            columns: HashMap::new(),
+            columns,
             capacity,
-        }
+        };
+        buffer.append(batch);
+        buffer
     }
 
     fn len(&self) -> usize {
-        self.sample_numbers.len()
+        self.timestamps.len()
     }
 
-    fn push_batch(&mut self, batch: &SampleBatch) {
-        self.sample_numbers
-            .extend(batch.sample_numbers.iter().copied());
+    fn retained_rows(&self) -> Range<u64> {
+        self.next_row - self.len() as u64..self.next_row
+    }
+
+    fn schema_matches(&self, batch: &SampleBatch) -> bool {
+        batch.schema().len() == self.columns.len()
+            && batch.schema().iter().all(|incoming| {
+                self.columns
+                    .get(&incoming.index())
+                    .is_some_and(|stored| stored.metadata().as_ref() == incoming.metadata().as_ref())
+            })
+    }
+
+    fn append(&mut self, batch: &SampleBatch) {
+        debug_assert!(
+            self.schema_matches(batch),
+            "the parser guarantees a constant schema within a run"
+        );
         self.timestamps.extend(
             batch
-                .sample_numbers
+                .sample_numbers()
                 .iter()
-                .map(|&n| batch.segment.time_at(n + 1)),
+                .map(|&n| batch.segment().time_at(n + 1)),
         );
-        self.segment_metadata = batch.segment.clone();
+        self.segment_metadata = batch.segment().clone();
 
-        for col in &batch.columns {
+        for col in batch.schema() {
             self.columns
-                .entry(col.index)
-                .or_insert_with(|| ColumnBuffer::new(col.metadata.clone(), self.capacity))
-                .extend(&col.values);
+                .get_mut(&col.index())
+                .expect("schema checked above")
+                .extend(col.values());
         }
-    }
+        self.next_row += batch.len() as u64;
 
-    fn pop_front(&mut self) {
-        self.sample_numbers.pop_front();
-        self.timestamps.pop_front();
-        for col in self.columns.values_mut() {
-            col.pop_front();
-        }
-    }
-
-    fn sample_number_wraps(&self) -> bool {
-        match (self.sample_numbers.front(), self.sample_numbers.back()) {
-            (Some(first), Some(last)) => first > last,
-            _ => false,
-        }
-    }
-
-    fn find_start_after_sample(&self, sample_number: SampleNumber) -> Option<usize> {
-        if self.sample_numbers.is_empty() {
-            return None;
-        }
-
-        if !self.sample_number_wraps() {
-            let start = self
-                .sample_numbers
-                .partition_point(|&sn| sn <= sample_number);
-            if start == 0 || self.sample_numbers.get(start - 1).copied()? != sample_number {
-                return None;
+        while self.len() > self.capacity {
+            self.timestamps.pop_front();
+            for col in self.columns.values_mut() {
+                col.pop_front();
             }
-            return Some(start);
         }
 
-        self.sample_numbers
-            .iter()
-            .rposition(|&sn| sn == sample_number)
-            .map(|idx| idx + 1)
+        debug_assert!(
+            self.columns
+                .values()
+                .all(|column| column.len() == self.timestamps.len()),
+            "all columns must cover the retained row range"
+        );
     }
 }
 
 pub struct ActiveRun {
-    pub run_id: RunId,
+    /// The continuity generations stamped on every batch of this run.
+    pub generations: Generations,
     pub session_id: SessionId,
     pub segment_id: SegmentId,
     pub effective_rate: f64,
@@ -408,11 +397,12 @@ impl ActiveRun {
         &self.buffer.segment_metadata
     }
 
-    fn new(run_id: RunId, batch: &SampleBatch, last_n: SampleNumber, capacity: usize) -> Self {
-        let segment = &batch.segment;
+    fn new(batch: &SampleBatch, capacity: usize) -> Self {
+        let segment = &batch.segment();
+        let last_n = batch.last_sample().expect("active runs require samples");
         Self {
-            run_id,
-            session_id: batch.device.session_id,
+            generations: batch.generations(),
+            session_id: batch.device().session_id,
             segment_id: segment.segment_id,
             effective_rate: segment.sampling_rate as f64 / segment.decimation as f64,
             time_ref_epoch: segment.time_ref_epoch.clone(),
@@ -422,12 +412,47 @@ impl ActiveRun {
             buffer: RunBuffer::new(batch, capacity),
         }
     }
+
+    fn append(&mut self, batch: &SampleBatch) {
+        let last_n = batch.last_sample().expect("active runs require samples");
+        self.buffer.append(batch);
+        self.last_sample_number = last_n;
+        self.last_timestamp = batch.segment().time_at(last_n + 1);
+        self.last_seen = Instant::now();
+        self.segment_id = batch.segment().segment_id;
+    }
+
+    pub(crate) fn retained_rows(&self) -> Range<u64> {
+        self.buffer.retained_rows()
+    }
+
+    pub(crate) fn column_window(
+        &self,
+        column_id: ColumnId,
+        rows: Range<u64>,
+    ) -> Option<ColumnWindow<'_>> {
+        let retained = self.retained_rows();
+        if rows.start < retained.start || rows.end > retained.end || rows.start > rows.end {
+            return None;
+        }
+
+        let start = usize::try_from(rows.start - retained.start).ok()?;
+        let count = usize::try_from(rows.end - rows.start).ok()?;
+        let col_buf = self.buffer.columns.get(&column_id)?;
+        let (ta, tb) = self.buffer.timestamps.as_slices();
+        Some(ColumnWindow {
+            generations: self.generations,
+            effective_rate: self.effective_rate,
+            timestamps: clip(ta, tb, start, count),
+            values: col_buf.view(start, count),
+            column_metadata: col_buf.metadata().clone(),
+        })
+    }
 }
 
 pub struct Buffer {
     capacity: usize,
     active_runs: HashMap<StreamKey, ActiveRun>,
-    next_run_id: RunId,
 }
 
 impl Buffer {
@@ -435,34 +460,26 @@ impl Buffer {
         Self {
             capacity,
             active_runs: HashMap::new(),
-            next_run_id: 0,
         }
     }
 
     pub fn process_batch(&mut self, batch: &SampleBatch, stream_key: StreamKey) {
-        let Some(last_n) = batch.last_sample() else {
+        if batch.is_empty() {
             return;
-        };
-        let needs_new_run = !batch.is_continuous() || !self.active_runs.contains_key(&stream_key);
+        }
+        let needs_new_run = self
+            .active_runs
+            .get(&stream_key)
+            .is_none_or(|run| run.generations.stream != batch.generations().stream);
 
         if needs_new_run {
-            let new_run_id = self.next_run_id;
-            self.next_run_id += 1;
-            self.active_runs.insert(
-                stream_key,
-                ActiveRun::new(new_run_id, batch, last_n, self.capacity),
-            );
-        }
-
-        let active = self.active_runs.get_mut(&stream_key).unwrap();
-        active.buffer.push_batch(batch);
-        active.last_sample_number = last_n;
-        active.last_timestamp = batch.segment.time_at(last_n + 1);
-        active.last_seen = Instant::now();
-        active.segment_id = batch.segment.segment_id;
-
-        while active.buffer.len() > self.capacity {
-            active.buffer.pop_front();
+            self.active_runs
+                .insert(stream_key, ActiveRun::new(batch, self.capacity));
+        } else {
+            self.active_runs
+                .get_mut(&stream_key)
+                .expect("active run checked above")
+                .append(batch);
         }
     }
 
@@ -510,24 +527,12 @@ impl Buffer {
     /// [`ColumnWindow`] long term.
     pub fn column_window_last_n(&self, col: &ColumnKey, n: usize) -> Option<ColumnWindow<'_>> {
         let run = self.active_runs.get(&col.stream_key())?;
-        let buf = &run.buffer;
-        let len = buf.timestamps.len();
-        if len == 0 {
+        let retained = run.retained_rows();
+        if retained.is_empty() {
             return None;
         }
-        let count = n.min(len);
-        let start = len - count;
-        let col_buf = buf.columns.get(&col.column_id)?;
-        let (ta, tb) = buf.timestamps.as_slices();
-        let timestamps = clip(ta, tb, start, count);
-        let values = col_buf.view(start, count);
-        Some(ColumnWindow {
-            run_id: run.run_id,
-            effective_rate: run.effective_rate,
-            timestamps,
-            values,
-            column_metadata: col_buf.metadata().clone(),
-        })
+        let start = retained.end.saturating_sub(n as u64).max(retained.start);
+        run.column_window(col.column_id, start..retained.end)
     }
 
     /// Borrowing read of a single column over a wall-clock time range
@@ -558,84 +563,10 @@ impl Buffer {
         if start >= end {
             return None;
         }
-        let count = end - start;
-        let col_buf = buf.columns.get(&col.column_id)?;
-        let (ta, tb) = buf.timestamps.as_slices();
-        let timestamps = clip(ta, tb, start, count);
-        let values = col_buf.view(start, count);
-        Some(ColumnWindow {
-            run_id: run.run_id,
-            effective_rate: run.effective_rate,
-            timestamps,
-            values,
-            column_metadata: col_buf.metadata().clone(),
-        })
-    }
-
-    /// Borrowing read of a single column's samples strictly after `after`
-    /// within run `run_id`, for driving incremental consumers (see
-    /// [`crate::data::DerivedColumn`]). Returns borrows into the ring (no
-    /// copy); reduce before the borrow ends.
-    ///
-    /// `Ok(None)` means the cursor is caught up: no samples past `after` have
-    /// arrived yet. The two error cases are distinguished so a caller can
-    /// tell a run restart from stale retention apart:
-    /// - [`ReadError::NoActiveRun`]: the stream has no active run (or the
-    ///   buffer holds no streams at all).
-    /// - [`ReadError::CursorInvalidated`]: the stream's active run is not
-    ///   `run_id` (it restarted since the cursor was taken).
-    /// - [`ReadError::ColumnNotFound`]: the run exists but this column has
-    ///   never been seen on it.
-    /// - [`ReadError::CursorOutOfBuffer`]: `after` is not in the run's
-    ///   sample-number sequence, i.e. it has aged out of the ring (or is
-    ///   otherwise not a sample this run ever produced).
-    pub fn column_window_after(
-        &self,
-        col: &ColumnKey,
-        run_id: RunId,
-        after: SampleNumber,
-    ) -> Result<Option<ColumnWindow<'_>>, ReadError> {
-        let stream_key = col.stream_key();
-        let run = self
-            .active_runs
-            .get(&stream_key)
-            .ok_or(ReadError::NoActiveRun { stream_key })?;
-        if run.run_id != run_id {
-            return Err(ReadError::CursorInvalidated {
-                stream_key,
-                cursor_run: run_id,
-                current_run: run.run_id,
-            });
-        }
-        let buf = &run.buffer;
-        let col_buf = buf
-            .columns
-            .get(&col.column_id)
-            .ok_or(ReadError::ColumnNotFound {
-                stream_key,
-                column_id: col.column_id,
-            })?;
-        let Some(start) = buf.find_start_after_sample(after) else {
-            let earliest_available = buf.sample_numbers.front().copied().unwrap_or(after);
-            return Err(ReadError::CursorOutOfBuffer {
-                stream_key,
-                cursor_sample: after,
-                earliest_available,
-            });
-        };
-        let count = buf.len() - start;
-        if count == 0 {
-            return Ok(None);
-        }
-        let (ta, tb) = buf.timestamps.as_slices();
-        let timestamps = clip(ta, tb, start, count);
-        let values = col_buf.view(start, count);
-        Ok(Some(ColumnWindow {
-            run_id: run.run_id,
-            effective_rate: run.effective_rate,
-            timestamps,
-            values,
-            column_metadata: col_buf.metadata().clone(),
-        }))
+        let retained_start = run.retained_rows().start;
+        run.column_window(
+            col.column_id,
+            retained_start + start as u64..retained_start + end as u64,
+        )
     }
 }

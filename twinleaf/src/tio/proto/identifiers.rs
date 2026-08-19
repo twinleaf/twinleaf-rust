@@ -3,6 +3,8 @@ use super::route;
 pub use route::DeviceRoute;
 
 pub type SampleNumber = u32;
+/// Largest sample number representable by the 24-bit stream-data field.
+pub const MAX_SAMPLE_NUMBER: SampleNumber = 0x00ff_ffff;
 pub type SessionId = u32;
 pub type SegmentId = u8;
 pub type StreamId = u8;

@@ -185,7 +185,10 @@ impl DeviceTree {
             _ => {}
         }
 
-        if let Some(batch) = self.parser.process_packet(pkt) {
+        if let Err(error) = self.parser.push_packet(pkt) {
+            log::warn!("dropping invalid stream packet: {error}");
+        }
+        while let Some(batch) = self.parser.pop_batch() {
             self.batch_queue.push_back(batch);
         }
         if !self.metadata_announced.contains(&absolute_route) {

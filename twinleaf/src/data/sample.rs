@@ -75,22 +75,50 @@ impl std::fmt::Display for ColumnData {
 /// each column's decoded values live in a contiguous [`ColumnVec`].
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
-    pub route: DeviceRoute,
+    route: DeviceRoute,
     /// At most one boundary per batch, anchored at its first row.
-    pub boundary: Option<Boundary>,
-    pub sample_numbers: Vec<SampleNumber>,
+    boundary: Option<Boundary>,
+    generations: Generations,
+    sample_numbers: Vec<SampleNumber>,
     /// Columns in index order.
-    pub columns: Vec<Series>,
-    pub segment: Arc<SegmentMetadata>,
-    pub stream: Arc<StreamMetadata>,
-    pub device: Arc<DeviceMetadata>,
+    columns: Vec<Series>,
+    segment: Arc<SegmentMetadata>,
+    stream: Arc<StreamMetadata>,
+    device: Arc<DeviceMetadata>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Series {
-    pub index: ColumnId,
-    pub metadata: Arc<ColumnMetadata>,
-    pub values: ColumnVec,
+    index: ColumnId,
+    metadata: Arc<ColumnMetadata>,
+    values: ColumnVec,
+}
+
+impl Series {
+    pub fn new(index: ColumnId, metadata: Arc<ColumnMetadata>, values: ColumnVec) -> Series {
+        assert_eq!(
+            values.buffer_type(),
+            metadata.data_type.buffer_type(),
+            "column values must use the variant selected by their metadata"
+        );
+        Series {
+            index,
+            metadata,
+            values,
+        }
+    }
+
+    pub fn index(&self) -> ColumnId {
+        self.index
+    }
+
+    pub fn metadata(&self) -> &Arc<ColumnMetadata> {
+        &self.metadata
+    }
+
+    pub fn values(&self) -> &ColumnVec {
+        &self.values
+    }
 }
 
 impl SampleBatch {
@@ -98,6 +126,7 @@ impl SampleBatch {
     pub fn new(
         route: DeviceRoute,
         boundary: Option<Boundary>,
+        generations: Generations,
         sample_numbers: Vec<SampleNumber>,
         columns: Vec<Series>,
         segment: Arc<SegmentMetadata>,
@@ -110,15 +139,69 @@ impl SampleBatch {
                 .all(|c| c.values.len() == sample_numbers.len()),
             "every column must hold exactly one value per sample"
         );
+        assert!(
+            columns
+                .iter()
+                .enumerate()
+                .all(|(i, c)| columns[..i].iter().all(|prior| prior.index != c.index)),
+            "column ids must be unique within a batch"
+        );
         SampleBatch {
             route,
             boundary,
+            generations,
             sample_numbers,
             columns,
             segment,
             stream,
             device,
         }
+    }
+
+    /// Append one decoded row: `cells` must yield exactly one value per
+    /// column, in schema order.
+    pub(crate) fn push_row(
+        &mut self,
+        n: SampleNumber,
+        cells: impl IntoIterator<Item = ColumnData>,
+    ) {
+        self.sample_numbers.push(n);
+        let mut cells = cells.into_iter();
+        for series in &mut self.columns {
+            let cell = cells.next().expect("one cell per column");
+            series.values.push_data(&cell);
+        }
+        debug_assert!(cells.next().is_none(), "one cell per column");
+    }
+
+    pub fn route(&self) -> DeviceRoute {
+        self.route
+    }
+
+    /// The batch's boundary, anchored at its first row.
+    pub fn boundary(&self) -> Option<&Boundary> {
+        self.boundary.as_ref()
+    }
+
+    /// The continuity generations this batch's rows belong to.
+    pub fn generations(&self) -> Generations {
+        self.generations
+    }
+
+    pub fn sample_numbers(&self) -> &[SampleNumber] {
+        &self.sample_numbers
+    }
+
+    pub fn segment(&self) -> &Arc<SegmentMetadata> {
+        &self.segment
+    }
+
+    pub fn stream(&self) -> &Arc<StreamMetadata> {
+        &self.stream
+    }
+
+    pub fn device(&self) -> &Arc<DeviceMetadata> {
+        &self.device
     }
 
     pub fn len(&self) -> usize {
@@ -227,9 +310,42 @@ impl std::fmt::Display for SampleRow<'_> {
     }
 }
 
+/// Parser-assigned continuity generations, constant within a batch.
+///
+/// The parser stamps these where arrival order is authoritative, so consumers
+/// can compare identity instead of re-deriving it from boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Generations {
+    /// Per-stream run ordinal: bumps at every non-continuous boundary.
+    pub stream: u32,
+    /// Per-device generation: bumps at any of the device's streams' non-continuous,
+    /// non-[`BoundaryReason::Initial`] boundaries.
+    pub device: u32,
+    /// Whole-parse generation: as `device`, across all routed devices.
+    pub global: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Boundary {
     pub reason: BoundaryReason,
+}
+
+/// What a boundary says about the data around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryClass {
+    /// Deliberate, time-continuous segment rollover.
+    Seamless,
+    /// First data from a stream.
+    Startup,
+    /// Samples missing but the timeline is trustworthy.
+    DataLoss,
+    /// Session, time reference, rate, or segment reconfiguration.
+    Reconfig,
+    /// Timeline inconsistency. Current firmware never corrects a segment's
+    /// time reference in place — sync changes always restart acquisition into
+    /// a new segment — so these indicate wire corruption, a firmware clock
+    /// bug, or a device predating that behavior.
+    Anomaly,
 }
 
 #[derive(Debug, Clone)]
@@ -288,5 +404,22 @@ impl Boundary {
 
     pub fn is_initial(&self) -> bool {
         matches!(self.reason, BoundaryReason::Initial)
+    }
+
+    /// How this boundary should be interpreted, independent of continuity and
+    /// monotonicity.
+    pub fn class(&self) -> BoundaryClass {
+        match self.reason {
+            BoundaryReason::SegmentRollover { .. } => BoundaryClass::Seamless,
+            BoundaryReason::Initial => BoundaryClass::Startup,
+            BoundaryReason::SamplesLost { .. } => BoundaryClass::DataLoss,
+            BoundaryReason::SessionChanged { .. }
+            | BoundaryReason::TimeRefSessionChanged { .. }
+            | BoundaryReason::RateChanged { .. }
+            | BoundaryReason::SegmentChanged { .. } => BoundaryClass::Reconfig,
+            BoundaryReason::TimeForward { .. } | BoundaryReason::TimeBackward { .. } => {
+                BoundaryClass::Anomaly
+            }
+        }
     }
 }

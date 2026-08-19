@@ -123,7 +123,8 @@ pub fn log_dump(
                     };
                     rest = &rest[len..];
 
-                    let parsed = parser.process_packet(&pkt);
+                    let _ = parser.push_packet(&pkt);
+                    let parsed = parser.pop_batch();
                     record_parse_result(
                         &mut parsed_routes,
                         &mut unparsed_routes,
@@ -138,7 +139,7 @@ pub fn log_dump(
                         // Schema questions are answered once per batch.
                         let matched = filter.as_ref().is_none_or(|f| {
                             batch.schema().iter().any(|series| {
-                                f.matches(&pkt.routing, &batch.stream.name, &series.metadata.name)
+                                f.matches(&pkt.routing, &batch.stream().name, &series.metadata().name)
                             })
                         });
                         if !matched {

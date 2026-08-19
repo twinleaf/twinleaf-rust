@@ -4,13 +4,16 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
-use super::sample::{Boundary, BoundaryReason};
+use super::sample::{Boundary, BoundaryReason, Generations};
 use crate::tio;
 use proto::meta::MetadataType;
+use proto::route::RouteError;
 use proto::DeviceRoute;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tio::proto;
+use tio::proto::identifiers::MAX_SAMPLE_NUMBER;
 use tio::proto::meta::{
     ColumnMetadata, DeviceMetadata, MetadataContent, SegmentMetadata, StreamMetadata,
 };
@@ -151,6 +154,66 @@ pub struct DeviceMetadataSnapshot {
     pub streams: HashMap<u8, StreamMetadataSnapshot>,
 }
 
+/// Why an otherwise well-formed packet cannot be applied to the data state.
+#[derive(Debug, thiserror::Error)]
+pub enum PacketError {
+    #[error("packet route {packet_route} cannot be resolved below {root_route}: {source}")]
+    Route {
+        root_route: DeviceRoute,
+        packet_route: DeviceRoute,
+        #[source]
+        source: RouteError,
+    },
+    #[error("invalid data for {route} stream {stream_id}: {source}")]
+    Stream {
+        route: DeviceRoute,
+        stream_id: u8,
+        #[source]
+        source: StreamDataError,
+    },
+}
+
+/// A stream-data payload contradicts the metadata needed to interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StreamDataError {
+    #[error("stream advertises invalid segment count {count}")]
+    InvalidSegmentCount { count: usize },
+    #[error("segment {segment_id} is outside the advertised ring of {segment_count}")]
+    SegmentOutOfRange {
+        segment_id: u8,
+        segment_count: usize,
+    },
+    #[error("received {actual} columns for a schema containing {expected}")]
+    ColumnCount { expected: usize, actual: usize },
+    #[error("column data occupies {column_bytes} bytes, exceeding sample size {sample_size}")]
+    ColumnsExceedSample {
+        column_bytes: usize,
+        sample_size: usize,
+    },
+    #[error("stream advertises a zero-byte sample")]
+    ZeroSampleSize,
+    #[error("payload length {payload_len} is not a multiple of sample size {sample_size}")]
+    MisalignedPayload {
+        payload_len: usize,
+        sample_size: usize,
+    },
+    #[error("stream-data payload contains no rows")]
+    EmptyPayload,
+    #[error("{row_count} rows beginning at sample {first_sample_n} exceed the sample counter")]
+    SampleNumberOverflow {
+        first_sample_n: u32,
+        row_count: usize,
+    },
+    #[error("segment has invalid sampling rate {sampling_rate} and decimation {decimation}")]
+    InvalidRate { sampling_rate: u32, decimation: u32 },
+}
+
+/// Result of validating stream data against the metadata learned so far.
+enum RowState<'a> {
+    WaitingForMetadata,
+    Validated(ValidatedRows<'a>),
+}
+
 /// Metadata and continuity state for one stream on one device.
 #[derive(Debug, Clone)]
 struct StreamState {
@@ -163,6 +226,7 @@ struct StreamState {
 
     // State tracking for boundary detection
     established: bool,
+    run: u32,
     last_segment_id: u8,
     last_sample_number: u32,
     last_timestamp: f64,
@@ -180,6 +244,7 @@ impl StreamState {
             stream_id,
             current_segment_id: 0,
             established: false,
+            run: 0,
             last_segment_id: 0,
             last_sample_number: 0,
             last_timestamp: 0.0,
@@ -283,14 +348,9 @@ impl StreamState {
             });
         }
 
-        let expected_sample = self.last_sample_number.wrapping_add(1);
+        let expected_sample = self.last_sample_number + 1;
         if first_sample_n != expected_sample {
-            let ts_gap = time_gap.abs();
-            // A wrapping sample counter is benign when time remains continuous.
-            let is_benign_rollover =
-                first_sample_n < self.last_sample_number && ts_gap < half_period;
-
-            if !is_benign_rollover && ts_gap > half_period {
+            if time_gap.abs() > half_period {
                 return Some(Boundary {
                     reason: BoundaryReason::SamplesLost {
                         expected: expected_sample,
@@ -313,25 +373,45 @@ impl StreamState {
 
     /// Validate one encoded payload and update continuity state.
     ///
-    /// `None` means required metadata is not available or the payload does not
-    /// match the advertised schema. The caller can then issue the requests
-    /// returned by `missing_metadata`.
+    /// Missing metadata is a normal state; contradictions in complete metadata
+    /// or the encoded payload are errors.
     fn validate_rows<'a>(
         &'a mut self,
         data: &'a tio::proto::StreamDataPayload,
         device_metadata: Arc<DeviceMetadata>,
-    ) -> Option<ValidatedRows<'a>> {
-        let stream_metadata = self.metadata.as_ref()?.clone();
+        device_generation: &mut u32,
+        global_generation: &mut u32,
+    ) -> Result<RowState<'a>, StreamDataError> {
+        let Some(stream_metadata) = self.metadata.as_ref().cloned() else {
+            return Ok(RowState::WaitingForMetadata);
+        };
 
         // Segment ids index a fixed ring, so a wire value outside it is corrupt.
-        let n_segments = u8::try_from(stream_metadata.n_segments).ok()?;
-        if n_segments == 0 || data.segment_id >= n_segments {
-            return None;
+        let n_segments = u8::try_from(stream_metadata.n_segments).map_err(|_| {
+            StreamDataError::InvalidSegmentCount {
+                count: stream_metadata.n_segments,
+            }
+        })?;
+        if n_segments == 0 {
+            return Err(StreamDataError::InvalidSegmentCount { count: 0 });
+        }
+        if data.segment_id >= n_segments {
+            return Err(StreamDataError::SegmentOutOfRange {
+                segment_id: data.segment_id,
+                segment_count: stream_metadata.n_segments,
+            });
         }
         self.current_segment_id = data.segment_id;
 
-        if stream_metadata.n_columns != self.columns.len() {
-            return None;
+        match self.columns.len().cmp(&stream_metadata.n_columns) {
+            Ordering::Less => return Ok(RowState::WaitingForMetadata),
+            Ordering::Greater => {
+                return Err(StreamDataError::ColumnCount {
+                    expected: stream_metadata.n_columns,
+                    actual: self.columns.len(),
+                });
+            }
+            Ordering::Equal => {}
         }
 
         let expected_sample_size: usize = self
@@ -340,16 +420,44 @@ impl StreamState {
             .map(|column| column.data_type.size())
             .sum();
         if expected_sample_size > stream_metadata.sample_size {
-            return None;
+            return Err(StreamDataError::ColumnsExceedSample {
+                column_bytes: expected_sample_size,
+                sample_size: stream_metadata.sample_size,
+            });
         }
         if stream_metadata.sample_size == 0 {
-            return None;
+            return Err(StreamDataError::ZeroSampleSize);
         }
         if !data.data.len().is_multiple_of(stream_metadata.sample_size) {
-            return None;
+            return Err(StreamDataError::MisalignedPayload {
+                payload_len: data.data.len(),
+                sample_size: stream_metadata.sample_size,
+            });
         }
 
-        let next_sample = self.last_sample_number.wrapping_add(1);
+        let row_count = data.data.len() / stream_metadata.sample_size;
+        if row_count == 0 {
+            return Err(StreamDataError::EmptyPayload);
+        }
+        let sample_span =
+            u32::try_from(row_count - 1).map_err(|_| StreamDataError::SampleNumberOverflow {
+                first_sample_n: data.first_sample_n,
+                row_count,
+            })?;
+        let last_sample_n = data.first_sample_n.checked_add(sample_span).ok_or(
+            StreamDataError::SampleNumberOverflow {
+                first_sample_n: data.first_sample_n,
+                row_count,
+            },
+        )?;
+        if last_sample_n > MAX_SAMPLE_NUMBER {
+            return Err(StreamDataError::SampleNumberOverflow {
+                first_sample_n: data.first_sample_n,
+                row_count,
+            });
+        }
+
+        let next_sample = self.last_sample_number + 1;
         let next_segment = self.last_segment_id.wrapping_add(1) % n_segments;
 
         // A cached entry for a reused segment id can be a stale survivor from a
@@ -380,25 +488,34 @@ impl StreamState {
             // Synthesize from the previous segment only for a forced rollover;
             // otherwise wait for `missing_metadata` to request the real segment.
             (None, Some(prev)) => {
-                let rate = prev.sampling_rate.checked_div(prev.decimation).unwrap_or(0);
+                // Segments roll on whole seconds of the undecimated clock, on
+                // which output sample n sits at sample n * decimation.
+                let seconds_at = |sample: u64| {
+                    sample * u64::from(prev.decimation) / u64::from(prev.sampling_rate)
+                };
+                let next_sample = u64::from(next_sample);
                 let forced_rollover = self.established
                     && data.first_sample_n == 0
-                    && rate != 0
-                    && next_sample.is_multiple_of(rate)
+                    && prev.sampling_rate != 0
+                    && prev.decimation != 0
+                    && seconds_at(next_sample) > seconds_at(next_sample - 1)
                     && data.segment_id == next_segment;
                 if !forced_rollover {
-                    return None;
+                    return Ok(RowState::WaitingForMetadata);
                 }
                 let mut new_seg = (*prev).clone();
                 new_seg.segment_id = data.segment_id;
-                new_seg.start_time += next_sample / rate;
+                new_seg.start_time += seconds_at(next_sample) as u32;
                 (Arc::new(new_seg), true)
             }
-            (None, None) => return None,
+            (None, None) => return Ok(RowState::WaitingForMetadata),
         };
 
         if segment.decimation == 0 || segment.sampling_rate == 0 {
-            return None;
+            return Err(StreamDataError::InvalidRate {
+                sampling_rate: segment.sampling_rate,
+                decimation: segment.decimation,
+            });
         }
         let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
 
@@ -415,14 +532,16 @@ impl StreamState {
             is_segment_rollover,
         );
 
-        let row_count = data.data.len() / stream_metadata.sample_size;
-        if row_count == 0 {
-            return None;
+        if let Some(boundary) = boundary.as_ref().filter(|b| !b.is_continuous()) {
+            self.run += 1;
+            // Streams start up independently, so their first data must not bump
+            // the generations their peers share.
+            if !boundary.is_initial() {
+                *device_generation += 1;
+                *global_generation += 1;
+            }
         }
 
-        let last_sample_n = data
-            .first_sample_n
-            .wrapping_add((row_count.saturating_sub(1)) as u32);
         self.last_sample_number = last_sample_n;
         self.last_timestamp = segment.time_at(last_sample_n + 1);
         self.last_session_id = device_metadata.session_id;
@@ -432,17 +551,23 @@ impl StreamState {
         self.established = true;
 
         let sample_size = stream_metadata.sample_size;
-        Some(ValidatedRows {
+        Ok(RowState::Validated(ValidatedRows {
             boundary,
+            generations: Generations {
+                stream: self.run,
+                device: *device_generation,
+                global: *global_generation,
+            },
             segment,
             stream: stream_metadata,
             device: device_metadata,
             first_sample_n: data.first_sample_n,
+            last_sample_n,
             row_count,
             sample_size,
             encoded: &data.data,
             columns: &self.columns,
-        })
+        }))
     }
 
     fn invalidate_metadata(&mut self) {
@@ -478,6 +603,7 @@ struct DeviceState {
     streams: HashMap<u8, StreamState>,
     ignore_session: bool,
     metadata_rpcs_in_flight: usize,
+    generation: u32,
 }
 
 impl DeviceState {
@@ -487,6 +613,7 @@ impl DeviceState {
             streams: HashMap::new(),
             ignore_session,
             metadata_rpcs_in_flight: 0,
+            generation: 0,
         }
     }
 
@@ -499,6 +626,7 @@ impl DeviceState {
     fn forget_all_metadata(&mut self) {
         self.metadata = None;
         self.streams.clear();
+        self.metadata_rpcs_in_flight = 0;
     }
 
     fn accepts_stream(&mut self, stream_id: u8) -> bool {
@@ -596,6 +724,7 @@ impl DeviceState {
                             stream.invalidate_metadata();
                         }
                         self.metadata = None;
+                        self.metadata_rpcs_in_flight = 0;
                     }
                 }
             }
@@ -610,14 +739,24 @@ impl DeviceState {
     fn validate_stream_data<'a>(
         &'a mut self,
         data: &'a tio::proto::StreamDataPayload,
-    ) -> Option<ValidatedRows<'a>> {
-        let device_metadata = self.metadata.as_ref()?.clone();
+        global_generation: &mut u32,
+    ) -> Result<RowState<'a>, StreamDataError> {
+        let Some(device_metadata) = self.metadata.as_ref().cloned() else {
+            return Ok(RowState::WaitingForMetadata);
+        };
         if !self.accepts_stream(data.stream_id) {
-            return None;
+            return Ok(RowState::WaitingForMetadata);
         }
 
-        self.stream_mut(data.stream_id)
-            .validate_rows(data, device_metadata)
+        self.streams
+            .entry(data.stream_id)
+            .or_insert_with(|| StreamState::new(data.stream_id))
+            .validate_rows(
+                data,
+                device_metadata,
+                &mut self.generation,
+                global_generation,
+            )
     }
 
     fn take_metadata_requests(&mut self) -> Vec<tio::Packet> {
@@ -665,7 +804,8 @@ impl DeviceState {
 
 /// Result of applying one packet to the ordered metadata and continuity state.
 pub(super) enum PacketEvent<'a> {
-    None,
+    Applied,
+    WaitingForMetadata,
     Reset,
     Rows {
         route: DeviceRoute,
@@ -680,6 +820,7 @@ pub(super) struct ParseState {
     root_route: DeviceRoute,
     ignore_session: bool,
     devices: HashMap<DeviceRoute, DeviceState>,
+    global_generation: u32,
 }
 
 impl ParseState {
@@ -688,6 +829,7 @@ impl ParseState {
             root_route,
             ignore_session,
             devices: HashMap::new(),
+            global_generation: 0,
         }
     }
 
@@ -698,33 +840,53 @@ impl ParseState {
             .or_insert_with(|| DeviceState::new(ignore_session))
     }
 
-    pub(super) fn apply_packet<'a>(&'a mut self, packet: &'a tio::Packet) -> PacketEvent<'a> {
+    pub(super) fn apply_packet<'a>(
+        &'a mut self,
+        packet: &'a tio::Packet,
+    ) -> Result<PacketEvent<'a>, PacketError> {
         if let proto::Payload::ProxyStatus(status) = &packet.payload {
             if matches!(status.0, proto::ProxyStatus::SensorDisconnected) {
                 self.reset();
-                return PacketEvent::Reset;
+                return Ok(PacketEvent::Reset);
             }
-            return PacketEvent::None;
+            return Ok(PacketEvent::Applied);
         }
 
-        let Ok(route) = self.root_route.absolute_route(&packet.routing) else {
-            return PacketEvent::None;
-        };
+        let route = self
+            .root_route
+            .absolute_route(&packet.routing)
+            .map_err(|source| PacketError::Route {
+                root_route: self.root_route,
+                packet_route: packet.routing,
+                source,
+            })?;
 
         match &packet.payload {
             proto::Payload::StreamData(data) => {
-                let Some(rows) = self.device_mut(route).validate_stream_data(data) else {
-                    return PacketEvent::None;
-                };
-                PacketEvent::Rows {
-                    route,
-                    stream_id: data.stream_id,
-                    rows,
-                }
+                let ignore_session = self.ignore_session;
+                let device = self
+                    .devices
+                    .entry(route)
+                    .or_insert_with(|| DeviceState::new(ignore_session));
+                let state = device
+                    .validate_stream_data(data, &mut self.global_generation)
+                    .map_err(|source| PacketError::Stream {
+                        route,
+                        stream_id: data.stream_id,
+                        source,
+                    })?;
+                Ok(match state {
+                    RowState::WaitingForMetadata => PacketEvent::WaitingForMetadata,
+                    RowState::Validated(rows) => PacketEvent::Rows {
+                        route,
+                        stream_id: data.stream_id,
+                        rows,
+                    },
+                })
             }
             payload => {
                 self.device_mut(route).apply_control_payload(payload);
-                PacketEvent::None
+                Ok(PacketEvent::Applied)
             }
         }
     }
@@ -769,10 +931,12 @@ impl ParseState {
 /// at their position in the packet sequence.
 pub(super) struct ValidatedRows<'a> {
     pub(super) boundary: Option<Boundary>,
+    pub(super) generations: Generations,
     pub(super) segment: Arc<SegmentMetadata>,
     pub(super) stream: Arc<StreamMetadata>,
     pub(super) device: Arc<DeviceMetadata>,
     pub(super) first_sample_n: u32,
+    pub(super) last_sample_n: u32,
     pub(super) row_count: usize,
     pub(super) sample_size: usize,
     pub(super) encoded: &'a [u8],

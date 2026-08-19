@@ -153,11 +153,8 @@ impl LogSummary {
             });
         stream.sample_count += rows.row_count as u64;
 
-        let first_n = rows.first_sample_n.wrapping_add(1);
-        let last_n = rows
-            .first_sample_n
-            .wrapping_add(rows.row_count.saturating_sub(1) as u32)
-            .wrapping_add(1);
+        let first_n = rows.first_sample_n + 1;
+        let last_n = rows.last_sample_n + 1;
         let first_timestamp = rows.segment.time_at(first_n);
         let last_timestamp = rows.segment.time_at(last_n);
         stream.first_timestamp = Some(
@@ -269,8 +266,9 @@ fn decode_chunk(
     while !remaining.is_empty() {
         let (packet, len) = Packet::deserialize_bytes(&remaining)?;
         remaining.advance(len);
-        parser.push_packet(&packet);
-        while let Some(batch) = parser.next_batch() {
+        // Data contradicting its metadata yields no rows, as during the scan.
+        let _ = parser.push_packet(&packet);
+        while let Some(batch) = parser.pop_batch() {
             batches.push(batch);
         }
     }
@@ -358,11 +356,11 @@ impl LogReader {
             remaining.advance(len);
             summary.packet_count += 1;
 
-            if let PacketEvent::Rows {
+            if let Ok(PacketEvent::Rows {
                 route,
                 stream_id,
                 rows,
-            } = state.apply_packet(&packet)
+            }) = state.apply_packet(&packet)
             {
                 summary.observe_rows(route, stream_id, &rows);
             }

@@ -101,9 +101,11 @@ pub fn log_hdf(
                 &pkt.payload,
                 tio::proto::Payload::StreamData(data) if !data.data.is_empty()
             );
-            let samples_len = parser.push_packet(&pkt);
-            while let Some(batch) = parser.next_batch() {
-                let key = twinleaf::data::StreamKey::new(batch.route, batch.stream.stream_id);
+            let samples_len = parser
+                .push_packet(&pkt)
+                .map_or(0, |outcome| outcome.row_count());
+            while let Some(batch) = parser.pop_batch() {
+                let key = twinleaf::data::StreamKey::new(batch.route(), batch.stream().stream_id);
                 writer
                     .write_batch(batch, key)
                     .wrap_err("failed to append HDF5 batch")?;
@@ -129,7 +131,7 @@ pub fn log_hdf(
     }
 
     for batch in parser.finish() {
-        let key = twinleaf::data::StreamKey::new(batch.route, batch.stream.stream_id);
+        let key = twinleaf::data::StreamKey::new(batch.route(), batch.stream().stream_id);
         writer
             .write_batch(batch, key)
             .wrap_err("failed to append final HDF5 batch")?;
