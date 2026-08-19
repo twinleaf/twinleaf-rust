@@ -249,10 +249,15 @@ fn log_parsed(
 
         // The parser intercepts ProxyStatus (resetting on disconnect); RpcUpdate
         // is a parser no-op. The batch carries the absolute route.
-        let _ = parser.push_packet(&pkt);
-        let parsed = parser.pop_batch();
+        if let Err(error) = parser.push_packet(&pkt) {
+            log::warn!("dropping invalid stream packet: {error}");
+            rec.tick();
+            let _ = rec.flush_if_needed();
+            continue;
+        }
 
-        if let Some(batch) = &parsed {
+        let mut parsed_route = None;
+        while let Some(batch) = parser.pop_batch() {
             let abs_route = batch.route();
             if let Some(b) = batch.boundary() {
                 if let BoundaryReason::SamplesLost { expected, received } = b.reason {
@@ -265,20 +270,22 @@ fn log_parsed(
                         count
                     );
                 }
-                write_metadata_snapshot(&mut rec, batch)?;
+                write_metadata_snapshot(&mut rec, &batch)?;
             }
+            parsed_route = Some(abs_route);
+        }
 
-            // Only record the raw stream-data packet when it actually parsed
-            // into a batch (parser established), matching the old
-            // reconstruction which wrote exactly once per parseable packet.
-            if matches!(pkt.payload, tio::proto::Payload::StreamData(_)) {
-                let data_pkt = tio::Packet {
-                    payload: pkt.payload,
-                    routing: abs_route,
-                    ttl: 0,
-                };
-                rec.write(data_pkt)?;
-            }
+        // Only record the raw stream-data packet when it actually parsed into
+        // a batch, matching the old reconstruction which wrote once per
+        // parseable packet.
+        if let (Some(abs_route), tio::proto::Payload::StreamData(_)) = (parsed_route, &pkt.payload)
+        {
+            let data_pkt = tio::Packet {
+                payload: pkt.payload,
+                routing: abs_route,
+                ttl: 0,
+            };
+            rec.write(data_pkt)?;
         }
 
         rec.tick();

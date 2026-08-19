@@ -93,7 +93,11 @@ pub fn dump(
                         // Schema questions are answered once per batch.
                         let matched = filter.as_ref().is_none_or(|f| {
                             batch.schema().iter().any(|series| {
-                                f.matches(&sample_route, &batch.stream().name, &series.metadata().name)
+                                f.matches(
+                                    &sample_route,
+                                    &batch.stream().name,
+                                    &series.metadata().name,
+                                )
                             })
                         });
                         if !matched {

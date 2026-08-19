@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{SplitLevel, SplitPolicy};
 use std::collections::HashSet;
-use twinleaf::data::{LogReader, PacketParser};
+use twinleaf::data::{LogFile, PacketParser};
 use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
 
@@ -72,38 +72,45 @@ pub fn log_hdf(
     println!("Processing {} files...", files.len());
 
     for path in &files {
-        let mut input = LogReader::open(Path::new(path))
-            .wrap_err_with(|| format!("could not mmap {}", path))?;
+        let input =
+            LogFile::open(Path::new(path)).wrap_err_with(|| format!("could not mmap {}", path))?;
         let total_bytes = input.len() as u64;
+        let mut packets = input.packets();
         total_input_bytes += total_bytes;
         let mut progress = ByteProgress::new(total_bytes);
         progress.set_message(path.clone());
 
         let mut stopped_early = false;
         loop {
-            let pkt = match input.next_packet() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => break,
-                Err(e) => {
-                    log::warn!(
-                        "{}: parse error at offset {} ({:?}); stopping",
-                        path,
-                        input.position(),
-                        e
-                    );
+            let packet_offset = packets.position();
+            let pkt = match packets.next() {
+                Some(Ok(packet)) => packet,
+                Some(Err(error)) => {
+                    log::warn!("{}: {}; stopping", path, error);
                     stopped_early = true;
                     break;
                 }
+                None => break,
             };
-            progress.update(input.position() as u64);
+            progress.update(packets.position() as u64);
 
             let has_stream_data = matches!(
                 &pkt.payload,
                 tio::proto::Payload::StreamData(data) if !data.data.is_empty()
             );
-            let samples_len = parser
-                .push_packet(&pkt)
-                .map_or(0, |outcome| outcome.row_count());
+            let samples_len = match parser.push_packet(&pkt) {
+                Ok(outcome) => outcome.row_count(),
+                Err(error) => {
+                    log::warn!(
+                        "{}: invalid data at byte offset {}: {}; stopping",
+                        path,
+                        packet_offset,
+                        error
+                    );
+                    stopped_early = true;
+                    break;
+                }
+            };
             while let Some(batch) = parser.pop_batch() {
                 let key = twinleaf::data::StreamKey::new(batch.route(), batch.stream().stream_id);
                 writer
@@ -120,7 +127,7 @@ pub fn log_hdf(
         }
 
         progress.finish_with_message(
-            input.position() as u64,
+            packets.position() as u64,
             if stopped_early {
                 "Stopped at parse error"
             } else {

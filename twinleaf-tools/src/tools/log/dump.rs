@@ -123,37 +123,51 @@ pub fn log_dump(
                     };
                     rest = &rest[len..];
 
-                    let _ = parser.push_packet(&pkt);
-                    let parsed = parser.pop_batch();
+                    let packet_offset = file_data.len() - rest.len() - len;
+                    let outcome = match parser.push_packet(&pkt) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            log::warn!(
+                                "{}: invalid data at byte offset {}: {}; stopping",
+                                path,
+                                packet_offset,
+                                error
+                            );
+                            break;
+                        }
+                    };
                     record_parse_result(
                         &mut parsed_routes,
                         &mut unparsed_routes,
                         &pkt,
-                        parsed.as_ref().map_or(0, |b| b.len()),
+                        outcome.row_count(),
                     );
 
-                    let Some(batch) = parsed else {
-                        continue;
-                    };
-                    if route_matches(&pkt.routing) {
-                        // Schema questions are answered once per batch.
-                        let matched = filter.as_ref().is_none_or(|f| {
-                            batch.schema().iter().any(|series| {
-                                f.matches(&pkt.routing, &batch.stream().name, &series.metadata().name)
-                            })
-                        });
-                        if !matched {
-                            continue;
+                    while let Some(batch) = parser.pop_batch() {
+                        if route_matches(&pkt.routing) {
+                            // Schema questions are answered once per batch.
+                            let matched = filter.as_ref().is_none_or(|f| {
+                                batch.schema().iter().any(|series| {
+                                    f.matches(
+                                        &pkt.routing,
+                                        &batch.stream().name,
+                                        &series.metadata().name,
+                                    )
+                                })
+                            });
+                            if !matched {
+                                continue;
+                            }
+                            if meta {
+                                print_batch_meta(&batch, Some(&pkt.routing));
+                            }
+                            for row in batch.iter() {
+                                print_sample(row, Some(&pkt.routing));
+                            }
+                            printed_any = true;
+                        } else if in_subtree(&pkt.routing) {
+                            deeper_routes.insert(pkt.routing);
                         }
-                        if meta {
-                            print_batch_meta(&batch, Some(&pkt.routing));
-                        }
-                        for row in batch.iter() {
-                            print_sample(row, Some(&pkt.routing));
-                        }
-                        printed_any = true;
-                    } else if in_subtree(&pkt.routing) {
-                        deeper_routes.insert(pkt.routing);
                     }
                 }
             }

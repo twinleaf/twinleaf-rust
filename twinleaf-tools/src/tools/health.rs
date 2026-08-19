@@ -611,7 +611,11 @@ impl HealthState {
         st.last_device = Some(batch.device().clone());
         st.last_stream = Some(batch.stream().clone());
         st.last_segment = Some(batch.segment().clone());
-        st.last_schema = batch.schema().iter().map(|s| s.metadata().clone()).collect();
+        st.last_schema = batch
+            .schema()
+            .iter()
+            .map(|s| s.metadata().clone())
+            .collect();
 
         if let Some(boundary) = batch.boundary() {
             self.handle_boundary(&boundary.reason, &route, &batch.stream().name, sid);

@@ -15,7 +15,7 @@ pub use buffer::{clip, Buffer, ColumnVec, ColumnView, ColumnWindow, LatestRow};
 pub use filter::ColumnFilter;
 pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor};
-pub use reader::{LogIndex, LogReader, LogScanError, LogSummary, StreamSummary};
+pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub use sample::{
     Boundary, BoundaryClass, BoundaryReason, ColumnData, Generations, SampleBatch, SampleRow,
     Series,
