@@ -4,9 +4,10 @@
 //! computations (decimation, Welch, ...). [`ColumnProcessor`] pairs an op with
 //! one source column: [`ColumnProcessor::catch_up`] feeds it exactly the rows
 //! it has not seen yet, and transparently resets + replays retained history
-//! whenever the run restarts or the processor falls behind the ring.
+//! whenever the run restarts or the processor falls out of retention.
 
-use crate::data::{Buffer, ColumnKey, ColumnWindow, Generations};
+use crate::data::{Buffer, ColumnArray, ColumnKey, Generations, Run};
+use std::ops::Range;
 
 /// An incremental computation over one column's sample stream.
 /// Implementations are stateful; fed every sample exactly once, in order.
@@ -14,8 +15,9 @@ pub trait ColumnOp {
     type Output;
     /// Discard all state (new run, or view parameters changed).
     fn reset(&mut self);
-    /// Consume the next contiguous chunk of samples.
-    fn push(&mut self, chunk: &ColumnWindow);
+    /// Consume the next contiguous span of one run's rows: `timestamps` and
+    /// `values` are the same length and line up row by row.
+    fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray);
     fn output(&self) -> &Self::Output;
 }
 
@@ -54,28 +56,29 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 
         let needs_replay = self
             .cursor
-            .is_none_or(|c| c.stream != run.generations.stream)
+            .is_none_or(|c| c.stream != run.generations().stream)
             || self.next_row < retained.start
             || self.next_row > retained.end;
-        if needs_replay {
+        let rows = if needs_replay {
             self.op.reset();
-            if let Some(window) = run.column_window(self.key.column_id, retained.clone()) {
-                self.op.push(&window);
-            }
-            self.cursor = Some(run.generations);
-            self.next_row = retained.end;
-            return self.op.output();
-        }
+            self.cursor = Some(run.generations());
+            retained.clone()
+        } else {
+            self.next_row..retained.end
+        };
 
-        if self.next_row < retained.end {
-            if let Some(window) = run.column_window(self.key.column_id, self.next_row..retained.end)
-            {
-                self.op.push(&window);
-            }
-            self.next_row = retained.end;
-        }
-
+        self.feed(run, rows);
+        self.next_row = retained.end;
         self.op.output()
+    }
+
+    /// Push `rows` to the op, one contiguous span at a time.
+    fn feed(&mut self, run: &Run, rows: Range<u64>) {
+        for span in run.row_spans(rows) {
+            if let Some(column) = span.column(self.key.column_id) {
+                self.op.update_batch(span.timestamps(), column.values());
+            }
+        }
     }
 
     /// Force reset + replay on the next catch-up (e.g. op parameters changed).
@@ -101,8 +104,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{ColumnData, ColumnVec, SampleBatch, Series};
-    use crate::tio::proto::identifiers::{ColumnId, SampleNumber, StreamKey};
+    use crate::data::{ColumnBuilder, ColumnData, SampleBatch, Series};
+    use crate::tio::proto::identifiers::{ColumnId, SampleNumber};
     use crate::tio::proto::meta::{
         ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata,
         StreamMetadata,
@@ -127,14 +130,12 @@ mod tests {
             self.reset_count += 1;
         }
 
-        fn push(&mut self, chunk: &ColumnWindow) {
-            let (ta, tb) = chunk.timestamps;
-            let timestamps = ta.iter().chain(tb.iter()).copied();
-            let values = match chunk.values.to_owned() {
-                ColumnVec::F64(v) => v,
-                other => panic!("expected f64 column, got {other:?}"),
+        fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
+            let ColumnArray::F64(values) = values else {
+                panic!("expected f64 column, got {values:?}");
             };
-            self.samples.extend(timestamps.zip(values));
+            self.samples
+                .extend(timestamps.iter().copied().zip(values.iter().copied()));
         }
 
         fn output(&self) -> &Self::Output {
@@ -143,7 +144,6 @@ mod tests {
     }
 
     struct Fixture {
-        stream_key: StreamKey,
         column_key: ColumnKey,
         column_metadata: Arc<ColumnMetadata>,
         device: Arc<DeviceMetadata>,
@@ -154,7 +154,6 @@ mod tests {
     fn fixture() -> Fixture {
         let route = DeviceRoute::root();
         let stream_id = 1;
-        let stream_key = StreamKey::new(route, stream_id);
         let column_id: ColumnId = 0;
 
         let device = Arc::new(DeviceMetadata {
@@ -196,7 +195,6 @@ mod tests {
         let column_key = ColumnKey::new(route, stream_id, column_id);
 
         Fixture {
-            stream_key,
             column_key,
             column_metadata,
             device,
@@ -220,7 +218,7 @@ mod tests {
             rows: &[(SampleNumber, f64)],
         ) {
             let sample_numbers: Vec<SampleNumber> = rows.iter().map(|(n, _)| *n).collect();
-            let mut values = ColumnVec::empty_for(self.column_metadata.data_type.buffer_type());
+            let mut values = ColumnBuilder::empty_for(self.column_metadata.data_type.buffer_type());
             for (_, v) in rows {
                 values.push_data(&ColumnData::Float(*v));
             }
@@ -243,7 +241,7 @@ mod tests {
                 self.stream.clone(),
                 self.device.clone(),
             );
-            buffer.process_batch(&batch, self.stream_key);
+            buffer.process_batch(&batch);
         }
 
         /// Push a contiguous run of samples numbered `0..values.len()`.

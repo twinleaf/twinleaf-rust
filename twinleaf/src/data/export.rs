@@ -1,4 +1,4 @@
-use crate::data::{Boundary, ColumnFilter, ColumnVec, Generations, SampleBatch, Series};
+use crate::data::{Boundary, ColumnArray, ColumnFilter, Generations, SampleBatch, Series};
 use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, StreamKey};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
@@ -269,9 +269,9 @@ impl Hdf5Appender {
             ));
             for (i, col) in valid.iter().enumerate() {
                 let ty = match col.values() {
-                    ColumnVec::F64(_) => TypeDescriptor::Float(FloatSize::U8),
-                    ColumnVec::I64(_) => TypeDescriptor::Integer(IntSize::U8),
-                    ColumnVec::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
+                    ColumnArray::F64(_) => TypeDescriptor::Float(FloatSize::U8),
+                    ColumnArray::I64(_) => TypeDescriptor::Integer(IntSize::U8),
+                    ColumnArray::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
                 };
                 fields.push(CompoundField::new(&col.metadata().name, ty, 0, i + 2));
             }
@@ -341,10 +341,7 @@ impl Hdf5Appender {
                     }
                     FieldSource::Time => {
                         for i in 0..n {
-                            let bytes = batch
-                                .segment()
-                                .time_at(batch.sample_numbers()[i] + 1)
-                                .to_ne_bytes();
+                            let bytes = batch.timestamps()[i].to_ne_bytes();
                             let base = i * row_size + offset;
                             buf[base..base + 8].copy_from_slice(&bytes);
                         }
@@ -353,9 +350,9 @@ impl Hdf5Appender {
                         if let Some(col) = batch.schema().iter().find(|c| c.index() == *col_id) {
                             for i in 0..n {
                                 let bytes = match col.values() {
-                                    ColumnVec::F64(v) => v[i].to_ne_bytes(),
-                                    ColumnVec::I64(v) => v[i].to_ne_bytes(),
-                                    ColumnVec::U64(v) => v[i].to_ne_bytes(),
+                                    ColumnArray::F64(v) => v[i].to_ne_bytes(),
+                                    ColumnArray::I64(v) => v[i].to_ne_bytes(),
+                                    ColumnArray::U64(v) => v[i].to_ne_bytes(),
                                 };
                                 let base = i * row_size + offset;
                                 buf[base..base + 8].copy_from_slice(&bytes);
@@ -369,9 +366,9 @@ impl Hdf5Appender {
         }
 
         self.stats.total_samples += n as u64;
-        if let (Some(first_n), Some(last_n)) = (batch.first_sample(), batch.last_sample()) {
-            let first_t = batch.segment().time_at(first_n + 1);
-            let last_t = batch.segment().time_at(last_n + 1);
+        if let (Some(&first_t), Some(&last_t)) =
+            (batch.timestamps().first(), batch.timestamps().last())
+        {
             self.stats.start_time = Some(self.stats.start_time.map_or(first_t, |t| t.min(first_t)));
             self.stats.end_time = Some(self.stats.end_time.map_or(last_t, |t| t.max(last_t)));
         }

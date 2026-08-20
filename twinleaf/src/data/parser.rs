@@ -8,137 +8,59 @@
 //! [`PacketParser::take_requests`] returns the metadata RPCs needed to decode
 //! subsequent packets.
 
-use super::sample::{ColumnData, SampleBatch, Series};
+use super::coalesce::BatchCoalescer;
+use super::sample::SampleBatch;
 use super::state::{DeviceMetadataSnapshot, PacketError, PacketEvent, ParseState, ValidatedRows};
-use crate::data::ColumnVec;
 use crate::tio::{self, proto};
 use proto::identifiers::StreamKey;
 use proto::DeviceRoute;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
-impl ValidatedRows<'_> {
-    fn can_append_to(&self, batch: &SampleBatch) -> bool {
-        (Arc::ptr_eq(batch.segment(), &self.segment)
-            || batch.segment().as_ref() == self.segment.as_ref())
-            && batch.schema().len() == self.decodable_columns().count()
-            && batch
-                .schema()
-                .iter()
-                .zip(self.decodable_columns())
-                .all(|(series, column)| {
-                    Arc::ptr_eq(series.metadata(), column.metadata)
-                        || series.metadata().as_ref() == column.metadata.as_ref()
-                })
-    }
-
-    fn decode_into(&self, batch: &mut SampleBatch) {
-        for row in 0..self.row_count {
-            let start = row * self.sample_size;
-            let raw = &self.encoded[start..start + self.sample_size];
-            batch.push_row(
-                self.first_sample_n + row as u32,
-                self.decodable_columns().map(|column| {
-                    ColumnData::from_le_bytes(&raw[column.offset..], column.metadata.data_type)
-                }),
-            );
-        }
-    }
-
-    fn append_to(&self, batch: &mut SampleBatch) {
-        debug_assert!(self.can_append_to(batch));
-        debug_assert_eq!(batch.generations(), self.generations);
-        self.decode_into(batch);
-    }
-
-    fn into_batch(self, route: DeviceRoute, capacity: usize) -> SampleBatch {
-        let columns: Vec<_> = self
-            .decodable_columns()
-            .map(|column| {
-                Series::new(
-                    column.metadata.index,
-                    column.metadata.clone(),
-                    ColumnVec::with_capacity_for(column.buffer_type, capacity),
-                )
-            })
-            .collect();
-        let mut batch = SampleBatch::new(
-            route,
-            self.boundary.clone(),
-            self.generations,
-            Vec::with_capacity(capacity),
-            columns,
-            self.segment.clone(),
-            self.stream.clone(),
-            self.device.clone(),
-        );
-        self.decode_into(&mut batch);
-        batch
+fn drain_completed(coalescer: &mut BatchCoalescer, ready: &mut VecDeque<SampleBatch>) {
+    while let Some(batch) = coalescer.next_completed_batch() {
+        ready.push_back(batch);
     }
 }
 
 fn flush_pending_batches(
-    pending: &mut HashMap<StreamKey, SampleBatch>,
+    pending: &mut HashMap<StreamKey, BatchCoalescer>,
     ready: &mut VecDeque<SampleBatch>,
 ) {
     let mut keys: Vec<_> = pending.keys().copied().collect();
     keys.sort_unstable();
     for key in keys {
-        ready.push_back(pending.remove(&key).unwrap());
+        let coalescer = pending.get_mut(&key).expect("key came from the map");
+        coalescer.finish_buffered_batch();
+        drain_completed(coalescer, ready);
     }
 }
 
-/// Decode validated rows and either append, hold, or emit the resulting batch.
+/// Decode validated rows into their stream's coalescer and collect whatever it
+/// completes.
 fn queue_rows(
-    route: DeviceRoute,
-    stream_id: u8,
     input: ValidatedRows<'_>,
     target_rows: Option<usize>,
-    pending: &mut HashMap<StreamKey, SampleBatch>,
+    pending: &mut HashMap<StreamKey, BatchCoalescer>,
     ready: &mut VecDeque<SampleBatch>,
 ) -> usize {
     let rows = input.row_count;
-    let key = StreamKey::new(route, stream_id);
-    // A boundary ends its own stream's batch and emits immediately. Seamless
-    // and startup boundaries leave other streams accumulating, but a pending
-    // batch must never straddle a bump of the shared generations: emit everything
-    // from the older generation first, preserving arrival order at the bump.
-    let starts_boundary = input.boundary.is_some();
-    if pending
-        .values()
-        .any(|b| b.generations().global != input.generations.global)
-    {
+    let key = StreamKey::new(input.route, input.stream.stream_id);
+    // A stream's own continuity is the coalescer's business; the parser only
+    // enforces the rule spanning streams: a pending batch must never straddle a
+    // bump of the shared generations, so everything from the older generation emits
+    // first, preserving arrival order at the bump.
+    if pending.values().any(|c| {
+        c.buffered_generations()
+            .is_some_and(|e| e.global != input.generations.global)
+    }) {
         flush_pending_batches(pending, ready);
     }
 
-    match pending.entry(key) {
-        Entry::Occupied(mut entry) if !starts_boundary && input.can_append_to(entry.get()) => {
-            input.append_to(entry.get_mut());
-            if target_rows.is_none() || entry.get().len() >= target_rows.expect("checked above") {
-                ready.push_back(entry.remove());
-            }
-        }
-        Entry::Occupied(entry) => {
-            ready.push_back(entry.remove());
-            let capacity = target_rows.unwrap_or(rows).max(rows);
-            let batch = input.into_batch(route, capacity);
-            if starts_boundary || target_rows.is_none() || batch.len() >= capacity {
-                ready.push_back(batch);
-            } else {
-                pending.insert(key, batch);
-            }
-        }
-        Entry::Vacant(entry) => {
-            let capacity = target_rows.unwrap_or(rows).max(rows);
-            let batch = input.into_batch(route, capacity);
-            if starts_boundary || target_rows.is_none() || batch.len() >= capacity {
-                ready.push_back(batch);
-            } else {
-                entry.insert(batch);
-            }
-        }
-    }
+    let coalescer = pending
+        .entry(key)
+        .or_insert_with(|| BatchCoalescer::new(target_rows));
+    coalescer.push(&input);
+    drain_completed(coalescer, ready);
 
     rows
 }
@@ -152,7 +74,7 @@ fn queue_rows(
 pub struct PacketParser {
     state: ParseState,
     batch_target_rows: Option<usize>,
-    pending_batches: HashMap<StreamKey, SampleBatch>,
+    pending_batches: HashMap<StreamKey, BatchCoalescer>,
     ready_batches: VecDeque<SampleBatch>,
 }
 
@@ -219,13 +141,7 @@ impl PacketParser {
                 self.flush();
                 PacketOutcome::Reset
             }
-            PacketEvent::Rows {
-                route,
-                stream_id,
-                rows,
-            } => PacketOutcome::Rows(queue_rows(
-                route,
-                stream_id,
+            PacketEvent::Rows(rows) => PacketOutcome::Rows(queue_rows(
                 rows,
                 self.batch_target_rows,
                 &mut self.pending_batches,
@@ -288,7 +204,7 @@ impl PacketParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{Boundary, BoundaryClass, ColumnVec, Generations, StreamDataError};
+    use crate::data::{Boundary, BoundaryClass, ColumnArray, Generations, StreamDataError};
     use bytes::Bytes;
     use proto::identifiers::MAX_SAMPLE_NUMBER;
     use proto::meta::{
@@ -328,6 +244,27 @@ mod tests {
         decimation: u32,
     ) -> PacketParser {
         let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        announce_schema(
+            &mut parser,
+            column_types,
+            sample_size,
+            n_segments,
+            sampling_rate,
+            decimation,
+        );
+        parser
+    }
+
+    /// Push one device's metadata records into an existing parser, as the
+    /// device re-announces them after a reconnect.
+    fn announce_schema(
+        parser: &mut PacketParser,
+        column_types: &[DataType],
+        sample_size: usize,
+        n_segments: usize,
+        sampling_rate: u32,
+        decimation: u32,
+    ) {
         for content in [
             MetadataContent::Device(DeviceMetadata {
                 serial_number: "SN123".to_string(),
@@ -374,7 +311,6 @@ mod tests {
                 })))
                 .expect("valid column metadata");
         }
-        parser
     }
 
     /// Announce a device with `n_streams` single-`Float32`-column streams,
@@ -526,10 +462,10 @@ mod tests {
             .map(|series| series.metadata().name.as_str())
             .collect();
         assert_eq!(names, ["col_0", "col_2"]);
-        match (&batch.schema()[0].values(), &batch.schema()[1].values()) {
-            (ColumnVec::F64(floats), ColumnVec::I64(ints)) => {
-                assert_eq!(floats, &[1.0, 2.0]);
-                assert_eq!(ints, &[-3, -4]);
+        match (batch.schema()[0].values(), batch.schema()[1].values()) {
+            (ColumnArray::F64(floats), ColumnArray::I64(ints)) => {
+                assert_eq!(&floats[..], [1.0, 2.0]);
+                assert_eq!(&ints[..], [-3, -4]);
             }
             other => panic!("unexpected column buffers: {other:?}"),
         }
@@ -740,6 +676,50 @@ mod tests {
             }
         );
         assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_cannot_restamp_the_generations_it_used_before() {
+        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the first batch").generations();
+
+        parser
+            .push_packet(&tio::Packet {
+                payload: Payload::ProxyStatus(proto::ProxyStatusPayload(
+                    proto::ProxyStatus::SensorDisconnected,
+                )),
+                routing: DeviceRoute::root(),
+                ttl: 0,
+            })
+            .expect("a disconnect resets the parser");
+
+        // The device comes back and re-announces exactly the same schema.
+        announce_schema(&mut parser, &[DataType::Float32], 4, 1, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the first batch after reconnect");
+
+        assert_eq!(
+            before,
+            Generations {
+                stream: 1,
+                device: 0,
+                global: 0
+            }
+        );
+        assert_eq!(
+            after.generations(),
+            Generations {
+                stream: 2,
+                device: 1,
+                global: 1
+            }
+        );
+        assert!(after.is_initial(), "the reconnect opens a new run");
     }
 
     #[test]

@@ -4,7 +4,10 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
-use super::sample::{Boundary, BoundaryReason, Generations};
+use super::sample::{
+    Boundary, BoundaryReason, ColumnBuilder, ColumnData, Generations, RowSource,
+    SampleBatchBuilder,
+};
 use crate::tio;
 use proto::meta::MetadataType;
 use proto::route::RouteError;
@@ -378,6 +381,7 @@ impl StreamState {
     fn validate_rows<'a>(
         &'a mut self,
         data: &'a tio::proto::StreamDataPayload,
+        route: DeviceRoute,
         device_metadata: Arc<DeviceMetadata>,
         device_generation: &mut u32,
         global_generation: &mut u32,
@@ -552,6 +556,7 @@ impl StreamState {
 
         let sample_size = stream_metadata.sample_size;
         Ok(RowState::Validated(ValidatedRows {
+            route,
             boundary,
             generations: Generations {
                 stream: self.run,
@@ -574,6 +579,13 @@ impl StreamState {
         self.metadata = None;
         self.segments.clear();
         self.columns.clear();
+    }
+
+    /// Forget metadata and end the current run, keeping the run counter so the
+    /// rebuilt stream cannot restamp a run number it has already used.
+    fn reset(&mut self) {
+        self.invalidate_metadata();
+        self.established = false;
     }
 
     fn metadata_snapshot(&self) -> Option<StreamMetadataSnapshot> {
@@ -627,6 +639,17 @@ impl DeviceState {
         self.metadata = None;
         self.streams.clear();
         self.metadata_rpcs_in_flight = 0;
+    }
+
+    /// As [`StreamState::reset`] across every stream, opening a new device
+    /// generation for the break they all share.
+    fn reset(&mut self) {
+        self.metadata = None;
+        self.metadata_rpcs_in_flight = 0;
+        self.generation += 1;
+        for stream in self.streams.values_mut() {
+            stream.reset();
+        }
     }
 
     fn accepts_stream(&mut self, stream_id: u8) -> bool {
@@ -739,6 +762,7 @@ impl DeviceState {
     fn validate_stream_data<'a>(
         &'a mut self,
         data: &'a tio::proto::StreamDataPayload,
+        route: DeviceRoute,
         global_generation: &mut u32,
     ) -> Result<RowState<'a>, StreamDataError> {
         let Some(device_metadata) = self.metadata.as_ref().cloned() else {
@@ -753,6 +777,7 @@ impl DeviceState {
             .or_insert_with(|| StreamState::new(data.stream_id))
             .validate_rows(
                 data,
+                route,
                 device_metadata,
                 &mut self.generation,
                 global_generation,
@@ -807,11 +832,7 @@ pub(super) enum PacketEvent<'a> {
     Applied,
     WaitingForMetadata,
     Reset,
-    Rows {
-        route: DeviceRoute,
-        stream_id: u8,
-        rows: ValidatedRows<'a>,
-    },
+    Rows(ValidatedRows<'a>),
 }
 
 /// Route-aware state machine shared by incremental and seekable packet readers.
@@ -869,7 +890,7 @@ impl ParseState {
                     .entry(route)
                     .or_insert_with(|| DeviceState::new(ignore_session));
                 let state = device
-                    .validate_stream_data(data, &mut self.global_generation)
+                    .validate_stream_data(data, route, &mut self.global_generation)
                     .map_err(|source| PacketError::Stream {
                         route,
                         stream_id: data.stream_id,
@@ -877,11 +898,7 @@ impl ParseState {
                     })?;
                 Ok(match state {
                     RowState::WaitingForMetadata => PacketEvent::WaitingForMetadata,
-                    RowState::Validated(rows) => PacketEvent::Rows {
-                        route,
-                        stream_id: data.stream_id,
-                        rows,
-                    },
+                    RowState::Validated(rows) => PacketEvent::Rows(rows),
                 })
             }
             payload => {
@@ -891,8 +908,13 @@ impl ParseState {
         }
     }
 
+    /// Forget every route's metadata and end its runs. The generation counters
+    /// survive, so no stamp from before the reset can be reused after it.
     pub(super) fn reset(&mut self) {
-        self.devices.clear();
+        self.global_generation += 1;
+        for device in self.devices.values_mut() {
+            device.reset();
+        }
     }
 
     pub(super) fn take_requests(&mut self) -> Vec<tio::Packet> {
@@ -930,6 +952,7 @@ impl ParseState {
 /// Stream bytes validated against the metadata and continuity state in effect
 /// at their position in the packet sequence.
 pub(super) struct ValidatedRows<'a> {
+    pub(super) route: DeviceRoute,
     pub(super) boundary: Option<Boundary>,
     pub(super) generations: Generations,
     pub(super) segment: Arc<SegmentMetadata>,
@@ -969,5 +992,58 @@ impl ValidatedRows<'_> {
                     metadata,
                 })
             })
+    }
+}
+
+impl RowSource for ValidatedRows<'_> {
+    fn len(&self) -> usize {
+        self.row_count
+    }
+
+    fn boundary(&self) -> Option<&Boundary> {
+        self.boundary.as_ref()
+    }
+
+    fn generations(&self) -> Generations {
+        self.generations
+    }
+
+    fn segment(&self) -> &Arc<SegmentMetadata> {
+        &self.segment
+    }
+
+    fn start_builder(&self, capacity: usize) -> SampleBatchBuilder {
+        SampleBatchBuilder {
+            route: self.route,
+            boundary: self.boundary.clone(),
+            generations: self.generations,
+            sample_numbers: Vec::with_capacity(capacity),
+            timestamps: Vec::with_capacity(capacity),
+            columns: self
+                .decodable_columns()
+                .map(|column| {
+                    (
+                        column.metadata.clone(),
+                        ColumnBuilder::with_capacity_for(column.buffer_type, capacity),
+                    )
+                })
+                .collect(),
+            segment: self.segment.clone(),
+            stream: self.stream.clone(),
+            device: self.device.clone(),
+        }
+    }
+
+    fn append_to(&self, tail: &mut SampleBatchBuilder) {
+        for row in 0..self.row_count {
+            let start = row * self.sample_size;
+            let raw = &self.encoded[start..start + self.sample_size];
+            tail.push_row(
+                self.first_sample_n + row as u32,
+                self.decodable_columns().map(|column| {
+                    ColumnData::from_le_bytes(&raw[column.offset..], column.metadata.data_type)
+                }),
+            );
+        }
     }
 }

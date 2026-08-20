@@ -201,14 +201,9 @@ impl LogSummary {
         self.error.as_ref()
     }
 
-    fn observe_rows(
-        &mut self,
-        route: tio::proto::DeviceRoute,
-        stream_id: u8,
-        rows: &ValidatedRows<'_>,
-    ) {
+    fn observe_rows(&mut self, rows: &ValidatedRows<'_>) {
         self.devices
-            .entry(route)
+            .entry(rows.route)
             .or_insert_with(|| rows.device.clone());
 
         if let Some(boundary) = &rows.boundary {
@@ -217,7 +212,7 @@ impl LogSummary {
 
         let runs = self
             .streams
-            .entry(StreamKey::new(route, stream_id))
+            .entry(StreamKey::new(rows.route, rows.stream.stream_id))
             .or_default();
         if runs
             .last()
@@ -429,13 +424,8 @@ impl LogFile {
                 }
             };
             summary.packet_count += 1;
-            if let PacketEvent::Rows {
-                route,
-                stream_id,
-                rows,
-            } = event
-            {
-                summary.observe_rows(route, stream_id, &rows);
+            if let PacketEvent::Rows(rows) = event {
+                summary.observe_rows(&rows);
             }
 
             let position = packets.position();

@@ -3,7 +3,7 @@
 //! Reference algorithm: Li, Yang, Chua, "FPCS", IEEE TVCG 2025; adapted from
 //! <https://github.com/tmichela/fpcs> (MIT), `src/fpcs/fpcs_pure.py`.
 
-use twinleaf::data::{ColumnOp, ColumnView, ColumnWindow};
+use twinleaf::data::{ColumnArray, ColumnOp};
 
 /// Streaming FPCS decimator: consumes fixed-`ratio` windows, emits the earlier
 /// of each window's min/max, and carries the later one forward.
@@ -188,17 +188,12 @@ impl ColumnOp for Fpcs {
         self.previous_min_retained = None;
     }
 
-    fn push(&mut self, chunk: &ColumnWindow) {
-        let (ta, tb) = chunk.timestamps;
-        let times = ta.iter().chain(tb.iter()).copied();
-        match chunk.values {
-            ColumnView::F64(a, b) => self.push_values(times, a.iter().chain(b.iter()).copied()),
-            ColumnView::I64(a, b) => {
-                self.push_values(times, a.iter().chain(b.iter()).map(|&x| x as f64))
-            }
-            ColumnView::U64(a, b) => {
-                self.push_values(times, a.iter().chain(b.iter()).map(|&x| x as f64))
-            }
+    fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
+        let times = timestamps.iter().copied();
+        match values {
+            ColumnArray::F64(v) => self.push_values(times, v.iter().copied()),
+            ColumnArray::I64(v) => self.push_values(times, v.iter().map(|&x| x as f64)),
+            ColumnArray::U64(v) => self.push_values(times, v.iter().map(|&x| x as f64)),
         }
         self.prune_retention();
     }
@@ -211,52 +206,10 @@ impl ColumnOp for Fpcs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use twinleaf::data::Generations;
-    use twinleaf::tio::proto::{ColumnMetadata, DataType};
 
-    fn meta() -> Arc<ColumnMetadata> {
-        Arc::new(ColumnMetadata {
-            stream_id: 0,
-            index: 0,
-            data_type: DataType::Float64,
-            name: "ch".into(),
-            units: "V".into(),
-            description: "test".into(),
-        })
-    }
-
-    fn window<'a>(ts: &'a [f64], vals: &'a [f64]) -> ColumnWindow<'a> {
-        ColumnWindow {
-            generations: Generations {
-                stream: 1,
-                device: 0,
-                global: 0,
-            },
-            effective_rate: 1.0,
-            timestamps: (ts, &[]),
-            values: ColumnView::F64(vals, &[]),
-            column_metadata: meta(),
-        }
-    }
-
-    fn seam_window<'a>(
-        ta: &'a [f64],
-        tb: &'a [f64],
-        va: &'a [f64],
-        vb: &'a [f64],
-    ) -> ColumnWindow<'a> {
-        ColumnWindow {
-            generations: Generations {
-                stream: 1,
-                device: 0,
-                global: 0,
-            },
-            effective_rate: 1.0,
-            timestamps: (ta, tb),
-            values: ColumnView::F64(va, vb),
-            column_metadata: meta(),
-        }
+    /// Feed one span of `f64` samples.
+    fn push(op: &mut Fpcs, ts: &[f64], vals: &[f64]) {
+        op.update_batch(ts, &ColumnArray::F64(vals.to_vec().into()));
     }
 
     fn is_monotonic(out: &[(f64, f64)]) -> bool {
@@ -276,7 +229,7 @@ mod tests {
         let ts: Vec<f64> = (0..20).map(|i| i as f64).collect();
         let vals: Vec<f64> = (0..20).map(|i| (i as f64 * 0.7).sin()).collect();
         let mut op = Fpcs::new(1, 1000.0);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
         let expected: Vec<(f64, f64)> = ts.iter().copied().zip(vals.iter().copied()).collect();
         assert_eq!(op.output(), &expected);
     }
@@ -290,14 +243,14 @@ mod tests {
             .collect();
 
         let mut batch = Fpcs::new(7, 1e9);
-        batch.push(&window(&ts, &vals));
+        push(&mut batch, &ts, &vals);
         let expected = batch.output().clone();
         assert!(!expected.is_empty());
 
         for chunk_size in [1, 2, 3, 5, 7, 16, 64, 500] {
             let mut streamed = Fpcs::new(7, 1e9);
             for (tc, vc) in ts.chunks(chunk_size).zip(vals.chunks(chunk_size)) {
-                streamed.push(&window(tc, vc));
+                push(&mut streamed, tc, vc);
             }
             assert_eq!(
                 streamed.output(),
@@ -308,24 +261,20 @@ mod tests {
     }
 
     #[test]
-    fn streaming_matches_batch_across_ring_seam() {
+    fn streaming_matches_batch_across_every_span_split() {
         let n = 40;
         let ts: Vec<f64> = (0..n).map(|i| i as f64).collect();
         let vals: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.9).sin() * 5.0).collect();
 
         let mut batch = Fpcs::new(4, 1e9);
-        batch.push(&window(&ts, &vals));
+        push(&mut batch, &ts, &vals);
         let expected = batch.output().clone();
 
-        for seam in 1..n {
+        for split in 1..n {
             let mut streamed = Fpcs::new(4, 1e9);
-            streamed.push(&seam_window(
-                &ts[..seam],
-                &ts[seam..],
-                &vals[..seam],
-                &vals[seam..],
-            ));
-            assert_eq!(streamed.output(), &expected, "seam={seam} diverged");
+            push(&mut streamed, &ts[..split], &vals[..split]);
+            push(&mut streamed, &ts[split..], &vals[split..]);
+            assert_eq!(streamed.output(), &expected, "split={split} diverged");
         }
     }
 
@@ -346,14 +295,14 @@ mod tests {
 
         for ratio in [2, 3, 5, 9] {
             let mut batch = Fpcs::new(ratio, 1e9);
-            batch.push(&window(&ts, &vals));
+            push(&mut batch, &ts, &vals);
             let expected = batch.output().clone();
             assert!(is_monotonic(&expected));
 
             for chunk_size in [1, 4, 11, 13, 37, 600] {
                 let mut streamed = Fpcs::new(ratio, 1e9);
                 for (tc, vc) in ts.chunks(chunk_size).zip(vals.chunks(chunk_size)) {
-                    streamed.push(&window(tc, vc));
+                    push(&mut streamed, tc, vc);
                 }
                 assert!(
                     points_eq(streamed.output(), &expected),
@@ -373,7 +322,7 @@ mod tests {
         let ts = vec![0.0, 1.0, 2.0, 3.0];
         let vals = vec![-1.0, 100.0, -20.0, 150.0];
         let mut op = Fpcs::new(2, 1e9);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
 
         let out = op.output().clone();
         let pos = |p: (f64, f64)| {
@@ -399,7 +348,7 @@ mod tests {
         let ts = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
         let vals = vec![1.0, f64::NAN, 3.0, -5.0, 2.0, 9.0];
         let mut op = Fpcs::new(3, 1e9);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
         assert!(op.output().iter().any(|&(t, v)| t == 1.0 && v.is_nan()));
         assert!(is_monotonic(op.output()));
     }
@@ -409,14 +358,14 @@ mod tests {
         let ts: Vec<f64> = (0..20).map(|i| i as f64).collect();
         let vals: Vec<f64> = (0..20).map(|i| i as f64 * 2.0).collect();
         let mut op = Fpcs::new(3, 1e9);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
         assert!(!op.output().is_empty());
 
         op.reset();
         assert!(op.output().is_empty());
 
         // No residual state leaks into the next run.
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
         assert!(!op.output().is_empty());
     }
 
@@ -425,7 +374,7 @@ mod tests {
         let ts = vec![0.0, 1.0, 2.0, -30.0, 3.0, 4.0];
         let vals = vec![10.0, 11.0, 12.0, 99.0, 13.0, 14.0];
         let mut op = Fpcs::new(1, 1e9);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
 
         assert!(is_monotonic(op.output()));
         assert_eq!(
@@ -445,7 +394,7 @@ mod tests {
         let mut op = Fpcs::new(1, 5.0);
         let ts: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let vals: Vec<f64> = vec![0.0; 100];
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
 
         let out = op.output();
         let newest = out.last().unwrap().0;

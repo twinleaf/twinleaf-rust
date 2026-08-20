@@ -40,8 +40,8 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{
-        Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, LatestRow,
-        SampleBatch, StreamKey,
+        Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
+        StreamKey,
     },
     device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcRegistry, TreeEvent, TreeItem},
     tio::{
@@ -866,7 +866,7 @@ impl MonitorState {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
                     let key = StreamKey::new(*route, *sid);
                     if let Some(row) = buffer.latest_row(&key) {
-                        for (column_idx, _) in row.columns.iter().enumerate() {
+                        for (column_idx, _) in row.schema().iter().enumerate() {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
@@ -995,11 +995,6 @@ impl MonitorState {
         }
     }
 
-    fn handle_batch(&mut self, batch: SampleBatch, buffer: &mut Buffer) {
-        let stream_key = StreamKey::new(batch.route(), batch.stream().stream_id);
-        buffer.process_batch(&batch, stream_key);
-    }
-
     fn slot_of(&self, key: &ColumnKey) -> usize {
         self.plot_slots.get(key).copied().unwrap_or(0)
     }
@@ -1007,7 +1002,7 @@ impl MonitorState {
     fn window_samples(&self, buffer: &Buffer, col: &ColumnKey) -> Option<usize> {
         let run = buffer.get_run(&col.stream_key())?;
         Some(
-            (self.view.plot_window_seconds * run.effective_rate)
+            (self.view.plot_window_seconds * run.effective_rate())
                 .ceil()
                 .max(10.0) as usize,
         )
@@ -1115,7 +1110,11 @@ impl MonitorState {
 
         let t_end = keys
             .iter()
-            .filter_map(|k| buffer.get_run(&k.stream_key()).map(|r| r.last_timestamp))
+            .filter_map(|k| {
+                buffer
+                    .get_run(&k.stream_key())
+                    .and_then(Run::last_timestamp)
+            })
             .fold(f64::NEG_INFINITY, f64::max);
         if !t_end.is_finite() {
             return;
@@ -1176,12 +1175,9 @@ impl MonitorState {
 }
 
 fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
-    buffer.column_window_last_n(key, 1).map(|w| {
-        (
-            w.column_metadata.description.clone(),
-            w.column_metadata.units.clone(),
-        )
-    })
+    buffer
+        .column_metadata(key)
+        .map(|metadata| (metadata.description.clone(), metadata.units.clone()))
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -1526,7 +1522,7 @@ fn build_left_lines(
         return (lines, map, device_map);
     }
 
-    let latest: HashMap<StreamKey, LatestRow> = buffer
+    let latest: HashMap<StreamKey, SampleBatch> = buffer
         .stream_keys()
         .filter_map(|k| buffer.latest_row(k).map(|row| (*k, row)))
         .collect();
@@ -1534,14 +1530,14 @@ fn build_left_lines(
     let mut global_idx = 0;
     app.view.desc_width = latest
         .values()
-        .flat_map(|row| row.columns.iter())
-        .map(|(metadata, _)| metadata.description.len())
+        .flat_map(|row| row.schema().iter())
+        .map(|column| column.metadata().description.len())
         .max()
         .unwrap_or(0);
     app.view.units_width = latest
         .values()
-        .flat_map(|row| row.columns.iter())
-        .map(|(metadata, _)| metadata.units.len())
+        .flat_map(|row| row.schema().iter())
+        .map(|column| column.metadata().units.len())
         .max()
         .unwrap_or(0);
 
@@ -1620,9 +1616,14 @@ fn build_left_lines(
                 .as_ref()
                 .is_some_and(|s| s.route == *route && s.stream_id == sid);
             if let Some(row) = latest.get(&key) {
-                let is_stale =
-                    now.saturating_duration_since(row.last_seen) > stale_threshold(&row.segment);
-                for (col_idx, (metadata, value)) in row.columns.iter().enumerate() {
+                let is_stale = buffer.get_run(&key).is_some_and(|run| {
+                    now.saturating_duration_since(run.last_seen()) > stale_threshold(row.segment())
+                });
+                let sample = row.row(0).expect("latest_row is one row");
+                for (col_idx, (column, value)) in
+                    row.schema().iter().zip(sample.values()).enumerate()
+                {
+                    let metadata = column.metadata();
                     let nav_idx = global_idx;
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
@@ -1640,11 +1641,11 @@ fn build_left_lines(
                         column_id: col_idx,
                     });
                     let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
-                    let (val_str, val_f64) = fmt_value(value);
+                    let (val_str, val_f64) = fmt_value(&value);
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(&row.stream.name, &metadata.name, val_f64)
+                        .get_value_color(&row.stream().name, &metadata.name, val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
@@ -1663,7 +1664,7 @@ fn build_left_lines(
                     };
 
                     let (pipe_glyph, pipe_style) = if is_current_stream {
-                        ("┃ ", Style::default().fg(stream_color(&row.stream.name)))
+                        ("┃ ", Style::default().fg(stream_color(&row.stream().name)))
                     } else {
                         ("│ ", Style::default().fg(Color::DarkGray))
                     };
@@ -2268,7 +2269,7 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
             recv(data_rx) -> item => {
                 match item {
                     Ok(Ok(TreeItem::Batch(batch))) => {
-                        app.handle_batch(batch, &mut buffer);
+                        buffer.process_batch(&batch);
                     }
                     Ok(Ok(TreeItem::Event(event))) => {
                         app.handle_event(event, &rpc_tx);
