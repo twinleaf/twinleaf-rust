@@ -120,7 +120,7 @@ impl DeviceMetadata {
         let (name, varlen) = take_string(varlen, fixed[1])?;
         let (serial, varlen) = take_string(varlen, fixed[6])?;
         let (firmware, varlen) = take_string(varlen, fixed[7])?;
-        if (fixed.len() > 9) && (!varlen.is_empty()) {
+        if fixed.len() == 9 && !varlen.is_empty() {
             return Err(DecodeError::InvalidPayload);
         }
         Ok((
@@ -178,7 +178,7 @@ impl StreamMetadata {
             });
         }
         let (name, varlen) = take_string(varlen, fixed[8])?;
-        if (fixed.len() > 9) && (!varlen.is_empty()) {
+        if fixed.len() == 9 && !varlen.is_empty() {
             return Err(DecodeError::InvalidPayload);
         }
         Ok((
@@ -248,7 +248,7 @@ impl SegmentMetadata {
             });
         }
         let (timeref_serial, varlen) = take_string(varlen, fixed[5])?;
-        if (fixed.len() > 27) && (!varlen.is_empty()) {
+        if fixed.len() == 27 && !varlen.is_empty() {
             return Err(DecodeError::InvalidPayload);
         }
         Ok((
@@ -320,7 +320,7 @@ impl ColumnMetadata {
         let (name, varlen) = take_string(varlen, fixed[4])?;
         let (units, varlen) = take_string(varlen, fixed[5])?;
         let (desc, varlen) = take_string(varlen, fixed[6])?;
-        if (fixed.len() > 7) && (!varlen.is_empty()) {
+        if fixed.len() == 7 && !varlen.is_empty() {
             return Err(DecodeError::InvalidPayload);
         }
         Ok((
@@ -516,4 +516,72 @@ fn finish_fields(
     fixed.extend(extra_fixed);
     varlen.extend(extra_varlen);
     Ok((fixed, varlen))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known_metadata() -> [MetadataContent; 4] {
+        [
+            MetadataContent::Device(DeviceMetadata {
+                serial_number: "serial".to_string(),
+                firmware_hash: "firmware".to_string(),
+                n_streams: 1,
+                session_id: 42,
+                name: "device".to_string(),
+            }),
+            MetadataContent::Stream(StreamMetadata {
+                stream_id: 1,
+                name: "stream".to_string(),
+                n_columns: 1,
+                n_segments: 1,
+                sample_size: 4,
+                buf_samples: 128,
+            }),
+            MetadataContent::Segment(SegmentMetadata {
+                stream_id: 1,
+                segment_id: 2,
+                flags: TL_METADATA_SEGMENT_VALID,
+                time_ref_epoch: MetadataEpoch::Unix,
+                time_ref_serial: "clock".to_string(),
+                time_ref_session_id: 7,
+                start_time: 100,
+                sampling_rate: 1_000,
+                decimation: 2,
+                filter_cutoff: 10.0,
+                filter_type: MetadataFilter::FirstOrderCascade1,
+            }),
+            MetadataContent::Column(ColumnMetadata {
+                stream_id: 1,
+                index: 0,
+                data_type: DataType::Int24,
+                name: "value".to_string(),
+                units: "V".to_string(),
+                description: "measurement".to_string(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn known_metadata_extensions_round_trip() {
+        for content in known_metadata() {
+            let payload = MetadataPayload {
+                content,
+                flags: TL_METADATA_UPDATE,
+                unknown_fixed: vec![0xaa, 0xbb],
+                unknown_varlen: vec![0xcc, 0xdd],
+            };
+            let mut encoded = Vec::new();
+            payload.encode_body(&mut encoded).unwrap();
+
+            let decoded = MetadataPayload::deserialize(&encoded).unwrap();
+            assert_eq!(decoded.unknown_fixed, [0xaa, 0xbb]);
+            assert_eq!(decoded.unknown_varlen, [0xcc, 0xdd]);
+
+            let mut reencoded = Vec::new();
+            decoded.encode_body(&mut reencoded).unwrap();
+            assert_eq!(reencoded, encoded);
+        }
+    }
 }
