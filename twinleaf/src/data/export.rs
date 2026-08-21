@@ -287,9 +287,9 @@ impl Hdf5Appender {
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
-            format!("/{}", stream_name)
+            format!("/{}[{}]", stream_name, key.stream_id)
         } else {
-            format!("/{}/{}", route_str, stream_name)
+            format!("/{}/{}[{}]", route_str, stream_name, key.stream_id)
         };
         self.stats.streams_seen.insert(stream_id_path.clone());
 
@@ -323,9 +323,10 @@ impl Hdf5Appender {
             format!("/{}", route_str)
         };
         // Each run of a stream is its own table in the route group.
+        let table_stem = hdf_name_component(&stream_name);
         let table_name = match self.runs.index(key) {
-            Some(run) => format!("{stream_name}_run{run:06}"),
-            None => stream_name.clone(),
+            Some(run) => format!("{table_stem}_run{run:06}"),
+            None => table_stem,
         };
         let table_path = if group_path == "/" {
             format!("/{}", table_name)
@@ -509,6 +510,10 @@ impl Hdf5Appender {
         self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
         self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
         self.write_attr_scalar(loc, "session_id", &batch.device().session_id)?;
+        self.write_attr_scalar(loc, "stream_id", &batch.stream().stream_id)?;
+        self.write_attr_string(loc, "stream_name", &batch.stream().name)?;
+        self.write_attr_string(loc, "device_serial", &batch.device().serial_number)?;
+        self.write_attr_string(loc, "firmware_hash", &batch.device().firmware_hash)?;
 
         if let Some(id) = self.runs.index(*key) {
             self.write_attr_scalar(loc, "run_id", &id)?;
@@ -581,6 +586,23 @@ impl Hdf5Appender {
             .shape(SimpleExtents::from([vals.len()]))
             .create(name)?;
         attr.write_raw(vals)
+    }
+}
+
+/// HDF5 treats `/` as a path separator and NUL is not a valid link character.
+/// Keep the human-readable stream name while making it a single path component.
+fn hdf_name_component(name: &str) -> String {
+    let escaped: String = name
+        .chars()
+        .map(|character| match character {
+            '/' | '\0' => '_',
+            other => other,
+        })
+        .collect();
+    if escaped.is_empty() {
+        "unnamed".to_string()
+    } else {
+        escaped
     }
 }
 
@@ -795,6 +817,22 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_stream_names_are_rejected_by_the_schema_guard() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("duplicate_names");
+        let mut writer = appender(&path);
+        writer
+            .write_batch(batch(1, "field", "x"))
+            .expect("write first stream");
+        let error = writer
+            .write_batch(batch(2, "field", "x"))
+            .expect_err("a second stream of the same name must fail");
+        assert!(error.to_string().contains("schema changed"));
+        drop(writer);
+        std::fs::remove_file(path).expect("remove output");
+    }
+
+    #[test]
     fn changed_schema_is_rejected_instead_of_reinterpreted() {
         let _guard = hdf_test_lock();
         let path = temp_hdf("schema_change");
@@ -807,6 +845,30 @@ mod tests {
             .expect_err("schema change must fail");
         assert!(error.to_string().contains("schema changed"));
         drop(writer);
+        std::fs::remove_file(path).expect("remove output");
+    }
+
+    #[test]
+    fn normal_segment_rollover_reuses_a_flat_table() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("segment_rollover");
+        let mut writer = appender(&path);
+        writer
+            .write_batch(batch_in_segment(1, "field", "x", 0))
+            .expect("write first segment");
+        writer
+            .write_batch(batch_in_segment(1, "field", "x", 100))
+            .expect("write next segment");
+        writer.finish().expect("finish output");
+
+        let file = File::open(&path).expect("open output");
+        assert_eq!(
+            file.dataset("field")
+                .expect("open stream table")
+                .shape(),
+            vec![2]
+        );
+        drop(file);
         std::fs::remove_file(path).expect("remove output");
     }
 }
