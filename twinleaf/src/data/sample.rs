@@ -32,7 +32,8 @@ impl ColumnData {
             DataType::Int16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
             DataType::UInt16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
             DataType::Int24 => {
-                ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], 0]).into())
+                let sign = if data[2] & 0x80 == 0 { 0 } else { 0xff };
+                ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], sign]).into())
             }
             DataType::UInt24 => {
                 ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], 0]).into())
@@ -823,6 +824,21 @@ mod tests {
     use super::*;
     use tio::proto::meta::{MetadataEpoch, MetadataFilter};
     use tio::proto::DataType;
+
+    #[test]
+    fn signed_int24_values_are_sign_extended() {
+        for (bytes, expected) in [
+            ([0x00, 0x00, 0x00], 0),
+            ([0xff, 0xff, 0x7f], 8_388_607),
+            ([0xff, 0xff, 0xff], -1),
+            ([0x00, 0x00, 0x80], -8_388_608),
+        ] {
+            let ColumnData::Int(value) = ColumnData::from_le_bytes(&bytes, DataType::Int24) else {
+                panic!("expected an integer value");
+            };
+            assert_eq!(value, expected);
+        }
+    }
 
     /// A four-row float batch numbered 0..4, sampled at 4 Hz, with an initial
     /// boundary anchored at its first row.
