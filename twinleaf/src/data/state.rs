@@ -649,10 +649,12 @@ impl DeviceState {
         self.streams[index].get_or_insert_with(|| StreamState::new(stream_id))
     }
 
-    fn forget_all_metadata(&mut self) {
-        self.metadata = None;
-        self.streams.clear();
-        self.metadata_rpcs_in_flight = 0;
+    /// Bootstrap this route again after metadata contradicted the state used
+    /// to decode earlier rows. Preserve each stream's run counter so rebuilt
+    /// metadata cannot reuse an existing run identity.
+    fn forget_all_metadata(&mut self, global_generation: &mut u32) {
+        self.reset();
+        *global_generation += 1;
     }
 
     /// As [`StreamState::reset`] across every stream, opening a new device
@@ -666,7 +668,7 @@ impl DeviceState {
         }
     }
 
-    fn accepts_stream(&mut self, stream_id: u8) -> bool {
+    fn accepts_stream(&mut self, stream_id: u8, global_generation: &mut u32) -> bool {
         if self
             .metadata
             .as_ref()
@@ -674,7 +676,7 @@ impl DeviceState {
         {
             // An impossible stream id means our device description is stale or
             // corrupt. Bootstrap the route again instead of retaining it.
-            self.forget_all_metadata();
+            self.forget_all_metadata(global_generation);
             false
         } else {
             true
@@ -682,38 +684,48 @@ impl DeviceState {
     }
 
     /// Merge one metadata record into this route's decoding state.
-    fn apply_metadata(&mut self, metadata: &MetadataContent, source: MetadataSource) {
+    fn apply_metadata(
+        &mut self,
+        metadata: &MetadataContent,
+        source: MetadataSource,
+        global_generation: &mut u32,
+    ) {
         match metadata {
             MetadataContent::Device(incoming) => {
                 if let Some(current) = &self.metadata {
                     if current.serial_number != incoming.serial_number {
-                        self.streams.clear();
-                    } else if (current.session_id != incoming.session_id)
-                        || (current.firmware_hash != incoming.firmware_hash)
-                    {
+                        self.forget_all_metadata(global_generation);
+                    } else if current.session_id != incoming.session_id {
+                        // Keeping continuity state lets the first rows under the
+                        // new metadata report a specific SessionChanged boundary.
                         for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
+                    } else if current.firmware_hash != incoming.firmware_hash {
+                        // A firmware change can alter a schema without changing
+                        // the session or timeline, so it must explicitly end all
+                        // current runs rather than relying on boundary detection.
+                        self.forget_all_metadata(global_generation);
                     }
                 }
                 self.metadata = Some(Arc::new(incoming.clone()));
             }
             MetadataContent::Stream(incoming) => {
-                if !self.accepts_stream(incoming.stream_id) {
+                if !self.accepts_stream(incoming.stream_id, global_generation) {
                     return;
                 }
                 let stream = self.stream_mut(incoming.stream_id);
                 if let Some(current) = &stream.metadata {
                     if current.as_ref() != incoming {
                         // This should never happen: stream metadata is constant.
-                        self.forget_all_metadata();
+                        self.forget_all_metadata(global_generation);
                     }
                 } else {
                     stream.metadata = Some(Arc::new(incoming.clone()));
                 }
             }
             MetadataContent::Segment(incoming) => {
-                if !self.accepts_stream(incoming.stream_id) {
+                if !self.accepts_stream(incoming.stream_id, global_generation) {
                     return;
                 }
                 let stream = self.stream_mut(incoming.stream_id);
@@ -723,14 +735,14 @@ impl DeviceState {
                 }
             }
             MetadataContent::Column(incoming) => {
-                if !self.accepts_stream(incoming.stream_id) {
+                if !self.accepts_stream(incoming.stream_id, global_generation) {
                     return;
                 }
                 let stream = self.stream_mut(incoming.stream_id);
                 if incoming.index < stream.columns.len() {
                     if stream.columns[incoming.index].as_ref() != incoming {
                         // This should never happen: columns are constant.
-                        self.forget_all_metadata();
+                        self.forget_all_metadata(global_generation);
                     }
                 } else if incoming.index == stream.columns.len() {
                     stream.columns.push(Arc::new(incoming.clone()));
@@ -741,16 +753,20 @@ impl DeviceState {
     }
 
     /// Apply packets that update decoding state but do not contain sample rows.
-    fn apply_control_payload(&mut self, payload: &tio::proto::Payload) {
+    fn apply_control_payload(
+        &mut self,
+        payload: &tio::proto::Payload,
+        global_generation: &mut u32,
+    ) {
         match payload {
             tio::proto::Payload::RpcReply(reply) if reply.id == META_RPC_ID => {
                 self.metadata_rpcs_in_flight = self.metadata_rpcs_in_flight.saturating_sub(1);
                 for metadata in decode_metadata_reply(&reply.reply) {
-                    self.apply_metadata(&metadata, MetadataSource::Reply);
+                    self.apply_metadata(&metadata, MetadataSource::Reply, global_generation);
                 }
             }
             tio::proto::Payload::Metadata(update) => {
-                self.apply_metadata(&update.content, MetadataSource::Update)
+                self.apply_metadata(&update.content, MetadataSource::Update, global_generation)
             }
             tio::proto::Payload::Heartbeat(tio::proto::HeartbeatPayload::Session(session_id)) => {
                 if let Some(device) = &self.metadata {
@@ -780,7 +796,7 @@ impl DeviceState {
         let Some(device_metadata) = self.metadata.as_ref().cloned() else {
             return Ok(RowState::WaitingForMetadata);
         };
-        if !self.accepts_stream(data.stream_id) {
+        if !self.accepts_stream(data.stream_id, global_generation) {
             return Ok(RowState::WaitingForMetadata);
         }
 
@@ -923,7 +939,10 @@ impl ParseState {
                 })
             }
             payload => {
-                self.device_mut(route).apply_control_payload(payload);
+                let index = self.device_index(route);
+                self.devices[index]
+                    .1
+                    .apply_control_payload(payload, &mut self.global_generation);
                 Ok(PacketEvent::Applied)
             }
         }
