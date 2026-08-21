@@ -80,7 +80,7 @@ pub struct ProxyCli {
     #[arg(long)]
     pub(crate) dump_hb: bool,
 
-    /// Deprecated; running without -s <url> now auto-detects by default.
+    /// Deprecated; running without `-s <url>` now auto-detects by default.
     #[arg(short = 'a', long = "auto", hide = true)]
     pub(crate) auto: bool,
 

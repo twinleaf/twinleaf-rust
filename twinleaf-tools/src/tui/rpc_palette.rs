@@ -738,7 +738,7 @@ impl RpcPalette {
     }
 
     /// Render the palette into `area`. Caller is responsible for reserving
-    /// enough vertical space (see [`suggestion_rows`]).
+    /// enough vertical space (see [`Self::suggestion_rows`]).
     pub fn render(
         &mut self,
         f: &mut Frame,

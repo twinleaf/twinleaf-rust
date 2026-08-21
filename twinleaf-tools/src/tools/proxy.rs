@@ -10,11 +10,13 @@ mod nmea;
 pub use list::run_list;
 
 use crate::{MountArg, ProxyCli, ProxySubcommands};
+#[cfg(feature = "mdns")]
 use std::collections::BTreeMap;
 use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use twinleaf::device::discovery::{self, DiscoveredDevice, PortInterface};
+#[cfg(feature = "mdns")]
 use twinleaf::device::DeviceTree;
 use twinleaf::tio::{self, proto, proxy};
 
