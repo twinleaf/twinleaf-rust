@@ -50,9 +50,36 @@ pub fn log_hdf(
         None
     };
 
-    // Create writer with filter baked in
+    // Open every input before creating the output. Besides validating all paths,
+    // retaining the mappings ensures an output alias can never replace an input
+    // between validation and writer creation.
+    let mut inputs = Vec::with_capacity(files.len());
+    for path in &files {
+        let input =
+            LogFile::open(Path::new(path)).wrap_err_with(|| format!("could not mmap {path}"))?;
+        inputs.push((path, input));
+    }
+
+    let output_path = Path::new(&output);
+    if output_path.exists() {
+        let canonical_output = std::fs::canonicalize(output_path)
+            .wrap_err_with(|| format!("could not inspect output path {output}"))?;
+        if inputs.iter().any(|(path, _)| {
+            std::fs::canonicalize(Path::new(path)).is_ok_and(|input| input == canonical_output)
+        }) {
+            return Err(eyre::eyre!(
+                "output {output} refers to an input log; refusing to overwrite it"
+            ));
+        }
+        return Err(eyre::eyre!(
+            "output {output} already exists; choose a new output path"
+        ));
+    }
+
+    // The appender also uses exclusive creation, closing the race between the
+    // existence check and creation.
     let mut writer = export::Hdf5Appender::with_options(
-        Path::new(&output),
+        output_path,
         compress,
         debug,
         col_filter,
@@ -71,9 +98,7 @@ pub fn log_hdf(
 
     println!("Processing {} files...", files.len());
 
-    for path in &files {
-        let input =
-            LogFile::open(Path::new(path)).wrap_err_with(|| format!("could not mmap {}", path))?;
+    for (path, input) in inputs {
         let total_bytes = input.len() as u64;
         let mut packets = input.packets();
         total_input_bytes += total_bytes;
@@ -235,4 +260,60 @@ pub fn log_hdf(
     println!("{rule}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "twinleaf_hdf_cli_{label}_{}_{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            extension
+        ))
+    }
+
+    #[test]
+    fn invalid_input_does_not_create_output() {
+        let input = temp_path("missing", "tio");
+        let output = temp_path("missing", "h5");
+        let result = log_hdf(
+            vec![input.to_string_lossy().into_owned()],
+            Some(output.to_string_lossy().into_owned()),
+            None,
+            false,
+            false,
+            SplitLevel::None,
+            SplitPolicy::Continuous,
+        );
+
+        assert!(result.is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn input_output_alias_is_rejected_without_modifying_input() {
+        let input = temp_path("alias", "tio");
+        let sentinel = b"not a packet, but valid mmap input";
+        std::fs::write(&input, sentinel).expect("create input");
+        let result = log_hdf(
+            vec![input.to_string_lossy().into_owned()],
+            Some(input.to_string_lossy().into_owned()),
+            None,
+            false,
+            false,
+            SplitLevel::None,
+            SplitPolicy::Continuous,
+        );
+
+        let error = result.expect_err("input/output alias must fail");
+        assert!(error.to_string().contains("refers to an input log"));
+        assert_eq!(std::fs::read(&input).expect("read input"), sentinel);
+        std::fs::remove_file(input).expect("remove input");
+    }
 }

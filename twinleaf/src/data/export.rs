@@ -189,6 +189,7 @@ pub struct Hdf5Appender {
 }
 
 impl Hdf5Appender {
+    /// Creates a new appender, failing if `path` already exists.
     pub fn with_options(
         path: &Path,
         compress: bool,
@@ -197,8 +198,48 @@ impl Hdf5Appender {
         split_policy: SplitPolicy,
         split_level: RunSplitLevel,
     ) -> Result<Self> {
+        Self::from_file(
+            File::create_excl(path)?,
+            compress,
+            debug,
+            filter,
+            split_policy,
+            split_level,
+        )
+    }
+
+    /// Creates an appender that explicitly replaces an existing output file.
+    ///
+    /// Prefer [`Hdf5Appender::with_options`] unless the caller has separately
+    /// confirmed that replacing `path` is intentional and safe.
+    pub fn with_overwrite_options(
+        path: &Path,
+        compress: bool,
+        debug: bool,
+        filter: Option<ColumnFilter>,
+        split_policy: SplitPolicy,
+        split_level: RunSplitLevel,
+    ) -> Result<Self> {
+        Self::from_file(
+            File::create(path)?,
+            compress,
+            debug,
+            filter,
+            split_policy,
+            split_level,
+        )
+    }
+
+    fn from_file(
+        file: File,
+        compress: bool,
+        debug: bool,
+        filter: Option<ColumnFilter>,
+        split_policy: SplitPolicy,
+        split_level: RunSplitLevel,
+    ) -> Result<Self> {
         Ok(Self {
-            file: File::create(path)?,
+            file,
             tables: HashMap::new(),
             filter,
             compress,
@@ -728,6 +769,29 @@ mod tests {
         // The discontinuity is still reported, it just does not open a table.
         assert!(runs.observe(key(1), generations(2), Some(&lost())));
         assert_eq!(runs.index(key(1)), None);
+    }
+
+    #[test]
+    fn safe_constructor_does_not_replace_existing_files() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("exclusive");
+        std::fs::write(&path, b"existing input").expect("create sentinel");
+
+        assert!(Hdf5Appender::with_options(
+            &path,
+            false,
+            false,
+            None,
+            SplitPolicy::Continuous,
+            RunSplitLevel::None,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read sentinel"),
+            b"existing input"
+        );
+
+        std::fs::remove_file(path).expect("remove sentinel");
     }
 
     #[test]
