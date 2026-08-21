@@ -203,39 +203,35 @@ impl LogSummary {
 
     fn observe_rows(&mut self, rows: &ValidatedRows<'_>) {
         self.devices
-            .entry(rows.route)
-            .or_insert_with(|| rows.device.clone());
+            .entry(rows.stream_key().route)
+            .or_insert_with(|| rows.device().clone());
 
-        if let Some(boundary) = &rows.boundary {
+        if let Some(boundary) = rows.boundary() {
             self.boundaries[class_index(boundary.class())] += 1;
         }
 
-        let runs = self
-            .streams
-            .entry(StreamKey::new(rows.route, rows.stream.stream_id))
-            .or_default();
+        let runs = self.streams.entry(rows.stream_key()).or_default();
         if runs
             .last()
-            .is_none_or(|last| last.run < rows.generations.stream)
+            .is_none_or(|last| last.run < rows.generations().stream)
         {
             runs.push(StreamSummary {
-                run: rows.generations.stream,
-                opened_by: rows.boundary.as_ref().map(Boundary::class),
-                metadata: rows.stream.clone(),
-                segment: rows.segment.clone(),
-                columns: rows.columns.to_vec(),
+                run: rows.generations().stream,
+                opened_by: rows.boundary().map(Boundary::class),
+                metadata: rows.stream().clone(),
+                segment: rows.segment().clone(),
+                columns: rows.columns().to_vec(),
                 sample_count: 0,
                 first_timestamp: None,
                 last_timestamp: None,
             });
         }
         let stream = runs.last_mut().expect("a run was just opened if empty");
-        stream.sample_count += rows.row_count as u64;
+        stream.sample_count += rows.row_count() as u64;
 
-        let first_n = rows.first_sample_n + 1;
-        let last_n = rows.last_sample_n + 1;
-        let first_timestamp = rows.segment.time_at(first_n);
-        let last_timestamp = rows.segment.time_at(last_n);
+        let (first_n, last_n) = rows.sample_number_bounds();
+        let first_timestamp = rows.segment().time_at(first_n + 1);
+        let last_timestamp = rows.segment().time_at(last_n + 1);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp

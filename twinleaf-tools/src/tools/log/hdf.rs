@@ -112,9 +112,8 @@ pub fn log_hdf(
                 }
             };
             while let Some(batch) = parser.pop_batch() {
-                let key = twinleaf::data::StreamKey::new(batch.route(), batch.stream().stream_id);
                 writer
-                    .write_batch(batch, key)
+                    .write_batch(batch)
                     .wrap_err("failed to append HDF5 batch")?;
             }
             record_parse_result_parts(
@@ -138,9 +137,8 @@ pub fn log_hdf(
     }
 
     for batch in parser.finish() {
-        let key = twinleaf::data::StreamKey::new(batch.route(), batch.stream().stream_id);
         writer
-            .write_batch(batch, key)
+            .write_batch(batch)
             .wrap_err("failed to append final HDF5 batch")?;
     }
 

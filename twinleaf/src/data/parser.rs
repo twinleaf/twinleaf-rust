@@ -43,15 +43,16 @@ fn queue_rows(
     pending: &mut HashMap<StreamKey, BatchCoalescer>,
     ready: &mut VecDeque<SampleBatch>,
 ) -> usize {
-    let rows = input.row_count;
-    let key = StreamKey::new(input.route, input.stream.stream_id);
+    let rows = input.row_count();
+    let key = input.stream_key();
+    let global_generation = input.generations().global;
     // A stream's own continuity is the coalescer's business; the parser only
     // enforces the rule spanning streams: a pending batch must never straddle a
     // bump of the shared generations, so everything from the older generation emits
     // first, preserving arrival order at the bump.
     if pending.values().any(|c| {
         c.buffered_generations()
-            .is_some_and(|e| e.global != input.generations.global)
+            .is_some_and(|e| e.global != global_generation)
     }) {
         flush_pending_batches(pending, ready);
     }

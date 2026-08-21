@@ -170,7 +170,8 @@ impl Hdf5Appender {
     }
 
     /// Append an already-decoded batch.
-    pub fn write_batch(&mut self, batch: SampleBatch, key: StreamKey) -> Result<()> {
+    pub fn write_batch(&mut self, batch: SampleBatch) -> Result<()> {
+        let key = batch.stream_key();
         if self
             .runs
             .observe(key, batch.generations(), batch.boundary())
@@ -187,18 +188,19 @@ impl Hdf5Appender {
                 );
             }
         }
-        self.append_batch(&key, &batch)
+        self.append_batch(&batch)
     }
 
     pub fn finish(self) -> Result<ExportStats> {
         Ok(self.stats)
     }
 
-    fn append_batch(&mut self, key: &StreamKey, batch: &SampleBatch) -> Result<()> {
+    fn append_batch(&mut self, batch: &SampleBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
+        let key = batch.stream_key();
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
         let stream_name = batch.stream().name.clone();
 
@@ -240,7 +242,7 @@ impl Hdf5Appender {
             format!("/{}", route_str)
         };
         // Each run of a stream is its own table in the route group.
-        let table_name = match self.runs.index(*key) {
+        let table_name = match self.runs.index(key) {
             Some(run) => format!("{stream_name}_run{run:06}"),
             None => stream_name.clone(),
         };
@@ -296,7 +298,7 @@ impl Hdf5Appender {
             };
             let ds = builder.create(table_name.as_str())?;
 
-            self.write_metadata_attributes(&ds, batch, key)?;
+            self.write_metadata_attributes(&ds, batch, &key)?;
             self.write_field_metadata(&ds, &valid)?;
 
             // Map each (already index-ordered) compound field to its data source.
