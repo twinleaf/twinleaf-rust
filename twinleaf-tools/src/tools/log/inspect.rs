@@ -45,7 +45,8 @@ fn fmt_hms(secs: f64) -> String {
 fn skew_note(run: &StreamSummary) -> String {
     use console::style;
 
-    let declared = run.sample_count() as f64 / run.rate_hz();
+    // End-of-sample timestamps for N samples span N-1 sample intervals.
+    let declared = declared_timestamp_span(run.sample_count(), run.rate_hz());
     let observed = match (run.first_timestamp(), run.last_timestamp()) {
         (Some(a), Some(b)) => b - a,
         _ => 0.0,
@@ -62,6 +63,10 @@ fn skew_note(run: &StreamSummary) -> String {
         ))
         .yellow()
     )
+}
+
+fn declared_timestamp_span(sample_count: u64, rate_hz: f64) -> f64 {
+    sample_count.saturating_sub(1) as f64 / rate_hz
 }
 
 pub fn log_inspect(files: Vec<String>) -> eyre::Result<()> {
@@ -226,4 +231,16 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     println!("{rule}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::declared_timestamp_span;
+
+    #[test]
+    fn timestamp_span_has_one_fewer_interval_than_samples() {
+        assert_eq!(declared_timestamp_span(10, 2.0), 4.5);
+        assert_eq!(declared_timestamp_span(1, 2.0), 0.0);
+        assert_eq!(declared_timestamp_span(0, 2.0), 0.0);
+    }
 }
