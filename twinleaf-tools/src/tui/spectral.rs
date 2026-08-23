@@ -117,13 +117,33 @@ impl WelchOp {
 
         let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
         let sd = welch.periodogram();
+        // The signal is real, so its spectrum is Hermitian: the negative
+        // frequencies mirror the positive ones rather than carrying separate
+        // information, and each bin's in-phase and quadrature parts are already
+        // combined by the magnitude-squared. `welch-sde` keeps the first
+        // `dft_size / 2` bins without the factor of two that folds the mirror
+        // back on, so what it returns is a *two-sided* density. An amplitude
+        // density in `units/sqrt(Hz)` is conventionally one-sided, so every bin
+        // with a mirror partner carries twice the power. DC would be exempt and
+        // is dropped by the `f > 0` filter; Nyquist would be too, but it sits
+        // at index `dft_size / 2` and is never among the bins kept.
+        //
+        // Frequencies are spaced directly rather than read from the crate's
+        // `frequency()`, which spreads its `n` bins evenly over `0..=fs/2` so
+        // the last lands exactly on Nyquist. Those bins are really the first
+        // `dft_size / 2` DFT bins, spaced `fs / dft_size` apart, so the last
+        // sits one spacing below Nyquist and the crate's mapping stretches the
+        // axis by `n / (n - 1)` — 0.05% for a 4096-point transform, and about
+        // 3% for the short ones a brief window produces.
+        let bin_spacing = sampling_hz / welch.dft_size as f64;
         let pts: Vec<(f64, f64)> = sd
-            .frequency()
-            .into_iter()
-            .zip(sd.iter().copied())
-            .filter_map(|(f, d)| {
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, d)| {
+                let f = index as f64 * bin_spacing;
                 if f > 0.0 && d.is_finite() && d > 0.0 {
-                    Some((f, d.sqrt()))
+                    Some((f, (2.0 * d).sqrt()))
                 } else {
                     None
                 }
@@ -224,6 +244,96 @@ mod tests {
         let ts: Vec<f64> = (0..n).map(|i| i as f64 / sampling_hz).collect();
         let vals: Vec<f64> = ts.iter().map(|&t| (2.0 * PI * freq_hz * t).sin()).collect();
         (ts, vals)
+    }
+
+    /// Box-Muller over a xorshift stream: repeatable normal noise for tests
+    /// without pulling in an RNG dependency.
+    fn gaussian_noise(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let u1: f64 = next().max(1e-12);
+            let u2: f64 = next();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+        }
+    }
+
+    #[test]
+    fn amplitude_density_matches_injected_white_noise() {
+        // The displayed spectrum is an amplitude density in units/sqrt(Hz),
+        // which is a one-sided quantity. `welch-sde` returns the two-sided
+        // form, so without folding it the plot reads a factor of sqrt(2) low
+        // against a known noise source.
+        let sampling_hz: f64 = 1000.0;
+        let target_asd = 0.02_f64;
+        let sigma = target_asd * (sampling_hz / 2.0).sqrt();
+        let n = 16_384;
+        let mut gauss = gaussian_noise(0x2545F4914F6CDD1D);
+
+        let ts: Vec<f64> = (0..n).map(|i| i as f64 / sampling_hz).collect();
+        let vals: Vec<f64> = (0..n).map(|_| sigma * gauss()).collect();
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+
+        let data = op.output().as_ref().expect("expected Ok result");
+        let broadband: Vec<f64> = data
+            .points
+            .iter()
+            .filter(|(f, d)| *f > 100.0 && *f < 400.0 && d.is_finite())
+            .map(|(_, d)| *d)
+            .collect();
+        assert!(!broadband.is_empty(), "no broadband bins");
+
+        let rms = (broadband.iter().map(|d| d * d).sum::<f64>() / broadband.len() as f64).sqrt();
+        let ratio = rms / target_asd;
+        assert!(
+            (0.95..1.05).contains(&ratio),
+            "amplitude density drifted from the injected noise: {ratio}"
+        );
+    }
+
+    #[test]
+    fn spectrum_axis_is_spaced_by_fs_over_dft_size() {
+        // Bins are spaced `fs / dft_size` apart starting at DC, so the last
+        // sits one spacing below Nyquist. `welch-sde`'s own `frequency()`
+        // instead spreads them to land exactly on Nyquist, stretching every
+        // frequency by `n / (n - 1)`. DC is filtered out, so the first
+        // surviving bin is one spacing up.
+        let sampling_hz: f64 = 1000.0;
+        let n = 16_384;
+        let (ts, vals) = sine_signal(n, 400.0, sampling_hz);
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+
+        // DC is dropped, so the kept bins number dft_size / 2 - 1.
+        let dft_size = 2 * (data.points.len() + 1);
+        let expected_spacing = sampling_hz / dft_size as f64;
+
+        let spacing = data.points[1].0 - data.points[0].0;
+        assert!(
+            (spacing - expected_spacing).abs() < 1e-9,
+            "bin spacing {spacing}, expected {expected_spacing}"
+        );
+        assert!(
+            (data.points[0].0 - expected_spacing).abs() < 1e-9,
+            "first kept bin {} should be one spacing above DC",
+            data.points[0].0
+        );
+
+        let last = data.points[data.points.len() - 1].0;
+        let expected_last = sampling_hz / 2.0 - expected_spacing;
+        assert!(
+            (last - expected_last).abs() < 1e-9,
+            "last bin {last}, expected {expected_last} (one spacing below Nyquist)"
+        );
     }
 
     #[test]
