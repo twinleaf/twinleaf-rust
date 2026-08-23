@@ -1916,7 +1916,7 @@ fn render_fft_series(f: &mut Frame, app: &MonitorState, area: Rect) {
     let title = if series.len() == 1 {
         let s = &series[0];
         format!(
-            "{} — {} ({:.1}s, FFT {} of {} samples, seg {}, hop {}) | Median ASD: {:.3e} {}/√Hz",
+            "{} — {} ({:.1}s, FFT {} of {} samples, seg {}, hop {}) | Noise floor: {}",
             s.key.route,
             s.label,
             secs,
@@ -1924,8 +1924,13 @@ fn render_fft_series(f: &mut Frame, app: &MonitorState, area: Rect) {
             s.data.total_sample_count,
             s.data.segment_size,
             s.data.hop_size,
-            s.data.median_asd,
-            units,
+            s.data
+                .noise_floor
+                .map(|floor| format!("{floor:.3e} {units}/√Hz"))
+                // No estimate rather than a worse one: a spectrum too short or
+                // too contaminated to support a floor has no honest number to
+                // put here.
+                .unwrap_or_else(|| "—".to_string()),
         )
     } else {
         format!(

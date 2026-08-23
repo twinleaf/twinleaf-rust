@@ -14,7 +14,9 @@ const MIN_FFT_SAMPLES: usize = 60;
 #[derive(Debug, Clone)]
 pub struct FftReadyData {
     pub points: Vec<(f64, f64)>,
-    pub median_asd: f64,
+    /// Robust white-noise floor: rejects 1/f content and narrow peaks. `None`
+    /// when the spectrum is too short or too contaminated to support one.
+    pub noise_floor: Option<f64>,
     pub sample_count: usize,
     pub total_sample_count: usize,
     pub sampling_hz: f64,
@@ -157,17 +159,11 @@ impl WelchOp {
             });
         }
 
-        let mut asd_values: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
-        asd_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_asd = if asd_values.len().is_multiple_of(2) {
-            (asd_values[asd_values.len() / 2 - 1] + asd_values[asd_values.len() / 2]) / 2.0
-        } else {
-            asd_values[asd_values.len() / 2]
-        };
+        let noise_floor = estimate_white_noise_floor(&pts);
 
         Ok(FftReadyData {
             points: pts,
-            median_asd,
+            noise_floor,
             sample_count: fft_signal.len(),
             total_sample_count,
             sampling_hz,
@@ -228,6 +224,106 @@ fn latest_complete_welch_signal(signal: &[f64]) -> (&[f64], usize, usize) {
         segment_size,
         hop_size.max(1),
     )
+}
+
+/// Estimate the flat, broadband ASD level while rejecting low-frequency 1/f
+/// content and narrow spectral peaks.
+///
+/// Equal-sized frequency bands make the band medians insensitive to narrow
+/// peaks. The quiet quartile of all but the lowest bands identifies the white
+/// plateau without assuming a fixed corner frequency. Only bands close to
+/// that plateau contribute samples, and a final one-sided MAD clip removes
+/// any peaks that survived their band's median.
+pub fn estimate_white_noise_floor(points: &[(f64, f64)]) -> Option<f64> {
+    let log_values: Vec<f64> = points
+        .iter()
+        .filter(|(f, d)| f.is_finite() && *f > 0.0 && d.is_finite() && *d > 0.0)
+        .map(|(_, d)| d.ln())
+        .collect();
+    if log_values.len() < 16 {
+        return None;
+    }
+
+    let band_count = (log_values.len() / 16).clamp(8, 32).min(log_values.len());
+    let band_size = log_values.len().div_ceil(band_count);
+    let bands: Vec<&[f64]> = log_values.chunks(band_size).collect();
+    if bands.len() < 4 {
+        return None;
+    }
+
+    // Never seed the plateau from the lowest 1/8 of the frequency bands.
+    let low_band_count = (bands.len() / 8).max(1);
+    let mut usable_band_medians: Vec<f64> = bands[low_band_count..]
+        .iter()
+        .filter_map(|band| median(band))
+        .collect();
+    if usable_band_medians.len() < 3 {
+        return None;
+    }
+    usable_band_medians.sort_by(f64::total_cmp);
+
+    // A lower-quartile seed is resistant to both 1/f bands and broad peaks,
+    // while remaining representative of a noisy white plateau.
+    let plateau_seed = quantile_sorted(&usable_band_medians, 0.25)?;
+    let lower_half_end = usable_band_medians.len().div_ceil(2);
+    let lower_half = &usable_band_medians[..lower_half_end];
+    let band_mad = median_absolute_deviation(lower_half, plateau_seed).unwrap_or(0.0);
+    let plateau_tolerance = (3.0 * 1.4826 * band_mad).clamp((1.5_f64).ln(), (2.0_f64).ln());
+
+    let mut candidates = Vec::new();
+    for band in &bands[low_band_count..] {
+        let Some(band_median) = median(band) else {
+            continue;
+        };
+        if band_median <= plateau_seed + plateau_tolerance {
+            candidates.extend_from_slice(band);
+        }
+    }
+    if candidates.len() < 8 {
+        return None;
+    }
+
+    // Iterative, upper-only clipping preserves the center of the broadband
+    // distribution while removing spectral lines at any amplitude.
+    for _ in 0..4 {
+        let Some(center) = median(&candidates) else {
+            return None;
+        };
+        let mad = median_absolute_deviation(&candidates, center).unwrap_or(0.0);
+        let upper_limit = center + (3.5 * 1.4826 * mad).max((1.5_f64).ln());
+        let previous_len = candidates.len();
+        candidates.retain(|value| *value <= upper_limit);
+        if candidates.len() == previous_len || candidates.len() < 8 {
+            break;
+        }
+    }
+
+    median(&candidates).map(f64::exp).filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    let mut sorted: Vec<f64> = values.iter().copied().filter(|value| value.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    quantile_sorted(&sorted, 0.5)
+}
+
+fn median_absolute_deviation(values: &[f64], center: f64) -> Option<f64> {
+    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
+    median(&deviations)
+}
+
+fn quantile_sorted(sorted: &[f64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let position = quantile.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * fraction)
 }
 
 #[cfg(test)]
@@ -295,6 +391,47 @@ mod tests {
         assert!(
             (0.95..1.05).contains(&ratio),
             "amplitude density drifted from the injected noise: {ratio}"
+        );
+    }
+
+    #[test]
+    fn noise_floor_matches_injected_level_and_rejects_a_tone() {
+        // A strong tone on top of known white noise. The robust estimate must
+        // track the broadband level; the plain median, which sees every bin,
+        // is the thing it improves on.
+        let sampling_hz: f64 = 1000.0;
+        let target_asd = 0.02_f64;
+        let sigma = target_asd * (sampling_hz / 2.0).sqrt();
+        let n = 16_384;
+        let mut gauss = gaussian_noise(0x2545F4914F6CDD1D);
+
+        let ts: Vec<f64> = (0..n).map(|i| i as f64 / sampling_hz).collect();
+        let vals: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 / sampling_hz;
+                (2.0 * PI * 60.0 * t).sin() + sigma * gauss()
+            })
+            .collect();
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+
+        let floor = data.noise_floor.expect("estimate");
+        let ratio = floor / target_asd;
+        assert!(
+            (0.95..1.05).contains(&ratio),
+            "noise floor drifted from the injected level: {ratio}"
+        );
+
+        let peak = data
+            .points
+            .iter()
+            .map(|(_, d)| *d)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            floor < peak / 10.0,
+            "estimate {floor} was pulled toward the {peak} peak"
         );
     }
 
