@@ -160,12 +160,39 @@ impl NavPos {
     }
 }
 
+/// Cursor movements; every one re-engages `follow_selection`, unlike
+/// `NavScroll`, which moves the viewport and leaves the cursor behind.
+#[derive(Debug, Clone, Copy)]
+enum NavMove {
+    Up,
+    Down,
+    Left,
+    Right,
+    DeviceNext,
+    DevicePrev,
+    Home,
+    End,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Nav {
     idx: usize,
 }
 
 impl Nav {
+    fn step(&mut self, mv: NavMove, items: &[NavPos]) {
+        match mv {
+            NavMove::Up => self.step_linear(items, true),
+            NavMove::Down => self.step_linear(items, false),
+            NavMove::Left => self.step_between_streams(items, true),
+            NavMove::Right => self.step_between_streams(items, false),
+            NavMove::DevicePrev => self.step_device(items, true),
+            NavMove::DeviceNext => self.step_device(items, false),
+            NavMove::Home => self.home(items),
+            NavMove::End => self.end(items),
+        }
+    }
+
     /// Up/Down: linear traversal through flattened tree
     fn step_linear(&mut self, items: &[NavPos], backward: bool) {
         if items.is_empty() {
@@ -403,15 +430,8 @@ enum Action {
     SetMode(Mode),
     ExecuteRpc(RpcReq),
     SelectRoute(DeviceRoute),
-    NavUp,
-    NavDown,
-    NavLeft,
-    NavRight,
-    NavTabNext,
-    NavTabPrev,
+    Nav(NavMove),
     NavScroll(i16),
-    NavHome,
-    NavEnd,
     ClickNavIdx(usize),
     DragStart(usize, DragOrigin),
     DragTo(usize),
@@ -614,29 +634,9 @@ impl MonitorState {
                     self.update(Action::SetMode(Mode::Command), rpc_tx);
                 }
             }
-            Action::NavUp => {
+            Action::Nav(mv) => {
                 self.view.follow_selection = true;
-                self.nav.step_linear(&self.nav_items, true);
-            }
-            Action::NavDown => {
-                self.view.follow_selection = true;
-                self.nav.step_linear(&self.nav_items, false);
-            }
-            Action::NavLeft => {
-                self.view.follow_selection = true;
-                self.nav.step_between_streams(&self.nav_items, true);
-            }
-            Action::NavRight => {
-                self.view.follow_selection = true;
-                self.nav.step_between_streams(&self.nav_items, false);
-            }
-            Action::NavTabNext => {
-                self.view.follow_selection = true;
-                self.nav.step_device(&self.nav_items, false);
-            }
-            Action::NavTabPrev => {
-                self.view.follow_selection = true;
-                self.nav.step_device(&self.nav_items, true);
+                self.nav.step(mv, &self.nav_items);
             }
             Action::NavScroll(delta) => {
                 self.view.follow_selection = false;
@@ -645,14 +645,6 @@ impl MonitorState {
                 } else {
                     self.view.scroll.saturating_add(delta as u16)
                 };
-            }
-            Action::NavHome => {
-                self.view.follow_selection = true;
-                self.nav.home(&self.nav_items);
-            }
-            Action::NavEnd => {
-                self.view.follow_selection = true;
-                self.nav.end(&self.nav_items);
             }
             Action::ClickNavIdx(idx) => {
                 if idx < self.nav_items.len() {
@@ -1201,16 +1193,16 @@ fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
                 KeyCode::Char('q') => Some(Action::Quit),
                 KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
                 KeyCode::Esc => Some(Action::ClosePlot),
-                KeyCode::Up => Some(Action::NavUp),
-                KeyCode::Down => Some(Action::NavDown),
-                KeyCode::Left => Some(Action::NavLeft),
-                KeyCode::Right => Some(Action::NavRight),
-                KeyCode::BackTab => Some(Action::NavTabPrev),
-                KeyCode::Tab => Some(Action::NavTabNext),
+                KeyCode::Up => Some(Action::Nav(NavMove::Up)),
+                KeyCode::Down => Some(Action::Nav(NavMove::Down)),
+                KeyCode::Left => Some(Action::Nav(NavMove::Left)),
+                KeyCode::Right => Some(Action::Nav(NavMove::Right)),
+                KeyCode::BackTab => Some(Action::Nav(NavMove::DevicePrev)),
+                KeyCode::Tab => Some(Action::Nav(NavMove::DeviceNext)),
                 KeyCode::PageUp => Some(Action::NavScroll(-10)),
                 KeyCode::PageDown => Some(Action::NavScroll(10)),
-                KeyCode::Home => Some(Action::NavHome),
-                KeyCode::End => Some(Action::NavEnd),
+                KeyCode::Home => Some(Action::Nav(NavMove::Home)),
+                KeyCode::End => Some(Action::Nav(NavMove::End)),
                 KeyCode::Enter => Some(Action::TogglePlot),
                 KeyCode::Char(' ') => Some(Action::TogglePlotSeries),
                 KeyCode::Char('f') => Some(Action::ToggleFft),
@@ -2137,50 +2129,34 @@ fn render_plot_series(f: &mut Frame, app: &MonitorState, area: Rect) {
     f.render_widget(chart, area);
 }
 
-fn generate_linear_labels(
-    min: f64,
-    max: f64,
-    count: usize,
-    precision: usize,
-) -> Vec<Span<'static>> {
+/// `count` evenly spaced labels over `[min, max]`, each formatted by `fmt`
+/// and right-aligned to a shared width.
+fn axis_labels(min: f64, max: f64, count: usize, fmt: impl Fn(f64) -> String) -> Vec<Span<'static>> {
     if count < 2 {
         return vec![];
     }
     let step = (max - min) / ((count - 1) as f64);
     (0..count)
-        .map(|i| {
-            let v = min + (i as f64 * step);
-            Span::from(format!("{:>10.p$}", v, p = precision))
-        })
+        .map(|i| Span::from(format!("{:>10}", fmt(min + i as f64 * step))))
         .collect()
 }
 
-fn generate_log_labels(
-    min_log: f64,
-    max_log: f64,
-    count: usize,
-    precision: usize,
-) -> Vec<Span<'static>> {
-    if count < 2 {
-        return vec![];
-    }
-    let step = (max_log - min_log) / ((count - 1) as f64);
-    let max_val = 10f64.powf(max_log.max(min_log)).abs();
-    let use_scientific = !(0.01..1000.0).contains(&max_val);
+fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
+    axis_labels(min, max, count, |v| format!("{:.precision$}", v))
+}
 
-    (0..count)
-        .map(|i| {
-            let log_val = min_log + (i as f64 * step);
-            let real_val = 10f64.powf(log_val);
-
-            let s = if use_scientific {
-                format!("{:.p$e}", real_val, p = precision)
-            } else {
-                format!("{:.p$}", real_val, p = precision)
-            };
-            Span::from(format!("{:>10}", s))
-        })
-        .collect()
+/// Notation is chosen once from the axis maximum, so every label on the
+/// axis reads in the same style.
+fn generate_log_labels(min_log: f64, max_log: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
+    let use_scientific = !(0.01..1000.0).contains(&10f64.powf(max_log.max(min_log)).abs());
+    axis_labels(min_log, max_log, count, |log_val| {
+        let v = 10f64.powf(log_val);
+        if use_scientific {
+            format!("{:.precision$e}", v)
+        } else {
+            format!("{:.precision$}", v)
+        }
+    })
 }
 
 fn fmt_value(v: &ColumnData) -> (String, f64) {
