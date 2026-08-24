@@ -518,6 +518,35 @@ mod tests {
     }
 
     #[test]
+    fn tone_power_integrates_to_half_amplitude_squared() {
+        // Parseval closes the loop the peak-location test cannot: integrating
+        // the one-sided density across a tone recovers the sine's variance
+        // A^2/2, pinning the window-power bookkeeping with a coherent signal.
+        let sampling_hz: f64 = 1000.0;
+        let amplitude = 0.5_f64;
+        let n = 16_384;
+        let (ts, unit) = sine_signal(n, 100.0, sampling_hz);
+        let vals: Vec<f64> = unit.iter().map(|v| amplitude * v).collect();
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+
+        let df = data.points[1].0 - data.points[0].0;
+        let band_power: f64 = data
+            .points
+            .iter()
+            .filter(|(f, _)| (90.0..110.0).contains(f))
+            .map(|(_, d)| d * d * df)
+            .sum();
+        let ratio = band_power / (amplitude * amplitude / 2.0);
+        assert!(
+            (0.97..1.03).contains(&ratio),
+            "integrated tone power drifted from A^2/2: {ratio}"
+        );
+    }
+
+    #[test]
     fn too_few_samples_reports_have_and_need() {
         let n = MIN_FFT_SAMPLES - 1;
         let ts: Vec<f64> = (0..n).map(|i| i as f64).collect();
