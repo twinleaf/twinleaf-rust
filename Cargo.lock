@@ -3025,12 +3025,12 @@ dependencies = [
  "mdns-sd",
  "nucleo-matcher",
  "ratatui",
+ "rustfft",
  "serialport",
  "termtree",
  "toml_edit",
  "tui-prompts",
  "twinleaf",
- "welch-sde",
 ]
 
 [[package]]
@@ -3322,17 +3322,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "welch-sde"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cf9e00ede58031fc5fefd05329aeb93ffbc195ca5416e35144f1eff3c196067"
-dependencies = [
- "num-complex",
- "num-traits",
- "rustfft",
 ]
 
 [[package]]

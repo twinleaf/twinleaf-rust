@@ -2,9 +2,10 @@
 //! signal and recomputes the estimate only when `push` delivers new samples.
 
 use std::collections::VecDeque;
+use std::f64::consts::PI;
 
+use rustfft::{num_complex::Complex, FftPlanner};
 use twinleaf::data::{ColumnArray, ColumnOp};
-use welch_sde::{Build, SpectralDensity};
 
 const WELCH_DEFAULT_SEGMENTS: usize = 4;
 const WELCH_DEFAULT_OVERLAP: f64 = 0.5;
@@ -117,40 +118,7 @@ impl WelchOp {
         let mean_val = fft_signal.iter().sum::<f64>() / fft_signal.len() as f64;
         let detrended: Vec<f64> = fft_signal.iter().map(|x| x - mean_val).collect();
 
-        let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
-        let sd = welch.periodogram();
-        // The signal is real, so its spectrum is Hermitian: the negative
-        // frequencies mirror the positive ones rather than carrying separate
-        // information, and each bin's in-phase and quadrature parts are already
-        // combined by the magnitude-squared. `welch-sde` keeps the first
-        // `dft_size / 2` bins without the factor of two that folds the mirror
-        // back on, so what it returns is a *two-sided* density. An amplitude
-        // density in `units/sqrt(Hz)` is conventionally one-sided, so every bin
-        // with a mirror partner carries twice the power. DC would be exempt and
-        // is dropped by the `f > 0` filter; Nyquist would be too, but it sits
-        // at index `dft_size / 2` and is never among the bins kept.
-        //
-        // Frequencies are spaced directly rather than read from the crate's
-        // `frequency()`, which spreads its `n` bins evenly over `0..=fs/2` so
-        // the last lands exactly on Nyquist. Those bins are really the first
-        // `dft_size / 2` DFT bins, spaced `fs / dft_size` apart, so the last
-        // sits one spacing below Nyquist and the crate's mapping stretches the
-        // axis by `n / (n - 1)` — 0.05% for a 4096-point transform, and about
-        // 3% for the short ones a brief window produces.
-        let bin_spacing = sampling_hz / welch.dft_size as f64;
-        let pts: Vec<(f64, f64)> = sd
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(index, d)| {
-                let f = index as f64 * bin_spacing;
-                if f > 0.0 && d.is_finite() && d > 0.0 {
-                    Some((f, (2.0 * d).sqrt()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let pts = welch_asd_points(&detrended, sampling_hz, segment_size, hop_size);
 
         if pts.is_empty() {
             return Err(FftStatus::NoValidFrequencyBins {
@@ -196,6 +164,52 @@ impl ColumnOp for WelchOp {
     fn output(&self) -> &Self::Output {
         &self.result
     }
+}
+
+/// Welch estimate of the one-sided amplitude density in `units/sqrt(Hz)`:
+/// Hann-windowed segments zero-padded to a power-of-two DFT, mirrored bins
+/// folded by two, spaced `fs / dft_size` starting one spacing above DC.
+/// Nyquist sits at index `dft_size / 2`, outside the kept half.
+fn welch_asd_points(
+    signal: &[f64],
+    sampling_hz: f64,
+    segment_size: usize,
+    hop_size: usize,
+) -> Vec<(f64, f64)> {
+    let dft_size = segment_size.next_power_of_two();
+    let hann: Vec<f64> = (0..segment_size)
+        .map(|i| (PI * i as f64 / (segment_size - 1) as f64).sin().powi(2))
+        .collect();
+
+    let fft = FftPlanner::new().plan_fft_forward(dft_size);
+    let mut power = vec![0.0; dft_size / 2];
+    let mut segment_count = 0usize;
+    let mut dft_buffer = vec![Complex::new(0.0, 0.0); dft_size];
+    for segment in signal.windows(segment_size).step_by(hop_size) {
+        dft_buffer.fill(Complex::new(0.0, 0.0));
+        for ((sample, weight), slot) in segment.iter().zip(&hann).zip(&mut dft_buffer) {
+            *slot = Complex::new(sample * weight, 0.0);
+        }
+        fft.process(&mut dft_buffer);
+        for (total, bin) in power.iter_mut().zip(&dft_buffer) {
+            *total += bin.norm_sqr();
+        }
+        segment_count += 1;
+    }
+
+    let hann_power: f64 = hann.iter().map(|w| w * w).sum();
+    let scale = 2.0 / (hann_power * segment_count as f64 * sampling_hz);
+    let bin_spacing = sampling_hz / dft_size as f64;
+    power
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, total)| {
+            let density = total * scale;
+            (density.is_finite() && density > 0.0)
+                .then(|| (index as f64 * bin_spacing, density.sqrt()))
+        })
+        .collect()
 }
 
 /// Longest signal prefix (from the end, i.e. the most recent samples) whose
@@ -362,9 +376,9 @@ mod tests {
     #[test]
     fn amplitude_density_matches_injected_white_noise() {
         // The displayed spectrum is an amplitude density in units/sqrt(Hz),
-        // which is a one-sided quantity. `welch-sde` returns the two-sided
-        // form, so without folding it the plot reads a factor of sqrt(2) low
-        // against a known noise source.
+        // which is a one-sided quantity. The raw Welch periodogram is the
+        // two-sided form, so without folding it the plot reads a factor of
+        // sqrt(2) low against a known noise source.
         let sampling_hz: f64 = 1000.0;
         let target_asd = 0.02_f64;
         let sigma = target_asd * (sampling_hz / 2.0).sqrt();
@@ -438,8 +452,8 @@ mod tests {
     #[test]
     fn spectrum_axis_is_spaced_by_fs_over_dft_size() {
         // Bins are spaced `fs / dft_size` apart starting at DC, so the last
-        // sits one spacing below Nyquist. `welch-sde`'s own `frequency()`
-        // instead spreads them to land exactly on Nyquist, stretching every
+        // sits one spacing below Nyquist. A linspace onto `0..=fs/2` (the
+        // `welch-sde` bug this guards against) would instead stretch every
         // frequency by `n / (n - 1)`. DC is filtered out, so the first
         // surviving bin is one spacing up.
         let sampling_hz: f64 = 1000.0;
