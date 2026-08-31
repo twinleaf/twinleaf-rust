@@ -159,6 +159,7 @@ impl std::fmt::Display for DataType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferType {
     Float,
     Int,

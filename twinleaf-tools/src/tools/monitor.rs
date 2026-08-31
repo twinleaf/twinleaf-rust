@@ -40,8 +40,8 @@ use ratatui::{
 use toml_edit::{DocumentMut, InlineTable, Value};
 use twinleaf::{
     data::{
-        Buffer, ColumnData, ColumnKey, ColumnOp, DerivedColumn, DeviceMetadataSnapshot, LatestRow,
-        SampleBatch, StreamKey,
+        Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
+        StreamKey,
     },
     device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcRegistry, TreeEvent, TreeItem},
     tio::{
@@ -491,8 +491,8 @@ struct MonitorState {
     fft_series: Vec<FftSeries>,
     fft_status: FftStatus,
     plot_series: Vec<PlotSeries>,
-    plot_pipes: HashMap<ColumnKey, DerivedColumn<Fpcs>>,
-    fft_pipes: HashMap<ColumnKey, DerivedColumn<WelchOp>>,
+    plot_pipes: HashMap<ColumnKey, ColumnProcessor<Fpcs>>,
+    fft_pipes: HashMap<ColumnKey, ColumnProcessor<WelchOp>>,
     /// Channels pinned via space, in selection order; empty follows the cursor.
     plotted: Vec<ColumnKey>,
     /// Color slot per pinned channel; never renumbered while pinned, so colors
@@ -522,7 +522,7 @@ impl MonitorState {
     fn new(depth_limit: Option<usize>, parent_route: &DeviceRoute) -> Self {
         Self {
             depth_limit,
-            parent_route: parent_route.clone(),
+            parent_route: *parent_route,
             mode: Mode::Normal,
             view: ViewConfig::default(),
             nav: Nav::default(),
@@ -589,7 +589,7 @@ impl MonitorState {
                 let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
             }
             Action::SelectRoute(route) => {
-                self.palette_route = Some(route.clone());
+                self.palette_route = Some(route);
                 let registry = self
                     .rpc_routes
                     .get(&route)
@@ -785,7 +785,7 @@ impl MonitorState {
         let lowest_free_slot = (0..)
             .find(|slot| !self.plot_slots.values().any(|used| used == slot))
             .unwrap();
-        self.plot_slots.insert(col.clone(), lowest_free_slot);
+        self.plot_slots.insert(col, lowest_free_slot);
         self.plotted.push(col);
         self.view.show_plot = true;
     }
@@ -814,7 +814,7 @@ impl MonitorState {
 
     fn update_rpc_registry(&mut self, route: DeviceRoute, registry: RpcRegistry) {
         self.rpc_routes
-            .entry(route.clone())
+            .entry(route)
             .or_default()
             .on_fetch_success(registry);
         self.update_palette_suggestions_for(&route);
@@ -822,7 +822,7 @@ impl MonitorState {
 
     fn update_rpclist_error(&mut self, route: DeviceRoute, error: String) {
         self.rpc_routes
-            .entry(route.clone())
+            .entry(route)
             .or_default()
             .on_fetch_error(error);
         self.update_palette_suggestions_for(&route);
@@ -860,18 +860,18 @@ impl MonitorState {
             if stream_ids.is_empty() {
                 new_items.push(NavPos::EmptyDevice {
                     device_idx: dev_idx,
-                    route: route.clone(),
+                    route: *route,
                 });
             } else {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
-                    let key = StreamKey::new(route.clone(), *sid);
+                    let key = StreamKey::new(*route, *sid);
                     if let Some(row) = buffer.latest_row(&key) {
-                        for (column_idx, _) in row.columns.iter().enumerate() {
+                        for (column_idx, _) in row.schema().iter().enumerate() {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
                                 spec: ColumnKey {
-                                    route: route.clone(),
+                                    route: *route,
                                     stream_id: *sid,
                                     column_id: column_idx,
                                 },
@@ -893,7 +893,7 @@ impl MonitorState {
         self.nav.idx = prev_selection
             .and_then(|prev| {
                 let prev_spec = prev.spec().cloned();
-                let prev_route = prev.route().clone();
+                let prev_route = *prev.route();
                 self.nav_items
                     .iter()
                     .position(|pos| match (&prev_spec, pos.spec()) {
@@ -915,15 +915,13 @@ impl MonitorState {
 
     fn current_route(&self) -> DeviceRoute {
         self.current_pos()
-            .map(|p| p.route().clone())
-            .unwrap_or_else(|| self.parent_route.clone())
+            .map(|p| *p.route())
+            .unwrap_or_else(|| self.parent_route)
     }
 
     /// Device the RPC palette targets: the override, or the nav-derived device.
     fn palette_route(&self) -> DeviceRoute {
-        self.palette_route
-            .clone()
-            .unwrap_or_else(|| self.current_route())
+        self.palette_route.unwrap_or_else(|| self.current_route())
     }
 
     fn current_device_index(&self) -> usize {
@@ -937,14 +935,14 @@ impl MonitorState {
     fn handle_event(&mut self, event: TreeEvent, rpc_tx: &Sender<RpcWorkerReq>) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
-                self.discovered_routes.insert(route.clone());
+                self.discovered_routes.insert(route);
                 if self
                     .rpc_routes
-                    .entry(route.clone())
+                    .entry(route)
                     .or_default()
                     .on_route_discovered()
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
                 }
                 self.device_status.entry(route).or_default();
             }
@@ -952,12 +950,7 @@ impl MonitorState {
                 route,
                 event: DeviceEvent::NewHash(hash),
             } => {
-                if self
-                    .rpc_routes
-                    .entry(route.clone())
-                    .or_default()
-                    .on_new_hash(hash)
-                {
+                if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
                     let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
                 }
             }
@@ -967,11 +960,11 @@ impl MonitorState {
             } => {
                 if self
                     .rpc_routes
-                    .entry(route.clone())
+                    .entry(route)
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route.clone()));
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
                 }
                 self.device_status.entry(route).or_default().on_heartbeat();
             }
@@ -979,15 +972,10 @@ impl MonitorState {
                 route,
                 event: DeviceEvent::Status(status),
             } => {
-                if self
-                    .rpc_routes
-                    .entry(route.clone())
-                    .or_default()
-                    .on_status(status)
-                {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route.clone()));
+                if self.rpc_routes.entry(route).or_default().on_status(status) {
+                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
                 }
-                let dev_status = self.device_status.entry(route.clone()).or_default();
+                let dev_status = self.device_status.entry(route).or_default();
                 match status {
                     ProxyStatus::SensorDisconnected => dev_status.connected = false,
                     ProxyStatus::SensorReconnected => dev_status.connected = true,
@@ -1007,11 +995,6 @@ impl MonitorState {
         }
     }
 
-    fn handle_batch(&mut self, batch: SampleBatch, buffer: &mut Buffer) {
-        let stream_key = StreamKey::new(batch.route.clone(), batch.stream.stream_id);
-        buffer.process_batch(&batch, stream_key);
-    }
-
     fn slot_of(&self, key: &ColumnKey) -> usize {
         self.plot_slots.get(key).copied().unwrap_or(0)
     }
@@ -1019,7 +1002,7 @@ impl MonitorState {
     fn window_samples(&self, buffer: &Buffer, col: &ColumnKey) -> Option<usize> {
         let run = buffer.get_run(&col.stream_key())?;
         Some(
-            (self.view.plot_window_seconds * run.effective_rate)
+            (self.view.plot_window_seconds * run.effective_rate())
                 .ceil()
                 .max(10.0) as usize,
         )
@@ -1083,9 +1066,9 @@ impl MonitorState {
                 continue;
             }
 
-            let pipe = self.fft_pipes.entry(key.clone()).or_insert_with(|| {
-                DerivedColumn::new(
-                    key.clone(),
+            let pipe = self.fft_pipes.entry(key).or_insert_with(|| {
+                ColumnProcessor::new(
+                    key,
                     WelchOp::new(window_samples, sampling_hz, self.view.plot_window_seconds),
                 )
             });
@@ -1098,9 +1081,9 @@ impl MonitorState {
             if params_changed {
                 pipe.invalidate();
             }
-            pipe.sync(buffer);
+            pipe.catch_up(buffer);
 
-            match pipe.op().output() {
+            match pipe.output() {
                 Ok(data) => {
                     let Some((label, units)) = column_label_units(buffer, &key) else {
                         continue;
@@ -1127,7 +1110,11 @@ impl MonitorState {
 
         let t_end = keys
             .iter()
-            .filter_map(|k| buffer.get_run(&k.stream_key()).map(|r| r.last_timestamp))
+            .filter_map(|k| {
+                buffer
+                    .get_run(&k.stream_key())
+                    .and_then(Run::last_timestamp)
+            })
             .fold(f64::NEG_INFINITY, f64::max);
         if !t_end.is_finite() {
             return;
@@ -1142,8 +1129,8 @@ impl MonitorState {
 
         for key in &keys {
             let window_samples = self.window_samples(buffer, key);
-            let pipe = self.plot_pipes.entry(key.clone()).or_insert_with(|| {
-                DerivedColumn::new(key.clone(), Fpcs::new(1, MAX_PLOT_WINDOW_SECONDS * 1.25))
+            let pipe = self.plot_pipes.entry(*key).or_insert_with(|| {
+                ColumnProcessor::new(*key, Fpcs::new(1, MAX_PLOT_WINDOW_SECONDS * 1.25))
             });
             if let Some(window_samples) = window_samples {
                 let ratio = ((window_samples as f64) / (buckets as f64)).ceil().max(1.0) as usize;
@@ -1152,7 +1139,7 @@ impl MonitorState {
                     pipe.invalidate();
                 }
             }
-            pipe.sync(buffer);
+            pipe.catch_up(buffer);
         }
 
         for key in keys.into_iter() {
@@ -1160,7 +1147,7 @@ impl MonitorState {
             let Some(pipe) = self.plot_pipes.get(&key) else {
                 continue;
             };
-            let out = pipe.op().output();
+            let out = pipe.output();
             let start = out.partition_point(|&(t, _)| t < t_start);
             let end = out.partition_point(|&(t, _)| t <= t_end);
             if start >= end {
@@ -1188,12 +1175,9 @@ impl MonitorState {
 }
 
 fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
-    buffer.column_window_last_n(key, 1).map(|w| {
-        (
-            w.column_metadata.description.clone(),
-            w.column_metadata.units.clone(),
-        )
-    })
+    buffer
+        .column_metadata(key)
+        .map(|metadata| (metadata.description.clone(), metadata.units.clone()))
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -1538,22 +1522,22 @@ fn build_left_lines(
         return (lines, map, device_map);
     }
 
-    let latest: HashMap<StreamKey, LatestRow> = buffer
+    let latest: HashMap<StreamKey, SampleBatch> = buffer
         .stream_keys()
-        .filter_map(|k| buffer.latest_row(k).map(|row| (k.clone(), row)))
+        .filter_map(|k| buffer.latest_row(k).map(|row| (*k, row)))
         .collect();
 
     let mut global_idx = 0;
     app.view.desc_width = latest
         .values()
-        .flat_map(|row| row.columns.iter())
-        .map(|(metadata, _)| metadata.description.len())
+        .flat_map(|row| row.schema().iter())
+        .map(|column| column.metadata().description.len())
         .max()
         .unwrap_or(0);
     app.view.units_width = latest
         .values()
-        .flat_map(|row| row.columns.iter())
-        .map(|(metadata, _)| metadata.units.len())
+        .flat_map(|row| row.schema().iter())
+        .map(|column| column.metadata().units.len())
         .max()
         .unwrap_or(0);
 
@@ -1606,7 +1590,7 @@ fn build_left_lines(
             header_spans.push(Span::raw(format!(" [{}]", route)));
         }
 
-        device_map.insert(lines.len(), route.clone());
+        device_map.insert(lines.len(), *route);
         lines.push(Line::from(header_spans));
 
         let mut stream_ids: Vec<_> = latest
@@ -1627,14 +1611,19 @@ fn build_left_lines(
         }
 
         for sid in stream_ids {
-            let key = StreamKey::new(route.clone(), sid);
+            let key = StreamKey::new(*route, sid);
             let is_current_stream = selected_stream
                 .as_ref()
                 .is_some_and(|s| s.route == *route && s.stream_id == sid);
             if let Some(row) = latest.get(&key) {
-                let is_stale =
-                    now.saturating_duration_since(row.last_seen) > stale_threshold(&row.segment);
-                for (col_idx, (metadata, value)) in row.columns.iter().enumerate() {
+                let is_stale = buffer.get_run(&key).is_some_and(|run| {
+                    now.saturating_duration_since(run.last_seen()) > stale_threshold(row.segment())
+                });
+                let sample = row.row(0).expect("latest_row is one row");
+                for (col_idx, (column, value)) in
+                    row.schema().iter().zip(sample.values()).enumerate()
+                {
+                    let metadata = column.metadata();
                     let nav_idx = global_idx;
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
@@ -1647,16 +1636,16 @@ fn build_left_lines(
                         _ => app.nav.idx == nav_idx,
                     };
                     let plot_slot = app.plot_slots.get(&ColumnKey {
-                        route: route.clone(),
+                        route: *route,
                         stream_id: sid,
                         column_id: col_idx,
                     });
                     let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
-                    let (val_str, val_f64) = fmt_value(value);
+                    let (val_str, val_f64) = fmt_value(&value);
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(&row.stream.name, &metadata.name, val_f64)
+                        .get_value_color(&row.stream().name, &metadata.name, val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
@@ -1675,7 +1664,7 @@ fn build_left_lines(
                     };
 
                     let (pipe_glyph, pipe_style) = if is_current_stream {
-                        ("┃ ", Style::default().fg(stream_color(&row.stream.name)))
+                        ("┃ ", Style::default().fg(stream_color(&row.stream().name)))
                     } else {
                         ("│ ", Style::default().fg(Color::DarkGray))
                     };
@@ -2240,14 +2229,14 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     } = config;
 
     let proxy = tio::proxy::Interface::new(&tio.root);
-    let parent_route: DeviceRoute = tio.route.clone();
+    let parent_route: DeviceRoute = tio.route;
 
-    let tree = DeviceTree::open(&proxy, parent_route.clone())
+    let tree = DeviceTree::open(&proxy, parent_route)
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
         .with_proxy_help()?;
     let data_rx = spawn_tree_worker(tree);
 
-    let rpc_client = RpcClient::open(&proxy, parent_route.clone())
+    let rpc_client = RpcClient::open(&proxy, parent_route)
         .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))
         .with_proxy_help()?;
     let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
@@ -2280,7 +2269,7 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
             recv(data_rx) -> item => {
                 match item {
                     Ok(Ok(TreeItem::Batch(batch))) => {
-                        app.handle_batch(batch, &mut buffer);
+                        buffer.process_batch(&batch);
                     }
                     Ok(Ok(TreeItem::Event(event))) => {
                         app.handle_event(event, &rpc_tx);

@@ -96,12 +96,12 @@ impl Drop for Recorder {
 /// updates followed by one column update per series, all stamped with the
 /// batch's absolute route.
 fn write_metadata_snapshot(rec: &mut Recorder, batch: &SampleBatch) -> eyre::Result<()> {
-    let abs_route = batch.route;
-    rec.write(batch.device.make_update_with_route(abs_route))?;
-    rec.write(batch.stream.make_update_with_route(abs_route))?;
-    rec.write(batch.segment.make_update_with_route(abs_route))?;
+    let abs_route = batch.route();
+    rec.write(batch.device().make_update_with_route(abs_route))?;
+    rec.write(batch.stream().make_update_with_route(abs_route))?;
+    rec.write(batch.segment().make_update_with_route(abs_route))?;
     for series in batch.schema() {
-        rec.write(series.metadata.make_update_with_route(abs_route))?;
+        rec.write(series.metadata().make_update_with_route(abs_route))?;
     }
     Ok(())
 }
@@ -249,35 +249,43 @@ fn log_parsed(
 
         // The parser intercepts ProxyStatus (resetting on disconnect); RpcUpdate
         // is a parser no-op. The batch carries the absolute route.
-        let parsed = parser.process_packet(&pkt);
+        if let Err(error) = parser.push_packet(&pkt) {
+            log::warn!("dropping invalid stream packet: {error}");
+            rec.tick();
+            let _ = rec.flush_if_needed();
+            continue;
+        }
 
-        if let Some(batch) = &parsed {
-            let abs_route = batch.route;
-            if let Some(b) = &batch.boundary {
+        let mut parsed_route = None;
+        while let Some(batch) = parser.pop_batch() {
+            let abs_route = batch.route();
+            if let Some(b) = batch.boundary() {
                 if let BoundaryReason::SamplesLost { expected, received } = b.reason {
                     let count = received.wrapping_sub(expected);
                     rec.samples_dropped += count as u64;
                     log::warn!(
                         "{}/{} dropped {} samples",
                         abs_route,
-                        batch.stream.name,
+                        batch.stream().name,
                         count
                     );
                 }
-                write_metadata_snapshot(&mut rec, batch)?;
+                write_metadata_snapshot(&mut rec, &batch)?;
             }
+            parsed_route = Some(abs_route);
+        }
 
-            // Only record the raw stream-data packet when it actually parsed
-            // into a batch (parser established), matching the old
-            // reconstruction which wrote exactly once per parseable packet.
-            if matches!(pkt.payload, tio::proto::Payload::StreamData(_)) {
-                let data_pkt = tio::Packet {
-                    payload: pkt.payload,
-                    routing: abs_route,
-                    ttl: 0,
-                };
-                rec.write(data_pkt)?;
-            }
+        // Only record the raw stream-data packet when it actually parsed into
+        // a batch, matching the old reconstruction which wrote once per
+        // parseable packet.
+        if let (Some(abs_route), tio::proto::Payload::StreamData(_)) = (parsed_route, &pkt.payload)
+        {
+            let data_pkt = tio::Packet {
+                payload: pkt.payload,
+                routing: abs_route,
+                ttl: 0,
+            };
+            rec.write(data_pkt)?;
         }
 
         rec.tick();

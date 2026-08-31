@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use twinleaf::data::{ColumnOp, ColumnView, ColumnWindow};
+use twinleaf::data::{ColumnArray, ColumnOp};
 use welch_sde::{Build, SpectralDensity};
 
 const WELCH_DEFAULT_SEGMENTS: usize = 4;
@@ -165,15 +165,11 @@ impl ColumnOp for WelchOp {
         self.result = Err(FftStatus::WaitingForSamples);
     }
 
-    fn push(&mut self, chunk: &ColumnWindow) {
-        match chunk.values {
-            ColumnView::F64(a, b) => self.ring.extend(a.iter().chain(b.iter()).copied()),
-            ColumnView::I64(a, b) => self
-                .ring
-                .extend(a.iter().chain(b.iter()).map(|&x| x as f64)),
-            ColumnView::U64(a, b) => self
-                .ring
-                .extend(a.iter().chain(b.iter()).map(|&x| x as f64)),
+    fn update_batch(&mut self, _timestamps: &[f64], values: &ColumnArray) {
+        match values {
+            ColumnArray::F64(v) => self.ring.extend(v.iter().copied()),
+            ColumnArray::I64(v) => self.ring.extend(v.iter().map(|&x| x as f64)),
+            ColumnArray::U64(v) => self.ring.extend(v.iter().map(|&x| x as f64)),
         }
         while self.ring.len() > self.window_samples {
             self.ring.pop_front();
@@ -218,28 +214,10 @@ fn latest_complete_welch_signal(signal: &[f64]) -> (&[f64], usize, usize) {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
-    use std::sync::Arc;
-    use twinleaf::tio::proto::{ColumnMetadata, DataType};
 
-    fn meta() -> Arc<ColumnMetadata> {
-        Arc::new(ColumnMetadata {
-            stream_id: 0,
-            index: 0,
-            data_type: DataType::Float64,
-            name: "ch".into(),
-            units: "V".into(),
-            description: "test".into(),
-        })
-    }
-
-    fn window<'a>(ts: &'a [f64], vals: &'a [f64]) -> ColumnWindow<'a> {
-        ColumnWindow {
-            run_id: 0,
-            effective_rate: 1.0,
-            timestamps: (ts, &[]),
-            values: ColumnView::F64(vals, &[]),
-            column_metadata: meta(),
-        }
+    /// Feed one span of `f64` samples.
+    fn push(op: &mut WelchOp, ts: &[f64], vals: &[f64]) {
+        op.update_batch(ts, &ColumnArray::F64(vals.to_vec().into()));
     }
 
     fn sine_signal(n: usize, freq_hz: f64, sampling_hz: f64) -> (Vec<f64>, Vec<f64>) {
@@ -256,7 +234,7 @@ mod tests {
         let (ts, vals) = sine_signal(n, freq_hz, sampling_hz);
 
         let mut op = WelchOp::new(n, sampling_hz, 10.0);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
 
         let data = op.output().as_ref().expect("expected Ok result");
         let (peak_freq, _) =
@@ -285,7 +263,7 @@ mod tests {
         let vals: Vec<f64> = vec![1.0; n];
 
         let mut op = WelchOp::new(1000, 100.0, 5.0);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
 
         match op.output() {
             Err(FftStatus::TooFewSamples { have, need, .. }) => {
@@ -304,7 +282,7 @@ mod tests {
             let vals: Vec<f64> = vec![1.0; n];
 
             let mut op = WelchOp::new(1000, bad_hz, 5.0);
-            op.push(&window(&ts, &vals));
+            push(&mut op, &ts, &vals);
 
             assert!(
                 matches!(op.output(), Err(FftStatus::InvalidSampleRate { .. })),
@@ -322,7 +300,7 @@ mod tests {
         let vals: Vec<f64> = (0..n).map(|i| (i as f64 * 0.1).sin()).collect();
 
         let mut op = WelchOp::new(window_samples, 100.0, 5.0);
-        op.push(&window(&ts, &vals));
+        push(&mut op, &ts, &vals);
 
         assert_eq!(op.ring.len(), window_samples);
         let data = op.output().as_ref().expect("expected Ok result");
@@ -337,7 +315,7 @@ mod tests {
         let (ts, vals) = sine_signal(n, 37.0, sampling_hz);
 
         let mut batch = WelchOp::new(window_samples, sampling_hz, 5.0);
-        batch.push(&window(&ts, &vals));
+        push(&mut batch, &ts, &vals);
         let expected = batch
             .output()
             .as_ref()
@@ -348,7 +326,7 @@ mod tests {
         for chunk_size in [1, 7, 64, 500] {
             let mut streamed = WelchOp::new(window_samples, sampling_hz, 5.0);
             for (tc, vc) in ts.chunks(chunk_size).zip(vals.chunks(chunk_size)) {
-                streamed.push(&window(tc, vc));
+                push(&mut streamed, tc, vc);
             }
             let got = &streamed
                 .output()

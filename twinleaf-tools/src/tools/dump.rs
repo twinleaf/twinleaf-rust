@@ -89,11 +89,15 @@ pub fn dump(
                 };
                 match next {
                     Ok(Some(TreeItem::Batch(batch))) => {
-                        let sample_route = batch.route;
+                        let sample_route = batch.route();
                         // Schema questions are answered once per batch.
                         let matched = filter.as_ref().is_none_or(|f| {
                             batch.schema().iter().any(|series| {
-                                f.matches(&sample_route, &batch.stream.name, &series.metadata.name)
+                                f.matches(
+                                    &sample_route,
+                                    &batch.stream().name,
+                                    &series.metadata().name,
+                                )
                             })
                         });
                         if !matched {
@@ -130,16 +134,16 @@ pub fn print_batch_meta(batch: &SampleBatch, route: Option<&DeviceRoute>) {
         "".to_string()
     };
 
-    if let Some(boundary) = &batch.boundary {
+    if let Some(boundary) = batch.boundary() {
         println!("# {}BOUNDARY {:?}", route_str, boundary.reason);
         if !boundary.is_continuous() {
-            println!("# {}DEVICE {:?}", route_str, batch.device);
-            println!("# {}STREAM {:?}", route_str, batch.stream);
+            println!("# {}DEVICE {:?}", route_str, batch.device());
+            println!("# {}STREAM {:?}", route_str, batch.stream());
             for series in batch.schema() {
-                println!("# {}COLUMN {:?}", route_str, series.metadata);
+                println!("# {}COLUMN {:?}", route_str, series.metadata());
             }
         }
-        println!("# {}SEGMENT {:?}", route_str, batch.segment);
+        println!("# {}SEGMENT {:?}", route_str, batch.segment());
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::data::{Boundary, ColumnFilter, ColumnVec, SampleBatch, Series};
+use crate::data::{Boundary, ColumnArray, ColumnFilter, Generations, SampleBatch, Series};
 use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, StreamKey};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
@@ -8,7 +8,7 @@ use hdf5_sys::h5p::H5P_DEFAULT;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-pub type RunId = u64;
+type TableIndex = u64;
 
 /// Controls when to start a new run in the output file.
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +37,78 @@ pub enum RunSplitLevel {
     PerDevice,
     /// All streams globally share a run counter: `/{route}/{stream}_run{id}`
     Global,
+}
+
+/// Scope over which streams share a table counter, per [`RunSplitLevel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RunScope {
+    Stream(StreamKey),
+    Device(DeviceRoute),
+    Global,
+}
+
+/// Table numbering driven by the parser's continuity generations.
+///
+/// The first batch stamped with a new generation carries the boundary that opened
+/// it, so it decides once whether the generation gets its own table or aliases the
+/// current one; later batches in scope, from any stream, read the index back.
+struct RunTables {
+    policy: SplitPolicy,
+    level: RunSplitLevel,
+    /// `(generation in use, table index)` per scope.
+    open: HashMap<RunScope, (u32, TableIndex)>,
+}
+
+impl RunTables {
+    fn new(policy: SplitPolicy, level: RunSplitLevel) -> Self {
+        Self {
+            policy,
+            level,
+            open: HashMap::new(),
+        }
+    }
+
+    fn scope(&self, key: StreamKey) -> Option<RunScope> {
+        match self.level {
+            RunSplitLevel::None => None,
+            RunSplitLevel::PerStream => Some(RunScope::Stream(key)),
+            RunSplitLevel::PerDevice => Some(RunScope::Device(key.route)),
+            RunSplitLevel::Global => Some(RunScope::Global),
+        }
+    }
+
+    /// Account for one batch, returning whether its boundary split the run.
+    fn observe(
+        &mut self,
+        key: StreamKey,
+        generations: Generations,
+        boundary: Option<&Boundary>,
+    ) -> bool {
+        let splits = boundary.is_some_and(|b| {
+            !b.is_initial()
+                && match self.policy {
+                    SplitPolicy::Continuous => !b.is_continuous(),
+                    SplitPolicy::Monotonic => !b.is_monotonic(),
+                }
+        });
+        if let Some(scope) = self.scope(key) {
+            let generation = match self.level {
+                RunSplitLevel::PerDevice => generations.device,
+                RunSplitLevel::Global => generations.global,
+                RunSplitLevel::PerStream | RunSplitLevel::None => generations.stream,
+            };
+            let open = self.open.entry(scope).or_insert((generation, 0));
+            if open.0 != generation {
+                *open = (generation, open.1 + splits as TableIndex);
+            }
+        }
+        splits
+    }
+
+    /// Table index for a stream's current run, or `None` without splitting.
+    fn index(&self, key: StreamKey) -> Option<TableIndex> {
+        Some(self.open.get(&self.scope(key)?).map_or(0, |open| open.1))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -71,11 +143,7 @@ pub struct Hdf5Appender {
     filter: Option<ColumnFilter>,
     compress: bool,
     debug: bool,
-    split_policy: SplitPolicy,
-    split_level: RunSplitLevel,
-    stream_runs: HashMap<StreamKey, RunId>,
-    device_runs: HashMap<DeviceRoute, RunId>,
-    global_run: RunId,
+    runs: RunTables,
     seen_debug: HashSet<String>,
     stats: ExportStats,
 }
@@ -95,11 +163,7 @@ impl Hdf5Appender {
             filter,
             compress,
             debug,
-            split_policy,
-            split_level,
-            stream_runs: HashMap::new(),
-            device_runs: HashMap::new(),
-            global_run: 0,
+            runs: RunTables::new(split_policy, split_level),
             seen_debug: HashSet::new(),
             stats: ExportStats::default(),
         })
@@ -107,68 +171,36 @@ impl Hdf5Appender {
 
     /// Append an already-decoded batch.
     pub fn write_batch(&mut self, batch: SampleBatch, key: StreamKey) -> Result<()> {
-        if self.should_split(batch.boundary.as_ref()) {
-            self.handle_discontinuity(&key);
+        if self
+            .runs
+            .observe(key, batch.generations(), batch.boundary())
+        {
+            self.stats.discontinuities_detected += 1;
         }
         if self.debug {
-            if let Some(boundary) = &batch.boundary {
+            if let Some(boundary) = batch.boundary() {
                 log::info!(
                     "[{}] sample_n={} boundary={:?}",
-                    batch.stream.name,
+                    batch.stream().name,
                     batch.first_sample().unwrap_or(0),
                     boundary.reason
                 );
             }
         }
-        self.write_chunks(&key, &[batch])
-    }
-
-    fn should_split(&self, boundary: Option<&Boundary>) -> bool {
-        !boundary.is_some_and(Boundary::is_initial)
-            && match self.split_policy {
-                SplitPolicy::Continuous => boundary.is_some_and(|b| !b.is_continuous()),
-                SplitPolicy::Monotonic => boundary.is_some_and(|b| !b.is_monotonic()),
-            }
-    }
-
-    fn handle_discontinuity(&mut self, key: &StreamKey) {
-        self.stats.discontinuities_detected += 1;
-        match self.split_level {
-            RunSplitLevel::None => {}
-            RunSplitLevel::PerStream => {
-                *self.stream_runs.entry(*key).or_insert(0) += 1;
-            }
-            RunSplitLevel::PerDevice => {
-                *self.device_runs.entry(key.route).or_insert(0) += 1;
-            }
-            RunSplitLevel::Global => {
-                self.global_run += 1;
-            }
-        }
-    }
-
-    /// Name of the compound table for this stream's current run.
-    fn table_name(&self, stream_name: &str, key: &StreamKey) -> String {
-        match self.split_level {
-            RunSplitLevel::None => stream_name.to_string(),
-            _ => {
-                let run = self.get_run_id(key).unwrap_or(0);
-                format!("{}_run{:06}", stream_name, run)
-            }
-        }
+        self.append_batch(&key, &batch)
     }
 
     pub fn finish(self) -> Result<ExportStats> {
         Ok(self.stats)
     }
 
-    fn write_chunks(&mut self, key: &StreamKey, chunks: &[SampleBatch]) -> Result<()> {
-        let Some(first) = chunks.first() else {
+    fn append_batch(&mut self, key: &StreamKey, batch: &SampleBatch) -> Result<()> {
+        if batch.is_empty() {
             return Ok(());
-        };
+        }
 
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
-        let stream_name = first.stream.name.clone();
+        let stream_name = batch.stream().name.clone();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
@@ -180,17 +212,17 @@ impl Hdf5Appender {
 
         // Apply the column filter; the parser already emits columns index-ordered.
         let mut valid: Vec<&Series> = Vec::new();
-        for col in &first.columns {
+        for col in batch.schema() {
             if let Some(f) = &self.filter {
-                let path = f.get_path_string(&key.route, &stream_name, &col.metadata.name);
+                let path = f.get_path_string(&key.route, &stream_name, &col.metadata().name);
                 if self.debug && self.seen_debug.insert(path.clone()) {
                     println!(
                         "[DEBUG] Filter: '{}' -> {}",
                         path,
-                        f.matches(&key.route, &stream_name, &col.metadata.name)
+                        f.matches(&key.route, &stream_name, &col.metadata().name)
                     );
                 }
-                if !f.matches(&key.route, &stream_name, &col.metadata.name) {
+                if !f.matches(&key.route, &stream_name, &col.metadata().name) {
                     continue;
                 }
             }
@@ -200,14 +232,18 @@ impl Hdf5Appender {
         if valid.is_empty() {
             return Ok(());
         }
-        valid.sort_by_key(|c| c.index);
+        valid.sort_by_key(|c| c.index());
 
         let group_path = if route_str.is_empty() {
             "/".to_string()
         } else {
             format!("/{}", route_str)
         };
-        let table_name = self.table_name(&stream_name, key);
+        // Each run of a stream is its own table in the route group.
+        let table_name = match self.runs.index(*key) {
+            Some(run) => format!("{stream_name}_run{run:06}"),
+            None => stream_name.clone(),
+        };
         let table_path = if group_path == "/" {
             format!("/{}", table_name)
         } else {
@@ -232,12 +268,12 @@ impl Hdf5Appender {
                 1,
             ));
             for (i, col) in valid.iter().enumerate() {
-                let ty = match col.values {
-                    ColumnVec::F64(_) => TypeDescriptor::Float(FloatSize::U8),
-                    ColumnVec::I64(_) => TypeDescriptor::Integer(IntSize::U8),
-                    ColumnVec::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
+                let ty = match col.values() {
+                    ColumnArray::F64(_) => TypeDescriptor::Float(FloatSize::U8),
+                    ColumnArray::I64(_) => TypeDescriptor::Integer(IntSize::U8),
+                    ColumnArray::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
                 };
-                fields.push(CompoundField::new(&col.metadata.name, ty, 0, i + 2));
+                fields.push(CompoundField::new(&col.metadata().name, ty, 0, i + 2));
             }
 
             // `to_c_repr` assigns aligned byte offsets and the total row size.
@@ -260,7 +296,7 @@ impl Hdf5Appender {
             };
             let ds = builder.create(table_name.as_str())?;
 
-            self.write_metadata_attributes(&ds, chunks.last().unwrap(), key)?;
+            self.write_metadata_attributes(&ds, batch, key)?;
             self.write_field_metadata(&ds, &valid)?;
 
             // Map each (already index-ordered) compound field to its data source.
@@ -271,7 +307,7 @@ impl Hdf5Appender {
                     let source = match f.index {
                         0 => FieldSource::Sample,
                         1 => FieldSource::Time,
-                        k => FieldSource::Column(valid[k - 2].index),
+                        k => FieldSource::Column(valid[k - 2].index()),
                     };
                     (f.offset, source)
                 })
@@ -287,7 +323,7 @@ impl Hdf5Appender {
             );
         }
 
-        let n: usize = chunks.iter().map(|c| c.len()).sum();
+        let n = batch.len();
         {
             let info = self.tables.get(&table_path).unwrap();
             let row_size = info.row_size;
@@ -295,42 +331,34 @@ impl Hdf5Appender {
 
             for (offset, source) in &info.fields {
                 let offset = *offset;
-                let mut row = 0;
-                for chunk in chunks {
-                    let clen = chunk.len();
-                    match source {
-                        FieldSource::Sample => {
-                            for i in 0..clen {
-                                let bytes = chunk.sample_numbers[i].to_ne_bytes();
-                                let base = (row + i) * row_size + offset;
-                                buf[base..base + bytes.len()].copy_from_slice(&bytes);
-                            }
+                match source {
+                    FieldSource::Sample => {
+                        for i in 0..n {
+                            let bytes = batch.sample_numbers()[i].to_ne_bytes();
+                            let base = i * row_size + offset;
+                            buf[base..base + bytes.len()].copy_from_slice(&bytes);
                         }
-                        FieldSource::Time => {
-                            for i in 0..clen {
-                                let bytes = chunk
-                                    .segment
-                                    .time_at(chunk.sample_numbers[i] + 1)
-                                    .to_ne_bytes();
-                                let base = (row + i) * row_size + offset;
+                    }
+                    FieldSource::Time => {
+                        for i in 0..n {
+                            let bytes = batch.timestamps()[i].to_ne_bytes();
+                            let base = i * row_size + offset;
+                            buf[base..base + 8].copy_from_slice(&bytes);
+                        }
+                    }
+                    FieldSource::Column(col_id) => {
+                        if let Some(col) = batch.schema().iter().find(|c| c.index() == *col_id) {
+                            for i in 0..n {
+                                let bytes = match col.values() {
+                                    ColumnArray::F64(v) => v[i].to_ne_bytes(),
+                                    ColumnArray::I64(v) => v[i].to_ne_bytes(),
+                                    ColumnArray::U64(v) => v[i].to_ne_bytes(),
+                                };
+                                let base = i * row_size + offset;
                                 buf[base..base + 8].copy_from_slice(&bytes);
                             }
                         }
-                        FieldSource::Column(col_id) => {
-                            if let Some(col) = chunk.columns.iter().find(|c| c.index == *col_id) {
-                                for i in 0..clen {
-                                    let bytes = match &col.values {
-                                        ColumnVec::F64(v) => v[i].to_ne_bytes(),
-                                        ColumnVec::I64(v) => v[i].to_ne_bytes(),
-                                        ColumnVec::U64(v) => v[i].to_ne_bytes(),
-                                    };
-                                    let base = (row + i) * row_size + offset;
-                                    buf[base..base + 8].copy_from_slice(&bytes);
-                                }
-                            }
-                        }
                     }
-                    row += clen;
                 }
             }
 
@@ -338,10 +366,9 @@ impl Hdf5Appender {
         }
 
         self.stats.total_samples += n as u64;
-        let last = chunks.last().unwrap();
-        if let (Some(first_n), Some(last_n)) = (first.first_sample(), last.last_sample()) {
-            let first_t = first.segment.time_at(first_n + 1);
-            let last_t = last.segment.time_at(last_n + 1);
+        if let (Some(&first_t), Some(&last_t)) =
+            (batch.timestamps().first(), batch.timestamps().last())
+        {
             self.stats.start_time = Some(self.stats.start_time.map_or(first_t, |t| t.min(first_t)));
             self.stats.end_time = Some(self.stats.end_time.map_or(last_t, |t| t.max(last_t)));
         }
@@ -383,15 +410,14 @@ impl Hdf5Appender {
         batch: &SampleBatch,
         key: &StreamKey,
     ) -> Result<()> {
-        let meta = &batch.segment;
+        let meta = &batch.segment();
         self.write_attr_scalar(loc, "sampling_rate", &meta.sampling_rate)?;
         self.write_attr_scalar(loc, "decimation", &meta.decimation)?;
         self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
         self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
-        self.write_attr_scalar(loc, "session_id", &batch.device.session_id)?;
+        self.write_attr_scalar(loc, "session_id", &batch.device().session_id)?;
 
-        let run_id = self.get_run_id(key);
-        if let Some(id) = run_id {
+        if let Some(id) = self.runs.index(*key) {
             self.write_attr_scalar(loc, "run_id", &id)?;
         }
 
@@ -418,24 +444,13 @@ impl Hdf5Appender {
         units.push(to_vlu("s"));
         descriptions.push(to_vlu("Time in seconds"));
         for col in valid {
-            units.push(to_vlu(&col.metadata.units));
-            descriptions.push(to_vlu(&col.metadata.description));
+            units.push(to_vlu(&col.metadata().units));
+            descriptions.push(to_vlu(&col.metadata().description));
         }
 
         self.write_attr_string_array(loc, "units", &units)?;
         self.write_attr_string_array(loc, "descriptions", &descriptions)?;
         Ok(())
-    }
-
-    fn get_run_id(&self, key: &StreamKey) -> Option<RunId> {
-        match self.split_level {
-            RunSplitLevel::None => None,
-            RunSplitLevel::PerStream => Some(self.stream_runs.get(key).copied().unwrap_or(0)),
-            RunSplitLevel::PerDevice => {
-                Some(self.device_runs.get(&key.route).copied().unwrap_or(0))
-            }
-            RunSplitLevel::Global => Some(self.global_run),
-        }
     }
 
     fn ensure_group(&self, path: &str) -> Result<()> {
@@ -479,4 +494,90 @@ impl Hdf5Appender {
 fn to_vlu(s: &str) -> VarLenUnicode {
     s.parse::<VarLenUnicode>()
         .unwrap_or_else(|_| "".parse().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::BoundaryReason;
+
+    fn key(stream_id: u8) -> StreamKey {
+        StreamKey::new(DeviceRoute::root(), stream_id)
+    }
+
+    /// Generations as the parser stamps them for a stream whose own run is `stream`:
+    /// only the boundaries after the initial one bump the shared generations.
+    fn generations(stream: u32) -> Generations {
+        Generations {
+            stream,
+            device: stream - 1,
+            global: stream - 1,
+        }
+    }
+
+    fn lost() -> Boundary {
+        Boundary {
+            reason: BoundaryReason::SamplesLost {
+                expected: 2,
+                received: 9,
+            },
+        }
+    }
+
+    #[test]
+    fn only_qualifying_boundaries_advance_the_table_index() {
+        let opened = [
+            Boundary {
+                reason: BoundaryReason::Initial,
+            },
+            lost(),
+            Boundary {
+                reason: BoundaryReason::SessionChanged { old: 1, new: 2 },
+            },
+        ];
+        // Data loss is still monotonic, so only the session change splits there.
+        for (policy, expected) in [
+            (SplitPolicy::Continuous, [0, 1, 2]),
+            (SplitPolicy::Monotonic, [0, 0, 1]),
+        ] {
+            let mut runs = RunTables::new(policy, RunSplitLevel::PerStream);
+            let indices: Vec<TableIndex> = opened
+                .iter()
+                .enumerate()
+                .map(|(run, boundary)| {
+                    runs.observe(key(1), generations(run as u32 + 1), Some(boundary));
+                    runs.index(key(1)).expect("split tables are numbered")
+                })
+                .collect();
+            assert_eq!(indices, expected, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn a_device_generation_moves_every_stream_of_the_device_to_one_table() {
+        let mut runs = RunTables::new(SplitPolicy::Continuous, RunSplitLevel::PerDevice);
+        runs.observe(
+            key(1),
+            generations(1),
+            Some(&Boundary {
+                reason: BoundaryReason::Initial,
+            }),
+        );
+        runs.observe(key(1), generations(2), Some(&lost()));
+        assert_eq!(runs.index(key(1)), Some(1));
+        // A stream that never saw the boundary reads the generation's table back.
+        assert_eq!(runs.index(key(2)), Some(1));
+
+        // Rows still stamped with the old generation land in the table in use.
+        assert!(!runs.observe(key(2), generations(1), None));
+        assert_eq!(runs.index(key(2)), Some(1));
+    }
+
+    #[test]
+    fn unsplit_tables_have_no_run_index() {
+        let mut runs = RunTables::new(SplitPolicy::Continuous, RunSplitLevel::None);
+        // The discontinuity is still reported, it just does not open a table.
+        assert!(runs.observe(key(1), generations(2), Some(&lost())));
+        assert_eq!(runs.index(key(1)), None);
+    }
 }

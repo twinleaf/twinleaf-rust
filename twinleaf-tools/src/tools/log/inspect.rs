@@ -1,10 +1,32 @@
 use super::progress::ByteProgress;
-use twinleaf::data::LogReader;
+use twinleaf::data::{BoundaryClass, LogFile, StreamSummary};
 use twinleaf::device::DeviceRoute;
 
+const BOUNDARY_CLASSES: [BoundaryClass; 5] = [
+    BoundaryClass::Startup,
+    BoundaryClass::Seamless,
+    BoundaryClass::DataLoss,
+    BoundaryClass::Reconfig,
+    BoundaryClass::Anomaly,
+];
+
+fn class_label(class: BoundaryClass) -> &'static str {
+    match class {
+        BoundaryClass::Seamless => "seamless",
+        BoundaryClass::Startup => "startup",
+        BoundaryClass::DataLoss => "data loss",
+        BoundaryClass::Reconfig => "reconfig",
+        BoundaryClass::Anomaly => "anomaly",
+    }
+}
+
+/// Formats a duration, or an offset that a backward timeline made negative.
 fn fmt_hms(secs: f64) -> String {
-    if !secs.is_finite() || secs <= 0.0 {
+    if !secs.is_finite() || secs == 0.0 {
         return "0s".to_string();
+    }
+    if secs < 0.0 {
+        return format!("-{}", fmt_hms(-secs));
     }
     let total = secs as u64;
     let h = total / 3600;
@@ -17,6 +39,29 @@ fn fmt_hms(secs: f64) -> String {
     } else {
         format!("{:.1}s", s)
     }
+}
+
+/// Warns when the samples a run declares cannot fit the time it spans.
+fn skew_note(run: &StreamSummary) -> String {
+    use console::style;
+
+    let declared = run.sample_count() as f64 / run.rate_hz();
+    let observed = match (run.first_timestamp(), run.last_timestamp()) {
+        (Some(a), Some(b)) => b - a,
+        _ => 0.0,
+    };
+    if !declared.is_finite() || declared <= 0.0 || (declared - observed).abs() / declared <= 0.05 {
+        return String::new();
+    }
+    format!(
+        "  {}",
+        style(format!(
+            "⚠ declared {} vs observed {}",
+            fmt_hms(declared),
+            fmt_hms(observed)
+        ))
+        .yellow()
+    )
 }
 
 pub fn log_inspect(files: Vec<String>) -> eyre::Result<()> {
@@ -33,7 +78,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     use console::style;
     use eyre::WrapErr;
 
-    let input = LogReader::open(std::path::Path::new(path))
+    let input = LogFile::open(std::path::Path::new(path))
         .wrap_err_with(|| format!("could not mmap {}", path))?;
     let total_bytes = input.len() as u64;
 
@@ -50,12 +95,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     });
     let summary = index.summary();
     if let Some(error) = summary.error() {
-        log::warn!(
-            "{}: parse error at offset {} ({:?}); stopping",
-            path,
-            error.offset(),
-            error.packet_error()
-        );
+        log::warn!("{}: {}; stopping", path, error);
     }
 
     if let Some(progress) = progress {
@@ -96,48 +136,44 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     if summary.streams().is_empty() {
         println!("   (no sample data seen)");
     } else {
-        for (key, s) in summary.streams() {
-            let rate_hz = s.rate_hz();
-            let declared = if rate_hz > 0.0 {
-                s.sample_count() as f64 / rate_hz
+        for (key, runs) in summary.streams() {
+            let Some(s) = runs.first() else { continue };
+            let samples: u64 = runs.iter().map(|run| run.sample_count()).sum();
+            let trailing = if runs.len() > 1 {
+                format!("  {}", style(format!("{} runs", runs.len())).yellow())
             } else {
-                0.0
-            };
-            let observed = match (s.first_timestamp(), s.last_timestamp()) {
-                (Some(a), Some(b)) => b - a,
-                _ => 0.0,
-            };
-            let skew = if declared > 0.0 {
-                (declared - observed).abs() / declared
-            } else {
-                0.0
-            };
-            let trailing = if skew > 0.05 && declared > 0.0 {
-                format!(
-                    "  {}",
-                    style(format!(
-                        "⚠ declared {} vs observed {}",
-                        fmt_hms(declared),
-                        fmt_hms(observed)
-                    ))
-                    .yellow()
-                )
-            } else {
-                String::new()
+                skew_note(s)
             };
             println!(
                 "   • {} {} {:<12} {:>6.0} {}  {:>4} {}  {:>10} {}{}",
                 key.route,
                 key.stream_id,
                 s.metadata().name,
-                rate_hz,
+                s.rate_hz(),
                 unit("Hz"),
                 s.columns().len(),
                 unit("cols"),
-                s.sample_count(),
+                samples,
                 unit("samples"),
                 trailing,
             );
+            if runs.len() > 1 {
+                let base = s.first_timestamp().unwrap_or(0.0);
+                for run in runs {
+                    println!(
+                        "        {} {:<9} {:>6.0} {} {:>10} {}  {} → {}{}",
+                        style(format!("run {}", run.run())).dim(),
+                        run.opened_by().map_or("—", class_label),
+                        run.rate_hz(),
+                        unit("Hz"),
+                        run.sample_count(),
+                        unit("samples"),
+                        fmt_hms(run.first_timestamp().unwrap_or(base) - base),
+                        fmt_hms(run.last_timestamp().unwrap_or(base) - base),
+                        skew_note(run),
+                    );
+                }
+            }
             if !s.columns().is_empty() {
                 let cols: Vec<String> = s
                     .columns()
@@ -162,17 +198,31 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     }
 
     println!();
-    let boundary_text = format!(
-        "{} session changes, {} segment changes",
-        summary.session_changes(),
-        summary.segment_changes()
-    );
-    let styled_boundaries = if summary.session_changes() > 0 || summary.segment_changes() > 0 {
-        style(boundary_text).yellow().to_string()
+    let counts: Vec<String> = BOUNDARY_CLASSES
+        .iter()
+        .filter(|class| summary.boundaries(**class) > 0)
+        .map(|class| format!("{} {}", summary.boundaries(*class), class_label(*class)))
+        .collect();
+    let disruptive = summary.boundaries(BoundaryClass::DataLoss)
+        + summary.boundaries(BoundaryClass::Reconfig)
+        + summary.boundaries(BoundaryClass::Anomaly);
+    let boundaries = if counts.is_empty() {
+        "none".to_string()
+    } else if disruptive > 0 {
+        style(counts.join(", ")).yellow().to_string()
     } else {
-        boundary_text
+        counts.join(", ")
     };
-    println!(" {} {}", label("Boundaries:"), styled_boundaries);
+    println!(" {} {}", label("Boundaries:"), boundaries);
+
+    let anomalies = summary.boundaries(BoundaryClass::Anomaly);
+    if anomalies > 0 {
+        let note = format!(
+            "{anomalies} timeline anomalies: timestamps in this log are untrustworthy (firmware or wire fault)"
+        );
+        log::warn!("{}: {}", path, note);
+        println!(" {}", style(format!("⚠ {note}")).red().bold());
+    }
     println!("{rule}");
 
     Ok(())

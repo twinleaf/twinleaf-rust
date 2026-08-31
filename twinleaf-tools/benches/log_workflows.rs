@@ -19,7 +19,7 @@ use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use twinleaf::data::{LogReader, PacketParser};
+use twinleaf::data::{LogFile, PacketParser};
 use twinleaf::device::DeviceRoute;
 use twinleaf_tools::tools::log::{log_csv, log_hdf, log_inspect};
 use twinleaf_tools::{SplitLevel, SplitPolicy};
@@ -110,16 +110,18 @@ fn path_string(path: &Path) -> String {
 
 /// Choose a stable CSV target before timing any workflow.
 fn discover_csv_target(input: &Path) -> eyre::Result<String> {
-    let mut input = LogReader::open(input)?;
+    let input = LogFile::open(input)?;
     let mut parser = PacketParser::new(DeviceRoute::root(), false);
 
-    while let Some(packet) = input.next_packet()? {
-        if let Some(batch) = parser.process_packet(&packet) {
-            let stream_id = batch.stream.stream_id;
-            return Ok(if batch.route.is_empty() {
+    for packet in input.packets() {
+        let packet = packet?;
+        parser.push_packet(&packet)?;
+        if let Some(batch) = parser.pop_batch() {
+            let stream_id = batch.stream().stream_id;
+            return Ok(if batch.route().is_empty() {
                 format!("/{stream_id}")
             } else {
-                format!("{}/{stream_id}", batch.route)
+                format!("{}/{stream_id}", batch.route())
             });
         }
     }
@@ -128,14 +130,15 @@ fn discover_csv_target(input: &Path) -> eyre::Result<String> {
 }
 
 fn run_decode(input: &Path) -> eyre::Result<RunStats> {
-    let mut input = LogReader::open(input)?;
+    let input = LogFile::open(input)?;
     let mut parser = PacketParser::new(DeviceRoute::root(), false);
     let mut stats = RunStats::default();
 
-    while let Some(packet) = input.next_packet()? {
+    for packet in input.packets() {
+        let packet = packet?;
         stats.packets += 1;
-        parser.push_packet(&packet);
-        while let Some(batch) = parser.next_batch() {
+        parser.push_packet(&packet)?;
+        while let Some(batch) = parser.pop_batch() {
             stats.batches += 1;
             stats.rows += batch.len() as u64;
             black_box(batch);
@@ -151,7 +154,7 @@ fn run_decode(input: &Path) -> eyre::Result<RunStats> {
 }
 
 fn run_indexed_decode(input: &Path) -> eyre::Result<RunStats> {
-    let input = LogReader::open(input)?;
+    let input = LogFile::open(input)?;
     let index = input.scan(DeviceRoute::root(), false);
     if let Some(error) = index.summary().error() {
         return Err(eyre::eyre!(error.to_string()));

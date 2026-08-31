@@ -1,4 +1,5 @@
 mod buffer;
+mod coalesce;
 mod filter;
 mod parser;
 mod pipeline;
@@ -11,10 +12,14 @@ pub mod export;
 
 pub use crate::tio::proto::identifiers::{ColumnKey, StreamId, StreamKey};
 pub use crate::tio::proto::DeviceRoute;
-pub use buffer::{clip, Buffer, ColumnVec, ColumnView, ColumnWindow, LatestRow, ReadError, RunId};
+pub use buffer::{Buffer, Run};
+pub use coalesce::BatchCoalescer;
 pub use filter::ColumnFilter;
-pub use parser::PacketParser;
-pub use pipeline::{ColumnOp, DerivedColumn};
-pub use reader::{LogIndex, LogReader, LogScanError, LogSummary, StreamSummary};
-pub use sample::{Boundary, BoundaryReason, ColumnData, SampleBatch, SampleRow, Series};
-pub use state::{DeviceMetadataSnapshot, StreamMetadataSnapshot};
+pub use parser::{PacketOutcome, PacketParser};
+pub use pipeline::{ColumnOp, ColumnProcessor};
+pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
+pub use sample::{
+    Boundary, BoundaryClass, BoundaryReason, ColumnArray, ColumnBuilder, ColumnData, Generations,
+    SampleBatch, SampleRow, ScalarBuffer, Series,
+};
+pub use state::{DeviceMetadataSnapshot, PacketError, StreamDataError, StreamMetadataSnapshot};
