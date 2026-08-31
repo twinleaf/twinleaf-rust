@@ -739,7 +739,7 @@ impl HealthState {
                 let affected: Vec<DeviceRoute> = self
                     .device_states
                     .keys()
-                    .filter(|route| subtree.relative_route(route).is_ok())
+                    .filter(|route| route.starts_with(&subtree))
                     .copied()
                     .collect();
                 for route in affected {
@@ -749,7 +749,7 @@ impl HealthState {
                 }
                 if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
                     for (key, st) in &mut self.stats {
-                        if subtree.relative_route(&key.route).is_ok() {
+                        if key.route.starts_with(&subtree) {
                             st.reset_timing();
                             st.rate_slope.reset();
                             st.received_count = 0;

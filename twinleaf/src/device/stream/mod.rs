@@ -69,13 +69,19 @@ enum Discovery {
 }
 
 /// Everything the connection's stream needs to stay live: the parser, the
-/// routes known and the metadata revision last seen for each, and where
-/// discovery stands.
+/// routes known and the metadata revision last seen for each, where discovery
+/// stands, and the latest link status per affected subtree.
 struct StreamState {
     parser: PacketParser,
     known_routes: HashSet<DeviceRoute>,
     metadata_seen: HashMap<DeviceRoute, u32>,
     discovery: HashMap<DeviceRoute, Discovery>,
+    /// Latest status per affected subtree, keyed by the subtree's root, so a
+    /// late subscriber learns the link state it did not watch happen. A new
+    /// status supersedes every entry under it, so a nested entry is always
+    /// newer than the one containing it: replaying root-first is replaying in
+    /// causal order.
+    link_state: HashMap<DeviceRoute, proto::ProxyStatus>,
     batches: VecDeque<SampleBatch>,
     events: VecDeque<Event>,
 }
@@ -87,6 +93,7 @@ impl StreamState {
             known_routes: HashSet::new(),
             metadata_seen: HashMap::new(),
             discovery: HashMap::new(),
+            link_state: HashMap::new(),
             batches: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -128,14 +135,24 @@ impl StreamState {
     }
 
     /// Bring a new event subscriber up to date with what the pump already
-    /// knows, filtered exactly as live events are.
+    /// knows — the routes heard from, each subtree's link state, the latest
+    /// metadata — filtered exactly as live events are.
     fn replay(&self, sink: &mut Sink<Event>) -> bool {
         self.known_routes.iter().all(|route| {
             sink.offer(Scope::point(*route), || Event::Tree {
                 route: *route,
                 event: TreeEvent::RouteDiscovered,
             })
-        }) && self.latest_metadata().all(|(route, snapshot)| {
+        }) && {
+            let mut link: Vec<_> = self.link_state.iter().collect();
+            link.sort_by_key(|(subtree, _)| subtree.len());
+            link.into_iter().all(|(subtree, status)| {
+                sink.offer(Scope::subtree(*subtree), || Event::Link {
+                    subtree: *subtree,
+                    event: LinkEvent::Status(*status),
+                })
+            })
+        } && self.latest_metadata().all(|(route, snapshot)| {
             sink.offer(Scope::point(route), || Event::Device {
                 route,
                 event: DeviceEvent::Metadata(snapshot),
@@ -227,9 +244,9 @@ impl StreamState {
     /// session there rediscovers.
     fn forget_metadata(&mut self, subtree: DeviceRoute) {
         self.metadata_seen
-            .retain(|route, _| subtree.relative_route(route).is_err());
+            .retain(|route, _| !route.starts_with(&subtree));
         self.discovery
-            .retain(|route, _| subtree.relative_route(route).is_err());
+            .retain(|route, _| !route.starts_with(&subtree));
         self.parser.reset_subtree(subtree);
     }
 
@@ -249,6 +266,8 @@ impl StreamState {
     /// direct connection, one mount behind a `tio proxy --mount` fan-in, which
     /// rewrites the status onto its mount prefix.
     fn apply_status(&mut self, subtree: DeviceRoute, status: proto::ProxyStatus) {
+        self.link_state.retain(|root, _| !root.starts_with(&subtree));
+        self.link_state.insert(subtree, status);
         self.events.push_back(Event::Link {
             subtree,
             event: LinkEvent::Status(status),
@@ -259,7 +278,7 @@ impl StreamState {
                 let refresh: Vec<_> = self
                     .known_routes
                     .iter()
-                    .filter(|route| subtree.relative_route(route).is_ok())
+                    .filter(|route| route.starts_with(&subtree))
                     .map(|route| Event::Device {
                         route: *route,
                         event: DeviceEvent::NewHash(None),
@@ -1539,6 +1558,90 @@ mod tests {
         assert!(
             commands.recv_timeout(Duration::from_millis(500)).is_err(),
             "a raw tap decodes nothing and discovers nothing"
+        );
+    }
+
+    /// Link state is a level, not an edge: a subscriber that joins during an
+    /// outage learns what it did not watch happen, and converges with one
+    /// that watched.
+    #[test]
+    fn a_late_subscriber_replays_the_link_state_it_did_not_watch() {
+        let (sink, early) = Sink::new(EVENT_QUEUE_LEN, everything());
+        let (handle, deliver, _commands, _endpoint, _worker) = pump(PumpSink::Events(sink));
+        let mount: DeviceRoute = "/2".parse().unwrap();
+        deliver.send(samples(0, mount)).unwrap();
+        deliver
+            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(mount))
+            .unwrap();
+        wait_for(&early, |event| {
+            matches!(
+                event,
+                Event::Link {
+                    event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected),
+                    ..
+                }
+            )
+        });
+
+        let late = subscribe(&handle, everything(), PumpSink::Events);
+        let first = late.recv_timeout(Duration::from_secs(5)).expect("replay");
+        assert!(
+            matches!(first, Event::Tree { route, event: TreeEvent::RouteDiscovered } if route == mount)
+        );
+        let second = late.recv_timeout(Duration::from_secs(5)).expect("replay");
+        assert!(
+            matches!(second, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if subtree == mount)
+        );
+
+        // A view pinned below the mount has no business with the route fact,
+        // but its own link state still reaches it.
+        let pinned = subscribe(&handle, exactly("/2/1"), PumpSink::Events);
+        assert!(matches!(
+            pinned.recv_timeout(Duration::from_secs(5)).expect("replay"),
+            Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if subtree == mount
+        ));
+    }
+
+    /// A status supersedes the stored state of every subtree it covers, so a
+    /// stale narrower fact never replays past the broader one that ended it.
+    #[test]
+    fn a_broader_status_supersedes_the_narrower_state_it_covers() {
+        let (sink, early) = Sink::new(EVENT_QUEUE_LEN, everything());
+        let (handle, deliver, _commands, _endpoint, _worker) = pump(PumpSink::Events(sink));
+        let mount: DeviceRoute = "/2".parse().unwrap();
+        deliver.send(samples(0, mount)).unwrap();
+        deliver
+            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(mount))
+            .unwrap();
+        deliver
+            .send(Packet::proxy_status(proto::ProxyStatus::SensorReconnected))
+            .unwrap();
+        wait_for(&early, |event| {
+            matches!(
+                event,
+                Event::Link {
+                    event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected),
+                    ..
+                }
+            )
+        });
+
+        let late = subscribe(&handle, everything(), PumpSink::Events);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let replayed: Vec<Event> = std::iter::from_fn(|| late.recv_deadline(deadline).ok()).collect();
+        assert!(replayed.iter().any(|event| matches!(
+            event,
+            Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected) } if *subtree == DeviceRoute::root()
+        )));
+        assert!(
+            !replayed.iter().any(|event| matches!(
+                event,
+                Event::Link {
+                    event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected),
+                    ..
+                }
+            )),
+            "the mount's stale disconnect outlived the reconnect that covered it"
         );
     }
 

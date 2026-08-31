@@ -101,9 +101,19 @@ impl ProxyClient {
     }
 
     fn try_send(&self, pkt: &Packet) -> bool {
-        // ProxyStatus should be route-agnostic
+        // A status concerns the subtree at its route. Clamp it into this
+        // port's coordinates — its own root when the whole port is inside the
+        // affected subtree — and skip it when the two subtrees are disjoint.
+        // The forwarding flags never apply: a status is the reset marker every
+        // port needs, whatever it forwards.
         if pkt.ptype() == PacketType::PROXY_STATUS {
-            return self.tx.try_send(pkt.clone()).is_ok();
+            let clamped = match self.scope.relative_route(&pkt.route()) {
+                Ok(below) if below.len() <= self.depth => below,
+                Ok(_) => return true,
+                Err(_) if self.scope.starts_with(&pkt.route()) => DeviceRoute::root(),
+                Err(_) => return true,
+            };
+            return self.tx.try_send(pkt.with_route(clamped)).is_ok();
         }
 
         let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.route()) {
@@ -1331,6 +1341,53 @@ mod tests {
         assert_eq!(second.recv().unwrap().unwrap(), b"second");
         assert!(core.rpc_map.is_empty());
         assert!(core.rpc_timeouts.is_empty());
+    }
+
+    /// A status names a subtree, so a scoped port must receive it in its own
+    /// coordinates — never in the proxy's — and never for a disjoint mount.
+    #[test]
+    fn a_status_is_clamped_into_the_ports_subtree_or_skipped() {
+        let status = |route: &str| {
+            Packet::proxy_status(proto::ProxyStatus::SensorDisconnected)
+                .with_route(route.parse().unwrap())
+        };
+        let client = |scope: &str, depth: usize| {
+            let (tx, delivered) = channel::unbounded();
+            let (_up, rx) = channel::unbounded::<Packet>();
+            (
+                ProxyClient::new(
+                    tx,
+                    rx,
+                    Duration::from_secs(1),
+                    scope.parse().unwrap(),
+                    depth,
+                    true,
+                    true,
+                ),
+                delivered,
+            )
+        };
+
+        let (deep, delivered) = client("/1", twinleaf_proto::MAX_ROUTING_SIZE);
+        assert!(deep.try_send(&status("/")));
+        assert!(deep.try_send(&status("/1/3")));
+        assert!(deep.try_send(&status("/2")));
+        let routes: Vec<DeviceRoute> = delivered.try_iter().map(|pkt| pkt.route()).collect();
+        assert_eq!(
+            routes,
+            [DeviceRoute::root(), "/3".parse().unwrap()],
+            "clamped into port coordinates, the disjoint mount skipped"
+        );
+
+        let (shallow, delivered) = client("/1", 0);
+        assert!(shallow.try_send(&status("/1")));
+        assert!(shallow.try_send(&status("/1/3")));
+        let routes: Vec<DeviceRoute> = delivered.try_iter().map(|pkt| pkt.route()).collect();
+        assert_eq!(
+            routes,
+            [DeviceRoute::root()],
+            "a subtree past the port's depth is not its business"
+        );
     }
 
     #[test]

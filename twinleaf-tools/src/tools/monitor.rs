@@ -950,7 +950,7 @@ impl MonitorState {
                 let affected: Vec<_> = self
                     .discovered_routes
                     .iter()
-                    .filter(|route| subtree.relative_route(route).is_ok())
+                    .filter(|route| route.starts_with(&subtree))
                     .copied()
                     .collect();
                 for route in affected {

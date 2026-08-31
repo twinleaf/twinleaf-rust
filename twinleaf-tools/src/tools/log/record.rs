@@ -112,18 +112,23 @@ impl Described {
             .is_some_and(|stream| stream.segment().segment_id == segment_id)
     }
 
-    /// Splice everything the event lane has published into the file.
-    fn drain_events(&mut self, rec: &mut Recorder, events: &Receiver<Event>) -> eyre::Result<()> {
+    /// Splice everything the event lane has published into the file. False
+    /// once the lane has lagged: the gate no longer matches what the file
+    /// says, so nothing is written until the caller resubscribes and the
+    /// fresh lane's replay redescribes every stream.
+    fn drain_events(&mut self, rec: &mut Recorder, events: &Receiver<Event>) -> eyre::Result<bool> {
         loop {
-            let event = match events.try_recv() {
-                Ok(Some(event)) => event,
-                Ok(None) | Err(RecvError::Disconnected) | Err(RecvError::Timeout) => return Ok(()),
-                Err(RecvError::Lagged(skipped)) => {
-                    log::warn!("dropped {skipped} events");
-                    continue;
+            match events.try_recv() {
+                Ok(Some(event)) => self.apply(rec, event)?,
+                Ok(None) | Err(RecvError::Disconnected) | Err(RecvError::Timeout) => {
+                    return Ok(true)
                 }
-            };
-            self.apply(rec, event)?;
+                Err(RecvError::Lagged(skipped)) => {
+                    log::warn!("dropped {skipped} events; resubscribing to redescribe the streams");
+                    self.0.clear();
+                    return Ok(false);
+                }
+            }
         }
     }
 
@@ -145,9 +150,7 @@ impl Described {
             Event::Link {
                 subtree,
                 event: LinkEvent::Status(ProxyStatus::SensorDisconnected),
-            } => self
-                .0
-                .retain(|route, _| subtree.relative_route(route).is_err()),
+            } => self.0.retain(|route, _| !route.starts_with(&subtree)),
             Event::Link { .. } | Event::Tree { .. } | Event::Device { .. } => {}
         }
         Ok(())
@@ -155,13 +158,18 @@ impl Described {
 
     /// Record a data packet, but only once the file describes the very segment
     /// it carries, so every recorded sample decodes from the file alone, and
-    /// decodes as what it was. Anything else is not this recorder's to write.
+    /// decodes as what it was. A status passes through ungated: it is the
+    /// marker replay resets on, splitting the runs where the live stream did
+    /// — the one signal left when a device reconnects within one session.
     fn write_data(&self, rec: &mut Recorder, pkt: &tio::Packet) -> eyre::Result<()> {
-        let tio::proto::Payload::Samples(samples) = pkt.payload() else {
-            return Ok(());
-        };
-        if self.covers(pkt.route(), samples.stream_id, samples.segment_id) {
-            rec.write(pkt.with_ttl(0)?)?;
+        match pkt.payload() {
+            tio::proto::Payload::Samples(samples) => {
+                if self.covers(pkt.route(), samples.stream_id, samples.segment_id) {
+                    rec.write(pkt.with_ttl(0)?)?;
+                }
+            }
+            tio::proto::Payload::ProxyStatus(_) => rec.write(pkt.with_ttl(0)?)?,
+            _ => {}
         }
         Ok(())
     }
@@ -309,7 +317,7 @@ fn log_parsed(
     // description has not been spliced in yet is dropped rather than recorded
     // under the description it replaces.
     let packets = tree.packets();
-    let events = tree.events();
+    let mut events = tree.events();
     let batches = tree.samples();
 
     let mut described = Described::default();
@@ -320,7 +328,9 @@ fn log_parsed(
             Err(error) => return Err(error.wrap_err("stream ended")),
         };
 
-        described.drain_events(&mut rec, &events)?;
+        if !described.drain_events(&mut rec, &events)? {
+            events = tree.events();
+        }
         count_lost_samples(&mut rec, &batches);
         described.write_data(&mut rec, &pkt)?;
 
@@ -579,6 +589,138 @@ mod tests {
             recorded,
             [(1, vec![0]), (2, vec![1])],
             "each recorded sample is read back under the session that sent it"
+        );
+    }
+
+    /// A link drop leaves the device's session, segment, and numbering
+    /// untouched — the common reconnect — so the recorded status is the only
+    /// thing telling replay to split the runs where the live stream did.
+    #[test]
+    fn a_same_session_reconnect_replays_as_two_runs() {
+        let route = DeviceRoute::root();
+        let path = scratch_file("same-session");
+        let mut rec = recorder(&path);
+        let mut file = Described::default();
+
+        file.apply(&mut rec, described(1, route)).unwrap();
+        file.write_data(&mut rec, &samples(0, route)).unwrap();
+        file.write_data(
+            &mut rec,
+            &Packet::proxy_status(ProxyStatus::SensorDisconnected),
+        )
+        .unwrap();
+        file.apply(
+            &mut rec,
+            Event::Link {
+                subtree: route,
+                event: LinkEvent::Status(ProxyStatus::SensorDisconnected),
+            },
+        )
+        .unwrap();
+        file.apply(&mut rec, described(1, route)).unwrap();
+        file.write_data(&mut rec, &samples(5, route)).unwrap();
+        drop(rec);
+
+        let log = LogFile::open(&path).expect("the recorded log");
+        let runs: Vec<(bool, u32)> = log
+            .scan(DeviceRoute::root(), false)
+            .batches(1)
+            .map(|batch| {
+                let batch = batch.expect("the recorded log decodes");
+                (batch.is_initial(), batch.sample_numbers()[0].value())
+            })
+            .collect();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            runs,
+            [(true, 0), (true, 5)],
+            "the recorded disconnect opens a new run on replay"
+        );
+    }
+
+    /// Behind `--mount`, the marker carries its subtree: replay resets only
+    /// the mount that bounced.
+    #[test]
+    fn a_mounted_disconnect_marker_resets_only_its_subtree_on_replay() {
+        let steady: DeviceRoute = "/1".parse().unwrap();
+        let bounced: DeviceRoute = "/2".parse().unwrap();
+        let path = scratch_file("mounted-marker");
+        let mut rec = recorder(&path);
+        let mut file = Described::default();
+
+        for route in [steady, bounced] {
+            file.apply(&mut rec, described(1, route)).unwrap();
+            file.write_data(&mut rec, &samples(0, route)).unwrap();
+        }
+        file.write_data(
+            &mut rec,
+            &Packet::proxy_status(ProxyStatus::SensorDisconnected).with_route(bounced),
+        )
+        .unwrap();
+        file.apply(
+            &mut rec,
+            Event::Link {
+                subtree: bounced,
+                event: LinkEvent::Status(ProxyStatus::SensorDisconnected),
+            },
+        )
+        .unwrap();
+        file.apply(&mut rec, described(1, bounced)).unwrap();
+        for route in [steady, bounced] {
+            file.write_data(&mut rec, &samples(1, route)).unwrap();
+        }
+        drop(rec);
+
+        let log = LogFile::open(&path).expect("the recorded log");
+        let runs: Vec<(DeviceRoute, bool, u32)> = log
+            .scan(DeviceRoute::root(), false)
+            .batches(1)
+            .map(|batch| {
+                let batch = batch.expect("the recorded log decodes");
+                (
+                    batch.route(),
+                    batch.is_initial(),
+                    batch.sample_numbers()[0].value(),
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            runs,
+            [
+                (steady, true, 0),
+                (bounced, true, 0),
+                (steady, false, 1),
+                (bounced, true, 1),
+            ],
+            "only the bounced mount's run splits at the marker"
+        );
+    }
+
+    /// What `drain_events` does on `Lagged`: the gate clears, samples stop
+    /// being written, and the fresh lane's replayed description reopens the
+    /// file — never a sample under a description the lag made stale.
+    #[test]
+    fn a_lagged_event_lane_drops_samples_until_redescribed() {
+        let route = DeviceRoute::root();
+        let path = scratch_file("lagged");
+        let mut rec = recorder(&path);
+        let mut file = Described::default();
+
+        file.apply(&mut rec, described(1, route)).unwrap();
+        file.write_data(&mut rec, &samples(0, route)).unwrap();
+        file.0.clear();
+        file.write_data(&mut rec, &samples(1, route)).unwrap();
+        file.apply(&mut rec, described(1, route)).unwrap();
+        file.write_data(&mut rec, &samples(2, route)).unwrap();
+        drop(rec);
+
+        let recorded = recorded_sessions(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            recorded,
+            [(1, vec![0]), (1, vec![2])],
+            "nothing was recorded while the gate distrusted itself"
         );
     }
 
