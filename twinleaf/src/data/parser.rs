@@ -204,9 +204,11 @@ impl PacketParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{Boundary, BoundaryClass, ColumnArray, Generations, StreamDataError};
+    use crate::data::{
+        Boundary, BoundaryClass, BoundaryReason, Buffer, ColumnArray, Generations, StreamDataError,
+    };
     use bytes::Bytes;
-    use proto::identifiers::MAX_SAMPLE_NUMBER;
+    use proto::identifiers::{ColumnKey, StreamKey, MAX_SAMPLE_NUMBER};
     use proto::meta::{
         ColumnMetadata, DeviceMetadata, MetadataContent, MetadataEpoch, MetadataFilter,
         MetadataPayload, SegmentMetadata, StreamMetadata,
@@ -265,14 +267,34 @@ mod tests {
         sampling_rate: u32,
         decimation: u32,
     ) {
-        for content in [
-            MetadataContent::Device(DeviceMetadata {
+        announce_schema_for(
+            parser,
+            DeviceMetadata {
                 serial_number: "SN123".to_string(),
                 firmware_hash: "fw".to_string(),
                 n_streams: 1,
                 session_id: 42,
                 name: "test-device".to_string(),
-            }),
+            },
+            column_types,
+            sample_size,
+            n_segments,
+            sampling_rate,
+            decimation,
+        );
+    }
+
+    fn announce_schema_for(
+        parser: &mut PacketParser,
+        device: DeviceMetadata,
+        column_types: &[DataType],
+        sample_size: usize,
+        n_segments: usize,
+        sampling_rate: u32,
+        decimation: u32,
+    ) {
+        for content in [
+            MetadataContent::Device(device),
             MetadataContent::Stream(StreamMetadata {
                 stream_id: STREAM_ID,
                 name: "test-stream".to_string(),
@@ -720,6 +742,178 @@ mod tests {
             }
         );
         assert!(after.is_initial(), "the reconnect opens a new run");
+    }
+
+    #[test]
+    fn a_replacement_device_cannot_join_the_previous_devices_buffer_run() {
+        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut buffer = Buffer::new(128);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the first device's batch");
+        let before_generations = before.generations();
+        buffer.process_batch(&before);
+
+        announce_schema_for(
+            &mut parser,
+            DeviceMetadata {
+                serial_number: "SN456".to_string(),
+                firmware_hash: "replacement-fw".to_string(),
+                n_streams: 1,
+                session_id: 42,
+                name: "replacement-device".to_string(),
+            },
+            &[DataType::Float32],
+            4,
+            1,
+            1,
+            1,
+        );
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid replacement rows");
+        let after = parser.pop_batch().expect("the replacement device's batch");
+
+        assert_eq!(
+            after.generations(),
+            Generations {
+                stream: before_generations.stream + 1,
+                device: before_generations.device + 1,
+                global: before_generations.global + 1,
+            }
+        );
+        assert!(after.is_initial(), "a replacement device opens a new run");
+        buffer.process_batch(&after);
+
+        let key = StreamKey::new(DeviceRoute::root(), STREAM_ID);
+        let run = buffer.get_run(&key).expect("the replacement run");
+        assert_eq!(run.retained_rows(), 0..1);
+        assert_eq!(
+            buffer
+                .latest_row(&key)
+                .expect("the replacement row")
+                .device()
+                .serial_number,
+            "SN456"
+        );
+    }
+
+    #[test]
+    fn firmware_change_without_a_session_change_opens_a_new_run() {
+        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the old firmware's batch");
+
+        announce_schema_for(
+            &mut parser,
+            DeviceMetadata {
+                serial_number: "SN123".to_string(),
+                firmware_hash: "new-fw".to_string(),
+                n_streams: 1,
+                session_id: 42,
+                name: "test-device".to_string(),
+            },
+            &[DataType::Float32],
+            4,
+            1,
+            1,
+            1,
+        );
+        parser
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .expect("valid rows under the new firmware");
+        let after = parser.pop_batch().expect("the new firmware's batch");
+
+        assert_eq!(after.generations().stream, before.generations().stream + 1);
+        assert_eq!(after.generations().device, before.generations().device + 1);
+        assert_eq!(after.generations().global, before.generations().global + 1);
+        assert!(after.is_initial(), "the firmware schema starts a new run");
+    }
+
+    #[test]
+    fn session_change_keeps_its_specific_boundary_and_opens_a_new_run() {
+        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the old session's batch");
+
+        announce_schema_for(
+            &mut parser,
+            DeviceMetadata {
+                serial_number: "SN123".to_string(),
+                firmware_hash: "fw".to_string(),
+                n_streams: 1,
+                session_id: 43,
+                name: "test-device".to_string(),
+            },
+            &[DataType::Float32],
+            4,
+            1,
+            1,
+            1,
+        );
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows in the new session");
+        let after = parser.pop_batch().expect("the new session's batch");
+
+        assert_eq!(after.generations().stream, before.generations().stream + 1);
+        assert_eq!(after.generations().device, before.generations().device + 1);
+        assert_eq!(after.generations().global, before.generations().global + 1);
+        assert!(matches!(
+            after.boundary().map(|boundary| &boundary.reason),
+            Some(BoundaryReason::SessionChanged { old: 42, new: 43 })
+        ));
+    }
+
+    #[test]
+    fn changed_schema_cannot_reuse_the_previous_run_identity() {
+        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut buffer = Buffer::new(128);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the old schema's batch");
+        let before_generations = before.generations();
+        buffer.process_batch(&before);
+
+        // Contradicting an already-used column invalidates the route. The
+        // device then re-announces the complete replacement schema.
+        parser
+            .push_packet(&metadata_packet(MetadataContent::Column(ColumnMetadata {
+                stream_id: STREAM_ID,
+                index: 0,
+                data_type: DataType::Float64,
+                name: "wide".to_string(),
+                units: String::new(),
+                description: String::new(),
+            })))
+            .expect("the changed column triggers rediscovery");
+        announce_schema(&mut parser, &[DataType::Float64], 8, 1, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 8]))
+            .expect("valid rows under the new schema");
+        let after = parser.pop_batch().expect("the new schema's batch");
+
+        assert_eq!(after.generations().stream, before_generations.stream + 1);
+        assert_eq!(after.generations().device, before_generations.device + 1);
+        assert_eq!(after.generations().global, before_generations.global + 1);
+        buffer.process_batch(&after);
+        let key = StreamKey::new(DeviceRoute::root(), STREAM_ID);
+        let run = buffer.get_run(&key).expect("the new schema's run");
+        assert_eq!(run.retained_rows(), 0..1);
+        assert_eq!(run.stream().sample_size, 8);
+        assert_eq!(
+            buffer
+                .column_metadata(&ColumnKey::new(DeviceRoute::root(), STREAM_ID, 0))
+                .expect("the new column")
+                .data_type,
+            DataType::Float64
+        );
     }
 
     #[test]

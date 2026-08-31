@@ -66,7 +66,7 @@ impl CsvOutput {
                 "{}.{}.{}.csv",
                 self.prefix,
                 route_label,
-                batch.stream().name
+                filename_component(&batch.stream().name)
             );
             if !self.force && std::path::Path::new(&path).exists() {
                 return Err(eyre::eyre!("output {} already exists", path)
@@ -83,8 +83,12 @@ impl CsvOutput {
             self.path = Some(path);
 
             let output_path = self.path.as_deref().unwrap_or_default();
-            writeln!(self.writer.as_mut().unwrap(), "{}", self.header.join(","))
-                .wrap_err_with(|| format!("failed to write {}", output_path))?;
+            writeln!(
+                self.writer.as_mut().unwrap(),
+                "{}",
+                csv_header(&self.header)
+            )
+            .wrap_err_with(|| format!("failed to write {}", output_path))?;
         }
 
         let output_path = self.path.as_deref().unwrap_or_default();
@@ -297,5 +301,50 @@ fn route_filename_label(route: &DeviceRoute) -> String {
             .map(|hop| hop.to_string())
             .collect::<Vec<_>>()
             .join(".")
+    }
+}
+
+fn csv_header(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            if field.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", field.replace('"', "\"\""))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn filename_component(name: &str) -> String {
+    let escaped: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if escaped.is_empty() {
+        "unnamed".to_string()
+    } else {
+        escaped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_header_quotes_special_column_names() {
+        assert_eq!(
+            csv_header(&["time".to_string(), "x,\"quoted\"".to_string()]),
+            "time,\"x,\"\"quoted\"\"\""
+        );
     }
 }

@@ -43,7 +43,10 @@ fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String])
 
 fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
     let mut device = Device::new(port);
-    let peer_addr = stream.peer_addr().unwrap();
+    let peer_addr = stream.peer_addr().map_or_else(
+        |error| format!("<unknown: {error}>"),
+        |peer| peer.to_string(),
+    );
     println!("Connection from: {}", peer_addr);
 
     'outer: loop {

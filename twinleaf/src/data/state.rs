@@ -221,7 +221,7 @@ enum RowState<'a> {
 #[derive(Debug, Clone)]
 struct StreamState {
     metadata: Option<Arc<StreamMetadata>>,
-    segments: HashMap<u8, Arc<SegmentMetadata>>,
+    segments: Vec<Option<Arc<SegmentMetadata>>>,
     columns: Vec<Arc<ColumnMetadata>>,
 
     stream_id: u8,
@@ -242,7 +242,7 @@ impl StreamState {
     fn new(stream_id: u8) -> Self {
         Self {
             metadata: None,
-            segments: HashMap::new(),
+            segments: Vec::new(),
             columns: Vec::new(),
             stream_id,
             current_segment_id: 0,
@@ -255,6 +255,18 @@ impl StreamState {
             last_time_ref_session_id: 0,
             effective_rate: 0.0,
         }
+    }
+
+    fn segment(&self, segment_id: u8) -> Option<&Arc<SegmentMetadata>> {
+        self.segments.get(usize::from(segment_id))?.as_ref()
+    }
+
+    fn set_segment(&mut self, segment: SegmentMetadata) {
+        let index = usize::from(segment.segment_id);
+        if self.segments.len() <= index {
+            self.segments.resize(index + 1, None);
+        }
+        self.segments[index] = Some(Arc::new(segment));
     }
 
     /// Describe the metadata still needed before this stream can be decoded.
@@ -270,7 +282,7 @@ impl StreamState {
                 missing.push(MetadataRequest::stream(self.stream_id));
             }
         }
-        if !self.segments.contains_key(&self.current_segment_id) {
+        if self.segment(self.current_segment_id).is_none() {
             missing.push(MetadataRequest::segment(
                 self.current_segment_id,
                 self.stream_id,
@@ -469,20 +481,20 @@ impl StreamState {
         // is behind where we already are, evict it so we fall back to synthesis
         // below and re-request the real metadata instead of rewinding time.
         if data.segment_id != self.last_segment_id {
-            if let Some(seg) = self.segments.get(&data.segment_id) {
+            if let Some(seg) = self.segment(data.segment_id) {
                 if self.established && seg.decimation != 0 && seg.sampling_rate != 0 {
                     let half_period =
                         0.5 * f64::from(seg.decimation) / f64::from(seg.sampling_rate);
                     if seg.time_at(data.first_sample_n) < self.last_timestamp - half_period {
-                        self.segments.remove(&data.segment_id);
+                        self.segments[usize::from(data.segment_id)] = None;
                     }
                 }
             }
         }
 
         let (segment, is_segment_rollover) = match (
-            self.segments.get(&data.segment_id).cloned(),
-            self.segments.get(&self.last_segment_id).cloned(),
+            self.segment(data.segment_id).cloned(),
+            self.segment(self.last_segment_id).cloned(),
         ) {
             (Some(seg), _) => {
                 let is_segment_rollover =
@@ -594,7 +606,7 @@ impl StreamState {
         }
         Some(StreamMetadataSnapshot {
             stream: self.metadata.as_ref()?.clone(),
-            segment: self.segments.get(&self.current_segment_id)?.clone(),
+            segment: self.segment(self.current_segment_id)?.clone(),
             columns: self.columns.clone(),
         })
     }
@@ -612,7 +624,7 @@ enum MetadataSource {
 #[derive(Clone)]
 struct DeviceState {
     metadata: Option<Arc<DeviceMetadata>>,
-    streams: HashMap<u8, StreamState>,
+    streams: Vec<Option<StreamState>>,
     ignore_session: bool,
     metadata_rpcs_in_flight: usize,
     generation: u32,
@@ -622,7 +634,7 @@ impl DeviceState {
     fn new(ignore_session: bool) -> Self {
         Self {
             metadata: None,
-            streams: HashMap::new(),
+            streams: Vec::new(),
             ignore_session,
             metadata_rpcs_in_flight: 0,
             generation: 0,
@@ -630,15 +642,19 @@ impl DeviceState {
     }
 
     fn stream_mut(&mut self, stream_id: u8) -> &mut StreamState {
-        self.streams
-            .entry(stream_id)
-            .or_insert_with(|| StreamState::new(stream_id))
+        let index = usize::from(stream_id);
+        if self.streams.len() <= index {
+            self.streams.resize_with(index + 1, || None);
+        }
+        self.streams[index].get_or_insert_with(|| StreamState::new(stream_id))
     }
 
-    fn forget_all_metadata(&mut self) {
-        self.metadata = None;
-        self.streams.clear();
-        self.metadata_rpcs_in_flight = 0;
+    /// Bootstrap this route again after metadata contradicted the state used
+    /// to decode earlier rows. Preserve each stream's run counter so rebuilt
+    /// metadata cannot reuse an existing run identity.
+    fn forget_all_metadata(&mut self, global_generation: &mut u32) {
+        self.reset();
+        *global_generation += 1;
     }
 
     /// As [`StreamState::reset`] across every stream, opening a new device
@@ -647,12 +663,12 @@ impl DeviceState {
         self.metadata = None;
         self.metadata_rpcs_in_flight = 0;
         self.generation += 1;
-        for stream in self.streams.values_mut() {
+        for stream in self.streams.iter_mut().flatten() {
             stream.reset();
         }
     }
 
-    fn accepts_stream(&mut self, stream_id: u8) -> bool {
+    fn accepts_stream(&mut self, stream_id: u8, global_generation: &mut u32) -> bool {
         if self
             .metadata
             .as_ref()
@@ -660,7 +676,7 @@ impl DeviceState {
         {
             // An impossible stream id means our device description is stale or
             // corrupt. Bootstrap the route again instead of retaining it.
-            self.forget_all_metadata();
+            self.forget_all_metadata(global_generation);
             false
         } else {
             true
@@ -668,57 +684,65 @@ impl DeviceState {
     }
 
     /// Merge one metadata record into this route's decoding state.
-    fn apply_metadata(&mut self, metadata: &MetadataContent, source: MetadataSource) {
+    fn apply_metadata(
+        &mut self,
+        metadata: &MetadataContent,
+        source: MetadataSource,
+        global_generation: &mut u32,
+    ) {
         match metadata {
             MetadataContent::Device(incoming) => {
                 if let Some(current) = &self.metadata {
                     if current.serial_number != incoming.serial_number {
-                        self.streams.clear();
-                    } else if (current.session_id != incoming.session_id)
-                        || (current.firmware_hash != incoming.firmware_hash)
-                    {
-                        for stream in self.streams.values_mut() {
+                        self.forget_all_metadata(global_generation);
+                    } else if current.session_id != incoming.session_id {
+                        // Keeping continuity state lets the first rows under the
+                        // new metadata report a specific SessionChanged boundary.
+                        for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
+                    } else if current.firmware_hash != incoming.firmware_hash {
+                        // A firmware change can alter a schema without changing
+                        // the session or timeline, so it must explicitly end all
+                        // current runs rather than relying on boundary detection.
+                        self.forget_all_metadata(global_generation);
                     }
                 }
                 self.metadata = Some(Arc::new(incoming.clone()));
             }
             MetadataContent::Stream(incoming) => {
-                if !self.accepts_stream(incoming.stream_id) {
+                if !self.accepts_stream(incoming.stream_id, global_generation) {
                     return;
                 }
                 let stream = self.stream_mut(incoming.stream_id);
                 if let Some(current) = &stream.metadata {
                     if current.as_ref() != incoming {
                         // This should never happen: stream metadata is constant.
-                        self.forget_all_metadata();
+                        self.forget_all_metadata(global_generation);
                     }
                 } else {
                     stream.metadata = Some(Arc::new(incoming.clone()));
                 }
             }
             MetadataContent::Segment(incoming) => {
-                if !self.accepts_stream(incoming.stream_id) {
+                if !self.accepts_stream(incoming.stream_id, global_generation) {
                     return;
                 }
                 let stream = self.stream_mut(incoming.stream_id);
-                stream
-                    .segments
-                    .insert(incoming.segment_id, Arc::new(incoming.clone()));
+                stream.set_segment(incoming.clone());
                 if source == MetadataSource::Update {
                     stream.current_segment_id = incoming.segment_id;
                 }
             }
             MetadataContent::Column(incoming) => {
-                if !self.accepts_stream(incoming.stream_id) {
+                if !self.accepts_stream(incoming.stream_id, global_generation) {
                     return;
                 }
                 let stream = self.stream_mut(incoming.stream_id);
                 if incoming.index < stream.columns.len() {
                     if stream.columns[incoming.index].as_ref() != incoming {
                         // This should never happen: columns are constant.
-                        self.forget_all_metadata();
+                        self.forget_all_metadata(global_generation);
                     }
                 } else if incoming.index == stream.columns.len() {
                     stream.columns.push(Arc::new(incoming.clone()));
@@ -729,21 +753,25 @@ impl DeviceState {
     }
 
     /// Apply packets that update decoding state but do not contain sample rows.
-    fn apply_control_payload(&mut self, payload: &tio::proto::Payload) {
+    fn apply_control_payload(
+        &mut self,
+        payload: &tio::proto::Payload,
+        global_generation: &mut u32,
+    ) {
         match payload {
             tio::proto::Payload::RpcReply(reply) if reply.id == META_RPC_ID => {
                 self.metadata_rpcs_in_flight = self.metadata_rpcs_in_flight.saturating_sub(1);
                 for metadata in decode_metadata_reply(&reply.reply) {
-                    self.apply_metadata(&metadata, MetadataSource::Reply);
+                    self.apply_metadata(&metadata, MetadataSource::Reply, global_generation);
                 }
             }
             tio::proto::Payload::Metadata(update) => {
-                self.apply_metadata(&update.content, MetadataSource::Update)
+                self.apply_metadata(&update.content, MetadataSource::Update, global_generation)
             }
             tio::proto::Payload::Heartbeat(tio::proto::HeartbeatPayload::Session(session_id)) => {
                 if let Some(device) = &self.metadata {
                     if device.session_id != *session_id && !self.ignore_session {
-                        for stream in self.streams.values_mut() {
+                        for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
                         self.metadata = None;
@@ -768,13 +796,16 @@ impl DeviceState {
         let Some(device_metadata) = self.metadata.as_ref().cloned() else {
             return Ok(RowState::WaitingForMetadata);
         };
-        if !self.accepts_stream(data.stream_id) {
+        if !self.accepts_stream(data.stream_id, global_generation) {
             return Ok(RowState::WaitingForMetadata);
         }
 
-        self.streams
-            .entry(data.stream_id)
-            .or_insert_with(|| StreamState::new(data.stream_id))
+        let index = usize::from(data.stream_id);
+        if self.streams.len() <= index {
+            self.streams.resize_with(index + 1, || None);
+        }
+        self.streams[index]
+            .get_or_insert_with(|| StreamState::new(data.stream_id))
             .validate_rows(
                 data,
                 route,
@@ -799,7 +830,7 @@ impl DeviceState {
         match self.metadata.as_ref() {
             Some(device) => {
                 for stream_id in 1..=device.n_streams as u8 {
-                    if let Some(stream) = self.streams.get(&stream_id) {
+                    if let Some(stream) = self.streams.get(usize::from(stream_id)).and_then(Option::as_ref) {
                         missing.extend(stream.missing_metadata());
                     } else {
                         missing.push(MetadataRequest::stream(stream_id));
@@ -820,7 +851,7 @@ impl DeviceState {
         for stream_id in 1..=device.n_streams as u8 {
             streams.insert(
                 stream_id,
-                self.streams.get(&stream_id)?.metadata_snapshot()?,
+                self.streams.get(usize::from(stream_id))?.as_ref()?.metadata_snapshot()?,
             );
         }
         Some(DeviceMetadataSnapshot { device, streams })
@@ -840,7 +871,7 @@ pub(super) enum PacketEvent<'a> {
 pub(super) struct ParseState {
     root_route: DeviceRoute,
     ignore_session: bool,
-    devices: HashMap<DeviceRoute, DeviceState>,
+    devices: Vec<(DeviceRoute, DeviceState)>,
     global_generation: u32,
 }
 
@@ -849,16 +880,25 @@ impl ParseState {
         Self {
             root_route,
             ignore_session,
-            devices: HashMap::new(),
+            devices: Vec::new(),
             global_generation: 0,
         }
     }
 
+    fn device_index(&mut self, route: DeviceRoute) -> usize {
+        match self.devices.iter().position(|(known, _)| *known == route) {
+            Some(index) => index,
+            None => {
+                self.devices
+                    .push((route, DeviceState::new(self.ignore_session)));
+                self.devices.len() - 1
+            }
+        }
+    }
+
     fn device_mut(&mut self, route: DeviceRoute) -> &mut DeviceState {
-        let ignore_session = self.ignore_session;
-        self.devices
-            .entry(route)
-            .or_insert_with(|| DeviceState::new(ignore_session))
+        let index = self.device_index(route);
+        &mut self.devices[index].1
     }
 
     pub(super) fn apply_packet<'a>(
@@ -884,12 +924,9 @@ impl ParseState {
 
         match &packet.payload {
             proto::Payload::StreamData(data) => {
-                let ignore_session = self.ignore_session;
-                let device = self
-                    .devices
-                    .entry(route)
-                    .or_insert_with(|| DeviceState::new(ignore_session));
-                let state = device
+                let index = self.device_index(route);
+                let state = self.devices[index]
+                    .1
                     .validate_stream_data(data, route, &mut self.global_generation)
                     .map_err(|source| PacketError::Stream {
                         route,
@@ -902,7 +939,10 @@ impl ParseState {
                 })
             }
             payload => {
-                self.device_mut(route).apply_control_payload(payload);
+                let index = self.device_index(route);
+                self.devices[index]
+                    .1
+                    .apply_control_payload(payload, &mut self.global_generation);
                 Ok(PacketEvent::Applied)
             }
         }
@@ -912,13 +952,13 @@ impl ParseState {
     /// survive, so no stamp from before the reset can be reused after it.
     pub(super) fn reset(&mut self) {
         self.global_generation += 1;
-        for device in self.devices.values_mut() {
+        for (_, device) in &mut self.devices {
             device.reset();
         }
     }
 
     pub(super) fn take_requests(&mut self) -> Vec<tio::Packet> {
-        let routes: Vec<_> = self.devices.keys().copied().collect();
+        let routes: Vec<_> = self.devices.iter().map(|(route, _)| *route).collect();
         let mut out = Vec::new();
         for route in routes {
             out.extend(self.take_requests_for(route));
@@ -941,11 +981,11 @@ impl ParseState {
     }
 
     pub(super) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
-        self.devices.get(&route)?.metadata_snapshot()
+        self.devices.iter().find(|(known, _)| *known == route)?.1.metadata_snapshot()
     }
 
     pub(super) fn routes(&self) -> Vec<DeviceRoute> {
-        self.devices.keys().copied().collect()
+        self.devices.iter().map(|(route, _)| *route).collect()
     }
 }
 
