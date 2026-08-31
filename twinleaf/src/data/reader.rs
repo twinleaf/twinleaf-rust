@@ -1,10 +1,10 @@
 //! Seekable and indexed access to immutable TIO log files.
 
-use super::keys::StreamKey;
 use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{Boundary, BoundaryClass, SampleBatch};
+use super::sample::StreamKey;
+use super::sample::{sample_time, Boundary, BoundaryClass, SampleBatch};
 use super::state::{PacketError, ScannedRows};
-use super::{ColumnRecord, DeviceRecord, SegmentExt, SegmentRecord, StreamRecord};
+use super::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
 use memmap2::Mmap;
@@ -142,8 +142,8 @@ impl StreamSummary {
         self.segment.get()
     }
 
-    pub fn columns(&self) -> &[ColumnRecord] {
-        &self.columns
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
+        self.columns.iter().map(ColumnRecord::get)
     }
 
     pub fn sample_count(&self) -> u64 {
@@ -184,8 +184,12 @@ impl LogSummary {
         self.packet_count
     }
 
-    pub fn devices(&self) -> &BTreeMap<tio::proto::DeviceRoute, DeviceRecord> {
-        &self.devices
+    pub fn devices(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (tio::proto::DeviceRoute, wire::Device<'_>)> + '_ {
+        self.devices
+            .iter()
+            .map(|(&route, device)| (route, device.get()))
     }
 
     /// Runs of each stream, in the order they were scanned.
@@ -231,8 +235,8 @@ impl LogSummary {
         stream.sample_count += rows.row_count() as u64;
 
         let (first_n, last_n) = rows.sample_number_bounds();
-        let first_timestamp = rows.segment().get().time_at(first_n + 1);
-        let last_timestamp = rows.segment().get().time_at(last_n + 1);
+        let first_timestamp = sample_time(rows.segment().get(), first_n.value() + 1);
+        let last_timestamp = sample_time(rows.segment().get(), last_n.value() + 1);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp
@@ -461,7 +465,7 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::records::{column, device, segment, stream};
+    use crate::data::fixtures::{column, device, segment, stream};
     use crate::data::{Generations, StreamDataError};
     use crate::tio::proto::{DataType, DeviceRoute};
 
@@ -565,7 +569,8 @@ mod tests {
 
         let summary = log.scan(DeviceRoute::root(), true);
         let summary = summary.summary();
-        let runs = &summary.streams()[&StreamKey::new(DeviceRoute::root(), 1)];
+        let runs = &summary.streams()
+            [&StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(1))];
 
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run(), 1);
@@ -594,7 +599,8 @@ mod tests {
 
         let summary = log.scan(DeviceRoute::root(), true);
         let summary = summary.summary();
-        let runs = &summary.streams()[&StreamKey::new(DeviceRoute::root(), 1)];
+        let runs = &summary.streams()
+            [&StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(1))];
 
         assert_eq!(summary.boundaries(BoundaryClass::Anomaly), 1);
         assert_eq!(runs.len(), 2);

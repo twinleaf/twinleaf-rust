@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{CaptureCli, TioOpts};
 use twinleaf::device::capture::{read_capture, CaptureReadout};
-use twinleaf::tio::proxy;
+use twinleaf::Connection;
 
 pub fn run_capture(capture_cli: CaptureCli) -> eyre::Result<()> {
     capture(&capture_cli.tio, capture_cli.rpc_name, capture_cli.timeout)
@@ -11,8 +11,8 @@ pub fn run_capture(capture_cli: CaptureCli) -> eyre::Result<()> {
 pub fn capture(tio: &TioOpts, rpc_name: String, timeout: Duration) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let proxy = proxy::Connection::open(&tio.root);
-    let device = proxy.device(tio.route);
+    let connection = Connection::open(&tio.root);
+    let device = connection.device(tio.route);
 
     let readout = read_capture(&device, &rpc_name, timeout)
         .wrap_err_with(|| format!("failed to read capture {}", rpc_name))?;

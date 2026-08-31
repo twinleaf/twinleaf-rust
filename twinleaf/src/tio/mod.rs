@@ -1,6 +1,8 @@
 //! The raw TIO packet layer: transports, the multiplexing proxy, and the wire
-//! codec. Reach for it only to see or forge packets; everything else belongs to
-//! [`Connection`](proxy::Connection) and [`DeviceTree`](crate::DeviceTree).
+//! codec. This is wire and proxy-server plumbing, not the application story:
+//! reach for it only to forge packets or to serve a proxy. Applications open a
+//! [`Connection`](crate::Connection), whose views hand out
+//! [`Packet`]s, events and samples already filtered to what they cover.
 
 pub(crate) mod os;
 pub mod proto;

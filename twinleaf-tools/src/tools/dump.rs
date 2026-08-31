@@ -1,9 +1,10 @@
 use crate::tools::recv_before;
-use crate::{DumpCli, ProxyHelp, TioOpts};
+use crate::{DumpCli, TioOpts};
 use std::time::Instant;
 use twinleaf::data::{ColumnFilter, SampleBatch, SampleRow};
-use twinleaf::device::{DeviceRoute, RecvError, RecvTimeoutError};
-use twinleaf::tio::{self, proxy};
+use twinleaf::device::DeviceRoute;
+use twinleaf::tio;
+use twinleaf::Connection;
 use twinleaf_proto::data;
 
 pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
@@ -33,80 +34,44 @@ pub fn dump(
         None
     };
 
-    let proxy = proxy::Connection::open(&tio.root);
+    let connection = Connection::open(&tio.root);
     let route = tio.route;
-    let port_depth = depth.unwrap_or(twinleaf_proto::MAX_ROUTING_SIZE);
+    let tree = connection.tree(route);
+    let tree = depth.map_or_else(|| tree.clone(), |depth| tree.to_depth(depth));
 
     let deadline = duration.map(|duration| Instant::now() + duration);
 
     log::info!("dumping from {} (route {})", tio.root, route);
 
-    // The packet modes read the wire directly; only sample mode parses.
-    let raw_port = |what: &str| {
-        proxy::open_port(&proxy, None, route, port_depth, true, true)
-            .wrap_err_with(|| format!("could not open {what} port on {}", tio.root))
-            .with_proxy_help()
-    };
-
     match (data, meta) {
         // Raw mode (no flags): dump all packets
         (false, false) => {
-            let port = raw_port("packet")?;
-            while let Some(pkt) = recv_before(&port, deadline)
-                .map_err(|error| eyre::Report::new(error).wrap_err("stream ended"))?
+            let packets = tree.packets();
+            while let Some(pkt) =
+                recv_before(&packets, deadline, "packets").wrap_err("stream ended")?
             {
-                let abs_pkt = pkt.with_route(route.absolute_route(&pkt.route())?);
-                println!("{:?}", abs_pkt);
+                println!("{:?}", pkt);
             }
         }
 
         // Metadata-only mode (-m): filter to metadata packets
         (false, true) => {
-            let port = raw_port("metadata")?;
-            while let Some(pkt) = recv_before(&port, deadline)
-                .map_err(|error| eyre::Report::new(error).wrap_err("stream ended"))?
+            let packets = tree.packets();
+            while let Some(pkt) =
+                recv_before(&packets, deadline, "packets").wrap_err("stream ended")?
             {
                 if let tio::proto::Payload::Metadata(record, _) = pkt.payload() {
-                    let abs_route = route.absolute_route(&pkt.route())?;
-                    print_metadata_record(&abs_route, record);
+                    print_metadata_record(&pkt.route(), record);
                 }
             }
         }
 
-        // Sample mode (-d or -d -m): use DeviceTree for parsed samples
+        // Sample mode (-d or -d -m): parsed samples
         (true, _) => {
-            let tree = proxy
-                .tree_with(route, port_depth, None)
-                .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
-                .with_proxy_help()?;
-            let batches = tree
-                .subscribe()
-                .wrap_err("could not start the data stream")
-                .with_proxy_help()?;
-
-            loop {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    break;
-                }
-                let next = match deadline {
-                    Some(deadline) => batches.recv_deadline(deadline),
-                    None => match batches.recv() {
-                        Ok(batch) => Ok(batch),
-                        Err(RecvError::Lagged(skipped)) => Err(RecvTimeoutError::Lagged(skipped)),
-                        Err(RecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
-                    },
-                };
-                let batch = match next {
-                    Ok(batch) => batch,
-                    Err(RecvTimeoutError::Lagged(skipped)) => {
-                        log::warn!("dropped {skipped} sample batches");
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(error @ RecvTimeoutError::Disconnected) => {
-                        return Err(eyre::Report::new(error).wrap_err("stream ended"));
-                    }
-                };
+            let batches = tree.samples();
+            while let Some(batch) =
+                recv_before(&batches, deadline, "sample batches").wrap_err("stream ended")?
+            {
                 let sample_route = batch.route();
                 // Schema questions are answered once per batch.
                 let matched = filter.as_ref().is_none_or(|f| {

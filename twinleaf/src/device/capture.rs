@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-use crate::data::DataTypeExt;
 use crate::device::{CallError, Device};
 use crate::tio::proto::DataType;
 use twinleaf_proto::capture as wire;
@@ -66,7 +65,7 @@ impl CaptureMetadata {
     }
 
     pub fn data_type_label(&self) -> String {
-        self.data_type.type_name()
+        self.data_type.to_string()
     }
 
     pub fn x_value_f64(&self, index: usize) -> f64 {

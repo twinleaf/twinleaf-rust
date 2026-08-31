@@ -16,7 +16,7 @@ use twinleaf::device::Device;
 use twinleaf::firmware::{
     self, github::GithubCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
 };
-use twinleaf::tio::proxy;
+use twinleaf::Connection;
 
 pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
     if upgrade_cli.all {
@@ -34,9 +34,9 @@ pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
 fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
     // A single connection to the hub is reused for discovery and every device;
     // per-device RPC ports are opened on it rather than new connections.
-    let hub = proxy::Connection::open(&tio.root);
+    let hub = Connection::open(&tio.root);
 
-    let tree = hub.tree();
+    let tree = hub.tree(twinleaf::DeviceRoute::root());
     let routes = tree.discover_routes(ROUTE_DISCOVERY_WINDOW);
     if routes.is_empty() {
         return Err(eyre::eyre!("no active devices found on {}", tio.root)
@@ -65,7 +65,10 @@ fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
         );
 
         // One device's failure shouldn't stop the rest.
-        let result = check_and_upgrade(&tree.device(route), skip_confirm);
+        let result = match tree.device(route) {
+            Ok(device) => check_and_upgrade(&device, skip_confirm),
+            Err(error) => Err(error.into()),
+        };
         if let Err(e) = result {
             failures += 1;
             println!("{}", style(format!("  error: {:#}", e)).red());
@@ -334,12 +337,12 @@ fn download_and_flash(
     flash_with_progress(device, &firmware_data)
 }
 
-/// Open a session on one device. The returned [`proxy::Connection`] owns the
+/// Open a session on one device. The returned [`Connection`] owns the
 /// connection and must be kept alive for as long as the device is used.
-fn open_device(tio: &TioOpts) -> eyre::Result<(proxy::Connection, Device)> {
-    let proxy = proxy::Connection::open(&tio.root);
-    let device = proxy.device(tio.route);
-    Ok((proxy, device))
+fn open_device(tio: &TioOpts) -> eyre::Result<(Connection, Device)> {
+    let connection = Connection::open(&tio.root);
+    let device = connection.device(tio.route);
+    Ok((connection, device))
 }
 
 fn confirm(prompt: &str, skip_confirm: bool) -> eyre::Result<bool> {

@@ -1,10 +1,14 @@
-//! The [`Connection`] and the packet [`Port`]s that multiplex one transport.
+//! Wire and server plumbing: the [`Connection`] and the packet [`Port`]s that
+//! multiplex one transport.
 //!
 //! A proxy thread owns the hardware port and fans it out to any number of
 //! `Port`s, each restricted to a subtree and a traffic class, negotiating the
-//! serial rate on the way. `Port` is the raw half; the device layer builds its
-//! trees, devices, and streams on the same connection.
+//! serial rate on the way. This is what a proxy *server* serves its clients
+//! with; applications reach devices through [`Connection`](crate::Connection),
+//! whose views hand out packets, events and samples already filtered to what
+//! they cover.
 
+use super::proto::route::RouteError;
 use super::proto::{self, DeviceRoute, Packet, ProxyStatus};
 use super::proxy_core::{ProxyClient, ProxyCommand, ProxyCore};
 use super::transport;
@@ -215,16 +219,26 @@ pub enum PortError {
     RpcTimeoutTooShort,
     #[error("RPC timeout too long")]
     RpcTimeoutTooLong,
+    /// The worker's command lane is full. Transient: it is still running, and
+    /// the same request may succeed once it drains.
+    #[error("the proxy is busy")]
+    ProxyBusy,
+    /// The proxy worker has stopped. Terminal.
     #[error("failed to set up new proxy client")]
     FailedNewClientSetup,
 }
 
+/// The RPC budget a caller gets without asking, and the range it may ask for.
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_millis(3000);
+const MIN_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn checked_rpc_timeout(timeout: Option<Duration>) -> Result<Duration, PortError> {
-    let timeout = timeout.unwrap_or(Duration::from_millis(3000));
-    if timeout < Duration::from_millis(100) {
+    let timeout = timeout.unwrap_or(DEFAULT_RPC_TIMEOUT);
+    if timeout < MIN_RPC_TIMEOUT {
         return Err(PortError::RpcTimeoutTooShort);
     }
-    if timeout > Duration::from_secs(60) {
+    if timeout > MAX_RPC_TIMEOUT {
         return Err(PortError::RpcTimeoutTooLong);
     }
     Ok(timeout)
@@ -238,8 +252,8 @@ pub(crate) type RawCallResult = Result<Vec<u8>, RawCallError>;
 /// This deliberately contains no device-layer decoding or registry concepts.
 #[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum RawCallError {
-    #[error("RPC route exceeds endpoint scope")]
-    InvalidRoute,
+    #[error("RPC route exceeds endpoint scope: {0}")]
+    InvalidRoute(#[source] RouteError),
     #[error("RPC request was not submitted to the proxy")]
     RequestNotSubmitted,
     #[error("RPC timed out in the proxy")]
@@ -259,6 +273,9 @@ pub(crate) enum RawCallError {
 #[derive(Clone)]
 pub(crate) struct ProxyHandle {
     commands: channel::Sender<ProxyCommand>,
+    /// Disconnects when the worker stops. A queued command outlives the
+    /// worker's receiver, so a stranded port never disconnects on its own.
+    worker_alive: channel::Receiver<()>,
     client_rx_channel_size: usize,
     client_tx_channel_size: usize,
 }
@@ -267,9 +284,11 @@ impl ProxyHandle {
     /// Queue a port for the worker to adopt, never waiting on a worker that may
     /// be blocked acquiring a transport that never opens.
     fn register_port(&self, client: ProxyClient) -> Result<(), PortError> {
-        self.commands
-            .try_send(ProxyCommand::OpenPort { client })
-            .map_err(|_| PortError::FailedNewClientSetup)
+        match self.commands.try_send(ProxyCommand::OpenPort { client }) {
+            Ok(()) => Ok(()),
+            Err(channel::TrySendError::Full(_)) => Err(PortError::ProxyBusy),
+            Err(channel::TrySendError::Disconnected(_)) => Err(PortError::FailedNewClientSetup),
+        }
     }
 
     fn open_port(
@@ -316,6 +335,15 @@ impl RpcEndpoint {
         self.scope
     }
 
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Disconnects when the proxy worker stops.
+    pub(crate) fn worker_alive(&self) -> &channel::Receiver<()> {
+        &self.proxy.worker_alive
+    }
+
     pub(crate) fn submit(
         &self,
         route: DeviceRoute,
@@ -325,9 +353,9 @@ impl RpcEndpoint {
         let relative = self
             .scope
             .relative_route(&route)
-            .map_err(|_| RawCallError::InvalidRoute)?;
+            .map_err(RawCallError::InvalidRoute)?;
         if relative.len() > self.depth {
-            return Err(RawCallError::InvalidRoute);
+            return Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree));
         }
         let request = Packet::rpc_request(name, args, 0, route)
             .map_err(|_| RawCallError::RequestNotSubmitted)?;
@@ -347,13 +375,45 @@ impl RpcEndpoint {
         &self.proxy.commands
     }
 
-    /// The same capability narrowed to `depth` levels under `scope`.
-    pub(crate) fn scoped(&self, scope: DeviceRoute, depth: usize) -> RpcEndpoint {
-        RpcEndpoint {
+    /// The same capability narrowed to exactly `scope`, which this endpoint
+    /// must already cover: no view may widen its own authority.
+    pub(crate) fn scoped(&self, scope: DeviceRoute) -> Result<RpcEndpoint, RouteError> {
+        Ok(RpcEndpoint {
+            depth: 0,
+            ..self.subtree(scope)?
+        })
+    }
+
+    /// The same capability narrowed to the subtree at `scope`, keeping the
+    /// depth that remains below it.
+    pub(crate) fn subtree(&self, scope: DeviceRoute) -> Result<RpcEndpoint, RouteError> {
+        let below = self.scope.relative_route(&scope)?.len();
+        let Some(depth) = self.depth.checked_sub(below) else {
+            return Err(RouteError::OutsideSubtree);
+        };
+        Ok(RpcEndpoint {
             proxy: self.proxy.clone(),
             scope,
             depth,
             timeout: self.timeout,
+        })
+    }
+
+    /// The same capability reaching no deeper than `depth`. Narrowing only:
+    /// a view may not reach past what it was given.
+    pub(crate) fn to_depth(&self, depth: usize) -> RpcEndpoint {
+        RpcEndpoint {
+            depth: depth.min(self.depth),
+            ..self.clone()
+        }
+    }
+
+    /// The same capability on a different RPC budget, clamped to the range the
+    /// proxy accepts: a view is never worth failing over one.
+    pub(crate) fn with_timeout(&self, timeout: Duration) -> RpcEndpoint {
+        RpcEndpoint {
+            timeout: timeout.clamp(MIN_RPC_TIMEOUT, MAX_RPC_TIMEOUT),
+            ..self.clone()
         }
     }
 
@@ -371,18 +431,25 @@ impl RpcEndpoint {
         )
     }
 
-    /// Test-only endpoint with no proxy behind it. Returns the endpoint and
-    /// the far end receiving the commands it submits.
+    /// Test-only endpoint with no proxy behind it. Returns the endpoint, the
+    /// far end receiving the commands it submits, and the lifeline the worker
+    /// would hold: dropping it is the worker stopping.
     #[cfg(test)]
     pub(crate) fn test_pair(
         scope: DeviceRoute,
         depth: usize,
-    ) -> (RpcEndpoint, channel::Receiver<ProxyCommand>) {
+    ) -> (
+        RpcEndpoint,
+        channel::Receiver<ProxyCommand>,
+        channel::Sender<()>,
+    ) {
         let (commands, receiver) = channel::bounded(16);
+        let (alive, worker_alive) = channel::bounded(0);
         (
             RpcEndpoint {
                 proxy: ProxyHandle {
                     commands,
+                    worker_alive,
                     client_rx_channel_size: 4,
                     client_tx_channel_size: 4,
                 },
@@ -391,14 +458,16 @@ impl RpcEndpoint {
                 timeout: Duration::from_secs(3),
             },
             receiver,
+            alive,
         )
     }
 }
 
-/// A live link to one device tree, over serial, TCP, or UDP.
+/// The transport half of a link to one device tree, over serial, TCP, or UDP.
 ///
 /// Opening one starts the I/O thread that owns the transport and reconnects on
-/// its own; [`tree`](Connection::tree) is the way from here to devices.
+/// its own. This is the half a proxy server runs on;
+/// [`Connection`](crate::Connection) is what an application opens.
 pub struct Connection {
     proxy: ProxyHandle,
 }
@@ -426,6 +495,7 @@ impl Connection {
             }
         };
         let url_string = url.to_string();
+        let (alive, worker_alive) = channel::bounded(0);
         thread::spawn(move || {
             #[cfg(target_os = "windows")]
             let _priority = super::os::windows_helpers::ActivityGuard::latency_critical()
@@ -442,12 +512,14 @@ impl Connection {
                 command_receiver,
                 status_sender,
                 only_clients,
+                alive,
             );
             proxy.run();
         });
         Connection {
             proxy: ProxyHandle {
                 commands: command_sender,
+                worker_alive,
                 client_rx_channel_size: client_rx_channel_size(),
                 client_tx_channel_size: client_tx_channel_size(),
             },
@@ -470,7 +542,9 @@ impl Connection {
 }
 
 /// Open a raw packet port on `connection`, filtered to `depth` levels under
-/// `scope`. Prefer [`DeviceTree`](crate::DeviceTree) unless you need packets.
+/// `scope`: one client of the proxy mux, which is what a server hands out.
+/// Applications tap the wire with
+/// [`DeviceTree::packets`](crate::DeviceTree::packets) instead.
 pub fn open_port(
     connection: &Connection,
     rpc_timeout: Option<Duration>,
@@ -560,7 +634,7 @@ mod tests {
     fn endpoint_submits_an_absolute_routed_call_without_a_caller_id() {
         let scope: DeviceRoute = "/1".parse().unwrap();
         let route: DeviceRoute = "/1/2".parse().unwrap();
-        let (endpoint, commands) = RpcEndpoint::test_pair(scope, 1);
+        let (endpoint, commands, _worker) = RpcEndpoint::test_pair(scope, 1);
 
         let _pending = endpoint.submit(route, "dev.name", b"arg").unwrap();
         let ProxyCommand::Call {
@@ -587,7 +661,7 @@ mod tests {
     /// the caller: `tio dump -r tcp://<unreachable>` has to reach its deadline.
     #[test]
     fn opening_a_port_does_not_wait_for_a_worker_that_never_answers() {
-        let (endpoint, commands) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+        let (endpoint, commands, _worker) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
 
         let _port = endpoint.open_port(true, true).expect("the port is queued");
 
@@ -599,9 +673,28 @@ mod tests {
 
     #[test]
     fn opening_a_port_fails_once_the_worker_is_gone() {
-        let (endpoint, commands) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+        let (endpoint, commands, _worker) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
         drop(commands);
 
+        assert!(matches!(
+            endpoint.open_port(true, true),
+            Err(PortError::FailedNewClientSetup)
+        ));
+    }
+
+    /// A congested command lane says nothing about whether the worker lives,
+    /// so it must never be reported as the worker being gone.
+    #[test]
+    fn a_full_command_lane_is_distinct_from_a_stopped_worker() {
+        let (endpoint, commands, worker) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+        while endpoint.open_port(true, true).is_ok() {}
+
+        assert!(matches!(
+            endpoint.open_port(true, true),
+            Err(PortError::ProxyBusy)
+        ));
+        drop(worker);
+        drop(commands);
         assert!(matches!(
             endpoint.open_port(true, true),
             Err(PortError::FailedNewClientSetup)
@@ -611,17 +704,17 @@ mod tests {
     #[test]
     fn endpoint_rejects_routes_outside_its_scope_or_depth() {
         let scope: DeviceRoute = "/1".parse().unwrap();
-        let (endpoint, commands) = RpcEndpoint::test_pair(scope, 1);
+        let (endpoint, commands, _worker) = RpcEndpoint::test_pair(scope, 1);
 
         let outside: DeviceRoute = "/2".parse().unwrap();
         assert!(matches!(
             endpoint.submit(outside, "dev.name", b""),
-            Err(RawCallError::InvalidRoute)
+            Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree))
         ));
         let too_deep: DeviceRoute = "/1/2/3".parse().unwrap();
         assert!(matches!(
             endpoint.submit(too_deep, "dev.name", b""),
-            Err(RawCallError::InvalidRoute)
+            Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree))
         ));
         assert!(commands.is_empty());
     }

@@ -776,12 +776,13 @@ fn advertise_tcp(instance: &str, host_name: &str, port: u16) -> Option<MdnsServi
     Some(MdnsService { daemon, fullname })
 }
 
-/// Discover the device routes on `connection` and return the `dev.name` of
-/// each, over the one shared connection.
+/// Discover the device routes on `interface` and return the `dev.name` of
+/// each, over the link the server already owns.
 #[cfg(feature = "mdns")]
-fn discover_sensor_models(connection: &proxy::Connection) -> Vec<String> {
-    let tree = connection.tree();
-    tree.named_routes(MDNS_ROUTE_WINDOW)
+fn discover_sensor_models(interface: &proxy::Connection) -> Vec<String> {
+    twinleaf::Connection::over(interface)
+        .tree(proto::DeviceRoute::root())
+        .named_routes(MDNS_ROUTE_WINDOW)
         .into_iter()
         .filter_map(|nr| nr.name)
         .collect()

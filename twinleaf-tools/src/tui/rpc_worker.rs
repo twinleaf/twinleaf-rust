@@ -41,7 +41,8 @@ pub struct RegistryQueue {
 impl RegistryQueue {
     pub fn new(tree: DeviceTree) -> RegistryQueue {
         let (requests, results) = spawn("twinleaf-registry", move |route| {
-            (route, tree.rpc_registry(route).map_err(|e| e.to_string()))
+            let registry = tree.rpc_registry(route).map_err(|e| e.to_string());
+            (route, registry)
         });
         RegistryQueue {
             requests,

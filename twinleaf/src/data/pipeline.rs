@@ -104,10 +104,11 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::records;
+    use crate::data::fixtures;
+    use crate::data::metadata::buffer_type;
     use crate::data::sample::{BatchContext, SampleBatchBuilder};
     use crate::data::ColumnData;
-    use crate::data::{ColumnId, ColumnRecord, DataTypeExt, DeviceRecord, SampleNumber};
+    use crate::data::{ColumnRecord, DeviceRecord};
     use crate::data::{SegmentRecord, StreamRecord};
     use crate::tio::proto::{DataType, DeviceRoute};
     use twinleaf_proto::data as wire;
@@ -153,20 +154,23 @@ mod tests {
     fn fixture() -> Fixture {
         let route = DeviceRoute::root();
         let stream_id = 1;
-        let column_id: ColumnId = 0;
+        let column_id = twinleaf_proto::ColumnId::new(0);
 
-        let device = DeviceRecord::encode(records::device()).unwrap();
+        let device = DeviceRecord::encode(fixtures::device()).unwrap();
         let stream = StreamRecord::encode(wire::Stream {
             sample_size: 0,
             buf_samples: 1024,
-            ..records::stream(stream_id)
+            ..fixtures::stream(stream_id)
         })
         .unwrap();
-        let segment = SegmentRecord::encode(records::segment(stream_id)).unwrap();
-        let column_metadata =
-            ColumnRecord::encode(records::column(stream_id, column_id as u8, DataType::F64))
-                .unwrap();
-        let column_key = ColumnKey::new(route, stream_id, column_id);
+        let segment = SegmentRecord::encode(fixtures::segment(stream_id)).unwrap();
+        let column_metadata = ColumnRecord::encode(fixtures::column(
+            stream_id,
+            column_id.value(),
+            DataType::F64,
+        ))
+        .unwrap();
+        let column_key = ColumnKey::new(route, twinleaf_proto::StreamId::new(stream_id), column_id);
 
         Fixture {
             column_key,
@@ -180,7 +184,7 @@ mod tests {
     impl Fixture {
         /// Push one batch of `f64` rows, with an explicit stream generation and
         /// explicit sample numbers so runs can be restarted deliberately.
-        fn push(&self, buffer: &mut Buffer, stream_generation: u32, rows: &[(SampleNumber, f64)]) {
+        fn push(&self, buffer: &mut Buffer, stream_generation: u32, rows: &[(u32, f64)]) {
             self.push_in_segment(buffer, stream_generation, self.segment.clone(), rows);
         }
 
@@ -189,7 +193,7 @@ mod tests {
             buffer: &mut Buffer,
             stream_generation: u32,
             segment: SegmentRecord,
-            rows: &[(SampleNumber, f64)],
+            rows: &[(u32, f64)],
         ) {
             let mut builder = SampleBatchBuilder::new(
                 BatchContext::new(
@@ -206,12 +210,15 @@ mod tests {
                 ),
                 [(
                     self.column_metadata.clone(),
-                    self.column_metadata.get().data_type.buffer_type(),
+                    buffer_type(self.column_metadata.get().data_type),
                 )],
                 rows.len(),
             );
             for &(sample_number, value) in rows {
-                builder.push_row(sample_number, [ColumnData::Float(value)]);
+                builder.push_row(
+                    twinleaf_proto::SampleNumber::new(sample_number),
+                    [ColumnData::Float(value)],
+                );
             }
             let batch = builder.finish();
             buffer.process_batch(&batch);
@@ -222,7 +229,7 @@ mod tests {
             let rows: Vec<_> = values
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| (i as SampleNumber, v))
+                .map(|(i, &v)| (i as u32, v))
                 .collect();
             self.push(buffer, 1, &rows);
         }
@@ -282,8 +289,18 @@ mod tests {
             .unwrap()
         };
         // A seamless rollover keeps the stream generation, so the run continues.
-        fx.push_in_segment(&mut buffer, 1, rolled(1, 2), &[(0, 2.0), (1, 3.0)]);
-        fx.push_in_segment(&mut buffer, 1, rolled(0, 4), &[(0, 4.0), (1, 5.0)]);
+        fx.push_in_segment(
+            &mut buffer,
+            1,
+            rolled(twinleaf_proto::SegmentId::new(1), 2),
+            &[(0, 2.0), (1, 3.0)],
+        );
+        fx.push_in_segment(
+            &mut buffer,
+            1,
+            rolled(twinleaf_proto::SegmentId::new(0), 4),
+            &[(0, 4.0), (1, 5.0)],
+        );
 
         let out = processor.catch_up(&buffer).clone();
         assert_eq!(

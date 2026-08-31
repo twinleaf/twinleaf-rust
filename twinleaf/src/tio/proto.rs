@@ -372,14 +372,16 @@ impl Packet {
             });
         }
         let mut buf = [0u8; MAX_PACKET_SIZE];
+        let stream_id = twinleaf_proto::StreamId::try_new(stream_id)
+            .ok_or(EncodeError::InvalidStreamId(stream_id))?;
         let len = wire::Samples {
             stream_id,
-            segment_id,
-            first: first_sample_n,
+            segment_id: twinleaf_proto::SegmentId::new(segment_id),
+            first: twinleaf_proto::SampleNumber::new(first_sample_n),
             data,
         }
         .write(&mut buf)
-        .ok_or(EncodeError::InvalidStreamId(stream_id))?;
+        .ok_or(EncodeError::InvalidStreamId(stream_id.value()))?;
         Ok(finish(&mut buf, len, routing))
     }
 

@@ -86,6 +86,138 @@ impl SessionId {
     }
 }
 
+impl core::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// TIO data-stream id. Stream 0 is reserved for the legacy 32-bit sample
+/// format; current metadata and sample packets use ids 1 through 127.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct StreamId(u8);
+
+impl StreamId {
+    pub const MIN: u8 = 1;
+    pub const MAX: u8 = 127;
+
+    pub const fn new(value: u8) -> Self {
+        assert!(
+            value >= Self::MIN && value <= Self::MAX,
+            "stream id out of range"
+        );
+        Self(value)
+    }
+
+    pub const fn try_new(value: u8) -> Option<Self> {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Id of a segment within a stream's segment ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SegmentId(u8);
+
+impl SegmentId {
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Id of a column within one stream schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ColumnId(u8);
+
+impl ColumnId {
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl core::fmt::Display for ColumnId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Sample counter within one segment. Current stream packets encode 24 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SampleNumber(u32);
+
+impl SampleNumber {
+    pub const MAX: u32 = (1 << 24) - 1;
+
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+
+    pub const fn fits_stream_packet(self) -> bool {
+        self.0 <= Self::MAX
+    }
+
+    pub const fn wrapping_sub(self, other: Self) -> u32 {
+        self.0.wrapping_sub(other.0)
+    }
+
+    pub const fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl core::fmt::Display for SampleNumber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Numeric comparisons stay convenient without making sample numbers
+/// implicitly interchangeable with arbitrary `u32` function arguments.
+impl PartialEq<u32> for SampleNumber {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Hardware revision used by `dev.revision` and firmware packages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

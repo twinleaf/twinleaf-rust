@@ -1,5 +1,4 @@
 use super::progress::ByteProgress;
-use twinleaf::data::DataTypeExt;
 use twinleaf::data::{BoundaryClass, LogFile, StreamSummary};
 use twinleaf::device::DeviceRoute;
 
@@ -123,17 +122,16 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
 
     println!();
     println!(" {}", style("Devices:").bold().cyan());
-    if summary.devices().is_empty() {
+    if summary.devices().len() == 0 {
         println!("   (no device metadata seen)");
     } else {
         for (route, device) in summary.devices() {
-            let d = device.get();
             println!(
                 "   • {}  {}  {}  {}",
                 route,
-                d.name,
-                style(format!("fw {}", d.firmware)).dim(),
-                style(format!("serial {}", d.serial)).dim(),
+                device.name,
+                style(format!("fw {}", device.firmware)).dim(),
+                style(format!("serial {}", device.serial)).dim(),
             );
         }
     }
@@ -181,13 +179,11 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                     );
                 }
             }
-            if !s.columns().is_empty() {
+            if s.columns().len() != 0 {
                 let cols: Vec<String> = s
                     .columns()
-                    .iter()
                     .map(|column| {
-                        let column = column.get();
-                        let data_type = column.data_type.type_name();
+                        let data_type = column.data_type.to_string();
                         if column.units.is_empty() {
                             format!("{} {}", column.name, style(data_type).dim())
                         } else {

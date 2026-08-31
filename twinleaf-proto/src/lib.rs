@@ -15,8 +15,8 @@ pub mod serial;
 pub use payload::{capture, data, heartbeat, log, rpc, settings, sync};
 
 pub use identifiers::{
-    BoardId, DeviceSerial, FirmwareMagic, FirmwareSerial, HwRev, RpcMethodId, RpcRequestId,
-    SessionId,
+    BoardId, ColumnId, DeviceSerial, FirmwareMagic, FirmwareSerial, HwRev, RpcMethodId,
+    RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
 };
 pub use packet::PacketType;
 pub use route::{DeviceRoute, RouteError};

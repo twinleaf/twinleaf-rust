@@ -8,10 +8,10 @@
 
 use crate::data::coalesce::BatchCoalescer;
 use crate::data::{
-    ColumnId, ColumnKey, ColumnRecord, Generations, SampleBatch, SampleNumber, SegmentRecord,
-    StreamKey, StreamRecord,
+    ColumnKey, ColumnRecord, Generations, SampleBatch, SegmentRecord, StreamKey, StreamRecord,
 };
 use twinleaf_proto::data as wire;
+use twinleaf_proto::{ColumnId, SampleNumber};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -67,7 +67,7 @@ impl Buffer {
     }
 
     /// A column's metadata as of its stream's newest schema.
-    pub fn column_metadata(&self, col: &ColumnKey) -> Option<ColumnRecord> {
+    pub fn column_metadata(&self, col: &ColumnKey) -> Option<wire::Column<'_>> {
         self.runs
             .get(&col.stream_key())?
             .column_metadata(col.column_id)
@@ -212,11 +212,11 @@ impl Run {
         Some(chunk.slice(chunk.len() - 1..chunk.len()))
     }
 
-    fn column_metadata(&self, column_id: ColumnId) -> Option<ColumnRecord> {
+    fn column_metadata(&self, column_id: ColumnId) -> Option<wire::Column<'_>> {
         self.columns
             .iter()
-            .find(|column| ColumnId::from(column.get().index) == column_id)
-            .cloned()
+            .find(|column| column.get().index == column_id)
+            .map(ColumnRecord::get)
     }
 
     pub fn generations(&self) -> Generations {
@@ -266,10 +266,11 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::records;
+    use crate::data::fixtures;
+    use crate::data::metadata::buffer_type;
     use crate::data::sample::{BatchContext, SampleBatchBuilder};
+    use crate::data::DeviceRecord;
     use crate::data::{ColumnArray, ColumnData, ColumnOp, ColumnProcessor};
-    use crate::data::{DataTypeExt, DeviceRecord};
     use crate::tio::proto::{DataType, DeviceRoute};
 
     /// Records every sample it is fed, plus the length of each span it was fed as,
@@ -324,7 +325,7 @@ mod tests {
             &self,
             buffer: &mut Buffer,
             stream_generation: u32,
-            rows: &[(SampleNumber, Vec<ColumnData>)],
+            rows: &[(u32, Vec<ColumnData>)],
         ) {
             self.push_in_segment(buffer, stream_generation, &self.segment, rows);
         }
@@ -334,7 +335,7 @@ mod tests {
             buffer: &mut Buffer,
             stream_generation: u32,
             segment: &SegmentRecord,
-            rows: &[(SampleNumber, Vec<ColumnData>)],
+            rows: &[(u32, Vec<ColumnData>)],
         ) {
             let mut builder = SampleBatchBuilder::new(
                 BatchContext::new(
@@ -351,12 +352,12 @@ mod tests {
                 ),
                 self.columns
                     .iter()
-                    .map(|metadata| (metadata.clone(), metadata.get().data_type.buffer_type())),
+                    .map(|metadata| (metadata.clone(), buffer_type(metadata.get().data_type))),
                 rows.len(),
             );
             for &(sample_number, ref row) in rows {
                 assert_eq!(row.len(), self.columns.len());
-                builder.push_row(sample_number, row.iter().cloned());
+                builder.push_row(SampleNumber::new(sample_number), row.iter().cloned());
             }
             let batch = builder.finish();
             buffer.process_batch(&batch);
@@ -364,12 +365,7 @@ mod tests {
 
         /// Push `samples` as one batch of a single float column whose values are
         /// the sample numbers.
-        fn push_floats(
-            &self,
-            buffer: &mut Buffer,
-            stream_generation: u32,
-            samples: Range<SampleNumber>,
-        ) {
+        fn push_floats(&self, buffer: &mut Buffer, stream_generation: u32, samples: Range<u32>) {
             let rows: Vec<_> = samples
                 .map(|n| (n, vec![ColumnData::Float(f64::from(n))]))
                 .collect();
@@ -392,32 +388,38 @@ mod tests {
                     name: &format!("col_{index}"),
                     units: &format!("u{index}"),
                     description: &format!("column {index}"),
-                    ..records::column(stream_id, index, *data_type)
+                    ..fixtures::column(stream_id, index, *data_type)
                 })
                 .unwrap()
             })
             .collect();
 
         Fixture {
-            stream_key: StreamKey::new(route, stream_id),
+            stream_key: StreamKey::new(route, twinleaf_proto::StreamId::new(stream_id)),
             column_keys: (0..columns.len())
-                .map(|index| ColumnKey::new(route, stream_id, index))
+                .map(|index| {
+                    ColumnKey::new(
+                        route,
+                        twinleaf_proto::StreamId::new(stream_id),
+                        ColumnId::new(u8::try_from(index).unwrap()),
+                    )
+                })
                 .collect(),
-            device: DeviceRecord::encode(records::device()).unwrap(),
+            device: DeviceRecord::encode(fixtures::device()).unwrap(),
             stream: StreamRecord::encode(wire::Stream {
                 n_columns: columns.len() as u8,
                 sample_size: 0,
                 buf_samples: 1024,
-                ..records::stream(stream_id)
+                ..fixtures::stream(stream_id)
             })
             .unwrap(),
-            segment: SegmentRecord::encode(records::segment(stream_id)).unwrap(),
+            segment: SegmentRecord::encode(fixtures::segment(stream_id)).unwrap(),
             columns,
         }
     }
 
     /// The samples a float run should hold for sample numbers `samples`.
-    fn expected(samples: Range<SampleNumber>) -> Vec<(f64, f64)> {
+    fn expected(samples: Range<u32>) -> Vec<(f64, f64)> {
         samples
             .map(|n| (f64::from(n) + 1.0, f64::from(n)))
             .collect()
@@ -435,7 +437,7 @@ mod tests {
         let run = buffer.get_run(&fx.stream_key).expect("the run");
         assert_eq!(run.retained_rows(), 0..300);
         assert_eq!(run.last_timestamp(), Some(300.0));
-        assert_eq!(run.last_sample_number(), Some(299));
+        assert_eq!(run.last_sample_number(), Some(SampleNumber::new(299)));
         assert_eq!(run.effective_rate(), 1.0);
 
         let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
@@ -508,7 +510,7 @@ mod tests {
         // A seamless rollover keeps the stream generation, so the run continues even
         // though the new segment starts a new chunk.
         let rolled = SegmentRecord::encode(wire::Segment {
-            segment_id: 1,
+            segment_id: twinleaf_proto::SegmentId::new(1),
             start_time: 4,
             ..fx.segment.get()
         })
@@ -558,7 +560,7 @@ mod tests {
             0..3,
             "row positions restart with the run"
         );
-        assert_eq!(run.last_sample_number(), Some(2));
+        assert_eq!(run.last_sample_number(), Some(SampleNumber::new(2)));
 
         let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
         assert_eq!(processor.catch_up(&buffer), &expected(0..3));
@@ -620,7 +622,7 @@ mod tests {
         assert!(matches!(values[2], ColumnData::UInt(12)));
 
         // No run for a stream that never received data.
-        let other = StreamKey::new(DeviceRoute::root(), 99);
+        let other = StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(99));
         assert!(buffer.latest_row(&other).is_none());
         assert!(buffer.get_run(&other).is_none());
     }
@@ -654,8 +656,8 @@ mod tests {
         let metadata = buffer
             .column_metadata(&fx.column_keys[0])
             .expect("the column");
-        assert_eq!(metadata.get().description, "column 0");
-        assert_eq!(metadata.get().units, "u0");
+        assert_eq!(metadata.description, "column 0");
+        assert_eq!(metadata.units, "u0");
 
         // A schema change rides a new stream generation, and the new run's columns
         // replace the old ones.
@@ -669,12 +671,15 @@ mod tests {
             buffer
                 .column_metadata(&changed.column_keys[1])
                 .expect("the added column")
-                .get()
                 .data_type,
             DataType::U64
         );
         assert!(buffer
-            .column_metadata(&ColumnKey::new(DeviceRoute::root(), 1, 7))
+            .column_metadata(&ColumnKey::new(
+                DeviceRoute::root(),
+                twinleaf_proto::StreamId::new(1),
+                ColumnId::new(7),
+            ))
             .is_none());
     }
 

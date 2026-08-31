@@ -4,39 +4,9 @@ use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use twinleaf::data::ColumnRecord;
-use twinleaf::data::{LogFile, PacketParser, SampleBatch, StreamKey};
+use twinleaf::data::{LogFile, PacketParser, SampleBatch, StreamMetadataSnapshot};
 use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
-
-#[derive(Clone, PartialEq)]
-struct CsvSchema {
-    key: StreamKey,
-    columns: Vec<ColumnRecord>,
-}
-
-impl CsvSchema {
-    fn from_batch(batch: &SampleBatch) -> Self {
-        Self {
-            key: batch.stream_key(),
-            columns: batch
-                .schema()
-                .iter()
-                .map(|series| series.record().clone())
-                .collect(),
-        }
-    }
-
-    fn matches(&self, batch: &SampleBatch) -> bool {
-        self.key == batch.stream_key()
-            && self.columns.len() == batch.schema().len()
-            && self
-                .columns
-                .iter()
-                .zip(batch.schema())
-                .all(|(expected, actual)| expected == actual.record())
-    }
-}
 
 struct CsvOutput {
     stream: StreamSel,
@@ -46,7 +16,7 @@ struct CsvOutput {
     path: Option<String>,
     stream_name: Option<String>,
     writer: Option<BufWriter<File>>,
-    schema: Option<CsvSchema>,
+    schema: Option<StreamMetadataSnapshot>,
     header: Vec<String>,
     row: String,
     rows_written: u64,
@@ -77,7 +47,7 @@ impl CsvOutput {
             return Ok(());
         }
         let is_match = match &self.stream {
-            StreamSel::Id(id) => batch.stream().stream_id == *id,
+            StreamSel::Id(id) => batch.stream().stream_id.value() == *id,
             StreamSel::Name(name) => batch.stream().name == name,
         };
         if !is_match {
@@ -85,14 +55,14 @@ impl CsvOutput {
         }
 
         if let Some(existing) = &self.schema {
-            if !existing.matches(&batch) {
+            if !existing.matches_schema(&batch) {
                 return Err(eyre::eyre!(
                     "stream identity or schema changed while writing {}; refusing to emit rows under a stale CSV header",
                     self.path.as_deref().unwrap_or("CSV output")
                 ));
             }
         } else {
-            self.schema = Some(CsvSchema::from_batch(&batch));
+            self.schema = Some(batch.metadata());
         }
 
         if self.writer.is_none() {
@@ -390,37 +360,5 @@ mod tests {
             csv_header(&["time".to_string(), "x,\"quoted\"".to_string()]),
             "time,\"x,\"\"quoted\"\"\""
         );
-    }
-
-    #[test]
-    fn csv_schema_distinguishes_duplicate_names_and_changed_columns() {
-        use twinleaf::tio::proto::DataType;
-
-        let column = |stream_id, name| {
-            ColumnRecord::encode(twinleaf_proto::data::Column {
-                stream_id,
-                index: 0,
-                data_type: DataType::F32,
-                name,
-                units: "V",
-                description: "",
-            })
-            .unwrap()
-        };
-        let original = CsvSchema {
-            key: StreamKey::new(DeviceRoute::root(), 1),
-            columns: vec![column(1, "value")],
-        };
-        let duplicate_name = CsvSchema {
-            key: StreamKey::new(DeviceRoute::root(), 2),
-            columns: vec![column(2, "value")],
-        };
-        let changed_column = CsvSchema {
-            key: StreamKey::new(DeviceRoute::root(), 1),
-            columns: vec![column(1, "renamed")],
-        };
-
-        assert!(original != duplicate_name);
-        assert!(original != changed_column);
     }
 }

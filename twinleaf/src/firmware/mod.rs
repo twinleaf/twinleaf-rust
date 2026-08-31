@@ -634,7 +634,7 @@ mod tests {
         firmware_len: usize,
         on_upload: impl FnMut(Completion) + Send + 'static,
     ) -> (Result<(), FirmwareError>, Vec<FlashEvent>) {
-        let (device, calls) = crate::device::Device::test_pair();
+        let (device, calls, _worker) = crate::device::Device::test_pair();
         let mut on_upload = on_upload;
         let responder = std::thread::spawn(move || {
             for call in calls.iter() {

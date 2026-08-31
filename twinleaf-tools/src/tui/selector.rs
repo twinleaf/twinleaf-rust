@@ -156,8 +156,7 @@ fn route_name(route: &NamedRoute) -> &str {
 }
 
 fn is_direct_child(parent: &DeviceRoute, candidate: &DeviceRoute) -> bool {
-    candidate.len() == parent.len() + 1
-        && candidate.as_slice().starts_with(parent.as_slice())
+    candidate.len() == parent.len() + 1 && candidate.as_slice().starts_with(parent.as_slice())
 }
 
 /// Flatten sorted subdevice routes into `(glyph prefix, route)` lines in

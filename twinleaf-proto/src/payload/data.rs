@@ -17,19 +17,21 @@
 
 use crate::packet::{Header, PacketType};
 use crate::sync::Epoch;
-use crate::{SessionId, HEADER_SIZE, MAX_PAYLOAD_SIZE};
+use crate::{
+    ColumnId, SampleNumber, SegmentId, SessionId, StreamId, HEADER_SIZE, MAX_PAYLOAD_SIZE,
+};
 
 /// `[record type][flags]` preceding every metadata record.
 pub const METADATA_HEADER_SIZE: usize = 2;
 /// `[first sample number u24le][segment id]` preceding a packet's samples.
 pub const SAMPLE_HEADER_SIZE: usize = 4;
 /// Sample numbers wrap at 24 bits on the wire.
-pub const MAX_SAMPLE_NUMBER: u32 = (1 << 24) - 1;
+pub const MAX_SAMPLE_NUMBER: u32 = crate::SampleNumber::MAX;
 
 /// Lowest stream id a device may allocate. Id 0 is reserved: `STREAM0` carries
 /// a 32-bit sample number instead of the 24-bit-plus-segment form used here.
-pub const FIRST_STREAM_ID: u8 = 1;
-pub const LAST_STREAM_ID: u8 = 127;
+pub const FIRST_STREAM_ID: u8 = crate::StreamId::MIN;
+pub const LAST_STREAM_ID: u8 = crate::StreamId::MAX;
 
 /// Column sample encoding (`TL_DATA_TYPE_*`). The high nibble is the byte size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -245,7 +247,7 @@ impl<'a> Device<'a> {
 /// Shape of one data stream (`TL_METADATA_STREAM`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream<'a> {
-    pub stream_id: u8,
+    pub stream_id: StreamId,
     pub n_columns: u8,
     pub n_segments: u8,
     /// Bytes per sample: the packed size of all columns.
@@ -264,7 +266,7 @@ impl<'a> Stream<'a> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let name = record.push(self.name);
         let head = record.head();
-        head[1] = self.stream_id;
+        head[1] = self.stream_id.value();
         head[2] = self.n_columns;
         head[3] = self.n_segments;
         head[4..6].copy_from_slice(&self.sample_size.to_le_bytes());
@@ -278,7 +280,7 @@ impl<'a> Stream<'a> {
         let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
         let head = record.head;
         Some(Self {
-            stream_id: head[1],
+            stream_id: StreamId::try_new(head[1])?,
             n_columns: head[2],
             n_segments: head[3],
             sample_size: u16::from_le_bytes(head[4..6].try_into().unwrap()),
@@ -292,8 +294,8 @@ impl<'a> Stream<'a> {
 /// (`TL_METADATA_SEGMENT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Segment<'a> {
-    pub stream_id: u8,
-    pub segment_id: u8,
+    pub stream_id: StreamId,
+    pub segment_id: SegmentId,
     pub flags: SegmentFlags,
     pub epoch: Epoch,
     /// Serial of the device that owns the timebase.
@@ -317,8 +319,8 @@ impl<'a> Segment<'a> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
         let serial = record.push(self.timeref_serial);
         let head = record.head();
-        head[1] = self.stream_id;
-        head[2] = self.segment_id;
+        head[1] = self.stream_id.value();
+        head[2] = self.segment_id.value();
         head[3] = self.flags.bits();
         head[4] = self.epoch.value();
         head[5] = serial;
@@ -336,8 +338,8 @@ impl<'a> Segment<'a> {
         let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
         let head = record.head;
         Some(Self {
-            stream_id: head[1],
-            segment_id: head[2],
+            stream_id: StreamId::try_new(head[1])?,
+            segment_id: SegmentId::new(head[2]),
             flags: SegmentFlags::from_bits(head[3]),
             epoch: Epoch::new(head[4]),
             timeref_session: SessionId::from_le_bytes(head[6..10].try_into().unwrap()),
@@ -354,9 +356,9 @@ impl<'a> Segment<'a> {
 /// One column of a stream's sample (`TL_METADATA_COLUMN`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Column<'a> {
-    pub stream_id: u8,
+    pub stream_id: StreamId,
     /// Position of this column within the packed sample.
-    pub index: u8,
+    pub index: ColumnId,
     pub data_type: DataType,
     pub name: &'a str,
     pub units: &'a str,
@@ -374,8 +376,8 @@ impl<'a> Column<'a> {
         let units = record.push(self.units);
         let description = record.push(self.description);
         let head = record.head();
-        head[1] = self.stream_id;
-        head[2] = self.index;
+        head[1] = self.stream_id.value();
+        head[2] = self.index.value();
         head[3] = self.data_type.value();
         head[4] = name;
         head[5] = units;
@@ -388,8 +390,8 @@ impl<'a> Column<'a> {
         let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
         let head = record.head;
         Some(Self {
-            stream_id: head[1],
-            index: head[2],
+            stream_id: StreamId::try_new(head[1])?,
+            index: ColumnId::new(head[2]),
             data_type: DataType::new(head[3]),
             name: record.take(head[4])?,
             units: record.take(head[5])?,
@@ -723,10 +725,10 @@ impl<'a> Iterator for MetadataReply<'a> {
 /// A run of consecutive samples from one stream segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Samples<'a> {
-    pub stream_id: u8,
-    pub segment_id: u8,
+    pub stream_id: StreamId,
+    pub segment_id: SegmentId,
     /// Sample number of the first sample in `data`.
-    pub first: u32,
+    pub first: SampleNumber,
     /// Samples packed back to back, each `Stream::sample_size` bytes.
     pub data: &'a [u8],
 }
@@ -755,12 +757,12 @@ impl<'a> Samples<'a> {
     /// Returns the packet length.
     pub fn write_header(
         buf: &mut [u8],
-        stream_id: u8,
-        segment_id: u8,
-        first: u32,
+        stream_id: StreamId,
+        segment_id: SegmentId,
+        first: SampleNumber,
         data_len: usize,
     ) -> Option<usize> {
-        if !(FIRST_STREAM_ID..=LAST_STREAM_ID).contains(&stream_id) || first > MAX_SAMPLE_NUMBER {
+        if !first.fits_stream_packet() {
             return None;
         }
         let payload_len = SAMPLE_HEADER_SIZE + data_len;
@@ -768,10 +770,10 @@ impl<'a> Samples<'a> {
         if payload_len > MAX_PAYLOAD_SIZE || buf.len() < total {
             return None;
         }
-        Header::new(PacketType::stream(stream_id)?, payload_len as u16)
+        Header::new(PacketType::stream(stream_id.value())?, payload_len as u16)
             .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
         buf[HEADER_SIZE..HEADER_SIZE + 3].copy_from_slice(&first.to_le_bytes()[..3]);
-        buf[HEADER_SIZE + 3] = segment_id;
+        buf[HEADER_SIZE + 3] = segment_id.value();
         Some(total)
     }
 
@@ -783,9 +785,9 @@ impl<'a> Samples<'a> {
         }
         let (head, data) = payload.split_at_checked(SAMPLE_HEADER_SIZE)?;
         Some(Self {
-            stream_id,
-            segment_id: head[3],
-            first: u32::from_le_bytes([head[0], head[1], head[2], 0]),
+            stream_id: StreamId::try_new(stream_id)?,
+            segment_id: SegmentId::new(head[3]),
+            first: SampleNumber::new(u32::from_le_bytes([head[0], head[1], head[2], 0])),
             data,
         })
     }
@@ -974,8 +976,8 @@ mod tests {
 
     fn segment() -> Segment<'static> {
         Segment {
-            stream_id: 1,
-            segment_id: 3,
+            stream_id: StreamId::new(1),
+            segment_id: SegmentId::new(3),
             flags: SegmentFlags::VALID | SegmentFlags::ACTIVE,
             epoch: Epoch::UNIX,
             timeref_serial: "twinleaf-37383731",
@@ -1005,7 +1007,7 @@ mod tests {
         round_trip(Metadata::Device(device()), MetadataFlags::PERIODIC);
         round_trip(
             Metadata::Stream(Stream {
-                stream_id: 1,
+                stream_id: StreamId::new(1),
                 n_columns: 6,
                 n_segments: 2,
                 sample_size: 24,
@@ -1017,8 +1019,8 @@ mod tests {
         round_trip(Metadata::Segment(segment()), MetadataFlags::UPDATE);
         round_trip(
             Metadata::Column(Column {
-                stream_id: 1,
-                index: 0,
+                stream_id: StreamId::new(1),
+                index: ColumnId::new(0),
                 data_type: DataType::F32,
                 name: "imu.accel.x",
                 units: "m/s^2",
@@ -1059,8 +1061,8 @@ mod tests {
     #[test]
     fn column_record_matches_the_packed_wire_layout() {
         let record = Column {
-            stream_id: 4,
-            index: 1,
+            stream_id: StreamId::new(4),
+            index: ColumnId::new(1),
             data_type: DataType::F32,
             name: "vbus",
             units: "V",
@@ -1189,8 +1191,8 @@ mod tests {
     #[test]
     fn strings_truncate_on_a_character_boundary() {
         let record = Column {
-            stream_id: 1,
-            index: 0,
+            stream_id: StreamId::new(1),
+            index: ColumnId::new(0),
             data_type: DataType::F32,
             name: "bar.therm",
             units: "°C",
@@ -1267,8 +1269,8 @@ mod tests {
     #[test]
     fn a_reply_frame_is_the_type_the_length_and_the_bare_record() {
         let record = Column {
-            stream_id: 4,
-            index: 1,
+            stream_id: StreamId::new(4),
+            index: ColumnId::new(1),
             data_type: DataType::F32,
             name: "vbus",
             units: "V",
@@ -1349,9 +1351,9 @@ mod tests {
     #[test]
     fn samples_round_trip_with_a_24_bit_sample_number() {
         let samples = Samples {
-            stream_id: 1,
-            segment_id: 7,
-            first: 0x00AB_CDEF,
+            stream_id: StreamId::new(1),
+            segment_id: SegmentId::new(7),
+            first: SampleNumber::new(0x00AB_CDEF),
             data: &[1, 2, 3, 4, 5, 6, 7, 8],
         };
         let mut buf = [0u8; 64];
@@ -1371,18 +1373,18 @@ mod tests {
     }
 
     #[test]
-    fn samples_reject_out_of_range_ids() {
+    fn samples_reject_an_out_of_range_number() {
         let mut buf = [0u8; 64];
-        let samples = |stream_id, first| Samples {
-            stream_id,
-            segment_id: 0,
-            first,
+        let samples = |first| Samples {
+            stream_id: StreamId::new(1),
+            segment_id: SegmentId::new(0),
+            first: SampleNumber::new(first),
             data: &[0; 4],
         };
-        assert_eq!(samples(0, 0).write(&mut buf), None, "stream 0 is reserved");
-        assert_eq!(samples(128, 0).write(&mut buf), None);
-        assert_eq!(samples(1, MAX_SAMPLE_NUMBER + 1).write(&mut buf), None);
-        assert!(samples(1, MAX_SAMPLE_NUMBER).write(&mut buf).is_some());
+        assert_eq!(StreamId::try_new(0), None, "stream 0 is reserved");
+        assert_eq!(StreamId::try_new(128), None);
+        assert_eq!(samples(MAX_SAMPLE_NUMBER + 1).write(&mut buf), None);
+        assert!(samples(MAX_SAMPLE_NUMBER).write(&mut buf).is_some());
     }
 
     #[test]

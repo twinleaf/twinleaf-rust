@@ -26,8 +26,8 @@ impl RpcErrorPayload {
 pub enum CallError {
     #[error("RPC request was not submitted to the proxy")]
     RequestNotSubmitted,
-    #[error("RPC route exceeds port scope")]
-    InvalidRoute,
+    #[error("RPC route outside this view: {0}")]
+    InvalidRoute(#[from] twinleaf_proto::RouteError),
     #[error("proxy disconnected while waiting for the RPC reply")]
     ResponseLost,
     #[error("timed out waiting for the RPC reply")]
@@ -43,7 +43,7 @@ pub enum CallError {
 impl From<proxy::RawCallError> for CallError {
     fn from(error: proxy::RawCallError) -> Self {
         match error {
-            proxy::RawCallError::InvalidRoute => Self::InvalidRoute,
+            proxy::RawCallError::InvalidRoute(error) => Self::InvalidRoute(error),
             proxy::RawCallError::RequestNotSubmitted => Self::RequestNotSubmitted,
             proxy::RawCallError::Timeout => Self::Timeout,
             proxy::RawCallError::DeviceDisconnected => Self::DeviceDisconnected,
