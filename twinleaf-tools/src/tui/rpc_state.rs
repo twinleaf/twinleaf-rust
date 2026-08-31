@@ -1,5 +1,5 @@
 use twinleaf::{
-    device::{RpcList, RpcRegistry},
+    device::RpcRegistry,
     tio::proto::{identifiers::SessionId, ProxyStatus},
 };
 
@@ -141,8 +141,7 @@ impl RouteRpcState {
         }
     }
 
-    pub fn on_fetch_success(&mut self, list: &RpcList) {
-        let registry = RpcRegistry::from(list);
+    pub fn on_fetch_success(&mut self, registry: RpcRegistry) {
         self.phase = RouteRpcPhase::Ready { registry };
     }
 

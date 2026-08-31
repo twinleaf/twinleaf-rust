@@ -1,49 +1,69 @@
+use super::cache;
 use super::{RpcDescriptor, RpcRegistry};
-use std::collections::HashMap;
 use crate::tio::{proto, proto::DeviceRoute, proto::RpcArgs, proto::RpcReply, proxy};
 
 use directories::BaseDirs;
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, BufRead, Write};
+use std::io;
 
 #[derive(Debug, thiserror::Error)]
-pub enum RpcListError {
+pub enum RpcRegistryError {
     #[error("could not locate cache directory")]
     CacheDirError,
-    #[error("cached RPC list is corrupted or outdated")]
-    InvalidCacheError,
     #[error("cache file I/O error: {0}")]
     CacheFileError(#[from] io::Error),
     #[error("RPC error: {0}")]
     DeviceRpcError(proxy::RpcError),
 }
 
-#[derive(Debug, Clone)]
-pub struct RpcList {
-    pub route: DeviceRoute,
-    pub hash: u32,
-    pub vec: Vec<(String, u16)>,
-    pub map: HashMap<String, u16>,
-}
-
 pub struct RpcClient {
     port: proxy::Port,
-    root_route: DeviceRoute,
+}
+
+/// Cache filename stem for a device-supplied name. The name is untrusted — a
+/// network device could report `../..` — so keep it to a charset that cannot
+/// escape the cache directory; the hash still makes the filename unique.
+fn cache_stem(dev_name: &str) -> String {
+    dev_name
+        .chars()
+        .take(64)
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// Keeping the cache tidy is an optimization, never a reason to fail a registry
+/// the device already answered for — an unwritable cache directory only costs a
+/// round-trip next time.
+fn warn_cache(result: io::Result<()>, action: &str, path: &std::path::Path) {
+    if let Err(error) = result {
+        log::warn!("could not {action} RPC cache {}: {error}", path.display());
+    }
+}
+
+fn make_registry(entries: cache::Entries, hash: u32) -> RpcRegistry {
+    let specs = entries
+        .into_iter()
+        .map(|(name, meta)| RpcDescriptor::from_meta(meta, name))
+        .collect();
+    let mut registry = RpcRegistry::new(specs);
+    registry.hash = Some(hash);
+    registry
 }
 
 impl RpcClient {
-    pub fn new(port: proxy::Port, root_route: DeviceRoute) -> Self {
-        Self { port, root_route }
+    pub fn new(port: proxy::Port) -> Self {
+        Self { port }
     }
 
     pub fn open(proxy: &proxy::Interface, route: DeviceRoute) -> Result<Self, proxy::PortError> {
-        let port = proxy.subtree_rpc(route.clone())?;
-        Ok(Self::new(port, route))
+        Ok(Self::new(proxy.subtree_rpc(route)?))
     }
 
-    pub fn root_route(&self) -> &DeviceRoute {
-        &self.root_route
+    pub fn root_route(&self) -> DeviceRoute {
+        self.port.scope()
     }
 
     pub fn raw_rpc(
@@ -52,7 +72,11 @@ impl RpcClient {
         name: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>, proxy::RpcError> {
-        let relative = self.root_route.relative_route(route).unwrap_or(*route);
+        let relative = self
+            .port
+            .scope()
+            .relative_route(route)
+            .map_err(|_| proxy::RpcError::InvalidRoute)?;
 
         let req = proto::Packet::rpc_request(name, arg, 0, relative);
         self.port.send(req)?;
@@ -94,133 +118,62 @@ impl RpcClient {
         self.rpc(route, name, ())
     }
 
-    fn read_rpc_cache(
+    fn fetch_registry_entries(
         &self,
         route: &DeviceRoute,
-        hash: u32,
-        file: fs::File,
-    ) -> Result<RpcList, RpcListError> {
-        let reader = io::BufReader::new(file);
-        let mut vec: Vec<(String, u16)> = Vec::new();
-        let mut map: HashMap<String, u16> = HashMap::new();
-        let mut hasher = DefaultHasher::new();
-        let mut hash_line: Option<String> = None;
-
-        for line in reader.lines() {
-            let line = line?;
-
-            let Some((meta, name)) = line.split_once(' ') else {
-                // Line without a space is the trailing checksum
-                hash_line = Some(line);
-                break;
-            };
-
-            let meta =
-                u16::from_str_radix(meta, 16).map_err(|_| RpcListError::InvalidCacheError)?;
-            let name = name.trim().to_string();
-
-            vec.push((name.clone(), meta));
-            map.insert(name.clone(), meta);
-            (name, meta).hash(&mut hasher);
-        }
-
-        match hash_line {
-            Some(line) => {
-                let cached_hash =
-                    u64::from_str_radix(&line, 16).map_err(|_| RpcListError::InvalidCacheError)?;
-                if cached_hash == hasher.finish() {
-                    Ok(RpcList {
-                        route: route.clone(),
-                        hash,
-                        vec,
-                        map,
-                    })
-                } else {
-                    Err(RpcListError::InvalidCacheError)
-                }
-            }
-            None => Err(RpcListError::InvalidCacheError),
-        }
-    }
-
-    fn write_rpc_cache(
-        &self,
-        route: &DeviceRoute,
-        hash: u32,
-        file: fs::File,
-    ) -> Result<RpcList, RpcListError> {
-        let mut writer = io::BufWriter::new(file);
-        let mut vec: Vec<(String, u16)> = Vec::new();
-        let mut map: HashMap<String, u16> = HashMap::new();
-        let mut hasher = DefaultHasher::new();
-
+    ) -> Result<cache::Entries, RpcRegistryError> {
         let nrpcs: u16 = self
             .get(route, "rpc.listinfo")
-            .map_err(RpcListError::DeviceRpcError)?;
+            .map_err(RpcRegistryError::DeviceRpcError)?;
+        let mut entries = Vec::with_capacity(nrpcs.into());
 
         for id in 0..nrpcs {
             let (meta, name): (u16, String) = self
                 .rpc(route, "rpc.listinfo", id)
-                .map_err(RpcListError::DeviceRpcError)?;
-            writeln!(writer, "{:04x} {}", meta, name)?;
-
-            vec.push((name.clone(), meta));
-            map.insert(name.clone(), meta);
-            (name, meta).hash(&mut hasher);
+                .map_err(RpcRegistryError::DeviceRpcError)?;
+            entries.push((name, meta));
         }
-
-        writeln!(writer, "{:016x}", hasher.finish())?;
-        Ok(RpcList {
-            route: route.clone(),
-            hash,
-            vec,
-            map,
-        })
+        Ok(entries)
     }
 
-    pub fn rpc_list(&self, route: &DeviceRoute) -> Result<RpcList, RpcListError> {
-        let tl_cache_dir = BaseDirs::new()
-            .ok_or(RpcListError::CacheDirError)?
+    pub fn registry(&self, route: &DeviceRoute) -> Result<RpcRegistry, RpcRegistryError> {
+        let cache_dir = BaseDirs::new()
+            .ok_or(RpcRegistryError::CacheDirError)?
             .cache_dir()
             .join("twinleaf");
-        fs::create_dir_all(&tl_cache_dir).map_err(|_| RpcListError::CacheDirError)?;
+        fs::create_dir_all(&cache_dir).map_err(|_| RpcRegistryError::CacheDirError)?;
 
         let dev_name: String = self
             .get(route, "dev.name")
-            .map_err(RpcListError::DeviceRpcError)?;
+            .map_err(RpcRegistryError::DeviceRpcError)?;
         let hash: u32 = self
             .get(route, "rpc.hash")
-            .map_err(RpcListError::DeviceRpcError)?;
+            .map_err(RpcRegistryError::DeviceRpcError)?;
         // TODO: evict stale cache files from old firmware versions (<dev_name>.*.rpcs)
-        let base_name = format!("{}.{:x}.rpcs", dev_name, hash);
-        let file_path = tl_cache_dir.join(&base_name);
+        let cache_path = cache_dir.join(format!("{}.{hash:x}.rpcs", cache_stem(&dev_name)));
 
-        // Remove empty files left by aborted writes
-        match fs::metadata(&file_path) {
-            Ok(metadata) => match metadata.len() {
-                0 => fs::remove_file(&file_path),
-                _ => Ok(()),
+        match fs::File::open(&cache_path) {
+            Ok(file) => match cache::read(file)? {
+                Some(entries) => return Ok(make_registry(entries, hash)),
+                None => warn_cache(fs::remove_file(&cache_path), "discard stale", &cache_path),
             },
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(other_err) => Err(other_err),
-        }?;
-
-        let cache_file = fs::File::open(&file_path);
-        match cache_file {
-            Ok(file) => match self.read_rpc_cache(route, hash, file) {
-                Ok(rpclist) => Ok(rpclist),
-                Err(RpcListError::InvalidCacheError) => {
-                    fs::remove_file(&file_path)?;
-                    let cache_file = fs::File::create(&file_path)?;
-                    self.write_rpc_cache(route, hash, cache_file)
-                }
-                Err(other_err) => Err(other_err),
-            },
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let cache_file = fs::File::create(&file_path)?;
-                self.write_rpc_cache(route, hash, cache_file)
-            }
-            Err(other_err) => Err(RpcListError::CacheFileError(other_err)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(RpcRegistryError::CacheFileError(err)),
         }
+
+        let entries = self.fetch_registry_entries(route)?;
+        warn_cache(cache::write(&cache_path, &entries), "write", &cache_path);
+        Ok(make_registry(entries, hash))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_stem;
+
+    #[test]
+    fn cache_stem_cannot_escape_the_cache_directory() {
+        assert_eq!(cache_stem("../../etc/passwd"), "______etc_passwd");
+        assert_eq!(cache_stem("sync-v2"), "sync-v2");
     }
 }

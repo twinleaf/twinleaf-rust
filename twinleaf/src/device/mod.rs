@@ -8,4 +8,4 @@ pub use capture::CaptureRpc;
 pub use connection::{
     BatchError, Device, DeviceEvent, DeviceTree, NamedRoute, ProxyDisconnected, TreeEvent, TreeItem,
 };
-pub use rpc::{RpcClient, RpcDescriptor, RpcList, RpcListError, RpcRegistry};
+pub use rpc::{RpcClient, RpcDescriptor, RpcRegistry, RpcRegistryError};

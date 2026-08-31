@@ -11,10 +11,7 @@ pub mod export;
 
 pub use crate::tio::proto::identifiers::{ColumnKey, StreamId, StreamKey};
 pub use crate::tio::proto::DeviceRoute;
-pub use buffer::{
-    clip, AlignedWindow, Buffer, ColumnVec, ColumnView, ColumnWindow, CursorPosition, ReadError,
-    RunId,
-};
+pub use buffer::{clip, Buffer, ColumnVec, ColumnView, ColumnWindow, LatestRow, ReadError, RunId};
 pub use filter::ColumnFilter;
 pub use parser::PacketParser;
 pub use pipeline::{ColumnOp, DerivedColumn};

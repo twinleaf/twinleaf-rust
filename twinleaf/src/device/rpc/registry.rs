@@ -1,4 +1,3 @@
-use super::client::RpcList;
 use crate::tio::proto::RpcMeta;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,18 +63,5 @@ impl RpcRegistry {
             }
         }
         out
-    }
-}
-
-impl From<&RpcList> for RpcRegistry {
-    fn from(list: &RpcList) -> Self {
-        let specs = list
-            .vec
-            .iter()
-            .map(|(name, meta)| RpcDescriptor::from_meta(*meta, name.clone()))
-            .collect();
-        let mut registry = Self::new(specs);
-        registry.hash = Some(list.hash);
-        registry
     }
 }

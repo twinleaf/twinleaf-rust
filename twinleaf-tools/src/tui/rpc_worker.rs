@@ -2,24 +2,30 @@
 //! loops can't block on RPC round-trips.
 //!
 //! Hosts call [`spawn_rpc_worker`] once, get a request/response channel pair,
-//! send [`RpcWorkerReq`] variants (fetch RPC list, execute RPC) and consume
+//! send [`RpcWorkerReq`] variants (fetch RPC registry, execute RPC) and consume
 //! [`RpcWorkerResp`] from the response side. The palette widget itself has no
 //! awareness of this module — hosts wire palette events to worker requests.
 
 use crossbeam::channel::{self, Receiver, Sender};
-use twinleaf::device::{DeviceRoute, RpcClient, RpcList};
+use twinleaf::device::{DeviceRoute, RpcClient, RpcRegistry};
 
 use crate::tools::rpc::{encode_rpc_argument, format_rpc_value, resolve_rpc_type};
 use crate::tui::rpc_palette::{RpcReq, RpcResp};
 
 pub enum RpcWorkerReq {
-    FetchList(DeviceRoute),
+    FetchRegistry(DeviceRoute),
     Execute(RpcReq),
 }
 
 pub enum RpcWorkerResp {
-    List(RpcList),
-    ListErr { route: DeviceRoute, error: String },
+    Registry {
+        route: DeviceRoute,
+        registry: RpcRegistry,
+    },
+    RegistryErr {
+        route: DeviceRoute,
+        error: String,
+    },
     RpcResult(RpcResp),
 }
 
@@ -64,9 +70,9 @@ pub fn spawn_rpc_worker(client: RpcClient) -> (Sender<RpcWorkerReq>, Receiver<Rp
     std::thread::spawn(move || {
         while let Ok(req) = req_rx.recv() {
             let resp = match req {
-                RpcWorkerReq::FetchList(route) => match client.rpc_list(&route) {
-                    Ok(list) => Some(RpcWorkerResp::List(list)),
-                    Err(err) => Some(RpcWorkerResp::ListErr {
+                RpcWorkerReq::FetchRegistry(route) => match client.registry(&route) {
+                    Ok(registry) => Some(RpcWorkerResp::Registry { route, registry }),
+                    Err(err) => Some(RpcWorkerResp::RegistryErr {
                         route,
                         error: err.to_string(),
                     }),
