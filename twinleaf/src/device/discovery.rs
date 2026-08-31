@@ -7,7 +7,7 @@
 //! [`enumerate_serial`] is a synchronous serial-only snapshot for callers that
 //! just want a one-shot list.
 
-use crate::device::{DeviceTree, NamedRoute};
+use crate::device::NamedRoute;
 use crate::tio::{proto::DeviceRoute, proxy};
 use crossbeam::channel;
 #[cfg(feature = "mdns")]
@@ -211,11 +211,12 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
 /// or the device otherwise fails to respond. Total wall-clock time is
 /// bounded by roughly twice `timeout` (reconnect budget + RPC budget).
 pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
-    let interface = proxy::Interface::new_proxy(url, Some(timeout), None);
-    let port = interface
-        .new_port(Some(timeout), DeviceRoute::root(), 0, false, false)
-        .ok()?;
-    port.rpc("dev.name", ()).ok()
+    let connection = proxy::Connection::open_with(url, Some(timeout), None);
+    connection
+        .device_with(DeviceRoute::root(), Some(timeout))
+        .ok()?
+        .get("dev.name")
+        .ok()
 }
 
 /// RPC/reconnect budget for each probe connection.
@@ -304,17 +305,14 @@ fn reprobe_serial(
 /// One probe pass over `url`: resolve the root `dev.name` and snapshot the
 /// routes alive behind it. Errors when the event channel closed.
 fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), ()> {
-    let interface = proxy::Interface::new_proxy(url, Some(PROBE_TIMEOUT), None);
-    let Ok(port) = interface.new_port(
-        Some(PROBE_TIMEOUT),
+    let connection = proxy::Connection::open_with(url, Some(PROBE_TIMEOUT), None);
+    let Ok(tree) = connection.tree_with(
         DeviceRoute::root(),
-        usize::MAX,
-        true,
-        true,
+        twinleaf_proto::MAX_ROUTING_SIZE,
+        Some(PROBE_TIMEOUT),
     ) else {
         return Ok(());
     };
-    let mut tree = DeviceTree::new(port, DeviceRoute::root());
 
     let mut routes = Vec::new();
     for named in tree.named_routes(ROUTE_DISCOVERY_WINDOW) {

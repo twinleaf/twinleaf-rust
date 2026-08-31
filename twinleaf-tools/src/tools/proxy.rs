@@ -16,9 +16,8 @@ use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use twinleaf::device::discovery::{self, DiscoveredDevice, PortInterface};
-#[cfg(feature = "mdns")]
-use twinleaf::device::DeviceTree;
 use twinleaf::tio::{self, proto, proxy};
+use twinleaf_proto::log::LogLevel;
 
 fn init_proxy_logging(verbose: bool, debug: bool) {
     use std::io::Write;
@@ -239,7 +238,7 @@ fn auto_detect_serial() -> eyre::Result<String> {
 /// events, and the server's own monitoring port on it.
 struct DeviceLink {
     prefix: proto::DeviceRoute,
-    interface: proxy::Interface,
+    interface: proxy::Connection,
     status_rx: crossbeam::channel::Receiver<proxy::Event>,
     monitor_port: proxy::Port,
 }
@@ -261,10 +260,10 @@ enum Disconnect {
     PortForwardFailed,
 }
 
-fn is_rpc(payload: &proto::Payload) -> bool {
+fn is_rpc(pkt: &proto::Packet) -> bool {
     matches!(
-        payload,
-        proto::Payload::RpcRequest(_) | proto::Payload::RpcReply(_) | proto::Payload::RpcError(_)
+        pkt.ptype(),
+        proto::PacketType::RPC_REQ | proto::PacketType::RPC_REP | proto::PacketType::RPC_ERROR
     )
 }
 
@@ -325,13 +324,13 @@ impl ProxyServer {
         struct PendingLink {
             prefix: proto::DeviceRoute,
             locator: String,
-            interface: proxy::Interface,
+            interface: proxy::Connection,
             status_rx: crossbeam::channel::Receiver<proxy::Event>,
         }
         let mut pending = Vec::with_capacity(self.layout.mounts.len());
         for mount in &self.layout.mounts {
             let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
-            let interface = proxy::Interface::new_proxy(
+            let interface = proxy::Connection::open_with(
                 &mount.locator,
                 Some(self.config.reconnect_timeout),
                 Some(status_send),
@@ -350,7 +349,8 @@ impl ProxyServer {
         // backs up). The guard lives until `run` returns, then sends goodbyes.
         #[cfg(feature = "mdns")]
         let _mdns = {
-            let interfaces: Vec<&proxy::Interface> = pending.iter().map(|p| &p.interface).collect();
+            let interfaces: Vec<&proxy::Connection> =
+                pending.iter().map(|p| &p.interface).collect();
             self.advertise_mdns(&interfaces)
         };
 
@@ -359,7 +359,14 @@ impl ProxyServer {
         // loop below drains these immediately, so they never back up.
         let mut links = Vec::with_capacity(pending.len());
         for p in pending {
-            let monitor_port = match p.interface.subtree_full(self.config.subtree) {
+            let monitor_port = match proxy::open_port(
+                &p.interface,
+                None,
+                self.config.subtree,
+                usize::MAX,
+                true,
+                true,
+            ) {
                 Ok(port) => port,
                 Err(e) => {
                     let last_status = p.status_rx.iter().last();
@@ -424,7 +431,7 @@ impl ProxyServer {
     /// Advertise this proxy over mDNS (only when opted in). Returns a guard
     /// that keeps the advertisement live until dropped.
     #[cfg(feature = "mdns")]
-    fn advertise_mdns(&self, interfaces: &[&proxy::Interface]) -> Option<MdnsService> {
+    fn advertise_mdns(&self, interfaces: &[&proxy::Connection]) -> Option<MdnsService> {
         if !self.config.mdns {
             return None;
         }
@@ -447,7 +454,7 @@ impl ProxyServer {
     /// models (ignoring COMM/HUB routing devices), and render e.g. `VMR (x2)`.
     /// Falls back to `tio-proxy (host)` when no sensors are found.
     #[cfg(feature = "mdns")]
-    fn mdns_instance_name(&self, interfaces: &[&proxy::Interface], host: &str) -> String {
+    fn mdns_instance_name(&self, interfaces: &[&proxy::Connection], host: &str) -> String {
         let mut models = Vec::new();
         for &interface in interfaces {
             models.extend(discover_sensor_models(interface));
@@ -570,11 +577,11 @@ impl ProxyServer {
         // for rx and tx are inverted. Also, we use the proxy port channel size setting
         // instead of the physical ports setting.
         let (rx_send, client_rx) =
-            tio::transport::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
+            tio::transport::Port::rx_channel_custom(proxy::client_tx_channel_size());
         let client = match tio::transport::Port::from_tcp_stream_custom(
             stream,
             tio::transport::Port::rx_to_channel(rx_send),
-            proxy::Interface::get_client_rx_channel_size(),
+            proxy::client_rx_channel_size(),
         ) {
             Ok(client_port) => client_port,
             _ => return,
@@ -583,16 +590,15 @@ impl ProxyServer {
         log::debug!("Accepted client from {}", addr);
         let mut ports = Vec::with_capacity(links.len());
         for link in links {
-            let port = link
-                .interface
-                .new_port(
-                    Some(Duration::from_millis(2000)),
-                    self.config.subtree,
-                    usize::MAX,
-                    true,
-                    true,
-                )
-                .expect("Failed to create new proxy port");
+            let port = proxy::open_port(
+                &link.interface,
+                Some(Duration::from_millis(2000)),
+                self.config.subtree,
+                usize::MAX,
+                true,
+                true,
+            )
+            .expect("Failed to create new proxy port");
             ports.push((link.prefix, port));
         }
 
@@ -612,15 +618,15 @@ impl ProxyServer {
                 let oper = sel.select();
                 match oper.index() {
                     0 => {
-                        let Ok(Ok(mut pkt)) = oper.recv(&client_rx) else {
+                        let Ok(Ok(pkt)) = oper.recv(&client_rx) else {
                             break Disconnect::ClientClosed;
                         };
                         if dump_traffic {
-                            log::info!("{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
+                            log::info!("{}->{} -- {:?}", addr, pkt.route(), pkt.payload());
                         }
                         let mut dest = None;
                         for (prefix, port) in &ports {
-                            if let Ok(relative) = prefix.relative_route(&pkt.routing) {
+                            if let Ok(relative) = prefix.relative_route(&pkt.route()) {
                                 dest = Some((relative, port));
                                 break;
                             }
@@ -629,31 +635,30 @@ impl ProxyServer {
                             log::debug!(
                                 "Client {} addressed unmounted route {}",
                                 addr,
-                                pkt.routing
+                                pkt.route()
                             );
                             continue;
                         };
-                        pkt.routing = relative;
-                        if port.try_send(pkt).is_err() {
+                        if port.try_send(pkt.with_route(relative)).is_err() {
                             break Disconnect::PortForwardFailed;
                         }
                     }
                     i => {
                         let (prefix, port) = &ports[i - 1];
-                        let Ok(mut pkt) = oper.recv(port.receiver()) else {
+                        let Ok(pkt) = oper.recv(port.receiver()) else {
                             break Disconnect::PortReceiveFailed;
                         };
-                        let Ok(routing) = prefix.absolute_route(&pkt.routing) else {
+                        let Ok(routing) = prefix.absolute_route(&pkt.route()) else {
                             log::warn!(
                                 "Dropping packet for client {}: route {} exceeds max depth",
                                 addr,
-                                pkt.routing
+                                pkt.route()
                             );
                             continue;
                         };
-                        pkt.routing = routing;
-                        if dump_traffic && is_rpc(&pkt.payload) {
-                            log::info!("{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
+                        let pkt = pkt.with_route(routing);
+                        if dump_traffic && is_rpc(&pkt) {
+                            log::info!("{}->{} -- {:?}", pkt.route(), addr, pkt.payload());
                         }
                         match client.try_send(pkt) {
                             Ok(()) => slow.packet_delivered(&addr),
@@ -684,32 +689,33 @@ impl ProxyServer {
         });
     }
 
-    fn log_device_packet(&self, mut pkt: proto::Packet, prefix: &proto::DeviceRoute) {
-        let Ok(routing) = prefix.absolute_route(&pkt.routing) else {
+    fn log_device_packet(&self, pkt: proto::Packet, prefix: &proto::DeviceRoute) {
+        let Ok(routing) = prefix.absolute_route(&pkt.route()) else {
             log::warn!("Dropping packet whose mounted route exceeds max depth");
             return;
         };
-        pkt.routing = routing;
-        let dump = match pkt.payload {
+        let pkt = pkt.with_route(routing);
+        let payload = pkt.payload();
+        let dump = match payload {
             proto::Payload::Heartbeat(_) => self.config.dump_hb,
-            proto::Payload::Metadata(_) => self.config.dump_meta,
-            proto::Payload::StreamData(_) => self.config.dump_data,
+            proto::Payload::Metadata(..) => self.config.dump_meta,
+            proto::Payload::Samples(_) => self.config.dump_data,
             _ => self.config.dump_traffic,
         };
         if dump {
-            log::info!("Packet from {} -- {:?}", pkt.routing, pkt.payload);
+            log::info!("Packet from {} -- {:?}", routing, payload);
         }
-        if let proto::Payload::LogMessage(log_msg) = pkt.payload {
+        if let proto::Payload::Log(message) = payload {
             // Map the device-reported level onto the log crate's level
             // so the logger filter and prefix reflect it.
-            let level = match &log_msg.level {
-                proto::LogLevel::Critical | proto::LogLevel::Error => log::Level::Error,
-                proto::LogLevel::Warning => log::Level::Warn,
-                proto::LogLevel::Info => log::Level::Info,
-                proto::LogLevel::Debug => log::Level::Debug,
-                proto::LogLevel::Unknown(_) => log::Level::Info,
+            let level = match message.level {
+                LogLevel::CRITICAL | LogLevel::ERROR => log::Level::Error,
+                LogLevel::WARNING => log::Level::Warn,
+                LogLevel::DEBUG => log::Level::Debug,
+                _ => log::Level::Info,
             };
-            log::log!(target: &format!("device::{}", pkt.routing), level, "{}", log_msg.message);
+            let text = String::from_utf8_lossy(message.message);
+            log::log!(target: &format!("device::{routing}"), level, "{text}");
         }
     }
 }
@@ -770,13 +776,11 @@ fn advertise_tcp(instance: &str, host_name: &str, port: u16) -> Option<MdnsServi
     Some(MdnsService { daemon, fullname })
 }
 
-/// Discover the device routes on `interface` and return the `dev.name` of each,
-/// over the one shared connection.
+/// Discover the device routes on `connection` and return the `dev.name` of
+/// each, over the one shared connection.
 #[cfg(feature = "mdns")]
-fn discover_sensor_models(interface: &proxy::Interface) -> Vec<String> {
-    let Ok(mut tree) = DeviceTree::open(interface, proto::DeviceRoute::root()) else {
-        return Vec::new();
-    };
+fn discover_sensor_models(connection: &proxy::Connection) -> Vec<String> {
+    let tree = connection.tree();
     tree.named_routes(MDNS_ROUTE_WINDOW)
         .into_iter()
         .filter_map(|nr| nr.name)

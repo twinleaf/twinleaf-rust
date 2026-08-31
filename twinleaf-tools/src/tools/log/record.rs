@@ -4,9 +4,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::time::{Duration, Instant};
-use twinleaf::data::{PacketParser, SampleBatch};
-use twinleaf::device::{Device, DeviceRoute};
+use twinleaf::data::{MetadataQuery, PacketParser, SampleBatch};
+use twinleaf::device::{DeviceRoute, PendingReply};
 use twinleaf::tio::{self, proxy};
+use twinleaf_proto::data as wire;
 
 fn ensure_open<'a>(fo: &'a mut Option<File>, path: &str) -> eyre::Result<&'a mut File> {
     use eyre::WrapErr;
@@ -59,13 +60,11 @@ impl Recorder {
 
     fn write(&mut self, pkt: tio::Packet) -> eyre::Result<()> {
         use eyre::WrapErr;
-        let serialized = pkt
-            .serialize()
-            .wrap_err("failed to serialize packet for log")?;
+        let raw = pkt.as_bytes();
         let f = ensure_open(&mut self.file_out, &self.path)?;
-        f.write_all(&serialized)
+        f.write_all(raw)
             .wrap_err_with(|| format!("failed to write {}", self.path))?;
-        self.bytes_written += serialized.len() as u64;
+        self.bytes_written += raw.len() as u64;
         Ok(())
     }
 
@@ -97,11 +96,12 @@ impl Drop for Recorder {
 /// batch's absolute route.
 fn write_metadata_snapshot(rec: &mut Recorder, batch: &SampleBatch) -> eyre::Result<()> {
     let abs_route = batch.route();
-    rec.write(batch.device().make_update_with_route(abs_route))?;
-    rec.write(batch.stream().make_update_with_route(abs_route))?;
-    rec.write(batch.segment().make_update_with_route(abs_route))?;
+    let (device, stream, segment) = batch.records();
+    rec.write(device.update(abs_route)?)?;
+    rec.write(stream.update(abs_route)?)?;
+    rec.write(segment.update(abs_route)?)?;
     for series in batch.schema() {
-        rec.write(series.metadata().make_update_with_route(abs_route))?;
+        rec.write(series.record().update(abs_route)?)?;
     }
     Ok(())
 }
@@ -117,7 +117,7 @@ pub fn log(
     use indicatif::{ProgressBar, ProgressStyle};
     use std::path::Path;
 
-    let proxy = proxy::Interface::new(&tio.root);
+    let proxy = proxy::Connection::open(&tio.root);
     let route = tio.route;
 
     let file_name = Path::new(&file)
@@ -161,7 +161,7 @@ pub fn log(
 }
 
 fn log_raw(
-    proxy: &proxy::Interface,
+    proxy: &proxy::Connection,
     root: &str,
     route: DeviceRoute,
     depth: Option<usize>,
@@ -170,9 +170,8 @@ fn log_raw(
 ) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let port_depth = depth.unwrap_or(tio::proto::TIO_PACKET_MAX_ROUTING_SIZE);
-    let port = proxy
-        .new_port(None, route, port_depth, true, true)
+    let port_depth = depth.unwrap_or(twinleaf_proto::MAX_ROUTING_SIZE);
+    let port = proxy::open_port(proxy, None, route, port_depth, true, true)
         .wrap_err_with(|| format!("could not open port on {}", root))
         .with_proxy_help()?;
 
@@ -192,11 +191,7 @@ fn log_raw(
                 return Err(eyre::Report::new(error).wrap_err(context));
             }
         };
-        let abs_pkt = tio::Packet {
-            routing: route.absolute_route(&pkt.routing)?,
-            ..pkt
-        };
-        rec.write(abs_pkt)?;
+        rec.write(pkt.with_route(route.absolute_route(&pkt.route())?))?;
         rec.tick();
         rec.flush_if_needed()?;
     }
@@ -213,7 +208,7 @@ fn log_raw(
 }
 
 fn log_parsed(
-    proxy: &proxy::Interface,
+    proxy: &proxy::Connection,
     root: &str,
     route: DeviceRoute,
     mut rec: Recorder,
@@ -226,18 +221,37 @@ fn log_parsed(
     // and maintain per-route parsers ourselves (what DeviceTree used to do), so
     // we can hold the raw stream-data packet instead of reconstructing it from
     // a parsed sample.
-    let port = proxy
-        .new_port(None, route, usize::MAX, true, true)
+    let port = proxy::open_port(proxy, None, route, usize::MAX, true, true)
+        .wrap_err_with(|| format!("could not open device tree on {}", root))
+        .with_proxy_help()?;
+    let tree = proxy
+        .tree_with(route, twinleaf_proto::MAX_ROUTING_SIZE, None)
         .wrap_err_with(|| format!("could not open device tree on {}", root))
         .with_proxy_help()?;
 
     let mut parser = PacketParser::new(route, false);
+    let mut metadata_calls: Vec<(MetadataQuery, PendingReply)> = Vec::new();
     loop {
-        for req in parser.take_requests() {
-            if let Err(e) = port.send(req) {
-                return Err(eyre::Report::new(e).wrap_err("stream ended"));
+        for query in parser.take_metadata_queries() {
+            match tree.submit(query.route, wire::METADATA_RPC_METHOD, &query.args()) {
+                Ok(pending) => metadata_calls.push((query, pending)),
+                Err(_) => parser.fail_metadata_query(query),
             }
         }
+        metadata_calls = metadata_calls
+            .into_iter()
+            .filter_map(|(query, pending)| match pending.try_get() {
+                Some(Ok(reply)) => {
+                    parser.apply_metadata_reply(query, &reply);
+                    None
+                }
+                Some(Err(_)) => {
+                    parser.fail_metadata_query(query);
+                    None
+                }
+                None => Some((query, pending)),
+            })
+            .collect();
 
         let pkt = match recv_before(&port, deadline) {
             Ok(Some(pkt)) => pkt,
@@ -278,14 +292,8 @@ fn log_parsed(
         // Only record the raw stream-data packet when it actually parsed into
         // a batch, matching the old reconstruction which wrote once per
         // parseable packet.
-        if let (Some(abs_route), tio::proto::Payload::StreamData(_)) = (parsed_route, &pkt.payload)
-        {
-            let data_pkt = tio::Packet {
-                payload: pkt.payload,
-                routing: abs_route,
-                ttl: 0,
-            };
-            rec.write(data_pkt)?;
+        if let (Some(abs_route), tio::proto::Payload::Samples(_)) = (parsed_route, pkt.payload()) {
+            rec.write(pkt.with_route(abs_route).with_ttl(0)?)?;
         }
 
         rec.tick();
@@ -312,34 +320,30 @@ fn log_parsed(
 pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let proxy = proxy::Interface::new(&tio.root);
+    let proxy = proxy::Connection::open(&tio.root);
     let route = tio.route;
 
-    let mut device = Device::open(&proxy, route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
+    let device = proxy.device(route);
 
     let meta = device
-        .get_metadata()
-        .wrap_err("failed to fetch device metadata")?;
+        .metadata()
+        .wrap_err("failed to fetch device metadata")
+        .with_proxy_help()?;
 
     let mut file_out: Option<File> = None;
 
     let write_packet = |fo: &mut Option<File>, pkt: tio::Packet| -> eyre::Result<()> {
-        let raw = pkt
-            .serialize()
-            .wrap_err("failed to serialize metadata packet")?;
         let f = ensure_open(fo, &file)?;
-        f.write_all(&raw)
+        f.write_all(pkt.as_bytes())
             .wrap_err_with(|| format!("failed to write {}", file))
     };
 
-    write_packet(&mut file_out, meta.device.make_update_with_route(route))?;
+    write_packet(&mut file_out, meta.device.update(route)?)?;
     for (_id, stream) in meta.streams {
-        write_packet(&mut file_out, stream.stream.make_update_with_route(route))?;
-        write_packet(&mut file_out, stream.segment.make_update_with_route(route))?;
+        write_packet(&mut file_out, stream.stream.update(route)?)?;
+        write_packet(&mut file_out, stream.segment.update(route)?)?;
         for col in stream.columns {
-            write_packet(&mut file_out, col.make_update_with_route(route))?;
+            write_packet(&mut file_out, col.update(route)?)?;
         }
     }
     Ok(())
@@ -355,18 +359,18 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
     let mut packet_count = 0usize;
 
     while !rest.is_empty() {
-        let (pkt, len) = tio::Packet::deserialize(rest)
+        let (pkt, len) = tio::Packet::from_slice_prefix(rest)
             .wrap_err_with(|| format!("could not parse packet in {}", input))?;
         rest = &rest[len..];
         packet_count += 1;
 
-        if !matches!(pkt.payload, tio::proto::Payload::Metadata(_)) {
+        if pkt.ptype() != tio::proto::PacketType::METADATA {
             bail!(
                 "{} does not look like a metadata file (found non-metadata packet)",
                 input
             );
         }
-        routes.insert(pkt.routing);
+        routes.insert(pkt.route());
     }
 
     if packet_count == 0 {
@@ -400,14 +404,10 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
 
     rest = &data;
     while !rest.is_empty() {
-        let (mut pkt, len) = tio::Packet::deserialize(rest)
+        let (pkt, len) = tio::Packet::from_slice_prefix(rest)
             .wrap_err_with(|| format!("could not parse packet in {}", input))?;
         rest = &rest[len..];
-        pkt.routing = new_route;
-        let raw = pkt
-            .serialize()
-            .wrap_err_with(|| format!("failed to serialize packet for {}", output_path))?;
-        file.write_all(&raw)
+        file.write_all(pkt.with_route(new_route).as_bytes())
             .wrap_err_with(|| format!("failed to write {}", output_path))?;
     }
 

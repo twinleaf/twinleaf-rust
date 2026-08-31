@@ -14,7 +14,7 @@ use std::{collections::VecDeque, ops::Range};
 /// target or once rows that cannot share a batch with it arrive. Completed
 /// batches come back out in push order through
 /// [`BatchCoalescer::next_completed_batch`].
-pub struct BatchCoalescer {
+pub(crate) struct BatchCoalescer {
     /// Rows to accumulate before completing a batch; `None` completes every
     /// pushed batch on its own.
     target_rows: Option<usize>,
@@ -96,71 +96,50 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::records;
     use crate::data::sample::{BatchContext, Boundary, BoundaryReason, ColumnArray, ColumnData};
-    use crate::tio::proto::identifiers::{SampleNumber, StreamKey};
-    use crate::tio::proto::meta::{
-        ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata,
-        StreamMetadata,
-    };
-    use crate::tio::proto::{BufferType, DataType, DeviceRoute};
-    use std::sync::Arc;
+    use crate::data::StreamKey;
+    use crate::data::StreamRecord;
+    use crate::data::{BufferType, ColumnRecord, DeviceRecord, SampleNumber, SegmentRecord};
+    use crate::tio::proto::{DataType, DeviceRoute};
+    use twinleaf_proto::data as wire;
 
-    fn segment(segment_id: u8) -> Arc<SegmentMetadata> {
-        Arc::new(SegmentMetadata {
-            stream_id: 1,
+    fn segment(segment_id: u8) -> SegmentRecord {
+        SegmentRecord::encode(wire::Segment {
             segment_id,
-            flags: 0,
-            time_ref_epoch: MetadataEpoch::Unix,
-            time_ref_serial: "clock".to_string(),
-            time_ref_session_id: 7,
-            start_time: 0,
             sampling_rate: 4,
-            decimation: 1,
-            filter_cutoff: 0.0,
-            filter_type: MetadataFilter::Unfiltered,
+            ..records::segment(1)
         })
+        .unwrap()
     }
 
     /// A float batch of `rows` rows numbered from `first`, whose values are the
     /// sample numbers.
     fn batch(
-        segment: &Arc<SegmentMetadata>,
+        segment: &SegmentRecord,
         first: SampleNumber,
         rows: u32,
         boundary: Option<Boundary>,
         generations: Generations,
     ) -> SampleBatch {
-        let column = Arc::new(ColumnMetadata {
-            stream_id: 1,
-            index: 0,
-            data_type: DataType::Float64,
-            name: "col_0".to_string(),
-            units: String::new(),
-            description: String::new(),
-        });
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
                 StreamKey::new(DeviceRoute::root(), 1),
                 boundary,
                 generations,
                 segment.clone(),
-                Arc::new(StreamMetadata {
-                    stream_id: 1,
-                    name: "test-stream".to_string(),
-                    n_columns: 1,
+                StreamRecord::encode(wire::Stream {
                     n_segments: 2,
                     sample_size: 8,
-                    buf_samples: 128,
-                }),
-                Arc::new(DeviceMetadata {
-                    serial_number: "SN123".to_string(),
-                    firmware_hash: "fw".to_string(),
-                    n_streams: 1,
-                    session_id: 42,
-                    name: "test-device".to_string(),
-                }),
+                    ..records::stream(1)
+                })
+                .unwrap(),
+                DeviceRecord::encode(records::device()).unwrap(),
             ),
-            [(column, BufferType::Float)],
+            [(
+                ColumnRecord::encode(records::column(1, 0, DataType::F64)).unwrap(),
+                BufferType::Float,
+            )],
             rows as usize,
         );
         for n in first..first + rows {
@@ -278,7 +257,7 @@ mod tests {
     fn a_different_segment_completes_the_buffered_rows() {
         let mut coalescer = BatchCoalescer::new(Some(8));
         coalescer.push_batch(&batch(&segment(0), 0, 2, None, generations(1)));
-        coalescer.push_batch(&batch(&segment(0), 2, 2, None, generations(1)));
+        coalescer.push_batch(&batch(&segment(1), 2, 2, None, generations(1)));
         assert_eq!(
             coalescer
                 .next_completed_batch()

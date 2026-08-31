@@ -25,7 +25,7 @@ use ratatui::{
 };
 use tui_prompts::{State, TextState};
 use twinleaf::device::{DeviceRoute, RpcDescriptor, RpcRegistry};
-use twinleaf::tio::proto::RpcValueType;
+use twinleaf::device::{RpcMetaExt, RpcValueType};
 
 const RPCLIST_MAX_LEN: usize = 12;
 /// Close-affordance title on the input block; also hit-tested for clicks.
@@ -131,11 +131,6 @@ fn parse_palette_line(line: &str) -> ParsedLine {
         bad_type,
         roles,
     }
-}
-
-#[derive(Debug)]
-pub struct RpcResp {
-    pub result: Result<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

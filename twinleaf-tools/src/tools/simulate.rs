@@ -10,8 +10,14 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::tio::proto::RpcMetaFlags;
-use twinleaf::tio::proto::{self, meta};
+// Incoming packets are still parsed with the host's owned model; everything
+// this device *sends* is written by the wire crate, as firmware would.
+use twinleaf::tio::proto;
+use twinleaf_proto::data::MetadataType;
+use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
+use twinleaf_proto::{data, heartbeat, log, packet, rpc, settings, sync};
+use twinleaf_proto::{DeviceRoute, RpcRequestId, SessionId};
+use twinleaf_proto::{MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;
@@ -69,8 +75,6 @@ const CAPTURE_X_UNITS: &str = "s";
 const CAPTURE_STATUS_IDLE: u8 = 0;
 const CAPTURE_STATUS_CAPTURING: u8 = 1;
 const CAPTURE_STATUS_DONE: u8 = 2;
-const MAX_SAMPLE_NUMBER: u32 = 0x00ff_ffff;
-const STREAM_DATA_HEADER_BYTES: usize = 4;
 const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 const STATUS_SAMPLE_BYTES: usize = 2;
 const AUX_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
@@ -478,7 +482,7 @@ impl TestDevice {
             .samplerate
             .checked_mul(cli.segment_seconds)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "segment too long"))?;
-        if segment_samples > MAX_SAMPLE_NUMBER {
+        if segment_samples > data::MAX_SAMPLE_NUMBER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "segment contains too many samples for TIO sample numbering",
@@ -487,7 +491,7 @@ impl TestDevice {
         let aux_segment_samples = AUX_SAMPLE_RATE
             .checked_mul(cli.segment_seconds)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "aux segment too long"))?;
-        if aux_segment_samples > MAX_SAMPLE_NUMBER {
+        if aux_segment_samples > data::MAX_SAMPLE_NUMBER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "aux segment contains too many samples for TIO sample numbering",
@@ -730,7 +734,7 @@ impl TestDevice {
                     if !self.accept_packet_from(addr)? {
                         continue;
                     }
-                    match proto::Packet::deserialize(&buf[..size]) {
+                    match proto::Packet::from_slice_prefix(&buf[..size]) {
                         Ok((packet, parsed_size)) if parsed_size == size => {
                             self.handle_packet(packet, addr)?;
                         }
@@ -818,49 +822,51 @@ impl TestDevice {
     }
 
     fn handle_packet(&mut self, packet: proto::Packet, addr: SocketAddr) -> io::Result<()> {
-        if let proto::Payload::RpcRequest(req) = packet.payload {
-            self.handle_rpc(req, packet.routing, addr)?;
+        if let proto::Payload::RpcRequest(req) = packet.payload() {
+            self.handle_rpc(req, packet.route(), addr)?;
         }
         Ok(())
     }
 
     fn handle_rpc(
         &mut self,
-        req: proto::RpcRequestPayload,
-        routing: proto::DeviceRoute,
+        request: rpc::Request<'_>,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         self.update_capture();
 
-        let method = match &req.method {
-            proto::RpcMethod::Name(name) => name.as_str(),
-            proto::RpcMethod::Id(_) => {
-                return self.send_rpc_error(req.id, proto::RpcErrorCode::NotFound, routing, addr)
-            }
+        let id = request.id.value();
+        let arg = request.args;
+        let rpc::Method::ByName(name) = request.method else {
+            return self.send_rpc_error(id, RpcError::NotFound, routing, addr);
+        };
+        let Ok(method) = std::str::from_utf8(name) else {
+            return self.send_rpc_error(id, RpcError::NotFound, routing, addr);
         };
 
         match method {
-            "dev.name" => self.rpc_read_string(req.id, DEVICE_NAME, &req.arg, routing, addr),
-            "dev.desc" => self.rpc_read_string(req.id, &self.desc.clone(), &req.arg, routing, addr),
-            "dev.stop" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
+            "dev.name" => self.rpc_read_string(id, DEVICE_NAME, arg, routing, addr),
+            "dev.desc" => self.rpc_read_string(id, &self.desc.clone(), arg, routing, addr),
+            "dev.stop" => self.send_rpc_reply(id, &[], routing, addr),
             // Accept and acknowledge each firmware chunk (contents ignored).
-            "dev.firmware.upload" => self.send_rpc_reply(req.id, Vec::new(), routing, addr),
+            "dev.firmware.upload" => self.send_rpc_reply(id, &[], routing, addr),
             // Commit: simulate a reboot into a new build by rewriting dev.desc.
             "dev.firmware.upgrade" => {
                 self.desc = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]".to_string();
-                self.send_rpc_reply(req.id, Vec::new(), routing, addr)
+                self.send_rpc_reply(id, &[], routing, addr)
             }
-            "rpc.hash" => self.rpc_read_u32(req.id, self.rpc_hash, &req.arg, routing, addr),
-            "rpc.name" => self.rpc_name(req.id, &req.arg, routing, addr),
-            "rpc.id" => self.rpc_id(req.id, &req.arg, routing, addr),
-            "rpc.info" => self.rpc_info(req.id, &req.arg, routing, addr),
-            "rpc.list" => self.rpc_list_and_info(req.id, &req.arg, false, routing, addr),
-            "rpc.listinfo" => self.rpc_list_and_info(req.id, &req.arg, true, routing, addr),
-            "dev.metadata" => self.rpc_metadata(req.id, &req.arg, routing, addr),
+            "rpc.hash" => self.rpc_read_u32(id, self.rpc_hash, arg, routing, addr),
+            "rpc.name" => self.rpc_name(id, arg, routing, addr),
+            "rpc.id" => self.rpc_id(id, arg, routing, addr),
+            "rpc.info" => self.rpc_info(id, arg, routing, addr),
+            "rpc.list" => self.rpc_list_and_info(id, arg, false, routing, addr),
+            "rpc.listinfo" => self.rpc_list_and_info(id, arg, true, routing, addr),
+            "dev.metadata" => self.rpc_metadata(id, arg, routing, addr),
             "test.amplitude" => {
                 let next = self.read_or_write_nonnegative_f64(
-                    req.id,
-                    &req.arg,
+                    id,
+                    arg,
                     self.params.amplitude,
                     routing,
                     addr,
@@ -870,8 +876,8 @@ impl TestDevice {
             }
             "test.frequency" => {
                 let next = self.read_or_write_nonnegative_f64(
-                    req.id,
-                    &req.arg,
+                    id,
+                    arg,
                     self.params.frequency,
                     routing,
                     addr,
@@ -880,29 +886,24 @@ impl TestDevice {
                 Ok(())
             }
             "test.noise" => {
-                let next = self.read_or_write_nonnegative_f64(
-                    req.id,
-                    &req.arg,
-                    self.params.noise,
-                    routing,
-                    addr,
-                )?;
+                let next =
+                    self.read_or_write_nonnegative_f64(id, arg, self.params.noise, routing, addr)?;
                 self.params.noise = next;
                 Ok(())
             }
             "test.status" => {
-                let next = self.read_or_write_u8(req.id, &req.arg, self.status, routing, addr)?;
+                let next = self.read_or_write_u8(id, arg, self.status, routing, addr)?;
                 self.status = next;
                 Ok(())
             }
             "test.enable" => {
-                let next = self.read_or_write_u8(req.id, &req.arg, self.enable, routing, addr)?;
+                let next = self.read_or_write_u8(id, arg, self.enable, routing, addr)?;
                 self.enable = next;
                 Ok(())
             }
-            "test.go" => self.rpc_action(req.id, &req.arg, routing, addr),
-            "test.capture" => self.rpc_capture(req.id, &req.arg, routing, addr),
-            _ => self.send_rpc_error(req.id, proto::RpcErrorCode::NotFound, routing, addr),
+            "test.go" => self.rpc_action(id, arg, routing, addr),
+            "test.capture" => self.rpc_capture(id, arg, routing, addr),
+            _ => self.send_rpc_error(id, RpcError::NotFound, routing, addr),
         }
     }
 
@@ -911,13 +912,13 @@ impl TestDevice {
         id: u16,
         value: &str,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if !arg.is_empty() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::ReadOnly, routing, addr);
+            return self.send_rpc_error(id, RpcError::ReadOnly, routing, addr);
         }
-        self.send_rpc_reply(id, value.as_bytes().to_vec(), routing, addr)
+        self.send_rpc_reply(id, value.as_bytes(), routing, addr)
     }
 
     fn rpc_read_u32(
@@ -925,13 +926,13 @@ impl TestDevice {
         id: u16,
         value: u32,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if !arg.is_empty() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::ReadOnly, routing, addr);
+            return self.send_rpc_error(id, RpcError::ReadOnly, routing, addr);
         }
-        self.send_rpc_reply(id, value.to_le_bytes().to_vec(), routing, addr)
+        self.send_rpc_reply(id, &value.to_le_bytes(), routing, addr)
     }
 
     /// `rpc.name`: index (u16) -> RPC name. Port of tl-chibi's `rpc_name()`.
@@ -939,17 +940,17 @@ impl TestDevice {
         &self,
         id: u16,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if arg.len() != 2 {
-            return self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::ArgsSize, routing, addr);
         }
         let index = u16::from_le_bytes([arg[0], arg[1]]) as usize;
         let Some(spec) = self.rpcs.get(index) else {
-            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
         };
-        self.send_rpc_reply(id, spec.name.as_bytes().to_vec(), routing, addr)
+        self.send_rpc_reply(id, spec.name.as_bytes(), routing, addr)
     }
 
     /// `rpc.id`: RPC name -> index (u16). Port of tl-chibi's `rpc_id()`.
@@ -957,21 +958,19 @@ impl TestDevice {
         &self,
         id: u16,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if arg.is_empty() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
         }
         let index = self
             .rpcs
             .iter()
             .position(|spec| spec.name.as_bytes() == arg);
         match index {
-            Some(index) => {
-                self.send_rpc_reply(id, (index as u16).to_le_bytes().to_vec(), routing, addr)
-            }
-            None => self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr),
+            Some(index) => self.send_rpc_reply(id, &(index as u16).to_le_bytes(), routing, addr),
+            None => self.send_rpc_error(id, RpcError::Invalid, routing, addr),
         }
     }
 
@@ -980,21 +979,16 @@ impl TestDevice {
         &self,
         id: u16,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if arg.is_empty() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
         }
         let Some(spec) = self.rpcs.iter().find(|spec| spec.name.as_bytes() == arg) else {
-            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
         };
-        self.send_rpc_reply(
-            id,
-            spec.legacy_metadata().to_le_bytes().to_vec(),
-            routing,
-            addr,
-        )
+        self.send_rpc_reply(id, &spec.legacy_metadata().to_le_bytes(), routing, addr)
     }
 
     /// `rpc.list` / `rpc.listinfo`: with no argument, the number of RPCs (u16);
@@ -1005,24 +999,19 @@ impl TestDevice {
         id: u16,
         arg: &[u8],
         prepend_info: bool,
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if arg.is_empty() {
-            return self.send_rpc_reply(
-                id,
-                (self.rpcs.len() as u16).to_le_bytes().to_vec(),
-                routing,
-                addr,
-            );
+            return self.send_rpc_reply(id, &(self.rpcs.len() as u16).to_le_bytes(), routing, addr);
         }
         if arg.len() != 2 {
-            return self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::ArgsSize, routing, addr);
         }
 
         let index = u16::from_le_bytes([arg[0], arg[1]]) as usize;
         let Some(spec) = self.rpcs.get(index) else {
-            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
         };
 
         let mut reply = Vec::new();
@@ -1030,39 +1019,45 @@ impl TestDevice {
             reply.extend(spec.legacy_metadata().to_le_bytes());
         }
         reply.extend(spec.name.as_bytes());
-        self.send_rpc_reply(id, reply, routing, addr)
+        self.send_rpc_reply(id, &reply, routing, addr)
     }
 
     fn rpc_metadata(
         &self,
         id: u16,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        let reply = if arg.is_empty() {
-            self.all_metadata_reply()?
-        } else if arg.len().is_multiple_of(3) {
+        let query = match data::MetadataQuery::parse(arg) {
+            Ok(query) => query,
+            Err(data::MetadataQueryError::Misaligned) => {
+                return self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)
+            }
+            Err(data::MetadataQueryError::TooManySelectors) => {
+                return self.send_rpc_error(id, RpcError::Invalid, routing, addr)
+            }
+        };
+
+        let reply = if query.is_bootstrap() {
+            self.bootstrap_metadata_reply()?
+        } else {
+            // The reply stops at packet capacity like tl-chibi: the host is
+            // expected to re-request whatever records did not fit.
             let mut reply = Vec::new();
-            for req in arg.chunks_exact(3) {
-                if self
-                    .append_metadata_record(&mut reply, req[0], req[1], req[2])
-                    .is_err()
-                {
-                    return self.send_rpc_error(
-                        id,
-                        proto::RpcErrorCode::InvalidArgs,
-                        routing,
-                        addr,
-                    );
+            for selector in query.selectors() {
+                let record = match self.requested_record(selector) {
+                    Ok(record) => record,
+                    Err(_) => return self.send_rpc_error(id, RpcError::Invalid, routing, addr),
+                };
+                if !append_record(&mut reply, record)? {
+                    break;
                 }
             }
             reply
-        } else {
-            return self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr);
         };
 
-        self.send_rpc_reply(id, reply, routing, addr)
+        self.send_rpc_reply(id, &reply, routing, addr)
     }
 
     fn read_or_write_nonnegative_f64(
@@ -1070,24 +1065,24 @@ impl TestDevice {
         id: u16,
         arg: &[u8],
         current: f64,
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<f64> {
         let value = match arg.len() {
             0 => current,
             8 => f64::from_le_bytes(arg.try_into().unwrap()),
             _ => {
-                self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr)?;
+                self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)?;
                 return Ok(current);
             }
         };
 
         if !value.is_finite() || value < 0.0 {
-            self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr)?;
+            self.send_rpc_error(id, RpcError::Invalid, routing, addr)?;
             return Ok(current);
         }
 
-        self.send_rpc_reply(id, value.to_le_bytes().to_vec(), routing, addr)?;
+        self.send_rpc_reply(id, &value.to_le_bytes(), routing, addr)?;
         Ok(value)
     }
 
@@ -1096,19 +1091,19 @@ impl TestDevice {
         id: u16,
         arg: &[u8],
         current: u8,
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<u8> {
         let value = match arg.len() {
             0 => current,
             1 => arg[0],
             _ => {
-                self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr)?;
+                self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)?;
                 return Ok(current);
             }
         };
 
-        self.send_rpc_reply(id, vec![value], routing, addr)?;
+        self.send_rpc_reply(id, &[value], routing, addr)?;
         Ok(value)
     }
 
@@ -1116,49 +1111,49 @@ impl TestDevice {
         &self,
         id: u16,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if !arg.is_empty() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::ArgsSize, routing, addr);
         }
         terminal_println!("test.go action invoked");
-        self.send_rpc_reply(id, Vec::new(), routing, addr)
+        self.send_rpc_reply(id, &[], routing, addr)
     }
 
     fn rpc_capture(
         &mut self,
         id: u16,
         arg: &[u8],
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         let selector = match arg.len() {
             0 => -2,
             2 => i16::from_le_bytes([arg[0], arg[1]]),
             _ => {
-                self.send_rpc_error(id, proto::RpcErrorCode::WrongSizeArgs, routing, addr)?;
+                self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)?;
                 return Ok(());
             }
         };
 
         match selector {
             -1 => self.rpc_capture_trigger(id, routing, addr),
-            -2 => self.send_rpc_reply(id, vec![self.capture.status()], routing, addr),
-            -3 => self.send_rpc_reply(id, self.capture_metadata_reply(), routing, addr),
+            -2 => self.send_rpc_reply(id, &[self.capture.status()], routing, addr),
+            -3 => self.send_rpc_reply(id, &self.capture_metadata_reply(), routing, addr),
             index if index >= 0 => self.rpc_capture_block(id, index as u16, routing, addr),
-            _ => self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr),
+            _ => self.send_rpc_error(id, RpcError::Invalid, routing, addr),
         }
     }
 
     fn rpc_capture_trigger(
         &mut self,
         id: u16,
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if self.capture.locked() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::Busy, routing, addr);
+            return self.send_rpc_error(id, RpcError::Busy, routing, addr);
         }
 
         let (data, info) = self.generate_capture_data();
@@ -1169,24 +1164,24 @@ impl TestDevice {
             info.length,
             CAPTURE_TRIGGER_DELAY.as_secs_f64()
         );
-        self.send_rpc_reply(id, Vec::new(), routing, addr)
+        self.send_rpc_reply(id, &[], routing, addr)
     }
 
     fn rpc_capture_block(
         &mut self,
         id: u16,
         index: u16,
-        routing: proto::DeviceRoute,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
         if self.capture.locked() {
-            return self.send_rpc_error(id, proto::RpcErrorCode::Busy, routing, addr);
+            return self.send_rpc_error(id, RpcError::Busy, routing, addr);
         }
 
         let Some(block) = self.capture.block(index) else {
-            return self.send_rpc_error(id, proto::RpcErrorCode::InvalidArgs, routing, addr);
+            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
         };
-        self.send_rpc_reply(id, block.to_vec(), routing, addr)
+        self.send_rpc_reply(id, block, routing, addr)
     }
 
     fn capture_metadata_reply(&self) -> Vec<u8> {
@@ -1196,7 +1191,7 @@ impl TestDevice {
 
         fixed.push(CAPTURE_METADATA_FIXED_LEN);
         fixed.push(CAPTURE_METADATA_VERSION);
-        fixed.push(u8::from(proto::DataType::Float32));
+        fixed.push(data::DataType::F32.value());
         fixed.push(0);
         fixed.extend(
             u32::try_from(self.capture.export_size())
@@ -1256,7 +1251,7 @@ impl TestDevice {
         };
 
         if self.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            self.send_packet(&self.heartbeat_packet(), client.addr)?;
+            self.send_heartbeat(client.addr)?;
             self.last_heartbeat = Instant::now();
         }
 
@@ -1273,17 +1268,16 @@ impl TestDevice {
         let level = self.next_log_level();
         let lucky_number = (self.rng.next_u64() % 10_000) as u32;
         let message = self.random_log_message(lucky_number);
-        self.send_packet(
-            &proto::Packet {
-                payload: proto::Payload::LogMessage(proto::LogMessagePayload {
-                    data: lucky_number,
-                    level,
-                    message,
-                }),
-                routing: proto::DeviceRoute::root(),
-                ttl: 0,
-            },
+        let entry = log::LogMessage {
+            level,
+            data: lucky_number,
+            message: message.as_bytes(),
+        };
+        self.send_written(
             addr,
+            DeviceRoute::root(),
+            || format!("log message level={level:?} data={lucky_number}"),
+            |buf| entry.write(buf),
         )?;
         self.next_log_message_at = Instant::now() + self.next_log_delay();
         Ok(())
@@ -1348,14 +1342,14 @@ impl TestDevice {
             SINE_STREAM_ID,
             first_sample_n,
             segment_id,
-            waveform_data,
+            &waveform_data,
             addr,
         )?;
         self.send_stream_packet(
             STATUS_STREAM_ID,
             first_sample_n,
             segment_id,
-            status_data,
+            &status_data,
             addr,
         )?;
 
@@ -1408,7 +1402,7 @@ impl TestDevice {
             data.extend(sawtooth.to_le_bytes());
         }
 
-        self.send_stream_packet(AUX_STREAM_ID, first_sample_n, segment_id, data, addr)?;
+        self.send_stream_packet(AUX_STREAM_ID, first_sample_n, segment_id, &data, addr)?;
 
         for _ in 0..batch_len {
             self.advance_aux_sample();
@@ -1422,21 +1416,27 @@ impl TestDevice {
         stream_id: u8,
         first_sample_n: u32,
         segment_id: u8,
-        data: Vec<u8>,
+        samples: &[u8],
         addr: SocketAddr,
     ) -> io::Result<()> {
-        self.send_packet(
-            &proto::Packet {
-                payload: proto::Payload::StreamData(proto::StreamDataPayload {
-                    stream_id,
-                    first_sample_n,
-                    segment_id,
-                    data: data.into(),
-                }),
-                routing: proto::DeviceRoute::root(),
-                ttl: 0,
-            },
+        let packet = data::Samples {
+            stream_id,
+            segment_id,
+            first: first_sample_n,
+            data: samples,
+        };
+        self.send_written(
             addr,
+            DeviceRoute::root(),
+            || {
+                format!(
+                    "stream data stream_id={stream_id} segment_id={segment_id} \
+                     first_sample_n={first_sample_n} data_bytes={} max_data_bytes={}",
+                    samples.len(),
+                    stream_data_max_data_bytes()
+                )
+            },
+            |buf| packet.write(buf),
         )
     }
 
@@ -1523,13 +1523,13 @@ impl TestDevice {
         next_log_delay(&mut self.rng)
     }
 
-    fn next_log_level(&mut self) -> proto::LogLevel {
+    fn next_log_level(&mut self) -> log::LogLevel {
         let levels = [
-            proto::LogLevel::Critical,
-            proto::LogLevel::Error,
-            proto::LogLevel::Warning,
-            proto::LogLevel::Info,
-            proto::LogLevel::Debug,
+            log::LogLevel::CRITICAL,
+            log::LogLevel::ERROR,
+            log::LogLevel::WARNING,
+            log::LogLevel::INFO,
+            log::LogLevel::DEBUG,
         ];
         let level = levels[self.next_log_level % levels.len()];
         self.next_log_level = self.next_log_level.wrapping_add(1);
@@ -1552,7 +1552,10 @@ impl TestDevice {
     fn send_sample_segment_updates_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
         if self.pending_segment_update && self.sample_number == 0 {
             for stream_id in [SINE_STREAM_ID, STATUS_STREAM_ID] {
-                self.send_packet(&self.segment_metadata(stream_id).make_update(), addr)?;
+                self.send_metadata(
+                    data::Metadata::Segment(self.segment_record(stream_id)),
+                    addr,
+                )?;
             }
             self.pending_segment_update = false;
         }
@@ -1561,234 +1564,213 @@ impl TestDevice {
 
     fn send_aux_segment_update_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
         if self.aux_pending_segment_update && self.aux_sample_number == 0 {
-            self.send_packet(&self.segment_metadata(AUX_STREAM_ID).make_update(), addr)?;
+            self.send_metadata(
+                data::Metadata::Segment(self.segment_record(AUX_STREAM_ID)),
+                addr,
+            )?;
             self.aux_pending_segment_update = false;
         }
         Ok(())
     }
 
     fn send_initial_packets(&self, addr: SocketAddr) -> io::Result<()> {
-        self.send_packet(&self.settings_packet(), addr)?;
-        self.send_packet(&self.heartbeat_packet(), addr)?;
-        self.send_packet(&self.device_metadata().make_update(), addr)?;
+        self.send_rpc_hash_setting(addr)?;
+        self.send_heartbeat(addr)?;
+        self.send_metadata(data::Metadata::Device(self.device_record()), addr)?;
         for stream_id in Self::stream_ids() {
-            self.send_packet(
-                &self
-                    .stream_metadata(stream_id)
-                    .expect("known stream")
-                    .make_update(),
+            self.send_metadata(data::Metadata::Stream(self.stream_record(stream_id)?), addr)?;
+            self.send_metadata(
+                data::Metadata::Segment(self.segment_record(stream_id)),
                 addr,
             )?;
-            self.send_packet(&self.segment_metadata(stream_id).make_update(), addr)?;
             for column_index in 0..Self::column_count(stream_id).expect("known stream") {
-                self.send_packet(
-                    &self
-                        .column_metadata(stream_id, column_index)
-                        .expect("known column")
-                        .make_update(),
-                    addr,
-                )?;
+                let column = Self::column_record(stream_id, column_index).expect("known column");
+                self.send_metadata(data::Metadata::Column(column), addr)?;
             }
         }
         Ok(())
     }
 
+    fn send_heartbeat(&self, addr: SocketAddr) -> io::Result<()> {
+        let beat = heartbeat::Heartbeat::Session(SessionId::new(self.session_id));
+        self.send_written(
+            addr,
+            DeviceRoute::root(),
+            || format!("heartbeat session={}", self.session_id),
+            |buf| beat.write(buf),
+        )
+    }
+
+    /// The `rpc.hash` broadcast a device sends on connect, so a client knows
+    /// which RPC table it is talking to before it asks anything.
+    fn send_rpc_hash_setting(&self, addr: SocketAddr) -> io::Result<()> {
+        let hash = self.rpc_hash.to_le_bytes();
+        let setting = settings::Setting {
+            name: b"rpc.hash",
+            flags: 0,
+            reply: &hash,
+        };
+        self.send_written(
+            addr,
+            DeviceRoute::root(),
+            || "rpc.hash setting".to_string(),
+            |buf| setting.write(buf),
+        )
+    }
+
+    fn send_metadata(&self, record: data::Metadata<'_>, addr: SocketAddr) -> io::Result<()> {
+        self.send_written(
+            addr,
+            DeviceRoute::root(),
+            move || format!("metadata {record:?}"),
+            move |buf| record.write(data::MetadataFlags::UPDATE, buf),
+        )
+    }
+
     fn send_rpc_reply(
         &self,
         id: u16,
-        reply: Vec<u8>,
-        routing: proto::DeviceRoute,
+        reply: &[u8],
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        self.send_packet(
-            &proto::Packet {
-                payload: proto::Payload::RpcReply(proto::RpcReplyPayload { id, reply }),
-                routing,
-                ttl: 0,
-            },
+        self.send_written(
             addr,
+            routing,
+            || format!("rpc reply id={id} reply_bytes={}", reply.len()),
+            |buf| rpc::write_reply(buf, RpcRequestId::new(id), reply),
         )
     }
 
     fn send_rpc_error(
         &self,
         id: u16,
-        error: proto::RpcErrorCode,
-        routing: proto::DeviceRoute,
+        error: RpcError,
+        routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        self.send_packet(
-            &proto::Packet {
-                payload: proto::Payload::RpcError(proto::RpcErrorPayload {
-                    id,
-                    error,
-                    extra: Vec::new(),
-                }),
-                routing,
-                ttl: 0,
-            },
+        self.send_written(
             addr,
+            routing,
+            || format!("rpc error id={id} error={error:?}"),
+            |buf| rpc::write_error(buf, RpcRequestId::new(id), error),
         )
     }
 
-    fn send_packet(&self, packet: &proto::Packet, addr: SocketAddr) -> io::Result<()> {
-        let raw = packet.serialize().map_err(|source| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("could not encode {}: {source}", describe_packet(packet)),
-            )
-        })?;
-        self.socket.send_to(&raw, addr)?;
+    /// Send a packet built by one of twinleaf-proto's device-side writers,
+    /// addressed to the device it speaks for: `routing` is empty for this
+    /// device itself, and one hop per level for a simulated subtree device.
+    fn send_written(
+        &self,
+        addr: SocketAddr,
+        routing: DeviceRoute,
+        describe: impl Fn() -> String,
+        write: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) -> io::Result<()> {
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut written = write(&mut buf)
+            .and_then(|len| packet::Packet::from_slice(&buf[..len]))
+            .ok_or_else(|| encode_error(&describe(), "does not fit a packet"))?;
+        // Hops travel leaf-first on the wire, the reverse of a route's order.
+        for &hop in routing.as_slice().iter().rev() {
+            written
+                .push_hop(hop)
+                .map_err(|_| encode_error(&describe(), "cannot carry its route"))?;
+        }
+        self.socket.send_to(written.as_slice(), addr)?;
         Ok(())
     }
 
-    fn all_metadata_reply(&self) -> io::Result<Vec<u8>> {
+    /// The bootstrap reply: records in sweep order — the device, then each
+    /// stream with its current segment and its columns — stopping at reply
+    /// capacity like tl-chibi.
+    fn bootstrap_metadata_reply(&self) -> io::Result<Vec<u8>> {
         let mut reply = Vec::new();
-        self.append_metadata_record(&mut reply, u8::from(meta::MetadataType::Device), 0, 0)?;
+        if !append_record(&mut reply, data::Metadata::Device(self.device_record()))? {
+            return Ok(reply);
+        }
         for stream_id in Self::stream_ids() {
-            self.append_metadata_record(
-                &mut reply,
-                u8::from(meta::MetadataType::Stream),
-                stream_id,
-                0,
-            )?;
-            self.append_metadata_record(
-                &mut reply,
-                u8::from(meta::MetadataType::Segment),
-                stream_id,
-                self.segment_id,
-            )?;
+            let mut records = vec![
+                data::Metadata::Stream(self.stream_record(stream_id)?),
+                data::Metadata::Segment(self.segment_record_at(stream_id, self.segment_id)),
+            ];
             for column_index in 0..Self::column_count(stream_id).expect("known stream") {
-                self.append_metadata_record(
-                    &mut reply,
-                    u8::from(meta::MetadataType::Column),
-                    stream_id,
-                    column_index,
-                )?;
+                let column = Self::column_record(stream_id, column_index).expect("known column");
+                records.push(data::Metadata::Column(column));
+            }
+            for record in records {
+                if !append_record(&mut reply, record)? {
+                    return Ok(reply);
+                }
             }
         }
         Ok(reply)
     }
 
-    fn append_metadata_record(
+    /// The record a `dev.metadata` selector names.
+    fn requested_record(
         &self,
-        reply: &mut Vec<u8>,
-        metadata_type: u8,
-        stream_id: u8,
-        index: u8,
-    ) -> io::Result<()> {
-        let (mtype, body) = match meta::MetadataType::from(metadata_type) {
-            meta::MetadataType::Device => {
-                let (fixed, varlen) = self
-                    .device_metadata()
-                    .serialize(&[], &[])
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "device metadata"))?;
-                (meta::MetadataType::Device, join_metadata(fixed, varlen))
-            }
-            meta::MetadataType::Stream => {
-                let Some(stream) = self.stream_metadata(stream_id) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "unknown stream metadata",
-                    ));
-                };
-                let (fixed, varlen) = stream
-                    .serialize(&[], &[])
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stream metadata"))?;
-                (meta::MetadataType::Stream, join_metadata(fixed, varlen))
-            }
-            meta::MetadataType::Segment if Self::is_known_stream(stream_id) => {
-                let mut segment = self.segment_metadata(stream_id);
-                segment.segment_id = index;
-                let current_segment_id = if stream_id == AUX_STREAM_ID {
-                    self.aux_segment_id
+        selector: data::MetadataSelector,
+    ) -> io::Result<data::Metadata<'static>> {
+        let data::MetadataSelector {
+            mtype,
+            stream_id,
+            index,
+        } = selector;
+        match mtype {
+            MetadataType::Device => Ok(data::Metadata::Device(self.device_record())),
+            MetadataType::Stream => Ok(data::Metadata::Stream(self.stream_record(stream_id)?)),
+            MetadataType::Segment if Self::is_known_stream(stream_id) => {
+                Ok(data::Metadata::Segment(if index == data::CURRENT_SEGMENT {
+                    self.segment_record(stream_id)
                 } else {
-                    self.segment_id
-                };
-                let current_start_time = if stream_id == AUX_STREAM_ID {
-                    self.aux_segment_start_time
-                } else {
-                    self.segment_start_time
-                };
-                let delta_segments =
-                    u32::from((index + N_SEGMENTS - current_segment_id) % N_SEGMENTS);
-                segment.start_time = current_start_time
-                    .saturating_add(delta_segments.saturating_mul(self.segment_seconds));
-                let (fixed, varlen) = segment
-                    .serialize(&[], &[])
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment metadata"))?;
-                (meta::MetadataType::Segment, join_metadata(fixed, varlen))
+                    self.segment_record_at(stream_id, index)
+                }))
             }
-            meta::MetadataType::Column => {
-                let Some(column) = self.column_metadata(stream_id, index) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "unknown column metadata",
-                    ));
-                };
-                let (fixed, varlen) = column
-                    .serialize(&[], &[])
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "column metadata"))?;
-                (meta::MetadataType::Column, join_metadata(fixed, varlen))
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown metadata request",
-                ))
-            }
-        };
-
-        let len = u8::try_from(body.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "metadata too large"))?;
-        reply.push(u8::from(mtype));
-        reply.push(len);
-        reply.extend(body);
-        Ok(())
-    }
-
-    fn device_metadata(&self) -> meta::DeviceMetadata {
-        meta::DeviceMetadata {
-            serial_number: DEVICE_SERIAL.to_string(),
-            firmware_hash: DEVICE_FIRMWARE.to_string(),
-            n_streams: 3,
-            session_id: self.session_id,
-            name: DEVICE_NAME.to_string(),
+            MetadataType::Column => match Self::column_record(stream_id, index) {
+                Some(column) => Ok(data::Metadata::Column(column)),
+                None => Err(no_record_for(&format!(
+                    "column {index} of stream {stream_id}"
+                ))),
+            },
+            MetadataType::Segment | MetadataType::Unknown(_) => Err(no_record_for(&format!(
+                "metadata type {:?} of stream {stream_id}",
+                mtype
+            ))),
         }
     }
 
-    fn stream_metadata(&self, stream_id: u8) -> Option<meta::StreamMetadata> {
-        let stream = match stream_id {
-            SINE_STREAM_ID => meta::StreamMetadata {
-                stream_id: SINE_STREAM_ID,
-                name: "sine".to_string(),
-                n_columns: 2,
-                n_segments: N_SEGMENTS as usize,
-                sample_size: SINE_SAMPLE_BYTES,
-                buf_samples: self.sample_rate as usize,
-            },
-            STATUS_STREAM_ID => meta::StreamMetadata {
-                stream_id: STATUS_STREAM_ID,
-                name: "status".to_string(),
-                n_columns: 2,
-                n_segments: N_SEGMENTS as usize,
-                sample_size: STATUS_SAMPLE_BYTES,
-                buf_samples: self.sample_rate as usize,
-            },
-            AUX_STREAM_ID => meta::StreamMetadata {
-                stream_id: AUX_STREAM_ID,
-                name: "aux".to_string(),
-                n_columns: 2,
-                n_segments: N_SEGMENTS as usize,
-                sample_size: AUX_SAMPLE_BYTES,
-                buf_samples: AUX_SAMPLE_RATE as usize,
-            },
-            _ => return None,
-        };
-        Some(stream)
+    fn device_record(&self) -> data::Device<'static> {
+        data::Device {
+            session: SessionId::new(self.session_id),
+            n_streams: 3,
+            name: DEVICE_NAME,
+            serial: DEVICE_SERIAL,
+            firmware: DEVICE_FIRMWARE,
+        }
     }
 
-    fn segment_metadata(&self, stream_id: u8) -> meta::SegmentMetadata {
+    /// An unknown stream has no record, and neither does one whose sample or
+    /// buffer size the record's 16-bit fields cannot hold.
+    fn stream_record(&self, stream_id: u8) -> io::Result<data::Stream<'static>> {
+        let missing = || no_record_for(&format!("stream {stream_id}"));
+        let (name, sample_size, buf_samples) = match stream_id {
+            SINE_STREAM_ID => ("sine", SINE_SAMPLE_BYTES, self.sample_rate),
+            STATUS_STREAM_ID => ("status", STATUS_SAMPLE_BYTES, self.sample_rate),
+            AUX_STREAM_ID => ("aux", AUX_SAMPLE_BYTES, AUX_SAMPLE_RATE),
+            _ => return Err(missing()),
+        };
+        Ok(data::Stream {
+            stream_id,
+            n_columns: 2,
+            n_segments: N_SEGMENTS,
+            sample_size: u16::try_from(sample_size).map_err(|_| missing())?,
+            buf_samples: u16::try_from(buf_samples).map_err(|_| missing())?,
+            name,
+        })
+    }
+
+    fn segment_record(&self, stream_id: u8) -> data::Segment<'static> {
         let (segment_id, start_time, sampling_rate) = match stream_id {
             AUX_STREAM_ID => (
                 self.aux_segment_id,
@@ -1798,74 +1780,61 @@ impl TestDevice {
             _ => (self.segment_id, self.segment_start_time, self.sample_rate),
         };
 
-        meta::SegmentMetadata {
+        data::Segment {
             stream_id,
             segment_id,
-            flags: 0x01 | 0x02,
-            time_ref_epoch: meta::MetadataEpoch::Unix,
-            time_ref_serial: DEVICE_SERIAL.to_string(),
-            time_ref_session_id: self.session_id,
+            flags: data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE,
+            epoch: sync::Epoch::UNIX,
+            timeref_serial: DEVICE_SERIAL,
+            timeref_session: SessionId::new(self.session_id),
             start_time,
             sampling_rate,
             decimation: 1,
             filter_cutoff: sampling_rate as f32 / 2.0,
-            filter_type: meta::MetadataFilter::Unfiltered,
+            filter_type: data::FilterType::NONE,
         }
     }
 
-    fn column_metadata(&self, stream_id: u8, index: u8) -> Option<meta::ColumnMetadata> {
-        let column = match (stream_id, index) {
-            (SINE_STREAM_ID, 0) => meta::ColumnMetadata {
-                stream_id,
-                index: index.into(),
-                data_type: proto::DataType::Float64,
-                name: "sine".to_string(),
-                units: "V".to_string(),
-                description: "Noisy sine wave".to_string(),
-            },
-            (SINE_STREAM_ID, 1) => meta::ColumnMetadata {
-                stream_id,
-                index: index.into(),
-                data_type: proto::DataType::Float64,
-                name: "cosine".to_string(),
-                units: "V".to_string(),
-                description: "Noisy quadrature wave".to_string(),
-            },
-            (STATUS_STREAM_ID, 0) => meta::ColumnMetadata {
-                stream_id,
-                index: index.into(),
-                data_type: proto::DataType::UInt8,
-                name: "status".to_string(),
-                units: "".to_string(),
-                description: "Mirrors the test.status RPC".to_string(),
-            },
-            (STATUS_STREAM_ID, 1) => meta::ColumnMetadata {
-                stream_id,
-                index: index.into(),
-                data_type: proto::DataType::UInt8,
-                name: "signal_level".to_string(),
-                units: "".to_string(),
-                description: "Fixed simulated signal level".to_string(),
-            },
-            (AUX_STREAM_ID, 0) => meta::ColumnMetadata {
-                stream_id,
-                index: index.into(),
-                data_type: proto::DataType::Float64,
-                name: "triangle".to_string(),
-                units: "arb".to_string(),
-                description: "Triangle wave".to_string(),
-            },
-            (AUX_STREAM_ID, 1) => meta::ColumnMetadata {
-                stream_id,
-                index: index.into(),
-                data_type: proto::DataType::Float64,
-                name: "sawtooth".to_string(),
-                units: "arb".to_string(),
-                description: "Sawtooth wave".to_string(),
-            },
+    /// The segment record for a segment other than the one being acquired: it
+    /// starts one segment length later for each step past the current one.
+    fn segment_record_at(&self, stream_id: u8, segment_id: u8) -> data::Segment<'static> {
+        let mut segment = self.segment_record(stream_id);
+        let ahead = u32::from((segment_id + N_SEGMENTS - segment.segment_id) % N_SEGMENTS);
+        segment.start_time = segment
+            .start_time
+            .saturating_add(ahead.saturating_mul(self.segment_seconds));
+        segment.segment_id = segment_id;
+        segment
+    }
+
+    fn column_record(stream_id: u8, index: u8) -> Option<data::Column<'static>> {
+        let (data_type, name, units, description) = match (stream_id, index) {
+            (SINE_STREAM_ID, 0) => (data::DataType::F64, "sine", "V", "Noisy sine wave"),
+            (SINE_STREAM_ID, 1) => (data::DataType::F64, "cosine", "V", "Noisy quadrature wave"),
+            (STATUS_STREAM_ID, 0) => (
+                data::DataType::U8,
+                "status",
+                "",
+                "Mirrors the test.status RPC",
+            ),
+            (STATUS_STREAM_ID, 1) => (
+                data::DataType::U8,
+                "signal_level",
+                "",
+                "Fixed simulated signal level",
+            ),
+            (AUX_STREAM_ID, 0) => (data::DataType::F64, "triangle", "arb", "Triangle wave"),
+            (AUX_STREAM_ID, 1) => (data::DataType::F64, "sawtooth", "arb", "Sawtooth wave"),
             _ => return None,
         };
-        Some(column)
+        Some(data::Column {
+            stream_id,
+            index,
+            data_type,
+            name,
+            units,
+            description,
+        })
     }
 
     fn is_known_stream(stream_id: u8) -> bool {
@@ -1882,34 +1851,40 @@ impl TestDevice {
     fn stream_ids() -> [u8; 3] {
         [SINE_STREAM_ID, STATUS_STREAM_ID, AUX_STREAM_ID]
     }
-
-    fn heartbeat_packet(&self) -> proto::Packet {
-        proto::Packet {
-            payload: proto::Payload::Heartbeat(proto::HeartbeatPayload::Session(self.session_id)),
-            routing: proto::DeviceRoute::root(),
-            ttl: 0,
-        }
-    }
-
-    fn settings_packet(&self) -> proto::Packet {
-        proto::Packet {
-            payload: proto::Payload::Settings(proto::SettingsPayload::RpcHash(self.rpc_hash)),
-            routing: proto::DeviceRoute::root(),
-            ttl: 0,
-        }
-    }
 }
 
-fn join_metadata(mut fixed: Vec<u8>, varlen: Vec<u8>) -> Vec<u8> {
-    fixed.extend(varlen);
-    fixed
+fn encode_error(what: &str, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("could not encode {what}: it {why}"),
+    )
+}
+
+fn no_record_for(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("this device has no metadata record for {what}"),
+    )
+}
+
+/// Append one bare record to a `dev.metadata` reply, behind the
+/// `[record type][record length]` framing those replies use.
+/// Append `record` as one reply frame; `Ok(false)` leaves the reply unchanged
+/// because it is at capacity.
+fn append_record(reply: &mut Vec<u8>, record: data::Metadata<'_>) -> io::Result<bool> {
+    let mut frame = vec![0u8; data::METADATA_REPLY_FRAME_HEADER + record.record_len()];
+    let len = record
+        .write_reply_frame(&mut frame)
+        .ok_or_else(|| encode_error("a metadata record", "does not fit a reply frame"))?;
+    if reply.len() + len > data::MAX_METADATA_REPLY_SIZE {
+        return Ok(false);
+    }
+    reply.extend_from_slice(&frame[..len]);
+    Ok(true)
 }
 
 fn stream_data_max_data_bytes() -> usize {
-    proto::TIO_PACKET_MAX_TOTAL_SIZE
-        .saturating_sub(proto::TIO_PACKET_HEADER_SIZE)
-        .saturating_sub(proto::TIO_PACKET_MAX_ROUTING_SIZE)
-        .saturating_sub(STREAM_DATA_HEADER_BYTES)
+    MAX_PAYLOAD_SIZE.saturating_sub(data::SAMPLE_HEADER_SIZE)
 }
 
 fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
@@ -1921,10 +1896,7 @@ fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
 
 #[cfg(test)]
 fn rpc_reply_max_reply_bytes() -> usize {
-    proto::TIO_PACKET_MAX_TOTAL_SIZE
-        .saturating_sub(proto::TIO_PACKET_HEADER_SIZE)
-        .saturating_sub(proto::TIO_PACKET_MAX_ROUTING_SIZE)
-        .saturating_sub(2)
+    MAX_PAYLOAD_SIZE.saturating_sub(2)
 }
 
 fn append_capture_metadata_string(varlen: &mut Vec<u8>, value: &str) -> u8 {
@@ -1949,33 +1921,6 @@ fn next_log_delay(rng: &mut GaussianRng) -> Duration {
 fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
     let span = CAPTURE_SAMPLE_COUNT_MAX - CAPTURE_SAMPLE_COUNT_MIN + 1;
     CAPTURE_SAMPLE_COUNT_MIN + (rng.next_u64() as usize % span)
-}
-
-fn describe_packet(packet: &proto::Packet) -> String {
-    match &packet.payload {
-        proto::Payload::StreamData(data) => format!(
-            "stream data stream_id={} segment_id={} first_sample_n={} data_bytes={} max_data_bytes={}",
-            data.stream_id,
-            data.segment_id,
-            data.first_sample_n,
-            data.data.len(),
-            stream_data_max_data_bytes()
-        ),
-        proto::Payload::Metadata(metadata) => format!("metadata {:?}", metadata.content),
-        proto::Payload::RpcReply(reply) => {
-            format!("rpc reply id={} reply_bytes={}", reply.id, reply.reply.len())
-        }
-        proto::Payload::RpcError(error) => {
-            format!("rpc error id={} error={:?}", error.id, error.error)
-        }
-        proto::Payload::RpcRequest(request) => format!(
-            "rpc request id={} method={:?} arg_bytes={}",
-            request.id,
-            request.method,
-            request.arg.len()
-        ),
-        other => format!("{other:?}"),
-    }
 }
 
 fn unix_duration() -> Duration {
@@ -2120,6 +2065,62 @@ mod tests {
     }
 
     #[test]
+    fn metadata_bootstrap_replies_in_sweep_order_within_capacity() {
+        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
+        let device = TestDevice::new(cli).unwrap();
+
+        let reply = device.bootstrap_metadata_reply().unwrap();
+        assert!(reply.len() <= data::MAX_METADATA_REPLY_SIZE);
+        let kinds: Vec<_> = data::MetadataReply::parse(&reply)
+            .unwrap()
+            .map(|(kind, _)| kind)
+            .collect();
+        let mut expected = vec![MetadataType::Device];
+        for _ in TestDevice::stream_ids() {
+            expected.extend([
+                MetadataType::Stream,
+                MetadataType::Segment,
+                MetadataType::Column,
+                MetadataType::Column,
+            ]);
+        }
+        assert_eq!(kinds, expected);
+    }
+
+    #[test]
+    fn a_metadata_reply_at_capacity_refuses_further_records() {
+        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
+        let device = TestDevice::new(cli).unwrap();
+
+        let mut reply = vec![0u8; data::MAX_METADATA_REPLY_SIZE - 5];
+        let before = reply.clone();
+        let appended =
+            append_record(&mut reply, data::Metadata::Device(device.device_record())).unwrap();
+        assert!(!appended);
+        assert_eq!(reply, before);
+    }
+
+    #[test]
+    fn metadata_selectors_resolve_the_current_segment_sentinel() {
+        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
+        let device = TestDevice::new(cli).unwrap();
+
+        let record = device
+            .requested_record(data::MetadataSelector::segment(
+                SINE_STREAM_ID,
+                data::CURRENT_SEGMENT,
+            ))
+            .unwrap();
+        let data::Metadata::Segment(segment) = record else {
+            panic!("expected a segment record");
+        };
+        assert_eq!(segment.segment_id, device.segment_id);
+        assert!(device
+            .requested_record(data::MetadataSelector::stream(99))
+            .is_err());
+    }
+
+    #[test]
     fn capture_data_uses_current_sine_parameters() {
         let cli = SimulateCli::parse_from([
             "tio-simulate",
@@ -2170,7 +2171,7 @@ mod tests {
 
         assert_eq!(metadata[0], CAPTURE_METADATA_FIXED_LEN);
         assert_eq!(metadata[1], CAPTURE_METADATA_VERSION);
-        assert_eq!(metadata[2], u8::from(proto::DataType::Float32));
+        assert_eq!(metadata[2], data::DataType::F32.value());
         assert_eq!(
             u32::from_le_bytes(metadata[4..8].try_into().unwrap()),
             u32::try_from(data_len).unwrap()

@@ -120,8 +120,8 @@ pub fn log_hdf(
             progress.update(packets.position() as u64);
 
             let has_stream_data = matches!(
-                &pkt.payload,
-                tio::proto::Payload::StreamData(data) if !data.data.is_empty()
+                pkt.payload(),
+                tio::proto::Payload::Samples(data) if !data.data.is_empty()
             );
             let samples_len = match parser.push_packet(&pkt) {
                 Ok(outcome) => outcome.row_count(),
@@ -144,7 +144,7 @@ pub fn log_hdf(
             record_parse_result_parts(
                 &mut parsed_routes,
                 &mut unparsed_routes,
-                &pkt.routing,
+                &pkt.route(),
                 has_stream_data,
                 samples_len,
             );

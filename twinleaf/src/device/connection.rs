@@ -263,7 +263,10 @@ impl DeviceTree {
     /// The RPCs the device at `route` offers, from the on-disk cache when its
     /// `rpc.hash` still matches, otherwise by walking `rpc.listinfo`.
     pub fn rpc_registry(&self, route: DeviceRoute) -> Result<RpcRegistry, RpcRegistryError> {
-        RpcRegistry::load_with(|name, arg| self.raw_rpc(route, name, arg))
+        RpcRegistry::load_with(|name, arg| {
+            let pending = self.submit(route, name, arg)?;
+            Ok(move || pending.wait())
+        })
     }
 }
 

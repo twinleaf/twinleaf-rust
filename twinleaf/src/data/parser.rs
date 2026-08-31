@@ -5,14 +5,16 @@
 //! decodes its rows and accumulates them into [`SampleBatch`] values.
 //!
 //! Stream data can arrive before its metadata. Such packets produce no rows;
-//! [`PacketParser::take_requests`] returns the metadata RPCs needed to decode
-//! subsequent packets.
+//! [`PacketParser::take_metadata_queries`] returns the metadata the caller must
+//! fetch before subsequent packets decode.
 
 use super::coalesce::BatchCoalescer;
+use super::keys::StreamKey;
 use super::sample::SampleBatch;
-use super::state::{DeviceMetadataSnapshot, PacketError, PacketEvent, ParseState, ValidatedRows};
+use super::state::{
+    DeviceMetadataSnapshot, MetadataQuery, PacketError, PacketEvent, ParseState, ScannedRows,
+};
 use crate::tio::{self, proto};
-use proto::identifiers::StreamKey;
 use proto::DeviceRoute;
 use std::collections::{HashMap, VecDeque};
 
@@ -38,7 +40,7 @@ fn flush_pending_batches(
 /// Decode validated rows into their stream's coalescer and collect whatever it
 /// completes.
 fn queue_rows(
-    input: ValidatedRows<'_>,
+    input: ScannedRows<'_>,
     target_rows: Option<usize>,
     pending: &mut HashMap<StreamKey, BatchCoalescer>,
     ready: &mut VecDeque<SampleBatch>,
@@ -102,8 +104,16 @@ impl PacketOutcome {
     }
 }
 
+/// A parser's decoding state at one point in a packet sequence.
+///
+/// Taken with [`PacketParser::checkpoint`] and resumed with
+/// [`PacketParser::replay_from`], so a long log can be re-read from the middle
+/// without replaying everything before it.
+#[derive(Clone)]
+pub struct ParserCheckpoint(ParseState);
+
 impl PacketParser {
-    pub(super) fn from_state(state: ParseState) -> Self {
+    fn from_state(state: ParseState) -> Self {
         Self {
             state,
             batch_target_rows: None,
@@ -131,7 +141,7 @@ impl PacketParser {
     /// Ingest one port-relative packet and advance the decoding state.
     ///
     /// Missing metadata is reported as [`PacketOutcome::WaitingForMetadata`];
-    /// call [`PacketParser::take_requests`] to obtain the corresponding RPCs.
+    /// call [`PacketParser::take_metadata_queries`] to learn what to fetch.
     /// Invalid stream data returns [`PacketError`]. Completed batches are
     /// available through [`PacketParser::pop_batch`].
     pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, PacketError> {
@@ -149,6 +159,31 @@ impl PacketParser {
                 &mut self.ready_batches,
             )),
         })
+    }
+
+    /// Ingest one packet, validating it without decoding sample values.
+    ///
+    /// The counterpart to [`push_packet`](Self::push_packet) for a scanning
+    /// pass that only summarizes a log; no batch is ever produced.
+    pub fn scan_packet<'a>(
+        &'a mut self,
+        packet: &'a tio::Packet,
+    ) -> Result<Option<ScannedRows<'a>>, PacketError> {
+        Ok(match self.state.apply_packet(packet)? {
+            PacketEvent::Rows(rows) => Some(rows),
+            PacketEvent::Applied | PacketEvent::WaitingForMetadata | PacketEvent::Reset => None,
+        })
+    }
+
+    /// Capture the decoding state reached so far.
+    pub fn checkpoint(&self) -> ParserCheckpoint {
+        ParserCheckpoint(self.state.clone())
+    }
+
+    /// Start a parser from a captured state, as if it had read every packet
+    /// that preceded the checkpoint.
+    pub fn replay_from(checkpoint: &ParserCheckpoint) -> Self {
+        Self::from_state(checkpoint.0.clone())
     }
 
     /// Pop the oldest completed batch currently buffered.
@@ -179,16 +214,27 @@ impl PacketParser {
         self.state.reset();
     }
 
-    /// Pending metadata requests across all routes. Each packet's routing is
-    /// stamped relative to this parser's root and can be sent directly on the
-    /// corresponding port.
-    pub fn take_requests(&mut self) -> Vec<tio::Packet> {
-        self.state.take_requests()
+    /// Metadata still missing, as one query per route that lacks any. The
+    /// caller answers each with [`apply_metadata_reply`](Self::apply_metadata_reply)
+    /// or [`fail_metadata_query`](Self::fail_metadata_query).
+    pub fn take_metadata_queries(&mut self) -> Vec<MetadataQuery> {
+        self.state.take_metadata_queries()
     }
 
-    /// Ensure a route has parser state and take its pending metadata requests.
-    pub fn take_requests_for(&mut self, route: DeviceRoute) -> Vec<tio::Packet> {
-        self.state.take_requests_for(route)
+    /// Ensure a route has parser state and take its pending metadata query.
+    pub fn take_metadata_queries_for(&mut self, route: DeviceRoute) -> Vec<MetadataQuery> {
+        self.state.take_metadata_queries_for(route)
+    }
+
+    /// Apply a `dev.metadata` reply. A reply carrying fewer records than the
+    /// query selected leaves the rest missing, for the next query to ask for.
+    pub fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
+        self.state.apply_metadata_reply(query, reply)
+    }
+
+    /// Give up on a query, arming discovery for its route again.
+    pub fn fail_metadata_query(&mut self, query: MetadataQuery) {
+        self.state.fail_metadata_query(query)
     }
 
     /// Return complete metadata for an absolute route once it is available.
@@ -205,35 +251,31 @@ impl PacketParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::records;
     use crate::data::{
-        Boundary, BoundaryClass, BoundaryReason, Buffer, ColumnArray, Generations, StreamDataError,
+        Boundary, BoundaryClass, BoundaryReason, Buffer, ColumnArray, ColumnKey, Generations,
+        StreamDataError, StreamKey,
     };
-    use bytes::Bytes;
-    use proto::identifiers::{ColumnKey, StreamKey, MAX_SAMPLE_NUMBER};
-    use proto::meta::{
-        ColumnMetadata, DeviceMetadata, MetadataContent, MetadataEpoch, MetadataFilter,
-        MetadataPayload, SegmentMetadata, StreamMetadata,
-    };
-    use proto::{DataType, Payload, StreamDataPayload};
+    use proto::DataType;
+    use proto::MAX_SAMPLE_NUMBER;
+    use twinleaf_proto::data as wire;
 
     const STREAM_ID: u8 = 1;
 
-    fn metadata_packet(content: MetadataContent) -> tio::Packet {
-        tio::Packet {
-            payload: Payload::Metadata(MetadataPayload {
-                content,
-                flags: 0,
-                unknown_fixed: Vec::new(),
-                unknown_varlen: Vec::new(),
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+    fn metadata_packet(record: wire::Metadata<'_>) -> tio::Packet {
+        tio::Packet::metadata(record, wire::MetadataFlags::default(), DeviceRoute::root())
+            .expect("a valid metadata record")
+    }
+
+    fn announce(parser: &mut PacketParser, record: wire::Metadata<'_>) {
+        parser
+            .push_packet(&metadata_packet(record))
+            .expect("valid metadata");
     }
 
     /// Announce a device with one stream whose columns have `column_types`, then
     /// return a parser holding that metadata.
-    fn parser_with_schema(column_types: &[DataType], sample_size: usize) -> PacketParser {
+    fn parser_with_schema(column_types: &[DataType], sample_size: u16) -> PacketParser {
         parser_with_clock(column_types, sample_size, 1, 1, 1)
     }
 
@@ -241,8 +283,8 @@ mod tests {
     /// segment 0 is announced, so later segments must be synthesized.
     fn parser_with_clock(
         column_types: &[DataType],
-        sample_size: usize,
-        n_segments: usize,
+        sample_size: u16,
+        n_segments: u8,
         sampling_rate: u32,
         decimation: u32,
     ) -> PacketParser {
@@ -263,20 +305,14 @@ mod tests {
     fn announce_schema(
         parser: &mut PacketParser,
         column_types: &[DataType],
-        sample_size: usize,
-        n_segments: usize,
+        sample_size: u16,
+        n_segments: u8,
         sampling_rate: u32,
         decimation: u32,
     ) {
         announce_schema_for(
             parser,
-            DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "fw".to_string(),
-                n_streams: 1,
-                session_id: 42,
-                name: "test-device".to_string(),
-            },
+            records::device(),
             column_types,
             sample_size,
             n_segments,
@@ -287,119 +323,82 @@ mod tests {
 
     fn announce_schema_for(
         parser: &mut PacketParser,
-        device: DeviceMetadata,
+        device: wire::Device<'_>,
         column_types: &[DataType],
-        sample_size: usize,
-        n_segments: usize,
+        sample_size: u16,
+        n_segments: u8,
         sampling_rate: u32,
         decimation: u32,
     ) {
-        for content in [
-            MetadataContent::Device(device),
-            MetadataContent::Stream(StreamMetadata {
-                stream_id: STREAM_ID,
-                name: "test-stream".to_string(),
-                n_columns: column_types.len(),
+        announce(parser, wire::Metadata::Device(device));
+        announce(
+            parser,
+            wire::Metadata::Stream(wire::Stream {
+                n_columns: column_types.len() as u8,
                 n_segments,
                 sample_size,
-                buf_samples: 128,
+                ..records::stream(STREAM_ID)
             }),
-            MetadataContent::Segment(SegmentMetadata {
-                stream_id: STREAM_ID,
-                segment_id: 0,
-                flags: 0,
-                time_ref_epoch: MetadataEpoch::Unix,
-                time_ref_serial: "clock".to_string(),
-                time_ref_session_id: 7,
-                start_time: 0,
+        );
+        announce(
+            parser,
+            wire::Metadata::Segment(wire::Segment {
                 sampling_rate,
                 decimation,
-                filter_cutoff: 0.0,
-                filter_type: MetadataFilter::Unfiltered,
+                ..records::segment(STREAM_ID)
             }),
-        ] {
-            parser
-                .push_packet(&metadata_packet(content))
-                .expect("valid metadata");
-        }
+        );
         for (index, data_type) in column_types.iter().enumerate() {
-            parser
-                .push_packet(&metadata_packet(MetadataContent::Column(ColumnMetadata {
-                    stream_id: STREAM_ID,
-                    index,
-                    data_type: *data_type,
-                    name: format!("col_{index}"),
-                    units: String::new(),
-                    description: String::new(),
-                })))
-                .expect("valid column metadata");
+            announce(
+                parser,
+                wire::Metadata::Column(wire::Column {
+                    name: &format!("col_{index}"),
+                    ..records::column(STREAM_ID, index as u8, *data_type)
+                }),
+            );
         }
     }
 
     /// Announce a device with `n_streams` single-`Float32`-column streams,
     /// numbered from 1.
-    fn parser_with_streams(n_streams: usize) -> PacketParser {
+    fn parser_with_streams(n_streams: u8) -> PacketParser {
         let mut parser = PacketParser::new(DeviceRoute::root(), true);
-        parser
-            .push_packet(&metadata_packet(MetadataContent::Device(DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "fw".to_string(),
+        announce(
+            &mut parser,
+            wire::Metadata::Device(wire::Device {
                 n_streams,
-                session_id: 42,
-                name: "test-device".to_string(),
-            })))
-            .expect("valid metadata");
-        for stream_id in 1..=n_streams as u8 {
-            for content in [
-                MetadataContent::Stream(StreamMetadata {
-                    stream_id,
-                    name: format!("stream-{stream_id}"),
-                    n_columns: 1,
-                    n_segments: 1,
-                    sample_size: 4,
-                    buf_samples: 128,
+                ..records::device()
+            }),
+        );
+        for stream_id in 1..=n_streams {
+            announce(
+                &mut parser,
+                wire::Metadata::Stream(wire::Stream {
+                    name: &format!("stream-{stream_id}"),
+                    ..records::stream(stream_id)
                 }),
-                MetadataContent::Segment(SegmentMetadata {
-                    stream_id,
-                    segment_id: 0,
-                    flags: 0,
-                    time_ref_epoch: MetadataEpoch::Unix,
-                    time_ref_serial: "clock".to_string(),
-                    time_ref_session_id: 7,
-                    start_time: 0,
-                    sampling_rate: 1,
-                    decimation: 1,
-                    filter_cutoff: 0.0,
-                    filter_type: MetadataFilter::Unfiltered,
-                }),
-                MetadataContent::Column(ColumnMetadata {
-                    stream_id,
-                    index: 0,
-                    data_type: DataType::Float32,
-                    name: "col_0".to_string(),
-                    units: String::new(),
-                    description: String::new(),
-                }),
-            ] {
-                parser
-                    .push_packet(&metadata_packet(content))
-                    .expect("valid metadata");
-            }
+            );
+            announce(
+                &mut parser,
+                wire::Metadata::Segment(records::segment(stream_id)),
+            );
+            announce(
+                &mut parser,
+                wire::Metadata::Column(records::column(stream_id, 0, DataType::F32)),
+            );
         }
         parser
     }
 
     fn stream_data_packet_for(stream_id: u8, first_sample_n: u32, rows: usize) -> tio::Packet {
-        tio::Packet {
-            payload: Payload::StreamData(StreamDataPayload {
-                stream_id,
-                first_sample_n,
-                segment_id: 0,
-                data: Bytes::from(vec![0; 4 * rows]),
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+        tio::Packet::samples(
+            stream_id,
+            0,
+            first_sample_n,
+            &vec![0; 4 * rows],
+            DeviceRoute::root(),
+        )
+        .expect("valid samples")
     }
 
     fn stream_data_packet_in_segment(
@@ -407,64 +406,206 @@ mod tests {
         first_sample_n: u32,
         data: Vec<u8>,
     ) -> tio::Packet {
-        tio::Packet {
-            payload: Payload::StreamData(StreamDataPayload {
-                stream_id: STREAM_ID,
-                first_sample_n,
-                segment_id,
-                data: Bytes::from(data),
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+        tio::Packet::samples(
+            STREAM_ID,
+            segment_id,
+            first_sample_n,
+            &data,
+            DeviceRoute::root(),
+        )
+        .expect("valid samples")
     }
 
     fn stream_data_packet(first_sample_n: u32, data: Vec<u8>) -> tio::Packet {
         stream_data_packet_in_segment(0, first_sample_n, data)
     }
 
+    /// One `dev.metadata` reply carrying `records`, in wire framing.
+    fn metadata_reply(records: &[wire::Metadata<'_>]) -> Vec<u8> {
+        let mut reply = vec![0u8; wire::MAX_METADATA_REPLY_SIZE];
+        let mut written = 0;
+        for record in records {
+            written += record
+                .write_reply_frame(&mut reply[written..])
+                .expect("the fixtures fit one reply");
+        }
+        reply.truncate(written);
+        reply
+    }
+
+    /// Take the query for the root route, asserting there is exactly one.
+    fn take_query(parser: &mut PacketParser) -> MetadataQuery {
+        let mut queries = parser.take_metadata_queries_for(DeviceRoute::root());
+        assert_eq!(
+            queries.len(),
+            1,
+            "one query per route with anything missing"
+        );
+        queries.pop().expect("the query")
+    }
+
     #[test]
-    fn metadata_requests_rearm_only_after_a_terminal_response() {
+    fn a_query_stays_outstanding_until_it_completes() {
         let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+        assert!(
+            query.selectors.is_empty(),
+            "an unknown device bootstraps with a device-chosen prefix"
+        );
+        assert!(parser
+            .take_metadata_queries_for(DeviceRoute::root())
+            .is_empty());
 
-        let first = parser.take_requests_for(DeviceRoute::root());
-        assert_eq!(first.len(), 1);
-        let request_id = match &first[0].payload {
-            Payload::RpcRequest(request) => request.id,
-            other => panic!("expected metadata RPC request, got {other:?}"),
-        };
-        assert!(parser.take_requests_for(DeviceRoute::root()).is_empty());
+        parser.fail_metadata_query(query);
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            Vec::new(),
+            "a failure arms discovery again"
+        );
+    }
 
-        parser
-            .push_packet(&tio::Packet {
-                payload: Payload::RpcReply(proto::RpcReplyPayload {
-                    id: request_id,
-                    reply: Vec::new(),
-                }),
-                routing: DeviceRoute::root(),
-                ttl: 0,
-            })
-            .unwrap();
-        assert_eq!(parser.take_requests_for(DeviceRoute::root()).len(), 1);
-        assert!(parser.take_requests_for(DeviceRoute::root()).is_empty());
+    #[test]
+    fn a_completed_query_cannot_complete_twice() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
 
-        parser
-            .push_packet(&tio::Packet::rpc_error(
-                request_id,
-                proto::RpcErrorCode::Timeout,
-                DeviceRoute::root(),
-            ))
-            .unwrap();
-        assert_eq!(parser.take_requests_for(DeviceRoute::root()).len(), 1);
+        parser.apply_metadata_reply(
+            query.clone(),
+            &metadata_reply(&[wire::Metadata::Device(records::device())]),
+        );
+        let next = take_query(&mut parser);
+        assert_eq!(next.selectors, [wire::MetadataSelector::stream(STREAM_ID)]);
+
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Device(records::device())]),
+        );
+        assert!(
+            parser
+                .take_metadata_queries_for(DeviceRoute::root())
+                .is_empty(),
+            "a stale completion does not free the outstanding query's slot"
+        );
+        parser.fail_metadata_query(next);
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::stream(STREAM_ID)],
+            "only the live query re-arms discovery"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_before_a_reset_cannot_apply_after_it() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+        parser.reset();
+
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Device(records::device())]),
+        );
+        assert!(
+            parser.metadata(DeviceRoute::root()).is_none(),
+            "the stale reply's records were not applied"
+        );
+        assert!(
+            take_query(&mut parser).selectors.is_empty(),
+            "the route is still bootstrapping"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_before_a_session_change_cannot_apply_after_it() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let bootstrap = take_query(&mut parser);
+        parser.apply_metadata_reply(
+            bootstrap,
+            &metadata_reply(&[wire::Metadata::Device(records::device())]),
+        );
+        let query = take_query(&mut parser);
+        assert_eq!(query.selectors, [wire::MetadataSelector::stream(STREAM_ID)]);
+
+        announce(
+            &mut parser,
+            wire::Metadata::Device(wire::Device {
+                session: twinleaf_proto::SessionId::new(43),
+                ..records::device()
+            }),
+        );
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[
+                wire::Metadata::Stream(records::stream(STREAM_ID)),
+                wire::Metadata::Segment(records::segment(STREAM_ID)),
+                wire::Metadata::Column(records::column(STREAM_ID, 0, DataType::F32)),
+            ]),
+        );
+        assert!(parser.metadata(DeviceRoute::root()).is_none());
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::stream(STREAM_ID)],
+            "the new session starts its stream metadata over"
+        );
+    }
+
+    #[test]
+    fn a_capacity_limited_reply_leaves_the_rest_to_ask_for() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[
+                wire::Metadata::Device(records::device()),
+                wire::Metadata::Stream(records::stream(STREAM_ID)),
+                wire::Metadata::Segment(records::segment(STREAM_ID)),
+            ]),
+        );
+
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::column(STREAM_ID, 0)],
+            "the record the reply stopped short of is still missing"
+        );
+    }
+
+    #[test]
+    fn a_query_carries_at_most_one_requests_worth_of_selectors() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Device(wire::Device {
+                n_streams: 40,
+                ..records::device()
+            })]),
+        );
+
+        let query = take_query(&mut parser);
+        assert_eq!(query.selectors.len(), wire::MAX_METADATA_SELECTORS);
+        assert_eq!(
+            query.args().len(),
+            wire::MAX_METADATA_SELECTORS * wire::MetadataSelector::SIZE
+        );
+    }
+
+    #[test]
+    fn a_malformed_reply_arms_discovery_again() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+
+        parser.apply_metadata_reply(query, &[wire::MetadataType::Device.into(), 200]);
+        assert!(parser.metadata(DeviceRoute::root()).is_none());
+        assert!(take_query(&mut parser).selectors.is_empty());
     }
 
     #[test]
     fn unknown_column_type_is_absent_from_the_batch() {
         // A newer firmware reports a type this build predates, between two
         // columns it understands.
-        let unknown = DataType::Unknown(0x35);
+        let unknown = DataType::new(0x35);
         assert_eq!(unknown.size(), 3);
-        let mut parser = parser_with_schema(&[DataType::Float32, unknown, DataType::Int16], 9);
+        let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
 
         let mut data = Vec::new();
         for (value, raw) in [(1.0f32, -3i16), (2.0f32, -4i16)] {
@@ -482,7 +623,7 @@ mod tests {
         let names: Vec<&str> = batch
             .schema()
             .iter()
-            .map(|series| series.metadata().name.as_str())
+            .map(|series| series.metadata().name)
             .collect();
         assert_eq!(names, ["col_0", "col_2"]);
         match (batch.schema()[0].values(), batch.schema()[1].values()) {
@@ -496,7 +637,7 @@ mod tests {
 
     #[test]
     fn segment_id_outside_the_ring_is_rejected() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         // The stream advertises a single segment, so any other id is corrupt and
         // must not become the state the next packet is validated against.
         assert!(matches!(
@@ -517,7 +658,7 @@ mod tests {
 
     #[test]
     fn rows_past_the_24_bit_sample_field_are_rejected() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
 
         assert!(matches!(
             parser.push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 8])),
@@ -536,7 +677,7 @@ mod tests {
 
     #[test]
     fn all_columns_unknown_yields_rows_without_columns() {
-        let mut parser = parser_with_schema(&[DataType::Unknown(0x35)], 3);
+        let mut parser = parser_with_schema(&[DataType::new(0x35)], 3);
         parser
             .push_packet(&stream_data_packet(7, vec![0; 6]))
             .expect("rows are still counted");
@@ -548,7 +689,7 @@ mod tests {
     /// Drive a forced rollover: `output_rows` samples of segment 0, then the
     /// first sample of segment 1 whose metadata has not arrived.
     fn rollover_batch(sampling_rate: u32, decimation: u32, output_rows: usize) -> SampleBatch {
-        let mut parser = parser_with_clock(&[DataType::Float32], 4, 2, sampling_rate, decimation);
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, sampling_rate, decimation);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4 * output_rows]))
             .expect("valid rows");
@@ -598,7 +739,7 @@ mod tests {
 
     #[test]
     fn startup_opens_a_run_without_disturbing_the_shared_generations() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         let mut generations = Vec::new();
         // Contiguous samples, then a gap the timeline confirms as data loss.
         for first_sample_n in [0, 1, 10] {
@@ -631,7 +772,7 @@ mod tests {
 
     #[test]
     fn generations_are_constant_within_an_accumulated_batch() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4).with_batch_rows(4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4).with_batch_rows(4);
         for first_sample_n in [0, 2, 4] {
             parser
                 .push_packet(&stream_data_packet(first_sample_n, vec![0; 8]))
@@ -703,24 +844,20 @@ mod tests {
 
     #[test]
     fn a_reconnect_cannot_restamp_the_generations_it_used_before() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4]))
             .expect("valid rows");
         let before = parser.pop_batch().expect("the first batch").generations();
 
         parser
-            .push_packet(&tio::Packet {
-                payload: Payload::ProxyStatus(proto::ProxyStatusPayload(
-                    proto::ProxyStatus::SensorDisconnected,
-                )),
-                routing: DeviceRoute::root(),
-                ttl: 0,
-            })
+            .push_packet(&tio::Packet::proxy_status(
+                proto::ProxyStatus::SensorDisconnected,
+            ))
             .expect("a disconnect resets the parser");
 
         // The device comes back and re-announces exactly the same schema.
-        announce_schema(&mut parser, &[DataType::Float32], 4, 1, 1, 1);
+        announce_schema(&mut parser, &[DataType::F32], 4, 1, 1, 1);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4]))
             .expect("valid rows");
@@ -747,7 +884,7 @@ mod tests {
 
     #[test]
     fn a_replacement_device_cannot_join_the_previous_devices_buffer_run() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         let mut buffer = Buffer::new(128);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4]))
@@ -758,14 +895,13 @@ mod tests {
 
         announce_schema_for(
             &mut parser,
-            DeviceMetadata {
-                serial_number: "SN456".to_string(),
-                firmware_hash: "replacement-fw".to_string(),
-                n_streams: 1,
-                session_id: 42,
-                name: "replacement-device".to_string(),
+            wire::Device {
+                name: "replacement-device",
+                serial: "SN456",
+                firmware: "replacement-fw",
+                ..records::device()
             },
-            &[DataType::Float32],
+            &[DataType::F32],
             4,
             1,
             1,
@@ -795,14 +931,14 @@ mod tests {
                 .latest_row(&key)
                 .expect("the replacement row")
                 .device()
-                .serial_number,
+                .serial,
             "SN456"
         );
     }
 
     #[test]
     fn firmware_change_without_a_session_change_opens_a_new_run() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4]))
             .expect("valid rows");
@@ -810,14 +946,11 @@ mod tests {
 
         announce_schema_for(
             &mut parser,
-            DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "new-fw".to_string(),
-                n_streams: 1,
-                session_id: 42,
-                name: "test-device".to_string(),
+            wire::Device {
+                firmware: "new-fw",
+                ..records::device()
             },
-            &[DataType::Float32],
+            &[DataType::F32],
             4,
             1,
             1,
@@ -836,7 +969,7 @@ mod tests {
 
     #[test]
     fn session_change_keeps_its_specific_boundary_and_opens_a_new_run() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4]))
             .expect("valid rows");
@@ -844,14 +977,11 @@ mod tests {
 
         announce_schema_for(
             &mut parser,
-            DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "fw".to_string(),
-                n_streams: 1,
-                session_id: 43,
-                name: "test-device".to_string(),
+            wire::Device {
+                session: twinleaf_proto::SessionId::new(43),
+                ..records::device()
             },
-            &[DataType::Float32],
+            &[DataType::F32],
             4,
             1,
             1,
@@ -873,7 +1003,7 @@ mod tests {
 
     #[test]
     fn changed_schema_cannot_reuse_the_previous_run_identity() {
-        let mut parser = parser_with_schema(&[DataType::Float32], 4);
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
         let mut buffer = Buffer::new(128);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 4]))
@@ -885,16 +1015,12 @@ mod tests {
         // Contradicting an already-used column invalidates the route. The
         // device then re-announces the complete replacement schema.
         parser
-            .push_packet(&metadata_packet(MetadataContent::Column(ColumnMetadata {
-                stream_id: STREAM_ID,
-                index: 0,
-                data_type: DataType::Float64,
-                name: "wide".to_string(),
-                units: String::new(),
-                description: String::new(),
+            .push_packet(&metadata_packet(wire::Metadata::Column(wire::Column {
+                name: "wide",
+                ..records::column(STREAM_ID, 0, DataType::F64)
             })))
             .expect("the changed column triggers rediscovery");
-        announce_schema(&mut parser, &[DataType::Float64], 8, 1, 1, 1);
+        announce_schema(&mut parser, &[DataType::F64], 8, 1, 1, 1);
         parser
             .push_packet(&stream_data_packet(0, vec![0; 8]))
             .expect("valid rows under the new schema");
@@ -912,8 +1038,9 @@ mod tests {
             buffer
                 .column_metadata(&ColumnKey::new(DeviceRoute::root(), STREAM_ID, 0))
                 .expect("the new column")
+                .get()
                 .data_type,
-            DataType::Float64
+            DataType::F64
         );
     }
 
@@ -927,6 +1054,6 @@ mod tests {
             PacketOutcome::WaitingForMetadata
         );
         assert!(parser.pop_batch().is_none());
-        assert_eq!(parser.take_requests().len(), 1);
+        assert_eq!(parser.take_metadata_queries().len(), 1);
     }
 }

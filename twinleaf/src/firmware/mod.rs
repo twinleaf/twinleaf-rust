@@ -9,10 +9,11 @@
 //! can plug in their own source. A ready-made GitHub-backed catalog is provided
 //! in [`github`] behind the `firmware-update` feature.
 
-use crate::tio::proto::{DeviceRoute, Packet, Payload, RpcErrorCode};
-use crate::tio::proxy::{Port, RecvError, RpcError};
+use crate::device::{CallError, Device, PendingReply};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use twinleaf_proto::rpc as wire_rpc;
 
 #[cfg(feature = "firmware-update")]
 pub mod github;
@@ -20,10 +21,13 @@ pub mod github;
 /// Firmware images are uploaded to the device in fixed-size chunks.
 const UPLOAD_CHUNK_SIZE: usize = 288;
 /// Maximum number of upload chunks awaiting acknowledgement at once.
-const MAX_CHUNKS_IN_FLIGHT: u16 = 2;
+const MAX_CHUNKS_IN_FLIGHT: usize = 2;
 /// Time to keep the link up after committing, so the device is not
 /// power-cycled mid-write. Part of the safe upgrade procedure, not just UX.
+#[cfg(not(test))]
 const COMMIT_SETTLE_TIME: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const COMMIT_SETTLE_TIME: Duration = Duration::from_millis(10);
 
 /// A firmware build date (UTC calendar date). Ordered chronologically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -152,7 +156,7 @@ pub enum FlashEvent {
 #[derive(Debug, thiserror::Error)]
 pub enum FirmwareError {
     #[error("device RPC failed: {0}")]
-    Rpc(#[from] RpcError),
+    Rpc(#[from] CallError),
     #[error("could not determine installed firmware: {0}")]
     Parse(String),
     #[error("firmware catalog error: {0}")]
@@ -257,8 +261,8 @@ fn parse_installed(desc: &str) -> InstalledFirmware {
 ///
 /// Everything is derived from the single `dev.desc` RPC; `dev.name`/
 /// `dev.revision` are not used.
-pub fn query_installed(device: &Port) -> Result<InstalledFirmware, FirmwareError> {
-    let desc: String = device.rpc("dev.desc", ())?;
+pub fn query_installed(device: &Device) -> Result<InstalledFirmware, FirmwareError> {
+    let desc: String = device.get("dev.desc")?;
     Ok(parse_installed(&desc))
 }
 
@@ -392,7 +396,7 @@ pub fn download_cached(
 /// blocks for a short settle period after committing (see
 /// [`FlashEvent::Finalizing`]) so the device is not power-cycled mid-write.
 pub fn flash(
-    device: &Port,
+    device: &Device,
     firmware_data: &[u8],
     mut on_event: impl FnMut(FlashEvent),
 ) -> Result<(), FirmwareError> {
@@ -401,10 +405,10 @@ pub fn flash(
     on_event(FlashEvent::Stopping);
     let stop_outcome = match device.action("dev.stop") {
         Ok(()) => StopOutcome::Stopped,
-        Err(RpcError::DeviceError(ref e)) if matches!(e.error, RpcErrorCode::NotFound) => {
+        Err(CallError::DeviceError(ref e)) if matches!(e.error, wire_rpc::RpcError::NotFound) => {
             StopOutcome::Unsupported
         }
-        Err(RpcError::DeviceError(ref e)) if matches!(e.error, RpcErrorCode::WrongDeviceState) => {
+        Err(CallError::DeviceError(ref e)) if matches!(e.error, wire_rpc::RpcError::State) => {
             StopOutcome::AlreadyStopped
         }
         Err(e) => return Err(e.into()),
@@ -413,74 +417,53 @@ pub fn flash(
 
     let total_chunks = firmware_data.len().div_ceil(UPLOAD_CHUNK_SIZE);
 
-    let mut next_send_chunk: u16 = 0;
-    let mut next_ack_chunk: u16 = 0;
-    let mut more_to_send = true;
-
-    while more_to_send || (next_ack_chunk != next_send_chunk) {
-        if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
-            let offset = usize::from(next_send_chunk) * UPLOAD_CHUNK_SIZE;
-            let chunk_end = (offset + UPLOAD_CHUNK_SIZE).min(firmware_data.len());
-
-            device
-                .send(Packet::rpc_request(
-                    "dev.firmware.upload",
-                    &firmware_data[offset..chunk_end],
-                    next_send_chunk,
-                    DeviceRoute::root(),
+    let send_chunk = |chunk: usize| {
+        let offset = chunk * UPLOAD_CHUNK_SIZE;
+        let chunk_end = (offset + UPLOAD_CHUNK_SIZE).min(firmware_data.len());
+        device
+            .submit("dev.firmware.upload", &firmware_data[offset..chunk_end])
+            .map_err(|e| {
+                FirmwareError::Upload(format!(
+                    "failed to send firmware chunk {}/{}: {}",
+                    chunk + 1,
+                    total_chunks,
+                    e
                 ))
-                .map_err(|e| {
-                    FirmwareError::Upload(format!(
-                        "failed to send firmware chunk {}/{}: {}",
-                        next_send_chunk + 1,
-                        total_chunks,
-                        e
-                    ))
-                })?;
-            next_send_chunk += 1;
-            more_to_send = chunk_end < firmware_data.len();
+            })
+    };
+
+    let mut next_fresh_chunk = 0usize;
+    let mut in_flight: VecDeque<PendingReply> = VecDeque::new();
+
+    for chunk in 0..total_chunks {
+        while next_fresh_chunk < total_chunks && in_flight.len() < MAX_CHUNKS_IN_FLIGHT {
+            in_flight.push_back(send_chunk(next_fresh_chunk)?);
+            next_fresh_chunk += 1;
         }
 
-        let pkt = if more_to_send && ((next_send_chunk - next_ack_chunk) < MAX_CHUNKS_IN_FLIGHT) {
-            match device.try_recv() {
-                Ok(pkt) => pkt,
-                Err(RecvError::WouldBlock) => continue,
-                Err(e) => {
-                    return Err(FirmwareError::Upload(format!(
-                        "failed to receive firmware upload ack: {}",
-                        e
-                    )))
-                }
-            }
-        } else {
-            device.recv().map_err(|e| {
-                FirmwareError::Upload(format!("failed to receive firmware upload ack: {}", e))
-            })?
-        };
-
-        match pkt.payload {
-            Payload::RpcReply(rep) => {
-                if rep.id != next_ack_chunk {
-                    return Err(FirmwareError::Upload(format!(
-                        "firmware chunk ack out of order (expected {}, got {})",
-                        next_ack_chunk, rep.id
-                    )));
-                }
-                next_ack_chunk += 1;
-                on_event(FlashEvent::Uploading {
-                    chunk: next_ack_chunk as usize,
-                    total: total_chunks,
-                });
-            }
-            Payload::RpcError(err) => {
+        match in_flight
+            .pop_front()
+            .expect("the window holds the next unacknowledged chunk")
+            .wait()
+        {
+            Ok(_) => on_event(FlashEvent::Uploading {
+                chunk: chunk + 1,
+                total: total_chunks,
+            }),
+            Err(CallError::DeviceError(payload)) => {
                 return Err(FirmwareError::Upload(format!(
                     "device rejected firmware chunk {}/{}: {}",
-                    next_ack_chunk + 1,
+                    chunk + 1,
                     total_chunks,
-                    err.error
-                )));
+                    payload.error
+                )))
             }
-            _ => continue,
+            Err(e) => {
+                return Err(FirmwareError::Upload(format!(
+                    "failed to receive firmware upload ack: {}",
+                    e
+                )))
+            }
         }
     }
 
@@ -497,6 +480,12 @@ pub fn flash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tio::proto::Payload;
+    use crate::tio::proxy::{RawCallError, RawCallResult};
+    use crate::tio::proxy_core::ProxyCommand;
+
+    /// Where a scripted device sends one call's completion.
+    type Completion = crossbeam::channel::Sender<RawCallResult>;
 
     fn installed(date: Option<&str>, hash: Option<&str>) -> InstalledFirmware {
         InstalledFirmware {
@@ -635,6 +624,94 @@ mod tests {
         .unwrap();
         assert_eq!(latest.date, FirmwareDate::parse("2026-03-17").unwrap());
         assert_eq!(latest.short_hash, "5d1494");
+    }
+
+    /// Run [`flash`] against a scripted fake device at the endpoint the
+    /// library actually calls through. `on_upload` decides how to complete
+    /// each `dev.firmware.upload` call; control RPCs (`dev.stop`,
+    /// `dev.firmware.upgrade`) are always acknowledged.
+    fn flash_against(
+        firmware_len: usize,
+        on_upload: impl FnMut(Completion) + Send + 'static,
+    ) -> (Result<(), FirmwareError>, Vec<FlashEvent>) {
+        let (device, calls) = crate::device::Device::test_pair();
+        let mut on_upload = on_upload;
+        let responder = std::thread::spawn(move || {
+            for call in calls.iter() {
+                let ProxyCommand::Call {
+                    request, result, ..
+                } = call
+                else {
+                    panic!("flash only submits direct RPC calls");
+                };
+                let Payload::RpcRequest(request) = request.payload() else {
+                    panic!("expected an RPC request");
+                };
+                let wire_rpc::Method::ByName(name) = request.method else {
+                    panic!("expected a call by name");
+                };
+                match name {
+                    b"dev.firmware.upload" => on_upload(result),
+                    _ => {
+                        let _ = result.send(Ok(Vec::new()));
+                    }
+                }
+            }
+        });
+
+        let firmware = vec![0xa5u8; firmware_len];
+        let mut events = Vec::new();
+        let result = flash(&device, &firmware, |e| events.push(e));
+        drop(device);
+        responder.join().unwrap();
+        (result, events)
+    }
+
+    #[test]
+    fn flash_acknowledges_every_chunk_in_order_and_commits() {
+        // Three chunks, each acknowledged as it is uploaded; the window keeps
+        // two in flight, so the last two are sent before the first is acked.
+        let (result, events) = flash_against(2 * UPLOAD_CHUNK_SIZE + 10, |result| {
+            let _ = result.send(Ok(Vec::new()));
+        });
+
+        result.unwrap();
+        let uploaded: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                FlashEvent::Uploading { chunk, .. } => Some(*chunk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uploaded, [1, 2, 3]);
+        assert!(events.contains(&FlashEvent::Complete));
+    }
+
+    #[test]
+    fn flash_fails_when_a_chunk_times_out() {
+        let (result, _) = flash_against(100, |result| {
+            let _ = result.send(Err(RawCallError::Timeout));
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to receive firmware upload ack"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn flash_fails_when_the_device_rejects_a_chunk() {
+        let (result, _) = flash_against(100, |result| {
+            let _ = result.send(Err(RawCallError::Device {
+                error: wire_rpc::RpcError::Invalid,
+                message: Vec::new(),
+            }));
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("device rejected firmware chunk 1/1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser, ValueHint},
     Args, Subcommand,
 };
-use twinleaf::tio::proto::RpcValueType;
+use twinleaf::device::RpcValueType;
 
 use crate::TioOpts;
 

@@ -4,146 +4,48 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
+use super::keys::StreamKey;
 use super::sample::{
     BatchContext, Boundary, BoundaryReason, ColumnData, Generations, RowSource, SampleBatchBuilder,
 };
+use super::{BufferType, ColumnRecord, DataTypeExt, DeviceRecord, MetadataType, SegmentExt};
+use super::{SegmentRecord, StreamRecord};
 use crate::tio;
-use proto::meta::MetadataType;
 use proto::route::RouteError;
 use proto::DeviceRoute;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tio::proto;
-use tio::proto::identifiers::{StreamKey, MAX_SAMPLE_NUMBER};
-use tio::proto::meta::{
-    ColumnMetadata, DeviceMetadata, MetadataContent, SegmentMetadata, StreamMetadata,
-};
+use tio::proto::MAX_SAMPLE_NUMBER;
+use twinleaf_proto::data as wire;
+use twinleaf_proto::heartbeat::Heartbeat;
 
-const MAX_METADATA_PER_RPC: usize = 16;
-const META_RPC_ID: u16 = 7855;
-
+/// A request for metadata one route still lacks, in selectors rather than
+/// packets: the caller owns the RPC that answers it.
 #[derive(Debug, Clone)]
-struct MetadataRequest {
-    mtype: MetadataType,
-    stream_id: u8,
-    index: u8,
+pub struct MetadataQuery {
+    pub route: DeviceRoute,
+    pub selectors: Vec<wire::MetadataSelector>,
+    generation: u32,
 }
 
-impl MetadataRequest {
-    fn device() -> Self {
-        Self {
-            mtype: MetadataType::Device,
-            stream_id: 0,
-            index: 0,
-        }
+impl MetadataQuery {
+    /// The `dev.metadata` argument for these selectors. Empty selects the
+    /// device-chosen bootstrap prefix.
+    pub fn args(&self) -> Vec<u8> {
+        self.selectors
+            .iter()
+            .flat_map(|selector| selector.encode())
+            .collect()
     }
-    fn stream(stream_id: u8) -> Self {
-        Self {
-            mtype: MetadataType::Stream,
-            stream_id,
-            index: 0,
-        }
-    }
-    fn segment(index: u8, stream_id: u8) -> Self {
-        Self {
-            mtype: MetadataType::Segment,
-            stream_id,
-            index,
-        }
-    }
-    fn column(index: u8, stream_id: u8) -> Self {
-        Self {
-            mtype: MetadataType::Column,
-            stream_id,
-            index,
-        }
-    }
-}
-
-fn encode_metadata_request(requests: &[MetadataRequest]) -> Vec<u8> {
-    assert!(requests.len() <= MAX_METADATA_PER_RPC);
-    let mut encoded = Vec::with_capacity(requests.len() * 3);
-    for request in requests {
-        encoded.push(request.mtype.clone().into());
-        encoded.push(request.stream_id);
-        encoded.push(request.index);
-    }
-    encoded
-}
-
-/// Pack missing metadata descriptors into `dev.metadata` RPC requests.
-fn build_metadata_request_packets(requests: &[MetadataRequest]) -> Vec<tio::Packet> {
-    let mut packets = Vec::new();
-    let mut remaining = requests;
-    while !remaining.is_empty() {
-        let request_count = if remaining.len() > MAX_METADATA_PER_RPC {
-            MAX_METADATA_PER_RPC
-        } else if remaining.len() == 1 {
-            // If we don't know anything about the device, send zero
-            // arguments to get an automatic reply fitting as many things
-            // as possible at the beginning, to bootstrap the process
-            // more efficiently
-            if let MetadataType::Device = remaining[0].mtype {
-                remaining = &remaining[1..];
-                0
-            } else {
-                1
-            }
-        } else {
-            remaining.len()
-        };
-        packets.push(tio::Packet::rpc_request(
-            "dev.metadata",
-            &encode_metadata_request(&remaining[..request_count]),
-            META_RPC_ID,
-            DeviceRoute::root(),
-        ));
-        remaining = &remaining[request_count..];
-    }
-    packets
-}
-
-/// Decode the concatenated metadata records returned by `dev.metadata`.
-fn decode_metadata_reply(reply: &[u8]) -> Vec<MetadataContent> {
-    use tio::proto::meta;
-    let mut decoded = Vec::new();
-    let mut remaining = reply;
-    while remaining.len() >= 2 {
-        let metadata_type = MetadataType::from(remaining[0]);
-        let record_len = usize::from(remaining[1]);
-        let Some(record) = remaining.get(2..2 + record_len) else {
-            break;
-        };
-        remaining = &remaining[2 + record_len..];
-        let content = match metadata_type {
-            MetadataType::Device => meta::DeviceMetadata::deserialize(record)
-                .ok()
-                .map(|(metadata, _, _)| MetadataContent::Device(metadata)),
-            MetadataType::Stream => meta::StreamMetadata::deserialize(record)
-                .ok()
-                .map(|(metadata, _, _)| MetadataContent::Stream(metadata)),
-            MetadataType::Segment => meta::SegmentMetadata::deserialize(record)
-                .ok()
-                .map(|(metadata, _, _)| MetadataContent::Segment(metadata)),
-            MetadataType::Column => meta::ColumnMetadata::deserialize(record)
-                .ok()
-                .map(|(metadata, _, _)| MetadataContent::Column(metadata)),
-            _ => None,
-        };
-        if let Some(content) = content {
-            decoded.push(content);
-        }
-    }
-    decoded
 }
 
 /// Point-in-time metadata needed to interpret one stream's sample rows.
 #[derive(Debug, Clone)]
 pub struct StreamMetadataSnapshot {
-    pub stream: Arc<StreamMetadata>,
-    pub segment: Arc<SegmentMetadata>,
-    pub columns: Vec<Arc<ColumnMetadata>>,
+    pub stream: StreamRecord,
+    pub segment: SegmentRecord,
+    pub columns: Vec<ColumnRecord>,
 }
 
 /// Point-in-time metadata for one device and all advertised streams.
@@ -152,7 +54,7 @@ pub struct StreamMetadataSnapshot {
 /// after every advertised stream has a stream, current segment, and columns.
 #[derive(Debug, Clone)]
 pub struct DeviceMetadataSnapshot {
-    pub device: Arc<DeviceMetadata>,
+    pub device: DeviceRecord,
     pub streams: HashMap<u8, StreamMetadataSnapshot>,
 }
 
@@ -178,13 +80,10 @@ pub enum PacketError {
 /// A stream-data payload contradicts the metadata needed to interpret it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamDataError {
-    #[error("stream advertises invalid segment count {count}")]
-    InvalidSegmentCount { count: usize },
+    #[error("stream advertises a zero-length segment ring")]
+    ZeroSegmentCount,
     #[error("segment {segment_id} is outside the advertised ring of {segment_count}")]
-    SegmentOutOfRange {
-        segment_id: u8,
-        segment_count: usize,
-    },
+    SegmentOutOfRange { segment_id: u8, segment_count: u8 },
     #[error("received {actual} columns for a schema containing {expected}")]
     ColumnCount { expected: usize, actual: usize },
     #[error("column data occupies {column_bytes} bytes, exceeding sample size {sample_size}")]
@@ -213,15 +112,15 @@ pub enum StreamDataError {
 /// Result of validating stream data against the metadata learned so far.
 enum RowState<'a> {
     WaitingForMetadata,
-    Validated(ValidatedRows<'a>),
+    Validated(ScannedRows<'a>),
 }
 
 /// Metadata and continuity state for one stream on one device.
 #[derive(Debug, Clone)]
 struct StreamState {
-    metadata: Option<Arc<StreamMetadata>>,
-    segments: Vec<Option<Arc<SegmentMetadata>>>,
-    columns: Vec<Arc<ColumnMetadata>>,
+    metadata: Option<StreamRecord>,
+    segments: Vec<Option<SegmentRecord>>,
+    columns: Vec<ColumnRecord>,
 
     stream_id: u8,
     current_segment_id: u8,
@@ -256,35 +155,35 @@ impl StreamState {
         }
     }
 
-    fn segment(&self, segment_id: u8) -> Option<&Arc<SegmentMetadata>> {
+    fn segment(&self, segment_id: u8) -> Option<&SegmentRecord> {
         self.segments.get(usize::from(segment_id))?.as_ref()
     }
 
-    fn set_segment(&mut self, segment: SegmentMetadata) {
-        let index = usize::from(segment.segment_id);
+    fn set_segment(&mut self, segment_id: u8, segment: SegmentRecord) {
+        let index = usize::from(segment_id);
         if self.segments.len() <= index {
             self.segments.resize(index + 1, None);
         }
-        self.segments[index] = Some(Arc::new(segment));
+        self.segments[index] = Some(segment);
     }
 
     /// Describe the metadata still needed before this stream can be decoded.
-    fn missing_metadata(&self) -> Vec<MetadataRequest> {
+    fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         let mut missing = Vec::new();
         match self.metadata.as_ref() {
             Some(metadata) => {
-                for index in self.columns.len()..metadata.n_columns {
-                    missing.push(MetadataRequest::column(index as u8, self.stream_id))
+                for index in self.columns.len()..usize::from(metadata.get().n_columns) {
+                    missing.push(wire::MetadataSelector::column(self.stream_id, index as u8))
                 }
             }
             None => {
-                missing.push(MetadataRequest::stream(self.stream_id));
+                missing.push(wire::MetadataSelector::stream(self.stream_id));
             }
         }
         if self.segment(self.current_segment_id).is_none() {
-            missing.push(MetadataRequest::segment(
-                self.current_segment_id,
+            missing.push(wire::MetadataSelector::segment(
                 self.stream_id,
+                self.current_segment_id,
             ));
         }
         missing
@@ -294,8 +193,8 @@ impl StreamState {
         &self,
         first_sample_n: u32,
         first_timestamp: f64,
-        device: &DeviceMetadata,
-        segment: &Arc<SegmentMetadata>,
+        device: wire::Device<'_>,
+        segment: wire::Segment<'_>,
         new_rate: f64,
         is_segment_rollover: bool,
     ) -> Option<Boundary> {
@@ -305,20 +204,20 @@ impl StreamState {
             });
         }
 
-        if device.session_id != self.last_session_id {
+        if device.session.value() != self.last_session_id {
             return Some(Boundary {
                 reason: BoundaryReason::SessionChanged {
                     old: self.last_session_id,
-                    new: device.session_id,
+                    new: device.session.value(),
                 },
             });
         }
 
-        if segment.time_ref_session_id != self.last_time_ref_session_id {
+        if segment.timeref_session.value() != self.last_time_ref_session_id {
             return Some(Boundary {
                 reason: BoundaryReason::TimeRefSessionChanged {
                     old: self.last_time_ref_session_id,
-                    new: segment.time_ref_session_id,
+                    new: segment.timeref_session.value(),
                 },
             });
         }
@@ -391,140 +290,143 @@ impl StreamState {
     /// or the encoded payload are errors.
     fn validate_rows<'a>(
         &'a mut self,
-        data: &'a tio::proto::StreamDataPayload,
+        data: wire::Samples<'a>,
         route: DeviceRoute,
-        device_metadata: Arc<DeviceMetadata>,
+        device_metadata: DeviceRecord,
         device_generation: &mut u32,
         global_generation: &mut u32,
     ) -> Result<RowState<'a>, StreamDataError> {
-        let Some(stream_metadata) = self.metadata.as_ref().cloned() else {
+        let Some(stream_metadata) = self.metadata.clone() else {
             return Ok(RowState::WaitingForMetadata);
         };
+        let stream = stream_metadata.get();
 
         // Segment ids index a fixed ring, so a wire value outside it is corrupt.
-        let n_segments = u8::try_from(stream_metadata.n_segments).map_err(|_| {
-            StreamDataError::InvalidSegmentCount {
-                count: stream_metadata.n_segments,
-            }
-        })?;
-        if n_segments == 0 {
-            return Err(StreamDataError::InvalidSegmentCount { count: 0 });
+        if stream.n_segments == 0 {
+            return Err(StreamDataError::ZeroSegmentCount);
         }
-        if data.segment_id >= n_segments {
+        if data.segment_id >= stream.n_segments {
             return Err(StreamDataError::SegmentOutOfRange {
                 segment_id: data.segment_id,
-                segment_count: stream_metadata.n_segments,
+                segment_count: stream.n_segments,
             });
         }
         self.current_segment_id = data.segment_id;
 
-        match self.columns.len().cmp(&stream_metadata.n_columns) {
+        let n_columns = usize::from(stream.n_columns);
+        match self.columns.len().cmp(&n_columns) {
             Ordering::Less => return Ok(RowState::WaitingForMetadata),
             Ordering::Greater => {
                 return Err(StreamDataError::ColumnCount {
-                    expected: stream_metadata.n_columns,
+                    expected: n_columns,
                     actual: self.columns.len(),
                 });
             }
             Ordering::Equal => {}
         }
 
+        let sample_size = usize::from(stream.sample_size);
         let expected_sample_size: usize = self
             .columns
             .iter()
-            .map(|column| column.data_type.size())
+            .map(|column| column.get().data_type.size())
             .sum();
-        if expected_sample_size > stream_metadata.sample_size {
+        if expected_sample_size > sample_size {
             return Err(StreamDataError::ColumnsExceedSample {
                 column_bytes: expected_sample_size,
-                sample_size: stream_metadata.sample_size,
+                sample_size,
             });
         }
-        if stream_metadata.sample_size == 0 {
+        if sample_size == 0 {
             return Err(StreamDataError::ZeroSampleSize);
         }
-        if !data.data.len().is_multiple_of(stream_metadata.sample_size) {
+        if !data.data.len().is_multiple_of(sample_size) {
             return Err(StreamDataError::MisalignedPayload {
                 payload_len: data.data.len(),
-                sample_size: stream_metadata.sample_size,
+                sample_size,
             });
         }
 
-        let row_count = data.data.len() / stream_metadata.sample_size;
+        let row_count = data.data.len() / sample_size;
         if row_count == 0 {
             return Err(StreamDataError::EmptyPayload);
         }
         let sample_span =
             u32::try_from(row_count - 1).map_err(|_| StreamDataError::SampleNumberOverflow {
-                first_sample_n: data.first_sample_n,
+                first_sample_n: data.first,
                 row_count,
             })?;
-        let last_sample_n = data.first_sample_n.checked_add(sample_span).ok_or(
-            StreamDataError::SampleNumberOverflow {
-                first_sample_n: data.first_sample_n,
-                row_count,
-            },
-        )?;
+        let last_sample_n =
+            data.first
+                .checked_add(sample_span)
+                .ok_or(StreamDataError::SampleNumberOverflow {
+                    first_sample_n: data.first,
+                    row_count,
+                })?;
         if last_sample_n > MAX_SAMPLE_NUMBER {
             return Err(StreamDataError::SampleNumberOverflow {
-                first_sample_n: data.first_sample_n,
+                first_sample_n: data.first,
                 row_count,
             });
         }
 
         let next_sample = self.last_sample_number + 1;
-        let next_segment = self.last_segment_id.wrapping_add(1) % n_segments;
+        let next_segment = self.last_segment_id.wrapping_add(1) % stream.n_segments;
 
         // A cached entry for a reused segment id can be a stale survivor from a
         // previous trip around the segment ring. If its timestamp for this data
         // is behind where we already are, evict it so we fall back to synthesis
         // below and re-request the real metadata instead of rewinding time.
-        if data.segment_id != self.last_segment_id {
-            if let Some(seg) = self.segment(data.segment_id) {
-                if self.established && seg.decimation != 0 && seg.sampling_rate != 0 {
+        if data.segment_id != self.last_segment_id && self.established {
+            let stale = self.segment(data.segment_id).is_some_and(|record| {
+                let seg = record.get();
+                seg.decimation != 0 && seg.sampling_rate != 0 && {
                     let half_period =
                         0.5 * f64::from(seg.decimation) / f64::from(seg.sampling_rate);
-                    if seg.time_at(data.first_sample_n) < self.last_timestamp - half_period {
-                        self.segments[usize::from(data.segment_id)] = None;
-                    }
+                    seg.time_at(data.first) < self.last_timestamp - half_period
                 }
+            });
+            if stale {
+                self.segments[usize::from(data.segment_id)] = None;
             }
         }
 
-        let (segment, is_segment_rollover) = match (
+        let (segment_record, is_segment_rollover) = match (
             self.segment(data.segment_id).cloned(),
             self.segment(self.last_segment_id).cloned(),
         ) {
             (Some(seg), _) => {
-                let is_segment_rollover =
-                    data.segment_id == next_segment && data.first_sample_n == 0;
+                let is_segment_rollover = data.segment_id == next_segment && data.first == 0;
                 (seg, is_segment_rollover)
             }
             // Synthesize from the previous segment only for a forced rollover;
             // otherwise wait for `missing_metadata` to request the real segment.
-            (None, Some(prev)) => {
+            (None, Some(previous)) => {
+                let mut rolled = previous.get();
                 // Segments roll on whole seconds of the undecimated clock, on
                 // which output sample n sits at sample n * decimation.
                 let seconds_at = |sample: u64| {
-                    sample * u64::from(prev.decimation) / u64::from(prev.sampling_rate)
+                    sample * u64::from(rolled.decimation) / u64::from(rolled.sampling_rate)
                 };
                 let next_sample = u64::from(next_sample);
                 let forced_rollover = self.established
-                    && data.first_sample_n == 0
-                    && prev.sampling_rate != 0
-                    && prev.decimation != 0
+                    && data.first == 0
+                    && rolled.sampling_rate != 0
+                    && rolled.decimation != 0
                     && seconds_at(next_sample) > seconds_at(next_sample - 1)
                     && data.segment_id == next_segment;
                 if !forced_rollover {
                     return Ok(RowState::WaitingForMetadata);
                 }
-                let mut new_seg = (*prev).clone();
-                new_seg.segment_id = data.segment_id;
-                new_seg.start_time += seconds_at(next_sample) as u32;
-                (Arc::new(new_seg), true)
+                rolled.start_time += seconds_at(next_sample) as u32;
+                rolled.segment_id = data.segment_id;
+                let rolled = SegmentRecord::encode(rolled)
+                    .expect("a re-timed copy of a retained record is the same length");
+                (rolled, true)
             }
             (None, None) => return Ok(RowState::WaitingForMetadata),
         };
+        let segment = segment_record.get();
 
         if segment.decimation == 0 || segment.sampling_rate == 0 {
             return Err(StreamDataError::InvalidRate {
@@ -534,15 +436,11 @@ impl StreamState {
         }
         let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
 
-        let period = 1.0 / new_rate;
-        let first_timestamp =
-            f64::from(segment.start_time) + period * f64::from(data.first_sample_n);
-
         let boundary = self.detect_boundary(
-            data.first_sample_n,
-            first_timestamp,
-            &device_metadata,
-            &segment,
+            data.first,
+            segment.time_at(data.first),
+            device_metadata.get(),
+            segment,
             new_rate,
             is_segment_rollover,
         );
@@ -559,29 +457,29 @@ impl StreamState {
 
         self.last_sample_number = last_sample_n;
         self.last_timestamp = segment.time_at(last_sample_n + 1);
-        self.last_session_id = device_metadata.session_id;
-        self.last_time_ref_session_id = segment.time_ref_session_id;
+        self.last_session_id = device_metadata.get().session.value();
+        self.last_time_ref_session_id = segment.timeref_session.value();
         self.last_segment_id = segment.segment_id;
         self.effective_rate = new_rate;
         self.established = true;
 
-        let sample_size = stream_metadata.sample_size;
-        Ok(RowState::Validated(ValidatedRows {
-            key: StreamKey::new(route, stream_metadata.stream_id),
+        let key = StreamKey::new(route, stream.stream_id);
+        Ok(RowState::Validated(ScannedRows {
+            key,
             boundary,
             generations: Generations {
                 stream: self.run,
                 device: *device_generation,
                 global: *global_generation,
             },
-            segment,
+            segment: segment_record,
             stream: stream_metadata,
             device: device_metadata,
-            first_sample_n: data.first_sample_n,
+            first_sample_n: data.first,
             last_sample_n,
             row_count,
             sample_size,
-            encoded: &data.data,
+            encoded: data.data,
             columns: &self.columns,
         }))
     }
@@ -622,10 +520,11 @@ enum MetadataSource {
 /// Metadata and stream state for one absolute device route.
 #[derive(Clone)]
 struct DeviceState {
-    metadata: Option<Arc<DeviceMetadata>>,
+    metadata: Option<DeviceRecord>,
     streams: Vec<Option<StreamState>>,
     ignore_session: bool,
-    metadata_rpcs_in_flight: usize,
+    query_in_flight: bool,
+    metadata_generation: u32,
     generation: u32,
 }
 
@@ -635,7 +534,8 @@ impl DeviceState {
             metadata: None,
             streams: Vec::new(),
             ignore_session,
-            metadata_rpcs_in_flight: 0,
+            query_in_flight: false,
+            metadata_generation: 0,
             generation: 0,
         }
     }
@@ -660,18 +560,25 @@ impl DeviceState {
     /// generation for the break they all share.
     fn reset(&mut self) {
         self.metadata = None;
-        self.metadata_rpcs_in_flight = 0;
+        self.rediscover_metadata();
         self.generation += 1;
         for stream in self.streams.iter_mut().flatten() {
             stream.reset();
         }
     }
 
+    /// Open a new metadata generation: no query minted before this point can
+    /// still apply, and discovery is armed again.
+    fn rediscover_metadata(&mut self) {
+        self.metadata_generation = self.metadata_generation.wrapping_add(1);
+        self.query_in_flight = false;
+    }
+
     fn accepts_stream(&mut self, stream_id: u8, global_generation: &mut u32) -> bool {
         if self
             .metadata
             .as_ref()
-            .is_some_and(|device| usize::from(stream_id) > device.n_streams)
+            .is_some_and(|device| stream_id > device.get().n_streams)
         {
             // An impossible stream id means our device description is stale or
             // corrupt. Bootstrap the route again instead of retaining it.
@@ -682,104 +589,127 @@ impl DeviceState {
         }
     }
 
-    /// Merge one metadata record into this route's decoding state.
+    /// Merge one metadata record into this route's decoding state. A record
+    /// that does not parse as the type it claims is ignored.
     fn apply_metadata(
         &mut self,
-        metadata: &MetadataContent,
+        kind: MetadataType,
+        record: &[u8],
         source: MetadataSource,
         global_generation: &mut u32,
     ) {
-        match metadata {
-            MetadataContent::Device(incoming) => {
-                if let Some(current) = &self.metadata {
-                    if current.serial_number != incoming.serial_number {
+        match kind {
+            MetadataType::Device => {
+                let Some(incoming) = DeviceRecord::new(record) else {
+                    return;
+                };
+                if let Some(previous) = self.metadata.take() {
+                    let (old, new) = (previous.get(), incoming.get());
+                    if old.serial != new.serial {
                         self.forget_all_metadata(global_generation);
-                    } else if current.session_id != incoming.session_id {
+                    } else if old.session != new.session {
                         // Keeping continuity state lets the first rows under the
                         // new metadata report a specific SessionChanged boundary.
                         for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
-                    } else if current.firmware_hash != incoming.firmware_hash {
+                        self.rediscover_metadata();
+                    } else if old.firmware != new.firmware {
                         // A firmware change can alter a schema without changing
                         // the session or timeline, so it must explicitly end all
                         // current runs rather than relying on boundary detection.
                         self.forget_all_metadata(global_generation);
                     }
                 }
-                self.metadata = Some(Arc::new(incoming.clone()));
+                self.metadata = Some(incoming);
             }
-            MetadataContent::Stream(incoming) => {
-                if !self.accepts_stream(incoming.stream_id, global_generation) {
+            MetadataType::Stream => {
+                let Some(incoming) = StreamRecord::new(record) else {
+                    return;
+                };
+                let stream_id = incoming.get().stream_id;
+                if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
-                let stream = self.stream_mut(incoming.stream_id);
-                if let Some(current) = &stream.metadata {
-                    if current.as_ref() != incoming {
-                        // This should never happen: stream metadata is constant.
-                        self.forget_all_metadata(global_generation);
+                let stream = self.stream_mut(stream_id);
+                let changed = match &stream.metadata {
+                    Some(current) => *current != incoming,
+                    None => {
+                        stream.metadata = Some(incoming);
+                        false
                     }
-                } else {
-                    stream.metadata = Some(Arc::new(incoming.clone()));
+                };
+                if changed {
+                    // This should never happen: stream metadata is constant.
+                    self.forget_all_metadata(global_generation);
                 }
             }
-            MetadataContent::Segment(incoming) => {
-                if !self.accepts_stream(incoming.stream_id, global_generation) {
+            MetadataType::Segment => {
+                let Some(incoming) = SegmentRecord::new(record) else {
+                    return;
+                };
+                let segment = incoming.get();
+                let (stream_id, segment_id) = (segment.stream_id, segment.segment_id);
+                if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
-                let stream = self.stream_mut(incoming.stream_id);
-                stream.set_segment(incoming.clone());
+                let stream = self.stream_mut(stream_id);
+                stream.set_segment(segment_id, incoming);
                 if source == MetadataSource::Update {
-                    stream.current_segment_id = incoming.segment_id;
+                    stream.current_segment_id = segment_id;
                 }
             }
-            MetadataContent::Column(incoming) => {
-                if !self.accepts_stream(incoming.stream_id, global_generation) {
+            MetadataType::Column => {
+                let Some(incoming) = ColumnRecord::new(record) else {
+                    return;
+                };
+                let column = incoming.get();
+                let (stream_id, index) = (column.stream_id, usize::from(column.index));
+                if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
-                let stream = self.stream_mut(incoming.stream_id);
-                if incoming.index < stream.columns.len() {
-                    if stream.columns[incoming.index].as_ref() != incoming {
-                        // This should never happen: columns are constant.
-                        self.forget_all_metadata(global_generation);
+                let stream = self.stream_mut(stream_id);
+                let changed = match stream.columns.get(index) {
+                    Some(current) => *current != incoming,
+                    None => {
+                        if index == stream.columns.len() {
+                            stream.columns.push(incoming);
+                        }
+                        false
                     }
-                } else if incoming.index == stream.columns.len() {
-                    stream.columns.push(Arc::new(incoming.clone()));
+                };
+                if changed {
+                    // This should never happen: columns are constant.
+                    self.forget_all_metadata(global_generation);
                 }
             }
-            _ => {}
+            MetadataType::Unknown(_) => {}
         }
     }
 
     /// Apply packets that update decoding state but do not contain sample rows.
-    fn apply_control_payload(
-        &mut self,
-        payload: &tio::proto::Payload,
-        global_generation: &mut u32,
-    ) {
-        match payload {
-            tio::proto::Payload::RpcReply(reply) if reply.id == META_RPC_ID => {
-                self.metadata_rpcs_in_flight = self.metadata_rpcs_in_flight.saturating_sub(1);
-                for metadata in decode_metadata_reply(&reply.reply) {
-                    self.apply_metadata(&metadata, MetadataSource::Reply, global_generation);
-                }
+    fn apply_control_packet(&mut self, packet: &tio::Packet, global_generation: &mut u32) {
+        match packet.payload() {
+            proto::Payload::Metadata(..) => {
+                let (kind, _, record) = wire::split_metadata(packet.payload_bytes())
+                    .expect("a metadata payload was framed when the packet was validated");
+                self.apply_metadata(
+                    kind.into(),
+                    record,
+                    MetadataSource::Update,
+                    global_generation,
+                );
             }
-            tio::proto::Payload::Metadata(update) => {
-                self.apply_metadata(&update.content, MetadataSource::Update, global_generation)
-            }
-            tio::proto::Payload::Heartbeat(tio::proto::HeartbeatPayload::Session(session_id)) => {
+            proto::Payload::Heartbeat(Heartbeat::Session(session)) => {
                 if let Some(device) = &self.metadata {
-                    if device.session_id != *session_id && !self.ignore_session {
+                    if device.get().session != session && !self.ignore_session {
                         for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
                         self.metadata = None;
-                        self.metadata_rpcs_in_flight = 0;
+                        self.rediscover_metadata();
                     }
                 }
-            }
-            tio::proto::Payload::RpcError(error) if error.id == META_RPC_ID => {
-                self.metadata_rpcs_in_flight = self.metadata_rpcs_in_flight.saturating_sub(1);
             }
             _ => {}
         }
@@ -788,11 +718,11 @@ impl DeviceState {
     /// Validate one stream-data packet using metadata for this route.
     fn validate_stream_data<'a>(
         &'a mut self,
-        data: &'a tio::proto::StreamDataPayload,
+        data: wire::Samples<'a>,
         route: DeviceRoute,
         global_generation: &mut u32,
     ) -> Result<RowState<'a>, StreamDataError> {
-        let Some(device_metadata) = self.metadata.as_ref().cloned() else {
+        let Some(device_metadata) = self.metadata.clone() else {
             return Ok(RowState::WaitingForMetadata);
         };
         if !self.accepts_stream(data.stream_id, global_generation) {
@@ -814,44 +744,86 @@ impl DeviceState {
             )
     }
 
-    fn take_metadata_requests(&mut self) -> Vec<tio::Packet> {
-        if self.metadata_rpcs_in_flight != 0 {
-            return Vec::new();
+    /// One query for as much of the missing metadata as a request may carry,
+    /// while none is outstanding for this route.
+    fn take_metadata_query(&mut self, route: DeviceRoute) -> Option<MetadataQuery> {
+        if self.query_in_flight {
+            return None;
         }
-        let requests = self.metadata_request_packets();
-        self.metadata_rpcs_in_flight = requests.len();
-        requests
+        let missing = self.missing_metadata();
+        let selectors = match missing.as_slice() {
+            [] => return None,
+            [only] if only.mtype == MetadataType::Device => Vec::new(),
+            missing => missing[..missing.len().min(wire::MAX_METADATA_SELECTORS)].to_vec(),
+        };
+        self.query_in_flight = true;
+        Some(MetadataQuery {
+            route,
+            selectors,
+            generation: self.metadata_generation,
+        })
     }
 
-    /// Build requests for every piece of metadata this route still lacks.
-    fn metadata_request_packets(&self) -> Vec<tio::Packet> {
-        let mut missing = Vec::new();
+    /// False if `query` names a metadata generation this route has already
+    /// left, including one it left by completing that same query.
+    fn complete_metadata_query(&mut self, query: &MetadataQuery) -> bool {
+        if query.generation != self.metadata_generation {
+            return false;
+        }
+        self.rediscover_metadata();
+        true
+    }
+
+    fn apply_metadata_reply(
+        &mut self,
+        query: MetadataQuery,
+        reply: &[u8],
+        global_generation: &mut u32,
+    ) {
+        if !self.complete_metadata_query(&query) {
+            return;
+        }
+        match wire::MetadataReply::parse(reply) {
+            Some(records) => {
+                for (kind, record) in records {
+                    self.apply_metadata(kind, record, MetadataSource::Reply, global_generation);
+                }
+            }
+            None => log::warn!("dropping a dev.metadata reply with broken framing"),
+        }
+    }
+
+    fn fail_metadata_query(&mut self, query: MetadataQuery) {
+        self.complete_metadata_query(&query);
+    }
+
+    /// Every piece of metadata this route still lacks.
+    fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         match self.metadata.as_ref() {
-            Some(device) => {
-                for stream_id in 1..=device.n_streams as u8 {
-                    if let Some(stream) = self
+            Some(device) => (1..=device.get().n_streams)
+                .flat_map(|stream_id| {
+                    match self
                         .streams
                         .get(usize::from(stream_id))
                         .and_then(Option::as_ref)
                     {
-                        missing.extend(stream.missing_metadata());
-                    } else {
-                        missing.push(MetadataRequest::stream(stream_id));
+                        Some(stream) => stream.missing_metadata(),
+                        None => vec![wire::MetadataSelector::stream(stream_id)],
                     }
-                }
-            }
-            None => missing.push(MetadataRequest::device()),
+                })
+                .collect(),
+            None => vec![wire::MetadataSelector::device()],
         }
-        build_metadata_request_packets(&missing)
     }
 
     fn metadata_snapshot(&self) -> Option<DeviceMetadataSnapshot> {
-        if !self.metadata_request_packets().is_empty() {
+        if !self.missing_metadata().is_empty() {
             return None;
         }
         let device = self.metadata.as_ref()?.clone();
-        let mut streams = HashMap::with_capacity(device.n_streams);
-        for stream_id in 1..=device.n_streams as u8 {
+        let n_streams = device.get().n_streams;
+        let mut streams = HashMap::with_capacity(usize::from(n_streams));
+        for stream_id in 1..=n_streams {
             streams.insert(
                 stream_id,
                 self.streams
@@ -869,7 +841,7 @@ pub(super) enum PacketEvent<'a> {
     Applied,
     WaitingForMetadata,
     Reset,
-    Rows(ValidatedRows<'a>),
+    Rows(ScannedRows<'a>),
 }
 
 /// Route-aware state machine shared by incremental and seekable packet readers.
@@ -911,25 +883,26 @@ impl ParseState {
         &'a mut self,
         packet: &'a tio::Packet,
     ) -> Result<PacketEvent<'a>, PacketError> {
-        if let proto::Payload::ProxyStatus(status) = &packet.payload {
-            if matches!(status.0, proto::ProxyStatus::SensorDisconnected) {
+        if let proto::Payload::ProxyStatus(status) = packet.payload() {
+            if matches!(status, proto::ProxyStatus::SensorDisconnected) {
                 self.reset();
                 return Ok(PacketEvent::Reset);
             }
             return Ok(PacketEvent::Applied);
         }
 
+        let packet_route = packet.route();
         let route = self
             .root_route
-            .absolute_route(&packet.routing)
+            .absolute_route(&packet_route)
             .map_err(|source| PacketError::Route {
                 root_route: self.root_route,
-                packet_route: packet.routing,
+                packet_route,
                 source,
             })?;
 
-        match &packet.payload {
-            proto::Payload::StreamData(data) => {
+        match packet.payload() {
+            proto::Payload::Samples(data) => {
                 let index = self.device_index(route);
                 let state = self.devices[index]
                     .1
@@ -944,11 +917,11 @@ impl ParseState {
                     RowState::Validated(rows) => PacketEvent::Rows(rows),
                 })
             }
-            payload => {
+            _ => {
                 let index = self.device_index(route);
                 self.devices[index]
                     .1
-                    .apply_control_payload(payload, &mut self.global_generation);
+                    .apply_control_packet(packet, &mut self.global_generation);
                 Ok(PacketEvent::Applied)
             }
         }
@@ -963,27 +936,33 @@ impl ParseState {
         }
     }
 
-    pub(super) fn take_requests(&mut self) -> Vec<tio::Packet> {
-        let routes: Vec<_> = self.devices.iter().map(|(route, _)| *route).collect();
-        let mut out = Vec::new();
-        for route in routes {
-            out.extend(self.take_requests_for(route));
-        }
-        out
+    pub(super) fn take_metadata_queries(&mut self) -> Vec<MetadataQuery> {
+        self.devices
+            .iter_mut()
+            .filter_map(|(route, device)| device.take_metadata_query(*route))
+            .collect()
     }
 
-    pub(super) fn take_requests_for(&mut self, route: DeviceRoute) -> Vec<tio::Packet> {
-        let Ok(relative) = self.root_route.relative_route(&route) else {
+    pub(super) fn take_metadata_queries_for(&mut self, route: DeviceRoute) -> Vec<MetadataQuery> {
+        if self.root_route.relative_route(&route).is_err() {
             return Vec::new();
-        };
+        }
         self.device_mut(route)
-            .take_metadata_requests()
+            .take_metadata_query(route)
             .into_iter()
-            .map(|mut request| {
-                request.routing = relative;
-                request
-            })
             .collect()
+    }
+
+    pub(super) fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
+        let index = self.device_index(query.route);
+        self.devices[index]
+            .1
+            .apply_metadata_reply(query, reply, &mut self.global_generation);
+    }
+
+    pub(super) fn fail_metadata_query(&mut self, query: MetadataQuery) {
+        let index = self.device_index(query.route);
+        self.devices[index].1.fail_metadata_query(query);
     }
 
     pub(super) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
@@ -1000,64 +979,64 @@ impl ParseState {
 }
 
 /// Stream bytes validated against the metadata and continuity state in effect
-/// at their position in the packet sequence.
-pub(super) struct ValidatedRows<'a> {
+/// at their position in the packet sequence, described without decoding them.
+pub struct ScannedRows<'a> {
     key: StreamKey,
     boundary: Option<Boundary>,
     generations: Generations,
-    segment: Arc<SegmentMetadata>,
-    stream: Arc<StreamMetadata>,
-    device: Arc<DeviceMetadata>,
+    segment: SegmentRecord,
+    stream: StreamRecord,
+    device: DeviceRecord,
     first_sample_n: u32,
     last_sample_n: u32,
     row_count: usize,
     sample_size: usize,
     encoded: &'a [u8],
-    columns: &'a [Arc<ColumnMetadata>],
+    columns: &'a [ColumnRecord],
 }
 
 /// One column of a decoded batch: where its bytes start within a sample, the
 /// buffer its values land in, and its metadata.
 struct DecodableColumn<'a> {
     offset: usize,
-    buffer_type: proto::BufferType,
-    metadata: &'a Arc<ColumnMetadata>,
+    buffer_type: BufferType,
+    metadata: &'a ColumnRecord,
 }
 
-impl ValidatedRows<'_> {
-    pub(super) fn stream_key(&self) -> StreamKey {
+impl ScannedRows<'_> {
+    pub fn stream_key(&self) -> StreamKey {
         self.key
     }
 
-    pub(super) fn boundary(&self) -> Option<&Boundary> {
+    pub fn boundary(&self) -> Option<&Boundary> {
         self.boundary.as_ref()
     }
 
-    pub(super) fn generations(&self) -> Generations {
+    pub fn generations(&self) -> Generations {
         self.generations
     }
 
-    pub(super) fn segment(&self) -> &Arc<SegmentMetadata> {
+    pub fn segment(&self) -> &SegmentRecord {
         &self.segment
     }
 
-    pub(super) fn stream(&self) -> &Arc<StreamMetadata> {
+    pub fn stream(&self) -> &StreamRecord {
         &self.stream
     }
 
-    pub(super) fn device(&self) -> &Arc<DeviceMetadata> {
+    pub fn device(&self) -> &DeviceRecord {
         &self.device
     }
 
-    pub(super) fn columns(&self) -> &[Arc<ColumnMetadata>] {
+    pub fn columns(&self) -> &[ColumnRecord] {
         self.columns
     }
 
-    pub(super) fn row_count(&self) -> usize {
+    pub fn row_count(&self) -> usize {
         self.row_count
     }
 
-    pub(super) fn sample_number_bounds(&self) -> (u32, u32) {
+    pub fn sample_number_bounds(&self) -> (u32, u32) {
         (self.first_sample_n, self.last_sample_n)
     }
 
@@ -1068,20 +1047,20 @@ impl ValidatedRows<'_> {
             .iter()
             .scan(0usize, |offset, metadata| {
                 let at = *offset;
-                *offset += metadata.data_type.size();
+                *offset += metadata.get().data_type.size();
                 Some((at, metadata))
             })
             .filter_map(|(offset, metadata)| {
                 Some(DecodableColumn {
                     offset,
-                    buffer_type: metadata.data_type.decoded_buffer_type()?,
+                    buffer_type: metadata.get().data_type.decoded_buffer_type()?,
                     metadata,
                 })
             })
     }
 }
 
-impl RowSource for ValidatedRows<'_> {
+impl RowSource for ScannedRows<'_> {
     fn len(&self) -> usize {
         self.row_count
     }
@@ -1094,8 +1073,8 @@ impl RowSource for ValidatedRows<'_> {
         self.generations()
     }
 
-    fn segment(&self) -> &Arc<SegmentMetadata> {
-        self.segment()
+    fn segment_record(&self) -> &SegmentRecord {
+        &self.segment
     }
 
     fn start_builder(&self, capacity: usize) -> SampleBatchBuilder {
@@ -1121,7 +1100,10 @@ impl RowSource for ValidatedRows<'_> {
             tail.push_row(
                 self.first_sample_n + row as u32,
                 self.decodable_columns().map(|column| {
-                    ColumnData::from_le_bytes(&raw[column.offset..], column.metadata.data_type)
+                    ColumnData::from_le_bytes(
+                        &raw[column.offset..],
+                        column.metadata.get().data_type,
+                    )
                 }),
             );
         }

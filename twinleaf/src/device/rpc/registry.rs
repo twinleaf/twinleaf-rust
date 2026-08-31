@@ -3,9 +3,13 @@
 use super::cache;
 use super::{CallError, RpcReply};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use twinleaf_proto::rpc::RpcMeta;
+
+/// Most `rpc.listinfo` fetches in flight at once during a walk, bounding the
+/// request burst a memory-tight device must absorb.
+const WALK_WINDOW: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcRegistryError {
@@ -46,28 +50,41 @@ impl RpcRegistry {
         Self { rpcs, hash: None }
     }
 
-    /// Walk one device's RPC table, a call at a time, on a blocking surface.
+    /// Walk one device's RPC table on a blocking surface, keeping up to
+    /// [`WALK_WINDOW`] independent fetches in flight to hide round trips.
     ///
     /// `dev.name` and `rpc.hash` identify the on-disk cache entry; only a miss
-    /// enumerates `rpc.listinfo`.
-    pub(crate) fn load_with(
-        mut call: impl FnMut(&str, &[u8]) -> Result<Vec<u8>, CallError>,
+    /// enumerates `rpc.listinfo`. `submit` starts a call; the closure it
+    /// returns blocks for that call's reply.
+    pub(crate) fn load_with<Wait: FnOnce() -> Result<Vec<u8>, CallError>>(
+        mut submit: impl FnMut(&str, &[u8]) -> Result<Wait, CallError>,
     ) -> Result<Self, RpcRegistryError> {
-        let mut ask =
-            |name: &str, arg: &[u8]| call(name, arg).map_err(RpcRegistryError::DeviceRpcError);
-        let dev_name: String = decode(ask("dev.name", &[])?)?;
-        let hash: u32 = decode(ask("rpc.hash", &[])?)?;
+        let mut start =
+            |name: &str, arg: &[u8]| submit(name, arg).map_err(RpcRegistryError::DeviceRpcError);
+        let finish = |wait: Wait| wait().map_err(RpcRegistryError::DeviceRpcError);
+        let entry = |reply| decode::<(u16, String)>(reply).map(|(meta, name)| (name, meta));
+
+        let name_wait = start("dev.name", &[])?;
+        let hash_wait = start("rpc.hash", &[])?;
+        let dev_name: String = decode(finish(name_wait)?)?;
+        let hash: u32 = decode(finish(hash_wait)?)?;
         let path = cache::path(&dev_name, hash).ok_or(RpcRegistryError::CacheDirError)?;
         if let Some(entries) = cache::load(&path)? {
             return Ok(Self::from_entries(entries, hash));
         }
-        let total: u16 = decode(ask("rpc.listinfo", &[])?)?;
-        let entries = (0..total)
-            .map(|index| {
-                decode::<(u16, String)>(ask("rpc.listinfo", &index.to_le_bytes())?)
-                    .map(|(meta, name)| (name, meta))
-            })
-            .collect::<Result<cache::Entries, RpcRegistryError>>()?;
+        let total: u16 = decode(finish(start("rpc.listinfo", &[])?)?)?;
+        let mut in_flight = VecDeque::with_capacity(WALK_WINDOW);
+        let mut entries = cache::Entries::with_capacity(total.into());
+        for index in 0..total {
+            if in_flight.len() == WALK_WINDOW {
+                let oldest = in_flight.pop_front().expect("full window is nonempty");
+                entries.push(entry(finish(oldest)?)?);
+            }
+            in_flight.push_back(start("rpc.listinfo", &index.to_le_bytes())?);
+        }
+        for wait in in_flight {
+            entries.push(entry(finish(wait)?)?);
+        }
         cache::store(&path, &entries);
         Ok(Self::from_entries(entries, hash))
     }
@@ -117,7 +134,8 @@ mod tests {
         let mut replies = replies.into_iter();
         let Err(error) = RpcRegistry::load_with(|name, arg| {
             asked.push((name.to_string(), arg.to_vec()));
-            replies.next().ok_or(CallError::Timeout)
+            let reply = replies.next();
+            Ok(move || reply.ok_or(CallError::Timeout))
         }) else {
             panic!("the walk runs out of replies");
         };
@@ -144,6 +162,52 @@ mod tests {
                 ("rpc.listinfo".to_string(), vec![1, 0]),
             ]
         );
+    }
+
+    /// One reply short of `total`, so the walk fails on the last wait and
+    /// never writes the on-disk cache; every submission still happens first.
+    #[test]
+    fn descriptor_fetches_run_a_window_ahead_of_their_replies() {
+        let total = 10u16;
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut replies = [
+            b"test-device".to_vec(),
+            0xfeed_f00du32.to_le_bytes().to_vec(),
+            total.to_le_bytes().to_vec(),
+        ]
+        .into_iter()
+        .chain((0..total - 1).map(|i| descriptor(&format!("rpc{i}"))));
+
+        let result = RpcRegistry::load_with(|name, arg| {
+            events.borrow_mut().push(format!("ask {name} {arg:?}"));
+            let reply = replies.next();
+            let events = &events;
+            Ok(move || {
+                events.borrow_mut().push("wait".to_string());
+                reply.ok_or(CallError::Timeout)
+            })
+        });
+
+        assert!(matches!(
+            result,
+            Err(RpcRegistryError::DeviceRpcError(CallError::Timeout))
+        ));
+        let events = events.into_inner();
+        let pos = |needle: &str| {
+            events
+                .iter()
+                .position(|e| e == needle)
+                .expect("event missing")
+        };
+        let descriptor_waits: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| *e == "wait")
+            .map(|(i, _)| i)
+            .skip(3)
+            .collect();
+        assert!(pos("ask rpc.listinfo [7, 0]") < descriptor_waits[0]);
+        assert!(pos("ask rpc.listinfo [9, 0]") < *descriptor_waits.last().unwrap());
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! Seekable and indexed access to immutable TIO log files.
 
-use super::parser::PacketParser;
+use super::keys::StreamKey;
+use super::parser::{PacketParser, ParserCheckpoint};
 use super::sample::{Boundary, BoundaryClass, SampleBatch};
-use super::state::{PacketError, PacketEvent, ParseState, ValidatedRows};
-use crate::tio::proto::identifiers::StreamKey;
-use crate::tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
+use super::state::{PacketError, ScannedRows};
+use super::{ColumnRecord, DeviceRecord, SegmentExt, SegmentRecord, StreamRecord};
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
 use memmap2::Mmap;
@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use twinleaf_proto::data as wire;
 
 const INDEX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 1024 * 1024;
@@ -83,7 +83,7 @@ impl Iterator for PacketIter {
         }
 
         let offset = self.position;
-        match Packet::deserialize_bytes(&self.remaining) {
+        match Packet::from_wire_prefix(&self.remaining) {
             Ok((packet, len)) => {
                 self.remaining.advance(len);
                 self.position += len;
@@ -115,9 +115,9 @@ fn class_index(class: BoundaryClass) -> usize {
 pub struct StreamSummary {
     run: u32,
     opened_by: Option<BoundaryClass>,
-    metadata: Arc<StreamMetadata>,
-    segment: Arc<SegmentMetadata>,
-    columns: Vec<Arc<ColumnMetadata>>,
+    metadata: StreamRecord,
+    segment: SegmentRecord,
+    columns: Vec<ColumnRecord>,
     sample_count: u64,
     first_timestamp: Option<f64>,
     last_timestamp: Option<f64>,
@@ -134,15 +134,15 @@ impl StreamSummary {
         self.opened_by
     }
 
-    pub fn metadata(&self) -> &StreamMetadata {
-        &self.metadata
+    pub fn metadata(&self) -> wire::Stream<'_> {
+        self.metadata.get()
     }
 
-    pub fn segment(&self) -> &SegmentMetadata {
-        &self.segment
+    pub fn segment(&self) -> wire::Segment<'_> {
+        self.segment.get()
     }
 
-    pub fn columns(&self) -> &[Arc<ColumnMetadata>] {
+    pub fn columns(&self) -> &[ColumnRecord] {
         &self.columns
     }
 
@@ -159,7 +159,8 @@ impl StreamSummary {
     }
 
     pub fn rate_hz(&self) -> f64 {
-        f64::from(self.segment.sampling_rate) / f64::from(self.segment.decimation.max(1))
+        let segment = self.segment();
+        f64::from(segment.sampling_rate) / f64::from(segment.decimation.max(1))
     }
 }
 
@@ -168,7 +169,7 @@ impl StreamSummary {
 pub struct LogSummary {
     bytes_scanned: usize,
     packet_count: u64,
-    devices: BTreeMap<tio::proto::DeviceRoute, Arc<DeviceMetadata>>,
+    devices: BTreeMap<tio::proto::DeviceRoute, DeviceRecord>,
     streams: BTreeMap<StreamKey, Vec<StreamSummary>>,
     boundaries: [u64; BOUNDARY_CLASSES],
     error: Option<LogError>,
@@ -183,7 +184,7 @@ impl LogSummary {
         self.packet_count
     }
 
-    pub fn devices(&self) -> &BTreeMap<tio::proto::DeviceRoute, Arc<DeviceMetadata>> {
+    pub fn devices(&self) -> &BTreeMap<tio::proto::DeviceRoute, DeviceRecord> {
         &self.devices
     }
 
@@ -201,7 +202,7 @@ impl LogSummary {
         self.error.as_ref()
     }
 
-    fn observe_rows(&mut self, rows: &ValidatedRows<'_>) {
+    fn observe_rows(&mut self, rows: &ScannedRows<'_>) {
         self.devices
             .entry(rows.stream_key().route)
             .or_insert_with(|| rows.device().clone());
@@ -230,8 +231,8 @@ impl LogSummary {
         stream.sample_count += rows.row_count() as u64;
 
         let (first_n, last_n) = rows.sample_number_bounds();
-        let first_timestamp = rows.segment().time_at(first_n + 1);
-        let last_timestamp = rows.segment().time_at(last_n + 1);
+        let first_timestamp = rows.segment().get().time_at(first_n + 1);
+        let last_timestamp = rows.segment().get().time_at(last_n + 1);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp
@@ -247,7 +248,7 @@ impl LogSummary {
 
 struct IndexedChunk {
     bytes: Range<usize>,
-    state: ParseState,
+    state: ParserCheckpoint,
 }
 
 /// Compact first-pass result used to summarize and decode a log.
@@ -327,7 +328,7 @@ fn decode_chunk(
     batch_rows: usize,
 ) -> Result<Vec<SampleBatch>, LogError> {
     let mut packets = PacketIter::new(data.slice(chunk.bytes.clone()), chunk.bytes.start);
-    let mut parser = PacketParser::from_state(chunk.state.clone()).with_batch_rows(batch_rows);
+    let mut parser = PacketParser::replay_from(&chunk.state).with_batch_rows(batch_rows);
     let mut batches = Vec::new();
 
     loop {
@@ -391,11 +392,11 @@ impl LogFile {
         mut progress: impl FnMut(usize),
     ) -> LogIndex {
         let mut packets = self.packets();
-        let mut state = ParseState::new(root_route, ignore_session);
+        let mut parser = PacketParser::new(root_route, ignore_session);
         let mut summary = LogSummary::default();
         let mut chunks = Vec::new();
         let mut chunk_start = 0;
-        let mut chunk_state = state.clone();
+        let mut chunk_state = parser.checkpoint();
         let mut next_progress = PROGRESS_BYTES;
         let mut scanned = 0;
 
@@ -409,8 +410,8 @@ impl LogFile {
                 }
                 None => break,
             };
-            let event = match state.apply_packet(&packet) {
-                Ok(event) => event,
+            let validated = match parser.scan_packet(&packet) {
+                Ok(validated) => validated,
                 Err(source) => {
                     summary.error = Some(LogError::Data {
                         offset: packet_offset,
@@ -420,7 +421,7 @@ impl LogFile {
                 }
             };
             summary.packet_count += 1;
-            if let PacketEvent::Rows(rows) = event {
+            if let Some(rows) = validated {
                 summary.observe_rows(&rows);
             }
 
@@ -436,7 +437,7 @@ impl LogFile {
                     state: chunk_state,
                 });
                 chunk_start = position;
-                chunk_state = state.clone();
+                chunk_state = parser.checkpoint();
             }
         }
 
@@ -460,47 +461,28 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::records::{column, device, segment, stream};
     use crate::data::{Generations, StreamDataError};
-    use crate::tio::proto::meta::{
-        ColumnMetadata, DeviceMetadata, MetadataContent, MetadataEpoch, MetadataFilter,
-        MetadataPayload, SegmentMetadata, StreamMetadata,
-    };
-    use crate::tio::proto::{DataType, DeviceRoute, HeartbeatPayload, Payload, StreamDataPayload};
+    use crate::tio::proto::{DataType, DeviceRoute};
 
     fn encoded_log(packets: impl IntoIterator<Item = Packet>) -> Bytes {
         let mut encoded = Vec::new();
         for packet in packets {
-            encoded.extend(packet.serialize().unwrap());
+            encoded.extend_from_slice(packet.as_bytes());
         }
         Bytes::from(encoded)
     }
 
-    fn metadata_packet(content: MetadataContent) -> Packet {
-        Packet {
-            payload: Payload::Metadata(MetadataPayload {
-                content,
-                flags: 0,
-                unknown_fixed: Vec::new(),
-                unknown_varlen: Vec::new(),
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+    fn metadata_packet(record: wire::Metadata<'_>) -> Packet {
+        Packet::metadata(record, wire::MetadataFlags::default(), DeviceRoute::root())
+            .expect("a valid metadata record")
     }
 
     #[test]
     fn packet_iterators_are_independent() {
         let data = encoded_log([
-            Packet {
-                payload: Payload::Heartbeat(HeartbeatPayload::Session(1)),
-                routing: DeviceRoute::root(),
-                ttl: 0,
-            },
-            Packet {
-                payload: Payload::Heartbeat(HeartbeatPayload::Session(2)),
-                routing: DeviceRoute::root(),
-                ttl: 0,
-            },
+            Packet::heartbeat_session(1, DeviceRoute::root()),
+            Packet::heartbeat_session(2, DeviceRoute::root()),
         ]);
         let log = LogFile { data };
         let mut first = log.packets();
@@ -530,66 +512,19 @@ mod tests {
         assert_eq!(packets.position(), 0);
     }
 
-    fn segment_metadata(sampling_rate: u32) -> SegmentMetadata {
-        SegmentMetadata {
-            stream_id: 1,
-            segment_id: 0,
-            flags: 0,
-            time_ref_epoch: MetadataEpoch::Unix,
-            time_ref_serial: "clock".to_string(),
-            time_ref_session_id: 7,
-            start_time: 0,
-            sampling_rate,
-            decimation: 1,
-            filter_cutoff: 0.0,
-            filter_type: MetadataFilter::Unfiltered,
-        }
-    }
-
     /// One device with one 1 Hz stream of a single `f32` column.
     fn schema_packets() -> Vec<Packet> {
-        [
-            MetadataContent::Device(DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "fw".to_string(),
-                n_streams: 1,
-                session_id: 42,
-                name: "test-device".to_string(),
-            }),
-            MetadataContent::Stream(StreamMetadata {
-                stream_id: 1,
-                name: "test-stream".to_string(),
-                n_columns: 1,
-                n_segments: 1,
-                sample_size: 4,
-                buf_samples: 128,
-            }),
-            MetadataContent::Segment(segment_metadata(1)),
-            MetadataContent::Column(ColumnMetadata {
-                stream_id: 1,
-                index: 0,
-                data_type: DataType::Float32,
-                name: "value".to_string(),
-                units: String::new(),
-                description: String::new(),
-            }),
+        vec![
+            metadata_packet(wire::Metadata::Device(device())),
+            metadata_packet(wire::Metadata::Stream(stream(1))),
+            metadata_packet(wire::Metadata::Segment(segment(1))),
+            metadata_packet(wire::Metadata::Column(column(1, 0, DataType::F32))),
         ]
-        .into_iter()
-        .map(metadata_packet)
-        .collect()
     }
 
     fn data_packet(first_sample_n: u32, segment_id: u8) -> Packet {
-        Packet {
-            payload: Payload::StreamData(StreamDataPayload {
-                stream_id: 1,
-                first_sample_n,
-                segment_id,
-                data: Bytes::from_static(&[0; 4]),
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+        Packet::samples(1, segment_id, first_sample_n, &[0; 4], DeviceRoute::root())
+            .expect("valid samples")
     }
 
     #[test]
@@ -619,9 +554,10 @@ mod tests {
     fn a_mid_log_rate_change_summarizes_each_run_separately() {
         let mut packets = schema_packets();
         packets.extend([data_packet(0, 0), data_packet(1, 0)]);
-        packets.push(metadata_packet(MetadataContent::Segment(segment_metadata(
-            10,
-        ))));
+        packets.push(metadata_packet(wire::Metadata::Segment(wire::Segment {
+            sampling_rate: 10,
+            ..segment(1)
+        })));
         packets.extend([data_packet(2, 0), data_packet(3, 0)]);
         let log = LogFile {
             data: encoded_log(packets),
@@ -669,14 +605,7 @@ mod tests {
     fn indexed_batches_carry_the_generations_of_a_linear_parse() {
         // Padding the log past a checkpoint forces the decode to resume from a
         // cloned parser state rather than from the beginning of the log.
-        let filler = Packet {
-            payload: Payload::RpcReply(crate::tio::proto::RpcReplyPayload {
-                id: 1,
-                reply: vec![0; 400],
-            }),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        };
+        let filler = Packet::rpc_reply(1, &[0; 400], DeviceRoute::root()).unwrap();
         let mut packets = schema_packets();
         packets.push(data_packet(0, 0));
         packets.extend(std::iter::repeat_n(filler, INDEX_CHUNK_BYTES / 400 + 1));

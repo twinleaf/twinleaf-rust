@@ -8,11 +8,10 @@
 
 use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq};
 use crate::tui::rpc_state::RouteRpcState;
-use crate::tui::rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp};
-use crate::tui::tree_worker::spawn_tree_worker;
+use crate::tui::rpc_worker::{PendingRpc, RegistryQueue};
 use crate::{HealthCli, ProxyHelp};
 use chrono::{DateTime, Local};
-use crossbeam::channel::{self, Sender};
+use crossbeam::channel;
 use ratatui::{
     crossterm::{
         event::{
@@ -33,18 +32,12 @@ use ratatui::{
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io,
-    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryReason, StreamKey},
-    device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcRegistry, TreeEvent, TreeItem},
-    tio::{
-        self,
-        proto::meta::{
-            ColumnMetadata, DeviceMetadata, MetadataFilter, SegmentMetadata, StreamMetadata,
-        },
-    },
+    data::{BoundaryReason, ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord},
+    device::{DeviceEvent, DeviceRoute, RecvError, RpcRegistry, TreeEvent},
+    tio,
 };
 
 pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
@@ -237,10 +230,10 @@ struct StreamStats {
     last_seen: Option<Instant>,
 
     // Last-known metadata; deliberately survives the reset methods.
-    last_device: Option<Arc<DeviceMetadata>>,
-    last_stream: Option<Arc<StreamMetadata>>,
-    last_segment: Option<Arc<SegmentMetadata>>,
-    last_schema: Vec<Arc<ColumnMetadata>>,
+    last_device: Option<DeviceRecord>,
+    last_stream: Option<StreamRecord>,
+    last_segment: Option<SegmentRecord>,
+    last_schema: Vec<ColumnRecord>,
     recent_boundaries: VecDeque<(SystemTime, BoundaryReason)>,
 }
 
@@ -602,23 +595,20 @@ impl HealthState {
 
         let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
-            name: batch.stream().name.clone(),
-            current_session_id: Some(batch.device().session_id),
+            name: batch.stream().name.to_string(),
+            current_session_id: Some(batch.device().session.value()),
             ..Default::default()
         });
 
-        st.name = batch.stream().name.clone();
-        st.last_device = Some(batch.device().clone());
-        st.last_stream = Some(batch.stream().clone());
-        st.last_segment = Some(batch.segment().clone());
-        st.last_schema = batch
-            .schema()
-            .iter()
-            .map(|s| s.metadata().clone())
-            .collect();
+        let (device, stream, segment) = batch.records();
+        st.name = batch.stream().name.to_string();
+        st.last_device = Some(device.clone());
+        st.last_stream = Some(stream.clone());
+        st.last_segment = Some(segment.clone());
+        st.last_schema = batch.schema().iter().map(|s| s.record().clone()).collect();
 
         if let Some(boundary) = batch.boundary() {
-            self.handle_boundary(&boundary.reason, &route, &batch.stream().name, sid);
+            self.handle_boundary(&boundary.reason, &route, batch.stream().name, sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();
@@ -735,7 +725,7 @@ impl HealthState {
         }
     }
 
-    fn handle_event(&mut self, event: TreeEvent, now: Instant, rpc_tx: &Sender<RpcWorkerReq>) {
+    fn handle_event(&mut self, event: TreeEvent, now: Instant, registries: &mut RegistryQueue) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.device_states.entry(route).or_default();
@@ -746,7 +736,7 @@ impl HealthState {
                     .or_default()
                     .on_route_discovered()
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
             }
             TreeEvent::Device {
@@ -759,7 +749,7 @@ impl HealthState {
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
                 self.device_states
                     .entry(route)
@@ -772,7 +762,7 @@ impl HealthState {
             } => {
                 self.log_event(format!("[{}] STATUS: {:?}", route, status), Color::Yellow);
                 if self.rpc_routes.entry(route).or_default().on_status(status) {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
                 if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
                     for (key, st) in self.stats.iter_mut() {
@@ -800,9 +790,15 @@ impl HealthState {
                 event: DeviceEvent::MetadataReady(metadata),
             } => {
                 self.log_event(
-                    format!("[{}] METADATA READY: {}", route, metadata.device.name),
+                    format!("[{}] METADATA READY: {}", route, metadata.device.get().name),
                     Color::Green,
                 );
+            }
+            TreeEvent::Device {
+                route,
+                event: DeviceEvent::MetadataUnavailable,
+            } => {
+                self.log_event(format!("[{}] NO METADATA SUPPORT", route), Color::Red);
             }
             TreeEvent::Device {
                 route,
@@ -810,7 +806,7 @@ impl HealthState {
             } => {
                 self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Color::Green);
                 if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
             }
         }
@@ -838,11 +834,23 @@ impl HealthState {
         }
     }
 
+    /// Show the outcome of a palette call in the palette's status line.
+    fn set_rpc_result(&mut self, result: Result<String, String>) {
+        let (msg, color) = match result {
+            Ok(reply) => (
+                format!("{}: {}", self.palette.last_rpc_command(), reply),
+                Color::Green,
+            ),
+            Err(error) => (format!("ERR: {}", error), Color::Red),
+        };
+        self.palette.set_rpc_result(msg, color);
+    }
+
     fn update(
         &mut self,
         action: Action,
         root_route: &DeviceRoute,
-        rpc_tx: &Sender<RpcWorkerReq>,
+        pending: &mut PendingRpc,
     ) -> bool {
         let total = self.filtered_event_count();
         let display_count = self.event_display_lines;
@@ -922,7 +930,9 @@ impl HealthState {
                 self.palette.exit();
             }
             Action::ExecuteRpc(req) => {
-                let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
+                if let Some(result) = pending.start(req) {
+                    self.set_rpc_result(result);
+                }
             }
             Action::SelectRoute(route) => self.select_palette_route(route),
             Action::ResetStats => {
@@ -1152,12 +1162,13 @@ fn draw_detail_pane(
             .collect()
     }
 
-    fn column_cells(schema: &[Arc<ColumnMetadata>]) -> Vec<(Vec<Span<'static>>, usize, usize)> {
+    fn column_cells(schema: &[ColumnRecord]) -> Vec<(Vec<Span<'static>>, usize, usize)> {
         schema
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let mut spans = vec![Span::raw(c.name.clone())];
+                let c = c.get();
+                let mut spans = vec![Span::raw(c.name.to_string())];
                 let mut nat = c.name.len();
                 if !c.units.is_empty() {
                     spans.push(Span::styled(
@@ -1176,18 +1187,20 @@ fn draw_detail_pane(
     }
 
     let device_row = st.last_device.as_ref().map(|d| {
+        let d = d.get();
         (
-            d.name.clone(),
+            d.name.to_string(),
             vec![
-                ("serial", d.serial_number.clone()),
-                ("session", format!("{:#010x}", d.session_id)),
-                ("firmware", d.firmware_hash.clone()),
+                ("serial", d.serial.to_string()),
+                ("session", format!("{:#010x}", d.session.value())),
+                ("firmware", d.firmware.to_string()),
             ],
         )
     });
     let stream_row = st.last_stream.as_ref().map(|s| {
+        let s = s.get();
         (
-            s.name.clone(),
+            s.name.to_string(),
             vec![
                 ("columns", s.n_columns.to_string()),
                 ("segments", s.n_segments.to_string()),
@@ -1195,16 +1208,17 @@ fn draw_detail_pane(
         )
     });
     let segment_row = st.last_segment.as_ref().map(|s| {
+        let s = s.get();
         let mut pairs = vec![
             ("id", s.segment_id.to_string()),
             ("rate", format!("{} Hz", s.sampling_rate)),
             ("decimation", s.decimation.to_string()),
-            ("epoch", format!("{:?}", s.time_ref_epoch)),
+            ("epoch", format!("{}", s.epoch)),
         ];
-        if s.filter_type != MetadataFilter::Unfiltered {
+        if s.filter_type != twinleaf_proto::data::FilterType::NONE {
             pairs.push((
                 "filter",
-                format!("{:?} @ {} Hz", s.filter_type, s.filter_cutoff),
+                format!("{} @ {} Hz", s.filter_type, s.filter_cutoff),
             ));
         }
         pairs
@@ -1819,27 +1833,26 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
 
     let mut terminal = ratatui::init();
 
-    let proxy = tio::proxy::Interface::new(&config.tio.root);
+    let proxy = tio::proxy::Connection::open(&config.tio.root);
     let root_route = config.tio.route;
 
-    let tree = DeviceTree::open(&proxy, root_route)
+    // One connection: the library pumps samples, cloned trees call.
+    let tree = proxy
+        .tree_with(root_route, twinleaf_proto::MAX_ROUTING_SIZE, None)
         .map_err(|e| {
             ratatui::restore();
             eyre::Report::new(e)
         })
         .wrap_err_with(|| format!("could not open device tree on {}", config.tio.root))
         .with_proxy_help()?;
-
-    let rpc_client = RpcClient::open(&proxy, root_route)
-        .map_err(|e| {
-            ratatui::restore();
-            eyre::Report::new(e)
-        })
-        .wrap_err_with(|| format!("could not open RPC client on {}", config.tio.root))
+    let batches = tree
+        .subscribe()
+        .wrap_err("could not start the data stream")
         .with_proxy_help()?;
-    let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
+    let events = tree.events().wrap_err("could not start the event stream")?;
 
-    let data_rx = spawn_tree_worker(tree);
+    let mut registries = RegistryQueue::new(tree.clone());
+    let mut pending = PendingRpc::new(tree);
 
     // Key thread
     let (key_tx, key_rx) = channel::unbounded();
@@ -1858,54 +1871,56 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
     let mut stream_error = None;
 
     'main: loop {
+        let rpc_rx = pending.receiver().clone();
+        let registry_rx = registries.receiver().clone();
         crossbeam::select! {
-            recv(data_rx) -> item => {
-                let now = Instant::now();
-                match item {
-                    Ok(Ok(TreeItem::Batch(batch))) => {
-                        app.handle_batch(batch, now);
-                    }
-                    Ok(Ok(TreeItem::Event(event))) => {
-                        app.handle_event(event, now, &rpc_tx);
-                    }
-                    Ok(Err(e)) => {
-                        stream_error = Some(e);
+            recv(batches.receiver()) -> batch => {
+                match batch {
+                    Ok(Ok(batch)) => app.handle_batch(batch, Instant::now()),
+                    Ok(Err(lagged)) => app.log_event(format!("{lagged}"), Color::Red),
+                    Err(_) => {
+                        stream_error = Some(RecvError::Disconnected);
                         break 'main;
                     }
-                    Err(_) => break 'main,
+                }
+            }
+
+            recv(events.receiver()) -> event => {
+                match event {
+                    Ok(Ok(event)) => app.handle_event(event, Instant::now(), &mut registries),
+                    Ok(Err(lagged)) => app.log_event(format!("{lagged}"), Color::Red),
+                    Err(_) => {
+                        stream_error = Some(RecvError::Disconnected);
+                        break 'main;
+                    }
                 }
             }
 
             recv(key_rx) -> ev => {
                 if let Ok(ev) = ev {
                     if let Some(action) = get_action(ev, &mut app, &root_route) {
-                        if app.update(action, &root_route, &rpc_tx) {
+                        if app.update(action, &root_route, &mut pending) {
                             break 'main;
                         }
                     }
                 }
             }
 
-            recv(rpc_resp_rx) -> resp => {
-                if let Ok(resp) = resp {
-                    match resp {
-                        RpcWorkerResp::Registry { route, registry } => {
-                            app.update_rpc_registry(route, registry, &root_route)
-                        }
-                        RpcWorkerResp::RegistryErr { route, error } => {
-                            app.update_rpclist_error(route, error, &root_route);
-                        }
-                        RpcWorkerResp::RpcResult(res) => {
-                            let (msg, col) = match res.result {
-                                Ok(s) => (
-                                    format!("{}: {}", app.palette.last_rpc_command(), s),
-                                    Color::Green,
-                                ),
-                                Err(s) => (format!("ERR: {}", s), Color::Red),
-                            };
-                            app.palette.set_rpc_result(msg, col);
-                        }
+            recv(registry_rx) -> loaded => {
+                match loaded.map(|loaded| registries.resolve(loaded)) {
+                    Ok((route, Ok(registry))) => {
+                        app.update_rpc_registry(route, registry, &root_route)
                     }
+                    Ok((route, Err(error))) => {
+                        app.update_rpclist_error(route, error, &root_route);
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            recv(rpc_rx) -> result => {
+                if let Ok(result) = result {
+                    app.set_rpc_result(result);
                 }
             }
 

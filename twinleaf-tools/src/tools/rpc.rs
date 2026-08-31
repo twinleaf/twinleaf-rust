@@ -2,9 +2,9 @@ use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
-use twinleaf::device::RpcClient;
+use twinleaf::device::{CallError, Device, RpcValue, RpcValueTypeExt};
+use twinleaf::device::{RpcMeta, RpcMetaExt, RpcValueType};
 use twinleaf::tio;
-use twinleaf::tio::proto::{RpcMeta, RpcValue, RpcValueType};
 
 pub(crate) fn resolve_rpc_type(metadata: Option<u16>) -> RpcValueType {
     let kind = metadata
@@ -68,14 +68,12 @@ pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
 pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let proxy = proxy::Interface::new(&tio.root);
-    let route = tio.route;
-    let rpc_client = RpcClient::open(&proxy, route)
-        .wrap_err_with(|| format!("could not open RPC client for {}", tio.root))
+    let proxy = proxy::Connection::open(&tio.root);
+    let device = proxy.device(tio.route);
+    let registry = device
+        .rpc_registry()
+        .wrap_err("failed to query RPC registry")
         .with_proxy_help()?;
-    let registry = rpc_client
-        .registry(&route)
-        .wrap_err("failed to query RPC registry")?;
 
     for desc in registry.iter() {
         println!(
@@ -89,7 +87,7 @@ pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     Ok(())
 }
 
-fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType {
+fn infer_rpc_type(name: &str, device: &Device, kind: &str) -> RpcValueType {
     let meta: Option<u16> = device.rpc("rpc.info", name.to_string()).ok();
     if meta.is_none() {
         println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
@@ -105,20 +103,36 @@ pub fn rpc(
     rep_type: Option<RpcValueType>,
     debug: bool,
 ) -> eyre::Result<()> {
-    use eyre::WrapErr;
-
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
-    let proxy = proxy::Interface::new_proxy(&tio.root, None, Some(status_send));
-    let route = tio.route;
-    let device = proxy
-        .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
+    let proxy = proxy::Connection::open_with(&tio.root, None, Some(status_send));
+    let device = proxy.device(tio.route);
+
+    let outcome = call_and_print(&device, &rpc_name, rpc_arg, req_type, rep_type);
+
+    // The device holds the worker too, so both must go before its status ends.
+    drop(device);
+    drop(proxy);
+    if debug {
+        for s in proxy_status.iter() {
+            println!("{:?}", s);
+        }
+    }
+    outcome
+}
+
+fn call_and_print(
+    device: &Device,
+    rpc_name: &str,
+    rpc_arg: Option<String>,
+    req_type: Option<RpcValueType>,
+    rep_type: Option<RpcValueType>,
+) -> eyre::Result<()> {
+    use eyre::WrapErr;
 
     let req_type = req_type.or_else(|| {
         rpc_arg
             .is_some()
-            .then(|| infer_rpc_type(&rpc_name, &device, "arg"))
+            .then(|| infer_rpc_type(rpc_name, device, "arg"))
     });
 
     let arg_bytes = match (rpc_arg.as_deref(), req_type.as_ref()) {
@@ -128,36 +142,21 @@ pub fn rpc(
         (Some(_), None) => unreachable!("req_type is set whenever rpc_arg is present"),
     };
 
-    let reply = match device.raw_rpc(&rpc_name, &arg_bytes) {
-        Ok(rep) => rep,
-        Err(err) => {
-            drop(proxy);
-            if debug {
-                for s in proxy_status.try_iter() {
-                    println!("{:?}", s);
-                }
-            }
-            return Err(eyre::Report::new(err).wrap_err(format!("RPC {} failed", rpc_name)));
-        }
-    };
+    let reply = device
+        .raw_rpc(rpc_name, &arg_bytes)
+        .wrap_err_with(|| format!("RPC {} failed", rpc_name))
+        .with_proxy_help()?;
 
     if !reply.is_empty() {
         let rep_type = rep_type
             .or(req_type)
-            .unwrap_or_else(|| infer_rpc_type(&rpc_name, &device, "ret"));
+            .unwrap_or_else(|| infer_rpc_type(rpc_name, device, "ret"));
         let value = rep_type
             .decode(&reply)
             .wrap_err_with(|| format!("could not decode reply from RPC {}", rpc_name))?;
-        let formatted = format_rpc_value(&value);
-        println!("Reply: {}", formatted);
+        println!("Reply: {}", format_rpc_value(&value));
     }
     println!("OK");
-    drop(proxy);
-    for s in proxy_status.iter() {
-        if debug {
-            println!("{:?}", s);
-        }
-    }
     Ok(())
 }
 
@@ -170,12 +169,9 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
         rpc_name.clone()
     };
 
-    let proxy = proxy::Interface::new(&tio.root);
+    let proxy = proxy::Connection::open(&tio.root);
     let route = tio.route;
-    let device = proxy
-        .device_rpc(route)
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
+    let device = proxy.device(route);
 
     if is_capture {
         let trigger_rpc_name = rpc_name[..rpc_name.len() - 6].to_string() + ".trigger";
@@ -189,11 +185,11 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
     for i in 0u16..=65535u16 {
         match device.raw_rpc(&rpc_name, i.to_le_bytes().as_ref()) {
             Ok(mut rep) => full_reply.append(&mut rep),
-            Err(proxy::RpcError::DeviceError(err)) => {
-                if let tio::proto::RpcErrorCode::InvalidArgs = err.error {
+            Err(CallError::DeviceError(err)) => {
+                if let twinleaf_proto::rpc::RpcError::Invalid = err.error {
                     break;
                 } else {
-                    return Err(eyre::Report::new(proxy::RpcError::DeviceError(err))
+                    return Err(eyre::Report::new(CallError::DeviceError(err))
                         .wrap_err(format!("RPC {} failed at chunk {}", rpc_name, i)));
                 }
             }

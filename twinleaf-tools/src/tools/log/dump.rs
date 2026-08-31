@@ -1,5 +1,5 @@
 use super::{record_parse_result, report_missing_metadata, unparseable_routes};
-use crate::tools::dump::{print_batch_meta, print_metadata_payload, print_sample};
+use crate::tools::dump::{print_batch_meta, print_metadata_record, print_sample};
 use std::collections::HashSet;
 use twinleaf::data::PacketParser;
 use twinleaf::device::DeviceRoute;
@@ -54,15 +54,15 @@ pub fn log_dump(
             for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
                 while !rest.is_empty() {
-                    let (pkt, len) = tio::Packet::deserialize(rest)
+                    let (pkt, len) = tio::Packet::from_slice_prefix(rest)
                         .wrap_err_with(|| format!("could not parse packet in {}", path))?;
                     rest = &rest[len..];
 
-                    if route_matches(&pkt.routing) {
+                    if route_matches(&pkt.route()) {
                         println!("{:?}", pkt);
                         printed_any = true;
-                    } else if in_subtree(&pkt.routing) {
-                        deeper_routes.insert(pkt.routing);
+                    } else if in_subtree(&pkt.route()) {
+                        deeper_routes.insert(pkt.route());
                     }
                 }
             }
@@ -73,7 +73,7 @@ pub fn log_dump(
             for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
                 while !rest.is_empty() {
-                    let (pkt, len) = match tio::Packet::deserialize(rest) {
+                    let (pkt, len) = match tio::Packet::from_slice_prefix(rest) {
                         Ok(res) => res,
                         Err(e) => {
                             log::warn!(
@@ -87,12 +87,12 @@ pub fn log_dump(
                     };
                     rest = &rest[len..];
 
-                    if let tio::proto::Payload::Metadata(mp) = &pkt.payload {
-                        if route_matches(&pkt.routing) {
-                            print_metadata_payload(&pkt.routing, mp);
+                    if let tio::proto::Payload::Metadata(record, _) = pkt.payload() {
+                        if route_matches(&pkt.route()) {
+                            print_metadata_record(&pkt.route(), record);
                             printed_any = true;
-                        } else if in_subtree(&pkt.routing) {
-                            deeper_routes.insert(pkt.routing);
+                        } else if in_subtree(&pkt.route()) {
+                            deeper_routes.insert(pkt.route());
                         }
                     }
                 }
@@ -109,7 +109,7 @@ pub fn log_dump(
             for (path, file_data) in iter_packets(&files)? {
                 let mut rest: &[u8] = &file_data;
                 while !rest.is_empty() {
-                    let (pkt, len) = match tio::Packet::deserialize(rest) {
+                    let (pkt, len) = match tio::Packet::from_slice_prefix(rest) {
                         Ok(res) => res,
                         Err(e) => {
                             log::warn!(
@@ -143,15 +143,16 @@ pub fn log_dump(
                         outcome.row_count(),
                     );
 
+                    let packet_route = pkt.route();
                     while let Some(batch) = parser.pop_batch() {
-                        if route_matches(&pkt.routing) {
+                        if route_matches(&packet_route) {
                             // Schema questions are answered once per batch.
                             let matched = filter.as_ref().is_none_or(|f| {
                                 batch.schema().iter().any(|series| {
                                     f.matches(
-                                        &pkt.routing,
-                                        &batch.stream().name,
-                                        &series.metadata().name,
+                                        &packet_route,
+                                        batch.stream().name,
+                                        series.metadata().name,
                                     )
                                 })
                             });
@@ -159,14 +160,14 @@ pub fn log_dump(
                                 continue;
                             }
                             if meta {
-                                print_batch_meta(&batch, Some(&pkt.routing));
+                                print_batch_meta(&batch, Some(&packet_route));
                             }
                             for row in batch.iter() {
-                                print_sample(row, Some(&pkt.routing));
+                                print_sample(row, Some(&packet_route));
                             }
                             printed_any = true;
-                        } else if in_subtree(&pkt.routing) {
-                            deeper_routes.insert(pkt.routing);
+                        } else if in_subtree(&packet_route) {
+                            deeper_routes.insert(packet_route);
                         }
                     }
                 }

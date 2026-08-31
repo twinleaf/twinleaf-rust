@@ -4,16 +4,15 @@ use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::sync::Arc;
+use twinleaf::data::ColumnRecord;
 use twinleaf::data::{LogFile, PacketParser, SampleBatch, StreamKey};
 use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
-use twinleaf::tio::proto::meta::ColumnMetadata;
 
 #[derive(Clone, PartialEq)]
 struct CsvSchema {
     key: StreamKey,
-    columns: Vec<Arc<ColumnMetadata>>,
+    columns: Vec<ColumnRecord>,
 }
 
 impl CsvSchema {
@@ -23,7 +22,7 @@ impl CsvSchema {
             columns: batch
                 .schema()
                 .iter()
-                .map(|series| series.metadata().clone())
+                .map(|series| series.record().clone())
                 .collect(),
         }
     }
@@ -35,7 +34,7 @@ impl CsvSchema {
                 .columns
                 .iter()
                 .zip(batch.schema())
-                .all(|(expected, actual)| expected.as_ref() == actual.metadata().as_ref())
+                .all(|(expected, actual)| expected == actual.record())
     }
 }
 
@@ -79,7 +78,7 @@ impl CsvOutput {
         }
         let is_match = match &self.stream {
             StreamSel::Id(id) => batch.stream().stream_id == *id,
-            StreamSel::Name(name) => &batch.stream().name == name,
+            StreamSel::Name(name) => batch.stream().name == name,
         };
         if !is_match {
             return Ok(());
@@ -102,7 +101,7 @@ impl CsvOutput {
                 batch
                     .schema()
                     .iter()
-                    .map(|series| series.metadata().name.clone()),
+                    .map(|series| series.metadata().name.to_string()),
             );
 
             let route_label = route_filename_label(&self.route);
@@ -110,7 +109,7 @@ impl CsvOutput {
                 "{}.{}.{}.csv",
                 self.prefix,
                 route_label,
-                filename_component(&batch.stream().name)
+                filename_component(batch.stream().name)
             );
             if !self.force && std::path::Path::new(&path).exists() {
                 return Err(eyre::eyre!("output {} already exists", path)
@@ -123,7 +122,7 @@ impl CsvOutput {
                 .open(&path)
                 .wrap_err_with(|| format!("could not open {}", path))?;
             self.writer = Some(BufWriter::new(file));
-            self.stream_name = Some(batch.stream().name.clone());
+            self.stream_name = Some(batch.stream().name.to_string());
             self.path = Some(path);
 
             let output_path = self.path.as_deref().unwrap_or_default();
@@ -257,8 +256,8 @@ pub fn log_csv(
             };
             progress.update(packets.position() as u64);
 
-            let samples_len = match &pkt.payload {
-                tio::proto::Payload::StreamData(_) if pkt.routing != target_route => 0,
+            let samples_len = match pkt.payload() {
+                tio::proto::Payload::Samples(_) if pkt.route() != target_route => 0,
                 _ => match parser.push_packet(&pkt) {
                     Ok(outcome) => outcome.row_count(),
                     Err(error) => {
@@ -273,7 +272,7 @@ pub fn log_csv(
                 },
             };
 
-            if pkt.routing == target_route {
+            if pkt.route() == target_route {
                 record_parse_result(&mut parsed_routes, &mut unparsed_routes, &pkt, samples_len);
             }
 
@@ -341,6 +340,7 @@ fn route_filename_label(route: &DeviceRoute) -> String {
         "root".to_string()
     } else {
         route
+            .as_slice()
             .iter()
             .map(|hop| hop.to_string())
             .collect::<Vec<_>>()
@@ -396,25 +396,28 @@ mod tests {
     fn csv_schema_distinguishes_duplicate_names_and_changed_columns() {
         use twinleaf::tio::proto::DataType;
 
-        let column = |stream_id, name: &str| ColumnMetadata {
-            stream_id,
-            index: 0,
-            data_type: DataType::Float32,
-            name: name.to_string(),
-            units: "V".to_string(),
-            description: String::new(),
+        let column = |stream_id, name| {
+            ColumnRecord::encode(twinleaf_proto::data::Column {
+                stream_id,
+                index: 0,
+                data_type: DataType::F32,
+                name,
+                units: "V",
+                description: "",
+            })
+            .unwrap()
         };
         let original = CsvSchema {
             key: StreamKey::new(DeviceRoute::root(), 1),
-            columns: vec![Arc::new(column(1, "value"))],
+            columns: vec![column(1, "value")],
         };
         let duplicate_name = CsvSchema {
             key: StreamKey::new(DeviceRoute::root(), 2),
-            columns: vec![Arc::new(column(2, "value"))],
+            columns: vec![column(2, "value")],
         };
         let changed_column = CsvSchema {
             key: StreamKey::new(DeviceRoute::root(), 1),
-            columns: vec![Arc::new(column(1, "renamed"))],
+            columns: vec![column(1, "renamed")],
         };
 
         assert!(original != duplicate_name);

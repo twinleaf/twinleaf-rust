@@ -1,10 +1,9 @@
-use super::route;
+//! Ids, and the hashmap keys naming a stream or a column within one across the
+//! device tree. Host data-plane identity, not a wire concept.
 
-pub use route::DeviceRoute;
+use crate::tio::proto::DeviceRoute;
 
 pub type SampleNumber = u32;
-/// Largest sample number representable by the 24-bit stream-data field.
-pub const MAX_SAMPLE_NUMBER: SampleNumber = 0x00ff_ffff;
 pub type SessionId = u32;
 pub type SegmentId = u8;
 pub type StreamId = u8;
@@ -20,10 +19,6 @@ pub struct StreamKey {
 impl StreamKey {
     pub fn new(route: DeviceRoute, stream_id: StreamId) -> Self {
         Self { route, stream_id }
-    }
-
-    pub fn device_route(&self) -> DeviceRoute {
-        self.route
     }
 }
 
@@ -54,10 +49,6 @@ impl ColumnKey {
             route: self.route,
             stream_id: self.stream_id,
         }
-    }
-
-    pub fn device_route(&self) -> DeviceRoute {
-        self.route
     }
 }
 

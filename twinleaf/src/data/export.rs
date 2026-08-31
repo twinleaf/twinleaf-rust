@@ -1,6 +1,8 @@
-use crate::data::{Boundary, ColumnArray, ColumnFilter, Generations, SampleBatch, Series};
-use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, StreamKey};
-use crate::tio::proto::meta::{ColumnMetadata, DeviceMetadata, StreamMetadata};
+use crate::data::{
+    Boundary, ColumnArray, ColumnFilter, ColumnId, ColumnRecord, DeviceRecord, Generations,
+    SampleBatch, Series, StreamKey, StreamRecord,
+};
+use crate::tio::proto::DeviceRoute;
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
 use hdf5::{Dataset, Dataspace, File, H5Type, Location, Result, SimpleExtents};
@@ -8,7 +10,6 @@ use hdf5_sys::h5d::H5Dwrite;
 use hdf5_sys::h5p::H5P_DEFAULT;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 
 type TableIndex = u64;
 
@@ -145,35 +146,36 @@ struct TableInfo {
 /// rollovers; a different device or column schema must not reuse the layout.
 struct TableSchema {
     key: StreamKey,
-    device: Arc<DeviceMetadata>,
-    stream: Arc<StreamMetadata>,
-    columns: Vec<Arc<ColumnMetadata>>,
+    device: DeviceRecord,
+    stream: StreamRecord,
+    columns: Vec<ColumnRecord>,
 }
 
 impl TableSchema {
     fn from_batch(batch: &SampleBatch, columns: &[&Series]) -> Self {
+        let (device, stream, _) = batch.records();
         Self {
             key: batch.stream_key(),
-            device: batch.device().clone(),
-            stream: batch.stream().clone(),
+            device: device.clone(),
+            stream: stream.clone(),
             columns: columns
                 .iter()
-                .map(|column| column.metadata().clone())
+                .map(|column| column.record().clone())
                 .collect(),
         }
     }
 
     fn matches(&self, batch: &SampleBatch, columns: &[&Series]) -> bool {
         self.key == batch.stream_key()
-            && self.device.serial_number == batch.device().serial_number
-            && self.stream.name == batch.stream().name
-            && self.stream.sample_size == batch.stream().sample_size
+            && self.device.get().serial == batch.device().serial
+            && self.stream.get().name == batch.stream().name
+            && self.stream.get().sample_size == batch.stream().sample_size
             && self.columns.len() == columns.len()
             && self
                 .columns
                 .iter()
                 .zip(columns)
-                .all(|(expected, actual)| expected.as_ref() == actual.metadata().as_ref())
+                .all(|(expected, actual)| *expected == *actual.record())
     }
 }
 
@@ -200,28 +202,6 @@ impl Hdf5Appender {
     ) -> Result<Self> {
         Self::from_file(
             File::create_excl(path)?,
-            compress,
-            debug,
-            filter,
-            split_policy,
-            split_level,
-        )
-    }
-
-    /// Creates an appender that explicitly replaces an existing output file.
-    ///
-    /// Prefer [`Hdf5Appender::with_options`] unless the caller has separately
-    /// confirmed that replacing `path` is intentional and safe.
-    pub fn with_overwrite_options(
-        path: &Path,
-        compress: bool,
-        debug: bool,
-        filter: Option<ColumnFilter>,
-        split_policy: SplitPolicy,
-        split_level: RunSplitLevel,
-    ) -> Result<Self> {
-        Self::from_file(
-            File::create(path)?,
             compress,
             debug,
             filter,
@@ -283,7 +263,7 @@ impl Hdf5Appender {
 
         let key = batch.stream_key();
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
-        let stream_name = batch.stream().name.clone();
+        let stream_name = batch.stream().name.to_string();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
@@ -297,15 +277,15 @@ impl Hdf5Appender {
         let mut valid: Vec<&Series> = Vec::new();
         for col in batch.schema() {
             if let Some(f) = &self.filter {
-                let path = f.get_path_string(&key.route, &stream_name, &col.metadata().name);
+                let path = f.get_path_string(&key.route, &stream_name, col.metadata().name);
                 if self.debug && self.seen_debug.insert(path.clone()) {
                     println!(
                         "[DEBUG] Filter: '{}' -> {}",
                         path,
-                        f.matches(&key.route, &stream_name, &col.metadata().name)
+                        f.matches(&key.route, &stream_name, col.metadata().name)
                     );
                 }
-                if !f.matches(&key.route, &stream_name, &col.metadata().name) {
+                if !f.matches(&key.route, &stream_name, col.metadata().name) {
                     continue;
                 }
             }
@@ -366,7 +346,7 @@ impl Hdf5Appender {
                     ColumnArray::I64(_) => TypeDescriptor::Integer(IntSize::U8),
                     ColumnArray::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
                 };
-                fields.push(CompoundField::new(&col.metadata().name, ty, 0, i + 2));
+                fields.push(CompoundField::new(col.metadata().name, ty, 0, i + 2));
             }
 
             // `to_c_repr` assigns aligned byte offsets and the total row size.
@@ -504,29 +484,26 @@ impl Hdf5Appender {
         batch: &SampleBatch,
         key: &StreamKey,
     ) -> Result<()> {
-        let meta = &batch.segment();
+        let meta = batch.segment();
         self.write_attr_scalar(loc, "sampling_rate", &meta.sampling_rate)?;
         self.write_attr_scalar(loc, "decimation", &meta.decimation)?;
         self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
         self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
-        self.write_attr_scalar(loc, "session_id", &batch.device().session_id)?;
+        self.write_attr_scalar(loc, "session_id", &batch.device().session.value())?;
         self.write_attr_scalar(loc, "stream_id", &batch.stream().stream_id)?;
-        self.write_attr_string(loc, "stream_name", &batch.stream().name)?;
-        self.write_attr_string(loc, "device_serial", &batch.device().serial_number)?;
-        self.write_attr_string(loc, "firmware_hash", &batch.device().firmware_hash)?;
+        self.write_attr_string(loc, "stream_name", batch.stream().name)?;
+        self.write_attr_string(loc, "device_serial", batch.device().serial)?;
+        self.write_attr_string(loc, "firmware_hash", batch.device().firmware)?;
 
         if let Some(id) = self.runs.index(*key) {
             self.write_attr_scalar(loc, "run_id", &id)?;
         }
 
-        let epoch_u8: u8 = meta.time_ref_epoch.clone().into();
-        self.write_attr_scalar(loc, "time_ref_epoch", &epoch_u8)?;
+        self.write_attr_scalar(loc, "time_ref_epoch", &meta.epoch.value())?;
+        self.write_attr_scalar(loc, "filter_type", &meta.filter_type.value())?;
 
-        let filter_type_u8: u8 = meta.filter_type.clone().into();
-        self.write_attr_scalar(loc, "filter_type", &filter_type_u8)?;
-
-        if !meta.time_ref_serial.is_empty() {
-            self.write_attr_string(loc, "time_ref_serial", &meta.time_ref_serial)?;
+        if !meta.timeref_serial.is_empty() {
+            self.write_attr_string(loc, "time_ref_serial", meta.timeref_serial)?;
         }
         Ok(())
     }
@@ -542,8 +519,8 @@ impl Hdf5Appender {
         units.push(to_vlu("s"));
         descriptions.push(to_vlu("Time in seconds"));
         for col in valid {
-            units.push(to_vlu(&col.metadata().units));
-            descriptions.push(to_vlu(&col.metadata().description));
+            units.push(to_vlu(col.metadata().units));
+            descriptions.push(to_vlu(col.metadata().description));
         }
 
         self.write_attr_string_array(loc, "units", &units)?;
@@ -614,15 +591,15 @@ fn to_vlu(s: &str) -> VarLenUnicode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::metadata::{DataTypeExt, DeviceRecord, SegmentRecord, StreamRecord};
+    use crate::data::records;
     use crate::data::sample::{BatchContext, SampleBatchBuilder};
     use crate::data::{BoundaryReason, ColumnData};
-    use crate::tio::proto::meta::{
-        DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata, StreamMetadata,
-    };
     use crate::tio::proto::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Mutex, MutexGuard};
+    use twinleaf_proto::data as wire;
 
     fn key(stream_id: u8) -> StreamKey {
         StreamKey::new(DeviceRoute::root(), stream_id)
@@ -657,14 +634,13 @@ mod tests {
         column_name: &str,
         start_time: u32,
     ) -> SampleBatch {
-        let column = Arc::new(ColumnMetadata {
-            stream_id,
-            index: 0,
-            data_type: DataType::Float32,
-            name: column_name.to_string(),
-            units: "V".to_string(),
-            description: "test column".to_string(),
-        });
+        let column = ColumnRecord::encode(wire::Column {
+            name: column_name,
+            units: "V",
+            description: "test column",
+            ..records::column(stream_id, 0, DataType::F32)
+        })
+        .unwrap();
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
                 key(stream_id),
@@ -674,36 +650,25 @@ mod tests {
                     device: 0,
                     global: 0,
                 },
-                Arc::new(SegmentMetadata {
-                    stream_id,
+                SegmentRecord::encode(wire::Segment {
                     segment_id: 1,
-                    flags: 0,
-                    time_ref_epoch: MetadataEpoch::Zero,
-                    time_ref_serial: String::new(),
-                    time_ref_session_id: 0,
                     start_time,
-                    sampling_rate: 1,
-                    decimation: 1,
-                    filter_cutoff: 0.0,
-                    filter_type: MetadataFilter::Unfiltered,
-                }),
-                Arc::new(StreamMetadata {
-                    stream_id,
-                    name: stream_name.to_string(),
-                    n_columns: 1,
-                    n_segments: 1,
-                    sample_size: 4,
+                    ..records::segment(stream_id)
+                })
+                .unwrap(),
+                StreamRecord::encode(wire::Stream {
+                    name: stream_name,
                     buf_samples: 1,
-                }),
-                Arc::new(DeviceMetadata {
-                    serial_number: "serial".to_string(),
-                    firmware_hash: "firmware".to_string(),
+                    ..records::stream(stream_id)
+                })
+                .unwrap(),
+                DeviceRecord::encode(wire::Device {
                     n_streams: 2,
-                    session_id: 1,
-                    name: "device".to_string(),
-                }),
+                    ..records::device()
+                })
+                .unwrap(),
             ),
-            [(column.clone(), column.data_type.buffer_type())],
+            [(column.clone(), column.get().data_type.buffer_type())],
             1,
         );
         builder.push_row(0, [ColumnData::Float(1.0)]);
@@ -863,9 +828,7 @@ mod tests {
 
         let file = File::open(&path).expect("open output");
         assert_eq!(
-            file.dataset("field")
-                .expect("open stream table")
-                .shape(),
+            file.dataset("field").expect("open stream table").shape(),
             vec![2]
         );
         drop(file);

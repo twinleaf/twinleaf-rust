@@ -1,12 +1,13 @@
+use super::keys::StreamKey;
+use super::metadata::SampleClock;
+use super::{BufferType, ColumnId, SampleNumber, SegmentExt, SegmentId, SessionId};
+use super::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord, TimeRefSessionId};
 use crate::tio;
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
-use tio::proto::identifiers::{
-    ColumnId, SampleNumber, SegmentId, SessionId, StreamKey, TimeRefSessionId,
-};
-use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
-use tio::proto::{BufferType, DeviceRoute};
+use tio::proto::DeviceRoute;
+use twinleaf_proto::data as wire;
 
 #[derive(Debug, Clone)]
 pub enum ColumnData {
@@ -29,36 +30,36 @@ impl ColumnData {
     pub(super) fn from_le_bytes(data: &[u8], data_type: tio::proto::DataType) -> ColumnData {
         use tio::proto::DataType;
         match data_type {
-            DataType::Int8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
-            DataType::UInt8 => ColumnData::UInt(data[0].into()),
-            DataType::Int16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
-            DataType::UInt16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
-            DataType::Int24 => {
+            DataType::I8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
+            DataType::U8 => ColumnData::UInt(data[0].into()),
+            DataType::I16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
+            DataType::U16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
+            DataType::I24 => {
                 let sign = if data[2] & 0x80 == 0 { 0 } else { 0xff };
                 ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], sign]).into())
             }
-            DataType::UInt24 => {
+            DataType::U24 => {
                 ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], 0]).into())
             }
-            DataType::Int32 => {
+            DataType::I32 => {
                 ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
             }
-            DataType::UInt32 => {
+            DataType::U32 => {
                 ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
             }
-            DataType::Int64 => ColumnData::Int(i64::from_le_bytes([
+            DataType::I64 => ColumnData::Int(i64::from_le_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ])),
-            DataType::UInt64 => ColumnData::UInt(u64::from_le_bytes([
+            DataType::U64 => ColumnData::UInt(u64::from_le_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ])),
-            DataType::Float32 => {
+            DataType::F32 => {
                 ColumnData::Float(f32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
             }
-            DataType::Float64 => ColumnData::Float(f64::from_le_bytes([
+            DataType::F64 => ColumnData::Float(f64::from_le_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ])),
-            DataType::Unknown(_) => ColumnData::Unknown,
+            _ => ColumnData::Unknown,
         }
     }
 }
@@ -266,9 +267,9 @@ pub(super) struct BatchContext {
     /// At most one boundary per batch, anchored at its first row.
     boundary: Option<Boundary>,
     generations: Generations,
-    segment: Arc<SegmentMetadata>,
-    stream: Arc<StreamMetadata>,
-    device: Arc<DeviceMetadata>,
+    segment: SegmentRecord,
+    stream: StreamRecord,
+    device: DeviceRecord,
 }
 
 impl BatchContext {
@@ -276,16 +277,18 @@ impl BatchContext {
         key: StreamKey,
         boundary: Option<Boundary>,
         generations: Generations,
-        segment: Arc<SegmentMetadata>,
-        stream: Arc<StreamMetadata>,
-        device: Arc<DeviceMetadata>,
+        segment: SegmentRecord,
+        stream: StreamRecord,
+        device: DeviceRecord,
     ) -> Self {
         assert_eq!(
-            key.stream_id, stream.stream_id,
+            key.stream_id,
+            stream.get().stream_id,
             "stream key must match metadata"
         );
         assert_eq!(
-            key.stream_id, segment.stream_id,
+            key.stream_id,
+            segment.get().stream_id,
             "segment must match stream"
         );
         Self {
@@ -311,17 +314,21 @@ pub struct SampleBatch {
 
 #[derive(Debug, Clone)]
 pub struct Series {
-    index: ColumnId,
-    metadata: Arc<ColumnMetadata>,
+    metadata: ColumnRecord,
     values: ColumnArray,
 }
 
 impl Series {
     pub fn index(&self) -> ColumnId {
-        self.index
+        self.metadata.get().index.into()
     }
 
-    pub fn metadata(&self) -> &Arc<ColumnMetadata> {
+    pub fn metadata(&self) -> wire::Column<'_> {
+        self.metadata.get()
+    }
+
+    /// The column's descriptor as retained, for a caller relaying it onward.
+    pub fn record(&self) -> &ColumnRecord {
         &self.metadata
     }
 
@@ -331,7 +338,6 @@ impl Series {
 
     fn slice(&self, rows: Range<usize>) -> Series {
         Series {
-            index: self.index,
             metadata: self.metadata.clone(),
             values: self.values.slice(rows),
         }
@@ -344,7 +350,7 @@ pub(super) trait RowSource {
     fn len(&self) -> usize;
     fn boundary(&self) -> Option<&Boundary>;
     fn generations(&self) -> Generations;
-    fn segment(&self) -> &Arc<SegmentMetadata>;
+    fn segment_record(&self) -> &SegmentRecord;
     /// An empty builder shaped like these rows: their metadata, boundary and
     /// generations, with room for `capacity` rows.
     fn start_builder(&self, capacity: usize) -> SampleBatchBuilder;
@@ -361,8 +367,10 @@ pub(super) struct SampleBatchBuilder {
     sample_numbers: Vec<SampleNumber>,
     /// Each row's end-of-sample time, carried alongside its sample number.
     timestamps: Vec<f64>,
+    /// The segment's clock, read once because `push_row` runs per row.
+    clock: SampleClock,
     /// One accumulating buffer per decodable column, in schema order.
-    columns: Vec<(Arc<ColumnMetadata>, ColumnBuilder)>,
+    columns: Vec<(ColumnRecord, ColumnBuilder)>,
 }
 
 impl RowSource for SampleBatch {
@@ -378,7 +386,7 @@ impl RowSource for SampleBatch {
         self.context.generations
     }
 
-    fn segment(&self) -> &Arc<SegmentMetadata> {
+    fn segment_record(&self) -> &SegmentRecord {
         &self.context.segment
     }
 
@@ -409,7 +417,7 @@ impl RowSource for SampleBatch {
 impl SampleBatchBuilder {
     pub(super) fn new(
         context: BatchContext,
-        columns: impl IntoIterator<Item = (Arc<ColumnMetadata>, BufferType)>,
+        columns: impl IntoIterator<Item = (ColumnRecord, BufferType)>,
         capacity: usize,
     ) -> Self {
         let key = context.key;
@@ -417,7 +425,8 @@ impl SampleBatchBuilder {
             .into_iter()
             .map(|(metadata, buffer_type)| {
                 assert_eq!(
-                    key.stream_id, metadata.stream_id,
+                    key.stream_id,
+                    metadata.get().stream_id,
                     "column must match stream"
                 );
                 (
@@ -427,6 +436,7 @@ impl SampleBatchBuilder {
             })
             .collect();
         Self {
+            clock: SampleClock::of(context.segment.get()),
             context,
             sample_numbers: Vec::with_capacity(capacity),
             timestamps: Vec::with_capacity(capacity),
@@ -444,7 +454,7 @@ impl SampleBatchBuilder {
 
     pub(super) fn accepts(&self, rows: &impl RowSource) -> bool {
         self.context.generations == rows.generations()
-            && Arc::ptr_eq(&self.context.segment, rows.segment())
+            && self.context.segment == *rows.segment_record()
     }
 
     /// Append one decoded row: `cells` must yield exactly one value per
@@ -455,7 +465,7 @@ impl SampleBatchBuilder {
         cells: impl IntoIterator<Item = ColumnData>,
     ) {
         self.sample_numbers.push(n);
-        self.timestamps.push(self.context.segment.time_at(n + 1));
+        self.timestamps.push(self.clock.time_at(n + 1));
         let mut cells = cells.into_iter();
         for (_, values) in &mut self.columns {
             values.push_data(&cells.next().expect("one cell per column"));
@@ -478,7 +488,6 @@ impl SampleBatchBuilder {
                 .columns
                 .iter()
                 .map(|(metadata, values)| Series {
-                    index: metadata.index,
                     metadata: metadata.clone(),
                     values: values.freeze_rows(rows.clone()),
                 })
@@ -496,7 +505,6 @@ impl SampleBatchBuilder {
                 .columns
                 .into_iter()
                 .map(|(metadata, values)| Series {
-                    index: metadata.index,
                     metadata,
                     values: values.into(),
                 })
@@ -549,16 +557,25 @@ impl SampleBatch {
         &self.timestamps
     }
 
-    pub fn segment(&self) -> &Arc<SegmentMetadata> {
-        &self.context.segment
+    pub fn segment(&self) -> wire::Segment<'_> {
+        self.context.segment.get()
     }
 
-    pub fn stream(&self) -> &Arc<StreamMetadata> {
-        &self.context.stream
+    pub fn stream(&self) -> wire::Stream<'_> {
+        self.context.stream.get()
     }
 
-    pub fn device(&self) -> &Arc<DeviceMetadata> {
-        &self.context.device
+    pub fn device(&self) -> wire::Device<'_> {
+        self.context.device.get()
+    }
+
+    /// The batch's descriptors as retained, for a caller relaying them onward.
+    pub fn records(&self) -> (&DeviceRecord, &StreamRecord, &SegmentRecord) {
+        (
+            &self.context.device,
+            &self.context.stream,
+            &self.context.segment,
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -584,7 +601,7 @@ impl SampleBatch {
     }
 
     pub fn column(&self, id: ColumnId) -> Option<&Series> {
-        self.columns.iter().find(|c| c.index == id)
+        self.columns.iter().find(|c| c.index() == id)
     }
 
     pub fn row(&self, row: usize) -> Option<SampleRow<'_>> {
@@ -631,17 +648,17 @@ impl<'a> SampleRow<'a> {
     pub fn n(&self) -> SampleNumber {
         self.batch.sample_numbers[self.row]
     }
-    pub fn stream(&self) -> &'a Arc<StreamMetadata> {
-        &self.batch.context.stream
+    pub fn stream(&self) -> wire::Stream<'a> {
+        self.batch.context.stream.get()
     }
-    pub fn segment(&self) -> &'a Arc<SegmentMetadata> {
-        &self.batch.context.segment
+    pub fn segment(&self) -> wire::Segment<'a> {
+        self.batch.context.segment.get()
     }
-    pub fn device(&self) -> &'a Arc<DeviceMetadata> {
-        &self.batch.context.device
+    pub fn device(&self) -> wire::Device<'a> {
+        self.batch.context.device.get()
     }
     pub fn timestamp_begin(&self) -> f64 {
-        self.batch.context.segment.time_at(self.n())
+        self.segment().time_at(self.n())
     }
     pub fn timestamp_end(&self) -> f64 {
         self.batch.timestamps[self.row]
@@ -664,13 +681,13 @@ impl std::fmt::Display for SampleRow<'_> {
         write!(
             f,
             "SAMPLE({}:{}:{}) {:.6}",
-            self.batch.context.device.session_id,
-            self.batch.context.stream.stream_id,
-            self.batch.context.segment.segment_id,
+            self.device().session.value(),
+            self.stream().stream_id,
+            self.segment().segment_id,
             self.timestamp_end()
         )?;
         for (series, value) in self.batch.schema().iter().zip(self.values()) {
-            write!(f, " {}: {}", series.metadata.name, value)?;
+            write!(f, " {}: {}", series.metadata().name, value)?;
         }
         write!(f, " [#{}]", self.n())
     }
@@ -793,7 +810,7 @@ impl Boundary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tio::proto::meta::{MetadataEpoch, MetadataFilter};
+    use crate::data::records::{column, device, segment, stream};
     use tio::proto::DataType;
 
     #[test]
@@ -804,7 +821,7 @@ mod tests {
             ([0xff, 0xff, 0xff], -1),
             ([0x00, 0x00, 0x80], -8_388_608),
         ] {
-            let ColumnData::Int(value) = ColumnData::from_le_bytes(&bytes, DataType::Int24) else {
+            let ColumnData::Int(value) = ColumnData::from_le_bytes(&bytes, DataType::I24) else {
                 panic!("expected an integer value");
             };
             assert_eq!(value, expected);
@@ -814,27 +831,6 @@ mod tests {
     /// A four-row float batch numbered 0..4, sampled at 4 Hz, with an initial
     /// boundary anchored at its first row.
     fn batch() -> SampleBatch {
-        let segment = Arc::new(SegmentMetadata {
-            stream_id: 1,
-            segment_id: 0,
-            flags: 0,
-            time_ref_epoch: MetadataEpoch::Unix,
-            time_ref_serial: "clock".to_string(),
-            time_ref_session_id: 7,
-            start_time: 0,
-            sampling_rate: 4,
-            decimation: 1,
-            filter_cutoff: 0.0,
-            filter_type: MetadataFilter::Unfiltered,
-        });
-        let column = Arc::new(ColumnMetadata {
-            stream_id: 1,
-            index: 0,
-            data_type: DataType::Float64,
-            name: "col_0".to_string(),
-            units: String::new(),
-            description: String::new(),
-        });
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
                 StreamKey::new(DeviceRoute::root(), 1),
@@ -846,24 +842,22 @@ mod tests {
                     device: 0,
                     global: 0,
                 },
-                segment,
-                Arc::new(StreamMetadata {
-                    stream_id: 1,
-                    name: "test-stream".to_string(),
-                    n_columns: 1,
-                    n_segments: 1,
+                SegmentRecord::encode(wire::Segment {
+                    sampling_rate: 4,
+                    ..segment(1)
+                })
+                .unwrap(),
+                StreamRecord::encode(wire::Stream {
                     sample_size: 8,
-                    buf_samples: 128,
-                }),
-                Arc::new(DeviceMetadata {
-                    serial_number: "SN123".to_string(),
-                    firmware_hash: "fw".to_string(),
-                    n_streams: 1,
-                    session_id: 42,
-                    name: "test-device".to_string(),
-                }),
+                    ..stream(1)
+                })
+                .unwrap(),
+                DeviceRecord::encode(device()).unwrap(),
             ),
-            [(column, BufferType::Float)],
+            [(
+                ColumnRecord::encode(column(1, 0, DataType::F64)).unwrap(),
+                BufferType::Float,
+            )],
             4,
         );
         for n in 0..4 {

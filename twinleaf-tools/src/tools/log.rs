@@ -103,8 +103,8 @@ fn record_parse_result(
     record_parse_result_parts(
         parsed,
         unparsed,
-        &pkt.routing,
-        matches!(&pkt.payload, tio::proto::Payload::StreamData(data) if !data.data.is_empty()),
+        &pkt.route(),
+        matches!(pkt.payload(), tio::proto::Payload::Samples(data) if !data.data.is_empty()),
         samples_len,
     );
 }

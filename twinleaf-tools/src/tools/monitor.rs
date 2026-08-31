@@ -12,13 +12,12 @@ use crate::tui::{
     decimate::Fpcs,
     rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq},
     rpc_state::RouteRpcState,
-    rpc_worker::{spawn_rpc_worker, RpcWorkerReq, RpcWorkerResp},
+    rpc_worker::{PendingRpc, RegistryQueue},
     scroll::{follow_scroll, NAV_MARGIN},
     spectral::{FftReadyData, FftStatus, WelchOp},
-    tree_worker::spawn_tree_worker,
 };
 use crate::{MonitorCli, ProxyHelp, TioOpts};
-use crossbeam::channel::{self, Sender};
+use crossbeam::channel;
 use ratatui::{
     crossterm::{
         event::{
@@ -43,11 +42,8 @@ use twinleaf::{
         Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
         StreamKey,
     },
-    device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcRegistry, TreeEvent, TreeItem},
-    tio::{
-        self,
-        proto::{ProxyStatus, SegmentMetadata},
-    },
+    device::{DeviceEvent, DeviceRoute, RecvError, RpcRegistry, TreeEvent},
+    tio::{self, proto::ProxyStatus},
 };
 
 pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
@@ -588,7 +584,19 @@ impl MonitorState {
         }
     }
 
-    fn update(&mut self, action: Action, rpc_tx: &Sender<RpcWorkerReq>) -> bool {
+    /// Show the outcome of a palette call in the palette's status line.
+    fn set_rpc_result(&mut self, result: Result<String, String>) {
+        let (msg, color) = match result {
+            Ok(reply) => (
+                format!("{}: {}", self.palette.last_rpc_command(), reply),
+                Color::Green,
+            ),
+            Err(error) => (format!("ERR: {}", error), Color::Red),
+        };
+        self.palette.set_rpc_result(msg, color);
+    }
+
+    fn update(&mut self, action: Action, pending: &mut PendingRpc) -> bool {
         match action {
             Action::Quit => return true,
             Action::SetMode(Mode::Command) => {
@@ -606,7 +614,9 @@ impl MonitorState {
                 self.palette.exit();
             }
             Action::ExecuteRpc(req) => {
-                let _ = rpc_tx.send(RpcWorkerReq::Execute(req));
+                if let Some(result) = pending.start(req) {
+                    self.set_rpc_result(result);
+                }
             }
             Action::SelectRoute(route) => {
                 self.palette_route = Some(route);
@@ -620,7 +630,7 @@ impl MonitorState {
                 if self.mode == Mode::Command {
                     // Same device toggles the palette closed; another retargets it.
                     if self.palette_route() == route {
-                        self.update(Action::SetMode(Mode::Normal), rpc_tx);
+                        self.update(Action::SetMode(Mode::Normal), pending);
                     } else {
                         let registry = self
                             .rpc_routes
@@ -631,7 +641,7 @@ impl MonitorState {
                     }
                 } else {
                     self.palette_route = Some(route);
-                    self.update(Action::SetMode(Mode::Command), rpc_tx);
+                    self.update(Action::SetMode(Mode::Command), pending);
                 }
             }
             Action::Nav(mv) => {
@@ -713,7 +723,7 @@ impl MonitorState {
                                 DragOrigin::Gap => None,
                             };
                             if let Some(click) = click {
-                                self.update(click, rpc_tx);
+                                self.update(click, pending);
                             }
                         } else {
                             let (lo, hi) = drag.range();
@@ -924,7 +934,7 @@ impl MonitorState {
         self.visible_routes().len()
     }
 
-    fn handle_event(&mut self, event: TreeEvent, rpc_tx: &Sender<RpcWorkerReq>) {
+    fn handle_event(&mut self, event: TreeEvent, registries: &mut RegistryQueue) {
         match event {
             TreeEvent::RouteDiscovered(route) => {
                 self.discovered_routes.insert(route);
@@ -934,7 +944,7 @@ impl MonitorState {
                     .or_default()
                     .on_route_discovered()
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
                 self.device_status.entry(route).or_default();
             }
@@ -943,7 +953,7 @@ impl MonitorState {
                 event: DeviceEvent::NewHash(hash),
             } => {
                 if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
             }
             TreeEvent::Device {
@@ -956,7 +966,7 @@ impl MonitorState {
                     .or_default()
                     .on_heartbeat(session_id)
                 {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
                 self.device_status.entry(route).or_default().on_heartbeat();
             }
@@ -965,7 +975,7 @@ impl MonitorState {
                 event: DeviceEvent::Status(status),
             } => {
                 if self.rpc_routes.entry(route).or_default().on_status(status) {
-                    let _ = rpc_tx.send(RpcWorkerReq::FetchRegistry(route));
+                    registries.fetch(route);
                 }
                 let dev_status = self.device_status.entry(route).or_default();
                 match status {
@@ -981,7 +991,7 @@ impl MonitorState {
                 self.device_metadata.insert(route, metadata);
             }
             TreeEvent::Device {
-                event: DeviceEvent::RpcInvalidated(_),
+                event: DeviceEvent::RpcInvalidated(_) | DeviceEvent::MetadataUnavailable,
                 ..
             } => {}
         }
@@ -1167,9 +1177,10 @@ impl MonitorState {
 }
 
 fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
-    buffer
-        .column_metadata(key)
-        .map(|metadata| (metadata.description.clone(), metadata.units.clone()))
+    buffer.column_metadata(key).map(|metadata| {
+        let metadata = metadata.get();
+        (metadata.description.to_string(), metadata.units.to_string())
+    })
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -1451,7 +1462,7 @@ fn render_monitor_panel(
     }
 }
 
-fn stale_threshold(segment: &SegmentMetadata) -> Duration {
+fn stale_threshold(segment: twinleaf_proto::data::Segment<'_>) -> Duration {
     let rate = segment.sampling_rate as f64 / segment.decimation.max(1) as f64;
     let period_ms = if rate > 0.0 { 1000.0 / rate } else { 0.0 };
     Duration::from_millis((period_ms * 2.0).max(1200.0) as u64)
@@ -1536,7 +1547,7 @@ fn build_left_lines(
     let selected_stream = app.current_selection();
 
     for (dev_idx, route) in routes.iter().enumerate() {
-        let dev = app.device_metadata.get(route).map(|m| m.device.as_ref());
+        let dev = app.device_metadata.get(route).map(|m| m.device.get());
 
         let status = app.device_status.get(route);
         let is_alive = status
@@ -1555,10 +1566,10 @@ fn build_left_lines(
         };
 
         let header_text = if let Some(d) = dev {
-            if d.serial_number.is_empty() {
-                d.name.clone()
+            if d.serial.is_empty() {
+                d.name.to_string()
             } else {
-                format!("{}  Serial: {}", d.name, d.serial_number)
+                format!("{}  Serial: {}", d.name, d.serial)
             }
         } else {
             format!("<{}>", route)
@@ -1637,16 +1648,16 @@ fn build_left_lines(
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(&row.stream().name, &metadata.name, val_f64)
+                        .get_value_color(row.stream().name, metadata.name, val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
-                    let mut desc = metadata.description.clone();
+                    let mut desc = metadata.description.to_string();
                     if desc.len() < app.view.desc_width {
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
-                    let units = metadata.units.clone();
+                    let units = metadata.units.to_string();
                     let padded_units = if app.view.units_width > 0 && !units.is_empty() {
                         format!("{:>width$}", units, width = app.view.units_width)
                     } else if app.view.units_width > 0 {
@@ -1656,7 +1667,7 @@ fn build_left_lines(
                     };
 
                     let (pipe_glyph, pipe_style) = if is_current_stream {
-                        ("┃ ", Style::default().fg(stream_color(&row.stream().name)))
+                        ("┃ ", Style::default().fg(stream_color(row.stream().name)))
                     } else {
                         ("│ ", Style::default().fg(Color::DarkGray))
                     };
@@ -2131,7 +2142,12 @@ fn render_plot_series(f: &mut Frame, app: &MonitorState, area: Rect) {
 
 /// `count` evenly spaced labels over `[min, max]`, each formatted by `fmt`
 /// and right-aligned to a shared width.
-fn axis_labels(min: f64, max: f64, count: usize, fmt: impl Fn(f64) -> String) -> Vec<Span<'static>> {
+fn axis_labels(
+    min: f64,
+    max: f64,
+    count: usize,
+    fmt: impl Fn(f64) -> String,
+) -> Vec<Span<'static>> {
     if count < 2 {
         return vec![];
     }
@@ -2141,13 +2157,23 @@ fn axis_labels(min: f64, max: f64, count: usize, fmt: impl Fn(f64) -> String) ->
         .collect()
 }
 
-fn generate_linear_labels(min: f64, max: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
+fn generate_linear_labels(
+    min: f64,
+    max: f64,
+    count: usize,
+    precision: usize,
+) -> Vec<Span<'static>> {
     axis_labels(min, max, count, |v| format!("{:.precision$}", v))
 }
 
 /// Notation is chosen once from the axis maximum, so every label on the
 /// axis reads in the same style.
-fn generate_log_labels(min_log: f64, max_log: f64, count: usize, precision: usize) -> Vec<Span<'static>> {
+fn generate_log_labels(
+    min_log: f64,
+    max_log: f64,
+    count: usize,
+    precision: usize,
+) -> Vec<Span<'static>> {
     let use_scientific = !(0.01..1000.0).contains(&10f64.powf(max_log.max(min_log)).abs());
     axis_labels(min_log, max_log, count, |log_val| {
         let v = 10f64.powf(log_val);
@@ -2209,18 +2235,22 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
         depth,
     } = config;
 
-    let proxy = tio::proxy::Interface::new(&tio.root);
+    let proxy = tio::proxy::Connection::open(&tio.root);
     let parent_route: DeviceRoute = tio.route;
 
-    let tree = DeviceTree::open(&proxy, parent_route)
+    // One connection: the library pumps samples, cloned trees call.
+    let tree = proxy
+        .tree_with(parent_route, twinleaf_proto::MAX_ROUTING_SIZE, None)
         .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
         .with_proxy_help()?;
-    let data_rx = spawn_tree_worker(tree);
-
-    let rpc_client = RpcClient::open(&proxy, parent_route)
-        .wrap_err_with(|| format!("could not open RPC client on {}", tio.root))
+    let batches = tree
+        .subscribe()
+        .wrap_err("could not start the data stream")
         .with_proxy_help()?;
-    let (rpc_tx, rpc_resp_rx) = spawn_rpc_worker(rpc_client);
+    let events = tree.events().wrap_err("could not start the event stream")?;
+
+    let mut registries = RegistryQueue::new(tree.clone());
+    let mut pending = PendingRpc::new(tree);
 
     let (key_tx, key_rx) = channel::unbounded();
     std::thread::spawn(move || loop {
@@ -2246,53 +2276,52 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
     let mut stream_error = None;
 
     'main: loop {
+        let rpc_rx = pending.receiver().clone();
+        let registry_rx = registries.receiver().clone();
         crossbeam::select! {
-            recv(data_rx) -> item => {
-                match item {
-                    Ok(Ok(TreeItem::Batch(batch))) => {
-                        buffer.process_batch(&batch);
-                    }
-                    Ok(Ok(TreeItem::Event(event))) => {
-                        app.handle_event(event, &rpc_tx);
-                    }
-                    Ok(Err(e)) => {
-                        stream_error = Some(e);
+            recv(batches.receiver()) -> batch => {
+                match batch {
+                    Ok(Ok(batch)) => buffer.process_batch(&batch),
+                    Ok(Err(lagged)) => log::warn!("{lagged}"),
+                    Err(_) => {
+                        stream_error = Some(RecvError::Disconnected);
                         break 'main;
                     }
-                    Err(_) => break 'main,
+                }
+            }
+
+            recv(events.receiver()) -> event => {
+                match event {
+                    Ok(Ok(event)) => app.handle_event(event, &mut registries),
+                    Ok(Err(lagged)) => log::warn!("{lagged}"),
+                    Err(_) => {
+                        stream_error = Some(RecvError::Disconnected);
+                        break 'main;
+                    }
                 }
             }
 
             recv(key_rx) -> ev => {
                 if let Ok(ev) = ev {
                     if let Some(act) = get_action(ev, &mut app) {
-                        if app.update(act, &rpc_tx) {
+                        if app.update(act, &mut pending) {
                             break 'main;
                         }
                     }
                 }
             }
 
-            recv(rpc_resp_rx) -> resp => {
-                if let Ok(resp) = resp {
-                    match resp {
-                        RpcWorkerResp::Registry { route, registry } => {
-                            app.update_rpc_registry(route, registry);
-                        }
-                        RpcWorkerResp::RegistryErr { route, error } => {
-                            app.update_rpclist_error(route, error);
-                        }
-                        RpcWorkerResp::RpcResult(res) => {
-                            let (msg, col) = match res.result {
-                                Ok(s) => (
-                                    format!("{}: {}", app.palette.last_rpc_command(), s),
-                                    Color::Green,
-                                ),
-                                Err(s) => (format!("ERR: {}", s), Color::Red),
-                            };
-                            app.palette.set_rpc_result(msg, col);
-                        }
-                    }
+            recv(registry_rx) -> loaded => {
+                match loaded.map(|loaded| registries.resolve(loaded)) {
+                    Ok((route, Ok(registry))) => app.update_rpc_registry(route, registry),
+                    Ok((route, Err(error))) => app.update_rpclist_error(route, error),
+                    Err(_) => {}
+                }
+            }
+
+            recv(rpc_rx) -> result => {
+                if let Ok(result) = result {
+                    app.set_rpc_result(result);
                 }
             }
 

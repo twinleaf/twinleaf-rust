@@ -104,15 +104,13 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::records;
     use crate::data::sample::{BatchContext, SampleBatchBuilder};
     use crate::data::ColumnData;
-    use crate::tio::proto::identifiers::{ColumnId, SampleNumber};
-    use crate::tio::proto::meta::{
-        ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata,
-        StreamMetadata,
-    };
+    use crate::data::{ColumnId, ColumnRecord, DataTypeExt, DeviceRecord, SampleNumber};
+    use crate::data::{SegmentRecord, StreamRecord};
     use crate::tio::proto::{DataType, DeviceRoute};
-    use std::sync::Arc;
+    use twinleaf_proto::data as wire;
 
     /// Records every `(timestamp, value)` it is pushed, in push order. The
     /// simplest possible [`ColumnOp`], used to assert exactly-once,
@@ -146,10 +144,10 @@ mod tests {
 
     struct Fixture {
         column_key: ColumnKey,
-        column_metadata: Arc<ColumnMetadata>,
-        device: Arc<DeviceMetadata>,
-        stream: Arc<StreamMetadata>,
-        segment: Arc<SegmentMetadata>,
+        column_metadata: ColumnRecord,
+        device: DeviceRecord,
+        stream: StreamRecord,
+        segment: SegmentRecord,
     }
 
     fn fixture() -> Fixture {
@@ -157,42 +155,17 @@ mod tests {
         let stream_id = 1;
         let column_id: ColumnId = 0;
 
-        let device = Arc::new(DeviceMetadata {
-            serial_number: "SN123".to_string(),
-            firmware_hash: "fw".to_string(),
-            n_streams: 1,
-            session_id: 42,
-            name: "test-device".to_string(),
-        });
-        let stream = Arc::new(StreamMetadata {
-            stream_id,
-            name: "test-stream".to_string(),
-            n_columns: 1,
-            n_segments: 1,
+        let device = DeviceRecord::encode(records::device()).unwrap();
+        let stream = StreamRecord::encode(wire::Stream {
             sample_size: 0,
             buf_samples: 1024,
-        });
-        let segment = Arc::new(SegmentMetadata {
-            stream_id,
-            segment_id: 0,
-            flags: 0,
-            time_ref_epoch: MetadataEpoch::Unix,
-            time_ref_serial: "clock".to_string(),
-            time_ref_session_id: 7,
-            start_time: 0,
-            sampling_rate: 1,
-            decimation: 1,
-            filter_cutoff: 0.0,
-            filter_type: MetadataFilter::Unfiltered,
-        });
-        let column_metadata = Arc::new(ColumnMetadata {
-            stream_id,
-            index: column_id,
-            data_type: DataType::Float64,
-            name: "col_0".to_string(),
-            units: String::new(),
-            description: String::new(),
-        });
+            ..records::stream(stream_id)
+        })
+        .unwrap();
+        let segment = SegmentRecord::encode(records::segment(stream_id)).unwrap();
+        let column_metadata =
+            ColumnRecord::encode(records::column(stream_id, column_id as u8, DataType::F64))
+                .unwrap();
         let column_key = ColumnKey::new(route, stream_id, column_id);
 
         Fixture {
@@ -215,7 +188,7 @@ mod tests {
             &self,
             buffer: &mut Buffer,
             stream_generation: u32,
-            segment: Arc<SegmentMetadata>,
+            segment: SegmentRecord,
             rows: &[(SampleNumber, f64)],
         ) {
             let mut builder = SampleBatchBuilder::new(
@@ -233,7 +206,7 @@ mod tests {
                 ),
                 [(
                     self.column_metadata.clone(),
-                    self.column_metadata.data_type.buffer_type(),
+                    self.column_metadata.get().data_type.buffer_type(),
                 )],
                 rows.len(),
             );
@@ -300,16 +273,17 @@ mod tests {
         fx.push(&mut buffer, 1, &[(0, 0.0), (1, 1.0)]);
         processor.catch_up(&buffer);
 
-        let mut second = (*fx.segment).clone();
-        second.segment_id = 1;
-        second.start_time = 2;
+        let rolled = |segment_id, start_time| {
+            SegmentRecord::encode(wire::Segment {
+                segment_id,
+                start_time,
+                ..fx.segment.get()
+            })
+            .unwrap()
+        };
         // A seamless rollover keeps the stream generation, so the run continues.
-        fx.push_in_segment(&mut buffer, 1, Arc::new(second), &[(0, 2.0), (1, 3.0)]);
-
-        let mut third = (*fx.segment).clone();
-        third.segment_id = 0;
-        third.start_time = 4;
-        fx.push_in_segment(&mut buffer, 1, Arc::new(third), &[(0, 4.0), (1, 5.0)]);
+        fx.push_in_segment(&mut buffer, 1, rolled(1, 2), &[(0, 2.0), (1, 3.0)]);
+        fx.push_in_segment(&mut buffer, 1, rolled(0, 4), &[(0, 4.0), (1, 5.0)]);
 
         let out = processor.catch_up(&buffer).clone();
         assert_eq!(
