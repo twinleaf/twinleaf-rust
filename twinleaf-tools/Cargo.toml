@@ -26,6 +26,7 @@ crossbeam = "0.8"
 serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}
 twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["firmware-update"] }
+twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"

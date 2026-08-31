@@ -2,6 +2,7 @@
 
 members = [
     "twinleaf",
+    "twinleaf-proto",
     "twinleaf-tools",
 ]
 
