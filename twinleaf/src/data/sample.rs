@@ -2,7 +2,9 @@ use crate::tio;
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
-use tio::proto::identifiers::{ColumnId, SampleNumber, SegmentId, SessionId, TimeRefSessionId};
+use tio::proto::identifiers::{
+    ColumnId, SampleNumber, SegmentId, SessionId, StreamKey, TimeRefSessionId,
+};
 use tio::proto::meta::{ColumnMetadata, DeviceMetadata, SegmentMetadata, StreamMetadata};
 use tio::proto::{BufferType, DeviceRoute};
 
@@ -24,7 +26,7 @@ impl ColumnData {
         }
     }
 
-    pub fn from_le_bytes(data: &[u8], data_type: tio::proto::DataType) -> ColumnData {
+    pub(super) fn from_le_bytes(data: &[u8], data_type: tio::proto::DataType) -> ColumnData {
         use tio::proto::DataType;
         match data_type {
             DataType::Int8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
@@ -121,23 +123,17 @@ impl<T> Deref for ScalarBuffer<T> {
     }
 }
 
-/// One column's decoded values while they are still being accumulated; freeze
-/// into a [`ColumnArray`] to share them.
+/// One column's decoded values while they are still being accumulated.
 #[derive(Debug, Clone)]
-pub enum ColumnBuilder {
+enum ColumnBuilder {
     F64(Vec<f64>),
     I64(Vec<i64>),
     U64(Vec<u64>),
 }
 
 impl ColumnBuilder {
-    /// Empty vec of the variant selected by a column's resolved buffer type.
-    pub fn empty_for(bt: BufferType) -> Self {
-        Self::with_capacity_for(bt, 0)
-    }
-
     /// Empty vec of the selected variant with room for `capacity` decoded values.
-    pub fn with_capacity_for(bt: BufferType, capacity: usize) -> Self {
+    fn with_capacity_for(bt: BufferType, capacity: usize) -> Self {
         match bt {
             BufferType::Float => Self::F64(Vec::with_capacity(capacity)),
             BufferType::Int => Self::I64(Vec::with_capacity(capacity)),
@@ -146,7 +142,7 @@ impl ColumnBuilder {
     }
 
     /// The buffer type whose columns land in this variant.
-    pub fn buffer_type(&self) -> BufferType {
+    fn buffer_type(&self) -> BufferType {
         match self {
             Self::F64(_) => BufferType::Float,
             Self::I64(_) => BufferType::Int,
@@ -159,7 +155,7 @@ impl ColumnBuilder {
     /// Panics on any other variant mismatch: the cell was decoded for a
     /// different column type and dropping it would desync this column from
     /// its batch's rows.
-    pub fn push_data(&mut self, v: &ColumnData) {
+    fn push_data(&mut self, v: &ColumnData) {
         match (self, v) {
             (Self::F64(d), ColumnData::Float(x)) => d.push(*x),
             (Self::F64(d), ColumnData::Int(x)) => d.push(*x as f64),
@@ -171,7 +167,7 @@ impl ColumnBuilder {
 
     /// Copy a frozen column's values onto the end of this one. Panics on a
     /// variant mismatch: the two columns describe different data.
-    pub fn extend_from(&mut self, values: &ColumnArray) {
+    fn extend_from(&mut self, values: &ColumnArray) {
         match (self, values) {
             (Self::F64(d), ColumnArray::F64(v)) => d.extend_from_slice(v),
             (Self::I64(d), ColumnArray::I64(v)) => d.extend_from_slice(v),
@@ -184,35 +180,8 @@ impl ColumnBuilder {
         }
     }
 
-    pub fn len(&self) -> usize {
-        match self {
-            Self::F64(v) => v.len(),
-            Self::I64(v) => v.len(),
-            Self::U64(v) => v.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Read one cell as a scalar [`ColumnData`]; `Unknown` when out of bounds.
-    pub fn get(&self, i: usize) -> ColumnData {
-        match self {
-            Self::F64(v) => v
-                .get(i)
-                .map_or(ColumnData::Unknown, |&x| ColumnData::Float(x)),
-            Self::I64(v) => v
-                .get(i)
-                .map_or(ColumnData::Unknown, |&x| ColumnData::Int(x)),
-            Self::U64(v) => v
-                .get(i)
-                .map_or(ColumnData::Unknown, |&x| ColumnData::UInt(x)),
-        }
-    }
-
     /// Freeze a copy of `rows` only, leaving this column accumulating.
-    pub(crate) fn freeze_rows(&self, rows: Range<usize>) -> ColumnArray {
+    fn freeze_rows(&self, rows: Range<usize>) -> ColumnArray {
         match self {
             Self::F64(v) => ColumnArray::F64(v[rows].to_vec().into()),
             Self::I64(v) => ColumnArray::I64(v[rows].to_vec().into()),
@@ -221,8 +190,8 @@ impl ColumnBuilder {
     }
 }
 
-/// Frozen twin of [`ColumnBuilder`]: one column's decoded values, shared and
-/// sliceable. Derefs to a plain slice within each variant.
+/// One frozen column's decoded values, shared and sliceable. Derefs to a plain
+/// slice within each variant.
 #[derive(Debug, Clone)]
 pub enum ColumnArray {
     F64(ScalarBuffer<f64>),
@@ -289,21 +258,55 @@ impl From<ColumnBuilder> for ColumnArray {
 
 /// An immutable batch of samples in columnar (Structure-of-Arrays) form:
 /// metadata is held once, and each column's decoded values live in a shared
-/// [`ColumnArray`]. Build one incrementally with [`SampleBatchBuilder`].
+/// [`ColumnArray`]. Instances are produced by packet parsers and can be cheaply
+/// narrowed with [`SampleBatch::slice`].
 #[derive(Debug, Clone)]
-pub struct SampleBatch {
-    route: DeviceRoute,
+pub(super) struct BatchContext {
+    key: StreamKey,
     /// At most one boundary per batch, anchored at its first row.
     boundary: Option<Boundary>,
     generations: Generations,
+    segment: Arc<SegmentMetadata>,
+    stream: Arc<StreamMetadata>,
+    device: Arc<DeviceMetadata>,
+}
+
+impl BatchContext {
+    pub(super) fn new(
+        key: StreamKey,
+        boundary: Option<Boundary>,
+        generations: Generations,
+        segment: Arc<SegmentMetadata>,
+        stream: Arc<StreamMetadata>,
+        device: Arc<DeviceMetadata>,
+    ) -> Self {
+        assert_eq!(
+            key.stream_id, stream.stream_id,
+            "stream key must match metadata"
+        );
+        assert_eq!(
+            key.stream_id, segment.stream_id,
+            "segment must match stream"
+        );
+        Self {
+            key,
+            boundary,
+            generations,
+            segment,
+            stream,
+            device,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SampleBatch {
+    context: BatchContext,
     sample_numbers: ScalarBuffer<SampleNumber>,
     /// Each row's end-of-sample time, materialized at construction.
     timestamps: ScalarBuffer<f64>,
     /// Columns in index order.
     columns: Vec<Series>,
-    segment: Arc<SegmentMetadata>,
-    stream: Arc<StreamMetadata>,
-    device: Arc<DeviceMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,20 +317,6 @@ pub struct Series {
 }
 
 impl Series {
-    pub fn new(index: ColumnId, metadata: Arc<ColumnMetadata>, values: ColumnBuilder) -> Series {
-        let values = ColumnArray::from(values);
-        assert_eq!(
-            values.buffer_type(),
-            metadata.data_type.buffer_type(),
-            "column values must use the variant selected by their metadata"
-        );
-        Series {
-            index,
-            metadata,
-            values,
-        }
-    }
-
     pub fn index(&self) -> ColumnId {
         self.index
     }
@@ -349,18 +338,9 @@ impl Series {
     }
 }
 
-/// Each row's end-of-sample time, the timestamp convention throughout the crate.
-fn timestamps_for(segment: &SegmentMetadata, sample_numbers: &[SampleNumber]) -> ScalarBuffer<f64> {
-    sample_numbers
-        .iter()
-        .map(|&n| segment.time_at(n + 1))
-        .collect::<Vec<_>>()
-        .into()
-}
-
 /// Rows that can enter a [`crate::data::BatchCoalescer`]: they describe the
 /// batch they would form and can append themselves onto an accumulating builder.
-pub(crate) trait RowSource {
+pub(super) trait RowSource {
     fn len(&self) -> usize;
     fn boundary(&self) -> Option<&Boundary>;
     fn generations(&self) -> Generations;
@@ -376,18 +356,13 @@ pub(crate) trait RowSource {
 
 /// Accumulates decoded rows into a [`SampleBatch`], one row or one batch at a
 /// time.
-pub(crate) struct SampleBatchBuilder {
-    pub(crate) route: DeviceRoute,
-    pub(crate) boundary: Option<Boundary>,
-    pub(crate) generations: Generations,
-    pub(crate) sample_numbers: Vec<SampleNumber>,
+pub(super) struct SampleBatchBuilder {
+    context: BatchContext,
+    sample_numbers: Vec<SampleNumber>,
     /// Each row's end-of-sample time, carried alongside its sample number.
-    pub(crate) timestamps: Vec<f64>,
+    timestamps: Vec<f64>,
     /// One accumulating buffer per decodable column, in schema order.
-    pub(crate) columns: Vec<(Arc<ColumnMetadata>, ColumnBuilder)>,
-    pub(crate) segment: Arc<SegmentMetadata>,
-    pub(crate) stream: Arc<StreamMetadata>,
-    pub(crate) device: Arc<DeviceMetadata>,
+    columns: Vec<(Arc<ColumnMetadata>, ColumnBuilder)>,
 }
 
 impl RowSource for SampleBatch {
@@ -396,38 +371,25 @@ impl RowSource for SampleBatch {
     }
 
     fn boundary(&self) -> Option<&Boundary> {
-        self.boundary.as_ref()
+        self.context.boundary.as_ref()
     }
 
     fn generations(&self) -> Generations {
-        self.generations
+        self.context.generations
     }
 
     fn segment(&self) -> &Arc<SegmentMetadata> {
-        &self.segment
+        &self.context.segment
     }
 
     fn start_builder(&self, capacity: usize) -> SampleBatchBuilder {
-        SampleBatchBuilder {
-            route: self.route,
-            boundary: self.boundary.clone(),
-            generations: self.generations,
-            sample_numbers: Vec::with_capacity(capacity),
-            timestamps: Vec::with_capacity(capacity),
-            columns: self
-                .columns
+        SampleBatchBuilder::new(
+            self.context.clone(),
+            self.columns
                 .iter()
-                .map(|column| {
-                    (
-                        column.metadata.clone(),
-                        ColumnBuilder::with_capacity_for(column.values.buffer_type(), capacity),
-                    )
-                })
-                .collect(),
-            segment: self.segment.clone(),
-            stream: self.stream.clone(),
-            device: self.device.clone(),
-        }
+                .map(|column| (column.metadata.clone(), column.values.buffer_type())),
+            capacity,
+        )
     }
 
     fn append_to(&self, tail: &mut SampleBatchBuilder) {
@@ -445,15 +407,55 @@ impl RowSource for SampleBatch {
 }
 
 impl SampleBatchBuilder {
+    pub(super) fn new(
+        context: BatchContext,
+        columns: impl IntoIterator<Item = (Arc<ColumnMetadata>, BufferType)>,
+        capacity: usize,
+    ) -> Self {
+        let key = context.key;
+        let columns = columns
+            .into_iter()
+            .map(|(metadata, buffer_type)| {
+                assert_eq!(
+                    key.stream_id, metadata.stream_id,
+                    "column must match stream"
+                );
+                (
+                    metadata,
+                    ColumnBuilder::with_capacity_for(buffer_type, capacity),
+                )
+            })
+            .collect();
+        Self {
+            context,
+            sample_numbers: Vec::with_capacity(capacity),
+            timestamps: Vec::with_capacity(capacity),
+            columns,
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.sample_numbers.len()
+    }
+
+    pub(super) fn generations(&self) -> Generations {
+        self.context.generations
+    }
+
+    pub(super) fn accepts(&self, rows: &impl RowSource) -> bool {
+        self.context.generations == rows.generations()
+            && Arc::ptr_eq(&self.context.segment, rows.segment())
+    }
+
     /// Append one decoded row: `cells` must yield exactly one value per
     /// column, in schema order.
-    pub(crate) fn push_row(
+    pub(super) fn push_row(
         &mut self,
         n: SampleNumber,
         cells: impl IntoIterator<Item = ColumnData>,
     ) {
         self.sample_numbers.push(n);
-        self.timestamps.push(self.segment.time_at(n + 1));
+        self.timestamps.push(self.context.segment.time_at(n + 1));
         let mut cells = cells.into_iter();
         for (_, values) in &mut self.columns {
             values.push_data(&cells.next().expect("one cell per column"));
@@ -463,11 +465,13 @@ impl SampleBatchBuilder {
 
     /// Freeze a copy of `rows` only, leaving the builder accumulating. The
     /// boundary is anchored at the first row, as in [`SampleBatch::slice`].
-    pub(crate) fn freeze_rows(&self, rows: Range<usize>) -> SampleBatch {
+    pub(super) fn freeze_rows(&self, rows: Range<usize>) -> SampleBatch {
+        let mut context = self.context.clone();
+        if rows.start != 0 {
+            context.boundary = None;
+        }
         SampleBatch {
-            route: self.route,
-            boundary: (rows.start == 0).then(|| self.boundary.clone()).flatten(),
-            generations: self.generations,
+            context,
             sample_numbers: self.sample_numbers[rows.clone()].to_vec().into(),
             timestamps: self.timestamps[rows.clone()].to_vec().into(),
             columns: self
@@ -479,18 +483,13 @@ impl SampleBatchBuilder {
                     values: values.freeze_rows(rows.clone()),
                 })
                 .collect(),
-            segment: self.segment.clone(),
-            stream: self.stream.clone(),
-            device: self.device.clone(),
         }
     }
 
     /// Freeze the accumulated rows into a shareable batch.
-    pub(crate) fn finish(self) -> SampleBatch {
+    pub(super) fn finish(self) -> SampleBatch {
         SampleBatch {
-            route: self.route,
-            boundary: self.boundary,
-            generations: self.generations,
+            context: self.context,
             timestamps: self.timestamps.into(),
             sample_numbers: self.sample_numbers.into(),
             columns: self
@@ -502,80 +501,43 @@ impl SampleBatchBuilder {
                     values: values.into(),
                 })
                 .collect(),
-            segment: self.segment,
-            stream: self.stream,
-            device: self.device,
         }
     }
 }
 
 impl SampleBatch {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        route: DeviceRoute,
-        boundary: Option<Boundary>,
-        generations: Generations,
-        sample_numbers: Vec<SampleNumber>,
-        columns: Vec<Series>,
-        segment: Arc<SegmentMetadata>,
-        stream: Arc<StreamMetadata>,
-        device: Arc<DeviceMetadata>,
-    ) -> SampleBatch {
-        assert!(
-            columns
-                .iter()
-                .all(|c| c.values.len() == sample_numbers.len()),
-            "every column must hold exactly one value per sample"
-        );
-        assert!(
-            columns
-                .iter()
-                .enumerate()
-                .all(|(i, c)| columns[..i].iter().all(|prior| prior.index != c.index)),
-            "column ids must be unique within a batch"
-        );
-        SampleBatch {
-            route,
-            boundary,
-            generations,
-            timestamps: timestamps_for(&segment, &sample_numbers),
-            sample_numbers: sample_numbers.into(),
-            columns,
-            segment,
-            stream,
-            device,
-        }
-    }
-
     /// A view of `rows` that shares this batch's buffers instead of copying
     /// them. The boundary is anchored at the first row, so it survives only a
     /// slice that starts there.
     pub fn slice(&self, rows: Range<usize>) -> SampleBatch {
+        let mut context = self.context.clone();
+        if rows.start != 0 {
+            context.boundary = None;
+        }
         SampleBatch {
-            route: self.route,
-            boundary: (rows.start == 0).then(|| self.boundary.clone()).flatten(),
-            generations: self.generations,
+            context,
             sample_numbers: self.sample_numbers.slice(rows.clone()),
             timestamps: self.timestamps.slice(rows.clone()),
             columns: self.columns.iter().map(|c| c.slice(rows.clone())).collect(),
-            segment: self.segment.clone(),
-            stream: self.stream.clone(),
-            device: self.device.clone(),
         }
     }
 
     pub fn route(&self) -> DeviceRoute {
-        self.route
+        self.context.key.route
+    }
+
+    pub fn stream_key(&self) -> StreamKey {
+        self.context.key
     }
 
     /// The batch's boundary, anchored at its first row.
     pub fn boundary(&self) -> Option<&Boundary> {
-        self.boundary.as_ref()
+        self.context.boundary.as_ref()
     }
 
     /// The continuity generations this batch's rows belong to.
     pub fn generations(&self) -> Generations {
-        self.generations
+        self.context.generations
     }
 
     pub fn sample_numbers(&self) -> &[SampleNumber] {
@@ -588,15 +550,15 @@ impl SampleBatch {
     }
 
     pub fn segment(&self) -> &Arc<SegmentMetadata> {
-        &self.segment
+        &self.context.segment
     }
 
     pub fn stream(&self) -> &Arc<StreamMetadata> {
-        &self.stream
+        &self.context.stream
     }
 
     pub fn device(&self) -> &Arc<DeviceMetadata> {
-        &self.device
+        &self.context.device
     }
 
     pub fn len(&self) -> usize {
@@ -635,17 +597,26 @@ impl SampleBatch {
 
     /// True unless the boundary marks a break in continuity.
     pub fn is_continuous(&self) -> bool {
-        self.boundary.as_ref().is_none_or(|b| b.is_continuous())
+        self.context
+            .boundary
+            .as_ref()
+            .is_none_or(|b| b.is_continuous())
     }
 
     /// True unless the boundary marks a non-monotonic break.
     pub fn is_monotonic(&self) -> bool {
-        self.boundary.as_ref().is_none_or(|b| b.is_monotonic())
+        self.context
+            .boundary
+            .as_ref()
+            .is_none_or(|b| b.is_monotonic())
     }
 
     /// True only when the boundary is the stream's first sample.
     pub fn is_initial(&self) -> bool {
-        self.boundary.as_ref().is_some_and(|b| b.is_initial())
+        self.context
+            .boundary
+            .as_ref()
+            .is_some_and(|b| b.is_initial())
     }
 }
 
@@ -661,16 +632,16 @@ impl<'a> SampleRow<'a> {
         self.batch.sample_numbers[self.row]
     }
     pub fn stream(&self) -> &'a Arc<StreamMetadata> {
-        &self.batch.stream
+        &self.batch.context.stream
     }
     pub fn segment(&self) -> &'a Arc<SegmentMetadata> {
-        &self.batch.segment
+        &self.batch.context.segment
     }
     pub fn device(&self) -> &'a Arc<DeviceMetadata> {
-        &self.batch.device
+        &self.batch.context.device
     }
     pub fn timestamp_begin(&self) -> f64 {
-        self.batch.segment.time_at(self.n())
+        self.batch.context.segment.time_at(self.n())
     }
     pub fn timestamp_end(&self) -> f64 {
         self.batch.timestamps[self.row]
@@ -693,9 +664,9 @@ impl std::fmt::Display for SampleRow<'_> {
         write!(
             f,
             "SAMPLE({}:{}:{}) {:.6}",
-            self.batch.device.session_id,
-            self.batch.stream.stream_id,
-            self.batch.segment.segment_id,
+            self.batch.context.device.session_id,
+            self.batch.context.stream.stream_id,
+            self.batch.context.segment.segment_id,
             self.timestamp_end()
         )?;
         for (series, value) in self.batch.schema().iter().zip(self.values()) {
@@ -864,36 +835,37 @@ mod tests {
             units: String::new(),
             description: String::new(),
         });
-        let mut builder = SampleBatchBuilder {
-            route: DeviceRoute::root(),
-            boundary: Some(Boundary {
-                reason: BoundaryReason::Initial,
-            }),
-            generations: Generations {
-                stream: 1,
-                device: 0,
-                global: 0,
-            },
-            sample_numbers: Vec::new(),
-            timestamps: Vec::new(),
-            columns: vec![(column, ColumnBuilder::empty_for(BufferType::Float))],
-            segment,
-            stream: Arc::new(StreamMetadata {
-                stream_id: 1,
-                name: "test-stream".to_string(),
-                n_columns: 1,
-                n_segments: 1,
-                sample_size: 8,
-                buf_samples: 128,
-            }),
-            device: Arc::new(DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "fw".to_string(),
-                n_streams: 1,
-                session_id: 42,
-                name: "test-device".to_string(),
-            }),
-        };
+        let mut builder = SampleBatchBuilder::new(
+            BatchContext::new(
+                StreamKey::new(DeviceRoute::root(), 1),
+                Some(Boundary {
+                    reason: BoundaryReason::Initial,
+                }),
+                Generations {
+                    stream: 1,
+                    device: 0,
+                    global: 0,
+                },
+                segment,
+                Arc::new(StreamMetadata {
+                    stream_id: 1,
+                    name: "test-stream".to_string(),
+                    n_columns: 1,
+                    n_segments: 1,
+                    sample_size: 8,
+                    buf_samples: 128,
+                }),
+                Arc::new(DeviceMetadata {
+                    serial_number: "SN123".to_string(),
+                    firmware_hash: "fw".to_string(),
+                    n_streams: 1,
+                    session_id: 42,
+                    name: "test-device".to_string(),
+                }),
+            ),
+            [(column, BufferType::Float)],
+            4,
+        );
         for n in 0..4 {
             builder.push_row(n, [ColumnData::Float(f64::from(n) * 10.0)]);
         }

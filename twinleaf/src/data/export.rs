@@ -1,5 +1,6 @@
 use crate::data::{Boundary, ColumnArray, ColumnFilter, Generations, SampleBatch, Series};
 use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, StreamKey};
+use crate::tio::proto::meta::{ColumnMetadata, DeviceMetadata, StreamMetadata};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
 use hdf5::{Dataset, Dataspace, File, H5Type, Location, Result, SimpleExtents};
@@ -7,6 +8,7 @@ use hdf5_sys::h5d::H5Dwrite;
 use hdf5_sys::h5p::H5P_DEFAULT;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 type TableIndex = u64;
 
@@ -135,6 +137,44 @@ struct TableInfo {
     row_size: usize,
     /// `(byte offset, source)` for each compound field, in field order.
     fields: Vec<(usize, FieldSource)>,
+    schema: TableSchema,
+}
+
+/// Structural schema represented by one HDF5 compound table. Segment and
+/// session metadata are deliberately excluded so flat exports can span normal
+/// rollovers; a different device or column schema must not reuse the layout.
+struct TableSchema {
+    key: StreamKey,
+    device: Arc<DeviceMetadata>,
+    stream: Arc<StreamMetadata>,
+    columns: Vec<Arc<ColumnMetadata>>,
+}
+
+impl TableSchema {
+    fn from_batch(batch: &SampleBatch, columns: &[&Series]) -> Self {
+        Self {
+            key: batch.stream_key(),
+            device: batch.device().clone(),
+            stream: batch.stream().clone(),
+            columns: columns
+                .iter()
+                .map(|column| column.metadata().clone())
+                .collect(),
+        }
+    }
+
+    fn matches(&self, batch: &SampleBatch, columns: &[&Series]) -> bool {
+        self.key == batch.stream_key()
+            && self.device.serial_number == batch.device().serial_number
+            && self.stream.name == batch.stream().name
+            && self.stream.sample_size == batch.stream().sample_size
+            && self.columns.len() == columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(columns)
+                .all(|(expected, actual)| expected.as_ref() == actual.metadata().as_ref())
+    }
 }
 
 pub struct Hdf5Appender {
@@ -149,6 +189,7 @@ pub struct Hdf5Appender {
 }
 
 impl Hdf5Appender {
+    /// Creates a new appender, failing if `path` already exists.
     pub fn with_options(
         path: &Path,
         compress: bool,
@@ -157,8 +198,48 @@ impl Hdf5Appender {
         split_policy: SplitPolicy,
         split_level: RunSplitLevel,
     ) -> Result<Self> {
+        Self::from_file(
+            File::create_excl(path)?,
+            compress,
+            debug,
+            filter,
+            split_policy,
+            split_level,
+        )
+    }
+
+    /// Creates an appender that explicitly replaces an existing output file.
+    ///
+    /// Prefer [`Hdf5Appender::with_options`] unless the caller has separately
+    /// confirmed that replacing `path` is intentional and safe.
+    pub fn with_overwrite_options(
+        path: &Path,
+        compress: bool,
+        debug: bool,
+        filter: Option<ColumnFilter>,
+        split_policy: SplitPolicy,
+        split_level: RunSplitLevel,
+    ) -> Result<Self> {
+        Self::from_file(
+            File::create(path)?,
+            compress,
+            debug,
+            filter,
+            split_policy,
+            split_level,
+        )
+    }
+
+    fn from_file(
+        file: File,
+        compress: bool,
+        debug: bool,
+        filter: Option<ColumnFilter>,
+        split_policy: SplitPolicy,
+        split_level: RunSplitLevel,
+    ) -> Result<Self> {
         Ok(Self {
-            file: File::create(path)?,
+            file,
             tables: HashMap::new(),
             filter,
             compress,
@@ -170,7 +251,8 @@ impl Hdf5Appender {
     }
 
     /// Append an already-decoded batch.
-    pub fn write_batch(&mut self, batch: SampleBatch, key: StreamKey) -> Result<()> {
+    pub fn write_batch(&mut self, batch: SampleBatch) -> Result<()> {
+        let key = batch.stream_key();
         if self
             .runs
             .observe(key, batch.generations(), batch.boundary())
@@ -187,26 +269,27 @@ impl Hdf5Appender {
                 );
             }
         }
-        self.append_batch(&key, &batch)
+        self.append_batch(&batch)
     }
 
     pub fn finish(self) -> Result<ExportStats> {
         Ok(self.stats)
     }
 
-    fn append_batch(&mut self, key: &StreamKey, batch: &SampleBatch) -> Result<()> {
+    fn append_batch(&mut self, batch: &SampleBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
+        let key = batch.stream_key();
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
         let stream_name = batch.stream().name.clone();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
-            format!("/{}", stream_name)
+            format!("/{}[{}]", stream_name, key.stream_id)
         } else {
-            format!("/{}/{}", route_str, stream_name)
+            format!("/{}/{}[{}]", route_str, stream_name, key.stream_id)
         };
         self.stats.streams_seen.insert(stream_id_path.clone());
 
@@ -240,15 +323,25 @@ impl Hdf5Appender {
             format!("/{}", route_str)
         };
         // Each run of a stream is its own table in the route group.
-        let table_name = match self.runs.index(*key) {
-            Some(run) => format!("{stream_name}_run{run:06}"),
-            None => stream_name.clone(),
+        let table_stem = hdf_name_component(&stream_name);
+        let table_name = match self.runs.index(key) {
+            Some(run) => format!("{table_stem}_run{run:06}"),
+            None => table_stem,
         };
         let table_path = if group_path == "/" {
             format!("/{}", table_name)
         } else {
             format!("{}/{}", group_path, table_name)
         };
+
+        if let Some(info) = self.tables.get(&table_path) {
+            if !info.schema.matches(batch, &valid) {
+                return Err(format!(
+                    "metadata or schema changed while writing HDF5 table {table_path}; split the export into distinct runs"
+                )
+                .into());
+            }
+        }
 
         // Create the compound table on first sight of this stream/run.
         if !self.tables.contains_key(&table_path) {
@@ -296,7 +389,7 @@ impl Hdf5Appender {
             };
             let ds = builder.create(table_name.as_str())?;
 
-            self.write_metadata_attributes(&ds, batch, key)?;
+            self.write_metadata_attributes(&ds, batch, &key)?;
             self.write_field_metadata(&ds, &valid)?;
 
             // Map each (already index-ordered) compound field to its data source.
@@ -319,6 +412,7 @@ impl Hdf5Appender {
                     dataset: ds,
                     row_size: layout.size,
                     fields: field_sources,
+                    schema: TableSchema::from_batch(batch, &valid),
                 },
             );
         }
@@ -416,6 +510,10 @@ impl Hdf5Appender {
         self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
         self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
         self.write_attr_scalar(loc, "session_id", &batch.device().session_id)?;
+        self.write_attr_scalar(loc, "stream_id", &batch.stream().stream_id)?;
+        self.write_attr_string(loc, "stream_name", &batch.stream().name)?;
+        self.write_attr_string(loc, "device_serial", &batch.device().serial_number)?;
+        self.write_attr_string(loc, "firmware_hash", &batch.device().firmware_hash)?;
 
         if let Some(id) = self.runs.index(*key) {
             self.write_attr_scalar(loc, "run_id", &id)?;
@@ -491,6 +589,23 @@ impl Hdf5Appender {
     }
 }
 
+/// HDF5 treats `/` as a path separator and NUL is not a valid link character.
+/// Keep the human-readable stream name while making it a single path component.
+fn hdf_name_component(name: &str) -> String {
+    let escaped: String = name
+        .chars()
+        .map(|character| match character {
+            '/' | '\0' => '_',
+            other => other,
+        })
+        .collect();
+    if escaped.is_empty() {
+        "unnamed".to_string()
+    } else {
+        escaped
+    }
+}
+
 fn to_vlu(s: &str) -> VarLenUnicode {
     s.parse::<VarLenUnicode>()
         .unwrap_or_else(|_| "".parse().unwrap())
@@ -499,7 +614,15 @@ fn to_vlu(s: &str) -> VarLenUnicode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::BoundaryReason;
+    use crate::data::sample::{BatchContext, SampleBatchBuilder};
+    use crate::data::{BoundaryReason, ColumnData};
+    use crate::tio::proto::meta::{
+        DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata, StreamMetadata,
+    };
+    use crate::tio::proto::DataType;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     fn key(stream_id: u8) -> StreamKey {
         StreamKey::new(DeviceRoute::root(), stream_id)
@@ -522,6 +645,95 @@ mod tests {
                 received: 9,
             },
         }
+    }
+
+    fn batch(stream_id: u8, stream_name: &str, column_name: &str) -> SampleBatch {
+        batch_in_segment(stream_id, stream_name, column_name, 0)
+    }
+
+    fn batch_in_segment(
+        stream_id: u8,
+        stream_name: &str,
+        column_name: &str,
+        start_time: u32,
+    ) -> SampleBatch {
+        let column = Arc::new(ColumnMetadata {
+            stream_id,
+            index: 0,
+            data_type: DataType::Float32,
+            name: column_name.to_string(),
+            units: "V".to_string(),
+            description: "test column".to_string(),
+        });
+        let mut builder = SampleBatchBuilder::new(
+            BatchContext::new(
+                key(stream_id),
+                None,
+                Generations {
+                    stream: 1,
+                    device: 0,
+                    global: 0,
+                },
+                Arc::new(SegmentMetadata {
+                    stream_id,
+                    segment_id: 1,
+                    flags: 0,
+                    time_ref_epoch: MetadataEpoch::Zero,
+                    time_ref_serial: String::new(),
+                    time_ref_session_id: 0,
+                    start_time,
+                    sampling_rate: 1,
+                    decimation: 1,
+                    filter_cutoff: 0.0,
+                    filter_type: MetadataFilter::Unfiltered,
+                }),
+                Arc::new(StreamMetadata {
+                    stream_id,
+                    name: stream_name.to_string(),
+                    n_columns: 1,
+                    n_segments: 1,
+                    sample_size: 4,
+                    buf_samples: 1,
+                }),
+                Arc::new(DeviceMetadata {
+                    serial_number: "serial".to_string(),
+                    firmware_hash: "firmware".to_string(),
+                    n_streams: 2,
+                    session_id: 1,
+                    name: "device".to_string(),
+                }),
+            ),
+            [(column.clone(), column.data_type.buffer_type())],
+            1,
+        );
+        builder.push_row(0, [ColumnData::Float(1.0)]);
+        builder.finish()
+    }
+
+    fn temp_hdf(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "twinleaf_export_{label}_{}_{}.h5",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn appender(path: &Path) -> Hdf5Appender {
+        Hdf5Appender::with_options(
+            path,
+            false,
+            false,
+            None,
+            SplitPolicy::Continuous,
+            RunSplitLevel::None,
+        )
+        .expect("create test HDF5 output")
+    }
+
+    fn hdf_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().expect("lock HDF5 tests")
     }
 
     #[test]
@@ -579,5 +791,84 @@ mod tests {
         // The discontinuity is still reported, it just does not open a table.
         assert!(runs.observe(key(1), generations(2), Some(&lost())));
         assert_eq!(runs.index(key(1)), None);
+    }
+
+    #[test]
+    fn safe_constructor_does_not_replace_existing_files() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("exclusive");
+        std::fs::write(&path, b"existing input").expect("create sentinel");
+
+        assert!(Hdf5Appender::with_options(
+            &path,
+            false,
+            false,
+            None,
+            SplitPolicy::Continuous,
+            RunSplitLevel::None,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read sentinel"),
+            b"existing input"
+        );
+
+        std::fs::remove_file(path).expect("remove sentinel");
+    }
+
+    #[test]
+    fn duplicate_stream_names_are_rejected_by_the_schema_guard() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("duplicate_names");
+        let mut writer = appender(&path);
+        writer
+            .write_batch(batch(1, "field", "x"))
+            .expect("write first stream");
+        let error = writer
+            .write_batch(batch(2, "field", "x"))
+            .expect_err("a second stream of the same name must fail");
+        assert!(error.to_string().contains("schema changed"));
+        drop(writer);
+        std::fs::remove_file(path).expect("remove output");
+    }
+
+    #[test]
+    fn changed_schema_is_rejected_instead_of_reinterpreted() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("schema_change");
+        let mut writer = appender(&path);
+        writer
+            .write_batch(batch(1, "field", "x"))
+            .expect("write original schema");
+        let error = writer
+            .write_batch(batch(1, "field", "renamed"))
+            .expect_err("schema change must fail");
+        assert!(error.to_string().contains("schema changed"));
+        drop(writer);
+        std::fs::remove_file(path).expect("remove output");
+    }
+
+    #[test]
+    fn normal_segment_rollover_reuses_a_flat_table() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("segment_rollover");
+        let mut writer = appender(&path);
+        writer
+            .write_batch(batch_in_segment(1, "field", "x", 0))
+            .expect("write first segment");
+        writer
+            .write_batch(batch_in_segment(1, "field", "x", 100))
+            .expect("write next segment");
+        writer.finish().expect("finish output");
+
+        let file = File::open(&path).expect("open output");
+        assert_eq!(
+            file.dataset("field")
+                .expect("open stream table")
+                .shape(),
+            vec![2]
+        );
+        drop(file);
+        std::fs::remove_file(path).expect("remove output");
     }
 }

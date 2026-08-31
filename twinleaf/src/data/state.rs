@@ -5,8 +5,7 @@
 //! validated bytes immediately or retain only their metadata and boundaries.
 
 use super::sample::{
-    Boundary, BoundaryReason, ColumnBuilder, ColumnData, Generations, RowSource,
-    SampleBatchBuilder,
+    BatchContext, Boundary, BoundaryReason, ColumnData, Generations, RowSource, SampleBatchBuilder,
 };
 use crate::tio;
 use proto::meta::MetadataType;
@@ -16,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tio::proto;
-use tio::proto::identifiers::MAX_SAMPLE_NUMBER;
+use tio::proto::identifiers::{StreamKey, MAX_SAMPLE_NUMBER};
 use tio::proto::meta::{
     ColumnMetadata, DeviceMetadata, MetadataContent, SegmentMetadata, StreamMetadata,
 };
@@ -568,7 +567,7 @@ impl StreamState {
 
         let sample_size = stream_metadata.sample_size;
         Ok(RowState::Validated(ValidatedRows {
-            route,
+            key: StreamKey::new(route, stream_metadata.stream_id),
             boundary,
             generations: Generations {
                 stream: self.run,
@@ -830,7 +829,11 @@ impl DeviceState {
         match self.metadata.as_ref() {
             Some(device) => {
                 for stream_id in 1..=device.n_streams as u8 {
-                    if let Some(stream) = self.streams.get(usize::from(stream_id)).and_then(Option::as_ref) {
+                    if let Some(stream) = self
+                        .streams
+                        .get(usize::from(stream_id))
+                        .and_then(Option::as_ref)
+                    {
                         missing.extend(stream.missing_metadata());
                     } else {
                         missing.push(MetadataRequest::stream(stream_id));
@@ -851,7 +854,10 @@ impl DeviceState {
         for stream_id in 1..=device.n_streams as u8 {
             streams.insert(
                 stream_id,
-                self.streams.get(usize::from(stream_id))?.as_ref()?.metadata_snapshot()?,
+                self.streams
+                    .get(usize::from(stream_id))?
+                    .as_ref()?
+                    .metadata_snapshot()?,
             );
         }
         Some(DeviceMetadataSnapshot { device, streams })
@@ -981,7 +987,11 @@ impl ParseState {
     }
 
     pub(super) fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
-        self.devices.iter().find(|(known, _)| *known == route)?.1.metadata_snapshot()
+        self.devices
+            .iter()
+            .find(|(known, _)| *known == route)?
+            .1
+            .metadata_snapshot()
     }
 
     pub(super) fn routes(&self) -> Vec<DeviceRoute> {
@@ -992,32 +1002,68 @@ impl ParseState {
 /// Stream bytes validated against the metadata and continuity state in effect
 /// at their position in the packet sequence.
 pub(super) struct ValidatedRows<'a> {
-    pub(super) route: DeviceRoute,
-    pub(super) boundary: Option<Boundary>,
-    pub(super) generations: Generations,
-    pub(super) segment: Arc<SegmentMetadata>,
-    pub(super) stream: Arc<StreamMetadata>,
-    pub(super) device: Arc<DeviceMetadata>,
-    pub(super) first_sample_n: u32,
-    pub(super) last_sample_n: u32,
-    pub(super) row_count: usize,
-    pub(super) sample_size: usize,
-    pub(super) encoded: &'a [u8],
-    pub(super) columns: &'a [Arc<ColumnMetadata>],
+    key: StreamKey,
+    boundary: Option<Boundary>,
+    generations: Generations,
+    segment: Arc<SegmentMetadata>,
+    stream: Arc<StreamMetadata>,
+    device: Arc<DeviceMetadata>,
+    first_sample_n: u32,
+    last_sample_n: u32,
+    row_count: usize,
+    sample_size: usize,
+    encoded: &'a [u8],
+    columns: &'a [Arc<ColumnMetadata>],
 }
 
 /// One column of a decoded batch: where its bytes start within a sample, the
 /// buffer its values land in, and its metadata.
-pub(super) struct DecodableColumn<'a> {
-    pub(super) offset: usize,
-    pub(super) buffer_type: proto::BufferType,
-    pub(super) metadata: &'a Arc<ColumnMetadata>,
+struct DecodableColumn<'a> {
+    offset: usize,
+    buffer_type: proto::BufferType,
+    metadata: &'a Arc<ColumnMetadata>,
 }
 
 impl ValidatedRows<'_> {
+    pub(super) fn stream_key(&self) -> StreamKey {
+        self.key
+    }
+
+    pub(super) fn boundary(&self) -> Option<&Boundary> {
+        self.boundary.as_ref()
+    }
+
+    pub(super) fn generations(&self) -> Generations {
+        self.generations
+    }
+
+    pub(super) fn segment(&self) -> &Arc<SegmentMetadata> {
+        &self.segment
+    }
+
+    pub(super) fn stream(&self) -> &Arc<StreamMetadata> {
+        &self.stream
+    }
+
+    pub(super) fn device(&self) -> &Arc<DeviceMetadata> {
+        &self.device
+    }
+
+    pub(super) fn columns(&self) -> &[Arc<ColumnMetadata>] {
+        self.columns
+    }
+
+    pub(super) fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub(super) fn sample_number_bounds(&self) -> (u32, u32) {
+        (self.first_sample_n, self.last_sample_n)
+    }
+
     /// The columns a batch can hold, in schema order. Columns whose wire type
     /// this build cannot decode are absent, so every batch stays rectangular.
-    pub(super) fn decodable_columns(&self) -> impl Iterator<Item = DecodableColumn<'_>> {
+    fn decodable_columns(&self) -> impl Iterator<Item = DecodableColumn<'_>> {
         self.columns
             .iter()
             .scan(0usize, |offset, metadata| {
@@ -1041,37 +1087,31 @@ impl RowSource for ValidatedRows<'_> {
     }
 
     fn boundary(&self) -> Option<&Boundary> {
-        self.boundary.as_ref()
+        self.boundary()
     }
 
     fn generations(&self) -> Generations {
-        self.generations
+        self.generations()
     }
 
     fn segment(&self) -> &Arc<SegmentMetadata> {
-        &self.segment
+        self.segment()
     }
 
     fn start_builder(&self, capacity: usize) -> SampleBatchBuilder {
-        SampleBatchBuilder {
-            route: self.route,
-            boundary: self.boundary.clone(),
-            generations: self.generations,
-            sample_numbers: Vec::with_capacity(capacity),
-            timestamps: Vec::with_capacity(capacity),
-            columns: self
-                .decodable_columns()
-                .map(|column| {
-                    (
-                        column.metadata.clone(),
-                        ColumnBuilder::with_capacity_for(column.buffer_type, capacity),
-                    )
-                })
-                .collect(),
-            segment: self.segment.clone(),
-            stream: self.stream.clone(),
-            device: self.device.clone(),
-        }
+        SampleBatchBuilder::new(
+            BatchContext::new(
+                self.key,
+                self.boundary.clone(),
+                self.generations,
+                self.segment.clone(),
+                self.stream.clone(),
+                self.device.clone(),
+            ),
+            self.decodable_columns()
+                .map(|column| (column.metadata.clone(), column.buffer_type)),
+            capacity,
+        )
     }
 
     fn append_to(&self, tail: &mut SampleBatchBuilder) {

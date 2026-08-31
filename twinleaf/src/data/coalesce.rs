@@ -6,8 +6,7 @@
 //! generations, and a batch that starts a boundary always stands alone.
 
 use super::sample::{Generations, RowSource, SampleBatch, SampleBatchBuilder};
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::{collections::VecDeque, ops::Range};
 
 /// Accumulates one stream's batches into batches of about `target_rows` rows.
 ///
@@ -35,7 +34,7 @@ impl BatchCoalescer {
 
     /// Merge `rows` into the buffered tail, completing batches as needed.
     /// Empty inputs are ignored.
-    pub(crate) fn push(&mut self, rows: &impl RowSource) {
+    pub(super) fn push(&mut self, rows: &impl RowSource) {
         if rows.len() == 0 {
             return;
         }
@@ -43,9 +42,11 @@ impl BatchCoalescer {
             self.finish_buffered_batch();
         }
         let capacity = self.target_rows.unwrap_or(rows.len()).max(rows.len());
-        let tail = self.tail.get_or_insert_with(|| rows.start_builder(capacity));
+        let tail = self
+            .tail
+            .get_or_insert_with(|| rows.start_builder(capacity));
         rows.append_to(tail);
-        let buffered = tail.sample_numbers.len();
+        let buffered = tail.len();
         // A boundary batch stands alone, so the rows after it start fresh.
         if rows.boundary().is_some() || self.target_rows.is_none_or(|target| buffered >= target) {
             self.finish_buffered_batch();
@@ -72,41 +73,37 @@ impl BatchCoalescer {
 
     /// Rows held in the tail, not yet completed.
     pub fn buffered_len(&self) -> usize {
-        self.tail.as_ref().map_or(0, |t| t.sample_numbers.len())
+        self.tail.as_ref().map_or(0, SampleBatchBuilder::len)
     }
 
     /// The generations the buffered rows belong to, if any are buffered.
     pub fn buffered_generations(&self) -> Option<Generations> {
-        self.tail.as_ref().map(|t| t.generations)
+        self.tail.as_ref().map(SampleBatchBuilder::generations)
     }
 
-    /// The builder accumulating the buffered rows; `Some` only while rows
-    /// are buffered.
-    pub(crate) fn tail(&self) -> Option<&SampleBatchBuilder> {
-        self.tail.as_ref()
+    /// Freeze a copy of rows from the buffered tail, leaving it accumulating.
+    pub(super) fn buffered_rows(&self, rows: Range<usize>) -> Option<SampleBatch> {
+        self.tail.as_ref().map(|tail| tail.freeze_rows(rows))
     }
 
     /// Whether `rows` may continue the buffered tail. Rows merge only within
     /// one metadata and generation, and never across a boundary.
     fn tail_accepts(&self, rows: &impl RowSource) -> bool {
-        rows.boundary().is_none()
-            && self.tail.as_ref().is_some_and(|tail| {
-                tail.generations == rows.generations()
-                    && Arc::ptr_eq(&tail.segment, rows.segment())
-            })
+        rows.boundary().is_none() && self.tail.as_ref().is_some_and(|tail| tail.accepts(rows))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::sample::{Boundary, BoundaryReason, ColumnArray, ColumnBuilder, ColumnData};
-    use crate::tio::proto::identifiers::SampleNumber;
+    use crate::data::sample::{BatchContext, Boundary, BoundaryReason, ColumnArray, ColumnData};
+    use crate::tio::proto::identifiers::{SampleNumber, StreamKey};
     use crate::tio::proto::meta::{
         ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata,
         StreamMetadata,
     };
     use crate::tio::proto::{BufferType, DataType, DeviceRoute};
+    use std::sync::Arc;
 
     fn segment(segment_id: u8) -> Arc<SegmentMetadata> {
         Arc::new(SegmentMetadata {
@@ -141,30 +138,31 @@ mod tests {
             units: String::new(),
             description: String::new(),
         });
-        let mut builder = SampleBatchBuilder {
-            route: DeviceRoute::root(),
-            boundary,
-            generations,
-            sample_numbers: Vec::new(),
-            timestamps: Vec::new(),
-            columns: vec![(column, ColumnBuilder::empty_for(BufferType::Float))],
-            segment: segment.clone(),
-            stream: Arc::new(StreamMetadata {
-                stream_id: 1,
-                name: "test-stream".to_string(),
-                n_columns: 1,
-                n_segments: 2,
-                sample_size: 8,
-                buf_samples: 128,
-            }),
-            device: Arc::new(DeviceMetadata {
-                serial_number: "SN123".to_string(),
-                firmware_hash: "fw".to_string(),
-                n_streams: 1,
-                session_id: 42,
-                name: "test-device".to_string(),
-            }),
-        };
+        let mut builder = SampleBatchBuilder::new(
+            BatchContext::new(
+                StreamKey::new(DeviceRoute::root(), 1),
+                boundary,
+                generations,
+                segment.clone(),
+                Arc::new(StreamMetadata {
+                    stream_id: 1,
+                    name: "test-stream".to_string(),
+                    n_columns: 1,
+                    n_segments: 2,
+                    sample_size: 8,
+                    buf_samples: 128,
+                }),
+                Arc::new(DeviceMetadata {
+                    serial_number: "SN123".to_string(),
+                    firmware_hash: "fw".to_string(),
+                    n_streams: 1,
+                    session_id: 42,
+                    name: "test-device".to_string(),
+                }),
+            ),
+            [(column, BufferType::Float)],
+            rows as usize,
+        );
         for n in first..first + rows {
             builder.push_row(n, [ColumnData::Float(f64::from(n))]);
         }
@@ -304,11 +302,10 @@ mod tests {
     fn frozen_tail_rows_stay_buffered_and_independent() {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(8));
-        assert!(coalescer.tail().is_none());
+        assert!(coalescer.buffered_rows(0..0).is_none());
         coalescer.push_batch(&batch(&segment, 0, 3, None, generations(1)));
 
-        let tail = coalescer.tail().expect("the buffered rows");
-        let frozen = tail.freeze_rows(1..3);
+        let frozen = coalescer.buffered_rows(1..3).expect("the buffered rows");
         assert_eq!(frozen.sample_numbers(), [1, 2]);
         assert_eq!(values(&frozen), [1.0, 2.0]);
         assert_eq!(coalescer.buffered_len(), 3);

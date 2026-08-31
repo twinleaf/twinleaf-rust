@@ -104,7 +104,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{ColumnBuilder, ColumnData, SampleBatch, Series};
+    use crate::data::sample::{BatchContext, SampleBatchBuilder};
+    use crate::data::ColumnData;
     use crate::tio::proto::identifiers::{ColumnId, SampleNumber};
     use crate::tio::proto::meta::{
         ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata,
@@ -217,30 +218,29 @@ mod tests {
             segment: Arc<SegmentMetadata>,
             rows: &[(SampleNumber, f64)],
         ) {
-            let sample_numbers: Vec<SampleNumber> = rows.iter().map(|(n, _)| *n).collect();
-            let mut values = ColumnBuilder::empty_for(self.column_metadata.data_type.buffer_type());
-            for (_, v) in rows {
-                values.push_data(&ColumnData::Float(*v));
-            }
-            let series = vec![Series::new(
-                self.column_key.column_id,
-                self.column_metadata.clone(),
-                values,
-            )];
-            let batch = SampleBatch::new(
-                DeviceRoute::root(),
-                None,
-                Generations {
-                    stream: stream_generation,
-                    device: 0,
-                    global: 0,
-                },
-                sample_numbers,
-                series,
-                segment,
-                self.stream.clone(),
-                self.device.clone(),
+            let mut builder = SampleBatchBuilder::new(
+                BatchContext::new(
+                    self.column_key.stream_key(),
+                    None,
+                    Generations {
+                        stream: stream_generation,
+                        device: 0,
+                        global: 0,
+                    },
+                    segment,
+                    self.stream.clone(),
+                    self.device.clone(),
+                ),
+                [(
+                    self.column_metadata.clone(),
+                    self.column_metadata.data_type.buffer_type(),
+                )],
+                rows.len(),
             );
+            for &(sample_number, value) in rows {
+                builder.push_row(sample_number, [ColumnData::Float(value)]);
+            }
+            let batch = builder.finish();
             buffer.process_batch(&batch);
         }
 
