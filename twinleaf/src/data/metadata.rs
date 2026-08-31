@@ -1,14 +1,17 @@
-//! Metadata descriptors the host retains, and the vocabulary it reads off
-//! them: a record's type, a column's buffer kind, a segment's clock.
+//! Private owned backing for borrowed protocol metadata, the point-in-time
+//! snapshots published from it, and the decoded storage class chosen for each
+//! wire data type.
 
-use super::SampleNumber;
+use super::sample::{SampleBatch, StreamKey};
+use crate::tio;
 use crate::tio::proto::{DataType, DeviceRoute, EncodeError, Packet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use twinleaf_proto::data as wire;
-use twinleaf_proto::MAX_PAYLOAD_SIZE;
+use twinleaf_proto::{ColumnId, StreamId, MAX_PAYLOAD_SIZE};
 
-pub use wire::MetadataType;
+pub(crate) use wire::MetadataType;
 
 macro_rules! metadata_record {
     ($record:ident, $kind:ident) => {
@@ -17,30 +20,31 @@ macro_rules! metadata_record {
         /// Equality is byte equality, so a field a newer device adds still
         /// counts as a change.
         #[derive(Clone, PartialEq, Eq)]
-        pub struct $record(Arc<[u8]>);
+        pub(crate) struct $record(Arc<[u8]>);
 
         impl $record {
             /// Retain a copy of `record` if it parses as this descriptor.
-            pub fn new(record: &[u8]) -> Option<Self> {
+            pub(crate) fn new(record: &[u8]) -> Option<Self> {
                 wire::$kind::parse(record)?;
                 Some(Self(Arc::from(record)))
             }
 
             /// Retain a record this host built rather than received.
-            pub fn encode(fields: wire::$kind<'_>) -> Option<Self> {
+            #[allow(dead_code)]
+            pub(crate) fn encode(fields: wire::$kind<'_>) -> Option<Self> {
                 let record = wire::Metadata::$kind(fields);
                 let mut buf = [0u8; MAX_PAYLOAD_SIZE];
                 let (_, len) = record.write_record(buf.get_mut(..record.record_len())?)?;
                 Self::new(&buf[..len])
             }
 
-            pub fn get(&self) -> wire::$kind<'_> {
+            pub(crate) fn get(&self) -> wire::$kind<'_> {
                 wire::$kind::parse(&self.0).expect("record parsed when retained")
             }
 
             /// This descriptor as an UPDATE broadcast, carrying the record
             /// exactly as retained.
-            pub fn update(&self, routing: DeviceRoute) -> Result<Packet, EncodeError> {
+            pub(crate) fn update(&self, routing: DeviceRoute) -> Result<Packet, EncodeError> {
                 Packet::metadata_record(
                     MetadataType::$kind.into(),
                     wire::MetadataFlags::UPDATE,
@@ -63,82 +67,208 @@ metadata_record!(StreamRecord, Stream);
 metadata_record!(SegmentRecord, Segment);
 metadata_record!(ColumnRecord, Column);
 
-/// Host-side classification of a column's wire type.
-pub trait DataTypeExt {
-    fn type_name(&self) -> String;
-
-    /// The buffer a column of this type lands in, defaulting undecodable wire
-    /// types to [`BufferType::Float`].
-    fn buffer_type(&self) -> BufferType;
-
-    /// The buffer a decoded column of this type lands in, or `None` for a wire
-    /// type this build does not know how to decode.
-    fn decoded_buffer_type(&self) -> Option<BufferType>;
+/// A request for metadata one route still lacks, in selectors rather than
+/// packets: the caller owns the RPC that answers it.
+#[derive(Debug, Clone)]
+pub struct MetadataQuery {
+    pub route: DeviceRoute,
+    pub selectors: Vec<wire::MetadataSelector>,
+    pub(super) generation: u32,
 }
 
-impl DataTypeExt for DataType {
-    fn type_name(&self) -> String {
-        self.to_string()
+impl MetadataQuery {
+    /// The `dev.metadata` argument for these selectors. Empty selects the
+    /// device-chosen bootstrap prefix.
+    pub fn args(&self) -> Vec<u8> {
+        self.selectors
+            .iter()
+            .flat_map(|selector| selector.encode())
+            .collect()
+    }
+}
+
+/// Point-in-time metadata for one routed stream: its identity, the device and
+/// stream that describe it, its current segment, and its columns.
+///
+/// This is the owned counterpart to the borrowed protocol views a
+/// [`SampleBatch`] returns. It holds no sample arrays and clones by pointer, so
+/// applications can keep it after dropping the batch it came from.
+#[derive(Debug, Clone)]
+pub struct StreamMetadataSnapshot(Arc<StreamMetadataInner>);
+
+#[derive(Debug)]
+struct StreamMetadataInner {
+    key: StreamKey,
+    device: DeviceRecord,
+    stream: StreamRecord,
+    segment: SegmentRecord,
+    columns: Vec<ColumnRecord>,
+}
+
+impl StreamMetadataSnapshot {
+    pub(super) fn new(
+        key: StreamKey,
+        device: DeviceRecord,
+        stream: StreamRecord,
+        segment: SegmentRecord,
+        columns: Vec<ColumnRecord>,
+    ) -> StreamMetadataSnapshot {
+        StreamMetadataSnapshot(Arc::new(StreamMetadataInner {
+            key,
+            device,
+            stream,
+            segment,
+            columns,
+        }))
     }
 
-    fn buffer_type(&self) -> BufferType {
-        self.decoded_buffer_type().unwrap_or(BufferType::Float)
+    pub fn route(&self) -> DeviceRoute {
+        self.0.key.route
     }
 
-    fn decoded_buffer_type(&self) -> Option<BufferType> {
-        Some(match *self {
-            DataType::F32 | DataType::F64 => BufferType::Float,
-
-            DataType::I8 | DataType::I16 | DataType::I24 | DataType::I32 | DataType::I64 => {
-                BufferType::Int
-            }
-
-            DataType::U8 | DataType::U16 | DataType::U24 | DataType::U32 | DataType::U64 => {
-                BufferType::UInt
-            }
-
-            _ => return None,
-        })
+    pub fn stream_key(&self) -> StreamKey {
+        self.0.key
     }
+
+    pub fn device(&self) -> wire::Device<'_> {
+        self.0.device.get()
+    }
+
+    pub fn stream(&self) -> wire::Stream<'_> {
+        self.0.stream.get()
+    }
+
+    pub fn segment(&self) -> wire::Segment<'_> {
+        self.0.segment.get()
+    }
+
+    /// The stream's columns in index order.
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
+        self.0.columns.iter().map(ColumnRecord::get)
+    }
+
+    pub fn column(&self, id: ColumnId) -> Option<wire::Column<'_>> {
+        self.columns().find(|column| column.index == id)
+    }
+
+    /// Whether `batch` has this routed stream identity and exact column
+    /// schema. Device and segment changes do not change a stream schema.
+    pub fn matches_schema(&self, batch: &SampleBatch) -> bool {
+        self.0.key == batch.stream_key()
+            && self.0.columns.len() == batch.schema().len()
+            && self
+                .0
+                .columns
+                .iter()
+                .zip(batch.schema())
+                .all(|(expected, actual)| expected == actual.record())
+    }
+
+    /// Encode the retained descriptors as byte-faithful UPDATE packets, ordered
+    /// device, stream, segment, then columns.
+    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, EncodeError> {
+        std::iter::once(self.0.device.update(self.route()))
+            .chain(self.stream_packets())
+            .collect()
+    }
+
+    /// The stream's own descriptors, without the device record it shares with
+    /// its peers.
+    fn stream_packets(&self) -> impl Iterator<Item = Result<tio::Packet, EncodeError>> + '_ {
+        let routing = self.route();
+        [
+            self.0.stream.update(routing),
+            self.0.segment.update(routing),
+        ]
+        .into_iter()
+        .chain(
+            self.0
+                .columns
+                .iter()
+                .map(move |column| column.update(routing)),
+        )
+    }
+}
+
+/// Point-in-time metadata for one device and all advertised streams.
+///
+/// The parser learns these records incrementally. A snapshot is available only
+/// after every advertised stream has a stream, current segment, and columns.
+#[derive(Debug, Clone)]
+pub struct DeviceMetadataSnapshot(Arc<DeviceMetadataInner>);
+
+#[derive(Debug)]
+struct DeviceMetadataInner {
+    route: DeviceRoute,
+    device: DeviceRecord,
+    streams: HashMap<StreamId, StreamMetadataSnapshot>,
+}
+
+impl DeviceMetadataSnapshot {
+    pub(super) fn new(
+        route: DeviceRoute,
+        device: DeviceRecord,
+        streams: HashMap<StreamId, StreamMetadataSnapshot>,
+    ) -> DeviceMetadataSnapshot {
+        DeviceMetadataSnapshot(Arc::new(DeviceMetadataInner {
+            route,
+            device,
+            streams,
+        }))
+    }
+
+    pub fn device(&self) -> wire::Device<'_> {
+        self.0.device.get()
+    }
+
+    pub fn stream(&self, stream_id: StreamId) -> Option<&StreamMetadataSnapshot> {
+        self.0.streams.get(&stream_id)
+    }
+
+    pub fn streams(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (StreamId, &StreamMetadataSnapshot)> + '_ {
+        self.0.streams.iter().map(|(&id, stream)| (id, stream))
+    }
+
+    /// Encode every retained descriptor as a byte-faithful UPDATE packet, the
+    /// device record once ahead of its streams.
+    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, EncodeError> {
+        std::iter::once(self.0.device.update(self.0.route))
+            .chain(
+                self.0
+                    .streams
+                    .values()
+                    .flat_map(StreamMetadataSnapshot::stream_packets),
+            )
+            .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn buffer_type(data_type: DataType) -> BufferType {
+    decoded_buffer_type(data_type).unwrap_or(BufferType::Float)
+}
+
+/// The storage class for a decoded column, or `None` for an unknown wire type.
+pub(crate) fn decoded_buffer_type(data_type: DataType) -> Option<BufferType> {
+    Some(match data_type {
+        DataType::F32 | DataType::F64 => BufferType::Float,
+        DataType::I8 | DataType::I16 | DataType::I24 | DataType::I32 | DataType::I64 => {
+            BufferType::Int
+        }
+        DataType::U8 | DataType::U16 | DataType::U24 | DataType::U32 | DataType::U64 => {
+            BufferType::UInt
+        }
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferType {
+pub(crate) enum BufferType {
     Float,
     Int,
     UInt,
-}
-
-/// A segment's map from sample number to time, in seconds after its epoch.
-/// Read once by a caller timestamping many rows.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SampleClock {
-    start_time: f64,
-    period: f64,
-}
-
-impl SampleClock {
-    pub(crate) fn of(segment: wire::Segment<'_>) -> Self {
-        Self {
-            start_time: f64::from(segment.start_time),
-            period: f64::from(segment.decimation) / f64::from(segment.sampling_rate),
-        }
-    }
-
-    pub(crate) fn time_at(&self, n: SampleNumber) -> f64 {
-        self.start_time + self.period * f64::from(n)
-    }
-}
-
-/// Host-side timing over a segment descriptor.
-pub trait SegmentExt {
-    fn time_at(&self, n: SampleNumber) -> f64;
-}
-
-impl SegmentExt for wire::Segment<'_> {
-    fn time_at(&self, n: SampleNumber) -> f64 {
-        SampleClock::of(*self).time_at(n)
-    }
 }
 
 #[cfg(test)]

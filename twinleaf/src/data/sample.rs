@@ -1,13 +1,94 @@
-use super::keys::StreamKey;
-use super::metadata::SampleClock;
-use super::{BufferType, ColumnId, SampleNumber, SegmentExt, SegmentId, SessionId};
-use super::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord, TimeRefSessionId};
+//! The decoded sample model: routed stream and column identity, immutable
+//! columnar batches, row views, and parser-reported continuity boundaries.
+
+use super::metadata::StreamMetadataSnapshot;
+use super::{BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
 use crate::tio;
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 use tio::proto::DeviceRoute;
 use twinleaf_proto::data as wire;
+use twinleaf_proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
+
+/// A stream within one connection or parser root.
+///
+/// The route identifies the device relative to that enclosing source. Two
+/// independent connections can therefore have the same `StreamKey`; an
+/// application combining sources must pair it with its own source identity.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
+pub struct StreamKey {
+    pub route: DeviceRoute,
+    pub stream_id: StreamId,
+}
+
+impl StreamKey {
+    pub fn new(route: DeviceRoute, stream_id: StreamId) -> Self {
+        Self { route, stream_id }
+    }
+}
+
+impl std::fmt::Display for StreamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}]:{}", self.route, self.stream_id)
+    }
+}
+
+/// A column within one routed stream.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
+pub struct ColumnKey {
+    pub route: DeviceRoute,
+    pub stream_id: StreamId,
+    pub column_id: ColumnId,
+}
+
+impl ColumnKey {
+    pub fn new(route: DeviceRoute, stream_id: StreamId, column_id: ColumnId) -> Self {
+        Self {
+            route,
+            stream_id,
+            column_id,
+        }
+    }
+
+    pub fn stream_key(&self) -> StreamKey {
+        StreamKey {
+            route: self.route,
+            stream_id: self.stream_id,
+        }
+    }
+}
+
+impl std::fmt::Display for ColumnKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}]:{}/{}", self.route, self.stream_id, self.column_id)
+    }
+}
+
+/// A segment's map from sample number to time, read once while constructing a
+/// batch so timestamping every row does not repeatedly divide its rate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SampleClock {
+    start_time: f64,
+    period: f64,
+}
+
+impl SampleClock {
+    pub(crate) fn of(segment: wire::Segment<'_>) -> Self {
+        Self {
+            start_time: f64::from(segment.start_time),
+            period: f64::from(segment.decimation) / f64::from(segment.sampling_rate),
+        }
+    }
+
+    pub(crate) fn time_at(&self, n: u32) -> f64 {
+        self.start_time + self.period * f64::from(n)
+    }
+}
+
+pub(crate) fn sample_time(segment: wire::Segment<'_>, n: u32) -> f64 {
+    SampleClock::of(segment).time_at(n)
+}
 
 #[derive(Debug, Clone)]
 pub enum ColumnData {
@@ -202,7 +283,7 @@ pub enum ColumnArray {
 
 impl ColumnArray {
     /// The buffer type whose columns land in this variant.
-    pub fn buffer_type(&self) -> BufferType {
+    pub(crate) fn buffer_type(&self) -> BufferType {
         match self {
             Self::F64(_) => BufferType::Float,
             Self::I64(_) => BufferType::Int,
@@ -320,15 +401,14 @@ pub struct Series {
 
 impl Series {
     pub fn index(&self) -> ColumnId {
-        self.metadata.get().index.into()
+        self.metadata.get().index
     }
 
     pub fn metadata(&self) -> wire::Column<'_> {
         self.metadata.get()
     }
 
-    /// The column's descriptor as retained, for a caller relaying it onward.
-    pub fn record(&self) -> &ColumnRecord {
+    pub(crate) fn record(&self) -> &ColumnRecord {
         &self.metadata
     }
 
@@ -344,7 +424,7 @@ impl Series {
     }
 }
 
-/// Rows that can enter a [`crate::data::BatchCoalescer`]: they describe the
+/// Rows that can enter a batch coalescer: they describe the
 /// batch they would form and can append themselves onto an accumulating builder.
 pub(super) trait RowSource {
     fn len(&self) -> usize;
@@ -465,7 +545,7 @@ impl SampleBatchBuilder {
         cells: impl IntoIterator<Item = ColumnData>,
     ) {
         self.sample_numbers.push(n);
-        self.timestamps.push(self.clock.time_at(n + 1));
+        self.timestamps.push(self.clock.time_at(n.value() + 1));
         let mut cells = cells.into_iter();
         for (_, values) in &mut self.columns {
             values.push_data(&cells.next().expect("one cell per column"));
@@ -569,13 +649,32 @@ impl SampleBatch {
         self.context.device.get()
     }
 
-    /// The batch's descriptors as retained, for a caller relaying them onward.
-    pub fn records(&self) -> (&DeviceRecord, &StreamRecord, &SegmentRecord) {
+    /// Retain this batch's metadata without retaining its sample arrays.
+    pub fn metadata(&self) -> StreamMetadataSnapshot {
+        StreamMetadataSnapshot::new(
+            self.context.key,
+            self.context.device.clone(),
+            self.context.stream.clone(),
+            self.context.segment.clone(),
+            self.columns
+                .iter()
+                .map(|series| series.metadata.clone())
+                .collect(),
+        )
+    }
+
+    pub(crate) fn records(&self) -> (&DeviceRecord, &StreamRecord, &SegmentRecord) {
         (
             &self.context.device,
             &self.context.stream,
             &self.context.segment,
         )
+    }
+
+    /// Encode a complete, byte-faithful metadata snapshot for this batch. See
+    /// [`StreamMetadataSnapshot::metadata_packets`].
+    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, tio::proto::EncodeError> {
+        self.metadata().metadata_packets()
     }
 
     pub fn len(&self) -> usize {
@@ -658,7 +757,7 @@ impl<'a> SampleRow<'a> {
         self.batch.context.device.get()
     }
     pub fn timestamp_begin(&self) -> f64 {
-        self.segment().time_at(self.n())
+        sample_time(self.segment(), self.n().value())
     }
     pub fn timestamp_end(&self) -> f64 {
         self.batch.timestamps[self.row]
@@ -738,10 +837,7 @@ pub enum BoundaryReason {
     /// Device session changed
     SessionChanged { old: SessionId, new: SessionId },
     /// Time reference epoch changed
-    TimeRefSessionChanged {
-        old: TimeRefSessionId,
-        new: TimeRefSessionId,
-    },
+    TimeRefSessionChanged { old: SessionId, new: SessionId },
     /// Time jumped backward unexpectedly
     TimeBackward { gap_seconds: f64 },
     /// Time jumped forward unexpectedly with no gap in sample numbers, e.g. a
@@ -810,7 +906,7 @@ impl Boundary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::records::{column, device, segment, stream};
+    use crate::data::fixtures::{column, device, segment, stream};
     use tio::proto::DataType;
 
     #[test]
@@ -833,7 +929,7 @@ mod tests {
     fn batch() -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
-                StreamKey::new(DeviceRoute::root(), 1),
+                StreamKey::new(DeviceRoute::root(), StreamId::new(1)),
                 Some(Boundary {
                     reason: BoundaryReason::Initial,
                 }),
@@ -861,9 +957,39 @@ mod tests {
             4,
         );
         for n in 0..4 {
-            builder.push_row(n, [ColumnData::Float(f64::from(n) * 10.0)]);
+            builder.push_row(
+                SampleNumber::new(n),
+                [ColumnData::Float(f64::from(n) * 10.0)],
+            );
         }
         builder.finish()
+    }
+
+    #[test]
+    fn owned_metadata_matches_only_the_same_routed_schema() {
+        let original = batch();
+        let metadata = original.metadata();
+        assert!(metadata.matches_schema(&original));
+        assert_eq!(metadata.device(), original.device());
+        assert_eq!(metadata.stream(), original.stream());
+        assert_eq!(metadata.segment(), original.segment());
+        assert_eq!(
+            metadata.columns().collect::<Vec<_>>(),
+            vec![original.schema()[0].metadata()]
+        );
+
+        let mut another_stream = original.clone();
+        another_stream.context.key.stream_id = StreamId::new(2);
+        assert!(!metadata.matches_schema(&another_stream));
+
+        let mut changed_schema = original.clone();
+        let column = changed_schema.columns[0].metadata.get();
+        changed_schema.columns[0].metadata = ColumnRecord::encode(wire::Column {
+            name: "renamed",
+            ..column
+        })
+        .unwrap();
+        assert!(!metadata.matches_schema(&changed_schema));
     }
 
     #[test]
@@ -877,7 +1003,7 @@ mod tests {
         let expected: Vec<f64> = batch
             .sample_numbers()
             .iter()
-            .map(|&n| batch.segment().time_at(n + 1))
+            .map(|&n| sample_time(batch.segment(), n.value() + 1))
             .collect();
         assert_eq!(batch.timestamps(), expected);
         assert_eq!(batch.timestamps(), [0.25, 0.5, 0.75, 1.0]);

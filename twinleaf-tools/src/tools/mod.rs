@@ -1,6 +1,3 @@
-use std::time::Instant;
-use twinleaf::tio::{self, proxy as tio_proxy};
-
 pub mod capture;
 pub mod dump;
 pub mod health;
@@ -11,20 +8,30 @@ pub mod rpc;
 pub mod simulate;
 pub mod upgrade;
 
-/// Blocks for the next packet, returning `None` once the deadline expires.
-pub fn recv_before(
-    port: &tio_proxy::Port,
+use std::time::Instant;
+use twinleaf::device::RecvError;
+use twinleaf::Receiver;
+
+/// Blocks for the next item, returning `None` once `deadline` passes. Lag is
+/// reported and skipped: what a subscription shed is not the end of it.
+pub fn recv_before<T>(
+    items: &Receiver<T>,
     deadline: Option<Instant>,
-) -> Result<Option<tio::Packet>, tio_proxy::RecvError> {
-    match deadline {
-        None => port.recv().map(Some),
-        Some(deadline) if Instant::now() >= deadline => Ok(None),
-        Some(deadline) => match port.recv_deadline(deadline) {
-            Ok(pkt) => Ok(Some(pkt)),
-            Err(tio_proxy::RecvTimeoutError::Timeout) => Ok(None),
-            Err(tio_proxy::RecvTimeoutError::ProxyDisconnected) => {
-                Err(tio_proxy::RecvError::ProxyDisconnected)
+    kind: &str,
+) -> eyre::Result<Option<T>> {
+    loop {
+        let next = match deadline {
+            Some(deadline) => items.recv_deadline(deadline),
+            None => items.recv(),
+        };
+        return match next {
+            Ok(item) => Ok(Some(item)),
+            Err(RecvError::Lagged(skipped)) => {
+                ::log::warn!("dropped {skipped} {kind}");
+                continue;
             }
-        },
+            Err(RecvError::Timeout) => Ok(None),
+            Err(error @ RecvError::Disconnected) => Err(eyre::Report::new(error)),
+        };
     }
 }

@@ -5,6 +5,7 @@ use tio::proxy;
 use twinleaf::device::{CallError, Device, RpcValue, RpcValueTypeExt};
 use twinleaf::device::{RpcMeta, RpcMetaExt, RpcValueType};
 use twinleaf::tio;
+use twinleaf::Connection;
 
 pub(crate) fn resolve_rpc_type(metadata: Option<u16>) -> RpcValueType {
     let kind = metadata
@@ -68,8 +69,8 @@ pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
 pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let proxy = proxy::Connection::open(&tio.root);
-    let device = proxy.device(tio.route);
+    let connection = Connection::open(&tio.root);
+    let device = connection.device(tio.route);
     let registry = device
         .rpc_registry()
         .wrap_err("failed to query RPC registry")
@@ -104,14 +105,14 @@ pub fn rpc(
     debug: bool,
 ) -> eyre::Result<()> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
-    let proxy = proxy::Connection::open_with(&tio.root, None, Some(status_send));
-    let device = proxy.device(tio.route);
+    let connection = Connection::open_with(&tio.root, None, Some(status_send));
+    let device = connection.device(tio.route);
 
     let outcome = call_and_print(&device, &rpc_name, rpc_arg, req_type, rep_type);
 
     // The device holds the worker too, so both must go before its status ends.
     drop(device);
-    drop(proxy);
+    drop(connection);
     if debug {
         for s in proxy_status.iter() {
             println!("{:?}", s);
@@ -169,9 +170,9 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
         rpc_name.clone()
     };
 
-    let proxy = proxy::Connection::open(&tio.root);
+    let connection = Connection::open(&tio.root);
     let route = tio.route;
-    let device = proxy.device(route);
+    let device = connection.device(route);
 
     if is_capture {
         let trigger_rpc_name = rpc_name[..rpc_name.len() - 6].to_string() + ".trigger";

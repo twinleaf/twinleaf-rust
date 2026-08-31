@@ -2,13 +2,15 @@
 
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::device::stream::{
-    DeviceEvent, NamedRoute, PumpHandle, Receiver, RecvTimeoutError, TreeEvent,
+    DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, Stream, TreeEvent,
 };
 use crate::device::{CallError, RpcArgs, RpcRegistry, RpcRegistryError, RpcReply};
+use crate::tio;
+use crate::tio::proto::route::RouteError;
 use crate::tio::proto::DeviceRoute;
-use crate::tio::proxy::{self, Connection};
+use crate::tio::proxy;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam::channel;
@@ -20,6 +22,9 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 /// Why [`DeviceTree::metadata`] returned no metadata.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 pub enum MetadataError {
+    /// The requested route is outside this tree view.
+    #[error(transparent)]
+    Route(#[from] RouteError),
     /// The device's firmware has no `dev.metadata`, so its streams can never be
     /// described. Terminal.
     #[error("the device does not report metadata")]
@@ -34,170 +39,232 @@ pub enum MetadataError {
 
 /// A reply that has not arrived yet.
 ///
-/// Blocking is just consuming it now with [`wait`](Self::wait); a caller that
-/// must keep doing other work polls [`try_get`](Self::try_get) instead. Every
-/// pending reply resolves: with the value, or with the device's or the proxy's
-/// error (the proxy times outstanding RPCs out).
-#[must_use = "the RPC is in flight; wait on the reply or poll it"]
-pub struct PendingReply {
+/// Blocking is just consuming it now with [`wait`](Self::wait). Every pending
+/// reply resolves: with the value, or with the device's or the proxy's error
+/// (the proxy times outstanding RPCs out).
+#[must_use = "the RPC is in flight; wait on the reply"]
+pub(crate) struct PendingReply {
     replies: channel::Receiver<proxy::RawCallResult>,
 }
 
 impl PendingReply {
     /// Block until the reply resolves.
-    pub fn wait(self) -> Result<Vec<u8>, CallError> {
+    pub(crate) fn wait(self) -> Result<Vec<u8>, CallError> {
         Ok(self
             .replies
             .recv()
             .unwrap_or(Err(proxy::RawCallError::ProxyClosed))?)
     }
+}
 
-    /// The reply if it has already arrived, `None` while still in flight.
-    pub fn try_get(&self) -> Option<Result<Vec<u8>, CallError>> {
-        match self.replies.try_recv() {
-            Ok(reply) => Some(reply.map_err(CallError::from)),
-            Err(channel::TryRecvError::Empty) => None,
-            Err(channel::TryRecvError::Disconnected) => Some(Err(CallError::ResponseLost)),
-        }
-    }
+/// A live link to one device tree, over serial, TCP, or UDP.
+///
+/// Opening one starts the I/O thread that owns the transport and reconnects on
+/// its own, and owns the one stream every view minted here shares. It is the
+/// whole tree at full depth: [`tree`](Connection::tree) names any subtree and
+/// [`device`](Connection::device) any single device — neither can fail here —
+/// and the three subscriptions are the same here as on any view. Cloning is
+/// free; every clone is the same connection.
+#[derive(Clone)]
+pub struct Connection {
+    tree: DeviceTree,
 }
 
 impl Connection {
-    /// The whole device tree reachable through this connection.
-    pub fn tree(&self) -> DeviceTree {
-        self.tree_with(DeviceRoute::root(), twinleaf_proto::MAX_ROUTING_SIZE, None)
-            .expect("the default RPC timeout is in range")
+    /// Open a connection to `url` and start driving its transport.
+    pub fn open(url: &str) -> Connection {
+        Self::open_with(url, None, None)
     }
 
-    /// The subtree rooted at `route`, reaching `depth` levels below it and
-    /// giving up on an RPC after `rpc_timeout` instead of the default.
-    pub fn tree_with(
-        &self,
-        route: DeviceRoute,
-        depth: usize,
-        rpc_timeout: Option<Duration>,
-    ) -> Result<DeviceTree, proxy::PortError> {
-        Ok(DeviceTree {
-            endpoint: self.rpc_endpoint(rpc_timeout, route, depth)?,
-            pump: Arc::new(Mutex::new(None)),
-        })
+    /// Open a connection that gives up on a reconnect after `reconnect_timeout`
+    /// and reports transport events to `status_queue`.
+    pub fn open_with(
+        url: &str,
+        reconnect_timeout: Option<Duration>,
+        status_queue: Option<channel::Sender<proxy::Event>>,
+    ) -> Connection {
+        Self::over(&proxy::Connection::open_with(
+            url,
+            reconnect_timeout,
+            status_queue,
+        ))
     }
 
-    /// The device at `route`. Shorthand for `self.tree().device(route)`.
-    pub fn device(&self, route: DeviceRoute) -> Device {
-        self.tree().device(route)
-    }
-
-    /// The device at `route`, giving up on an RPC after `rpc_timeout`.
-    pub fn device_with(
-        &self,
-        route: DeviceRoute,
-        rpc_timeout: Option<Duration>,
-    ) -> Result<Device, proxy::PortError> {
-        Ok(self.tree_with(route, 0, rpc_timeout)?.device(route))
-    }
-}
-
-/// A session with a routed device tree.
-///
-/// RPCs go straight to the proxy worker and block only on their own
-/// completion, so nothing else needs to run. [`subscribe`](Self::subscribe) and
-/// [`events`](Self::events) start a private pump that drains the tree's data
-/// continuously and hands out owned receivers; neither borrows the tree.
-/// Cloning is cheap: every clone is the same capability over the same proxy
-/// worker and shares the pump.
-///
-/// ```no_run
-/// use twinleaf::{Connection, DeviceRoute};
-///
-/// let tree = Connection::open("tcp://localhost").tree();
-/// let name: String = tree.get(DeviceRoute::root(), "dev.name")?;
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Clone)]
-pub struct DeviceTree {
-    endpoint: proxy::RpcEndpoint,
-    pump: Arc<Mutex<Option<PumpHandle>>>,
-}
-
-impl DeviceTree {
-    /// The device at `route`, the only way to mint a [`Device`].
-    pub fn device(&self, route: DeviceRoute) -> Device {
-        Device {
+    /// A device view of a link a proxy server already owns.
+    ///
+    /// A server keeps its own [`tio::proxy`](crate::tio::proxy) plumbing —
+    /// ports, the status queue — and asks the device layer its questions over
+    /// that transport rather than opening a second one.
+    pub fn over(proxy: &proxy::Connection) -> Connection {
+        let root = proxy
+            .rpc_endpoint(None, DeviceRoute::root(), twinleaf_proto::MAX_ROUTING_SIZE)
+            .expect("the default RPC timeout is in range");
+        Connection {
             tree: DeviceTree {
-                endpoint: self.endpoint.scoped(route, 0),
-                pump: Arc::new(Mutex::new(None)),
+                stream: Arc::new(Stream::new(root.clone())),
+                endpoint: root,
             },
         }
     }
 
-    /// Subscribe to the subtree's sample batches, each tagged with the route it
-    /// came from. The first subscription starts the pump.
-    pub fn subscribe(&self) -> Result<Receiver<SampleBatch>, proxy::PortError> {
-        self.mint(PumpHandle::batches)
-    }
-
-    /// Subscribe to the subtree's connection, metadata and invalidation events.
-    /// A new subscriber is first told the routes and metadata already known.
-    pub fn events(&self) -> Result<Receiver<TreeEvent>, proxy::PortError> {
-        self.mint(PumpHandle::events)
-    }
-
-    /// Start the pump if it is not already running, and take a receiver from it.
-    fn mint<T>(
-        &self,
-        subscribe: impl Fn(&PumpHandle) -> Option<Receiver<T>>,
-    ) -> Result<Receiver<T>, proxy::PortError> {
-        let mut pump = self.pump.lock().expect("the stream pump lock is poisoned");
-        if let Some(receiver) = pump.as_ref().and_then(&subscribe) {
-            return Ok(receiver);
+    /// The tree at and below `route`: the whole tree from the root route.
+    /// [`to_depth`](DeviceTree::to_depth) and
+    /// [`with_timeout`](DeviceTree::with_timeout) narrow the view further.
+    ///
+    /// Every route is under the connection's root, so this cannot fail; only
+    /// narrowing an already-narrowed view can.
+    pub fn tree(&self, route: DeviceRoute) -> DeviceTree {
+        DeviceTree {
+            endpoint: self
+                .tree
+                .endpoint
+                .subtree(route)
+                .expect("every route is under the connection's root"),
+            stream: self.tree.stream.clone(),
         }
-        let handle = PumpHandle::start(&self.endpoint)?;
-        let receiver = subscribe(&handle).ok_or(proxy::PortError::FailedNewClientSetup)?;
-        *pump = Some(handle);
-        Ok(receiver)
+    }
+
+    /// The device at `route`. Shorthand for `self.tree(route)` narrowed to
+    /// exactly that node, with the same infallibility.
+    pub fn device(&self, route: DeviceRoute) -> Device {
+        self.tree
+            .device(route)
+            .expect("every route is under the connection's root")
+    }
+
+    /// Subscribe to every route's sample batches. See [`DeviceTree::samples`].
+    pub fn samples(&self) -> Receiver<SampleBatch> {
+        self.tree.samples()
+    }
+
+    /// Subscribe to every route's events. See [`DeviceTree::events`].
+    pub fn events(&self) -> Receiver<Event> {
+        self.tree.events()
+    }
+
+    /// Subscribe to the connection's whole packet stream. See
+    /// [`DeviceTree::packets`].
+    pub fn packets(&self) -> Receiver<tio::Packet> {
+        self.tree.packets()
+    }
+}
+
+/// A routed view of a device tree.
+///
+/// Use this view when the target route varies from one operation to the next;
+/// [`Device`] binds one route for repeated operations on the same device. RPCs
+/// go straight to the proxy worker and block only on their own completion, so
+/// nothing else needs to run. [`samples`](Self::samples),
+/// [`events`](Self::events) and [`packets`](Self::packets) take owned
+/// receivers from the connection's one stream, filtered to this subtree and
+/// carrying absolute routes; each holds the stream it came from, so it keeps
+/// delivering once every view is dropped. Cloning is cheap: every clone is the
+/// same capability over the same proxy worker.
+///
+/// ```no_run
+/// use twinleaf::{Connection, DeviceRoute};
+///
+/// let root = DeviceRoute::root();
+/// let tree = Connection::open("tcp://localhost").tree(root);
+/// let name: String = tree.get(root, "dev.name").expect("read device name");
+/// ```
+#[derive(Clone)]
+pub struct DeviceTree {
+    endpoint: proxy::RpcEndpoint,
+    stream: Arc<Stream>,
+}
+
+impl DeviceTree {
+    /// The device at `route`, the only way to mint a [`Device`].
+    ///
+    /// Fails when `route` lies outside the subtree this view covers; that the
+    /// device is there is proven by its first RPC, not here.
+    pub fn device(&self, route: DeviceRoute) -> Result<Device, RouteError> {
+        Ok(Device {
+            tree: DeviceTree {
+                endpoint: self.endpoint.scoped(route)?,
+                stream: self.stream.clone(),
+            },
+        })
+    }
+
+    /// The same view reaching no deeper than `depth` levels below its root.
+    pub fn to_depth(&self, depth: usize) -> DeviceTree {
+        DeviceTree {
+            endpoint: self.endpoint.to_depth(depth),
+            stream: self.stream.clone(),
+        }
+    }
+
+    /// The same view giving up on its own RPCs after `rpc_timeout` instead of
+    /// the default. The connection's shared metadata discovery keeps the
+    /// default.
+    pub fn with_timeout(&self, rpc_timeout: Duration) -> DeviceTree {
+        DeviceTree {
+            endpoint: self.endpoint.with_timeout(rpc_timeout),
+            stream: self.stream.clone(),
+        }
+    }
+
+    /// Subscribe to the subtree's sample batches, each tagged with the route it
+    /// came from. The first subscription on the connection starts its pump.
+    pub fn samples(&self) -> Receiver<SampleBatch> {
+        self.stream.batches(Scope::of(&self.endpoint))
+    }
+
+    /// Subscribe to the subtree's facts: the link's, the population's, and
+    /// each covered device's. A new subscriber is first told the routes and
+    /// metadata already known.
+    pub fn events(&self) -> Receiver<Event> {
+        self.stream.events(Scope::of(&self.endpoint))
+    }
+
+    /// Subscribe to the subtree's packets as they arrive on the wire, before
+    /// anything parses them. A tap is passive: it neither decodes samples nor
+    /// asks a device to describe itself.
+    pub fn packets(&self) -> Receiver<tio::Packet> {
+        self.stream.packets(Scope::of(&self.endpoint))
     }
 
     /// Collect complete metadata for `route`, waiting up to `METADATA_TIMEOUT`.
+    /// A route outside this view is rejected before waiting.
     pub fn metadata(&self, route: DeviceRoute) -> Result<DeviceMetadataSnapshot, MetadataError> {
-        let events = self.events().map_err(|_| MetadataError::Disconnected)?;
+        self.endpoint.scoped(route)?;
+        let events = self.events();
         let deadline = Instant::now() + METADATA_TIMEOUT;
         loop {
             let event = match events.recv_deadline(deadline) {
                 Ok(event) => event,
-                Err(RecvTimeoutError::Lagged(_)) => continue,
-                Err(RecvTimeoutError::Timeout) => return Err(MetadataError::Timeout),
-                Err(RecvTimeoutError::Disconnected) => return Err(MetadataError::Disconnected),
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Timeout) => return Err(MetadataError::Timeout),
+                Err(RecvError::Disconnected) => return Err(MetadataError::Disconnected),
             };
-            let TreeEvent::Device { route: from, event } = event else {
-                continue;
-            };
-            if from != route {
-                continue;
-            }
             match event {
-                DeviceEvent::MetadataReady(snapshot) => return Ok(snapshot),
-                DeviceEvent::MetadataUnavailable => return Err(MetadataError::Unsupported),
-                DeviceEvent::Status(_)
-                | DeviceEvent::RpcInvalidated(_)
-                | DeviceEvent::Heartbeat { .. }
-                | DeviceEvent::NewHash(_) => {}
+                Event::Device { route: from, event } if from == route => match event {
+                    DeviceEvent::Metadata(snapshot) => return Ok(snapshot),
+                    DeviceEvent::MetadataUnavailable => return Err(MetadataError::Unsupported),
+                    DeviceEvent::Heartbeat { .. }
+                    | DeviceEvent::RpcInvalidated(_)
+                    | DeviceEvent::NewHash(_) => {}
+                },
+                Event::Device { .. } | Event::Tree { .. } | Event::Link { .. } => {}
             }
         }
     }
 
     /// Passively observe the subtree for `window` and return the routes seen, sorted.
     pub fn discover_routes(&self, window: Duration) -> Vec<DeviceRoute> {
-        let Ok(events) = self.events() else {
-            return Vec::new();
-        };
+        let events = self.events();
         let deadline = Instant::now() + window;
         let mut routes = Vec::new();
         loop {
             match events.recv_deadline(deadline) {
-                Ok(TreeEvent::RouteDiscovered(route)) => routes.push(route),
-                Ok(TreeEvent::Device { .. }) | Err(RecvTimeoutError::Lagged(_)) => {}
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+                Ok(Event::Tree {
+                    route,
+                    event: TreeEvent::RouteDiscovered,
+                }) => routes.push(route),
+                Ok(Event::Device { .. }) | Ok(Event::Link { .. }) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Timeout) | Err(RecvError::Disconnected) => break,
             }
         }
         routes.sort();
@@ -222,7 +289,10 @@ impl DeviceTree {
     }
 
     /// Issue an RPC without waiting for its reply.
-    pub fn submit(
+    ///
+    /// This stays private until the asynchronous reply type is part of the
+    /// public API; the blocking routed methods below are public.
+    pub(crate) fn submit(
         &self,
         route: DeviceRoute,
         name: &str,
@@ -233,6 +303,9 @@ impl DeviceTree {
         })
     }
 
+    /// Call `name` at `route` with already encoded arguments and return the raw
+    /// reply. An out-of-scope route returns [`CallError::InvalidRoute`] without
+    /// submitting a request.
     pub fn raw_rpc(
         &self,
         route: DeviceRoute,
@@ -242,6 +315,8 @@ impl DeviceTree {
         self.submit(route, name, arg)?.wait()
     }
 
+    /// Call a typed RPC at `route`, encoding its arguments and decoding its
+    /// reply.
     pub fn rpc<ReqT: RpcArgs, RepT: RpcReply>(
         &self,
         route: DeviceRoute,
@@ -252,10 +327,12 @@ impl DeviceTree {
         RepT::decode_reply(&ret).map_err(CallError::InvalidReply)
     }
 
+    /// Call a no-argument RPC at `route` that returns no value.
     pub fn action(&self, route: DeviceRoute, name: &str) -> Result<(), CallError> {
         self.rpc(route, name, ())
     }
 
+    /// Call a no-argument RPC at `route` and decode its reply as `T`.
     pub fn get<T: RpcReply>(&self, route: DeviceRoute, name: &str) -> Result<T, CallError> {
         self.rpc(route, name, ())
     }
@@ -272,16 +349,16 @@ impl DeviceTree {
 
 /// A route-free view of one exact device, minted by [`DeviceTree::device`].
 ///
-/// An exact, depth-zero [`DeviceTree`] slice: the session can only address
-/// its own root route, so this wrapper removes route arguments. Use
-/// [`DeviceTree`] directly to address a subtree.
+/// An exact, depth-zero [`DeviceTree`] slice. It is cheap to create and does
+/// not contact the device; the first operation establishes whether the device
+/// exists. Use it when several operations share one route, and use
+/// [`DeviceTree`] when the route varies between operations.
 ///
 /// ```no_run
 /// use twinleaf::{Connection, DeviceRoute};
 ///
 /// let device = Connection::open("tcp://localhost").device(DeviceRoute::root());
-/// let name: String = device.rpc("dev.name", ())?;
-/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// let name: String = device.rpc("dev.name", ()).expect("read device name");
 /// ```
 #[derive(Clone)]
 pub struct Device {
@@ -293,14 +370,20 @@ impl Device {
         self.tree.endpoint.scope()
     }
 
-    /// Subscribe to this device's sample batches. See [`DeviceTree::subscribe`].
-    pub fn subscribe(&self) -> Result<Receiver<SampleBatch>, proxy::PortError> {
-        self.tree.subscribe()
+    /// Subscribe to this device's sample batches. See [`DeviceTree::samples`].
+    pub fn samples(&self) -> Receiver<SampleBatch> {
+        self.tree.samples()
     }
 
-    /// Subscribe to this device's events. See [`DeviceTree::events`].
-    pub fn events(&self) -> Result<Receiver<TreeEvent>, proxy::PortError> {
+    /// Subscribe to this device's facts, and the link's. See
+    /// [`DeviceTree::events`].
+    pub fn events(&self) -> Receiver<Event> {
         self.tree.events()
+    }
+
+    /// Subscribe to this device's packets. See [`DeviceTree::packets`].
+    pub fn packets(&self) -> Receiver<tio::Packet> {
+        self.tree.packets()
     }
 
     /// Collect this device's metadata. See [`DeviceTree::metadata`].
@@ -308,8 +391,16 @@ impl Device {
         self.tree.metadata(self.route())
     }
 
-    /// Issue an RPC without waiting for its reply. See [`DeviceTree::submit`].
-    pub fn submit(&self, name: &str, arg: &[u8]) -> Result<PendingReply, CallError> {
+    /// The same device giving up on its RPCs after `rpc_timeout` instead of
+    /// the default.
+    pub fn with_timeout(&self, rpc_timeout: Duration) -> Device {
+        Device {
+            tree: self.tree.with_timeout(rpc_timeout),
+        }
+    }
+
+    /// Issue an RPC without waiting for its reply.
+    pub(crate) fn submit(&self, name: &str, arg: &[u8]) -> Result<PendingReply, CallError> {
         self.tree.submit(self.route(), name, arg)
     }
 
@@ -333,24 +424,26 @@ impl Device {
         self.tree.get(self.route(), name)
     }
 
-    /// The RPCs this device offers. See [`DeviceTree::rpc_registry`].
+    /// The RPCs this device offers, from the on-disk cache when its
+    /// `rpc.hash` still matches, otherwise by walking `rpc.listinfo`.
     pub fn rpc_registry(&self) -> Result<RpcRegistry, RpcRegistryError> {
         self.tree.rpc_registry(self.route())
     }
 
-    /// Test-only device with no proxy behind it. Returns the device and the far
-    /// end receiving the calls it submits.
+    /// Test-only device with no proxy behind it. Returns the device, the far
+    /// end receiving the calls it submits, and the worker's lifeline.
     #[cfg(test)]
     pub(crate) fn test_pair() -> (
         Device,
         channel::Receiver<crate::tio::proxy_core::ProxyCommand>,
+        channel::Sender<()>,
     ) {
-        let (endpoint, commands) = proxy::RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+        let (endpoint, commands, worker) = proxy::RpcEndpoint::test_pair(DeviceRoute::root(), 0);
         let tree = DeviceTree {
+            stream: Arc::new(Stream::new(endpoint.clone())),
             endpoint,
-            pump: Arc::new(Mutex::new(None)),
         };
-        (Device { tree }, commands)
+        (Device { tree }, commands, worker)
     }
 }
 
@@ -363,14 +456,56 @@ mod tests {
     use std::thread;
     use twinleaf_proto::rpc as wire_rpc;
 
-    fn test_tree() -> (DeviceTree, channel::Receiver<ProxyCommand>) {
-        let (device, commands) = Device::test_pair();
-        (device.tree, commands)
+    fn test_tree() -> (
+        DeviceTree,
+        channel::Receiver<ProxyCommand>,
+        channel::Sender<()>,
+    ) {
+        let (device, commands, worker) = Device::test_pair();
+        (device.tree, commands, worker)
+    }
+
+    /// A view may not mint one that reaches further than itself: containment is
+    /// checked here, existence at the first RPC.
+    #[test]
+    fn a_device_must_lie_within_the_trees_scope_and_depth() {
+        let route = |text: &str| text.parse::<DeviceRoute>().expect("a valid route");
+        let (endpoint, _commands, _worker) = proxy::RpcEndpoint::test_pair(route("/1"), 1);
+        let tree = DeviceTree {
+            stream: Arc::new(Stream::new(endpoint.clone())),
+            endpoint,
+        };
+
+        assert!(tree.device(route("/1")).is_ok());
+        assert!(tree.device(route("/1/2")).is_ok());
+        assert!(matches!(
+            tree.device(route("/2")),
+            Err(RouteError::OutsideSubtree)
+        ));
+        assert!(matches!(
+            tree.device(route("/1/2/3")),
+            Err(RouteError::OutsideSubtree)
+        ));
+    }
+
+    #[test]
+    fn metadata_rejects_a_route_outside_the_tree_before_waiting() {
+        let route = |text: &str| text.parse::<DeviceRoute>().expect("a valid route");
+        let (endpoint, _commands, _worker) = proxy::RpcEndpoint::test_pair(route("/1"), 1);
+        let tree = DeviceTree {
+            stream: Arc::new(Stream::new(endpoint.clone())),
+            endpoint,
+        };
+
+        assert!(matches!(
+            tree.metadata(route("/2")),
+            Err(MetadataError::Route(RouteError::OutsideSubtree))
+        ));
     }
 
     #[test]
     fn a_blocking_rpc_waits_on_its_own_completion() {
-        let (tree, commands) = test_tree();
+        let (tree, commands, _worker) = test_tree();
         let responder = thread::spawn(move || {
             let ProxyCommand::Call {
                 request, result, ..
@@ -392,7 +527,7 @@ mod tests {
 
     #[test]
     fn concurrent_typed_rpcs_complete_out_of_order() {
-        let (tree, commands) = test_tree();
+        let (tree, commands, _worker) = test_tree();
         let responder = thread::spawn(move || {
             let in_flight: Vec<_> = (0..2).map(|_| commands.recv().unwrap()).collect();
             for call in in_flight.into_iter().rev() {
@@ -425,7 +560,7 @@ mod tests {
 
     #[test]
     fn raw_call_failures_map_to_typed_call_errors() {
-        let (tree, commands) = test_tree();
+        let (tree, commands, _worker) = test_tree();
         let responder = thread::spawn(move || {
             let failures = [
                 Some(RawCallError::Device {

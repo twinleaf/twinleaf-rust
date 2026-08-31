@@ -96,19 +96,19 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::records;
+    use crate::data::fixtures;
     use crate::data::sample::{BatchContext, Boundary, BoundaryReason, ColumnArray, ColumnData};
     use crate::data::StreamKey;
     use crate::data::StreamRecord;
-    use crate::data::{BufferType, ColumnRecord, DeviceRecord, SampleNumber, SegmentRecord};
+    use crate::data::{BufferType, ColumnRecord, DeviceRecord, SegmentRecord};
     use crate::tio::proto::{DataType, DeviceRoute};
     use twinleaf_proto::data as wire;
 
     fn segment(segment_id: u8) -> SegmentRecord {
         SegmentRecord::encode(wire::Segment {
-            segment_id,
+            segment_id: twinleaf_proto::SegmentId::new(segment_id),
             sampling_rate: 4,
-            ..records::segment(1)
+            ..fixtures::segment(1)
         })
         .unwrap()
     }
@@ -117,33 +117,36 @@ mod tests {
     /// sample numbers.
     fn batch(
         segment: &SegmentRecord,
-        first: SampleNumber,
+        first: u32,
         rows: u32,
         boundary: Option<Boundary>,
         generations: Generations,
     ) -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
-                StreamKey::new(DeviceRoute::root(), 1),
+                StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(1)),
                 boundary,
                 generations,
                 segment.clone(),
                 StreamRecord::encode(wire::Stream {
                     n_segments: 2,
                     sample_size: 8,
-                    ..records::stream(1)
+                    ..fixtures::stream(1)
                 })
                 .unwrap(),
-                DeviceRecord::encode(records::device()).unwrap(),
+                DeviceRecord::encode(fixtures::device()).unwrap(),
             ),
             [(
-                ColumnRecord::encode(records::column(1, 0, DataType::F64)).unwrap(),
+                ColumnRecord::encode(fixtures::column(1, 0, DataType::F64)).unwrap(),
                 BufferType::Float,
             )],
             rows as usize,
         );
         for n in first..first + rows {
-            builder.push_row(n, [ColumnData::Float(f64::from(n))]);
+            builder.push_row(
+                twinleaf_proto::SampleNumber::new(n),
+                [ColumnData::Float(f64::from(n))],
+            );
         }
         builder.finish()
     }
@@ -218,8 +221,8 @@ mod tests {
             2,
             Some(Boundary {
                 reason: BoundaryReason::SamplesLost {
-                    expected: 2,
-                    received: 2,
+                    expected: twinleaf_proto::SampleNumber::new(2),
+                    received: twinleaf_proto::SampleNumber::new(2),
                 },
             }),
             generations(1),

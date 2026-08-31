@@ -1,6 +1,6 @@
 use crate::data::{
-    Boundary, ColumnArray, ColumnFilter, ColumnId, ColumnRecord, DeviceRecord, Generations,
-    SampleBatch, Series, StreamKey, StreamRecord,
+    Boundary, ColumnArray, ColumnFilter, ColumnRecord, DeviceRecord, Generations, SampleBatch,
+    Series, StreamKey, StreamRecord,
 };
 use crate::tio::proto::DeviceRoute;
 use hdf5::filters::{Blosc, BloscShuffle};
@@ -10,6 +10,7 @@ use hdf5_sys::h5d::H5Dwrite;
 use hdf5_sys::h5p::H5P_DEFAULT;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use twinleaf_proto::{ColumnId, SampleNumber};
 
 type TableIndex = u64;
 
@@ -244,7 +245,7 @@ impl Hdf5Appender {
                 log::info!(
                     "[{}] sample_n={} boundary={:?}",
                     batch.stream().name,
-                    batch.first_sample().unwrap_or(0),
+                    batch.first_sample().unwrap_or(SampleNumber::new(0)),
                     boundary.reason
                 );
             }
@@ -408,7 +409,7 @@ impl Hdf5Appender {
                 match source {
                     FieldSource::Sample => {
                         for i in 0..n {
-                            let bytes = batch.sample_numbers()[i].to_ne_bytes();
+                            let bytes = batch.sample_numbers()[i].value().to_ne_bytes();
                             let base = i * row_size + offset;
                             buf[base..base + bytes.len()].copy_from_slice(&bytes);
                         }
@@ -490,7 +491,7 @@ impl Hdf5Appender {
         self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
         self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
         self.write_attr_scalar(loc, "session_id", &batch.device().session.value())?;
-        self.write_attr_scalar(loc, "stream_id", &batch.stream().stream_id)?;
+        self.write_attr_scalar(loc, "stream_id", &batch.stream().stream_id.value())?;
         self.write_attr_string(loc, "stream_name", batch.stream().name)?;
         self.write_attr_string(loc, "device_serial", batch.device().serial)?;
         self.write_attr_string(loc, "firmware_hash", batch.device().firmware)?;
@@ -591,8 +592,8 @@ fn to_vlu(s: &str) -> VarLenUnicode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::metadata::{DataTypeExt, DeviceRecord, SegmentRecord, StreamRecord};
-    use crate::data::records;
+    use crate::data::fixtures;
+    use crate::data::metadata::{buffer_type, DeviceRecord, SegmentRecord, StreamRecord};
     use crate::data::sample::{BatchContext, SampleBatchBuilder};
     use crate::data::{BoundaryReason, ColumnData};
     use crate::tio::proto::DataType;
@@ -602,7 +603,10 @@ mod tests {
     use twinleaf_proto::data as wire;
 
     fn key(stream_id: u8) -> StreamKey {
-        StreamKey::new(DeviceRoute::root(), stream_id)
+        StreamKey::new(
+            DeviceRoute::root(),
+            twinleaf_proto::StreamId::new(stream_id),
+        )
     }
 
     /// Generations as the parser stamps them for a stream whose own run is `stream`:
@@ -618,8 +622,8 @@ mod tests {
     fn lost() -> Boundary {
         Boundary {
             reason: BoundaryReason::SamplesLost {
-                expected: 2,
-                received: 9,
+                expected: SampleNumber::new(2),
+                received: SampleNumber::new(9),
             },
         }
     }
@@ -638,7 +642,7 @@ mod tests {
             name: column_name,
             units: "V",
             description: "test column",
-            ..records::column(stream_id, 0, DataType::F32)
+            ..fixtures::column(stream_id, 0, DataType::F32)
         })
         .unwrap();
         let mut builder = SampleBatchBuilder::new(
@@ -651,27 +655,27 @@ mod tests {
                     global: 0,
                 },
                 SegmentRecord::encode(wire::Segment {
-                    segment_id: 1,
+                    segment_id: twinleaf_proto::SegmentId::new(1),
                     start_time,
-                    ..records::segment(stream_id)
+                    ..fixtures::segment(stream_id)
                 })
                 .unwrap(),
                 StreamRecord::encode(wire::Stream {
                     name: stream_name,
                     buf_samples: 1,
-                    ..records::stream(stream_id)
+                    ..fixtures::stream(stream_id)
                 })
                 .unwrap(),
                 DeviceRecord::encode(wire::Device {
                     n_streams: 2,
-                    ..records::device()
+                    ..fixtures::device()
                 })
                 .unwrap(),
             ),
-            [(column.clone(), column.get().data_type.buffer_type())],
+            [(column.clone(), buffer_type(column.get().data_type))],
             1,
         );
-        builder.push_row(0, [ColumnData::Float(1.0)]);
+        builder.push_row(SampleNumber::new(0), [ColumnData::Float(1.0)]);
         builder.finish()
     }
 
@@ -709,7 +713,10 @@ mod tests {
             },
             lost(),
             Boundary {
-                reason: BoundaryReason::SessionChanged { old: 1, new: 2 },
+                reason: BoundaryReason::SessionChanged {
+                    old: twinleaf_proto::SessionId::new(1),
+                    new: twinleaf_proto::SessionId::new(2),
+                },
             },
         ];
         // Data loss is still monotonic, so only the session change splits there.

@@ -9,7 +9,7 @@
 use crate::tui::rpc_palette::{PaletteEvent, RpcPalette, RpcPaletteStatus, RpcReq};
 use crate::tui::rpc_state::RouteRpcState;
 use crate::tui::rpc_worker::{PendingRpc, RegistryQueue};
-use crate::{HealthCli, ProxyHelp};
+use crate::HealthCli;
 use chrono::{DateTime, Local};
 use crossbeam::channel;
 use ratatui::{
@@ -35,9 +35,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryReason, ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord},
-    device::{DeviceEvent, DeviceRoute, RecvError, RpcRegistry, TreeEvent},
-    tio,
+    data::{BoundaryReason, StreamKey, StreamMetadataSnapshot},
+    device::{
+        DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError, RpcRegistry,
+        TreeEvent,
+    },
+    tio, Connection, SampleNumber, SessionId, StreamId,
 };
 
 pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
@@ -218,9 +221,9 @@ struct StreamStats {
     jitter_ms: f64,
     jitter_window: Option<TimeWindow>,
 
-    last_n: Option<u32>,
+    last_n: Option<SampleNumber>,
     samples_dropped: u64,
-    current_session_id: Option<u32>,
+    current_session_id: Option<SessionId>,
 
     rate_slope: OnlineSlope,
     received_count: u64,
@@ -230,15 +233,18 @@ struct StreamStats {
     last_seen: Option<Instant>,
 
     // Last-known metadata; deliberately survives the reset methods.
-    last_device: Option<DeviceRecord>,
-    last_stream: Option<StreamRecord>,
-    last_segment: Option<SegmentRecord>,
-    last_schema: Vec<ColumnRecord>,
+    metadata: Option<StreamMetadataSnapshot>,
     recent_boundaries: VecDeque<(SystemTime, BoundaryReason)>,
 }
 
 impl StreamStats {
-    fn on_sample(&mut self, sample_n: u32, t_data: f64, now: Instant, jitter_window_s: u64) {
+    fn on_sample(
+        &mut self,
+        sample_n: SampleNumber,
+        t_data: f64,
+        now: Instant,
+        jitter_window_s: u64,
+    ) {
         if self.host_epoch.is_none() {
             self.host_epoch = Some(now);
         }
@@ -290,7 +296,7 @@ impl StreamStats {
         self.last_n = None;
     }
 
-    fn reset_for_new_session(&mut self, session_id: u32) {
+    fn reset_for_new_session(&mut self, session_id: SessionId) {
         self.reset_timing();
         self.samples_dropped = 0;
         self.current_session_id = Some(session_id);
@@ -588,7 +594,7 @@ impl HealthState {
         let sid = batch.stream().stream_id;
 
         if let Some(filter) = &self.streams_filter {
-            if !filter.contains(&sid) {
+            if !filter.contains(&sid.value()) {
                 return;
             }
         }
@@ -596,16 +602,14 @@ impl HealthState {
         let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
             name: batch.stream().name.to_string(),
-            current_session_id: Some(batch.device().session.value()),
+            current_session_id: Some(batch.device().session),
             ..Default::default()
         });
 
-        let (device, stream, segment) = batch.records();
         st.name = batch.stream().name.to_string();
-        st.last_device = Some(device.clone());
-        st.last_stream = Some(stream.clone());
-        st.last_segment = Some(segment.clone());
-        st.last_schema = batch.schema().iter().map(|s| s.record().clone()).collect();
+        if st.metadata.is_none() || batch.boundary().is_some() {
+            st.metadata = Some(batch.metadata());
+        }
 
         if let Some(boundary) = batch.boundary() {
             self.handle_boundary(&boundary.reason, &route, batch.stream().name, sid);
@@ -625,7 +629,7 @@ impl HealthState {
         reason: &BoundaryReason,
         route: &DeviceRoute,
         stream_name: &str,
-        stream_id: u8,
+        stream_id: StreamId,
     ) {
         let key = StreamKey::new(*route, stream_id);
         if let Some(st) = self.stats.get_mut(&key) {
@@ -725,9 +729,46 @@ impl HealthState {
         }
     }
 
-    fn handle_event(&mut self, event: TreeEvent, now: Instant, registries: &mut RegistryQueue) {
+    fn handle_event(&mut self, event: StreamEvent, now: Instant, registries: &mut RegistryQueue) {
         match event {
-            TreeEvent::RouteDiscovered(route) => {
+            StreamEvent::Link {
+                subtree,
+                event: LinkEvent::Status(status),
+            } => {
+                self.log_event(format!("[{}] STATUS: {:?}", subtree, status), Color::Yellow);
+                let affected: Vec<DeviceRoute> = self
+                    .device_states
+                    .keys()
+                    .filter(|route| subtree.relative_route(route).is_ok())
+                    .copied()
+                    .collect();
+                for route in affected {
+                    if self.rpc_routes.entry(route).or_default().on_status(status) {
+                        registries.fetch(route);
+                    }
+                }
+                if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
+                    for (key, st) in &mut self.stats {
+                        if subtree.relative_route(&key.route).is_ok() {
+                            st.reset_timing();
+                            st.rate_slope.reset();
+                            st.received_count = 0;
+                            st.rate_smps = 0.0;
+                            st.host_epoch = None;
+                        }
+                    }
+                }
+            }
+            StreamEvent::Link {
+                event: LinkEvent::InputOverrun,
+                ..
+            } => {
+                self.log_event("INPUT OVERRUN: samples were lost".into(), Color::Red);
+            }
+            StreamEvent::Tree {
+                route,
+                event: TreeEvent::RouteDiscovered,
+            } => {
                 self.device_states.entry(route).or_default();
                 self.log_event(format!("[{}] ROUTE DISCOVERED", route), Color::Green);
                 if self
@@ -739,76 +780,43 @@ impl HealthState {
                     registries.fetch(route);
                 }
             }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::Heartbeat { session_id },
-            } => {
-                if self
-                    .rpc_routes
-                    .entry(route)
-                    .or_default()
-                    .on_heartbeat(session_id)
-                {
-                    registries.fetch(route);
+            StreamEvent::Device { route, event } => match event {
+                DeviceEvent::Heartbeat { session_id } => {
+                    if self
+                        .rpc_routes
+                        .entry(route)
+                        .or_default()
+                        .on_heartbeat(session_id)
+                    {
+                        registries.fetch(route);
+                    }
+                    self.device_states
+                        .entry(route)
+                        .or_default()
+                        .on_heartbeat(now);
                 }
-                self.device_states
-                    .entry(route)
-                    .or_default()
-                    .on_heartbeat(now);
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::Status(status),
-            } => {
-                self.log_event(format!("[{}] STATUS: {:?}", route, status), Color::Yellow);
-                if self.rpc_routes.entry(route).or_default().on_status(status) {
-                    registries.fetch(route);
+                DeviceEvent::RpcInvalidated(method) => {
+                    self.log_event(
+                        format!("[{}] RPC INVALIDATED: {:?}", route, method),
+                        Color::Cyan,
+                    );
                 }
-                if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
-                    for (key, st) in self.stats.iter_mut() {
-                        if key.route == route {
-                            st.reset_timing();
-                            st.rate_slope.reset();
-                            st.received_count = 0;
-                            st.rate_smps = 0.0;
-                            st.host_epoch = None;
-                        }
+                DeviceEvent::Metadata(snapshot) => {
+                    self.log_event(
+                        format!("[{}] METADATA: {}", route, snapshot.device().name),
+                        Color::Green,
+                    );
+                }
+                DeviceEvent::MetadataUnavailable => {
+                    self.log_event(format!("[{}] NO METADATA SUPPORT", route), Color::Red);
+                }
+                DeviceEvent::NewHash(hash) => {
+                    self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Color::Green);
+                    if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
+                        registries.fetch(route);
                     }
                 }
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::RpcInvalidated(method),
-            } => {
-                self.log_event(
-                    format!("[{}] RPC INVALIDATED: {:?}", route, method),
-                    Color::Cyan,
-                );
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::MetadataReady(metadata),
-            } => {
-                self.log_event(
-                    format!("[{}] METADATA READY: {}", route, metadata.device.get().name),
-                    Color::Green,
-                );
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::MetadataUnavailable,
-            } => {
-                self.log_event(format!("[{}] NO METADATA SUPPORT", route), Color::Red);
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::NewHash(hash),
-            } => {
-                self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Color::Green);
-                if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
-                    registries.fetch(route);
-                }
-            }
+            },
         }
     }
 
@@ -978,14 +986,14 @@ impl HealthState {
 struct DisplayRow {
     key: StreamKey,
     route: String,
-    stream_id: u8,
+    stream_id: StreamId,
     name: String,
     rate_smps: f64,
     drift_s: f64,
     ppm: f64,
     jitter_ms: f64,
     samples_dropped: u64,
-    last_n: Option<u32>,
+    last_n: Option<SampleNumber>,
     last_data: Option<f64>,
     elapsed_time: Option<f64>,
     age_s: Option<f64>,
@@ -1062,7 +1070,7 @@ impl DisplayRow {
                 None => Cell::from("-"),
             }
         } else {
-            Cell::from(format!("{}", self.last_n.unwrap_or(0)))
+            Cell::from(format!("{}", self.last_n.unwrap_or(SampleNumber::new(0))))
         };
         Row::new(vec![
             Cell::from(route_cell.to_string()).style(style),
@@ -1162,22 +1170,23 @@ fn draw_detail_pane(
             .collect()
     }
 
-    fn column_cells(schema: &[ColumnRecord]) -> Vec<(Vec<Span<'static>>, usize, usize)> {
+    fn column_cells<'a>(
+        schema: impl ExactSizeIterator<Item = twinleaf_proto::data::Column<'a>>,
+    ) -> Vec<(Vec<Span<'static>>, usize, usize)> {
+        let len = schema.len();
         schema
-            .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let c = c.get();
-                let mut spans = vec![Span::raw(c.name.to_string())];
-                let mut nat = c.name.len();
-                if !c.units.is_empty() {
+            .map(|(i, column)| {
+                let mut spans = vec![Span::raw(column.name.to_string())];
+                let mut nat = column.name.len();
+                if !column.units.is_empty() {
                     spans.push(Span::styled(
-                        format!(" ({})", c.units),
+                        format!(" ({})", column.units),
                         Style::default().fg(Color::DarkGray),
                     ));
-                    nat += c.units.len() + 3;
+                    nat += column.units.len() + 3;
                 }
-                if i + 1 < schema.len() {
+                if i + 1 < len {
                     spans.push(Span::raw(", "));
                     nat += 2;
                 }
@@ -1186,39 +1195,39 @@ fn draw_detail_pane(
             .collect()
     }
 
-    let device_row = st.last_device.as_ref().map(|d| {
-        let d = d.get();
+    let device_row = st.metadata.as_ref().map(|metadata| {
+        let device = metadata.device();
         (
-            d.name.to_string(),
+            device.name.to_string(),
             vec![
-                ("serial", d.serial.to_string()),
-                ("session", format!("{:#010x}", d.session.value())),
-                ("firmware", d.firmware.to_string()),
+                ("serial", device.serial.to_string()),
+                ("session", format!("{:#010x}", device.session.value())),
+                ("firmware", device.firmware.to_string()),
             ],
         )
     });
-    let stream_row = st.last_stream.as_ref().map(|s| {
-        let s = s.get();
+    let stream_row = st.metadata.as_ref().map(|metadata| {
+        let stream = metadata.stream();
         (
-            s.name.to_string(),
+            stream.name.to_string(),
             vec![
-                ("columns", s.n_columns.to_string()),
-                ("segments", s.n_segments.to_string()),
+                ("columns", stream.n_columns.to_string()),
+                ("segments", stream.n_segments.to_string()),
             ],
         )
     });
-    let segment_row = st.last_segment.as_ref().map(|s| {
-        let s = s.get();
+    let segment_row = st.metadata.as_ref().map(|metadata| {
+        let segment = metadata.segment();
         let mut pairs = vec![
-            ("id", s.segment_id.to_string()),
-            ("rate", format!("{} Hz", s.sampling_rate)),
-            ("decimation", s.decimation.to_string()),
-            ("epoch", format!("{}", s.epoch)),
+            ("id", segment.segment_id.to_string()),
+            ("rate", format!("{} Hz", segment.sampling_rate)),
+            ("decimation", segment.decimation.to_string()),
+            ("epoch", segment.epoch.to_string()),
         ];
-        if s.filter_type != twinleaf_proto::data::FilterType::NONE {
+        if segment.filter_type != twinleaf_proto::data::FilterType::NONE {
             pairs.push((
                 "filter",
-                format!("{} @ {} Hz", s.filter_type, s.filter_cutoff),
+                format!("{} @ {} Hz", segment.filter_type, segment.filter_cutoff),
             ));
         }
         pairs
@@ -1279,7 +1288,9 @@ fn draw_detail_pane(
     meta_lines.extend(flow(
         "columns",
         (None, 0),
-        column_cells(&st.last_schema),
+        st.metadata
+            .as_ref()
+            .map_or_else(Vec::new, |metadata| column_cells(metadata.columns())),
         inner_w,
     ));
     meta_lines.push(Line::default());
@@ -1833,23 +1844,13 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
 
     let mut terminal = ratatui::init();
 
-    let proxy = tio::proxy::Connection::open(&config.tio.root);
+    let connection = Connection::open(&config.tio.root);
     let root_route = config.tio.route;
 
     // One connection: the library pumps samples, cloned trees call.
-    let tree = proxy
-        .tree_with(root_route, twinleaf_proto::MAX_ROUTING_SIZE, None)
-        .map_err(|e| {
-            ratatui::restore();
-            eyre::Report::new(e)
-        })
-        .wrap_err_with(|| format!("could not open device tree on {}", config.tio.root))
-        .with_proxy_help()?;
-    let batches = tree
-        .subscribe()
-        .wrap_err("could not start the data stream")
-        .with_proxy_help()?;
-    let events = tree.events().wrap_err("could not start the event stream")?;
+    let tree = connection.tree(root_route);
+    let batches = tree.samples();
+    let events = tree.events();
 
     let mut registries = RegistryQueue::new(tree.clone());
     let mut pending = PendingRpc::new(tree);
@@ -1875,22 +1876,26 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
         let registry_rx = registries.receiver().clone();
         crossbeam::select! {
             recv(batches.receiver()) -> batch => {
-                match batch {
-                    Ok(Ok(batch)) => app.handle_batch(batch, Instant::now()),
-                    Ok(Err(lagged)) => app.log_event(format!("{lagged}"), Color::Red),
-                    Err(_) => {
-                        stream_error = Some(RecvError::Disconnected);
+                match batches.resolve(batch) {
+                    Ok(batch) => app.handle_batch(batch, Instant::now()),
+                    Err(error @ RecvError::Lagged(_)) => {
+                        app.log_event(format!("{error}"), Color::Red)
+                    }
+                    Err(error) => {
+                        stream_error = Some(error);
                         break 'main;
                     }
                 }
             }
 
             recv(events.receiver()) -> event => {
-                match event {
-                    Ok(Ok(event)) => app.handle_event(event, Instant::now(), &mut registries),
-                    Ok(Err(lagged)) => app.log_event(format!("{lagged}"), Color::Red),
-                    Err(_) => {
-                        stream_error = Some(RecvError::Disconnected);
+                match events.resolve(event) {
+                    Ok(event) => app.handle_event(event, Instant::now(), &mut registries),
+                    Err(error @ RecvError::Lagged(_)) => {
+                        app.log_event(format!("{error}"), Color::Red)
+                    }
+                    Err(error) => {
+                        stream_error = Some(error);
                         break 'main;
                     }
                 }

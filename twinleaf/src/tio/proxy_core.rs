@@ -93,6 +93,13 @@ impl ProxyClient {
         }
     }
 
+    /// The far ends of a queued client's channels, for tests standing in for
+    /// the worker that would have adopted it.
+    #[cfg(test)]
+    pub(crate) fn test_channels(self) -> (channel::Sender<Packet>, channel::Receiver<Packet>) {
+        (self.tx, self.rx)
+    }
+
     fn try_send(&self, pkt: &Packet) -> bool {
         // ProxyStatus should be route-agnostic
         if pkt.ptype() == PacketType::PROXY_STATUS {
@@ -303,6 +310,10 @@ pub(crate) struct ProxyCore {
     next_rpc_id: u16,
     rpc_map: HashMap<u16, RpcMapEntry>,
     rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
+
+    /// Disconnects when the worker stops, so a client holding a port the
+    /// worker never adopted can still tell that it is gone.
+    _alive: channel::Sender<()>,
 }
 
 /// How long a device that has already sent a packet may stay silent before
@@ -329,6 +340,7 @@ impl ProxyCore {
         command_queue: channel::Receiver<ProxyCommand>,
         status_queue: channel::Sender<Event>,
         notify_new_client_only: bool,
+        alive: channel::Sender<()>,
     ) -> ProxyCore {
         ProxyCore {
             url,
@@ -347,6 +359,7 @@ impl ProxyCore {
             next_rpc_id: 0,
             rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
+            _alive: alive,
         }
     }
 
@@ -1247,7 +1260,8 @@ mod tests {
     fn test_core() -> ProxyCore {
         let (_new_client_tx, new_client_rx) = channel::bounded(1);
         let (status_tx, _status_rx) = channel::bounded(16);
-        ProxyCore::new(String::new(), None, new_client_rx, status_tx, false)
+        let (alive, _worker_alive) = channel::bounded(0);
+        ProxyCore::new(String::new(), None, new_client_rx, status_tx, false, alive)
     }
 
     fn insert_rpc(

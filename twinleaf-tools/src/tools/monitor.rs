@@ -16,7 +16,7 @@ use crate::tui::{
     scroll::{follow_scroll, NAV_MARGIN},
     spectral::{FftReadyData, FftStatus, WelchOp},
 };
-use crate::{MonitorCli, ProxyHelp, TioOpts};
+use crate::{MonitorCli, TioOpts};
 use crossbeam::channel;
 use ratatui::{
     crossterm::{
@@ -42,8 +42,12 @@ use twinleaf::{
         Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
         StreamKey,
     },
-    device::{DeviceEvent, DeviceRoute, RecvError, RpcRegistry, TreeEvent},
-    tio::{self, proto::ProxyStatus},
+    device::{
+        DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError, RpcRegistry,
+        TreeEvent,
+    },
+    tio::proto::ProxyStatus,
+    Connection,
 };
 
 pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
@@ -144,7 +148,7 @@ impl NavPos {
     fn column_idx(&self) -> Option<usize> {
         match self {
             NavPos::EmptyDevice { .. } => None,
-            NavPos::Column { spec, .. } => Some(spec.column_id),
+            NavPos::Column { spec, .. } => Some(spec.column_id.index()),
         }
     }
 
@@ -254,7 +258,7 @@ impl Nav {
                         if *device_idx == target_dev && *stream_idx == target_stream)
             })
             .min_by_key(|(_, pos)| {
-                (pos.column_idx().unwrap_or(0) as isize - cur_column as isize).abs()
+                (pos.column_idx().unwrap_or(0) as isize - cur_column.index() as isize).abs()
             })
             .map(|(i, _)| i)
             .unwrap_or(self.idx);
@@ -302,7 +306,7 @@ impl Nav {
                         stream_idx, spec, ..
                     } => {
                         let s = (*stream_idx as isize - cur_stream as isize).abs();
-                        let c = (spec.column_id as isize - cur_column as isize).abs();
+                        let c = (spec.column_id.index() as isize - cur_column as isize).abs();
                         (s, c)
                     }
                 };
@@ -875,7 +879,10 @@ impl MonitorState {
                                 spec: ColumnKey {
                                     route: *route,
                                     stream_id: *sid,
-                                    column_id: column_idx,
+                                    column_id: twinleaf::ColumnId::new(
+                                        u8::try_from(column_idx)
+                                            .expect("wire schemas contain at most 256 columns"),
+                                    ),
                                 },
                             });
                         }
@@ -934,9 +941,42 @@ impl MonitorState {
         self.visible_routes().len()
     }
 
-    fn handle_event(&mut self, event: TreeEvent, registries: &mut RegistryQueue) {
+    fn handle_event(&mut self, event: StreamEvent, registries: &mut RegistryQueue) {
         match event {
-            TreeEvent::RouteDiscovered(route) => {
+            StreamEvent::Link {
+                subtree,
+                event: LinkEvent::Status(status),
+            } => {
+                let affected: Vec<_> = self
+                    .discovered_routes
+                    .iter()
+                    .filter(|route| subtree.relative_route(route).is_ok())
+                    .copied()
+                    .collect();
+                for route in affected {
+                    if self.rpc_routes.entry(route).or_default().on_status(status) {
+                        registries.fetch(route);
+                    }
+                    let dev_status = self.device_status.entry(route).or_default();
+                    match status {
+                        ProxyStatus::SensorDisconnected => dev_status.connected = false,
+                        ProxyStatus::SensorReconnected => dev_status.connected = true,
+                        ProxyStatus::FailedToConnect
+                        | ProxyStatus::FailedToReconnect
+                        | ProxyStatus::Unknown(_) => {}
+                    }
+                }
+            }
+            StreamEvent::Link {
+                event: LinkEvent::InputOverrun,
+                ..
+            } => {
+                log::warn!("the stream engine's input overran")
+            }
+            StreamEvent::Tree {
+                route,
+                event: TreeEvent::RouteDiscovered,
+            } => {
                 self.discovered_routes.insert(route);
                 if self
                     .rpc_routes
@@ -948,52 +988,28 @@ impl MonitorState {
                 }
                 self.device_status.entry(route).or_default();
             }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::NewHash(hash),
-            } => {
-                if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
-                    registries.fetch(route);
+            StreamEvent::Device { route, event } => match event {
+                DeviceEvent::NewHash(hash) => {
+                    if self.rpc_routes.entry(route).or_default().on_new_hash(hash) {
+                        registries.fetch(route);
+                    }
                 }
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::Heartbeat { session_id },
-            } => {
-                if self
-                    .rpc_routes
-                    .entry(route)
-                    .or_default()
-                    .on_heartbeat(session_id)
-                {
-                    registries.fetch(route);
+                DeviceEvent::Heartbeat { session_id } => {
+                    if self
+                        .rpc_routes
+                        .entry(route)
+                        .or_default()
+                        .on_heartbeat(session_id)
+                    {
+                        registries.fetch(route);
+                    }
+                    self.device_status.entry(route).or_default().on_heartbeat();
                 }
-                self.device_status.entry(route).or_default().on_heartbeat();
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::Status(status),
-            } => {
-                if self.rpc_routes.entry(route).or_default().on_status(status) {
-                    registries.fetch(route);
+                DeviceEvent::Metadata(snapshot) => {
+                    self.device_metadata.insert(route, snapshot);
                 }
-                let dev_status = self.device_status.entry(route).or_default();
-                match status {
-                    ProxyStatus::SensorDisconnected => dev_status.connected = false,
-                    ProxyStatus::SensorReconnected => dev_status.connected = true,
-                    _ => {}
-                }
-            }
-            TreeEvent::Device {
-                route,
-                event: DeviceEvent::MetadataReady(metadata),
-            } => {
-                self.device_metadata.insert(route, metadata);
-            }
-            TreeEvent::Device {
-                event: DeviceEvent::RpcInvalidated(_) | DeviceEvent::MetadataUnavailable,
-                ..
-            } => {}
+                DeviceEvent::RpcInvalidated(_) | DeviceEvent::MetadataUnavailable => {}
+            },
         }
     }
 
@@ -1177,10 +1193,9 @@ impl MonitorState {
 }
 
 fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
-    buffer.column_metadata(key).map(|metadata| {
-        let metadata = metadata.get();
-        (metadata.description.to_string(), metadata.units.to_string())
-    })
+    buffer
+        .column_metadata(key)
+        .map(|metadata| (metadata.description.to_string(), metadata.units.to_string()))
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -1547,7 +1562,7 @@ fn build_left_lines(
     let selected_stream = app.current_selection();
 
     for (dev_idx, route) in routes.iter().enumerate() {
-        let dev = app.device_metadata.get(route).map(|m| m.device.get());
+        let dev = app.device_metadata.get(route).map(|m| m.device());
 
         let status = app.device_status.get(route);
         let is_alive = status
@@ -1641,7 +1656,10 @@ fn build_left_lines(
                     let plot_slot = app.plot_slots.get(&ColumnKey {
                         route: *route,
                         stream_id: sid,
-                        column_id: col_idx,
+                        column_id: twinleaf::ColumnId::new(
+                            u8::try_from(col_idx)
+                                .expect("wire schemas contain at most 256 columns"),
+                        ),
                     });
                     let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
                     let (val_str, val_f64) = fmt_value(&value);
@@ -2235,19 +2253,13 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
         depth,
     } = config;
 
-    let proxy = tio::proxy::Connection::open(&tio.root);
+    let connection = Connection::open(&tio.root);
     let parent_route: DeviceRoute = tio.route;
 
     // One connection: the library pumps samples, cloned trees call.
-    let tree = proxy
-        .tree_with(parent_route, twinleaf_proto::MAX_ROUTING_SIZE, None)
-        .wrap_err_with(|| format!("could not open device tree on {}", tio.root))
-        .with_proxy_help()?;
-    let batches = tree
-        .subscribe()
-        .wrap_err("could not start the data stream")
-        .with_proxy_help()?;
-    let events = tree.events().wrap_err("could not start the event stream")?;
+    let tree = connection.tree(parent_route);
+    let batches = tree.samples();
+    let events = tree.events();
 
     let mut registries = RegistryQueue::new(tree.clone());
     let mut pending = PendingRpc::new(tree);
@@ -2280,22 +2292,22 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
         let registry_rx = registries.receiver().clone();
         crossbeam::select! {
             recv(batches.receiver()) -> batch => {
-                match batch {
-                    Ok(Ok(batch)) => buffer.process_batch(&batch),
-                    Ok(Err(lagged)) => log::warn!("{lagged}"),
-                    Err(_) => {
-                        stream_error = Some(RecvError::Disconnected);
+                match batches.resolve(batch) {
+                    Ok(batch) => buffer.process_batch(&batch),
+                    Err(error @ RecvError::Lagged(_)) => log::warn!("{error}"),
+                    Err(error) => {
+                        stream_error = Some(error);
                         break 'main;
                     }
                 }
             }
 
             recv(events.receiver()) -> event => {
-                match event {
-                    Ok(Ok(event)) => app.handle_event(event, &mut registries),
-                    Ok(Err(lagged)) => log::warn!("{lagged}"),
-                    Err(_) => {
-                        stream_error = Some(RecvError::Disconnected);
+                match events.resolve(event) {
+                    Ok(event) => app.handle_event(event, &mut registries),
+                    Err(error @ RecvError::Lagged(_)) => log::warn!("{error}"),
+                    Err(error) => {
+                        stream_error = Some(error);
                         break 'main;
                     }
                 }

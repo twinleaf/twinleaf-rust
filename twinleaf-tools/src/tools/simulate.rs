@@ -16,7 +16,9 @@ use twinleaf::tio::proto;
 use twinleaf_proto::data::MetadataType;
 use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf_proto::{data, heartbeat, log, packet, rpc, settings, sync};
-use twinleaf_proto::{DeviceRoute, RpcRequestId, SessionId};
+use twinleaf_proto::{
+    ColumnId, DeviceRoute, RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
+};
 use twinleaf_proto::{MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -1420,9 +1422,9 @@ impl TestDevice {
         addr: SocketAddr,
     ) -> io::Result<()> {
         let packet = data::Samples {
-            stream_id,
-            segment_id,
-            first: first_sample_n,
+            stream_id: StreamId::new(stream_id),
+            segment_id: SegmentId::new(segment_id),
+            first: SampleNumber::new(first_sample_n),
             data: samples,
         };
         self.send_written(
@@ -1761,7 +1763,7 @@ impl TestDevice {
             _ => return Err(missing()),
         };
         Ok(data::Stream {
-            stream_id,
+            stream_id: StreamId::new(stream_id),
             n_columns: 2,
             n_segments: N_SEGMENTS,
             sample_size: u16::try_from(sample_size).map_err(|_| missing())?,
@@ -1781,8 +1783,8 @@ impl TestDevice {
         };
 
         data::Segment {
-            stream_id,
-            segment_id,
+            stream_id: StreamId::new(stream_id),
+            segment_id: SegmentId::new(segment_id),
             flags: data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE,
             epoch: sync::Epoch::UNIX,
             timeref_serial: DEVICE_SERIAL,
@@ -1799,11 +1801,11 @@ impl TestDevice {
     /// starts one segment length later for each step past the current one.
     fn segment_record_at(&self, stream_id: u8, segment_id: u8) -> data::Segment<'static> {
         let mut segment = self.segment_record(stream_id);
-        let ahead = u32::from((segment_id + N_SEGMENTS - segment.segment_id) % N_SEGMENTS);
+        let ahead = u32::from((segment_id + N_SEGMENTS - segment.segment_id.value()) % N_SEGMENTS);
         segment.start_time = segment
             .start_time
             .saturating_add(ahead.saturating_mul(self.segment_seconds));
-        segment.segment_id = segment_id;
+        segment.segment_id = SegmentId::new(segment_id);
         segment
     }
 
@@ -1828,8 +1830,8 @@ impl TestDevice {
             _ => return None,
         };
         Some(data::Column {
-            stream_id,
-            index,
+            stream_id: StreamId::new(stream_id),
+            index: ColumnId::new(index),
             data_type,
             name,
             units,
@@ -2114,7 +2116,7 @@ mod tests {
         let data::Metadata::Segment(segment) = record else {
             panic!("expected a segment record");
         };
-        assert_eq!(segment.segment_id, device.segment_id);
+        assert_eq!(segment.segment_id.value(), device.segment_id);
         assert!(device
             .requested_record(data::MetadataSelector::stream(99))
             .is_err());

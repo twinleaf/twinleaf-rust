@@ -1,13 +1,14 @@
 use crate::tools::recv_before;
 use crate::{ProxyHelp, TioOpts};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::time::{Duration, Instant};
-use twinleaf::data::{MetadataQuery, PacketParser, SampleBatch};
-use twinleaf::device::{DeviceRoute, PendingReply};
-use twinleaf::tio::{self, proxy};
-use twinleaf_proto::data as wire;
+use twinleaf::data::{DeviceMetadataSnapshot, SampleBatch};
+use twinleaf::device::{DeviceEvent, DeviceRoute, Event, LinkEvent, RecvError};
+use twinleaf::tio;
+use twinleaf::tio::proto::ProxyStatus;
+use twinleaf::{Connection, Receiver, SegmentId, StreamId};
 
 fn ensure_open<'a>(fo: &'a mut Option<File>, path: &str) -> eyre::Result<&'a mut File> {
     use eyre::WrapErr;
@@ -91,19 +92,110 @@ impl Drop for Recorder {
     }
 }
 
-/// Write a full metadata snapshot for `batch`: the device, stream, and segment
-/// updates followed by one column update per series, all stamped with the
-/// batch's absolute route.
-fn write_metadata_snapshot(rec: &mut Recorder, batch: &SampleBatch) -> eyre::Result<()> {
-    let abs_route = batch.route();
-    let (device, stream, segment) = batch.records();
-    rec.write(device.update(abs_route)?)?;
-    rec.write(stream.update(abs_route)?)?;
-    rec.write(segment.update(abs_route)?)?;
-    for series in batch.schema() {
-        rec.write(series.record().update(abs_route)?)?;
+/// What the file currently says about each route: the snapshot last spliced
+/// into it, which is what everything written after it will be decoded under.
+///
+/// The event lane publishes one snapshot per metadata revision, so it is the
+/// single mechanism that describes a route — a revision is written once, and
+/// only the packets that revision describes are written under it.
+#[derive(Default)]
+struct Described(HashMap<DeviceRoute, DeviceMetadataSnapshot>);
+
+impl Described {
+    /// Whether the file already describes the exact stream and segment a data
+    /// packet carries. A packet the file has yet to be told about would be
+    /// read back under the record its own update replaced.
+    fn covers(&self, route: DeviceRoute, stream_id: StreamId, segment_id: SegmentId) -> bool {
+        self.0
+            .get(&route)
+            .and_then(|snapshot| snapshot.stream(stream_id))
+            .is_some_and(|stream| stream.segment().segment_id == segment_id)
     }
-    Ok(())
+
+    /// Splice everything the event lane has published into the file.
+    fn drain_events(&mut self, rec: &mut Recorder, events: &Receiver<Event>) -> eyre::Result<()> {
+        loop {
+            let event = match events.try_recv() {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(RecvError::Disconnected) | Err(RecvError::Timeout) => return Ok(()),
+                Err(RecvError::Lagged(skipped)) => {
+                    log::warn!("dropped {skipped} events");
+                    continue;
+                }
+            };
+            self.apply(rec, event)?;
+        }
+    }
+
+    /// Take one fact: a published snapshot describes its route from here on,
+    /// and a disconnect ends what the file said about the subtree it names —
+    /// the session that follows redescribes itself, and nothing of it belongs
+    /// under the records of the one before.
+    fn apply(&mut self, rec: &mut Recorder, event: Event) -> eyre::Result<()> {
+        match event {
+            Event::Device {
+                route,
+                event: DeviceEvent::Metadata(snapshot),
+            } => {
+                for packet in snapshot.metadata_packets()? {
+                    rec.write(packet)?;
+                }
+                self.0.insert(route, snapshot);
+            }
+            Event::Link {
+                subtree,
+                event: LinkEvent::Status(ProxyStatus::SensorDisconnected),
+            } => self
+                .0
+                .retain(|route, _| subtree.relative_route(route).is_err()),
+            Event::Link { .. } | Event::Tree { .. } | Event::Device { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Record a data packet, but only once the file describes the very segment
+    /// it carries, so every recorded sample decodes from the file alone, and
+    /// decodes as what it was. Anything else is not this recorder's to write.
+    fn write_data(&self, rec: &mut Recorder, pkt: &tio::Packet) -> eyre::Result<()> {
+        let tio::proto::Payload::Samples(samples) = pkt.payload() else {
+            return Ok(());
+        };
+        if self.covers(pkt.route(), samples.stream_id, samples.segment_id) {
+            rec.write(pkt.with_ttl(0)?)?;
+        }
+        Ok(())
+    }
+}
+
+/// Count the samples the parsed lane reports lost. Nothing is described from
+/// here: a boundary is news about continuity, not about what the file says.
+fn count_lost_samples(rec: &mut Recorder, batches: &Receiver<SampleBatch>) {
+    use twinleaf::data::BoundaryReason;
+
+    loop {
+        let batch = match batches.try_recv() {
+            Ok(Some(batch)) => batch,
+            Ok(None) | Err(RecvError::Disconnected) | Err(RecvError::Timeout) => return,
+            Err(RecvError::Lagged(skipped)) => {
+                log::warn!("dropped {skipped} sample batches");
+                continue;
+            }
+        };
+        let Some(boundary) = batch.boundary() else {
+            continue;
+        };
+        let BoundaryReason::SamplesLost { expected, received } = boundary.reason else {
+            continue;
+        };
+        let count = received.wrapping_sub(expected);
+        rec.samples_dropped += count as u64;
+        log::warn!(
+            "{}/{} dropped {} samples",
+            batch.route(),
+            batch.stream().name,
+            count
+        );
+    }
 }
 
 pub fn log(
@@ -117,7 +209,7 @@ pub fn log(
     use indicatif::{ProgressBar, ProgressStyle};
     use std::path::Path;
 
-    let proxy = proxy::Connection::open(&tio.root);
+    let connection = Connection::open(&tio.root);
     let route = tio.route;
 
     let file_name = Path::new(&file)
@@ -154,29 +246,25 @@ pub fn log(
     rec.pb.set_message(initial_msg);
 
     if raw {
-        log_raw(&proxy, &tio.root, route, depth, rec, deadline)
+        log_raw(&connection, route, depth, rec, deadline)
     } else {
-        log_parsed(&proxy, &tio.root, route, rec, deadline)
+        log_parsed(&connection, route, rec, deadline)
     }
 }
 
 fn log_raw(
-    proxy: &proxy::Connection,
-    root: &str,
+    connection: &Connection,
     route: DeviceRoute,
     depth: Option<usize>,
     mut rec: Recorder,
     deadline: Option<Instant>,
 ) -> eyre::Result<()> {
-    use eyre::WrapErr;
-
-    let port_depth = depth.unwrap_or(twinleaf_proto::MAX_ROUTING_SIZE);
-    let port = proxy::open_port(proxy, None, route, port_depth, true, true)
-        .wrap_err_with(|| format!("could not open port on {}", root))
-        .with_proxy_help()?;
+    let tree = connection.tree(route);
+    let tree = depth.map_or_else(|| tree.clone(), |depth| tree.to_depth(depth));
+    let packets = tree.packets();
 
     loop {
-        let pkt = match recv_before(&port, deadline) {
+        let pkt = match recv_before(&packets, deadline, "packets") {
             Ok(Some(pkt)) => pkt,
             Ok(None) => break,
             Err(error) => {
@@ -188,10 +276,10 @@ fn log_raw(
                         rec.bytes_written, rec.path
                     )
                 };
-                return Err(eyre::Report::new(error).wrap_err(context));
+                return Err(error.wrap_err(context));
             }
         };
-        rec.write(pkt.with_route(route.absolute_route(&pkt.route())?))?;
+        rec.write(pkt)?;
         rec.tick();
         rec.flush_if_needed()?;
     }
@@ -208,93 +296,33 @@ fn log_raw(
 }
 
 fn log_parsed(
-    proxy: &proxy::Connection,
-    root: &str,
+    connection: &Connection,
     route: DeviceRoute,
     mut rec: Recorder,
     deadline: Option<Instant>,
 ) -> eyre::Result<()> {
-    use eyre::WrapErr;
-    use twinleaf::data::BoundaryReason;
+    let tree = connection.tree(route);
 
-    // Byte-faithful recorder: receive packets directly from a subtree_full port
-    // and maintain per-route parsers ourselves (what DeviceTree used to do), so
-    // we can hold the raw stream-data packet instead of reconstructing it from
-    // a parsed sample.
-    let port = proxy::open_port(proxy, None, route, usize::MAX, true, true)
-        .wrap_err_with(|| format!("could not open device tree on {}", root))
-        .with_proxy_help()?;
-    let tree = proxy
-        .tree_with(route, twinleaf_proto::MAX_ROUTING_SIZE, None)
-        .wrap_err_with(|| format!("could not open device tree on {}", root))
-        .with_proxy_help()?;
+    // Byte-faithful recorder: the raw tap supplies the stream-data packets
+    // verbatim, while the parsed lanes say what describes them. The tap runs
+    // ahead of the event lane by the pump's parse latency, so a packet whose
+    // description has not been spliced in yet is dropped rather than recorded
+    // under the description it replaces.
+    let packets = tree.packets();
+    let events = tree.events();
+    let batches = tree.samples();
 
-    let mut parser = PacketParser::new(route, false);
-    let mut metadata_calls: Vec<(MetadataQuery, PendingReply)> = Vec::new();
+    let mut described = Described::default();
     loop {
-        for query in parser.take_metadata_queries() {
-            match tree.submit(query.route, wire::METADATA_RPC_METHOD, &query.args()) {
-                Ok(pending) => metadata_calls.push((query, pending)),
-                Err(_) => parser.fail_metadata_query(query),
-            }
-        }
-        metadata_calls = metadata_calls
-            .into_iter()
-            .filter_map(|(query, pending)| match pending.try_get() {
-                Some(Ok(reply)) => {
-                    parser.apply_metadata_reply(query, &reply);
-                    None
-                }
-                Some(Err(_)) => {
-                    parser.fail_metadata_query(query);
-                    None
-                }
-                None => Some((query, pending)),
-            })
-            .collect();
-
-        let pkt = match recv_before(&port, deadline) {
+        let pkt = match recv_before(&packets, deadline, "packets") {
             Ok(Some(pkt)) => pkt,
             Ok(None) => break,
-            Err(e) => {
-                return Err(eyre::Report::new(e).wrap_err("stream ended"));
-            }
+            Err(error) => return Err(error.wrap_err("stream ended")),
         };
 
-        // The parser intercepts ProxyStatus (resetting on disconnect); RpcUpdate
-        // is a parser no-op. The batch carries the absolute route.
-        if let Err(error) = parser.push_packet(&pkt) {
-            log::warn!("dropping invalid stream packet: {error}");
-            rec.tick();
-            let _ = rec.flush_if_needed();
-            continue;
-        }
-
-        let mut parsed_route = None;
-        while let Some(batch) = parser.pop_batch() {
-            let abs_route = batch.route();
-            if let Some(b) = batch.boundary() {
-                if let BoundaryReason::SamplesLost { expected, received } = b.reason {
-                    let count = received.wrapping_sub(expected);
-                    rec.samples_dropped += count as u64;
-                    log::warn!(
-                        "{}/{} dropped {} samples",
-                        abs_route,
-                        batch.stream().name,
-                        count
-                    );
-                }
-                write_metadata_snapshot(&mut rec, &batch)?;
-            }
-            parsed_route = Some(abs_route);
-        }
-
-        // Only record the raw stream-data packet when it actually parsed into
-        // a batch, matching the old reconstruction which wrote once per
-        // parseable packet.
-        if let (Some(abs_route), tio::proto::Payload::Samples(_)) = (parsed_route, pkt.payload()) {
-            rec.write(pkt.with_route(abs_route).with_ttl(0)?)?;
-        }
+        described.drain_events(&mut rec, &events)?;
+        count_lost_samples(&mut rec, &batches);
+        described.write_data(&mut rec, &pkt)?;
 
         rec.tick();
         let _ = rec.flush_if_needed();
@@ -320,10 +348,10 @@ fn log_parsed(
 pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let proxy = proxy::Connection::open(&tio.root);
+    let connection = Connection::open(&tio.root);
     let route = tio.route;
 
-    let device = proxy.device(route);
+    let device = connection.device(route);
 
     let meta = device
         .metadata()
@@ -338,13 +366,8 @@ pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to write {}", file))
     };
 
-    write_packet(&mut file_out, meta.device.update(route)?)?;
-    for (_id, stream) in meta.streams {
-        write_packet(&mut file_out, stream.stream.update(route)?)?;
-        write_packet(&mut file_out, stream.segment.update(route)?)?;
-        for col in stream.columns {
-            write_packet(&mut file_out, col.update(route)?)?;
-        }
+    for packet in meta.metadata_packets()? {
+        write_packet(&mut file_out, packet)?;
     }
     Ok(())
 }
@@ -412,4 +435,206 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twinleaf::data::{LogFile, PacketParser};
+    use twinleaf::tio::proto::{DataType, Packet};
+    use twinleaf::{ColumnId, SessionId};
+    use twinleaf_proto::data as wire;
+    use twinleaf_proto::sync::Epoch;
+
+    const STREAM: u8 = 1;
+
+    /// The four records that let a parser decode one f32 stream, as the device
+    /// in `session` describes them.
+    fn metadata_records(session: u32) -> [wire::Metadata<'static>; 4] {
+        [
+            wire::Metadata::Device(wire::Device {
+                session: SessionId::new(session),
+                n_streams: 1,
+                name: "d",
+                serial: "s",
+                firmware: "f",
+            }),
+            wire::Metadata::Stream(wire::Stream {
+                stream_id: StreamId::new(STREAM),
+                n_columns: 1,
+                n_segments: 2,
+                sample_size: 4,
+                buf_samples: 128,
+                name: "stream",
+            }),
+            wire::Metadata::Segment(wire::Segment {
+                stream_id: StreamId::new(STREAM),
+                segment_id: SegmentId::new(0),
+                flags: wire::SegmentFlags::default(),
+                epoch: Epoch::UNIX,
+                timeref_serial: "clock",
+                timeref_session: SessionId::new(session),
+                start_time: 0,
+                sampling_rate: 1,
+                decimation: 1,
+                filter_cutoff: 0.0,
+                filter_type: wire::FilterType::NONE,
+            }),
+            wire::Metadata::Column(wire::Column {
+                stream_id: StreamId::new(STREAM),
+                index: ColumnId::new(0),
+                data_type: DataType::F32,
+                name: "col",
+                units: "",
+                description: "",
+            }),
+        ]
+    }
+
+    /// The snapshot the pump's parser would publish for `session`.
+    fn snapshot(session: u32, route: DeviceRoute) -> DeviceMetadataSnapshot {
+        let mut parser = PacketParser::new(DeviceRoute::root(), false);
+        for record in metadata_records(session) {
+            let packet = Packet::metadata(record, wire::MetadataFlags::UPDATE, route)
+                .expect("one record fits");
+            parser.push_packet(&packet).expect("valid metadata");
+        }
+        parser.metadata(route).expect("complete metadata")
+    }
+
+    fn described(session: u32, route: DeviceRoute) -> Event {
+        Event::Device {
+            route,
+            event: DeviceEvent::Metadata(snapshot(session, route)),
+        }
+    }
+
+    fn samples_in(segment_id: u8, first: u32, route: DeviceRoute) -> Packet {
+        Packet::samples(STREAM, segment_id, first, &[0; 4], route).expect("valid samples")
+    }
+
+    fn samples(first: u32, route: DeviceRoute) -> Packet {
+        samples_in(0, first, route)
+    }
+
+    fn recorder(path: &str) -> Recorder {
+        Recorder::new(
+            indicatif::ProgressBar::hidden(),
+            path.to_string(),
+            String::new(),
+            false,
+        )
+    }
+
+    fn scratch_file(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("twinleaf-{}-{}.tio", name, std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Every sample the file holds, paired with the session the file says it
+    /// belongs to.
+    fn recorded_sessions(path: &str) -> Vec<(u32, Vec<u32>)> {
+        let log = LogFile::open(path).expect("the recorded log");
+        log.scan(DeviceRoute::root(), false)
+            .batches(1)
+            .map(|batch| {
+                let batch = batch.expect("the recorded log decodes");
+                let samples = batch.sample_numbers().iter().map(|n| n.value()).collect();
+                (batch.device().session.value(), samples)
+            })
+            .collect()
+    }
+
+    /// A disconnect ends the session the file describes. The tap runs ahead of
+    /// the event lane, so the next session's first packets arrive before
+    /// anything describes them: they are dropped, never read back as samples
+    /// of the session that ended.
+    #[test]
+    fn a_reconnect_never_records_samples_under_the_session_before_it() {
+        let route = DeviceRoute::root();
+        let path = scratch_file("reconnect");
+        let mut rec = recorder(&path);
+        let mut file = Described::default();
+
+        file.apply(&mut rec, described(1, route)).unwrap();
+        file.write_data(&mut rec, &samples(0, route)).unwrap();
+        file.apply(
+            &mut rec,
+            Event::Link {
+                subtree: route,
+                event: LinkEvent::Status(ProxyStatus::SensorDisconnected),
+            },
+        )
+        .unwrap();
+        file.write_data(&mut rec, &samples(0, route)).unwrap();
+        file.apply(&mut rec, described(2, route)).unwrap();
+        file.write_data(&mut rec, &samples(1, route)).unwrap();
+        drop(rec);
+
+        let recorded = recorded_sessions(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            recorded,
+            [(1, vec![0]), (2, vec![1])],
+            "each recorded sample is read back under the session that sent it"
+        );
+    }
+
+    /// The tap runs ahead of the event lane, so a device's segment update is
+    /// followed by samples the file has yet to be told about. They belong to
+    /// the segment that arrived, not to the one its update replaced.
+    #[test]
+    fn samples_of_an_undescribed_segment_are_not_recorded_under_the_old_one() {
+        let route = DeviceRoute::root();
+        let path = scratch_file("segment");
+        let mut rec = recorder(&path);
+        let mut file = Described::default();
+
+        file.apply(&mut rec, described(1, route)).unwrap();
+        let described_bytes = rec.bytes_written;
+        file.write_data(&mut rec, &samples_in(1, 8, route)).unwrap();
+        let written = rec.bytes_written;
+        drop(rec);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            written, described_bytes,
+            "a segment the file does not describe is not recorded under one it does"
+        );
+    }
+
+    /// One revision, one description: the event lane owns the splice, so a
+    /// route is described once however many lanes reported it.
+    #[test]
+    fn a_revision_is_described_once() {
+        let route = DeviceRoute::root();
+        let path = scratch_file("revision");
+        let mut rec = recorder(&path);
+        let mut file = Described::default();
+
+        file.apply(&mut rec, described(1, route)).unwrap();
+        let described_bytes = rec.bytes_written;
+        for first in 0..4 {
+            file.write_data(&mut rec, &samples(first, route)).unwrap();
+        }
+        let data_bytes = rec.bytes_written - described_bytes;
+        drop(rec);
+
+        let log = LogFile::open(&path).expect("the recorded log");
+        let metadata = log
+            .packets()
+            .filter(|packet| {
+                matches!(
+                    packet.as_ref().expect("a recorded packet").payload(),
+                    tio::proto::Payload::Metadata(_, _)
+                )
+            })
+            .count();
+        drop(log);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(metadata, 4, "the snapshot's four records, written once");
+        assert!(data_bytes > 0, "the samples the description covers");
+    }
 }

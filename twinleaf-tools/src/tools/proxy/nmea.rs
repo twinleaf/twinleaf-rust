@@ -1,16 +1,15 @@
 use crate::TioOpts;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::thread;
 use twinleaf::device::Device;
-use twinleaf::tio;
+use twinleaf::Connection;
 
 pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     use color_eyre::Help;
     use eyre::WrapErr;
 
-    let proxy = Arc::new(tio::proxy::Connection::open(&tio.root));
+    let connection = Connection::open(&tio.root);
     let route = tio.route;
 
     let bind_addr = format!("0.0.0.0:{}", tcp_port);
@@ -21,7 +20,7 @@ pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     println!("Listening on {}", bind_addr);
 
     for stream in listener.incoming().flatten() {
-        let device = proxy.device(route);
+        let device = connection.device(route);
         thread::spawn(move || broadcast_to_client(stream, device));
     }
     Ok(())
@@ -46,10 +45,7 @@ fn broadcast_to_client(mut stream: TcpStream, device: Device) {
     );
     println!("Connection from: {}", peer_addr);
 
-    let Ok(batches) = device.subscribe() else {
-        eprintln!("could not start the data stream for {peer_addr}");
-        return;
-    };
+    let batches = device.samples();
 
     'outer: loop {
         let batch = match batches.recv() {
@@ -61,7 +57,7 @@ fn broadcast_to_client(mut stream: TcpStream, device: Device) {
         };
 
         // Only process samples from stream ID 1
-        if batch.stream().stream_id != 1 {
+        if batch.stream().stream_id.value() != 1 {
             continue;
         }
 

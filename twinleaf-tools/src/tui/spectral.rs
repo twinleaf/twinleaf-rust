@@ -312,11 +312,17 @@ pub fn estimate_white_noise_floor(points: &[(f64, f64)]) -> Option<f64> {
         }
     }
 
-    median(&candidates).map(f64::exp).filter(|value| value.is_finite() && *value > 0.0)
+    median(&candidates)
+        .map(f64::exp)
+        .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn median(values: &[f64]) -> Option<f64> {
-    let mut sorted: Vec<f64> = values.iter().copied().filter(|value| value.is_finite()).collect();
+    let mut sorted: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
     if sorted.is_empty() {
         return None;
     }
