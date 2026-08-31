@@ -943,7 +943,7 @@ impl ParseState {
     pub(super) fn reset_subtree(&mut self, subtree: DeviceRoute) {
         self.global_generation += 1;
         for (route, device) in &mut self.devices {
-            if subtree.relative_route(route).is_ok() {
+            if route.starts_with(&subtree) {
                 device.reset();
             }
         }
