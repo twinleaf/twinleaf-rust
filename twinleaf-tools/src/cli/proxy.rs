@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueHint};
 use twinleaf::device::DeviceRoute;
 
-use crate::{parse_device_route, TioOpts};
+use crate::{parse_device_route, ListCli, TioOpts};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,7 +13,7 @@ pub struct ProxyCli {
     #[command(subcommand)]
     pub subcommands: Option<ProxySubcommands>,
 
-    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single connected device
+    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single serial device (use `tio proxy list` for network discovery)
     #[arg(value_hint = ValueHint::Url, conflicts_with = "mounts")]
     pub(crate) sensor_url: Option<String>,
 
@@ -24,6 +24,10 @@ pub struct ProxyCli {
     /// TCP port to listen on for clients
     #[arg(short = 'p', long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Advertise this proxy over mDNS (off by default)
+    #[arg(long = "mdns")]
+    pub(crate) mdns: bool,
 
     /// Kick off slow clients instead of dropping traffic
     #[arg(short = 'k', long)]
@@ -80,7 +84,7 @@ pub struct ProxyCli {
     #[arg(short = 'a', long = "auto", hide = true)]
     pub(crate) auto: bool,
 
-    /// Deprecated; use `tio list` instead.
+    /// Deprecated; use `tio proxy list` instead.
     #[arg(short = 'e', long = "enumerate", name = "enum", hide = true)]
     pub(crate) enumerate: bool,
 }
@@ -117,6 +121,9 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
 
 #[derive(Subcommand, Debug)]
 pub enum ProxySubcommands {
+    /// Discover devices; selecting one starts a proxy
+    List(ListCli),
+
     /// Bridge Twinleaf sensor data to NMEA TCP stream
     Nmea {
         #[command(flatten)]

@@ -12,18 +12,84 @@ use eyre::WrapErr;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Duration;
+use twinleaf::device::{DeviceRoute, DeviceTree};
 use twinleaf::firmware::{
     self, github::GithubCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
 };
 use twinleaf::tio::proxy;
 
 pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
+    if upgrade_cli.all {
+        return firmware_upgrade_all(&upgrade_cli.tio, upgrade_cli.yes);
+    }
     match (upgrade_cli.firmware_path, upgrade_cli.downgrade) {
         (Some(path), _) => firmware_upgrade(&upgrade_cli.tio, path, upgrade_cli.yes),
         (None, true) => firmware_select(&upgrade_cli.tio),
         (None, false) => firmware_upgrade_latest(&upgrade_cli.tio, upgrade_cli.yes),
     }
 }
+
+/// Discover every device active on the hub at `tio.root` and run the update
+/// check/upgrade on each.
+fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
+    // A single connection to the hub is reused for discovery and every device;
+    // per-device RPC ports are opened on it rather than new connections.
+    let hub = proxy::Interface::new(&tio.root);
+
+    let mut tree = DeviceTree::open(&hub, DeviceRoute::root())
+        .wrap_err_with(|| format!("could not connect to {}", tio.root))
+        .with_proxy_help()?;
+    let routes = tree.discover_routes(ROUTE_DISCOVERY_WINDOW);
+    if routes.is_empty() {
+        return Err(eyre::eyre!("no active devices found on {}", tio.root)
+            .suggestion("check that the device is plugged in and powered"));
+    }
+
+    let total = routes.len();
+    println!(
+        "Found {} device{} on {}; checking for firmware updates...",
+        total,
+        if total == 1 { "" } else { "s" },
+        tio.root
+    );
+
+    let mut failures = 0usize;
+    for (i, route) in routes.into_iter().enumerate() {
+        let label = if route.is_empty() {
+            "/ (root)".to_string()
+        } else {
+            route.to_string()
+        };
+        println!();
+        println!(
+            "{}",
+            style(format!("[{}/{}] {}", i + 1, total, label)).bold()
+        );
+
+        // One device's failure shouldn't stop the rest.
+        let result = hub
+            .device_rpc(route)
+            .wrap_err("could not open device")
+            .and_then(|device| check_and_upgrade(&device, skip_confirm));
+        if let Err(e) = result {
+            failures += 1;
+            println!("{}", style(format!("  error: {:#}", e)).red());
+        }
+    }
+
+    if failures > 0 {
+        return Err(eyre::eyre!(
+            "{} of {} device(s) could not be checked",
+            failures,
+            total
+        ));
+    }
+    Ok(())
+}
+
+/// How long to listen for heartbeats to enumerate the active routes on a hub.
+/// Heartbeats fire at 5 Hz, so this covers several per device.
+const ROUTE_DISCOVERY_WINDOW: Duration = Duration::from_millis(600);
 
 /// Flash a firmware image from a local file.
 pub fn firmware_upgrade(
@@ -33,7 +99,7 @@ pub fn firmware_upgrade(
 ) -> eyre::Result<()> {
     let firmware_data = std::fs::read(&firmware_path)
         .wrap_err_with(|| format!("could not read firmware file {:?}", firmware_path))?;
-    log::info!("loaded {} bytes firmware", firmware_data.len());
+    log::debug!("loaded {} bytes firmware", firmware_data.len());
 
     let label = firmware_path
         .file_name()
@@ -62,13 +128,18 @@ pub fn firmware_upgrade(
     flash_with_progress(&device, &firmware_data)
 }
 
-/// Detect the sensor, compare against the latest published firmware, and (if
-/// newer) download and flash it.
+/// Detect the sensor at `tio`, compare against the latest published firmware,
+/// and (if newer) download and flash it.
 fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
     let (_proxy, device) = open_device(tio)?;
+    check_and_upgrade(&device, skip_confirm)
+}
 
+/// Check one already-open device against the catalog and, if a newer release
+/// exists, download and flash it.
+fn check_and_upgrade(device: &proxy::Port, skip_confirm: bool) -> eyre::Result<()> {
     let installed =
-        firmware::query_installed(&device).wrap_err("could not read installed firmware info")?;
+        firmware::query_installed(device).wrap_err("could not read installed firmware info")?;
     let catalog = GithubCatalog::twinleaf();
     let report =
         firmware::check_for_update(installed, &catalog).wrap_err("firmware update check failed")?;
@@ -146,7 +217,7 @@ fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()
         return Ok(());
     }
 
-    download_and_flash(&device, &catalog, &release)
+    download_and_flash(device, &catalog, &release)
 }
 
 /// Detect the sensor, list every published firmware, and let the user pick one
@@ -261,7 +332,7 @@ fn download_and_flash(
     let cache_root = firmware::default_cache_dir()
         .ok_or_else(|| eyre::eyre!("could not determine a cache directory"))?;
     let firmware_data = download_with_progress(catalog, release, &cache_root)?;
-    log::info!("loaded {} bytes firmware", firmware_data.len());
+    log::debug!("loaded {} bytes firmware", firmware_data.len());
 
     flash_with_progress(device, &firmware_data)
 }

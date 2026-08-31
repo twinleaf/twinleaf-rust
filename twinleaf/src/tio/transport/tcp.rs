@@ -40,6 +40,9 @@ impl Port {
         // surface synchronously, then switch to mio for non-blocking I/O.
         let std_stream = std::net::TcpStream::connect(*address)?;
         std_stream.set_nonblocking(true)?;
+        // TIO packets are small and latency-sensitive (RPCs, heartbeats);
+        // Nagle + delayed ACK would serialize a burst of requests.
+        std_stream.set_nodelay(true)?;
         let stream = TcpStream::from_std(std_stream);
         Port::from_stream(stream)
     }
@@ -59,6 +62,10 @@ impl Port {
 }
 
 impl RawPort for Port {
+    fn kind(&self) -> super::TransportKind {
+        super::TransportKind::Tcp
+    }
+
     fn recv(&mut self) -> Result<Packet, RecvError> {
         let mut res = self.recv_buffered();
         if let Err(RecvError::NotReady) = res {

@@ -1,6 +1,7 @@
 mod capture;
 mod dump;
 mod health;
+mod list;
 mod log;
 mod monitor;
 mod proxy;
@@ -11,6 +12,7 @@ mod upgrade;
 pub use capture::CaptureCli;
 pub use dump::DumpCli;
 pub use health::HealthCli;
+pub use list::ListCli;
 pub use log::{
     parse_csv_target, CsvTarget, LogCli, LogSubcommands, MetaSubcommands, SplitLevel, SplitPolicy,
     StreamSel,
@@ -50,12 +52,8 @@ pub struct TioCli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// List connected devices
-    List {
-        /// Include serial ports with unknown VID/PID
-        #[arg(short = 'a', long = "all")]
-        all: bool,
-    },
+    /// Shortcut for `tio proxy list`
+    List(ListCli),
 
     /// Live sensor data display
     Monitor(MonitorCli),
