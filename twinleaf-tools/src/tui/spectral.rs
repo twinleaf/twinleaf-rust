@@ -2,9 +2,10 @@
 //! signal and recomputes the estimate only when `push` delivers new samples.
 
 use std::collections::VecDeque;
+use std::f64::consts::PI;
 
+use rustfft::{num_complex::Complex, FftPlanner};
 use twinleaf::data::{ColumnArray, ColumnOp};
-use welch_sde::{Build, SpectralDensity};
 
 const WELCH_DEFAULT_SEGMENTS: usize = 4;
 const WELCH_DEFAULT_OVERLAP: f64 = 0.5;
@@ -14,7 +15,9 @@ const MIN_FFT_SAMPLES: usize = 60;
 #[derive(Debug, Clone)]
 pub struct FftReadyData {
     pub points: Vec<(f64, f64)>,
-    pub median_asd: f64,
+    /// Robust white-noise floor: rejects 1/f content and narrow peaks. `None`
+    /// when the spectrum is too short or too contaminated to support one.
+    pub noise_floor: Option<f64>,
     pub sample_count: usize,
     pub total_sample_count: usize,
     pub sampling_hz: f64,
@@ -115,20 +118,7 @@ impl WelchOp {
         let mean_val = fft_signal.iter().sum::<f64>() / fft_signal.len() as f64;
         let detrended: Vec<f64> = fft_signal.iter().map(|x| x - mean_val).collect();
 
-        let welch: SpectralDensity<f64> = SpectralDensity::builder(&detrended, sampling_hz).build();
-        let sd = welch.periodogram();
-        let pts: Vec<(f64, f64)> = sd
-            .frequency()
-            .into_iter()
-            .zip(sd.iter().copied())
-            .filter_map(|(f, d)| {
-                if f > 0.0 && d.is_finite() && d > 0.0 {
-                    Some((f, d.sqrt()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let pts = welch_asd_points(&detrended, sampling_hz, segment_size, hop_size);
 
         if pts.is_empty() {
             return Err(FftStatus::NoValidFrequencyBins {
@@ -137,17 +127,11 @@ impl WelchOp {
             });
         }
 
-        let mut asd_values: Vec<f64> = pts.iter().map(|(_, d)| *d).collect();
-        asd_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_asd = if asd_values.len().is_multiple_of(2) {
-            (asd_values[asd_values.len() / 2 - 1] + asd_values[asd_values.len() / 2]) / 2.0
-        } else {
-            asd_values[asd_values.len() / 2]
-        };
+        let noise_floor = estimate_white_noise_floor(&pts);
 
         Ok(FftReadyData {
             points: pts,
-            median_asd,
+            noise_floor,
             sample_count: fft_signal.len(),
             total_sample_count,
             sampling_hz,
@@ -182,6 +166,52 @@ impl ColumnOp for WelchOp {
     }
 }
 
+/// Welch estimate of the one-sided amplitude density in `units/sqrt(Hz)`:
+/// Hann-windowed segments zero-padded to a power-of-two DFT, mirrored bins
+/// folded by two, spaced `fs / dft_size` starting one spacing above DC.
+/// Nyquist sits at index `dft_size / 2`, outside the kept half.
+fn welch_asd_points(
+    signal: &[f64],
+    sampling_hz: f64,
+    segment_size: usize,
+    hop_size: usize,
+) -> Vec<(f64, f64)> {
+    let dft_size = segment_size.next_power_of_two();
+    let hann: Vec<f64> = (0..segment_size)
+        .map(|i| (PI * i as f64 / (segment_size - 1) as f64).sin().powi(2))
+        .collect();
+
+    let fft = FftPlanner::new().plan_fft_forward(dft_size);
+    let mut power = vec![0.0; dft_size / 2];
+    let mut segment_count = 0usize;
+    let mut dft_buffer = vec![Complex::new(0.0, 0.0); dft_size];
+    for segment in signal.windows(segment_size).step_by(hop_size) {
+        dft_buffer.fill(Complex::new(0.0, 0.0));
+        for ((sample, weight), slot) in segment.iter().zip(&hann).zip(&mut dft_buffer) {
+            *slot = Complex::new(sample * weight, 0.0);
+        }
+        fft.process(&mut dft_buffer);
+        for (total, bin) in power.iter_mut().zip(&dft_buffer) {
+            *total += bin.norm_sqr();
+        }
+        segment_count += 1;
+    }
+
+    let hann_power: f64 = hann.iter().map(|w| w * w).sum();
+    let scale = 2.0 / (hann_power * segment_count as f64 * sampling_hz);
+    let bin_spacing = sampling_hz / dft_size as f64;
+    power
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, total)| {
+            let density = total * scale;
+            (density.is_finite() && density > 0.0)
+                .then(|| (index as f64 * bin_spacing, density.sqrt()))
+        })
+        .collect()
+}
+
 /// Longest signal prefix (from the end, i.e. the most recent samples) whose
 /// length is an exact `segment_size + (segments - 1) * hop_size` for Welch's
 /// method with `WELCH_DEFAULT_SEGMENTS` segments overlapped
@@ -210,6 +240,106 @@ fn latest_complete_welch_signal(signal: &[f64]) -> (&[f64], usize, usize) {
     )
 }
 
+/// Estimate the flat, broadband ASD level while rejecting low-frequency 1/f
+/// content and narrow spectral peaks.
+///
+/// Equal-sized frequency bands make the band medians insensitive to narrow
+/// peaks. The quiet quartile of all but the lowest bands identifies the white
+/// plateau without assuming a fixed corner frequency. Only bands close to
+/// that plateau contribute samples, and a final one-sided MAD clip removes
+/// any peaks that survived their band's median.
+pub fn estimate_white_noise_floor(points: &[(f64, f64)]) -> Option<f64> {
+    let log_values: Vec<f64> = points
+        .iter()
+        .filter(|(f, d)| f.is_finite() && *f > 0.0 && d.is_finite() && *d > 0.0)
+        .map(|(_, d)| d.ln())
+        .collect();
+    if log_values.len() < 16 {
+        return None;
+    }
+
+    let band_count = (log_values.len() / 16).clamp(8, 32).min(log_values.len());
+    let band_size = log_values.len().div_ceil(band_count);
+    let bands: Vec<&[f64]> = log_values.chunks(band_size).collect();
+    if bands.len() < 4 {
+        return None;
+    }
+
+    // Never seed the plateau from the lowest 1/8 of the frequency bands.
+    let low_band_count = (bands.len() / 8).max(1);
+    let mut usable_band_medians: Vec<f64> = bands[low_band_count..]
+        .iter()
+        .filter_map(|band| median(band))
+        .collect();
+    if usable_band_medians.len() < 3 {
+        return None;
+    }
+    usable_band_medians.sort_by(f64::total_cmp);
+
+    // A lower-quartile seed is resistant to both 1/f bands and broad peaks,
+    // while remaining representative of a noisy white plateau.
+    let plateau_seed = quantile_sorted(&usable_band_medians, 0.25)?;
+    let lower_half_end = usable_band_medians.len().div_ceil(2);
+    let lower_half = &usable_band_medians[..lower_half_end];
+    let band_mad = median_absolute_deviation(lower_half, plateau_seed).unwrap_or(0.0);
+    let plateau_tolerance = (3.0 * 1.4826 * band_mad).clamp((1.5_f64).ln(), (2.0_f64).ln());
+
+    let mut candidates = Vec::new();
+    for band in &bands[low_band_count..] {
+        let Some(band_median) = median(band) else {
+            continue;
+        };
+        if band_median <= plateau_seed + plateau_tolerance {
+            candidates.extend_from_slice(band);
+        }
+    }
+    if candidates.len() < 8 {
+        return None;
+    }
+
+    // Iterative, upper-only clipping preserves the center of the broadband
+    // distribution while removing spectral lines at any amplitude.
+    for _ in 0..4 {
+        let Some(center) = median(&candidates) else {
+            return None;
+        };
+        let mad = median_absolute_deviation(&candidates, center).unwrap_or(0.0);
+        let upper_limit = center + (3.5 * 1.4826 * mad).max((1.5_f64).ln());
+        let previous_len = candidates.len();
+        candidates.retain(|value| *value <= upper_limit);
+        if candidates.len() == previous_len || candidates.len() < 8 {
+            break;
+        }
+    }
+
+    median(&candidates).map(f64::exp).filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    let mut sorted: Vec<f64> = values.iter().copied().filter(|value| value.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    quantile_sorted(&sorted, 0.5)
+}
+
+fn median_absolute_deviation(values: &[f64], center: f64) -> Option<f64> {
+    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
+    median(&deviations)
+}
+
+fn quantile_sorted(sorted: &[f64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let position = quantile.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * fraction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +354,137 @@ mod tests {
         let ts: Vec<f64> = (0..n).map(|i| i as f64 / sampling_hz).collect();
         let vals: Vec<f64> = ts.iter().map(|&t| (2.0 * PI * freq_hz * t).sin()).collect();
         (ts, vals)
+    }
+
+    /// Box-Muller over a xorshift stream: repeatable normal noise for tests
+    /// without pulling in an RNG dependency.
+    fn gaussian_noise(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let u1: f64 = next().max(1e-12);
+            let u2: f64 = next();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+        }
+    }
+
+    #[test]
+    fn amplitude_density_matches_injected_white_noise() {
+        // The displayed spectrum is an amplitude density in units/sqrt(Hz),
+        // which is a one-sided quantity. The raw Welch periodogram is the
+        // two-sided form, so without folding it the plot reads a factor of
+        // sqrt(2) low against a known noise source.
+        let sampling_hz: f64 = 1000.0;
+        let target_asd = 0.02_f64;
+        let sigma = target_asd * (sampling_hz / 2.0).sqrt();
+        let n = 16_384;
+        let mut gauss = gaussian_noise(0x2545F4914F6CDD1D);
+
+        let ts: Vec<f64> = (0..n).map(|i| i as f64 / sampling_hz).collect();
+        let vals: Vec<f64> = (0..n).map(|_| sigma * gauss()).collect();
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+
+        let data = op.output().as_ref().expect("expected Ok result");
+        let broadband: Vec<f64> = data
+            .points
+            .iter()
+            .filter(|(f, d)| *f > 100.0 && *f < 400.0 && d.is_finite())
+            .map(|(_, d)| *d)
+            .collect();
+        assert!(!broadband.is_empty(), "no broadband bins");
+
+        let rms = (broadband.iter().map(|d| d * d).sum::<f64>() / broadband.len() as f64).sqrt();
+        let ratio = rms / target_asd;
+        assert!(
+            (0.95..1.05).contains(&ratio),
+            "amplitude density drifted from the injected noise: {ratio}"
+        );
+    }
+
+    #[test]
+    fn noise_floor_matches_injected_level_and_rejects_a_tone() {
+        // A strong tone on top of known white noise. The robust estimate must
+        // track the broadband level; the plain median, which sees every bin,
+        // is the thing it improves on.
+        let sampling_hz: f64 = 1000.0;
+        let target_asd = 0.02_f64;
+        let sigma = target_asd * (sampling_hz / 2.0).sqrt();
+        let n = 16_384;
+        let mut gauss = gaussian_noise(0x2545F4914F6CDD1D);
+
+        let ts: Vec<f64> = (0..n).map(|i| i as f64 / sampling_hz).collect();
+        let vals: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 / sampling_hz;
+                (2.0 * PI * 60.0 * t).sin() + sigma * gauss()
+            })
+            .collect();
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+
+        let floor = data.noise_floor.expect("estimate");
+        let ratio = floor / target_asd;
+        assert!(
+            (0.95..1.05).contains(&ratio),
+            "noise floor drifted from the injected level: {ratio}"
+        );
+
+        let peak = data
+            .points
+            .iter()
+            .map(|(_, d)| *d)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            floor < peak / 10.0,
+            "estimate {floor} was pulled toward the {peak} peak"
+        );
+    }
+
+    #[test]
+    fn spectrum_axis_is_spaced_by_fs_over_dft_size() {
+        // Bins are spaced `fs / dft_size` apart starting at DC, so the last
+        // sits one spacing below Nyquist. A linspace onto `0..=fs/2` (the
+        // `welch-sde` bug this guards against) would instead stretch every
+        // frequency by `n / (n - 1)`. DC is filtered out, so the first
+        // surviving bin is one spacing up.
+        let sampling_hz: f64 = 1000.0;
+        let n = 16_384;
+        let (ts, vals) = sine_signal(n, 400.0, sampling_hz);
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+
+        // DC is dropped, so the kept bins number dft_size / 2 - 1.
+        let dft_size = 2 * (data.points.len() + 1);
+        let expected_spacing = sampling_hz / dft_size as f64;
+
+        let spacing = data.points[1].0 - data.points[0].0;
+        assert!(
+            (spacing - expected_spacing).abs() < 1e-9,
+            "bin spacing {spacing}, expected {expected_spacing}"
+        );
+        assert!(
+            (data.points[0].0 - expected_spacing).abs() < 1e-9,
+            "first kept bin {} should be one spacing above DC",
+            data.points[0].0
+        );
+
+        let last = data.points[data.points.len() - 1].0;
+        let expected_last = sampling_hz / 2.0 - expected_spacing;
+        assert!(
+            (last - expected_last).abs() < 1e-9,
+            "last bin {last}, expected {expected_last} (one spacing below Nyquist)"
+        );
     }
 
     #[test]
@@ -253,6 +514,35 @@ mod tests {
         assert!(
             (peak_freq - freq_hz).abs() <= 2.0 * bin_hz,
             "peak at {peak_freq} Hz, expected near {freq_hz} Hz (bin={bin_hz})"
+        );
+    }
+
+    #[test]
+    fn tone_power_integrates_to_half_amplitude_squared() {
+        // Parseval closes the loop the peak-location test cannot: integrating
+        // the one-sided density across a tone recovers the sine's variance
+        // A^2/2, pinning the window-power bookkeeping with a coherent signal.
+        let sampling_hz: f64 = 1000.0;
+        let amplitude = 0.5_f64;
+        let n = 16_384;
+        let (ts, unit) = sine_signal(n, 100.0, sampling_hz);
+        let vals: Vec<f64> = unit.iter().map(|v| amplitude * v).collect();
+
+        let mut op = WelchOp::new(n, sampling_hz, 10.0);
+        push(&mut op, &ts, &vals);
+        let data = op.output().as_ref().expect("expected Ok result");
+
+        let df = data.points[1].0 - data.points[0].0;
+        let band_power: f64 = data
+            .points
+            .iter()
+            .filter(|(f, _)| (90.0..110.0).contains(f))
+            .map(|(_, d)| d * d * df)
+            .sum();
+        let ratio = band_power / (amplitude * amplitude / 2.0);
+        assert!(
+            (0.97..1.03).contains(&ratio),
+            "integrated tone power drifted from A^2/2: {ratio}"
         );
     }
 
