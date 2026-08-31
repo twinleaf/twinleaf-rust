@@ -1,4 +1,8 @@
+//! The on-disk RPC registry cache: the only part of the RPC layer that touches
+//! a filesystem.
+
 use crc::{Crc, CRC_32_ISO_HDLC};
+use directories::BaseDirs;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -9,11 +13,63 @@ pub(super) type Entries = Vec<(String, u16)>;
 const CACHE_CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Where a device's registry is cached, `None` when no usable cache directory
+/// exists.
+// TODO: evict stale cache files from old firmware versions (<dev_name>.*.rpcs)
+pub(super) fn path(dev_name: &str, hash: u32) -> Option<PathBuf> {
+    let dir = BaseDirs::new()?.cache_dir().join("twinleaf");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{}.{hash:x}.rpcs", stem(dev_name))))
+}
+
+/// Cache filename stem for a device-supplied name. The name is untrusted — a
+/// network device could report `../..` — so keep it to a charset that cannot
+/// escape the cache directory; the hash still makes the filename unique.
+fn stem(dev_name: &str) -> String {
+    dev_name
+        .chars()
+        .take(64)
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// The cached entries for `path`, or `None` when there is nothing usable there.
+pub(super) fn load(path: &Path) -> io::Result<Option<Entries>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match read(file)? {
+        Some(entries) => Ok(Some(entries)),
+        None => {
+            warn(fs::remove_file(path), "discard stale", path);
+            Ok(None)
+        }
+    }
+}
+
+/// Keeping the cache tidy is an optimization, never a reason to fail a registry
+/// the device already answered for — an unwritable cache directory only costs a
+/// round-trip next time.
+pub(super) fn store(path: &Path, entries: &Entries) {
+    warn(write(path, entries), "write", path);
+}
+
+fn warn(result: io::Result<()>, action: &str, path: &Path) {
+    if let Err(error) = result {
+        log::warn!("could not {action} RPC cache {}: {error}", path.display());
+    }
+}
+
 /// Read the private on-disk RPC cache format.
 ///
 /// Invalid contents are a cache miss rather than a user-facing error: the
 /// caller can discard the file and fetch a fresh registry from the device.
-pub(super) fn read(file: File) -> io::Result<Option<Entries>> {
+fn read(file: File) -> io::Result<Option<Entries>> {
     let reader = io::BufReader::new(file);
     let mut lines = reader.lines();
     let mut entries = Vec::new();
@@ -62,7 +118,7 @@ fn create_temporary(path: &Path) -> io::Result<(PathBuf, File)> {
 }
 
 /// Write a complete cache file and atomically publish it at `path`.
-pub(super) fn write(path: &Path, entries: &[(String, u16)]) -> io::Result<()> {
+fn write(path: &Path, entries: &[(String, u16)]) -> io::Result<()> {
     let (temporary, file) = create_temporary(path)?;
     let result = (|| {
         let mut writer = io::BufWriter::new(file);
@@ -84,4 +140,15 @@ pub(super) fn write(path: &Path, entries: &[(String, u16)]) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stem;
+
+    #[test]
+    fn stem_cannot_escape_the_cache_directory() {
+        assert_eq!(stem("../../etc/passwd"), "______etc_passwd");
+        assert_eq!(stem("sync-v2"), "sync-v2");
+    }
 }

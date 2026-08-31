@@ -1,9 +1,10 @@
-use super::proto::RpcReply;
-use super::proto::{self, DeviceRoute, Packet};
-use super::proxy::Event;
+use super::proto::{self, DeviceRoute, Packet, PacketType, RpcMethod};
+use super::proxy::{Event, RawCallError, RawCallResult};
 use super::transport;
 use super::transport::Port as HardwarePort;
 use super::transport::{ReceiveResult, RecvError};
+use twinleaf_proto::heartbeat::Heartbeat;
+use twinleaf_proto::rpc::RpcError;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -23,16 +24,19 @@ impl StatusQueue {
             Event::NewClient(_) => true,
             _ => !self.only_new_client,
         } {
-            self.dest
-                .try_send(event)
-                .expect("Failed to send event to proxy status queue");
+            match self.dest.try_send(event) {
+                Ok(()) | Err(channel::TrySendError::Disconnected(_)) => {}
+                Err(channel::TrySendError::Full(event)) => {
+                    log::warn!("dropping proxy status event because its queue is full: {event:?}");
+                }
+            }
         }
     }
 }
 
 /// Internal proxy state per client
 #[derive(Debug)]
-pub struct ProxyClient {
+pub(crate) struct ProxyClient {
     /// Used to send packets to the client
     tx: channel::Sender<Packet>,
 
@@ -55,6 +59,17 @@ pub struct ProxyClient {
 
     /// Forward packets that are not sample data nor RPC-related.
     forward_nonrpc: bool,
+}
+
+pub(crate) enum ProxyCommand {
+    OpenPort {
+        client: ProxyClient,
+    },
+    Call {
+        request: Packet,
+        timeout: Duration,
+        result: channel::Sender<RawCallResult>,
+    },
 }
 
 impl ProxyClient {
@@ -80,11 +95,11 @@ impl ProxyClient {
 
     fn try_send(&self, pkt: &Packet) -> bool {
         // ProxyStatus should be route-agnostic
-        if matches!(pkt.payload, proto::Payload::ProxyStatus(_)) {
+        if pkt.ptype() == PacketType::PROXY_STATUS {
             return self.tx.try_send(pkt.clone()).is_ok();
         }
 
-        let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.routing) {
+        let scoped_route = if let Ok(r) = self.scope.relative_route(&pkt.route()) {
             if r.len() <= self.depth {
                 r
             } else {
@@ -93,33 +108,23 @@ impl ProxyClient {
         } else {
             return true;
         };
-        if !match pkt.payload {
-            proto::Payload::RpcRequest(_)
-            | proto::Payload::RpcReply(_)
-            | proto::Payload::RpcError(_) => true,
-            proto::Payload::LegacyStreamData(_) | proto::Payload::StreamData(_) => {
-                self.forward_data
-            }
+        if !match pkt.ptype() {
+            PacketType::RPC_REQ | PacketType::RPC_REP | PacketType::RPC_ERROR => true,
+            _ if pkt.is_data() => self.forward_data,
             _ => self.forward_nonrpc,
         } {
             return true;
         }
-        self.tx
-            .try_send(Packet {
-                payload: pkt.payload.clone(),
-                routing: scoped_route,
-                ttl: pkt.ttl,
-            })
-            .is_ok()
+        self.tx.try_send(pkt.with_route(scoped_route)).is_ok()
     }
 
     fn recv(&self) -> Result<Packet, channel::TryRecvError> {
-        let mut pkt = self.rx.try_recv()?;
-        pkt.routing = self
+        let pkt = self.rx.try_recv()?;
+        let absolute = self
             .scope
-            .absolute_route(&pkt.routing)
+            .absolute_route(&pkt.route())
             .expect("Port validates scoped routes before enqueueing them");
-        Ok(pkt)
+        Ok(pkt.with_route(absolute))
     }
 }
 
@@ -145,7 +150,7 @@ struct ProxyDevice {
     last_session: Option<u32>,
     restarted: bool,
     rpc_meta: HashMap<String, u16>,
-    pending_broadcasts: Vec<(String, DeviceRoute, u64)>,
+    pending_broadcasts: Vec<(String, DeviceRoute, Option<u64>)>,
     pending_lookup: Option<(String, DeviceRoute)>,
 }
 
@@ -207,10 +212,9 @@ impl ProxyDevice {
         }
         if !self.has_static_rate() {
             if let Ok(pkt) = &res {
-                if let proto::Payload::Heartbeat(proto::HeartbeatPayload::Session(session)) =
-                    pkt.payload
-                {
-                    if pkt.routing.is_empty() {
+                if let proto::Payload::Heartbeat(Heartbeat::Session(session)) = pkt.payload() {
+                    let session = session.value();
+                    if pkt.route().is_empty() {
                         // This is a heartbeat for the root sensor
                         let old_session = self.last_session.replace(session);
                         if let RateChange::WaitingForSession = self.rate_change_state {
@@ -233,19 +237,57 @@ impl ProxyDevice {
     }
 }
 
+enum RpcTarget {
+    Port { client_id: u64, original_id: u16 },
+    Direct(channel::Sender<RawCallResult>),
+    Internal(u16),
+}
+
+enum RpcOrigin {
+    Port(u64),
+    Direct {
+        result: channel::Sender<RawCallResult>,
+        timeout: Duration,
+    },
+    Internal,
+}
+
+#[derive(Clone, Copy)]
+enum RpcFailure {
+    Timeout,
+    DeviceDisconnected,
+    ProxyClosed,
+}
+
+impl RpcFailure {
+    fn wire_error(self) -> RpcError {
+        match self {
+            Self::Timeout => RpcError::Timeout,
+            Self::DeviceDisconnected | Self::ProxyClosed => RpcError::Undefined,
+        }
+    }
+
+    fn direct_error(self) -> RawCallError {
+        match self {
+            Self::Timeout => RawCallError::Timeout,
+            Self::DeviceDisconnected => RawCallError::DeviceDisconnected,
+            Self::ProxyClosed => RawCallError::ProxyClosed,
+        }
+    }
+}
+
 struct RpcMapEntry {
-    id: u16,
-    client: u64,
+    target: RpcTarget,
     route: DeviceRoute,
     timeout: Instant,
     has_arg: bool,
-    method: proto::RpcMethod,
+    method: RpcMethod,
 }
 
-pub struct ProxyCore {
+pub(crate) struct ProxyCore {
     url: String,
     reconnect_timeout: Option<Duration>,
-    new_client_queue: channel::Receiver<ProxyClient>,
+    command_queue: channel::Receiver<ProxyCommand>,
     status_queue: StatusQueue,
 
     device: Option<ProxyDevice>,
@@ -284,14 +326,14 @@ impl ProxyCore {
     pub fn new(
         url: String,
         reconnect_timeout: Option<Duration>,
-        new_client_queue: channel::Receiver<ProxyClient>,
+        command_queue: channel::Receiver<ProxyCommand>,
         status_queue: channel::Sender<Event>,
         notify_new_client_only: bool,
     ) -> ProxyCore {
         ProxyCore {
             url,
             reconnect_timeout,
-            new_client_queue,
+            command_queue,
             status_queue: StatusQueue {
                 dest: status_queue,
                 only_new_client: notify_new_client_only,
@@ -346,11 +388,7 @@ impl ProxyCore {
         }
     }
 
-    fn rpc_restore(
-        &mut self,
-        wire_id: u16,
-        route: &DeviceRoute,
-    ) -> Option<(u64, u16, proto::RpcMethod, bool)> {
+    fn rpc_restore(&mut self, wire_id: u16, route: &DeviceRoute) -> Option<RpcMapEntry> {
         let remap = match self.rpc_map.remove(&wire_id) {
             None => {
                 return None;
@@ -369,49 +407,81 @@ impl ProxyCore {
         } else {
             log::warn!("Failed to find RPC timeout in map");
         }
-        Some((remap.client, remap.id, remap.method, remap.has_arg))
+        Some(remap)
+    }
+
+    fn next_wire_rpc_id(&mut self) -> Option<u16> {
+        for _ in 0..=u16::MAX {
+            let wire_id = self.next_rpc_id;
+            self.next_rpc_id = self.next_rpc_id.wrapping_add(1);
+            if !self.rpc_map.contains_key(&wire_id) {
+                return Some(wire_id);
+            }
+        }
+        None
     }
 
     // RPC failures are returned so the caller can notify the requesting client.
-    fn forward_to_device(
-        &mut self,
-        mut pkt: Packet,
-        client_id: u64,
-    ) -> Result<(), proto::RpcErrorCode> {
+    fn forward_to_device(&mut self, mut pkt: Packet, origin: RpcOrigin) -> Result<(), RpcError> {
         let mut rpc_mapped_id: Option<u16> = None;
         let mut timeout = Instant::now();
-        if let proto::Payload::RpcRequest(req) = &mut pkt.payload {
-            let wire_id = self.next_rpc_id;
-            // Always increment even if it fails, on the slim chance it hits an open spot
-            // next time.
-            self.next_rpc_id = self.next_rpc_id.wrapping_add(1);
-            if self.rpc_map.contains_key(&wire_id) {
-                return Err(proto::RpcErrorCode::OutOfMemory);
-            }
-            timeout += if client_id != 0 {
-                self.clients
-                    .get(&client_id)
-                    .expect("Invalid client when forwarding RPC")
-                    .rpc_timeout
-            } else {
-                // Timeout internal RPCs after 1 second
-                Duration::from_secs(1)
+        let port_client = match &origin {
+            RpcOrigin::Port(client_id) => Some(*client_id),
+            RpcOrigin::Direct { .. } | RpcOrigin::Internal => None,
+        };
+        // Decide from the borrowed view before rewriting the packet's bytes.
+        let request = match pkt.payload() {
+            proto::Payload::RpcRequest(req) => Some((
+                req.id.value(),
+                RpcMethod::from_wire(req.method),
+                !req.args.is_empty(),
+            )),
+            _ => None,
+        };
+        if let Some((client_rpc_id, method, has_arg)) = request {
+            let wire_id = self.next_wire_rpc_id().ok_or(RpcError::NoBufs)?;
+            let target = match origin {
+                RpcOrigin::Port(client_id) => {
+                    timeout += self
+                        .clients
+                        .get(&client_id)
+                        .expect("Invalid client when forwarding RPC")
+                        .rpc_timeout;
+                    RpcTarget::Port {
+                        client_id,
+                        original_id: client_rpc_id,
+                    }
+                }
+                RpcOrigin::Direct {
+                    result,
+                    timeout: call_timeout,
+                } => {
+                    timeout += call_timeout;
+                    RpcTarget::Direct(result)
+                }
+                RpcOrigin::Internal => {
+                    timeout += Duration::from_secs(1);
+                    RpcTarget::Internal(client_rpc_id)
+                }
             };
             self.rpc_map.insert(
                 wire_id,
                 RpcMapEntry {
-                    id: req.id,
-                    client: client_id,
-                    route: pkt.routing,
+                    target,
+                    route: pkt.route(),
                     timeout,
-                    method: req.method.clone(),
-                    has_arg: !req.arg.is_empty(),
+                    method,
+                    has_arg,
                 },
             );
-            self.status_queue
-                .send(Event::RpcRemap((client_id, req.id), wire_id));
-            req.id = wire_id;
+            if let Some(client_id) = port_client {
+                self.status_queue
+                    .send(Event::RpcRemap((client_id, client_rpc_id), wire_id));
+            }
+            pkt = pkt.with_rpc_id(wire_id);
             rpc_mapped_id = Some(wire_id);
+        } else if port_client.is_none() {
+            return Err(RpcError::Malformed);
         }
         if let Some(dev) = &self.device {
             if let Ok(()) = dev.tio_port.send(pkt) {
@@ -429,18 +499,14 @@ impl ProxyCore {
             self.rpc_map
                 .remove(&rpc_id)
                 .expect("Unexpected missing timeout set");
-            Err(proto::RpcErrorCode::Undefined)
+            Err(RpcError::Undefined)
         } else {
             Ok(())
         }
     }
 
     fn broadcast_status(&self, status: proto::ProxyStatus) {
-        let pkt = Packet {
-            payload: proto::Payload::ProxyStatus(proto::ProxyStatusPayload(status)),
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        };
+        let pkt = Packet::proxy_status(status);
         for client in self.clients.values() {
             client.try_send(&pkt);
         }
@@ -448,19 +514,150 @@ impl ProxyCore {
 
     fn broadcast_rpc_update(
         &self,
-        method: &proto::RpcMethod,
+        method: &RpcMethod,
         route: &DeviceRoute,
-        exclude_client: u64,
+        exclude_client: Option<u64>,
     ) {
-        let pkt = Packet {
-            payload: proto::Payload::RpcUpdate(proto::RpcUpdatePayload(method.clone())),
-            routing: *route,
-            ttl: 0,
+        let Ok(pkt) = method.update_packet(*route) else {
+            log::warn!("Dropping RPC update for a method name that does not fit a packet");
+            return;
         };
         for (client_id, client) in self.clients.iter() {
-            if *client_id != exclude_client {
+            if Some(*client_id) != exclude_client {
                 let _ = client.tx.try_send(pkt.clone());
             }
+        }
+    }
+
+    fn invalidate_after_write(
+        &mut self,
+        method: &RpcMethod,
+        route: DeviceRoute,
+        exclude_client: Option<u64>,
+    ) {
+        let RpcMethod::Name(name) = method else {
+            return;
+        };
+        let should_broadcast = self
+            .device
+            .as_ref()
+            .and_then(|dev| dev.rpc_meta.get(name))
+            .map(|&meta| {
+                let readable = (meta & 0x0100) != 0;
+                let writable = (meta & 0x0200) != 0;
+                readable && writable
+            });
+
+        match should_broadcast {
+            Some(true) => self.broadcast_rpc_update(method, &route, exclude_client),
+            Some(false) => {}
+            None => {
+                let should_send = if let Some(dev) = self.device.as_mut() {
+                    dev.pending_broadcasts
+                        .push((name.clone(), route, exclude_client));
+                    if dev.pending_lookup.is_none() {
+                        dev.pending_lookup = Some((name.clone(), route));
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_send {
+                    let _ = self.send_internal_rpc(
+                        "rpc.info",
+                        name.as_bytes(),
+                        RPC_INFO_LOOKUP_ID,
+                        route,
+                    );
+                }
+            }
+        }
+    }
+
+    fn dispatch_device_packet(&mut self, pkt: Packet) {
+        let route = pkt.route();
+        let Some(wire_id) = (match pkt.payload() {
+            proto::Payload::RpcReply(reply) => Some(reply.req_id.value()),
+            proto::Payload::RpcError(error) => Some(error.req_id.value()),
+            _ => None,
+        }) else {
+            let mut to_drop = Vec::new();
+            for (client_id, client) in self.clients.iter() {
+                if !client.try_send(&pkt) {
+                    self.status_queue.send(Event::ClientSendFailed(*client_id));
+                    to_drop.push(*client_id);
+                }
+            }
+            for client_id in to_drop {
+                self.drop_client(client_id);
+            }
+            return;
+        };
+
+        let Some(remap) = self.rpc_restore(wire_id, &route) else {
+            self.status_queue.send(Event::RpcRestoreNotFound(wire_id));
+            return;
+        };
+        let RpcMapEntry {
+            target,
+            method,
+            has_arg,
+            ..
+        } = remap;
+
+        if let RpcTarget::Internal(original_id) = &target {
+            match pkt.payload() {
+                proto::Payload::RpcReply(reply) => {
+                    self.internal_rpc_reply(*original_id, reply.value)
+                }
+                proto::Payload::RpcError(error) => {
+                    self.internal_rpc_error(*original_id, RpcError::from(error.code))
+                }
+                _ => unreachable!(),
+            }
+            return;
+        }
+
+        let exclude_client = match &target {
+            RpcTarget::Port { client_id, .. } => Some(*client_id),
+            RpcTarget::Direct(_) => None,
+            RpcTarget::Internal(_) => unreachable!(),
+        };
+        if has_arg && pkt.ptype() == PacketType::RPC_REP {
+            self.invalidate_after_write(&method, route, exclude_client);
+        }
+
+        match target {
+            RpcTarget::Port {
+                client_id,
+                original_id,
+            } => {
+                let Some(client) = self.clients.get(&client_id) else {
+                    self.status_queue.send(Event::RpcClientNotFound(client_id));
+                    return;
+                };
+                self.status_queue
+                    .send(Event::RpcRestore(wire_id, (client_id, original_id)));
+                let restored = pkt.with_rpc_id(original_id);
+                if !client.try_send(&restored) {
+                    self.status_queue.send(Event::ClientSendFailed(client_id));
+                    self.drop_client(client_id);
+                }
+            }
+            RpcTarget::Direct(result) => {
+                let reply = match pkt.payload() {
+                    proto::Payload::RpcReply(reply) => Ok(reply.value.to_vec()),
+                    proto::Payload::RpcError(error) => Err(RawCallError::Device {
+                        error: RpcError::from(error.code),
+                        message: error.message.to_vec(),
+                    }),
+                    _ => unreachable!(),
+                };
+                let _ = result.send(reply);
+            }
+            RpcTarget::Internal(_) => unreachable!(),
         }
     }
 
@@ -468,8 +665,9 @@ impl ProxyCore {
     /// all clients that have an RPC with timeout < `until` (all RPCs if None).
     /// Used to generate RPC timeouts, or to notify a client that it will never
     /// get a reply when the device disconnects or restarts.
-    fn dispatch_rpc_errors(&mut self, error: proto::RpcErrorCode, until: Option<Instant>) {
+    fn dispatch_rpc_errors(&mut self, failure: RpcFailure, until: Option<Instant>) {
         let mut to_remove = Vec::new();
+        let mut failed = Vec::new();
         let mut to_drop = Vec::new();
         for (timeout, rpc_ids) in self.rpc_timeouts.iter() {
             if let Some(timeout_bound) = until {
@@ -480,7 +678,7 @@ impl ProxyCore {
             to_remove.push(*timeout);
             for rpc_id in rpc_ids {
                 self.status_queue
-                    .send(if let proto::RpcErrorCode::Timeout = error {
+                    .send(if matches!(failure, RpcFailure::Timeout) {
                         Event::RpcTimeout(*rpc_id)
                     } else {
                         Event::RpcCancel(*rpc_id)
@@ -489,26 +687,37 @@ impl ProxyCore {
                     .rpc_map
                     .remove(rpc_id)
                     .expect("RPC ID from timeout missing in main map");
-                let client = if let Some(c) = self.clients.get(&remap.client) {
-                    c
-                } else {
-                    // Client is gone.
-                    continue;
-                };
-                if !client.try_send(&Packet::rpc_error(remap.id, error, remap.route)) {
-                    to_drop.push(remap.client);
-                    // This can happen without a problem per se, if e.g. a client
-                    // issues an RPC which will time out, and disconnects before
-                    // said timeout occurs, so it's only a debug-level log.
-                    log::debug!(
-                        "Failed to send generated RPC error to client {:?}",
-                        remap.client
-                    );
-                }
+                failed.push(remap);
             }
         }
         for timeout in to_remove {
             self.rpc_timeouts.remove(&timeout);
+        }
+        for remap in failed {
+            match remap.target {
+                RpcTarget::Port {
+                    client_id,
+                    original_id,
+                } => {
+                    let Some(client) = self.clients.get(&client_id) else {
+                        continue;
+                    };
+                    if !client.try_send(&Packet::rpc_error(
+                        original_id,
+                        failure.wire_error(),
+                        remap.route,
+                    )) {
+                        to_drop.push(client_id);
+                        log::debug!("Failed to send generated RPC error to client {client_id}");
+                    }
+                }
+                RpcTarget::Direct(result) => {
+                    let _ = result.send(Err(failure.direct_error()));
+                }
+                RpcTarget::Internal(original_id) => {
+                    self.internal_rpc_error(original_id, failure.wire_error());
+                }
+            }
         }
         for client_id in to_drop {
             self.drop_client(client_id);
@@ -517,7 +726,7 @@ impl ProxyCore {
 
     fn process_rpc_timeouts(&mut self) -> Duration {
         let now = Instant::now();
-        self.dispatch_rpc_errors(proto::RpcErrorCode::Timeout, Some(now));
+        self.dispatch_rpc_errors(RpcFailure::Timeout, Some(now));
         if let Some(timeout) = self.rpc_timeouts.keys().next() {
             timeout.saturating_duration_since(now) + Duration::from_millis(1)
         } else {
@@ -525,12 +734,19 @@ impl ProxyCore {
         }
     }
 
-    fn send_internal_rpc(&mut self, pkt: Packet) -> Result<(), proto::RpcErrorCode> {
-        self.forward_to_device(pkt, 0)
+    fn send_internal_rpc(
+        &mut self,
+        name: &str,
+        arg: &[u8],
+        id: u16,
+        route: DeviceRoute,
+    ) -> Result<(), RpcError> {
+        let pkt = Packet::rpc_request(name, arg, id, route).map_err(|_| RpcError::ArgsSize)?;
+        self.forward_to_device(pkt, RpcOrigin::Internal)
     }
 
     /// Process a reply to an RPC issued by the ProxyCore.
-    fn internal_rpc_reply(&mut self, rep: &proto::RpcReplyPayload) {
+    fn internal_rpc_reply(&mut self, id: u16, value: &[u8]) {
         fn get_rate_vars(proxy: &ProxyCore) -> Option<(RateChange, u32)> {
             if let Some(dev) = proxy.device.as_ref() {
                 dev.tio_port
@@ -541,9 +757,10 @@ impl ProxyCore {
             }
         }
 
-        if rep.id == QUERY_RATE_RPC_ID {
+        if id == QUERY_RATE_RPC_ID {
             if let Some((RateChange::WaitingDeviceRate, target)) = get_rate_vars(self) {
-                let next_state = if let Ok(value) = u32::decode_reply(&rep.reply) {
+                let next_state = if let Ok(raw) = <[u8; 4]>::try_from(value) {
+                    let value = u32::from_le_bytes(raw);
                     if value == 0 {
                         self.status_queue.send(Event::AutoRateIncompatible(0));
                         self.status_queue.send(Event::AutoRateGaveUp);
@@ -566,7 +783,7 @@ impl ProxyCore {
                 self.device.as_mut().expect("").rate_change_state = next_state;
                 return;
             }
-        } else if rep.id == SET_RATE_RPC_ID {
+        } else if id == SET_RATE_RPC_ID {
             if let Some((RateChange::WaitingNewRate, target)) = get_rate_vars(self) {
                 self.status_queue.send(Event::SetRate(target));
                 let next_state = match self.device.as_ref().expect("").tio_port.set_rate(target) {
@@ -579,14 +796,14 @@ impl ProxyCore {
                 self.device.as_mut().expect("").rate_change_state = next_state;
                 return;
             }
-        } else if rep.id == RPC_INFO_LOOKUP_ID {
+        } else if id == RPC_INFO_LOOKUP_ID {
             let broadcast_info = self.device.as_mut().and_then(|dev| {
                 let (name, _) = dev.pending_lookup.take()?;
-                if rep.reply.len() < 2 {
+                if value.len() < 2 {
                     return None;
                 }
 
-                let meta = u16::from_le_bytes([rep.reply[0], rep.reply[1]]);
+                let meta = u16::from_le_bytes([value[0], value[1]]);
                 dev.rpc_meta.insert(name.clone(), meta);
 
                 let readable = (meta & 0x0100) != 0;
@@ -612,21 +829,17 @@ impl ProxyCore {
             if let Some((matching, should_broadcast, next_lookup)) = broadcast_info {
                 if should_broadcast {
                     for (name, route, exclude_client) in matching {
-                        self.broadcast_rpc_update(
-                            &proto::RpcMethod::Name(name),
-                            &route,
-                            exclude_client,
-                        );
+                        self.broadcast_rpc_update(&RpcMethod::Name(name), &route, exclude_client);
                     }
                 }
 
                 if let Some((next_name, next_route)) = next_lookup {
-                    let _ = self.send_internal_rpc(Packet::rpc_request(
+                    let _ = self.send_internal_rpc(
                         "rpc.info",
                         next_name.as_bytes(),
                         RPC_INFO_LOOKUP_ID,
                         next_route,
-                    ));
+                    );
                 }
             }
             return;
@@ -634,18 +847,18 @@ impl ProxyCore {
             // Note: internal RPCs still get remapped with all other RPCs,
             // so this ID does not come from the device itself, but from the
             // proxy remapping, and it should never be an unexpected value.
-            panic!("Unexpected reply ID to internal RPC: {}", rep.id)
+            panic!("Unexpected reply ID to internal RPC: {}", id)
         }
 
         log::debug!(
             "Unexpected internal rpc reply 0x{:x} in state {:?}",
-            rep.id,
+            id,
             get_rate_vars(self)
         );
     }
 
-    fn internal_rpc_error(&mut self, err: &proto::RpcErrorPayload) {
-        if err.id == RPC_INFO_LOOKUP_ID {
+    fn internal_rpc_error(&mut self, id: u16, error: RpcError) {
+        if id == RPC_INFO_LOOKUP_ID {
             if let Some(dev) = self.device.as_mut() {
                 // Clear current lookup
                 let failed_name = dev.pending_lookup.take().map(|(n, _)| n);
@@ -658,19 +871,19 @@ impl ProxyCore {
                 // Start next lookup if there are more pending
                 if let Some((next_name, next_route, _)) = dev.pending_broadcasts.first().cloned() {
                     dev.pending_lookup = Some((next_name.clone(), next_route));
-                    let _ = self.send_internal_rpc(Packet::rpc_request(
+                    let _ = self.send_internal_rpc(
                         "rpc.info",
                         next_name.as_bytes(),
                         RPC_INFO_LOOKUP_ID,
                         next_route,
-                    ));
+                    );
                 }
             }
             return;
         }
 
         // We could handle this better, but just keep the device to the default speed until the port is reset
-        self.status_queue.send(Event::AutoRateRpcError(err.error));
+        self.status_queue.send(Event::AutoRateRpcError(error));
         if let Some(dev) = self.device.as_mut() {
             dev.rate_change_state = RateChange::GaveUp;
             self.status_queue.send(Event::AutoRateGaveUp);
@@ -689,12 +902,12 @@ impl ProxyCore {
         let next_state = match device(self).rate_change_state.clone() {
             RateChange::QueryDeviceRate => {
                 let target = device(self).rates().target_bps;
-                if let Err(rpc_error) = self.send_internal_rpc(Packet::rpc_request(
+                if let Err(rpc_error) = self.send_internal_rpc(
                     "dev.port.rate.near",
                     &target.to_le_bytes(),
                     QUERY_RATE_RPC_ID,
                     DeviceRoute::root(),
-                )) {
+                ) {
                     self.status_queue.send(Event::AutoRateRpcError(rpc_error));
                     RateChange::GaveUp
                 } else {
@@ -705,12 +918,12 @@ impl ProxyCore {
             RateChange::SetDeviceRate => {
                 if self.rpc_map.is_empty() {
                     let target = device(self).rates().target_bps;
-                    if let Err(rpc_error) = self.send_internal_rpc(Packet::rpc_request(
+                    if let Err(rpc_error) = self.send_internal_rpc(
                         "dev.port.rate",
                         &target.to_le_bytes(),
                         SET_RATE_RPC_ID,
                         DeviceRoute::root(),
-                    )) {
+                    ) {
                         self.status_queue.send(Event::AutoRateRpcError(rpc_error));
                         RateChange::GaveUp
                     } else {
@@ -744,27 +957,17 @@ impl ProxyCore {
     }
 
     fn cancel_active_rpcs(&mut self) {
-        self.dispatch_rpc_errors(proto::RpcErrorCode::Undefined, None);
+        self.dispatch_rpc_errors(RpcFailure::DeviceDisconnected, None);
     }
 
-    pub fn run(&mut self, startup: Option<channel::Sender<io::Result<()>>>) {
+    pub(crate) fn run(&mut self) {
         use channel::TryRecvError;
 
         if let Err(error) = self.try_setup_device() {
             log::debug!("failed to open {}: {error}", self.url);
-            if let Some(startup) = startup {
-                let _ = startup.send(Err(error));
-            }
             self.status_queue.send(Event::FailedToConnect);
             self.broadcast_status(proto::ProxyStatus::FailedToConnect);
             return;
-        }
-        if let Some(startup) = startup {
-            // If the constructor stopped waiting, do not leave a detached worker
-            // holding the transport it was meant to acquire.
-            if startup.send(Ok(())).is_err() {
-                return;
-            }
         }
         let mut device_timeout = Instant::now();
 
@@ -848,10 +1051,15 @@ impl ProxyCore {
                 }
             }
 
-            sel.recv(&self.new_client_queue);
-            if let Some(device) = &self.device {
-                sel.recv(&device.rx_channel);
-            }
+            let command_index = if safe_to_forward {
+                Some(sel.recv(&self.command_queue))
+            } else {
+                None
+            };
+            let device_index = self
+                .device
+                .as_ref()
+                .map(|device| sel.recv(&device.rx_channel));
 
             let index = match sel.ready_timeout(timeout) {
                 Ok(index) => index,
@@ -895,11 +1103,11 @@ impl ProxyCore {
                 // will be returned to send back.
                 let mut rpc_errors = vec![];
                 for pkt in packets {
-                    let reply_target = match &pkt.payload {
-                        proto::Payload::RpcRequest(req) => Some((pkt.routing, req.id)),
+                    let reply_target = match pkt.payload() {
+                        proto::Payload::RpcRequest(req) => Some((pkt.route(), req.id.value())),
                         _ => None,
                     };
-                    if let Err(error) = self.forward_to_device(pkt, client_id) {
+                    if let Err(error) = self.forward_to_device(pkt, RpcOrigin::Port(client_id)) {
                         let (route, id) =
                             reply_target.expect("only RPC requests produce forwarding errors");
                         rpc_errors.push(Packet::rpc_error(id, error, route));
@@ -927,15 +1135,35 @@ impl ProxyCore {
                         self.drop_client(client_id);
                     }
                 }
-            } else if index == ids.len() {
-                // new proxy client
+            } else if Some(index) == command_index {
+                // New ports and direct RPC calls share one bounded command lane.
                 loop {
-                    match self.new_client_queue.try_recv() {
-                        Ok(client) => {
-                            self.status_queue
-                                .send(Event::NewClient(self.next_client_id));
-                            self.clients.insert(self.next_client_id, client);
+                    match self.command_queue.try_recv() {
+                        Ok(ProxyCommand::OpenPort { client }) => {
+                            let client_id = self.next_client_id;
                             self.next_client_id += 1;
+                            self.clients.insert(client_id, client);
+                            self.status_queue.send(Event::NewClient(client_id));
+                        }
+                        Ok(ProxyCommand::Call {
+                            request,
+                            timeout,
+                            result,
+                        }) => {
+                            let completion = result.clone();
+                            if let Err(error) = self
+                                .forward_to_device(request, RpcOrigin::Direct { result, timeout })
+                            {
+                                let error = if matches!(error, RpcError::Undefined) {
+                                    RawCallError::DeviceDisconnected
+                                } else {
+                                    RawCallError::Device {
+                                        error,
+                                        message: Vec::new(),
+                                    }
+                                };
+                                let _ = completion.send(Err(error));
+                            }
                         }
                         Err(TryRecvError::Empty) => {
                             break;
@@ -946,11 +1174,11 @@ impl ProxyCore {
                         }
                     }
                 }
-            } else {
+            } else if Some(index) == device_index {
                 // data from the device
                 while let Some(device) = self.device.as_mut() {
                     match device.try_recv(&self.status_queue) {
-                        Ok(Ok(mut pkt)) => {
+                        Ok(Ok(pkt)) => {
                             // First packet since (re)connect: the device is live, announce it.
                             let first_packet =
                                 !std::mem::replace(&mut device.seen_since_connect, true);
@@ -964,140 +1192,7 @@ impl ProxyCore {
                                     self.status_queue.send(Event::SensorConnected);
                                 }
                             }
-                            // In general, packets get forwarded to all clients,
-                            // except for RPCs which are directed only to the
-                            // client which placed the request.
-                            if let Some(wire_id) = match &pkt.payload {
-                                proto::Payload::RpcReply(rep) => Some(rep.id),
-                                proto::Payload::RpcError(err) => Some(err.id),
-                                _ => None,
-                            } {
-                                // Remap RPC reply or error ID to client + ID
-                                let (client_id, original_id, method, has_arg) =
-                                    if let Some((client_id, rpc_id, method, has_arg)) =
-                                        self.rpc_restore(wire_id, &pkt.routing)
-                                    {
-                                        if client_id == 0 {
-                                            // internal reply
-                                            (0, rpc_id, method, has_arg)
-                                        } else if self.clients.contains_key(&client_id) {
-                                            self.status_queue.send(Event::RpcRestore(
-                                                wire_id,
-                                                (client_id, rpc_id),
-                                            ));
-                                            (client_id, rpc_id, method, has_arg)
-                                        } else {
-                                            // If we cannot find the client which originally sent the
-                                            // request, just drop the packet and send an event.
-                                            self.status_queue
-                                                .send(Event::RpcClientNotFound(client_id));
-                                            continue;
-                                        }
-                                    } else {
-                                        self.status_queue.send(Event::RpcRestoreNotFound(wire_id));
-                                        continue;
-                                    };
-                                // Restore original ID, and process internal RPCs.
-                                match &mut pkt.payload {
-                                    proto::Payload::RpcReply(rep) => {
-                                        rep.id = original_id;
-                                        if client_id == 0 {
-                                            self.internal_rpc_reply(rep);
-                                            continue;
-                                        }
-                                        if has_arg {
-                                            if let proto::RpcMethod::Name(ref name) = method {
-                                                let should_broadcast = self
-                                                    .device
-                                                    .as_ref()
-                                                    .and_then(|dev| dev.rpc_meta.get(name))
-                                                    .map(|&meta| {
-                                                        let readable = (meta & 0x0100) != 0;
-                                                        let writable = (meta & 0x0200) != 0;
-                                                        readable && writable
-                                                    });
-
-                                                match should_broadcast {
-                                                    Some(true) => {
-                                                        self.broadcast_rpc_update(
-                                                            &method,
-                                                            &pkt.routing,
-                                                            client_id,
-                                                        );
-                                                    }
-                                                    Some(false) => {
-                                                        // Not readable+writable, don't broadcast
-                                                    }
-                                                    None => {
-                                                        // Not cached - queue and start lookup with rpc.info directly
-                                                        let should_send = if let Some(dev) =
-                                                            self.device.as_mut()
-                                                        {
-                                                            dev.pending_broadcasts.push((
-                                                                name.clone(),
-                                                                pkt.routing,
-                                                                client_id,
-                                                            ));
-                                                            if dev.pending_lookup.is_none() {
-                                                                dev.pending_lookup = Some((
-                                                                    name.clone(),
-                                                                    pkt.routing,
-                                                                ));
-                                                                Some((name.clone(), pkt.routing))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        } else {
-                                                            None
-                                                        };
-
-                                                        // Call rpc.info directly with the name
-                                                        if let Some((name, route)) = should_send {
-                                                            let _ = self.send_internal_rpc(
-                                                                Packet::rpc_request(
-                                                                    "rpc.info",
-                                                                    name.as_bytes(),
-                                                                    RPC_INFO_LOOKUP_ID,
-                                                                    route,
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    proto::Payload::RpcError(err) => {
-                                        err.id = original_id;
-                                        if client_id == 0 {
-                                            self.internal_rpc_error(err);
-                                            continue;
-                                        }
-                                    }
-                                    _ => {
-                                        // should never happen due to outer match
-                                        panic!("unexpected payload")
-                                    }
-                                }
-                                // Forward with correct request id to the requestor
-                                if let Some(client) = self.clients.get(&client_id) {
-                                    if !client.try_send(&pkt) {
-                                        self.status_queue.send(Event::ClientSendFailed(client_id));
-                                        self.drop_client(client_id);
-                                    }
-                                }
-                            } else {
-                                let mut to_drop = vec![];
-                                for (client_id, client) in self.clients.iter() {
-                                    if !client.try_send(&pkt) {
-                                        self.status_queue.send(Event::ClientSendFailed(*client_id));
-                                        to_drop.push(*client_id);
-                                    }
-                                }
-                                for client_id in to_drop {
-                                    self.drop_client(client_id);
-                                }
-                            }
+                            self.dispatch_device_packet(pkt);
                         }
                         // Got a RecvError
                         Ok(Err(err)) => {
@@ -1131,6 +1226,15 @@ impl ProxyCore {
                         }
                     }
                 }
+            } else {
+                unreachable!("ready channel was not registered with the proxy select loop");
+            }
+        }
+
+        self.dispatch_rpc_errors(RpcFailure::ProxyClosed, None);
+        while let Ok(command) = self.command_queue.try_recv() {
+            if let ProxyCommand::Call { result, .. } = command {
+                let _ = result.send(Err(RawCallError::ProxyClosed));
             }
         }
     }
@@ -1140,11 +1244,197 @@ impl ProxyCore {
 mod tests {
     use super::*;
 
+    fn test_core() -> ProxyCore {
+        let (_new_client_tx, new_client_rx) = channel::bounded(1);
+        let (status_tx, _status_rx) = channel::bounded(16);
+        ProxyCore::new(String::new(), None, new_client_rx, status_tx, false)
+    }
+
+    fn insert_rpc(
+        core: &mut ProxyCore,
+        wire_id: u16,
+        client_id: u64,
+        client_request_id: u16,
+        route: DeviceRoute,
+        timeout: Instant,
+    ) {
+        core.rpc_map.insert(
+            wire_id,
+            RpcMapEntry {
+                target: RpcTarget::Port {
+                    client_id,
+                    original_id: client_request_id,
+                },
+                route,
+                timeout,
+                has_arg: false,
+                method: RpcMethod::Name("dev.name".into()),
+            },
+        );
+        core.rpc_timeouts
+            .entry(timeout)
+            .or_default()
+            .insert(wire_id);
+    }
+
+    fn insert_direct_rpc(
+        core: &mut ProxyCore,
+        wire_id: u16,
+        route: DeviceRoute,
+        timeout: Instant,
+    ) -> channel::Receiver<RawCallResult> {
+        let (result, receiver) = channel::bounded(1);
+        core.rpc_map.insert(
+            wire_id,
+            RpcMapEntry {
+                target: RpcTarget::Direct(result),
+                route,
+                timeout,
+                has_arg: false,
+                method: RpcMethod::Name("dev.name".into()),
+            },
+        );
+        core.rpc_timeouts
+            .entry(timeout)
+            .or_default()
+            .insert(wire_id);
+        receiver
+    }
+
+    #[test]
+    fn direct_rpcs_complete_independently_and_out_of_order() {
+        let mut core = test_core();
+        let first_route: DeviceRoute = "/1".parse().unwrap();
+        let second_route: DeviceRoute = "/2".parse().unwrap();
+        let timeout = Instant::now() + Duration::from_secs(3);
+        let first = insert_direct_rpc(&mut core, 20, first_route, timeout);
+        let second = insert_direct_rpc(&mut core, 21, second_route, timeout);
+
+        core.dispatch_device_packet(Packet::rpc_reply(21, b"second", second_route).unwrap());
+        core.dispatch_device_packet(Packet::rpc_reply(20, b"first", first_route).unwrap());
+
+        assert_eq!(first.recv().unwrap().unwrap(), b"first");
+        assert_eq!(second.recv().unwrap().unwrap(), b"second");
+        assert!(core.rpc_map.is_empty());
+        assert!(core.rpc_timeouts.is_empty());
+    }
+
+    #[test]
+    fn a_wire_timeout_is_distinct_from_a_local_direct_call_timeout() {
+        let mut core = test_core();
+        let route = DeviceRoute::root();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let wire_error = insert_direct_rpc(&mut core, 20, route, deadline);
+        core.dispatch_device_packet(Packet::rpc_error(20, RpcError::Timeout, route));
+        assert!(matches!(
+            wire_error.recv().unwrap(),
+            Err(RawCallError::Device {
+                error: RpcError::Timeout,
+                ..
+            })
+        ));
+
+        let expired = Instant::now() - Duration::from_millis(1);
+        let local_timeout = insert_direct_rpc(&mut core, 21, route, expired);
+        core.process_rpc_timeouts();
+        assert!(matches!(
+            local_timeout.recv().unwrap(),
+            Err(RawCallError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn disconnect_resolves_every_direct_call_without_replaying_it() {
+        let mut core = test_core();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let first = insert_direct_rpc(&mut core, 20, DeviceRoute::root(), deadline);
+        let second = insert_direct_rpc(&mut core, 21, DeviceRoute::root(), deadline);
+
+        core.cancel_active_rpcs();
+
+        assert!(matches!(
+            first.recv().unwrap(),
+            Err(RawCallError::DeviceDisconnected)
+        ));
+        assert!(matches!(
+            second.recv().unwrap(),
+            Err(RawCallError::DeviceDisconnected)
+        ));
+        assert!(core.rpc_map.is_empty());
+        assert!(core.rpc_timeouts.is_empty());
+    }
+
+    #[test]
+    fn a_full_status_observer_cannot_kill_rpc_progress() {
+        let (status, events) = channel::bounded(1);
+        let queue = StatusQueue {
+            dest: status,
+            only_new_client: false,
+        };
+        queue.send(Event::SensorConnected);
+        queue.send(Event::SensorDisconnected);
+        assert!(matches!(events.recv().unwrap(), Event::SensorConnected));
+    }
+
+    #[test]
+    fn rpc_replies_restore_independently_and_out_of_order() {
+        let mut core = test_core();
+        let first_route: DeviceRoute = "/1".parse().unwrap();
+        let second_route: DeviceRoute = "/2".parse().unwrap();
+        let timeout = Instant::now() + Duration::from_secs(3);
+        insert_rpc(&mut core, 20, 3, 100, first_route, timeout);
+        insert_rpc(&mut core, 21, 4, 101, second_route, timeout);
+
+        let remap = core.rpc_restore(21, &second_route).unwrap();
+        assert!(matches!(
+            remap.target,
+            RpcTarget::Port {
+                client_id: 4,
+                original_id: 101
+            }
+        ));
+        assert!(!remap.has_arg);
+        assert!(matches!(remap.method, RpcMethod::Name(name) if name == "dev.name"));
+        let remap = core.rpc_restore(20, &first_route).unwrap();
+        assert!(matches!(
+            remap.target,
+            RpcTarget::Port {
+                client_id: 3,
+                original_id: 100
+            }
+        ));
+        assert!(!remap.has_arg);
+        assert!(matches!(remap.method, RpcMethod::Name(name) if name == "dev.name"));
+        assert!(core.rpc_map.is_empty());
+        assert!(core.rpc_timeouts.is_empty());
+    }
+
+    #[test]
+    fn rpc_reply_from_the_wrong_route_does_not_consume_the_request() {
+        let mut core = test_core();
+        let requested_route: DeviceRoute = "/1".parse().unwrap();
+        let wrong_route: DeviceRoute = "/2".parse().unwrap();
+        let timeout = Instant::now() + Duration::from_secs(3);
+        insert_rpc(&mut core, 20, 3, 100, requested_route, timeout);
+
+        assert!(core.rpc_restore(20, &wrong_route).is_none());
+        assert!(core.rpc_map.contains_key(&20));
+        assert!(core.rpc_timeouts[&timeout].contains(&20));
+        let remap = core.rpc_restore(20, &requested_route).unwrap();
+        assert!(matches!(
+            remap.target,
+            RpcTarget::Port {
+                client_id: 3,
+                original_id: 100
+            }
+        ));
+        assert!(!remap.has_arg);
+        assert!(matches!(remap.method, RpcMethod::Name(name) if name == "dev.name"));
+    }
+
     #[test]
     fn rpc_timeout_is_delivered_with_the_client_request_id() {
-        let (_new_client_tx, new_client_rx) = channel::bounded(1);
-        let (status_tx, _status_rx) = channel::bounded(4);
-        let mut core = ProxyCore::new(String::new(), None, new_client_rx, status_tx, false);
+        let mut core = test_core();
 
         let (to_client_tx, to_client_rx) = channel::bounded(1);
         let (_from_client_tx, from_client_rx) = channel::bounded(1);
@@ -1165,30 +1455,23 @@ mod tests {
         let wire_id = 12;
         let client_request_id = 7855;
         let timeout = Instant::now() - Duration::from_millis(1);
-        core.rpc_map.insert(
+        insert_rpc(
+            &mut core,
             wire_id,
-            RpcMapEntry {
-                id: client_request_id,
-                client: client_id,
-                route: DeviceRoute::root(),
-                timeout,
-                has_arg: false,
-                method: proto::RpcMethod::Name("dev.metadata".into()),
-            },
+            client_id,
+            client_request_id,
+            DeviceRoute::root(),
+            timeout,
         );
-        core.rpc_timeouts
-            .entry(timeout)
-            .or_default()
-            .insert(wire_id);
 
         core.process_rpc_timeouts();
 
         let packet = to_client_rx.try_recv().unwrap();
-        let proto::Payload::RpcError(error) = packet.payload else {
+        let proto::Payload::RpcError(error) = packet.payload() else {
             panic!("expected an RPC timeout packet");
         };
-        assert_eq!(error.id, client_request_id);
-        assert!(matches!(error.error, proto::RpcErrorCode::Timeout));
+        assert_eq!(error.req_id.value(), client_request_id);
+        assert!(matches!(RpcError::from(error.code), RpcError::Timeout));
         assert!(core.rpc_map.is_empty());
         assert!(core.rpc_timeouts.is_empty());
     }

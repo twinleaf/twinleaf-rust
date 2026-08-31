@@ -8,11 +8,15 @@
 //! `RecvError::Text(textual_data)`
 
 use super::{iobuf::IOBuf, proto, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
-use crc::{Crc, CRC_32_ISO_HDLC};
 use mio_serial::{SerialPort, SerialPortBuilderExt};
 use std::io;
 use std::io::Write;
 use std::time::{Duration, Instant};
+use twinleaf_proto::serial as wire;
+use twinleaf_proto::{MAX_PACKET_SIZE, SLIP_END};
+
+/// Deserializer capacity: the largest packet plus its trailing CRC32.
+const RX_CAPACITY: usize = MAX_PACKET_SIZE + wire::CRC_SIZE;
 
 fn io_error(error: mio_serial::Error) -> io::Error {
     let kind = match error.kind() {
@@ -64,6 +68,8 @@ pub struct Port {
     rates: RateInfo,
     /// Incoming buffer, used to buffer partial packets.
     rxbuf: IOBuf,
+    /// SLIP/CRC decoder fed from `rxbuf`.
+    deserializer: wire::Deserializer<RX_CAPACITY>,
     /// Instant when we received data most recently. This is used
     /// to clear out stale data from `rxbuf`.
     last_rx: Instant,
@@ -125,6 +131,7 @@ impl Port {
                 target_bps: target_rate,
             },
             rxbuf: IOBuf::new(),
+            deserializer: wire::Deserializer::new(),
             last_rx: Instant::now(),
             txbuf: IOBuf::new(),
             startup_time: Instant::now(),
@@ -135,87 +142,54 @@ impl Port {
     /// Attempts to receive a packet only from the data currently present
     /// in the incoming buffer.
     fn recv_buffered(&mut self) -> Result<Packet, RecvError> {
-        let mut pkt = Vec::<u8>::new();
-        let mut esc = false;
-        let mut text = true;
-        let mut offset = 0;
-        let mut consume_to = 0;
-        let data = &self.rxbuf.data();
-        while offset < data.len() {
-            // Avoid packets that are too long, since we know they are invalid.
-            // If pkt's size reached the max packet length + CRC32 + separator,
-            // we know it's too long.
-            if pkt.len() >= (proto::TIO_PACKET_MAX_TOTAL_SIZE + std::mem::size_of::<u32>() + 1) {
-                self.rxbuf.consume(offset);
-                return Err(RecvError::Protocol(proto::DecodeError::PacketTooBig(pkt)));
-            }
-            // This will always succeed when converting an u8.
-            let c = char::from_u32(data[offset].into()).expect("byte to char conversion");
-            if text && ((c == '\n') || (c == '\r')) {
-                // Newline character preceded by valid text characters (possibly none).
-                // By the way the tio wire protocol over serial is designed, this can
-                // only be a text packet.
-                if !pkt.is_empty() {
-                    self.rxbuf.consume(offset + 1);
-                    return Err(RecvError::Text(String::from_utf8_lossy(&pkt).to_string()));
-                } else {
-                    consume_to = offset + 1;
-                }
-            } else if data[offset] == 0xC0 {
-                // This denotes the end of a SLIP packet. no matter what, we'll return
-                // from here, either successfully with a packet, or with an error,
-                // so consume the data so far.
-                self.rxbuf.consume(offset + 1);
-                if pkt.len() < 4 + std::mem::size_of::<u32>() {
-                    // A packet must fit at least the header and its final CRC32
-                    return Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall(pkt)));
-                }
-                let len = pkt.len() - std::mem::size_of::<u32>();
-                let expected_crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&pkt[..len]);
-                // This will always succeed, because the vec slice must be 4 bytes
-                let received_crc = u32::from_le_bytes(pkt[len..].try_into().expect("array size"));
-                if received_crc != expected_crc {
-                    return Err(RecvError::Protocol(proto::DecodeError::CRC32(pkt)));
-                }
-                // At this point the whole packet should be here, and there should not
-                // be any bytes left over.
-                return match Packet::deserialize(&pkt[..len]) {
-                    Ok((tio_pkt, size)) => {
-                        if size != len {
-                            Err(RecvError::IO(io::Error::from(io::ErrorKind::InvalidData)))
-                        } else {
-                            Ok(tio_pkt)
-                        }
-                    }
-                    Err(proto::DecodeError::NeedMore) => {
-                        Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall(pkt)))
-                    }
-                    Err(perr) => Err(RecvError::Protocol(perr)),
-                };
-            } else {
-                if !c.is_ascii_graphic() && (c != ' ') && (c != '\t') {
-                    text = false;
-                }
-                if esc {
-                    if data[offset] == 0xDC {
-                        pkt.push(0xC0);
-                    } else {
-                        pkt.push(0xDB);
-                    }
-                    esc = false;
-                } else {
-                    if data[offset] == 0xDB {
-                        esc = true;
-                    } else {
-                        pkt.push(data[offset]);
-                    }
-                }
-            }
-            offset += 1;
-        }
-        self.rxbuf.consume(consume_to);
-        Err(RecvError::NotReady)
+        let (consumed, frame) = self.deserializer.push(self.rxbuf.data());
+        let res = match frame {
+            Some(frame) => decode_frame(&frame),
+            None => Err(RecvError::NotReady),
+        };
+        self.rxbuf.consume(consumed);
+        res
     }
+
+    /// Discards all the received data, both buffered and partially decoded.
+    fn flush_rx(&mut self) {
+        self.rxbuf.flush();
+        self.deserializer = wire::Deserializer::new();
+    }
+}
+
+/// Turns a deserialized frame into a packet, or into the error it represents.
+fn decode_frame(frame: &wire::Frame) -> Result<Packet, RecvError> {
+    use wire::FrameErrors;
+    let data = frame.data;
+    if let Some(packet) = frame.packet() {
+        return match Packet::from_slice_prefix(packet) {
+            Ok((tio_pkt, size)) => {
+                if size != packet.len() {
+                    Err(RecvError::IO(io::Error::from(io::ErrorKind::InvalidData)))
+                } else {
+                    Ok(tio_pkt)
+                }
+            }
+            // A frame is a whole packet or nothing, so a short one is not
+            // a packet still arriving.
+            Err(proto::DecodeError::NeedMore) => {
+                Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall))
+            }
+            Err(perr) => Err(RecvError::Protocol(perr)),
+        };
+    }
+    let errors = frame.errors;
+    Err(if errors.contains(FrameErrors::TEXT) {
+        RecvError::Text(String::from_utf8_lossy(data).to_string())
+    } else if errors.contains(FrameErrors::TOO_BIG) {
+        RecvError::Protocol(proto::DecodeError::PacketTooBig)
+    } else if errors.contains(FrameErrors::SHORT) {
+        RecvError::Protocol(proto::DecodeError::PacketTooSmall)
+    } else {
+        // CRC mismatch, or a bad escape which corrupted the frame.
+        RecvError::Protocol(proto::DecodeError::CRC32)
+    })
 }
 
 impl RawPort for Port {
@@ -230,7 +204,7 @@ impl RawPort for Port {
             // This could happen e.g. reprogramming a board mid-packet.
             let now = Instant::now();
             if now.duration_since(self.last_rx) > Duration::from_millis(200) {
-                self.rxbuf.flush();
+                self.flush_rx();
             }
             if let Err(e) = self.rxbuf.refill(&mut self.port) {
                 #[cfg(target_os = "macos")]
@@ -251,7 +225,7 @@ impl RawPort for Port {
             if self.first_rx && !self.rxbuf.empty() {
                 self.first_rx = false;
                 if self.startup_holdoff() {
-                    self.rxbuf.flush();
+                    self.flush_rx();
                     return Err(RecvError::NotReady);
                 }
             }
@@ -266,25 +240,11 @@ impl RawPort for Port {
             return Err(SendError::Full);
         }
 
-        let raw = pkt.serialize()?;
-        let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-        let mut encoded = vec![0xC0u8];
-        for byte in [&raw, &crc32.checksum(&raw).to_le_bytes()[..]].concat() {
-            match byte {
-                0xC0 => {
-                    encoded.push(0xDB);
-                    encoded.push(0xDC);
-                }
-                0xDB => {
-                    encoded.push(0xDB);
-                    encoded.push(0xDD);
-                }
-                any => {
-                    encoded.push(any);
-                }
-            }
-        }
-        encoded.push(0xC0);
+        let raw = pkt.as_bytes();
+        // The leading separator terminates any partial frame at the receiver.
+        let mut encoded = vec![SLIP_END; 1 + wire::max_serialized_size(raw.len())];
+        let size = wire::serialize(raw, &mut encoded[1..]).expect("No fit in frame buffer");
+        encoded.truncate(1 + size);
 
         match self.port.write(&encoded) {
             Ok(size) => {

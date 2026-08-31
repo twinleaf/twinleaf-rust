@@ -1,4 +1,7 @@
-use super::RpcValueType;
+//! Dynamic RPC values, for hosts that learn an RPC's type from its metadata
+//! at run time rather than from a Rust type at compile time.
+
+use twinleaf_proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcValueType};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RpcValue {
@@ -28,8 +31,14 @@ impl std::fmt::Display for RpcValue {
     }
 }
 
-impl RpcValueType {
-    pub fn encode(self, value: &RpcValue) -> Result<Vec<u8>, RpcValueEncodeError> {
+/// Host-side codecs between the shared value-type tag and owned [`RpcValue`]s.
+pub trait RpcValueTypeExt {
+    fn encode(self, value: &RpcValue) -> Result<Vec<u8>, RpcValueEncodeError>;
+    fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError>;
+}
+
+impl RpcValueTypeExt for RpcValueType {
+    fn encode(self, value: &RpcValue) -> Result<Vec<u8>, RpcValueEncodeError> {
         match (self, value) {
             (RpcValueType::Unit, RpcValue::Unit) => Ok(Vec::new()),
             (
@@ -70,7 +79,7 @@ impl RpcValueType {
         }
     }
 
-    pub fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError> {
+    fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError> {
         match self {
             RpcValueType::Unit => Ok(RpcValue::Unit),
             RpcValueType::Int {
@@ -216,4 +225,53 @@ pub enum RpcValueDecodeError {
     UnsupportedIntegerSize(u8),
     #[error("unsupported float size: {0} bytes")]
     UnsupportedFloatSize(u8),
+}
+
+/// Host-side display helpers over the shared metadata word.
+pub trait RpcMetaExt {
+    fn perm_str(&self) -> String;
+    fn type_str(&self) -> String;
+}
+
+impl RpcMetaExt for RpcMeta {
+    fn perm_str(&self) -> String {
+        if self.is_unknown() {
+            return "???".to_string();
+        }
+        let (r, w) = match self.access() {
+            RpcAccess::ReadWrite => ("R", "W"),
+            RpcAccess::ReadOnly => ("R", "-"),
+            RpcAccess::WriteOnly => ("-", "W"),
+            RpcAccess::Action => ("-", "-"),
+        };
+        let p = if self.is_persistent() { "P" } else { "-" };
+        format!("{r}{w}{p}")
+    }
+
+    fn type_str(&self) -> String {
+        let flags = self.flags();
+        if flags.contains(RpcMetaFlags::CAPTURE) {
+            return "capture".to_string();
+        }
+        if flags.contains(RpcMetaFlags::BOOL) {
+            return "bool".to_string();
+        }
+        match self.kind() {
+            RpcValueType::Unit => String::new(),
+            RpcValueType::Int { signed, size } => {
+                let bits = (size as usize) * 8;
+                if signed {
+                    format!("i{bits}")
+                } else {
+                    format!("u{bits}")
+                }
+            }
+            RpcValueType::Float { size } => format!("f{}", (size as usize) * 8),
+            RpcValueType::String { max_len } => match max_len {
+                Some(n) => format!("string<{n}>"),
+                None => "string".to_string(),
+            },
+            RpcValueType::Raw { .. } => String::new(),
+        }
+    }
 }

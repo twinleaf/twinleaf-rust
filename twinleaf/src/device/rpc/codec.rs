@@ -1,3 +1,6 @@
+//! Typed RPC arguments and replies: what a session's `rpc` call encodes and
+//! decodes.
+
 use bytes::{Buf, BufMut};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -106,6 +109,27 @@ impl RpcArgs for String {
 impl<T: RpcArgs + ?Sized> RpcArgs for &T {
     fn encode_into(&self, output: &mut Vec<u8>) {
         (*self).encode_into(output);
+    }
+}
+
+impl RpcArgs for [u8] {
+    fn encode_into(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(self);
+    }
+}
+
+impl RpcArgs for Vec<u8> {
+    fn encode_into(&self, output: &mut Vec<u8>) {
+        self.as_slice().encode_into(output);
+    }
+}
+
+/// The undecoded reply, for callers that interpret the bytes themselves.
+impl RpcReply for Vec<u8> {
+    fn decode_from(input: &mut &[u8]) -> Result<Self, RpcDecodeError> {
+        let value = input.to_vec();
+        *input = &[];
+        Ok(value)
     }
 }
 

@@ -50,7 +50,7 @@ impl Port {
     /// Attempts to receive a packet only from the data currently present
     /// in the incoming buffer.
     fn recv_buffered(&mut self) -> Result<Packet, RecvError> {
-        match Packet::deserialize(self.rxbuf.data()) {
+        match Packet::from_slice_prefix(self.rxbuf.data()) {
             Ok((pkt, size)) => {
                 self.rxbuf.consume(size);
                 Ok(pkt)
@@ -80,8 +80,8 @@ impl RawPort for Port {
             return Err(SendError::Full);
         }
 
-        let raw = pkt.serialize()?;
-        match self.stream.write(&raw) {
+        let raw = pkt.as_bytes();
+        match self.stream.write(raw) {
             Ok(size) => {
                 if size == raw.len() {
                     // The entire packet was written out
@@ -104,7 +104,7 @@ impl RawPort for Port {
                         // the TCP buffer completely full.
                         // Maintain the same semantics and buffer the whole thing in txbuf.
                         // IOBuf sized such that it can always store at least a full packet.
-                        self.txbuf.add_data(&raw[..]).expect("No fit in IOBuf");
+                        self.txbuf.add_data(raw).expect("No fit in IOBuf");
                         Err(SendError::MustDrain)
                     }
                     _ => Err(SendError::IO(err)),

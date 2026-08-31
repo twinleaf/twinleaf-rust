@@ -1,11 +1,18 @@
 pub mod capture;
 mod connection;
 pub mod discovery;
-mod rpc;
+pub(crate) mod rpc;
+mod stream;
 
 pub use crate::tio::proto::DeviceRoute;
-pub use capture::CaptureRpc;
-pub use connection::{
-    BatchError, Device, DeviceEvent, DeviceTree, NamedRoute, ProxyDisconnected, TreeEvent, TreeItem,
+pub use connection::{Device, DeviceTree, MetadataError, PendingReply};
+pub use rpc::{
+    CallError, RpcAccess, RpcArgs, RpcDecodeError, RpcDescriptor, RpcErrorPayload, RpcMeta,
+    RpcMetaExt, RpcMetaFlags, RpcMethod, RpcRegistry, RpcRegistryError, RpcReply,
+    RpcReplyFixedSize, RpcStringLen, RpcValue, RpcValueDecodeError, RpcValueEncodeError,
+    RpcValueType, RpcValueTypeExt,
 };
-pub use rpc::{RpcClient, RpcDescriptor, RpcRegistry, RpcRegistryError};
+pub use stream::{
+    DeviceEvent, IntoIter, Iter, NamedRoute, Receiver, RecvError, RecvTimeoutError, TreeEvent,
+    TryRecvError,
+};

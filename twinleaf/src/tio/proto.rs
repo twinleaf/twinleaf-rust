@@ -1,68 +1,57 @@
-pub mod identifiers;
-pub mod legacy;
-pub mod meta;
-pub mod route;
-mod rpc;
+//! The host packet: one validated wire buffer, read through the `twinleaf-proto` codecs.
 
 use bytes::Bytes;
-pub use legacy::{
-    LegacySourceInfoPayload, LegacyStreamDataPayload, LegacyStreamInfoPayload,
-    LegacyTimebaseInfoPayload,
-};
-pub use meta::{
-    ColumnMetadata, DeviceMetadata, MetadataPayload, MetadataType, SegmentMetadata, StreamMetadata,
-};
 use num_enum::{FromPrimitive, IntoPrimitive};
+use std::fmt;
+use twinleaf_proto::data as wire;
+use twinleaf_proto::heartbeat::Heartbeat;
+use twinleaf_proto::log::LogMessage;
+use twinleaf_proto::packet::{Header, PacketError, PacketView};
+use twinleaf_proto::rpc as wire_rpc;
+use twinleaf_proto::settings::Setting;
+use twinleaf_proto::SessionId as WireSessionId;
+use twinleaf_proto::{RpcMethodId, RpcRequestId};
+use twinleaf_proto::{HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, MAX_TTL};
+
 pub use route::DeviceRoute;
-pub use rpc::{
-    RpcAccess, RpcArgs, RpcDecodeError, RpcErrorCode, RpcErrorPayload, RpcMeta, RpcMetaFlags,
-    RpcMethod, RpcReply, RpcReplyFixedSize, RpcReplyPayload, RpcRequestPayload, RpcStringLen,
-    RpcValue, RpcValueDecodeError, RpcValueEncodeError, RpcValueType,
-};
+pub use twinleaf_proto::data::{DataType, MAX_SAMPLE_NUMBER};
+pub use twinleaf_proto::packet::PacketType;
+pub use twinleaf_proto::route;
 
-#[derive(Debug, Clone)]
-pub struct GenericPayload {
-    pub packet_type: u8,
-    pub payload: Vec<u8>,
+/// Shortest data payload a host accepts: the sample header plus one byte.
+const MIN_SAMPLE_PAYLOAD: usize = wire::SAMPLE_HEADER_SIZE + 1;
+
+/// One complete, validated TIO packet.
+///
+/// The bytes are the packet: every accessor re-reads them through the wire
+/// codecs rather than holding a decoded copy.
+#[derive(Clone)]
+pub struct Packet {
+    raw: Bytes,
 }
 
+/// Borrowed view of a packet's payload.
+///
+/// Text fields are `&str` only where the wire codec validated them as UTF-8;
+/// everything else stays bytes, and callers convert at the point of use.
 #[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-#[derive(FromPrimitive, IntoPrimitive)]
-pub enum LogLevel {
-    Critical = 0,
-    Error = 1,
-    Warning = 2,
-    Info = 3,
-    Debug = 4,
-    #[num_enum(catch_all)]
-    Unknown(u8),
+pub enum Payload<'a> {
+    Log(LogMessage<'a>),
+    RpcRequest(wire_rpc::Request<'a>),
+    RpcReply(wire_rpc::Reply<'a>),
+    RpcError(wire_rpc::ErrorReply<'a>),
+    Heartbeat(Heartbeat<'a>),
+    Metadata(wire::Metadata<'a>, wire::MetadataFlags),
+    Samples(wire::Samples<'a>),
+    Setting(Setting<'a>),
+    RpcUpdate(wire_rpc::Method<'a>),
+    ProxyStatus(ProxyStatus),
+    /// A packet type this build does not interpret, kept whole so it can be
+    /// forwarded and logged.
+    Unknown(PacketType, &'a [u8]),
 }
 
-#[derive(Debug, Clone)]
-pub struct LogMessagePayload {
-    pub data: u32,
-    pub level: LogLevel,
-    pub message: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum HeartbeatPayload {
-    Session(u32),
-    Any(Vec<u8>),
-}
-
-#[derive(Debug, Clone)]
-pub enum SettingsPayload {
-    RpcHash(u32),
-    Unknown {
-        name: String,
-        flags: u8,
-        reply: Vec<u8>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[derive(FromPrimitive, IntoPrimitive)]
 pub enum ProxyStatus {
@@ -74,154 +63,39 @@ pub enum ProxyStatus {
     Unknown(u8),
 }
 
-#[derive(Debug, Clone)]
-pub struct ProxyStatusPayload(pub ProxyStatus);
-
-#[derive(Debug, Clone)]
-pub struct RpcUpdatePayload(pub RpcMethod);
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-#[derive(FromPrimitive, IntoPrimitive)]
-pub enum DataType {
-    UInt8 = 0x10,
-    Int8 = 0x11,
-    UInt16 = 0x20,
-    Int16 = 0x21,
-    UInt24 = 0x30,
-    Int24 = 0x31,
-    UInt32 = 0x40,
-    Int32 = 0x41,
-    UInt64 = 0x80,
-    Int64 = 0x81,
-    Float32 = 0x42,
-    Float64 = 0x82,
-    #[num_enum(catch_all)]
-    Unknown(u8),
-}
-
-impl DataType {
-    pub fn type_name(&self) -> String {
-        self.to_string()
-    }
-
-    pub fn size(&self) -> usize {
-        let raw: u8 = (*self).into();
-        (raw >> 4).into()
-    }
-    pub fn buffer_type(&self) -> BufferType {
-        match self {
-            DataType::Float32 | DataType::Float64 => BufferType::Float,
-
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int24
-            | DataType::Int32
-            | DataType::Int64 => BufferType::Int,
-
-            DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt24
-            | DataType::UInt32
-            | DataType::UInt64 => BufferType::UInt,
-
-            DataType::Unknown(_) => BufferType::Float,
-        }
-    }
-
-    /// The buffer a decoded column of this type lands in, or `None` for a wire
-    /// type this build does not know how to decode.
-    pub fn decoded_buffer_type(&self) -> Option<BufferType> {
-        match self {
-            DataType::Unknown(_) => None,
-            known => Some(known.buffer_type()),
-        }
-    }
-}
-
-impl std::fmt::Display for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DataType::UInt8 => write!(f, "u8"),
-            DataType::Int8 => write!(f, "i8"),
-            DataType::UInt16 => write!(f, "u16"),
-            DataType::Int16 => write!(f, "i16"),
-            DataType::UInt24 => write!(f, "u24"),
-            DataType::Int24 => write!(f, "i24"),
-            DataType::UInt32 => write!(f, "u32"),
-            DataType::Int32 => write!(f, "i32"),
-            DataType::UInt64 => write!(f, "u64"),
-            DataType::Int64 => write!(f, "i64"),
-            DataType::Float32 => write!(f, "f32"),
-            DataType::Float64 => write!(f, "f64"),
-            DataType::Unknown(n) => write!(f, "raw{}", n),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferType {
-    Float,
-    Int,
-    UInt,
-}
-
-#[derive(Debug, Clone)]
-pub struct StreamDataPayload {
-    pub stream_id: u8,
-    pub first_sample_n: u32,
-    pub segment_id: u8,
-    pub data: Bytes,
-}
-
-#[derive(Debug, Clone)]
-pub enum Payload {
-    LogMessage(LogMessagePayload),
-    RpcRequest(RpcRequestPayload),
-    RpcReply(RpcReplyPayload),
-    RpcError(RpcErrorPayload),
-    Heartbeat(HeartbeatPayload),
-    LegacyTimebaseUpdate(LegacyTimebaseInfoPayload),
-    LegacySourceUpdate(LegacySourceInfoPayload),
-    LegacyStreamUpdate(LegacyStreamInfoPayload),
-    LegacyStreamData(LegacyStreamDataPayload),
-    Metadata(MetadataPayload),
-    Settings(SettingsPayload),
-    StreamData(StreamDataPayload),
-    ProxyStatus(ProxyStatusPayload),
-    RpcUpdate(RpcUpdatePayload),
-    Unknown(GenericPayload),
-}
-
-#[derive(Debug, Clone)]
-pub struct Packet {
-    pub payload: Payload,
-    pub routing: DeviceRoute,
-    pub ttl: usize,
-}
-
-#[derive(Debug, thiserror::Error)]
+/// Why a buffer is not one packet. Transports count and log these; none of
+/// them is matched on beyond [`Self::NeedMore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     #[error("more data needed")]
     NeedMore,
-    #[error("bad name")]
-    BadName,
     #[error("CRC32 mismatch")]
-    CRC32(Vec<u8>),
+    CRC32,
     #[error("packet too big")]
-    PacketTooBig(Vec<u8>),
+    PacketTooBig,
     #[error("packet too small")]
-    PacketTooSmall(Vec<u8>),
+    PacketTooSmall,
     #[error("invalid packet type")]
-    InvalidPacketType(Vec<u8>),
+    InvalidPacketType,
     #[error("payload too big")]
-    PayloadTooBig(Vec<u8>),
+    PayloadTooBig,
     #[error("routing too big")]
-    RoutingTooBig(Vec<u8>),
-    #[error("payload is too short: expected at least {expected} bytes, got {actual}")]
-    PayloadTooShort { expected: usize, actual: usize },
+    RoutingTooBig,
+    #[error("payload too short")]
+    PayloadTooShort,
     #[error("invalid payload")]
     InvalidPayload,
+}
+
+impl From<PacketError> for DecodeError {
+    fn from(error: PacketError) -> Self {
+        match error {
+            PacketError::NeedMore => Self::NeedMore,
+            PacketError::InvalidPacketType => Self::InvalidPacketType,
+            PacketError::PayloadTooBig => Self::PayloadTooBig,
+            PacketError::RoutingTooBig => Self::RoutingTooBig,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -234,591 +108,439 @@ pub enum EncodeError {
     InvalidStreamId(u8),
     #[error("sample number {0} does not fit in the 24-bit packet field")]
     SampleNumberTooLarge(u32),
-    #[error("this payload variant does not have a wire encoder")]
-    UnsupportedPayload,
-    #[error("variable metadata extensions require a fixed extension")]
-    VariableExtensionWithoutFixed,
-    #[error("fixed metadata extension has an invalid length prefix")]
-    InvalidFixedExtension,
 }
 
-impl EncodeError {
-    fn payload_too_large(actual: usize) -> Self {
-        Self::PayloadTooLarge {
-            actual,
-            maximum: TIO_PACKET_MAX_PAYLOAD_SIZE,
-        }
-    }
+/// An RPC method named the way the request that reached it named it. Owned, so
+/// the proxy can hold it while a request is outstanding.
+#[derive(Debug, Clone)]
+pub enum RpcMethod {
+    Id(u16),
+    Name(String),
 }
 
-#[repr(u8)]
-#[derive(FromPrimitive, IntoPrimitive)]
-enum TioPktType {
-    Invalid = 0,
-    Log = 1,
-    RpcReq = 2,
-    RpcRep = 3,
-    RpcError = 4,
-    Heartbeat = 5,
-    LegacyTimebaseUpdate = 6,
-    LegacySourceUpdate = 7,
-    LegacyStreamUpdate = 8,
-    Reserved0 = 9,
-    Reserved1 = 10,
-    Metadata = 11,
-    Settings = 12,
-    Reserved2 = 13,
-    ProxyStatus = 64,
-    RpcUpdate = 65,
-    LegacyStreamData = 128,
-    #[num_enum(catch_all)]
-    UnknownOrStream(u8),
-}
-
-static TIO_PTYPE_STREAM0: u8 = 128;
-
-#[repr(C, packed)]
-struct TioPktHdr {
-    pkt_type: u8,
-    routing_size_and_ttl: u8,
-    payload_size: u16,
-}
-
-pub const TIO_PACKET_HEADER_SIZE: usize = 4;
-pub const TIO_PACKET_MAX_ROUTING_SIZE: usize = 8;
-pub const TIO_PACKET_MAX_TOTAL_SIZE: usize = 512;
-const TIO_PACKET_MAX_PAYLOAD_SIZE: usize =
-    TIO_PACKET_MAX_TOTAL_SIZE - TIO_PACKET_HEADER_SIZE - TIO_PACKET_MAX_ROUTING_SIZE;
-/// Largest TTL representable by the header's high nibble.
-const TIO_PACKET_MAX_TTL: usize = 0x0f;
-
-impl TioPktHdr {
-    fn deserialize(raw: &[u8]) -> Result<TioPktHdr, DecodeError> {
-        if raw.is_empty() {
-            return Err(DecodeError::NeedMore);
-        }
-
-        // Keep the raw packet type for forward compatibility even if it does not match
-        // a known type, as long as it's not one of the reserved values
-        let packet_type = TioPktType::from(raw[0]);
-        let packet_type_valid = !matches!(
-            packet_type,
-            TioPktType::Invalid | TioPktType::Reserved0 | TioPktType::Reserved1
-        );
-        if !packet_type_valid {
-            return Err(DecodeError::InvalidPacketType(raw.to_vec()));
-        }
-
-        // If the packet type appears valid, wait to have a full header
-        if raw.len() < std::mem::size_of::<TioPktHdr>() {
-            return Err(DecodeError::NeedMore);
-        }
-        let pkt_hdr = TioPktHdr {
-            pkt_type: packet_type.into(),
-            routing_size_and_ttl: raw[1],
-            payload_size: u16::from_le_bytes([raw[2], raw[3]]),
-        };
-
-        if pkt_hdr.routing_size() > TIO_PACKET_MAX_ROUTING_SIZE {
-            return Err(DecodeError::RoutingTooBig(raw.to_vec()));
-        }
-        if pkt_hdr.payload_size as usize > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(DecodeError::PayloadTooBig(raw.to_vec()));
-        }
-
-        let packet_len = pkt_hdr.packet_size();
-
-        if raw.len() < packet_len {
-            return Err(DecodeError::NeedMore);
-        }
-        Ok(pkt_hdr)
-    }
-
-    fn ptype(&self) -> TioPktType {
-        TioPktType::from(self.pkt_type)
-    }
-
-    fn stream_id(&self) -> Option<usize> {
-        if self.pkt_type >= TIO_PTYPE_STREAM0 {
-            Some((self.pkt_type - TIO_PTYPE_STREAM0) as usize)
-        } else {
-            None
+impl RpcMethod {
+    pub fn from_wire(method: wire_rpc::Method<'_>) -> Self {
+        match method {
+            wire_rpc::Method::ById(id) => Self::Id(id.value()),
+            wire_rpc::Method::ByName(name) => {
+                Self::Name(String::from_utf8_lossy(name).into_owned())
+            }
         }
     }
 
-    fn ttl(&self) -> usize {
-        (self.routing_size_and_ttl >> 4) as usize
-    }
-
-    fn routing_offset(&self) -> usize {
-        self.payload_offset() + self.payload_size()
-    }
-
-    fn routing_size(&self) -> usize {
-        (self.routing_size_and_ttl & 0x0Fu8) as usize
-    }
-
-    fn payload_offset(&self) -> usize {
-        std::mem::size_of::<TioPktHdr>()
-    }
-
-    fn payload_size(&self) -> usize {
-        self.payload_size as usize
-    }
-
-    fn packet_size(&self) -> usize {
-        self.routing_offset() + self.routing_size()
-    }
-}
-
-impl LogMessagePayload {
-    fn deserialize(raw: &[u8]) -> Result<LogMessagePayload, DecodeError> {
-        if raw.len() < 5 {
-            return Err(DecodeError::PayloadTooShort {
-                expected: 5,
-                actual: raw.len(),
-            });
-        }
-        Ok(LogMessagePayload {
-            data: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-            level: LogLevel::from(raw[4]),
-            message: String::from_utf8_lossy(&raw[5..]).to_string(),
+    pub fn to_wire(&self) -> Result<wire_rpc::Method<'_>, EncodeError> {
+        Ok(match self {
+            Self::Id(id) => wire_rpc::Method::ById(RpcMethodId::try_new(*id).ok_or(
+                EncodeError::ValueTooLarge {
+                    value: usize::from(*id),
+                    maximum: usize::from(RpcMethodId::MAX),
+                },
+            )?),
+            Self::Name(name) => wire_rpc::Method::ByName(name.as_bytes()),
         })
     }
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        output.extend(self.data.to_le_bytes());
-        output.push(u8::from(self.level));
-        output.extend(self.message.as_bytes());
-        Ok(())
+
+    /// The proxy's notice that another client's RPC changed this method.
+    pub fn update_packet(&self, routing: DeviceRoute) -> Result<Packet, EncodeError> {
+        Packet::rpc_update(self.to_wire()?, routing)
     }
 }
 
-impl HeartbeatPayload {
-    fn deserialize(raw: &[u8]) -> Result<HeartbeatPayload, DecodeError> {
-        if raw.len() == 4 {
-            let session = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            Ok(HeartbeatPayload::Session(session))
-        } else {
-            Ok(HeartbeatPayload::Any(raw.to_vec()))
+fn parse_payload<'a>(header: Header, payload: &'a [u8]) -> Result<Payload<'a>, DecodeError> {
+    let ptype = header.ptype;
+    let too_short = DecodeError::PayloadTooShort;
+    Ok(match ptype {
+        PacketType::LOG => Payload::Log(LogMessage::parse(payload).ok_or(too_short)?),
+        PacketType::RPC_REQ => {
+            Payload::RpcRequest(wire_rpc::Request::parse(payload).ok_or(too_short)?)
         }
-    }
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        match self {
-            HeartbeatPayload::Session(session) => output.extend(session.to_le_bytes()),
-            HeartbeatPayload::Any(payload) => output.extend(payload),
-        };
-        Ok(())
-    }
-}
-
-impl SettingsPayload {
-    fn deserialize(raw: &[u8]) -> Result<SettingsPayload, DecodeError> {
-        if raw.len() < 2 {
-            return Err(DecodeError::PayloadTooShort {
-                expected: 2,
-                actual: raw.len(),
-            });
+        PacketType::RPC_REP => Payload::RpcReply(wire_rpc::Reply::parse(payload).ok_or(too_short)?),
+        PacketType::RPC_ERROR => {
+            Payload::RpcError(wire_rpc::ErrorReply::parse(payload).ok_or(too_short)?)
         }
-        let name_len = raw[0] as usize;
-        let flags = raw[1];
-        let content = &raw[2..];
-
-        if content.len() < name_len {
-            return Err(DecodeError::PayloadTooShort {
-                expected: 2 + name_len,
-                actual: raw.len(),
-            });
+        PacketType::HEARTBEAT => {
+            Payload::Heartbeat(Heartbeat::parse(payload).ok_or(DecodeError::InvalidPayload)?)
         }
-        let name =
-            String::from_utf8(content[..name_len].to_vec()).map_err(|_| DecodeError::BadName)?;
-        let reply = content[name_len..].to_vec();
-
-        match name.as_str() {
-            "rpc.hash" => {
-                if reply.len() < 4 {
-                    return Err(DecodeError::PayloadTooShort {
-                        expected: 2 + name_len + 4,
-                        actual: raw.len(),
-                    });
+        PacketType::METADATA => parse_metadata(ptype, payload)?,
+        PacketType::SETTING => Payload::Setting(Setting::parse(payload).ok_or(too_short)?),
+        PacketType::PROXY_STATUS => {
+            Payload::ProxyStatus(ProxyStatus::from(*payload.first().ok_or(too_short)?))
+        }
+        PacketType::RPC_UPDATE => {
+            Payload::RpcUpdate(wire_rpc::parse_update(payload).ok_or(DecodeError::InvalidPayload)?)
+        }
+        _ => match ptype.stream_id() {
+            Some(stream_id) if stream_id >= wire::FIRST_STREAM_ID => {
+                if payload.len() < MIN_SAMPLE_PAYLOAD {
+                    return Err(too_short);
                 }
-                let hash = u32::from_le_bytes(reply[..4].try_into().unwrap());
-                Ok(SettingsPayload::RpcHash(hash))
+                Payload::Samples(
+                    wire::Samples::parse(header, payload).ok_or(DecodeError::InvalidPayload)?,
+                )
             }
-            _ => Ok(SettingsPayload::Unknown { name, flags, reply }),
-        }
-    }
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        match self {
-            SettingsPayload::RpcHash(hash) => {
-                let name = b"rpc.hash";
-                output.push(name.len() as u8);
-                output.push(0); // flags
-                output.extend(name);
-                output.extend(hash.to_le_bytes());
-            }
-            SettingsPayload::Unknown { name, flags, reply } => {
-                if name.len() > u8::MAX.into() {
-                    return Err(EncodeError::ValueTooLarge {
-                        value: name.len(),
-                        maximum: u8::MAX.into(),
-                    });
-                }
-                output.push(name.len() as u8);
-                output.push(*flags);
-                output.extend(name.as_bytes());
-                output.extend(reply);
-            }
-        }
-        Ok(())
-    }
+            // Legacy metadata and stream types, and anything this build
+            // predates, ride along whole so a proxy can forward them.
+            _ => Payload::Unknown(ptype, payload),
+        },
+    })
 }
 
-impl StreamDataPayload {
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let sample_ser = self.first_sample_n.to_le_bytes();
-        if sample_ser[3] != 0 {
-            return Err(EncodeError::SampleNumberTooLarge(self.first_sample_n));
-        }
-        output.extend([sample_ser[0], sample_ser[1], sample_ser[2], self.segment_id]);
-        output.extend(&self.data);
-        Ok(())
-    }
-
-    fn deserialize_bytes(raw: Bytes, stream_id: u8) -> Result<Self, DecodeError> {
-        if raw.len() < 5 {
-            return Err(DecodeError::PayloadTooShort {
-                expected: 5,
-                actual: raw.len(),
-            });
-        }
-        Ok(Self {
-            stream_id,
-            first_sample_n: u32::from_le_bytes([raw[0], raw[1], raw[2], 0u8]),
-            segment_id: raw[3],
-            data: raw.slice(4..),
-        })
-    }
-}
-
-impl ProxyStatusPayload {
-    pub fn deserialize(raw: &[u8]) -> Result<ProxyStatusPayload, DecodeError> {
-        if raw.is_empty() {
-            return Err(DecodeError::PayloadTooShort {
-                expected: 1,
-                actual: 0,
-            });
-        }
-        Ok(ProxyStatusPayload(ProxyStatus::from(raw[0])))
-    }
-
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        output.push(u8::from(self.0));
-        Ok(())
-    }
-}
-
-const RPC_METHOD_TYPE_ID: u8 = 0;
-const RPC_METHOD_TYPE_NAME: u8 = 1;
-impl RpcUpdatePayload {
-    pub fn deserialize(raw: &[u8]) -> Result<RpcUpdatePayload, DecodeError> {
-        if raw.is_empty() {
-            return Err(DecodeError::PayloadTooShort {
-                expected: 1,
-                actual: 0,
-            });
-        }
-        let method = match raw[0] {
-            RPC_METHOD_TYPE_ID => {
-                if raw.len() < 3 {
-                    return Err(DecodeError::PayloadTooShort {
-                        expected: 3,
-                        actual: raw.len(),
-                    });
-                }
-                RpcMethod::Id(u16::from_le_bytes([raw[1], raw[2]]))
-            }
-            RPC_METHOD_TYPE_NAME => {
-                if raw.len() < 3 {
-                    return Err(DecodeError::PayloadTooShort {
-                        expected: 3,
-                        actual: raw.len(),
-                    });
-                }
-                let name_len = u16::from_le_bytes([raw[1], raw[2]]) as usize;
-                if raw.len() < 3 + name_len {
-                    return Err(DecodeError::PayloadTooShort {
-                        expected: 3 + name_len,
-                        actual: raw.len(),
-                    });
-                }
-                RpcMethod::Name(String::from_utf8_lossy(&raw[3..3 + name_len]).to_string())
-            }
-            _ => return Err(DecodeError::InvalidPayload),
-        };
-        Ok(RpcUpdatePayload(method))
-    }
-
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        match &self.0 {
-            RpcMethod::Id(id) => {
-                output.push(RPC_METHOD_TYPE_ID);
-                output.extend(id.to_le_bytes());
-            }
-            RpcMethod::Name(name) => {
-                let name_bytes = name.as_bytes();
-                output.push(RPC_METHOD_TYPE_NAME);
-                output.extend((name_bytes.len() as u16).to_le_bytes());
-                output.extend(name_bytes);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl GenericPayload {
-    fn deserialize(raw: &[u8], packet_type: u8) -> Result<GenericPayload, DecodeError> {
-        Ok(GenericPayload {
-            packet_type,
-            payload: raw.to_vec(),
-        })
-    }
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        output.extend(&self.payload);
-        Ok(())
-    }
-}
-
-impl Payload {
-    fn packet_type(&self) -> Result<u8, EncodeError> {
-        let packet_type = match self {
-            Payload::LogMessage(_) => TioPktType::Log.into(),
-            Payload::RpcRequest(_) => TioPktType::RpcReq.into(),
-            Payload::RpcReply(_) => TioPktType::RpcRep.into(),
-            Payload::RpcError(_) => TioPktType::RpcError.into(),
-            Payload::Heartbeat(_) => TioPktType::Heartbeat.into(),
-            Payload::Metadata(_) => TioPktType::Metadata.into(),
-            Payload::Settings(_) => TioPktType::Settings.into(),
-            Payload::LegacyStreamData(_) => TioPktType::LegacyStreamData.into(),
-            Payload::StreamData(payload) => {
-                if !(1..=127).contains(&payload.stream_id) {
-                    return Err(EncodeError::InvalidStreamId(payload.stream_id));
-                }
-                TIO_PTYPE_STREAM0 + payload.stream_id
-            }
-            Payload::ProxyStatus(_) => TioPktType::ProxyStatus.into(),
-            Payload::RpcUpdate(_) => TioPktType::RpcUpdate.into(),
-            Payload::Unknown(payload) => payload.packet_type,
-            _ => return Err(EncodeError::UnsupportedPayload),
-        };
-        Ok(packet_type)
-    }
-
-    fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), EncodeError> {
-        match self {
-            Payload::LogMessage(p) => p.encode_body(output),
-            Payload::RpcRequest(p) => p.encode_body(output),
-            Payload::RpcReply(p) => p.encode_body(output),
-            Payload::RpcError(p) => p.encode_body(output),
-            Payload::Heartbeat(p) => p.encode_body(output),
-            Payload::Metadata(p) => p.encode_body(output),
-            Payload::Settings(p) => p.encode_body(output),
-            Payload::LegacyStreamData(p) => p.encode_body(output),
-            Payload::StreamData(p) => p.encode_body(output),
-            Payload::ProxyStatus(p) => p.encode_body(output),
-            Payload::RpcUpdate(p) => p.encode_body(output),
-            Payload::Unknown(p) => p.encode_body(output),
-            _ => Err(EncodeError::UnsupportedPayload),
-        }
-    }
-    fn deserialize(hdr: &TioPktHdr, raw_payload: &[u8]) -> Result<Payload, DecodeError> {
-        match hdr.ptype() {
-            TioPktType::Invalid
-            | TioPktType::Reserved0
-            | TioPktType::Reserved1
-            | TioPktType::Reserved2 => {
-                // This should never happen for how the code is organized, since
-                // it should be ruled out by parsing the header first, but handle
-                // this case anyway.
-                Err(DecodeError::InvalidPacketType(vec![hdr.pkt_type]))
-            }
-            TioPktType::Log => Ok(Payload::LogMessage(LogMessagePayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::RpcReq => Ok(Payload::RpcRequest(RpcRequestPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::RpcRep => Ok(Payload::RpcReply(RpcReplyPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::RpcError => Ok(Payload::RpcError(RpcErrorPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::Heartbeat => Ok(Payload::Heartbeat(HeartbeatPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::LegacyTimebaseUpdate
-            | TioPktType::LegacySourceUpdate
-            | TioPktType::LegacyStreamUpdate => {
-                // For now we deserialize these just into generic payloads, so they can
-                // be sent around by the proxy. TODO: fully decode legacy metadata.
-                Ok(Payload::Unknown(GenericPayload::deserialize(
-                    raw_payload,
-                    hdr.pkt_type,
-                )?))
-            }
-            TioPktType::LegacyStreamData => Ok(Payload::LegacyStreamData(
-                LegacyStreamDataPayload::deserialize(raw_payload)?,
-            )),
-            TioPktType::Metadata => Ok(Payload::Metadata(MetadataPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::Settings => Ok(Payload::Settings(SettingsPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::ProxyStatus => Ok(Payload::ProxyStatus(ProxyStatusPayload::deserialize(
-                raw_payload,
-            )?)),
-            TioPktType::RpcUpdate => Ok(Payload::RpcUpdate(RpcUpdatePayload::deserialize(
-                raw_payload,
-            )?)),
-            // Stream data is decoded by the caller, which owns the backing storage.
-            TioPktType::UnknownOrStream(_) => Ok(Payload::Unknown(GenericPayload::deserialize(
-                raw_payload,
-                hdr.pkt_type,
-            )?)),
+/// A metadata record this build knows, or its framing checked and the payload
+/// kept whole for forwarding.
+fn parse_metadata(ptype: PacketType, payload: &[u8]) -> Result<Payload<'_>, DecodeError> {
+    let (kind, _, record) = wire::split_metadata(payload).ok_or(DecodeError::PayloadTooShort)?;
+    match wire::Metadata::parse(payload) {
+        Some((record, flags)) => Ok(Payload::Metadata(record, flags)),
+        None if wire::Metadata::defines(kind) => Err(DecodeError::InvalidPayload),
+        None => {
+            wire::split_record(record).ok_or(DecodeError::InvalidPayload)?;
+            Ok(Payload::Unknown(ptype, payload))
         }
     }
 }
 
 impl Packet {
-    pub fn rpc_request(name: &str, arg: &[u8], id: u16, routing: DeviceRoute) -> Self {
-        Self {
-            payload: Payload::RpcRequest(RpcRequestPayload {
-                id,
-                method: RpcMethod::Name(name.into()),
-                arg: arg.to_vec(),
-            }),
-            routing,
-            ttl: 0,
+    /// Validate and take ownership of exactly one packet's bytes. Every other
+    /// constructor funnels through here.
+    pub fn from_wire(raw: Bytes) -> Result<Packet, DecodeError> {
+        let (view, len) = PacketView::parse_prefix(&raw)?;
+        if len != raw.len() {
+            return Err(DecodeError::PacketTooBig);
         }
+        DeviceRoute::from_wire(view.routing).map_err(|_| DecodeError::RoutingTooBig)?;
+        parse_payload(view.header, view.payload)?;
+        Ok(Packet { raw })
     }
 
-    pub fn rpc_error(id: u16, error: RpcErrorCode, routing: DeviceRoute) -> Self {
-        Self {
-            payload: Payload::RpcError(RpcErrorPayload {
-                id,
-                error,
-                extra: Vec::new(),
-            }),
-            routing,
-            ttl: 0,
-        }
+    /// Parse one packet from the start of `raw`, sharing its storage, and
+    /// report how many bytes it consumed.
+    pub fn from_wire_prefix(raw: &Bytes) -> Result<(Packet, usize), DecodeError> {
+        let len = PacketView::parse_prefix(raw)?.1;
+        Ok((Self::from_wire(raw.slice(..len))?, len))
     }
 
-    pub fn heartbeat(payload: Vec<u8>, routing: DeviceRoute) -> Self {
-        Self {
-            payload: Payload::Heartbeat(HeartbeatPayload::Any(payload)),
-            routing,
-            ttl: 0,
-        }
+    /// As [`from_wire_prefix`](Self::from_wire_prefix), copying the packet out
+    /// of a transport's byte stream.
+    pub fn from_slice_prefix(raw: &[u8]) -> Result<(Packet, usize), DecodeError> {
+        let len = PacketView::parse_prefix(raw)?.1;
+        Ok((Self::from_wire(Bytes::copy_from_slice(&raw[..len]))?, len))
     }
 
-    /// Deserialize from caller-owned shared storage. Stream sample bytes are a
-    /// zero-copy [`Bytes`] slice of `raw`.
-    pub fn deserialize_bytes(raw: &Bytes) -> Result<(Packet, usize), DecodeError> {
-        let pkt_hdr = TioPktHdr::deserialize(raw.as_ref())?;
-        let pkt_len = pkt_hdr.packet_size();
-        let payload_range = pkt_hdr.payload_offset()..pkt_hdr.routing_offset();
-        let payload_raw = &raw[payload_range.clone()];
-        let routing_raw = &raw[pkt_hdr.routing_offset()..pkt_len];
-        let payload = match pkt_hdr.ptype() {
-            TioPktType::UnknownOrStream(_) => match pkt_hdr.stream_id() {
-                Some(stream_id) => Payload::StreamData(StreamDataPayload::deserialize_bytes(
-                    raw.slice(payload_range),
-                    stream_id as u8,
-                )?),
-                None => Payload::deserialize(&pkt_hdr, payload_raw)?,
-            },
-            _ => Payload::deserialize(&pkt_hdr, payload_raw)?,
-        };
-
-        Ok((
-            Packet {
-                payload,
-                routing: DeviceRoute::from_bytes(routing_raw)
-                    .expect("routing should have been validated in header deserialization"),
-                ttl: pkt_hdr.ttl(),
-            },
-            pkt_len,
-        ))
-    }
-
-    pub fn deserialize(raw: &[u8]) -> Result<(Packet, usize), DecodeError> {
-        let pkt_len = TioPktHdr::deserialize(raw)?.packet_size();
-        Self::deserialize_bytes(&Bytes::copy_from_slice(&raw[..pkt_len]))
-    }
-
-    pub fn serialize(&self) -> Result<Vec<u8>, EncodeError> {
-        let packet_type = self.payload.packet_type()?;
-        let mut ret = vec![packet_type, 0, 0, 0];
-        self.payload.encode_body(&mut ret)?;
-        let payload_size = ret.len() - TIO_PACKET_HEADER_SIZE;
-        if payload_size > TIO_PACKET_MAX_PAYLOAD_SIZE {
-            return Err(EncodeError::payload_too_large(payload_size));
-        }
-        if self.ttl > TIO_PACKET_MAX_TTL {
-            return Err(EncodeError::ValueTooLarge {
-                value: self.ttl,
-                maximum: TIO_PACKET_MAX_TTL,
+    pub fn rpc_request(
+        name: &str,
+        arg: &[u8],
+        id: u16,
+        routing: DeviceRoute,
+    ) -> Result<Packet, EncodeError> {
+        let method = wire_rpc::Method::ByName(name.as_bytes());
+        let payload_len =
+            wire_rpc::request_payload_len(method, arg).ok_or(EncodeError::ValueTooLarge {
+                value: name.len(),
+                maximum: wire_rpc::NAMELEN_MASK as usize,
+            })?;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(EncodeError::PayloadTooLarge {
+                actual: payload_len,
+                maximum: MAX_PAYLOAD_SIZE,
             });
         }
-        ret[2..4].copy_from_slice(&(payload_size as u16).to_le_bytes());
-        ret[1] = ((self.ttl as u8) << 4) | self.routing.len() as u8;
-        ret.extend(self.routing.iter().rev());
-        Ok(ret)
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = wire_rpc::write_request(&mut buf, RpcRequestId::new(id), method, arg)
+            .expect("payload sized above");
+        Ok(finish(&mut buf, len, routing))
+    }
+
+    pub fn rpc_reply(id: u16, value: &[u8], routing: DeviceRoute) -> Result<Packet, EncodeError> {
+        let payload_len = 2 + value.len();
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(EncodeError::PayloadTooLarge {
+                actual: payload_len,
+                maximum: MAX_PAYLOAD_SIZE,
+            });
+        }
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = wire_rpc::write_reply(&mut buf, RpcRequestId::new(id), value)
+            .expect("payload sized above");
+        Ok(finish(&mut buf, len, routing))
+    }
+
+    /// Refuse a request with a bare error code and no message.
+    pub fn rpc_error(id: u16, code: wire_rpc::RpcError, routing: DeviceRoute) -> Packet {
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = HEADER_SIZE + 4;
+        Header::new(PacketType::RPC_ERROR, 4).write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+        wire_rpc::write_error(&mut buf, RpcRequestId::new(id), code)
+            .expect("a bare error payload always fits");
+        finish(&mut buf, len, routing)
+    }
+
+    /// The proxy's notice that another client's RPC changed a method.
+    pub fn rpc_update(
+        method: wire_rpc::Method<'_>,
+        routing: DeviceRoute,
+    ) -> Result<Packet, EncodeError> {
+        let name_len = match method {
+            wire_rpc::Method::ById(_) => 0,
+            wire_rpc::Method::ByName(name) => name.len(),
+        };
+        let payload_len =
+            wire_rpc::update_payload_len(method).ok_or(EncodeError::PayloadTooLarge {
+                actual: wire_rpc::UPDATE_HEADER_SIZE + name_len,
+                maximum: MAX_PAYLOAD_SIZE,
+            })?;
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = wire_rpc::write_update(&mut buf, method).expect("payload sized above");
+        debug_assert_eq!(len, HEADER_SIZE + payload_len);
+        Ok(finish(&mut buf, len, routing))
+    }
+
+    /// The keepalive a host sends to hold a link open.
+    pub fn heartbeat(routing: DeviceRoute) -> Packet {
+        Self::write_heartbeat(Heartbeat::Any(&[]), routing)
+    }
+
+    pub fn heartbeat_session(session: u32, routing: DeviceRoute) -> Packet {
+        Self::write_heartbeat(Heartbeat::Session(WireSessionId::new(session)), routing)
+    }
+
+    fn write_heartbeat(beat: Heartbeat<'_>, routing: DeviceRoute) -> Packet {
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = beat.write(&mut buf).expect("a heartbeat always fits");
+        finish(&mut buf, len, routing)
+    }
+
+    /// The proxy's own connection-status announcement, which has no route.
+    pub fn proxy_status(status: ProxyStatus) -> Packet {
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        Header::new(PacketType::PROXY_STATUS, 1)
+            .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+        buf[HEADER_SIZE] = u8::from(status);
+        finish(&mut buf, HEADER_SIZE + 1, DeviceRoute::root())
+    }
+
+    pub fn metadata(
+        record: wire::Metadata<'_>,
+        flags: wire::MetadataFlags,
+        routing: DeviceRoute,
+    ) -> Result<Packet, EncodeError> {
+        let payload_len = wire::METADATA_HEADER_SIZE + record.record_len();
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(EncodeError::PayloadTooLarge {
+                actual: payload_len,
+                maximum: MAX_PAYLOAD_SIZE,
+            });
+        }
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = record.write(flags, &mut buf).expect("payload sized above");
+        Ok(finish(&mut buf, len, routing))
+    }
+
+    /// As [`Self::metadata`], carrying a record byte for byte as it was
+    /// received rather than re-encoding it from parsed fields. `kind` is the
+    /// record's wire type byte.
+    pub fn metadata_record(
+        kind: u8,
+        flags: wire::MetadataFlags,
+        record: &[u8],
+        routing: DeviceRoute,
+    ) -> Result<Packet, EncodeError> {
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = wire::write_metadata_record(&mut buf, kind, flags, record).ok_or(
+            EncodeError::PayloadTooLarge {
+                actual: wire::METADATA_HEADER_SIZE + record.len(),
+                maximum: MAX_PAYLOAD_SIZE,
+            },
+        )?;
+        Ok(finish(&mut buf, len, routing))
+    }
+
+    pub fn samples(
+        stream_id: u8,
+        segment_id: u8,
+        first_sample_n: u32,
+        data: &[u8],
+        routing: DeviceRoute,
+    ) -> Result<Packet, EncodeError> {
+        if first_sample_n > MAX_SAMPLE_NUMBER {
+            return Err(EncodeError::SampleNumberTooLarge(first_sample_n));
+        }
+        let payload_len = wire::SAMPLE_HEADER_SIZE + data.len();
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(EncodeError::PayloadTooLarge {
+                actual: payload_len,
+                maximum: MAX_PAYLOAD_SIZE,
+            });
+        }
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let len = wire::Samples {
+            stream_id,
+            segment_id,
+            first: first_sample_n,
+            data,
+        }
+        .write(&mut buf)
+        .ok_or(EncodeError::InvalidStreamId(stream_id))?;
+        Ok(finish(&mut buf, len, routing))
+    }
+
+    /// The payload, re-parsed from the packet's bytes.
+    pub fn payload(&self) -> Payload<'_> {
+        let view = self.view();
+        parse_payload(view.header, view.payload).expect("payload validated in from_wire")
+    }
+
+    /// The payload's bytes, for a caller retaining part of it verbatim rather
+    /// than reading it through [`Self::payload`].
+    pub fn payload_bytes(&self) -> &[u8] {
+        self.view().payload
+    }
+
+    pub fn ptype(&self) -> PacketType {
+        self.view().header.ptype
+    }
+
+    pub fn route(&self) -> DeviceRoute {
+        DeviceRoute::from_wire(self.view().routing).expect("routing validated in from_wire")
+    }
+
+    pub fn ttl(&self) -> u8 {
+        self.view().header.ttl
+    }
+
+    /// True for a packet carrying stream samples, legacy encodings included.
+    pub fn is_data(&self) -> bool {
+        self.ptype().stream_id().is_some()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub fn into_bytes(self) -> Bytes {
+        self.raw
+    }
+
+    /// Re-address this packet, keeping its payload and TTL.
+    pub fn with_route(&self, route: DeviceRoute) -> Packet {
+        if route == self.route() {
+            return self.clone();
+        }
+        self.rebuilt(route, self.ttl())
+    }
+
+    /// Re-stamp this packet's TTL, keeping its payload and route.
+    pub fn with_ttl(&self, ttl: u8) -> Result<Packet, EncodeError> {
+        if ttl > MAX_TTL {
+            return Err(EncodeError::ValueTooLarge {
+                value: usize::from(ttl),
+                maximum: usize::from(MAX_TTL),
+            });
+        }
+        Ok(self.rebuilt(self.route(), ttl))
+    }
+
+    /// Renumber the request an RPC packet belongs to. Requests, replies, and
+    /// errors all lead with that id, so a proxy remapping the ids it forwards
+    /// edits both directions here. Any other packet is returned unchanged.
+    pub fn with_rpc_id(&self, id: u16) -> Packet {
+        let view = self.view();
+        if !matches!(
+            view.header.ptype,
+            PacketType::RPC_REQ | PacketType::RPC_REP | PacketType::RPC_ERROR
+        ) {
+            return self.clone();
+        }
+        let mut raw = self.raw.to_vec();
+        let payload = &mut raw[view.header.payload_range()];
+        if !wire_rpc::set_req_id(payload, RpcRequestId::new(id)) {
+            return self.clone();
+        }
+        Packet { raw: raw.into() }
+    }
+
+    fn view(&self) -> PacketView<'_> {
+        PacketView::parse_prefix(&self.raw)
+            .expect("bytes validated in from_wire")
+            .0
+    }
+
+    /// Copy the packet with a new header. Routing and TTL are the only header
+    /// fields a host edits, and neither can push a valid packet over its size
+    /// ceiling.
+    fn rebuilt(&self, route: DeviceRoute, ttl: u8) -> Packet {
+        let view = self.view();
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let payload_end = HEADER_SIZE + view.payload.len();
+        Header {
+            ptype: view.header.ptype,
+            routing_size: route.len() as u8,
+            ttl,
+            payload_size: view.header.payload_size,
+        }
+        .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+        buf[HEADER_SIZE..payload_end].copy_from_slice(view.payload);
+        finish(&mut buf, payload_end, route)
+    }
+}
+
+/// Stamp a route onto a header-and-payload a wire writer left unaddressed, and
+/// freeze the result. A valid payload plus the longest route still fits a
+/// packet, so this cannot overflow `buf`.
+fn finish(buf: &mut [u8; MAX_PACKET_SIZE], len: usize, routing: DeviceRoute) -> Packet {
+    let mut header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap())
+        .expect("a wire writer stamped this header");
+    header.routing_size = routing.len() as u8;
+    header.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+    let total = len + routing.len();
+    routing
+        .write_wire(&mut buf[len..total])
+        .expect("a route fits behind its payload");
+    Packet {
+        raw: Bytes::copy_from_slice(&buf[..total]),
+    }
+}
+
+impl fmt::Debug for Packet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Packet")
+            .field("payload", &self.payload())
+            .field("routing", &self.route())
+            .field("ttl", &self.ttl())
+            .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DeviceRoute, EncodeError, HeartbeatPayload, Packet, Payload, SettingsPayload,
-        TIO_PACKET_MAX_PAYLOAD_SIZE, TIO_PACKET_MAX_TTL,
-    };
+    use super::*;
 
-    fn packet(payload: Payload) -> Packet {
-        Packet {
-            payload,
-            routing: DeviceRoute::root(),
-            ttl: 0,
-        }
+    const MAX_TTL: usize = super::MAX_TTL as usize;
+
+    fn route(value: &str) -> DeviceRoute {
+        value.parse().unwrap()
     }
 
     #[test]
     fn encode_reports_payload_size_limit() {
-        let actual = TIO_PACKET_MAX_PAYLOAD_SIZE + 1;
-        let error = packet(Payload::Heartbeat(HeartbeatPayload::Any(vec![0; actual])))
-            .serialize()
-            .unwrap_err();
+        let arg = vec![0; MAX_PAYLOAD_SIZE];
+        let error = Packet::rpc_request("x", &arg, 0, DeviceRoute::root()).unwrap_err();
 
         assert_eq!(
             error,
             EncodeError::PayloadTooLarge {
-                actual,
-                maximum: TIO_PACKET_MAX_PAYLOAD_SIZE,
+                actual: 5 + MAX_PAYLOAD_SIZE,
+                maximum: MAX_PAYLOAD_SIZE,
             }
         );
     }
 
     #[test]
     fn rpc_request_encoding_preserves_wire_layout() {
-        let route = "/1/2".parse::<DeviceRoute>().unwrap();
-        let encoded = Packet::rpc_request("x", &[1, 2], 0x1234, route)
-            .serialize()
-            .unwrap();
+        let packet = Packet::rpc_request("x", &[1, 2], 0x1234, route("/1/2")).unwrap();
 
         assert_eq!(
-            encoded,
+            packet.as_bytes(),
             [
                 2, 2, 7, 0, // RPC request header, two routing hops
                 0x34, 0x12, // request ID
@@ -831,52 +553,100 @@ mod tests {
 
     #[test]
     fn ttl_survives_a_serialize_roundtrip() {
-        let sent = Packet {
-            payload: Payload::Heartbeat(HeartbeatPayload::Session(1)),
-            routing: "/1/2".parse::<DeviceRoute>().unwrap(),
-            ttl: 3,
-        };
-        let (received, _) = Packet::deserialize(&sent.serialize().unwrap()).unwrap();
+        let sent = Packet::heartbeat_session(1, route("/1/2"))
+            .with_ttl(3)
+            .unwrap();
+        let received = Packet::from_wire(sent.clone().into_bytes()).unwrap();
 
-        assert_eq!(received.ttl, 3);
-        assert_eq!(received.routing, sent.routing);
+        assert_eq!(received.ttl(), 3);
+        assert_eq!(received.route(), sent.route());
+        assert!(matches!(
+            received.payload(),
+            Payload::Heartbeat(Heartbeat::Session(session)) if session.value() == 1
+        ));
     }
 
     #[test]
     fn encode_rejects_a_ttl_that_does_not_fit_the_header_nibble() {
-        let error = Packet {
-            payload: Payload::Heartbeat(HeartbeatPayload::Session(1)),
-            routing: DeviceRoute::root(),
-            ttl: TIO_PACKET_MAX_TTL + 1,
-        }
-        .serialize()
-        .unwrap_err();
+        let error = Packet::heartbeat_session(1, DeviceRoute::root())
+            .with_ttl(MAX_TTL as u8 + 1)
+            .unwrap_err();
 
         assert_eq!(
             error,
             EncodeError::ValueTooLarge {
-                value: TIO_PACKET_MAX_TTL + 1,
-                maximum: TIO_PACKET_MAX_TTL,
+                value: MAX_TTL + 1,
+                maximum: MAX_TTL,
             }
         );
     }
 
     #[test]
-    fn encode_rejects_settings_names_that_do_not_fit_the_length_field() {
-        let error = packet(Payload::Settings(SettingsPayload::Unknown {
-            name: "x".repeat(usize::from(u8::MAX) + 1),
-            flags: 0,
-            reply: Vec::new(),
-        }))
-        .serialize()
-        .unwrap_err();
+    fn a_metadata_record_this_build_does_not_know_is_forwarded_whole() {
+        let payload = [5, wire::MetadataFlags::UPDATE.bits(), 3, 0xaa, 0xbb, 0xcc];
+        let mut raw = vec![PacketType::METADATA.value(), 0, payload.len() as u8, 0];
+        raw.extend_from_slice(&payload);
+        let packet = Packet::from_wire(Bytes::from(raw.clone())).unwrap();
 
-        assert_eq!(
-            error,
-            EncodeError::ValueTooLarge {
-                value: usize::from(u8::MAX) + 1,
-                maximum: usize::from(u8::MAX),
-            }
-        );
+        assert!(matches!(
+            packet.payload(),
+            Payload::Unknown(PacketType::METADATA, body) if body == payload
+        ));
+        assert_eq!(packet.as_bytes(), raw);
+    }
+
+    #[test]
+    fn a_broken_metadata_record_is_rejected() {
+        // A device record whose name length runs past the record.
+        let payload = [1, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0];
+        let mut raw = vec![PacketType::METADATA.value(), 0, payload.len() as u8, 0];
+        raw.extend_from_slice(&payload);
+
+        assert!(matches!(
+            Packet::from_wire(Bytes::from(raw)),
+            Err(DecodeError::InvalidPayload)
+        ));
+    }
+
+    #[test]
+    fn a_prefix_shares_storage_and_reports_what_it_consumed() {
+        let first = Packet::heartbeat_session(1, DeviceRoute::root());
+        let second = Packet::rpc_error(7, wire_rpc::RpcError::Timeout, DeviceRoute::root());
+        let mut stream = first.as_bytes().to_vec();
+        stream.extend_from_slice(second.as_bytes());
+        let stream = Bytes::from(stream);
+
+        let (packet, used) = Packet::from_wire_prefix(&stream).unwrap();
+        assert_eq!(used, first.as_bytes().len());
+        assert_eq!(packet.as_bytes(), first.as_bytes());
+
+        let (packet, used) = Packet::from_wire_prefix(&stream.slice(used..)).unwrap();
+        assert_eq!(used, second.as_bytes().len());
+        assert_eq!(packet.as_bytes(), second.as_bytes());
+    }
+
+    #[test]
+    fn trailing_bytes_are_not_a_packet() {
+        let mut raw = Packet::heartbeat(DeviceRoute::root()).as_bytes().to_vec();
+        raw.push(0);
+
+        assert!(matches!(
+            Packet::from_wire(Bytes::from(raw)),
+            Err(DecodeError::PacketTooBig)
+        ));
+    }
+
+    #[test]
+    fn rescoping_a_route_keeps_the_payload() {
+        let packet = Packet::rpc_request("dev.name", b"", 3, route("/1"))
+            .unwrap()
+            .with_route(route("/4/5"));
+
+        assert_eq!(packet.route(), route("/4/5"));
+        assert!(matches!(
+            packet.payload(),
+            Payload::RpcRequest(request)
+                if request.method == wire_rpc::Method::ByName(b"dev.name")
+        ));
     }
 }

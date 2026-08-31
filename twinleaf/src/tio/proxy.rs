@@ -1,20 +1,16 @@
-//! Proxy
+//! The [`Connection`] and the packet [`Port`]s that multiplex one transport.
 //!
-//! A proxy allows to multiplex access to a hardware port, by one or more
-//! `proxy::Port`s. These allow sending and receiving `proto::Packet`s
-//! to/from a single sensor, or an arbitrary device tree, and restrcting the
-//! type of traffic. Also, the proxy implements serial port rate negotiation
-//! for higher data rates.
-//!
-//! Note: the proxy runs in a dedicated thread.
+//! A proxy thread owns the hardware port and fans it out to any number of
+//! `Port`s, each restricted to a subtree and a traffic class, negotiating the
+//! serial rate on the way. `Port` is the raw half; the device layer builds its
+//! trees, devices, and streams on the same connection.
 
 use super::proto::{self, DeviceRoute, Packet, ProxyStatus};
-use super::proto::{RpcArgs, RpcDecodeError, RpcReply};
-use super::proxy_core::{ProxyClient, ProxyCore};
+use super::proxy_core::{ProxyClient, ProxyCommand, ProxyCore};
 use super::transport;
+use twinleaf_proto::rpc as wire_rpc;
 
 use std::env;
-use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,7 +46,7 @@ pub enum Event {
     RootDeviceRestarted,
     AutoRateGaveUp,
     AutoRateQueried(u32),
-    AutoRateRpcError(proto::RpcErrorCode),
+    AutoRateRpcError(wire_rpc::RpcError),
     AutoRateRpcInvalid,
     AutoRateIncompatible(u32),
     AutoRateCompatible(u32),
@@ -91,17 +87,6 @@ pub enum SendError {
     InvalidRoute(Packet),
 }
 
-impl SendError {
-    /// Recover the packet that was not submitted to the proxy.
-    pub fn into_packet(self) -> Packet {
-        match self {
-            Self::WouldBlock(packet)
-            | Self::ProxyDisconnected(packet)
-            | Self::InvalidRoute(packet) => packet,
-        }
-    }
-}
-
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RecvError {
     #[error("no packet available")]
@@ -119,43 +104,32 @@ pub enum RecvTimeoutError {
     ProxyDisconnected,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum RpcError {
-    #[error("RPC request was not submitted to the proxy")]
-    RequestNotSubmitted,
-    #[error("RPC route exceeds port scope")]
-    InvalidRoute,
-    #[error("proxy disconnected while waiting for the RPC reply")]
-    ResponseLost,
-    #[error("timed out waiting for the RPC reply")]
-    Timeout,
-    #[error("device returned error: {0}")]
-    DeviceError(proto::RpcErrorPayload),
-    #[error("RPC reply did not match expected type: {0}")]
-    InvalidReply(#[source] RpcDecodeError),
-}
-
-impl From<SendError> for RpcError {
-    fn from(error: SendError) -> Self {
-        match error {
-            SendError::InvalidRoute(_) => Self::InvalidRoute,
-            SendError::WouldBlock(_) | SendError::ProxyDisconnected(_) => Self::RequestNotSubmitted,
-        }
-    }
-}
-
 impl Port {
-    /// Get the scope for this port
-    pub fn scope(&self) -> DeviceRoute {
-        self.scope
+    /// Test-only port wired directly to channel pairs, with no proxy behind
+    /// it. Returns the port, the far end receiving what the port sends, and
+    /// the far end for delivering packets to the port.
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Port, channel::Receiver<Packet>, channel::Sender<Packet>) {
+        let (tx, sent) = channel::bounded(256);
+        let (deliver, rx) = channel::bounded(256);
+        (
+            Port {
+                tx,
+                rx,
+                depth: 0,
+                scope: DeviceRoute::root(),
+            },
+            sent,
+            deliver,
+        )
     }
 
     /// Sends a TIO packet to this port synchronously. This call will
     /// block if the port is backed up.
     #[allow(clippy::result_large_err)] // Preserve ownership when submission fails.
     pub fn send(&self, packet: Packet) -> Result<(), SendError> {
-        if packet.routing.len() > self.depth || self.scope.absolute_route(&packet.routing).is_err()
-        {
+        let route = packet.route();
+        if route.len() > self.depth || self.scope.absolute_route(&route).is_err() {
             return Err(SendError::InvalidRoute(packet));
         }
         match self.tx.send(packet) {
@@ -167,8 +141,8 @@ impl Port {
     /// Attempts to send a TIO packet to this port without blocking.
     #[allow(clippy::result_large_err)] // Preserve ownership when submission fails.
     pub fn try_send(&self, packet: Packet) -> Result<(), SendError> {
-        if packet.routing.len() > self.depth || self.scope.absolute_route(&packet.routing).is_err()
-        {
+        let route = packet.route();
+        if route.len() > self.depth || self.scope.absolute_route(&route).is_err() {
             return Err(SendError::InvalidRoute(packet));
         }
         match self.tx.try_send(packet) {
@@ -178,11 +152,6 @@ impl Port {
                 Err(SendError::ProxyDisconnected(pkt))
             }
         }
-    }
-
-    /// `Select` the tx channel
-    pub fn select_send<'a>(&'a self, sel: &mut crossbeam::channel::Select<'a>) -> usize {
-        sel.send(&self.tx)
     }
 
     /// Waits for a packet to be available, and returns it.
@@ -229,11 +198,6 @@ impl Port {
         }
     }
 
-    /// `Select` the rx channel
-    pub fn select_recv<'a>(&'a self, sel: &mut crossbeam::channel::Select<'a>) -> usize {
-        sel.recv(&self.rx)
-    }
-
     /// To use `crossbeam::channel::select!`.
     pub fn receiver(&self) -> &crossbeam::channel::Receiver<Packet> {
         &self.rx
@@ -242,44 +206,6 @@ impl Port {
     /// Iterate over packets (until disconnect or break out).
     pub fn iter(&self) -> crossbeam::channel::Iter<'_, Packet> {
         self.rx.iter()
-    }
-
-    /// Iterate over packets (until disconnect, break out, or empty channel).
-    pub fn try_iter(&self) -> crossbeam::channel::TryIter<'_, Packet> {
-        self.rx.try_iter()
-    }
-
-    /// Generic any sized input/output RPC, blocking
-    pub fn raw_rpc(&self, name: &str, arg: &[u8]) -> Result<Vec<u8>, RpcError> {
-        self.send(Packet::rpc_request(name, arg, 0, DeviceRoute::root()))?;
-        loop {
-            match self.recv() {
-                Ok(pkt) => match pkt.payload {
-                    proto::Payload::RpcReply(rep) => return Ok(rep.reply),
-                    proto::Payload::RpcError(err) => return Err(RpcError::DeviceError(err)),
-                    _ => continue,
-                },
-                Err(_) => return Err(RpcError::ResponseLost),
-            }
-        }
-    }
-
-    pub fn rpc<ReqT: RpcArgs, RepT: RpcReply>(
-        &self,
-        name: &str,
-        arg: ReqT,
-    ) -> Result<RepT, RpcError> {
-        let ret = self.raw_rpc(name, &arg.encode_args())?;
-        RepT::decode_reply(&ret).map_err(RpcError::InvalidReply)
-    }
-
-    /// Action: rpc with no argument which returns nothing
-    pub fn action(&self, name: &str) -> Result<(), RpcError> {
-        self.rpc(name, ())
-    }
-
-    pub fn get<T: RpcReply>(&self, name: &str) -> Result<T, RpcError> {
-        self.rpc(name, ())
     }
 }
 
@@ -293,41 +219,210 @@ pub enum PortError {
     FailedNewClientSetup,
 }
 
-/// Failure to establish the proxy's immediate transport.
-#[derive(Debug, thiserror::Error)]
-pub enum ConnectError {
-    #[error("failed to open {locator}")]
-    Open {
-        locator: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("proxy worker for {locator} stopped during startup")]
-    WorkerStopped { locator: String },
+fn checked_rpc_timeout(timeout: Option<Duration>) -> Result<Duration, PortError> {
+    let timeout = timeout.unwrap_or(Duration::from_millis(3000));
+    if timeout < Duration::from_millis(100) {
+        return Err(PortError::RpcTimeoutTooShort);
+    }
+    if timeout > Duration::from_secs(60) {
+        return Err(PortError::RpcTimeoutTooLong);
+    }
+    Ok(timeout)
 }
 
-/// Interface to a port proxy. Can create new ports.
-pub struct Interface {
-    new_client_queue: channel::Sender<ProxyClient>,
-    new_client_confirm: Option<channel::Receiver<Event>>,
+/// An owned low-level RPC result delivered directly by the proxy worker.
+pub(crate) type RawCallResult = Result<Vec<u8>, RawCallError>;
+
+/// Why a raw RPC submitted directly to the proxy did not return a value.
+///
+/// This deliberately contains no device-layer decoding or registry concepts.
+#[derive(Debug, Clone, thiserror::Error)]
+pub(crate) enum RawCallError {
+    #[error("RPC route exceeds endpoint scope")]
+    InvalidRoute,
+    #[error("RPC request was not submitted to the proxy")]
+    RequestNotSubmitted,
+    #[error("RPC timed out in the proxy")]
+    Timeout,
+    #[error("device disconnected while the RPC was in flight")]
+    DeviceDisconnected,
+    #[error("proxy worker stopped while the RPC was in flight")]
+    ProxyClosed,
+    #[error("device returned RPC error {error}")]
+    Device {
+        error: wire_rpc::RpcError,
+        message: Vec<u8>,
+    },
+}
+
+/// Cloneable access to the one proxy worker behind a [`Connection`].
+#[derive(Clone)]
+pub(crate) struct ProxyHandle {
+    commands: channel::Sender<ProxyCommand>,
     client_rx_channel_size: usize,
     client_tx_channel_size: usize,
 }
 
-impl Interface {
-    fn spawn_proxy(
+impl ProxyHandle {
+    /// Queue a port for the worker to adopt, never waiting on a worker that may
+    /// be blocked acquiring a transport that never opens.
+    fn register_port(&self, client: ProxyClient) -> Result<(), PortError> {
+        self.commands
+            .try_send(ProxyCommand::OpenPort { client })
+            .map_err(|_| PortError::FailedNewClientSetup)
+    }
+
+    fn open_port(
+        &self,
+        rpc_timeout: Duration,
+        scope: DeviceRoute,
+        depth: usize,
+        forward_data: bool,
+        forward_nonrpc: bool,
+    ) -> Result<Port, PortError> {
+        let (client_to_proxy_sender, proxy_from_client_receiver) =
+            channel::bounded::<Packet>(self.client_tx_channel_size);
+        let (proxy_to_client_sender, client_from_proxy_receiver) =
+            channel::bounded::<Packet>(self.client_rx_channel_size);
+        self.register_port(ProxyClient::new(
+            proxy_to_client_sender,
+            proxy_from_client_receiver,
+            rpc_timeout,
+            scope,
+            depth,
+            forward_data,
+            forward_nonrpc,
+        ))?;
+        Ok(Port {
+            tx: client_to_proxy_sender,
+            rx: client_from_proxy_receiver,
+            depth,
+            scope,
+        })
+    }
+}
+
+/// Scoped raw-RPC capability. The proxy worker owns request IDs and progress.
+#[derive(Clone)]
+pub(crate) struct RpcEndpoint {
+    proxy: ProxyHandle,
+    scope: DeviceRoute,
+    depth: usize,
+    timeout: Duration,
+}
+
+impl RpcEndpoint {
+    pub(crate) fn scope(&self) -> DeviceRoute {
+        self.scope
+    }
+
+    pub(crate) fn submit(
+        &self,
+        route: DeviceRoute,
+        name: &str,
+        args: &[u8],
+    ) -> Result<channel::Receiver<RawCallResult>, RawCallError> {
+        let relative = self
+            .scope
+            .relative_route(&route)
+            .map_err(|_| RawCallError::InvalidRoute)?;
+        if relative.len() > self.depth {
+            return Err(RawCallError::InvalidRoute);
+        }
+        let request = Packet::rpc_request(name, args, 0, route)
+            .map_err(|_| RawCallError::RequestNotSubmitted)?;
+        let (result, receiver) = channel::bounded(1);
+        match self.commands().try_send(ProxyCommand::Call {
+            request,
+            timeout: self.timeout,
+            result,
+        }) {
+            Ok(()) => Ok(receiver),
+            Err(channel::TrySendError::Full(_)) => Err(RawCallError::RequestNotSubmitted),
+            Err(channel::TrySendError::Disconnected(_)) => Err(RawCallError::ProxyClosed),
+        }
+    }
+
+    fn commands(&self) -> &channel::Sender<ProxyCommand> {
+        &self.proxy.commands
+    }
+
+    /// The same capability narrowed to `depth` levels under `scope`.
+    pub(crate) fn scoped(&self, scope: DeviceRoute, depth: usize) -> RpcEndpoint {
+        RpcEndpoint {
+            proxy: self.proxy.clone(),
+            scope,
+            depth,
+            timeout: self.timeout,
+        }
+    }
+
+    pub(crate) fn open_port(
+        &self,
+        forward_data: bool,
+        forward_nonrpc: bool,
+    ) -> Result<Port, PortError> {
+        self.proxy.open_port(
+            self.timeout,
+            self.scope,
+            self.depth,
+            forward_data,
+            forward_nonrpc,
+        )
+    }
+
+    /// Test-only endpoint with no proxy behind it. Returns the endpoint and
+    /// the far end receiving the commands it submits.
+    #[cfg(test)]
+    pub(crate) fn test_pair(
+        scope: DeviceRoute,
+        depth: usize,
+    ) -> (RpcEndpoint, channel::Receiver<ProxyCommand>) {
+        let (commands, receiver) = channel::bounded(16);
+        (
+            RpcEndpoint {
+                proxy: ProxyHandle {
+                    commands,
+                    client_rx_channel_size: 4,
+                    client_tx_channel_size: 4,
+                },
+                scope,
+                depth,
+                timeout: Duration::from_secs(3),
+            },
+            receiver,
+        )
+    }
+}
+
+/// A live link to one device tree, over serial, TCP, or UDP.
+///
+/// Opening one starts the I/O thread that owns the transport and reconnects on
+/// its own; [`tree`](Connection::tree) is the way from here to devices.
+pub struct Connection {
+    proxy: ProxyHandle,
+}
+
+impl Connection {
+    /// Open a connection to `url` and start driving its transport.
+    pub fn open(url: &str) -> Connection {
+        Self::open_with(url, None, None)
+    }
+
+    /// Open a connection that gives up on a reconnect after `reconnect_timeout`
+    /// and reports transport events to `status_queue`.
+    pub fn open_with(
         url: &str,
         reconnect_timeout: Option<Duration>,
         status_queue: Option<channel::Sender<Event>>,
-        startup: Option<channel::Sender<io::Result<()>>>,
-    ) -> Interface {
-        let (client_sender, client_receiver) = channel::bounded::<ProxyClient>(5);
-        let (status_sender, status_receiver, only_clients) = {
+    ) -> Connection {
+        let (command_sender, command_receiver) = channel::bounded::<ProxyCommand>(64);
+        let (status_sender, only_clients) = {
             if let Some(status_sender) = status_queue {
-                (status_sender, None, false)
+                (status_sender, false)
             } else {
-                let (s, r) = channel::bounded::<Event>(50);
-                (s, Some(r), true)
+                let (sender, _receiver) = channel::bounded::<Event>(1);
+                (sender, true)
             }
         };
         let url_string = url.to_string();
@@ -344,181 +439,69 @@ impl Interface {
             let mut proxy = ProxyCore::new(
                 url_string,
                 reconnect_timeout,
-                client_receiver,
+                command_receiver,
                 status_sender,
                 only_clients,
             );
-            proxy.run(startup);
+            proxy.run();
         });
-        Interface {
-            new_client_queue: client_sender,
-            new_client_confirm: status_receiver,
-            client_rx_channel_size: Self::get_client_rx_channel_size(),
-            client_tx_channel_size: Self::get_client_tx_channel_size(),
+        Connection {
+            proxy: ProxyHandle {
+                commands: command_sender,
+                client_rx_channel_size: client_rx_channel_size(),
+                client_tx_channel_size: client_tx_channel_size(),
+            },
         }
     }
 
-    /// Create an Interface and start its ProxyCore without waiting for the
-    /// immediate transport to open.
-    pub fn new_proxy(
-        url: &str,
-        reconnect_timeout: Option<Duration>,
-        status_queue: Option<channel::Sender<Event>>,
-    ) -> Interface {
-        Self::spawn_proxy(url, reconnect_timeout, status_queue, None)
-    }
-
-    /// Create an Interface after its immediate serial, TCP, or UDP transport
-    /// has opened successfully.
-    ///
-    /// This does not wait for a sensor packet or for devices behind a remote
-    /// TCP proxy. Packet processing and reconnection remain asynchronous.
-    pub fn connect(
-        url: &str,
-        reconnect_timeout: Option<Duration>,
-        status_queue: Option<channel::Sender<Event>>,
-    ) -> Result<Interface, ConnectError> {
-        let (startup_tx, startup_rx) = channel::bounded::<io::Result<()>>(1);
-        let interface = Self::spawn_proxy(url, reconnect_timeout, status_queue, Some(startup_tx));
-        match startup_rx.recv() {
-            Ok(Ok(())) => Ok(interface),
-            Ok(Err(source)) => Err(ConnectError::Open {
-                locator: url.to_string(),
-                source,
-            }),
-            Err(_) => Err(ConnectError::WorkerStopped {
-                locator: url.to_string(),
-            }),
-        }
-    }
-
-    /// Create a new proxy which connects to a url with default parameters.
-    pub fn new(url: &str) -> Interface {
-        Self::new_proxy(url, None, None)
-    }
-
-    pub fn get_client_rx_channel_size() -> usize {
-        let min_size = transport::DEFAULT_RX_CHANNEL_SIZE;
-        if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
-            std::cmp::max(req.parse().unwrap_or(0), min_size)
-        } else {
-            min_size
-        }
-    }
-
-    pub fn get_client_tx_channel_size() -> usize {
-        let min_size = transport::DEFAULT_TX_CHANNEL_SIZE;
-        if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
-            std::cmp::max(req.parse().unwrap_or(0), min_size)
-        } else {
-            min_size
-        }
-    }
-
-    /// Create a new port
-    pub fn new_port(
+    pub(crate) fn rpc_endpoint(
         &self,
         rpc_timeout: Option<Duration>,
         scope: DeviceRoute,
         depth: usize,
-        forward_data: bool,
-        forward_nonrpc: bool,
-    ) -> Result<Port, PortError> {
-        let default_rpc_timeout = Duration::from_millis(3000);
-        let rpc_timeout = rpc_timeout.unwrap_or(default_rpc_timeout);
-        if rpc_timeout < Duration::from_millis(100) {
-            return Err(PortError::RpcTimeoutTooShort);
-        }
-        if rpc_timeout > Duration::from_secs(60) {
-            return Err(PortError::RpcTimeoutTooLong);
-        }
-
-        let (client_to_proxy_sender, proxy_from_client_receiver) =
-            channel::bounded::<Packet>(self.client_tx_channel_size);
-        let (proxy_to_client_sender, client_from_proxy_receiver) =
-            channel::bounded::<Packet>(self.client_rx_channel_size);
-        if self
-            .new_client_queue
-            .send(ProxyClient::new(
-                proxy_to_client_sender,
-                proxy_from_client_receiver,
-                rpc_timeout,
-                scope,
-                depth,
-                forward_data,
-                forward_nonrpc,
-            ))
-            .is_err()
-        {
-            return Err(PortError::FailedNewClientSetup);
-        }
-        if let Some(confirm) = &self.new_client_confirm {
-            if confirm.recv().is_err() {
-                return Err(PortError::FailedNewClientSetup);
-            }
-        }
-        Ok(Port {
-            tx: client_to_proxy_sender,
-            rx: client_from_proxy_receiver,
-            depth,
+    ) -> Result<RpcEndpoint, PortError> {
+        Ok(RpcEndpoint {
+            proxy: self.proxy.clone(),
             scope,
+            depth,
+            timeout: checked_rpc_timeout(rpc_timeout)?,
         })
-    }
-
-    /// New port with default parameters for a subtree, receiving all packets.
-    pub fn subtree_full(&self, subtree_root: DeviceRoute) -> Result<Port, PortError> {
-        self.new_port(None, subtree_root, usize::MAX, true, true)
-    }
-
-    /// New port with default parameters for a subtree, receiving only RPCs.
-    pub fn subtree_rpc(&self, subtree_root: DeviceRoute) -> Result<Port, PortError> {
-        self.new_port(None, subtree_root, usize::MAX, false, false)
-    }
-
-    /// New port with default parameters for a subtree, useful to probe connected devices.
-    pub fn subtree_probe(&self, subtree_root: DeviceRoute) -> Result<Port, PortError> {
-        self.new_port(None, subtree_root, usize::MAX, false, true)
-    }
-
-    /// New port for the full device tree, useful to probe connected devices.
-    pub fn tree_probe(&self) -> Result<Port, PortError> {
-        self.subtree_probe(DeviceRoute::root())
-    }
-
-    /// New port with default parameters for the full device tree, receiving all packets.
-    pub fn tree_full(&self) -> Result<Port, PortError> {
-        self.subtree_full(DeviceRoute::root())
-    }
-
-    /// New port with default parameters for the full device tree, receiving only RPCs.
-    pub fn tree_rpc(&self) -> Result<Port, PortError> {
-        self.subtree_rpc(DeviceRoute::root())
-    }
-
-    /// New port with default parameters for a specific device, receiving all packets.
-    pub fn device_full(&self, address: DeviceRoute) -> Result<Port, PortError> {
-        self.new_port(None, address, 0, true, true)
-    }
-
-    /// New port with default parameters for a specific device, receiving only RPCs.
-    pub fn device_rpc(&self, address: DeviceRoute) -> Result<Port, PortError> {
-        self.new_port(None, address, 0, false, false)
-    }
-
-    /// New port with default parameters for the root device, receiving all packets.
-    pub fn root_full(&self) -> Result<Port, PortError> {
-        self.device_full(DeviceRoute::root())
-    }
-
-    /// New port with default parameters for the root device, receiving only RPCs.
-    pub fn root_rpc(&self) -> Result<Port, PortError> {
-        self.device_rpc(DeviceRoute::root())
     }
 }
 
-impl Default for Interface {
-    fn default() -> Self {
-        Self::new(DEFAULT_URL)
+/// Open a raw packet port on `connection`, filtered to `depth` levels under
+/// `scope`. Prefer [`DeviceTree`](crate::DeviceTree) unless you need packets.
+pub fn open_port(
+    connection: &Connection,
+    rpc_timeout: Option<Duration>,
+    scope: DeviceRoute,
+    depth: usize,
+    forward_data: bool,
+    forward_nonrpc: bool,
+) -> Result<Port, PortError> {
+    let rpc_timeout = checked_rpc_timeout(rpc_timeout)?;
+    connection
+        .proxy
+        .open_port(rpc_timeout, scope, depth, forward_data, forward_nonrpc)
+}
+
+/// Depth of the queue the proxy fills for each of its ports.
+pub fn client_rx_channel_size() -> usize {
+    let min_size = transport::DEFAULT_RX_CHANNEL_SIZE;
+    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
+        std::cmp::max(req.parse().unwrap_or(0), min_size)
+    } else {
+        min_size
+    }
+}
+
+/// Depth of the queue each port fills for the proxy.
+pub fn client_tx_channel_size() -> usize {
+    let min_size = transport::DEFAULT_TX_CHANNEL_SIZE;
+    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
+        std::cmp::max(req.parse().unwrap_or(0), min_size)
+    } else {
+        min_size
     }
 }
 
@@ -542,14 +525,14 @@ mod tests {
     fn recv_deadline_returns_a_queued_packet() {
         let (port, proxy_tx) = test_port();
         proxy_tx
-            .send(Packet::heartbeat(Vec::new(), DeviceRoute::root()))
+            .send(Packet::heartbeat(DeviceRoute::root()))
             .unwrap();
 
         let packet = port
             .recv_deadline(Instant::now() + Duration::from_millis(100))
             .unwrap();
 
-        assert!(matches!(packet.payload, proto::Payload::Heartbeat(_)));
+        assert!(matches!(packet.payload(), proto::Payload::Heartbeat(_)));
     }
 
     #[test]
@@ -571,5 +554,75 @@ mod tests {
             port.recv_deadline(Instant::now() + Duration::from_millis(100)),
             Err(RecvTimeoutError::ProxyDisconnected)
         ));
+    }
+
+    #[test]
+    fn endpoint_submits_an_absolute_routed_call_without_a_caller_id() {
+        let scope: DeviceRoute = "/1".parse().unwrap();
+        let route: DeviceRoute = "/1/2".parse().unwrap();
+        let (endpoint, commands) = RpcEndpoint::test_pair(scope, 1);
+
+        let _pending = endpoint.submit(route, "dev.name", b"arg").unwrap();
+        let ProxyCommand::Call {
+            request, timeout, ..
+        } = commands.recv().unwrap()
+        else {
+            panic!("expected a direct RPC command");
+        };
+
+        assert_eq!(request.route(), route);
+        assert_eq!(timeout, Duration::from_secs(3));
+        let proto::Payload::RpcRequest(request) = request.payload() else {
+            panic!("expected an RPC request");
+        };
+        assert_eq!(request.id.value(), 0);
+        assert_eq!(request.args, b"arg");
+        assert!(matches!(
+            request.method,
+            wire_rpc::Method::ByName(name) if name == b"dev.name"
+        ));
+    }
+
+    /// A worker stuck acquiring a transport it will never open must not hold up
+    /// the caller: `tio dump -r tcp://<unreachable>` has to reach its deadline.
+    #[test]
+    fn opening_a_port_does_not_wait_for_a_worker_that_never_answers() {
+        let (endpoint, commands) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+
+        let _port = endpoint.open_port(true, true).expect("the port is queued");
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ProxyCommand::OpenPort { .. })
+        ));
+    }
+
+    #[test]
+    fn opening_a_port_fails_once_the_worker_is_gone() {
+        let (endpoint, commands) = RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+        drop(commands);
+
+        assert!(matches!(
+            endpoint.open_port(true, true),
+            Err(PortError::FailedNewClientSetup)
+        ));
+    }
+
+    #[test]
+    fn endpoint_rejects_routes_outside_its_scope_or_depth() {
+        let scope: DeviceRoute = "/1".parse().unwrap();
+        let (endpoint, commands) = RpcEndpoint::test_pair(scope, 1);
+
+        let outside: DeviceRoute = "/2".parse().unwrap();
+        assert!(matches!(
+            endpoint.submit(outside, "dev.name", b""),
+            Err(RawCallError::InvalidRoute)
+        ));
+        let too_deep: DeviceRoute = "/1/2/3".parse().unwrap();
+        assert!(matches!(
+            endpoint.submit(too_deep, "dev.name", b""),
+            Err(RawCallError::InvalidRoute)
+        ));
+        assert!(commands.is_empty());
     }
 }

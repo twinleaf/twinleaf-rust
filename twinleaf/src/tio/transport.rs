@@ -67,14 +67,11 @@ pub enum SendError {
     /// Issue with the underlying IO operation.
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
-    /// The packet could not be encoded for the wire.
-    #[error("could not encode packet: {0}")]
-    Encode(#[from] proto::EncodeError),
 }
 
 /// Possible errors when setting a custom data rate
 #[derive(Debug, thiserror::Error)]
-pub enum RateError {
+pub(crate) enum RateError {
     #[error("rate changes not supported on this port")]
     Unsupported,
     #[error("invalid rate")]
@@ -85,7 +82,7 @@ pub enum RateError {
 
 /// Custom data rate info associated with the port
 #[derive(Clone)]
-pub struct RateInfo {
+pub(crate) struct RateInfo {
     /// Default/fallback rate
     pub default_bps: u32,
     /// Target rate.
@@ -95,7 +92,7 @@ pub struct RateInfo {
 
 /// The kind of link a [`Port`] talks over, for policies which depend on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportKind {
+pub(crate) enum TransportKind {
     Serial,
     Tcp,
     Udp,
@@ -236,10 +233,10 @@ pub struct Port {
 }
 
 /// Default size of the rx channel when receiving to a crossbeam channel.
-pub static DEFAULT_RX_CHANNEL_SIZE: usize = 32768;
+pub(crate) static DEFAULT_RX_CHANNEL_SIZE: usize = 32768;
 
 /// Default size of the tx channel when sending to a crossbeam channel.
-pub static DEFAULT_TX_CHANNEL_SIZE: usize = 32768;
+pub(crate) static DEFAULT_TX_CHANNEL_SIZE: usize = 32768;
 
 impl Port {
     #[cfg(feature = "serial")]
@@ -303,9 +300,7 @@ impl Port {
                 Some({
                     let mut until_hb = max_interval.saturating_sub(last_sent.elapsed());
                     if (until_hb == Duration::ZERO) | startup {
-                        match raw_port
-                            .send(&Packet::heartbeat(Vec::new(), proto::DeviceRoute::root()))
-                        {
+                        match raw_port.send(&Packet::heartbeat(proto::DeviceRoute::root())) {
                             Err(SendError::MustDrain) => {
                                 needs_draining = true;
                                 poll.registry()
@@ -559,7 +554,7 @@ impl Port {
     /// on the underlying raw port. If it returns an `Err()`, the port is closed.
     ///
     /// The most common use for a `Port` is to receive on a channel, see `rx_to_channel_cb`.
-    pub fn new<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
+    pub(crate) fn new<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
         url: &str,
         rx: RXT,
     ) -> io::Result<Port> {
@@ -599,25 +594,10 @@ impl Port {
         }
     }
 
-    /// Create a new port from a `mio::net::TcpStream`. See `new()`.
-    pub fn from_mio_stream<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
-        stream: mio::net::TcpStream,
-        rx: RXT,
-    ) -> io::Result<Port> {
-        Port::from_raw(tcp::Port::from_stream(stream)?, rx)
-    }
-
-    /// Create a new port from a `std::net::TcpStream`. See `new()`.
-    pub fn from_tcp_stream<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
-        stream: std::net::TcpStream,
-        rx: RXT,
-    ) -> io::Result<Port> {
-        stream.set_nonblocking(true)?;
-        Port::from_mio_stream(mio::net::TcpStream::from_std(stream), rx)
-    }
-
     /// Same as `from_mio_stream`, but with configurable tx channel size.
-    pub fn from_mio_stream_custom<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
+    pub(crate) fn from_mio_stream_custom<
+        RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static,
+    >(
         stream: mio::net::TcpStream,
         rx: RXT,
         tx_size: usize,
@@ -635,17 +615,8 @@ impl Port {
         Port::from_mio_stream_custom(mio::net::TcpStream::from_std(stream), rx, tx_size)
     }
 
-    /// Creates a sender/receiver pair to be used with `rx_to_channel`:
-    /// ```no_run
-    /// use twinleaf::tio::transport::Port;
-    ///
-    /// let url = "tcp://localhost:7855";
-    /// let (port_rx_send, port_rx) = Port::rx_channel();
-    /// let port = Port::new(url, Port::rx_to_channel(port_rx_send)).unwrap();
-    /// ```
-    /// In the example, `port.send()` can now be used to send and `port_rx.recv()`
-    /// to receive.
-    pub fn rx_channel() -> (
+    /// Creates a sender/receiver pair to be used with `rx_to_channel`.
+    pub(crate) fn rx_channel() -> (
         crossbeam::channel::Sender<ReceiveResult>,
         crossbeam::channel::Receiver<ReceiveResult>,
     ) {
@@ -673,7 +644,7 @@ impl Port {
 
     /// Same as `rx_to_channel`, but with a user specified callback for when
     /// the channel is full.
-    pub fn rx_to_channel_cb<FullCBT: Fn(ReceiveResult) + Send + 'static>(
+    pub(crate) fn rx_to_channel_cb<FullCBT: Fn(ReceiveResult) + Send + 'static>(
         rx_send: crossbeam::channel::Sender<ReceiveResult>,
         full_cb: FullCBT,
     ) -> impl Fn(ReceiveResult) -> io::Result<()> {
@@ -730,17 +701,17 @@ impl Port {
     }
 
     /// The kind of link this port talks over.
-    pub fn kind(&self) -> TransportKind {
+    pub(crate) fn kind(&self) -> TransportKind {
         self.kind
     }
 
     /// Get data rate information for the underlying raw port (if supported).
-    pub fn rate_info(&self) -> Option<RateInfo> {
+    pub(crate) fn rate_info(&self) -> Option<RateInfo> {
         self.rates.clone()
     }
 
     /// Set data rate for the underlying raw port (if supported).
-    pub fn set_rate(&self, rate: u32) -> Result<(), RateError> {
+    pub(crate) fn set_rate(&self, rate: u32) -> Result<(), RateError> {
         let tx = self.tx.as_ref().expect("Tx channel invalid");
         if tx.send(PacketOrControl::SetRate(rate)).is_err() {
             return Err(RateError::Failed);
