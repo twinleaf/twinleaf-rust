@@ -5,21 +5,18 @@
 //! validated bytes immediately or retain only their metadata and boundaries.
 
 use super::metadata::{
-    decoded_buffer_type, DeviceMetadataSnapshot, MetadataQuery, StreamMetadataSnapshot,
+    decoded_buffer_type, BufferType, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord,
+    MetadataQuery, SegmentRecord, StreamMetadataSnapshot, StreamRecord,
 };
 use super::sample::{
     sample_time, BatchContext, BoundaryReason, ColumnData, Generations, RowSource,
     SampleBatchBuilder, StreamKey,
 };
-use super::{BufferType, ColumnRecord, DeviceRecord, MetadataType};
-use super::{SegmentRecord, StreamRecord};
 use crate::tio;
-use proto::route::RouteError;
-use proto::DeviceRoute;
+use crate::tio::proto::route::RouteError;
+use crate::tio::proto::{self, DeviceRoute, MAX_SAMPLE_NUMBER};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use tio::proto;
-use tio::proto::MAX_SAMPLE_NUMBER;
 use twinleaf_proto::data as wire;
 use twinleaf_proto::heartbeat::Heartbeat;
 use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
@@ -27,17 +24,28 @@ use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
 /// Why an otherwise well-formed packet cannot be applied to the data state.
 #[derive(Debug, thiserror::Error)]
 pub enum PacketError {
+    /// The packet sits too deep to address from the root this parser tracks.
     #[error("packet route {packet_route} cannot be resolved below {root_route}: {source}")]
     Route {
+        /// Absolute route the parser is anchored at.
         root_route: DeviceRoute,
+        /// Route the packet carried, relative to `root_route`.
         packet_route: DeviceRoute,
+        /// The routing failure hit while joining the two.
         #[source]
         source: RouteError,
     },
+    /// A stream-data payload contradicts the metadata retained for its stream.
+    ///
+    /// The rows are dropped, but the retained metadata survives for later
+    /// packets.
     #[error("invalid data for {route} stream {stream_id}: {source}")]
     Stream {
+        /// Absolute route of the device that sent the data.
         route: DeviceRoute,
+        /// Stream the payload belongs to, within that device.
         stream_id: StreamId,
+        /// Which part of the payload or schema was contradictory.
         #[source]
         source: StreamDataError,
     },
@@ -46,36 +54,67 @@ pub enum PacketError {
 /// A stream-data payload contradicts the metadata needed to interpret it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamDataError {
+    /// The stream record is corrupt: no segment id can fall inside its ring.
     #[error("stream advertises a zero-length segment ring")]
     ZeroSegmentCount,
+    /// The data packet names a segment the stream record cannot describe.
     #[error("segment {segment_id} is outside the advertised ring of {segment_count}")]
     SegmentOutOfRange {
+        /// Segment id carried by the data packet.
         segment_id: SegmentId,
+        /// Ring size from the stream record; valid ids fall below it.
         segment_count: u8,
     },
+    /// More column records are retained than the stream record now admits.
+    ///
+    /// Too few is not an error; the parser waits for the rest to arrive.
     #[error("received {actual} columns for a schema containing {expected}")]
-    ColumnCount { expected: usize, actual: usize },
+    ColumnCount {
+        /// Column count the stream record advertises.
+        expected: usize,
+        /// Column records retained for the stream.
+        actual: usize,
+    },
+    /// The packed column types do not fit the stream's declared sample stride.
+    ///
+    /// A stride with room to spare is accepted; only overflow is rejected.
     #[error("column data occupies {column_bytes} bytes, exceeding sample size {sample_size}")]
     ColumnsExceedSample {
+        /// Packed size of every column type in the schema.
         column_bytes: usize,
+        /// Per-sample stride the stream record declares.
         sample_size: usize,
     },
+    /// The stream record's stride leaves the payload's row count undefined.
     #[error("stream advertises a zero-byte sample")]
     ZeroSampleSize,
+    /// The payload ends mid-sample, so the packet is truncated or corrupt.
     #[error("payload length {payload_len} is not a multiple of sample size {sample_size}")]
     MisalignedPayload {
+        /// Byte length of the encoded sample payload.
         payload_len: usize,
+        /// Stride the payload length must be a multiple of.
         sample_size: usize,
     },
+    /// The sender emitted a data packet carrying no rows to apply.
     #[error("stream-data payload contains no rows")]
     EmptyPayload,
+    /// The packet's rows run past the 24-bit wrap of the sample counter.
     #[error("{row_count} rows beginning at sample {first_sample_n} exceed the sample counter")]
     SampleNumberOverflow {
+        /// Sample number of the packet's first row.
         first_sample_n: SampleNumber,
+        /// Rows the payload decodes to, starting at `first_sample_n`.
         row_count: usize,
     },
+    /// The segment's timebase is undefined, so no row can be timestamped.
     #[error("segment has invalid sampling rate {sampling_rate} and decimation {decimation}")]
-    InvalidRate { sampling_rate: u32, decimation: u32 },
+    InvalidRate {
+        /// Samples per second before decimation, from the segment record.
+        sampling_rate: u32,
+        /// Divisor on the sampling rate; the two give the output rate.
+        decimation: u32,
+    },
 }
 
 /// Result of validating stream data against the metadata learned so far.
@@ -575,13 +614,13 @@ impl DeviceState {
     /// that does not parse as the type it claims is ignored.
     fn apply_metadata(
         &mut self,
-        kind: MetadataType,
+        kind: wire::MetadataType,
         record: &[u8],
         source: MetadataSource,
         global_generation: &mut u32,
     ) {
         match kind {
-            MetadataType::Device => {
+            wire::MetadataType::Device => {
                 let Some(incoming) = DeviceRecord::new(record) else {
                     return;
                 };
@@ -608,7 +647,7 @@ impl DeviceState {
                 }
                 self.metadata = Some(incoming);
             }
-            MetadataType::Stream => {
+            wire::MetadataType::Stream => {
                 let Some(incoming) = StreamRecord::new(record) else {
                     return;
                 };
@@ -631,7 +670,7 @@ impl DeviceState {
                     self.revise_metadata();
                 }
             }
-            MetadataType::Segment => {
+            wire::MetadataType::Segment => {
                 let Some(incoming) = SegmentRecord::new(record) else {
                     return;
                 };
@@ -652,7 +691,7 @@ impl DeviceState {
                     self.revise_metadata();
                 }
             }
-            MetadataType::Column => {
+            wire::MetadataType::Column => {
                 let Some(incoming) = ColumnRecord::new(record) else {
                     return;
                 };
@@ -679,7 +718,7 @@ impl DeviceState {
                     self.revise_metadata();
                 }
             }
-            MetadataType::Unknown(_) => {}
+            wire::MetadataType::Unknown(_) => {}
         }
     }
 
@@ -750,7 +789,7 @@ impl DeviceState {
         let missing = self.missing_metadata();
         let selectors = match missing.as_slice() {
             [] => return None,
-            [only] if only.mtype == MetadataType::Device => Vec::new(),
+            [only] if only.mtype == wire::MetadataType::Device => Vec::new(),
             missing => missing[..missing.len().min(wire::MAX_METADATA_SELECTORS)].to_vec(),
         };
         self.query_in_flight = true;

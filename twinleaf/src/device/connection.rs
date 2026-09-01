@@ -59,12 +59,19 @@ impl PendingReply {
 
 /// A live link to one device tree, over serial, TCP, or UDP.
 ///
-/// Opening one starts the I/O thread that owns the transport and reconnects on
-/// its own, and owns the one stream every view minted here shares. It is the
-/// whole tree at full depth: [`tree`](Connection::tree) names any subtree and
-/// [`device`](Connection::device) any single device — neither can fail here —
-/// and the three subscriptions are the same here as on any view. Cloning is
-/// free; every clone is the same connection.
+/// Opening one starts background workers that own the transport and proxy and
+/// reconnect on their own; the first subscription starts the stream pump every
+/// view minted here shares. It is the whole tree at full depth:
+/// [`tree`](Connection::tree) names any subtree and [`device`](Connection::device)
+/// any single device — neither can fail here — and the three subscriptions are
+/// the same here as on any view. Cloning is free; every clone is the same
+/// connection.
+///
+/// # Platform behavior
+///
+/// On macOS and Windows, the transport and proxy workers ask the OS for
+/// latency-critical execution and inhibit idle system sleep while active. These
+/// requests are best-effort and require no caller setup.
 #[derive(Clone)]
 pub struct Connection {
     tree: DeviceTree,
@@ -72,12 +79,24 @@ pub struct Connection {
 
 impl Connection {
     /// Open a connection to `url` and start driving its transport.
+    ///
+    /// Accepted transport locators are:
+    ///
+    /// - `serial://port[:target_bps[:default_bps]]`, with both rates defaulting
+    ///   to 115200. The `serial://` prefix may be omitted for `/dev/...` paths
+    ///   on Unix and `COM...` ports on Windows. Requires the `serial` feature.
+    /// - `tcp://address[:port]`, with `tcp4://` and `tcp6://` variants.
+    /// - `udp://address[:port]`, with `udp4://` and `udp6://` variants.
+    ///
+    /// TCP and UDP use port 7855 when no port is given.
     pub fn open(url: &str) -> Connection {
         Self::open_with(url, None, None)
     }
 
     /// Open a connection that gives up on a reconnect after `reconnect_timeout`
     /// and reports transport events to `status_queue`.
+    ///
+    /// See [`open`](Self::open) for accepted transport locators.
     pub fn open_with(
         url: &str,
         reconnect_timeout: Option<Duration>,

@@ -1,23 +1,22 @@
 //! Incremental per-column computation driven by a [`Buffer`].
-//!
-//! [`ColumnOp`] is what app crates implement for stateful streaming
-//! computations (decimation, Welch, ...). [`ColumnProcessor`] pairs an op with
-//! one source column: [`ColumnProcessor::catch_up`] feeds it exactly the rows
-//! it has not seen yet, and transparently resets + replays retained history
-//! whenever the run restarts or the processor falls out of retention.
 
-use crate::data::{Buffer, ColumnArray, ColumnKey, Generations, Run};
+use super::buffer::{Buffer, Run};
+use super::sample::{ColumnArray, ColumnKey, Generations};
 use std::ops::Range;
 
-/// An incremental computation over one column's sample stream.
+/// An incremental computation over one column's sample stream, such as
+/// decimation or a Welch periodogram.
+///
 /// Implementations are stateful; fed every sample exactly once, in order.
 pub trait ColumnOp {
+    /// What the operation accumulates and hands back.
     type Output;
     /// Discard all state (new run, or view parameters changed).
     fn reset(&mut self);
     /// Consume the next contiguous span of one run's rows: `timestamps` and
     /// `values` are the same length and line up row by row.
     fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray);
+    /// The current result, reflecting every row fed so far.
     fn output(&self) -> &Self::Output;
 }
 
@@ -33,6 +32,7 @@ pub struct ColumnProcessor<Op: ColumnOp> {
 }
 
 impl<Op: ColumnOp> ColumnProcessor<Op> {
+    /// Drive `op` from the column at `key`.
     pub fn new(key: ColumnKey, op: Op) -> Self {
         Self {
             key,
@@ -42,6 +42,7 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
         }
     }
 
+    /// The column this processor follows.
     pub fn key(&self) -> &ColumnKey {
         &self.key
     }
@@ -86,10 +87,12 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
         self.cursor = None;
     }
 
+    /// The operation being driven.
     pub fn op(&self) -> &Op {
         &self.op
     }
 
+    /// The operation's current output, without feeding it any new rows.
     pub fn output(&self) -> &Op::Output {
         self.op.output()
     }
@@ -105,11 +108,10 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::buffer_type;
-    use crate::data::sample::{BatchContext, SampleBatchBuilder};
-    use crate::data::ColumnData;
-    use crate::data::{ColumnRecord, DeviceRecord};
-    use crate::data::{SegmentRecord, StreamRecord};
+    use crate::data::metadata::{
+        buffer_type, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord,
+    };
+    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::tio::proto::{DataType, DeviceRoute};
     use twinleaf_proto::data as wire;
 

@@ -3,17 +3,13 @@
 //! [`PacketParser`] applies packets in arrival order. Shared metadata and
 //! continuity state validates each stream payload, after which this module
 //! decodes its rows and accumulates them into [`SampleBatch`] values.
-//!
-//! Stream data can arrive before its metadata. Such packets produce no rows;
-//! [`PacketParser::take_metadata_queries`] returns the metadata the caller must
-//! fetch before subsequent packets decode.
 
 use super::coalesce::BatchCoalescer;
 use super::metadata::{DeviceMetadataSnapshot, MetadataQuery};
 use super::sample::{SampleBatch, StreamKey};
 use super::state::{PacketError, PacketEvent, ParseState, ScannedRows};
-use crate::tio::{self, proto};
-use proto::DeviceRoute;
+use crate::tio;
+use crate::tio::proto::DeviceRoute;
 use std::collections::{HashMap, VecDeque};
 
 /// Incremental, route-aware parser for TIO packets.
@@ -22,6 +18,10 @@ use std::collections::{HashMap, VecDeque};
 /// default each decodable stream-data packet emits one [`SampleBatch`].
 /// [`PacketParser::with_batch_rows`] instead accumulates compatible packets for
 /// bulk consumers. Boundaries and schema changes always end the current batch.
+///
+/// Stream data can arrive before the metadata describing it. Such packets
+/// produce no rows; [`PacketParser::take_metadata_queries`] returns the
+/// metadata the caller must fetch before subsequent packets decode.
 pub struct PacketParser {
     state: ParseState,
     batcher: Batcher,
@@ -271,13 +271,11 @@ impl Batcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::buffer::Buffer;
     use crate::data::fixtures;
-    use crate::data::{
-        BoundaryClass, BoundaryReason, Buffer, ColumnArray, ColumnKey, Generations,
-        StreamDataError, StreamKey,
-    };
-    use proto::DataType;
-    use proto::MAX_SAMPLE_NUMBER;
+    use crate::data::sample::{BoundaryClass, BoundaryReason, ColumnArray, ColumnKey, Generations};
+    use crate::data::state::StreamDataError;
+    use crate::tio::proto::{DataType, ProxyStatus, MAX_SAMPLE_NUMBER};
     use twinleaf_proto::data as wire;
 
     const STREAM_ID: u8 = 1;
@@ -905,9 +903,7 @@ mod tests {
         let before = parser.pop_batch().expect("the first batch").generations();
 
         parser
-            .push_packet(&tio::Packet::proxy_status(
-                proto::ProxyStatus::SensorDisconnected,
-            ))
+            .push_packet(&tio::Packet::proxy_status(ProxyStatus::SensorDisconnected))
             .expect("a disconnect resets the parser");
 
         // The device comes back and re-announces exactly the same schema.
@@ -958,8 +954,7 @@ mod tests {
 
         parser
             .push_packet(
-                &tio::Packet::proxy_status(proto::ProxyStatus::SensorDisconnected)
-                    .with_route(bounced),
+                &tio::Packet::proxy_status(ProxyStatus::SensorDisconnected).with_route(bounced),
             )
             .expect("a routed disconnect applies");
 

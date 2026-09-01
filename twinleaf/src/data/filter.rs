@@ -1,9 +1,16 @@
+//! Glob matching over column paths.
+//!
+//! [`ColumnFilter`] holds two patterns per filter — one matching the named node
+//! itself, one matching its subtree — so naming a node selects everything
+//! beneath it without the caller enumerating depths.
+
 use crate::tio::proto::DeviceRoute;
 use glob::Pattern;
 
-/// Glob filter over column paths of the form `/{route}/{stream}/{column}`,
-/// e.g. `/0/1/vector/x` (route `/0/1`, stream `vector`, column `x`). Routes are
-/// numeric device indices; streams and columns are names.
+/// Glob filter over column paths of the form `/{route}/{stream}/{column}`.
+///
+/// For example `/0/1/vector/x` is route `/0/1`, stream `vector`, column `x`.
+/// Routes are numeric device indices; streams and columns are names.
 ///
 /// A pattern names a node in that tree and selects **that node and everything
 /// under it**, like a path in `.gitignore`. Naming a stream keeps all its
@@ -36,6 +43,7 @@ pub struct ColumnFilter {
 }
 
 impl ColumnFilter {
+    /// Compile a pattern, failing only when it is not valid glob syntax.
     pub fn new(pattern_str: &str) -> Result<Self, String> {
         let normalized = Self::normalize_pattern(pattern_str);
         let build = |p: &str| Pattern::new(p).map_err(|e| format!("Invalid glob pattern: {}", e));
@@ -71,6 +79,8 @@ impl ColumnFilter {
         }
     }
 
+    /// Whether this column is selected, either by being the named node or by
+    /// living under it.
     pub fn matches(&self, route: &DeviceRoute, stream_name: &str, col_name: &str) -> bool {
         let full_path = self.get_path_string(route, stream_name, col_name);
         let opts = glob::MatchOptions {
@@ -82,6 +92,7 @@ impl ColumnFilter {
         self.node.matches_with(&full_path, opts) || self.subtree.matches_with(&full_path, opts)
     }
 
+    /// The `/{route}/{stream}/{column}` path that patterns are matched against.
     pub fn get_path_string(
         &self,
         route: &DeviceRoute,

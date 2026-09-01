@@ -6,18 +6,14 @@
 //! front chunk. Reads hand back slices of the retained chunks and copy at
 //! most the still-accumulating rows they ask for.
 
-use crate::data::coalesce::BatchCoalescer;
-use crate::data::{
-    ColumnKey, ColumnRecord, Generations, SampleBatch, SegmentRecord, StreamKey, StreamRecord,
-};
+use super::coalesce::BatchCoalescer;
+use super::metadata::{ColumnRecord, SegmentRecord, StreamRecord};
+use super::sample::{ColumnKey, Generations, SampleBatch, StreamKey};
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
+use std::time::Instant;
 use twinleaf_proto::data as wire;
 use twinleaf_proto::{ColumnId, SampleNumber};
-
-use std::{
-    collections::{HashMap, VecDeque},
-    ops::Range,
-    time::Instant,
-};
 
 /// The newest samples of every stream that has delivered data, each capped at
 /// `capacity` rows.
@@ -27,6 +23,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// A buffer retaining at most `capacity` rows of each stream.
     pub fn new(capacity: usize) -> Buffer {
         Buffer {
             capacity,
@@ -49,6 +46,7 @@ impl Buffer {
         }
     }
 
+    /// The stream's current run, or `None` if it has delivered no data.
     pub fn get_run(&self, stream_key: &StreamKey) -> Option<&Run> {
         self.runs.get(stream_key)
     }
@@ -219,6 +217,7 @@ impl Run {
             .map(ColumnRecord::get)
     }
 
+    /// The continuity generations stamped on every batch of this run.
     pub fn generations(&self) -> Generations {
         self.generations
     }
@@ -230,6 +229,7 @@ impl Run {
         self.last_seen
     }
 
+    /// This run's stream descriptor, as of its newest batch.
     pub fn stream(&self) -> wire::Stream<'_> {
         self.stream.get()
     }
@@ -252,6 +252,7 @@ impl Run {
         self.last_row().map(|row| row.timestamps()[0])
     }
 
+    /// Sample number of the newest retained row, or `None` if none remain.
     pub fn last_sample_number(&self) -> Option<SampleNumber> {
         self.last_row().map(|row| row.sample_numbers()[0])
     }
@@ -267,10 +268,9 @@ impl Run {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::buffer_type;
-    use crate::data::sample::{BatchContext, SampleBatchBuilder};
-    use crate::data::DeviceRecord;
-    use crate::data::{ColumnArray, ColumnData, ColumnOp, ColumnProcessor};
+    use crate::data::metadata::{buffer_type, DeviceRecord};
+    use crate::data::pipeline::{ColumnOp, ColumnProcessor};
+    use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
     use crate::tio::proto::{DataType, DeviceRoute};
 
     /// Records every sample it is fed, plus the length of each span it was fed as,

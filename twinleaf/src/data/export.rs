@@ -1,7 +1,36 @@
-use crate::data::{
-    BoundaryReason, ColumnArray, ColumnFilter, ColumnRecord, DeviceRecord, Generations,
-    SampleBatch, Series, StreamKey, StreamRecord,
-};
+//! HDF5 export of decoded sample batches.
+//!
+//! [`Hdf5Appender`] writes batches into one file, one group per device route
+//! and one compound table per stream:
+//!
+//! ```text
+//! recording.h5
+//! ├── vector          root device
+//! ├── 0/
+//! │   └── accel       device at route /0
+//! └── 1/
+//!     └── therm
+//! ```
+//!
+//! Every table carries the same leading fields:
+//!
+//! | Field         | Type             | Source                      |
+//! |---------------|------------------|-----------------------------|
+//! | `sample`      | u32              | sample number               |
+//! | `time`        | f64              | end-of-sample timestamp     |
+//! | *column name* | f64, i64, or u64 | one field per stream column |
+//!
+//! Tables are jagged. Streams sample independently, so two tables in one file
+//! do not start or end at the same `time`, even at the same run number. Align
+//! rows on the `time` field, never on row index.
+//!
+//! Two independent choices control how runs land in the file. [`SplitPolicy`]
+//! decides which breaks start a new run at all; [`RunSplitLevel`] decides which
+//! streams roll to a new table when one does.
+
+use super::filter::ColumnFilter;
+use super::metadata::{ColumnRecord, DeviceRecord, StreamRecord};
+use super::sample::{BoundaryReason, ColumnArray, Generations, SampleBatch, Series, StreamKey};
 use crate::tio::proto::DeviceRoute;
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
@@ -14,7 +43,17 @@ use twinleaf_proto::{ColumnId, SampleNumber};
 
 type TableIndex = u64;
 
-/// Controls when to start a new run in the output file.
+/// Which discontinuities start a new run.
+///
+/// | Break                                | `Continuous`  | `Monotonic`   |
+/// |--------------------------------------|---------------|---------------|
+/// | Segment rollover                     | append        | append        |
+/// | Samples lost, rate changed           | **new table** | append        |
+/// | Session changed, time went backward  | **new table** | **new table** |
+///
+/// `Continuous` yields tables whose rows are contiguous, one per parser run
+/// ([`Generations::stream`]). `Monotonic` yields fewer tables, each possibly
+/// spanning several runs, which may contain gaps but never run backward.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SplitPolicy {
     /// Split on any discontinuity (default)
@@ -24,12 +63,27 @@ pub enum SplitPolicy {
     Monotonic,
 }
 
-/// Controls the granularity of run splitting in the HDF5 output.
+/// Which streams roll to a new table when a run splits.
 ///
-/// Every stream is written as a single compound table (with `sample`, `time`,
-/// and one field per column) inside the group for its device route. Run
-/// splitting controls how discontinuities carve a stream into multiple tables;
-/// each run becomes its own table in the same route group.
+/// Each run becomes its own table in the same route group. Given one recording
+/// where `accel` loses samples midway and `gyro` does not:
+///
+/// ```text
+/// None          PerStream            PerDevice
+/// /             /                    /
+/// ├── accel     ├── accel_run000000  ├── accel_run000000
+/// └── gyro      ├── accel_run000001  ├── accel_run000001
+///               └── gyro_run000000   ├── gyro_run000000
+///                                    └── gyro_run000001
+/// ```
+///
+/// `PerDevice` rolls every stream on the device at once, so tables sharing a
+/// run number cover the same acquisition run and can be read as one block.
+/// `Global` does the same across every device in the file.
+///
+/// Choose by what has to be read together: `PerStream` isolates each stream's
+/// own breaks, `PerDevice` and `Global` keep peers aligned across a break so a
+/// run number selects one comparable block of streams.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RunSplitLevel {
     /// No run splitting - one table per stream: `/{route}/{stream}`
@@ -115,13 +169,20 @@ impl RunTables {
     }
 }
 
+/// What one export wrote, returned by [`Hdf5Appender::finish`].
 #[derive(Debug, Clone, Default)]
 pub struct ExportStats {
+    /// Rows written across every table.
     pub total_samples: u64,
+    /// Earliest `time` written, or `None` if nothing was.
     pub start_time: Option<f64>,
+    /// Latest `time` written, or `None` if nothing was.
     pub end_time: Option<f64>,
+    /// Streams that reached the file, as `/{route}/{stream}[{id}]`.
     pub streams_written: HashSet<String>,
+    /// Streams seen in the input, including any the filter dropped.
     pub streams_seen: HashSet<String>,
+    /// Breaks that [`SplitPolicy`] counted as a split.
     pub discontinuities_detected: u64,
 }
 
@@ -180,6 +241,10 @@ impl TableSchema {
     }
 }
 
+/// Writes [`SampleBatch`]es to one HDF5 file, one table per stream.
+///
+/// Build with [`Hdf5Appender::with_options`], feed with
+/// [`Hdf5Appender::write_batch`], close with [`Hdf5Appender::finish`].
 pub struct Hdf5Appender {
     file: File,
     tables: HashMap<String, TableInfo>,
@@ -253,6 +318,7 @@ impl Hdf5Appender {
         self.append_batch(&batch)
     }
 
+    /// Flush every open table and close the file.
     pub fn finish(self) -> Result<ExportStats> {
         Ok(self.stats)
     }
@@ -594,8 +660,7 @@ mod tests {
     use super::*;
     use crate::data::fixtures;
     use crate::data::metadata::{buffer_type, DeviceRecord, SegmentRecord, StreamRecord};
-    use crate::data::sample::{BatchContext, SampleBatchBuilder};
-    use crate::data::{BoundaryReason, ColumnData};
+    use crate::data::sample::{BatchContext, BoundaryReason, ColumnData, SampleBatchBuilder};
     use crate::tio::proto::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

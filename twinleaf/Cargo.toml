@@ -9,6 +9,14 @@ homepage = "https://twinleaf.com"
 repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+
 [features]
 default = ["serial", "firmware-update"]
 serial = ["dep:mio-serial", "dep:serialport"]

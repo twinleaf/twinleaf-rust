@@ -82,7 +82,7 @@ impl Event {
 }
 
 /// A discovered route paired with its device's `dev.name` (`None` if the device
-/// didn't answer). Returned by [`DeviceTree::named_routes`](super::DeviceTree::named_routes).
+/// didn't answer). Returned by [`DeviceTree::named_routes`](crate::device::DeviceTree::named_routes).
 #[derive(Debug, Clone)]
 pub struct NamedRoute {
     pub route: DeviceRoute,

@@ -1,61 +1,71 @@
-# Twinleaf I/O Library in Rust
+The `twinleaf` crate provides a high-level API for communicating with Twinleaf
+devices over the Twinleaf I/O (`tio`) protocol. It builds on
+[`twinleaf-proto`](https://docs.rs/twinleaf-proto), which provides the lower-level
+wire types and codecs.
 
-Library support for writing applications that work with Twinleaf quantum sensors and the Twinleaf I/O protocol.
+## Capabilities
 
-The high-level API follows the routed connection: a `Connection` owns the link
-and its I/O thread, `Connection::tree(route)` gives a `DeviceTree` view rooted at
-that route, and `Connection::device(route)` or `DeviceTree::device(route)` mints
-a `Device`. All three views hand out owned `Receiver`s. Sample batches and
-device events retain their absolute routes even when received from a
-single-device view.
+- Connect over serial, TCP, or UDP through [`Connection::open`].
+- Discover serial devices and, with the [`mdns`](#cargo-features) Cargo feature,
+  networked devices through [`Discovery`].
+- Address a routed subtree with [`DeviceTree`] or bind one route with [`Device`].
+- Call typed or dynamic RPCs and subscribe to [`SampleBatch`]es, [`Event`]s, or
+  raw [`Packet`]s.
+- Buffer and process live data or read recorded `tio` logs with the [data module].
+- Query and update device firmware through the [firmware module].
 
-```rust
+## API model
+
+All views share one connection and its background workers:
+
+```text
+Connection              scope: all reachable routes
+├── DeviceTree at /1    scope: /1 and its descendants; RPCs take a route
+└── Device at /1/2      scope: /1/2 only; route is already bound
+```
+
+Subscriptions return owned [`Receiver`]s rather than async streams. The
+connection drives I/O on background threads, so receiving does not require an
+async runtime or a caller-managed polling loop. Each receiver is filtered to
+the scope of the view that created it.
+
+## Example
+
+```rust,no_run
 use std::time::Duration;
 use twinleaf::{Connection, DeviceRoute};
 
-let conn = Connection::open("tcp://localhost");
-let device = conn.device(DeviceRoute::root());
+fn main() {
+    let connection = Connection::open("tcp://localhost");
+    let device = connection.device(DeviceRoute::root());
 
-let name: String = device.get("dev.name").expect("read device name");
-println!("connected to {name}");
+    let name: String = device.get("dev.name").expect("read device name");
 
-let batches = device.samples();
-let batch = batches
-    .recv_timeout(Duration::from_secs(5))
-    .expect("receive a sample batch");
-for row in batch.iter() {
-    let values: Vec<_> = row.values().collect();
-    println!("{} {values:?}", row.timestamp_end());
+    let samples = device.samples();
+    let batch = samples
+        .recv_timeout(Duration::from_secs(5))
+        .expect("receive sample data");
+
+    println!("{name}: {} rows from {}", batch.len(), batch.stream().name);
 }
 ```
 
-Use a `DeviceTree` when the route changes from one operation to the next:
+## Cargo features
 
-```rust
-use twinleaf::{Connection, DeviceRoute};
+- `serial` (default): serial connections and serial-device discovery.
+- `firmware-update` (default): the [GitHub-backed firmware catalog]. Firmware
+  queries and flashing are always available without this feature.
+- `mdns`: discovery of networked devices through mDNS/DNS-SD.
+- `hdf5`: HDF5 data export.
 
-let conn = Connection::open("tcp://localhost");
-let root = DeviceRoute::root();
-let tree = conn.tree(root);
-let name: String = tree.get(root, "dev.name").expect("read device name");
-```
-
-When several operations target the same route, `tree.device(route)` cheaply
-binds it once and removes the route argument. Creating that `Device` validates
-that the route is inside the tree view; the first operation still determines
-whether a device actually exists there.
-
-Most applications only need `Connection`, `Device` or `DeviceTree`, and
-`SampleBatch`. Batch metadata is exposed as borrowed `twinleaf-proto` device,
-stream, segment, and column fields. Call `SampleBatch::metadata()` only when an
-application needs a small owned snapshot that outlives the batch. Protocol
-identities such as `StreamId`, `SegmentId`, `ColumnId`, `SampleNumber`, and
-`SessionId` are distinct newtypes; use `value()` only when crossing into
-ordinary numeric code.
-
-`twinleaf::data` also contains optional host-side facilities: `Buffer` and
-`ColumnProcessor` support live applications such as an oscilloscope, while
-`LogFile` and `PacketParser` support offline and lower-level tools.
-`twinleaf::firmware` updates instruments, and `twinleaf::tio` is the raw packet
-layer beneath all of it. For more, study how the API is used in
-`twinleaf-tools`.
+[`Connection::open`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Connection.html#method.open
+[`Device`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Device.html
+[`DeviceTree`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.DeviceTree.html
+[`Discovery`]: https://docs.rs/twinleaf/latest/twinleaf/device/discovery/struct.Discovery.html
+[`Event`]: https://docs.rs/twinleaf/latest/twinleaf/device/enum.Event.html
+[`Packet`]: https://docs.rs/twinleaf/latest/twinleaf/tio/proto/struct.Packet.html
+[`Receiver`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Receiver.html
+[`SampleBatch`]: https://docs.rs/twinleaf/latest/twinleaf/data/struct.SampleBatch.html
+[data module]: https://docs.rs/twinleaf/latest/twinleaf/data/index.html
+[firmware module]: https://docs.rs/twinleaf/latest/twinleaf/firmware/index.html
+[GitHub-backed firmware catalog]: https://github.com/twinleaf/twinleaf-firmware-updates
