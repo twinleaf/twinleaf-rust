@@ -247,6 +247,10 @@ fn checked_rpc_timeout(timeout: Option<Duration>) -> Result<Duration, PortError>
 /// An owned low-level RPC result delivered directly by the proxy worker.
 pub(crate) type RawCallResult = Result<Vec<u8>, RawCallError>;
 
+/// What a direct call does with its outcome, exactly once. It runs on the
+/// proxy thread, so it must hand the outcome off without blocking.
+pub(crate) type Completion = Box<dyn FnOnce(RawCallResult) + Send>;
+
 /// Why a raw RPC submitted directly to the proxy did not return a value.
 ///
 /// This deliberately contains no device-layer decoding or registry concepts.
@@ -344,31 +348,63 @@ impl RpcEndpoint {
         &self.proxy.worker_alive
     }
 
+    /// Submit a call and receive its outcome on a oneshot. See
+    /// [`submit_with`](Self::submit_with) to run something else with it.
     pub(crate) fn submit(
         &self,
         route: DeviceRoute,
         name: &str,
         args: &[u8],
-    ) -> Result<channel::Receiver<RawCallResult>, RawCallError> {
-        let relative = self
-            .scope
-            .relative_route(&route)
-            .map_err(RawCallError::InvalidRoute)?;
+    ) -> oneshot::Receiver<RawCallResult> {
+        let (resolve, reply) = oneshot::channel();
+        self.submit_with(
+            route,
+            name,
+            args,
+            Box::new(move |outcome| {
+                let _ = resolve.send(outcome);
+            }),
+        );
+        reply
+    }
+
+    /// Submit a call; `complete` runs exactly once with its outcome, here if
+    /// the request cannot leave, otherwise on the proxy thread.
+    pub(crate) fn submit_with(
+        &self,
+        route: DeviceRoute,
+        name: &str,
+        args: &[u8],
+        complete: Completion,
+    ) {
+        let relative = match self.scope.relative_route(&route) {
+            Ok(relative) => relative,
+            Err(error) => return complete(Err(RawCallError::InvalidRoute(error))),
+        };
         if relative.len() > self.depth {
-            return Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree));
+            return complete(Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree)));
         }
-        let request = Packet::rpc_request(name, args, 0, route)
-            .map_err(|_| RawCallError::RequestNotSubmitted)?;
-        let (result, receiver) = channel::bounded(1);
-        match self.commands().try_send(ProxyCommand::Call {
+        let Ok(request) = Packet::rpc_request(name, args, 0, route) else {
+            return complete(Err(RawCallError::RequestNotSubmitted));
+        };
+        let command = ProxyCommand::Call {
             request,
             timeout: self.timeout,
-            result,
-        }) {
-            Ok(()) => Ok(receiver),
-            Err(channel::TrySendError::Full(_)) => Err(RawCallError::RequestNotSubmitted),
-            Err(channel::TrySendError::Disconnected(_)) => Err(RawCallError::ProxyClosed),
-        }
+            complete,
+        };
+        let (refused, error) = match self.commands().try_send(command) {
+            Ok(()) => return,
+            Err(channel::TrySendError::Full(command)) => {
+                (command, RawCallError::RequestNotSubmitted)
+            }
+            Err(channel::TrySendError::Disconnected(command)) => {
+                (command, RawCallError::ProxyClosed)
+            }
+        };
+        let ProxyCommand::Call { complete, .. } = refused else {
+            unreachable!("the refused command is the call just built");
+        };
+        complete(Err(error));
     }
 
     fn commands(&self) -> &channel::Sender<ProxyCommand> {
@@ -636,7 +672,7 @@ mod tests {
         let route: DeviceRoute = "/1/2".parse().unwrap();
         let (endpoint, commands, _worker) = RpcEndpoint::test_pair(scope, 1);
 
-        let _pending = endpoint.submit(route, "dev.name", b"arg").unwrap();
+        let _pending = endpoint.submit(route, "dev.name", b"arg");
         let ProxyCommand::Call {
             request, timeout, ..
         } = commands.recv().unwrap()
@@ -708,13 +744,13 @@ mod tests {
 
         let outside: DeviceRoute = "/2".parse().unwrap();
         assert!(matches!(
-            endpoint.submit(outside, "dev.name", b""),
-            Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree))
+            endpoint.submit(outside, "dev.name", b"").recv(),
+            Ok(Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree)))
         ));
         let too_deep: DeviceRoute = "/1/2/3".parse().unwrap();
         assert!(matches!(
-            endpoint.submit(too_deep, "dev.name", b""),
-            Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree))
+            endpoint.submit(too_deep, "dev.name", b"").recv(),
+            Ok(Err(RawCallError::InvalidRoute(RouteError::OutsideSubtree)))
         ));
         assert!(commands.is_empty());
     }

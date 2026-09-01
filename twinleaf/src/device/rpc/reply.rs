@@ -2,81 +2,104 @@
 
 use super::error::CallError;
 use crate::tio::proxy::{RawCallError, RawCallResult};
-use crossbeam::channel;
 use std::collections::VecDeque;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// A reply that has not arrived yet.
 ///
-/// Every pending reply resolves: with the value, or with the device's or the
-/// proxy's error (the proxy times outstanding calls out). Dropping it abandons
-/// the reply; the call itself still runs.
+/// Every pending reply resolves exactly once: with the value, or with the
+/// device's or the proxy's error (the proxy times outstanding calls out).
+/// Block for it with [`wait`](Self::wait), or `.await` it on any executor.
+/// Dropping it abandons the reply; the call itself still runs.
 #[must_use = "the RPC is in flight; wait on the reply"]
 pub struct PendingReply {
-    pub(crate) replies: channel::Receiver<RawCallResult>,
+    pub(crate) reply: oneshot::Receiver<RawCallResult>,
 }
 
 impl PendingReply {
     /// Block until the reply resolves.
     pub fn wait(self) -> Result<Vec<u8>, CallError> {
         Ok(self
-            .replies
+            .reply
             .recv()
             .unwrap_or(Err(RawCallError::ProxyClosed))?)
+    }
+}
+
+impl IntoFuture for PendingReply {
+    type Output = Result<Vec<u8>, CallError>;
+    type IntoFuture = ReplyFuture;
+
+    fn into_future(self) -> ReplyFuture {
+        ReplyFuture(self.reply.into_future())
+    }
+}
+
+/// A [`PendingReply`] being awaited.
+pub struct ReplyFuture(oneshot::AsyncReceiver<RawCallResult>);
+
+impl Future for ReplyFuture {
+    type Output = Result<Vec<u8>, CallError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|outcome| Ok(outcome.unwrap_or(Err(RawCallError::ProxyClosed))?))
     }
 }
 
 /// The replies to `calls`, in submission order, keeping up to `window` calls in
 /// flight to hide round trips.
 ///
-/// Calls are submitted lazily as the window opens. The first call that fails
-/// to submit ends the sequence with its error, abandoning the replies still in
-/// flight. Nothing is ever retransmitted: only the caller knows whether a
-/// repeated call is harmless.
-pub fn pipelined<E: From<CallError>>(
-    calls: impl IntoIterator<Item = Result<PendingReply, E>>,
-    mut window: usize,
-) -> impl Iterator<Item = Result<Vec<u8>, E>> {
+/// Calls are submitted lazily as the window opens. Nothing is ever
+/// retransmitted: only the caller knows whether a repeated call is harmless.
+pub fn pipelined(
+    calls: impl IntoIterator<Item = PendingReply>,
+    window: usize,
+) -> impl Iterator<Item = Result<Vec<u8>, CallError>> {
     debug_assert!(window > 0, "a zero window would never submit anything");
     let mut calls = calls.into_iter();
     let mut in_flight = VecDeque::with_capacity(window);
     std::iter::from_fn(move || {
-        while in_flight.len() < window {
-            match calls.next() {
-                Some(Ok(pending)) => in_flight.push_back(pending),
-                Some(Err(error)) => {
-                    window = 0;
-                    in_flight.clear();
-                    return Some(Err(error));
-                }
-                None => break,
-            }
-        }
-        in_flight
-            .pop_front()
-            .map(|pending| pending.wait().map_err(E::from))
+        in_flight.extend(calls.by_ref().take(window - in_flight.len()));
+        in_flight.pop_front().map(PendingReply::wait)
     })
 }
 
 #[cfg(test)]
 pub(super) fn resolved(reply: Option<Vec<u8>>) -> PendingReply {
-    let (result, replies) = channel::bounded(1);
+    let (resolve, reply_rx) = oneshot::channel();
     if let Some(reply) = reply {
-        result.send(Ok(reply)).expect("the receiver is held");
+        resolve.send(Ok(reply)).expect("the receiver is held");
     }
-    PendingReply { replies }
+    PendingReply { reply: reply_rx }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::task::Waker;
+
+    fn block_on<F: IntoFuture>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future.into_future());
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+    }
 
     #[test]
     fn replies_come_back_in_submission_order_a_window_ahead() {
         let submitted = Cell::new(0);
         let calls = (0u8..10).map(|i| {
             submitted.set(submitted.get() + 1);
-            Ok::<_, CallError>(resolved(Some(vec![i])))
+            resolved(Some(vec![i]))
         });
         let mut replies = pipelined(calls, 4);
 
@@ -88,26 +111,23 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_submit_ends_the_sequence_with_its_error() {
-        let calls = [
-            Ok(resolved(Some(Vec::new()))),
-            Err(CallError::RequestNotSubmitted),
-            Ok(resolved(Some(Vec::new()))),
-        ];
-        let mut replies = pipelined(calls, 2);
-
-        assert!(matches!(
-            replies.next(),
-            Some(Err(CallError::RequestNotSubmitted))
-        ));
-        assert!(replies.next().is_none());
-    }
-
-    #[test]
     fn an_abandoned_reply_resolves_as_lost() {
         assert!(matches!(
             resolved(None).wait(),
             Err(CallError::ResponseLost)
         ));
+    }
+
+    #[test]
+    fn a_pending_reply_can_be_awaited() {
+        let (resolve, reply) = oneshot::channel();
+        let pending = PendingReply { reply };
+        let resolver = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            resolve.send(Ok(b"later".to_vec())).unwrap();
+        });
+
+        assert_eq!(block_on(pending).unwrap(), b"later");
+        resolver.join().unwrap();
     }
 }
