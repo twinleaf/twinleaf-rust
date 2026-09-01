@@ -685,7 +685,9 @@ mod tests {
             let mut sent = Vec::new();
             for call in calls.iter() {
                 let ProxyCommand::Call {
-                    request, result, ..
+                    request,
+                    complete: result,
+                    ..
                 } = call
                 else {
                     panic!("flash only submits direct RPC calls");
@@ -697,11 +699,11 @@ mod tests {
                     panic!("expected a call by name");
                 };
                 if name != b"dev.firmware.upload" {
-                    let _ = result.send(Ok(Vec::new()));
+                    result(Ok(Vec::new()));
                     continue;
                 }
                 if request.args.is_empty() {
-                    let _ = result.send(Ok(cursor.to_le_bytes().to_vec()));
+                    result(Ok(cursor.to_le_bytes().to_vec()));
                     continue;
                 }
                 let offset = u32::from_le_bytes(request.args[..4].try_into().unwrap());
@@ -713,7 +715,7 @@ mod tests {
                     message: Vec::new(),
                 };
                 if offset != cursor {
-                    let _ = result.send(Err(invalid()));
+                    result(Err(invalid()));
                     continue;
                 }
                 let reply = match fault(chunk) {
@@ -728,7 +730,7 @@ mod tests {
                     }
                     Fault::Reject => Err(invalid()),
                 };
-                let _ = result.send(reply);
+                result(reply);
             }
             (sent, cursor)
         });

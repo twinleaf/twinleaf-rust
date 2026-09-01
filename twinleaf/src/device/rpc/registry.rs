@@ -56,17 +56,17 @@ impl RpcRegistry {
     /// `dev.name` and `rpc.hash` identify the on-disk cache entry; only a miss
     /// enumerates `rpc.listinfo`.
     pub(crate) fn load_with(
-        mut submit: impl FnMut(&str, &[u8]) -> Result<PendingReply, CallError>,
+        mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<Self, RpcRegistryError> {
-        let name_reply = submit("dev.name", &[])?;
-        let hash_reply = submit("rpc.hash", &[])?;
+        let name_reply = submit("dev.name", &[]);
+        let hash_reply = submit("rpc.hash", &[]);
         let dev_name: String = decode(name_reply.wait()?)?;
         let hash: u32 = decode(hash_reply.wait()?)?;
         let path = cache::path(&dev_name, hash).ok_or(RpcRegistryError::CacheDirError)?;
         if let Some(entries) = cache::load(&path)? {
             return Ok(Self::from_entries(entries, hash));
         }
-        let total: u16 = decode(submit("rpc.listinfo", &[])?.wait()?)?;
+        let total: u16 = decode(submit("rpc.listinfo", &[]).wait()?)?;
         let descriptors = (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
         let entries = pipelined(descriptors, WALK_WINDOW)
             .map(|reply| decode::<(u16, String)>(reply?).map(|(meta, name)| (name, meta)))
@@ -121,7 +121,7 @@ mod tests {
         let mut replies = replies.into_iter();
         let Err(error) = RpcRegistry::load_with(|name, arg| {
             asked.push((name.to_string(), arg.to_vec()));
-            Ok(resolved(replies.next()))
+            resolved(replies.next())
         }) else {
             panic!("the walk runs out of replies");
         };

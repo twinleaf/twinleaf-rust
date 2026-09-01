@@ -287,17 +287,13 @@ impl DeviceTree {
             .collect()
     }
 
-    /// Issue an RPC at `route` without waiting for its reply. An out-of-scope
-    /// route returns [`CallError::InvalidRoute`] without submitting a request.
-    pub fn submit(
-        &self,
-        route: DeviceRoute,
-        name: &str,
-        arg: &[u8],
-    ) -> Result<PendingReply, CallError> {
-        Ok(PendingReply {
-            replies: self.endpoint.submit(route, name, arg)?,
-        })
+    /// Issue an RPC at `route` without waiting for its reply. Every call
+    /// resolves exactly once through its [`PendingReply`]; an out-of-scope
+    /// route resolves with [`CallError::InvalidRoute`] and no request leaves.
+    pub fn submit(&self, route: DeviceRoute, name: &str, arg: &[u8]) -> PendingReply {
+        PendingReply {
+            reply: self.endpoint.submit(route, name, arg),
+        }
     }
 
     /// Call `name` at `route` with already encoded arguments and return the raw
@@ -308,7 +304,7 @@ impl DeviceTree {
         name: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>, CallError> {
-        self.submit(route, name, arg)?.wait()
+        self.submit(route, name, arg).wait()
     }
 
     /// Call a typed RPC at `route`, encoding its arguments and decoding its
@@ -393,7 +389,7 @@ impl Device {
     }
 
     /// Issue an RPC without waiting for its reply.
-    pub fn submit(&self, name: &str, arg: &[u8]) -> Result<PendingReply, CallError> {
+    pub fn submit(&self, name: &str, arg: &[u8]) -> PendingReply {
         self.tree.submit(self.route(), name, arg)
     }
 
@@ -501,7 +497,9 @@ mod tests {
         let (tree, commands, _worker) = test_tree();
         let responder = thread::spawn(move || {
             let ProxyCommand::Call {
-                request, result, ..
+                request,
+                complete: result,
+                ..
             } = commands.recv().unwrap()
             else {
                 panic!("expected a direct RPC command");
@@ -510,7 +508,7 @@ mod tests {
                 panic!("expected an RPC request");
             };
             assert_eq!(request.method, wire_rpc::Method::ByName(b"dev.name"));
-            result.send(Ok(b"ASM".to_vec())).unwrap();
+            result(Ok(b"ASM".to_vec()));
         });
 
         let name: String = tree.get(DeviceRoute::root(), "dev.name").unwrap();
@@ -525,7 +523,9 @@ mod tests {
             let in_flight: Vec<_> = (0..2).map(|_| commands.recv().unwrap()).collect();
             for call in in_flight.into_iter().rev() {
                 let ProxyCommand::Call {
-                    request, result, ..
+                    request,
+                    complete: result,
+                    ..
                 } = call
                 else {
                     panic!("expected a direct RPC command");
@@ -536,7 +536,7 @@ mod tests {
                 let wire_rpc::Method::ByName(name) = request.method else {
                     panic!("expected a call by name");
                 };
-                result.send(Ok(name.to_vec())).unwrap();
+                result(Ok(name.to_vec()));
             }
         });
 
@@ -564,11 +564,14 @@ mod tests {
                 None,
             ];
             for failure in failures {
-                let ProxyCommand::Call { result, .. } = commands.recv().unwrap() else {
+                let ProxyCommand::Call {
+                    complete: result, ..
+                } = commands.recv().unwrap()
+                else {
                     panic!("expected a direct RPC command");
                 };
                 match failure {
-                    Some(failure) => result.send(Err(failure)).unwrap(),
+                    Some(failure) => result(Err(failure)),
                     None => drop(result),
                 }
             }

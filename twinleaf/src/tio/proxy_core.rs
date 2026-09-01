@@ -1,5 +1,5 @@
 use super::proto::{self, DeviceRoute, Packet, PacketType, RpcMethod};
-use super::proxy::{Event, RawCallError, RawCallResult};
+use super::proxy::{Completion, Event, RawCallError};
 use super::transport;
 use super::transport::Port as HardwarePort;
 use super::transport::{ReceiveResult, RecvError};
@@ -68,7 +68,7 @@ pub(crate) enum ProxyCommand {
     Call {
         request: Packet,
         timeout: Duration,
-        result: channel::Sender<RawCallResult>,
+        complete: Completion,
     },
 }
 
@@ -256,17 +256,31 @@ impl ProxyDevice {
 
 enum RpcTarget {
     Port { client_id: u64, original_id: u16 },
-    Direct(channel::Sender<RawCallResult>),
+    Direct(Completion),
     Internal(u16),
 }
 
 enum RpcOrigin {
     Port(u64),
     Direct {
-        result: channel::Sender<RawCallResult>,
+        complete: Completion,
         timeout: Duration,
     },
     Internal,
+}
+
+impl RpcOrigin {
+    /// Refuse the request with `error`, delivering it to a direct caller here;
+    /// a port's caller builds the error packet itself.
+    fn refuse(self, error: RpcError) -> RpcError {
+        if let Self::Direct { complete, .. } = self {
+            complete(Err(RawCallError::Device {
+                error,
+                message: Vec::new(),
+            }));
+        }
+        error
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -462,7 +476,9 @@ impl ProxyCore {
             _ => None,
         };
         if let Some((client_rpc_id, method, has_arg)) = request {
-            let wire_id = self.next_wire_rpc_id().ok_or(RpcError::NoBufs)?;
+            let Some(wire_id) = self.next_wire_rpc_id() else {
+                return Err(origin.refuse(RpcError::NoBufs));
+            };
             let target = match origin {
                 RpcOrigin::Port(client_id) => {
                     timeout += self
@@ -476,11 +492,11 @@ impl ProxyCore {
                     }
                 }
                 RpcOrigin::Direct {
-                    result,
+                    complete,
                     timeout: call_timeout,
                 } => {
                     timeout += call_timeout;
-                    RpcTarget::Direct(result)
+                    RpcTarget::Direct(complete)
                 }
                 RpcOrigin::Internal => {
                     timeout += Duration::from_secs(1);
@@ -504,7 +520,7 @@ impl ProxyCore {
             pkt = pkt.with_rpc_id(wire_id);
             rpc_mapped_id = Some(wire_id);
         } else if port_client.is_none() {
-            return Err(RpcError::Malformed);
+            return Err(origin.refuse(RpcError::Malformed));
         }
         if let Some(dev) = &self.device {
             if let Ok(()) = dev.tio_port.send(pkt) {
@@ -519,9 +535,13 @@ impl ProxyCore {
         // loop soon but remove the rpc from the map and send back an error to
         // the client.
         if let Some(rpc_id) = rpc_mapped_id {
-            self.rpc_map
+            let entry = self
+                .rpc_map
                 .remove(&rpc_id)
                 .expect("Unexpected missing timeout set");
+            if let RpcTarget::Direct(complete) = entry.target {
+                complete(Err(RawCallError::DeviceDisconnected));
+            }
             Err(RpcError::Undefined)
         } else {
             Ok(())
@@ -669,7 +689,7 @@ impl ProxyCore {
                     self.drop_client(client_id);
                 }
             }
-            RpcTarget::Direct(result) => {
+            RpcTarget::Direct(complete) => {
                 let reply = match pkt.payload() {
                     proto::Payload::RpcReply(reply) => Ok(reply.value.to_vec()),
                     proto::Payload::RpcError(error) => Err(RawCallError::Device {
@@ -678,7 +698,7 @@ impl ProxyCore {
                     }),
                     _ => unreachable!(),
                 };
-                let _ = result.send(reply);
+                complete(reply);
             }
             RpcTarget::Internal(_) => unreachable!(),
         }
@@ -734,9 +754,7 @@ impl ProxyCore {
                         log::debug!("Failed to send generated RPC error to client {client_id}");
                     }
                 }
-                RpcTarget::Direct(result) => {
-                    let _ = result.send(Err(failure.direct_error()));
-                }
+                RpcTarget::Direct(complete) => complete(Err(failure.direct_error())),
                 RpcTarget::Internal(original_id) => {
                     self.internal_rpc_error(original_id, failure.wire_error());
                 }
@@ -1171,22 +1189,12 @@ impl ProxyCore {
                         Ok(ProxyCommand::Call {
                             request,
                             timeout,
-                            result,
+                            complete,
                         }) => {
-                            let completion = result.clone();
-                            if let Err(error) = self
-                                .forward_to_device(request, RpcOrigin::Direct { result, timeout })
-                            {
-                                let error = if matches!(error, RpcError::Undefined) {
-                                    RawCallError::DeviceDisconnected
-                                } else {
-                                    RawCallError::Device {
-                                        error,
-                                        message: Vec::new(),
-                                    }
-                                };
-                                let _ = completion.send(Err(error));
-                            }
+                            let _ = self.forward_to_device(
+                                request,
+                                RpcOrigin::Direct { complete, timeout },
+                            );
                         }
                         Err(TryRecvError::Empty) => {
                             break;
@@ -1256,8 +1264,8 @@ impl ProxyCore {
 
         self.dispatch_rpc_errors(RpcFailure::ProxyClosed, None);
         while let Ok(command) = self.command_queue.try_recv() {
-            if let ProxyCommand::Call { result, .. } = command {
-                let _ = result.send(Err(RawCallError::ProxyClosed));
+            if let ProxyCommand::Call { complete, .. } = command {
+                complete(Err(RawCallError::ProxyClosed));
             }
         }
     }
@@ -1306,12 +1314,14 @@ mod tests {
         wire_id: u16,
         route: DeviceRoute,
         timeout: Instant,
-    ) -> channel::Receiver<RawCallResult> {
-        let (result, receiver) = channel::bounded(1);
+    ) -> oneshot::Receiver<crate::tio::proxy::RawCallResult> {
+        let (resolve, receiver) = oneshot::channel();
         core.rpc_map.insert(
             wire_id,
             RpcMapEntry {
-                target: RpcTarget::Direct(result),
+                target: RpcTarget::Direct(Box::new(move |outcome| {
+                    let _ = resolve.send(outcome);
+                })),
                 route,
                 timeout,
                 has_arg: false,

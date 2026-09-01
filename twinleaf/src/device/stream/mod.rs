@@ -424,7 +424,8 @@ struct Pump {
     commands: channel::Receiver<PumpSink>,
     commands_open: bool,
     state: StreamState,
-    metadata_calls: Vec<(MetadataQuery, channel::Receiver<proxy::RawCallResult>)>,
+    replies: channel::Receiver<(MetadataQuery, proxy::RawCallResult)>,
+    resolve: channel::Sender<(MetadataQuery, proxy::RawCallResult)>,
     batches: Vec<Sink<SampleBatch>>,
     events: Vec<Sink<Event>>,
     packets: Vec<Sink<tio::Packet>>,
@@ -437,13 +438,15 @@ impl Pump {
     fn start(root: &proxy::RpcEndpoint) -> Option<channel::Sender<PumpSink>> {
         let data = Pump::register(root)?;
         let (commands, received) = channel::unbounded();
+        let (resolve, replies) = channel::unbounded();
         let pump = Pump {
             state: StreamState::new(),
             root: root.clone(),
             data,
             commands: received,
             commands_open: true,
-            metadata_calls: Vec::new(),
+            replies,
+            resolve,
             batches: Vec::new(),
             events: Vec::new(),
             packets: Vec::new(),
@@ -606,17 +609,9 @@ impl Pump {
     }
 
     fn drain_metadata_replies(&mut self) {
-        let mut waiting = Vec::with_capacity(self.metadata_calls.len());
-        for (query, pending) in std::mem::take(&mut self.metadata_calls) {
-            match pending.try_recv() {
-                Ok(result) => self.complete_metadata(query, result),
-                Err(channel::TryRecvError::Empty) => waiting.push((query, pending)),
-                Err(channel::TryRecvError::Disconnected) => {
-                    self.complete_metadata(query, Err(proxy::RawCallError::ProxyClosed))
-                }
-            }
+        while let Ok((query, result)) = self.replies.try_recv() {
+            self.complete_metadata(query, result);
         }
-        self.metadata_calls = waiting;
     }
 
     /// Apply a finished `dev.metadata` call, or decide when to ask again.
@@ -647,13 +642,16 @@ impl Pump {
             .collect();
         for route in due {
             for query in self.state.parser.take_metadata_queries_for(route) {
-                match self
-                    .root
-                    .submit(route, wire::METADATA_RPC_METHOD, &query.args())
-                {
-                    Ok(pending) => self.metadata_calls.push((query, pending)),
-                    Err(error) => self.complete_metadata(query, Err(error)),
-                }
+                let resolve = self.resolve.clone();
+                let args = query.args();
+                self.root.submit_with(
+                    route,
+                    wire::METADATA_RPC_METHOD,
+                    &args,
+                    Box::new(move |result| {
+                        let _ = resolve.send((query, result));
+                    }),
+                );
             }
         }
     }
@@ -681,9 +679,7 @@ impl Pump {
     fn wait(&self) {
         let mut select = channel::Select::new();
         select.recv(self.data.receiver());
-        for (_, pending) in &self.metadata_calls {
-            select.recv(pending);
-        }
+        select.recv(&self.replies);
         for sink in &self.batches {
             select.recv(&sink.alive);
         }
@@ -749,13 +745,15 @@ mod tests {
             proxy::RpcEndpoint::test_pair(DeviceRoute::root(), twinleaf_proto::MAX_ROUTING_SIZE);
         let (data, _sent, deliver) = proxy::Port::test_pair();
         let (subscriptions, received) = channel::unbounded();
+        let (resolve, replies) = channel::unbounded();
         let mut pump = Pump {
             state: StreamState::new(),
             root: endpoint.clone(),
             data,
             commands: received,
             commands_open: true,
-            metadata_calls: Vec::new(),
+            replies,
+            resolve,
             batches: Vec::new(),
             events: Vec::new(),
             packets: Vec::new(),
@@ -919,9 +917,11 @@ mod tests {
     /// one-shot that answers it.
     fn metadata_call(
         commands: &channel::Receiver<ProxyCommand>,
-    ) -> (DeviceRoute, Vec<u8>, channel::Sender<proxy::RawCallResult>) {
+    ) -> (DeviceRoute, Vec<u8>, proxy::Completion) {
         let ProxyCommand::Call {
-            request, result, ..
+            request,
+            complete: result,
+            ..
         } = commands
             .recv_timeout(Duration::from_secs(5))
             .expect("the pump submits the query")
@@ -981,12 +981,12 @@ mod tests {
         }
 
         // An RPC issued while the pump is buried in samples still completes.
-        let pending = endpoint
-            .submit(root, "dev.name", b"")
-            .expect("the endpoint accepts the call");
+        let pending = endpoint.submit(root, "dev.name", b"");
         let result = loop {
             let ProxyCommand::Call {
-                request, result, ..
+                request,
+                complete: result,
+                ..
             } = commands
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the call reaches the proxy")
@@ -1000,7 +1000,7 @@ mod tests {
                 break result;
             }
         };
-        result.send(Ok(b"ASM".to_vec())).unwrap();
+        result(Ok(b"ASM".to_vec()));
         assert_eq!(
             pending
                 .recv_timeout(Duration::from_secs(5))
@@ -1038,8 +1038,8 @@ mod tests {
         let second = metadata_call(&commands);
         assert_ne!(first.0, second.0, "one query per route");
         assert!(first.1.is_empty() && second.1.is_empty(), "both bootstrap");
-        second.2.send(Ok(device_reply())).unwrap();
-        first.2.send(Ok(device_reply())).unwrap();
+        (second.2)(Ok(device_reply()));
+        (first.2)(Ok(device_reply()));
 
         let wanted: Vec<Vec<u8>> = (0..2).map(|_| metadata_call(&commands).1).collect();
         assert!(
@@ -1120,12 +1120,10 @@ mod tests {
         deliver.send(samples(0, DeviceRoute::root())).unwrap();
 
         let (_, _, result) = metadata_call(&commands);
-        result
-            .send(Err(proxy::RawCallError::Device {
-                error: wire_rpc::RpcError::NotFound,
-                message: Vec::new(),
-            }))
-            .unwrap();
+        result(Err(proxy::RawCallError::Device {
+            error: wire_rpc::RpcError::NotFound,
+            message: Vec::new(),
+        }));
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let reported = std::iter::from_fn(|| events.recv_deadline(deadline).ok()).any(|event| {
@@ -1166,12 +1164,10 @@ mod tests {
         let root = DeviceRoute::root();
         deliver.send(samples(0, root)).unwrap();
         let (_, _, result) = metadata_call(&commands);
-        result
-            .send(Err(proxy::RawCallError::Device {
-                error: wire_rpc::RpcError::NotFound,
-                message: Vec::new(),
-            }))
-            .unwrap();
+        result(Err(proxy::RawCallError::Device {
+            error: wire_rpc::RpcError::NotFound,
+            message: Vec::new(),
+        }));
         wait_for(&events, |event| {
             matches!(
                 event,
@@ -1320,15 +1316,10 @@ mod tests {
                 }
             )
         });
-        stale
-            .send(Err(proxy::RawCallError::Device {
-                error: wire_rpc::RpcError::NotFound,
-                message: Vec::new(),
-            }))
-            .unwrap();
-        while !stale.is_empty() {
-            thread::sleep(Duration::from_millis(1));
-        }
+        stale(Err(proxy::RawCallError::Device {
+            error: wire_rpc::RpcError::NotFound,
+            message: Vec::new(),
+        }));
 
         let child: DeviceRoute = "/1".parse().unwrap();
         deliver.send(samples(0, child)).unwrap();
@@ -1736,8 +1727,11 @@ mod tests {
     fn a_first_subscription_waits_out_a_busy_command_lane() {
         let (stream, endpoint, commands, _worker) = stream();
         let root = DeviceRoute::root();
-        let queued: Vec<_> =
-            std::iter::from_fn(|| endpoint.submit(root, "dev.name", b"").ok()).collect();
+        let queued: Vec<_> = std::iter::from_fn(|| {
+            let reply = endpoint.submit(root, "dev.name", b"");
+            matches!(reply.try_recv(), Err(oneshot::TryRecvError::Empty)).then_some(reply)
+        })
+        .collect();
         assert!(!queued.is_empty(), "the lane takes what it can hold");
         assert!(matches!(
             endpoint.open_port(true, true),
