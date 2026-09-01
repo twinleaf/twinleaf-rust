@@ -2,7 +2,7 @@
 
 use super::parser::{PacketParser, ParserCheckpoint};
 use super::sample::StreamKey;
-use super::sample::{sample_time, Boundary, BoundaryClass, SampleBatch};
+use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch};
 use super::state::{PacketError, ScannedRows};
 use super::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
 use crate::tio::{self, Packet};
@@ -222,7 +222,7 @@ impl LogSummary {
         {
             runs.push(StreamSummary {
                 run: rows.generations().stream,
-                opened_by: rows.boundary().map(Boundary::class),
+                opened_by: rows.boundary().map(BoundaryReason::class),
                 metadata: rows.stream().clone(),
                 segment: rows.segment().clone(),
                 columns: rows.columns().to_vec(),

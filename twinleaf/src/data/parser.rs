@@ -9,8 +9,8 @@
 //! fetch before subsequent packets decode.
 
 use super::coalesce::BatchCoalescer;
-use super::sample::{SampleBatch, StreamKey};
 use super::metadata::{DeviceMetadataSnapshot, MetadataQuery};
+use super::sample::{SampleBatch, StreamKey};
 use super::state::{PacketError, PacketEvent, ParseState, ScannedRows};
 use crate::tio::{self, proto};
 use proto::DeviceRoute;
@@ -273,7 +273,7 @@ mod tests {
     use super::*;
     use crate::data::fixtures;
     use crate::data::{
-        Boundary, BoundaryClass, BoundaryReason, Buffer, ColumnArray, ColumnKey, Generations,
+        BoundaryClass, BoundaryReason, Buffer, ColumnArray, ColumnKey, Generations,
         StreamDataError, StreamKey,
     };
     use proto::DataType;
@@ -754,7 +754,7 @@ mod tests {
         let batch = rollover_batch(10, 3, 7);
         assert_eq!(batch.segment().start_time, 2);
         assert!(matches!(
-            batch.boundary().map(Boundary::class),
+            batch.boundary().map(BoundaryReason::class),
             Some(BoundaryClass::Seamless)
         ));
     }
@@ -766,7 +766,7 @@ mod tests {
         let batch = rollover_batch(10, 2, 5);
         assert_eq!(batch.segment().start_time, 1);
         assert!(matches!(
-            batch.boundary().map(Boundary::class),
+            batch.boundary().map(BoundaryReason::class),
             Some(BoundaryClass::Seamless)
         ));
     }
@@ -1086,7 +1086,7 @@ mod tests {
         assert_eq!(after.generations().device, before.generations().device + 1);
         assert_eq!(after.generations().global, before.generations().global + 1);
         assert!(matches!(
-            after.boundary().map(|boundary| &boundary.reason),
+            after.boundary(),
             Some(BoundaryReason::SessionChanged { old, new })
                 if old.value() == 42 && new.value() == 43
         ));

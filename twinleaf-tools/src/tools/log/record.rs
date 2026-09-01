@@ -192,7 +192,7 @@ fn count_lost_samples(rec: &mut Recorder, batches: &Receiver<SampleBatch>) {
         let Some(boundary) = batch.boundary() else {
             continue;
         };
-        let BoundaryReason::SamplesLost { expected, received } = boundary.reason else {
+        let BoundaryReason::SamplesLost { expected, received } = *boundary else {
             continue;
         };
         let count = received.wrapping_sub(expected);

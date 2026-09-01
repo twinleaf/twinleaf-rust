@@ -107,7 +107,7 @@ pub fn print_batch_meta(batch: &SampleBatch, route: Option<&DeviceRoute>) {
     };
 
     if let Some(boundary) = batch.boundary() {
-        println!("# {}BOUNDARY {:?}", route_str, boundary.reason);
+        println!("# {}BOUNDARY {:?}", route_str, boundary);
         if !boundary.is_continuous() {
             println!("# {}DEVICE {:?}", route_str, batch.device());
             println!("# {}STREAM {:?}", route_str, batch.stream());

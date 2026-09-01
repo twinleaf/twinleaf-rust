@@ -346,7 +346,7 @@ impl From<ColumnBuilder> for ColumnArray {
 pub(super) struct BatchContext {
     key: StreamKey,
     /// At most one boundary per batch, anchored at its first row.
-    boundary: Option<Boundary>,
+    boundary: Option<BoundaryReason>,
     generations: Generations,
     segment: SegmentRecord,
     stream: StreamRecord,
@@ -356,7 +356,7 @@ pub(super) struct BatchContext {
 impl BatchContext {
     pub(super) fn new(
         key: StreamKey,
-        boundary: Option<Boundary>,
+        boundary: Option<BoundaryReason>,
         generations: Generations,
         segment: SegmentRecord,
         stream: StreamRecord,
@@ -428,7 +428,7 @@ impl Series {
 /// batch they would form and can append themselves onto an accumulating builder.
 pub(super) trait RowSource {
     fn len(&self) -> usize;
-    fn boundary(&self) -> Option<&Boundary>;
+    fn boundary(&self) -> Option<&BoundaryReason>;
     fn generations(&self) -> Generations;
     fn segment_record(&self) -> &SegmentRecord;
     /// An empty builder shaped like these rows: their metadata, boundary and
@@ -458,7 +458,7 @@ impl RowSource for SampleBatch {
         self.sample_numbers.len()
     }
 
-    fn boundary(&self) -> Option<&Boundary> {
+    fn boundary(&self) -> Option<&BoundaryReason> {
         self.context.boundary.as_ref()
     }
 
@@ -619,7 +619,7 @@ impl SampleBatch {
     }
 
     /// The batch's boundary, anchored at its first row.
-    pub fn boundary(&self) -> Option<&Boundary> {
+    pub fn boundary(&self) -> Option<&BoundaryReason> {
         self.context.boundary.as_ref()
     }
 
@@ -807,11 +807,6 @@ pub struct Generations {
     pub global: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct Boundary {
-    pub reason: BoundaryReason,
-}
-
 /// What a boundary says about the data around it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryClass {
@@ -863,16 +858,16 @@ pub enum BoundaryReason {
     },
 }
 
-impl Boundary {
+impl BoundaryReason {
     /// Only boundary where continuity is preserved
     pub fn is_continuous(&self) -> bool {
-        matches!(self.reason, BoundaryReason::SegmentRollover { .. })
+        matches!(self, BoundaryReason::SegmentRollover { .. })
     }
 
     /// Boundaries where there may be a gap but time is still monotonic
     pub fn is_monotonic(&self) -> bool {
         matches!(
-            self.reason,
+            self,
             BoundaryReason::SamplesLost { .. }
                 | BoundaryReason::RateChanged { .. }
                 | BoundaryReason::SegmentRollover { .. }
@@ -882,13 +877,13 @@ impl Boundary {
     }
 
     pub fn is_initial(&self) -> bool {
-        matches!(self.reason, BoundaryReason::Initial)
+        matches!(self, BoundaryReason::Initial)
     }
 
     /// How this boundary should be interpreted, independent of continuity and
     /// monotonicity.
     pub fn class(&self) -> BoundaryClass {
-        match self.reason {
+        match self {
             BoundaryReason::SegmentRollover { .. } => BoundaryClass::Seamless,
             BoundaryReason::Initial => BoundaryClass::Startup,
             BoundaryReason::SamplesLost { .. } => BoundaryClass::DataLoss,
@@ -930,9 +925,7 @@ mod tests {
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
                 StreamKey::new(DeviceRoute::root(), StreamId::new(1)),
-                Some(Boundary {
-                    reason: BoundaryReason::Initial,
-                }),
+                Some(BoundaryReason::Initial),
                 Generations {
                     stream: 1,
                     device: 0,

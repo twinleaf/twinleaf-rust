@@ -1,6 +1,6 @@
 use crate::data::{
-    Boundary, ColumnArray, ColumnFilter, ColumnRecord, DeviceRecord, Generations, SampleBatch,
-    Series, StreamKey, StreamRecord,
+    BoundaryReason, ColumnArray, ColumnFilter, ColumnRecord, DeviceRecord, Generations,
+    SampleBatch, Series, StreamKey, StreamRecord,
 };
 use crate::tio::proto::DeviceRoute;
 use hdf5::filters::{Blosc, BloscShuffle};
@@ -86,7 +86,7 @@ impl RunTables {
         &mut self,
         key: StreamKey,
         generations: Generations,
-        boundary: Option<&Boundary>,
+        boundary: Option<&BoundaryReason>,
     ) -> bool {
         let splits = boundary.is_some_and(|b| {
             !b.is_initial()
@@ -246,7 +246,7 @@ impl Hdf5Appender {
                     "[{}] sample_n={} boundary={:?}",
                     batch.stream().name,
                     batch.first_sample().unwrap_or(SampleNumber::new(0)),
-                    boundary.reason
+                    boundary
                 );
             }
         }
@@ -619,12 +619,10 @@ mod tests {
         }
     }
 
-    fn lost() -> Boundary {
-        Boundary {
-            reason: BoundaryReason::SamplesLost {
-                expected: SampleNumber::new(2),
-                received: SampleNumber::new(9),
-            },
+    fn lost() -> BoundaryReason {
+        BoundaryReason::SamplesLost {
+            expected: SampleNumber::new(2),
+            received: SampleNumber::new(9),
         }
     }
 
@@ -708,15 +706,11 @@ mod tests {
     #[test]
     fn only_qualifying_boundaries_advance_the_table_index() {
         let opened = [
-            Boundary {
-                reason: BoundaryReason::Initial,
-            },
+            BoundaryReason::Initial,
             lost(),
-            Boundary {
-                reason: BoundaryReason::SessionChanged {
-                    old: twinleaf_proto::SessionId::new(1),
-                    new: twinleaf_proto::SessionId::new(2),
-                },
+            BoundaryReason::SessionChanged {
+                old: twinleaf_proto::SessionId::new(1),
+                new: twinleaf_proto::SessionId::new(2),
             },
         ];
         // Data loss is still monotonic, so only the session change splits there.
@@ -740,13 +734,7 @@ mod tests {
     #[test]
     fn a_device_generation_moves_every_stream_of_the_device_to_one_table() {
         let mut runs = RunTables::new(SplitPolicy::Continuous, RunSplitLevel::PerDevice);
-        runs.observe(
-            key(1),
-            generations(1),
-            Some(&Boundary {
-                reason: BoundaryReason::Initial,
-            }),
-        );
+        runs.observe(key(1), generations(1), Some(&BoundaryReason::Initial));
         runs.observe(key(1), generations(2), Some(&lost()));
         assert_eq!(runs.index(key(1)), Some(1));
         // A stream that never saw the boundary reads the generation's table back.

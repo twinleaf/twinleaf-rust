@@ -4,9 +4,12 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
-use super::metadata::{decoded_buffer_type, DeviceMetadataSnapshot, MetadataQuery, StreamMetadataSnapshot};
+use super::metadata::{
+    decoded_buffer_type, DeviceMetadataSnapshot, MetadataQuery, StreamMetadataSnapshot,
+};
 use super::sample::{
-    sample_time, BatchContext, Boundary, BoundaryReason, ColumnData, Generations, RowSource, SampleBatchBuilder, StreamKey,
+    sample_time, BatchContext, BoundaryReason, ColumnData, Generations, RowSource,
+    SampleBatchBuilder, StreamKey,
 };
 use super::{BufferType, ColumnRecord, DeviceRecord, MetadataType};
 use super::{SegmentRecord, StreamRecord};
@@ -166,37 +169,29 @@ impl StreamState {
         segment: wire::Segment<'_>,
         new_rate: f64,
         is_segment_rollover: bool,
-    ) -> Option<Boundary> {
+    ) -> Option<BoundaryReason> {
         if !self.established {
-            return Some(Boundary {
-                reason: BoundaryReason::Initial,
-            });
+            return Some(BoundaryReason::Initial);
         }
 
         if device.session != self.last_session_id {
-            return Some(Boundary {
-                reason: BoundaryReason::SessionChanged {
-                    old: self.last_session_id,
-                    new: device.session,
-                },
+            return Some(BoundaryReason::SessionChanged {
+                old: self.last_session_id,
+                new: device.session,
             });
         }
 
         if segment.timeref_session != self.last_time_ref_session_id {
-            return Some(Boundary {
-                reason: BoundaryReason::TimeRefSessionChanged {
-                    old: self.last_time_ref_session_id,
-                    new: segment.timeref_session,
-                },
+            return Some(BoundaryReason::TimeRefSessionChanged {
+                old: self.last_time_ref_session_id,
+                new: segment.timeref_session,
             });
         }
 
         if (new_rate - self.effective_rate).abs() > 1e-9 {
-            return Some(Boundary {
-                reason: BoundaryReason::RateChanged {
-                    old_rate: self.effective_rate,
-                    new_rate,
-                },
+            return Some(BoundaryReason::RateChanged {
+                old_rate: self.effective_rate,
+                new_rate,
             });
         }
 
@@ -204,10 +199,8 @@ impl StreamState {
         let time_gap = first_timestamp - self.last_timestamp;
 
         if time_gap < -half_period {
-            return Some(Boundary {
-                reason: BoundaryReason::TimeBackward {
-                    gap_seconds: -time_gap,
-                },
+            return Some(BoundaryReason::TimeBackward {
+                gap_seconds: -time_gap,
             });
         }
 
@@ -215,38 +208,32 @@ impl StreamState {
             // A benign rollover is time-continuous; a stream restart leaves a
             // forward gap. Backward jumps already returned above.
             let time_continuous = time_gap < half_period;
-            return Some(Boundary {
-                reason: if is_segment_rollover && time_continuous {
-                    BoundaryReason::SegmentRollover {
-                        old_id: self.last_segment_id,
-                        new_id: segment.segment_id,
-                    }
-                } else {
-                    BoundaryReason::SegmentChanged {
-                        old_id: self.last_segment_id,
-                        new_id: segment.segment_id,
-                    }
-                },
+            return Some(if is_segment_rollover && time_continuous {
+                BoundaryReason::SegmentRollover {
+                    old_id: self.last_segment_id,
+                    new_id: segment.segment_id,
+                }
+            } else {
+                BoundaryReason::SegmentChanged {
+                    old_id: self.last_segment_id,
+                    new_id: segment.segment_id,
+                }
             });
         }
 
         let expected_sample = SampleNumber::new(self.last_sample_number.value() + 1);
         if first_sample_n != expected_sample {
             if time_gap.abs() > half_period {
-                return Some(Boundary {
-                    reason: BoundaryReason::SamplesLost {
-                        expected: expected_sample,
-                        received: first_sample_n,
-                    },
+                return Some(BoundaryReason::SamplesLost {
+                    expected: expected_sample,
+                    received: first_sample_n,
                 });
             }
         } else if time_gap > half_period {
             // Sample numbers are contiguous, so the segment's metadata (e.g. start_time)
             // was corrected in place, and must not pass silently as a continuous batch.
-            return Some(Boundary {
-                reason: BoundaryReason::TimeForward {
-                    gap_seconds: time_gap,
-                },
+            return Some(BoundaryReason::TimeForward {
+                gap_seconds: time_gap,
             });
         }
 
@@ -997,7 +984,7 @@ impl ParseState {
 /// at their position in the packet sequence, described without decoding them.
 pub(crate) struct ScannedRows<'a> {
     key: StreamKey,
-    boundary: Option<Boundary>,
+    boundary: Option<BoundaryReason>,
     generations: Generations,
     segment: SegmentRecord,
     stream: StreamRecord,
@@ -1023,7 +1010,7 @@ impl ScannedRows<'_> {
         self.key
     }
 
-    pub(crate) fn boundary(&self) -> Option<&Boundary> {
+    pub(crate) fn boundary(&self) -> Option<&BoundaryReason> {
         self.boundary.as_ref()
     }
 
@@ -1080,7 +1067,7 @@ impl RowSource for ScannedRows<'_> {
         self.row_count
     }
 
-    fn boundary(&self) -> Option<&Boundary> {
+    fn boundary(&self) -> Option<&BoundaryReason> {
         self.boundary()
     }
 
