@@ -4,7 +4,7 @@ use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::device::stream::{
     DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, Stream, TreeEvent,
 };
-use crate::device::{CallError, RpcArgs, RpcRegistry, RpcRegistryError, RpcReply};
+use crate::device::{CallError, PendingReply, RpcArgs, RpcRegistry, RpcRegistryError, RpcReply};
 use crate::tio;
 use crate::tio::proto::route::RouteError;
 use crate::tio::proto::DeviceRoute;
@@ -35,26 +35,6 @@ pub enum MetadataError {
     /// The link to the proxy closed. Terminal.
     #[error("proxy disconnected")]
     Disconnected,
-}
-
-/// A reply that has not arrived yet.
-///
-/// Blocking is just consuming it now with [`wait`](Self::wait). Every pending
-/// reply resolves: with the value, or with the device's or the proxy's error
-/// (the proxy times outstanding RPCs out).
-#[must_use = "the RPC is in flight; wait on the reply"]
-pub(crate) struct PendingReply {
-    replies: channel::Receiver<proxy::RawCallResult>,
-}
-
-impl PendingReply {
-    /// Block until the reply resolves.
-    pub(crate) fn wait(self) -> Result<Vec<u8>, CallError> {
-        Ok(self
-            .replies
-            .recv()
-            .unwrap_or(Err(proxy::RawCallError::ProxyClosed))?)
-    }
 }
 
 /// A live link to one device tree, over serial, TCP, or UDP.
@@ -307,11 +287,9 @@ impl DeviceTree {
             .collect()
     }
 
-    /// Issue an RPC without waiting for its reply.
-    ///
-    /// This stays private until the asynchronous reply type is part of the
-    /// public API; the blocking routed methods below are public.
-    pub(crate) fn submit(
+    /// Issue an RPC at `route` without waiting for its reply. An out-of-scope
+    /// route returns [`CallError::InvalidRoute`] without submitting a request.
+    pub fn submit(
         &self,
         route: DeviceRoute,
         name: &str,
@@ -323,8 +301,7 @@ impl DeviceTree {
     }
 
     /// Call `name` at `route` with already encoded arguments and return the raw
-    /// reply. An out-of-scope route returns [`CallError::InvalidRoute`] without
-    /// submitting a request.
+    /// reply.
     pub fn raw_rpc(
         &self,
         route: DeviceRoute,
@@ -359,10 +336,7 @@ impl DeviceTree {
     /// The RPCs the device at `route` offers, from the on-disk cache when its
     /// `rpc.hash` still matches, otherwise by walking `rpc.listinfo`.
     pub fn rpc_registry(&self, route: DeviceRoute) -> Result<RpcRegistry, RpcRegistryError> {
-        RpcRegistry::load_with(|name, arg| {
-            let pending = self.submit(route, name, arg)?;
-            Ok(move || pending.wait())
-        })
+        RpcRegistry::load_with(|name, arg| self.submit(route, name, arg))
     }
 }
 
@@ -419,7 +393,7 @@ impl Device {
     }
 
     /// Issue an RPC without waiting for its reply.
-    pub(crate) fn submit(&self, name: &str, arg: &[u8]) -> Result<PendingReply, CallError> {
+    pub fn submit(&self, name: &str, arg: &[u8]) -> Result<PendingReply, CallError> {
         self.tree.submit(self.route(), name, arg)
     }
 
