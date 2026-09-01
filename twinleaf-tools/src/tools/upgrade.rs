@@ -422,6 +422,17 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
             bar.set_length(total as u64);
             bar.set_position(chunk as u64);
         }
+        FlashEvent::Resuming {
+            chunk,
+            total,
+            error,
+        } => {
+            let _ = crate::multi_progress().println(format!(
+                " {} {}",
+                label("dev.firmware.upload"),
+                style(format!("{error}; resuming from chunk {chunk}/{total}")).yellow()
+            ));
+        }
         FlashEvent::Committing => {
             // Persist the upload result (the bar above is transient).
             if let Some(bar) = upload.take() {

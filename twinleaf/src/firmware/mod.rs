@@ -19,8 +19,14 @@ pub mod github;
 
 /// Firmware images are uploaded to the device in fixed-size chunks.
 const UPLOAD_CHUNK_SIZE: usize = 288;
+/// Bytes of every chunk that are envelope rather than image data: the AES IV
+/// and the size/offset/crc/id header the device checks before appending.
+const CHUNK_ENVELOPE: usize = 32;
 /// Maximum number of upload chunks awaiting acknowledgement at once.
 const MAX_CHUNKS_IN_FLIGHT: usize = 2;
+/// Consecutive resumptions that leave the device's upload cursor where it was
+/// before the upload is abandoned.
+const MAX_STALLS: u32 = 3;
 /// Time to keep the link up after committing, so the device is not
 /// power-cycled mid-write. Part of the safe upgrade procedure, not just UX.
 #[cfg(not(test))]
@@ -135,7 +141,7 @@ pub enum StopOutcome {
 }
 
 /// Progress events emitted by [`flash`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlashEvent {
     /// About to issue `dev.stop`.
     Stopping,
@@ -143,6 +149,13 @@ pub enum FlashEvent {
     Stopped(StopOutcome),
     /// `chunk` of `total` chunks have been acknowledged by the device.
     Uploading { chunk: usize, total: usize },
+    /// The upload failed with `error` and is resuming at `chunk` of `total`,
+    /// where the device reports its upload cursor.
+    Resuming {
+        chunk: usize,
+        total: usize,
+        error: String,
+    },
     /// Upload finished; the commit RPC is being issued.
     Committing,
     /// Commit accepted; settling before the link can be dropped.
@@ -391,9 +404,12 @@ pub fn download_cached(
 
 /// Upload a firmware image to the device and commit the upgrade.
 ///
-/// Progress is reported through `on_event`; nothing is printed. The function
-/// blocks for a short settle period after committing (see
-/// [`FlashEvent::Finalizing`]) so the device is not power-cycled mid-write.
+/// Progress is reported through `on_event`; nothing is printed. A chunk lost
+/// in either direction fails its window; the upload then reads the device's
+/// cursor and resumes from that chunk, giving up only after [`MAX_STALLS`]
+/// resumptions in a row that move the cursor nowhere. The function blocks for
+/// a short settle period after committing (see [`FlashEvent::Finalizing`]) so
+/// the device is not power-cycled mid-write.
 pub fn flash(
     device: &Device,
     firmware_data: &[u8],
@@ -415,41 +431,49 @@ pub fn flash(
     on_event(FlashEvent::Stopped(stop_outcome));
 
     let total_chunks = firmware_data.len().div_ceil(UPLOAD_CHUNK_SIZE);
-    let chunks = firmware_data
-        .chunks(UPLOAD_CHUNK_SIZE)
-        .enumerate()
-        .map(|(chunk, data)| {
-            device.submit("dev.firmware.upload", data).map_err(|e| {
+    let mut resume_at = 0;
+    let mut stalls = 0;
+    loop {
+        let sends = firmware_data
+            .chunks(UPLOAD_CHUNK_SIZE)
+            .skip(resume_at)
+            .map(|data| device.submit("dev.firmware.upload", data));
+        let outcome = pipelined(sends, MAX_CHUNKS_IN_FLIGHT)
+            .enumerate()
+            .try_for_each(|(sent, ack)| {
+                ack.map(|_| {
+                    on_event(FlashEvent::Uploading {
+                        chunk: resume_at + sent + 1,
+                        total: total_chunks,
+                    })
+                })
+            });
+        let Err(error) = outcome else { break };
+        let next = match device.get::<u32>("dev.firmware.upload") {
+            Ok(cursor) => chunk_at(cursor, firmware_data).ok_or_else(|| {
                 FirmwareError::Upload(format!(
-                    "failed to send firmware chunk {}/{}: {}",
-                    chunk + 1,
-                    total_chunks,
-                    e
+                    "the device's upload cursor ({cursor} bytes) is not a chunk boundary of this image"
                 ))
-            })
-        });
-    for (chunk, ack) in pipelined(chunks, MAX_CHUNKS_IN_FLIGHT).enumerate() {
-        match ack {
-            Ok(_) => on_event(FlashEvent::Uploading {
-                chunk: chunk + 1,
-                total: total_chunks,
-            }),
-            Err(FirmwareError::Rpc(CallError::DeviceError(payload))) => {
-                return Err(FirmwareError::Upload(format!(
-                    "device rejected firmware chunk {}/{}: {}",
-                    chunk + 1,
-                    total_chunks,
-                    payload.error
-                )))
-            }
-            Err(FirmwareError::Rpc(e)) => {
-                return Err(FirmwareError::Upload(format!(
-                    "failed to receive firmware upload ack: {}",
-                    e
-                )))
-            }
-            Err(not_sent) => return Err(not_sent),
+            })?,
+            Err(_) => resume_at,
+        };
+        stalls = if next > resume_at { 0 } else { stalls + 1 };
+        if stalls == MAX_STALLS {
+            return Err(FirmwareError::Upload(format!(
+                "firmware chunk {}/{} failed {stalls} times without progress: {error}",
+                next + 1,
+                total_chunks
+            )));
         }
+        if next == total_chunks {
+            break;
+        }
+        on_event(FlashEvent::Resuming {
+            chunk: next + 1,
+            total: total_chunks,
+            error: error.to_string(),
+        });
+        resume_at = next;
     }
 
     on_event(FlashEvent::Committing);
@@ -462,15 +486,29 @@ pub fn flash(
     Ok(())
 }
 
+/// The chunk of `image` starting at the device's upload cursor, `image`'s chunk
+/// count when the cursor is at its end, or None when this image has no chunk
+/// boundary there.
+fn chunk_at(cursor: u32, image: &[u8]) -> Option<usize> {
+    let total_chunks = image.len().div_ceil(UPLOAD_CHUNK_SIZE);
+    let data_per_chunk = UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE;
+    let data = image.len().saturating_sub(total_chunks * CHUNK_ENVELOPE);
+    let cursor = cursor as usize;
+    if cursor == data {
+        Some(total_chunks)
+    } else if cursor.is_multiple_of(data_per_chunk) && cursor / data_per_chunk < total_chunks {
+        Some(cursor / data_per_chunk)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tio::proto::Payload;
-    use crate::tio::proxy::{RawCallError, RawCallResult};
+    use crate::tio::proxy::RawCallError;
     use crate::tio::proxy_core::ProxyCommand;
-
-    /// Where a scripted device sends one call's completion.
-    type Completion = crossbeam::channel::Sender<RawCallResult>;
 
     fn installed(date: Option<&str>, hash: Option<&str>) -> InstalledFirmware {
         InstalledFirmware {
@@ -611,17 +649,40 @@ mod tests {
         assert_eq!(latest.short_hash, "5d1494");
     }
 
-    /// Run [`flash`] against a scripted fake device at the endpoint the
-    /// library actually calls through. `on_upload` decides how to complete
-    /// each `dev.firmware.upload` call; control RPCs (`dev.stop`,
-    /// `dev.firmware.upgrade`) are always acknowledged.
+    /// What the fake device does with a chunk that arrived at its cursor.
+    enum Fault {
+        Deliver,
+        LoseRequest,
+        LoseAck,
+        Reject,
+    }
+
+    /// A chunked image whose every chunk announces its data offset in its
+    /// first four bytes, so the fake device can check it as the real one does.
+    fn image(len: usize) -> Vec<u8> {
+        let mut image = vec![0xa5u8; len];
+        for (index, chunk) in image.chunks_mut(UPLOAD_CHUNK_SIZE).enumerate() {
+            let offset = (index * (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE)) as u32;
+            chunk[..4].copy_from_slice(&offset.to_le_bytes());
+        }
+        image
+    }
+
+    /// Run [`flash`] against a fake device that keeps tl-chibi's upload
+    /// cursor: an empty request reads it, a chunk whose offset is elsewhere is
+    /// rejected, and `fault` decides what happens to one that matches. Control
+    /// RPCs are always acknowledged. Returns the outcome, the events, the
+    /// chunk indices sent in order, and the device's final cursor.
     fn flash_against(
         firmware_len: usize,
-        on_upload: impl FnMut(Completion) + Send + 'static,
-    ) -> (Result<(), FirmwareError>, Vec<FlashEvent>) {
+        cursor: u32,
+        fault: impl FnMut(usize) -> Fault + Send + 'static,
+    ) -> (Result<(), FirmwareError>, Vec<FlashEvent>, Vec<usize>, u32) {
         let (device, calls, _worker) = crate::device::Device::test_pair();
-        let mut on_upload = on_upload;
         let responder = std::thread::spawn(move || {
+            let mut cursor = cursor;
+            let mut fault = fault;
+            let mut sent = Vec::new();
             for call in calls.iter() {
                 let ProxyCommand::Call {
                     request, result, ..
@@ -635,68 +696,170 @@ mod tests {
                 let wire_rpc::Method::ByName(name) = request.method else {
                     panic!("expected a call by name");
                 };
-                match name {
-                    b"dev.firmware.upload" => on_upload(result),
-                    _ => {
-                        let _ = result.send(Ok(Vec::new()));
-                    }
+                if name != b"dev.firmware.upload" {
+                    let _ = result.send(Ok(Vec::new()));
+                    continue;
                 }
+                if request.args.is_empty() {
+                    let _ = result.send(Ok(cursor.to_le_bytes().to_vec()));
+                    continue;
+                }
+                let offset = u32::from_le_bytes(request.args[..4].try_into().unwrap());
+                let data = (request.args.len() - CHUNK_ENVELOPE) as u32;
+                let chunk = offset as usize / (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE);
+                sent.push(chunk);
+                let invalid = || RawCallError::Device {
+                    error: wire_rpc::RpcError::Invalid,
+                    message: Vec::new(),
+                };
+                if offset != cursor {
+                    let _ = result.send(Err(invalid()));
+                    continue;
+                }
+                let reply = match fault(chunk) {
+                    Fault::Deliver => {
+                        cursor += data;
+                        Ok(Vec::new())
+                    }
+                    Fault::LoseRequest => Err(RawCallError::Timeout),
+                    Fault::LoseAck => {
+                        cursor += data;
+                        Err(RawCallError::Timeout)
+                    }
+                    Fault::Reject => Err(invalid()),
+                };
+                let _ = result.send(reply);
             }
+            (sent, cursor)
         });
 
-        let firmware = vec![0xa5u8; firmware_len];
         let mut events = Vec::new();
-        let result = flash(&device, &firmware, |e| events.push(e));
+        let result = flash(&device, &image(firmware_len), |e| events.push(e));
         drop(device);
-        responder.join().unwrap();
-        (result, events)
+        let (sent, cursor) = responder.join().unwrap();
+        (result, events, sent, cursor)
     }
 
-    #[test]
-    fn flash_acknowledges_every_chunk_in_order_and_commits() {
-        // Three chunks, each acknowledged as it is uploaded; the window keeps
-        // two in flight, so the last two are sent before the first is acked.
-        let (result, events) = flash_against(2 * UPLOAD_CHUNK_SIZE + 10, |result| {
-            let _ = result.send(Ok(Vec::new()));
-        });
+    /// Three chunks: two full ones and a short tail.
+    const THREE_CHUNKS: usize = 2 * UPLOAD_CHUNK_SIZE + 64;
+    const THREE_CHUNKS_DATA: u32 = (THREE_CHUNKS - 3 * CHUNK_ENVELOPE) as u32;
 
-        result.unwrap();
-        let uploaded: Vec<usize> = events
+    fn acked(events: &[FlashEvent]) -> Vec<usize> {
+        events
             .iter()
             .filter_map(|e| match e {
                 FlashEvent::Uploading { chunk, .. } => Some(*chunk),
                 _ => None,
             })
-            .collect();
-        assert_eq!(uploaded, [1, 2, 3]);
+            .collect()
+    }
+
+    fn resumed(events: &[FlashEvent]) -> Vec<usize> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FlashEvent::Resuming { chunk, .. } => Some(*chunk),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flash_acknowledges_every_chunk_in_order_and_commits() {
+        let (result, events, sent, cursor) = flash_against(THREE_CHUNKS, 0, |_| Fault::Deliver);
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 2]);
+        assert_eq!(acked(&events), [1, 2, 3]);
+        assert_eq!(cursor, THREE_CHUNKS_DATA);
         assert!(events.contains(&FlashEvent::Complete));
     }
 
+    /// Losing chunk 1 also gets chunk 2, already in flight, rejected for its
+    /// offset; the upload reads the cursor and resends both.
     #[test]
-    fn flash_fails_when_a_chunk_times_out() {
-        let (result, _) = flash_against(100, |result| {
-            let _ = result.send(Err(RawCallError::Timeout));
+    fn a_lost_chunk_is_resent_from_the_devices_cursor() {
+        let mut lost = false;
+        let (result, events, sent, cursor) = flash_against(THREE_CHUNKS, 0, move |chunk| {
+            if chunk == 1 && !std::mem::replace(&mut lost, true) {
+                Fault::LoseRequest
+            } else {
+                Fault::Deliver
+            }
         });
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 2, 1, 2]);
+        assert_eq!(resumed(&events), [2]);
+        assert_eq!(cursor, THREE_CHUNKS_DATA);
+    }
+
+    /// A chunk the device applied but whose ack was lost is not resent: the
+    /// cursor is already past it.
+    #[test]
+    fn a_lost_ack_is_not_resent() {
+        let (result, events, sent, cursor) = flash_against(THREE_CHUNKS, 0, |chunk| {
+            if chunk == 1 {
+                Fault::LoseAck
+            } else {
+                Fault::Deliver
+            }
+        });
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 2]);
+        assert!(resumed(&events).is_empty());
+        assert_eq!(cursor, THREE_CHUNKS_DATA);
+    }
+
+    /// A device already holding the first chunk rejects chunk 0; the upload
+    /// resumes from wherever the cursor is by then.
+    #[test]
+    fn a_partial_upload_resumes_where_the_device_left_off() {
+        let first_chunk = (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE) as u32;
+        let (result, events, sent, cursor) =
+            flash_against(THREE_CHUNKS, first_chunk, |_| Fault::Deliver);
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 2]);
+        assert_eq!(resumed(&events), [3]);
+        assert_eq!(cursor, THREE_CHUNKS_DATA);
+    }
+
+    #[test]
+    fn an_upload_the_device_keeps_rejecting_fails_without_progress() {
+        let (result, _, sent, _) = flash_against(100, 0, |_| Fault::Reject);
+
         let err = result.unwrap_err().to_string();
+        assert_eq!(sent.len(), MAX_STALLS as usize);
         assert!(
-            err.contains("failed to receive firmware upload ack"),
+            err.contains("failed 3 times without progress") && err.contains("invalid arguments"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn flash_fails_when_the_device_rejects_a_chunk() {
-        let (result, _) = flash_against(100, |result| {
-            let _ = result.send(Err(RawCallError::Device {
-                error: wire_rpc::RpcError::Invalid,
-                message: Vec::new(),
-            }));
-        });
+    fn an_upload_that_keeps_timing_out_fails_without_progress() {
+        let (result, _, sent, _) = flash_against(100, 0, |_| Fault::LoseRequest);
+
         let err = result.unwrap_err().to_string();
+        assert_eq!(sent.len(), MAX_STALLS as usize);
         assert!(
-            err.contains("device rejected firmware chunk 1/1"),
+            err.contains("failed 3 times without progress") && err.contains("timed out"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn the_cursor_maps_to_a_chunk_only_on_a_boundary_of_this_image() {
+        let image = image(THREE_CHUNKS);
+        let data_per_chunk = (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE) as u32;
+
+        assert_eq!(chunk_at(0, &image), Some(0));
+        assert_eq!(chunk_at(data_per_chunk, &image), Some(1));
+        assert_eq!(chunk_at(THREE_CHUNKS_DATA, &image), Some(3));
+        assert_eq!(chunk_at(data_per_chunk + 1, &image), None);
+        assert_eq!(chunk_at(THREE_CHUNKS_DATA + 256, &image), None);
     }
 
     #[test]
