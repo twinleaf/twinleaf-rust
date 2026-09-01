@@ -6,12 +6,11 @@ mod stream;
 
 pub use crate::tio::proto::route::RouteError;
 pub use crate::tio::proto::DeviceRoute;
-pub(crate) use connection::PendingReply;
 pub use connection::{Connection, Device, DeviceTree, MetadataError};
 pub use rpc::{
-    CallError, RpcAccess, RpcArgs, RpcDecodeError, RpcDescriptor, RpcErrorPayload, RpcMeta,
-    RpcMetaExt, RpcMetaFlags, RpcMethod, RpcRegistry, RpcRegistryError, RpcReply,
-    RpcReplyFixedSize, RpcStringLen, RpcValue, RpcValueDecodeError, RpcValueEncodeError,
+    pipelined, CallError, PendingReply, RpcAccess, RpcArgs, RpcDecodeError, RpcDescriptor,
+    RpcErrorPayload, RpcMeta, RpcMetaExt, RpcMetaFlags, RpcMethod, RpcRegistry, RpcRegistryError,
+    RpcReply, RpcReplyFixedSize, RpcStringLen, RpcValue, RpcValueDecodeError, RpcValueEncodeError,
     RpcValueType, RpcValueTypeExt,
 };
 pub use stream::{DeviceEvent, Event, LinkEvent, NamedRoute, Receiver, RecvError, TreeEvent};

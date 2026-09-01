@@ -9,8 +9,7 @@
 //! can plug in their own source. A ready-made GitHub-backed catalog is provided
 //! in [`github`] behind the `firmware-update` feature.
 
-use crate::device::{CallError, Device, PendingReply};
-use std::collections::VecDeque;
+use crate::device::{pipelined, CallError, Device};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use twinleaf_proto::rpc as wire_rpc;
@@ -416,13 +415,11 @@ pub fn flash(
     on_event(FlashEvent::Stopped(stop_outcome));
 
     let total_chunks = firmware_data.len().div_ceil(UPLOAD_CHUNK_SIZE);
-
-    let send_chunk = |chunk: usize| {
-        let offset = chunk * UPLOAD_CHUNK_SIZE;
-        let chunk_end = (offset + UPLOAD_CHUNK_SIZE).min(firmware_data.len());
-        device
-            .submit("dev.firmware.upload", &firmware_data[offset..chunk_end])
-            .map_err(|e| {
+    let chunks = firmware_data
+        .chunks(UPLOAD_CHUNK_SIZE)
+        .enumerate()
+        .map(|(chunk, data)| {
+            device.submit("dev.firmware.upload", data).map_err(|e| {
                 FirmwareError::Upload(format!(
                     "failed to send firmware chunk {}/{}: {}",
                     chunk + 1,
@@ -430,27 +427,14 @@ pub fn flash(
                     e
                 ))
             })
-    };
-
-    let mut next_fresh_chunk = 0usize;
-    let mut in_flight: VecDeque<PendingReply> = VecDeque::new();
-
-    for chunk in 0..total_chunks {
-        while next_fresh_chunk < total_chunks && in_flight.len() < MAX_CHUNKS_IN_FLIGHT {
-            in_flight.push_back(send_chunk(next_fresh_chunk)?);
-            next_fresh_chunk += 1;
-        }
-
-        match in_flight
-            .pop_front()
-            .expect("the window holds the next unacknowledged chunk")
-            .wait()
-        {
+        });
+    for (chunk, ack) in pipelined(chunks, MAX_CHUNKS_IN_FLIGHT).enumerate() {
+        match ack {
             Ok(_) => on_event(FlashEvent::Uploading {
                 chunk: chunk + 1,
                 total: total_chunks,
             }),
-            Err(CallError::DeviceError(payload)) => {
+            Err(FirmwareError::Rpc(CallError::DeviceError(payload))) => {
                 return Err(FirmwareError::Upload(format!(
                     "device rejected firmware chunk {}/{}: {}",
                     chunk + 1,
@@ -458,12 +442,13 @@ pub fn flash(
                     payload.error
                 )))
             }
-            Err(e) => {
+            Err(FirmwareError::Rpc(e)) => {
                 return Err(FirmwareError::Upload(format!(
                     "failed to receive firmware upload ack: {}",
                     e
                 )))
             }
+            Err(not_sent) => return Err(not_sent),
         }
     }
 
