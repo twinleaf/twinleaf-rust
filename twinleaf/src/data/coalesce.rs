@@ -97,7 +97,7 @@ impl BatchCoalescer {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::sample::{BatchContext, Boundary, BoundaryReason, ColumnArray, ColumnData};
+    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData};
     use crate::data::StreamKey;
     use crate::data::StreamRecord;
     use crate::data::{BufferType, ColumnRecord, DeviceRecord, SegmentRecord};
@@ -119,7 +119,7 @@ mod tests {
         segment: &SegmentRecord,
         first: u32,
         rows: u32,
-        boundary: Option<Boundary>,
+        boundary: Option<BoundaryReason>,
         generations: Generations,
     ) -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
@@ -219,11 +219,9 @@ mod tests {
             &segment,
             2,
             2,
-            Some(Boundary {
-                reason: BoundaryReason::SamplesLost {
-                    expected: twinleaf_proto::SampleNumber::new(2),
-                    received: twinleaf_proto::SampleNumber::new(2),
-                },
+            Some(BoundaryReason::SamplesLost {
+                expected: twinleaf_proto::SampleNumber::new(2),
+                received: twinleaf_proto::SampleNumber::new(2),
             }),
             generations(1),
         ));

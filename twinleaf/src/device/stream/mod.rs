@@ -6,9 +6,9 @@ mod event;
 mod subscription;
 
 pub use event::{DeviceEvent, Event, LinkEvent, NamedRoute, TreeEvent};
-pub use subscription::{Receiver, RecvError};
 pub(crate) use subscription::Scope;
 use subscription::Sink;
+pub use subscription::{Receiver, RecvError};
 
 use crate::data::{DeviceMetadataSnapshot, MetadataQuery, PacketParser, SampleBatch};
 use crate::device::RpcMethod;
@@ -266,7 +266,8 @@ impl StreamState {
     /// direct connection, one mount behind a `tio proxy --mount` fan-in, which
     /// rewrites the status onto its mount prefix.
     fn apply_status(&mut self, subtree: DeviceRoute, status: proto::ProxyStatus) {
-        self.link_state.retain(|root, _| !root.starts_with(&subtree));
+        self.link_state
+            .retain(|root, _| !root.starts_with(&subtree));
         self.link_state.insert(subtree, status);
         self.events.push_back(Event::Link {
             subtree,
@@ -1442,18 +1443,18 @@ mod tests {
         let bounced: DeviceRoute = "/2".parse().unwrap();
         describe(&deliver, steady, 1);
         describe(&deliver, bounced, 1);
-        wait_for(&events, |event| {
-            matches!(event, Event::Device { route, event: DeviceEvent::Metadata(_) } if *route == bounced)
-        });
+        wait_for(
+            &events,
+            |event| matches!(event, Event::Device { route, event: DeviceEvent::Metadata(_) } if *route == bounced),
+        );
 
         deliver
-            .send(
-                Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(bounced),
-            )
+            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(bounced))
             .unwrap();
-        wait_for(&events, |event| {
-            matches!(event, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if *subtree == bounced)
-        });
+        wait_for(
+            &events,
+            |event| matches!(event, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if *subtree == bounced),
+        );
 
         // Both re-broadcast; only the bounced mount's description is news.
         describe(&deliver, steady, 1);
@@ -1504,9 +1505,10 @@ mod tests {
             .send(Packet::proxy_status(proto::ProxyStatus::SensorReconnected).with_route(mount))
             .unwrap();
 
-        wait_for(&below, |event| {
-            matches!(event, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected) } if *subtree == mount)
-        });
+        wait_for(
+            &below,
+            |event| matches!(event, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected) } if *subtree == mount),
+        );
         assert!(
             matches!(
                 elsewhere.recv_timeout(Duration::from_millis(200)),
@@ -1630,7 +1632,8 @@ mod tests {
 
         let late = subscribe(&handle, everything(), PumpSink::Events);
         let deadline = Instant::now() + Duration::from_millis(500);
-        let replayed: Vec<Event> = std::iter::from_fn(|| late.recv_deadline(deadline).ok()).collect();
+        let replayed: Vec<Event> =
+            std::iter::from_fn(|| late.recv_deadline(deadline).ok()).collect();
         assert!(replayed.iter().any(|event| matches!(
             event,
             Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected) } if *subtree == DeviceRoute::root()

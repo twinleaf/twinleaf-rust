@@ -21,16 +21,16 @@ pub mod export;
 pub use crate::tio::proto::DataType;
 pub use buffer::{Buffer, Run};
 pub use filter::ColumnFilter;
-pub use metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamMetadataSnapshot};
 pub(crate) use metadata::{
     BufferType, ColumnRecord, DeviceRecord, MetadataType, SegmentRecord, StreamRecord,
 };
+pub use metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamMetadataSnapshot};
 pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub use sample::{
-    Boundary, BoundaryClass, BoundaryReason, ColumnArray, ColumnData, ColumnKey, Generations,
-    SampleBatch, SampleRow, ScalarBuffer, Series, StreamKey,
+    BoundaryClass, BoundaryReason, ColumnArray, ColumnData, ColumnKey, Generations, SampleBatch,
+    SampleRow, ScalarBuffer, Series, StreamKey,
 };
 pub use state::{PacketError, StreamDataError};
 
