@@ -11,8 +11,6 @@ use std::sync::Arc;
 use twinleaf_proto::data as wire;
 use twinleaf_proto::{ColumnId, StreamId, MAX_PAYLOAD_SIZE};
 
-pub(crate) use wire::MetadataType;
-
 macro_rules! metadata_record {
     ($record:ident, $kind:ident) => {
         /// One retained metadata descriptor: the bare wire record, without the
@@ -46,7 +44,7 @@ macro_rules! metadata_record {
             /// exactly as retained.
             pub(crate) fn update(&self, routing: DeviceRoute) -> Result<Packet, EncodeError> {
                 Packet::metadata_record(
-                    MetadataType::$kind.into(),
+                    wire::MetadataType::$kind.into(),
                     wire::MetadataFlags::UPDATE,
                     &self.0,
                     routing,
@@ -71,7 +69,12 @@ metadata_record!(ColumnRecord, Column);
 /// packets: the caller owns the RPC that answers it.
 #[derive(Debug, Clone)]
 pub struct MetadataQuery {
+    /// The device to address the `dev.metadata` call to.
     pub route: DeviceRoute,
+    /// Records this route still lacks, capped at what one request may carry.
+    ///
+    /// Empty when only the device record is missing, which selects the
+    /// device-chosen bootstrap prefix instead.
     pub selectors: Vec<wire::MetadataSelector>,
     pub(super) generation: u32,
 }
@@ -122,22 +125,27 @@ impl StreamMetadataSnapshot {
         }))
     }
 
+    /// The route half of [`Self::stream_key`].
     pub fn route(&self) -> DeviceRoute {
         self.0.key.route
     }
 
+    /// Route and stream id together, the identity a [`SampleBatch`] carries.
     pub fn stream_key(&self) -> StreamKey {
         self.0.key
     }
 
+    /// The device descriptor, borrowed from the retained wire record.
     pub fn device(&self) -> wire::Device<'_> {
         self.0.device.get()
     }
 
+    /// The stream descriptor, borrowed from the retained wire record.
     pub fn stream(&self) -> wire::Stream<'_> {
         self.0.stream.get()
     }
 
+    /// The current segment's descriptor, borrowed from its retained record.
     pub fn segment(&self) -> wire::Segment<'_> {
         self.0.segment.get()
     }
@@ -147,6 +155,7 @@ impl StreamMetadataSnapshot {
         self.0.columns.iter().map(ColumnRecord::get)
     }
 
+    /// The column whose index is `id`, or `None` if the schema has no such column.
     pub fn column(&self, id: ColumnId) -> Option<wire::Column<'_>> {
         self.columns().find(|column| column.index == id)
     }
@@ -217,14 +226,17 @@ impl DeviceMetadataSnapshot {
         }))
     }
 
+    /// The device descriptor, borrowed from the retained wire record.
     pub fn device(&self) -> wire::Device<'_> {
         self.0.device.get()
     }
 
+    /// One stream's snapshot, or `None` if the device advertises no such id.
     pub fn stream(&self, stream_id: StreamId) -> Option<&StreamMetadataSnapshot> {
         self.0.streams.get(&stream_id)
     }
 
+    /// Every advertised stream paired with its id, in no particular order.
     pub fn streams(
         &self,
     ) -> impl ExactSizeIterator<Item = (StreamId, &StreamMetadataSnapshot)> + '_ {

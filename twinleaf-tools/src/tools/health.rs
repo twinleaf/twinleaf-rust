@@ -612,7 +612,7 @@ impl HealthState {
         }
 
         if let Some(boundary) = batch.boundary() {
-            self.handle_boundary(&boundary, &route, batch.stream().name, sid);
+            self.handle_boundary(boundary, &route, batch.stream().name, sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();

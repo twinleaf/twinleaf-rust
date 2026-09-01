@@ -1,13 +1,13 @@
 //! The decoded sample model: routed stream and column identity, immutable
 //! columnar batches, row views, and parser-reported continuity boundaries.
 
-use super::metadata::StreamMetadataSnapshot;
-use super::{BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
+use super::metadata::{
+    BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamMetadataSnapshot, StreamRecord,
+};
 use crate::tio;
-
+use crate::tio::proto::DeviceRoute;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
-use tio::proto::DeviceRoute;
 use twinleaf_proto::data as wire;
 use twinleaf_proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 
@@ -18,11 +18,14 @@ use twinleaf_proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 /// application combining sources must pair it with its own source identity.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct StreamKey {
+    /// Hops from the enclosing source down to the device, root-to-leaf.
     pub route: DeviceRoute,
+    /// The stream's id on that device, 1 through 127.
     pub stream_id: StreamId,
 }
 
 impl StreamKey {
+    /// A key naming one stream on one device.
     pub fn new(route: DeviceRoute, stream_id: StreamId) -> Self {
         Self { route, stream_id }
     }
@@ -37,12 +40,16 @@ impl std::fmt::Display for StreamKey {
 /// A column within one routed stream.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct ColumnKey {
+    /// Hops from the enclosing source down to the device, root-to-leaf.
     pub route: DeviceRoute,
+    /// The stream's id on that device, 1 through 127.
     pub stream_id: StreamId,
+    /// The column's position within the stream's packed sample.
     pub column_id: ColumnId,
 }
 
 impl ColumnKey {
+    /// A key naming one column of one stream on one device.
     pub fn new(route: DeviceRoute, stream_id: StreamId, column_id: ColumnId) -> Self {
         Self {
             route,
@@ -51,6 +58,7 @@ impl ColumnKey {
         }
     }
 
+    /// The stream this column belongs to.
     pub fn stream_key(&self) -> StreamKey {
         StreamKey {
             route: self.route,
@@ -90,15 +98,21 @@ pub(crate) fn sample_time(segment: wire::Segment<'_>, n: u32) -> f64 {
     SampleClock::of(segment).time_at(n)
 }
 
+/// One decoded scalar, in the storage class its column decodes to.
 #[derive(Debug, Clone)]
 pub enum ColumnData {
+    /// Signed integer, sign-extended from its narrower wire width.
     Int(i64),
+    /// Unsigned integer, zero-extended from its narrower wire width.
     UInt(u64),
+    /// Floating point, widened from `f32` where the column is 32-bit.
     Float(f64),
+    /// Cell whose wire data type this build cannot decode.
     Unknown,
 }
 
 impl ColumnData {
+    /// `None` only for `Unknown`; wide integers lose precision in the cast.
     pub fn try_as_f64(&self) -> Option<f64> {
         match *self {
             ColumnData::Int(i) => Some(i as f64),
@@ -276,8 +290,11 @@ impl ColumnBuilder {
 /// slice within each variant.
 #[derive(Debug, Clone)]
 pub enum ColumnArray {
+    /// Float column; signed integer cells are widened into one.
     F64(ScalarBuffer<f64>),
+    /// Signed integer column, whatever its narrower wire width.
     I64(ScalarBuffer<i64>),
+    /// Unsigned integer column, whatever its narrower wire width.
     U64(ScalarBuffer<u64>),
 }
 
@@ -291,6 +308,7 @@ impl ColumnArray {
         }
     }
 
+    /// Values in this column, one per row of its batch.
     pub fn len(&self) -> usize {
         match self {
             Self::F64(v) => v.len(),
@@ -299,6 +317,7 @@ impl ColumnArray {
         }
     }
 
+    /// True when the column holds no values.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -383,6 +402,11 @@ impl BatchContext {
     }
 }
 
+/// Rows of one stream from one device, held column-major.
+///
+/// Immutable and cloned by pointer. Metadata accessors return borrowed
+/// protocol views of the records the parser retained, so reading them
+/// copies nothing and stays byte-faithful to what the instrument sent.
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
     context: BatchContext,
@@ -393,6 +417,7 @@ pub struct SampleBatch {
     columns: Vec<Series>,
 }
 
+/// One column of a batch: its metadata and its decoded values.
 #[derive(Debug, Clone)]
 pub struct Series {
     metadata: ColumnRecord,
@@ -400,10 +425,12 @@ pub struct Series {
 }
 
 impl Series {
+    /// The column's position within the stream's packed sample.
     pub fn index(&self) -> ColumnId {
         self.metadata.get().index
     }
 
+    /// Borrowed view of the column record the parser retained.
     pub fn metadata(&self) -> wire::Column<'_> {
         self.metadata.get()
     }
@@ -412,6 +439,7 @@ impl Series {
         &self.metadata
     }
 
+    /// The column's decoded values, in row order.
     pub fn values(&self) -> &ColumnArray {
         &self.values
     }
@@ -610,10 +638,12 @@ impl SampleBatch {
         }
     }
 
+    /// Hops to the device that produced these rows, root-to-leaf.
     pub fn route(&self) -> DeviceRoute {
         self.context.key.route
     }
 
+    /// Which routed stream these rows came from.
     pub fn stream_key(&self) -> StreamKey {
         self.context.key
     }
@@ -628,6 +658,7 @@ impl SampleBatch {
         self.context.generations
     }
 
+    /// Each row's counter within its segment, in row order.
     pub fn sample_numbers(&self) -> &[SampleNumber] {
         &self.sample_numbers
     }
@@ -637,14 +668,17 @@ impl SampleBatch {
         &self.timestamps
     }
 
+    /// Borrowed view of the segment these rows were sampled in.
     pub fn segment(&self) -> wire::Segment<'_> {
         self.context.segment.get()
     }
 
+    /// Borrowed view of the stream record these rows belong to.
     pub fn stream(&self) -> wire::Stream<'_> {
         self.context.stream.get()
     }
 
+    /// Borrowed view of the record of the device that sent these rows.
     pub fn device(&self) -> wire::Device<'_> {
         self.context.device.get()
     }
@@ -677,18 +711,22 @@ impl SampleBatch {
         self.metadata().metadata_packets()
     }
 
+    /// Rows in this batch, matching every column's length.
     pub fn len(&self) -> usize {
         self.sample_numbers.len()
     }
 
+    /// True when the batch carries no rows.
     pub fn is_empty(&self) -> bool {
         self.sample_numbers.is_empty()
     }
 
+    /// First row's sample number; `None` when the batch is empty.
     pub fn first_sample(&self) -> Option<SampleNumber> {
         self.sample_numbers.first().copied()
     }
 
+    /// Last row's sample number; `None` when the batch is empty.
     pub fn last_sample(&self) -> Option<SampleNumber> {
         self.sample_numbers.last().copied()
     }
@@ -699,14 +737,17 @@ impl SampleBatch {
         &self.columns
     }
 
+    /// One column by its schema index; `None` when the schema has no such column.
     pub fn column(&self, id: ColumnId) -> Option<&Series> {
         self.columns.iter().find(|c| c.index() == id)
     }
 
+    /// A borrowing view of one row; `None` past the last row.
     pub fn row(&self, row: usize) -> Option<SampleRow<'_>> {
         (row < self.len()).then_some(SampleRow { batch: self, row })
     }
 
+    /// Borrowing views of every row, in row order.
     pub fn iter(&self) -> impl Iterator<Item = SampleRow<'_>> {
         (0..self.len()).map(move |row| SampleRow { batch: self, row })
     }
@@ -744,21 +785,27 @@ pub struct SampleRow<'a> {
 }
 
 impl<'a> SampleRow<'a> {
+    /// The row's counter within its segment.
     pub fn n(&self) -> SampleNumber {
         self.batch.sample_numbers[self.row]
     }
+    /// Borrowed view of the stream record this row belongs to.
     pub fn stream(&self) -> wire::Stream<'a> {
         self.batch.context.stream.get()
     }
+    /// Borrowed view of the segment this row was sampled in.
     pub fn segment(&self) -> wire::Segment<'a> {
         self.batch.context.segment.get()
     }
+    /// Borrowed view of the record of the device that sent this row.
     pub fn device(&self) -> wire::Device<'a> {
         self.batch.context.device.get()
     }
+    /// Start of the sample's interval, in seconds after the segment epoch.
     pub fn timestamp_begin(&self) -> f64 {
         sample_time(self.segment(), self.n().value())
     }
+    /// End of the sample's interval, the time the batch materialized.
     pub fn timestamp_end(&self) -> f64 {
         self.batch.timestamps[self.row]
     }
@@ -810,61 +857,109 @@ pub struct Generations {
 /// What a boundary says about the data around it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryClass {
-    /// Deliberate, time-continuous segment rollover.
+    /// The stream continues without a gap.
     Seamless,
-    /// First data from a stream.
+    /// The first data observed for a stream.
     Startup,
-    /// Samples missing but the timeline is trustworthy.
+    /// Samples are missing, but time remains monotonic.
     DataLoss,
-    /// Session, time reference, rate, or segment reconfiguration.
+    /// The session, time reference, rate, or segment changed.
     Reconfig,
-    /// Timeline inconsistency. Current firmware never corrects a segment's
-    /// time reference in place — sync changes always restart acquisition into
-    /// a new segment — so these indicate wire corruption, a firmware clock
-    /// bug, or a device predating that behavior.
+    /// The timeline is inconsistent, possibly from corrupted data or a device clock error.
     Anomaly,
 }
 
+/// Why a stream started or changed.
+///
+/// Attached to the first batch affected. Use:
+///
+/// - [`class`](Self::class) to categorize the cause.
+/// - [`is_continuous`](Self::is_continuous) to check for an unbroken timeline.
+/// - [`is_monotonic`](Self::is_monotonic) to check that time did not move backward.
+///
+/// | Reason                  | [`class`](Self::class) | [`is_continuous`](Self::is_continuous) | [`is_monotonic`](Self::is_monotonic) |
+/// |-------------------------|------------|-----|-----|
+/// | `SegmentRollover`       | `Seamless` | yes | yes |
+/// | `Initial`               | `Startup`  | no  | no  |
+/// | `SamplesLost`           | `DataLoss` | no  | yes |
+/// | `SessionChanged`        | `Reconfig` | no  | no  |
+/// | `TimeRefSessionChanged` | `Reconfig` | no  | no  |
+/// | `RateChanged`           | `Reconfig` | no  | yes |
+/// | `SegmentChanged`        | `Reconfig` | no  | yes |
+/// | `TimeForward`           | `Anomaly`  | no  | yes |
+/// | `TimeBackward`          | `Anomaly`  | no  | no  |
+///
+/// Continuous boundaries are always monotonic. The class describes the cause,
+/// not its effect on the timeline.
 #[derive(Debug, Clone)]
 pub enum BoundaryReason {
     /// First sample from this stream
     Initial,
     /// Device session changed
-    SessionChanged { old: SessionId, new: SessionId },
+    SessionChanged {
+        /// Session the preceding rows carried.
+        old: SessionId,
+        /// Session the device reports now.
+        new: SessionId,
+    },
     /// Time reference epoch changed
-    TimeRefSessionChanged { old: SessionId, new: SessionId },
+    TimeRefSessionChanged {
+        /// Time reference session the preceding rows carried.
+        old: SessionId,
+        /// Time reference session the segment names now.
+        new: SessionId,
+    },
     /// Time jumped backward unexpectedly
-    TimeBackward { gap_seconds: f64 },
+    TimeBackward {
+        /// How far time went back, in seconds, as a positive magnitude.
+        gap_seconds: f64,
+    },
     /// Time jumped forward unexpectedly with no gap in sample numbers, e.g. a
     /// segment's start time was corrected in place
-    TimeForward { gap_seconds: f64 },
+    TimeForward {
+        /// How far time skipped ahead, in seconds.
+        gap_seconds: f64,
+    },
     /// Sampling rate changed
-    RateChanged { old_rate: f64, new_rate: f64 },
+    RateChanged {
+        /// Rate the preceding rows were sampled at, in Hz after decimation.
+        old_rate: f64,
+        /// Rate now in force, in Hz after decimation.
+        new_rate: f64,
+    },
 
     /// Segment rolled over (continuous, but new segment)
     SegmentRollover {
+        /// Segment that ended.
         old_id: SegmentId,
+        /// Segment the rows continue into.
         new_id: SegmentId,
     },
     /// Segment changed unexpectedly (not a natural rollover)
     SegmentChanged {
+        /// Segment the stream had been in.
         old_id: SegmentId,
+        /// Segment the rows arrived in.
         new_id: SegmentId,
     },
     /// Samples were lost (gap in sequence)
     SamplesLost {
+        /// Sample number the first row should have carried.
         expected: SampleNumber,
+        /// Sample number the first row actually carried.
         received: SampleNumber,
     },
 }
 
 impl BoundaryReason {
-    /// Only boundary where continuity is preserved
+    /// Only boundary where continuity is preserved, and always monotonic too.
     pub fn is_continuous(&self) -> bool {
         matches!(self, BoundaryReason::SegmentRollover { .. })
     }
 
-    /// Boundaries where there may be a gap but time is still monotonic
+    /// Boundaries where there may be a gap but time is still monotonic.
+    ///
+    /// A superset of [`is_continuous`](Self::is_continuous).
     pub fn is_monotonic(&self) -> bool {
         matches!(
             self,
@@ -876,6 +971,7 @@ impl BoundaryReason {
         )
     }
 
+    /// True only for the first data a stream has ever delivered.
     pub fn is_initial(&self) -> bool {
         matches!(self, BoundaryReason::Initial)
     }

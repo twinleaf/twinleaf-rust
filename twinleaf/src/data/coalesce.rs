@@ -6,7 +6,8 @@
 //! generations, and a batch that starts a boundary always stands alone.
 
 use super::sample::{Generations, RowSource, SampleBatch, SampleBatchBuilder};
-use std::{collections::VecDeque, ops::Range};
+use std::collections::VecDeque;
+use std::ops::Range;
 
 /// Accumulates one stream's batches into batches of about `target_rows` rows.
 ///
@@ -97,10 +98,10 @@ impl BatchCoalescer {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData};
-    use crate::data::StreamKey;
-    use crate::data::StreamRecord;
-    use crate::data::{BufferType, ColumnRecord, DeviceRecord, SegmentRecord};
+    use crate::data::metadata::{
+        BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord,
+    };
+    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData, StreamKey};
     use crate::tio::proto::{DataType, DeviceRoute};
     use twinleaf_proto::data as wire;
 

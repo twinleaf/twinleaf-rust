@@ -1,10 +1,9 @@
 //! Seekable and indexed access to immutable TIO log files.
 
+use super::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
 use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::StreamKey;
-use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch};
+use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch, StreamKey};
 use super::state::{PacketError, ScannedRows};
-use super::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
 use memmap2::Mmap;
@@ -37,21 +36,28 @@ pub struct PacketIter {
 /// Wire or semantic failure at a byte offset in a log.
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
+    /// The bytes at that offset are not a well-formed packet.
     #[error("could not decode packet at byte offset {offset}: {source}")]
     Packet {
+        /// Byte offset at which the undecodable packet begins.
         offset: usize,
+        /// Which framing or header check rejected the bytes.
         #[source]
         source: tio::proto::DecodeError,
     },
+    /// A well-formed packet contradicts the state built from earlier ones.
     #[error("invalid data at byte offset {offset}: {source}")]
     Data {
+        /// Byte offset at which the rejected packet begins.
         offset: usize,
+        /// Why the packet could not be applied to the data state.
         #[source]
         source: PacketError,
     },
 }
 
 impl LogError {
+    /// Byte offset at which the failing packet begins.
     pub fn offset(&self) -> usize {
         match self {
             Self::Packet { offset, .. } | Self::Data { offset, .. } => *offset,
@@ -134,30 +140,41 @@ impl StreamSummary {
         self.opened_by
     }
 
+    /// Stream record in effect for the whole run.
     pub fn metadata(&self) -> wire::Stream<'_> {
         self.metadata.get()
     }
 
+    /// Segment record in effect for the whole run.
     pub fn segment(&self) -> wire::Segment<'_> {
         self.segment.get()
     }
 
+    /// Every column of a sample, in schema order.
     pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
         self.columns.iter().map(ColumnRecord::get)
     }
 
+    /// Rows counted in this run alone, not across the whole stream.
     pub fn sample_count(&self) -> u64 {
         self.sample_count
     }
 
+    /// End time of the run's earliest sample, in seconds after its epoch.
+    ///
+    /// `None` only for a run in which no rows were counted.
     pub fn first_timestamp(&self) -> Option<f64> {
         self.first_timestamp
     }
 
+    /// End time of the run's latest sample, in seconds after its epoch.
+    ///
+    /// `None` only for a run in which no rows were counted.
     pub fn last_timestamp(&self) -> Option<f64> {
         self.last_timestamp
     }
 
+    /// Output rate in hertz, after decimation of the sampling rate.
     pub fn rate_hz(&self) -> f64 {
         let segment = self.segment();
         f64::from(segment.sampling_rate) / f64::from(segment.decimation.max(1))
@@ -176,14 +193,17 @@ pub struct LogSummary {
 }
 
 impl LogSummary {
+    /// Bytes consumed before the scan stopped, excluding any failing packet.
     pub fn bytes_scanned(&self) -> usize {
         self.bytes_scanned
     }
 
+    /// Packets of every type accepted before the scan stopped.
     pub fn packet_count(&self) -> u64 {
         self.packet_count
     }
 
+    /// Devices that produced rows, in route order.
     pub fn devices(
         &self,
     ) -> impl ExactSizeIterator<Item = (tio::proto::DeviceRoute, wire::Device<'_>)> + '_ {
@@ -202,6 +222,7 @@ impl LogSummary {
         self.boundaries[class_index(class)]
     }
 
+    /// Failure that ended the scan early; `None` if the log scanned to its end.
     pub fn error(&self) -> Option<&LogError> {
         self.error.as_ref()
     }
@@ -268,6 +289,7 @@ pub struct LogIndex {
 }
 
 impl LogIndex {
+    /// What the indexing scan found, error included if one ended it early.
     pub fn summary(&self) -> &LogSummary {
         &self.summary
     }
@@ -290,6 +312,7 @@ impl LogIndex {
         }
     }
 
+    /// Indexed ranges, one per checkpoint rather than one per packet.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
@@ -466,7 +489,8 @@ impl LogFile {
 mod tests {
     use super::*;
     use crate::data::fixtures::{column, device, segment, stream};
-    use crate::data::{Generations, StreamDataError};
+    use crate::data::sample::Generations;
+    use crate::data::state::StreamDataError;
     use crate::tio::proto::{DataType, DeviceRoute};
 
     fn encoded_log(packets: impl IntoIterator<Item = Packet>) -> Bytes {
