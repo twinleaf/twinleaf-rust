@@ -18,7 +18,8 @@
 //!
 //! Each view offers three subscriptions, filtered to its appropriate scope:
 //!
-//! - [`samples`](DeviceTree::samples): decoded [`SampleBatch`](crate::data::SampleBatch)es, the output of
+//! - [`samples`](DeviceTree::samples): decoded
+//!   [`SampleBatch`](crate::data::SampleBatch)es, the output of
 //!   [`data::PacketParser`](crate::data::PacketParser).
 //! - [`events`](DeviceTree::events): interpreted [`Event`]s, for link status,
 //!   route discovery, and per-device facts such as metadata and heartbeats.

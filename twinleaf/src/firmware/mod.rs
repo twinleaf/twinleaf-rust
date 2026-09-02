@@ -39,8 +39,11 @@ const COMMIT_SETTLE_TIME: Duration = Duration::from_millis(10);
 /// A firmware build date (UTC calendar date). Ordered chronologically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FirmwareDate {
+    /// Four-digit year.
     pub year: u16,
+    /// Month, 1 to 12.
     pub month: u8,
+    /// Day of the month, 1 to 31.
     pub day: u8,
 }
 
@@ -91,10 +94,15 @@ pub struct InstalledFirmware {
 /// A firmware image published in a [`FirmwareCatalog`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareRelease {
+    /// Sensor name the image is for, such as `ASM`.
     pub name: String,
+    /// Hardware revision the image is for, such as `R6`.
     pub revision: String,
+    /// Build date.
     pub date: FirmwareDate,
+    /// Short build hash, as in the filename.
     pub short_hash: String,
+    /// The image's filename in the catalog.
     pub filename: String,
     /// Catalog-specific locator used by [`FirmwareCatalog::download`].
     pub url: String,
@@ -121,6 +129,7 @@ pub enum UpdateStatus {
 /// The full picture needed to present an update decision to a user.
 #[derive(Debug, Clone)]
 pub struct UpdateReport {
+    /// What the device runs now.
     pub installed: InstalledFirmware,
     /// All published releases for this name/revision, sorted newest-first.
     /// Empty for development builds or when nothing is published. Useful for a
@@ -128,6 +137,7 @@ pub struct UpdateReport {
     pub releases: Vec<FirmwareRelease>,
     /// The latest published release (i.e. `releases.first()`), if any.
     pub latest: Option<FirmwareRelease>,
+    /// How `installed` compares to `latest`.
     pub status: UpdateStatus,
 }
 
@@ -150,12 +160,20 @@ pub enum FlashEvent {
     /// `dev.stop` completed with this outcome.
     Stopped(StopOutcome),
     /// `chunk` of `total` chunks have been acknowledged by the device.
-    Uploading { chunk: usize, total: usize },
+    Uploading {
+        /// Chunks acknowledged so far.
+        chunk: usize,
+        /// Chunks in the image.
+        total: usize,
+    },
     /// The upload failed with `error` and is resuming at `chunk` of `total`,
     /// where the device reports its upload cursor.
     Resuming {
+        /// The chunk the upload resumes at, counted from one.
         chunk: usize,
+        /// Chunks in the image.
         total: usize,
+        /// What failed.
         error: String,
     },
     /// Upload finished. The commit RPC is being issued.
@@ -169,14 +187,19 @@ pub enum FlashEvent {
 /// Errors produced by firmware operations.
 #[derive(Debug, thiserror::Error)]
 pub enum FirmwareError {
+    /// A device RPC failed.
     #[error("device RPC failed: {0}")]
     Rpc(#[from] CallError),
+    /// `dev.desc` did not describe the installed firmware.
     #[error("could not determine installed firmware: {0}")]
     Parse(String),
+    /// The catalog could not list or fetch releases.
     #[error("firmware catalog error: {0}")]
     Catalog(String),
+    /// The on-disk image cache could not be read or written.
     #[error("firmware cache I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The upload did not complete.
     #[error("firmware upload failed: {0}")]
     Upload(String),
 }

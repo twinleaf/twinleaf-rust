@@ -1,11 +1,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 #![warn(rustdoc::all)]
 
-#[deny(missing_docs)]
 pub mod data;
-#[deny(missing_docs)]
 pub mod device;
 pub mod firmware;
 pub mod tio;

@@ -20,7 +20,8 @@
 //!
 //! [`RpcMeta`], [`RpcValueType`], [`RpcAccess`], [`RpcStringLen`],
 //! [`RpcMetaFlags`], and [`RpcMethod`] are the protocol's own definitions,
-//! re-exported from [`twinleaf_proto::rpc`] so a host needs no second crate.
+//! re-exported from [`proto::rpc`](crate::proto::rpc) so a host needs no second
+//! crate.
 //! The wire layout of requests, replies, and errors is documented there.
 
 mod cache;

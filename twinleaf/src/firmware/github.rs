@@ -7,7 +7,9 @@ const HTTP_USER_AGENT: &str = concat!("twinleaf/", env!("CARGO_PKG_VERSION"));
 /// A [`FirmwareCatalog`] backed by a public GitHub repository laid out as
 /// `{name}/{revision}/{name}-{revision}-firmware-{YYYY-MM-DD}-{hash}.bin`.
 pub struct GithubCatalog {
+    /// The repository's owner.
     pub owner: String,
+    /// The repository's name.
     pub repo: String,
 }
 
