@@ -31,11 +31,8 @@ pub enum Queued<T> {
     Gap(u64),
 }
 
-/// An owned subscription to one subtree's stream.
-///
-/// Progress is internal: the pump keeps draining the device whether or not
-/// anything is receiving here, and holding this keeps that pump running even
-/// once every view it was minted from is gone. Dropping it releases both.
+/// An owned subscription to one subtree's stream. Holding it keeps the pump
+/// running even after every view is gone; dropping it releases both.
 pub struct Receiver<T> {
     items: channel::Receiver<Queued<T>>,
     _lifeline: channel::Sender<()>,
@@ -65,10 +62,8 @@ impl<T> Receiver<T> {
         self.resolve_timed(self.items.recv_timeout(timeout))
     }
 
-    /// Block until `deadline`, which can be reused across a loop without
-    /// extending the caller's overall budget. The bound holds whatever the
-    /// queue depth: a channel only consults a deadline once it runs dry, so a
-    /// saturated subscription would otherwise deliver items forever.
+    /// Block until `deadline`. The bound holds even when the queue never runs
+    /// dry, so a saturated subscription cannot deliver forever.
     pub fn recv_deadline(&self, deadline: Instant) -> Result<T, RecvError> {
         if Instant::now() >= deadline {
             return Err(RecvError::Timeout);
@@ -146,10 +141,8 @@ impl Scope {
             .is_ok_and(|below| below.len() <= self.depth)
     }
 
-    /// Whether the two regions share any route. On a tree this is exactly
-    /// "either root lies inside the other": any shared route has both roots as
-    /// prefixes, making one root an ancestor-or-equal of the other and thus a
-    /// shared route itself.
+    /// Whether the two regions share any route: on a tree, whether either root
+    /// lies inside the other.
     pub(super) fn intersects(&self, other: &Scope) -> bool {
         self.covers(other.route) || other.covers(self.route)
     }

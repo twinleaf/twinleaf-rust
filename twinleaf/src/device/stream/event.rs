@@ -2,18 +2,13 @@
 
 use super::subscription::Scope;
 use crate::data::DeviceMetadataSnapshot;
-use crate::device::RpcMethod;
-use crate::tio::proto::{self, DeviceRoute};
+use crate::tio::proto::{self, DeviceRoute, RpcMethod};
 use twinleaf_proto::SessionId;
 
-/// What a link is doing. It belongs to a transport rather than to any one
-/// route, so it concerns a whole subtree: everything on a direct connection,
-/// one mount behind a `tio proxy --mount` fan-in.
-///
-/// These events arrive via both direct serial and tio-proxy connections. A
-/// direct serial connection closes after `SensorDisconnected`; a tio-proxy TCP
-/// connection can remain open, making the status event the disconnection
-/// signal shared by both transports.
+/// What a link is doing. It belongs to the transport, so it concerns a whole
+/// subtree: a direct connection, or one mount behind `tio proxy --mount`.
+/// A `SensorDisconnected` status is the disconnection signal on every
+/// transport, since a proxy's TCP link can stay open after it.
 #[derive(Debug, Clone, Copy)]
 pub enum LinkEvent {
     /// Connection status changed.
@@ -38,7 +33,10 @@ pub enum DeviceEvent {
     /// since the last time it was published.
     Metadata(DeviceMetadataSnapshot),
     /// Device heartbeat, including the session id for the standard format.
-    Heartbeat { session_id: Option<SessionId> },
+    Heartbeat {
+        /// The session the device reports, when its heartbeat carries one.
+        session_id: Option<SessionId>,
+    },
     /// The device answered `dev.metadata` with `NotFound`: its firmware cannot
     /// describe its streams, so nothing on this route will ever decode.
     MetadataUnavailable,
@@ -55,17 +53,23 @@ pub enum DeviceEvent {
 pub enum Event {
     /// A link, heard by the views its subtree touches.
     Link {
+        /// Every route the link serves.
         subtree: DeviceRoute,
+        /// What happened to it.
         event: LinkEvent,
     },
     /// The population, heard by the views that cover the route.
     Tree {
+        /// The route concerned.
         route: DeviceRoute,
+        /// What happened at it.
         event: TreeEvent,
     },
     /// One device, heard by the views that cover it.
     Device {
+        /// The device's route.
         route: DeviceRoute,
+        /// What the device did.
         event: DeviceEvent,
     },
 }
@@ -85,6 +89,8 @@ impl Event {
 /// didn't answer). Returned by [`DeviceTree::named_routes`](crate::device::DeviceTree::named_routes).
 #[derive(Debug, Clone)]
 pub struct NamedRoute {
+    /// The route discovered.
     pub route: DeviceRoute,
+    /// Its `dev.name`, when the device answered.
     pub name: Option<String>,
 }

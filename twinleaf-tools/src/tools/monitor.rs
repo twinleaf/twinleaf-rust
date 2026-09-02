@@ -43,7 +43,7 @@ use twinleaf::{
         StreamKey,
     },
     device::{
-        DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError, RpcRegistry,
+        rpc::RpcRegistry, DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError,
         TreeEvent,
     },
     tio::proto::ProxyStatus,

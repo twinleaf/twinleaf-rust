@@ -7,21 +7,18 @@ mod subscription;
 
 pub use event::{DeviceEvent, Event, LinkEvent, NamedRoute, TreeEvent};
 pub(crate) use subscription::Scope;
-use subscription::Sink;
 pub use subscription::{Receiver, RecvError};
 
 use crate::data::{DeviceMetadataSnapshot, MetadataQuery, PacketParser, SampleBatch};
-use crate::device::RpcMethod;
 use crate::tio;
-use crate::tio::proto::{self, DeviceRoute};
+use crate::tio::proto::{self, DeviceRoute, RpcMethod};
 use crate::tio::proxy;
-
+use crossbeam::channel;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use crossbeam::channel;
+use subscription::Sink;
 use twinleaf_proto::data as wire;
 use twinleaf_proto::rpc as wire_rpc;
 
@@ -36,10 +33,8 @@ const EVENT_QUEUE_LEN: usize = 4096;
 /// covers, so this is deep enough to ride out a recorder's disk stall.
 const PACKET_QUEUE_LEN: usize = 8192;
 
-/// How long a first subscription keeps asking for the pump's port while the
-/// proxy's command lane is congested, and how often it asks. A pump replacing a
-/// port it lost keeps asking for as long as the worker lives, so it has no
-/// budget: congestion is momentary, and only a stopped worker is terminal.
+/// How long, and how often, a first subscription retries the pump's port
+/// through a congested command lane.
 const REGISTER_BUDGET: Duration = Duration::from_secs(2);
 const REGISTER_POLL: Duration = Duration::from_millis(50);
 
@@ -68,19 +63,15 @@ enum Discovery {
     Unsupported,
 }
 
-/// Everything the connection's stream needs to stay live: the parser, the
-/// routes known and the metadata revision last seen for each, where discovery
-/// stands, and the latest link status per affected subtree.
+/// What keeps the stream live: the parser, known routes and their metadata
+/// revisions, discovery progress, and the latest link status per subtree.
 struct StreamState {
     parser: PacketParser,
     known_routes: HashSet<DeviceRoute>,
     metadata_seen: HashMap<DeviceRoute, u32>,
     discovery: HashMap<DeviceRoute, Discovery>,
-    /// Latest status per affected subtree, keyed by the subtree's root, so a
-    /// late subscriber learns the link state it did not watch happen. A new
-    /// status supersedes every entry under it, so a nested entry is always
-    /// newer than the one containing it: replaying root-first is replaying in
-    /// causal order.
+    /// Latest status per subtree, replayed root-first to late subscribers; a new
+    /// status supersedes every entry under it.
     link_state: HashMap<DeviceRoute, proto::ProxyStatus>,
     batches: VecDeque<SampleBatch>,
     events: VecDeque<Event>,
@@ -111,9 +102,8 @@ impl StreamState {
         self.events.push_back(Event::Device { route, event });
     }
 
-    /// Emit [`DeviceEvent::Metadata`] whenever a route's complete metadata is a
-    /// revision not yet seen. Every transition to completeness bumps the
-    /// revision, so an unseen one is the only moment a snapshot can be news.
+    /// Emit [`DeviceEvent::Metadata`] when a route's complete metadata is a
+    /// revision not yet published.
     fn publish_metadata(&mut self, route: DeviceRoute) {
         let Some(revision) = self.parser.metadata_revision(route) else {
             return;
@@ -134,9 +124,8 @@ impl StreamState {
             .filter_map(|route| Some((*route, self.parser.metadata(*route)?)))
     }
 
-    /// Bring a new event subscriber up to date with what the pump already
-    /// knows — the routes heard from, each subtree's link state, the latest
-    /// metadata — filtered exactly as live events are.
+    /// Bring a new event subscriber up to date: routes heard, each subtree's link
+    /// state, and the latest metadata, filtered as live events are.
     fn replay(&self, sink: &mut Sink<Event>) -> bool {
         self.known_routes.iter().all(|route| {
             sink.offer(Scope::point(*route), || Event::Tree {
@@ -200,9 +189,8 @@ impl StreamState {
         self.publish_metadata(route);
     }
 
-    /// Give up on a query and hold its route off for a growing delay. A query
-    /// a reset or a new session already overtook says nothing about what the
-    /// route is discovering now, so it holds nothing off.
+    /// Give up on a query and hold its route off for a growing delay, unless a
+    /// reset or a new session already overtook the query.
     fn back_off(&mut self, query: MetadataQuery) {
         let route = query.route;
         if !self.parser.fail_metadata_query(query) {
@@ -250,11 +238,8 @@ impl StreamState {
         self.parser.reset_subtree(subtree);
     }
 
-    /// The inlet overflowed. Only the loss itself is news: the packets that
-    /// vanished leave sample-number gaps the parser already reports, a missed
-    /// segment update self-heals on the next id mismatch, and a missed session
-    /// change is caught by the next heartbeat. Resetting here would turn
-    /// sustained overload into an endless rediscovery storm.
+    /// Report the inlet overflowing without resetting: the parser reports the
+    /// gaps, and the next heartbeat catches a missed session change.
     fn input_overrun(&mut self) {
         self.events.push_back(Event::Link {
             subtree: DeviceRoute::root(),
@@ -262,9 +247,8 @@ impl StreamState {
         });
     }
 
-    /// Apply a link's status to the subtree it concerns: everything on a
-    /// direct connection, one mount behind a `tio proxy --mount` fan-in, which
-    /// rewrites the status onto its mount prefix.
+    /// Apply a link's status to the subtree it concerns: a direct connection, or
+    /// one mount behind `tio proxy --mount`.
     fn apply_status(&mut self, subtree: DeviceRoute, status: proto::ProxyStatus) {
         self.link_state
             .retain(|root, _| !root.starts_with(&subtree));
@@ -293,12 +277,8 @@ impl StreamState {
         }
     }
 
-    /// Take one packet. Route identity reaches every view, and every control
-    /// packet reaches the parser whatever its route — a session change missed
-    /// on an uncovered route would leave a stale snapshot to replay as fresh.
-    /// Only sample decoding waits on coverage. A status proves nothing about
-    /// its route — `FailedToConnect` means the device is not there — so it is
-    /// applied before any of that.
+    /// Take one packet: status first, then route identity and control packets for
+    /// every route, and sample decoding only when `covered`.
     fn process_packet(&mut self, pkt: &tio::Packet, covered: bool) {
         if let proto::Payload::ProxyStatus(status) = pkt.payload() {
             return self.apply_status(pkt.route(), status);
@@ -357,10 +337,8 @@ enum PumpSink {
     Packets(Sink<tio::Packet>),
 }
 
-/// The connection's one stream: a pump thread started at the first
-/// subscription and running until the last view of the connection is gone.
-/// Every view minted from the connection subscribes here, so they share a
-/// port, a parser, and one discovery.
+/// The connection's one stream: a pump started at the first subscription that
+/// every view shares, so they share a port, a parser, and one discovery.
 pub(super) struct Stream {
     root: proxy::RpcEndpoint,
     pump: OnceLock<channel::Sender<PumpSink>>,
@@ -386,9 +364,8 @@ impl Stream {
         self.mint(scope, PACKET_QUEUE_LEN, PumpSink::Packets)
     }
 
-    /// Hand the pump one more sink, starting it if this is the first. A sink
-    /// no pump takes is dropped here, so its receiver reports `Disconnected`
-    /// on the first receive instead of waiting on a stream nothing feeds.
+    /// Hand the pump one more sink, starting it if this is the first. A sink no
+    /// pump takes is dropped, so its receiver reports `Disconnected`.
     fn mint<T>(
         self: &Arc<Stream>,
         scope: Scope,
@@ -403,8 +380,7 @@ impl Stream {
     }
 
     /// The running pump's command lane, started by the first subscription that
-    /// finds none. A start that failed memoizes nothing: only a stopped proxy
-    /// worker is terminal, and every later subscription tries again.
+    /// finds none. A failed start is retried by every later subscription.
     fn pump(&self) -> Option<&channel::Sender<PumpSink>> {
         if let Some(pump) = self.pump.get() {
             return Some(pump);
@@ -432,9 +408,8 @@ struct Pump {
 }
 
 impl Pump {
-    /// Open the connection's one data port and start the thread that drains
-    /// it, or `None` when no port could be had: there is nothing to serve, and
-    /// nothing is remembered.
+    /// Open the connection's one data port and start the thread draining it, or
+    /// `None` when no port could be had.
     fn start(root: &proxy::RpcEndpoint) -> Option<channel::Sender<PumpSink>> {
         let data = Pump::register(root)?;
         let (commands, received) = channel::unbounded();
@@ -459,8 +434,7 @@ impl Pump {
     }
 
     /// Ask the worker for the data port, waiting out a command lane that is
-    /// merely congested: it is shared with every RPC, so a busy instant says
-    /// nothing about whether the connection has a stream to give.
+    /// merely congested.
     fn register(root: &proxy::RpcEndpoint) -> Option<proxy::Port> {
         let deadline = Instant::now() + REGISTER_BUDGET;
         loop {
@@ -477,9 +451,8 @@ impl Pump {
         }
     }
 
-    /// The pump outlives every subscription: it ends only when the link does,
-    /// or when the last view that could subscribe is gone. With no live sinks
-    /// it drains its port and discards, which coverage gating makes cheap.
+    /// Run until the link ends or the last view that could subscribe is gone,
+    /// draining and discarding while no sink is live.
     fn run(mut self) {
         loop {
             self.drain_commands();
@@ -515,9 +488,8 @@ impl Pump {
         }
     }
 
-    /// True if any live view decodes `route`; only those routes are decoded and
-    /// asked for metadata. Raw taps are passive — they neither decode nor
-    /// discover — so their scopes are not counted here.
+    /// True if any live view decodes `route`; raw taps neither decode nor
+    /// discover, so their scopes do not count.
     fn covers(&self, route: DeviceRoute) -> bool {
         self.batches
             .iter()
@@ -526,10 +498,8 @@ impl Pump {
             .any(|scope| scope.covers(route))
     }
 
-    /// Take what the port had queued on entry and no more, so a device that
-    /// keeps writing cannot starve new subscriptions or publishing.
-    ///
-    /// False once the proxy link is gone.
+    /// Take what the port had queued on entry and no more; false once the proxy
+    /// link is gone.
     fn drain_input(&mut self) -> bool {
         self.drain_metadata_replies();
         for _ in 0..self.data.receiver().len().max(1) {
@@ -546,11 +516,8 @@ impl Pump {
         true
     }
 
-    /// Offer a packet to the raw taps, before anything parses it and with the
-    /// absolute route it arrived with. RPC invalidations are the engine's own
-    /// input, not device data, so they stop here; a status concerns the whole
-    /// subtree at its route and is a recorded stream's own reset marker, so
-    /// every tap that subtree touches hears it.
+    /// Offer a packet to the raw taps, unparsed and with its absolute route.
+    /// Invalidations stop here; a status reaches every tap its subtree touches.
     fn tap(&mut self, packet: &tio::Packet) {
         if self.packets.is_empty() || matches!(packet.payload(), proto::Payload::RpcUpdate(_)) {
             return;
@@ -563,9 +530,8 @@ impl Pump {
             .retain_mut(|sink| sink.offer(scope, || packet.clone()));
     }
 
-    /// False once the worker has stopped and its port has run dry, so the last
-    /// packets it queued — the status saying why it stopped among them — are
-    /// still published.
+    /// False once the worker has stopped and its port has run dry, so its last
+    /// packets are still published.
     fn link_alive(&self) -> bool {
         !self.data.receiver().is_empty() || self.worker_alive()
     }
@@ -579,11 +545,8 @@ impl Pump {
         )
     }
 
-    /// The port died. While the worker lives, the drop was this client falling
-    /// behind — loss to report rather than an end — so registration is retried
-    /// for as long as the worker is there to answer it. A congested command
-    /// lane is never terminal; a stopped worker, and nothing left to subscribe,
-    /// are.
+    /// Re-register after the port died, for as long as the worker lives; false
+    /// once it, or the last subscriber, is gone.
     fn reopen(&mut self) -> bool {
         loop {
             if !self.worker_alive() {
@@ -728,10 +691,8 @@ mod tests {
         }
     }
 
-    /// A pump serving `sinks` over a port with no proxy behind it: the lane new
-    /// subscriptions take, the far end that delivers packets to it, the far end
-    /// that answers its RPCs, and the worker lifeline the test holds until it
-    /// wants the proxy to look gone.
+    /// A pump serving `sinks` over a port with no proxy: the subscription lane,
+    /// the packet and RPC far ends, and the worker lifeline.
     fn pump_with(
         sinks: Vec<PumpSink>,
     ) -> (

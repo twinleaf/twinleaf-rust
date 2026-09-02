@@ -4,7 +4,8 @@
 
 use crossbeam::channel::{self, Receiver, Sender};
 use std::collections::HashSet;
-use twinleaf::device::{DeviceRoute, DeviceTree, RpcRegistry, RpcValueTypeExt};
+use twinleaf::device::rpc::{RpcRegistry, RpcValueTypeExt};
+use twinleaf::device::{DeviceRoute, DeviceTree};
 
 use crate::tools::rpc::{encode_rpc_argument, format_rpc_value, resolve_rpc_type};
 use crate::tui::rpc_palette::RpcReq;

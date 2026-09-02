@@ -1,4 +1,4 @@
-use twinleaf::{device::RpcRegistry, tio::proto::ProxyStatus, SessionId};
+use twinleaf::{device::rpc::RpcRegistry, tio::proto::ProxyStatus, SessionId};
 
 use crate::tui::rpc_palette::RpcPaletteStatus;
 

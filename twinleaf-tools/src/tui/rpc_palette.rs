@@ -24,8 +24,8 @@ use ratatui::{
     Frame,
 };
 use tui_prompts::{State, TextState};
-use twinleaf::device::{DeviceRoute, RpcDescriptor, RpcRegistry};
-use twinleaf::device::{RpcMetaExt, RpcValueType};
+use twinleaf::device::rpc::{RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueType};
+use twinleaf::device::DeviceRoute;
 
 const RPCLIST_MAX_LEN: usize = 12;
 /// Close-affordance title on the input block; also hit-tested for clicks.
