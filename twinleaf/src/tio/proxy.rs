@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel;
 
+/// Where a tool connects when told nothing else: a proxy on this host.
 pub const DEFAULT_URL: &str = "tcp://localhost";
 
 /// Status event that ProxyCore sent back to an optional user specified channel
@@ -33,34 +34,59 @@ pub enum Event {
     SensorDisconnected,
     /// First packet received after a disconnect.
     SensorReconnected,
+    /// The transport never opened.
     FailedToConnect,
+    /// Reconnecting was given up on.
     FailedToReconnect,
+    /// The worker is stopping.
     Exiting,
+    /// A text line the device sent.
     Text(String),
     /// A buffer from the device did not decode as a packet.
     ProtocolError(packet::DecodeError),
     /// The transport failed in a way that ends the worker.
     FatalError(transport::RecvError),
+    /// A client port was opened, with its id.
     NewClient(u64),
+    /// A client's request id was rewritten to a wire id for the device.
     RpcRemap((u64, u16), u16),
+    /// A reply's wire id was restored to the client's request id.
     RpcRestore(u16, (u64, u16)),
+    /// A reply arrived for a wire id with no outstanding request.
     RpcRestoreNotFound(u16),
+    /// A reply's client had already gone.
     RpcClientNotFound(u64),
+    /// A request timed out, by wire id.
     RpcTimeout(u16),
+    /// A request was failed because its device or link went away.
     RpcCancel(u16),
+    /// A client's queue was full, so the client was dropped.
     ClientSendFailed(u64),
+    /// A client port was closed.
     ClientTerminated(u64),
+    /// The root device's heartbeat carried a new session id.
     RootDeviceRestarted,
+    /// Serial rate negotiation stopped at the current rate.
     AutoRateGaveUp,
+    /// The device was asked whether it supports this rate.
     AutoRateQueried(u32),
+    /// The device refused a rate query.
     AutoRateRpcError(wire_rpc::RpcError),
+    /// The device's rate reply did not decode.
     AutoRateRpcInvalid,
+    /// The device cannot run at the target rate; it offered this one.
     AutoRateIncompatible(u32),
+    /// The device confirmed this rate.
     AutoRateCompatible(u32),
+    /// Waiting for the device to switch rates.
     AutoRateWait,
+    /// The device was told to switch to this rate.
     AutoRateSet(u32),
+    /// The host's serial port was set to this rate.
     SetRate(u32),
+    /// The host's serial port refused the rate.
     SetRateFailed,
+    /// Nothing arrived after a rate change, so the host fell back.
     NoData,
 }
 
@@ -84,20 +110,27 @@ pub struct Port {
     scope: DeviceRoute,
 }
 
+/// Why a port could not take a packet. Each carries the packet back.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SendError {
+    /// The port's queue is full.
     #[error("channel full")]
     WouldBlock(Packet),
+    /// The proxy worker is gone.
     #[error("proxy disconnected")]
     ProxyDisconnected(Packet),
+    /// The route lies outside the port's scope.
     #[error("route exceeds port scope")]
     InvalidRoute(Packet),
 }
 
+/// Why a non-blocking receive returned no packet.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RecvError {
+    /// Nothing is queued.
     #[error("no packet available")]
     WouldBlock,
+    /// The proxy worker is gone.
     #[error("proxy disconnected")]
     ProxyDisconnected,
 }
@@ -105,8 +138,10 @@ pub enum RecvError {
 /// Error returned by a receive operation with a time bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecvTimeoutError {
+    /// Nothing arrived in time.
     #[error("timed out waiting for a packet")]
     Timeout,
+    /// The proxy worker is gone.
     #[error("proxy disconnected")]
     ProxyDisconnected,
 }
@@ -216,10 +251,13 @@ impl Port {
     }
 }
 
+/// Why a port or RPC endpoint could not be opened.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PortError {
+    /// The RPC timeout is below the minimum.
     #[error("RPC timeout too short")]
     RpcTimeoutTooShort,
+    /// The RPC timeout is above the maximum.
     #[error("RPC timeout too long")]
     RpcTimeoutTooLong,
     /// The worker's command lane is full. Transient: it is still running, and

@@ -1,19 +1,14 @@
-//! Abstract port
+//! One OS link turned into packets: serial, TCP, or UDP, owned by a thread.
 //!
-//! The `Port` object provides a few things:
-//! - Abstracting across the specific `RawPort`s. This abstraction
-//!   is powerful enough that it should never be needed to use
-//!   the low level `RawPort` object.
-//! - Connecting the ports to external code in a flexible way.
-//!   This is achieved via a owned-callback interface, and it
-//!   importantly allows to bridge the `mio` world of the low level
-//!   ports with crossbeam channels.
-//! - Automating some basic port operations. A `Port` provides
-//!   polling, send queues, as-needed port draining, startup
-//!   holdoff, and the sending of heartbeats as needed to satisfy
-//!   periodic packet receiving requirements.
+//! A [`Port`] here is the wire's end. On its own thread it frames bytes into
+//! [`Packet`]s, queues packets to write, negotiates serial rates, and sends
+//! heartbeats. Two things need one: the proxy, for its link to the device
+//! tree, and a proxy server, for each client socket it accepts. An application
+//! never opens one. [`Connection`](crate::Connection) opens the proxy, and the
+//! proxy opens the port.
 //!
-//! Note: `Port` sets up a dedicated thread to perform the above.
+//! What arrives is handed to a callback or a channel of [`ReceiveResult`].
+//! What leaves goes through [`send`](Port::send).
 
 mod iobuf;
 #[cfg(feature = "serial")]
@@ -222,9 +217,8 @@ enum ControlResult {
     SetRateError(RateError),
 }
 
-/// Opaque abstract port object, encapsulating I/O with an underlying
-/// `RawPort` as well as automating all the requirements from the
-/// RawPort interface.
+/// One link's I/O thread: packets in through a callback or channel, packets
+/// out through [`send`](Self::send). Dropping it closes the link.
 pub struct Port {
     tx: Option<Box<crossbeam::channel::Sender<PacketOrControl>>>,
     waker: mio::Waker,
