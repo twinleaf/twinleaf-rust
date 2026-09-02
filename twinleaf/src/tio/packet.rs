@@ -31,8 +31,8 @@ pub struct Packet {
 
 /// Borrowed view of a packet's payload.
 ///
-/// Text fields are `&str` only where the wire codec validated them as UTF-8;
-/// everything else stays bytes, and callers convert at the point of use.
+/// Text fields are `&str` only where the wire codec validated them as UTF-8.
+/// Everything else stays bytes, and callers convert at the point of use.
 #[derive(Debug, Clone, Copy)]
 pub enum Payload<'a> {
     Log(LogMessage<'a>),
@@ -62,8 +62,8 @@ pub enum ProxyStatus {
     Unknown(u8),
 }
 
-/// Why a buffer is not one packet. Transports count and log these; none of
-/// them is matched on beyond [`Self::NeedMore`].
+/// Why a buffer is not one packet. Transports count and log these, and none
+/// of them is matched on beyond [`Self::NeedMore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     #[error("more data needed")]

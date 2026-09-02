@@ -4,7 +4,7 @@
 //! A proxy thread owns the hardware port and fans it out to any number of
 //! `Port`s, each restricted to a subtree and a traffic class, negotiating the
 //! serial rate on the way. This is what a proxy *server* serves its clients
-//! with; applications reach devices through [`Connection`](crate::Connection),
+//! with. Applications reach devices through [`Connection`](crate::Connection),
 //! whose views hand out packets, events and samples already filtered to what
 //! they cover.
 
@@ -371,7 +371,7 @@ impl RpcEndpoint {
         reply
     }
 
-    /// Submit a call; `complete` runs exactly once with its outcome, here if
+    /// Submit a call. `complete` runs exactly once with its outcome, here if
     /// the request cannot leave, otherwise on the proxy thread.
     pub(crate) fn submit_with(
         &self,
@@ -505,7 +505,7 @@ impl RpcEndpoint {
 /// The transport half of a link to one device tree, over serial, TCP, or UDP.
 ///
 /// Opening one starts the I/O thread that owns the transport and reconnects on
-/// its own. This is the half a proxy server runs on;
+/// its own. This is the half a proxy server runs on.
 /// [`Connection`](crate::Connection) is what an application opens.
 pub struct Connection {
     proxy: ProxyHandle,

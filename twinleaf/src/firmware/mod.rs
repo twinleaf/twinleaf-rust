@@ -2,8 +2,9 @@
 //!
 //! This module is dependency-free "plumbing": it queries what firmware a
 //! device is running, compares it against a catalog of published firmware,
-//! and flashes an image — with **no** user interaction, printing, or progress
-//! rendering. Callers (the `tio` CLI, the macOS app, …) supply the porcelain.
+//! and flashes an image, with no user interaction, printing, or progress
+//! rendering. Callers such as the `tio` CLI and the macOS app supply the
+//! porcelain.
 //!
 //! Networking is abstracted behind the [`FirmwareCatalog`] trait so consumers
 //! can plug in their own source. A ready-made GitHub-backed catalog is provided
@@ -113,7 +114,7 @@ pub enum UpdateStatus {
     /// published release. No catalog lookup is performed in this case.
     DevelopmentBuild,
     /// The installed build date could not be determined, so freshness is
-    /// unknown; the caller should decide whether to offer the latest release.
+    /// unknown. The caller should decide whether to offer the latest release.
     Unknown,
 }
 
@@ -133,11 +134,11 @@ pub struct UpdateReport {
 /// Result of the `dev.stop` issued at the start of [`flash`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// `dev.stop` succeeded; the device stopped streaming.
+    /// `dev.stop` succeeded and the device stopped streaming.
     Stopped,
     /// The device reported it was already stopped.
     AlreadyStopped,
-    /// The device has no `dev.stop` RPC; flashing proceeds anyway.
+    /// The device has no `dev.stop` RPC. Flashing proceeds anyway.
     Unsupported,
 }
 
@@ -157,9 +158,9 @@ pub enum FlashEvent {
         total: usize,
         error: String,
     },
-    /// Upload finished; the commit RPC is being issued.
+    /// Upload finished. The commit RPC is being issued.
     Committing,
-    /// Commit accepted; settling before the link can be dropped.
+    /// Commit accepted. Settling before the link can be dropped.
     Finalizing,
     /// Upgrade fully committed.
     Complete,
@@ -220,7 +221,7 @@ fn bracket_content(desc: &str) -> Option<&str> {
 ///
 /// The general shape is `{header} ({serial}) [{date}/{build}]`:
 /// - `header` whitespace-splits into `{vendor} {name} {revision}` (name/revision
-///   are tokens 1 and 2; absent for headers that aren't in that form),
+///   are tokens 1 and 2, and absent for headers that aren't in that form),
 /// - the parenthesized field is the device serial (`(null)` -> none),
 /// - inside `[...]`, the part before `/` is the build date and the part after
 ///   `/` is the build version (which contains `DEV` for development builds).
@@ -272,15 +273,15 @@ fn parse_installed(desc: &str) -> InstalledFirmware {
 
 /// Query a connected device for the firmware it is currently running.
 ///
-/// Everything is derived from the single `dev.desc` RPC; `dev.name`/
+/// Everything is derived from the single `dev.desc` RPC. `dev.name` and
 /// `dev.revision` are not used.
 pub fn query_installed(device: &Device) -> Result<InstalledFirmware, FirmwareError> {
     let desc: String = device.get("dev.desc")?;
     Ok(parse_installed(&desc))
 }
 
-/// Pick the newest release from a list (newest build date wins; filename breaks
-/// ties deterministically).
+/// Pick the newest release from a list. The newest build date wins, and the
+/// filename breaks ties deterministically.
 pub fn latest_release(mut releases: Vec<FirmwareRelease>) -> Option<FirmwareRelease> {
     releases.sort_by(|a, b| {
         a.date
@@ -369,7 +370,7 @@ pub fn cache_path(cache_root: &Path, release: &FirmwareRelease) -> PathBuf {
 /// Return a release's bytes, using the on-disk cache when possible.
 ///
 /// If the exact file (its name embeds the build date and hash) is already
-/// cached, it is read from disk; otherwise it is downloaded via `catalog` and
+/// cached, it is read from disk. Otherwise it is downloaded via `catalog` and
 /// written atomically (temp file + rename) so an interrupted download never
 /// leaves a truncated image behind.
 pub fn download_cached(
@@ -405,9 +406,9 @@ pub fn download_cached(
 
 /// Upload a firmware image to the device and commit the upgrade.
 ///
-/// Progress is reported through `on_event`; nothing is printed. A chunk lost
-/// in either direction fails its window; the upload then reads the device's
-/// cursor and resumes from that chunk, giving up only after three
+/// Progress is reported through `on_event`, and nothing is printed. A chunk
+/// lost in either direction fails its window. The upload then reads the
+/// device's cursor and resumes from that chunk, giving up only after three
 /// resumptions in a row that move the cursor nowhere. The function blocks for
 /// a short settle period after committing (see [`FlashEvent::Finalizing`]) so
 /// the device is not power-cycled mid-write.
@@ -779,7 +780,7 @@ mod tests {
     }
 
     /// Losing chunk 1 also gets chunk 2, already in flight, rejected for its
-    /// offset; the upload reads the cursor and resends both.
+    /// offset. The upload reads the cursor and resends both.
     #[test]
     fn a_lost_chunk_is_resent_from_the_devices_cursor() {
         let mut lost = false;
@@ -815,7 +816,7 @@ mod tests {
         assert_eq!(cursor, THREE_CHUNKS_DATA);
     }
 
-    /// A device already holding the first chunk rejects chunk 0; the upload
+    /// A device already holding the first chunk rejects chunk 0. The upload
     /// resumes from wherever the cursor is by then.
     #[test]
     fn a_partial_upload_resumes_where_the_device_left_off() {

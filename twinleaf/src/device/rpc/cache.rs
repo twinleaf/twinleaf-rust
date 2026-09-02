@@ -51,7 +51,7 @@ pub(super) fn load(path: &Path) -> io::Result<Option<Entries>> {
     }
 }
 
-/// Write the cache; an unwritable directory only costs a round-trip next
+/// Write the cache. An unwritable directory only costs a round-trip next
 /// time, never a failed registry.
 pub(super) fn store(path: &Path, entries: &Entries) {
     warn(write(path, entries), "write", path);
@@ -63,7 +63,7 @@ fn warn(result: io::Result<()>, action: &str, path: &Path) {
     }
 }
 
-/// Read the private on-disk cache format; invalid contents are a miss, not
+/// Read the private on-disk cache format. Invalid contents are a miss, not
 /// an error.
 fn read(file: File) -> io::Result<Option<Entries>> {
     let reader = io::BufReader::new(file);

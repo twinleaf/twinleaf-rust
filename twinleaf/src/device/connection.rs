@@ -39,8 +39,8 @@ pub enum MetadataError {
 ///
 /// Opening one starts the workers that own the transport and reconnect on
 /// their own. It covers the whole tree, so [`tree`](Connection::tree) and
-/// [`device`](Connection::device) cannot fail. Cloning is free; every clone is
-/// the same connection.
+/// [`device`](Connection::device) cannot fail. Cloning is free, and every
+/// clone is the same connection.
 ///
 /// On macOS and Windows the workers request latency-critical scheduling and
 /// inhibit idle sleep while active.
@@ -133,9 +133,9 @@ impl Connection {
 
 /// A routed view of a device tree.
 ///
-/// RPCs take a route, for when it varies between operations; [`Device`] binds
+/// RPCs take a route, for when it varies between operations. [`Device`] binds
 /// one. Subscriptions are filtered to this subtree and carry absolute routes.
-/// Cloning is cheap; every clone is the same view.
+/// Cloning is cheap, and every clone is the same view.
 ///
 /// ```no_run
 /// use twinleaf::{Connection, DeviceRoute};
@@ -258,7 +258,7 @@ impl DeviceTree {
     }
 
     /// Issue an RPC at `route` without waiting. The reply resolves exactly
-    /// once; an out-of-scope route resolves with [`CallError::InvalidRoute`].
+    /// once. An out-of-scope route resolves with [`CallError::InvalidRoute`].
     pub fn submit(&self, route: DeviceRoute, name: &str, arg: &[u8]) -> PendingReply {
         PendingReply {
             reply: self.endpoint.submit(route, name, arg),
@@ -307,7 +307,7 @@ impl DeviceTree {
 
 /// One device with its route bound, minted by [`DeviceTree::device`].
 ///
-/// Cheap to create and never contacts the device; the first operation learns
+/// Cheap to create and never contacts the device. The first operation learns
 /// whether it exists.
 ///
 /// ```no_run
