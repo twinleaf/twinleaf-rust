@@ -2,10 +2,10 @@ use crate::tools::recv_before;
 use crate::{DumpCli, TioOpts};
 use std::time::Instant;
 use twinleaf::data::{ColumnFilter, SampleBatch, SampleRow};
-use twinleaf::device::DeviceRoute;
+use twinleaf::proto::data;
 use twinleaf::tio;
 use twinleaf::Connection;
-use twinleaf_proto::data;
+use twinleaf::DeviceRoute;
 
 pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
     dump(
@@ -60,7 +60,7 @@ pub fn dump(
             while let Some(pkt) =
                 recv_before(&packets, deadline, "packets").wrap_err("stream ended")?
             {
-                if let tio::proto::Payload::Metadata(record, _) = pkt.payload() {
+                if let tio::packet::Payload::Metadata(record, _) = pkt.payload() {
                     print_metadata_record(&pkt.route(), record);
                 }
             }

@@ -142,7 +142,8 @@ pub mod export;
 #[cfg(test)]
 mod fixtures;
 
-pub use crate::tio::proto::DataType;
+#[doc(no_inline)]
+pub use crate::proto::data::DataType;
 pub use buffer::{Buffer, Run};
 pub use filter::ColumnFilter;
 pub use metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamMetadataSnapshot};

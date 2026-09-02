@@ -5,9 +5,9 @@ use super::stream::{
     DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, Stream, TreeEvent,
 };
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
+use crate::proto::DeviceRoute;
+use crate::proto::RouteError;
 use crate::tio;
-use crate::tio::proto::route::RouteError;
-use crate::tio::proto::DeviceRoute;
 use crate::tio::proxy;
 use crossbeam::channel;
 use std::sync::Arc;
@@ -83,7 +83,7 @@ impl Connection {
     /// owns, so the server asks its questions over the same transport.
     pub fn over(proxy: &proxy::Connection) -> Connection {
         let root = proxy
-            .rpc_endpoint(None, DeviceRoute::root(), twinleaf_proto::MAX_ROUTING_SIZE)
+            .rpc_endpoint(None, DeviceRoute::root(), crate::proto::MAX_ROUTING_SIZE)
             .expect("the default RPC timeout is in range");
         Connection {
             tree: DeviceTree {
@@ -410,11 +410,11 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tio::proto;
+    use crate::proto::rpc as wire_rpc;
+    use crate::tio::packet;
     use crate::tio::proxy::RawCallError;
     use crate::tio::proxy_core::ProxyCommand;
     use std::thread;
-    use twinleaf_proto::rpc as wire_rpc;
 
     fn test_tree() -> (
         DeviceTree,
@@ -475,7 +475,7 @@ mod tests {
             else {
                 panic!("expected a direct RPC command");
             };
-            let proto::Payload::RpcRequest(request) = request.payload() else {
+            let packet::Payload::RpcRequest(request) = request.payload() else {
                 panic!("expected an RPC request");
             };
             assert_eq!(request.method, wire_rpc::Method::ByName(b"dev.name"));
@@ -501,7 +501,7 @@ mod tests {
                 else {
                     panic!("expected a direct RPC command");
                 };
-                let proto::Payload::RpcRequest(request) = request.payload() else {
+                let packet::Payload::RpcRequest(request) = request.payload() else {
                     panic!("expected an RPC request");
                 };
                 let wire_rpc::Method::ByName(name) = request.method else {

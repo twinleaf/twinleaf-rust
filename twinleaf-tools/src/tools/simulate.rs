@@ -12,14 +12,15 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // Incoming packets are still parsed with the host's owned model; everything
 // this device *sends* is written by the wire crate, as firmware would.
-use twinleaf::tio::proto;
-use twinleaf_proto::data::MetadataType;
-use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
-use twinleaf_proto::{data, heartbeat, log, packet, rpc, settings, sync};
-use twinleaf_proto::{
+use twinleaf::proto;
+use twinleaf::proto::data::MetadataType;
+use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
+use twinleaf::proto::{data, heartbeat, log, rpc, settings, sync};
+use twinleaf::proto::{
     ColumnId, DeviceRoute, RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
 };
-use twinleaf_proto::{MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
+use twinleaf::proto::{MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
+use twinleaf::tio::packet;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;
@@ -736,7 +737,7 @@ impl TestDevice {
                     if !self.accept_packet_from(addr)? {
                         continue;
                     }
-                    match proto::Packet::from_slice_prefix(&buf[..size]) {
+                    match packet::Packet::from_slice_prefix(&buf[..size]) {
                         Ok((packet, parsed_size)) if parsed_size == size => {
                             self.handle_packet(packet, addr)?;
                         }
@@ -823,8 +824,8 @@ impl TestDevice {
         Ok(())
     }
 
-    fn handle_packet(&mut self, packet: proto::Packet, addr: SocketAddr) -> io::Result<()> {
-        if let proto::Payload::RpcRequest(req) = packet.payload() {
+    fn handle_packet(&mut self, packet: packet::Packet, addr: SocketAddr) -> io::Result<()> {
+        if let packet::Payload::RpcRequest(req) = packet.payload() {
             self.handle_rpc(req, packet.route(), addr)?;
         }
         Ok(())
@@ -1671,7 +1672,7 @@ impl TestDevice {
     ) -> io::Result<()> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut written = write(&mut buf)
-            .and_then(|len| packet::Packet::from_slice(&buf[..len]))
+            .and_then(|len| proto::packet::Packet::from_slice(&buf[..len]))
             .ok_or_else(|| encode_error(&describe(), "does not fit a packet"))?;
         // Hops travel leaf-first on the wire, the reverse of a route's order.
         for &hop in routing.as_slice().iter().rev() {

@@ -4,9 +4,9 @@ use super::cache;
 use super::codec::RpcReply;
 use super::error::CallError;
 use super::reply::{pipelined, PendingReply};
+use crate::proto::rpc::RpcMeta;
 use std::collections::BTreeMap;
 use std::io;
-use twinleaf_proto::rpc::RpcMeta;
 
 /// Most `rpc.listinfo` fetches in flight at once during a walk, bounding the
 /// request burst a memory-tight device must absorb.

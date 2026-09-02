@@ -189,7 +189,7 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
         match device.raw_rpc(&rpc_name, i.to_le_bytes().as_ref()) {
             Ok(mut rep) => full_reply.append(&mut rep),
             Err(CallError::DeviceError(err)) => {
-                if let twinleaf_proto::rpc::RpcError::Invalid = err.error {
+                if let twinleaf::proto::rpc::RpcError::Invalid = err.error {
                     break;
                 } else {
                     return Err(eyre::Report::new(CallError::DeviceError(err))

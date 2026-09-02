@@ -102,12 +102,13 @@ mod tests {
         BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord,
     };
     use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData, StreamKey};
-    use crate::tio::proto::{DataType, DeviceRoute};
-    use twinleaf_proto::data as wire;
+    use crate::proto::data as wire;
+    use crate::proto::data::DataType;
+    use crate::proto::DeviceRoute;
 
     fn segment(segment_id: u8) -> SegmentRecord {
         SegmentRecord::encode(wire::Segment {
-            segment_id: twinleaf_proto::SegmentId::new(segment_id),
+            segment_id: crate::proto::SegmentId::new(segment_id),
             sampling_rate: 4,
             ..fixtures::segment(1)
         })
@@ -125,7 +126,7 @@ mod tests {
     ) -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
             BatchContext::new(
-                StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(1)),
+                StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1)),
                 boundary,
                 generations,
                 segment.clone(),
@@ -145,7 +146,7 @@ mod tests {
         );
         for n in first..first + rows {
             builder.push_row(
-                twinleaf_proto::SampleNumber::new(n),
+                crate::proto::SampleNumber::new(n),
                 [ColumnData::Float(f64::from(n))],
             );
         }
@@ -221,8 +222,8 @@ mod tests {
             2,
             2,
             Some(BoundaryReason::SamplesLost {
-                expected: twinleaf_proto::SampleNumber::new(2),
-                received: twinleaf_proto::SampleNumber::new(2),
+                expected: crate::proto::SampleNumber::new(2),
+                received: crate::proto::SampleNumber::new(2),
             }),
             generations(1),
         ));

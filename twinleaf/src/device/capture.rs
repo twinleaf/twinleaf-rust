@@ -6,10 +6,10 @@
 
 use super::connection::Device;
 use super::rpc::CallError;
-use crate::tio::proto::DataType;
+use crate::proto::capture as wire;
+use crate::proto::data::DataType;
+use crate::proto::rpc::RpcError;
 use std::time::{Duration, Instant};
-use twinleaf_proto::capture as wire;
-use twinleaf_proto::rpc::RpcError;
 
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CAPTURE_TRIGGER_INDEX: i16 = -1;

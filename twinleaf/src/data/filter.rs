@@ -4,7 +4,7 @@
 //! itself, one matching its subtree — so naming a node selects everything
 //! beneath it without the caller enumerating depths.
 
-use crate::tio::proto::DeviceRoute;
+use crate::proto::DeviceRoute;
 use glob::Pattern;
 
 /// Glob filter over column paths of the form `/{route}/{stream}/{column}`.
@@ -113,7 +113,7 @@ impl ColumnFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tio::proto::DeviceRoute;
+    use crate::proto::DeviceRoute;
 
     fn route(s: &str) -> DeviceRoute {
         s.parse().unwrap()

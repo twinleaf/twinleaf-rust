@@ -2,8 +2,8 @@ use super::{record_parse_result, report_missing_metadata, unparseable_routes};
 use crate::tools::dump::{print_batch_meta, print_metadata_record, print_sample};
 use std::collections::HashSet;
 use twinleaf::data::PacketParser;
-use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
+use twinleaf::DeviceRoute;
 
 pub fn log_dump(
     files: Vec<String>,
@@ -87,7 +87,7 @@ pub fn log_dump(
                     };
                     rest = &rest[len..];
 
-                    if let tio::proto::Payload::Metadata(record, _) = pkt.payload() {
+                    if let tio::packet::Payload::Metadata(record, _) = pkt.payload() {
                         if route_matches(&pkt.route()) {
                             print_metadata_record(&pkt.route(), record);
                             printed_any = true;

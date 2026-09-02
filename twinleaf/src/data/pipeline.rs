@@ -112,8 +112,9 @@ mod tests {
         buffer_type, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord,
     };
     use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
-    use crate::tio::proto::{DataType, DeviceRoute};
-    use twinleaf_proto::data as wire;
+    use crate::proto::data as wire;
+    use crate::proto::data::DataType;
+    use crate::proto::DeviceRoute;
 
     /// Records every `(timestamp, value)` it is pushed, in push order. The
     /// simplest possible [`ColumnOp`], used to assert exactly-once,
@@ -156,7 +157,7 @@ mod tests {
     fn fixture() -> Fixture {
         let route = DeviceRoute::root();
         let stream_id = 1;
-        let column_id = twinleaf_proto::ColumnId::new(0);
+        let column_id = crate::proto::ColumnId::new(0);
 
         let device = DeviceRecord::encode(fixtures::device()).unwrap();
         let stream = StreamRecord::encode(wire::Stream {
@@ -172,7 +173,7 @@ mod tests {
             DataType::F64,
         ))
         .unwrap();
-        let column_key = ColumnKey::new(route, twinleaf_proto::StreamId::new(stream_id), column_id);
+        let column_key = ColumnKey::new(route, crate::proto::StreamId::new(stream_id), column_id);
 
         Fixture {
             column_key,
@@ -218,7 +219,7 @@ mod tests {
             );
             for &(sample_number, value) in rows {
                 builder.push_row(
-                    twinleaf_proto::SampleNumber::new(sample_number),
+                    crate::proto::SampleNumber::new(sample_number),
                     [ColumnData::Float(value)],
                 );
             }
@@ -294,13 +295,13 @@ mod tests {
         fx.push_in_segment(
             &mut buffer,
             1,
-            rolled(twinleaf_proto::SegmentId::new(1), 2),
+            rolled(crate::proto::SegmentId::new(1), 2),
             &[(0, 2.0), (1, 3.0)],
         );
         fx.push_in_segment(
             &mut buffer,
             1,
-            rolled(twinleaf_proto::SegmentId::new(0), 4),
+            rolled(crate::proto::SegmentId::new(0), 4),
             &[(0, 4.0), (1, 5.0)],
         );
 

@@ -87,7 +87,7 @@ pub mod discovery;
 pub mod rpc;
 mod stream;
 
-pub use crate::tio::proto::route::RouteError;
-pub use crate::tio::proto::DeviceRoute;
+#[doc(no_inline)]
+pub use crate::proto::RouteError;
 pub use connection::{Connection, Device, DeviceTree, MetadataError};
 pub use stream::{DeviceEvent, Event, LinkEvent, NamedRoute, Receiver, RecvError, TreeEvent};

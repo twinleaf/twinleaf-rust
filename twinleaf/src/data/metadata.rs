@@ -3,13 +3,15 @@
 //! wire data type.
 
 use super::sample::{SampleBatch, StreamKey};
+use crate::proto::data as wire;
+use crate::proto::data::DataType;
+use crate::proto::DeviceRoute;
+use crate::proto::{ColumnId, StreamId, MAX_PAYLOAD_SIZE};
 use crate::tio;
-use crate::tio::proto::{DataType, DeviceRoute, EncodeError, Packet};
+use crate::tio::packet::{EncodeError, Packet};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::{ColumnId, StreamId, MAX_PAYLOAD_SIZE};
 
 macro_rules! metadata_record {
     ($record:ident, $kind:ident) => {
@@ -286,7 +288,7 @@ pub(crate) enum BufferType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use twinleaf_proto::SessionId;
+    use crate::proto::SessionId;
 
     fn route(value: &str) -> DeviceRoute {
         value.parse().unwrap()

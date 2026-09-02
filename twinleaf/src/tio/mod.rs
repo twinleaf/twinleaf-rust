@@ -5,9 +5,9 @@
 //! [`Packet`]s, events and samples already filtered to what they cover.
 
 pub(crate) mod os;
-pub mod proto;
+pub mod packet;
 pub mod proxy;
 pub(crate) mod proxy_core;
 pub mod transport;
 
-pub use proto::Packet;
+pub use packet::Packet;

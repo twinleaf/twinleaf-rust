@@ -12,14 +12,16 @@ use super::sample::{
     sample_time, BatchContext, BoundaryReason, ColumnData, Generations, RowSource,
     SampleBatchBuilder, StreamKey,
 };
+use crate::proto::data as wire;
+use crate::proto::data::MAX_SAMPLE_NUMBER;
+use crate::proto::heartbeat::Heartbeat;
+use crate::proto::DeviceRoute;
+use crate::proto::RouteError;
+use crate::proto::{SampleNumber, SegmentId, SessionId, StreamId};
 use crate::tio;
-use crate::tio::proto::route::RouteError;
-use crate::tio::proto::{self, DeviceRoute, MAX_SAMPLE_NUMBER};
+use crate::tio::packet;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::heartbeat::Heartbeat;
-use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
 
 /// Why an otherwise well-formed packet cannot be applied to the data state.
 #[derive(Debug, thiserror::Error)]
@@ -725,7 +727,7 @@ impl DeviceState {
     /// Apply packets that update decoding state but do not contain sample rows.
     fn apply_control_packet(&mut self, packet: &tio::Packet, global_generation: &mut u32) {
         match packet.payload() {
-            proto::Payload::Metadata(..) => {
+            packet::Payload::Metadata(..) => {
                 let (kind, _, record) = wire::split_metadata(packet.payload_bytes())
                     .expect("a metadata payload was framed when the packet was validated");
                 self.apply_metadata(
@@ -735,7 +737,7 @@ impl DeviceState {
                     global_generation,
                 );
             }
-            proto::Payload::Heartbeat(Heartbeat::Session(session)) => {
+            packet::Payload::Heartbeat(Heartbeat::Session(session)) => {
                 if let Some(device) = &self.metadata {
                     if device.get().session != session && !self.ignore_session {
                         for stream in self.streams.iter_mut().flatten() {
@@ -929,8 +931,8 @@ impl ParseState {
                 source,
             })?;
 
-        if let proto::Payload::ProxyStatus(status) = packet.payload() {
-            if matches!(status, proto::ProxyStatus::SensorDisconnected) {
+        if let packet::Payload::ProxyStatus(status) = packet.payload() {
+            if matches!(status, packet::ProxyStatus::SensorDisconnected) {
                 self.reset_subtree(route);
                 return Ok(PacketEvent::Reset);
             }
@@ -938,7 +940,7 @@ impl ParseState {
         }
 
         match packet.payload() {
-            proto::Payload::Samples(data) => {
+            packet::Payload::Samples(data) => {
                 let index = self.device_index(route);
                 let state = self.devices[index]
                     .1

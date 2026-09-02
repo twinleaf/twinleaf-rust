@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{LogCli, LogSubcommands, MetaSubcommands};
-use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
+use twinleaf::DeviceRoute;
 
 mod csv;
 mod dump;
@@ -104,7 +104,7 @@ fn record_parse_result(
         parsed,
         unparsed,
         &pkt.route(),
-        matches!(pkt.payload(), tio::proto::Payload::Samples(data) if !data.data.is_empty()),
+        matches!(pkt.payload(), tio::packet::Payload::Samples(data) if !data.data.is_empty()),
         samples_len,
     );
 }

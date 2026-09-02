@@ -63,7 +63,7 @@ fn main() {
 [`DeviceTree`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.DeviceTree.html
 [`Discovery`]: https://docs.rs/twinleaf/latest/twinleaf/device/discovery/struct.Discovery.html
 [`Event`]: https://docs.rs/twinleaf/latest/twinleaf/device/enum.Event.html
-[`Packet`]: https://docs.rs/twinleaf/latest/twinleaf/tio/proto/struct.Packet.html
+[`Packet`]: https://docs.rs/twinleaf/latest/twinleaf/tio/packet/struct.Packet.html
 [`Receiver`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Receiver.html
 [`SampleBatch`]: https://docs.rs/twinleaf/latest/twinleaf/data/struct.SampleBatch.html
 [data module]: https://docs.rs/twinleaf/latest/twinleaf/data/index.html

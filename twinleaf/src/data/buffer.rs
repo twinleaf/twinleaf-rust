@@ -9,11 +9,11 @@
 use super::coalesce::BatchCoalescer;
 use super::metadata::{ColumnRecord, SegmentRecord, StreamRecord};
 use super::sample::{ColumnKey, Generations, SampleBatch, StreamKey};
+use crate::proto::data as wire;
+use crate::proto::{ColumnId, SampleNumber};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::time::Instant;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::{ColumnId, SampleNumber};
 
 /// The newest samples of every stream that has delivered data, each capped at
 /// `capacity` rows.
@@ -271,7 +271,8 @@ mod tests {
     use crate::data::metadata::{buffer_type, DeviceRecord};
     use crate::data::pipeline::{ColumnOp, ColumnProcessor};
     use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
-    use crate::tio::proto::{DataType, DeviceRoute};
+    use crate::proto::data::DataType;
+    use crate::proto::DeviceRoute;
 
     /// Records every sample it is fed, plus the length of each span it was fed as,
     /// so tests can see where the buffer's chunk boundaries fall.
@@ -395,12 +396,12 @@ mod tests {
             .collect();
 
         Fixture {
-            stream_key: StreamKey::new(route, twinleaf_proto::StreamId::new(stream_id)),
+            stream_key: StreamKey::new(route, crate::proto::StreamId::new(stream_id)),
             column_keys: (0..columns.len())
                 .map(|index| {
                     ColumnKey::new(
                         route,
-                        twinleaf_proto::StreamId::new(stream_id),
+                        crate::proto::StreamId::new(stream_id),
                         ColumnId::new(u8::try_from(index).unwrap()),
                     )
                 })
@@ -510,7 +511,7 @@ mod tests {
         // A seamless rollover keeps the stream generation, so the run continues even
         // though the new segment starts a new chunk.
         let rolled = SegmentRecord::encode(wire::Segment {
-            segment_id: twinleaf_proto::SegmentId::new(1),
+            segment_id: crate::proto::SegmentId::new(1),
             start_time: 4,
             ..fx.segment.get()
         })
@@ -622,7 +623,7 @@ mod tests {
         assert!(matches!(values[2], ColumnData::UInt(12)));
 
         // No run for a stream that never received data.
-        let other = StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(99));
+        let other = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(99));
         assert!(buffer.latest_row(&other).is_none());
         assert!(buffer.get_run(&other).is_none());
     }
@@ -677,7 +678,7 @@ mod tests {
         assert!(buffer
             .column_metadata(&ColumnKey::new(
                 DeviceRoute::root(),
-                twinleaf_proto::StreamId::new(1),
+                crate::proto::StreamId::new(1),
                 ColumnId::new(7),
             ))
             .is_none());

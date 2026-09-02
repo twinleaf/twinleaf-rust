@@ -5,8 +5,8 @@ use super::{
 use crate::{SplitLevel, SplitPolicy};
 use std::collections::HashSet;
 use twinleaf::data::{LogFile, PacketParser};
-use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
+use twinleaf::DeviceRoute;
 
 pub fn log_hdf(
     files: Vec<String>,
@@ -121,7 +121,7 @@ pub fn log_hdf(
 
             let has_stream_data = matches!(
                 pkt.payload(),
-                tio::proto::Payload::Samples(data) if !data.data.is_empty()
+                tio::packet::Payload::Samples(data) if !data.data.is_empty()
             );
             let samples_len = match parser.push_packet(&pkt) {
                 Ok(outcome) => outcome.row_count(),

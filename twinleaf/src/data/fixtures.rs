@@ -1,9 +1,9 @@
 //! Shared field values for the unit tests of this module.
 
-use crate::tio::proto::DataType;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::sync::Epoch;
-use twinleaf_proto::{ColumnId, SegmentId, SessionId, StreamId};
+use crate::proto::data as wire;
+use crate::proto::data::DataType;
+use crate::proto::sync::Epoch;
+use crate::proto::{ColumnId, SegmentId, SessionId, StreamId};
 
 pub(crate) fn device() -> wire::Device<'static> {
     wire::Device {

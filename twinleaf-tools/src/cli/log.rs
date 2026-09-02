@@ -1,8 +1,7 @@
+use crate::{parse_device_route, TioOpts};
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use std::time::Duration;
-use twinleaf::device::DeviceRoute;
-
-use crate::{parse_device_route, TioOpts};
+use twinleaf::DeviceRoute;
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]

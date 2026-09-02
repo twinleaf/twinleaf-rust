@@ -9,7 +9,7 @@
 
 use super::connection::Connection;
 use super::stream::NamedRoute;
-use crate::tio::proto::DeviceRoute;
+use crate::proto::DeviceRoute;
 use crossbeam::channel;
 #[cfg(feature = "mdns")]
 use std::collections::HashMap;

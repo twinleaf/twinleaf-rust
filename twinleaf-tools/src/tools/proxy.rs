@@ -16,8 +16,9 @@ use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 use twinleaf::device::discovery::{self, DiscoveredDevice, PortInterface};
-use twinleaf::tio::{self, proto, proxy};
-use twinleaf_proto::log::LogLevel;
+use twinleaf::proto;
+use twinleaf::proto::log::LogLevel;
+use twinleaf::tio::{self, packet, proxy};
 
 fn init_proxy_logging(verbose: bool, debug: bool) {
     use std::io::Write;
@@ -260,7 +261,7 @@ enum Disconnect {
     PortForwardFailed,
 }
 
-fn is_rpc(pkt: &proto::Packet) -> bool {
+fn is_rpc(pkt: &packet::Packet) -> bool {
     matches!(
         pkt.ptype(),
         proto::PacketType::RPC_REQ | proto::PacketType::RPC_REP | proto::PacketType::RPC_ERROR
@@ -689,7 +690,7 @@ impl ProxyServer {
         });
     }
 
-    fn log_device_packet(&self, pkt: proto::Packet, prefix: &proto::DeviceRoute) {
+    fn log_device_packet(&self, pkt: packet::Packet, prefix: &proto::DeviceRoute) {
         let Ok(routing) = prefix.absolute_route(&pkt.route()) else {
             log::warn!("Dropping packet whose mounted route exceeds max depth");
             return;
@@ -697,15 +698,15 @@ impl ProxyServer {
         let pkt = pkt.with_route(routing);
         let payload = pkt.payload();
         let dump = match payload {
-            proto::Payload::Heartbeat(_) => self.config.dump_hb,
-            proto::Payload::Metadata(..) => self.config.dump_meta,
-            proto::Payload::Samples(_) => self.config.dump_data,
+            packet::Payload::Heartbeat(_) => self.config.dump_hb,
+            packet::Payload::Metadata(..) => self.config.dump_meta,
+            packet::Payload::Samples(_) => self.config.dump_data,
             _ => self.config.dump_traffic,
         };
         if dump {
             log::info!("Packet from {} -- {:?}", routing, payload);
         }
-        if let proto::Payload::Log(message) = payload {
+        if let packet::Payload::Log(message) = payload {
             // Map the device-reported level onto the log crate's level
             // so the logger filter and prefix reflect it.
             let level = match message.level {

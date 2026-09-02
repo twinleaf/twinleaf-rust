@@ -2,7 +2,7 @@
 //! pump fills, and the [`Scope`] that filters between them.
 
 use super::Stream;
-use crate::tio::proto::DeviceRoute;
+use crate::proto::DeviceRoute;
 use crate::tio::proxy;
 use crossbeam::channel;
 use std::sync::Arc;

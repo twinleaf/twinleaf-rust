@@ -5,9 +5,10 @@ use std::fs::File;
 use std::io::Write;
 use std::time::{Duration, Instant};
 use twinleaf::data::{DeviceMetadataSnapshot, SampleBatch};
-use twinleaf::device::{DeviceEvent, DeviceRoute, Event, LinkEvent, RecvError};
+use twinleaf::device::{DeviceEvent, Event, LinkEvent, RecvError};
 use twinleaf::tio;
-use twinleaf::tio::proto::ProxyStatus;
+use twinleaf::tio::packet::ProxyStatus;
+use twinleaf::DeviceRoute;
 use twinleaf::{Connection, Receiver, SegmentId, StreamId};
 
 fn ensure_open<'a>(fo: &'a mut Option<File>, path: &str) -> eyre::Result<&'a mut File> {
@@ -163,12 +164,12 @@ impl Described {
     /// — the one signal left when a device reconnects within one session.
     fn write_data(&self, rec: &mut Recorder, pkt: &tio::Packet) -> eyre::Result<()> {
         match pkt.payload() {
-            tio::proto::Payload::Samples(samples) => {
+            tio::packet::Payload::Samples(samples) => {
                 if self.covers(pkt.route(), samples.stream_id, samples.segment_id) {
                     rec.write(pkt.with_ttl(0)?)?;
                 }
             }
-            tio::proto::Payload::ProxyStatus(_) => rec.write(pkt.with_ttl(0)?)?,
+            tio::packet::Payload::ProxyStatus(_) => rec.write(pkt.with_ttl(0)?)?,
             _ => {}
         }
         Ok(())
@@ -397,7 +398,7 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
         rest = &rest[len..];
         packet_count += 1;
 
-        if pkt.ptype() != tio::proto::PacketType::METADATA {
+        if pkt.ptype() != twinleaf::proto::PacketType::METADATA {
             bail!(
                 "{} does not look like a metadata file (found non-metadata packet)",
                 input
@@ -451,10 +452,11 @@ pub fn meta_reroute(input: String, route: DeviceRoute, output: Option<String>) -
 mod tests {
     use super::*;
     use twinleaf::data::{LogFile, PacketParser};
-    use twinleaf::tio::proto::{DataType, Packet};
+    use twinleaf::proto::data as wire;
+    use twinleaf::proto::data::DataType;
+    use twinleaf::proto::sync::Epoch;
+    use twinleaf::tio::packet::Packet;
     use twinleaf::{ColumnId, SessionId};
-    use twinleaf_proto::data as wire;
-    use twinleaf_proto::sync::Epoch;
 
     const STREAM: u8 = 1;
 
@@ -770,7 +772,7 @@ mod tests {
             .filter(|packet| {
                 matches!(
                     packet.as_ref().expect("a recorded packet").payload(),
-                    tio::proto::Payload::Metadata(_, _)
+                    tio::packet::Payload::Metadata(_, _)
                 )
             })
             .count();

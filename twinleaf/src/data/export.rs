@@ -31,7 +31,8 @@
 use super::filter::ColumnFilter;
 use super::metadata::{ColumnRecord, DeviceRecord, StreamRecord};
 use super::sample::{BoundaryReason, ColumnArray, Generations, SampleBatch, Series, StreamKey};
-use crate::tio::proto::DeviceRoute;
+use crate::proto::DeviceRoute;
+use crate::proto::{ColumnId, SampleNumber};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
 use hdf5::{Dataset, Dataspace, File, H5Type, Location, Result, SimpleExtents};
@@ -39,7 +40,6 @@ use hdf5_sys::h5d::H5Dwrite;
 use hdf5_sys::h5p::H5P_DEFAULT;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use twinleaf_proto::{ColumnId, SampleNumber};
 
 type TableIndex = u64;
 
@@ -661,17 +661,14 @@ mod tests {
     use crate::data::fixtures;
     use crate::data::metadata::{buffer_type, DeviceRecord, SegmentRecord, StreamRecord};
     use crate::data::sample::{BatchContext, BoundaryReason, ColumnData, SampleBatchBuilder};
-    use crate::tio::proto::DataType;
+    use crate::proto::data as wire;
+    use crate::proto::data::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
-    use twinleaf_proto::data as wire;
 
     fn key(stream_id: u8) -> StreamKey {
-        StreamKey::new(
-            DeviceRoute::root(),
-            twinleaf_proto::StreamId::new(stream_id),
-        )
+        StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(stream_id))
     }
 
     /// Generations as the parser stamps them for a stream whose own run is `stream`:
@@ -718,7 +715,7 @@ mod tests {
                     global: 0,
                 },
                 SegmentRecord::encode(wire::Segment {
-                    segment_id: twinleaf_proto::SegmentId::new(1),
+                    segment_id: crate::proto::SegmentId::new(1),
                     start_time,
                     ..fixtures::segment(stream_id)
                 })
@@ -774,8 +771,8 @@ mod tests {
             BoundaryReason::Initial,
             lost(),
             BoundaryReason::SessionChanged {
-                old: twinleaf_proto::SessionId::new(1),
-                new: twinleaf_proto::SessionId::new(2),
+                old: crate::proto::SessionId::new(1),
+                new: crate::proto::SessionId::new(2),
             },
         ];
         // Data loss is still monotonic, so only the session change splits there.

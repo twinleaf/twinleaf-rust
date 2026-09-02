@@ -37,10 +37,9 @@ use std::{
 use twinleaf::{
     data::{BoundaryReason, StreamKey, StreamMetadataSnapshot},
     device::{
-        rpc::RpcRegistry, DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError,
-        TreeEvent,
+        rpc::RpcRegistry, DeviceEvent, Event as StreamEvent, LinkEvent, RecvError, TreeEvent,
     },
-    tio, Connection, SampleNumber, SessionId, StreamId,
+    tio, Connection, DeviceRoute, SampleNumber, SessionId, StreamId,
 };
 
 pub fn run_health(config: HealthConfig) -> eyre::Result<()> {
@@ -747,7 +746,7 @@ impl HealthState {
                         registries.fetch(route);
                     }
                 }
-                if matches!(status, tio::proto::ProxyStatus::SensorDisconnected) {
+                if matches!(status, tio::packet::ProxyStatus::SensorDisconnected) {
                     for (key, st) in &mut self.stats {
                         if key.route.starts_with(&subtree) {
                             st.reset_timing();
@@ -1171,7 +1170,7 @@ fn draw_detail_pane(
     }
 
     fn column_cells<'a>(
-        schema: impl ExactSizeIterator<Item = twinleaf_proto::data::Column<'a>>,
+        schema: impl ExactSizeIterator<Item = twinleaf::proto::data::Column<'a>>,
     ) -> Vec<(Vec<Span<'static>>, usize, usize)> {
         let len = schema.len();
         schema
@@ -1224,7 +1223,7 @@ fn draw_detail_pane(
             ("decimation", segment.decimation.to_string()),
             ("epoch", segment.epoch.to_string()),
         ];
-        if segment.filter_type != twinleaf_proto::data::FilterType::NONE {
+        if segment.filter_type != twinleaf::proto::data::FilterType::NONE {
             pairs.push((
                 "filter",
                 format!("{} @ {} Hz", segment.filter_type, segment.filter_cutoff),

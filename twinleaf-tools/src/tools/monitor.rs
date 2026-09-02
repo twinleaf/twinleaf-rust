@@ -43,11 +43,10 @@ use twinleaf::{
         StreamKey,
     },
     device::{
-        rpc::RpcRegistry, DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError,
-        TreeEvent,
+        rpc::RpcRegistry, DeviceEvent, Event as StreamEvent, LinkEvent, RecvError, TreeEvent,
     },
-    tio::proto::ProxyStatus,
-    Connection,
+    tio::packet::ProxyStatus,
+    Connection, DeviceRoute,
 };
 
 pub fn run_monitor(config: MonitorConfig) -> eyre::Result<()> {
@@ -1477,7 +1476,7 @@ fn render_monitor_panel(
     }
 }
 
-fn stale_threshold(segment: twinleaf_proto::data::Segment<'_>) -> Duration {
+fn stale_threshold(segment: twinleaf::proto::data::Segment<'_>) -> Duration {
     let rate = segment.sampling_rate as f64 / segment.decimation.max(1) as f64;
     let period_ms = if rate > 0.0 { 1000.0 / rate } else { 0.0 };
     Duration::from_millis((period_ms * 2.0).max(1200.0) as u64)
