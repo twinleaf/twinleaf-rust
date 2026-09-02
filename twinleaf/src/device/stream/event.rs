@@ -43,13 +43,13 @@ pub enum DeviceEvent {
     MetadataUnavailable,
     /// Another client completed an RPC that can invalidate a cached value.
     RpcInvalidated(RpcMethod),
-    /// `Some(hash)` comes from a settings packet; `None` requests a refresh
+    /// `Some(hash)` comes from a settings packet. `None` requests a refresh
     /// after reconnection.
     NewHash(Option<u32>),
 }
 
 /// One fact from the connection, scoped by subject. Every view subscribes to
-/// the same vocabulary; only how much of it reaches the view changes.
+/// the same vocabulary. Only how much of it reaches the view changes.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// A link, heard by the views its subtree touches.

@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// A reply that has not arrived yet. It resolves exactly once, with the value
-/// or the error; block with [`wait`](Self::wait) or `.await` it. Dropping it
+/// or the error. Block with [`wait`](Self::wait) or `.await` it. Dropping it
 /// abandons the reply, not the call.
 #[must_use = "the RPC is in flight; wait on the reply"]
 pub struct PendingReply {
@@ -48,7 +48,7 @@ impl Future for ReplyFuture {
 }
 
 /// The replies to `calls` in submission order, with up to `window` in flight.
-/// Calls are submitted as the window opens; nothing is ever retransmitted.
+/// Calls are submitted as the window opens. Nothing is ever retransmitted.
 pub fn pipelined(
     calls: impl IntoIterator<Item = PendingReply>,
     window: usize,

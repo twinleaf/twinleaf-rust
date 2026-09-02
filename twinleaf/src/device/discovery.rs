@@ -2,7 +2,7 @@
 //!
 //! Find Twinleaf devices reachable from this host: local serial ports and, with
 //! the `mdns` feature, networked devices advertising the `_twinleaf._tcp`/`_udp`
-//! mDNS/DNS-SD service. [`Discovery`] is the main entry point — it streams
+//! mDNS/DNS-SD service. [`Discovery`] is the main entry point. It streams
 //! devices as they appear and disappear, drawing from both sources.
 //! [`enumerate_serial`] is a synchronous serial-only snapshot for callers that
 //! just want a one-shot list.
@@ -173,7 +173,7 @@ impl Drop for Discovery {
     }
 }
 
-/// Twinleaf devices on local serial ports, by USB VID/PID; `include_unknown`
+/// Twinleaf devices on local serial ports, by USB VID/PID. `include_unknown`
 /// adds every other port as [`PortInterface::Unknown`].
 pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
     #[cfg(not(feature = "serial"))]
@@ -216,7 +216,7 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
     }
 }
 
-/// Briefly connect to `url` and read its `dev.name`; `None` when the port is
+/// Briefly connect to `url` and read its `dev.name`. `None` when the port is
 /// busy or the device does not answer within about twice `timeout`.
 pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
     let connection = Connection::open_with(url, Some(timeout), None);
@@ -235,7 +235,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const ROUTE_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
 
 /// How often serial ports are rescanned and reprobed for hotplug and
-/// late-booting subdevices; network devices are probed once.
+/// late-booting subdevices. Network devices are probed once.
 const REPROBE_PERIOD: Duration = Duration::from_secs(2);
 
 /// [`Discovery`]'s probe worker: probe each queued URL, then keep re-scanning
@@ -338,7 +338,7 @@ fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), (
     tx.send(event).map_err(|_| ())
 }
 
-/// Service types Twinleaf network devices advertise; TCP is preferred when
+/// Service types Twinleaf network devices advertise. TCP is preferred when
 /// both appear. Firmware built before 2026-06-15 advertises `_tio`.
 #[cfg(feature = "mdns")]
 const TWINLEAF_MDNS_SERVICES: [&str; 4] = [

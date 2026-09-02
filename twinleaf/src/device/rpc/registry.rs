@@ -63,7 +63,7 @@ impl RpcRegistry {
     }
 
     /// Walk one device's RPC table through `submit`, [`WALK_WINDOW`] fetches in
-    /// flight; only a cache miss on `dev.name` and `rpc.hash` enumerates it.
+    /// flight. Only a cache miss on `dev.name` and `rpc.hash` enumerates it.
     pub(crate) fn load_with(
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<Self, RpcRegistryError> {

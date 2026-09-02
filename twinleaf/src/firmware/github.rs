@@ -137,7 +137,7 @@ mod tests {
     }
 
     /// Live end-to-end check against the public firmware repo. Network-gated,
-    /// so it is ignored by default; run with `cargo test -- --ignored`.
+    /// so it is ignored by default. Run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn live_list_and_download_asm_r6() {

@@ -149,7 +149,7 @@ pub enum CaptureError {
         /// The block that stayed busy.
         index: i16,
     },
-    /// The metadata reply did not parse; carries its length.
+    /// The metadata reply did not parse. Carries its length.
     #[error("capture metadata reply is not a valid metadata record ({0} bytes)")]
     InvalidMetadata(usize),
     /// The metadata layout is one this build does not read.

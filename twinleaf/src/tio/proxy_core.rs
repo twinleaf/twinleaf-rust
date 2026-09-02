@@ -271,8 +271,8 @@ enum RpcOrigin {
 }
 
 impl RpcOrigin {
-    /// Refuse the request with `error`, delivering it to a direct caller here;
-    /// a port's caller builds the error packet itself.
+    /// Refuse the request with `error`, delivering it to a direct caller here.
+    /// A port's caller builds the error packet itself.
     fn refuse(self, error: RpcError) -> RpcError {
         if let Self::Direct { complete, .. } = self {
             complete(Err(RawCallError::Device {
@@ -1355,7 +1355,7 @@ mod tests {
     }
 
     /// A status names a subtree, so a scoped port must receive it in its own
-    /// coordinates — never in the proxy's — and never for a disjoint mount.
+    /// coordinates, never in the proxy's, and never for a disjoint mount.
     #[test]
     fn a_status_is_clamped_into_the_ports_subtree_or_skipped() {
         let status = |route: &str| {

@@ -55,7 +55,7 @@ fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
 
 /// Why a route is not being asked for metadata right now.
 enum Discovery {
-    /// The last query failed; ask again once `until` passes.
+    /// The last query failed. Ask again once `until` passes.
     Backoff { until: Instant, delay: Duration },
     /// A backed-off route that has come due: eligible again, and remembering
     /// the delay the next failure doubles.
@@ -71,7 +71,7 @@ struct StreamState {
     known_routes: HashSet<DeviceRoute>,
     metadata_seen: HashMap<DeviceRoute, u32>,
     discovery: HashMap<DeviceRoute, Discovery>,
-    /// Latest status per subtree, replayed root-first to late subscribers; a new
+    /// Latest status per subtree, replayed root-first to late subscribers. A new
     /// status supersedes every entry under it.
     link_state: HashMap<DeviceRoute, packet::ProxyStatus>,
     batches: VecDeque<SampleBatch>,
@@ -489,7 +489,7 @@ impl Pump {
         }
     }
 
-    /// True if any live view decodes `route`; raw taps neither decode nor
+    /// True if any live view decodes `route`. Raw taps neither decode nor
     /// discover, so their scopes do not count.
     fn covers(&self, route: DeviceRoute) -> bool {
         self.batches
@@ -499,7 +499,7 @@ impl Pump {
             .any(|scope| scope.covers(route))
     }
 
-    /// Take what the port had queued on entry and no more; false once the proxy
+    /// Take what the port had queued on entry and no more. False once the proxy
     /// link is gone.
     fn drain_input(&mut self) -> bool {
         self.drain_metadata_replies();
@@ -518,7 +518,7 @@ impl Pump {
     }
 
     /// Offer a packet to the raw taps, unparsed and with its absolute route.
-    /// Invalidations stop here; a status reaches every tap its subtree touches.
+    /// Invalidations stop here. A status reaches every tap its subtree touches.
     fn tap(&mut self, packet: &tio::Packet) {
         if self.packets.is_empty() || matches!(packet.payload(), packet::Payload::RpcUpdate(_)) {
             return;
@@ -546,7 +546,7 @@ impl Pump {
         )
     }
 
-    /// Re-register after the port died, for as long as the worker lives; false
+    /// Re-register after the port died, for as long as the worker lives. False
     /// once it, or the last subscriber, is gone.
     fn reopen(&mut self) -> bool {
         loop {
@@ -1037,7 +1037,7 @@ mod tests {
         });
     }
 
-    /// A session change makes the route rediscover; subscribers must be told
+    /// A session change makes the route rediscover. Subscribers must be told
     /// what it found instead of keeping what the old session said.
     #[test]
     fn a_new_session_republishes_metadata_once_the_route_rediscovers() {
@@ -1056,7 +1056,7 @@ mod tests {
         });
     }
 
-    /// Devices re-broadcast their metadata; saying again what a subscriber
+    /// Devices re-broadcast their metadata. Saying again what a subscriber
     /// already has is not news.
     #[test]
     fn re_broadcasting_identical_metadata_does_not_republish_it() {
@@ -1307,7 +1307,7 @@ mod tests {
         }
     }
 
-    /// Link facts belong to the transport, so a device view hears them; another
+    /// Link facts belong to the transport, so a device view hears them. Another
     /// device's facts are not its business.
     #[test]
     fn a_device_view_hears_link_facts_but_not_another_routes_device_facts() {
@@ -1354,8 +1354,8 @@ mod tests {
         assert!(heard_status, "the device view heard the link's own status");
     }
 
-    /// A status carries a fabricated route — `FailedToConnect` means nothing
-    /// is there — so it must never mint a device.
+    /// A status carries a fabricated route, since `FailedToConnect` means
+    /// nothing is there, so it must never mint a device.
     #[test]
     fn a_status_packet_discovers_no_route() {
         let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());

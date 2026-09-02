@@ -32,7 +32,7 @@ pub enum Queued<T> {
 }
 
 /// An owned subscription to one subtree's stream. Holding it keeps the pump
-/// running even after every view is gone; dropping it releases both.
+/// running even after every view is gone. Dropping it releases both.
 pub struct Receiver<T> {
     items: channel::Receiver<Queued<T>>,
     _lifeline: channel::Sender<()>,
