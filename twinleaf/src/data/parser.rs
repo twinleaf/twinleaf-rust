@@ -8,8 +8,8 @@ use super::coalesce::BatchCoalescer;
 use super::metadata::{DeviceMetadataSnapshot, MetadataQuery};
 use super::sample::{SampleBatch, StreamKey};
 use super::state::{PacketError, PacketEvent, ParseState, ScannedRows};
+use crate::proto::DeviceRoute;
 use crate::tio;
-use crate::tio::proto::DeviceRoute;
 use std::collections::{HashMap, VecDeque};
 
 /// Incremental, route-aware parser for TIO packets.
@@ -275,8 +275,9 @@ mod tests {
     use crate::data::fixtures;
     use crate::data::sample::{BoundaryClass, BoundaryReason, ColumnArray, ColumnKey, Generations};
     use crate::data::state::StreamDataError;
-    use crate::tio::proto::{DataType, ProxyStatus, MAX_SAMPLE_NUMBER};
-    use twinleaf_proto::data as wire;
+    use crate::proto::data as wire;
+    use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
+    use crate::tio::packet::ProxyStatus;
 
     const STREAM_ID: u8 = 1;
 
@@ -447,7 +448,7 @@ mod tests {
         announce(
             &mut parser,
             wire::Metadata::Segment(wire::Segment {
-                segment_id: twinleaf_proto::SegmentId::new(1),
+                segment_id: crate::proto::SegmentId::new(1),
                 ..fixtures::segment(STREAM_ID)
             }),
         );
@@ -460,7 +461,7 @@ mod tests {
         assert_ne!(parser.metadata_revision(route), before);
         let snapshot = parser.metadata(route).expect("complete metadata");
         let stream = snapshot
-            .stream(twinleaf_proto::StreamId::new(STREAM_ID))
+            .stream(crate::proto::StreamId::new(STREAM_ID))
             .expect("the described stream");
         assert_eq!(stream.segment().segment_id.value(), 0);
     }
@@ -573,7 +574,7 @@ mod tests {
         announce(
             &mut parser,
             wire::Metadata::Device(wire::Device {
-                session: twinleaf_proto::SessionId::new(43),
+                session: crate::proto::SessionId::new(43),
                 ..fixtures::device()
             }),
         );
@@ -856,7 +857,7 @@ mod tests {
             .push_packet(&stream_data_packet_for(1, 0, 2))
             .expect("valid rows");
         let initial = parser.pop_batch().expect("the initial batch");
-        assert_eq!(initial.stream().stream_id, twinleaf_proto::StreamId::new(1));
+        assert_eq!(initial.stream().stream_id, crate::proto::StreamId::new(1));
         assert!(parser.pop_batch().is_none(), "stream 2 still accumulates");
 
         // A gap on stream 1 bumps the shared generations: stream 2's held rows
@@ -865,7 +866,7 @@ mod tests {
             .push_packet(&stream_data_packet_for(1, 10, 2))
             .expect("valid rows");
         let held = parser.pop_batch().expect("the flushed pre-bump batch");
-        assert_eq!(held.stream().stream_id, twinleaf_proto::StreamId::new(2));
+        assert_eq!(held.stream().stream_id, crate::proto::StreamId::new(2));
         assert_eq!(
             held.generations(),
             Generations {
@@ -877,7 +878,7 @@ mod tests {
         let boundary_batch = parser.pop_batch().expect("the boundary batch");
         assert_eq!(
             boundary_batch.stream().stream_id,
-            twinleaf_proto::StreamId::new(1)
+            crate::proto::StreamId::new(1)
         );
         assert_eq!(
             boundary_batch.generations(),
@@ -1005,10 +1006,7 @@ mod tests {
         assert!(after.is_initial(), "a replacement device opens a new run");
         buffer.process_batch(&after);
 
-        let key = StreamKey::new(
-            DeviceRoute::root(),
-            twinleaf_proto::StreamId::new(STREAM_ID),
-        );
+        let key = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(STREAM_ID));
         let run = buffer.get_run(&key).expect("the replacement run");
         assert_eq!(run.retained_rows(), 0..1);
         assert_eq!(
@@ -1063,7 +1061,7 @@ mod tests {
         announce_schema_for(
             &mut parser,
             wire::Device {
-                session: twinleaf_proto::SessionId::new(43),
+                session: crate::proto::SessionId::new(43),
                 ..fixtures::device()
             },
             &[DataType::F32],
@@ -1116,10 +1114,7 @@ mod tests {
         assert_eq!(after.generations().device, before_generations.device + 1);
         assert_eq!(after.generations().global, before_generations.global + 1);
         buffer.process_batch(&after);
-        let key = StreamKey::new(
-            DeviceRoute::root(),
-            twinleaf_proto::StreamId::new(STREAM_ID),
-        );
+        let key = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(STREAM_ID));
         let run = buffer.get_run(&key).expect("the new schema's run");
         assert_eq!(run.retained_rows(), 0..1);
         assert_eq!(run.stream().sample_size, 8);
@@ -1127,8 +1122,8 @@ mod tests {
             buffer
                 .column_metadata(&ColumnKey::new(
                     DeviceRoute::root(),
-                    twinleaf_proto::StreamId::new(STREAM_ID),
-                    twinleaf_proto::ColumnId::new(0),
+                    crate::proto::StreamId::new(STREAM_ID),
+                    crate::proto::ColumnId::new(0),
                 ))
                 .expect("the new column")
                 .data_type,

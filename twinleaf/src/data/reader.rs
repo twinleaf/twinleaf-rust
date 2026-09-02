@@ -4,6 +4,7 @@ use super::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
 use super::parser::{PacketParser, ParserCheckpoint};
 use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch, StreamKey};
 use super::state::{PacketError, ScannedRows};
+use crate::proto::data as wire;
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
 use memmap2::Mmap;
@@ -12,7 +13,6 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::path::Path;
-use twinleaf_proto::data as wire;
 
 const INDEX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 1024 * 1024;
@@ -43,7 +43,7 @@ pub enum LogError {
         offset: usize,
         /// Which framing or header check rejected the bytes.
         #[source]
-        source: tio::proto::DecodeError,
+        source: tio::packet::DecodeError,
     },
     /// A well-formed packet contradicts the state built from earlier ones.
     #[error("invalid data at byte offset {offset}: {source}")]
@@ -186,7 +186,7 @@ impl StreamSummary {
 pub struct LogSummary {
     bytes_scanned: usize,
     packet_count: u64,
-    devices: BTreeMap<tio::proto::DeviceRoute, DeviceRecord>,
+    devices: BTreeMap<crate::proto::DeviceRoute, DeviceRecord>,
     streams: BTreeMap<StreamKey, Vec<StreamSummary>>,
     boundaries: [u64; BOUNDARY_CLASSES],
     error: Option<LogError>,
@@ -206,7 +206,7 @@ impl LogSummary {
     /// Devices that produced rows, in route order.
     pub fn devices(
         &self,
-    ) -> impl ExactSizeIterator<Item = (tio::proto::DeviceRoute, wire::Device<'_>)> + '_ {
+    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::Device<'_>)> + '_ {
         self.devices
             .iter()
             .map(|(&route, device)| (route, device.get()))
@@ -407,14 +407,14 @@ impl LogFile {
 
     /// Scan packet structure, metadata, boundaries, and row counts without
     /// decoding sample values.
-    pub fn scan(&self, root_route: tio::proto::DeviceRoute, ignore_session: bool) -> LogIndex {
+    pub fn scan(&self, root_route: crate::proto::DeviceRoute, ignore_session: bool) -> LogIndex {
         self.scan_with_progress(root_route, ignore_session, |_| {})
     }
 
     /// Scan the log and periodically report the byte position reached.
     pub fn scan_with_progress(
         &self,
-        root_route: tio::proto::DeviceRoute,
+        root_route: crate::proto::DeviceRoute,
         ignore_session: bool,
         mut progress: impl FnMut(usize),
     ) -> LogIndex {
@@ -491,7 +491,8 @@ mod tests {
     use crate::data::fixtures::{column, device, segment, stream};
     use crate::data::sample::Generations;
     use crate::data::state::StreamDataError;
-    use crate::tio::proto::{DataType, DeviceRoute};
+    use crate::proto::data::DataType;
+    use crate::proto::DeviceRoute;
 
     fn encoded_log(packets: impl IntoIterator<Item = Packet>) -> Bytes {
         let mut encoded = Vec::new();
@@ -594,7 +595,7 @@ mod tests {
         let summary = log.scan(DeviceRoute::root(), true);
         let summary = summary.summary();
         let runs = &summary.streams()
-            [&StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(1))];
+            [&StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1))];
 
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run(), 1);
@@ -624,7 +625,7 @@ mod tests {
         let summary = log.scan(DeviceRoute::root(), true);
         let summary = summary.summary();
         let runs = &summary.streams()
-            [&StreamKey::new(DeviceRoute::root(), twinleaf_proto::StreamId::new(1))];
+            [&StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1))];
 
         assert_eq!(summary.boundaries(BoundaryClass::Anomaly), 1);
         assert_eq!(runs.len(), 2);

@@ -11,9 +11,9 @@
 
 use crate::device::rpc::{pipelined, CallError};
 use crate::device::Device;
+use crate::proto::rpc as wire_rpc;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use twinleaf_proto::rpc as wire_rpc;
 
 #[cfg(feature = "firmware-update")]
 pub mod github;
@@ -507,7 +507,7 @@ fn chunk_at(cursor: u32, image: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tio::proto::Payload;
+    use crate::tio::packet::Payload;
     use crate::tio::proxy::RawCallError;
     use crate::tio::proxy_core::ProxyCommand;
 

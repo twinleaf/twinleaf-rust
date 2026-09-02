@@ -2,8 +2,9 @@
 
 use super::subscription::Scope;
 use crate::data::DeviceMetadataSnapshot;
-use crate::tio::proto::{self, DeviceRoute, RpcMethod};
-use twinleaf_proto::SessionId;
+use crate::proto::DeviceRoute;
+use crate::proto::SessionId;
+use crate::tio::packet::{self, RpcMethod};
 
 /// What a link is doing. It belongs to the transport, so it concerns a whole
 /// subtree: a direct connection, or one mount behind `tio proxy --mount`.
@@ -12,7 +13,7 @@ use twinleaf_proto::SessionId;
 #[derive(Debug, Clone, Copy)]
 pub enum LinkEvent {
     /// Connection status changed.
-    Status(proto::ProxyStatus),
+    Status(packet::ProxyStatus),
     /// The engine's own inlet overflowed: packets were lost for every
     /// subscriber, continuity boundaries mark the gap, and the stream goes on.
     InputOverrun,

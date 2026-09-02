@@ -16,8 +16,8 @@ use ratatui::Frame;
 use twinleaf::device::discovery::{
     DiscoveredDevice, Discovery, DiscoveryConfig, DiscoveryEvent, PortInterface,
 };
-use twinleaf::device::{DeviceRoute, NamedRoute};
-
+use twinleaf::device::NamedRoute;
+use twinleaf::DeviceRoute;
 const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 /// A discovered device together with the subdevice routes probed behind it

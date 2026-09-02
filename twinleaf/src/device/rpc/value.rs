@@ -1,7 +1,7 @@
 //! Dynamic RPC values, for hosts that learn an RPC's type from its metadata
 //! at run time rather than from a Rust type at compile time.
 
-use twinleaf_proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcValueType};
+use crate::proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcValueType};
 
 /// An RPC value whose type was learned at run time.
 #[derive(Debug, Clone, PartialEq)]

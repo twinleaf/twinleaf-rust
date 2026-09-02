@@ -3,7 +3,7 @@
 //! Implements a `RawPort` for a UDP socket, and an MIO event source.
 //! Tio packets are sent and received unchanged in individual UDP datagrams.
 
-use super::{proto, Packet, RawPort, RecvError, SendError};
+use super::{packet, Packet, RawPort, RecvError, SendError};
 use mio::net::UdpSocket;
 use std::io;
 use std::net::SocketAddr;
@@ -84,8 +84,8 @@ impl RawPort for Port {
             Err(e) => {
                 // Since here we should get the whole packet in a single datagram,
                 // if something is missing at the end we don't want to pass along NeedMore
-                if let proto::DecodeError::NeedMore = e {
-                    Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall))
+                if let packet::DecodeError::NeedMore = e {
+                    Err(RecvError::Protocol(packet::DecodeError::PacketTooSmall))
                 } else {
                     Err(RecvError::Protocol(e))
                 }

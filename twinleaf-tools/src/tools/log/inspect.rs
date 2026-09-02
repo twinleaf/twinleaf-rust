@@ -1,7 +1,6 @@
 use super::progress::ByteProgress;
 use twinleaf::data::{BoundaryClass, LogFile, StreamSummary};
-use twinleaf::device::DeviceRoute;
-
+use twinleaf::DeviceRoute;
 const BOUNDARY_CLASSES: [BoundaryClass; 5] = [
     BoundaryClass::Startup,
     BoundaryClass::Seamless,

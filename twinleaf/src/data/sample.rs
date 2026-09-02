@@ -4,12 +4,12 @@
 use super::metadata::{
     BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamMetadataSnapshot, StreamRecord,
 };
+use crate::proto::data as wire;
+use crate::proto::DeviceRoute;
+use crate::proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 use crate::tio;
-use crate::tio::proto::DeviceRoute;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 
 /// A stream within one connection or parser root.
 ///
@@ -122,8 +122,11 @@ impl ColumnData {
         }
     }
 
-    pub(super) fn from_le_bytes(data: &[u8], data_type: tio::proto::DataType) -> ColumnData {
-        use tio::proto::DataType;
+    pub(super) fn from_le_bytes(
+        data: &[u8],
+        data_type: crate::proto::data::DataType,
+    ) -> ColumnData {
+        use crate::proto::data::DataType;
         match data_type {
             DataType::I8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
             DataType::U8 => ColumnData::UInt(data[0].into()),
@@ -707,7 +710,7 @@ impl SampleBatch {
 
     /// Encode a complete, byte-faithful metadata snapshot for this batch. See
     /// [`StreamMetadataSnapshot::metadata_packets`].
-    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, tio::proto::EncodeError> {
+    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, tio::packet::EncodeError> {
         self.metadata().metadata_packets()
     }
 
@@ -998,7 +1001,7 @@ impl BoundaryReason {
 mod tests {
     use super::*;
     use crate::data::fixtures::{column, device, segment, stream};
-    use tio::proto::DataType;
+    use crate::proto::data::DataType;
 
     #[test]
     fn signed_int24_values_are_sign_extended() {

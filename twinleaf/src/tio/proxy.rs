@@ -8,11 +8,12 @@
 //! whose views hand out packets, events and samples already filtered to what
 //! they cover.
 
-use super::proto::route::RouteError;
-use super::proto::{self, DeviceRoute, Packet, ProxyStatus};
+use super::packet::{self, Packet, ProxyStatus};
 use super::proxy_core::{ProxyClient, ProxyCommand, ProxyCore};
 use super::transport;
-use twinleaf_proto::rpc as wire_rpc;
+use crate::proto::rpc as wire_rpc;
+use crate::proto::DeviceRoute;
+use crate::proto::RouteError;
 
 use std::env;
 use std::thread;
@@ -36,7 +37,9 @@ pub enum Event {
     FailedToReconnect,
     Exiting,
     Text(String),
-    ProtocolError(proto::DecodeError),
+    /// A buffer from the device did not decode as a packet.
+    ProtocolError(packet::DecodeError),
+    /// The transport failed in a way that ends the worker.
     FatalError(transport::RecvError),
     NewClient(u64),
     RpcRemap((u64, u16), u16),
@@ -642,7 +645,7 @@ mod tests {
             .recv_deadline(Instant::now() + Duration::from_millis(100))
             .unwrap();
 
-        assert!(matches!(packet.payload(), proto::Payload::Heartbeat(_)));
+        assert!(matches!(packet.payload(), packet::Payload::Heartbeat(_)));
     }
 
     #[test]
@@ -682,7 +685,7 @@ mod tests {
 
         assert_eq!(request.route(), route);
         assert_eq!(timeout, Duration::from_secs(3));
-        let proto::Payload::RpcRequest(request) = request.payload() else {
+        let packet::Payload::RpcRequest(request) = request.payload() else {
             panic!("expected an RPC request");
         };
         assert_eq!(request.id.value(), 0);

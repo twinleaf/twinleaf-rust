@@ -21,7 +21,8 @@ mod serial;
 mod tcp;
 mod udp;
 
-use super::proto::{self, Packet};
+use super::packet::{self, Packet};
+use crate::proto;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::thread;
@@ -38,7 +39,7 @@ pub enum RecvError {
     Disconnected,
     /// Error in the data.
     #[error("protocol error: {0}")]
-    Protocol(#[from] proto::DecodeError),
+    Protocol(#[from] packet::DecodeError),
     /// Plain text received outside the packet protocol.
     #[error("{0}")]
     Text(String),

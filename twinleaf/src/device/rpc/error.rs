@@ -1,7 +1,7 @@
 use super::codec::RpcDecodeError;
-use crate::tio::proto::route::RouteError;
+use crate::proto::rpc as wire;
+use crate::proto::RouteError;
 use crate::tio::proxy;
-use twinleaf_proto::rpc as wire;
 
 /// A device's refusal, owned so a client can carry it out of the receive loop.
 #[derive(Debug, Clone, thiserror::Error)]

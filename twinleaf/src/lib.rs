@@ -10,9 +10,12 @@ pub mod device;
 pub mod firmware;
 pub mod tio;
 
+/// The wire protocol, shared with device firmware.
+pub use twinleaf_proto as proto;
+
 pub use data::{SampleBatch, SampleRow};
 pub use device::{
-    Connection, Device, DeviceEvent, DeviceRoute, DeviceTree, Event, LinkEvent, Receiver,
-    RecvError, TreeEvent,
+    Connection, Device, DeviceEvent, DeviceTree, Event, LinkEvent, Receiver, RecvError, TreeEvent,
 };
-pub use twinleaf_proto::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
+#[doc(no_inline)]
+pub use proto::{ColumnId, DeviceRoute, SampleNumber, SegmentId, SessionId, StreamId};

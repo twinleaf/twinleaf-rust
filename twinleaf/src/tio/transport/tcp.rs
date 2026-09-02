@@ -5,7 +5,7 @@
 //! packets have a header that allows for figuring out the total size
 //! of a packet, so it can be split up again at the receiving end.
 
-use super::{iobuf::IOBuf, proto, Packet, RawPort, RecvError, SendError};
+use super::{iobuf::IOBuf, packet, Packet, RawPort, RecvError, SendError};
 use mio::net::TcpStream;
 use std::io;
 use std::io::Write;
@@ -55,7 +55,7 @@ impl Port {
                 self.rxbuf.consume(size);
                 Ok(pkt)
             }
-            Err(proto::DecodeError::NeedMore) => Err(RecvError::NotReady),
+            Err(packet::DecodeError::NeedMore) => Err(RecvError::NotReady),
             Err(perr) => Err(RecvError::Protocol(perr)),
         }
     }

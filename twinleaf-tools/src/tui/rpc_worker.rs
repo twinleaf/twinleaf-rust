@@ -2,13 +2,13 @@
 //! registry loads it asks for. Each runs on one worker thread so the loop only
 //! ever receives finished results.
 
+use crate::tools::rpc::{encode_rpc_argument, format_rpc_value, resolve_rpc_type};
+use crate::tui::rpc_palette::RpcReq;
 use crossbeam::channel::{self, Receiver, Sender};
 use std::collections::HashSet;
 use twinleaf::device::rpc::{RpcRegistry, RpcValueTypeExt};
-use twinleaf::device::{DeviceRoute, DeviceTree};
-
-use crate::tools::rpc::{encode_rpc_argument, format_rpc_value, resolve_rpc_type};
-use crate::tui::rpc_palette::RpcReq;
+use twinleaf::device::DeviceTree;
+use twinleaf::DeviceRoute;
 
 /// One route's finished registry load, or why it failed.
 pub type LoadedRegistry = (DeviceRoute, Result<RpcRegistry, String>);

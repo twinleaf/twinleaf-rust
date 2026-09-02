@@ -1,10 +1,11 @@
-use super::proto::{self, DeviceRoute, Packet, PacketType, RpcMethod};
+use super::packet::{self, Packet, RpcMethod};
 use super::proxy::{Completion, Event, RawCallError};
 use super::transport;
 use super::transport::Port as HardwarePort;
 use super::transport::{ReceiveResult, RecvError};
-use twinleaf_proto::heartbeat::Heartbeat;
-use twinleaf_proto::rpc::RpcError;
+use crate::proto::heartbeat::Heartbeat;
+use crate::proto::rpc::RpcError;
+use crate::proto::{DeviceRoute, PacketType};
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -229,7 +230,7 @@ impl ProxyDevice {
         }
         if !self.has_static_rate() {
             if let Ok(pkt) = &res {
-                if let proto::Payload::Heartbeat(Heartbeat::Session(session)) = pkt.payload() {
+                if let packet::Payload::Heartbeat(Heartbeat::Session(session)) = pkt.payload() {
                     let session = session.value();
                     if pkt.route().is_empty() {
                         // This is a heartbeat for the root sensor
@@ -468,7 +469,7 @@ impl ProxyCore {
         };
         // Decide from the borrowed view before rewriting the packet's bytes.
         let request = match pkt.payload() {
-            proto::Payload::RpcRequest(req) => Some((
+            packet::Payload::RpcRequest(req) => Some((
                 req.id.value(),
                 RpcMethod::from_wire(req.method),
                 !req.args.is_empty(),
@@ -548,7 +549,7 @@ impl ProxyCore {
         }
     }
 
-    fn broadcast_status(&self, status: proto::ProxyStatus) {
+    fn broadcast_status(&self, status: packet::ProxyStatus) {
         let pkt = Packet::proxy_status(status);
         for client in self.clients.values() {
             client.try_send(&pkt);
@@ -622,8 +623,8 @@ impl ProxyCore {
     fn dispatch_device_packet(&mut self, pkt: Packet) {
         let route = pkt.route();
         let Some(wire_id) = (match pkt.payload() {
-            proto::Payload::RpcReply(reply) => Some(reply.req_id.value()),
-            proto::Payload::RpcError(error) => Some(error.req_id.value()),
+            packet::Payload::RpcReply(reply) => Some(reply.req_id.value()),
+            packet::Payload::RpcError(error) => Some(error.req_id.value()),
             _ => None,
         }) else {
             let mut to_drop = Vec::new();
@@ -652,10 +653,10 @@ impl ProxyCore {
 
         if let RpcTarget::Internal(original_id) = &target {
             match pkt.payload() {
-                proto::Payload::RpcReply(reply) => {
+                packet::Payload::RpcReply(reply) => {
                     self.internal_rpc_reply(*original_id, reply.value)
                 }
-                proto::Payload::RpcError(error) => {
+                packet::Payload::RpcError(error) => {
                     self.internal_rpc_error(*original_id, RpcError::from(error.code))
                 }
                 _ => unreachable!(),
@@ -691,8 +692,8 @@ impl ProxyCore {
             }
             RpcTarget::Direct(complete) => {
                 let reply = match pkt.payload() {
-                    proto::Payload::RpcReply(reply) => Ok(reply.value.to_vec()),
-                    proto::Payload::RpcError(error) => Err(RawCallError::Device {
+                    packet::Payload::RpcReply(reply) => Ok(reply.value.to_vec()),
+                    packet::Payload::RpcError(error) => Err(RawCallError::Device {
                         error: RpcError::from(error.code),
                         message: error.message.to_vec(),
                     }),
@@ -1007,7 +1008,7 @@ impl ProxyCore {
         if let Err(error) = self.try_setup_device() {
             log::debug!("failed to open {}: {error}", self.url);
             self.status_queue.send(Event::FailedToConnect);
-            self.broadcast_status(proto::ProxyStatus::FailedToConnect);
+            self.broadcast_status(packet::ProxyStatus::FailedToConnect);
             return;
         }
         let mut device_timeout = Instant::now();
@@ -1021,7 +1022,7 @@ impl ProxyCore {
                     log::debug!("failed to reopen {}: {error}", self.url);
                     if Instant::now() > device_timeout {
                         self.status_queue.send(Event::FailedToReconnect);
-                        self.broadcast_status(proto::ProxyStatus::FailedToReconnect);
+                        self.broadcast_status(packet::ProxyStatus::FailedToReconnect);
                         break;
                     }
                     timeout = std::cmp::min(timeout, RECONNECT_POLL_INTERVAL);
@@ -1038,7 +1039,7 @@ impl ProxyCore {
                 device_timeout =
                     Instant::now() + self.reconnect_timeout.unwrap_or(Duration::from_secs(0));
                 self.status_queue.send(Event::SensorDisconnected);
-                self.broadcast_status(proto::ProxyStatus::SensorDisconnected);
+                self.broadcast_status(packet::ProxyStatus::SensorDisconnected);
                 continue;
             }
 
@@ -1145,7 +1146,7 @@ impl ProxyCore {
                 let mut rpc_errors = vec![];
                 for pkt in packets {
                     let reply_target = match pkt.payload() {
-                        proto::Payload::RpcRequest(req) => Some((pkt.route(), req.id.value())),
+                        packet::Payload::RpcRequest(req) => Some((pkt.route(), req.id.value())),
                         _ => None,
                     };
                     if let Err(error) = self.forward_to_device(pkt, RpcOrigin::Port(client_id)) {
@@ -1216,7 +1217,7 @@ impl ProxyCore {
                             if first_packet {
                                 if self.ever_connected {
                                     self.status_queue.send(Event::SensorReconnected);
-                                    self.broadcast_status(proto::ProxyStatus::SensorReconnected);
+                                    self.broadcast_status(packet::ProxyStatus::SensorReconnected);
                                 } else {
                                     // Initial connect needs no wire status broadcast.
                                     self.ever_connected = true;
@@ -1252,7 +1253,7 @@ impl ProxyCore {
                                     None => Duration::from_secs(0),
                                 };
                             self.status_queue.send(Event::SensorDisconnected);
-                            self.broadcast_status(proto::ProxyStatus::SensorDisconnected);
+                            self.broadcast_status(packet::ProxyStatus::SensorDisconnected);
                             break;
                         }
                     }
@@ -1358,7 +1359,7 @@ mod tests {
     #[test]
     fn a_status_is_clamped_into_the_ports_subtree_or_skipped() {
         let status = |route: &str| {
-            Packet::proxy_status(proto::ProxyStatus::SensorDisconnected)
+            Packet::proxy_status(packet::ProxyStatus::SensorDisconnected)
                 .with_route(route.parse().unwrap())
         };
         let client = |scope: &str, depth: usize| {
@@ -1378,7 +1379,7 @@ mod tests {
             )
         };
 
-        let (deep, delivered) = client("/1", twinleaf_proto::MAX_ROUTING_SIZE);
+        let (deep, delivered) = client("/1", crate::proto::MAX_ROUTING_SIZE);
         assert!(deep.try_send(&status("/")));
         assert!(deep.try_send(&status("/1/3")));
         assert!(deep.try_send(&status("/2")));
@@ -1548,7 +1549,7 @@ mod tests {
         core.process_rpc_timeouts();
 
         let packet = to_client_rx.try_recv().unwrap();
-        let proto::Payload::RpcError(error) = packet.payload() else {
+        let packet::Payload::RpcError(error) = packet.payload() else {
             panic!("expected an RPC timeout packet");
         };
         assert_eq!(error.req_id.value(), client_request_id);

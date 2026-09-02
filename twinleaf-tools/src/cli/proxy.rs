@@ -1,7 +1,6 @@
-use clap::{Parser, Subcommand, ValueHint};
-use twinleaf::device::DeviceRoute;
-
 use crate::{parse_device_route, ListCli, TioOpts};
+use clap::{Parser, Subcommand, ValueHint};
+use twinleaf::DeviceRoute;
 
 #[derive(Parser, Debug)]
 #[command(

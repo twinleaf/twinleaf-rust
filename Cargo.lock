@@ -3082,7 +3082,6 @@ dependencies = [
  "toml_edit",
  "tui-prompts",
  "twinleaf",
- "twinleaf-proto",
 ]
 
 [[package]]

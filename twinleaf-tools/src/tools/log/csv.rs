@@ -5,8 +5,8 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use twinleaf::data::{LogFile, PacketParser, SampleBatch, StreamMetadataSnapshot};
-use twinleaf::device::DeviceRoute;
 use twinleaf::tio;
+use twinleaf::DeviceRoute;
 
 struct CsvOutput {
     stream: StreamSel,
@@ -227,7 +227,7 @@ pub fn log_csv(
             progress.update(packets.position() as u64);
 
             let samples_len = match pkt.payload() {
-                tio::proto::Payload::Samples(_) if pkt.route() != target_route => 0,
+                tio::packet::Payload::Samples(_) if pkt.route() != target_route => 0,
                 _ => match parser.push_packet(&pkt) {
                     Ok(outcome) => outcome.row_count(),
                     Err(error) => {

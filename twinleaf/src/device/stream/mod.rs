@@ -10,8 +10,11 @@ pub(crate) use subscription::Scope;
 pub use subscription::{Receiver, RecvError};
 
 use crate::data::{DeviceMetadataSnapshot, MetadataQuery, PacketParser, SampleBatch};
+use crate::proto::data as wire;
+use crate::proto::rpc as wire_rpc;
+use crate::proto::DeviceRoute;
 use crate::tio;
-use crate::tio::proto::{self, DeviceRoute, RpcMethod};
+use crate::tio::packet::{self, RpcMethod};
 use crate::tio::proxy;
 use crossbeam::channel;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,8 +22,6 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use subscription::Sink;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::rpc as wire_rpc;
 
 /// Batches a subscriber may fall behind by before the pump sheds them.
 const BATCH_QUEUE_LEN: usize = 1024;
@@ -44,7 +45,7 @@ const METADATA_RETRY_MAX: Duration = Duration::from_secs(8);
 
 /// The one setting a host reads as more than opaque bytes: its value is the
 /// device's RPC table hash, a u32le.
-fn rpc_hash(setting: &twinleaf_proto::settings::Setting<'_>) -> Option<u32> {
+fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
     if setting.name != b"rpc.hash" {
         return None;
     }
@@ -72,7 +73,7 @@ struct StreamState {
     discovery: HashMap<DeviceRoute, Discovery>,
     /// Latest status per subtree, replayed root-first to late subscribers; a new
     /// status supersedes every entry under it.
-    link_state: HashMap<DeviceRoute, proto::ProxyStatus>,
+    link_state: HashMap<DeviceRoute, packet::ProxyStatus>,
     batches: VecDeque<SampleBatch>,
     events: VecDeque<Event>,
 }
@@ -249,7 +250,7 @@ impl StreamState {
 
     /// Apply a link's status to the subtree it concerns: a direct connection, or
     /// one mount behind `tio proxy --mount`.
-    fn apply_status(&mut self, subtree: DeviceRoute, status: proto::ProxyStatus) {
+    fn apply_status(&mut self, subtree: DeviceRoute, status: packet::ProxyStatus) {
         self.link_state
             .retain(|root, _| !root.starts_with(&subtree));
         self.link_state.insert(subtree, status);
@@ -258,8 +259,8 @@ impl StreamState {
             event: LinkEvent::Status(status),
         });
         match status {
-            proto::ProxyStatus::SensorDisconnected => self.forget_metadata(subtree),
-            proto::ProxyStatus::SensorReconnected => {
+            packet::ProxyStatus::SensorDisconnected => self.forget_metadata(subtree),
+            packet::ProxyStatus::SensorReconnected => {
                 let refresh: Vec<_> = self
                     .known_routes
                     .iter()
@@ -271,16 +272,16 @@ impl StreamState {
                     .collect();
                 self.events.extend(refresh);
             }
-            proto::ProxyStatus::FailedToConnect
-            | proto::ProxyStatus::FailedToReconnect
-            | proto::ProxyStatus::Unknown(_) => {}
+            packet::ProxyStatus::FailedToConnect
+            | packet::ProxyStatus::FailedToReconnect
+            | packet::ProxyStatus::Unknown(_) => {}
         }
     }
 
     /// Take one packet: status first, then route identity and control packets for
     /// every route, and sample decoding only when `covered`.
     fn process_packet(&mut self, pkt: &tio::Packet, covered: bool) {
-        if let proto::Payload::ProxyStatus(status) = pkt.payload() {
+        if let packet::Payload::ProxyStatus(status) = pkt.payload() {
             return self.apply_status(pkt.route(), status);
         }
         let route = pkt.route();
@@ -292,7 +293,7 @@ impl StreamState {
         }
 
         match pkt.payload() {
-            proto::Payload::RpcUpdate(method) => {
+            packet::Payload::RpcUpdate(method) => {
                 if covered {
                     self.device_event(
                         route,
@@ -301,7 +302,7 @@ impl StreamState {
                 }
                 return;
             }
-            proto::Payload::Heartbeat(beat) => {
+            packet::Payload::Heartbeat(beat) => {
                 if covered {
                     self.device_event(
                         route,
@@ -311,12 +312,12 @@ impl StreamState {
                     );
                 }
             }
-            proto::Payload::Setting(setting) => {
+            packet::Payload::Setting(setting) => {
                 if let (true, Some(hash)) = (covered, rpc_hash(&setting)) {
                     self.device_event(route, DeviceEvent::NewHash(Some(hash)));
                 }
             }
-            proto::Payload::Samples(_) if !covered => return,
+            packet::Payload::Samples(_) if !covered => return,
             _ => {}
         }
 
@@ -519,11 +520,11 @@ impl Pump {
     /// Offer a packet to the raw taps, unparsed and with its absolute route.
     /// Invalidations stop here; a status reaches every tap its subtree touches.
     fn tap(&mut self, packet: &tio::Packet) {
-        if self.packets.is_empty() || matches!(packet.payload(), proto::Payload::RpcUpdate(_)) {
+        if self.packets.is_empty() || matches!(packet.payload(), packet::Payload::RpcUpdate(_)) {
             return;
         }
         let scope = match packet.payload() {
-            proto::Payload::ProxyStatus(_) => Scope::subtree(packet.route()),
+            packet::Payload::ProxyStatus(_) => Scope::subtree(packet.route()),
             _ => Scope::point(packet.route()),
         };
         self.packets
@@ -670,17 +671,18 @@ impl Pump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tio::proto::{DataType, Packet};
+    use crate::proto::data::DataType;
+    use crate::proto::rpc::Method;
+    use crate::proto::sync::Epoch;
+    use crate::proto::SessionId as WireSessionId;
+    use crate::tio::packet::Packet;
     use crate::tio::proxy_core::ProxyCommand;
-    use twinleaf_proto::rpc::Method;
-    use twinleaf_proto::sync::Epoch;
-    use twinleaf_proto::SessionId as WireSessionId;
 
     /// The whole tree, as a root tree view covers it.
     fn everything() -> Scope {
         Scope {
             route: DeviceRoute::root(),
-            depth: twinleaf_proto::MAX_ROUTING_SIZE,
+            depth: crate::proto::MAX_ROUTING_SIZE,
         }
     }
 
@@ -703,7 +705,7 @@ mod tests {
         channel::Sender<()>,
     ) {
         let (endpoint, commands, worker) =
-            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), twinleaf_proto::MAX_ROUTING_SIZE);
+            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), crate::proto::MAX_ROUTING_SIZE);
         let (data, _sent, deliver) = proxy::Port::test_pair();
         let (subscriptions, received) = channel::unbounded();
         let (resolve, replies) = channel::unbounded();
@@ -760,7 +762,7 @@ mod tests {
         channel::Sender<()>,
     ) {
         let (endpoint, commands, worker) =
-            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), twinleaf_proto::MAX_ROUTING_SIZE);
+            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), crate::proto::MAX_ROUTING_SIZE);
         (
             Arc::new(Stream::new(endpoint.clone())),
             endpoint,
@@ -798,7 +800,7 @@ mod tests {
                 firmware: "f",
             }),
             wire::Metadata::Stream(wire::Stream {
-                stream_id: twinleaf_proto::StreamId::new(1),
+                stream_id: crate::proto::StreamId::new(1),
                 n_columns: 1,
                 n_segments: 2,
                 sample_size: 4,
@@ -807,8 +809,8 @@ mod tests {
             }),
             wire::Metadata::Segment(segment_record(0)),
             wire::Metadata::Column(wire::Column {
-                stream_id: twinleaf_proto::StreamId::new(1),
-                index: twinleaf_proto::ColumnId::new(0),
+                stream_id: crate::proto::StreamId::new(1),
+                index: crate::proto::ColumnId::new(0),
                 data_type: DataType::F32,
                 name: "col",
                 units: "",
@@ -820,8 +822,8 @@ mod tests {
     /// The stream's segment `segment_id`, starting one second per segment in.
     fn segment_record(segment_id: u8) -> wire::Segment<'static> {
         wire::Segment {
-            stream_id: twinleaf_proto::StreamId::new(1),
-            segment_id: twinleaf_proto::SegmentId::new(segment_id),
+            stream_id: crate::proto::StreamId::new(1),
+            segment_id: crate::proto::SegmentId::new(segment_id),
             flags: wire::SegmentFlags::default(),
             epoch: Epoch::UNIX,
             timeref_serial: "clock",
@@ -856,7 +858,7 @@ mod tests {
     /// The current segment of the one stream a snapshot describes.
     fn current_segment(snapshot: &DeviceMetadataSnapshot) -> u8 {
         snapshot
-            .stream(twinleaf_proto::StreamId::new(1))
+            .stream(crate::proto::StreamId::new(1))
             .expect("the described stream")
             .segment()
             .segment_id
@@ -890,7 +892,7 @@ mod tests {
             panic!("expected a direct RPC command");
         };
         let route = request.route();
-        let proto::Payload::RpcRequest(rpc) = request.payload() else {
+        let packet::Payload::RpcRequest(rpc) = request.payload() else {
             panic!("expected an RPC request");
         };
         assert_eq!(
@@ -954,7 +956,7 @@ mod tests {
             else {
                 panic!("expected a direct RPC command");
             };
-            let proto::Payload::RpcRequest(rpc) = request.payload() else {
+            let packet::Payload::RpcRequest(rpc) = request.payload() else {
                 panic!("expected an RPC request");
             };
             if rpc.method == Method::ByName(b"dev.name") {
@@ -1184,7 +1186,7 @@ mod tests {
         let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());
         let (_handle, deliver, commands, _endpoint, worker) = pump(PumpSink::Events(sink));
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::FailedToReconnect))
+            .send(Packet::proxy_status(packet::ProxyStatus::FailedToReconnect))
             .unwrap();
         drop((worker, commands, deliver));
 
@@ -1192,7 +1194,7 @@ mod tests {
             matches!(
                 event,
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::FailedToReconnect),
+                    event: LinkEvent::Status(packet::ProxyStatus::FailedToReconnect),
                     ..
                 }
             )
@@ -1266,13 +1268,15 @@ mod tests {
         let (_, _, stale) = metadata_call(&commands);
 
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected))
+            .send(Packet::proxy_status(
+                packet::ProxyStatus::SensorDisconnected,
+            ))
             .unwrap();
         wait_for(&events, |event| {
             matches!(
                 event,
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected),
+                    event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected),
                     ..
                 }
             )
@@ -1317,7 +1321,9 @@ mod tests {
         // The wide view covers the root, so the root's device facts are
         // produced; only the filter keeps them from the device view.
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected))
+            .send(Packet::proxy_status(
+                packet::ProxyStatus::SensorDisconnected,
+            ))
             .unwrap();
         deliver.send(Packet::heartbeat(root)).unwrap();
         deliver.send(Packet::heartbeat(child)).unwrap();
@@ -1330,7 +1336,7 @@ mod tests {
                 .expect("the device view keeps receiving")
             {
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected),
+                    event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected),
                     ..
                 } => heard_status = true,
                 Event::Link { .. } => {}
@@ -1356,7 +1362,7 @@ mod tests {
         let (_handle, deliver, _commands, _endpoint, _worker) = pump(PumpSink::Events(sink));
         let root = DeviceRoute::root();
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::FailedToConnect))
+            .send(Packet::proxy_status(packet::ProxyStatus::FailedToConnect))
             .unwrap();
         deliver.send(Packet::heartbeat(root)).unwrap();
 
@@ -1367,7 +1373,7 @@ mod tests {
         loop {
             match events.recv_deadline(deadline).expect("the pump publishes") {
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::FailedToConnect),
+                    event: LinkEvent::Status(packet::ProxyStatus::FailedToConnect),
                     ..
                 } => heard_status = true,
                 Event::Tree {
@@ -1399,11 +1405,11 @@ mod tests {
         );
 
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(bounced))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorDisconnected).with_route(bounced))
             .unwrap();
         wait_for(
             &events,
-            |event| matches!(event, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if *subtree == bounced),
+            |event| matches!(event, Event::Link { subtree, event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected) } if *subtree == bounced),
         );
 
         // Both re-broadcast; only the bounced mount's description is news.
@@ -1424,7 +1430,7 @@ mod tests {
         }
 
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorReconnected).with_route(bounced))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorReconnected).with_route(bounced))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1452,12 +1458,12 @@ mod tests {
             pump_with(vec![PumpSink::Events(a), PumpSink::Events(b)]);
         let mount: DeviceRoute = "/1".parse().unwrap();
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorReconnected).with_route(mount))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorReconnected).with_route(mount))
             .unwrap();
 
         wait_for(
             &below,
-            |event| matches!(event, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected) } if *subtree == mount),
+            |event| matches!(event, Event::Link { subtree, event: LinkEvent::Status(packet::ProxyStatus::SensorReconnected) } if *subtree == mount),
         );
         assert!(
             matches!(
@@ -1481,16 +1487,16 @@ mod tests {
         let child: DeviceRoute = "/1".parse().unwrap();
 
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorReconnected))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorReconnected))
             .unwrap();
         deliver.send(samples(0, root)).unwrap();
         deliver.send(samples(7, child)).unwrap();
 
         let status = taps.recv_timeout(Duration::from_secs(5)).expect("a packet");
-        assert!(matches!(status.payload(), proto::Payload::ProxyStatus(_)));
+        assert!(matches!(status.payload(), packet::Payload::ProxyStatus(_)));
         let first = taps.recv_timeout(Duration::from_secs(5)).expect("a packet");
         assert_eq!(first.route(), root);
-        assert!(matches!(first.payload(), proto::Payload::Samples(_)));
+        assert!(matches!(first.payload(), packet::Payload::Samples(_)));
         assert_eq!(
             taps.recv_timeout(Duration::from_secs(5))
                 .expect("a packet")
@@ -1500,7 +1506,7 @@ mod tests {
 
         let status = scoped.recv_timeout(Duration::from_secs(5)).expect("packet");
         assert!(
-            matches!(status.payload(), proto::Payload::ProxyStatus(_)),
+            matches!(status.payload(), packet::Payload::ProxyStatus(_)),
             "the whole link's status reaches a tap scoped inside it"
         );
         let only = scoped.recv_timeout(Duration::from_secs(5)).expect("packet");
@@ -1525,13 +1531,13 @@ mod tests {
         let mount: DeviceRoute = "/2".parse().unwrap();
         deliver.send(samples(0, mount)).unwrap();
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(mount))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorDisconnected).with_route(mount))
             .unwrap();
         wait_for(&early, |event| {
             matches!(
                 event,
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected),
+                    event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected),
                     ..
                 }
             )
@@ -1544,7 +1550,7 @@ mod tests {
         );
         let second = late.recv_timeout(Duration::from_secs(5)).expect("replay");
         assert!(
-            matches!(second, Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if subtree == mount)
+            matches!(second, Event::Link { subtree, event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected) } if subtree == mount)
         );
 
         // A view pinned below the mount has no business with the route fact,
@@ -1552,7 +1558,7 @@ mod tests {
         let pinned = subscribe(&handle, exactly("/2/1"), PumpSink::Events);
         assert!(matches!(
             pinned.recv_timeout(Duration::from_secs(5)).expect("replay"),
-            Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected) } if subtree == mount
+            Event::Link { subtree, event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected) } if subtree == mount
         ));
     }
 
@@ -1565,16 +1571,16 @@ mod tests {
         let mount: DeviceRoute = "/2".parse().unwrap();
         deliver.send(samples(0, mount)).unwrap();
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorDisconnected).with_route(mount))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorDisconnected).with_route(mount))
             .unwrap();
         deliver
-            .send(Packet::proxy_status(proto::ProxyStatus::SensorReconnected))
+            .send(Packet::proxy_status(packet::ProxyStatus::SensorReconnected))
             .unwrap();
         wait_for(&early, |event| {
             matches!(
                 event,
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected),
+                    event: LinkEvent::Status(packet::ProxyStatus::SensorReconnected),
                     ..
                 }
             )
@@ -1586,13 +1592,13 @@ mod tests {
             std::iter::from_fn(|| late.recv_deadline(deadline).ok()).collect();
         assert!(replayed.iter().any(|event| matches!(
             event,
-            Event::Link { subtree, event: LinkEvent::Status(proto::ProxyStatus::SensorReconnected) } if *subtree == DeviceRoute::root()
+            Event::Link { subtree, event: LinkEvent::Status(packet::ProxyStatus::SensorReconnected) } if *subtree == DeviceRoute::root()
         )));
         assert!(
             !replayed.iter().any(|event| matches!(
                 event,
                 Event::Link {
-                    event: LinkEvent::Status(proto::ProxyStatus::SensorDisconnected),
+                    event: LinkEvent::Status(packet::ProxyStatus::SensorDisconnected),
                     ..
                 }
             )),

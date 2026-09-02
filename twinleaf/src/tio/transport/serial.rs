@@ -7,13 +7,13 @@
 //! delimited, plain text ascii, which is returned as a
 //! `RecvError::Text(textual_data)`
 
-use super::{iobuf::IOBuf, proto, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
+use super::{iobuf::IOBuf, packet, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
+use crate::proto::serial as wire;
+use crate::proto::{MAX_PACKET_SIZE, SLIP_END};
 use mio_serial::{SerialPort, SerialPortBuilderExt};
 use std::io;
 use std::io::Write;
 use std::time::{Duration, Instant};
-use twinleaf_proto::serial as wire;
-use twinleaf_proto::{MAX_PACKET_SIZE, SLIP_END};
 
 /// Deserializer capacity: the largest packet plus its trailing CRC32.
 const RX_CAPACITY: usize = MAX_PACKET_SIZE + wire::CRC_SIZE;
@@ -173,8 +173,8 @@ fn decode_frame(frame: &wire::Frame) -> Result<Packet, RecvError> {
             }
             // A frame is a whole packet or nothing, so a short one is not
             // a packet still arriving.
-            Err(proto::DecodeError::NeedMore) => {
-                Err(RecvError::Protocol(proto::DecodeError::PacketTooSmall))
+            Err(packet::DecodeError::NeedMore) => {
+                Err(RecvError::Protocol(packet::DecodeError::PacketTooSmall))
             }
             Err(perr) => Err(RecvError::Protocol(perr)),
         };
@@ -183,12 +183,12 @@ fn decode_frame(frame: &wire::Frame) -> Result<Packet, RecvError> {
     Err(if errors.contains(FrameErrors::TEXT) {
         RecvError::Text(String::from_utf8_lossy(data).to_string())
     } else if errors.contains(FrameErrors::TOO_BIG) {
-        RecvError::Protocol(proto::DecodeError::PacketTooBig)
+        RecvError::Protocol(packet::DecodeError::PacketTooBig)
     } else if errors.contains(FrameErrors::SHORT) {
-        RecvError::Protocol(proto::DecodeError::PacketTooSmall)
+        RecvError::Protocol(packet::DecodeError::PacketTooSmall)
     } else {
         // CRC mismatch, or a bad escape which corrupted the frame.
-        RecvError::Protocol(proto::DecodeError::CRC32)
+        RecvError::Protocol(packet::DecodeError::CRC32)
     })
 }
 

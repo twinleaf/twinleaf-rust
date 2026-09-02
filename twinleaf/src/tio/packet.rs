@@ -1,22 +1,21 @@
 //! The host packet: one validated wire buffer, read through the `twinleaf-proto` codecs.
 
+use crate::proto::data as wire;
+use crate::proto::heartbeat::Heartbeat;
+use crate::proto::log::LogMessage;
+use crate::proto::packet::{Header, PacketError, PacketView};
+use crate::proto::rpc as wire_rpc;
+use crate::proto::settings::Setting;
+use crate::proto::SessionId as WireSessionId;
+use crate::proto::{RpcMethodId, RpcRequestId};
+use crate::proto::{HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, MAX_TTL};
 use bytes::Bytes;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::fmt;
-use twinleaf_proto::data as wire;
-use twinleaf_proto::heartbeat::Heartbeat;
-use twinleaf_proto::log::LogMessage;
-use twinleaf_proto::packet::{Header, PacketError, PacketView};
-use twinleaf_proto::rpc as wire_rpc;
-use twinleaf_proto::settings::Setting;
-use twinleaf_proto::SessionId as WireSessionId;
-use twinleaf_proto::{RpcMethodId, RpcRequestId};
-use twinleaf_proto::{HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, MAX_TTL};
 
-pub use route::DeviceRoute;
-pub use twinleaf_proto::data::{DataType, MAX_SAMPLE_NUMBER};
-pub use twinleaf_proto::packet::PacketType;
-pub use twinleaf_proto::route;
+use crate::proto::data::MAX_SAMPLE_NUMBER;
+use crate::proto::packet::PacketType;
+use crate::proto::DeviceRoute;
 
 /// Shortest data payload a host accepts: the sample header plus one byte.
 const MIN_SAMPLE_PAYLOAD: usize = wire::SAMPLE_HEADER_SIZE + 1;
@@ -372,12 +371,12 @@ impl Packet {
             });
         }
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let stream_id = twinleaf_proto::StreamId::try_new(stream_id)
+        let stream_id = crate::proto::StreamId::try_new(stream_id)
             .ok_or(EncodeError::InvalidStreamId(stream_id))?;
         let len = wire::Samples {
             stream_id,
-            segment_id: twinleaf_proto::SegmentId::new(segment_id),
-            first: twinleaf_proto::SampleNumber::new(first_sample_n),
+            segment_id: crate::proto::SegmentId::new(segment_id),
+            first: crate::proto::SampleNumber::new(first_sample_n),
             data,
         }
         .write(&mut buf)
