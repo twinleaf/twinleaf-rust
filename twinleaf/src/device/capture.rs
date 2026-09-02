@@ -1,7 +1,13 @@
-use std::time::{Duration, Instant};
+//! One-shot captures read through a device's array RPC.
+//!
+//! A capturing RPC takes an `i16` selector: `-1` triggers a capture, `-2`
+//! reads its [`CaptureStatus`], `-3` its [`CaptureMetadata`], and `0..` the
+//! data one block at a time. [`read_capture`] runs the whole sequence.
 
-use crate::device::{CallError, Device};
+use super::connection::Device;
+use super::rpc::CallError;
 use crate::tio::proto::DataType;
+use std::time::{Duration, Instant};
 use twinleaf_proto::capture as wire;
 use twinleaf_proto::rpc::RpcError;
 
@@ -10,12 +16,18 @@ const CAPTURE_TRIGGER_INDEX: i16 = -1;
 const CAPTURE_STATUS_INDEX: i16 = -2;
 const CAPTURE_METADATA_INDEX: i16 = -3;
 
+/// Where a capture stands, as its status selector reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureStatus {
+    /// Nothing has been triggered.
     Idle,
+    /// A capture is in progress.
     Capturing,
+    /// A capture finished and its blocks can be read.
     Done,
+    /// The device failed the capture.
     Error,
+    /// A status byte this build does not know.
     Unknown(u8),
 }
 
@@ -31,18 +43,30 @@ impl CaptureStatus {
     }
 }
 
+/// What one capture holds and how to read it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureMetadata {
+    /// Bytes of capture data the block selectors serve.
     pub size: u32,
+    /// Bytes one block selector returns.
     pub blocksize: u16,
+    /// Element type of the data.
     pub data_type: DataType,
+    /// Elements captured.
     pub length: u32,
+    /// Multiplier taking a raw element to its value in `units`.
     pub y_calibration: f32,
+    /// x of element zero, in `x_units`.
     pub x_offset: f32,
+    /// x step between consecutive elements.
     pub x_stride: f32,
+    /// What was captured.
     pub name: String,
+    /// Units of a calibrated element.
     pub units: String,
+    /// What x measures.
     pub x_name: String,
+    /// Units of `x_offset` and `x_stride`.
     pub x_units: String,
 }
 
@@ -64,55 +88,99 @@ impl CaptureMetadata {
         }
     }
 
+    /// The element type's name.
     pub fn data_type_label(&self) -> String {
         self.data_type.to_string()
     }
 
+    /// x of element `index`.
     pub fn x_value_f64(&self, index: usize) -> f64 {
         f64::from(self.x_offset) + index as f64 * f64::from(self.x_stride)
     }
 }
 
+/// A finished capture: its metadata and every block, concatenated and cut
+/// to `size`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureReadout {
+    /// How to read `data`.
     pub metadata: CaptureMetadata,
+    /// The elements, little-endian.
     pub data: Vec<u8>,
 }
 
 impl CaptureReadout {
+    /// Every element as a calibrated `f64`.
     pub fn values_f64(&self) -> Result<Vec<f64>, CaptureError> {
         decode_capture_values(&self.data, &self.metadata)
     }
 }
 
+/// Why a capture could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
+    /// A capture RPC failed.
     #[error("capture RPC failed: {0}")]
     Rpc(#[from] CallError),
+    /// The status reply was not one byte.
     #[error("capture status reply should be 1 byte, got {actual}")]
-    InvalidStatusLength { actual: usize },
+    InvalidStatusLength {
+        /// Bytes received.
+        actual: usize,
+    },
+    /// The device reported the capture failed.
     #[error("capture status reported an error")]
     DeviceError,
+    /// The device reported idle after being triggered.
     #[error("capture status is idle; capture never started")]
     CaptureNotStarted,
+    /// The status byte is not one this build knows.
     #[error("capture status reported unknown value {0}")]
     UnknownStatus(u8),
+    /// The capture did not finish within the timeout.
     #[error("timed out waiting for capture data; last status was {last_status:?}")]
-    Timeout { last_status: CaptureStatus },
+    Timeout {
+        /// The status seen last.
+        last_status: CaptureStatus,
+    },
+    /// A block stayed busy past the timeout.
     #[error("timed out waiting for capture block {index}")]
-    BlockTimeout { index: i16 },
+    BlockTimeout {
+        /// The block that stayed busy.
+        index: i16,
+    },
+    /// The metadata reply did not parse; carries its length.
     #[error("capture metadata reply is not a valid metadata record ({0} bytes)")]
     InvalidMetadata(usize),
+    /// The metadata layout is one this build does not read.
     #[error("unsupported capture metadata version {version}; expected {expected}")]
-    UnsupportedMetadataVersion { version: u8, expected: u8 },
+    UnsupportedMetadataVersion {
+        /// The layout the device sent.
+        version: u8,
+        /// The layout this build reads.
+        expected: u8,
+    },
+    /// The metadata declares blocks of zero bytes.
     #[error("capture metadata reported blocksize 0")]
     ZeroBlocksize,
+    /// More blocks than an `i16` selector can address.
     #[error("capture requires too many blocks for i16 block indices: {blocks}")]
-    TooManyBlocks { blocks: usize },
+    TooManyBlocks {
+        /// Blocks the capture needs.
+        blocks: usize,
+    },
+    /// The element type has no size.
     #[error("capture metadata has zero-sized data type")]
     ZeroSizeDataType,
+    /// Fewer bytes than `length` elements need.
     #[error("capture data is too short for metadata length: {actual} < {required}")]
-    DataTooShort { actual: usize, required: usize },
+    DataTooShort {
+        /// Bytes read.
+        actual: usize,
+        /// Bytes `length` elements take.
+        required: usize,
+    },
+    /// An element type this build cannot decode.
     #[error("unsupported capture data type 0x{0:02x}")]
     UnsupportedDataType(u8),
 }
@@ -136,6 +204,8 @@ fn read_capture_metadata(device: &Device, rpc_name: &str) -> Result<CaptureMetad
     parse_capture_metadata(&reply)
 }
 
+/// Trigger a capture on `rpc_name`, wait up to `timeout` for it to finish,
+/// and read every block. `timeout` also bounds each busy block.
 pub fn read_capture(
     device: &Device,
     rpc_name: &str,

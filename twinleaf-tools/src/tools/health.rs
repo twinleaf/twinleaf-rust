@@ -37,7 +37,7 @@ use std::{
 use twinleaf::{
     data::{BoundaryReason, StreamKey, StreamMetadataSnapshot},
     device::{
-        DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError, RpcRegistry,
+        rpc::RpcRegistry, DeviceEvent, DeviceRoute, Event as StreamEvent, LinkEvent, RecvError,
         TreeEvent,
     },
     tio, Connection, SampleNumber, SessionId, StreamId,

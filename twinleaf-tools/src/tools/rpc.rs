@@ -2,8 +2,10 @@ use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
-use twinleaf::device::{CallError, Device, RpcValue, RpcValueTypeExt};
-use twinleaf::device::{RpcMeta, RpcMetaExt, RpcValueType};
+use twinleaf::device::rpc::{
+    CallError, RpcMeta, RpcMetaExt, RpcValue, RpcValueType, RpcValueTypeExt,
+};
+use twinleaf::device::Device;
 use twinleaf::tio;
 use twinleaf::Connection;
 

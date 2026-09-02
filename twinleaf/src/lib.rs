@@ -5,6 +5,7 @@
 
 #[deny(missing_docs)]
 pub mod data;
+#[deny(missing_docs)]
 pub mod device;
 pub mod firmware;
 pub mod tio;

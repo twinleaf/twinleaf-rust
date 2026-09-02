@@ -7,7 +7,8 @@
 //! [`enumerate_serial`] is a synchronous serial-only snapshot for callers that
 //! just want a one-shot list.
 
-use crate::device::{Connection, NamedRoute};
+use super::connection::Connection;
+use super::stream::NamedRoute;
 use crate::tio::proto::DeviceRoute;
 use crossbeam::channel;
 #[cfg(feature = "mdns")]
@@ -32,11 +33,15 @@ pub enum PortInterface {
 /// A device found during discovery.
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
+    /// The locator [`Connection::open`] takes.
     pub url: String,
+    /// How the device is reached.
     pub interface: PortInterface,
+    /// Its `dev.name`, once known.
     pub name: Option<String>,
 }
 
+/// What a discovery session looks for and how far it probes.
 #[derive(Debug, Clone, Copy)]
 pub struct DiscoveryConfig {
     /// Include serial ports with unrecognized USB VID/PID.
@@ -61,33 +66,43 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// What a discovery session reports as it runs.
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     /// A device appeared. `name` is set for mDNS instances (from the
     /// advertisement) and `None` for serial ports until a probe resolves it.
     Added(DiscoveredDevice),
     /// A device's `dev.name` was resolved after it was added.
-    Named { url: String, name: String },
+    Named {
+        /// The device's locator.
+        url: String,
+        /// Its `dev.name`.
+        name: String,
+    },
     /// The subdevices currently alive behind a device, refreshed each probe
     /// pass. Each event supersedes the previous one for `url`.
     Subdevices {
+        /// The device's locator.
         url: String,
+        /// The routes behind it, each with its name when known.
         routes: Vec<NamedRoute>,
     },
     /// A previously-added device went away (mDNS goodbye or serial unplug).
-    Removed { url: String },
+    Removed {
+        /// The device's locator.
+        url: String,
+    },
     /// Network browsing could not start, so no network devices will ever be
     /// reported. Serial discovery is unaffected.
-    NetworkUnavailable { reason: String },
+    NetworkUnavailable {
+        /// Why browsing could not start.
+        reason: String,
+    },
 }
 
-/// A running discovery session that streams [`DiscoveryEvent`]s as devices are
-/// found on serial ports and, when enabled, the local network. Serial ports are
-/// reported immediately; network devices arrive as mDNS resolves them.
-///
-/// Dropping the handle stops all browsing and name-probing and joins the worker
-/// threads, releasing any port held mid-probe — so it is safe to open a device
-/// for real right after the handle is dropped.
+/// A running discovery session streaming [`DiscoveryEvent`]s from serial ports
+/// and, when enabled, the network. Dropping it stops browsing and probing and
+/// releases any port held mid-probe.
 pub struct Discovery {
     events: channel::Receiver<DiscoveryEvent>,
     stop: Arc<AtomicBool>,
@@ -158,12 +173,8 @@ impl Drop for Discovery {
     }
 }
 
-/// Enumerate Twinleaf devices on local serial ports.
-///
-/// Matches known Twinleaf USB VID/PIDs (FTDI and STM32 variants). If
-/// `include_unknown` is true, other serial ports are also returned with
-/// `PortInterface::Unknown(vid, pid)` so callers can surface them as
-/// "also found these serial ports" style output.
+/// Twinleaf devices on local serial ports, by USB VID/PID; `include_unknown`
+/// adds every other port as [`PortInterface::Unknown`].
 pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
     #[cfg(not(feature = "serial"))]
     {
@@ -205,11 +216,8 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
     }
 }
 
-/// Briefly connect to a device and query its `dev.name` RPC.
-///
-/// Returns `Some(name)` on success, `None` if the port is busy, times out,
-/// or the device otherwise fails to respond. Total wall-clock time is
-/// bounded by roughly twice `timeout` (reconnect budget + RPC budget).
+/// Briefly connect to `url` and read its `dev.name`; `None` when the port is
+/// busy or the device does not answer within about twice `timeout`.
 pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
     let connection = Connection::open_with(url, Some(timeout), None);
     connection
@@ -226,9 +234,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// every live route.
 const ROUTE_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
 
-/// Serial re-scan/re-probe cadence, catching hotplug and late-booting
-/// subdevices. Network devices are probed once: reconnecting repeatedly
-/// could disrupt a session another host has with them.
+/// How often serial ports are rescanned and reprobed for hotplug and
+/// late-booting subdevices; network devices are probed once.
 const REPROBE_PERIOD: Duration = Duration::from_secs(2);
 
 /// [`Discovery`]'s probe worker: probe each queued URL, then keep re-scanning
@@ -331,9 +338,8 @@ fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), (
     tx.send(event).map_err(|_| ())
 }
 
-/// mDNS/DNS-SD service types Twinleaf network devices advertise. A device may
-/// advertise both transports; TCP is preferred when it does. Firmware built
-/// before 2026-06-15 advertises `_tio` instead of `_twinleaf`.
+/// Service types Twinleaf network devices advertise; TCP is preferred when
+/// both appear. Firmware built before 2026-06-15 advertises `_tio`.
 #[cfg(feature = "mdns")]
 const TWINLEAF_MDNS_SERVICES: [&str; 4] = [
     "_twinleaf._tcp.local.",
@@ -342,10 +348,8 @@ const TWINLEAF_MDNS_SERVICES: [&str; 4] = [
     "_tio._udp.local.",
 ];
 
-/// The records currently advertised for one mDNS instance label, keyed by
-/// fullname — which carries the service type, so the same device showing up
-/// under several of [`TWINLEAF_MDNS_SERVICES`] stays distinguishable — plus the
-/// URL announced to callers.
+/// The records advertised for one mDNS instance, keyed by fullname so one
+/// device under several service types stays distinct, plus its announced URL.
 #[cfg(feature = "mdns")]
 #[derive(Default)]
 struct Instance {
@@ -355,9 +359,8 @@ struct Instance {
 
 #[cfg(feature = "mdns")]
 impl Instance {
-    /// The URL this instance should be reachable at: the preferred transport
-    /// when advertised, otherwise any, picked deterministically so repeated
-    /// resolutions of the same records settle on one answer.
+    /// The URL to reach this instance at: the preferred transport when
+    /// advertised, otherwise any, chosen deterministically.
     fn preferred_url(&self, preferred: &str) -> Option<&str> {
         let mut urls: Vec<&str> = self.urls.values().map(String::as_str).collect();
         urls.sort_unstable();
@@ -376,10 +379,8 @@ fn network_unavailable(tx: &channel::Sender<DiscoveryEvent>, reason: String) {
     let _ = tx.send(DiscoveryEvent::NetworkUnavailable { reason });
 }
 
-/// Reconcile the URL announced for `label` against the records now advertised
-/// for it, emitting `Removed`/`Added` when it changes — a device that moves to a
-/// new address or loses its preferred transport is re-announced — and queueing
-/// the new URL on `probe_tx`. Errors when the event channel closed.
+/// Reconcile `label`'s announced URL with its current records, re-announcing
+/// it when it changes and queueing the new URL on `probe_tx`.
 #[cfg(feature = "mdns")]
 fn sync_instance(
     instances: &mut HashMap<String, Instance>,
@@ -415,12 +416,8 @@ fn sync_instance(
     Ok(())
 }
 
-/// [`Discovery`]'s network worker: browse `_twinleaf._tcp`/`_twinleaf._udp`
-/// continuously, emitting `Added` as instances resolve, re-announcing them when
-/// their address changes, and `Removed` on goodbye, until `stop` is set. When an
-/// instance advertises both transports, the preferred one (TCP unless
-/// `prefer_udp`) supersedes the other. Resolved devices are queued on `probe_tx`
-/// (when set) so the probe worker can enumerate their subdevices.
+/// [`Discovery`]'s network worker: browse until `stop` is set, announcing
+/// instances as they resolve, move, or leave, and queueing each on `probe_tx`.
 #[cfg(feature = "mdns")]
 fn browse_network(
     tx: &channel::Sender<DiscoveryEvent>,
@@ -504,10 +501,8 @@ fn instance_label(fullname: &str) -> String {
     fullname.to_string()
 }
 
-/// Host part for a discovered device's connect URL. Prefers the advertised
-/// `.local.` hostname — stable across IP changes and human-readable, and the OS
-/// resolver handles `.local.` via mDNS — falling back to a routable IPv4
-/// address (sorted for deterministic output) if no hostname is advertised.
+/// Host part of a discovered device's URL: the advertised `.local.` hostname,
+/// else its lowest routable IPv4 address.
 #[cfg(feature = "mdns")]
 fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
     let hostname = info.get_hostname().trim_end_matches('.');

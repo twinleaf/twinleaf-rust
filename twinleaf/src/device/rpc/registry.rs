@@ -1,8 +1,9 @@
 //! The set of RPCs a device offers, learned by walking `rpc.listinfo`.
 
 use super::cache;
-use super::{pipelined, CallError, PendingReply, RpcReply};
-
+use super::codec::RpcReply;
+use super::error::CallError;
+use super::reply::{pipelined, PendingReply};
 use std::collections::BTreeMap;
 use std::io;
 use twinleaf_proto::rpc::RpcMeta;
@@ -11,23 +12,31 @@ use twinleaf_proto::rpc::RpcMeta;
 /// request burst a memory-tight device must absorb.
 const WALK_WINDOW: usize = 8;
 
+/// Why a device's RPC table could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcRegistryError {
+    /// No cache directory exists on this host.
     #[error("could not locate cache directory")]
     CacheDirError,
+    /// The cache file could not be read or written.
     #[error("cache file I/O error: {0}")]
     CacheFileError(#[from] io::Error),
+    /// A call during the walk failed.
     #[error("RPC error: {0}")]
     DeviceRpcError(#[from] CallError),
 }
 
+/// One RPC a device offers.
 #[derive(Debug, Clone)]
 pub struct RpcDescriptor {
+    /// The name a call uses, such as `dev.name`.
     pub full_name: String,
+    /// Its type, access, and flags.
     pub meta: RpcMeta,
 }
 
 impl RpcDescriptor {
+    /// A descriptor from the metadata word as the device sends it.
     pub fn from_meta(meta: u16, name: String) -> RpcDescriptor {
         RpcDescriptor {
             full_name: name,
@@ -36,12 +45,15 @@ impl RpcDescriptor {
     }
 }
 
+/// The RPCs a device offers, by name.
 pub struct RpcRegistry {
     rpcs: BTreeMap<String, RpcDescriptor>,
+    /// The device's `rpc.hash`, when the table came from a device.
     pub hash: Option<u32>,
 }
 
 impl RpcRegistry {
+    /// A registry over `specs`, with no hash.
     pub fn new(specs: Vec<RpcDescriptor>) -> Self {
         let rpcs = specs
             .into_iter()
@@ -50,11 +62,8 @@ impl RpcRegistry {
         Self { rpcs, hash: None }
     }
 
-    /// Walk one device's RPC table through `submit`, keeping up to
-    /// [`WALK_WINDOW`] descriptor fetches in flight.
-    ///
-    /// `dev.name` and `rpc.hash` identify the on-disk cache entry; only a miss
-    /// enumerates `rpc.listinfo`.
+    /// Walk one device's RPC table through `submit`, [`WALK_WINDOW`] fetches in
+    /// flight; only a cache miss on `dev.name` and `rpc.hash` enumerates it.
     pub(crate) fn load_with(
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<Self, RpcRegistryError> {
@@ -85,14 +94,17 @@ impl RpcRegistry {
         registry
     }
 
+    /// The RPC called `name`.
     pub fn find(&self, name: &str) -> Option<&RpcDescriptor> {
         self.rpcs.get(name)
     }
 
+    /// Every name, sorted.
     pub fn names(&self) -> Vec<String> {
         self.rpcs.keys().cloned().collect()
     }
 
+    /// Every RPC, sorted by name.
     pub fn iter(&self) -> impl Iterator<Item = &RpcDescriptor> + '_ {
         self.rpcs.values()
     }

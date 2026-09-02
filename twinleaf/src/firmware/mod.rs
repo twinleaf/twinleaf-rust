@@ -9,7 +9,8 @@
 //! can plug in their own source. A ready-made GitHub-backed catalog is provided
 //! in [`github`] behind the `firmware-update` feature.
 
-use crate::device::{pipelined, CallError, Device};
+use crate::device::rpc::{pipelined, CallError};
+use crate::device::Device;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use twinleaf_proto::rpc as wire_rpc;
@@ -406,7 +407,7 @@ pub fn download_cached(
 ///
 /// Progress is reported through `on_event`; nothing is printed. A chunk lost
 /// in either direction fails its window; the upload then reads the device's
-/// cursor and resumes from that chunk, giving up only after [`MAX_STALLS`]
+/// cursor and resumes from that chunk, giving up only after three
 /// resumptions in a row that move the cursor nowhere. The function blocks for
 /// a short settle period after committing (see [`FlashEvent::Finalizing`]) so
 /// the device is not power-cycled mid-write.

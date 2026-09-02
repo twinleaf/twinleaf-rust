@@ -22,9 +22,8 @@ pub(super) fn path(dev_name: &str, hash: u32) -> Option<PathBuf> {
     Some(dir.join(format!("{}.{hash:x}.rpcs", stem(dev_name))))
 }
 
-/// Cache filename stem for a device-supplied name. The name is untrusted — a
-/// network device could report `../..` — so keep it to a charset that cannot
-/// escape the cache directory; the hash still makes the filename unique.
+/// Cache filename stem for a device-supplied name, restricted to a charset
+/// that cannot escape the cache directory.
 fn stem(dev_name: &str) -> String {
     dev_name
         .chars()
@@ -52,9 +51,8 @@ pub(super) fn load(path: &Path) -> io::Result<Option<Entries>> {
     }
 }
 
-/// Keeping the cache tidy is an optimization, never a reason to fail a registry
-/// the device already answered for — an unwritable cache directory only costs a
-/// round-trip next time.
+/// Write the cache; an unwritable directory only costs a round-trip next
+/// time, never a failed registry.
 pub(super) fn store(path: &Path, entries: &Entries) {
     warn(write(path, entries), "write", path);
 }
@@ -65,10 +63,8 @@ fn warn(result: io::Result<()>, action: &str, path: &Path) {
     }
 }
 
-/// Read the private on-disk RPC cache format.
-///
-/// Invalid contents are a cache miss rather than a user-facing error: the
-/// caller can discard the file and fetch a fresh registry from the device.
+/// Read the private on-disk cache format; invalid contents are a miss, not
+/// an error.
 fn read(file: File) -> io::Result<Option<Entries>> {
     let reader = io::BufReader::new(file);
     let mut lines = reader.lines();

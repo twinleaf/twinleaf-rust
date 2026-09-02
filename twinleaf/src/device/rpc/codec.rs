@@ -3,17 +3,31 @@
 
 use bytes::{Buf, BufMut};
 
+/// Why a reply's bytes did not decode as the requested type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RpcDecodeError {
+    /// Fewer bytes than the type needs.
     #[error("RPC reply is too short: expected at least {expected} bytes, got {actual}")]
-    TooShort { expected: usize, actual: usize },
+    TooShort {
+        /// Bytes the type needs.
+        expected: usize,
+        /// Bytes in the reply.
+        actual: usize,
+    },
+    /// Bytes left after the type was read.
     #[error("RPC reply has {remaining} trailing bytes")]
-    TrailingBytes { remaining: usize },
+    TrailingBytes {
+        /// Bytes left over.
+        remaining: usize,
+    },
 }
 
+/// A value that encodes as an RPC's arguments.
 pub trait RpcArgs {
+    /// Append the encoding to `output`.
     fn encode_into(&self, output: &mut Vec<u8>);
 
+    /// The encoding, freshly allocated.
     fn encode_args(&self) -> Vec<u8> {
         let mut output = Vec::new();
         self.encode_into(&mut output);
@@ -21,9 +35,12 @@ pub trait RpcArgs {
     }
 }
 
+/// A value that decodes from an RPC's reply.
 pub trait RpcReply: Sized {
+    /// Read one value from the front of `input`, advancing it.
     fn decode_from(input: &mut &[u8]) -> Result<Self, RpcDecodeError>;
 
+    /// Decode a whole reply, refusing one with bytes left over.
     fn decode_reply(mut input: &[u8]) -> Result<Self, RpcDecodeError> {
         let value = Self::decode_from(&mut input)?;
         if input.is_empty() {
@@ -36,9 +53,8 @@ pub trait RpcReply: Sized {
     }
 }
 
-/// Reply types with a fixed wire size. Only such a type can precede another
-/// value in a tuple reply, since variable-length values consume the remainder
-/// of the reply.
+/// Reply types of fixed wire size, the only kind that can precede another
+/// value in a tuple reply.
 pub trait RpcReplyFixedSize: RpcReply {}
 
 fn require_bytes(input: &[u8], expected: usize) -> Result<(), RpcDecodeError> {

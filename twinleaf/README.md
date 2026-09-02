@@ -9,8 +9,8 @@ wire types and codecs.
 - Discover serial devices and, with the [`mdns`](#cargo-features) Cargo feature,
   networked devices through [`Discovery`].
 - Address a routed subtree with [`DeviceTree`] or bind one route with [`Device`].
-- Call typed or dynamic RPCs and subscribe to [`SampleBatch`]es, [`Event`]s, or
-  raw [`Packet`]s.
+- Call [typed or dynamic RPCs] and subscribe to [`SampleBatch`]es, [`Event`]s,
+  or raw [`Packet`]s.
 - Buffer and process live data or read recorded `tio` logs with the [data module].
 - Query and update device firmware through the [firmware module].
 
@@ -68,4 +68,5 @@ fn main() {
 [`SampleBatch`]: https://docs.rs/twinleaf/latest/twinleaf/data/struct.SampleBatch.html
 [data module]: https://docs.rs/twinleaf/latest/twinleaf/data/index.html
 [firmware module]: https://docs.rs/twinleaf/latest/twinleaf/firmware/index.html
+[typed or dynamic RPCs]: https://docs.rs/twinleaf/latest/twinleaf/device/rpc/index.html
 [GitHub-backed firmware catalog]: https://github.com/twinleaf/twinleaf-firmware-updates

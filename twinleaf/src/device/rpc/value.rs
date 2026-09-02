@@ -3,13 +3,20 @@
 
 use twinleaf_proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcValueType};
 
+/// An RPC value whose type was learned at run time.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RpcValue {
+    /// No value: an action, or a reply with nothing in it.
     Unit,
+    /// Any unsigned integer type, widened.
     U64(u64),
+    /// Any signed integer type, widened.
     I64(i64),
+    /// Any float type, widened.
     F64(f64),
+    /// A string.
     Str(String),
+    /// Raw bytes, for a type with no better reading.
     Bytes(Vec<u8>),
 }
 
@@ -33,7 +40,9 @@ impl std::fmt::Display for RpcValue {
 
 /// Host-side codecs between the shared value-type tag and owned [`RpcValue`]s.
 pub trait RpcValueTypeExt {
+    /// Encode `value` as this type.
     fn encode(self, value: &RpcValue) -> Result<Vec<u8>, RpcValueEncodeError>;
+    /// Decode `bytes` as this type.
     fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError>;
 }
 
@@ -200,36 +209,65 @@ fn decode_signed(bytes: &[u8], size: u8) -> Result<RpcValue, RpcValueDecodeError
     Ok(RpcValue::I64(value))
 }
 
+/// Why a value could not be encoded as the type an RPC takes.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcValueEncodeError {
+    /// The value's kind is not the type's.
     #[error("cannot encode {actual} as {expected:?}")]
     TypeMismatch {
+        /// The type the RPC takes.
         expected: RpcValueType,
+        /// The kind of value offered.
         actual: &'static str,
     },
+    /// The value does not fit the type.
     #[error("value {value} is out of range for {target:?}")]
-    OutOfRange { value: String, target: RpcValueType },
+    OutOfRange {
+        /// The value, as written.
+        value: String,
+        /// The type it had to fit.
+        target: RpcValueType,
+    },
+    /// The string exceeds the type's length.
     #[error("string too long ({actual} bytes, max {max})")]
-    StringTooLong { max: u8, actual: usize },
+    StringTooLong {
+        /// Bytes the type allows.
+        max: u8,
+        /// Bytes in the string.
+        actual: usize,
+    },
+    /// An integer width this build cannot handle.
     #[error("unsupported integer size: {0} bytes")]
     UnsupportedIntegerSize(u8),
+    /// A float width this build cannot handle.
     #[error("unsupported float size: {0} bytes")]
     UnsupportedFloatSize(u8),
 }
 
+/// Why reply bytes could not be read as the type an RPC returns.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcValueDecodeError {
+    /// Fewer bytes than the type needs.
     #[error("expected {expected} bytes, got {actual}")]
-    InsufficientBytes { expected: usize, actual: usize },
+    InsufficientBytes {
+        /// Bytes the type needs.
+        expected: usize,
+        /// Bytes in the reply.
+        actual: usize,
+    },
+    /// An integer width this build cannot handle.
     #[error("unsupported integer size: {0} bytes")]
     UnsupportedIntegerSize(u8),
+    /// A float width this build cannot handle.
     #[error("unsupported float size: {0} bytes")]
     UnsupportedFloatSize(u8),
 }
 
 /// Host-side display helpers over the shared metadata word.
 pub trait RpcMetaExt {
+    /// Access as three letters, read, write, persistent, with `-` for each the RPC lacks.
     fn perm_str(&self) -> String;
+    /// The value type's name, or `capture` or `bool` when a flag refines it.
     fn type_str(&self) -> String;
 }
 

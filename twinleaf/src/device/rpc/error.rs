@@ -1,17 +1,20 @@
-use super::RpcDecodeError;
+use super::codec::RpcDecodeError;
+use crate::tio::proto::route::RouteError;
 use crate::tio::proxy;
-
 use twinleaf_proto::rpc as wire;
 
 /// A device's refusal, owned so a client can carry it out of the receive loop.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{error}")]
 pub struct RpcErrorPayload {
+    /// The code.
     pub error: wire::RpcError,
+    /// The message bytes, if the device sent any.
     pub extra: Vec<u8>,
 }
 
 impl RpcErrorPayload {
+    /// Own a parsed error reply.
     pub fn from_wire(error: wire::ErrorReply<'_>) -> Self {
         Self {
             error: error.error(),
@@ -24,18 +27,25 @@ impl RpcErrorPayload {
 /// came back, the device refused, or the reply did not decode.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CallError {
+    /// Never sent: the proxy was busy, or the name did not fit a packet.
     #[error("RPC request was not submitted to the proxy")]
     RequestNotSubmitted,
+    /// The route lies outside this view.
     #[error("RPC route outside this view: {0}")]
-    InvalidRoute(#[from] twinleaf_proto::RouteError),
+    InvalidRoute(#[from] RouteError),
+    /// The proxy closed before the reply came.
     #[error("proxy disconnected while waiting for the RPC reply")]
     ResponseLost,
+    /// No reply within the view's RPC timeout.
     #[error("timed out waiting for the RPC reply")]
     Timeout,
+    /// The device left before answering.
     #[error("device disconnected before the RPC completed")]
     DeviceDisconnected,
+    /// The device refused the call.
     #[error("device returned error: {0}")]
     DeviceError(RpcErrorPayload),
+    /// The reply did not decode as the expected type.
     #[error("RPC reply did not match expected type: {0}")]
     InvalidReply(#[source] RpcDecodeError),
 }
