@@ -1,21 +1,19 @@
-//! SYNC packet (timeref broadcast) wire format
+//! SYNC packet, a time reference.
 //!
 //! Payload: `{ type: u8, epoch: u8, serial_len: u8, pad: u8, time: u32le,
-//! session: u32le }` then a serial string of `serial_len` bytes (not
-//! NUL-terminated).
+//! session: u32le }` then a serial string of `serial_len` bytes, not
+//! NUL-terminated.
 //!
-//! A hub broadcasts one SYNC packet per second to every child port. `time` is
-//! the current second in `epoch`'s timescale at transmission; receivers anchor
-//! `time + 1` to their next PPS edge.
-//! `session` identifies the timebase instance and `serial` its source device,
-//! so a child can detect a reference change.
+//! A hub sends one SYNC packet per second to each child. `time` is the
+//! current second in `epoch`'s timescale, and the receiver labels its next
+//! pulse `time + 1`. `session` and `serial` identify the timebase source.
 
 use crate::packet::{Header, PacketType};
 use crate::SessionId;
 
 /// Timeref header bytes preceding the serial string.
 pub const TIMEREF_HEADER_SIZE: usize = 12;
-/// Longest serial receivers keep (tl_stream_timeref's `char serial[33]`).
+/// Longest serial, 32 bytes.
 pub const MAX_SERIAL_SIZE: usize = 32;
 
 /// Timescale identifier (TL_METADATA_EPOCH_*), including unknown values.
@@ -24,15 +22,21 @@ pub const MAX_SERIAL_SIZE: usize = 32;
 pub struct Epoch(u8);
 
 impl Epoch {
+    /// No timescale, 0.
     pub const INVALID: Self = Self(0);
+    /// Seconds from an arbitrary zero, 1.
     pub const ZERO: Self = Self(1);
+    /// Seconds since the source booted, 2.
     pub const SYSTIME: Self = Self(2);
+    /// Seconds since the Unix epoch, 3.
     pub const UNIX: Self = Self(3);
 
+    /// Epoch from its byte.
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
 
+    /// The epoch byte.
     pub const fn value(self) -> u8 {
         self.0
     }
@@ -50,11 +54,14 @@ impl core::fmt::Display for Epoch {
     }
 }
 
+/// Time reference carried by a SYNC packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeref<'a> {
+    /// Timescale of `time`.
     pub epoch: Epoch,
     /// Current second in `epoch`'s timescale when the packet was sent.
     pub time: u32,
+    /// Session id of the timebase source.
     pub session: SessionId,
     /// Serial of the timebase source (not NUL-terminated).
     pub serial: &'a [u8],

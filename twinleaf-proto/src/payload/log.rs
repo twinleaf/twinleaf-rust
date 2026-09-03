@@ -1,14 +1,10 @@
-//! LOG packet wire format
+//! LOG packet, a log message.
 //!
-//! Payload: `{ data: u32le, level: u8 }` then the message bytes, which are
-//! neither NUL-terminated nor padded — the message runs to the end of the
-//! payload: a host recovers its length as the payload size minus the
-//! fixed header.
+//! Payload: `{ data: u32le, level: u8 }` then the message bytes, not
+//! NUL-terminated, running to the end of the payload.
 //!
-//! `data` is a free 32-bit field the sender fills in: zero for `logInfo`,
-//! `errno` for `logInfoE`, milliseconds since boot for `logInfoT`, or any
-//! value for `logInfoN`. Firmware here sends the
-//! timestamp, so a host can order messages without trusting arrival time.
+//! `data` is chosen by the sender. Twinleaf devices send milliseconds since
+//! boot.
 
 use crate::packet::{Header, Packet, PacketType};
 
@@ -27,16 +23,23 @@ pub const MAX_MESSAGE_SIZE: usize = Packet::MAX_PAYLOAD - LOG_HEADER_SIZE;
 pub struct LogLevel(u8);
 
 impl LogLevel {
+    /// Critical, 0.
     pub const CRITICAL: Self = Self(0);
+    /// Error, 1.
     pub const ERROR: Self = Self(1);
+    /// Warning, 2.
     pub const WARNING: Self = Self(2);
+    /// Info, 3.
     pub const INFO: Self = Self(3);
+    /// Debug, 4.
     pub const DEBUG: Self = Self(4);
 
+    /// Level from its byte.
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
 
+    /// The level byte.
     pub const fn value(self) -> u8 {
         self.0
     }
@@ -45,9 +48,9 @@ impl LogLevel {
 /// One log message, as it travels in a LOG packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogMessage<'a> {
+    /// Severity.
     pub level: LogLevel,
-    /// Sender-defined payload; devices conventionally put milliseconds since
-    /// boot in it.
+    /// Sender-defined value, milliseconds since boot on Twinleaf devices.
     pub data: u32,
     /// Message text, not NUL-terminated.
     pub message: &'a [u8],

@@ -1,19 +1,16 @@
-//! Stream sample and metadata wire formats.
+//! Sample packets and metadata records.
 //!
-//! A METADATA packet payload is `[record type u8][flags u8]` followed by one
-//! record: a fixed-size head whose first byte is the head's own length, then
-//! the variable-length strings whose lengths that head records. Readers take
-//! the strings from the declared head length rather than a compiled-in offset,
-//! so a device may append head fields without breaking older hosts. A data
-//! packet has type `STREAM0 + stream_id` and a payload of
+//! A sample packet has type `STREAM0 + stream id` and a payload of
 //! `[first sample number u24le][segment id u8]` followed by packed samples.
 //!
-//! A `dev.metadata` RPC selects records with [`MetadataSelector`] triples and
-//! replies with `[type][record length u8][record]` frames ([`MetadataReply`]);
-//! the records are bare, with no `[type][flags]` header, so every record
-//! parses and writes on its own as well as through [`Metadata`].
+//! A METADATA packet payload is `[record type u8][flags u8]` followed by one
+//! record: a fixed-size head whose first byte is its own length, then the
+//! strings whose lengths the head records. A device may append head fields,
+//! and readers take the strings from the declared head length.
 //!
-//! Every layout here is normative, locked by the byte-exact tests below.
+//! A `dev.metadata` RPC selects records with [`MetadataSelector`] triples and
+//! replies with `[type][record length u8][record]` frames ([`MetadataReply`]).
+//! The records inside a reply are bare, with no `[type][flags]` header.
 
 use crate::packet::{Header, Packet, PacketType};
 use crate::sync::Epoch;
@@ -29,6 +26,7 @@ pub const MAX_SAMPLE_NUMBER: u32 = crate::SampleNumber::MAX;
 /// Lowest stream id a device may allocate. Id 0 is reserved: `STREAM0` carries
 /// a 32-bit sample number instead of the 24-bit-plus-segment form used here.
 pub const FIRST_STREAM_ID: u8 = crate::StreamId::MIN;
+/// Highest stream id, 127.
 pub const LAST_STREAM_ID: u8 = crate::StreamId::MAX;
 
 /// Column sample encoding (`TL_DATA_TYPE_*`). The high nibble is the byte size.
@@ -37,23 +35,37 @@ pub const LAST_STREAM_ID: u8 = crate::StreamId::MAX;
 pub struct DataType(u8);
 
 impl DataType {
+    /// Unsigned 8-bit, 0x10.
     pub const U8: Self = Self(0x10);
+    /// Signed 8-bit, 0x11.
     pub const I8: Self = Self(0x11);
+    /// Unsigned 16-bit, 0x20.
     pub const U16: Self = Self(0x20);
+    /// Signed 16-bit, 0x21.
     pub const I16: Self = Self(0x21);
+    /// Unsigned 24-bit, 0x30.
     pub const U24: Self = Self(0x30);
+    /// Signed 24-bit, 0x31.
     pub const I24: Self = Self(0x31);
+    /// Unsigned 32-bit, 0x40.
     pub const U32: Self = Self(0x40);
+    /// Signed 32-bit, 0x41.
     pub const I32: Self = Self(0x41);
+    /// Unsigned 64-bit, 0x80.
     pub const U64: Self = Self(0x80);
+    /// Signed 64-bit, 0x81.
     pub const I64: Self = Self(0x81);
+    /// 32-bit float, 0x42.
     pub const F32: Self = Self(0x42);
+    /// 64-bit float, 0x82.
     pub const F64: Self = Self(0x82);
 
+    /// Type from its byte.
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
 
+    /// The type byte.
     pub const fn value(self) -> u8 {
         self.0
     }
@@ -98,22 +110,27 @@ impl MetadataFlags {
     /// Closes a sweep: the host has now seen every record once.
     pub const LAST: Self = Self(1 << 2);
 
+    /// Flags from their byte.
     pub const fn from_bits(bits: u8) -> Self {
         Self(bits)
     }
 
+    /// The raw bits.
     pub const fn bits(self) -> u8 {
         self.0
     }
 
+    /// No flags set.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// Whether every bit of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Both sets of flags.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -138,22 +155,27 @@ impl SegmentFlags {
     /// New samples are still being generated for this segment.
     pub const ACTIVE: Self = Self(2);
 
+    /// Flags from their byte.
     pub const fn from_bits(bits: u8) -> Self {
         Self(bits)
     }
 
+    /// The raw bits.
     pub const fn bits(self) -> u8 {
         self.0
     }
 
+    /// No flags set.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// Whether every bit of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Both sets of flags.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -174,14 +196,19 @@ impl core::ops::BitOr for SegmentFlags {
 pub struct FilterType(u8);
 
 impl FilterType {
+    /// No filter, 0.
     pub const NONE: Self = Self(0);
+    /// First order IIR low-pass, 1.
     pub const IIR_SP_LPF1: Self = Self(1);
+    /// Second order IIR low-pass, 2.
     pub const IIR_SP_LPF2: Self = Self(2);
 
+    /// Filter from its byte.
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
 
+    /// The filter byte.
     pub const fn value(self) -> u8 {
         self.0
     }
@@ -201,11 +228,15 @@ impl core::fmt::Display for FilterType {
 /// Device identity and stream count (`TL_METADATA_DEVICE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Device<'a> {
+    /// Session id of the device.
     pub session: SessionId,
     /// Streams the host should expect to be described in this sweep.
     pub n_streams: u8,
+    /// Device name.
     pub name: &'a str,
+    /// Device serial.
     pub serial: &'a str,
+    /// Firmware build serial.
     pub firmware: &'a str,
 }
 
@@ -245,13 +276,17 @@ impl<'a> Device<'a> {
 /// Shape of one data stream (`TL_METADATA_STREAM`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream<'a> {
+    /// Stream id.
     pub stream_id: StreamId,
+    /// Number of columns in a sample.
     pub n_columns: u8,
+    /// Number of segments in the ring.
     pub n_segments: u8,
     /// Bytes per sample: the packed size of all columns.
     pub sample_size: u16,
     /// Samples the device retains for retransmission.
     pub buf_samples: u16,
+    /// Stream name.
     pub name: &'a str,
 }
 
@@ -292,19 +327,27 @@ impl<'a> Stream<'a> {
 /// (`TL_METADATA_SEGMENT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Segment<'a> {
+    /// Stream id.
     pub stream_id: StreamId,
+    /// Segment id.
     pub segment_id: SegmentId,
+    /// Segment state.
     pub flags: SegmentFlags,
+    /// Timescale of `start_time`.
     pub epoch: Epoch,
     /// Serial of the device that owns the timebase.
     pub timeref_serial: &'a str,
+    /// Session id of the timebase source.
     pub timeref_session: SessionId,
     /// Time of sample zero, in seconds after `epoch`.
     pub start_time: u32,
     /// Samples per second before decimation.
     pub sampling_rate: u32,
+    /// Samples averaged into each output sample.
     pub decimation: u32,
+    /// Filter cutoff in hertz.
     pub filter_cutoff: f32,
+    /// Filter applied before decimation.
     pub filter_type: FilterType,
 }
 
@@ -354,12 +397,17 @@ impl<'a> Segment<'a> {
 /// One column of a stream's sample (`TL_METADATA_COLUMN`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Column<'a> {
+    /// Stream id.
     pub stream_id: StreamId,
     /// Position of this column within the packed sample.
     pub index: ColumnId,
+    /// Sample encoding.
     pub data_type: DataType,
+    /// Column name.
     pub name: &'a str,
+    /// Units of the value.
     pub units: &'a str,
+    /// Description of the column.
     pub description: &'a str,
 }
 
@@ -403,10 +451,15 @@ impl<'a> Column<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MetadataType {
+    /// Device record, 1.
     Device,
+    /// Stream record, 2.
     Stream,
+    /// Segment record, 3.
     Segment,
+    /// Column record, 4.
     Column,
+    /// Any other record type.
     Unknown(u8),
 }
 
@@ -437,9 +490,13 @@ impl From<MetadataType> for u8 {
 /// One metadata record.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Metadata<'a> {
+    /// Device identity and stream count.
     Device(Device<'a>),
+    /// Shape of one stream.
     Stream(Stream<'a>),
+    /// Acquisition parameters of one segment.
     Segment(Segment<'a>),
+    /// One column of a stream.
     Column(Column<'a>),
 }
 
@@ -595,6 +652,7 @@ pub const MAX_METADATA_REPLY_SIZE: usize = Packet::MAX_PAYLOAD - crate::rpc::REP
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct MetadataSelector {
+    /// Record type requested.
     pub mtype: MetadataType,
     /// Ignored for a device record.
     pub stream_id: u8,
@@ -607,6 +665,7 @@ impl MetadataSelector {
     /// Encoded size of one selector.
     pub const SIZE: usize = 3;
 
+    /// Selector for the device record.
     pub const fn device() -> Self {
         Self {
             mtype: MetadataType::Device,
@@ -615,6 +674,7 @@ impl MetadataSelector {
         }
     }
 
+    /// Selector for a stream record.
     pub const fn stream(stream_id: u8) -> Self {
         Self {
             mtype: MetadataType::Stream,
@@ -623,6 +683,7 @@ impl MetadataSelector {
         }
     }
 
+    /// Selector for a segment record. `index` may be [`CURRENT_SEGMENT`].
     pub const fn segment(stream_id: u8, index: u8) -> Self {
         Self {
             mtype: MetadataType::Segment,
@@ -631,6 +692,7 @@ impl MetadataSelector {
         }
     }
 
+    /// Selector for a column record.
     pub const fn column(stream_id: u8, index: u8) -> Self {
         Self {
             mtype: MetadataType::Column,
@@ -639,6 +701,7 @@ impl MetadataSelector {
         }
     }
 
+    /// The three request bytes.
     pub fn encode(self) -> [u8; Self::SIZE] {
         [self.mtype.into(), self.stream_id, self.index]
     }
@@ -648,8 +711,10 @@ impl MetadataSelector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MetadataQueryError {
+    /// Argument length is not a multiple of three.
     #[error("argument length is not a whole number of selectors")]
     Misaligned,
+    /// More than sixteen selectors.
     #[error("more selectors than a request may carry")]
     TooManySelectors,
 }
@@ -664,6 +729,7 @@ pub struct MetadataQuery<'a> {
 }
 
 impl<'a> MetadataQuery<'a> {
+    /// Selectors from a request argument.
     pub fn parse(arg: &'a [u8]) -> Result<Self, MetadataQueryError> {
         if arg.len() % MetadataSelector::SIZE != 0 {
             return Err(MetadataQueryError::Misaligned);
@@ -674,10 +740,12 @@ impl<'a> MetadataQuery<'a> {
         Ok(Self { arg })
     }
 
+    /// Whether the argument is empty, requesting the device's default set.
     pub fn is_bootstrap(&self) -> bool {
         self.arg.is_empty()
     }
 
+    /// The selectors in request order.
     pub fn selectors(&self) -> impl Iterator<Item = MetadataSelector> + 'a {
         self.arg
             .chunks_exact(MetadataSelector::SIZE)
@@ -699,6 +767,7 @@ pub struct MetadataReply<'a> {
 }
 
 impl<'a> MetadataReply<'a> {
+    /// Frames from a reply payload. None if any frame is truncated.
     pub fn parse(reply: &'a [u8]) -> Option<Self> {
         let mut remaining = reply;
         while !remaining.is_empty() {
@@ -723,7 +792,9 @@ impl<'a> Iterator for MetadataReply<'a> {
 /// A run of consecutive samples from one stream segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Samples<'a> {
+    /// Stream id.
     pub stream_id: StreamId,
+    /// Segment id.
     pub segment_id: SegmentId,
     /// Sample number of the first sample in `data`.
     pub first: SampleNumber,
@@ -798,10 +869,25 @@ impl<'a> Samples<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Subject {
+    /// The device record.
     Device,
-    Stream { stream: u8 },
-    Segment { stream: u8 },
-    Column { stream: u8, column: u8 },
+    /// Stream record.
+    Stream {
+        /// Zero-based stream position.
+        stream: u8,
+    },
+    /// Current segment record.
+    Segment {
+        /// Zero-based stream position.
+        stream: u8,
+    },
+    /// Column record.
+    Column {
+        /// Zero-based stream position.
+        stream: u8,
+        /// Zero-based column position.
+        column: u8,
+    },
 }
 
 /// Round-robin walk over a device's metadata: the device, then for each stream
@@ -813,6 +899,7 @@ pub struct Sweep {
 }
 
 impl Sweep {
+    /// A sweep starting at the device record.
     pub const fn new() -> Self {
         Self {
             position: Position::Device,

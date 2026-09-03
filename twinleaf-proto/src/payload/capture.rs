@@ -1,12 +1,8 @@
-//! Capture metadata RPC reply wire format.
+//! Capture metadata, an RPC reply format.
 //!
 //! A capture RPC called with the metadata selector replies with a fixed head
-//! whose first byte is the head's own length, then the four strings whose
-//! lengths that head records, in the order `name`, `units`, `x_name`,
-//! `x_units`. This is the same length-prefixed scheme the metadata records
-//! use, so a reader takes the strings from the declared head length rather
-//! than a compiled-in offset and a device may append head fields without
-//! breaking older hosts.
+//! whose first byte is its own length, then four strings whose lengths the
+//! head records: `name`, `units`, `x_name`, `x_units`.
 
 use crate::data::{DataType, RecordReader, RecordWriter};
 
@@ -21,6 +17,7 @@ pub const METADATA_FIXED_LEN: usize = 30;
 pub struct CaptureMetadata<'a> {
     /// Layout of the reply; a reader that does not know it should stop.
     pub version: u8,
+    /// Element encoding.
     pub data_type: DataType,
     /// Bytes of capture data the block RPCs will serve: `length` elements.
     pub data_size: u32,
@@ -34,9 +31,13 @@ pub struct CaptureMetadata<'a> {
     pub x_offset: f32,
     /// x step between consecutive elements.
     pub x_stride: f32,
+    /// Capture name.
     pub name: &'a str,
+    /// Units of the values.
     pub units: &'a str,
+    /// Name of the x axis.
     pub x_name: &'a str,
+    /// Units of the x axis.
     pub x_units: &'a str,
 }
 
