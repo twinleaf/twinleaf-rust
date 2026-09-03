@@ -52,8 +52,6 @@ pub enum Payload<'a> {
     Samples(wire::Samples<'a>),
     /// A device announcing that one of its settings changed.
     Setting(Setting<'a>),
-    /// The proxy naming an RPC another client completed.
-    RpcUpdate(wire_rpc::Method<'a>),
     /// The proxy's own link status.
     ProxyStatus(ProxyStatus),
     /// A packet type this build does not interpret, kept whole so it can be
@@ -161,16 +159,6 @@ pub enum RpcMethod {
 }
 
 impl RpcMethod {
-    /// Own a parsed method, replacing invalid UTF-8 in a name.
-    pub fn from_wire(method: wire_rpc::Method<'_>) -> Self {
-        match method {
-            wire_rpc::Method::ById(id) => Self::Id(id.value()),
-            wire_rpc::Method::ByName(name) => {
-                Self::Name(String::from_utf8_lossy(name).into_owned())
-            }
-        }
-    }
-
     /// The borrowed form a request is written from.
     pub fn to_wire(&self) -> Result<wire_rpc::Method<'_>, EncodeError> {
         Ok(match self {
@@ -182,11 +170,6 @@ impl RpcMethod {
             )?),
             Self::Name(name) => wire_rpc::Method::ByName(name.as_bytes()),
         })
-    }
-
-    /// The proxy's notice that another client's RPC changed this method.
-    pub fn update_packet(&self, routing: DeviceRoute) -> Result<Packet, EncodeError> {
-        Packet::rpc_update(self.to_wire()?, routing)
     }
 }
 
@@ -209,9 +192,6 @@ fn parse_payload<'a>(header: Header, payload: &'a [u8]) -> Result<Payload<'a>, D
         PacketType::SETTING => Payload::Setting(Setting::parse(payload).ok_or(too_short)?),
         PacketType::PROXY_STATUS => {
             Payload::ProxyStatus(ProxyStatus::from(*payload.first().ok_or(too_short)?))
-        }
-        PacketType::RPC_UPDATE => {
-            Payload::RpcUpdate(wire_rpc::parse_update(payload).ok_or(DecodeError::InvalidPayload)?)
         }
         _ => match ptype.stream_id() {
             Some(stream_id) if stream_id >= wire::FIRST_STREAM_ID => {
@@ -318,26 +298,6 @@ impl Packet {
         wire_rpc::write_error(&mut buf, RpcRequestId::new(id), code)
             .expect("a bare error payload always fits");
         finish(&mut buf, len, routing)
-    }
-
-    /// The proxy's notice that another client's RPC changed a method.
-    pub fn rpc_update(
-        method: wire_rpc::Method<'_>,
-        routing: DeviceRoute,
-    ) -> Result<Packet, EncodeError> {
-        let name_len = match method {
-            wire_rpc::Method::ById(_) => 0,
-            wire_rpc::Method::ByName(name) => name.len(),
-        };
-        let payload_len =
-            wire_rpc::update_payload_len(method).ok_or(EncodeError::PayloadTooLarge {
-                actual: wire_rpc::UPDATE_HEADER_SIZE + name_len,
-                maximum: WirePacket::MAX_PAYLOAD,
-            })?;
-        let mut buf = [0u8; WirePacket::MAX_SIZE];
-        let len = wire_rpc::write_update(&mut buf, method).expect("payload sized above");
-        debug_assert_eq!(len, Header::SIZE + payload_len);
-        Ok(finish(&mut buf, len, routing))
     }
 
     /// The keepalive a host sends to hold a link open.

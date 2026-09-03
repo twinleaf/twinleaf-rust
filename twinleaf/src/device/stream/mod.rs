@@ -14,7 +14,7 @@ use crate::proto::data as wire;
 use crate::proto::rpc as wire_rpc;
 use crate::proto::DeviceRoute;
 use crate::tio;
-use crate::tio::packet::{self, RpcMethod};
+use crate::tio::packet;
 use crate::tio::proxy;
 use crossbeam::channel;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -293,15 +293,6 @@ impl StreamState {
         }
 
         match pkt.payload() {
-            packet::Payload::RpcUpdate(method) => {
-                if covered {
-                    self.device_event(
-                        route,
-                        DeviceEvent::RpcInvalidated(RpcMethod::from_wire(method)),
-                    );
-                }
-                return;
-            }
             packet::Payload::Heartbeat(beat) => {
                 if covered {
                     self.device_event(
@@ -518,9 +509,9 @@ impl Pump {
     }
 
     /// Offer a packet to the raw taps, unparsed and with its absolute route.
-    /// Invalidations stop here. A status reaches every tap its subtree touches.
+    /// A status reaches every tap its subtree touches.
     fn tap(&mut self, packet: &tio::Packet) {
-        if self.packets.is_empty() || matches!(packet.payload(), packet::Payload::RpcUpdate(_)) {
+        if self.packets.is_empty() {
             return;
         }
         let scope = match packet.payload() {

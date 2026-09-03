@@ -41,8 +41,6 @@ impl PacketType {
     pub const USER: Self = Self(64);
     /// Proxy link status, a `USER` packet.
     pub const PROXY_STATUS: Self = Self(64);
-    /// Method value changed, sent without a call.
-    pub const RPC_UPDATE: Self = Self(65);
     /// Samples of stream 0. Stream n is `STREAM0 + n`.
     pub const STREAM0: Self = Self(128);
 
@@ -350,7 +348,6 @@ mod tests {
 
     #[test]
     fn packet_type_preserves_extensions_and_stream_ids() {
-        assert_eq!(PacketType::try_new(65), Some(PacketType::RPC_UPDATE));
         assert_eq!(PacketType::new(77).value(), 77);
         assert_eq!(PacketType::stream(7).unwrap().value(), 135);
         assert_eq!(PacketType::stream(7).unwrap().stream_id(), Some(7));

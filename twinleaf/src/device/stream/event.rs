@@ -4,7 +4,7 @@ use super::subscription::Scope;
 use crate::data::DeviceMetadataSnapshot;
 use crate::proto::DeviceRoute;
 use crate::proto::SessionId;
-use crate::tio::packet::{self, RpcMethod};
+use crate::tio::packet;
 
 /// What a link is doing. It belongs to the transport, so it concerns a whole
 /// subtree: a direct connection, or one mount behind `tio proxy --mount`.
@@ -41,8 +41,6 @@ pub enum DeviceEvent {
     /// The device answered `dev.metadata` with `NotFound`: its firmware cannot
     /// describe its streams, so nothing on this route will ever decode.
     MetadataUnavailable,
-    /// Another client completed an RPC that can invalidate a cached value.
-    RpcInvalidated(RpcMethod),
     /// `Some(hash)` comes from a settings packet. `None` requests a refresh
     /// after reconnection.
     NewHash(Option<u32>),

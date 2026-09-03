@@ -213,9 +213,7 @@ impl DeviceTree {
                 Event::Device { route: from, event } if from == route => match event {
                     DeviceEvent::Metadata(snapshot) => return Ok(snapshot),
                     DeviceEvent::MetadataUnavailable => return Err(MetadataError::Unsupported),
-                    DeviceEvent::Heartbeat { .. }
-                    | DeviceEvent::RpcInvalidated(_)
-                    | DeviceEvent::NewHash(_) => {}
+                    DeviceEvent::Heartbeat { .. } | DeviceEvent::NewHash(_) => {}
                 },
                 Event::Device { .. } | Event::Tree { .. } | Event::Link { .. } => {}
             }

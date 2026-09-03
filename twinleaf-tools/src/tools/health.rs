@@ -794,12 +794,6 @@ impl HealthState {
                         .or_default()
                         .on_heartbeat(now);
                 }
-                DeviceEvent::RpcInvalidated(method) => {
-                    self.log_event(
-                        format!("[{}] RPC INVALIDATED: {:?}", route, method),
-                        Color::Cyan,
-                    );
-                }
                 DeviceEvent::Metadata(snapshot) => {
                     self.log_event(
                         format!("[{}] METADATA: {}", route, snapshot.device().name),

@@ -45,10 +45,9 @@ it removes the last routing byte and forwards the packet to that port.
 | 62      | `SYNC`       | Time reference, [`sync`]                 |
 | 63      | `TEXT`       | Console text                             |
 | 64      | `USER`       | Application defined                      |
-| 65      | `RPC_UPDATE` | Method value changed, [`rpc`]            |
 | 128 + n | `STREAM` n   | Samples of stream n, [`data`]            |
 
-Values 0, 9, 10, and 13 are invalid.
+Values 0, 9, 10, and 13 are invalid. Value 65 was `RPC_UPDATE` and is now unused.
 
 ## RPC Formats
 
