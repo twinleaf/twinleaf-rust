@@ -682,7 +682,7 @@ mod tests {
     fn everything() -> Scope {
         Scope {
             route: DeviceRoute::root(),
-            depth: crate::proto::MAX_ROUTING_SIZE,
+            depth: DeviceRoute::MAX_HOPS,
         }
     }
 
@@ -705,7 +705,7 @@ mod tests {
         channel::Sender<()>,
     ) {
         let (endpoint, commands, worker) =
-            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), crate::proto::MAX_ROUTING_SIZE);
+            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), DeviceRoute::MAX_HOPS);
         let (data, _sent, deliver) = proxy::Port::test_pair();
         let (subscriptions, received) = channel::unbounded();
         let (resolve, replies) = channel::unbounded();
@@ -762,7 +762,7 @@ mod tests {
         channel::Sender<()>,
     ) {
         let (endpoint, commands, worker) =
-            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), crate::proto::MAX_ROUTING_SIZE);
+            proxy::RpcEndpoint::test_pair(DeviceRoute::root(), DeviceRoute::MAX_HOPS);
         (
             Arc::new(Stream::new(endpoint.clone())),
             endpoint,

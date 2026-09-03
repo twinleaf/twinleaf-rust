@@ -4,12 +4,12 @@
 use crate::proto::data as wire;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogMessage;
+use crate::proto::packet::Packet as WirePacket;
 use crate::proto::packet::{Header, PacketError, PacketView};
 use crate::proto::rpc as wire_rpc;
 use crate::proto::settings::Setting;
 use crate::proto::SessionId as WireSessionId;
 use crate::proto::{RpcMethodId, RpcRequestId};
-use crate::proto::{HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, MAX_TTL};
 use bytes::Bytes;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::fmt;
@@ -283,13 +283,13 @@ impl Packet {
                 value: name.len(),
                 maximum: wire_rpc::NAMELEN_MASK as usize,
             })?;
-        if payload_len > MAX_PAYLOAD_SIZE {
+        if payload_len > WirePacket::MAX_PAYLOAD {
             return Err(EncodeError::PayloadTooLarge {
                 actual: payload_len,
-                maximum: MAX_PAYLOAD_SIZE,
+                maximum: WirePacket::MAX_PAYLOAD,
             });
         }
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let len = wire_rpc::write_request(&mut buf, RpcRequestId::new(id), method, arg)
             .expect("payload sized above");
         Ok(finish(&mut buf, len, routing))
@@ -298,13 +298,13 @@ impl Packet {
     /// The reply to request `id`, carrying `value`.
     pub fn rpc_reply(id: u16, value: &[u8], routing: DeviceRoute) -> Result<Packet, EncodeError> {
         let payload_len = 2 + value.len();
-        if payload_len > MAX_PAYLOAD_SIZE {
+        if payload_len > WirePacket::MAX_PAYLOAD {
             return Err(EncodeError::PayloadTooLarge {
                 actual: payload_len,
-                maximum: MAX_PAYLOAD_SIZE,
+                maximum: WirePacket::MAX_PAYLOAD,
             });
         }
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let len = wire_rpc::write_reply(&mut buf, RpcRequestId::new(id), value)
             .expect("payload sized above");
         Ok(finish(&mut buf, len, routing))
@@ -312,9 +312,9 @@ impl Packet {
 
     /// Refuse a request with a bare error code and no message.
     pub fn rpc_error(id: u16, code: wire_rpc::RpcError, routing: DeviceRoute) -> Packet {
-        let mut buf = [0u8; MAX_PACKET_SIZE];
-        let len = HEADER_SIZE + 4;
-        Header::new(PacketType::RPC_ERROR, 4).write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
+        let len = Header::SIZE + 4;
+        Header::new(PacketType::RPC_ERROR, 4).write((&mut buf[..Header::SIZE]).try_into().unwrap());
         wire_rpc::write_error(&mut buf, RpcRequestId::new(id), code)
             .expect("a bare error payload always fits");
         finish(&mut buf, len, routing)
@@ -332,11 +332,11 @@ impl Packet {
         let payload_len =
             wire_rpc::update_payload_len(method).ok_or(EncodeError::PayloadTooLarge {
                 actual: wire_rpc::UPDATE_HEADER_SIZE + name_len,
-                maximum: MAX_PAYLOAD_SIZE,
+                maximum: WirePacket::MAX_PAYLOAD,
             })?;
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let len = wire_rpc::write_update(&mut buf, method).expect("payload sized above");
-        debug_assert_eq!(len, HEADER_SIZE + payload_len);
+        debug_assert_eq!(len, Header::SIZE + payload_len);
         Ok(finish(&mut buf, len, routing))
     }
 
@@ -351,18 +351,18 @@ impl Packet {
     }
 
     fn write_heartbeat(beat: Heartbeat<'_>, routing: DeviceRoute) -> Packet {
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let len = beat.write(&mut buf).expect("a heartbeat always fits");
         finish(&mut buf, len, routing)
     }
 
     /// The proxy's own connection-status announcement, which has no route.
     pub fn proxy_status(status: ProxyStatus) -> Packet {
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         Header::new(PacketType::PROXY_STATUS, 1)
-            .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-        buf[HEADER_SIZE] = u8::from(status);
-        finish(&mut buf, HEADER_SIZE + 1, DeviceRoute::root())
+            .write((&mut buf[..Header::SIZE]).try_into().unwrap());
+        buf[Header::SIZE] = u8::from(status);
+        finish(&mut buf, Header::SIZE + 1, DeviceRoute::root())
     }
 
     /// One metadata record with its flags.
@@ -372,13 +372,13 @@ impl Packet {
         routing: DeviceRoute,
     ) -> Result<Packet, EncodeError> {
         let payload_len = wire::METADATA_HEADER_SIZE + record.record_len();
-        if payload_len > MAX_PAYLOAD_SIZE {
+        if payload_len > WirePacket::MAX_PAYLOAD {
             return Err(EncodeError::PayloadTooLarge {
                 actual: payload_len,
-                maximum: MAX_PAYLOAD_SIZE,
+                maximum: WirePacket::MAX_PAYLOAD,
             });
         }
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let len = record.write(flags, &mut buf).expect("payload sized above");
         Ok(finish(&mut buf, len, routing))
     }
@@ -392,11 +392,11 @@ impl Packet {
         record: &[u8],
         routing: DeviceRoute,
     ) -> Result<Packet, EncodeError> {
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let len = wire::write_metadata_record(&mut buf, kind, flags, record).ok_or(
             EncodeError::PayloadTooLarge {
                 actual: wire::METADATA_HEADER_SIZE + record.len(),
-                maximum: MAX_PAYLOAD_SIZE,
+                maximum: WirePacket::MAX_PAYLOAD,
             },
         )?;
         Ok(finish(&mut buf, len, routing))
@@ -414,13 +414,13 @@ impl Packet {
             return Err(EncodeError::SampleNumberTooLarge(first_sample_n));
         }
         let payload_len = wire::SAMPLE_HEADER_SIZE + data.len();
-        if payload_len > MAX_PAYLOAD_SIZE {
+        if payload_len > WirePacket::MAX_PAYLOAD {
             return Err(EncodeError::PayloadTooLarge {
                 actual: payload_len,
-                maximum: MAX_PAYLOAD_SIZE,
+                maximum: WirePacket::MAX_PAYLOAD,
             });
         }
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
         let stream_id = crate::proto::StreamId::try_new(stream_id)
             .ok_or(EncodeError::InvalidStreamId(stream_id))?;
         let len = wire::Samples {
@@ -486,10 +486,10 @@ impl Packet {
 
     /// Re-stamp this packet's TTL, keeping its payload and route.
     pub fn with_ttl(&self, ttl: u8) -> Result<Packet, EncodeError> {
-        if ttl > MAX_TTL {
+        if ttl > Header::MAX_TTL {
             return Err(EncodeError::ValueTooLarge {
                 value: usize::from(ttl),
-                maximum: usize::from(MAX_TTL),
+                maximum: usize::from(Header::MAX_TTL),
             });
         }
         Ok(self.rebuilt(self.route(), ttl))
@@ -525,16 +525,16 @@ impl Packet {
     /// ceiling.
     fn rebuilt(&self, route: DeviceRoute, ttl: u8) -> Packet {
         let view = self.view();
-        let mut buf = [0u8; MAX_PACKET_SIZE];
-        let payload_end = HEADER_SIZE + view.payload.len();
+        let mut buf = [0u8; WirePacket::MAX_SIZE];
+        let payload_end = Header::SIZE + view.payload.len();
         Header {
             ptype: view.header.ptype,
             routing_size: route.len() as u8,
             ttl,
             payload_size: view.header.payload_size,
         }
-        .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-        buf[HEADER_SIZE..payload_end].copy_from_slice(view.payload);
+        .write((&mut buf[..Header::SIZE]).try_into().unwrap());
+        buf[Header::SIZE..payload_end].copy_from_slice(view.payload);
         finish(&mut buf, payload_end, route)
     }
 }
@@ -542,11 +542,11 @@ impl Packet {
 /// Stamp a route onto a header-and-payload a wire writer left unaddressed, and
 /// freeze the result. A valid payload plus the longest route still fits a
 /// packet, so this cannot overflow `buf`.
-fn finish(buf: &mut [u8; MAX_PACKET_SIZE], len: usize, routing: DeviceRoute) -> Packet {
-    let mut header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap())
+fn finish(buf: &mut [u8; WirePacket::MAX_SIZE], len: usize, routing: DeviceRoute) -> Packet {
+    let mut header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap())
         .expect("a wire writer stamped this header");
     header.routing_size = routing.len() as u8;
-    header.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+    header.write((&mut buf[..Header::SIZE]).try_into().unwrap());
     let total = len + routing.len();
     routing
         .write_wire(&mut buf[len..total])
@@ -571,7 +571,7 @@ impl fmt::Debug for Packet {
 mod tests {
     use super::*;
 
-    const MAX_TTL: usize = super::MAX_TTL as usize;
+    const MAX_TTL: usize = Header::MAX_TTL as usize;
 
     fn route(value: &str) -> DeviceRoute {
         value.parse().unwrap()
@@ -579,14 +579,14 @@ mod tests {
 
     #[test]
     fn encode_reports_payload_size_limit() {
-        let arg = vec![0; MAX_PAYLOAD_SIZE];
+        let arg = vec![0; WirePacket::MAX_PAYLOAD];
         let error = Packet::rpc_request("x", &arg, 0, DeviceRoute::root()).unwrap_err();
 
         assert_eq!(
             error,
             EncodeError::PayloadTooLarge {
-                actual: 5 + MAX_PAYLOAD_SIZE,
-                maximum: MAX_PAYLOAD_SIZE,
+                actual: 5 + WirePacket::MAX_PAYLOAD,
+                maximum: WirePacket::MAX_PAYLOAD,
             }
         );
     }

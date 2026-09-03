@@ -8,15 +8,15 @@
 //! `RecvError::Text(textual_data)`
 
 use super::{iobuf::IOBuf, packet, Packet, RateError, RateInfo, RawPort, RecvError, SendError};
+use crate::proto::packet::Packet as WirePacket;
 use crate::proto::serial as wire;
-use crate::proto::{MAX_PACKET_SIZE, SLIP_END};
 use mio_serial::{SerialPort, SerialPortBuilderExt};
 use std::io;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// Deserializer capacity: the largest packet plus its trailing CRC32.
-const RX_CAPACITY: usize = MAX_PACKET_SIZE + wire::CRC_SIZE;
+const RX_CAPACITY: usize = WirePacket::MAX_SIZE + wire::CRC_SIZE;
 
 fn io_error(error: mio_serial::Error) -> io::Error {
     let kind = match error.kind() {
@@ -242,7 +242,7 @@ impl RawPort for Port {
 
         let raw = pkt.as_bytes();
         // The leading separator terminates any partial frame at the receiver.
-        let mut encoded = vec![SLIP_END; 1 + wire::max_serialized_size(raw.len())];
+        let mut encoded = vec![wire::SLIP_END; 1 + wire::max_serialized_size(raw.len())];
         let size = wire::serialize(raw, &mut encoded[1..]).expect("No fit in frame buffer");
         encoded.truncate(1 + size);
 

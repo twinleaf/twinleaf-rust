@@ -19,7 +19,6 @@ use twinleaf::proto::{data, heartbeat, log, rpc, settings, sync};
 use twinleaf::proto::{
     ColumnId, DeviceRoute, RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
 };
-use twinleaf::proto::{MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
 use twinleaf::tio::packet;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -1670,7 +1669,7 @@ impl TestDevice {
         describe: impl Fn() -> String,
         write: impl FnOnce(&mut [u8]) -> Option<usize>,
     ) -> io::Result<()> {
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; proto::packet::Packet::MAX_SIZE];
         let mut written = write(&mut buf)
             .and_then(|len| proto::packet::Packet::from_slice(&buf[..len]))
             .ok_or_else(|| encode_error(&describe(), "does not fit a packet"))?;
@@ -1887,7 +1886,7 @@ fn append_record(reply: &mut Vec<u8>, record: data::Metadata<'_>) -> io::Result<
 }
 
 fn stream_data_max_data_bytes() -> usize {
-    MAX_PAYLOAD_SIZE.saturating_sub(data::SAMPLE_HEADER_SIZE)
+    proto::packet::Packet::MAX_PAYLOAD.saturating_sub(data::SAMPLE_HEADER_SIZE)
 }
 
 fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
@@ -1899,7 +1898,7 @@ fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
 
 #[cfg(test)]
 fn rpc_reply_max_reply_bytes() -> usize {
-    MAX_PAYLOAD_SIZE.saturating_sub(2)
+    proto::packet::Packet::MAX_PAYLOAD.saturating_sub(2)
 }
 
 fn append_capture_metadata_string(varlen: &mut Vec<u8>, value: &str) -> u8 {

@@ -5,8 +5,9 @@
 use super::sample::{SampleBatch, StreamKey};
 use crate::proto::data as wire;
 use crate::proto::data::DataType;
+use crate::proto::packet::Packet as WirePacket;
 use crate::proto::DeviceRoute;
-use crate::proto::{ColumnId, StreamId, MAX_PAYLOAD_SIZE};
+use crate::proto::{ColumnId, StreamId};
 use crate::tio;
 use crate::tio::packet::{EncodeError, Packet};
 use std::collections::HashMap;
@@ -33,7 +34,7 @@ macro_rules! metadata_record {
             #[allow(dead_code)]
             pub(crate) fn encode(fields: wire::$kind<'_>) -> Option<Self> {
                 let record = wire::Metadata::$kind(fields);
-                let mut buf = [0u8; MAX_PAYLOAD_SIZE];
+                let mut buf = [0u8; WirePacket::MAX_PAYLOAD];
                 let (_, len) = record.write_record(buf.get_mut(..record.record_len())?)?;
                 Self::new(&buf[..len])
             }

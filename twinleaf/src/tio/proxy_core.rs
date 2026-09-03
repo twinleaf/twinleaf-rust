@@ -1379,7 +1379,7 @@ mod tests {
             )
         };
 
-        let (deep, delivered) = client("/1", crate::proto::MAX_ROUTING_SIZE);
+        let (deep, delivered) = client("/1", DeviceRoute::MAX_HOPS);
         assert!(deep.try_send(&status("/")));
         assert!(deep.try_send(&status("/1/3")));
         assert!(deep.try_send(&status("/2")));

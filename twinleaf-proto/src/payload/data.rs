@@ -15,11 +15,9 @@
 //!
 //! Every layout here is normative, locked by the byte-exact tests below.
 
-use crate::packet::{Header, PacketType};
+use crate::packet::{Header, Packet, PacketType};
 use crate::sync::Epoch;
-use crate::{
-    ColumnId, SampleNumber, SegmentId, SessionId, StreamId, HEADER_SIZE, MAX_PAYLOAD_SIZE,
-};
+use crate::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
 
 /// `[record type][flags]` preceding every metadata record.
 pub const METADATA_HEADER_SIZE: usize = 2;
@@ -500,7 +498,7 @@ impl<'a> Metadata<'a> {
     /// its length, or `None` if `buf` cannot hold the record's fixed head.
     /// Strings are truncated to fit whatever room remains.
     pub fn write(&self, flags: MetadataFlags, buf: &mut [u8]) -> Option<usize> {
-        let (kind, len) = self.write_record(buf.get_mut(HEADER_SIZE + METADATA_HEADER_SIZE..)?)?;
+        let (kind, len) = self.write_record(buf.get_mut(Header::SIZE + METADATA_HEADER_SIZE..)?)?;
         write_metadata_headers(buf, kind, flags, len)
     }
 
@@ -520,7 +518,7 @@ impl<'a> Metadata<'a> {
 }
 
 /// Stamp the packet and metadata headers around a record of `record_len` bytes
-/// already staged at `HEADER_SIZE + METADATA_HEADER_SIZE`, and return the
+/// already staged at `Header::SIZE + METADATA_HEADER_SIZE`, and return the
 /// packet's length.
 fn write_metadata_headers(
     buf: &mut [u8],
@@ -529,14 +527,14 @@ fn write_metadata_headers(
     record_len: usize,
 ) -> Option<usize> {
     let payload_len = METADATA_HEADER_SIZE + record_len;
-    if payload_len > MAX_PAYLOAD_SIZE {
+    if payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
     Header::new(PacketType::METADATA, payload_len as u16)
-        .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-    buf[HEADER_SIZE] = kind;
-    buf[HEADER_SIZE + 1] = flags.bits();
-    Some(HEADER_SIZE + payload_len)
+        .write((&mut buf[..Header::SIZE]).try_into().unwrap());
+    buf[Header::SIZE] = kind;
+    buf[Header::SIZE + 1] = flags.bits();
+    Some(Header::SIZE + payload_len)
 }
 
 /// Serialize a full METADATA packet (header included) carrying `record` as it
@@ -547,7 +545,7 @@ pub fn write_metadata_record(
     flags: MetadataFlags,
     record: &[u8],
 ) -> Option<usize> {
-    let start = HEADER_SIZE + METADATA_HEADER_SIZE;
+    let start = Header::SIZE + METADATA_HEADER_SIZE;
     buf.get_mut(start..start + record.len())?
         .copy_from_slice(record);
     write_metadata_headers(buf, kind, flags, record.len())
@@ -588,7 +586,7 @@ pub const METADATA_REPLY_FRAME_HEADER: usize = 2;
 /// Most record-frame bytes one `dev.metadata` reply can carry: the RPC reply
 /// payload minus its request id. A device stops a reply here, so a query may
 /// legitimately be answered with fewer records than it selected.
-pub const MAX_METADATA_REPLY_SIZE: usize = MAX_PAYLOAD_SIZE - crate::rpc::REPLY_HEADER_SIZE;
+pub const MAX_METADATA_REPLY_SIZE: usize = Packet::MAX_PAYLOAD - crate::rpc::REPLY_HEADER_SIZE;
 
 /// One `dev.metadata` request selector, encoded as `[type][stream id][index]`.
 ///
@@ -735,7 +733,7 @@ pub struct Samples<'a> {
 
 impl<'a> Samples<'a> {
     /// Byte offset of the first sample in a data packet.
-    pub const DATA_OFFSET: usize = HEADER_SIZE + SAMPLE_HEADER_SIZE;
+    pub const DATA_OFFSET: usize = Header::SIZE + SAMPLE_HEADER_SIZE;
 
     /// Serialize a full data packet (header included) into `buf`; returns its
     /// length. Returns `None` for an out-of-range stream id or sample number,
@@ -766,14 +764,14 @@ impl<'a> Samples<'a> {
             return None;
         }
         let payload_len = SAMPLE_HEADER_SIZE + data_len;
-        let total = HEADER_SIZE + payload_len;
-        if payload_len > MAX_PAYLOAD_SIZE || buf.len() < total {
+        let total = Header::SIZE + payload_len;
+        if payload_len > Packet::MAX_PAYLOAD || buf.len() < total {
             return None;
         }
         Header::new(PacketType::stream(stream_id.value())?, payload_len as u16)
-            .write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-        buf[HEADER_SIZE..HEADER_SIZE + 3].copy_from_slice(&first.to_le_bytes()[..3]);
-        buf[HEADER_SIZE + 3] = segment_id.value();
+            .write((&mut buf[..Header::SIZE]).try_into().unwrap());
+        buf[Header::SIZE..Header::SIZE + 3].copy_from_slice(&first.to_le_bytes()[..3]);
+        buf[Header::SIZE + 3] = segment_id.value();
         Some(total)
     }
 
@@ -993,7 +991,7 @@ mod tests {
     fn round_trip(metadata: Metadata<'_>, flags: MetadataFlags) {
         let mut buf = [0u8; 256];
         let len = metadata.write(flags, &mut buf).unwrap();
-        let header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
         assert_eq!(header.ptype, PacketType::METADATA);
         assert_eq!(header.packet_len(), len);
         assert_eq!(
@@ -1114,7 +1112,7 @@ mod tests {
     fn record_bytes(metadata: Metadata<'_>, flags: MetadataFlags, buf: &mut [u8]) -> usize {
         let len = metadata.write(flags, buf).unwrap();
         assert_eq!(
-            Metadata::parse(&buf[HEADER_SIZE..len]),
+            Metadata::parse(&buf[Header::SIZE..len]),
             Some((metadata, flags))
         );
         len
@@ -1130,7 +1128,7 @@ mod tests {
             let flags = MetadataFlags::UPDATE;
             let mut written = [0u8; 128];
             let len = metadata.write(flags, &mut written).unwrap();
-            let (_, flags, record) = split_metadata(&written[HEADER_SIZE..len]).unwrap();
+            let (_, flags, record) = split_metadata(&written[Header::SIZE..len]).unwrap();
 
             let mut relayed = [0u8; 128];
             let relayed_len = write_metadata_record(&mut relayed, kind, flags, record).unwrap();
@@ -1200,18 +1198,18 @@ mod tests {
         };
         // Room for the packet header, the metadata header, the 7-byte head,
         // "bar.therm", and one byte of the two-byte degree sign.
-        let mut buf = [0u8; HEADER_SIZE + METADATA_HEADER_SIZE + 7 + 9 + 1];
+        let mut buf = [0u8; Header::SIZE + METADATA_HEADER_SIZE + 7 + 9 + 1];
         let len = record
-            .write(&mut buf[HEADER_SIZE + METADATA_HEADER_SIZE..])
+            .write(&mut buf[Header::SIZE + METADATA_HEADER_SIZE..])
             .unwrap();
-        let parsed = Column::parse(&buf[HEADER_SIZE + METADATA_HEADER_SIZE..][..len]).unwrap();
+        let parsed = Column::parse(&buf[Header::SIZE + METADATA_HEADER_SIZE..][..len]).unwrap();
         assert_eq!(parsed.name, "bar.therm");
         assert_eq!(parsed.units, "", "split a multi-byte character");
     }
 
     #[test]
     fn write_rejects_a_buffer_too_small_for_the_head() {
-        let mut buf = [0u8; HEADER_SIZE + METADATA_HEADER_SIZE + 6];
+        let mut buf = [0u8; Header::SIZE + METADATA_HEADER_SIZE + 6];
         assert_eq!(
             Metadata::Device(device()).write(MetadataFlags::PERIODIC, &mut buf),
             None
@@ -1359,12 +1357,12 @@ mod tests {
         let mut buf = [0u8; 64];
         let len = samples.write(&mut buf).unwrap();
         #[rustfmt::skip]
-        assert_eq!(&buf[..HEADER_SIZE + SAMPLE_HEADER_SIZE], &[
+        assert_eq!(&buf[..Header::SIZE + SAMPLE_HEADER_SIZE], &[
             129, 0, 12, 0,              // header: STREAM0 + 1, payload 12
             0xEF, 0xCD, 0xAB,           // first sample number, 24-bit LE
             7,                          // segment_id
         ]);
-        let header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
         assert_eq!(header.packet_len(), len);
         assert_eq!(
             Samples::parse(header, &buf[header.payload_range()]),

@@ -14,13 +14,12 @@
 //! their RPC returns — but that is interpretation, not layout, so it stays
 //! with the caller.
 
-use crate::packet::{Header, PacketType};
-use crate::{HEADER_SIZE, MAX_PAYLOAD_SIZE};
+use crate::packet::{Header, Packet, PacketType};
 
 /// `{ name_len, flags }` preceding the name and value.
 pub const SETTING_HEADER_SIZE: usize = 2;
 /// Name and value together, at most (`TL_SETTING_MAX_PAYLOAD_SIZE`).
-pub const MAX_SETTING_SIZE: usize = MAX_PAYLOAD_SIZE - SETTING_HEADER_SIZE;
+pub const MAX_SETTING_SIZE: usize = Packet::MAX_PAYLOAD - SETTING_HEADER_SIZE;
 
 /// One setting announcement, as it travels in a SETTING packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +56,7 @@ impl<'a> Setting<'a> {
             return None;
         }
         let len = SETTING_HEADER_SIZE + self.name.len() + self.reply.len();
-        (len <= MAX_PAYLOAD_SIZE).then_some(len)
+        (len <= Packet::MAX_PAYLOAD).then_some(len)
     }
 
     /// Serialize a full SETTING packet (header included) into `buf`; returns
@@ -66,13 +65,13 @@ impl<'a> Setting<'a> {
     /// [`payload_len`]: Self::payload_len
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let payload_len = self.payload_len()?;
-        let total = HEADER_SIZE + payload_len;
+        let total = Header::SIZE + payload_len;
         if buf.len() < total {
             return None;
         }
         let hdr = Header::new(PacketType::SETTING, payload_len as u16);
-        hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-        self.write_payload(&mut buf[HEADER_SIZE..total])?;
+        hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+        self.write_payload(&mut buf[Header::SIZE..total])?;
         Some(total)
     }
 
@@ -104,8 +103,8 @@ mod tests {
         };
         let mut buf = [0u8; 64];
         let len = setting.write(&mut buf).unwrap();
-        assert_eq!(len, HEADER_SIZE + SETTING_HEADER_SIZE + 19 + 4);
-        assert_eq!(Setting::parse(&buf[HEADER_SIZE..len]), Some(setting));
+        assert_eq!(len, Header::SIZE + SETTING_HEADER_SIZE + 19 + 4);
+        assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
         assert_eq!(setting.name_str(), Some("aux.data.decimation"));
     }
 
@@ -141,7 +140,7 @@ mod tests {
             b'd', b'e', b'v', b'.', b'n', b'a', b'm', b'e', //
             b'X',
         ];
-        let header = Header::parse((&raw[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&raw[..Header::SIZE]).try_into().unwrap()).unwrap();
         assert_eq!(header.ptype, PacketType::SETTING);
         assert_eq!(header.packet_len(), raw.len());
 
@@ -174,8 +173,8 @@ mod tests {
         };
         let mut buf = [0u8; 32];
         let len = setting.write(&mut buf).unwrap();
-        assert_eq!(len, HEADER_SIZE + SETTING_HEADER_SIZE + 8);
-        assert_eq!(Setting::parse(&buf[HEADER_SIZE..len]), Some(setting));
+        assert_eq!(len, Header::SIZE + SETTING_HEADER_SIZE + 8);
+        assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
     }
 
     #[test]
@@ -197,22 +196,25 @@ mod tests {
             reply: b"",
         };
         assert_eq!(long_name.payload_len(), None);
-        assert_eq!(long_name.write(&mut [0u8; crate::MAX_PACKET_SIZE]), None);
+        assert_eq!(long_name.write(&mut [0u8; Packet::MAX_SIZE]), None);
 
         let oversize = Setting {
             name: b"n",
             flags: 0,
             reply: &[0u8; MAX_SETTING_SIZE],
         };
-        assert_eq!(oversize.write(&mut [0u8; crate::MAX_PACKET_SIZE]), None);
+        assert_eq!(oversize.write(&mut [0u8; Packet::MAX_SIZE]), None);
 
         // Name and value together fill the payload exactly.
         let full = Setting {
             reply: &[0u8; MAX_SETTING_SIZE - 1],
             ..oversize
         };
-        let mut buf = [0u8; crate::MAX_PACKET_SIZE];
-        assert_eq!(full.write(&mut buf), Some(HEADER_SIZE + MAX_PAYLOAD_SIZE));
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        assert_eq!(
+            full.write(&mut buf),
+            Some(Header::SIZE + Packet::MAX_PAYLOAD)
+        );
         // A short buffer is refused rather than truncated.
         assert_eq!(full.write(&mut [0u8; 16]), None);
     }

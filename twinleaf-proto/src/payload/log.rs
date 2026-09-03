@@ -10,13 +10,12 @@
 //! value for `logInfoN`. Firmware here sends the
 //! timestamp, so a host can order messages without trusting arrival time.
 
-use crate::packet::{Header, PacketType};
-use crate::{HEADER_SIZE, MAX_PAYLOAD_SIZE};
+use crate::packet::{Header, Packet, PacketType};
 
 /// `{ data, level }` preceding the message.
 pub const LOG_HEADER_SIZE: usize = 5;
 /// Longest message one LOG packet carries (`TL_LOG_MAX_MESSAGE_SIZE`).
-pub const MAX_MESSAGE_SIZE: usize = MAX_PAYLOAD_SIZE - LOG_HEADER_SIZE;
+pub const MAX_MESSAGE_SIZE: usize = Packet::MAX_PAYLOAD - LOG_HEADER_SIZE;
 
 /// Severity of a log message (`TL_LOG_*`), including unknown values.
 ///
@@ -75,15 +74,15 @@ impl<'a> LogMessage<'a> {
             return None;
         }
         let payload_len = LOG_HEADER_SIZE + self.message.len();
-        let total = HEADER_SIZE + payload_len;
+        let total = Header::SIZE + payload_len;
         if buf.len() < total {
             return None;
         }
         let hdr = Header::new(PacketType::LOG, payload_len as u16);
-        hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-        buf[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&self.data.to_le_bytes());
-        buf[HEADER_SIZE + 4] = self.level.value();
-        buf[HEADER_SIZE + LOG_HEADER_SIZE..total].copy_from_slice(self.message);
+        hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+        buf[Header::SIZE..Header::SIZE + 4].copy_from_slice(&self.data.to_le_bytes());
+        buf[Header::SIZE + 4] = self.level.value();
+        buf[Header::SIZE + LOG_HEADER_SIZE..total].copy_from_slice(self.message);
         Some(total)
     }
 }
@@ -101,8 +100,8 @@ mod tests {
         };
         let mut buf = [0u8; 64];
         let len = log.write(&mut buf).unwrap();
-        assert_eq!(len, HEADER_SIZE + LOG_HEADER_SIZE + 8);
-        assert_eq!(LogMessage::parse(&buf[HEADER_SIZE..len]), Some(log));
+        assert_eq!(len, Header::SIZE + LOG_HEADER_SIZE + 8);
+        assert_eq!(LogMessage::parse(&buf[Header::SIZE..len]), Some(log));
     }
 
     /// Byte-exact packed layout of the log payload behind its packet header
@@ -137,7 +136,7 @@ mod tests {
             1,    // TL_LOG_ERROR
             b'i', b'm', b'u', b' ', b'f', b'a', b'i', b'l',
         ];
-        let header = Header::parse((&raw[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&raw[..Header::SIZE]).try_into().unwrap()).unwrap();
         assert_eq!(header.ptype, PacketType::LOG);
         assert_eq!(header.packet_len(), raw.len());
         // tl_log_packet_message_size
@@ -174,8 +173,8 @@ mod tests {
         };
         let mut buf = [0u8; 16];
         let len = log.write(&mut buf).unwrap();
-        assert_eq!(len, HEADER_SIZE + LOG_HEADER_SIZE);
-        assert_eq!(LogMessage::parse(&buf[HEADER_SIZE..len]), Some(log));
+        assert_eq!(len, Header::SIZE + LOG_HEADER_SIZE);
+        assert_eq!(LogMessage::parse(&buf[Header::SIZE..len]), Some(log));
     }
 
     #[test]
@@ -186,16 +185,16 @@ mod tests {
             data: 0,
             message: &[b'x'; MAX_MESSAGE_SIZE + 1],
         };
-        assert_eq!(log.write(&mut [0u8; crate::MAX_PACKET_SIZE]), None);
+        assert_eq!(log.write(&mut [0u8; Packet::MAX_SIZE]), None);
         // A message that fits exactly still does.
         let full = LogMessage {
             message: &[b'x'; MAX_MESSAGE_SIZE],
             ..log
         };
-        let mut buf = [0u8; crate::MAX_PACKET_SIZE];
+        let mut buf = [0u8; Packet::MAX_SIZE];
         assert_eq!(
             full.write(&mut buf),
-            Some(HEADER_SIZE + MAX_PAYLOAD_SIZE),
+            Some(Header::SIZE + Packet::MAX_PAYLOAD),
             "the longest message fills the payload exactly"
         );
     }

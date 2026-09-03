@@ -11,7 +11,7 @@
 //! so a child can detect a reference change.
 
 use crate::packet::{Header, PacketType};
-use crate::{SessionId, HEADER_SIZE};
+use crate::SessionId;
 
 /// Timeref header bytes preceding the serial string.
 pub const TIMEREF_HEADER_SIZE: usize = 12;
@@ -88,12 +88,12 @@ impl<'a> Timeref<'a> {
             return None;
         }
         let payload_len = TIMEREF_HEADER_SIZE + self.serial.len();
-        let total = HEADER_SIZE + payload_len;
+        let total = Header::SIZE + payload_len;
         if buf.len() < total {
             return None;
         }
         let hdr = Header::new(PacketType::SYNC, payload_len as u16);
-        hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+        hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
         buf[4] = 0; // timeref type
         buf[5] = self.epoch.value();
         buf[6] = self.serial.len() as u8;
@@ -119,8 +119,8 @@ mod tests {
         };
         let mut buf = [0u8; 64];
         let len = timeref.write(&mut buf).unwrap();
-        assert_eq!(len, HEADER_SIZE + TIMEREF_HEADER_SIZE + 17);
-        assert_eq!(Timeref::parse(&buf[HEADER_SIZE..len]), Some(timeref));
+        assert_eq!(len, Header::SIZE + TIMEREF_HEADER_SIZE + 17);
+        assert_eq!(Timeref::parse(&buf[Header::SIZE..len]), Some(timeref));
     }
 
     /// Byte-exact packed layout of the timeref payload.

@@ -12,8 +12,8 @@
 //! so [`Any`](Heartbeat::Any) keeps the bytes
 //! rather than rejecting them.
 
-use crate::packet::{Header, PacketType};
-use crate::{SessionId, HEADER_SIZE, MAX_PAYLOAD_SIZE};
+use crate::packet::{Header, Packet, PacketType};
+use crate::SessionId;
 
 /// Payload length of a session-announcing heartbeat, `sizeof(tl_session_id)`.
 pub const SESSION_PAYLOAD_SIZE: usize = 4;
@@ -48,7 +48,7 @@ impl<'a> Heartbeat<'a> {
 
     /// Serialize a full HEARTBEAT packet (header included) into `buf`; returns
     /// its length. `None` if `buf` is too small or the payload exceeds
-    /// [`MAX_PAYLOAD_SIZE`].
+    /// [`Packet::MAX_PAYLOAD`].
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         match self {
             Self::Session(session) => write_packet(buf, &session.to_le_bytes()),
@@ -58,16 +58,16 @@ impl<'a> Heartbeat<'a> {
 }
 
 fn write_packet(buf: &mut [u8], payload: &[u8]) -> Option<usize> {
-    if payload.len() > MAX_PAYLOAD_SIZE {
+    if payload.len() > Packet::MAX_PAYLOAD {
         return None;
     }
-    let total = HEADER_SIZE + payload.len();
+    let total = Header::SIZE + payload.len();
     if buf.len() < total {
         return None;
     }
     let hdr = Header::new(PacketType::HEARTBEAT, payload.len() as u16);
-    hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-    buf[HEADER_SIZE..total].copy_from_slice(payload);
+    hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+    buf[Header::SIZE..total].copy_from_slice(payload);
     Some(total)
 }
 
@@ -84,7 +84,7 @@ mod tests {
         ] {
             let mut buf = [0u8; 32];
             let len = beat.write(&mut buf).unwrap();
-            assert_eq!(Heartbeat::parse(&buf[HEADER_SIZE..len]), Some(beat));
+            assert_eq!(Heartbeat::parse(&buf[Header::SIZE..len]), Some(beat));
         }
     }
 
@@ -134,15 +134,18 @@ mod tests {
     #[test]
     fn rejects_a_short_buffer_and_an_oversize_payload() {
         let beat = Heartbeat::Session(SessionId::new(7));
-        assert_eq!(beat.write(&mut [0u8; HEADER_SIZE + 3]), None);
+        assert_eq!(beat.write(&mut [0u8; Header::SIZE + 3]), None);
         assert_eq!(beat.session(), Some(SessionId::new(7)));
 
-        let oversize = Heartbeat::Any(&[0u8; MAX_PAYLOAD_SIZE + 1]);
-        assert_eq!(oversize.write(&mut [0u8; crate::MAX_PACKET_SIZE]), None);
+        let oversize = Heartbeat::Any(&[0u8; Packet::MAX_PAYLOAD + 1]);
+        assert_eq!(oversize.write(&mut [0u8; Packet::MAX_SIZE]), None);
         assert_eq!(oversize.session(), None);
 
-        let full = Heartbeat::Any(&[0u8; MAX_PAYLOAD_SIZE]);
-        let mut buf = [0u8; crate::MAX_PACKET_SIZE];
-        assert_eq!(full.write(&mut buf), Some(HEADER_SIZE + MAX_PAYLOAD_SIZE));
+        let full = Heartbeat::Any(&[0u8; Packet::MAX_PAYLOAD]);
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        assert_eq!(
+            full.write(&mut buf),
+            Some(Header::SIZE + Packet::MAX_PAYLOAD)
+        );
     }
 }

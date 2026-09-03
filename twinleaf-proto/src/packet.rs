@@ -5,9 +5,7 @@
 
 use core::ops::Range;
 
-use crate::route::ForwardError;
-
-use crate::{HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, MAX_ROUTING_SIZE};
+use crate::route::{DeviceRoute, ForwardError};
 
 /// Valid packet type, including unknown extension values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -89,6 +87,10 @@ pub struct Header {
 }
 
 impl Header {
+    /// Packet header size in bytes.
+    pub const SIZE: usize = 4;
+    pub const MAX_TTL: u8 = 15;
+
     pub fn new(ptype: PacketType, payload_size: u16) -> Self {
         Self {
             ptype,
@@ -99,7 +101,7 @@ impl Header {
     }
 
     /// Parse the 4-byte header. Returns `None` for a malformed header.
-    pub fn parse(buf: &[u8; HEADER_SIZE]) -> Option<Self> {
+    pub fn parse(buf: &[u8; Header::SIZE]) -> Option<Self> {
         Self::parse_prefix(buf).ok()
     }
 
@@ -109,19 +111,19 @@ impl Header {
             return Err(PacketError::NeedMore);
         };
         let ptype = PacketType::try_new(raw_ptype).ok_or(PacketError::InvalidPacketType)?;
-        if buf.len() < HEADER_SIZE {
+        if buf.len() < Header::SIZE {
             return Err(PacketError::NeedMore);
         }
         let routing_size = buf[1] & 0x0F;
         let payload_size = u16::from_le_bytes([buf[2], buf[3]]);
-        if routing_size as usize > MAX_ROUTING_SIZE {
+        if routing_size as usize > DeviceRoute::MAX_HOPS {
             return Err(PacketError::RoutingTooBig);
         }
-        if payload_size as usize > MAX_PAYLOAD_SIZE {
+        if payload_size as usize > Packet::MAX_PAYLOAD {
             return Err(PacketError::PayloadTooBig);
         }
-        let total = HEADER_SIZE + payload_size as usize + routing_size as usize;
-        if total > MAX_PACKET_SIZE {
+        let total = Header::SIZE + payload_size as usize + routing_size as usize;
+        if total > Packet::MAX_SIZE {
             return Err(PacketError::PayloadTooBig);
         }
         Ok(Self {
@@ -132,7 +134,7 @@ impl Header {
         })
     }
 
-    pub fn write(&self, buf: &mut [u8; HEADER_SIZE]) {
+    pub fn write(&self, buf: &mut [u8; Header::SIZE]) {
         buf[0] = self.ptype.value();
         buf[1] = (self.ttl << 4) | (self.routing_size & 0x0F);
         buf[2..4].copy_from_slice(&self.payload_size.to_le_bytes());
@@ -144,11 +146,11 @@ impl Header {
     }
 
     pub fn packet_len(&self) -> usize {
-        HEADER_SIZE + self.body_len()
+        Header::SIZE + self.body_len()
     }
 
     pub fn payload_range(&self) -> Range<usize> {
-        HEADER_SIZE..HEADER_SIZE + self.payload_size as usize
+        Header::SIZE..Header::SIZE + self.payload_size as usize
     }
 }
 
@@ -186,10 +188,13 @@ impl<'a> PacketView<'a> {
 #[derive(Clone)]
 pub struct Packet {
     len: u16,
-    buf: [u8; crate::MAX_PACKET_SIZE],
+    buf: [u8; Packet::MAX_SIZE],
 }
 
 impl Packet {
+    pub const MAX_SIZE: usize = 512;
+    pub const MAX_PAYLOAD: usize = Self::MAX_SIZE - Header::SIZE - DeviceRoute::MAX_HOPS;
+
     /// Copy one complete, valid packet.
     pub fn from_slice(data: &[u8]) -> Option<Self> {
         let header = Header::parse_prefix(data).ok()?;
@@ -198,7 +203,7 @@ impl Packet {
         }
         let mut packet = Self {
             len: data.len() as u16,
-            buf: [0; crate::MAX_PACKET_SIZE],
+            buf: [0; Packet::MAX_SIZE],
         };
         packet.buf[..data.len()].copy_from_slice(data);
         Some(packet)
@@ -239,6 +244,11 @@ impl Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_ceiling_is_the_packet_less_header_and_routing() {
+        assert_eq!(Packet::MAX_PAYLOAD, 500);
+    }
 
     #[test]
     fn header_roundtrip() {

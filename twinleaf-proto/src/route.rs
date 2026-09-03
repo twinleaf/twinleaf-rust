@@ -5,12 +5,11 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 
 use crate::packet::{Header, PacketError};
-use crate::{HEADER_SIZE, MAX_ROUTING_SIZE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RouteError {
-    #[error("route exceeds the maximum depth of {MAX_ROUTING_SIZE} hops")]
+    #[error("route exceeds the maximum depth of {} hops", DeviceRoute::MAX_HOPS)]
     TooLong,
     #[error("invalid route hop")]
     InvalidHop,
@@ -21,20 +20,22 @@ pub enum RouteError {
 /// Route in root-to-leaf order. Wire packets store hops in reverse order.
 #[derive(Clone, Copy)]
 pub struct DeviceRoute {
-    hops: [u8; MAX_ROUTING_SIZE],
+    hops: [u8; DeviceRoute::MAX_HOPS],
     len: u8,
 }
 
 impl DeviceRoute {
+    pub const MAX_HOPS: usize = 8;
+
     pub const fn root() -> Self {
         Self {
-            hops: [0; MAX_ROUTING_SIZE],
+            hops: [0; DeviceRoute::MAX_HOPS],
             len: 0,
         }
     }
 
     pub fn from_hops(hops: &[u8]) -> Result<Self, RouteError> {
-        if hops.len() > MAX_ROUTING_SIZE {
+        if hops.len() > DeviceRoute::MAX_HOPS {
             return Err(RouteError::TooLong);
         }
         let mut route = Self::root();
@@ -44,7 +45,7 @@ impl DeviceRoute {
     }
 
     pub fn from_wire(bytes: &[u8]) -> Result<Self, RouteError> {
-        if bytes.len() > MAX_ROUTING_SIZE {
+        if bytes.len() > DeviceRoute::MAX_HOPS {
             return Err(RouteError::TooLong);
         }
         let mut route = Self::root();
@@ -56,7 +57,7 @@ impl DeviceRoute {
 
     pub fn push(&mut self, hop: u8) -> Result<(), RouteError> {
         let index = self.len();
-        if index == MAX_ROUTING_SIZE {
+        if index == DeviceRoute::MAX_HOPS {
             return Err(RouteError::TooLong);
         }
         self.hops[index] = hop;
@@ -104,7 +105,7 @@ impl DeviceRoute {
 
     pub fn absolute_route(&self, relative: &Self) -> Result<Self, RouteError> {
         let combined_len = self.len() + relative.len();
-        if combined_len > MAX_ROUTING_SIZE {
+        if combined_len > DeviceRoute::MAX_HOPS {
             return Err(RouteError::TooLong);
         }
         let mut route = *self;
@@ -206,7 +207,7 @@ pub fn pop_hop(buf: &mut [u8]) -> Result<(u8, usize), ForwardError> {
     }
     let hop = buf[packet_len - 1];
     header.routing_size -= 1;
-    header.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+    header.write((&mut buf[..Header::SIZE]).try_into().unwrap());
     Ok((hop, packet_len - 1))
 }
 
@@ -217,7 +218,7 @@ pub fn push_hop(buf: &mut [u8], hop: u8) -> Result<usize, ForwardError> {
     if buf.len() < packet_len {
         return Err(ForwardError::Packet(PacketError::NeedMore));
     }
-    if header.routing_size as usize == MAX_ROUTING_SIZE {
+    if header.routing_size as usize == DeviceRoute::MAX_HOPS {
         return Err(ForwardError::RoutingFull);
     }
     if buf.len() < packet_len + 1 {
@@ -225,7 +226,7 @@ pub fn push_hop(buf: &mut [u8], hop: u8) -> Result<usize, ForwardError> {
     }
     buf[packet_len] = hop;
     header.routing_size += 1;
-    header.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
+    header.write((&mut buf[..Header::SIZE]).try_into().unwrap());
     Ok(packet_len + 1)
 }
 
@@ -237,7 +238,7 @@ mod tests {
     #[test]
     fn route_roundtrips_wire_order() {
         let route: DeviceRoute = "/1/2/3".parse().unwrap();
-        let mut wire = [0; MAX_ROUTING_SIZE];
+        let mut wire = [0; DeviceRoute::MAX_HOPS];
         let len = route.write_wire(&mut wire).unwrap();
         assert_eq!(&wire[..len], [3, 2, 1]);
         assert_eq!(DeviceRoute::from_wire(&wire[..len]).unwrap(), route);
@@ -264,10 +265,10 @@ mod tests {
         header.ttl = 3;
         let len = header.packet_len();
         let mut buf = vec![0; len + 1];
-        header.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-        buf[HEADER_SIZE..HEADER_SIZE + payload.len()].copy_from_slice(payload);
+        header.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+        buf[Header::SIZE..Header::SIZE + payload.len()].copy_from_slice(payload);
         route
-            .write_wire(&mut buf[HEADER_SIZE + payload.len()..len])
+            .write_wire(&mut buf[Header::SIZE + payload.len()..len])
             .unwrap();
         (buf, len)
     }
@@ -297,7 +298,7 @@ mod tests {
 
         let header = Header::parse_prefix(&buf[..len]).unwrap();
         assert_eq!(header.routing_size, 2);
-        let routing = &buf[HEADER_SIZE + 4..len];
+        let routing = &buf[Header::SIZE + 4..len];
         assert_eq!(DeviceRoute::from_wire(routing).unwrap().to_string(), "/2/7");
         assert_eq!(&buf[header.payload_range()], b"data");
     }

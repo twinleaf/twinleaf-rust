@@ -3,7 +3,14 @@
 //! The decoder also handles console text and the leading-zero workaround
 //! some senders emit before a frame.
 
-use crate::{CRC32, SLIP_END, SLIP_ESC, SLIP_ESC_END, SLIP_ESC_ESC};
+use crc::{Crc, CRC_32_ISO_HDLC};
+
+pub const SLIP_END: u8 = 0xC0;
+pub const SLIP_ESC: u8 = 0xDB;
+pub const SLIP_ESC_END: u8 = 0xDC;
+pub const SLIP_ESC_ESC: u8 = 0xDD;
+
+pub const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 pub const CRC_SIZE: usize = 4;
 
@@ -94,7 +101,7 @@ impl<'a> Frame<'a> {
 }
 
 /// Streaming deserializer. `CAPACITY` must cover the largest expected packet
-/// plus [`CRC_SIZE`], e.g. `MAX_PACKET_SIZE + CRC_SIZE`.
+/// plus [`CRC_SIZE`], e.g. `Packet::MAX_SIZE + CRC_SIZE`.
 pub struct Deserializer<const CAPACITY: usize> {
     buf: [u8; CAPACITY],
     len: usize,
@@ -230,6 +237,11 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc32_is_the_iso_hdlc_variant() {
+        assert_eq!(CRC32.checksum(b"123456789"), 0xCBF4_3926);
+    }
 
     const CAP: usize = 64 + CRC_SIZE;
 

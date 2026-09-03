@@ -83,7 +83,7 @@ impl Connection {
     /// owns, so the server asks its questions over the same transport.
     pub fn over(proxy: &proxy::Connection) -> Connection {
         let root = proxy
-            .rpc_endpoint(None, DeviceRoute::root(), crate::proto::MAX_ROUTING_SIZE)
+            .rpc_endpoint(None, DeviceRoute::root(), DeviceRoute::MAX_HOPS)
             .expect("the default RPC timeout is in range");
         Connection {
             tree: DeviceTree {

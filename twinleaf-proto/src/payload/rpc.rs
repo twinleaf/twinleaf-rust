@@ -13,8 +13,8 @@
 //! which names a method without calling it. A device's own announcement that a
 //! setting changed is a different packet, in [`crate::settings`].
 
-use crate::packet::{Header, PacketType};
-use crate::{RpcMethodId, RpcRequestId, HEADER_SIZE};
+use crate::packet::{Header, Packet, PacketType};
+use crate::{RpcMethodId, RpcRequestId};
 
 pub const REQUEST_BY_NAME: u16 = 0x8000;
 pub const NAMELEN_MASK: u16 = 0x7FFF;
@@ -183,13 +183,13 @@ pub fn write_request(
     args: &[u8],
 ) -> Option<usize> {
     let payload_len = request_payload_len(method, args)?;
-    let total = HEADER_SIZE + payload_len;
-    if buf.len() < total || payload_len > crate::MAX_PAYLOAD_SIZE {
+    let total = Header::SIZE + payload_len;
+    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
     let hdr = Header::new(PacketType::RPC_REQ, payload_len as u16);
-    hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-    write_request_payload(&mut buf[HEADER_SIZE..total], id, method, args)?;
+    hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+    write_request_payload(&mut buf[Header::SIZE..total], id, method, args)?;
     Some(total)
 }
 
@@ -263,13 +263,13 @@ impl<'a> Reply<'a> {
 /// Returns None if `buf` is too small.
 pub fn write_reply(buf: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option<usize> {
     let payload_len = 2 + value.len();
-    let total = HEADER_SIZE + payload_len;
+    let total = Header::SIZE + payload_len;
     if buf.len() < total || payload_len > u16::MAX as usize {
         return None;
     }
     let hdr = Header::new(PacketType::RPC_REP, payload_len as u16);
-    hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-    write_reply_payload(&mut buf[HEADER_SIZE..total], req_id, value)?;
+    hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+    write_reply_payload(&mut buf[Header::SIZE..total], req_id, value)?;
     Some(total)
 }
 
@@ -311,13 +311,13 @@ impl<'a> ErrorReply<'a> {
 
 /// Serialize a full error packet (header included) into `buf`; returns length.
 pub fn write_error(buf: &mut [u8], req_id: RpcRequestId, code: RpcError) -> Option<usize> {
-    let total = HEADER_SIZE + 4;
+    let total = Header::SIZE + 4;
     if buf.len() < total {
         return None;
     }
     let hdr = Header::new(PacketType::RPC_ERROR, 4);
-    hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-    write_error_payload(&mut buf[HEADER_SIZE..total], req_id, code.value(), &[])?;
+    hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+    write_error_payload(&mut buf[Header::SIZE..total], req_id, code.value(), &[])?;
     Some(total)
 }
 
@@ -729,7 +729,7 @@ mod tests {
             &1_843_200u32.to_le_bytes(),
         )
         .unwrap();
-        let header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
         assert_eq!(header.ptype, PacketType::RPC_REQ);
         assert_eq!(header.routing_size, 0, "the caller addresses it");
         assert_eq!(header.packet_len(), n);
@@ -746,7 +746,7 @@ mod tests {
             b"args",
         )
         .unwrap();
-        let request = Request::parse(&buf[HEADER_SIZE..n]).unwrap();
+        let request = Request::parse(&buf[Header::SIZE..n]).unwrap();
         assert_eq!(request.id, RpcRequestId::new(0xF001));
         assert_eq!(request.method, Method::ById(RpcMethodId::new(0x7FFF)));
         assert_eq!(request.args, b"args");
@@ -764,13 +764,13 @@ mod tests {
             ),
             None
         );
-        let mut big = [0u8; crate::MAX_PACKET_SIZE];
+        let mut big = [0u8; Packet::MAX_SIZE];
         assert_eq!(
             write_request(
                 &mut big,
                 RpcRequestId::new(1),
                 Method::ByName(b"x"),
-                &[0; crate::MAX_PAYLOAD_SIZE]
+                &[0; Packet::MAX_PAYLOAD]
             ),
             None,
             "payload past what a header can describe"
@@ -783,7 +783,7 @@ mod tests {
         let mut buf = [0u8; 32];
 
         let n = write_reply(&mut buf, RpcRequestId::new(0x1234), b"ok").unwrap();
-        let header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
         let Some(Answer::Reply(reply)) = Answer::parse(header.ptype, &buf[header.payload_range()])
         else {
             panic!("a reply packet parses as a reply");
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(header.packet_len(), n);
 
         let n = write_error(&mut buf, RpcRequestId::new(7), RpcError::NotFound).unwrap();
-        let header = Header::parse((&buf[..HEADER_SIZE]).try_into().unwrap()).unwrap();
+        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
         let Some(Answer::Error(error)) = Answer::parse(header.ptype, &buf[header.payload_range()])
         else {
             panic!("an error packet parses as an error");
@@ -817,17 +817,17 @@ mod tests {
         )
         .unwrap();
         assert!(set_req_id(
-            &mut buf[HEADER_SIZE..n],
+            &mut buf[Header::SIZE..n],
             RpcRequestId::new(0x1234)
         ));
-        let request = Request::parse(&buf[HEADER_SIZE..n]).unwrap();
+        let request = Request::parse(&buf[Header::SIZE..n]).unwrap();
         assert_eq!(request.id, RpcRequestId::new(0x1234));
         assert_eq!(request.method, Method::ByName(b"dev.name"));
         assert_eq!(request.args, b"x");
 
         let n = write_reply(&mut buf, RpcRequestId::new(0x1234), b"ok").unwrap();
-        assert!(set_req_id(&mut buf[HEADER_SIZE..n], RpcRequestId::new(7)));
-        let reply = Reply::parse(&buf[HEADER_SIZE..n]).unwrap();
+        assert!(set_req_id(&mut buf[Header::SIZE..n], RpcRequestId::new(7)));
+        let reply = Reply::parse(&buf[Header::SIZE..n]).unwrap();
         assert_eq!(reply.req_id, RpcRequestId::new(7));
         assert_eq!(reply.value, b"ok");
 
@@ -950,7 +950,7 @@ pub fn update_payload_len(method: Method<'_>) -> Option<usize> {
         Method::ById(_) => UPDATE_HEADER_SIZE,
         Method::ByName(name) => UPDATE_HEADER_SIZE.checked_add(name.len())?,
     };
-    (len <= crate::MAX_PAYLOAD_SIZE).then_some(len)
+    (len <= Packet::MAX_PAYLOAD).then_some(len)
 }
 
 /// Serialize a full RPC_UPDATE packet (header included) into `buf`; returns
@@ -960,13 +960,13 @@ pub fn update_payload_len(method: Method<'_>) -> Option<usize> {
 /// the device whose method changed before sending it on.
 pub fn write_update(buf: &mut [u8], method: Method<'_>) -> Option<usize> {
     let payload_len = update_payload_len(method)?;
-    let total = HEADER_SIZE + payload_len;
+    let total = Header::SIZE + payload_len;
     if buf.len() < total {
         return None;
     }
     let hdr = Header::new(PacketType::RPC_UPDATE, payload_len as u16);
-    hdr.write((&mut buf[..HEADER_SIZE]).try_into().unwrap());
-    write_update_payload(&mut buf[HEADER_SIZE..total], method)?;
+    hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
+    write_update_payload(&mut buf[Header::SIZE..total], method)?;
     Some(total)
 }
 
@@ -999,7 +999,7 @@ mod update_tests {
         ] {
             let mut buf = [0u8; 64];
             let len = write_update(&mut buf, method).unwrap();
-            assert_eq!(parse_update(&buf[HEADER_SIZE..len]), Some(method));
+            assert_eq!(parse_update(&buf[Header::SIZE..len]), Some(method));
         }
     }
 
@@ -1033,12 +1033,12 @@ mod update_tests {
     fn names_the_method_a_request_would_have_used() {
         let mut update = [0u8; 32];
         let len = write_update(&mut update, Method::ByName(b"dev.name")).unwrap();
-        let method = parse_update(&update[HEADER_SIZE..len]).unwrap();
+        let method = parse_update(&update[Header::SIZE..len]).unwrap();
 
         let mut request = [0u8; 32];
         let len = write_request(&mut request, RpcRequestId::new(1), method, &[]).unwrap();
         assert_eq!(
-            Request::parse(&request[HEADER_SIZE..len]).unwrap().method,
+            Request::parse(&request[Header::SIZE..len]).unwrap().method,
             Method::ByName(b"dev.name")
         );
     }
@@ -1077,17 +1077,17 @@ mod update_tests {
         let method = Method::ByName(b"dev.name");
         assert_eq!(write_update(&mut [0u8; 8], method), None);
 
-        let max_name = crate::MAX_PAYLOAD_SIZE - UPDATE_HEADER_SIZE;
+        let max_name = Packet::MAX_PAYLOAD - UPDATE_HEADER_SIZE;
         assert_eq!(update_payload_len(Method::ByName(&[b'x'; 1])), Some(4));
         assert_eq!(
             update_payload_len(Method::ByName(&[b'x'; 498])),
             None,
             "one byte past the payload ceiling"
         );
-        let mut buf = [0u8; crate::MAX_PACKET_SIZE];
+        let mut buf = [0u8; Packet::MAX_SIZE];
         assert_eq!(
             write_update(&mut buf, Method::ByName(&[b'x'; 497])),
-            Some(HEADER_SIZE + crate::MAX_PAYLOAD_SIZE)
+            Some(Header::SIZE + Packet::MAX_PAYLOAD)
         );
         assert_eq!(max_name, 497);
     }
