@@ -102,9 +102,7 @@ impl DeviceRoute {
         Ok(self.len())
     }
 
-    /// Whether this route is at or below `ancestor`, as
-    /// [`Path::starts_with`](https://doc.rust-lang.org/std/path/struct.Path.html#method.starts_with)
-    /// reads for filesystem paths.
+    /// Whether this route is `ancestor` or below it.
     pub fn starts_with(&self, ancestor: &Self) -> bool {
         self.as_slice().starts_with(ancestor.as_slice())
     }

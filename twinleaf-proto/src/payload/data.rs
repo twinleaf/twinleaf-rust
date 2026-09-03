@@ -501,16 +501,12 @@ pub enum Metadata<'a> {
 }
 
 impl<'a> Metadata<'a> {
-    /// Whether this crate knows the layout of record type `kind`. A host
-    /// forwards a record it does not know; it rejects one it does and cannot
-    /// parse.
+    /// Whether record type `kind` has a defined layout, 1 to 4.
     pub const fn defines(kind: u8) -> bool {
         matches!(kind, 1..=4)
     }
 
-    /// Serialize just the record, without the packet or metadata headers, and
-    /// return its type byte and length. This is the form a `dev.metadata` RPC
-    /// reply carries inside each frame.
+    /// Write the bare record into `buf`. Returns its type byte and length.
     pub fn write_record(&self, buf: &mut [u8]) -> Option<(u8, usize)> {
         let (kind, len) = match self {
             Self::Device(record) => (MetadataType::Device, record.write(buf)?),
@@ -521,10 +517,8 @@ impl<'a> Metadata<'a> {
         Some((kind.into(), len))
     }
 
-    /// Serialize this record as one `dev.metadata` reply frame,
-    /// `[type][record length u8][record]`, and return the frame's length.
-    /// `None` when the frame does not fit `buf` or the record is too long for
-    /// its `u8` length field.
+    /// Write one `dev.metadata` reply frame, `[type][record length u8][record]`.
+    /// Returns its length, or None if it does not fit `buf` or a `u8` length.
     pub fn write_reply_frame(&self, buf: &mut [u8]) -> Option<usize> {
         let (kind, len) = self.write_record(buf.get_mut(METADATA_REPLY_FRAME_HEADER..)?)?;
         buf[0] = kind;
@@ -532,9 +526,7 @@ impl<'a> Metadata<'a> {
         Some(METADATA_REPLY_FRAME_HEADER + len)
     }
 
-    /// Bytes [`Self::write_record`] produces: the head, plus each string capped
-    /// at what its `u8` length field can measure. A caller that must not
-    /// truncate sizes its buffer with this.
+    /// Length of the bare record, each string capped at 255 bytes.
     pub fn record_len(&self) -> usize {
         fn string(value: &str) -> usize {
             value.len().min(u8::MAX as usize)
@@ -551,9 +543,8 @@ impl<'a> Metadata<'a> {
         }
     }
 
-    /// Serialize a full METADATA packet (header included) into `buf`; returns
-    /// its length, or `None` if `buf` cannot hold the record's fixed head.
-    /// Strings are truncated to fit whatever room remains.
+    /// Write a full METADATA packet into `buf`. Returns its length, or None if
+    /// the head does not fit. Strings are truncated to the room left.
     pub fn write(&self, flags: MetadataFlags, buf: &mut [u8]) -> Option<usize> {
         let (kind, len) = self.write_record(buf.get_mut(Header::SIZE + METADATA_HEADER_SIZE..)?)?;
         write_metadata_headers(buf, kind, flags, len)
@@ -574,9 +565,8 @@ impl<'a> Metadata<'a> {
     }
 }
 
-/// Stamp the packet and metadata headers around a record of `record_len` bytes
-/// already staged at `Header::SIZE + METADATA_HEADER_SIZE`, and return the
-/// packet's length.
+/// Write the packet and metadata headers around a record already in place.
+/// Returns the packet length.
 fn write_metadata_headers(
     buf: &mut [u8],
     kind: u8,
@@ -608,9 +598,8 @@ pub fn write_metadata_record(
     write_metadata_headers(buf, kind, flags, record.len())
 }
 
-/// Split a METADATA packet payload into its record type byte, flags, and the
-/// record itself. Unlike [`Metadata::parse`] this needs no knowledge of the
-/// record's layout, so a host can forward a type this build does not define.
+/// Split a METADATA payload into record type, flags, and the record, without
+/// parsing the record.
 pub fn split_metadata(payload: &[u8]) -> Option<(u8, MetadataFlags, &[u8])> {
     let (head, record) = payload.split_at_checked(METADATA_HEADER_SIZE)?;
     Some((head[0], MetadataFlags::from_bits(head[1]), record))
@@ -619,11 +608,8 @@ pub fn split_metadata(payload: &[u8]) -> Option<(u8, MetadataFlags, &[u8])> {
 /// Shortest head a record can declare: its own length byte and one field.
 const MIN_RECORD_HEAD: usize = 2;
 
-/// Split a record into the head it declares and the strings that follow.
-/// Returns `None` when the record is truncated or declares a head too short to
-/// be one. This is the boundary every record parses from, offered on its own
-/// for a caller that keeps the two halves apart or checks the framing of a
-/// record type it cannot parse.
+/// Split a record into the head it declares and the strings after it. None if
+/// the record is truncated or the head is under two bytes.
 pub fn split_record(record: &[u8]) -> Option<(&[u8], &[u8])> {
     let declared = *record.first()? as usize;
     if declared < MIN_RECORD_HEAD || record.len() < declared {
@@ -640,15 +626,11 @@ pub const MAX_METADATA_SELECTORS: usize = 16;
 pub const CURRENT_SEGMENT: u8 = 0xff;
 /// `[type][record length u8]` preceding the record in each reply frame.
 pub const METADATA_REPLY_FRAME_HEADER: usize = 2;
-/// Most record-frame bytes one `dev.metadata` reply can carry: the RPC reply
-/// payload minus its request id. A device stops a reply here, so a query may
-/// legitimately be answered with fewer records than it selected.
+/// Most frame bytes in one `dev.metadata` reply. A reply may hold fewer
+/// records than were selected.
 pub const MAX_METADATA_REPLY_SIZE: usize = Packet::MAX_PAYLOAD - crate::rpc::REPLY_HEADER_SIZE;
 
 /// One `dev.metadata` request selector, encoded as `[type][stream id][index]`.
-///
-/// `stream_id` is an actual TIO stream id, not the zero-based position
-/// [`Subject`] speaks in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct MetadataSelector {
@@ -719,10 +701,8 @@ pub enum MetadataQueryError {
     TooManySelectors,
 }
 
-/// The validated selectors of a `dev.metadata` request argument.
-///
-/// The empty argument is the bootstrap query: it selects a device-chosen
-/// prefix of all records, as many as fit one reply.
+/// The selectors of a `dev.metadata` request argument. An empty argument
+/// selects a device-chosen prefix of all records.
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataQuery<'a> {
     arg: &'a [u8],
@@ -758,9 +738,6 @@ impl<'a> MetadataQuery<'a> {
 }
 
 /// The `[type][record length u8][record]` frames of a `dev.metadata` reply.
-///
-/// [`parse`](Self::parse) validates the whole framing up front: a truncated
-/// frame fails there instead of yielding the valid frames before it.
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataReply<'a> {
     frames: &'a [u8],
@@ -806,9 +783,8 @@ impl<'a> Samples<'a> {
     /// Byte offset of the first sample in a data packet.
     pub const DATA_OFFSET: usize = Header::SIZE + SAMPLE_HEADER_SIZE;
 
-    /// Serialize a full data packet (header included) into `buf`; returns its
-    /// length. Returns `None` for an out-of-range stream id or sample number,
-    /// or when the samples do not fit.
+    /// Write a full sample packet into `buf`. Returns its length, or None if
+    /// the sample number or samples do not fit.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let total = Self::write_header(
             buf,
@@ -821,9 +797,8 @@ impl<'a> Samples<'a> {
         Some(total)
     }
 
-    /// Write both headers of a packet carrying `data_len` bytes of samples,
-    /// which a producer may have staged in place at [`Self::DATA_OFFSET`].
-    /// Returns the packet length.
+    /// Write the headers of a packet carrying `data_len` bytes of samples
+    /// already in place at [`Self::DATA_OFFSET`]. Returns the packet length.
     pub fn write_header(
         buf: &mut [u8],
         stream_id: StreamId,
@@ -862,10 +837,7 @@ impl<'a> Samples<'a> {
     }
 }
 
-/// What one step of a metadata sweep asks the caller to describe.
-///
-/// `stream` and `column` are zero-based positions in the device's own ordering,
-/// not tio ids.
+/// The record one step of a metadata sweep describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Subject {
@@ -906,10 +878,8 @@ impl Sweep {
         }
     }
 
-    /// Advance one step. `columns[i]` is the column count of the device's `i`th
-    /// stream, re-read on every call: a position that no longer exists restarts
-    /// the pass at [`Subject::Device`]. The returned flag marks the record that
-    /// closes this pass.
+    /// Advance one step, given the column count of each stream. The flag marks
+    /// the record that closes a pass.
     pub fn step(&mut self, columns: &[u8]) -> (Subject, bool) {
         if !self.position.exists_in(columns) {
             self.position = Position::Device;

@@ -191,12 +191,8 @@ impl<'a> Request<'a> {
     }
 }
 
-/// Serialize a full request packet (header included) into `buf`; returns
-/// length. `None` if `buf` is too small or the payload overflows a packet.
-///
-/// The packet carries no routing — `routing_size_and_ttl` is zero — leaving
-/// addressing to the caller: a hub pushes the hops it wants afterwards, or
-/// hands the packet straight to the child port that is the only hop.
+/// Write a full RPC_REQ packet with no routing into `buf`. Returns its
+/// length, or None if it does not fit.
 pub fn write_request(
     buf: &mut [u8],
     id: RpcRequestId,
@@ -248,12 +244,8 @@ pub fn write_request_payload(
     Some(len)
 }
 
-/// Overwrite the request id an RPC payload starts with, returning whether
-/// there was room for one.
-///
-/// Requests, replies, and errors all lead with the id, so a hub that remaps
-/// the ids it forwards downstream and restores them on the way back edits both
-/// directions through this one writer. Nothing else in the payload moves.
+/// Overwrite the request id at the start of a request, reply, or error
+/// payload. Returns false if the payload is under two bytes.
 pub fn set_req_id(payload: &mut [u8], id: RpcRequestId) -> bool {
     let Some(field) = payload.get_mut(..2) else {
         return false;
@@ -365,11 +357,7 @@ pub fn write_error_payload(
     Some(len)
 }
 
-/// Either kind of answer to a request, told apart by the packet type.
-///
-/// A client waiting on one request cares only which request answered and
-/// whether it succeeded; both layouts start with the same `req_id`, which is
-/// what lets a hub read one field off either packet.
+/// A reply or an error, told apart by the packet type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer<'a> {
     /// A reply.
@@ -1002,9 +990,8 @@ pub const UPDATE_BY_NAME: u8 = 1;
 /// `[method type][id]`, or `[method type][name len]` before the name.
 pub const UPDATE_HEADER_SIZE: usize = 3;
 
-/// Parse the method an RPC_UPDATE payload names (packet header excluded).
-/// `None` for an unknown method type, a truncated payload, or an id with the
-/// by-name bit set.
+/// Parse the method an RPC_UPDATE payload names. None for an unknown method
+/// type, a truncated payload, or an invalid id.
 pub fn parse_update(payload: &[u8]) -> Option<Method<'_>> {
     let (&method_type, rest) = payload.split_first()?;
     let (field, rest) = rest.split_at_checked(2)?;
@@ -1026,11 +1013,8 @@ pub fn update_payload_len(method: Method<'_>) -> Option<usize> {
     (len <= Packet::MAX_PAYLOAD).then_some(len)
 }
 
-/// Serialize a full RPC_UPDATE packet (header included) into `buf`; returns
-/// its length. `None` if `buf` is too small or the payload overflows a packet.
-///
-/// Like a request, the packet carries no routing: the proxy pushes the hops of
-/// the device whose method changed before sending it on.
+/// Write a full RPC_UPDATE packet with no routing into `buf`. Returns its
+/// length, or None if it does not fit.
 pub fn write_update(buf: &mut [u8], method: Method<'_>) -> Option<usize> {
     let payload_len = update_payload_len(method)?;
     let total = Header::SIZE + payload_len;

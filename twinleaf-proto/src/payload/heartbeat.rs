@@ -20,9 +20,7 @@ pub enum Heartbeat<'a> {
 }
 
 impl<'a> Heartbeat<'a> {
-    /// Parse a heartbeat from a HEARTBEAT packet payload (packet header
-    /// excluded). Never fails: a payload that is not a session id is
-    /// [`Any`](Self::Any).
+    /// Parse a HEARTBEAT payload. Anything but a session id is [`Any`](Self::Any).
     pub fn parse(payload: &'a [u8]) -> Option<Self> {
         Some(match payload.try_into() {
             Ok(bytes) => Self::Session(SessionId::from_le_bytes(bytes)),
@@ -38,9 +36,8 @@ impl<'a> Heartbeat<'a> {
         }
     }
 
-    /// Serialize a full HEARTBEAT packet (header included) into `buf`; returns
-    /// its length. `None` if `buf` is too small or the payload exceeds
-    /// [`Packet::MAX_PAYLOAD`].
+    /// Write a full HEARTBEAT packet into `buf`. Returns its length, or None if
+    /// it does not fit.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         match self {
             Self::Session(session) => write_packet(buf, &session.to_le_bytes()),

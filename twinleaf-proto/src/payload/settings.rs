@@ -50,10 +50,8 @@ impl<'a> Setting<'a> {
         (len <= Packet::MAX_PAYLOAD).then_some(len)
     }
 
-    /// Serialize a full SETTING packet (header included) into `buf`; returns
-    /// its length. `None` if `buf` is too small or [`payload_len`] refuses.
-    ///
-    /// [`payload_len`]: Self::payload_len
+    /// Write a full SETTING packet into `buf`. Returns its length, or None if
+    /// it does not fit or the name exceeds 255 bytes.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let payload_len = self.payload_len()?;
         let total = Header::SIZE + payload_len;

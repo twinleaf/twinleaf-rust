@@ -13,11 +13,7 @@ pub const LOG_HEADER_SIZE: usize = 5;
 /// Longest message one LOG packet carries (`TL_LOG_MAX_MESSAGE_SIZE`).
 pub const MAX_MESSAGE_SIZE: usize = Packet::MAX_PAYLOAD - LOG_HEADER_SIZE;
 
-/// Severity of a log message (`TL_LOG_*`), including unknown values.
-///
-/// Ordered by verbosity, not by importance: [`CRITICAL`](Self::CRITICAL) is
-/// zero and [`DEBUG`](Self::DEBUG) is four, so a sender drops everything above
-/// its threshold with a single compare.
+/// Severity of a log message (`TL_LOG_*`), 0 for critical up to 4 for debug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct LogLevel(u8);
@@ -69,9 +65,8 @@ impl<'a> LogMessage<'a> {
         })
     }
 
-    /// Serialize a full LOG packet (header included) into `buf`; returns its
-    /// length. Returns None if `buf` is too small or the message exceeds
-    /// [`MAX_MESSAGE_SIZE`] — senders truncate rather than growing the packet.
+    /// Write a full LOG packet into `buf`. Returns its length, or None if it
+    /// does not fit or the message exceeds [`MAX_MESSAGE_SIZE`].
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         if self.message.len() > MAX_MESSAGE_SIZE {
             return None;

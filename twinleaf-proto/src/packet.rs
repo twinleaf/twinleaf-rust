@@ -253,9 +253,7 @@ impl Packet {
         &self.buf[..self.len as usize]
     }
 
-    /// The payload alone, for a router editing a packet in place — a hub
-    /// rewriting the RPC request ids it forwards. The header and the routing
-    /// bytes are out of reach, so the packet stays as valid as it was built.
+    /// The payload bytes, writable. The header and routing bytes stay as they are.
     pub fn payload_mut(&mut self) -> &mut [u8] {
         // Every constructor parses, and pop/push_hop only edit routing, so a
         // `Packet` always has a readable header.

@@ -87,9 +87,8 @@ impl<'a> Timeref<'a> {
         })
     }
 
-    /// Serialize a full SYNC packet (header included) into `buf`; returns
-    /// length. Returns None if `buf` is too small or the serial exceeds
-    /// [`MAX_SERIAL_SIZE`].
+    /// Write a full SYNC packet into `buf`. Returns its length, or None if it
+    /// does not fit or the serial exceeds [`MAX_SERIAL_SIZE`].
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         if self.serial.len() > MAX_SERIAL_SIZE {
             return None;
