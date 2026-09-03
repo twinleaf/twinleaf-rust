@@ -1,4 +1,4 @@
-//! Packet header parsing/serialization
+//! The packet header and whole-packet buffers.
 //!
 //! Wire layout: `[type u8][routing_size_and_ttl u8][payload_size u16le]`,
 //! then payload, then up to 8 routing bytes appended after the payload.
@@ -13,24 +13,40 @@ use crate::route::{DeviceRoute, ForwardError};
 pub struct PacketType(u8);
 
 impl PacketType {
+    /// Log message.
     pub const LOG: Self = Self(1);
+    /// RPC request.
     pub const RPC_REQ: Self = Self(2);
+    /// RPC reply.
     pub const RPC_REP: Self = Self(3);
+    /// RPC error.
     pub const RPC_ERROR: Self = Self(4);
+    /// Heartbeat.
     pub const HEARTBEAT: Self = Self(5);
+    /// Legacy timebase descriptor, unsupported.
     pub const LEGACY_TIMEBASE: Self = Self(6);
+    /// Legacy source descriptor, unsupported.
     pub const LEGACY_SOURCE: Self = Self(7);
+    /// Legacy stream descriptor, unsupported.
     pub const LEGACY_STREAM: Self = Self(8);
+    /// Stream metadata record.
     pub const METADATA: Self = Self(11);
+    /// Setting change broadcast.
     pub const SETTING: Self = Self(12);
-    /// Firmware-internal synchronization packet.
+    /// Time reference, hub to children.
     pub const SYNC: Self = Self(62);
+    /// Console text.
     pub const TEXT: Self = Self(63);
+    /// First application defined type.
     pub const USER: Self = Self(64);
+    /// Proxy link status, a `USER` packet.
     pub const PROXY_STATUS: Self = Self(64);
+    /// Method value changed, sent without a call.
     pub const RPC_UPDATE: Self = Self(65);
+    /// Samples of stream 0. Stream n is `STREAM0 + n`.
     pub const STREAM0: Self = Self(128);
 
+    /// Type from its byte. None for 0, 9, 10, and 13.
     pub const fn try_new(value: u8) -> Option<Self> {
         if matches!(value, 0 | 9 | 10 | 13) {
             None
@@ -48,10 +64,12 @@ impl PacketType {
         Self(value)
     }
 
+    /// The type byte.
     pub const fn value(self) -> u8 {
         self.0
     }
 
+    /// Sample packet type of stream `stream_id`. None above 127.
     pub const fn stream(stream_id: u8) -> Option<Self> {
         match 128u8.checked_add(stream_id) {
             Some(value) => Some(Self(value)),
@@ -59,6 +77,7 @@ impl PacketType {
         }
     }
 
+    /// The stream id if this is a sample packet type.
     pub const fn stream_id(self) -> Option<u8> {
         if self.0 >= Self::STREAM0.0 {
             Some(self.0 - Self::STREAM0.0)
@@ -68,29 +87,41 @@ impl PacketType {
     }
 }
 
+/// Why bytes do not parse as a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PacketError {
+    /// Not enough bytes yet.
     NeedMore,
+    /// Type byte 0, 9, 10, or 13.
     InvalidPacketType,
+    /// Payload above 500 bytes, or packet above 512.
     PayloadTooBig,
+    /// Routing above 8 bytes.
     RoutingTooBig,
 }
 
+/// The four byte packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Header {
+    /// Packet type.
     pub ptype: PacketType,
+    /// Number of routing bytes, 0 to 8.
     pub routing_size: u8,
+    /// Hops remaining, 0 to 15.
     pub ttl: u8,
+    /// Payload length, 0 to 500.
     pub payload_size: u16,
 }
 
 impl Header {
-    /// Packet header size in bytes.
+    /// Header length, 4 bytes.
     pub const SIZE: usize = 4;
+    /// Largest TTL, 15.
     pub const MAX_TTL: u8 = 15;
 
+    /// Header with no routing and a TTL of 0.
     pub fn new(ptype: PacketType, payload_size: u16) -> Self {
         Self {
             ptype,
@@ -134,6 +165,7 @@ impl Header {
         })
     }
 
+    /// Write the four header bytes.
     pub fn write(&self, buf: &mut [u8; Header::SIZE]) {
         buf[0] = self.ptype.value();
         buf[1] = (self.ttl << 4) | (self.routing_size & 0x0F);
@@ -145,10 +177,12 @@ impl Header {
         self.payload_size as usize + self.routing_size as usize
     }
 
+    /// Total packet length.
     pub fn packet_len(&self) -> usize {
         Header::SIZE + self.body_len()
     }
 
+    /// Byte range of the payload within the packet.
     pub fn payload_range(&self) -> Range<usize> {
         Header::SIZE..Header::SIZE + self.payload_size as usize
     }
@@ -157,8 +191,11 @@ impl Header {
 /// Borrowed packet payload and routing bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketView<'a> {
+    /// The parsed header.
     pub header: Header,
+    /// The payload bytes.
     pub payload: &'a [u8],
+    /// The routing bytes, next hop last.
     pub routing: &'a [u8],
 }
 
@@ -192,7 +229,9 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// Largest packet, 512 bytes.
     pub const MAX_SIZE: usize = 512;
+    /// Largest payload, 500 bytes.
     pub const MAX_PAYLOAD: usize = Self::MAX_SIZE - Header::SIZE - DeviceRoute::MAX_HOPS;
 
     /// Copy one complete, valid packet.
@@ -209,6 +248,7 @@ impl Packet {
         Some(packet)
     }
 
+    /// The packet bytes.
     pub fn as_slice(&self) -> &[u8] {
         &self.buf[..self.len as usize]
     }

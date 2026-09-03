@@ -1,4 +1,6 @@
-//! Device routes and in-place packet forwarding.
+//! Routes, the path from the root device to a device in the tree.
+//!
+//! A route is written `/1/2/3` and stored on the wire as `[3, 2, 1]`, one byte per hop.
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -6,13 +8,17 @@ use core::hash::{Hash, Hasher};
 
 use crate::packet::{Header, PacketError};
 
+/// Why a route is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RouteError {
+    /// More than eight hops.
     #[error("route exceeds the maximum depth of {} hops", DeviceRoute::MAX_HOPS)]
     TooLong,
+    /// A hop that is not a number from 0 to 255.
     #[error("invalid route hop")]
     InvalidHop,
+    /// The route does not start with the given subtree.
     #[error("route is outside the requested subtree")]
     OutsideSubtree,
 }
@@ -25,8 +31,10 @@ pub struct DeviceRoute {
 }
 
 impl DeviceRoute {
+    /// Most hops in a route, 8.
     pub const MAX_HOPS: usize = 8;
 
+    /// The root device, `/`.
     pub const fn root() -> Self {
         Self {
             hops: [0; DeviceRoute::MAX_HOPS],
@@ -34,6 +42,7 @@ impl DeviceRoute {
         }
     }
 
+    /// Route from hops in root-to-leaf order. Errors above eight hops.
     pub fn from_hops(hops: &[u8]) -> Result<Self, RouteError> {
         if hops.len() > DeviceRoute::MAX_HOPS {
             return Err(RouteError::TooLong);
@@ -44,6 +53,7 @@ impl DeviceRoute {
         Ok(route)
     }
 
+    /// Route from its wire bytes, which hold the leaf hop first.
     pub fn from_wire(bytes: &[u8]) -> Result<Self, RouteError> {
         if bytes.len() > DeviceRoute::MAX_HOPS {
             return Err(RouteError::TooLong);
@@ -55,6 +65,7 @@ impl DeviceRoute {
         Ok(route)
     }
 
+    /// Append a hop. Errors at eight hops.
     pub fn push(&mut self, hop: u8) -> Result<(), RouteError> {
         let index = self.len();
         if index == DeviceRoute::MAX_HOPS {
@@ -65,14 +76,17 @@ impl DeviceRoute {
         Ok(())
     }
 
+    /// The hops in root-to-leaf order.
     pub fn as_slice(&self) -> &[u8] {
         &self.hops[..self.len()]
     }
 
+    /// Number of hops.
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
+    /// Whether this is the root.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -95,6 +109,7 @@ impl DeviceRoute {
         self.as_slice().starts_with(ancestor.as_slice())
     }
 
+    /// `absolute` with this route removed from its front.
     pub fn relative_route(&self, absolute: &Self) -> Result<Self, RouteError> {
         let relative = absolute
             .as_slice()
@@ -103,6 +118,7 @@ impl DeviceRoute {
         Self::from_hops(relative)
     }
 
+    /// `relative` appended to this route.
     pub fn absolute_route(&self, relative: &Self) -> Result<Self, RouteError> {
         let combined_len = self.len() + relative.len();
         if combined_len > DeviceRoute::MAX_HOPS {
@@ -184,14 +200,17 @@ impl core::str::FromStr for DeviceRoute {
     }
 }
 
-/// In-place forwarding error.
+/// Why a packet could not be forwarded in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ForwardError {
+    /// The buffer does not hold a valid packet.
     Packet(PacketError),
     /// The packet is addressed to this device.
     NotRouted,
+    /// The packet already has eight hops.
     RoutingFull,
+    /// No room in the buffer for another hop.
     NoCapacity,
 }
 

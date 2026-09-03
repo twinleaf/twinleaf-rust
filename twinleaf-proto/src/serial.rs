@@ -1,17 +1,24 @@
-//! Twinleaf SLIP/CRC serial framing.
+//! SLIP framing for serial links.
 //!
-//! The decoder also handles console text and the leading-zero workaround
-//! some senders emit before a frame.
+//! A frame is the packet followed by its CRC32, little endian, SLIP encoded
+//! per RFC 1055 and ended with [`SLIP_END`]. Console text lines pass through
+//! as [`FrameErrors::TEXT`] frames.
 
 use crc::{Crc, CRC_32_ISO_HDLC};
 
+/// Frame delimiter, 0xC0.
 pub const SLIP_END: u8 = 0xC0;
+/// Escape, 0xDB.
 pub const SLIP_ESC: u8 = 0xDB;
+/// Escaped END, 0xDC.
 pub const SLIP_ESC_END: u8 = 0xDC;
+/// Escaped ESC, 0xDD.
 pub const SLIP_ESC_ESC: u8 = 0xDD;
 
+/// The frame checksum, CRC-32 ISO HDLC.
 pub const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
+/// Checksum length in bytes, 4.
 pub const CRC_SIZE: usize = 4;
 
 /// Worst-case encoded size for a packet.
@@ -65,14 +72,17 @@ impl FrameErrors {
     /// A printable text line terminated by CR/LF, not a binary frame.
     pub const TEXT: Self = Self(0x20);
 
+    /// No errors.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// Whether every bit of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// The raw bits.
     pub const fn bits(self) -> u8 {
         self.0
     }
@@ -85,7 +95,9 @@ impl FrameErrors {
 /// Decoded frame and any framing errors.
 #[derive(Debug)]
 pub struct Frame<'a> {
+    /// Frame contents, without the CRC once it verified.
     pub data: &'a [u8],
+    /// Errors found while decoding.
     pub errors: FrameErrors,
 }
 
@@ -118,6 +130,7 @@ impl<const CAPACITY: usize> Default for Deserializer<CAPACITY> {
 }
 
 impl<const CAPACITY: usize> Deserializer<CAPACITY> {
+    /// An empty deserializer.
     pub const fn new() -> Self {
         Self {
             buf: [0; CAPACITY],

@@ -1,4 +1,4 @@
-//! Typed identifiers shared by Twinleaf hosts and devices.
+//! Ids carried in packets and RPC replies.
 
 /// RPC transaction id, matching a reply or error to its request. Every `u16`
 /// value is valid; hosts may wrap the counter.
@@ -7,18 +7,22 @@
 pub struct RpcRequestId(u16);
 
 impl RpcRequestId {
+    /// Request id from its value.
     pub const fn new(value: u16) -> Self {
         Self(value)
     }
 
+    /// The id as a `u16`.
     pub const fn value(self) -> u16 {
         self.0
     }
 
+    /// Request id from its two wire bytes.
     pub const fn from_le_bytes(bytes: [u8; 2]) -> Self {
         Self(u16::from_le_bytes(bytes))
     }
 
+    /// The two wire bytes, little endian.
     pub const fn to_le_bytes(self) -> [u8; 2] {
         self.0.to_le_bytes()
     }
@@ -31,6 +35,7 @@ impl RpcRequestId {
 pub struct RpcMethodId(u16);
 
 impl RpcMethodId {
+    /// Largest method id, 0x7FFF.
     pub const MAX: u16 = 0x7fff;
 
     /// Panics for a value with the by-name bit set; in a `const` context this
@@ -40,6 +45,7 @@ impl RpcMethodId {
         Self(value)
     }
 
+    /// Method id from its value. None above [`MAX`](Self::MAX).
     pub const fn try_new(value: u16) -> Option<Self> {
         if value <= Self::MAX {
             Some(Self(value))
@@ -48,34 +54,39 @@ impl RpcMethodId {
         }
     }
 
+    /// The id as a `u16`.
     pub const fn value(self) -> u16 {
         self.0
     }
 
+    /// Method id from its two wire bytes. None if the by-name bit is set.
     pub const fn from_le_bytes(bytes: [u8; 2]) -> Option<Self> {
         Self::try_new(u16::from_le_bytes(bytes))
     }
 
+    /// The two wire bytes, little endian.
     pub const fn to_le_bytes(self) -> [u8; 2] {
         self.0.to_le_bytes()
     }
 }
 
-/// Per-boot random session id, reported by `dev.session` and every heartbeat so
-/// hosts detect device restarts.
+/// Session id, chosen at boot and reported by `dev.session` and every heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SessionId(u32);
 
 impl SessionId {
+    /// Session id from its value.
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
+    /// The id as a `u32`.
     pub const fn value(self) -> u32 {
         self.0
     }
 
+    /// Session id from its four wire bytes.
     pub const fn from_le_bytes(bytes: [u8; 4]) -> Self {
         Self(u32::from_le_bytes(bytes))
     }
@@ -99,9 +110,12 @@ impl core::fmt::Display for SessionId {
 pub struct StreamId(u8);
 
 impl StreamId {
+    /// First stream id, 1.
     pub const MIN: u8 = 1;
+    /// Last stream id, 127.
     pub const MAX: u8 = 127;
 
+    /// Stream id from its value. Panics outside 1 to 127.
     pub const fn new(value: u8) -> Self {
         assert!(
             value >= Self::MIN && value <= Self::MAX,
@@ -110,6 +124,7 @@ impl StreamId {
         Self(value)
     }
 
+    /// Stream id from its value. None outside 1 to 127.
     pub const fn try_new(value: u8) -> Option<Self> {
         if value >= Self::MIN && value <= Self::MAX {
             Some(Self(value))
@@ -118,6 +133,7 @@ impl StreamId {
         }
     }
 
+    /// The id as a `u8`.
     pub const fn value(self) -> u8 {
         self.0
     }
@@ -135,10 +151,12 @@ impl core::fmt::Display for StreamId {
 pub struct SegmentId(u8);
 
 impl SegmentId {
+    /// Segment id from its value.
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
 
+    /// The id as a `u8`.
     pub const fn value(self) -> u8 {
         self.0
     }
@@ -156,14 +174,17 @@ impl core::fmt::Display for SegmentId {
 pub struct ColumnId(u8);
 
 impl ColumnId {
+    /// Column id from its value.
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
 
+    /// The id as a `u8`.
     pub const fn value(self) -> u8 {
         self.0
     }
 
+    /// The column position in the stream schema.
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -181,24 +202,30 @@ impl core::fmt::Display for ColumnId {
 pub struct SampleNumber(u32);
 
 impl SampleNumber {
+    /// Largest sample number in a stream packet, 2^24 - 1.
     pub const MAX: u32 = (1 << 24) - 1;
 
+    /// Sample number from its value.
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
+    /// The number as a `u32`.
     pub const fn value(self) -> u32 {
         self.0
     }
 
+    /// Whether the number fits the 24-bit stream packet field.
     pub const fn fits_stream_packet(self) -> bool {
         self.0 <= Self::MAX
     }
 
+    /// Distance from `other`, wrapping at 2^32.
     pub const fn wrapping_sub(self, other: Self) -> u32 {
         self.0.wrapping_sub(other.0)
     }
 
+    /// Four little endian bytes.
     pub const fn to_le_bytes(self) -> [u8; 4] {
         self.0.to_le_bytes()
     }
@@ -224,7 +251,9 @@ impl PartialEq<u32> for SampleNumber {
 pub struct HwRev(u16);
 
 impl HwRev {
+    /// Lowest revision, 1.
     pub const MIN: u16 = 1;
+    /// Highest revision, 99.
     pub const MAX: u16 = 99;
 
     /// Panics when out of range; in a `const` context that is a compile error.
@@ -236,6 +265,7 @@ impl HwRev {
         Self(value)
     }
 
+    /// Revision from its value. None outside 1 to 99.
     pub const fn try_new(value: u16) -> Option<Self> {
         if value >= Self::MIN && value <= Self::MAX {
             Some(Self(value))
@@ -244,8 +274,7 @@ impl HwRev {
         }
     }
 
-    /// Parse a decimal string such as `env!("ETHAN_HW_REV")`; in a `const`
-    /// context a malformed or out-of-range value fails the build.
+    /// Revision from decimal text. Panics unless it is a number from 1 to 99.
     pub const fn parse(s: &str) -> Self {
         let bytes = s.as_bytes();
         assert!(!bytes.is_empty(), "hardware revision is empty");
@@ -263,6 +292,7 @@ impl HwRev {
         Self::new(value)
     }
 
+    /// The revision as a `u16`.
     pub const fn value(self) -> u16 {
         self.0
     }
@@ -285,12 +315,14 @@ impl core::fmt::Display for HwRev {
 pub struct DeviceSerial<T>(T);
 
 impl<T> DeviceSerial<T> {
+    /// Serial from its text.
     pub const fn new(value: T) -> Self {
         Self(value)
     }
 }
 
 impl<T: AsRef<str>> DeviceSerial<T> {
+    /// The serial text.
     pub fn as_str(&self) -> &str {
         self.0.as_ref()
     }
@@ -302,18 +334,19 @@ impl<T: AsRef<str>> core::fmt::Display for DeviceSerial<T> {
     }
 }
 
-/// Firmware build serial as exposed by `dev.firmware.serial` and the final
-/// `[...]` section of `dev.desc`.
+/// Firmware build serial, reported by `dev.firmware.serial`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FirmwareSerial<T>(T);
 
 impl<T> FirmwareSerial<T> {
+    /// Serial from its text.
     pub const fn new(value: T) -> Self {
         Self(value)
     }
 }
 
 impl<T: AsRef<str>> FirmwareSerial<T> {
+    /// The serial text.
     pub fn as_str(&self) -> &str {
         self.0.as_ref()
     }
@@ -330,6 +363,7 @@ impl<T: AsRef<str>> core::fmt::Display for FirmwareSerial<T> {
 pub struct BoardId([u8; 8]);
 
 impl BoardId {
+    /// Board id from its eight bytes.
     pub const fn from_bytes(bytes: [u8; 8]) -> Self {
         Self(bytes)
     }
@@ -352,10 +386,12 @@ impl BoardId {
         Self(bytes)
     }
 
+    /// The eight bytes.
     pub const fn as_bytes(&self) -> &[u8; 8] {
         &self.0
     }
 
+    /// The eight bytes by value.
     pub const fn to_bytes(self) -> [u8; 8] {
         self.0
     }
@@ -366,14 +402,17 @@ impl BoardId {
 pub struct FirmwareMagic([u8; 8]);
 
 impl FirmwareMagic {
+    /// Magic from its eight bytes.
     pub const fn new(bytes: [u8; 8]) -> Self {
         Self(bytes)
     }
 
+    /// The eight bytes.
     pub const fn as_bytes(&self) -> &[u8; 8] {
         &self.0
     }
 
+    /// The eight bytes by value.
     pub const fn to_bytes(self) -> [u8; 8] {
         self.0
     }
