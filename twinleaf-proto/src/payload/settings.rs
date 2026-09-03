@@ -1,18 +1,9 @@
-//! SETTING packet wire format
+//! SETTING packet, a setting change broadcast.
 //!
-//! Payload: `{ name_len: u8, flags: u8 }` then the name, then the value.
-//! Neither the name nor the value is NUL-terminated or padded: a reader takes
-//! `name_len` bytes of name and the rest of the payload as the value.
-//!
-//! A device broadcasts one whenever a setting changes, so clients sharing a
-//! proxy stay in step. A device builds it by calling the RPC and moving its
-//! reply in behind the name, which is why
-//! the value is exactly the bytes that RPC would have returned. `flags` is
-//! sent as zero there and is reserved.
-//!
-//! Names carry meaning to a host — `rpc.hash` is a u32le, others are whatever
-//! their RPC returns — but that is interpretation, not layout, so it stays
-//! with the caller.
+//! Payload: `{ name_len: u8, flags: u8 }` then the name, then the value, which
+//! runs to the end of the payload. Neither is NUL-terminated. The value is
+//! the bytes the RPC of that name would return. `flags` is reserved and sent
+//! as zero.
 
 use crate::packet::{Header, Packet, PacketType};
 

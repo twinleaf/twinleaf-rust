@@ -1,16 +1,8 @@
-//! HEARTBEAT packet wire format
+//! HEARTBEAT packet.
 //!
-//! The payload has no header of its own. A device beating on its own behalf
-//! sends exactly its 4-byte little-endian session id, which is what lets a
-//! receiver notice a restart: a routing hub reads the id straight off the
-//! payload to match a child against its hotplug map.
-//!
-//! Any other length is a heartbeat that says nothing but "still here". A hub
-//! keeping a child port awake sends an empty one, and hosts open a serial
-//! port with the same empty heartbeat, to flush a partial packet and to kick
-//! a legacy sensor out of text mode. Receivers ignore the contents,
-//! so [`Any`](Heartbeat::Any) keeps the bytes
-//! rather than rejecting them.
+//! The payload is the sender's session id, 4 bytes little endian, or anything
+//! else, usually empty. A hub sends empty heartbeats to keep a child port
+//! awake, and a host sends one when it opens a serial port.
 
 use crate::packet::{Header, Packet, PacketType};
 use crate::SessionId;

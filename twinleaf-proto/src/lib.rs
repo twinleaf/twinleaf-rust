@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(test), no_std)]
+#![deny(missing_docs)]
+#![warn(rustdoc::all)]
 
 pub mod identifiers;
 pub mod packet;

@@ -1,76 +1,90 @@
-//! RPC request/reply/error wire formats
+//! RPC packets: request, reply, error, and update.
 //!
 //! Request payload: `{ id: u16le, method: u16le }` then, if `method & 0x8000`,
-//! a method-name string of `method & 0x7FFF` bytes (not NUL-terminated),
-//! then the argument bytes.
-//! Reply payload: `{ req_id: u16le }` then the return value bytes.
+//! a method name of `method & 0x7FFF` bytes, not NUL-terminated, then the
+//! argument bytes.
+//! Reply payload: `{ req_id: u16le }` then the return value.
 //! Error payload: `{ req_id: u16le, code: u16le }` then an optional message.
-//!
-//! Both directions live here: a device answers requests, and a hub *asks* them
-//! of its own children. [`write_request`] and [`Answer`] are that second half.
-//!
-//! [`parse_update`] and [`write_update`] handle the proxy's RPC_UPDATE packet,
-//! which names a method without calling it. A device's own announcement that a
-//! setting changed is a different packet, in [`crate::settings`].
+//! Update payload: `{ method type: u8 }` then `{ id: u16le }` or
+//! `{ name len: u16le }` and the name. A proxy sends RPC_UPDATE to its other
+//! clients when one client's RPC changes a method.
 
 use crate::packet::{Header, Packet, PacketType};
 use crate::{RpcMethodId, RpcRequestId};
 
+/// Method word bit marking a request by name, 0x8000.
 pub const REQUEST_BY_NAME: u16 = 0x8000;
+/// Method word bits holding the name length, 0x7FFF.
 pub const NAMELEN_MASK: u16 = 0x7FFF;
 
 /// `[request id u16le]` preceding a reply's value.
 pub const REPLY_HEADER_SIZE: usize = 2;
 
-/// Every error code an RPC can answer with (`TL_RPC_ERROR_*`).
-///
-/// [`Self::Unknown`] is part of the protocol, not a decoding fallback:
-/// `TL_RPC_ERROR_USER` = 18 reserves every code from 18 up for
-/// per-RPC definitions this crate cannot name.
+/// Error codes (`TL_RPC_ERROR_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RpcError {
+    /// No error, 0.
     #[error("no error")]
     None,
+    /// Undefined error, 1.
     #[error("undefined error")]
     Undefined,
+    /// RPC not found, 2.
     #[error("RPC not found")]
     NotFound,
+    /// Malformed request, 3.
     #[error("malformed request")]
     Malformed,
+    /// Wrong argument size, 4.
     #[error("wrong size args")]
     ArgsSize,
+    /// Invalid arguments, 5.
     #[error("invalid arguments")]
     Invalid,
+    /// Read-only, 6.
     #[error("read-only")]
     ReadOnly,
+    /// Write-only, 7.
     #[error("write-only")]
     WriteOnly,
+    /// Timeout, 8.
     #[error("timeout")]
     Timeout,
+    /// Device busy, 9.
     #[error("device busy")]
     Busy,
+    /// Wrong device state, 10.
     #[error("wrong device state")]
     State,
+    /// Load failed, 11.
     #[error("load failed")]
     Load,
+    /// Load RPC failed, 12.
     #[error("load RPC failed")]
     LoadRpc,
+    /// Save failed, 13.
     #[error("save failed")]
     Save,
+    /// Save write failed, 14.
     #[error("save write failed")]
     SaveWrite,
+    /// Internal error, 15.
     #[error("internal error")]
     Internal,
+    /// Out of memory, 16.
     #[error("out of memory")]
     NoBufs,
+    /// Out of range, 17.
     #[error("out of range")]
     Range,
+    /// Any other code. Codes from 18 up are defined per RPC.
     #[error("unknown error code {0}")]
     Unknown(u16),
 }
 
 impl RpcError {
+    /// The error code.
     pub const fn value(self) -> u16 {
         match self {
             Self::None => 0,
@@ -128,16 +142,23 @@ impl From<RpcError> for u16 {
     }
 }
 
+/// How a request names its method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method<'a> {
+    /// By numeric id.
     ById(RpcMethodId),
+    /// By name, not NUL-terminated.
     ByName(&'a [u8]),
 }
 
+/// A request, as it travels in an RPC_REQ packet.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
+    /// Request id, returned with the reply.
     pub id: RpcRequestId,
+    /// Method called.
     pub method: Method<'a>,
+    /// Argument bytes.
     pub args: &'a [u8],
 }
 
@@ -244,7 +265,9 @@ pub fn set_req_id(payload: &mut [u8], id: RpcRequestId) -> bool {
 /// A successful answer: the request it belongs to and the returned value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reply<'a> {
+    /// Id of the request answered.
     pub req_id: RpcRequestId,
+    /// Return value bytes.
     pub value: &'a [u8],
 }
 
@@ -287,8 +310,11 @@ pub fn write_reply_payload(out: &mut [u8], req_id: RpcRequestId, value: &[u8]) -
 /// A refused request: the code, kept raw, and whatever message followed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorReply<'a> {
+    /// Id of the request answered.
     pub req_id: RpcRequestId,
+    /// Error code, see [`RpcError`].
     pub code: u16,
+    /// Optional message bytes.
     pub message: &'a [u8],
 }
 
@@ -346,7 +372,9 @@ pub fn write_error_payload(
 /// what lets a hub read one field off either packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer<'a> {
+    /// A reply.
     Reply(Reply<'a>),
+    /// An error.
     Error(ErrorReply<'a>),
 }
 
@@ -361,6 +389,7 @@ impl<'a> Answer<'a> {
         }
     }
 
+    /// Id of the request answered.
     pub fn req_id(&self) -> RpcRequestId {
         match self {
             Self::Reply(reply) => reply.req_id,
@@ -396,31 +425,41 @@ impl core::fmt::Debug for RpcMetaFlags {
 }
 
 impl RpcMetaFlags {
+    /// Readable, 0x0100.
     pub const READABLE: Self = Self(0x0100);
+    /// Writable, 0x0200.
     pub const WRITABLE: Self = Self(0x0200);
+    /// Saved across reboots, 0x0400.
     pub const PERSISTENT: Self = Self(0x0400);
+    /// Boolean value, 0x0800.
     pub const BOOL: Self = Self(0x0800);
+    /// Capture, read in blocks, 0x1000.
     pub const CAPTURE: Self = Self(0x1000);
 
     // Preserve unknown flag bits when decoding.
     const MASK: u16 = 0xff00;
 
+    /// Flags from an `rpc.info` word.
     pub const fn from_meta(meta: u16) -> Self {
         Self(meta & Self::MASK)
     }
 
+    /// The raw bits.
     pub const fn bits(self) -> u16 {
         self.0
     }
 
+    /// Whether every bit of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Both sets of flags.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    /// Access implied by the readable and writable flags.
     pub const fn access(self) -> RpcAccess {
         match (self.contains(Self::READABLE), self.contains(Self::WRITABLE)) {
             (true, true) => RpcAccess::ReadWrite,
@@ -430,6 +469,7 @@ impl RpcMetaFlags {
         }
     }
 
+    /// Whether the value is saved across reboots.
     pub const fn is_persistent(self) -> bool {
         self.contains(Self::PERSISTENT)
     }
@@ -443,11 +483,16 @@ impl core::ops::BitOr for RpcMetaFlags {
     }
 }
 
+/// Access of a method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcAccess {
+    /// Readable and writable.
     ReadWrite,
+    /// Readable only.
     ReadOnly,
+    /// Writable only.
     WriteOnly,
+    /// Neither, an action.
     Action,
 }
 
@@ -457,6 +502,7 @@ pub enum RpcAccess {
 pub struct RpcStringLen(u8);
 
 impl RpcStringLen {
+    /// Longest bounded length, 15.
     pub const MAX: u8 = 0x0f;
 
     /// Returns `None` for lengths which cannot be encoded, zero included:
@@ -469,6 +515,7 @@ impl RpcStringLen {
         }
     }
 
+    /// The length.
     pub const fn get(self) -> u8 {
         self.0
     }
@@ -483,11 +530,30 @@ impl core::fmt::Display for RpcStringLen {
 /// Value kind encoded in `rpc.info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcValueType {
+    /// No value.
     Unit,
-    Int { signed: bool, size: u8 },
-    Float { size: u8 },
-    String { max_len: Option<RpcStringLen> },
-    Raw { meta: u16 },
+    /// Integer.
+    Int {
+        /// Whether the integer is signed.
+        signed: bool,
+        /// Size in bytes, 1, 2, 4, or 8.
+        size: u8,
+    },
+    /// Float.
+    Float {
+        /// Size in bytes, 4 or 8.
+        size: u8,
+    },
+    /// String.
+    String {
+        /// Longest value in bytes, or None if unbounded.
+        max_len: Option<RpcStringLen>,
+    },
+    /// Any other encoding.
+    Raw {
+        /// The raw `rpc.info` word.
+        meta: u16,
+    },
 }
 
 impl RpcValueType {
@@ -496,6 +562,7 @@ impl RpcValueType {
     const TYPE_FLOAT: u8 = 2;
     const TYPE_STRING: u8 = 3;
 
+    /// Type from the low byte of an `rpc.info` word. None for an undefined encoding.
     pub const fn from_low_byte(byte: u8) -> Option<Self> {
         let data_type = byte & 0x0f;
         let data_size = (byte >> 4) & 0x0f;
@@ -528,6 +595,7 @@ impl RpcValueType {
         }
     }
 
+    /// The low byte of an `rpc.info` word.
     pub const fn low_byte(self) -> u8 {
         match self {
             Self::Unit => 0,
@@ -546,6 +614,7 @@ impl RpcValueType {
     }
 }
 
+/// The 16-bit `rpc.info` word: flags in the high byte, value type in the low byte.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct RpcMeta(u16);
 
@@ -568,6 +637,7 @@ impl RpcMeta {
     /// Void action RPC: no readable/writable flags.
     pub const ACTION: Self = Self(Self::TYPED);
 
+    /// Word from its bits.
     pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
@@ -577,10 +647,12 @@ impl RpcMeta {
         Self::typed(kind, flags)
     }
 
+    /// Word for a typed value.
     pub const fn typed(kind: RpcValueType, flags: RpcMetaFlags) -> Self {
         Self(Self::TYPED | kind.low_byte() as u16 | flags.bits())
     }
 
+    /// Word for an unsigned integer of `size` bytes.
     pub const fn fixed_uint(size: u8, flags: RpcMetaFlags) -> Self {
         assert!(matches!(size, 1 | 2 | 4 | 8), "unsupported RPC uint size");
         Self::typed(
@@ -592,34 +664,42 @@ impl RpcMeta {
         )
     }
 
+    /// Word for an unbounded string.
     pub const fn string(flags: RpcMetaFlags) -> Self {
         Self::typed(RpcValueType::String { max_len: None }, flags)
     }
 
+    /// The raw word.
     pub const fn bits(self) -> u16 {
         self.0
     }
 
+    /// The two wire bytes.
     pub const fn to_le_bytes(self) -> [u8; 2] {
         self.0.to_le_bytes()
     }
 
+    /// The flag bits.
     pub const fn flags(self) -> RpcMetaFlags {
         RpcMetaFlags::from_meta(self.0)
     }
 
+    /// Whether the word is zero, an untyped method.
     pub const fn is_unknown(self) -> bool {
         self.0 == 0
     }
 
+    /// Access of the method.
     pub const fn access(self) -> RpcAccess {
         self.flags().access()
     }
 
+    /// Whether the value is saved across reboots.
     pub const fn is_persistent(self) -> bool {
         self.flags().is_persistent()
     }
 
+    /// Value type.
     pub const fn kind(self) -> RpcValueType {
         if self.is_unknown() || self.flags().contains(RpcMetaFlags::CAPTURE) {
             return RpcValueType::Raw { meta: self.0 };
@@ -630,6 +710,7 @@ impl RpcMeta {
         }
     }
 
+    /// Fixed value size in bytes. None for strings and raw encodings.
     pub const fn size_bytes(self) -> Option<usize> {
         match self.kind() {
             RpcValueType::Unit => Some(0),
@@ -914,17 +995,9 @@ mod tests {
     }
 }
 
-/// RPC_UPDATE payload: `[method type u8]` then, for [`UPDATE_BY_ID`], the
-/// method's `[id u16le]`, and for [`UPDATE_BY_NAME`], its
-/// `[name len u16le][name bytes]` — a name neither NUL-terminated nor padded.
-/// Nothing follows: the packet names a method, it does not carry a value.
-///
-/// Host-side invention; no device sends it, only a proxy.
-/// When one client's RPC changes a method, the proxy tells the other clients
-/// which method moved so they can re-read it, addressing it exactly as the
-/// request did. A device never sees the packet, which is why its method field
-/// is spelled out rather than packed into the request's `method` word.
+/// Method given by id, 0.
 pub const UPDATE_BY_ID: u8 = 0;
+/// Method given by name, 1.
 pub const UPDATE_BY_NAME: u8 = 1;
 /// `[method type][id]`, or `[method type][name len]` before the name.
 pub const UPDATE_HEADER_SIZE: usize = 3;
