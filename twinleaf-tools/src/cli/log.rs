@@ -84,6 +84,21 @@ pub enum LogSubcommands {
         files: Vec<String>,
     },
 
+    /// Copy a damaged binary log, leaving out what does not decode
+    Repair {
+        /// Input log file
+        #[arg(value_hint = ValueHint::FilePath)]
+        input: String,
+
+        /// Output file path (defaults to the input filename with _repaired.tio)
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
+
+        /// Overwrite the output file if it already exists
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+
     /// Convert binary log data to CSV
     Csv {
         /// Stream selector (name or id, optionally with a route prefix like

@@ -22,6 +22,7 @@ required-features = ["hdf5"]
 
 [dependencies]
 bytes = "1"
+memmap2 = "0.9"
 crossbeam = "0.8"
 serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}

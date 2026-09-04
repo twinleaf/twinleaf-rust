@@ -11,6 +11,7 @@ mod hdf;
 mod inspect;
 mod progress;
 mod record;
+mod repair;
 
 pub use csv::log_csv;
 pub use dump::log_dump;
@@ -18,6 +19,7 @@ pub use dump::log_dump;
 pub use hdf::log_hdf;
 pub use inspect::log_inspect;
 pub use record::{log, log_metadata, meta_reroute};
+pub use repair::log_repair;
 
 const LOG_BATCH_ROWS: usize = 65_536;
 
@@ -44,6 +46,11 @@ pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
             depth,
         }) => log_dump(files, data, meta, sensor, glob, depth),
         Some(LogSubcommands::Inspect { files }) => log_inspect(files),
+        Some(LogSubcommands::Repair {
+            input,
+            output,
+            force,
+        }) => log_repair(input, output, force),
         Some(LogSubcommands::Csv {
             args,
             sensor,
