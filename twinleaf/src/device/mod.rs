@@ -54,7 +54,7 @@
 //! use std::time::Duration;
 //! use twinleaf::{Connection, DeviceRoute, Event, LinkEvent};
 //!
-//! let connection = Connection::open("serial:///dev/ttyACM0");
+//! let connection = Connection::open("serial:///dev/ttyACM0").expect("open the hub");
 //! let tree = connection.tree(DeviceRoute::root());
 //! for named in tree.named_routes(Duration::from_secs(2)) {
 //!     println!("{}: {}", named.route, named.name.as_deref().unwrap_or("(no answer)"));
@@ -74,7 +74,8 @@
 //! use twinleaf::device::rpc::{pipelined, RpcReply};
 //! use twinleaf::{Connection, DeviceRoute};
 //!
-//! let device = Connection::open("tcp://localhost").device(DeviceRoute::root());
+//! let connection = Connection::connect().expect("connect to a device");
+//! let device = connection.device(DeviceRoute::root());
 //! let calls = ["dev.name", "dev.desc", "dev.serial"].map(|name| device.submit(name, &[]));
 //! for reply in pipelined(calls, 3) {
 //!     let text = String::decode_reply(&reply.expect("a reply")).expect("a string");

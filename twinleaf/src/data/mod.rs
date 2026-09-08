@@ -61,7 +61,7 @@
 //!     }
 //! }
 //!
-//! let connection = Connection::open("tcp://localhost");
+//! let connection = Connection::connect().expect("connect to a device");
 //! let device = connection.device(DeviceRoute::root());
 //! let samples = device.samples();
 //!

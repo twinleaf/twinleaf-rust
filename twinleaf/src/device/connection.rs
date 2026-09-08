@@ -50,37 +50,27 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connect to `url` as the `tio` tools do: network URLs directly, serial
-    /// devices through a shared background `tio` holder, `auto` to the default.
-    pub fn connect(url: &str) -> std::io::Result<Connection> {
-        Self::connect_with(url, None, None)
+    /// Connect to the default device: the selection made in `tio list`, else
+    /// the only device attached. Errors when there are none or several.
+    pub fn connect() -> std::io::Result<Connection> {
+        Self::open("auto")
     }
 
-    /// As [`connect`](Self::connect), with transport reconnect and status options.
-    pub fn connect_with(
-        url: &str,
-        reconnect_timeout: Option<Duration>,
-        status_queue: Option<channel::Sender<proxy::Event>>,
-    ) -> std::io::Result<Connection> {
-        Ok(Self::open_with(
-            &super::runtime::resolve(url)?,
-            reconnect_timeout,
-            status_queue,
-        ))
-    }
-
-    /// Open a connection to `url` and start driving its transport.
+    /// Open a connection to the device at `url`.
     ///
-    /// Accepted transport locators are:
+    /// Devices are shared: the first process starts a background `tio` holder
+    /// and later ones join it, so install `twinleaf-tools`. A loopback URL is
+    /// already a proxy or holder and connects directly. Accepted locators are:
     ///
     /// - `serial://port[:target_bps[:default_bps]]`, with both rates defaulting
     ///   to 115200. The `serial://` prefix may be omitted for `/dev/...` paths
     ///   on Unix and `COM...` ports on Windows. Requires the `serial` feature.
     /// - `tcp://address[:port]`, with `tcp4://` and `tcp6://` variants.
     /// - `udp://address[:port]`, with `udp4://` and `udp6://` variants.
+    /// - `auto`, the `-r` spelling of [`connect`](Self::connect).
     ///
     /// TCP and UDP use port 7855 when no port is given.
-    pub fn open(url: &str) -> Connection {
+    pub fn open(url: &str) -> std::io::Result<Connection> {
         Self::open_with(url, None, None)
     }
 
@@ -90,16 +80,16 @@ impl Connection {
         url: &str,
         reconnect_timeout: Option<Duration>,
         status_queue: Option<channel::Sender<proxy::Event>>,
-    ) -> Connection {
-        Self::over(&proxy::Connection::open_with(
-            url,
+    ) -> std::io::Result<Connection> {
+        Ok(Self::over(&proxy::Connection::open_with(
+            &super::runtime::resolve(url)?,
             reconnect_timeout,
             status_queue,
-        ))
+        )))
     }
 
-    /// A connection over a link a [`proxy`](crate::tio::proxy) server already
-    /// owns, so the server asks its questions over the same transport.
+    /// A connection over a transport opened directly and exclusively with
+    /// [`proxy::Connection::open`], as a [`proxy`](crate::tio::proxy) server does.
     pub fn over(proxy: &proxy::Connection) -> Connection {
         let root = proxy
             .rpc_endpoint(None, DeviceRoute::root(), DeviceRoute::MAX_HOPS)
@@ -160,7 +150,8 @@ impl Connection {
 /// use twinleaf::{Connection, DeviceRoute};
 ///
 /// let root = DeviceRoute::root();
-/// let tree = Connection::open("tcp://localhost").tree(root);
+/// let connection = Connection::connect().expect("connect to a device");
+/// let tree = connection.tree(root);
 /// let name: String = tree.get(root, "dev.name").expect("read device name");
 /// ```
 #[derive(Clone)]
@@ -330,7 +321,8 @@ impl DeviceTree {
 /// ```no_run
 /// use twinleaf::{Connection, DeviceRoute};
 ///
-/// let device = Connection::open("tcp://localhost").device(DeviceRoute::root());
+/// let connection = Connection::connect().expect("connect to a device");
+/// let device = connection.device(DeviceRoute::root());
 /// let name: String = device.rpc("dev.name", ()).expect("read device name");
 /// ```
 #[derive(Clone)]

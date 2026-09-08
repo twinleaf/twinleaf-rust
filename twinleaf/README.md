@@ -5,16 +5,9 @@ wire types and codecs.
 
 ## Capabilities
 
-- Connect through [`Connection::connect`]: `auto` for the default device, a
-  serial device shared between processes through a background `tio` holder,
-  or a network URL. [`Connection::open`] drives one transport directly.
-- Discover serial devices and, with the [`mdns`](#cargo-features) Cargo feature,
-  networked devices through [`Discovery`].
-- Address a routed subtree with [`DeviceTree`] or bind one route with [`Device`].
-- Call [typed or dynamic RPCs] and subscribe to [`SampleBatch`]es, [`Event`]s,
-  or raw [`Packet`]s.
-- Buffer and process live data or read recorded `tio` logs with the [data module].
-- Query and update device firmware through the [firmware module].
+- Connect to the default device through [`Connection::connect`], or to a
+  specific one through [`Connection::open`]. Devices are shared between
+  processes through a background `tio` holder, so install `twinleaf-tools`.
 
 ## API model
 
@@ -38,8 +31,8 @@ use std::time::Duration;
 use twinleaf::{Connection, DeviceRoute};
 
 fn main() {
-    let connection = Connection::connect("auto").expect("connect to a device");
-    // or drive one transport directly: Connection::open("serial:///dev/ttyACM0")
+    let connection = Connection::connect().expect("connect to a device");
+    // or a specific device: Connection::open("serial:///dev/ttyACM0")
     let device = connection.device(DeviceRoute::root());
 
     let name: String = device.get("dev.name").expect("read device name");
@@ -61,6 +54,7 @@ fn main() {
 - `mdns`: discovery of networked devices through mDNS/DNS-SD.
 - `hdf5`: HDF5 data export.
 
+[`Connection::connect`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Connection.html#method.connect
 [`Connection::open`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Connection.html#method.open
 [`Device`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Device.html
 [`DeviceTree`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.DeviceTree.html

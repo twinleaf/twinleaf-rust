@@ -8,8 +8,10 @@
 //! just want a one-shot list.
 
 use super::connection::Connection;
+use super::runtime;
 use super::stream::NamedRoute;
 use crate::proto::DeviceRoute;
+use crate::tio::proxy;
 use crossbeam::channel;
 #[cfg(feature = "mdns")]
 use std::collections::HashMap;
@@ -216,12 +218,17 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
     }
 }
 
+/// A short-lived exclusive connection to `url`, or to the holder already
+/// serving it. Never starts one.
+fn probe(url: &str, timeout: Duration) -> Connection {
+    let url = runtime::shared_endpoint(url).unwrap_or_else(|| url.to_string());
+    Connection::over(&proxy::Connection::open_with(&url, Some(timeout), None))
+}
+
 /// Briefly connect to `url` and read its `dev.name`. `None` when the port is
 /// busy or the device does not answer within about twice `timeout`.
 pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
-    let url = super::runtime::shared_endpoint(url).unwrap_or_else(|| url.to_string());
-    let connection = Connection::open_with(&url, Some(timeout), None);
-    connection
+    probe(url, timeout)
         .device(DeviceRoute::root())
         .with_timeout(timeout)
         .get("dev.name")
@@ -313,9 +320,7 @@ fn reprobe_serial(
 /// One probe pass over `url`: resolve the root `dev.name` and snapshot the
 /// routes alive behind it. Errors when the event channel closed.
 fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), ()> {
-    let shared = super::runtime::shared_endpoint(url).unwrap_or_else(|| url.to_string());
-    let connection = Connection::open_with(&shared, Some(PROBE_TIMEOUT), None);
-    let tree = connection
+    let tree = probe(url, PROBE_TIMEOUT)
         .tree(DeviceRoute::root())
         .with_timeout(PROBE_TIMEOUT);
 

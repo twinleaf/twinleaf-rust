@@ -9,7 +9,7 @@ pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     use color_eyre::Help;
     use eyre::WrapErr;
 
-    let connection = Connection::connect(&tio.root)?;
+    let connection = Connection::open(&tio.root)?;
     let route = tio.route;
 
     let bind_addr = format!("0.0.0.0:{}", tcp_port);

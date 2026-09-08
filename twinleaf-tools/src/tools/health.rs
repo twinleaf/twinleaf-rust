@@ -1837,7 +1837,7 @@ fn run_health_app(config: HealthConfig) -> eyre::Result<()> {
 
     let mut terminal = ratatui::init();
 
-    let connection = Connection::connect(&config.tio.root)?;
+    let connection = Connection::open(&config.tio.root)?;
     let root_route = config.tio.route;
 
     // One connection: the library pumps samples, cloned trees call.
