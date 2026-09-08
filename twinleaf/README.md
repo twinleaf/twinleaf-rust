@@ -5,7 +5,9 @@ wire types and codecs.
 
 ## Capabilities
 
-- Connect over serial, TCP, or UDP through [`Connection::open`].
+- Connect through [`Connection::connect`]: `auto` for the default device, a
+  serial device shared between processes through a background `tio` holder,
+  or a network URL. [`Connection::open`] drives one transport directly.
 - Discover serial devices and, with the [`mdns`](#cargo-features) Cargo feature,
   networked devices through [`Discovery`].
 - Address a routed subtree with [`DeviceTree`] or bind one route with [`Device`].
@@ -36,7 +38,8 @@ use std::time::Duration;
 use twinleaf::{Connection, DeviceRoute};
 
 fn main() {
-    let connection = Connection::open("tcp://localhost");
+    let connection = Connection::connect("auto").expect("connect to a device");
+    // or drive one transport directly: Connection::open("serial:///dev/ttyACM0")
     let device = connection.device(DeviceRoute::root());
 
     let name: String = device.get("dev.name").expect("read device name");

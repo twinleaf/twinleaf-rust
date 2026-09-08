@@ -86,6 +86,7 @@ pub mod capture;
 mod connection;
 pub mod discovery;
 pub mod rpc;
+pub mod runtime;
 mod stream;
 
 #[doc(no_inline)]

@@ -3039,6 +3039,7 @@ dependencies = [
  "oneshot",
  "serde_json",
  "serialport",
+ "tempfile",
  "thiserror 2.0.20",
  "twinleaf-proto",
  "ureq",

@@ -50,6 +50,25 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Connect to `url` as the `tio` tools do: network URLs directly, serial
+    /// devices through a shared background `tio` holder, `auto` to the default.
+    pub fn connect(url: &str) -> std::io::Result<Connection> {
+        Self::connect_with(url, None, None)
+    }
+
+    /// As [`connect`](Self::connect), with transport reconnect and status options.
+    pub fn connect_with(
+        url: &str,
+        reconnect_timeout: Option<Duration>,
+        status_queue: Option<channel::Sender<proxy::Event>>,
+    ) -> std::io::Result<Connection> {
+        Ok(Self::open_with(
+            &super::runtime::resolve(url)?,
+            reconnect_timeout,
+            status_queue,
+        ))
+    }
+
     /// Open a connection to `url` and start driving its transport.
     ///
     /// Accepted transport locators are:

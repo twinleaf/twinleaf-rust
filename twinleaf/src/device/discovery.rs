@@ -219,7 +219,8 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
 /// Briefly connect to `url` and read its `dev.name`. `None` when the port is
 /// busy or the device does not answer within about twice `timeout`.
 pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
-    let connection = Connection::open_with(url, Some(timeout), None);
+    let url = super::runtime::shared_endpoint(url).unwrap_or_else(|| url.to_string());
+    let connection = Connection::open_with(&url, Some(timeout), None);
     connection
         .device(DeviceRoute::root())
         .with_timeout(timeout)
@@ -312,7 +313,8 @@ fn reprobe_serial(
 /// One probe pass over `url`: resolve the root `dev.name` and snapshot the
 /// routes alive behind it. Errors when the event channel closed.
 fn probe_device(url: &str, tx: &channel::Sender<DiscoveryEvent>) -> Result<(), ()> {
-    let connection = Connection::open_with(url, Some(PROBE_TIMEOUT), None);
+    let shared = super::runtime::shared_endpoint(url).unwrap_or_else(|| url.to_string());
+    let connection = Connection::open_with(&shared, Some(PROBE_TIMEOUT), None);
     let tree = connection
         .tree(DeviceRoute::root())
         .with_timeout(PROBE_TIMEOUT);

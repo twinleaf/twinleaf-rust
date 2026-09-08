@@ -19,7 +19,7 @@ mod udp;
 use super::packet::{self, Packet};
 use crate::proto;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -157,6 +157,20 @@ enum AddrFamilyRestrict {
 
 /// Default TCP and UDP port used by the TIO protocol.
 static TIO_DEFAULT_PORT: u16 = 7855;
+
+/// Whether `url` names this machine, by [`IpAddr::is_loopback`] or the name
+/// `localhost`, without resolving anything.
+pub(crate) fn is_loopback(url: &str) -> bool {
+    let addr = url.splitn(2, "://").nth(1).unwrap_or(url);
+    let ip = addr
+        .parse::<SocketAddr>()
+        .map(|sa| sa.ip())
+        .or_else(|_| addr.trim_matches(['[', ']']).parse::<IpAddr>());
+    match ip {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => addr.rsplit_once(':').map_or(addr, |(host, _)| host) == "localhost",
+    }
+}
 
 /// Resolve a fully specified socket address with address family restrictions.
 /// This will attempt to add the default port
