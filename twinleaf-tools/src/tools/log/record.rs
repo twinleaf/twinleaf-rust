@@ -218,7 +218,7 @@ pub fn log(
     use indicatif::{ProgressBar, ProgressStyle};
     use std::path::Path;
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let route = tio.route;
 
     let file_name = Path::new(&file)
@@ -359,7 +359,7 @@ fn log_parsed(
 pub fn log_metadata(tio: &TioOpts, file: String) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let route = tio.route;
 
     let device = connection.device(route);

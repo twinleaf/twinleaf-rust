@@ -2252,7 +2252,7 @@ fn run_monitor_app(config: MonitorConfig) -> eyre::Result<()> {
         depth,
     } = config;
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let parent_route: DeviceRoute = tio.route;
 
     // One connection: the library pumps samples, cloned trees call.

@@ -11,7 +11,7 @@ pub fn run_capture(capture_cli: CaptureCli) -> eyre::Result<()> {
 pub fn capture(tio: &TioOpts, rpc_name: String, timeout: Duration) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let device = connection.device(tio.route);
 
     let readout = read_capture(&device, &rpc_name, timeout)

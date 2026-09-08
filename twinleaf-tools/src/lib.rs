@@ -2,7 +2,6 @@ use clap::Parser;
 use indicatif::MultiProgress;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use twinleaf::tio::proxy;
 use twinleaf::DeviceRoute;
 pub mod cli;
 pub mod tools;
@@ -46,7 +45,7 @@ pub trait ProxyHelp<T> {
 impl<T> ProxyHelp<T> for eyre::Result<T> {
     fn with_proxy_help(self) -> eyre::Result<T> {
         use color_eyre::Help;
-        self.suggestion("start `tio proxy` first if using with multiple applications")
+        self.suggestion("run `tio list` to discover devices and host a selection")
             .suggestion("or specify a source with -r <url>")
     }
 }
@@ -71,9 +70,9 @@ pub struct TioOpts {
     #[arg(
         short = 'r',
         long = "root",
-        default_value_t = proxy::DEFAULT_URL.to_string(),
+        default_value = "auto",
         value_hint = clap::ValueHint::Url,
-        help = "Sensor root address"
+        help = "Sensor root address (auto selects the default or only device)"
     )]
     pub root: String,
 

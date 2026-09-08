@@ -34,7 +34,7 @@ pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
 fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
     // A single connection to the hub is reused for discovery and every device;
     // per-device RPC ports are opened on it rather than new connections.
-    let hub = Connection::open(&tio.root);
+    let hub = Connection::connect(&tio.root)?;
 
     let tree = hub.tree(twinleaf::DeviceRoute::root());
     let routes = tree.discover_routes(ROUTE_DISCOVERY_WINDOW);
@@ -340,7 +340,7 @@ fn download_and_flash(
 /// Open a session on one device. The returned [`Connection`] owns the
 /// connection and must be kept alive for as long as the device is used.
 fn open_device(tio: &TioOpts) -> eyre::Result<(Connection, Device)> {
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let device = connection.device(tio.route);
     Ok((connection, device))
 }

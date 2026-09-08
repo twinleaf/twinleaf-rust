@@ -1,7 +1,8 @@
 //! Device discovery frontend for `tio proxy list` and its `tio list` shortcut.
 //!
 //! On a terminal, opens the interactive picker (see [`crate::tui::selector`]):
-//! selecting a device starts a proxy on it, quitting prints the device tree.
+//! selecting devices hosts them as the default until Ctrl-C, quitting prints
+//! the device tree.
 //! Without a TTY, prints the tree after the scan window.
 
 use std::io::IsTerminal;

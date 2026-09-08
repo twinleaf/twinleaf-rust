@@ -13,16 +13,22 @@ use crate::{MountArg, ProxyCli, ProxySubcommands};
 #[cfg(feature = "mdns")]
 use std::collections::BTreeMap;
 use std::io;
-use std::net::TcpListener;
-use std::time::Duration;
+use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use twinleaf::device::discovery::{self, DiscoveredDevice, PortInterface};
+use twinleaf::device::runtime;
 use twinleaf::proto;
 use twinleaf::proto::log::LogLevel;
 use twinleaf::tio::{self, packet, proxy};
 
-fn init_proxy_logging(verbose: bool, debug: bool) {
+/// Holders log their own lifecycle in full and never relay device logs.
+fn init_proxy_logging(verbose: bool, debug: bool, holder: bool) {
     use std::io::Write;
-    let level_filter = if debug {
+    let level_filter = if holder {
+        "info,twinleaf=debug,twinleaf_tools=debug,device=off"
+    } else if debug {
         "trace"
     } else if verbose {
         "debug"
@@ -50,19 +56,39 @@ fn init_proxy_logging(verbose: bool, debug: bool) {
 
 pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
     match proxy_cli.subcommands.take() {
+        Some(ProxySubcommands::Stop { url }) => Ok(runtime::stop(&url)?),
         Some(ProxySubcommands::List(cli)) => list::run_list(cli),
         Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
-            init_proxy_logging(false, false);
+            init_proxy_logging(false, false, false);
             nmea::run_nmea_proxy(tio, tcp_port)
         }
         None => {
+            if proxy_cli.detach {
+                let endpoint = match proxy_cli.mounts.as_slice() {
+                    [] => runtime::detach(proxy_cli.sensor_url.as_deref().unwrap_or("auto"))?,
+                    mounts => runtime::compose(
+                        &mounts
+                            .iter()
+                            .map(|m| (m.locator.clone(), m.prefix))
+                            .collect::<Vec<_>>(),
+                    )?,
+                };
+                println!("{endpoint}");
+                return Ok(());
+            }
             if proxy_cli.enumerate {
                 return list::list_devices_deprecated(true);
             }
+            let holder = match proxy_cli.holder_key.as_deref().map(runtime::Holder::claim) {
+                None => None,
+                Some(Ok(holder)) => Some(holder),
+                Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Some(Err(e)) => return Err(e.into()),
+            };
             let mounts = std::mem::take(&mut proxy_cli.mounts);
             let layout = Layout::from_cli(mounts, proxy_cli.sensor_url.take())?;
 
-            init_proxy_logging(proxy_cli.verbose, proxy_cli.debug);
+            init_proxy_logging(proxy_cli.verbose, proxy_cli.debug, holder.is_some());
             if proxy_cli.timestamp_format != "%T%.3f " {
                 log::warn!(
                     "--timestamp is deprecated and no longer applied; \
@@ -78,19 +104,45 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
             let server = ProxyServer {
                 config: ProxyConfig::from(&proxy_cli),
                 layout,
+                holder,
+                hosted: false,
             };
             server.run()
         }
     }
 }
 
-/// Start a proxy with default settings on devices picked in `tio proxy list`,
-/// each mounted at its chosen route prefix (a single device sits at root).
+/// Make the devices picked in `tio proxy list` the default for every tool
+/// until Ctrl-C: one device by staying connected to it, several by hosting a
+/// hub of them.
 pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyre::Result<()> {
     use clap::Parser;
+    if let [(device, route)] = picked.as_slice() {
+        if route.is_empty() {
+            let _connection = twinleaf::Connection::open(&device.url)?;
+            println!(
+                "Using {} as the default while this runs. Ctrl-C to stop.",
+                device.name.as_deref().unwrap_or(&device.url)
+            );
+            loop {
+                std::thread::park();
+            }
+        }
+    }
     let cli = ProxyCli::parse_from(["tio-proxy"]);
-    init_proxy_logging(cli.verbose, cli.debug);
-    let server = ProxyServer {
+    init_proxy_logging(cli.verbose, cli.debug, false);
+    let mounts: Vec<_> = picked
+        .iter()
+        .map(|(device, prefix)| (device.url.clone(), *prefix))
+        .collect();
+    let holder = match runtime::Holder::claim(&runtime::composition_key(&mounts)) {
+        Ok(holder) => holder,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            eyre::bail!("the selection is already in use by another tio process")
+        }
+        Err(e) => return Err(e.into()),
+    };
+    ProxyServer {
         config: ProxyConfig::from(&cli),
         layout: Layout {
             mounts: picked
@@ -103,8 +155,10 @@ pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyr
                 })
                 .collect(),
         },
-    };
-    server.run()
+        holder: Some(holder),
+        hosted: true,
+    }
+    .run()
 }
 
 /// Server settings, fixed at startup.
@@ -306,6 +360,18 @@ impl SlowTracker {
 struct ProxyServer {
     config: ProxyConfig,
     layout: Layout,
+    holder: Option<runtime::Holder>,
+    /// A selection the user is hosting from the terminal: it never idles out.
+    hosted: bool,
+}
+
+/// Counts a client thread until it exits.
+struct Departure(Arc<AtomicUsize>);
+
+impl Drop for Departure {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ProxyServer {
@@ -315,7 +381,12 @@ impl ProxyServer {
 
         self.print_startup();
 
-        let new_client = self.start_listeners()?;
+        let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
+        let endpoint = match &self.holder {
+            Some(_) => create_listener_thread(SocketAddr::from(([127, 0, 0, 1], 0)), client_send)?,
+            None => self.start_listeners(client_send)?,
+        };
+        let endpoint = format!("tcp://{endpoint}");
 
         // Phase 1: open each upstream interface. No monitor port is created yet,
         // so the sensor discovery in phase 2 runs without an undrained port: the
@@ -330,9 +401,13 @@ impl ProxyServer {
         }
         let mut pending = Vec::with_capacity(self.layout.mounts.len());
         for mount in &self.layout.mounts {
+            let locator = match (&self.holder, self.hosted) {
+                (Some(_), false) => mount.locator.clone(),
+                (Some(_), true) | (None, _) => runtime::resolve(&mount.locator)?,
+            };
             let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
             let interface = proxy::Connection::open_with(
-                &mount.locator,
+                &locator,
                 Some(self.config.reconnect_timeout),
                 Some(status_send),
             );
@@ -390,6 +465,37 @@ impl ProxyServer {
             });
         }
 
+        if let Some(holder) = &self.holder {
+            for link in &links {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match link.status_rx.recv_deadline(deadline) {
+                        Ok(proxy::Event::SensorConnected | proxy::Event::SensorReconnected) => {
+                            break
+                        }
+                        Ok(
+                            proxy::Event::FailedToConnect
+                            | proxy::Event::FailedToReconnect
+                            | proxy::Event::Exiting,
+                        ) => bail!("holder upstream {} failed to connect", link.prefix),
+                        Ok(event) => log_proxy_event(event, &link.prefix),
+                        Err(_) => {
+                            bail!("holder upstream {} sent no packet within 10s", link.prefix)
+                        }
+                    }
+                }
+            }
+            holder.publish(&endpoint)?;
+            if self.hosted {
+                println!("Serving the selection as the default for every tool. Ctrl-C to stop.");
+            } else {
+                log::info!(
+                    "holder ready at {endpoint} ({})",
+                    std::env::current_exe().unwrap_or_default().display()
+                );
+            }
+        }
+
         let mut sel = crossbeam::channel::Select::new();
         let mut sources = Vec::with_capacity(1 + 2 * links.len());
         sel.recv(&new_client);
@@ -401,14 +507,42 @@ impl ProxyServer {
             sources.push(Source::DevicePacket(link));
         }
 
+        let clients = Arc::new(AtomicUsize::new(0));
+        let mut idle_since = Instant::now();
+        let mut next_tick = Instant::now();
         loop {
-            let oper = sel.select();
+            if let Some(holder) = self.holder.as_ref().filter(|_| Instant::now() >= next_tick) {
+                next_tick = Instant::now() + Duration::from_millis(250);
+                if clients.load(Ordering::Relaxed) > 0 {
+                    idle_since = Instant::now();
+                }
+                if !holder.published() {
+                    log::info!("stopped by tio proxy stop");
+                    break;
+                }
+                if idle_since.elapsed() >= runtime::IDLE && !holder.pinned() && !self.hosted {
+                    holder.withdraw()?;
+                    std::thread::sleep(runtime::WITHDRAWAL);
+                    if clients.load(Ordering::Relaxed) == 0 && new_client.is_empty() {
+                        log::info!("no clients for {:?}; exiting", runtime::IDLE);
+                        break;
+                    }
+                    holder.publish(&endpoint)?;
+                }
+            }
+            let oper = match &self.holder {
+                None => sel.select(),
+                Some(_) => match sel.select_deadline(next_tick) {
+                    Ok(oper) => oper,
+                    Err(_) => continue,
+                },
+            };
             match sources[oper.index()] {
                 Source::NewClient => {
                     let Ok(stream) = oper.recv(&new_client) else {
                         bail!("listener thread died unexpectedly");
                     };
-                    self.accept_client(stream, &links);
+                    self.accept_client(stream, &links, &clients);
                 }
                 Source::Status(link) => {
                     let Ok(evt) = oper.recv(&link.status_rx) else {
@@ -497,7 +631,9 @@ impl ProxyServer {
                 }
             }
         }
-        println!("  TCP port: {}", self.config.tcp_port);
+        if self.holder.is_none() {
+            println!("  TCP port: {}", self.config.tcp_port);
+        }
         println!("  Subtree: {}", self.config.subtree);
 
         let flags = [
@@ -519,10 +655,12 @@ impl ProxyServer {
         println!();
     }
 
-    fn start_listeners(&self) -> eyre::Result<crossbeam::channel::Receiver<std::net::TcpStream>> {
+    fn start_listeners(
+        &self,
+        client_send: crossbeam::channel::Sender<std::net::TcpStream>,
+    ) -> eyre::Result<SocketAddr> {
         use color_eyre::Help;
 
-        let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
         let started_v6 = create_listener_thread(
             std::net::SocketAddr::new(
                 std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
@@ -530,42 +668,46 @@ impl ProxyServer {
             ),
             client_send.clone(),
         );
-        let started_v4 = if let (Ok(()), false) = (&started_v6, cfg!(windows)) {
-            // If v6 started correctly and we are not in windows, pretend
-            // v4 also started correctly. The OS will pass the new clients
-            // through the v6 socket.
-            Ok(())
-        } else {
-            create_listener_thread(
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    self.config.tcp_port,
-                ),
-                client_send.clone(),
-            )
-        };
-        if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
-            let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
-                || matches!(e2.kind(), io::ErrorKind::AddrInUse);
-            let err = eyre::eyre!(
-                "could not bind TCP port {}: v6={}, v4={}",
-                self.config.tcp_port,
-                e1,
-                e2
-            );
-            return Err(if addr_in_use {
-                err.suggestion(format!(
-                    "another 'tio proxy' is likely running on port {}; try --port <N>",
-                    self.config.tcp_port
-                ))
-            } else {
-                err
-            });
+        // Outside windows a v6 socket also accepts v4 clients.
+        if let (Ok(addr), false) = (&started_v6, cfg!(windows)) {
+            return Ok(*addr);
         }
-        Ok(new_client)
+        let started_v4 = create_listener_thread(
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                self.config.tcp_port,
+            ),
+            client_send,
+        );
+        match (started_v6, started_v4) {
+            (Ok(addr), Ok(_)) | (Ok(addr), Err(_)) | (Err(_), Ok(addr)) => Ok(addr),
+            (Err(e1), Err(e2)) => {
+                let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
+                    || matches!(e2.kind(), io::ErrorKind::AddrInUse);
+                let err = eyre::eyre!(
+                    "could not bind TCP port {}: v6={}, v4={}",
+                    self.config.tcp_port,
+                    e1,
+                    e2
+                );
+                Err(if addr_in_use {
+                    err.suggestion(format!(
+                        "another 'tio proxy' is likely running on port {}; try --port <N>",
+                        self.config.tcp_port
+                    ))
+                } else {
+                    err
+                })
+            }
+        }
     }
 
-    fn accept_client(&self, stream: std::net::TcpStream, links: &[DeviceLink]) {
+    fn accept_client(
+        &self,
+        stream: std::net::TcpStream,
+        links: &[DeviceLink],
+        clients: &Arc<AtomicUsize>,
+    ) {
         let addr = match stream.peer_addr() {
             Ok(addr) => addr.to_string(),
             Err(err) => {
@@ -605,7 +747,10 @@ impl ProxyServer {
 
         let dump_traffic = self.config.dump_traffic;
         let disconnect_slow = self.config.disconnect_slow;
+        clients.fetch_add(1, Ordering::Relaxed);
+        let departure = Departure(clients.clone());
         std::thread::spawn(move || {
+            let _departure = departure;
             let mut slow = SlowTracker::default();
 
             // Slot 0 is the client's own traffic; slot 1 + i is ports[i].
@@ -875,8 +1020,9 @@ mod mdns_tests {
 fn create_listener_thread(
     addr: std::net::SocketAddr,
     client_send: crossbeam::channel::Sender<std::net::TcpStream>,
-) -> io::Result<()> {
+) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
+    let bound = listener.local_addr()?;
     std::thread::Builder::new()
         .name("listener".to_string())
         .spawn(move || {
@@ -887,7 +1033,7 @@ fn create_listener_thread(
                 };
             }
         })?;
-    Ok(())
+    Ok(bound)
 }
 
 fn log_proxy_event(evt: proxy::Event, prefix: &proto::DeviceRoute) {

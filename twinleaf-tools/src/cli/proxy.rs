@@ -9,6 +9,14 @@ use twinleaf::DeviceRoute;
     args_conflicts_with_subcommands = true
 )]
 pub struct ProxyCli {
+    /// Start or reuse a background holder on loopback and print its URL
+    #[arg(long, conflicts_with_all = ["port", "mdns", "subtree", "kick_slow", "reconnect_timeout", "dump", "dump_data", "dump_meta", "dump_hb", "verbose", "debug", "timestamp_format", "auto", "enum", "holder_key"])]
+    pub(crate) detach: bool,
+
+    /// Internal: serve as the registered holder for this key
+    #[arg(long, hide = true)]
+    pub(crate) holder_key: Option<String>,
+
     #[command(subcommand)]
     pub subcommands: Option<ProxySubcommands>,
 
@@ -120,7 +128,12 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
 
 #[derive(Subcommand, Debug)]
 pub enum ProxySubcommands {
-    /// Discover devices; selecting one starts a proxy
+    /// Stop a background holder by its exact loopback URL (list URLs with tio list)
+    Stop {
+        /// Loopback URL printed by tio proxy --detach
+        url: String,
+    },
+    /// Discover devices; host a selection as the default until Ctrl-C
     List(ListCli),
 
     /// Bridge Twinleaf sensor data to NMEA TCP stream

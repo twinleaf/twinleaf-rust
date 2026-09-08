@@ -71,7 +71,7 @@ pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
 pub fn list_rpcs(tio: &TioOpts) -> eyre::Result<()> {
     use eyre::WrapErr;
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let device = connection.device(tio.route);
     let registry = device
         .rpc_registry()
@@ -107,7 +107,7 @@ pub fn rpc(
     debug: bool,
 ) -> eyre::Result<()> {
     let (status_send, proxy_status) = crossbeam::channel::bounded::<proxy::Event>(100);
-    let connection = Connection::open_with(&tio.root, None, Some(status_send));
+    let connection = Connection::connect_with(&tio.root, None, Some(status_send))?;
     let device = connection.device(tio.route);
 
     let outcome = call_and_print(&device, &rpc_name, rpc_arg, req_type, rep_type);
@@ -172,7 +172,7 @@ pub fn rpc_dump(tio: &TioOpts, rpc_name: String, is_capture: bool) -> eyre::Resu
         rpc_name.clone()
     };
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let route = tio.route;
     let device = connection.device(route);
 

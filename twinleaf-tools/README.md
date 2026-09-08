@@ -25,8 +25,26 @@ place of `tio-tool {toolname}`.
 | `tio completions` | Generate shell completions for `tio`               |
 
 Every command that talks to a device takes `-r {url}` for the root address,
-default `tcp://localhost`, and `-s {route}` for a sensor in the tree, default
+default `auto`, and `-s {route}` for a sensor in the tree, default
 `/`. Run `tio {command} --help` for the full options.
+
+With `auto`, a tool connects to the device already in use, whether by another
+tool or a `tio list` selection, or else to the only device attached. A device, serial or network, is shared through a background holder: the
+first tool starts it, later tools join it, and it exits ten seconds after the
+last tool disconnects. Loopback URLs, an existing proxy or holder, connect
+directly. To keep a holder around, or to build one from several devices, pin
+it explicitly:
+
+```sh
+tio proxy --detach serial:///dev/ttyACM0   # print the holder's loopback URL
+tio proxy --detach --mount serial:///dev/ttyACM0=/1 --mount serial:///dev/ttyACM1=/2
+tio proxy stop tcp://127.0.0.1:12345       # release a holder by its URL
+```
+
+Holders live in `$XDG_RUNTIME_DIR/twinleaf` (or the local data directory), one
+lock file and one `.url` file per device; `TWINLEAF_RUNTIME_DIR` overrides the
+location and `TWINLEAF_TIO` names the executable that library applications
+start.
 
 ## Connecting to a device
 
@@ -47,7 +65,8 @@ tio proxy serial://COM3                    # wsl1
 ```
 
 `tio list` finds devices on serial ports and, over mDNS, on the network.
-Selecting one starts a proxy for it:
+Selecting devices hosts them as the default for every tool until you press
+Ctrl-C:
 
 ```sh
 tio list

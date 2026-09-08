@@ -34,7 +34,7 @@ pub fn dump(
         None
     };
 
-    let connection = Connection::open(&tio.root);
+    let connection = Connection::connect(&tio.root)?;
     let route = tio.route;
     let tree = connection.tree(route);
     let tree = depth.map_or_else(|| tree.clone(), |depth| tree.to_depth(depth));
