@@ -313,6 +313,8 @@ struct RpcMapEntry {
 
 pub(crate) struct ProxyCore {
     url: String,
+    /// Registry key of a serial device, taken while it was present.
+    identity: Option<String>,
     reconnect_timeout: Option<Duration>,
     command_queue: channel::Receiver<ProxyCommand>,
     status_queue: StatusQueue,
@@ -362,6 +364,7 @@ impl ProxyCore {
         alive: channel::Sender<()>,
     ) -> ProxyCore {
         ProxyCore {
+            identity: crate::device::runtime::identity(&url),
             url,
             reconnect_timeout,
             command_queue,
@@ -387,7 +390,18 @@ impl ProxyCore {
             return Ok(());
         }
         let (port_rx_send, port_rx) = HardwarePort::rx_channel();
-        let port = HardwarePort::new(&self.url, HardwarePort::rx_to_channel(port_rx_send))?;
+        let rx = HardwarePort::rx_to_channel(port_rx_send.clone());
+        let port = match HardwarePort::new(&self.url, rx) {
+            Ok(port) => port,
+            Err(error) => {
+                match crate::device::runtime::relocate(&self.url, self.identity.as_deref()) {
+                    Some(moved) => {
+                        HardwarePort::new(&moved, HardwarePort::rx_to_channel(port_rx_send))?
+                    }
+                    None => return Err(error),
+                }
+            }
+        };
         // Kickstart rate autonegotiation only if the port supports
         // changing rates and the target rate differs from the default.
         let mut rate_change_state = RateChange::DoNothing;
@@ -847,7 +861,7 @@ impl ProxyCore {
             self.broadcast_status(packet::ProxyStatus::FailedToConnect);
             return;
         }
-        let mut device_timeout = Instant::now();
+        let mut device_timeout = self.reconnect_timeout.map(|t| Instant::now() + t);
 
         'mainloop: loop {
             let mut timeout = self.process_rpc_timeouts();
@@ -856,7 +870,7 @@ impl ProxyCore {
                 self.cancel_active_rpcs();
                 if let Err(error) = self.try_setup_device() {
                     log::debug!("failed to reopen {}: {error}", self.url);
-                    if Instant::now() > device_timeout {
+                    if device_timeout.is_some_and(|deadline| Instant::now() > deadline) {
                         self.status_queue.send(Event::FailedToReconnect);
                         self.broadcast_status(packet::ProxyStatus::FailedToReconnect);
                         break;
@@ -872,8 +886,7 @@ impl ProxyCore {
                 .unwrap_or(false);
             if liveness_expired {
                 self.device = None;
-                device_timeout =
-                    Instant::now() + self.reconnect_timeout.unwrap_or(Duration::from_secs(0));
+                device_timeout = self.reconnect_timeout.map(|t| Instant::now() + t);
                 self.status_queue.send(Event::SensorDisconnected);
                 self.broadcast_status(packet::ProxyStatus::SensorDisconnected);
                 continue;
@@ -1083,11 +1096,7 @@ impl ProxyCore {
                         }
                         Err(TryRecvError::Disconnected) => {
                             self.device = None;
-                            device_timeout = Instant::now()
-                                + match self.reconnect_timeout {
-                                    Some(t) => t,
-                                    None => Duration::from_secs(0),
-                                };
+                            device_timeout = self.reconnect_timeout.map(|t| Instant::now() + t);
                             self.status_queue.send(Event::SensorDisconnected);
                             self.broadcast_status(packet::ProxyStatus::SensorDisconnected);
                             break;

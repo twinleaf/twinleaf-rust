@@ -79,6 +79,26 @@ pub fn device_key(url: &str) -> String {
     }))
 }
 
+/// Registry key of a serial `url`, `None` for network transports.
+pub(crate) fn identity(url: &str) -> Option<String> {
+    is_serial(url).then(|| device_key(url))
+}
+
+/// Where the device with `identity` is now, when a replug moved it off `url`.
+pub(crate) fn relocate(url: &str, identity: Option<&str>) -> Option<String> {
+    let key = identity?;
+    let (_, baud) = serial_locator(url);
+    super::discovery::enumerate_serial(true)
+        .into_iter()
+        .map(|device| device.url)
+        .filter(|candidate| {
+            !(cfg!(target_os = "macos") && candidate.starts_with("serial:///dev/tty."))
+        })
+        .find(|candidate| device_key(candidate) == key)
+        .map(|candidate| format!("{candidate}{baud}"))
+        .filter(|moved| moved != url)
+}
+
 /// `usb:<vid>:<pid>:<serial>` for `path`, unless several ports share it.
 #[cfg(feature = "serial")]
 fn usb_identity(path: &str) -> Option<String> {

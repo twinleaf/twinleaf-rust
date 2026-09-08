@@ -556,7 +556,7 @@ impl Connection {
     }
 
     /// Open a connection that gives up on a reconnect after `reconnect_timeout`
-    /// and reports transport events to `status_queue`.
+    /// (`None` retries forever) and reports transport events to `status_queue`.
     pub fn open_with(
         url: &str,
         reconnect_timeout: Option<Duration>,

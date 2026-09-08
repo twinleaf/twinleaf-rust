@@ -168,7 +168,7 @@ struct ProxyConfig {
     // Only consulted by the mDNS advertising path.
     #[cfg_attr(not(feature = "mdns"), allow(dead_code))]
     mdns: bool,
-    reconnect_timeout: Duration,
+    reconnect_timeout: Option<Duration>,
     disconnect_slow: bool,
     verbose: bool,
     debugging: bool,
@@ -184,7 +184,7 @@ impl From<&ProxyCli> for ProxyConfig {
         Self {
             tcp_port: cli.port,
             mdns: cli.mdns,
-            reconnect_timeout: Duration::from_secs(cli.reconnect_timeout),
+            reconnect_timeout: cli.reconnect_timeout.map(Duration::from_secs),
             disconnect_slow: cli.kick_slow,
             verbose: cli.verbose,
             debugging: cli.debug,
@@ -408,7 +408,7 @@ impl ProxyServer {
             let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
             let interface = proxy::Connection::open_with(
                 &locator,
-                Some(self.config.reconnect_timeout),
+                self.config.reconnect_timeout,
                 Some(status_send),
             );
             pending.push(PendingLink {

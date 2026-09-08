@@ -67,9 +67,9 @@ pub struct ProxyCli {
     )]
     pub(crate) timestamp_format: String,
 
-    /// Time limit for sensor reconnection attempts (seconds)
-    #[arg(short = 'T', long = "timeout", default_value = "30")]
-    pub(crate) reconnect_timeout: u64,
+    /// Give up reconnecting to the sensor after this many seconds (default: never)
+    #[arg(short = 'T', long = "timeout")]
+    pub(crate) reconnect_timeout: Option<u64>,
 
     /// Dump packet traffic except sample data/metadata or heartbeats
     #[arg(long)]

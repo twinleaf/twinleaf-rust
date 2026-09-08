@@ -85,7 +85,7 @@ impl Connection {
     }
 
     /// [`open`](Self::open), giving up on a reconnect after `reconnect_timeout`
-    /// and reporting transport events to `status_queue`.
+    /// (`None` retries forever) and reporting transport events to `status_queue`.
     pub fn open_with(
         url: &str,
         reconnect_timeout: Option<Duration>,
