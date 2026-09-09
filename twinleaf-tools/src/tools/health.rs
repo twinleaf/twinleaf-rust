@@ -295,18 +295,24 @@ impl StreamStats {
         self.last_n = None;
     }
 
+    /// Start the rate fit over, so a pause in delivery stops weighing on it.
+    fn reset_rate(&mut self) {
+        self.rate_slope.reset();
+        self.received_count = 0;
+        self.rate_smps = 0.0;
+        self.host_epoch = None;
+    }
+
     fn reset_for_new_session(&mut self, session_id: SessionId) {
         self.reset_timing();
+        self.reset_rate();
         self.samples_dropped = 0;
         self.current_session_id = Some(session_id);
     }
 
     fn reset_all(&mut self) {
         self.reset_timing();
-        self.rate_slope.reset();
-        self.received_count = 0;
-        self.rate_smps = 0.0;
-        self.host_epoch = None;
+        self.reset_rate();
         self.samples_dropped = 0;
     }
 
@@ -690,9 +696,7 @@ impl HealthState {
                 );
                 if let Some(st) = self.stats.get_mut(&key) {
                     st.reset_timing();
-                    st.rate_slope.reset();
-                    st.received_count = 0;
-                    st.rate_smps = 0.0;
+                    st.reset_rate();
                 }
             }
             BoundaryReason::TimeRefSessionChanged { old, new } => {
@@ -702,6 +706,7 @@ impl HealthState {
                 );
                 if let Some(st) = self.stats.get_mut(&key) {
                     st.reset_timing();
+                    st.reset_rate();
                 }
             }
             BoundaryReason::SegmentRollover { old_id, new_id } => {
@@ -750,10 +755,7 @@ impl HealthState {
                     for (key, st) in &mut self.stats {
                         if key.route.starts_with(&subtree) {
                             st.reset_timing();
-                            st.rate_slope.reset();
-                            st.received_count = 0;
-                            st.rate_smps = 0.0;
-                            st.host_epoch = None;
+                            st.reset_rate();
                         }
                     }
                 }
@@ -817,10 +819,7 @@ impl HealthState {
         for st in self.stats.values_mut() {
             if st.is_stale(now, self.stale_dur) && st.rate_slope.n >= 2 {
                 st.reset_timing();
-                st.rate_slope.reset();
-                st.received_count = 0;
-                st.rate_smps = 0.0;
-                st.host_epoch = None;
+                st.reset_rate();
             }
         }
 
