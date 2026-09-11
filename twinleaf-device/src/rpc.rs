@@ -233,7 +233,8 @@ fn find(table: &[RpcSpec], name: &[u8]) -> Result<usize, RpcError> {
         .ok_or(RpcError::Invalid)
 }
 
-fn reply(out: &mut [u8], parts: &[&[u8]]) -> Result<usize, RpcError> {
+/// Concatenate `parts` into `out` as one reply, its length on success.
+pub(crate) fn reply(out: &mut [u8], parts: &[&[u8]]) -> Result<usize, RpcError> {
     let len = parts.iter().map(|part| part.len()).sum();
     if out.len() < len {
         return Err(RpcError::NoBufs);

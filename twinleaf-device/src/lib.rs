@@ -4,4 +4,6 @@
 #![deny(missing_docs)]
 #![warn(rustdoc::all)]
 
+pub mod capture;
+pub mod metadata;
 pub mod rpc;

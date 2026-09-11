@@ -13,13 +13,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // Incoming packets are still parsed with the host's owned model; everything
 // this device *sends* is written by the wire crate, as firmware would.
 use twinleaf::proto;
-use twinleaf::proto::data::MetadataType;
+use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
+use twinleaf::proto::data::CURRENT_SEGMENT;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, heartbeat, log, rpc, settings, sync};
 use twinleaf::proto::{
     ColumnId, DeviceRoute, RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
 };
 use twinleaf::tio::packet;
+use twinleaf_device::capture::{self, Capture, Selector};
+use twinleaf_device::metadata::{self, Records};
 use twinleaf_device::rpc::{self as table, Access, RpcSpec, Value};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -44,6 +47,7 @@ macro_rules! terminal_eprintln {
 const SINE_STREAM_ID: u8 = 1;
 const STATUS_STREAM_ID: u8 = 2;
 const AUX_STREAM_ID: u8 = 3;
+const STREAM_IDS: [u8; 3] = [SINE_STREAM_ID, STATUS_STREAM_ID, AUX_STREAM_ID];
 const N_SEGMENTS: u8 = 16;
 const DEVICE_NAME: &str = "tio-test";
 // The simulator is a development/test device, so its build version is marked
@@ -68,16 +72,11 @@ const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
 const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
 const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
 const CAPTURE_SAMPLE_BYTES: usize = std::mem::size_of::<f32>();
-const CAPTURE_METADATA_VERSION: u8 = 1;
-const CAPTURE_METADATA_FIXED_LEN: u8 = 30;
 const CAPTURE_Y_CALIBRATION: f32 = 1.0;
 const CAPTURE_NAME: &str = "Test Signal";
 const CAPTURE_UNITS: &str = "V";
 const CAPTURE_X_NAME: &str = "Time";
 const CAPTURE_X_UNITS: &str = "s";
-const CAPTURE_STATUS_IDLE: u8 = 0;
-const CAPTURE_STATUS_CAPTURING: u8 = 1;
-const CAPTURE_STATUS_DONE: u8 = 2;
 const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 const STATUS_SAMPLE_BYTES: usize = 2;
 const AUX_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
@@ -169,13 +168,13 @@ impl CaptureBuffer {
         self.capturing.is_some()
     }
 
-    fn status(&self) -> u8 {
+    fn status(&self) -> capture::Status {
         if self.capturing.is_some() {
-            CAPTURE_STATUS_CAPTURING
+            capture::Status::Capturing
         } else if self.data.is_empty() {
-            CAPTURE_STATUS_IDLE
+            capture::Status::Idle
         } else {
-            CAPTURE_STATUS_DONE
+            capture::Status::Done
         }
     }
 
@@ -193,25 +192,25 @@ impl CaptureBuffer {
             .unwrap_or(self.data.len())
     }
 
-    #[cfg(test)]
-    fn block_count(&self) -> u16 {
-        let size = self.export_size();
-        if size == 0 {
-            return 0;
-        }
-
-        let block_size = usize::from(self.block_size);
-        let blocks = size.div_ceil(block_size);
-        u16::try_from(blocks).unwrap_or(u16::MAX)
-    }
-
-    fn block(&self, index: u16) -> Option<&[u8]> {
-        let start = usize::from(index) * usize::from(self.block_size);
-        let end = (start + usize::from(self.block_size)).min(self.data.len());
-        if start >= end {
-            None
-        } else {
-            Some(&self.data[start..end])
+    fn view(&self) -> Capture<'_> {
+        let info = self.info();
+        Capture {
+            status: self.status(),
+            data: &self.data,
+            metadata: CaptureMetadata {
+                version: METADATA_VERSION,
+                data_type: data::DataType::F32,
+                data_size: u32::try_from(self.export_size()).unwrap_or(u32::MAX),
+                block_size: self.block_size,
+                length: info.length,
+                y_calibration: info.y_calibration,
+                x_offset: info.x_offset,
+                x_stride: info.x_stride,
+                name: CAPTURE_NAME,
+                units: CAPTURE_UNITS,
+                x_name: CAPTURE_X_NAME,
+                x_units: CAPTURE_X_UNITS,
+            },
         }
     }
 }
@@ -338,6 +337,12 @@ impl TestDevice {
         let session_id = (seed as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
+        if u16::try_from(cli.samplerate).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sample rate too high for a stream record",
+            ));
+        }
         let segment_samples = cli
             .samplerate
             .checked_mul(cli.segment_seconds)
@@ -678,16 +683,16 @@ impl TestDevice {
                 self.send_rpc_reply(id, &[], routing, addr)
             }
             "rpc.hash" => self.rpc_read_u32(id, self.rpc_hash, arg, routing, addr),
-            "rpc.name" => self.rpc_table(id, routing, addr, |t, out| table::name(t, arg, out)),
-            "rpc.id" => self.rpc_table(id, routing, addr, |t, out| table::id(t, arg, out)),
-            "rpc.info" => self.rpc_table(id, routing, addr, |t, out| table::info(t, arg, out)),
-            "rpc.list" => {
-                self.rpc_table(id, routing, addr, |t, out| table::list(t, arg, false, out))
-            }
-            "rpc.listinfo" => {
-                self.rpc_table(id, routing, addr, |t, out| table::list(t, arg, true, out))
-            }
-            "dev.metadata" => self.rpc_metadata(id, arg, routing, addr),
+            "rpc.name" => self.answer(id, routing, addr, |out| table::name(&self.rpcs, arg, out)),
+            "rpc.id" => self.answer(id, routing, addr, |out| table::id(&self.rpcs, arg, out)),
+            "rpc.info" => self.answer(id, routing, addr, |out| table::info(&self.rpcs, arg, out)),
+            "rpc.list" => self.answer(id, routing, addr, |out| {
+                table::list(&self.rpcs, arg, false, out)
+            }),
+            "rpc.listinfo" => self.answer(id, routing, addr, |out| {
+                table::list(&self.rpcs, arg, true, out)
+            }),
+            "dev.metadata" => self.answer(id, routing, addr, |out| metadata::reply(self, arg, out)),
             "test.amplitude" => {
                 let next = self.read_or_write_nonnegative_f64(
                     id,
@@ -760,57 +765,19 @@ impl TestDevice {
         self.send_rpc_reply(id, &value.to_le_bytes(), routing, addr)
     }
 
-    /// Answer one of the `rpc.*` methods from the table.
-    fn rpc_table(
+    /// Send the reply or error an RPC answers with.
+    fn answer(
         &self,
         id: u16,
         routing: DeviceRoute,
         addr: SocketAddr,
-        answer: impl FnOnce(&[RpcSpec], &mut [u8]) -> Result<usize, RpcError>,
+        answer: impl FnOnce(&mut [u8]) -> Result<usize, RpcError>,
     ) -> io::Result<()> {
         let mut out = [0u8; table::REPLY_MAX];
-        match answer(&self.rpcs, &mut out) {
+        match answer(&mut out) {
             Ok(len) => self.send_rpc_reply(id, &out[..len], routing, addr),
             Err(error) => self.send_rpc_error(id, error, routing, addr),
         }
-    }
-
-    fn rpc_metadata(
-        &self,
-        id: u16,
-        arg: &[u8],
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        let query = match data::MetadataQuery::parse(arg) {
-            Ok(query) => query,
-            Err(data::MetadataQueryError::Misaligned) => {
-                return self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)
-            }
-            Err(data::MetadataQueryError::TooManySelectors) => {
-                return self.send_rpc_error(id, RpcError::Invalid, routing, addr)
-            }
-        };
-
-        let reply = if query.is_bootstrap() {
-            self.bootstrap_metadata_reply()?
-        } else {
-            // The reply stops at packet capacity like tl-chibi: the host is
-            // expected to re-request whatever records did not fit.
-            let mut reply = Vec::new();
-            for selector in query.selectors() {
-                let record = match self.requested_record(selector) {
-                    Ok(record) => record,
-                    Err(_) => return self.send_rpc_error(id, RpcError::Invalid, routing, addr),
-                };
-                if !append_record(&mut reply, record)? {
-                    break;
-                }
-            }
-            reply
-        };
-
-        self.send_rpc_reply(id, &reply, routing, addr)
     }
 
     fn read_or_write_nonnegative_f64(
@@ -881,34 +848,22 @@ impl TestDevice {
         routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        let selector = match arg.len() {
-            0 => -2,
-            2 => i16::from_le_bytes([arg[0], arg[1]]),
-            _ => {
-                self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)?;
-                return Ok(());
+        let mut out = [0u8; table::REPLY_MAX];
+        let answered = Selector::parse(arg).and_then(|selector| {
+            let len = self.capture.view().reply(selector, &mut out)?;
+            Ok((selector, len))
+        });
+        match answered {
+            Ok((Selector::Trigger, len)) => {
+                self.trigger_capture();
+                self.send_rpc_reply(id, &out[..len], routing, addr)
             }
-        };
-
-        match selector {
-            -1 => self.rpc_capture_trigger(id, routing, addr),
-            -2 => self.send_rpc_reply(id, &[self.capture.status()], routing, addr),
-            -3 => self.send_rpc_reply(id, &self.capture_metadata_reply(), routing, addr),
-            index if index >= 0 => self.rpc_capture_block(id, index as u16, routing, addr),
-            _ => self.send_rpc_error(id, RpcError::Invalid, routing, addr),
+            Ok((_, len)) => self.send_rpc_reply(id, &out[..len], routing, addr),
+            Err(error) => self.send_rpc_error(id, error, routing, addr),
         }
     }
 
-    fn rpc_capture_trigger(
-        &mut self,
-        id: u16,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if self.capture.locked() {
-            return self.send_rpc_error(id, RpcError::Busy, routing, addr);
-        }
-
+    fn trigger_capture(&mut self) {
         let (data, info) = self.generate_capture_data();
         self.capture
             .begin_capture(data, info, Instant::now() + CAPTURE_TRIGGER_DELAY);
@@ -917,52 +872,6 @@ impl TestDevice {
             info.length,
             CAPTURE_TRIGGER_DELAY.as_secs_f64()
         );
-        self.send_rpc_reply(id, &[], routing, addr)
-    }
-
-    fn rpc_capture_block(
-        &mut self,
-        id: u16,
-        index: u16,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if self.capture.locked() {
-            return self.send_rpc_error(id, RpcError::Busy, routing, addr);
-        }
-
-        let Some(block) = self.capture.block(index) else {
-            return self.send_rpc_error(id, RpcError::Invalid, routing, addr);
-        };
-        self.send_rpc_reply(id, block, routing, addr)
-    }
-
-    fn capture_metadata_reply(&self) -> Vec<u8> {
-        let info = self.capture.info();
-        let mut fixed = Vec::with_capacity(usize::from(CAPTURE_METADATA_FIXED_LEN));
-        let mut varlen = Vec::new();
-
-        fixed.push(CAPTURE_METADATA_FIXED_LEN);
-        fixed.push(CAPTURE_METADATA_VERSION);
-        fixed.push(data::DataType::F32.value());
-        fixed.push(0);
-        fixed.extend(
-            u32::try_from(self.capture.export_size())
-                .unwrap_or(u32::MAX)
-                .to_le_bytes(),
-        );
-        fixed.extend(self.capture.block_size.to_le_bytes());
-        fixed.extend(info.length.to_le_bytes());
-        fixed.extend(info.y_calibration.to_le_bytes());
-        fixed.extend(info.x_offset.to_le_bytes());
-        fixed.extend(info.x_stride.to_le_bytes());
-        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_NAME));
-        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_UNITS));
-        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_X_NAME));
-        fixed.push(append_capture_metadata_string(&mut varlen, CAPTURE_X_UNITS));
-        debug_assert_eq!(fixed.len(), usize::from(CAPTURE_METADATA_FIXED_LEN));
-        fixed.extend(varlen);
-        fixed
     }
 
     fn update_capture(&mut self) {
@@ -1329,15 +1238,16 @@ impl TestDevice {
     fn send_initial_packets(&self, addr: SocketAddr) -> io::Result<()> {
         self.send_rpc_hash_setting(addr)?;
         self.send_heartbeat(addr)?;
-        self.send_metadata(data::Metadata::Device(self.device_record()), addr)?;
-        for stream_id in Self::stream_ids() {
-            self.send_metadata(data::Metadata::Stream(self.stream_record(stream_id)?), addr)?;
+        self.send_metadata(data::Metadata::Device(self.device()), addr)?;
+        for stream_id in STREAM_IDS {
+            let stream = self.stream(stream_id).expect("known stream");
+            self.send_metadata(data::Metadata::Stream(stream), addr)?;
             self.send_metadata(
                 data::Metadata::Segment(self.segment_record(stream_id)),
                 addr,
             )?;
-            for column_index in 0..Self::column_count(stream_id).expect("known stream") {
-                let column = Self::column_record(stream_id, column_index).expect("known column");
+            for index in 0..stream.n_columns {
+                let column = self.column(stream_id, index).expect("known column");
                 self.send_metadata(data::Metadata::Column(column), addr)?;
             }
         }
@@ -1434,95 +1344,6 @@ impl TestDevice {
         Ok(())
     }
 
-    /// The bootstrap reply: records in sweep order — the device, then each
-    /// stream with its current segment and its columns — stopping at reply
-    /// capacity like tl-chibi.
-    fn bootstrap_metadata_reply(&self) -> io::Result<Vec<u8>> {
-        let mut reply = Vec::new();
-        if !append_record(&mut reply, data::Metadata::Device(self.device_record()))? {
-            return Ok(reply);
-        }
-        for stream_id in Self::stream_ids() {
-            let mut records = vec![
-                data::Metadata::Stream(self.stream_record(stream_id)?),
-                data::Metadata::Segment(self.segment_record_at(stream_id, self.segment_id)),
-            ];
-            for column_index in 0..Self::column_count(stream_id).expect("known stream") {
-                let column = Self::column_record(stream_id, column_index).expect("known column");
-                records.push(data::Metadata::Column(column));
-            }
-            for record in records {
-                if !append_record(&mut reply, record)? {
-                    return Ok(reply);
-                }
-            }
-        }
-        Ok(reply)
-    }
-
-    /// The record a `dev.metadata` selector names.
-    fn requested_record(
-        &self,
-        selector: data::MetadataSelector,
-    ) -> io::Result<data::Metadata<'static>> {
-        let data::MetadataSelector {
-            mtype,
-            stream_id,
-            index,
-        } = selector;
-        match mtype {
-            MetadataType::Device => Ok(data::Metadata::Device(self.device_record())),
-            MetadataType::Stream => Ok(data::Metadata::Stream(self.stream_record(stream_id)?)),
-            MetadataType::Segment if Self::is_known_stream(stream_id) => {
-                Ok(data::Metadata::Segment(if index == data::CURRENT_SEGMENT {
-                    self.segment_record(stream_id)
-                } else {
-                    self.segment_record_at(stream_id, index)
-                }))
-            }
-            MetadataType::Column => match Self::column_record(stream_id, index) {
-                Some(column) => Ok(data::Metadata::Column(column)),
-                None => Err(no_record_for(&format!(
-                    "column {index} of stream {stream_id}"
-                ))),
-            },
-            MetadataType::Segment | MetadataType::Unknown(_) => Err(no_record_for(&format!(
-                "metadata type {:?} of stream {stream_id}",
-                mtype
-            ))),
-        }
-    }
-
-    fn device_record(&self) -> data::Device<'static> {
-        data::Device {
-            session: SessionId::new(self.session_id),
-            n_streams: 3,
-            name: DEVICE_NAME,
-            serial: DEVICE_SERIAL,
-            firmware: DEVICE_FIRMWARE,
-        }
-    }
-
-    /// An unknown stream has no record, and neither does one whose sample or
-    /// buffer size the record's 16-bit fields cannot hold.
-    fn stream_record(&self, stream_id: u8) -> io::Result<data::Stream<'static>> {
-        let missing = || no_record_for(&format!("stream {stream_id}"));
-        let (name, sample_size, buf_samples) = match stream_id {
-            SINE_STREAM_ID => ("sine", SINE_SAMPLE_BYTES, self.sample_rate),
-            STATUS_STREAM_ID => ("status", STATUS_SAMPLE_BYTES, self.sample_rate),
-            AUX_STREAM_ID => ("aux", AUX_SAMPLE_BYTES, AUX_SAMPLE_RATE),
-            _ => return Err(missing()),
-        };
-        Ok(data::Stream {
-            stream_id: StreamId::new(stream_id),
-            n_columns: 2,
-            n_segments: N_SEGMENTS,
-            sample_size: u16::try_from(sample_size).map_err(|_| missing())?,
-            buf_samples: u16::try_from(buf_samples).map_err(|_| missing())?,
-            name,
-        })
-    }
-
     fn segment_record(&self, stream_id: u8) -> data::Segment<'static> {
         let (segment_id, start_time, sampling_rate) = match stream_id {
             AUX_STREAM_ID => (
@@ -1559,8 +1380,51 @@ impl TestDevice {
         segment.segment_id = SegmentId::new(segment_id);
         segment
     }
+}
 
-    fn column_record(stream_id: u8, index: u8) -> Option<data::Column<'static>> {
+impl Records for TestDevice {
+    fn device(&self) -> data::Device<'_> {
+        data::Device {
+            session: SessionId::new(self.session_id),
+            n_streams: STREAM_IDS.len() as u8,
+            name: DEVICE_NAME,
+            serial: DEVICE_SERIAL,
+            firmware: DEVICE_FIRMWARE,
+        }
+    }
+
+    fn stream_ids(&self) -> impl Iterator<Item = u8> {
+        STREAM_IDS.into_iter()
+    }
+
+    fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>> {
+        let (name, sample_size, buf_samples) = match stream_id {
+            SINE_STREAM_ID => ("sine", SINE_SAMPLE_BYTES, self.sample_rate),
+            STATUS_STREAM_ID => ("status", STATUS_SAMPLE_BYTES, self.sample_rate),
+            AUX_STREAM_ID => ("aux", AUX_SAMPLE_BYTES, AUX_SAMPLE_RATE),
+            _ => return None,
+        };
+        Some(data::Stream {
+            stream_id: StreamId::new(stream_id),
+            n_columns: 2,
+            n_segments: N_SEGMENTS,
+            sample_size: u16::try_from(sample_size).ok()?,
+            buf_samples: u16::try_from(buf_samples).ok()?,
+            name,
+        })
+    }
+
+    fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>> {
+        if !STREAM_IDS.contains(&stream_id) {
+            return None;
+        }
+        Some(match index {
+            CURRENT_SEGMENT => self.segment_record(stream_id),
+            index => self.segment_record_at(stream_id, index),
+        })
+    }
+
+    fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
         let (data_type, name, units, description) = match (stream_id, index) {
             (SINE_STREAM_ID, 0) => (data::DataType::F64, "sine", "V", "Noisy sine wave"),
             (SINE_STREAM_ID, 1) => (data::DataType::F64, "cosine", "V", "Noisy quadrature wave"),
@@ -1589,21 +1453,6 @@ impl TestDevice {
             description,
         })
     }
-
-    fn is_known_stream(stream_id: u8) -> bool {
-        matches!(stream_id, SINE_STREAM_ID | STATUS_STREAM_ID | AUX_STREAM_ID)
-    }
-
-    fn column_count(stream_id: u8) -> Option<u8> {
-        match stream_id {
-            SINE_STREAM_ID | STATUS_STREAM_ID | AUX_STREAM_ID => Some(2),
-            _ => None,
-        }
-    }
-
-    fn stream_ids() -> [u8; 3] {
-        [SINE_STREAM_ID, STATUS_STREAM_ID, AUX_STREAM_ID]
-    }
 }
 
 fn encode_error(what: &str, why: &str) -> io::Error {
@@ -1611,29 +1460,6 @@ fn encode_error(what: &str, why: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("could not encode {what}: it {why}"),
     )
-}
-
-fn no_record_for(what: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("this device has no metadata record for {what}"),
-    )
-}
-
-/// Append one bare record to a `dev.metadata` reply, behind the
-/// `[record type][record length]` framing those replies use.
-/// Append `record` as one reply frame; `Ok(false)` leaves the reply unchanged
-/// because it is at capacity.
-fn append_record(reply: &mut Vec<u8>, record: data::Metadata<'_>) -> io::Result<bool> {
-    let mut frame = vec![0u8; data::METADATA_REPLY_FRAME_HEADER + record.record_len()];
-    let len = record
-        .write_reply_frame(&mut frame)
-        .ok_or_else(|| encode_error("a metadata record", "does not fit a reply frame"))?;
-    if reply.len() + len > data::MAX_METADATA_REPLY_SIZE {
-        return Ok(false);
-    }
-    reply.extend_from_slice(&frame[..len]);
-    Ok(true)
 }
 
 fn stream_data_max_data_bytes() -> usize {
@@ -1645,13 +1471,6 @@ fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
         return 0;
     }
     (stream_data_max_data_bytes() / sample_bytes) as u64
-}
-
-fn append_capture_metadata_string(varlen: &mut Vec<u8>, value: &str) -> u8 {
-    let bytes = value.as_bytes();
-    let len = bytes.len().min(usize::from(u8::MAX));
-    varlen.extend(&bytes[..len]);
-    len as u8
 }
 
 fn next_drop_sample_after(rng: &mut GaussianRng, current_sample: u64, sample_rate: u32) -> u64 {
@@ -1701,22 +1520,17 @@ mod tests {
         );
 
         assert!(capture.locked());
-        assert_eq!(capture.status(), CAPTURE_STATUS_CAPTURING);
-        assert_eq!(capture.block_count(), 3);
-        assert!(capture.block(0).is_none());
+        assert_eq!(capture.status(), capture::Status::Capturing);
 
         capture.update(now + Duration::from_millis(499));
         assert!(capture.locked());
 
         capture.update(now + Duration::from_millis(500));
         assert!(!capture.locked());
-        assert_eq!(capture.status(), CAPTURE_STATUS_DONE);
+        assert_eq!(capture.status(), capture::Status::Done);
         assert_eq!(capture.export_size(), 10);
         assert_eq!(capture.info().length, 10);
-        assert_eq!(capture.block(0), Some(&[0, 1, 2, 3][..]));
-        assert_eq!(capture.block(1), Some(&[4, 5, 6, 7][..]));
-        assert_eq!(capture.block(2), Some(&[8, 9][..]));
-        assert!(capture.block(3).is_none());
+        assert_eq!(capture.view().block(2), Some(&[8, 9][..]));
     }
 
     #[test]
@@ -1729,14 +1543,15 @@ mod tests {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
         let device = TestDevice::new(cli).unwrap();
 
-        let reply = device.bootstrap_metadata_reply().unwrap();
-        assert!(reply.len() <= data::MAX_METADATA_REPLY_SIZE);
-        let kinds: Vec<_> = data::MetadataReply::parse(&reply)
+        let mut out = [0u8; table::REPLY_MAX];
+        let len = metadata::reply(&device, &[], &mut out).unwrap();
+        let kinds: Vec<_> = data::MetadataReply::parse(&out[..len])
             .unwrap()
             .map(|(kind, _)| kind)
             .collect();
+        use data::MetadataType;
         let mut expected = vec![MetadataType::Device];
-        for _ in TestDevice::stream_ids() {
+        for _ in STREAM_IDS {
             expected.extend([
                 MetadataType::Stream,
                 MetadataType::Segment,
@@ -1748,36 +1563,14 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_reply_at_capacity_refuses_further_records() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let device = TestDevice::new(cli).unwrap();
-
-        let mut reply = vec![0u8; data::MAX_METADATA_REPLY_SIZE - 5];
-        let before = reply.clone();
-        let appended =
-            append_record(&mut reply, data::Metadata::Device(device.device_record())).unwrap();
-        assert!(!appended);
-        assert_eq!(reply, before);
-    }
-
-    #[test]
     fn metadata_selectors_resolve_the_current_segment_sentinel() {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
         let device = TestDevice::new(cli).unwrap();
 
-        let record = device
-            .requested_record(data::MetadataSelector::segment(
-                SINE_STREAM_ID,
-                data::CURRENT_SEGMENT,
-            ))
-            .unwrap();
-        let data::Metadata::Segment(segment) = record else {
-            panic!("expected a segment record");
-        };
+        let segment = device.segment(SINE_STREAM_ID, CURRENT_SEGMENT).unwrap();
         assert_eq!(segment.segment_id.value(), device.segment_id);
-        assert!(device
-            .requested_record(data::MetadataSelector::stream(99))
-            .is_err());
+        assert!(device.stream(99).is_none());
+        assert!(device.segment(99, CURRENT_SEGMENT).is_none());
     }
 
     #[test]
@@ -1827,23 +1620,19 @@ mod tests {
             .capture
             .update(Instant::now() + Duration::from_millis(1));
 
-        let metadata = device.capture_metadata_reply();
+        let mut out = [0u8; table::REPLY_MAX];
+        let len = device
+            .capture
+            .view()
+            .reply(Selector::Metadata, &mut out)
+            .unwrap();
+        let metadata = CaptureMetadata::parse(&out[..len]).unwrap();
 
-        assert_eq!(metadata[0], CAPTURE_METADATA_FIXED_LEN);
-        assert_eq!(metadata[1], CAPTURE_METADATA_VERSION);
-        assert_eq!(metadata[2], data::DataType::F32.value());
-        assert_eq!(
-            u32::from_le_bytes(metadata[4..8].try_into().unwrap()),
-            u32::try_from(data_len).unwrap()
-        );
-        assert_eq!(
-            u32::from_le_bytes(metadata[10..14].try_into().unwrap()),
-            info.length
-        );
-        assert_eq!(
-            f32::from_le_bytes(metadata[14..18].try_into().unwrap()),
-            CAPTURE_Y_CALIBRATION
-        );
+        assert_eq!(metadata.version, METADATA_VERSION);
+        assert_eq!(metadata.data_type, data::DataType::F32);
+        assert_eq!(metadata.data_size, u32::try_from(data_len).unwrap());
+        assert_eq!(metadata.length, info.length);
+        assert_eq!(metadata.y_calibration, CAPTURE_Y_CALIBRATION);
     }
 
     #[test]
