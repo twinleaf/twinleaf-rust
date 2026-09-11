@@ -3047,6 +3047,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "twinleaf-device"
+version = "0.1.0"
+dependencies = [
+ "twinleaf-proto",
+]
+
+[[package]]
 name = "twinleaf-proto"
 version = "0.1.0"
 dependencies = [
@@ -3083,6 +3090,7 @@ dependencies = [
  "toml_edit",
  "tui-prompts",
  "twinleaf",
+ "twinleaf-device",
 ]
 
 [[package]]
