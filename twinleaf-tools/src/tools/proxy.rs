@@ -27,7 +27,7 @@ use twinleaf::proto::rpc::RpcError;
 use twinleaf::proto::SessionId;
 use twinleaf::tio::{self, packet, proxy};
 use twinleaf_device::device::{Device, Handled, Identity};
-use twinleaf_device::rpc::{Access, RpcSpec, Value};
+use twinleaf_device::rpc::{Access, Kind, RpcSpec};
 use twinleaf_device::Sink;
 
 /// What the virtual hub answers: identity and introspection, nothing more.
@@ -37,12 +37,12 @@ static HUB_RPCS: [RpcSpec; 12] = [
     RpcSpec::std("rpc.info", Access::RW),
     RpcSpec::std("rpc.list", Access::RW),
     RpcSpec::std("rpc.listinfo", Access::RW),
-    RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
-    RpcSpec::prop("dev.name", Value::String, Access::READ),
-    RpcSpec::prop("dev.desc", Value::String, Access::READ),
-    RpcSpec::prop("dev.serial", Value::String, Access::READ),
-    RpcSpec::prop("dev.firmware.serial", Value::String, Access::READ),
-    RpcSpec::prop("dev.session", Value::Uint(4), Access::READ),
+    RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("dev.name", Kind::String, Access::READ),
+    RpcSpec::prop("dev.desc", Kind::String, Access::READ),
+    RpcSpec::prop("dev.serial", Kind::String, Access::READ),
+    RpcSpec::prop("dev.firmware.serial", Kind::String, Access::READ),
+    RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
     RpcSpec::std("dev.metadata", Access::RW),
 ];
 

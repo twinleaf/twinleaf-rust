@@ -18,7 +18,7 @@ use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::device::{Call, Device, Handled, Identity};
-use twinleaf_device::rpc::{Access, Reply, RpcSpec, Value};
+use twinleaf_device::rpc::{Access, Kind, Reply, RpcSpec};
 use twinleaf_device::segments::{Params, Timeref};
 use twinleaf_device::settings::Setting;
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
@@ -144,22 +144,21 @@ static RPCS: [RpcSpec; 22] = [
     RpcSpec::std("rpc.info", Access::RW),
     RpcSpec::std("rpc.list", Access::RW),
     RpcSpec::std("rpc.listinfo", Access::RW),
-    RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
-    RpcSpec::prop("dev.name", Value::String, Access::READ),
-    RpcSpec::prop("dev.desc", Value::String, Access::READ),
-    RpcSpec::prop("dev.session", Value::Uint(4), Access::READ),
-    RpcSpec::prop("dev.loglevel", Value::Uint(1), Access::RW),
+    RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("dev.name", Kind::String, Access::READ),
+    RpcSpec::prop("dev.desc", Kind::String, Access::READ),
+    RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("dev.loglevel", Kind::Uint(1), Access::RW),
     RpcSpec::action("dev.stop"),
     RpcSpec::std("dev.firmware.upload", Access::WRITE),
     RpcSpec::action("dev.firmware.upgrade"),
     RpcSpec::std("dev.metadata", Access::RW),
-    RpcSpec::prop("settings.version", Value::Uint(4), Access::READ),
-    RpcSpec::prop("test.amplitude", Value::Float(8), Access::RW),
-    RpcSpec::prop("test.frequency", Value::Float(8), Access::RW),
-    RpcSpec::prop("test.noise", Value::Float(8), Access::RW),
-    RpcSpec::prop("test.status", Value::Uint(1), Access::RW),
-    RpcSpec::prop("test.enable", Value::Uint(1), Access::RW)
-        .with_extra_meta(RpcMetaFlags::BOOL.bits()),
+    RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("test.amplitude", Kind::Float(8), Access::RW),
+    RpcSpec::prop("test.frequency", Kind::Float(8), Access::RW),
+    RpcSpec::prop("test.noise", Kind::Float(8), Access::RW),
+    RpcSpec::prop("test.status", Kind::Uint(1), Access::RW),
+    RpcSpec::prop("test.enable", Kind::Bool, Access::RW),
     RpcSpec::action("test.go"),
     RpcSpec::std("test.capture", Access::READ)
         .with_extra_meta(RpcMetaFlags::READABLE.union(RpcMetaFlags::CAPTURE).bits()),

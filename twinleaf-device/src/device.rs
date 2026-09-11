@@ -344,7 +344,7 @@ fn send(out: &mut impl Sink, routing: &[u8], write: impl FnOnce(&mut [u8]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{Access, Value};
+    use crate::rpc::{Access, Kind};
     use twinleaf_proto::data::{DataType, FilterType, MetadataType, SegmentFlags};
     use twinleaf_proto::rpc::Answer;
     use twinleaf_proto::sync::Epoch;
@@ -352,12 +352,12 @@ mod tests {
 
     static TABLE: [RpcSpec; 7] = [
         RpcSpec::std("rpc.list", Access::RW),
-        RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
-        RpcSpec::prop("dev.name", Value::String, Access::READ),
-        RpcSpec::prop("dev.loglevel", Value::Uint(1), Access::RW),
-        RpcSpec::prop("settings.version", Value::Uint(4), Access::READ),
+        RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
+        RpcSpec::prop("dev.name", Kind::String, Access::READ),
+        RpcSpec::prop("dev.loglevel", Kind::Uint(1), Access::RW),
+        RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
         RpcSpec::std("dev.metadata", Access::RW),
-        RpcSpec::prop("app.gain", Value::Uint(1), Access::RW),
+        RpcSpec::prop("app.gain", Kind::Uint(1), Access::RW),
     ];
 
     struct OneStream;

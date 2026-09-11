@@ -24,9 +24,9 @@ pub enum Method {
     Prop = 3,
 }
 
-/// What a method's value is.
+/// What kind of value a method declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Value {
+pub enum Kind {
     /// Undeclared.
     Any,
     /// None.
@@ -39,17 +39,20 @@ pub enum Value {
     Float(u16),
     /// String.
     String,
+    /// A flag: one byte on the wire, and marked as a bool to hosts.
+    Bool,
 }
 
-impl Value {
+impl Kind {
     const fn bits(self) -> u32 {
         let (kind, size) = match self {
-            Value::Any => (0, 0),
-            Value::Void => (1, 0),
-            Value::Uint(size) => (2, size),
-            Value::Int(size) => (3, size),
-            Value::Float(size) => (4, size),
-            Value::String => (5, 0),
+            Kind::Any => (0, 0),
+            Kind::Void => (1, 0),
+            Kind::Uint(size) => (2, size),
+            Kind::Int(size) => (3, size),
+            Kind::Float(size) => (4, size),
+            Kind::String => (5, 0),
+            Kind::Bool => (2, 1),
         };
         kind << 4 | (size as u32) << 8
     }
@@ -92,25 +95,25 @@ pub struct RpcSpec {
     pub name: &'static str,
     /// How it is called.
     pub method: Method,
-    /// What its value is.
-    pub value: Value,
+    /// What kind of value it declares.
+    pub kind: Kind,
     /// Who may call it.
     pub access: Access,
     /// Description, hashed but not otherwise reported.
     pub desc: &'static str,
     /// Signature, hashed but not otherwise reported.
     pub signature: &'static str,
-    /// Metadata bits the flags word cannot carry, such as bool and capture.
+    /// Metadata bits the flags word cannot carry, such as capture.
     pub extra_meta: u16,
 }
 
 impl RpcSpec {
     /// An entry with no description or signature.
-    pub const fn new(name: &'static str, method: Method, value: Value, access: Access) -> Self {
+    pub const fn new(name: &'static str, method: Method, kind: Kind, access: Access) -> Self {
         Self {
             name,
             method,
-            value,
+            kind,
             access,
             desc: "",
             signature: "",
@@ -120,17 +123,17 @@ impl RpcSpec {
 
     /// A method with a custom argument and reply format.
     pub const fn std(name: &'static str, access: Access) -> Self {
-        Self::new(name, Method::Std, Value::Any, access)
+        Self::new(name, Method::Std, Kind::Any, access)
     }
 
     /// A method with no argument and no reply.
     pub const fn action(name: &'static str) -> Self {
-        Self::new(name, Method::Action, Value::Void, Access::WRITE)
+        Self::new(name, Method::Action, Kind::Void, Access::WRITE)
     }
 
     /// A property read with no argument and written with a value.
-    pub const fn prop(name: &'static str, value: Value, access: Access) -> Self {
-        Self::new(name, Method::Prop, value, access)
+    pub const fn prop(name: &'static str, kind: Kind, access: Access) -> Self {
+        Self::new(name, Method::Prop, kind, access)
     }
 
     /// The same entry with metadata bits beyond the flags word.
@@ -141,18 +144,19 @@ impl RpcSpec {
     /// The flags word libtio firmware keeps for the entry, which `rpc.hash`
     /// covers: method kind, value type and size, then access in the top byte.
     pub const fn flags(&self) -> u32 {
-        self.method as u32 | self.value.bits() | (self.access.0 as u32) << 24
+        self.method as u32 | self.kind.bits() | (self.access.0 as u32) << 24
     }
 
     /// The metadata `rpc.info` and `rpc.listinfo` report for a public caller.
     pub fn legacy_metadata(&self) -> u16 {
-        let (kind, size) = match self.value {
-            Value::Any => return self.extra_meta,
-            Value::Void => return 0x8000 | self.extra_meta,
-            Value::Uint(size) => (0, size),
-            Value::Int(size) => (1, size),
-            Value::Float(size) => (2, size),
-            Value::String => (3, 0),
+        let (kind, size, marks) = match self.kind {
+            Kind::Any => return self.extra_meta,
+            Kind::Void => return 0x8000 | self.extra_meta,
+            Kind::Uint(size) => (0, size, 0),
+            Kind::Int(size) => (1, size, 0),
+            Kind::Float(size) => (2, size, 0),
+            Kind::String => (3, 0, 0),
+            Kind::Bool => (0, 1, RpcMetaFlags::BOOL.bits()),
         };
         if size > 0xF {
             return self.extra_meta;
@@ -165,7 +169,7 @@ impl RpcSpec {
         .into_iter()
         .filter(|(bit, _)| self.access.contains(*bit))
         .fold(0, |meta, (_, flag)| meta | flag.bits());
-        0x8000 | size << 4 | kind | access | self.extra_meta
+        0x8000 | size << 4 | kind | access | marks | self.extra_meta
     }
 }
 
@@ -244,10 +248,9 @@ mod tests {
 
     fn table() -> [RpcSpec; 3] {
         [
-            RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
+            RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
             RpcSpec::action("dev.stop"),
-            RpcSpec::prop("test.enable", Value::Uint(1), Access::RW)
-                .with_extra_meta(RpcMetaFlags::BOOL.bits()),
+            RpcSpec::prop("test.enable", Kind::Bool, Access::RW),
         ]
     }
 
@@ -259,14 +262,14 @@ mod tests {
         assert_eq!(enable.flags(), 0x0300_0123);
         assert_eq!(RpcSpec::std("rpc.list", Access::RW).flags(), 0x0300_0001);
         assert_eq!(
-            RpcSpec::prop("dev.name", Value::String, Access::READ).flags(),
+            RpcSpec::prop("dev.name", Kind::String, Access::READ).flags(),
             0x0100_0053
         );
     }
 
     #[test]
     fn legacy_metadata_matches_firmware_encoding() {
-        let spec = RpcSpec::prop("test.amplitude", Value::Float(8), Access::RW);
+        let spec = RpcSpec::prop("test.amplitude", Kind::Float(8), Access::RW);
         assert_eq!(
             spec.legacy_metadata(),
             0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200
@@ -282,7 +285,7 @@ mod tests {
 
         let spec = RpcSpec::std("rpc.list", Access::RW);
         assert_eq!(spec.legacy_metadata(), 0);
-        let spec = RpcSpec::prop("wide", Value::Uint(16), Access::RW);
+        let spec = RpcSpec::prop("wide", Kind::Uint(16), Access::RW);
         assert_eq!(spec.legacy_metadata(), 0);
     }
 

@@ -5,16 +5,14 @@
 //! [`crate::device::Device::apply`], which broadcasts a SETTING packet on
 //! every write and counts it in `settings.version`.
 
-use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
+use twinleaf_proto::rpc::RpcError;
 
 use crate::rpc::{self, put, Reply, RpcSpec};
 
 /// A value a setting holds, encoded as its RPC reads and writes it.
 pub trait Scalar: Copy {
-    /// How the RPC table describes it.
-    const TYPE: rpc::Value;
-    /// Metadata bits the flags word cannot carry, such as bool.
-    const EXTRA_META: u16 = 0;
+    /// The kind of value the table declares for it.
+    const KIND: rpc::Kind;
 
     /// Decode the argument of a write.
     fn decode(args: &[u8]) -> Result<Self, RpcError>;
@@ -26,7 +24,7 @@ pub trait Scalar: Copy {
 macro_rules! number {
     ($($type:ty => $variant:ident,)*) => {$(
         impl Scalar for $type {
-            const TYPE: rpc::Value = rpc::Value::$variant(core::mem::size_of::<$type>() as u16);
+            const KIND: rpc::Kind = rpc::Kind::$variant(core::mem::size_of::<$type>() as u16);
 
             fn decode(args: &[u8]) -> Result<Self, RpcError> {
                 let bytes = args.try_into().map_err(|_| RpcError::ArgsSize)?;
@@ -51,8 +49,7 @@ number! {
 
 /// A flag, one byte on the wire like every other libtio bool.
 impl Scalar for bool {
-    const TYPE: rpc::Value = rpc::Value::Uint(1);
-    const EXTRA_META: u16 = RpcMetaFlags::BOOL.bits();
+    const KIND: rpc::Kind = rpc::Kind::Bool;
 
     fn decode(args: &[u8]) -> Result<Self, RpcError> {
         Ok(u8::decode(args)? != 0)
@@ -126,14 +123,14 @@ impl<T: Scalar> Setting<T> {
 
     /// The table entry it answers.
     pub fn spec(&self) -> RpcSpec {
-        RpcSpec::prop(self.name, T::TYPE, rpc::Access::RW).with_extra_meta(T::EXTRA_META)
+        RpcSpec::prop(self.name, T::KIND, rpc::Access::RW)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{Access, Method, Value};
+    use crate::rpc::{Access, Kind, Method};
 
     fn positive(value: f64) -> Result<f64, RpcError> {
         (value.is_finite() && value > 0.0)
@@ -201,28 +198,19 @@ mod tests {
     fn a_spec_describes_the_property_the_setting_answers() {
         let spec = Setting::new("app.rate", 1.0f64).spec();
         assert_eq!(spec.method, Method::Prop);
-        assert_eq!(spec.value, Value::Float(8));
+        assert_eq!(spec.kind, Kind::Float(8));
         assert_eq!(spec.access, Access::RW);
-        assert_eq!(spec.extra_meta, 0);
-
-        let spec = Setting::new("app.enable", true).spec();
-        assert_eq!(spec.value, Value::Uint(1));
-        assert_eq!(spec.extra_meta, RpcMetaFlags::BOOL.bits());
+        assert_eq!(Setting::new("app.enable", true).spec().kind, Kind::Bool);
 
         let kinds = [
-            Setting::new("u8", 0u8).spec().value,
-            Setting::new("u32", 0u32).spec().value,
-            Setting::new("i32", 0i32).spec().value,
-            Setting::new("f32", 0.0f32).spec().value,
+            Setting::new("u8", 0u8).spec().kind,
+            Setting::new("u32", 0u32).spec().kind,
+            Setting::new("i32", 0i32).spec().kind,
+            Setting::new("f32", 0.0f32).spec().kind,
         ];
         assert_eq!(
             kinds,
-            [
-                Value::Uint(1),
-                Value::Uint(4),
-                Value::Int(4),
-                Value::Float(4)
-            ]
+            [Kind::Uint(1), Kind::Uint(4), Kind::Int(4), Kind::Float(4)]
         );
     }
 }
