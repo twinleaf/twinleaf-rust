@@ -9,18 +9,20 @@ use ratatui::crossterm::{
 };
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use twinleaf::proto;
 use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
-use twinleaf::proto::data::CURRENT_SEGMENT;
 use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
-use twinleaf::proto::{ColumnId, DeviceRoute, SampleNumber, SegmentId, SessionId, StreamId};
+use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
-use twinleaf_device::device::{Call, Device, Handled, Identity, Sink};
-use twinleaf_device::metadata::Streams;
+use twinleaf_device::device::{Call, Device, Handled, Identity};
 use twinleaf_device::rpc::{put, Access, Reply, RpcSpec, Value};
+use twinleaf_device::segments::{Params, Timeref};
+use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
+use twinleaf_device::Sink;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;
@@ -41,11 +43,18 @@ macro_rules! terminal_eprintln {
     };
 }
 
-const SINE_STREAM_ID: u8 = 1;
-const STATUS_STREAM_ID: u8 = 2;
-const AUX_STREAM_ID: u8 = 3;
-const STREAM_IDS: [u8; 3] = [SINE_STREAM_ID, STATUS_STREAM_ID, AUX_STREAM_ID];
-const N_SEGMENTS: u8 = 16;
+/// The streams this device publishes, in the order it describes them.
+#[derive(Clone, Copy)]
+enum Signal {
+    Sine,
+    Status,
+    Aux,
+}
+
+/// The two sample clocks: one the sine and status streams share, one for aux.
+const WAVE_CLOCK: usize = 0;
+const AUX_CLOCK: usize = 1;
+const SEGMENTS: usize = 4;
 const DEVICE_NAME: &str = "tio-test";
 // The simulator is a development/test device, so its build version is marked
 // `DEV`. Format: `{vendor} {name} {revision} ({serial}) [{date}/{build}]`.
@@ -53,13 +62,10 @@ const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]
 const DEVICE_SERIAL: &str = "SIM0001";
 const DEVICE_FIRMWARE: &str = "twinleaf-rust-test";
 const SIGNAL_LEVEL: u8 = 234;
-const AUX_SAMPLE_RATE: u32 = 25;
+const AUX_SAMPLE_RATE: NonZeroU32 = NonZeroU32::new(25).expect("a positive rate");
 const AUX_WAVE_FREQUENCY: f64 = 0.25;
 const SAMPLE_DROP_INTERVAL_SECONDS: f64 = 60.0;
 const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
-/// "Never" sample-drop deadline used when random drops are disabled (`--no-drop`).
-/// `samples_generated` would need to run for billions of years to reach it.
-const NO_DROP_SENTINEL: u64 = u64::MAX;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
 const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
@@ -73,11 +79,62 @@ const CAPTURE_NAME: &str = "Test Signal";
 const CAPTURE_UNITS: &str = "V";
 const CAPTURE_X_NAME: &str = "Time";
 const CAPTURE_X_UNITS: &str = "s";
-const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
-const STATUS_SAMPLE_BYTES: usize = 2;
-const AUX_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 
 const UPGRADED_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]";
+
+const SINE_DEF: StreamDef = StreamDef {
+    name: "sine",
+    columns: &[
+        ColumnDef {
+            name: "sine",
+            units: "V",
+            data_type: data::DataType::F64,
+            description: "Noisy sine wave",
+        },
+        ColumnDef {
+            name: "cosine",
+            units: "V",
+            data_type: data::DataType::F64,
+            description: "Noisy quadrature wave",
+        },
+    ],
+};
+
+const STATUS_DEF: StreamDef = StreamDef {
+    name: "status",
+    columns: &[
+        ColumnDef {
+            name: "status",
+            units: "",
+            data_type: data::DataType::U8,
+            description: "Mirrors the test.status RPC",
+        },
+        ColumnDef {
+            name: "signal_level",
+            units: "",
+            data_type: data::DataType::U8,
+            description: "Fixed simulated signal level",
+        },
+    ],
+};
+
+const AUX_DEF: StreamDef = StreamDef {
+    name: "aux",
+    columns: &[
+        ColumnDef {
+            name: "triangle",
+            units: "arb",
+            data_type: data::DataType::F64,
+            description: "Triangle wave",
+        },
+        ColumnDef {
+            name: "sawtooth",
+            units: "arb",
+            data_type: data::DataType::F64,
+            description: "Sawtooth wave",
+        },
+    ],
+};
 
 /// The RPC table. Introspection first, like tl-chibi, and the order fixes
 /// the ids `rpc.list` reports and the `rpc.hash`.
@@ -111,6 +168,46 @@ struct SineParams {
     amplitude: f64,
     frequency: f64,
     noise: f64,
+}
+
+/// A sample clock: the streams it drives, how far the run has got, and when
+/// it next drops a sample.
+struct Clock {
+    rate: NonZeroU32,
+    segment_samples: u64,
+    streams: &'static [Signal],
+    generated: u64,
+    next_drop: Option<u64>,
+}
+
+impl Clock {
+    fn new(rate: NonZeroU32, seconds: u32, streams: &'static [Signal]) -> io::Result<Self> {
+        let samples = rate
+            .get()
+            .checked_mul(seconds)
+            .filter(|samples| *samples <= data::MAX_SAMPLE_NUMBER)
+            .ok_or_else(|| {
+                invalid_input("segment contains too many samples for TIO sample numbering")
+            })?;
+        Ok(Self {
+            rate,
+            segment_samples: u64::from(samples),
+            streams,
+            generated: 0,
+            next_drop: None,
+        })
+    }
+
+    /// How many samples it owes the run started at `started_at`.
+    fn due(&self, started_at: Instant) -> u64 {
+        let elapsed = started_at.elapsed().as_secs_f64();
+        ((elapsed * f64::from(self.rate.get())).floor() as u64).saturating_sub(self.generated)
+    }
+
+    /// Whether the sample it is about to take starts a new segment.
+    fn rolls_over(&self) -> bool {
+        self.generated > 0 && self.generated.is_multiple_of(self.segment_samples)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -347,29 +444,13 @@ struct TestDevice {
     status: u8,
     initial_enable: u8,
     enable: u8,
-    sample_rate: u32,
     segment_seconds: u32,
-    segment_samples: u32,
-    max_samples_per_packet: u64,
-    aux_segment_samples: u32,
-    aux_max_samples_per_packet: u64,
+    streams: [Stream<SEGMENTS>; 3],
+    clocks: [Clock; 2],
     device: Device<'static>,
     epoch: Instant,
     started_at: Instant,
-    start_time: u32,
-    samples_generated: u64,
-    sample_number: u32,
-    segment_id: u8,
-    segment_start_time: u32,
-    pending_segment_update: bool,
-    next_drop_sample: u64,
     no_drop: bool,
-    aux_samples_generated: u64,
-    aux_sample_number: u32,
-    aux_segment_id: u8,
-    aux_segment_start_time: u32,
-    aux_pending_segment_update: bool,
-    next_aux_drop_sample: u64,
     next_log_message_at: Instant,
     next_log_level: usize,
     capture: CaptureBuffer,
@@ -382,64 +463,22 @@ impl TestDevice {
         socket.set_nonblocking(true)?;
 
         let now = unix_duration();
-        let start_time = unix_time_secs(now);
         let seed = now.as_nanos() as u64 ^ u64::from(cli.port).rotate_left(32);
         let session_id = (seed as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
-        if u16::try_from(cli.samplerate).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "sample rate too high for a stream record",
-            ));
-        }
-        let segment_samples = cli
-            .samplerate
-            .checked_mul(cli.segment_seconds)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "segment too long"))?;
-        if segment_samples > data::MAX_SAMPLE_NUMBER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "segment contains too many samples for TIO sample numbering",
-            ));
-        }
-        let aux_segment_samples = AUX_SAMPLE_RATE
-            .checked_mul(cli.segment_seconds)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "aux segment too long"))?;
-        if aux_segment_samples > data::MAX_SAMPLE_NUMBER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "aux segment contains too many samples for TIO sample numbering",
-            ));
-        }
-        let max_samples_per_packet = max_stream_samples_per_packet(SINE_SAMPLE_BYTES)
-            .min(max_stream_samples_per_packet(STATUS_SAMPLE_BYTES));
-        let aux_max_samples_per_packet = max_stream_samples_per_packet(AUX_SAMPLE_BYTES);
-        if max_samples_per_packet == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stream sample is too large for a TIO packet",
-            ));
-        }
-        if aux_max_samples_per_packet == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "aux stream sample is too large for a TIO packet",
-            ));
-        }
-        let mut rng = GaussianRng::new(seed | 1);
-        let no_drop = cli.no_drop;
-        let next_drop_sample = if no_drop {
-            NO_DROP_SENTINEL
-        } else {
-            next_drop_sample_after(&mut rng, 0, cli.samplerate)
-        };
-        let next_aux_drop_sample = if no_drop {
-            NO_DROP_SENTINEL
-        } else {
-            next_drop_sample_after(&mut rng, 0, AUX_SAMPLE_RATE)
-        };
+        let sample_rate = NonZeroU32::new(cli.samplerate)
+            .ok_or_else(|| invalid_input("sample rate must be at least one hertz"))?;
+        let clocks = [
+            Clock::new(
+                sample_rate,
+                cli.segment_seconds,
+                &[Signal::Sine, Signal::Status],
+            )?,
+            Clock::new(AUX_SAMPLE_RATE, cli.segment_seconds, &[Signal::Aux])?,
+        ];
 
+        let mut rng = GaussianRng::new(seed | 1);
         let initial_params = SineParams {
             amplitude: cli.amplitude,
             frequency: cli.frequency,
@@ -449,7 +488,7 @@ impl TestDevice {
         let initial_enable = 1;
 
         let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, DEVICE_SERIAL, DEVICE_FIRMWARE)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "identity too long"))?;
+            .ok_or_else(|| invalid_input("identity too long"))?;
 
         Ok(Self {
             socket,
@@ -460,29 +499,13 @@ impl TestDevice {
             status: initial_status,
             initial_enable,
             enable: initial_enable,
-            sample_rate: cli.samplerate,
             segment_seconds: cli.segment_seconds,
-            segment_samples,
-            max_samples_per_packet,
-            aux_segment_samples,
-            aux_max_samples_per_packet,
+            streams: boot_streams(sample_rate)?,
+            clocks,
             device: Device::new(identity, SessionId::new(session_id), &RPCS),
             epoch: Instant::now(),
             started_at: Instant::now(),
-            start_time,
-            samples_generated: 0,
-            sample_number: 0,
-            segment_id: 0,
-            segment_start_time: start_time,
-            pending_segment_update: false,
-            next_drop_sample,
-            no_drop,
-            aux_samples_generated: 0,
-            aux_sample_number: 0,
-            aux_segment_id: 0,
-            aux_segment_start_time: start_time,
-            aux_pending_segment_update: false,
-            next_aux_drop_sample,
+            no_drop: cli.no_drop,
             next_log_message_at: Instant::now() + next_log_delay(&mut rng),
             next_log_level: 0,
             capture: CaptureBuffer::new(),
@@ -508,7 +531,7 @@ impl TestDevice {
             self.params.amplitude,
             self.params.frequency,
             self.params.noise,
-            self.sample_rate,
+            self.sample_rate(),
             self.segment_seconds
         );
         terminal_println!(
@@ -562,7 +585,7 @@ impl TestDevice {
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('d') => self.drop_samples_now()?,
+                    KeyCode::Char('d') => self.drop_samples_now(),
                     KeyCode::Char('r') => self.reboot()?,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(false);
@@ -630,33 +653,40 @@ impl TestDevice {
         }
     }
 
+    /// Restart acquisition: every stream stops and starts again at a fresh
+    /// time reference, so its samples begin at zero in a new segment.
     fn reset_run(&mut self) {
         self.started_at = Instant::now();
-        self.start_time = unix_time_secs(unix_duration());
-        self.samples_generated = 0;
-        self.sample_number = 0;
-        self.segment_id = 0;
-        self.segment_start_time = self.start_time;
-        self.pending_segment_update = false;
-        let next_drop_sample = self.next_drop_sample_after(0, self.sample_rate);
-        self.next_drop_sample = next_drop_sample;
-        self.aux_samples_generated = 0;
-        self.aux_sample_number = 0;
-        self.aux_segment_id = 0;
-        self.aux_segment_start_time = self.start_time;
-        self.aux_pending_segment_update = false;
-        let next_aux_drop_sample = self.next_drop_sample_after(0, AUX_SAMPLE_RATE);
-        self.next_aux_drop_sample = next_aux_drop_sample;
-        self.next_log_message_at = Instant::now() + self.next_log_delay();
+        let timeref = Timeref::new(
+            sync::Epoch::UNIX,
+            u32::try_from(unix_duration().as_secs()).unwrap_or(u32::MAX),
+            self.device.session,
+            DEVICE_SERIAL,
+        )
+        .expect("the device serial fits a time reference");
+        for stream in &mut self.streams {
+            stream.stop();
+            stream
+                .start(timeref.clone())
+                .expect("a stopped stream starts");
+        }
+        for clock in 0..self.clocks.len() {
+            self.clocks[clock].generated = 0;
+            self.clocks[clock].next_drop = self.next_drop(clock);
+        }
+        self.next_log_message_at = Instant::now() + next_log_delay(&mut self.rng);
         self.next_log_level = 0;
         self.capture.clear();
     }
 
+    /// Power-cycle: a new session, the settings a device boots with, and a
+    /// fresh segment ring on every stream.
     fn reboot(&mut self) -> io::Result<()> {
         self.device.session = SessionId::new(self.next_session_id());
         self.params = self.initial_params;
         self.status = self.initial_status;
         self.enable = self.initial_enable;
+        self.streams = boot_streams(self.sample_rate())?;
         self.reset_run();
         terminal_println!(
             "rebooted test device; new session id {}",
@@ -670,9 +700,9 @@ impl TestDevice {
     }
 
     fn connected(&mut self, addr: SocketAddr) -> io::Result<()> {
-        let (streams, now) = (self.streams(), self.now_ms());
+        let now = self.now_ms();
         let mut sink = UdpSink::new(&self.socket, addr);
-        self.device.connected(&streams, now, &mut sink);
+        self.device.connected(&self.streams[..], now, &mut sink);
         sink.finish()
     }
 
@@ -682,9 +712,8 @@ impl TestDevice {
 
     fn handle_packet(&mut self, packet: PacketView<'_>, addr: SocketAddr) -> io::Result<()> {
         self.update_capture();
-        let streams = self.streams();
         let mut sink = UdpSink::new(&self.socket, addr);
-        let call = match self.device.handle(&streams, packet, &mut sink) {
+        let call = match self.device.handle(&self.streams[..], packet, &mut sink) {
             Handled::Done => return sink.finish(),
             Handled::Rpc(call) => call,
         };
@@ -767,10 +796,11 @@ impl TestDevice {
         let sample_count = next_capture_sample_count(&mut self.rng);
         let mut data = Vec::with_capacity(sample_count * CAPTURE_SAMPLE_BYTES);
 
-        let noise_sigma = self.params.noise * (f64::from(self.sample_rate) / 2.0).sqrt();
-        let start_sample = self.samples_generated;
+        let rate = self.sample_rate().get();
+        let noise_sigma = self.params.noise * (f64::from(rate) / 2.0).sqrt();
+        let start_sample = self.clocks[WAVE_CLOCK].generated;
         for offset in 0..sample_count as u64 {
-            let t = (start_sample + offset) as f64 / f64::from(self.sample_rate);
+            let t = (start_sample + offset) as f64 / f64::from(rate);
             let phase = std::f64::consts::TAU * self.params.frequency * t;
             let value =
                 self.params.amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
@@ -780,8 +810,8 @@ impl TestDevice {
         let info = CaptureInfo {
             length: sample_count as u32,
             y_calibration: CAPTURE_Y_CALIBRATION,
-            x_offset: start_sample as f32 / self.sample_rate as f32,
-            x_stride: 1.0 / self.sample_rate as f32,
+            x_offset: start_sample as f32 / rate as f32,
+            x_stride: 1.0 / rate as f32,
         };
 
         (data, info)
@@ -799,8 +829,7 @@ impl TestDevice {
         sink.finish()?;
 
         self.send_log_message_if_due(client.addr)?;
-        self.send_due_samples(client.addr)?;
-        self.send_due_aux_samples(client.addr)
+        self.send_due_samples(client.addr)
     }
 
     fn send_log_message_if_due(&mut self, addr: SocketAddr) -> io::Result<()> {
@@ -816,240 +845,145 @@ impl TestDevice {
             data: lucky_number,
             message: message.as_bytes(),
         };
-        self.send_written(
-            addr,
-            DeviceRoute::root(),
-            || format!("log message level={level:?} data={lucky_number}"),
-            |buf| entry.write(buf),
-        )?;
-        self.next_log_message_at = Instant::now() + self.next_log_delay();
+        let mut buf = [0u8; proto::packet::Packet::MAX_SIZE];
+        let len = entry
+            .write(&mut buf)
+            .ok_or_else(|| invalid_input("log message does not fit a packet"))?;
+        let mut sink = UdpSink::new(&self.socket, addr);
+        sink.send(&buf[..len]);
+        sink.finish()?;
+        self.next_log_message_at = Instant::now() + next_log_delay(&mut self.rng);
         Ok(())
     }
 
     fn send_due_samples(&mut self, addr: SocketAddr) -> io::Result<()> {
-        for _ in 0..4 {
-            let due = self.due_samples();
-            if due == 0 {
-                break;
+        (0..self.clocks.len()).try_for_each(|clock| self.send_clock_samples(clock, addr))
+    }
+
+    /// The samples one clock owes: its streams roll over at a segment
+    /// boundary, skip the sample it owes a gap, and publish the rest.
+    fn send_clock_samples(&mut self, clock: usize, addr: SocketAddr) -> io::Result<()> {
+        for _ in 0..self.clocks[clock].due(self.started_at) {
+            if self.clocks[clock].rolls_over() {
+                self.rollover(clock);
             }
-
-            self.send_sample_segment_updates_if_needed(addr)?;
-
-            let samples_until_drop = self.next_drop_sample.saturating_sub(self.samples_generated);
-            if samples_until_drop == 0 {
-                self.drop_sample();
+            if self.clocks[clock].next_drop == Some(self.clocks[clock].generated) {
+                self.drop_sample(clock);
                 continue;
             }
+            self.push_samples(clock, addr)?;
+            self.clocks[clock].generated += 1;
+        }
+        self.flush_streams(clock, addr)
+    }
 
-            let samples_left_in_segment = u64::from(self.segment_samples - self.sample_number);
-            let batch_len = due
-                .min(self.max_samples_per_packet)
-                .min(samples_left_in_segment)
-                .min(samples_until_drop);
-            self.send_sample_batches(batch_len, addr)?;
+    /// One sample into each stream the clock drives.
+    fn push_samples(&mut self, clock: usize, addr: SocketAddr) -> io::Result<()> {
+        for &signal in self.clocks[clock].streams {
+            let sample = self.sample(signal);
+            let size = self.streams[signal as usize].def().sample_size();
+            let mut sink = UdpSink::new(&self.socket, addr);
+            self.streams[signal as usize].push(&sample[..size], &mut sink);
+            sink.finish()?;
         }
         Ok(())
     }
 
-    fn due_samples(&self) -> u64 {
-        let elapsed = self.started_at.elapsed().as_secs_f64();
-        let target = (elapsed * f64::from(self.sample_rate)).floor() as u64;
-        target.saturating_sub(self.samples_generated)
-    }
-
-    fn due_aux_samples(&self) -> u64 {
-        let elapsed = self.started_at.elapsed().as_secs_f64();
-        let target = (elapsed * f64::from(AUX_SAMPLE_RATE)).floor() as u64;
-        target.saturating_sub(self.aux_samples_generated)
-    }
-
-    fn send_sample_batches(&mut self, batch_len: u64, addr: SocketAddr) -> io::Result<()> {
-        let first_sample_n = self.sample_number;
-        let segment_id = self.segment_id;
-        let mut waveform_data = Vec::with_capacity((batch_len as usize) * SINE_SAMPLE_BYTES);
-        let mut status_data = Vec::with_capacity((batch_len as usize) * STATUS_SAMPLE_BYTES);
-        let noise_sigma = self.params.noise * (f64::from(self.sample_rate) / 2.0).sqrt();
-
-        for offset in 0..batch_len {
-            let t = (self.samples_generated + offset) as f64 / f64::from(self.sample_rate);
-            let phase = std::f64::consts::TAU * self.params.frequency * t;
-            let ch1 = self.params.amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
-            let ch2 = self.params.amplitude * phase.cos() + noise_sigma * self.rng.next_gaussian();
-            waveform_data.extend(ch1.to_le_bytes());
-            waveform_data.extend(ch2.to_le_bytes());
-            status_data.push(self.status);
-            status_data.push(SIGNAL_LEVEL);
+    fn flush_streams(&mut self, clock: usize, addr: SocketAddr) -> io::Result<()> {
+        let mut sink = UdpSink::new(&self.socket, addr);
+        for &signal in self.clocks[clock].streams {
+            self.streams[signal as usize].flush(&mut sink);
         }
-
-        self.send_stream_packet(
-            SINE_STREAM_ID,
-            first_sample_n,
-            segment_id,
-            &waveform_data,
-            addr,
-        )?;
-        self.send_stream_packet(
-            STATUS_STREAM_ID,
-            first_sample_n,
-            segment_id,
-            &status_data,
-            addr,
-        )?;
-
-        for _ in 0..batch_len {
-            self.advance_sample();
-        }
-
-        Ok(())
+        sink.finish()
     }
 
-    fn send_due_aux_samples(&mut self, addr: SocketAddr) -> io::Result<()> {
-        for _ in 0..4 {
-            let due = self.due_aux_samples();
-            if due == 0 {
-                break;
+    fn rollover(&mut self, clock: usize) {
+        for &signal in self.clocks[clock].streams {
+            self.streams[signal as usize].rollover();
+        }
+    }
+
+    /// One sample of `signal`, packed in column order at the front of the
+    /// widest sample the device takes.
+    fn sample(&mut self, signal: Signal) -> [u8; 16] {
+        match signal {
+            Signal::Sine => self.sine_sample(),
+            Signal::Status => {
+                let mut sample = [0u8; 16];
+                sample[..2].copy_from_slice(&[self.status, SIGNAL_LEVEL]);
+                sample
             }
+            Signal::Aux => self.aux_sample(),
+        }
+    }
 
-            self.send_aux_segment_update_if_needed(addr)?;
+    /// The rate of the streams the wave clock drives.
+    fn sample_rate(&self) -> NonZeroU32 {
+        self.clocks[WAVE_CLOCK].rate
+    }
 
-            let samples_until_drop = self
-                .next_aux_drop_sample
-                .saturating_sub(self.aux_samples_generated);
-            if samples_until_drop == 0 {
-                self.drop_aux_sample();
-                continue;
+    fn sine_sample(&mut self) -> [u8; 16] {
+        let rate = f64::from(self.sample_rate().get());
+        let t = self.clocks[WAVE_CLOCK].generated as f64 / rate;
+        let phase = std::f64::consts::TAU * self.params.frequency * t;
+        let noise_sigma = self.params.noise * (rate / 2.0).sqrt();
+        let sine = self.params.amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
+        let cosine = self.params.amplitude * phase.cos() + noise_sigma * self.rng.next_gaussian();
+        let mut sample = [0u8; 16];
+        sample[..8].copy_from_slice(&sine.to_le_bytes());
+        sample[8..].copy_from_slice(&cosine.to_le_bytes());
+        sample
+    }
+
+    fn aux_sample(&mut self) -> [u8; 16] {
+        let t = self.clocks[AUX_CLOCK].generated as f64 / f64::from(AUX_SAMPLE_RATE.get());
+        let phase = (AUX_WAVE_FREQUENCY * t).fract();
+        let triangle = 1.0 - 4.0 * (phase - 0.5).abs();
+        let sawtooth = 2.0 * phase - 1.0;
+        let mut sample = [0u8; 16];
+        sample[..8].copy_from_slice(&triangle.to_le_bytes());
+        sample[8..].copy_from_slice(&sawtooth.to_le_bytes());
+        sample
+    }
+
+    /// A dropped sample is the one gap a segment's sample numbers may have.
+    fn drop_sample(&mut self, clock: usize) {
+        let ids = self.clocks[clock]
+            .streams
+            .iter()
+            .map(|&signal| self.streams[signal as usize].id().to_string())
+            .collect::<Vec<String>>()
+            .join("/");
+        terminal_println!(
+            "dropped sample {} from stream {ids}",
+            self.clocks[clock].generated
+        );
+        for &signal in self.clocks[clock].streams {
+            self.streams[signal as usize].skip(1);
+        }
+        self.clocks[clock].generated += 1;
+        self.clocks[clock].next_drop = self.next_drop(clock);
+    }
+
+    fn drop_samples_now(&mut self) {
+        for clock in 0..self.clocks.len() {
+            if self.clocks[clock].rolls_over() {
+                self.rollover(clock);
             }
-
-            let samples_left_in_segment =
-                u64::from(self.aux_segment_samples - self.aux_sample_number);
-            let batch_len = due
-                .min(self.aux_max_samples_per_packet)
-                .min(samples_left_in_segment)
-                .min(samples_until_drop);
-            self.send_aux_sample_batch(batch_len, addr)?;
-        }
-        Ok(())
-    }
-
-    fn send_aux_sample_batch(&mut self, batch_len: u64, addr: SocketAddr) -> io::Result<()> {
-        let first_sample_n = self.aux_sample_number;
-        let segment_id = self.aux_segment_id;
-        let mut data = Vec::with_capacity((batch_len as usize) * AUX_SAMPLE_BYTES);
-
-        for offset in 0..batch_len {
-            let t = (self.aux_samples_generated + offset) as f64 / f64::from(AUX_SAMPLE_RATE);
-            let phase = (AUX_WAVE_FREQUENCY * t).fract();
-            let triangle = 1.0 - 4.0 * (phase - 0.5).abs();
-            let sawtooth = 2.0 * phase - 1.0;
-            data.extend(triangle.to_le_bytes());
-            data.extend(sawtooth.to_le_bytes());
-        }
-
-        self.send_stream_packet(AUX_STREAM_ID, first_sample_n, segment_id, &data, addr)?;
-
-        for _ in 0..batch_len {
-            self.advance_aux_sample();
-        }
-
-        Ok(())
-    }
-
-    fn send_stream_packet(
-        &self,
-        stream_id: u8,
-        first_sample_n: u32,
-        segment_id: u8,
-        samples: &[u8],
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        let packet = data::Samples {
-            stream_id: StreamId::new(stream_id),
-            segment_id: SegmentId::new(segment_id),
-            first: SampleNumber::new(first_sample_n),
-            data: samples,
-        };
-        self.send_written(
-            addr,
-            DeviceRoute::root(),
-            || {
-                format!(
-                    "stream data stream_id={stream_id} segment_id={segment_id} \
-                     first_sample_n={first_sample_n} data_bytes={} max_data_bytes={}",
-                    samples.len(),
-                    stream_data_max_data_bytes()
-                )
-            },
-            |buf| packet.write(buf),
-        )
-    }
-
-    fn advance_sample(&mut self) {
-        self.samples_generated = self.samples_generated.wrapping_add(1);
-        self.sample_number += 1;
-        if self.sample_number >= self.segment_samples {
-            self.sample_number = 0;
-            self.segment_id = (self.segment_id + 1) % N_SEGMENTS;
-            self.segment_start_time = self.segment_start_time.saturating_add(self.segment_seconds);
-            self.pending_segment_update = true;
+            self.drop_sample(clock);
         }
     }
 
-    fn advance_aux_sample(&mut self) {
-        self.aux_samples_generated = self.aux_samples_generated.wrapping_add(1);
-        self.aux_sample_number += 1;
-        if self.aux_sample_number >= self.aux_segment_samples {
-            self.aux_sample_number = 0;
-            self.aux_segment_id = (self.aux_segment_id + 1) % N_SEGMENTS;
-            self.aux_segment_start_time = self
-                .aux_segment_start_time
-                .saturating_add(self.segment_seconds);
-            self.aux_pending_segment_update = true;
-        }
-    }
-
-    fn drop_sample(&mut self) {
-        terminal_println!(
-            "dropped sample {} from streams {}/{}",
-            self.samples_generated,
-            SINE_STREAM_ID,
-            STATUS_STREAM_ID
-        );
-        self.advance_sample();
-        self.next_drop_sample =
-            self.next_drop_sample_after(self.samples_generated, self.sample_rate);
-    }
-
-    fn drop_aux_sample(&mut self) {
-        terminal_println!(
-            "dropped sample {} from stream {}",
-            self.aux_samples_generated,
-            AUX_STREAM_ID
-        );
-        self.advance_aux_sample();
-        self.next_aux_drop_sample =
-            self.next_drop_sample_after(self.aux_samples_generated, AUX_SAMPLE_RATE);
-    }
-
-    fn drop_samples_now(&mut self) -> io::Result<()> {
-        let addr = self.client.map(|client| client.addr);
-        if let Some(addr) = addr {
-            self.send_sample_segment_updates_if_needed(addr)?;
-        }
-        self.drop_sample();
-
-        if let Some(addr) = addr {
-            self.send_aux_segment_update_if_needed(addr)?;
-        }
-        self.drop_aux_sample();
-
-        Ok(())
-    }
-
-    fn next_drop_sample_after(&mut self, current_sample: u64, sample_rate: u32) -> u64 {
+    /// The sample a clock drops next, `None` while `--no-drop` holds.
+    fn next_drop(&mut self, clock: usize) -> Option<u64> {
         if self.no_drop {
-            return NO_DROP_SENTINEL;
+            return None;
         }
-        next_drop_sample_after(&mut self.rng, current_sample, sample_rate)
+        let (generated, rate) = (self.clocks[clock].generated, self.clocks[clock].rate.get());
+        let seconds = SAMPLE_DROP_INTERVAL_SECONDS - SAMPLE_DROP_JITTER_SECONDS
+            + self.rng.next_unit() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
+        let interval = (seconds * f64::from(rate)).round().max(1.0) as u64;
+        Some(generated.saturating_add(interval))
     }
 
     fn next_session_id(&mut self) -> u32 {
@@ -1060,10 +994,6 @@ impl TestDevice {
             session_id = session_id.wrapping_add(1);
         }
         session_id
-    }
-
-    fn next_log_delay(&mut self) -> Duration {
-        next_log_delay(&mut self.rng)
     }
 
     fn next_log_level(&mut self) -> log::LogLevel {
@@ -1091,188 +1021,26 @@ impl TestDevice {
         let template = templates[(self.rng.next_u64() as usize) % templates.len()];
         template.replace("{lucky}", &lucky_number.to_string())
     }
-
-    fn send_sample_segment_updates_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
-        if self.pending_segment_update && self.sample_number == 0 {
-            for stream_id in [SINE_STREAM_ID, STATUS_STREAM_ID] {
-                let segment = self.streams().current(stream_id);
-                self.send_metadata(data::Metadata::Segment(segment), addr)?;
-            }
-            self.pending_segment_update = false;
-        }
-        Ok(())
-    }
-
-    fn send_aux_segment_update_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
-        if self.aux_pending_segment_update && self.aux_sample_number == 0 {
-            let segment = self.streams().current(AUX_STREAM_ID);
-            self.send_metadata(data::Metadata::Segment(segment), addr)?;
-            self.aux_pending_segment_update = false;
-        }
-        Ok(())
-    }
-
-    fn send_metadata(&self, record: data::Metadata<'_>, addr: SocketAddr) -> io::Result<()> {
-        self.send_written(
-            addr,
-            DeviceRoute::root(),
-            move || format!("metadata {record:?}"),
-            move |buf| record.write(data::MetadataFlags::UPDATE, buf),
-        )
-    }
-
-    /// Send a packet built by one of twinleaf-proto's device-side writers,
-    /// addressed to the device it speaks for: `routing` is empty for this
-    /// device itself, and one hop per level for a simulated subtree device.
-    fn send_written(
-        &self,
-        addr: SocketAddr,
-        routing: DeviceRoute,
-        describe: impl Fn() -> String,
-        write: impl FnOnce(&mut [u8]) -> Option<usize>,
-    ) -> io::Result<()> {
-        let mut buf = [0u8; proto::packet::Packet::MAX_SIZE];
-        let mut written = write(&mut buf)
-            .and_then(|len| proto::packet::Packet::from_slice(&buf[..len]))
-            .ok_or_else(|| encode_error(&describe(), "does not fit a packet"))?;
-        // Hops travel leaf-first on the wire, the reverse of a route's order.
-        for &hop in routing.as_slice().iter().rev() {
-            written
-                .push_hop(hop)
-                .map_err(|_| encode_error(&describe(), "cannot carry its route"))?;
-        }
-        self.socket.send_to(written.as_slice(), addr)?;
-        Ok(())
-    }
-
-    fn streams(&self) -> SimStreams {
-        SimStreams {
-            session: self.device.session,
-            sample_rate: self.sample_rate,
-            segment_seconds: self.segment_seconds,
-            sine: Run {
-                segment_id: self.segment_id,
-                start_time: self.segment_start_time,
-            },
-            aux: Run {
-                segment_id: self.aux_segment_id,
-                start_time: self.aux_segment_start_time,
-            },
-        }
-    }
 }
 
-#[derive(Clone, Copy)]
-struct Run {
-    segment_id: u8,
-    start_time: u32,
-}
-
-/// The streams as their metadata describes them right now.
-#[derive(Clone, Copy)]
-struct SimStreams {
-    session: SessionId,
-    sample_rate: u32,
-    segment_seconds: u32,
-    sine: Run,
-    aux: Run,
-}
-
-impl SimStreams {
-    fn current(&self, stream_id: u8) -> data::Segment<'static> {
-        let (run, sampling_rate) = match stream_id {
-            AUX_STREAM_ID => (self.aux, AUX_SAMPLE_RATE),
-            _ => (self.sine, self.sample_rate),
+/// The streams a boot starts: no decimation, a cutoff at Nyquist, and a
+/// fresh segment ring on each.
+fn boot_streams(rate: NonZeroU32) -> io::Result<[Stream<SEGMENTS>; 3]> {
+    let stream = |id: u8, def: &'static StreamDef, rate: NonZeroU32| {
+        let params = Params {
+            rate,
+            decimation: NonZeroU32::MIN,
+            cutoff: rate.get() as f32 / 2.0,
+            enabled: true,
         };
-        data::Segment {
-            stream_id: StreamId::new(stream_id),
-            segment_id: SegmentId::new(run.segment_id),
-            flags: data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE,
-            epoch: sync::Epoch::UNIX,
-            timeref_serial: DEVICE_SERIAL,
-            timeref_session: self.session,
-            start_time: run.start_time,
-            sampling_rate,
-            decimation: 1,
-            filter_cutoff: sampling_rate as f32 / 2.0,
-            filter_type: data::FilterType::NONE,
-        }
-    }
-
-    /// The segment record for a segment other than the one being acquired: it
-    /// starts one segment length later for each step past the current one.
-    fn at(&self, stream_id: u8, segment_id: u8) -> data::Segment<'static> {
-        let mut segment = self.current(stream_id);
-        let ahead = u32::from((segment_id + N_SEGMENTS - segment.segment_id.value()) % N_SEGMENTS);
-        segment.start_time = segment
-            .start_time
-            .saturating_add(ahead.saturating_mul(self.segment_seconds));
-        segment.segment_id = SegmentId::new(segment_id);
-        segment
-    }
-}
-
-impl Streams for SimStreams {
-    fn ids(&self) -> impl Iterator<Item = u8> {
-        STREAM_IDS.into_iter()
-    }
-
-    fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>> {
-        let (name, sample_size, buf_samples) = match stream_id {
-            SINE_STREAM_ID => ("sine", SINE_SAMPLE_BYTES, self.sample_rate),
-            STATUS_STREAM_ID => ("status", STATUS_SAMPLE_BYTES, self.sample_rate),
-            AUX_STREAM_ID => ("aux", AUX_SAMPLE_BYTES, AUX_SAMPLE_RATE),
-            _ => return None,
-        };
-        Some(data::Stream {
-            stream_id: StreamId::new(stream_id),
-            n_columns: 2,
-            n_segments: N_SEGMENTS,
-            sample_size: u16::try_from(sample_size).ok()?,
-            buf_samples: u16::try_from(buf_samples).ok()?,
-            name,
-        })
-    }
-
-    fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>> {
-        if !STREAM_IDS.contains(&stream_id) {
-            return None;
-        }
-        Some(match index {
-            CURRENT_SEGMENT => self.current(stream_id),
-            index => self.at(stream_id, index),
-        })
-    }
-
-    fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
-        let (data_type, name, units, description) = match (stream_id, index) {
-            (SINE_STREAM_ID, 0) => (data::DataType::F64, "sine", "V", "Noisy sine wave"),
-            (SINE_STREAM_ID, 1) => (data::DataType::F64, "cosine", "V", "Noisy quadrature wave"),
-            (STATUS_STREAM_ID, 0) => (
-                data::DataType::U8,
-                "status",
-                "",
-                "Mirrors the test.status RPC",
-            ),
-            (STATUS_STREAM_ID, 1) => (
-                data::DataType::U8,
-                "signal_level",
-                "",
-                "Fixed simulated signal level",
-            ),
-            (AUX_STREAM_ID, 0) => (data::DataType::F64, "triangle", "arb", "Triangle wave"),
-            (AUX_STREAM_ID, 1) => (data::DataType::F64, "sawtooth", "arb", "Sawtooth wave"),
-            _ => return None,
-        };
-        Some(data::Column {
-            stream_id: StreamId::new(stream_id),
-            index: ColumnId::new(index),
-            data_type,
-            name,
-            units,
-            description,
-        })
-    }
+        Stream::new(StreamId::new(id), def, params)
+            .ok_or_else(|| invalid_input("stream sample is too large for a TIO packet"))
+    };
+    Ok([
+        stream(1, &SINE_DEF, rate)?,
+        stream(2, &STATUS_DEF, rate)?,
+        stream(3, &AUX_DEF, AUX_SAMPLE_RATE)?,
+    ])
 }
 
 /// A non-negative f64 property: no argument reads it, eight bytes write it.
@@ -1296,29 +1064,8 @@ fn u8_property(args: &[u8], current: u8) -> Result<u8, RpcError> {
     }
 }
 
-fn encode_error(what: &str, why: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("could not encode {what}: it {why}"),
-    )
-}
-
-fn stream_data_max_data_bytes() -> usize {
-    proto::packet::Packet::MAX_PAYLOAD.saturating_sub(data::SAMPLE_HEADER_SIZE)
-}
-
-fn max_stream_samples_per_packet(sample_bytes: usize) -> u64 {
-    if sample_bytes == 0 {
-        return 0;
-    }
-    (stream_data_max_data_bytes() / sample_bytes) as u64
-}
-
-fn next_drop_sample_after(rng: &mut GaussianRng, current_sample: u64, sample_rate: u32) -> u64 {
-    let min_seconds = SAMPLE_DROP_INTERVAL_SECONDS - SAMPLE_DROP_JITTER_SECONDS;
-    let seconds = min_seconds + rng.next_unit() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
-    let interval = (seconds * f64::from(sample_rate)).round().max(1.0) as u64;
-    current_sample.saturating_add(interval)
+fn invalid_input(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
 
 fn next_log_delay(rng: &mut GaussianRng) -> Duration {
@@ -1337,16 +1084,26 @@ fn unix_duration() -> Duration {
         .unwrap_or_else(|_| Duration::from_secs(0))
 }
 
-fn unix_time_secs(now: Duration) -> u32 {
-    u32::try_from(now.as_secs()).unwrap_or(u32::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-    use twinleaf_device::metadata;
+    use twinleaf::proto::data::CURRENT_SEGMENT;
+    use twinleaf_device::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
+
+    /// The segment the sine stream is acquiring.
+    fn sine(device: &TestDevice) -> &twinleaf_device::segments::Segment {
+        device.streams[Signal::Sine as usize].current()
+    }
+
+    /// A device with its streams acquiring, as a connecting client leaves it.
+    fn device(args: &[&str]) -> TestDevice {
+        let cli = SimulateCli::parse_from([&["tio-simulate", "--port", "0"], args].concat());
+        let mut device = TestDevice::new(cli).unwrap();
+        device.reset_run();
+        device
+    }
 
     #[test]
     fn capture_buffer_exports_indexed_blocks_after_delay() {
@@ -1382,48 +1139,78 @@ mod tests {
     }
 
     #[test]
-    fn metadata_bootstrap_replies_in_sweep_order_within_capacity() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let device = TestDevice::new(cli).unwrap();
-
-        let streams = device.streams();
+    fn every_stream_fits_one_metadata_bootstrap() {
+        let device = device(&[]);
+        let streams = &device.streams[..];
         let mut out = Reply::new();
-        metadata::reply(device.device.record(&streams), &streams, &[], &mut out).unwrap();
+        metadata::reply(device.device.record(streams), streams, &[], &mut out).unwrap();
         let kinds: Vec<_> = data::MetadataReply::parse(&out)
             .unwrap()
             .map(|(kind, _)| kind)
             .collect();
-        use data::MetadataType;
-        let mut expected = vec![MetadataType::Device];
-        for _ in STREAM_IDS {
-            expected.extend([
-                MetadataType::Stream,
-                MetadataType::Segment,
-                MetadataType::Column,
-                MetadataType::Column,
-            ]);
-        }
-        assert_eq!(kinds, expected);
+        assert_eq!(kinds[0], data::MetadataType::Device);
+        assert_eq!(kinds.len(), 1 + device.streams.len() * 4);
     }
 
     #[test]
-    fn metadata_selectors_resolve_the_current_segment_sentinel() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let device = TestDevice::new(cli).unwrap();
+    fn metadata_reports_the_ring_and_the_current_segment() {
+        let mut device = device(&["--samplerate", "4", "--segment-seconds", "1"]);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        device.send_due_samples(addr).unwrap();
 
-        let streams = device.streams();
-        let segment = streams.segment(SINE_STREAM_ID, CURRENT_SEGMENT).unwrap();
-        assert_eq!(segment.segment_id.value(), device.segment_id);
+        let streams = &device.streams[..];
+        let record = streams.stream(1).unwrap();
+        assert_eq!(record.n_segments, SEGMENTS as u8);
+        assert_eq!(record.buf_samples, 0);
+        assert_eq!(record.sample_size, 16);
+        let segment = streams.segment(1, CURRENT_SEGMENT).unwrap();
+        assert_eq!(segment.segment_id.value(), 0);
+        assert_eq!(segment.sampling_rate, 4);
+        assert_eq!(segment.filter_cutoff, 2.0);
+        assert_eq!(streams.segment(1, 0), Some(segment));
+        assert_eq!(streams.segment(1, 1), None);
         assert!(streams.stream(99).is_none());
         assert!(streams.segment(99, CURRENT_SEGMENT).is_none());
     }
 
     #[test]
+    fn a_clock_reaching_its_segment_length_rolls_over() {
+        let mut device = device(&["--samplerate", "4", "--segment-seconds", "1"]);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let start_time = sine(&device).timeref().start_time;
+        for _ in 0..=device.clocks[WAVE_CLOCK].segment_samples {
+            if device.clocks[WAVE_CLOCK].rolls_over() {
+                device.rollover(WAVE_CLOCK);
+            }
+            device.push_samples(WAVE_CLOCK, addr).unwrap();
+            device.clocks[WAVE_CLOCK].generated += 1;
+        }
+
+        assert_eq!(sine(&device).id().value(), 1);
+        assert_eq!(sine(&device).timeref().start_time, start_time + 1);
+    }
+
+    #[test]
+    fn a_reboot_starts_a_fresh_ring_where_a_reconnect_takes_the_next_segment() {
+        let mut device = device(&["--samplerate", "4", "--segment-seconds", "1"]);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        device.push_samples(WAVE_CLOCK, addr).unwrap();
+
+        device.reset_run();
+        assert_eq!(sine(&device).id().value(), 1);
+
+        let session = device.device.session;
+        device.reboot().unwrap();
+        assert_ne!(device.device.session, session);
+        assert!(device
+            .streams
+            .iter()
+            .all(|stream| stream.current().id().value() == 0));
+    }
+
+    #[test]
     fn capture_data_uses_current_sine_parameters() {
-        let cli = SimulateCli::parse_from([
-            "tio-simulate",
-            "--port",
-            "0",
+        let mut device = device(&[
             "--samplerate",
             "4",
             "--frequency",
@@ -1433,7 +1220,6 @@ mod tests {
             "--noise",
             "0",
         ]);
-        let mut device = TestDevice::new(cli).unwrap();
 
         let (data, info) = device.generate_capture_data();
 
@@ -1454,8 +1240,7 @@ mod tests {
 
     #[test]
     fn capture_metadata_uses_tl_chibi_type_and_y_calibration() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let mut device = TestDevice::new(cli).unwrap();
+        let mut device = device(&[]);
         let (data, info) = device.generate_capture_data();
         let data_len = data.len();
         device

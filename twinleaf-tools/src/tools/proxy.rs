@@ -26,8 +26,9 @@ use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::RpcError;
 use twinleaf::proto::SessionId;
 use twinleaf::tio::{self, packet, proxy};
-use twinleaf_device::device::{Device, Handled, Identity, Sink};
+use twinleaf_device::device::{Device, Handled, Identity};
 use twinleaf_device::rpc::{Access, RpcSpec, Value};
+use twinleaf_device::Sink;
 
 /// What the virtual hub answers: identity and introspection, nothing more.
 static HUB_RPCS: [RpcSpec; 12] = [

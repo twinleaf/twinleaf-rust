@@ -19,12 +19,7 @@ use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::metadata::{self, Streams};
 use crate::rpc::{self as table, put, Reply, RpcSpec};
-
-/// Where a device's packets go.
-pub trait Sink {
-    /// Send one complete packet.
-    fn send(&mut self, packet: &[u8]);
-}
+use crate::Sink;
 
 /// Milliseconds between heartbeats.
 pub const HEARTBEAT_INTERVAL: u64 = 200;
@@ -116,7 +111,7 @@ impl<'t> Device<'t> {
     }
 
     /// The device record: identity, session, and how many streams.
-    pub fn record(&self, streams: &impl Streams) -> data::Device<'_> {
+    pub fn record(&self, streams: &(impl Streams + ?Sized)) -> data::Device<'_> {
         data::Device {
             session: self.session,
             n_streams: streams.ids().count() as u8,
@@ -128,7 +123,7 @@ impl<'t> Device<'t> {
 
     /// Tell a host that has just connected everything it needs: the table
     /// hash, a heartbeat, and every metadata record.
-    pub fn connected(&mut self, streams: &impl Streams, now: u64, out: &mut impl Sink) {
+    pub fn connected(&mut self, streams: &(impl Streams + ?Sized), now: u64, out: &mut impl Sink) {
         let hash = self.hash.to_le_bytes();
         let setting = Setting {
             name: b"rpc.hash",
@@ -150,7 +145,7 @@ impl<'t> Device<'t> {
     /// Act on one packet from the host.
     pub fn handle<'p>(
         &mut self,
-        streams: &impl Streams,
+        streams: &(impl Streams + ?Sized),
         packet: PacketView<'p>,
         out: &mut impl Sink,
     ) -> Handled<'p, 't> {
@@ -220,7 +215,7 @@ impl<'t> Device<'t> {
     }
 
     /// Every metadata record, in sweep order.
-    fn records<'s, S: Streams>(
+    fn records<'s, S: Streams + ?Sized>(
         &'s self,
         streams: &'s S,
     ) -> impl Iterator<Item = Metadata<'s>> + 's {

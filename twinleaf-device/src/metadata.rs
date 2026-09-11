@@ -48,7 +48,7 @@ impl Streams for () {
 /// Answer `dev.metadata` into `out` for the device `device` describes.
 pub fn reply(
     device: data::Device<'_>,
-    streams: &impl Streams,
+    streams: &(impl Streams + ?Sized),
     arg: &[u8],
     out: &mut Reply,
 ) -> Result<(), RpcError> {
@@ -71,7 +71,7 @@ pub fn reply(
 /// The record a selector names.
 pub fn select<'a>(
     device: data::Device<'a>,
-    streams: &'a impl Streams,
+    streams: &'a (impl Streams + ?Sized),
     selector: MetadataSelector,
 ) -> Option<Metadata<'a>> {
     let MetadataSelector {
@@ -91,7 +91,7 @@ pub fn select<'a>(
 /// A listed stream the device cannot describe is an internal error.
 fn bootstrap(
     device: data::Device<'_>,
-    streams: &impl Streams,
+    streams: &(impl Streams + ?Sized),
     out: &mut Reply,
 ) -> Result<(), RpcError> {
     if !append(out, Metadata::Device(device))? {

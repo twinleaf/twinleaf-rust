@@ -7,4 +7,13 @@
 pub mod capture;
 pub mod device;
 pub mod metadata;
+pub mod publisher;
 pub mod rpc;
+pub mod segments;
+pub mod stream;
+
+/// Where a device's packets go.
+pub trait Sink {
+    /// Send one complete packet.
+    fn send(&mut self, packet: &[u8]);
+}
