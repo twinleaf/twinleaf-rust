@@ -10,20 +10,17 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-// Incoming packets are still parsed with the host's owned model; everything
-// this device *sends* is written by the wire crate, as firmware would.
 use twinleaf::proto;
 use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
 use twinleaf::proto::data::CURRENT_SEGMENT;
+use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
-use twinleaf::proto::{data, heartbeat, log, rpc, settings, sync};
-use twinleaf::proto::{
-    ColumnId, DeviceRoute, RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
-};
-use twinleaf::tio::packet;
+use twinleaf::proto::{data, log, sync};
+use twinleaf::proto::{ColumnId, DeviceRoute, SampleNumber, SegmentId, SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
-use twinleaf_device::metadata::{self, Records};
-use twinleaf_device::rpc::{self as table, Access, Reply, RpcSpec, Value};
+use twinleaf_device::device::{Call, Device, Handled, Identity, Sink};
+use twinleaf_device::metadata::Streams;
+use twinleaf_device::rpc::{put, Access, Reply, RpcSpec, Value};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;
@@ -64,7 +61,6 @@ const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
 /// `samples_generated` would need to run for billions of years to reach it.
 const NO_DROP_SENTINEL: u64 = u64::MAX;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
 const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
 const CAPTURE_TRIGGER_DELAY: Duration = Duration::from_millis(500);
@@ -81,6 +77,35 @@ const SINE_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 const STATUS_SAMPLE_BYTES: usize = 2;
 const AUX_SAMPLE_BYTES: usize = std::mem::size_of::<f64>() * 2;
 
+const UPGRADED_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]";
+
+/// The RPC table. Introspection first, like tl-chibi, and the order fixes
+/// the ids `rpc.list` reports and the `rpc.hash`.
+static RPCS: [RpcSpec; 20] = [
+    RpcSpec::std("rpc.name", Access::RW),
+    RpcSpec::std("rpc.id", Access::RW),
+    RpcSpec::std("rpc.info", Access::RW),
+    RpcSpec::std("rpc.list", Access::RW),
+    RpcSpec::std("rpc.listinfo", Access::RW),
+    RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
+    RpcSpec::prop("dev.name", Value::String, Access::READ),
+    RpcSpec::prop("dev.desc", Value::String, Access::READ),
+    RpcSpec::prop("dev.session", Value::Uint(4), Access::READ),
+    RpcSpec::action("dev.stop"),
+    RpcSpec::std("dev.firmware.upload", Access::WRITE),
+    RpcSpec::action("dev.firmware.upgrade"),
+    RpcSpec::std("dev.metadata", Access::RW),
+    RpcSpec::prop("test.amplitude", Value::Float(8), Access::RW),
+    RpcSpec::prop("test.frequency", Value::Float(8), Access::RW),
+    RpcSpec::prop("test.noise", Value::Float(8), Access::RW),
+    RpcSpec::prop("test.status", Value::Uint(1), Access::RW),
+    RpcSpec::prop("test.enable", Value::Uint(1), Access::RW)
+        .with_extra_meta(RpcMetaFlags::BOOL.bits()),
+    RpcSpec::action("test.go"),
+    RpcSpec::std("test.capture", Access::READ)
+        .with_extra_meta(RpcMetaFlags::READABLE.union(RpcMetaFlags::CAPTURE).bits()),
+];
+
 #[derive(Clone, Copy)]
 struct SineParams {
     amplitude: f64,
@@ -92,6 +117,36 @@ struct SineParams {
 struct Client {
     addr: SocketAddr,
     last_rx: Instant,
+}
+
+/// The device's packets go to the connected client, and the first send
+/// failure is kept for the caller.
+struct UdpSink<'a> {
+    socket: &'a UdpSocket,
+    addr: SocketAddr,
+    failed: Option<io::Error>,
+}
+
+impl<'a> UdpSink<'a> {
+    fn new(socket: &'a UdpSocket, addr: SocketAddr) -> Self {
+        Self {
+            socket,
+            addr,
+            failed: None,
+        }
+    }
+
+    fn finish(self) -> io::Result<()> {
+        self.failed.map_or(Ok(()), Err)
+    }
+}
+
+impl Sink for UdpSink<'_> {
+    fn send(&mut self, packet: &[u8]) {
+        if self.failed.is_none() {
+            self.failed = self.socket.send_to(packet, self.addr).err();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -292,16 +347,14 @@ struct TestDevice {
     status: u8,
     initial_enable: u8,
     enable: u8,
-    // Mutable device description (dev.desc). A firmware upgrade rewrites it so
-    // a post-upgrade re-read shows a different build.
-    desc: String,
     sample_rate: u32,
     segment_seconds: u32,
     segment_samples: u32,
     max_samples_per_packet: u64,
     aux_segment_samples: u32,
     aux_max_samples_per_packet: u64,
-    session_id: u32,
+    device: Device<'static>,
+    epoch: Instant,
     started_at: Instant,
     start_time: u32,
     samples_generated: u64,
@@ -317,13 +370,10 @@ struct TestDevice {
     aux_segment_start_time: u32,
     aux_pending_segment_update: bool,
     next_aux_drop_sample: u64,
-    last_heartbeat: Instant,
     next_log_message_at: Instant,
     next_log_level: usize,
     capture: CaptureBuffer,
     rng: GaussianRng,
-    rpcs: Vec<RpcSpec>,
-    rpc_hash: u32,
 }
 
 impl TestDevice {
@@ -398,33 +448,8 @@ impl TestDevice {
         let initial_status = 0;
         let initial_enable = 1;
 
-        // RPC table. Like tl-chibi's tl_rpc_finalize(), the introspection
-        // methods come first, and the table order determines both the ids
-        // reported by rpc.list/rpc.listinfo and the rpc.hash CRC.
-        let rpcs = vec![
-            RpcSpec::std("rpc.name", Access::RW),
-            RpcSpec::std("rpc.id", Access::RW),
-            RpcSpec::std("rpc.info", Access::RW),
-            RpcSpec::std("rpc.list", Access::RW),
-            RpcSpec::std("rpc.listinfo", Access::RW),
-            RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
-            RpcSpec::prop("dev.name", Value::String, Access::READ),
-            RpcSpec::prop("dev.desc", Value::String, Access::READ),
-            RpcSpec::action("dev.stop"),
-            RpcSpec::std("dev.firmware.upload", Access::WRITE),
-            RpcSpec::action("dev.firmware.upgrade"),
-            RpcSpec::std("dev.metadata", Access::RW),
-            RpcSpec::prop("test.amplitude", Value::Float(8), Access::RW),
-            RpcSpec::prop("test.frequency", Value::Float(8), Access::RW),
-            RpcSpec::prop("test.noise", Value::Float(8), Access::RW),
-            RpcSpec::prop("test.status", Value::Uint(1), Access::RW),
-            RpcSpec::prop("test.enable", Value::Uint(1), Access::RW)
-                .with_extra_meta(RpcMetaFlags::BOOL.bits()),
-            RpcSpec::action("test.go"),
-            RpcSpec::std("test.capture", Access::READ)
-                .with_extra_meta((RpcMetaFlags::READABLE | RpcMetaFlags::CAPTURE).bits()),
-        ];
-        let rpc_hash = table::hash(&rpcs);
+        let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, DEVICE_SERIAL, DEVICE_FIRMWARE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "identity too long"))?;
 
         Ok(Self {
             socket,
@@ -435,14 +460,14 @@ impl TestDevice {
             status: initial_status,
             initial_enable,
             enable: initial_enable,
-            desc: DEVICE_DESC.to_string(),
             sample_rate: cli.samplerate,
             segment_seconds: cli.segment_seconds,
             segment_samples,
             max_samples_per_packet,
             aux_segment_samples,
             aux_max_samples_per_packet,
-            session_id,
+            device: Device::new(identity, SessionId::new(session_id), &RPCS),
+            epoch: Instant::now(),
             started_at: Instant::now(),
             start_time,
             samples_generated: 0,
@@ -458,13 +483,10 @@ impl TestDevice {
             aux_segment_start_time: start_time,
             aux_pending_segment_update: false,
             next_aux_drop_sample,
-            last_heartbeat: Instant::now(),
             next_log_message_at: Instant::now() + next_log_delay(&mut rng),
             next_log_level: 0,
             capture: CaptureBuffer::new(),
             rng,
-            rpcs,
-            rpc_hash,
         })
     }
 
@@ -560,7 +582,7 @@ impl TestDevice {
                     if !self.accept_packet_from(addr)? {
                         continue;
                     }
-                    match packet::Packet::from_slice_prefix(&buf[..size]) {
+                    match PacketView::parse_prefix(&buf[..size]) {
                         Ok((packet, parsed_size)) if parsed_size == size => {
                             self.handle_packet(packet, addr)?;
                         }
@@ -593,7 +615,7 @@ impl TestDevice {
                 self.client = Some(Client { addr, last_rx: now });
                 self.reset_run();
                 terminal_println!("client connected: {addr}");
-                self.send_initial_packets(addr)?;
+                self.connected(addr)?;
                 Ok(true)
             }
         }
@@ -625,242 +647,101 @@ impl TestDevice {
         self.aux_pending_segment_update = false;
         let next_aux_drop_sample = self.next_drop_sample_after(0, AUX_SAMPLE_RATE);
         self.next_aux_drop_sample = next_aux_drop_sample;
-        self.last_heartbeat = Instant::now()
-            .checked_sub(HEARTBEAT_INTERVAL)
-            .unwrap_or_else(Instant::now);
         self.next_log_message_at = Instant::now() + self.next_log_delay();
         self.next_log_level = 0;
         self.capture.clear();
     }
 
     fn reboot(&mut self) -> io::Result<()> {
-        self.session_id = self.next_session_id();
+        self.device.session = SessionId::new(self.next_session_id());
         self.params = self.initial_params;
         self.status = self.initial_status;
         self.enable = self.initial_enable;
         self.reset_run();
-        terminal_println!("rebooted test device; new session id {}", self.session_id);
+        terminal_println!(
+            "rebooted test device; new session id {}",
+            self.device.session.value()
+        );
 
         if let Some(client) = self.client {
-            self.send_initial_packets(client.addr)?;
+            self.connected(client.addr)?;
         }
         Ok(())
     }
 
-    fn handle_packet(&mut self, packet: packet::Packet, addr: SocketAddr) -> io::Result<()> {
-        if let packet::Payload::RpcRequest(req) = packet.payload() {
-            self.handle_rpc(req, packet.route(), addr)?;
-        }
-        Ok(())
+    fn connected(&mut self, addr: SocketAddr) -> io::Result<()> {
+        let (streams, now) = (self.streams(), self.now_ms());
+        let mut sink = UdpSink::new(&self.socket, addr);
+        self.device.connected(&streams, now, &mut sink);
+        sink.finish()
     }
 
-    fn handle_rpc(
-        &mut self,
-        request: rpc::Request<'_>,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn handle_packet(&mut self, packet: PacketView<'_>, addr: SocketAddr) -> io::Result<()> {
         self.update_capture();
-
-        let id = request.id.value();
-        let arg = request.args;
-        let rpc::Method::ByName(name) = request.method else {
-            return self.send_rpc_error(id, RpcError::NotFound, routing, addr);
+        let streams = self.streams();
+        let mut sink = UdpSink::new(&self.socket, addr);
+        let call = match self.device.handle(&streams, packet, &mut sink) {
+            Handled::Done => return sink.finish(),
+            Handled::Rpc(call) => call,
         };
-        let Ok(method) = std::str::from_utf8(name) else {
-            return self.send_rpc_error(id, RpcError::NotFound, routing, addr);
-        };
+        sink.finish()?;
 
-        match method {
-            "dev.name" => self.rpc_read_string(id, DEVICE_NAME, arg, routing, addr),
-            "dev.desc" => self.rpc_read_string(id, &self.desc.clone(), arg, routing, addr),
-            "dev.stop" => self.send_rpc_reply(id, &[], routing, addr),
-            // Accept and acknowledge each firmware chunk (contents ignored).
-            "dev.firmware.upload" => self.send_rpc_reply(id, &[], routing, addr),
-            // Commit: simulate a reboot into a new build by rewriting dev.desc.
+        let result = self.app_rpc(&call);
+        let mut sink = UdpSink::new(&self.socket, addr);
+        call.reply(result.as_deref().map_err(|error| *error), &mut sink);
+        sink.finish()
+    }
+
+    /// The RPCs this device adds to the standard ones.
+    fn app_rpc(&mut self, call: &Call<'_, '_>) -> Result<Reply, RpcError> {
+        let args = call.args;
+        let mut reply = Reply::new();
+        match call.name {
+            "dev.stop" | "dev.firmware.upload" => {}
             "dev.firmware.upgrade" => {
-                self.desc = "Twinleaf tio-test R1 ((null)) [2026-06-08/000002]".to_string();
-                self.send_rpc_reply(id, &[], routing, addr)
+                self.device.identity.desc =
+                    UPGRADED_DESC.try_into().map_err(|_| RpcError::Internal)?;
             }
-            "rpc.hash" => self.rpc_read_u32(id, self.rpc_hash, arg, routing, addr),
-            "rpc.name" => self.answer(id, routing, addr, |out| table::name(&self.rpcs, arg, out)),
-            "rpc.id" => self.answer(id, routing, addr, |out| table::id(&self.rpcs, arg, out)),
-            "rpc.info" => self.answer(id, routing, addr, |out| table::info(&self.rpcs, arg, out)),
-            "rpc.list" => self.answer(id, routing, addr, |out| {
-                table::list(&self.rpcs, arg, false, out)
-            }),
-            "rpc.listinfo" => self.answer(id, routing, addr, |out| {
-                table::list(&self.rpcs, arg, true, out)
-            }),
-            "dev.metadata" => self.answer(id, routing, addr, |out| metadata::reply(self, arg, out)),
             "test.amplitude" => {
-                let next = self.read_or_write_nonnegative_f64(
-                    id,
-                    arg,
-                    self.params.amplitude,
-                    routing,
-                    addr,
-                )?;
-                self.params.amplitude = next;
-                Ok(())
+                self.params.amplitude = nonnegative_f64(args, self.params.amplitude)?;
+                put(&mut reply, &self.params.amplitude.to_le_bytes())?;
             }
             "test.frequency" => {
-                let next = self.read_or_write_nonnegative_f64(
-                    id,
-                    arg,
-                    self.params.frequency,
-                    routing,
-                    addr,
-                )?;
-                self.params.frequency = next;
-                Ok(())
+                self.params.frequency = nonnegative_f64(args, self.params.frequency)?;
+                put(&mut reply, &self.params.frequency.to_le_bytes())?;
             }
             "test.noise" => {
-                let next =
-                    self.read_or_write_nonnegative_f64(id, arg, self.params.noise, routing, addr)?;
-                self.params.noise = next;
-                Ok(())
+                self.params.noise = nonnegative_f64(args, self.params.noise)?;
+                put(&mut reply, &self.params.noise.to_le_bytes())?;
             }
             "test.status" => {
-                let next = self.read_or_write_u8(id, arg, self.status, routing, addr)?;
-                self.status = next;
-                Ok(())
+                self.status = u8_property(args, self.status)?;
+                put(&mut reply, &[self.status])?;
             }
             "test.enable" => {
-                let next = self.read_or_write_u8(id, arg, self.enable, routing, addr)?;
-                self.enable = next;
-                Ok(())
+                self.enable = u8_property(args, self.enable)?;
+                put(&mut reply, &[self.enable])?;
             }
-            "test.go" => self.rpc_action(id, arg, routing, addr),
-            "test.capture" => self.rpc_capture(id, arg, routing, addr),
-            _ => self.send_rpc_error(id, RpcError::NotFound, routing, addr),
-        }
-    }
-
-    fn rpc_read_string(
-        &self,
-        id: u16,
-        value: &str,
-        arg: &[u8],
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if !arg.is_empty() {
-            return self.send_rpc_error(id, RpcError::ReadOnly, routing, addr);
-        }
-        self.send_rpc_reply(id, value.as_bytes(), routing, addr)
-    }
-
-    fn rpc_read_u32(
-        &self,
-        id: u16,
-        value: u32,
-        arg: &[u8],
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if !arg.is_empty() {
-            return self.send_rpc_error(id, RpcError::ReadOnly, routing, addr);
-        }
-        self.send_rpc_reply(id, &value.to_le_bytes(), routing, addr)
-    }
-
-    /// Send the reply or error an RPC answers with.
-    fn answer(
-        &self,
-        id: u16,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-        answer: impl FnOnce(&mut Reply) -> Result<(), RpcError>,
-    ) -> io::Result<()> {
-        let mut out = Reply::new();
-        match answer(&mut out) {
-            Ok(()) => self.send_rpc_reply(id, &out, routing, addr),
-            Err(error) => self.send_rpc_error(id, error, routing, addr),
-        }
-    }
-
-    fn read_or_write_nonnegative_f64(
-        &self,
-        id: u16,
-        arg: &[u8],
-        current: f64,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<f64> {
-        let value = match arg.len() {
-            0 => current,
-            8 => f64::from_le_bytes(arg.try_into().unwrap()),
-            _ => {
-                self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)?;
-                return Ok(current);
+            "test.go" => {
+                if !args.is_empty() {
+                    return Err(RpcError::ArgsSize);
+                }
+                terminal_println!("test.go action invoked");
             }
-        };
-
-        if !value.is_finite() || value < 0.0 {
-            self.send_rpc_error(id, RpcError::Invalid, routing, addr)?;
-            return Ok(current);
-        }
-
-        self.send_rpc_reply(id, &value.to_le_bytes(), routing, addr)?;
-        Ok(value)
-    }
-
-    fn read_or_write_u8(
-        &self,
-        id: u16,
-        arg: &[u8],
-        current: u8,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<u8> {
-        let value = match arg.len() {
-            0 => current,
-            1 => arg[0],
-            _ => {
-                self.send_rpc_error(id, RpcError::ArgsSize, routing, addr)?;
-                return Ok(current);
+            "test.capture" => {
+                let selector = Selector::parse(args)?;
+                self.capture.view().reply(selector, &mut reply)?;
+                if selector == Selector::Trigger {
+                    self.trigger_capture();
+                }
             }
-        };
-
-        self.send_rpc_reply(id, &[value], routing, addr)?;
-        Ok(value)
-    }
-
-    fn rpc_action(
-        &self,
-        id: u16,
-        arg: &[u8],
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        if !arg.is_empty() {
-            return self.send_rpc_error(id, RpcError::ArgsSize, routing, addr);
+            _ => return Err(RpcError::NotFound),
         }
-        terminal_println!("test.go action invoked");
-        self.send_rpc_reply(id, &[], routing, addr)
-    }
-
-    fn rpc_capture(
-        &mut self,
-        id: u16,
-        arg: &[u8],
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        let mut out = Reply::new();
-        let answered = Selector::parse(arg).and_then(|selector| {
-            self.capture.view().reply(selector, &mut out)?;
-            Ok(selector)
-        });
-        match answered {
-            Ok(Selector::Trigger) => {
-                self.trigger_capture();
-                self.send_rpc_reply(id, &out, routing, addr)
-            }
-            Ok(_) => self.send_rpc_reply(id, &out, routing, addr),
-            Err(error) => self.send_rpc_error(id, error, routing, addr),
-        }
+        Ok(reply)
     }
 
     fn trigger_capture(&mut self) {
@@ -912,10 +793,10 @@ impl TestDevice {
             return Ok(());
         };
 
-        if self.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            self.send_heartbeat(client.addr)?;
-            self.last_heartbeat = Instant::now();
-        }
+        let now = self.now_ms();
+        let mut sink = UdpSink::new(&self.socket, client.addr);
+        self.device.tick(now, &mut sink);
+        sink.finish()?;
 
         self.send_log_message_if_due(client.addr)?;
         self.send_due_samples(client.addr)?;
@@ -1175,7 +1056,7 @@ impl TestDevice {
         let mut session_id = (self.rng.next_u64() as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
-        if session_id == self.session_id {
+        if session_id == self.device.session.value() {
             session_id = session_id.wrapping_add(1);
         }
         session_id
@@ -1214,10 +1095,8 @@ impl TestDevice {
     fn send_sample_segment_updates_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
         if self.pending_segment_update && self.sample_number == 0 {
             for stream_id in [SINE_STREAM_ID, STATUS_STREAM_ID] {
-                self.send_metadata(
-                    data::Metadata::Segment(self.segment_record(stream_id)),
-                    addr,
-                )?;
+                let segment = self.streams().current(stream_id);
+                self.send_metadata(data::Metadata::Segment(segment), addr)?;
             }
             self.pending_segment_update = false;
         }
@@ -1226,59 +1105,11 @@ impl TestDevice {
 
     fn send_aux_segment_update_if_needed(&mut self, addr: SocketAddr) -> io::Result<()> {
         if self.aux_pending_segment_update && self.aux_sample_number == 0 {
-            self.send_metadata(
-                data::Metadata::Segment(self.segment_record(AUX_STREAM_ID)),
-                addr,
-            )?;
+            let segment = self.streams().current(AUX_STREAM_ID);
+            self.send_metadata(data::Metadata::Segment(segment), addr)?;
             self.aux_pending_segment_update = false;
         }
         Ok(())
-    }
-
-    fn send_initial_packets(&self, addr: SocketAddr) -> io::Result<()> {
-        self.send_rpc_hash_setting(addr)?;
-        self.send_heartbeat(addr)?;
-        self.send_metadata(data::Metadata::Device(self.device()), addr)?;
-        for stream_id in STREAM_IDS {
-            let stream = self.stream(stream_id).expect("known stream");
-            self.send_metadata(data::Metadata::Stream(stream), addr)?;
-            self.send_metadata(
-                data::Metadata::Segment(self.segment_record(stream_id)),
-                addr,
-            )?;
-            for index in 0..stream.n_columns {
-                let column = self.column(stream_id, index).expect("known column");
-                self.send_metadata(data::Metadata::Column(column), addr)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn send_heartbeat(&self, addr: SocketAddr) -> io::Result<()> {
-        let beat = heartbeat::Heartbeat::Session(SessionId::new(self.session_id));
-        self.send_written(
-            addr,
-            DeviceRoute::root(),
-            || format!("heartbeat session={}", self.session_id),
-            |buf| beat.write(buf),
-        )
-    }
-
-    /// The `rpc.hash` broadcast a device sends on connect, so a client knows
-    /// which RPC table it is talking to before it asks anything.
-    fn send_rpc_hash_setting(&self, addr: SocketAddr) -> io::Result<()> {
-        let hash = self.rpc_hash.to_le_bytes();
-        let setting = settings::Setting {
-            name: b"rpc.hash",
-            flags: 0,
-            reply: &hash,
-        };
-        self.send_written(
-            addr,
-            DeviceRoute::root(),
-            || "rpc.hash setting".to_string(),
-            |buf| setting.write(buf),
-        )
     }
 
     fn send_metadata(&self, record: data::Metadata<'_>, addr: SocketAddr) -> io::Result<()> {
@@ -1287,36 +1118,6 @@ impl TestDevice {
             DeviceRoute::root(),
             move || format!("metadata {record:?}"),
             move |buf| record.write(data::MetadataFlags::UPDATE, buf),
-        )
-    }
-
-    fn send_rpc_reply(
-        &self,
-        id: u16,
-        reply: &[u8],
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        self.send_written(
-            addr,
-            routing,
-            || format!("rpc reply id={id} reply_bytes={}", reply.len()),
-            |buf| rpc::write_reply(buf, RpcRequestId::new(id), reply),
-        )
-    }
-
-    fn send_rpc_error(
-        &self,
-        id: u16,
-        error: RpcError,
-        routing: DeviceRoute,
-        addr: SocketAddr,
-    ) -> io::Result<()> {
-        self.send_written(
-            addr,
-            routing,
-            || format!("rpc error id={id} error={error:?}"),
-            |buf| rpc::write_error(buf, RpcRequestId::new(id), error),
         )
     }
 
@@ -1344,24 +1145,53 @@ impl TestDevice {
         Ok(())
     }
 
-    fn segment_record(&self, stream_id: u8) -> data::Segment<'static> {
-        let (segment_id, start_time, sampling_rate) = match stream_id {
-            AUX_STREAM_ID => (
-                self.aux_segment_id,
-                self.aux_segment_start_time,
-                AUX_SAMPLE_RATE,
-            ),
-            _ => (self.segment_id, self.segment_start_time, self.sample_rate),
-        };
+    fn streams(&self) -> SimStreams {
+        SimStreams {
+            session: self.device.session,
+            sample_rate: self.sample_rate,
+            segment_seconds: self.segment_seconds,
+            sine: Run {
+                segment_id: self.segment_id,
+                start_time: self.segment_start_time,
+            },
+            aux: Run {
+                segment_id: self.aux_segment_id,
+                start_time: self.aux_segment_start_time,
+            },
+        }
+    }
+}
 
+#[derive(Clone, Copy)]
+struct Run {
+    segment_id: u8,
+    start_time: u32,
+}
+
+/// The streams as their metadata describes them right now.
+#[derive(Clone, Copy)]
+struct SimStreams {
+    session: SessionId,
+    sample_rate: u32,
+    segment_seconds: u32,
+    sine: Run,
+    aux: Run,
+}
+
+impl SimStreams {
+    fn current(&self, stream_id: u8) -> data::Segment<'static> {
+        let (run, sampling_rate) = match stream_id {
+            AUX_STREAM_ID => (self.aux, AUX_SAMPLE_RATE),
+            _ => (self.sine, self.sample_rate),
+        };
         data::Segment {
             stream_id: StreamId::new(stream_id),
-            segment_id: SegmentId::new(segment_id),
+            segment_id: SegmentId::new(run.segment_id),
             flags: data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE,
             epoch: sync::Epoch::UNIX,
             timeref_serial: DEVICE_SERIAL,
-            timeref_session: SessionId::new(self.session_id),
-            start_time,
+            timeref_session: self.session,
+            start_time: run.start_time,
             sampling_rate,
             decimation: 1,
             filter_cutoff: sampling_rate as f32 / 2.0,
@@ -1371,8 +1201,8 @@ impl TestDevice {
 
     /// The segment record for a segment other than the one being acquired: it
     /// starts one segment length later for each step past the current one.
-    fn segment_record_at(&self, stream_id: u8, segment_id: u8) -> data::Segment<'static> {
-        let mut segment = self.segment_record(stream_id);
+    fn at(&self, stream_id: u8, segment_id: u8) -> data::Segment<'static> {
+        let mut segment = self.current(stream_id);
         let ahead = u32::from((segment_id + N_SEGMENTS - segment.segment_id.value()) % N_SEGMENTS);
         segment.start_time = segment
             .start_time
@@ -1382,18 +1212,8 @@ impl TestDevice {
     }
 }
 
-impl Records for TestDevice {
-    fn device(&self) -> data::Device<'_> {
-        data::Device {
-            session: SessionId::new(self.session_id),
-            n_streams: STREAM_IDS.len() as u8,
-            name: DEVICE_NAME,
-            serial: DEVICE_SERIAL,
-            firmware: DEVICE_FIRMWARE,
-        }
-    }
-
-    fn stream_ids(&self) -> impl Iterator<Item = u8> {
+impl Streams for SimStreams {
+    fn ids(&self) -> impl Iterator<Item = u8> {
         STREAM_IDS.into_iter()
     }
 
@@ -1419,8 +1239,8 @@ impl Records for TestDevice {
             return None;
         }
         Some(match index {
-            CURRENT_SEGMENT => self.segment_record(stream_id),
-            index => self.segment_record_at(stream_id, index),
+            CURRENT_SEGMENT => self.current(stream_id),
+            index => self.at(stream_id, index),
         })
     }
 
@@ -1452,6 +1272,27 @@ impl Records for TestDevice {
             units,
             description,
         })
+    }
+}
+
+/// A non-negative f64 property: no argument reads it, eight bytes write it.
+fn nonnegative_f64(args: &[u8], current: f64) -> Result<f64, RpcError> {
+    let value = match args.len() {
+        0 => current,
+        8 => f64::from_le_bytes(args.try_into().unwrap()),
+        _ => return Err(RpcError::ArgsSize),
+    };
+    (value.is_finite() && value >= 0.0)
+        .then_some(value)
+        .ok_or(RpcError::Invalid)
+}
+
+/// A u8 property: no argument reads it, one byte writes it.
+fn u8_property(args: &[u8], current: u8) -> Result<u8, RpcError> {
+    match args {
+        [] => Ok(current),
+        [value] => Ok(*value),
+        _ => Err(RpcError::ArgsSize),
     }
 }
 
@@ -1504,6 +1345,8 @@ fn unix_time_secs(now: Duration) -> u32 {
 mod tests {
     use super::*;
     use clap::Parser;
+    use twinleaf_device::metadata;
+    use twinleaf_device::rpc::REPLY_MAX;
 
     #[test]
     fn capture_buffer_exports_indexed_blocks_after_delay() {
@@ -1535,7 +1378,7 @@ mod tests {
 
     #[test]
     fn default_capture_block_size_fits_rpc_replies() {
-        assert!(usize::from(CAPTURE_DEFAULT_BLOCK_SIZE) <= table::REPLY_MAX);
+        assert!(usize::from(CAPTURE_DEFAULT_BLOCK_SIZE) <= REPLY_MAX);
     }
 
     #[test]
@@ -1543,8 +1386,9 @@ mod tests {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
         let device = TestDevice::new(cli).unwrap();
 
+        let streams = device.streams();
         let mut out = Reply::new();
-        metadata::reply(&device, &[], &mut out).unwrap();
+        metadata::reply(device.device.record(&streams), &streams, &[], &mut out).unwrap();
         let kinds: Vec<_> = data::MetadataReply::parse(&out)
             .unwrap()
             .map(|(kind, _)| kind)
@@ -1567,10 +1411,11 @@ mod tests {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
         let device = TestDevice::new(cli).unwrap();
 
-        let segment = device.segment(SINE_STREAM_ID, CURRENT_SEGMENT).unwrap();
+        let streams = device.streams();
+        let segment = streams.segment(SINE_STREAM_ID, CURRENT_SEGMENT).unwrap();
         assert_eq!(segment.segment_id.value(), device.segment_id);
-        assert!(device.stream(99).is_none());
-        assert!(device.segment(99, CURRENT_SEGMENT).is_none());
+        assert!(streams.stream(99).is_none());
+        assert!(streams.segment(99, CURRENT_SEGMENT).is_none());
     }
 
     #[test]

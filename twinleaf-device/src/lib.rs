@@ -5,5 +5,6 @@
 #![warn(rustdoc::all)]
 
 pub mod capture;
+pub mod device;
 pub mod metadata;
 pub mod rpc;

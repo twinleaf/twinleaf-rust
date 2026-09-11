@@ -14,12 +14,10 @@ use twinleaf_proto::rpc::RpcError;
 
 use crate::rpc::Reply;
 
-/// The records a device has. `None` is a stream or index it does not have.
-pub trait Records {
-    /// The device record.
-    fn device(&self) -> data::Device<'_>;
+/// The streams a device has. `None` is a stream or index it does not have.
+pub trait Streams {
     /// Every stream id, in bootstrap order.
-    fn stream_ids(&self) -> impl Iterator<Item = u8>;
+    fn ids(&self) -> impl Iterator<Item = u8>;
     /// The shape of a stream.
     fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>>;
     /// A segment of a stream, with [`CURRENT_SEGMENT`] naming the one acquiring.
@@ -28,17 +26,22 @@ pub trait Records {
     fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>>;
 }
 
-/// Answer `dev.metadata` into `out`.
-pub fn reply(records: &impl Records, arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+/// Answer `dev.metadata` into `out` for the device `device` describes.
+pub fn reply(
+    device: data::Device<'_>,
+    streams: &impl Streams,
+    arg: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
     let query = MetadataQuery::parse(arg).map_err(|error| match error {
         MetadataQueryError::Misaligned => RpcError::ArgsSize,
         MetadataQueryError::TooManySelectors => RpcError::Invalid,
     })?;
     if query.is_bootstrap() {
-        return bootstrap(records, out);
+        return bootstrap(device, streams, out);
     }
     for selector in query.selectors() {
-        let record = select(records, selector).ok_or(RpcError::Invalid)?;
+        let record = select(device, streams, selector).ok_or(RpcError::Invalid)?;
         if !append(out, record)? {
             break;
         }
@@ -47,33 +50,41 @@ pub fn reply(records: &impl Records, arg: &[u8], out: &mut Reply) -> Result<(), 
 }
 
 /// The record a selector names.
-pub fn select(records: &impl Records, selector: MetadataSelector) -> Option<Metadata<'_>> {
+pub fn select<'a>(
+    device: data::Device<'a>,
+    streams: &'a impl Streams,
+    selector: MetadataSelector,
+) -> Option<Metadata<'a>> {
     let MetadataSelector {
         mtype,
         stream_id,
         index,
     } = selector;
     match mtype {
-        MetadataType::Device => Some(Metadata::Device(records.device())),
-        MetadataType::Stream => records.stream(stream_id).map(Metadata::Stream),
-        MetadataType::Segment => records.segment(stream_id, index).map(Metadata::Segment),
-        MetadataType::Column => records.column(stream_id, index).map(Metadata::Column),
+        MetadataType::Device => Some(Metadata::Device(device)),
+        MetadataType::Stream => streams.stream(stream_id).map(Metadata::Stream),
+        MetadataType::Segment => streams.segment(stream_id, index).map(Metadata::Segment),
+        MetadataType::Column => streams.column(stream_id, index).map(Metadata::Column),
         MetadataType::Unknown(_) => None,
     }
 }
 
 /// A listed stream the device cannot describe is an internal error.
-fn bootstrap(records: &impl Records, out: &mut Reply) -> Result<(), RpcError> {
-    if !append(out, Metadata::Device(records.device()))? {
+fn bootstrap(
+    device: data::Device<'_>,
+    streams: &impl Streams,
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    if !append(out, Metadata::Device(device))? {
         return Ok(());
     }
-    for stream_id in records.stream_ids() {
-        let stream = records.stream(stream_id).ok_or(RpcError::Internal)?;
-        let segment = records
+    for stream_id in streams.ids() {
+        let stream = streams.stream(stream_id).ok_or(RpcError::Internal)?;
+        let segment = streams
             .segment(stream_id, CURRENT_SEGMENT)
             .ok_or(RpcError::Internal)?;
         let columns = (0..stream.n_columns).map(|index| {
-            records
+            streams
                 .column(stream_id, index)
                 .map(Metadata::Column)
                 .ok_or(RpcError::Internal)
@@ -117,22 +128,20 @@ mod tests {
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, SessionId, StreamId};
 
-    struct Fixture {
-        name: &'static str,
+    struct Fixture;
+
+    fn device(name: &str) -> data::Device<'_> {
+        data::Device {
+            session: SessionId::new(7),
+            n_streams: 2,
+            name,
+            serial: "S1",
+            firmware: "fw",
+        }
     }
 
-    impl Records for Fixture {
-        fn device(&self) -> data::Device<'_> {
-            data::Device {
-                session: SessionId::new(7),
-                n_streams: 2,
-                name: self.name,
-                serial: "S1",
-                firmware: "fw",
-            }
-        }
-
-        fn stream_ids(&self) -> impl Iterator<Item = u8> {
+    impl Streams for Fixture {
+        fn ids(&self) -> impl Iterator<Item = u8> {
             [1, 2].into_iter()
         }
 
@@ -192,7 +201,7 @@ mod tests {
     #[test]
     fn bootstrap_replies_in_sweep_order() {
         let mut out = Reply::new();
-        reply(&Fixture { name: "d" }, &[], &mut out).unwrap();
+        reply(device("d"), &Fixture, &[], &mut out).unwrap();
         use MetadataType::*;
         assert_eq!(
             kinds(&out),
@@ -202,10 +211,9 @@ mod tests {
 
     #[test]
     fn a_full_reply_stops_at_a_frame_boundary() {
-        let fixture = Fixture { name: "d" };
         let frame = |selector: MetadataSelector| {
             let mut one = Reply::new();
-            reply(&fixture, &selector.encode(), &mut one).unwrap();
+            reply(device("d"), &Fixture, &selector.encode(), &mut one).unwrap();
             one.len()
         };
         let room_for_one = REPLY_MAX - frame(MetadataSelector::stream(1)) + 1;
@@ -213,7 +221,7 @@ mod tests {
         let mut out = Reply::new();
         let padding = room_for_one - frame(MetadataSelector::device());
         out.resize_default(padding).unwrap();
-        bootstrap(&fixture, &mut out).unwrap();
+        bootstrap(device("d"), &Fixture, &mut out).unwrap();
         assert_eq!(kinds(&out[padding..]), [MetadataType::Device]);
     }
 
@@ -224,7 +232,7 @@ mod tests {
         arg.extend(MetadataSelector::segment(1, CURRENT_SEGMENT).encode());
         arg.extend(MetadataSelector::device().encode());
         let mut out = Reply::new();
-        reply(&Fixture { name: "d" }, &arg, &mut out).unwrap();
+        reply(device("d"), &Fixture, &arg, &mut out).unwrap();
         use MetadataType::*;
         assert_eq!(kinds(&out), [Column, Segment, Device]);
         let (_, segment) = MetadataReply::parse(&out).unwrap().nth(1).unwrap();
@@ -233,28 +241,37 @@ mod tests {
 
     #[test]
     fn a_bad_request_is_refused() {
-        let fixture = Fixture { name: "d" };
         let mut out = Reply::new();
-        assert_eq!(reply(&fixture, &[1, 2], &mut out), Err(RpcError::ArgsSize));
+        assert_eq!(
+            reply(device("d"), &Fixture, &[1, 2], &mut out),
+            Err(RpcError::ArgsSize)
+        );
         let too_many: Vec<u8> = (0..17)
             .flat_map(|_| MetadataSelector::device().encode())
             .collect();
-        assert_eq!(reply(&fixture, &too_many, &mut out), Err(RpcError::Invalid));
+        assert_eq!(
+            reply(device("d"), &Fixture, &too_many, &mut out),
+            Err(RpcError::Invalid)
+        );
         let unknown = MetadataSelector::stream(9).encode();
-        assert_eq!(reply(&fixture, &unknown, &mut out), Err(RpcError::Invalid));
+        assert_eq!(
+            reply(device("d"), &Fixture, &unknown, &mut out),
+            Err(RpcError::Invalid)
+        );
         let no_such_segment = MetadataSelector::segment(1, 4).encode();
         assert_eq!(
-            reply(&fixture, &no_such_segment, &mut out),
+            reply(device("d"), &Fixture, &no_such_segment, &mut out),
             Err(RpcError::Invalid)
         );
     }
 
     #[test]
     fn a_record_longer_than_a_frame_is_an_internal_error() {
-        let fixture = Fixture {
-            name: Box::leak("n".repeat(300).into_boxed_str()),
-        };
+        let long = "n".repeat(300);
         let mut out = Reply::new();
-        assert_eq!(reply(&fixture, &[], &mut out), Err(RpcError::Internal));
+        assert_eq!(
+            reply(device(&long), &Fixture, &[], &mut out),
+            Err(RpcError::Internal)
+        );
     }
 }
