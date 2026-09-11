@@ -12,4 +12,5 @@ keywords = ["twinleaf", "protocol", "no-std", "sensor", "firmware"]
 categories = ["embedded", "no-std"]
 
 [dependencies]
+heapless = "0.9"
 twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }

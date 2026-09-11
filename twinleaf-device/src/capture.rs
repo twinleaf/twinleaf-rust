@@ -8,7 +8,7 @@
 use twinleaf_proto::capture::CaptureMetadata;
 use twinleaf_proto::rpc::RpcError;
 
-use crate::rpc::reply;
+use crate::rpc::{put, Reply};
 
 /// Where a capture stands, as the status selector reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,17 +67,20 @@ pub struct Capture<'a> {
 }
 
 impl Capture<'_> {
-    /// Answer a selector into `out`, the reply length on success. A trigger
-    /// that is allowed gets an empty reply; starting the capture is the
-    /// device's to do.
-    pub fn reply(&self, selector: Selector, out: &mut [u8]) -> Result<usize, RpcError> {
+    /// Answer a selector into `out`. A trigger that is allowed gets an empty
+    /// reply; starting the capture is the device's to do.
+    pub fn reply(&self, selector: Selector, out: &mut Reply) -> Result<(), RpcError> {
         let busy = self.status == Status::Capturing;
         match selector {
             Selector::Trigger | Selector::Block(_) if busy => Err(RpcError::Busy),
-            Selector::Trigger => Ok(0),
-            Selector::Status => reply(out, &[&[self.status as u8]]),
-            Selector::Metadata => self.metadata.write(out).ok_or(RpcError::NoBufs),
-            Selector::Block(index) => reply(out, &[self.block(index).ok_or(RpcError::Invalid)?]),
+            Selector::Trigger => Ok(()),
+            Selector::Status => put(out, &[self.status as u8]),
+            Selector::Metadata => {
+                let mut buf = [0u8; crate::rpc::REPLY_MAX];
+                let len = self.metadata.write(&mut buf).ok_or(RpcError::NoBufs)?;
+                put(out, &buf[..len])
+            }
+            Selector::Block(index) => put(out, self.block(index).ok_or(RpcError::Invalid)?),
         }
     }
 
@@ -149,9 +152,9 @@ mod tests {
         assert_eq!(capture.block(2), Some(&[8, 9][..]));
         assert_eq!(capture.block(3), None);
 
-        let mut out = [0u8; 8];
-        assert_eq!(capture.reply(Selector::Block(2), &mut out), Ok(2));
-        assert_eq!(&out[..2], &[8, 9]);
+        let mut out = Reply::new();
+        assert_eq!(capture.reply(Selector::Block(2), &mut out), Ok(()));
+        assert_eq!(out.as_slice(), &[8, 9]);
         assert_eq!(
             capture.reply(Selector::Block(3), &mut out),
             Err(RpcError::Invalid)
@@ -161,7 +164,7 @@ mod tests {
     #[test]
     fn a_capture_in_progress_refuses_triggers_and_reads() {
         let capture = capture(Status::Capturing, &[]);
-        let mut out = [0u8; 8];
+        let mut out = Reply::new();
         assert_eq!(
             capture.reply(Selector::Trigger, &mut out),
             Err(RpcError::Busy)
@@ -170,22 +173,22 @@ mod tests {
             capture.reply(Selector::Block(0), &mut out),
             Err(RpcError::Busy)
         );
-        assert_eq!(capture.reply(Selector::Status, &mut out), Ok(1));
-        assert_eq!(out[0], Status::Capturing as u8);
+        assert_eq!(capture.reply(Selector::Status, &mut out), Ok(()));
+        assert_eq!(out.as_slice(), &[Status::Capturing as u8]);
 
         let capture = super::Capture {
             status: Status::Idle,
             ..capture
         };
-        assert_eq!(capture.reply(Selector::Trigger, &mut out), Ok(0));
+        assert_eq!(capture.reply(Selector::Trigger, &mut out), Ok(()));
     }
 
     #[test]
     fn metadata_round_trips() {
         let data = [0u8; 12];
         let capture = capture(Status::Done, &data);
-        let mut out = [0u8; 64];
-        let len = capture.reply(Selector::Metadata, &mut out).unwrap();
-        assert_eq!(CaptureMetadata::parse(&out[..len]), Some(capture.metadata));
+        let mut out = Reply::new();
+        capture.reply(Selector::Metadata, &mut out).unwrap();
+        assert_eq!(CaptureMetadata::parse(&out), Some(capture.metadata));
     }
 }

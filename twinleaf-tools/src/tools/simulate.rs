@@ -23,7 +23,7 @@ use twinleaf::proto::{
 use twinleaf::tio::packet;
 use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::metadata::{self, Records};
-use twinleaf_device::rpc::{self as table, Access, RpcSpec, Value};
+use twinleaf_device::rpc::{self as table, Access, Reply, RpcSpec, Value};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;
@@ -771,11 +771,11 @@ impl TestDevice {
         id: u16,
         routing: DeviceRoute,
         addr: SocketAddr,
-        answer: impl FnOnce(&mut [u8]) -> Result<usize, RpcError>,
+        answer: impl FnOnce(&mut Reply) -> Result<(), RpcError>,
     ) -> io::Result<()> {
-        let mut out = [0u8; table::REPLY_MAX];
+        let mut out = Reply::new();
         match answer(&mut out) {
-            Ok(len) => self.send_rpc_reply(id, &out[..len], routing, addr),
+            Ok(()) => self.send_rpc_reply(id, &out, routing, addr),
             Err(error) => self.send_rpc_error(id, error, routing, addr),
         }
     }
@@ -848,17 +848,17 @@ impl TestDevice {
         routing: DeviceRoute,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        let mut out = [0u8; table::REPLY_MAX];
+        let mut out = Reply::new();
         let answered = Selector::parse(arg).and_then(|selector| {
-            let len = self.capture.view().reply(selector, &mut out)?;
-            Ok((selector, len))
+            self.capture.view().reply(selector, &mut out)?;
+            Ok(selector)
         });
         match answered {
-            Ok((Selector::Trigger, len)) => {
+            Ok(Selector::Trigger) => {
                 self.trigger_capture();
-                self.send_rpc_reply(id, &out[..len], routing, addr)
+                self.send_rpc_reply(id, &out, routing, addr)
             }
-            Ok((_, len)) => self.send_rpc_reply(id, &out[..len], routing, addr),
+            Ok(_) => self.send_rpc_reply(id, &out, routing, addr),
             Err(error) => self.send_rpc_error(id, error, routing, addr),
         }
     }
@@ -1543,9 +1543,9 @@ mod tests {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
         let device = TestDevice::new(cli).unwrap();
 
-        let mut out = [0u8; table::REPLY_MAX];
-        let len = metadata::reply(&device, &[], &mut out).unwrap();
-        let kinds: Vec<_> = data::MetadataReply::parse(&out[..len])
+        let mut out = Reply::new();
+        metadata::reply(&device, &[], &mut out).unwrap();
+        let kinds: Vec<_> = data::MetadataReply::parse(&out)
             .unwrap()
             .map(|(kind, _)| kind)
             .collect();
@@ -1620,13 +1620,13 @@ mod tests {
             .capture
             .update(Instant::now() + Duration::from_millis(1));
 
-        let mut out = [0u8; table::REPLY_MAX];
-        let len = device
+        let mut out = Reply::new();
+        device
             .capture
             .view()
             .reply(Selector::Metadata, &mut out)
             .unwrap();
-        let metadata = CaptureMetadata::parse(&out[..len]).unwrap();
+        let metadata = CaptureMetadata::parse(&out).unwrap();
 
         assert_eq!(metadata.version, METADATA_VERSION);
         assert_eq!(metadata.data_type, data::DataType::F32);

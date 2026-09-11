@@ -10,6 +10,9 @@ use twinleaf_proto::serial::CRC32;
 /// Largest RPC reply: the payload less the two-byte request id.
 pub const REPLY_MAX: usize = Packet::MAX_PAYLOAD - 2;
 
+/// The value an RPC replies with.
+pub type Reply = heapless::Vec<u8, REPLY_MAX>;
+
 /// How a method is called.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -180,21 +183,21 @@ pub fn hash(table: &[RpcSpec]) -> u32 {
 }
 
 /// `rpc.name`: the name of the method at an index.
-pub fn name(table: &[RpcSpec], arg: &[u8], out: &mut [u8]) -> Result<usize, RpcError> {
+pub fn name(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
-    reply(out, &[spec.name.as_bytes()])
+    put(out, spec.name.as_bytes())
 }
 
 /// `rpc.id`: the index of the method with a name.
-pub fn id(table: &[RpcSpec], arg: &[u8], out: &mut [u8]) -> Result<usize, RpcError> {
+pub fn id(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     let index = find(table, arg)?;
-    reply(out, &[&(index as u16).to_le_bytes()])
+    put(out, &(index as u16).to_le_bytes())
 }
 
 /// `rpc.info`: the metadata of the method with a name.
-pub fn info(table: &[RpcSpec], arg: &[u8], out: &mut [u8]) -> Result<usize, RpcError> {
+pub fn info(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     let spec = &table[find(table, arg)?];
-    reply(out, &[&spec.legacy_metadata().to_le_bytes()])
+    put(out, &spec.legacy_metadata().to_le_bytes())
 }
 
 /// `rpc.list` and `rpc.listinfo`: the table size with no argument, or the name
@@ -203,19 +206,16 @@ pub fn list(
     table: &[RpcSpec],
     arg: &[u8],
     with_info: bool,
-    out: &mut [u8],
-) -> Result<usize, RpcError> {
+    out: &mut Reply,
+) -> Result<(), RpcError> {
     if arg.is_empty() {
-        return reply(out, &[&(table.len() as u16).to_le_bytes()]);
+        return put(out, &(table.len() as u16).to_le_bytes());
     }
     let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
-    let meta = spec.legacy_metadata().to_le_bytes();
-    let parts: &[&[u8]] = if with_info {
-        &[&meta, spec.name.as_bytes()]
-    } else {
-        &[spec.name.as_bytes()]
-    };
-    reply(out, parts)
+    if with_info {
+        put(out, &spec.legacy_metadata().to_le_bytes())?;
+    }
+    put(out, spec.name.as_bytes())
 }
 
 fn index(arg: &[u8]) -> Result<usize, RpcError> {
@@ -233,17 +233,9 @@ fn find(table: &[RpcSpec], name: &[u8]) -> Result<usize, RpcError> {
         .ok_or(RpcError::Invalid)
 }
 
-/// Concatenate `parts` into `out` as one reply, its length on success.
-pub(crate) fn reply(out: &mut [u8], parts: &[&[u8]]) -> Result<usize, RpcError> {
-    let len = parts.iter().map(|part| part.len()).sum();
-    if out.len() < len {
-        return Err(RpcError::NoBufs);
-    }
-    parts.iter().fold(0, |at, part| {
-        out[at..at + part.len()].copy_from_slice(part);
-        at + part.len()
-    });
-    Ok(len)
+/// Append `bytes` to a reply.
+pub fn put(out: &mut Reply, bytes: &[u8]) -> Result<(), RpcError> {
+    out.extend_from_slice(bytes).map_err(|_| RpcError::NoBufs)
 }
 
 #[cfg(test)]
@@ -323,42 +315,57 @@ mod tests {
         assert_eq!(hash(&table), CRC32.checksum(b"a\x01\0\0\0"));
     }
 
+    fn answer(call: impl FnOnce(&mut Reply) -> Result<(), RpcError>) -> Result<Vec<u8>, RpcError> {
+        let mut out = Reply::new();
+        call(&mut out).map(|()| out.to_vec())
+    }
+
     #[test]
     fn introspection_answers_by_index_and_by_name() {
         let table = table();
-        let mut out = [0u8; REPLY_MAX];
 
-        assert_eq!(list(&table, &[], false, &mut out), Ok(2));
-        assert_eq!(&out[..2], &3u16.to_le_bytes());
-
-        assert_eq!(name(&table, &1u16.to_le_bytes(), &mut out), Ok(8));
-        assert_eq!(&out[..8], b"dev.stop");
         assert_eq!(
-            name(&table, &3u16.to_le_bytes(), &mut out),
+            answer(|out| list(&table, &[], false, out)),
+            Ok(3u16.to_le_bytes().to_vec())
+        );
+
+        assert_eq!(
+            answer(|out| name(&table, &1u16.to_le_bytes(), out)),
+            Ok(b"dev.stop".to_vec())
+        );
+        assert_eq!(
+            answer(|out| name(&table, &3u16.to_le_bytes(), out)),
             Err(RpcError::Invalid)
         );
-        assert_eq!(name(&table, &[1], &mut out), Err(RpcError::ArgsSize));
+        assert_eq!(
+            answer(|out| name(&table, &[1], out)),
+            Err(RpcError::ArgsSize)
+        );
 
-        assert_eq!(id(&table, b"test.enable", &mut out), Ok(2));
-        assert_eq!(&out[..2], &2u16.to_le_bytes());
-        assert_eq!(id(&table, b"", &mut out), Err(RpcError::Invalid));
-        assert_eq!(id(&table, b"nope", &mut out), Err(RpcError::Invalid));
+        assert_eq!(
+            answer(|out| id(&table, b"test.enable", out)),
+            Ok(2u16.to_le_bytes().to_vec())
+        );
+        assert_eq!(answer(|out| id(&table, b"", out)), Err(RpcError::Invalid));
+        assert_eq!(
+            answer(|out| id(&table, b"nope", out)),
+            Err(RpcError::Invalid)
+        );
 
-        assert_eq!(info(&table, b"dev.stop", &mut out), Ok(2));
-        assert_eq!(&out[..2], &0x8000u16.to_le_bytes());
+        assert_eq!(
+            answer(|out| info(&table, b"dev.stop", out)),
+            Ok(0x8000u16.to_le_bytes().to_vec())
+        );
 
-        assert_eq!(list(&table, &2u16.to_le_bytes(), true, &mut out), Ok(13));
-        assert_eq!(&out[..2], &table[2].legacy_metadata().to_le_bytes());
-        assert_eq!(&out[2..13], b"test.enable");
+        let listed = answer(|out| list(&table, &2u16.to_le_bytes(), true, out)).unwrap();
+        assert_eq!(&listed[..2], &table[2].legacy_metadata().to_le_bytes());
+        assert_eq!(&listed[2..], b"test.enable");
     }
 
     #[test]
     fn a_reply_that_does_not_fit_is_refused() {
-        let table = table();
-        let mut out = [0u8; 4];
-        assert_eq!(
-            name(&table, &0u16.to_le_bytes(), &mut out),
-            Err(RpcError::NoBufs)
-        );
+        let mut out = Reply::new();
+        assert_eq!(put(&mut out, &[0; REPLY_MAX]), Ok(()));
+        assert_eq!(put(&mut out, &[0]), Err(RpcError::NoBufs));
     }
 }

@@ -12,6 +12,8 @@ use twinleaf_proto::data::{
 };
 use twinleaf_proto::rpc::RpcError;
 
+use crate::rpc::Reply;
+
 /// The records a device has. `None` is a stream or index it does not have.
 pub trait Records {
     /// The device record.
@@ -26,24 +28,22 @@ pub trait Records {
     fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>>;
 }
 
-/// Answer `dev.metadata` into `out`, the reply length on success.
-pub fn reply(records: &impl Records, arg: &[u8], out: &mut [u8]) -> Result<usize, RpcError> {
+/// Answer `dev.metadata` into `out`.
+pub fn reply(records: &impl Records, arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     let query = MetadataQuery::parse(arg).map_err(|error| match error {
         MetadataQueryError::Misaligned => RpcError::ArgsSize,
         MetadataQueryError::TooManySelectors => RpcError::Invalid,
     })?;
-    let mut reply = Reply { out, len: 0 };
     if query.is_bootstrap() {
-        bootstrap(records, &mut reply)?;
-        return Ok(reply.len);
+        return bootstrap(records, out);
     }
     for selector in query.selectors() {
         let record = select(records, selector).ok_or(RpcError::Invalid)?;
-        if !reply.append(record)? {
+        if !append(out, record)? {
             break;
         }
     }
-    Ok(reply.len)
+    Ok(())
 }
 
 /// The record a selector names.
@@ -63,8 +63,8 @@ pub fn select(records: &impl Records, selector: MetadataSelector) -> Option<Meta
 }
 
 /// A listed stream the device cannot describe is an internal error.
-fn bootstrap(records: &impl Records, reply: &mut Reply<'_>) -> Result<(), RpcError> {
-    if !reply.append(Metadata::Device(records.device()))? {
+fn bootstrap(records: &impl Records, out: &mut Reply) -> Result<(), RpcError> {
+    if !append(out, Metadata::Device(records.device()))? {
         return Ok(());
     }
     for stream_id in records.stream_ids() {
@@ -82,7 +82,7 @@ fn bootstrap(records: &impl Records, reply: &mut Reply<'_>) -> Result<(), RpcErr
             .into_iter()
             .chain(columns);
         for record in records {
-            if !reply.append(record?)? {
+            if !append(out, record?)? {
                 return Ok(());
             }
         }
@@ -90,36 +90,30 @@ fn bootstrap(records: &impl Records, reply: &mut Reply<'_>) -> Result<(), RpcErr
     Ok(())
 }
 
-struct Reply<'a> {
-    out: &'a mut [u8],
-    len: usize,
-}
-
-impl Reply<'_> {
-    /// Append one `[type][length][record]` frame, whole or not at all: proto's
-    /// writers shorten strings to the room left, and a reply must never carry
-    /// a shortened record. `Ok(false)` means it did not fit.
-    fn append(&mut self, record: Metadata<'_>) -> Result<bool, RpcError> {
-        let len = record.record_len();
-        if len > usize::from(u8::MAX) {
-            return Err(RpcError::Internal);
-        }
-        let end = self.len + METADATA_REPLY_FRAME_HEADER + len;
-        if end > self.out.len() {
-            return Ok(false);
-        }
-        record.write_reply_frame(&mut self.out[self.len..end]);
-        self.len = end;
-        Ok(true)
+/// Append one `[type][length][record]` frame, whole or not at all: proto's
+/// writers shorten strings to the room left, and a reply must never carry a
+/// shortened record. `Ok(false)` means it did not fit.
+fn append(out: &mut Reply, record: Metadata<'_>) -> Result<bool, RpcError> {
+    let len = record.record_len();
+    if len > usize::from(u8::MAX) {
+        return Err(RpcError::Internal);
     }
+    let start = out.len();
+    if out
+        .resize_default(start + METADATA_REPLY_FRAME_HEADER + len)
+        .is_err()
+    {
+        return Ok(false);
+    }
+    record.write_reply_frame(&mut out[start..]);
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use twinleaf_proto::data::{
-        DataType, FilterType, MetadataReply, SegmentFlags, MAX_METADATA_REPLY_SIZE,
-    };
+    use crate::rpc::REPLY_MAX;
+    use twinleaf_proto::data::{DataType, FilterType, MetadataReply, SegmentFlags};
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, SessionId, StreamId};
 
@@ -197,11 +191,11 @@ mod tests {
 
     #[test]
     fn bootstrap_replies_in_sweep_order() {
-        let mut out = [0u8; MAX_METADATA_REPLY_SIZE];
-        let len = reply(&Fixture { name: "d" }, &[], &mut out).unwrap();
+        let mut out = Reply::new();
+        reply(&Fixture { name: "d" }, &[], &mut out).unwrap();
         use MetadataType::*;
         assert_eq!(
-            kinds(&out[..len]),
+            kinds(&out),
             [Device, Stream, Segment, Column, Column, Stream, Segment, Column, Column]
         );
     }
@@ -209,14 +203,18 @@ mod tests {
     #[test]
     fn a_full_reply_stops_at_a_frame_boundary() {
         let fixture = Fixture { name: "d" };
-        let mut whole = [0u8; MAX_METADATA_REPLY_SIZE];
-        let device_frame =
-            reply(&fixture, &MetadataSelector::device().encode(), &mut whole).unwrap();
+        let frame = |selector: MetadataSelector| {
+            let mut one = Reply::new();
+            reply(&fixture, &selector.encode(), &mut one).unwrap();
+            one.len()
+        };
+        let room_for_one = REPLY_MAX - frame(MetadataSelector::stream(1)) + 1;
 
-        let mut out = [0u8; MAX_METADATA_REPLY_SIZE];
-        let len = reply(&fixture, &[], &mut out[..device_frame + 3]).unwrap();
-        assert_eq!(len, device_frame);
-        assert_eq!(kinds(&out[..len]), [MetadataType::Device]);
+        let mut out = Reply::new();
+        let padding = room_for_one - frame(MetadataSelector::device());
+        out.resize_default(padding).unwrap();
+        bootstrap(&fixture, &mut out).unwrap();
+        assert_eq!(kinds(&out[padding..]), [MetadataType::Device]);
     }
 
     #[test]
@@ -225,18 +223,18 @@ mod tests {
         arg.extend(MetadataSelector::column(2, 1).encode());
         arg.extend(MetadataSelector::segment(1, CURRENT_SEGMENT).encode());
         arg.extend(MetadataSelector::device().encode());
-        let mut out = [0u8; MAX_METADATA_REPLY_SIZE];
-        let len = reply(&Fixture { name: "d" }, &arg, &mut out).unwrap();
+        let mut out = Reply::new();
+        reply(&Fixture { name: "d" }, &arg, &mut out).unwrap();
         use MetadataType::*;
-        assert_eq!(kinds(&out[..len]), [Column, Segment, Device]);
-        let (_, segment) = MetadataReply::parse(&out[..len]).unwrap().nth(1).unwrap();
+        assert_eq!(kinds(&out), [Column, Segment, Device]);
+        let (_, segment) = MetadataReply::parse(&out).unwrap().nth(1).unwrap();
         assert_eq!(data::Segment::parse(segment).unwrap().segment_id.value(), 3);
     }
 
     #[test]
     fn a_bad_request_is_refused() {
         let fixture = Fixture { name: "d" };
-        let mut out = [0u8; MAX_METADATA_REPLY_SIZE];
+        let mut out = Reply::new();
         assert_eq!(reply(&fixture, &[1, 2], &mut out), Err(RpcError::ArgsSize));
         let too_many: Vec<u8> = (0..17)
             .flat_map(|_| MetadataSelector::device().encode())
@@ -256,7 +254,7 @@ mod tests {
         let fixture = Fixture {
             name: Box::leak("n".repeat(300).into_boxed_str()),
         };
-        let mut out = [0u8; MAX_METADATA_REPLY_SIZE];
+        let mut out = Reply::new();
         assert_eq!(reply(&fixture, &[], &mut out), Err(RpcError::Internal));
     }
 }
