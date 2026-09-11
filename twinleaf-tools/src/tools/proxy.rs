@@ -22,7 +22,28 @@ use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::device::runtime;
 use twinleaf::proto;
 use twinleaf::proto::log::LogLevel;
+use twinleaf::proto::packet::PacketView;
+use twinleaf::proto::rpc::RpcError;
+use twinleaf::proto::SessionId;
 use twinleaf::tio::{self, packet, proxy};
+use twinleaf_device::device::{Device, Handled, Identity, Sink};
+use twinleaf_device::rpc::{Access, RpcSpec, Value};
+
+/// What the virtual hub answers: identity and introspection, nothing more.
+static HUB_RPCS: [RpcSpec; 12] = [
+    RpcSpec::std("rpc.name", Access::RW),
+    RpcSpec::std("rpc.id", Access::RW),
+    RpcSpec::std("rpc.info", Access::RW),
+    RpcSpec::std("rpc.list", Access::RW),
+    RpcSpec::std("rpc.listinfo", Access::RW),
+    RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
+    RpcSpec::prop("dev.name", Value::String, Access::READ),
+    RpcSpec::prop("dev.desc", Value::String, Access::READ),
+    RpcSpec::prop("dev.serial", Value::String, Access::READ),
+    RpcSpec::prop("dev.firmware.serial", Value::String, Access::READ),
+    RpcSpec::prop("dev.session", Value::Uint(4), Access::READ),
+    RpcSpec::std("dev.metadata", Access::RW),
+];
 
 /// Holders log their own lifecycle in full and never relay device logs.
 fn init_proxy_logging(verbose: bool, debug: bool, detached: bool) {
@@ -145,8 +166,8 @@ pub fn run_proxy_for(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     init_proxy_logging(cli.verbose, cli.debug, false);
     ProxyServer::foreground(
         ProxyConfig::from(&cli),
-        Layout {
-            mounts: picked
+        Layout::new(
+            picked
                 .into_iter()
                 .map(
                     |PickedSubtree {
@@ -162,7 +183,7 @@ pub fn run_proxy_for(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
                     },
                 )
                 .collect(),
-        },
+        )?,
     )?
     .run()
 }
@@ -215,17 +236,49 @@ struct Mount {
     picked_name: Option<String>,
 }
 
+/// The device at the root when the mounts leave it free: a hub in name and
+/// identity only, since the proxy already does the routing.
+#[derive(Debug, Clone)]
+struct Hub {
+    identity: Identity,
+    session: SessionId,
+}
+
+impl Hub {
+    fn new() -> eyre::Result<Hub> {
+        use std::hash::{BuildHasher, Hasher};
+        let serial = format!("PROXY{}", std::process::id());
+        let firmware = format!("twinleaf-tools-{}", env!("CARGO_PKG_VERSION"));
+        let desc = format!("Twinleaf HUB-PROXY R0 ({serial}) [{firmware}]");
+        let identity = Identity::new("HUB-PROXY", &desc, &serial, &firmware)
+            .ok_or_else(|| eyre::eyre!("virtual hub identity does not fit its fields"))?;
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        Ok(Hub {
+            identity,
+            session: SessionId::new(random as u32),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Layout {
     mounts: Vec<Mount>,
+    hub: Option<Hub>,
 }
 
 impl Layout {
+    /// Mounts that leave the root free get the virtual hub there.
+    fn new(mounts: Vec<Mount>) -> eyre::Result<Layout> {
+        let root_free = mounts.iter().all(|mount| !mount.prefix.is_empty());
+        let hub = root_free.then(Hub::new).transpose()?;
+        Ok(Layout { mounts, hub })
+    }
+
     fn from_cli(mount_args: Vec<MountArg>, sensor_url: Option<String>) -> eyre::Result<Layout> {
         if mount_args.is_empty() {
-            return Ok(Layout {
-                mounts: vec![resolve_root_mount(sensor_url)?],
-            });
+            return Layout::new(vec![resolve_root_mount(sensor_url)?]);
         }
         let mut prefixes = std::collections::HashSet::new();
         for arg in &mount_args {
@@ -233,8 +286,8 @@ impl Layout {
                 return Err(eyre::eyre!("duplicate mount prefix {}", arg.prefix));
             }
         }
-        Ok(Layout {
-            mounts: mount_args
+        Layout::new(
+            mount_args
                 .into_iter()
                 .map(|arg| Mount {
                     locator: arg.locator,
@@ -244,7 +297,7 @@ impl Layout {
                     picked_name: None,
                 })
                 .collect(),
-        })
+        )
     }
 }
 
@@ -363,6 +416,36 @@ impl SlowTracker {
             self.dropped = 0;
         }
     }
+}
+
+/// The virtual hub's packets, parsed for the client they are going to.
+#[derive(Default)]
+struct Outbox(Vec<packet::Packet>);
+
+impl Sink for Outbox {
+    fn send(&mut self, packet: &[u8]) {
+        match packet::Packet::from_slice_prefix(packet) {
+            Ok((pkt, _)) => self.0.push(pkt),
+            Err(err) => log::warn!("Dropping malformed virtual hub packet: {err:?}"),
+        }
+    }
+}
+
+/// Hand one packet to the client, dropping or disconnecting a slow one.
+fn deliver(
+    client: &tio::transport::Port,
+    pkt: packet::Packet,
+    slow: &mut SlowTracker,
+    addr: &str,
+    disconnect_slow: bool,
+) -> Result<(), Disconnect> {
+    match client.try_send(pkt) {
+        Ok(()) => slow.packet_delivered(addr),
+        Err(tio::transport::SendError::Full) if !disconnect_slow => slow.packet_dropped(addr),
+        Err(tio::transport::SendError::Full) => return Err(Disconnect::TooSlow),
+        Err(_) => return Err(Disconnect::ClientClosed),
+    }
+    Ok(())
 }
 
 /// The server fronting the TCP port: fans the mounted devices' traffic out
@@ -723,6 +806,9 @@ impl ProxyServer {
                     mount.picked_name.as_deref().unwrap_or("device")
                 );
             }
+            if let Some(hub) = &self.layout.hub {
+                println!("    /   virtual hub {}", hub.identity.name);
+            }
         }
         if self.foreground {
             println!("  TCP port: {}", self.config.tcp_port);
@@ -840,11 +926,19 @@ impl ProxyServer {
 
         let dump_traffic = self.config.dump_traffic;
         let disconnect_slow = self.config.disconnect_slow;
+        let hub = self.layout.hub.clone();
         clients.fetch_add(1, Ordering::Relaxed);
         let departure = Departure(clients.clone());
         std::thread::spawn(move || {
             let _departure = departure;
             let mut slow = SlowTracker::default();
+            let epoch = Instant::now();
+            let now_ms = || epoch.elapsed().as_millis() as u64;
+            let mut outbox = Outbox::default();
+            let mut hub = hub.map(|hub| Device::new(hub.identity, hub.session, &HUB_RPCS));
+            if let Some(hub) = hub.as_mut() {
+                hub.connected(&(), now_ms(), &mut outbox);
+            }
 
             // Slot 0 is the client's own traffic; slot 1 + i is ports[i].
             let mut sel = crossbeam::channel::Select::new();
@@ -854,7 +948,26 @@ impl ProxyServer {
             }
 
             let reason = loop {
-                let oper = sel.select();
+                let delivered = outbox
+                    .0
+                    .drain(..)
+                    .try_for_each(|pkt| deliver(&client, pkt, &mut slow, &addr, disconnect_slow));
+                if let Err(reason) = delivered {
+                    break reason;
+                }
+                let oper = match hub.as_mut() {
+                    None => sel.select(),
+                    Some(hub) => {
+                        let wait = hub.deadline().saturating_sub(now_ms());
+                        match sel.select_timeout(Duration::from_millis(wait)) {
+                            Ok(oper) => oper,
+                            Err(_) => {
+                                hub.tick(now_ms(), &mut outbox);
+                                continue;
+                            }
+                        }
+                    }
+                };
                 match oper.index() {
                     0 => {
                         let Ok(Ok(pkt)) = oper.recv(&client_rx) else {
@@ -871,11 +984,20 @@ impl ProxyServer {
                             }
                         }
                         let Some((relative, port)) = dest else {
-                            log::debug!(
-                                "Client {} addressed unmounted route {}",
-                                addr,
-                                pkt.route()
-                            );
+                            match hub.as_mut() {
+                                Some(hub) if pkt.route().is_empty() => {
+                                    let (view, _) = PacketView::parse_prefix(pkt.as_bytes())
+                                        .expect("a host packet is a wire packet");
+                                    if let Handled::Rpc(call) = hub.handle(&(), view, &mut outbox) {
+                                        call.reply(Err(RpcError::NotFound), &mut outbox);
+                                    }
+                                }
+                                _ => log::debug!(
+                                    "Client {} addressed unmounted route {}",
+                                    addr,
+                                    pkt.route()
+                                ),
+                            }
                             continue;
                         };
                         if port.try_send(pkt.with_route(relative)).is_err() {
@@ -899,13 +1021,10 @@ impl ProxyServer {
                         if dump_traffic && is_rpc(&pkt) {
                             log::info!("{}->{} -- {:?}", pkt.route(), addr, pkt.payload());
                         }
-                        match client.try_send(pkt) {
-                            Ok(()) => slow.packet_delivered(&addr),
-                            Err(tio::transport::SendError::Full) if !disconnect_slow => {
-                                slow.packet_dropped(&addr)
-                            }
-                            Err(tio::transport::SendError::Full) => break Disconnect::TooSlow,
-                            Err(_) => break Disconnect::ClientClosed,
+                        if let Err(reason) =
+                            deliver(&client, pkt, &mut slow, &addr, disconnect_slow)
+                        {
+                            break reason;
                         }
                     }
                 }

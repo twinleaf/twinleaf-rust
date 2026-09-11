@@ -26,6 +26,25 @@ pub trait Streams {
     fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>>;
 }
 
+/// A device with no streams.
+impl Streams for () {
+    fn ids(&self) -> impl Iterator<Item = u8> {
+        core::iter::empty()
+    }
+
+    fn stream(&self, _stream_id: u8) -> Option<data::Stream<'_>> {
+        None
+    }
+
+    fn segment(&self, _stream_id: u8, _index: u8) -> Option<data::Segment<'_>> {
+        None
+    }
+
+    fn column(&self, _stream_id: u8, _index: u8) -> Option<data::Column<'_>> {
+        None
+    }
+}
+
 /// Answer `dev.metadata` into `out` for the device `device` describes.
 pub fn reply(
     device: data::Device<'_>,
