@@ -1,8 +1,7 @@
+use crate::{parse_device_route, TioOpts};
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use std::time::Duration;
-use twinleaf::device::DeviceRoute;
-
-use crate::{parse_device_route, TioOpts};
+use twinleaf::DeviceRoute;
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -67,6 +66,11 @@ pub enum LogSubcommands {
         /// Sensor path in the sensor tree (e.g., /, /0, /0/1)
         #[arg(short = 's', long = "sensor", default_value = "/", value_parser = parse_device_route)]
         sensor: DeviceRoute,
+
+        /// Filter streams/columns using a glob pattern (e.g. "sync", "/0/vector").
+        /// Requires -d.
+        #[arg(short = 'g', long = "glob", requires = "data")]
+        glob: Option<String>,
 
         /// Routing depth limit (default: unlimited)
         #[arg(long = "depth")]

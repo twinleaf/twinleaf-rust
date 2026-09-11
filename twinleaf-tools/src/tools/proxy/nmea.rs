@@ -1,0 +1,93 @@
+use crate::TioOpts;
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use twinleaf::device::Device;
+use twinleaf::Connection;
+
+pub(super) fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
+    use color_eyre::Help;
+    use eyre::WrapErr;
+
+    let connection = Connection::open(&tio.root)?;
+    let route = tio.route;
+
+    let bind_addr = format!("0.0.0.0:{}", tcp_port);
+    let listener = TcpListener::bind(&bind_addr)
+        .wrap_err_with(|| format!("could not bind to {}", bind_addr))
+        .suggestion(format!("port {} may be in use; try -p <N>", tcp_port))?;
+
+    println!("Listening on {}", bind_addr);
+
+    for stream in listener.incoming().flatten() {
+        let device = connection.device(route);
+        thread::spawn(move || broadcast_to_client(stream, device));
+    }
+    Ok(())
+}
+
+fn format_nmea_sentence(talker_id: &str, sentence_type: &str, fields: &[String]) -> String {
+    let mut sentence = format!("${}{}", talker_id, sentence_type);
+    for field in fields {
+        sentence.push(',');
+        sentence.push_str(field);
+    }
+
+    // Calculate checksum
+    let checksum = sentence[1..].bytes().fold(0u8, |acc, b| acc ^ b);
+    format!("{}*{:02X}\r\n", sentence, checksum)
+}
+
+fn broadcast_to_client(mut stream: TcpStream, device: Device) {
+    let peer_addr = stream.peer_addr().map_or_else(
+        |error| format!("<unknown: {error}>"),
+        |peer| peer.to_string(),
+    );
+    println!("Connection from: {}", peer_addr);
+
+    let batches = device.samples();
+
+    'outer: loop {
+        let batch = match batches.recv() {
+            Ok(batch) => batch,
+            Err(e) => {
+                eprintln!("stream ended: {e}");
+                break;
+            }
+        };
+
+        // Only process samples from stream ID 1
+        if batch.stream().stream_id.value() != 1 {
+            continue;
+        }
+
+        for row in batch.iter() {
+            // Convert timestamp to NMEA format (HHMMSS.SS)
+            let timestamp = row.timestamp_end();
+            let hours = (timestamp / 3600.0) as u32;
+            let minutes = ((timestamp % 3600.0) / 60.0) as u32;
+            let seconds = timestamp % 60.0;
+            let time_str = format!("{:02}{:02}{:05.2}", hours, minutes, seconds);
+
+            // Format data fields
+            let mut fields = vec![time_str];
+            for value in row.values() {
+                let value = match value {
+                    twinleaf::data::ColumnData::Int(x) => format!("{}", x),
+                    twinleaf::data::ColumnData::UInt(x) => format!("{}", x),
+                    twinleaf::data::ColumnData::Float(x) => format!("{:.2}", x),
+                    twinleaf::data::ColumnData::Unknown => "?".to_string(),
+                };
+                fields.push(value);
+            }
+
+            // Create NMEA sentence
+            let nmea = format_nmea_sentence("TL", "MAG", &fields);
+
+            if write!(stream, "{}", nmea).is_err() {
+                break 'outer;
+            }
+        }
+    }
+    println!("Disconnected: {}", peer_addr);
+}

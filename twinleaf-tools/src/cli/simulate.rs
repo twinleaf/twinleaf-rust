@@ -37,4 +37,8 @@ pub struct SimulateCli {
     /// UDP port to listen on
     #[arg(long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Never randomly drop samples (the 'd' key still drops one manually)
+    #[arg(long = "no-drop")]
+    pub(crate) no_drop: bool,
 }

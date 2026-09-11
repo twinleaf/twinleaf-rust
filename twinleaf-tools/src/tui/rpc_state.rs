@@ -1,7 +1,4 @@
-use twinleaf::{
-    device::{RpcList, RpcRegistry},
-    tio::proto::{identifiers::SessionId, ProxyStatus},
-};
+use twinleaf::{device::rpc::RpcRegistry, tio::packet::ProxyStatus, SessionId};
 
 use crate::tui::rpc_palette::RpcPaletteStatus;
 
@@ -141,8 +138,7 @@ impl RouteRpcState {
         }
     }
 
-    pub fn on_fetch_success(&mut self, list: &RpcList) {
-        let registry = RpcRegistry::from(list);
+    pub fn on_fetch_success(&mut self, registry: RpcRegistry) {
         self.phase = RouteRpcPhase::Ready { registry };
     }
 

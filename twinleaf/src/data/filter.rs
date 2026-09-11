@@ -1,107 +1,98 @@
-use crate::tio::proto::DeviceRoute;
+//! Glob matching over column paths.
+//!
+//! [`ColumnFilter`] holds two patterns per filter — one matching the named node
+//! itself, one matching its subtree — so naming a node selects everything
+//! beneath it without the caller enumerating depths.
+
+use crate::proto::DeviceRoute;
 use glob::Pattern;
 
-/// Column filter using glob patterns against paths of the form `/{route}/{stream}/{column}`.
+/// Glob filter over column paths of the form `/{route}/{stream}/{column}`.
 ///
-/// # Path Structure
-/// - Routes are always numeric device indices: `/0`, `/0/1`, `/0/1/2`
-/// - Streams and columns have alphabetic names: `vector`, `accel`, `x`, `y`
-/// - Full path example: `/0/1/vector/x` (route=`/0/1`, stream=`vector`, column=`x`)
+/// For example `/0/1/vector/x` is route `/0/1`, stream `vector`, column `x`.
+/// Routes are numeric device indices; streams and columns are names.
 ///
-/// # Pattern Behavior
-/// - `*` matches any characters EXCEPT `/` (single path segment)
-/// - `**` matches any characters INCLUDING `/` (zero or more segments)
+/// A pattern names a node in that tree and selects **that node and everything
+/// under it**, like a path in `.gitignore`. Naming a stream keeps all its
+/// columns; naming a route keeps every stream under it; naming a column keeps
+/// just that column.
 ///
-/// # Convenience Rules
-/// - Bare alphabetic names are treated as stream names and expanded:
-///   `vector` → `**/vector/**` (matches stream `vector` at any route depth, all columns)
+/// Wildcards match with strict separators, like a shell:
+/// - `*`  matches exactly one segment (does not cross `/`)
+/// - `**` matches any number of segments (crosses `/`)
 ///
-/// # Stream vs Column Disambiguation
-/// - Pattern ending with `/**` or `/*` indicates stream match (all columns)
-/// - Pattern ending with alphabetic name indicates column match
-/// - `**/x` → column `x` anywhere (implicit `**/*/x`)
-/// - `**/x/**` → stream `x` anywhere, all columns
-///
-/// # Route Detection
-/// Routes are detected by numeric-only segments. The first segment containing
-/// letters marks the beginning of stream/column portion.
+/// A bare name (no `/`) is shorthand for `**/name` — that node at any depth. A
+/// pattern containing `/` is anchored and used as written. An empty pattern
+/// matches nothing.
 ///
 /// # Examples
-/// | Pattern | Interpretation | Matches |
-/// |---------|----------------|---------|
-/// | `vector` | Stream anywhere | `/vector/*`, `/0/vector/*`, `/0/1/vector/*` |
-/// | `**/x` | Column anywhere | Any column named `x` |
-/// | `**/vector/**` | Stream anywhere | Stream `vector` at any depth |
-/// | `/0/vector/**` | Exact route+stream | All columns in `/0/vector` |
-/// | `/0/vector/x` | Exact column | Only `/0/vector/x` |
-/// | `/0/*/x` | Wildcard stream | Column `x` in any stream at `/0` |
-/// | `/0/**` | Recursive route | Everything under route `/0` |
+/// | Pattern        | Selects                                        |
+/// |----------------|------------------------------------------------|
+/// | `vector`       | stream `vector` (all columns), any route       |
+/// | `**/vector`    | same — bare name and `**/name` are equivalent  |
+/// | `sync.vco.x`   | the column `sync.vco.x`, any route             |
+/// | `/0`           | everything under route `/0`                     |
+/// | `/0/vector`    | stream `vector` under `/0` (all columns)        |
+/// | `/0/vector/x`  | exactly that column                            |
+/// | `/0/*/x`       | column `x` of any stream directly under `/0`    |
 pub struct ColumnFilter {
-    pattern: Pattern,
+    /// Matches the named node itself (a route, stream, or column path).
+    node: Pattern,
+    /// Matches anything beneath that node — i.e. the node's subtree.
+    subtree: Pattern,
 }
 
 impl ColumnFilter {
+    /// Compile a pattern, failing only when it is not valid glob syntax.
     pub fn new(pattern_str: &str) -> Result<Self, String> {
         let normalized = Self::normalize_pattern(pattern_str);
-        let pattern =
-            Pattern::new(&normalized).map_err(|e| format!("Invalid glob pattern: {}", e))?;
+        let build = |p: &str| Pattern::new(p).map_err(|e| format!("Invalid glob pattern: {}", e));
 
-        Ok(Self { pattern })
+        // A pattern selects the node it names (`node`) plus everything under it
+        // (`<node>/**`). An empty pattern matches nothing, so both stay empty —
+        // the empty glob only matches the empty string, which paths never are.
+        let (node, subtree) = if normalized.is_empty() {
+            (build("")?, build("")?)
+        } else {
+            (build(&normalized)?, build(&format!("{}/**", normalized))?)
+        };
+
+        Ok(Self { node, subtree })
     }
 
-    /// Normalize user pattern to a full path glob pattern.
+    /// Expand a user pattern into a glob naming one node of the tree.
     ///
-    /// Rules:
-    /// 1. Bare name (no `/`, no `*`) → `**/name/**` (stream anywhere)
-    /// 2. Pattern ending with alphabetic name (no trailing `/**`) → treat final segment as column
-    /// 3. Everything else → pass through as-is
+    /// - bare name (`vector`) → `**/vector` (a node named `vector` at any depth)
+    /// - anything containing `/` → used verbatim (anchored)
+    /// - empty input → empty (matches nothing)
+    ///
+    /// [`new`](Self::new) then also matches that node's subtree, so a bare name
+    /// selects the whole stream, a route selects all its streams, and so on.
     fn normalize_pattern(pattern_str: &str) -> String {
         let trimmed = pattern_str.trim();
-
-        // Empty pattern matches nothing (or should error?)
         if trimmed.is_empty() {
-            return trimmed.to_string();
+            String::new()
+        } else if trimmed.contains('/') {
+            trimmed.to_string()
+        } else {
+            format!("**/{}", trimmed)
         }
-
-        // If pattern already contains wildcards, analyze structure
-        if trimmed.contains('*') {
-            // Check if it looks like a column-anywhere pattern: **/name (no trailing /**)
-            // e.g., "**/x" should match column x anywhere
-            if trimmed.starts_with("**/") && !trimmed.ends_with("/**") && !trimmed.ends_with("/*") {
-                let after_prefix = &trimmed[3..]; // strip "**/""
-                                                  // If what remains is a simple name (no more slashes), it's a column pattern
-                                                  // **/x -> **/*/x (any route, any stream, column x)
-                if !after_prefix.contains('/') && Self::is_alphabetic_name(after_prefix) {
-                    return format!("**/*/{}", after_prefix);
-                }
-            }
-            // Otherwise use as-is - user knows what they're doing
-            return trimmed.to_string();
-        }
-
-        // No wildcards - check if bare name or path
-        if !trimmed.contains('/') {
-            // Bare name like "vector" without leading slash
-            // Interpret as: match this stream name at any route depth, all columns
-            return format!("**/{}/**", trimmed);
-        }
-
-        // Has slashes but no wildcards - use as-is for exact matching
-        trimmed.to_string()
     }
 
-    /// Check if a string looks like an alphabetic name (contains letters, not purely numeric)
-    fn is_alphabetic_name(s: &str) -> bool {
-        // A name is alphabetic if it contains at least one letter
-        // This distinguishes stream/column names from route indices
-        s.chars().any(|c| c.is_alphabetic())
-    }
-
+    /// Whether this column is selected, either by being the named node or by
+    /// living under it.
     pub fn matches(&self, route: &DeviceRoute, stream_name: &str, col_name: &str) -> bool {
         let full_path = self.get_path_string(route, stream_name, col_name);
-        self.pattern.matches(&full_path)
+        let opts = glob::MatchOptions {
+            require_literal_separator: true,
+            ..Default::default()
+        };
+        // The column matches if the pattern names this exact path, or names an
+        // ancestor (route or stream) whose subtree this column lives in.
+        self.node.matches_with(&full_path, opts) || self.subtree.matches_with(&full_path, opts)
     }
 
+    /// The `/{route}/{stream}/{column}` path that patterns are matched against.
     pub fn get_path_string(
         &self,
         route: &DeviceRoute,
@@ -116,5 +107,101 @@ impl ColumnFilter {
         } else {
             format!("/{}/{}/{}", clean_route, stream_name, col_name)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::DeviceRoute;
+
+    fn route(s: &str) -> DeviceRoute {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_bare_stream_name() {
+        let filter = ColumnFilter::new("vector").unwrap();
+        assert!(filter.matches(&route("/"), "vector", "x"));
+        assert!(filter.matches(&route("/0"), "vector", "y"));
+        assert!(filter.matches(&route("/0/1"), "vector", "z"));
+        assert!(!filter.matches(&route("/0"), "accel", "x"));
+    }
+
+    #[test]
+    fn test_column_anywhere() {
+        let filter = ColumnFilter::new("**/x").unwrap();
+        assert!(filter.matches(&route("/"), "vector", "x"));
+        assert!(filter.matches(&route("/0"), "accel", "x"));
+        assert!(filter.matches(&route("/0/1/2"), "gmr", "x"));
+        assert!(!filter.matches(&route("/0"), "vector", "y"));
+    }
+
+    #[test]
+    fn test_stream_anywhere_explicit() {
+        let filter = ColumnFilter::new("**/vector/**").unwrap();
+        assert!(filter.matches(&route("/"), "vector", "x"));
+        assert!(filter.matches(&route("/0/1"), "vector", "y"));
+        assert!(!filter.matches(&route("/0"), "accel", "x"));
+    }
+
+    #[test]
+    fn test_exact_stream_path() {
+        let filter = ColumnFilter::new("/0/vector/**").unwrap();
+        assert!(filter.matches(&route("/0"), "vector", "x"));
+        assert!(filter.matches(&route("/0"), "vector", "y"));
+        assert!(!filter.matches(&route("/1"), "vector", "x"));
+        assert!(!filter.matches(&route("/0"), "accel", "x"));
+    }
+
+    #[test]
+    fn test_exact_column() {
+        let filter = ColumnFilter::new("/0/vector/x").unwrap();
+        assert!(filter.matches(&route("/0"), "vector", "x"));
+        assert!(!filter.matches(&route("/0"), "vector", "y"));
+        assert!(!filter.matches(&route("/1"), "vector", "x"));
+    }
+
+    #[test]
+    fn test_wildcard_stream() {
+        let filter = ColumnFilter::new("/0/*/x").unwrap();
+        assert!(filter.matches(&route("/0"), "vector", "x"));
+        assert!(filter.matches(&route("/0"), "accel", "x"));
+        assert!(!filter.matches(&route("/0"), "vector", "y"));
+        assert!(!filter.matches(&route("/1"), "vector", "x"));
+    }
+
+    #[test]
+    fn test_recursive_route() {
+        let filter = ColumnFilter::new("/0/**").unwrap();
+        assert!(filter.matches(&route("/0"), "vector", "x"));
+        assert!(filter.matches(&route("/0"), "accel", "y"));
+        assert!(filter.matches(&route("/0/1"), "gmr", "z"));
+        assert!(!filter.matches(&route("/1"), "vector", "x"));
+    }
+
+    #[test]
+    fn test_root_stream() {
+        let filter = ColumnFilter::new("/vector/**").unwrap();
+        assert!(filter.matches(&route("/"), "vector", "x"));
+        assert!(filter.matches(&route("/"), "vector", "y"));
+        assert!(!filter.matches(&route("/0"), "vector", "x"));
+    }
+
+    #[test]
+    fn test_nested_route_stream() {
+        let filter = ColumnFilter::new("/0/1/vector/**").unwrap();
+        assert!(filter.matches(&route("/0/1"), "vector", "x"));
+        assert!(!filter.matches(&route("/0"), "vector", "x"));
+        assert!(!filter.matches(&route("/0/1/2"), "vector", "x"));
+    }
+
+    #[test]
+    fn test_wildcard_column() {
+        let filter = ColumnFilter::new("/0/vector/*").unwrap();
+        assert!(filter.matches(&route("/0"), "vector", "x"));
+        assert!(filter.matches(&route("/0"), "vector", "y"));
+        assert!(filter.matches(&route("/0"), "vector", "z"));
+        assert!(!filter.matches(&route("/0"), "accel", "x"));
     }
 }

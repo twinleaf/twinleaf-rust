@@ -1,7 +1,8 @@
 [package]
 name = "twinleaf-tools"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 description = "Tools for the Twinleaf I/O protocol for reading data from Twinleaf quantum sensors."
 homepage = "https://twinleaf.com"
@@ -9,20 +10,26 @@ repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
 
 [features]
-default = ["serial"]
+default = ["serial", "mdns"]
 serial = ["dep:serialport", "twinleaf/serial"]
+mdns = ["twinleaf/mdns", "dep:gethostname", "dep:mdns-sd"]
 hdf5 = ["twinleaf/hdf5"]
 
+[[bench]]
+name = "log_workflows"
+harness = false
+required-features = ["hdf5"]
+
 [dependencies]
+bytes = "1"
 crossbeam = "0.8"
 serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}
-twinleaf = {version = "1.9", path = "../twinleaf" }
+twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["firmware-update"] }
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"
-welch-sde = "0.1"
-memmap2 = "0.9"
+rustfft = "6"
 indicatif = "0.18"
 console = "0.16"
 chrono = "0.4"
@@ -35,4 +42,6 @@ humantime = "2.2"
 log = "0.4"
 env_logger = "0.11"
 indicatif-log-bridge = "0.2"
-dialoguer = "0.11"
+dialoguer = "0.12"
+gethostname = { version = "1", optional = true }
+mdns-sd = { version = "0.20", optional = true }

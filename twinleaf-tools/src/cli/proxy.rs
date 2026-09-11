@@ -1,7 +1,6 @@
+use crate::{parse_device_route, ListCli, TioOpts};
 use clap::{Parser, Subcommand, ValueHint};
-use twinleaf::device::DeviceRoute;
-
-use crate::{parse_device_route, TioOpts};
+use twinleaf::DeviceRoute;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -10,10 +9,18 @@ use crate::{parse_device_route, TioOpts};
     args_conflicts_with_subcommands = true
 )]
 pub struct ProxyCli {
+    /// Start or reuse a background holder on loopback and print its URL
+    #[arg(long, conflicts_with_all = ["port", "mdns", "subtree", "kick_slow", "reconnect_timeout", "dump", "dump_data", "dump_meta", "dump_hb", "verbose", "debug", "timestamp_format", "auto", "enum", "holder_key"])]
+    pub(crate) detach: bool,
+
+    /// Internal: serve as the registered holder for this key
+    #[arg(long, hide = true)]
+    pub(crate) holder_key: Option<String>,
+
     #[command(subcommand)]
     pub subcommands: Option<ProxySubcommands>,
 
-    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single connected device
+    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single serial device (use `tio proxy list` for network discovery)
     #[arg(value_hint = ValueHint::Url, conflicts_with = "mounts")]
     pub(crate) sensor_url: Option<String>,
 
@@ -24,6 +31,10 @@ pub struct ProxyCli {
     /// TCP port to listen on for clients
     #[arg(short = 'p', long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Advertise this proxy over mDNS (off by default)
+    #[arg(long = "mdns")]
+    pub(crate) mdns: bool,
 
     /// Kick off slow clients instead of dropping traffic
     #[arg(short = 'k', long)]
@@ -56,9 +67,9 @@ pub struct ProxyCli {
     )]
     pub(crate) timestamp_format: String,
 
-    /// Time limit for sensor reconnection attempts (seconds)
-    #[arg(short = 'T', long = "timeout", default_value = "30")]
-    pub(crate) reconnect_timeout: u64,
+    /// Give up reconnecting to the sensor after this many seconds (default: never)
+    #[arg(short = 'T', long = "timeout")]
+    pub(crate) reconnect_timeout: Option<u64>,
 
     /// Dump packet traffic except sample data/metadata or heartbeats
     #[arg(long)]
@@ -76,11 +87,11 @@ pub struct ProxyCli {
     #[arg(long)]
     pub(crate) dump_hb: bool,
 
-    /// Deprecated; running without -s <url> now auto-detects by default.
+    /// Deprecated; running without `-s <url>` now auto-detects by default.
     #[arg(short = 'a', long = "auto", hide = true)]
     pub(crate) auto: bool,
 
-    /// Deprecated; use `tio list` instead.
+    /// Deprecated; use `tio proxy list` instead.
     #[arg(short = 'e', long = "enumerate", name = "enum", hide = true)]
     pub(crate) enumerate: bool,
 }
@@ -101,7 +112,8 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
     if locator.is_empty() {
         return Err(format!("missing sensor locator before '=' in {s:?}"));
     }
-    let prefix = DeviceRoute::from_str(prefix_str)
+    let prefix = prefix_str
+        .parse::<DeviceRoute>()
         .map_err(|_| format!("invalid route prefix: {prefix_str:?}"))?;
     if prefix.len() != 1 {
         return Err(format!(
@@ -116,6 +128,14 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
 
 #[derive(Subcommand, Debug)]
 pub enum ProxySubcommands {
+    /// Stop a background holder by its exact loopback URL (list URLs with tio list)
+    Stop {
+        /// Loopback URL printed by tio proxy --detach
+        url: String,
+    },
+    /// Discover devices; host a selection as the default until Ctrl-C
+    List(ListCli),
+
     /// Bridge Twinleaf sensor data to NMEA TCP stream
     Nmea {
         #[command(flatten)]
