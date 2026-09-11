@@ -1,5 +1,5 @@
 //! A device's standing part: who it is, the RPCs every device answers, its
-//! heartbeat, and what a host learns on connecting.
+//! heartbeat, its log threshold, and what a host learns on connecting.
 //!
 //! Nothing here waits. The runtime that owns the transport and the clock calls
 //! [`Device::connected`] when a host appears, [`Device::handle`] with each
@@ -11,18 +11,23 @@
 use heapless::String;
 use twinleaf_proto::data::{self, Metadata, MetadataFlags, CURRENT_SEGMENT};
 use twinleaf_proto::heartbeat::Heartbeat;
+use twinleaf_proto::log::{LogLevel, LogMessage, MAX_MESSAGE_SIZE};
 use twinleaf_proto::packet::{Packet, PacketType, PacketView};
 use twinleaf_proto::route;
 use twinleaf_proto::rpc::{self, Method, Request, RpcError};
-use twinleaf_proto::settings::Setting;
+use twinleaf_proto::settings::Setting as Announcement;
 use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::metadata::{self, Streams};
 use crate::rpc::{self as table, put, Reply, RpcSpec};
+use crate::settings::{Changed, Scalar, Setting};
 use crate::Sink;
 
 /// Milliseconds between heartbeats.
 pub const HEARTBEAT_INTERVAL: u64 = 200;
+
+/// The level `dev.loglevel` boots at, as tl-chibi's `logThreshold` does.
+pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 
 /// What a device says it is: `dev.name`, `dev.desc`, and the device record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +91,8 @@ pub struct Device<'t> {
     table: &'t [RpcSpec],
     hash: u32,
     next_beat: u64,
+    loglevel: Setting<u8>,
+    settings_version: u32,
 }
 
 impl<'t> Device<'t> {
@@ -97,6 +104,8 @@ impl<'t> Device<'t> {
             table,
             hash: table::hash(table),
             next_beat: 0,
+            loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()),
+            settings_version: 0,
         }
     }
 
@@ -124,13 +133,7 @@ impl<'t> Device<'t> {
     /// Tell a host that has just connected everything it needs: the table
     /// hash, a heartbeat, and every metadata record.
     pub fn connected(&mut self, streams: &(impl Streams + ?Sized), now: u64, out: &mut impl Sink) {
-        let hash = self.hash.to_le_bytes();
-        let setting = Setting {
-            name: b"rpc.hash",
-            flags: 0,
-            reply: &hash,
-        };
-        send(out, &[], |buf| setting.write(buf));
+        announcement(out, "rpc.hash", &self.hash.to_le_bytes());
         self.beat(now, out);
         let mut records = self.records(streams).peekable();
         while let Some(record) = records.next() {
@@ -182,6 +185,14 @@ impl<'t> Device<'t> {
             "dev.serial" => read(args, self.identity.serial.as_bytes(), &mut reply),
             "dev.firmware.serial" => read(args, self.identity.firmware.as_bytes(), &mut reply),
             "dev.session" => read(args, &self.session.to_le_bytes(), &mut reply),
+            "dev.loglevel" => write(
+                &mut self.settings_version,
+                &mut self.loglevel,
+                args,
+                &mut reply,
+                out,
+            ),
+            "settings.version" => read(args, &self.settings_version.to_le_bytes(), &mut reply),
             "dev.metadata" => metadata::reply(self.record(streams), streams, args, &mut reply),
             _ => {
                 return Handled::Rpc(Call {
@@ -194,6 +205,46 @@ impl<'t> Device<'t> {
         };
         answer(out, routing, request.id, result.map(|()| reply.as_slice()));
         Handled::Done
+    }
+
+    /// Send `message` as a LOG packet, unless `level` is beneath the
+    /// threshold `dev.loglevel` holds. A message too long for one packet is
+    /// truncated at a character boundary.
+    pub fn log(&self, level: LogLevel, data: u32, message: &str, out: &mut impl Sink) {
+        if level.value() > self.loglevel.get() {
+            return;
+        }
+        let end = (0..=message.len().min(MAX_MESSAGE_SIZE))
+            .rev()
+            .find(|&end| message.is_char_boundary(end))
+            .expect("zero is a character boundary");
+        let entry = LogMessage {
+            level,
+            data,
+            message: &message.as_bytes()[..end],
+        };
+        send(out, &[], |buf| entry.write(buf));
+    }
+
+    /// Answer a setting's RPC, announcing and counting the value a write left.
+    pub fn apply<T: Scalar>(
+        &mut self,
+        setting: &mut Setting<T>,
+        args: &[u8],
+        out: &mut impl Sink,
+    ) -> Result<Reply, RpcError> {
+        let mut reply = Reply::new();
+        write(&mut self.settings_version, setting, args, &mut reply, out)?;
+        Ok(reply)
+    }
+
+    /// Power-cycle: a new session, and the heartbeat, log threshold, and
+    /// `settings.version` a boot starts from.
+    pub fn reboot(&mut self, session: SessionId) {
+        self.session = session;
+        self.next_beat = 0;
+        self.loglevel.reset();
+        self.settings_version = 0;
     }
 
     /// Send whatever is due at `now`.
@@ -243,6 +294,35 @@ fn read(args: &[u8], value: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     put(out, value)
 }
 
+/// Answer a setting's RPC, announcing the value a write left and counting it
+/// in `settings.version`.
+fn write<T: Scalar>(
+    version: &mut u32,
+    setting: &mut Setting<T>,
+    args: &[u8],
+    reply: &mut Reply,
+    out: &mut impl Sink,
+) -> Result<(), RpcError> {
+    match setting.rpc(args, reply)? {
+        Changed::Unchanged => {}
+        Changed::Changed => {
+            *version = version.wrapping_add(1);
+            announcement(out, setting.name(), reply);
+        }
+    }
+    Ok(())
+}
+
+/// Send a SETTING packet carrying a value as the RPC of `name` replies it.
+fn announcement(out: &mut impl Sink, name: &str, reply: &[u8]) {
+    let setting = Announcement {
+        name: name.as_bytes(),
+        flags: 0,
+        reply,
+    };
+    send(out, &[], |buf| setting.write(buf));
+}
+
 fn answer(out: &mut impl Sink, routing: &[u8], id: RpcRequestId, result: Result<&[u8], RpcError>) {
     match result {
         Ok(value) => send(out, routing, |buf| rpc::write_reply(buf, id, value)),
@@ -270,10 +350,12 @@ mod tests {
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 
-    static TABLE: [RpcSpec; 5] = [
+    static TABLE: [RpcSpec; 7] = [
         RpcSpec::std("rpc.list", Access::RW),
         RpcSpec::prop("rpc.hash", Value::Uint(4), Access::READ),
         RpcSpec::prop("dev.name", Value::String, Access::READ),
+        RpcSpec::prop("dev.loglevel", Value::Uint(1), Access::RW),
+        RpcSpec::prop("settings.version", Value::Uint(4), Access::READ),
         RpcSpec::std("dev.metadata", Access::RW),
         RpcSpec::prop("app.gain", Value::Uint(1), Access::RW),
     ];
@@ -356,6 +438,13 @@ mod tests {
         buf[..len].to_vec()
     }
 
+    /// Hand the device one request by name, with no route.
+    fn deliver(device: &mut Device<'_>, name: &[u8], args: &[u8], sent: &mut Sent) {
+        let packet = request(Method::ByName(name), args, &[]);
+        let (view, _) = PacketView::parse_prefix(&packet).unwrap();
+        device.handle(&OneStream, view, sent);
+    }
+
     fn answered(sent: &Sent) -> Answer<'_> {
         let [view] = sent.views()[..] else {
             panic!("one packet");
@@ -382,7 +471,7 @@ mod tests {
                 PacketType::METADATA,
             ]
         );
-        let setting = Setting::parse(views[0].payload).unwrap();
+        let setting = Announcement::parse(views[0].payload).unwrap();
         assert_eq!(setting.name, b"rpc.hash");
         assert_eq!(setting.reply, device.hash().to_le_bytes());
         assert_eq!(
@@ -449,9 +538,7 @@ mod tests {
         );
 
         let mut sent = Sent::default();
-        let packet = request(Method::ByName(b"dev.metadata"), &[], &[]);
-        let (view, _) = PacketView::parse_prefix(&packet).unwrap();
-        device.handle(&OneStream, view, &mut sent);
+        deliver(&mut device, b"dev.metadata", &[], &mut sent);
         let Answer::Reply(reply) = answered(&sent) else {
             panic!("a reply");
         };
@@ -462,17 +549,13 @@ mod tests {
     fn bad_requests_are_refused() {
         let mut device = device();
         let mut sent = Sent::default();
-        let packet = request(Method::ByName(b"dev.nope"), &[], &[]);
-        let (view, _) = PacketView::parse_prefix(&packet).unwrap();
-        device.handle(&OneStream, view, &mut sent);
+        deliver(&mut device, b"dev.nope", &[], &mut sent);
         assert!(
             matches!(answered(&sent), Answer::Error(error) if error.error() == RpcError::NotFound)
         );
 
         let mut sent = Sent::default();
-        let packet = request(Method::ByName(b"dev.name"), &[1], &[]);
-        let (view, _) = PacketView::parse_prefix(&packet).unwrap();
-        device.handle(&OneStream, view, &mut sent);
+        deliver(&mut device, b"dev.name", &[1], &mut sent);
         assert!(
             matches!(answered(&sent), Answer::Error(error) if error.error() == RpcError::ReadOnly)
         );
@@ -511,6 +594,132 @@ mod tests {
         assert!(
             matches!(Answer::parse(view.header.ptype, view.payload), Some(Answer::Error(error)) if error.error() == RpcError::Busy)
         );
+    }
+
+    #[test]
+    fn a_message_is_logged_at_the_threshold_and_dropped_beneath_it() {
+        let device = device();
+        let mut sent = Sent::default();
+        device.log(LogLevel::DEBUG, 1, "chatter", &mut sent);
+        assert!(sent.0.is_empty());
+
+        device.log(LogLevel::INFO, 7, "up", &mut sent);
+        device.log(LogLevel::CRITICAL, 8, "vbus", &mut sent);
+        let types: Vec<_> = sent.views().iter().map(|view| view.header.ptype).collect();
+        assert_eq!(types, [PacketType::LOG, PacketType::LOG]);
+        let logged: Vec<_> = sent
+            .views()
+            .iter()
+            .map(|view| LogMessage::parse(view.payload).unwrap())
+            .map(|entry| (entry.level, entry.data, entry.message.to_vec()))
+            .collect();
+        assert_eq!(
+            logged,
+            [
+                (LogLevel::INFO, 7, b"up".to_vec()),
+                (LogLevel::CRITICAL, 8, b"vbus".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_too_long_for_a_packet_is_truncated_at_a_character_boundary() {
+        let device = device();
+        let mut sent = Sent::default();
+        let message = "é".repeat(MAX_MESSAGE_SIZE);
+        device.log(LogLevel::ERROR, 0, &message, &mut sent);
+
+        let [view] = sent.views()[..] else {
+            panic!("one packet");
+        };
+        let entry = LogMessage::parse(view.payload).unwrap();
+        assert_eq!(entry.message.len(), MAX_MESSAGE_SIZE - 1);
+        assert_eq!(
+            core::str::from_utf8(entry.message),
+            Ok(&message[..MAX_MESSAGE_SIZE - 1])
+        );
+    }
+
+    #[test]
+    fn writing_dev_loglevel_raises_the_threshold_and_announces_it() {
+        let mut device = device();
+        let mut sent = Sent::default();
+        deliver(&mut device, b"dev.loglevel", &[], &mut sent);
+        assert!(
+            matches!(answered(&sent), Answer::Reply(reply) if reply.value == [DEFAULT_LOGLEVEL.value()])
+        );
+
+        let mut sent = Sent::default();
+        deliver(
+            &mut device,
+            b"dev.loglevel",
+            &[LogLevel::DEBUG.value()],
+            &mut sent,
+        );
+        let views = sent.views();
+        assert_eq!(views[0].header.ptype, PacketType::SETTING);
+        let setting = Announcement::parse(views[0].payload).unwrap();
+        assert_eq!(setting.name, b"dev.loglevel");
+        assert_eq!(setting.reply, [LogLevel::DEBUG.value()]);
+
+        let mut sent = Sent::default();
+        device.log(LogLevel::DEBUG, 0, "now heard", &mut sent);
+        assert_eq!(sent.0.len(), 1);
+
+        let mut sent = Sent::default();
+        deliver(&mut device, b"settings.version", &[], &mut sent);
+        assert!(
+            matches!(answered(&sent), Answer::Reply(reply) if reply.value == 1u32.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn a_reboot_restores_the_threshold_and_the_settings_version_a_boot_starts_from() {
+        let mut device = device();
+        let mut sent = Sent::default();
+        deliver(
+            &mut device,
+            b"dev.loglevel",
+            &[LogLevel::DEBUG.value()],
+            &mut sent,
+        );
+
+        device.reboot(SessionId::new(10));
+        assert_eq!(device.session, SessionId::new(10));
+
+        let mut sent = Sent::default();
+        deliver(&mut device, b"dev.loglevel", &[], &mut sent);
+        assert!(
+            matches!(answered(&sent), Answer::Reply(reply) if reply.value == [DEFAULT_LOGLEVEL.value()])
+        );
+
+        let mut sent = Sent::default();
+        deliver(&mut device, b"settings.version", &[], &mut sent);
+        assert!(
+            matches!(answered(&sent), Answer::Reply(reply) if reply.value == 0u32.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn an_applied_setting_is_announced_once_per_write() {
+        let mut device = device();
+        let mut gain = Setting::new("app.gain", 1u8);
+        let mut sent = Sent::default();
+
+        let reply = device.apply(&mut gain, &[], &mut sent).unwrap();
+        assert_eq!(reply.as_slice(), [1]);
+        assert!(sent.0.is_empty());
+
+        let reply = device.apply(&mut gain, &[9], &mut sent).unwrap();
+        assert_eq!(reply.as_slice(), [9]);
+        assert_eq!(gain.get(), 9);
+        let [view] = sent.views()[..] else {
+            panic!("one packet");
+        };
+        assert_eq!(view.header.ptype, PacketType::SETTING);
+        let setting = Announcement::parse(view.payload).unwrap();
+        assert_eq!(setting.name, b"app.gain");
+        assert_eq!(setting.reply, [9]);
     }
 
     #[test]

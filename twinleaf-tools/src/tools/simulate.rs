@@ -11,7 +11,6 @@ use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::proto;
 use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
 use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
@@ -19,14 +18,15 @@ use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::device::{Call, Device, Handled, Identity};
-use twinleaf_device::rpc::{put, Access, Reply, RpcSpec, Value};
+use twinleaf_device::rpc::{Access, Reply, RpcSpec, Value};
 use twinleaf_device::segments::{Params, Timeref};
+use twinleaf_device::settings::Setting;
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
 use twinleaf_device::Sink;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
-    let mut device = TestDevice::new(cli)?;
-    device.run()?;
+    let mut runtime = Runtime::new(cli)?;
+    runtime.run()?;
     Ok(())
 }
 
@@ -67,9 +67,9 @@ const AUX_WAVE_FREQUENCY: f64 = 0.25;
 const SAMPLE_DROP_INTERVAL_SECONDS: f64 = 60.0;
 const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
-const LOG_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
-const LOG_MESSAGE_JITTER: Duration = Duration::from_millis(4000);
-const CAPTURE_TRIGGER_DELAY: Duration = Duration::from_millis(500);
+const LOG_MESSAGE_MIN_INTERVAL_MS: u64 = 1500;
+const LOG_MESSAGE_JITTER_MS: u64 = 4000;
+const CAPTURE_TRIGGER_DELAY_MS: u64 = 500;
 const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
 const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
 const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
@@ -138,7 +138,7 @@ const AUX_DEF: StreamDef = StreamDef {
 
 /// The RPC table. Introspection first, like tl-chibi, and the order fixes
 /// the ids `rpc.list` reports and the `rpc.hash`.
-static RPCS: [RpcSpec; 20] = [
+static RPCS: [RpcSpec; 22] = [
     RpcSpec::std("rpc.name", Access::RW),
     RpcSpec::std("rpc.id", Access::RW),
     RpcSpec::std("rpc.info", Access::RW),
@@ -148,10 +148,12 @@ static RPCS: [RpcSpec; 20] = [
     RpcSpec::prop("dev.name", Value::String, Access::READ),
     RpcSpec::prop("dev.desc", Value::String, Access::READ),
     RpcSpec::prop("dev.session", Value::Uint(4), Access::READ),
+    RpcSpec::prop("dev.loglevel", Value::Uint(1), Access::RW),
     RpcSpec::action("dev.stop"),
     RpcSpec::std("dev.firmware.upload", Access::WRITE),
     RpcSpec::action("dev.firmware.upgrade"),
     RpcSpec::std("dev.metadata", Access::RW),
+    RpcSpec::prop("settings.version", Value::Uint(4), Access::READ),
     RpcSpec::prop("test.amplitude", Value::Float(8), Access::RW),
     RpcSpec::prop("test.frequency", Value::Float(8), Access::RW),
     RpcSpec::prop("test.noise", Value::Float(8), Access::RW),
@@ -163,11 +165,34 @@ static RPCS: [RpcSpec; 20] = [
         .with_extra_meta(RpcMetaFlags::READABLE.union(RpcMetaFlags::CAPTURE).bits()),
 ];
 
-#[derive(Clone, Copy)]
-struct SineParams {
-    amplitude: f64,
-    frequency: f64,
-    noise: f64,
+/// The values the `test.*` RPCs read and write.
+struct Settings {
+    amplitude: Setting<f64>,
+    frequency: Setting<f64>,
+    noise: Setting<f64>,
+    status: Setting<u8>,
+    enable: Setting<bool>,
+}
+
+impl Settings {
+    fn new(cli: &SimulateCli) -> Self {
+        Self {
+            amplitude: Setting::new("test.amplitude", cli.amplitude).checked(nonnegative),
+            frequency: Setting::new("test.frequency", cli.frequency).checked(nonnegative),
+            noise: Setting::new("test.noise", cli.noise).checked(nonnegative),
+            status: Setting::new("test.status", 0),
+            enable: Setting::new("test.enable", true),
+        }
+    }
+
+    /// Go back to the values a boot starts from.
+    fn reset(&mut self) {
+        self.amplitude.reset();
+        self.frequency.reset();
+        self.noise.reset();
+        self.status.reset();
+        self.enable.reset();
+    }
 }
 
 /// A sample clock: the streams it drives, how far the run has got, and when
@@ -198,10 +223,10 @@ impl Clock {
         })
     }
 
-    /// How many samples it owes the run started at `started_at`.
-    fn due(&self, started_at: Instant) -> u64 {
-        let elapsed = started_at.elapsed().as_secs_f64();
-        ((elapsed * f64::from(self.rate.get())).floor() as u64).saturating_sub(self.generated)
+    /// How many samples it owes after `elapsed` milliseconds of the run.
+    fn due(&self, elapsed: u64) -> u64 {
+        let seconds = elapsed as f64 / 1000.0;
+        ((seconds * f64::from(self.rate.get())).floor() as u64).saturating_sub(self.generated)
     }
 
     /// Whether the sample it is about to take starts a new segment.
@@ -216,19 +241,19 @@ struct Client {
     last_rx: Instant,
 }
 
-/// The device's packets go to the connected client, and the first send
-/// failure is kept for the caller.
+/// Where the device's packets go: the connected client, or nowhere while
+/// there is none. The first send failure is kept for the caller.
 struct UdpSink<'a> {
     socket: &'a UdpSocket,
-    addr: SocketAddr,
+    client: Option<SocketAddr>,
     failed: Option<io::Error>,
 }
 
 impl<'a> UdpSink<'a> {
-    fn new(socket: &'a UdpSocket, addr: SocketAddr) -> Self {
+    fn new(socket: &'a UdpSocket, client: Option<SocketAddr>) -> Self {
         Self {
             socket,
-            addr,
+            client,
             failed: None,
         }
     }
@@ -240,8 +265,8 @@ impl<'a> UdpSink<'a> {
 
 impl Sink for UdpSink<'_> {
     fn send(&mut self, packet: &[u8]) {
-        if self.failed.is_none() {
-            self.failed = self.socket.send_to(packet, self.addr).err();
+        if let (Some(addr), None) = (self.client, &self.failed) {
+            self.failed = self.socket.send_to(packet, addr).err();
         }
     }
 }
@@ -266,7 +291,7 @@ impl Default for CaptureInfo {
 }
 
 struct CapturingCapture {
-    ready_at: Instant,
+    ready_at: u64,
     data: Vec<u8>,
     info: CaptureInfo,
 }
@@ -295,7 +320,7 @@ impl CaptureBuffer {
         self.info = CaptureInfo::default();
     }
 
-    fn begin_capture(&mut self, data: Vec<u8>, info: CaptureInfo, ready_at: Instant) {
+    fn begin_capture(&mut self, data: Vec<u8>, info: CaptureInfo, ready_at: u64) {
         self.capturing = Some(CapturingCapture {
             ready_at,
             data,
@@ -303,7 +328,7 @@ impl CaptureBuffer {
         });
     }
 
-    fn update(&mut self, now: Instant) {
+    fn update(&mut self, now: u64) {
         let Some(capturing) = self.capturing.as_ref() else {
             return;
         };
@@ -435,35 +460,27 @@ impl GaussianRng {
     }
 }
 
-struct TestDevice {
-    socket: UdpSocket,
-    client: Option<Client>,
-    initial_params: SineParams,
-    params: SineParams,
-    initial_status: u8,
-    status: u8,
-    initial_enable: u8,
-    enable: u8,
-    segment_seconds: u32,
+/// The simulated device: what it is, what it holds, and what it publishes.
+/// Every method takes the milliseconds since boot its runtime keeps, and
+/// every packet it sends goes to that runtime's sink.
+struct Sim {
+    device: Device<'static>,
+    settings: Settings,
     streams: [Stream<SEGMENTS>; 3],
     clocks: [Clock; 2],
-    device: Device<'static>,
-    epoch: Instant,
-    started_at: Instant,
-    no_drop: bool,
-    next_log_message_at: Instant,
-    next_log_level: usize,
     capture: CaptureBuffer,
     rng: GaussianRng,
+    segment_seconds: u32,
+    started_ms: u64,
+    next_log_at: u64,
+    next_log_level: usize,
+    no_drop: bool,
+    notes: Vec<String>,
 }
 
-impl TestDevice {
-    fn new(cli: SimulateCli) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
-        socket.set_nonblocking(true)?;
-
-        let now = unix_duration();
-        let seed = now.as_nanos() as u64 ^ u64::from(cli.port).rotate_left(32);
+impl Sim {
+    fn new(cli: &SimulateCli) -> io::Result<Self> {
+        let seed = unix_duration().as_nanos() as u64 ^ u64::from(cli.port).rotate_left(32);
         let session_id = (seed as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
@@ -477,186 +494,80 @@ impl TestDevice {
             )?,
             Clock::new(AUX_SAMPLE_RATE, cli.segment_seconds, &[Signal::Aux])?,
         ];
-
-        let mut rng = GaussianRng::new(seed | 1);
-        let initial_params = SineParams {
-            amplitude: cli.amplitude,
-            frequency: cli.frequency,
-            noise: cli.noise,
-        };
-        let initial_status = 0;
-        let initial_enable = 1;
-
         let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, DEVICE_SERIAL, DEVICE_FIRMWARE)
             .ok_or_else(|| invalid_input("identity too long"))?;
 
+        let mut rng = GaussianRng::new(seed | 1);
         Ok(Self {
-            socket,
-            client: None,
-            initial_params,
-            params: initial_params,
-            initial_status,
-            status: initial_status,
-            initial_enable,
-            enable: initial_enable,
-            segment_seconds: cli.segment_seconds,
+            device: Device::new(identity, SessionId::new(session_id), &RPCS),
+            settings: Settings::new(cli),
             streams: boot_streams(sample_rate)?,
             clocks,
-            device: Device::new(identity, SessionId::new(session_id), &RPCS),
-            epoch: Instant::now(),
-            started_at: Instant::now(),
-            no_drop: cli.no_drop,
-            next_log_message_at: Instant::now() + next_log_delay(&mut rng),
-            next_log_level: 0,
             capture: CaptureBuffer::new(),
+            segment_seconds: cli.segment_seconds,
+            started_ms: 0,
+            next_log_at: next_log_delay(&mut rng),
+            next_log_level: 0,
+            no_drop: cli.no_drop,
+            notes: Vec::new(),
             rng,
         })
     }
 
-    fn run(&mut self) -> io::Result<()> {
-        let raw_mode = match RawModeGuard::enable() {
-            Ok(guard) => Some(guard),
-            Err(err) => {
-                terminal_eprintln!("keyboard shortcuts disabled: {err}");
-                None
-            }
+    /// A host has connected: acquisition restarts and the device describes
+    /// itself.
+    fn connected(&mut self, now: u64, out: &mut impl Sink) {
+        self.reset_run(now);
+        self.device.connected(&self.streams[..], now, out);
+    }
+
+    /// Answer one packet from the host.
+    fn handle(&mut self, packet: PacketView<'_>, now: u64, out: &mut impl Sink) {
+        self.update_capture(now);
+        let Handled::Rpc(call) = self.device.handle(&self.streams[..], packet, out) else {
+            return;
         };
-
-        terminal_println!(
-            "tio test listening on udp://0.0.0.0:{}",
-            self.socket.local_addr()?.port()
-        );
-        terminal_println!(
-            "  stream 1: 2 waveform channels, amplitude={} V frequency={} Hz noise={} V/sqrt(Hz) samplerate={} Hz segment={} s",
-            self.params.amplitude,
-            self.params.frequency,
-            self.params.noise,
-            self.sample_rate(),
-            self.segment_seconds
-        );
-        terminal_println!(
-            "  stream 2: status={} signal_level={}",
-            self.status,
-            SIGNAL_LEVEL
-        );
-        terminal_println!(
-            "  stream 3: aux triangle/sawtooth at {} Hz sampled at {} Hz",
-            AUX_WAVE_FREQUENCY,
-            AUX_SAMPLE_RATE
-        );
-        if self.no_drop {
-            terminal_println!("  random sample drops disabled (--no-drop)");
-        } else {
-            terminal_println!(
-                "  randomly dropping one sample from each sample clock about once per minute"
-            );
-        }
-        terminal_println!(
-            "  capture buffer: test.capture(-1) trigger, test.capture(-2) status, \
-             test.capture(-3) metadata, {}-{} f32 samples, ~{:.1}s delay",
-            CAPTURE_SAMPLE_COUNT_MIN,
-            CAPTURE_SAMPLE_COUNT_MAX,
-            CAPTURE_TRIGGER_DELAY.as_secs_f64()
-        );
-        if raw_mode.is_some() {
-            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
-        }
-        terminal_println!(
-            "  connect with: tio proxy udp4://127.0.0.1:{}",
-            self.socket.local_addr()?.port()
-        );
-
-        loop {
-            if raw_mode.is_some() && !self.handle_keyboard()? {
-                terminal_println!("stopping tio test");
-                return Ok(());
-            }
-            self.receive_packets()?;
-            self.expire_client();
-            self.send_periodic_packets()?;
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let result = self.app_rpc(&call, now, out);
+        call.reply(result.as_deref().map_err(|error| *error), out);
     }
 
-    fn handle_keyboard(&mut self) -> io::Result<bool> {
-        while event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('d') => self.drop_samples_now(),
-                    KeyCode::Char('r') => self.reboot()?,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(false);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(true)
+    /// Send everything due at `now`: the heartbeat, a log message, samples.
+    fn tick(&mut self, now: u64, out: &mut impl Sink) {
+        self.update_capture(now);
+        self.device.tick(now, out);
+        self.log_if_due(now, out);
+        self.send_due_samples(now, out);
     }
 
-    fn receive_packets(&mut self) -> io::Result<()> {
-        let mut buf = [0u8; 1024];
-        loop {
-            match self.socket.recv_from(&mut buf) {
-                Ok((size, addr)) => {
-                    if !self.accept_packet_from(addr)? {
-                        continue;
-                    }
-                    match PacketView::parse_prefix(&buf[..size]) {
-                        Ok((packet, parsed_size)) if parsed_size == size => {
-                            self.handle_packet(packet, addr)?;
-                        }
-                        Ok(_) => {
-                            terminal_eprintln!(
-                                "Ignoring UDP datagram with trailing bytes from {addr}"
-                            );
-                        }
-                        Err(err) => {
-                            terminal_eprintln!("Ignoring malformed packet from {addr}: {err:?}");
-                        }
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(err) => return Err(err),
-            }
-        }
+    /// Power-cycle: a new session, the settings a device boots with, and a
+    /// fresh segment ring on every stream.
+    fn reboot(&mut self, now: u64, out: &mut impl Sink) {
+        let session = SessionId::new(self.next_session_id());
+        self.device.reboot(session);
+        self.settings.reset();
+        self.streams =
+            boot_streams(self.sample_rate()).expect("streams that booted once boot again");
+        self.notes.push(format!(
+            "rebooted test device; new session id {}",
+            self.device.session.value()
+        ));
+        self.connected(now, out);
     }
 
-    fn accept_packet_from(&mut self, addr: SocketAddr) -> io::Result<bool> {
-        let now = Instant::now();
-        match self.client {
-            Some(mut client) if client.addr == addr => {
-                client.last_rx = now;
-                self.client = Some(client);
-                Ok(true)
+    /// Drop one sample from every clock, as the keyboard asks.
+    fn drop_now(&mut self) {
+        for clock in 0..self.clocks.len() {
+            if self.clocks[clock].rolls_over() {
+                self.rollover(clock);
             }
-            Some(client) if now.duration_since(client.last_rx) < CLIENT_TIMEOUT => Ok(false),
-            _ => {
-                self.client = Some(Client { addr, last_rx: now });
-                self.reset_run();
-                terminal_println!("client connected: {addr}");
-                self.connected(addr)?;
-                Ok(true)
-            }
-        }
-    }
-
-    fn expire_client(&mut self) {
-        if let Some(client) = self.client {
-            if Instant::now().duration_since(client.last_rx) > CLIENT_TIMEOUT {
-                terminal_println!("client disconnected: {}", client.addr);
-                self.client = None;
-            }
+            self.drop_sample(clock);
         }
     }
 
     /// Restart acquisition: every stream stops and starts again at a fresh
     /// time reference, so its samples begin at zero in a new segment.
-    fn reset_run(&mut self) {
-        self.started_at = Instant::now();
+    fn reset_run(&mut self, now: u64) {
+        self.started_ms = now;
         let timeref = Timeref::new(
             sync::Epoch::UNIX,
             u32::try_from(unix_duration().as_secs()).unwrap_or(u32::MAX),
@@ -674,59 +585,18 @@ impl TestDevice {
             self.clocks[clock].generated = 0;
             self.clocks[clock].next_drop = self.next_drop(clock);
         }
-        self.next_log_message_at = Instant::now() + next_log_delay(&mut self.rng);
+        self.next_log_at = now + next_log_delay(&mut self.rng);
         self.next_log_level = 0;
         self.capture.clear();
     }
 
-    /// Power-cycle: a new session, the settings a device boots with, and a
-    /// fresh segment ring on every stream.
-    fn reboot(&mut self) -> io::Result<()> {
-        self.device.session = SessionId::new(self.next_session_id());
-        self.params = self.initial_params;
-        self.status = self.initial_status;
-        self.enable = self.initial_enable;
-        self.streams = boot_streams(self.sample_rate())?;
-        self.reset_run();
-        terminal_println!(
-            "rebooted test device; new session id {}",
-            self.device.session.value()
-        );
-
-        if let Some(client) = self.client {
-            self.connected(client.addr)?;
-        }
-        Ok(())
-    }
-
-    fn connected(&mut self, addr: SocketAddr) -> io::Result<()> {
-        let now = self.now_ms();
-        let mut sink = UdpSink::new(&self.socket, addr);
-        self.device.connected(&self.streams[..], now, &mut sink);
-        sink.finish()
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64
-    }
-
-    fn handle_packet(&mut self, packet: PacketView<'_>, addr: SocketAddr) -> io::Result<()> {
-        self.update_capture();
-        let mut sink = UdpSink::new(&self.socket, addr);
-        let call = match self.device.handle(&self.streams[..], packet, &mut sink) {
-            Handled::Done => return sink.finish(),
-            Handled::Rpc(call) => call,
-        };
-        sink.finish()?;
-
-        let result = self.app_rpc(&call);
-        let mut sink = UdpSink::new(&self.socket, addr);
-        call.reply(result.as_deref().map_err(|error| *error), &mut sink);
-        sink.finish()
-    }
-
     /// The RPCs this device adds to the standard ones.
-    fn app_rpc(&mut self, call: &Call<'_, '_>) -> Result<Reply, RpcError> {
+    fn app_rpc(
+        &mut self,
+        call: &Call<'_, '_>,
+        now: u64,
+        out: &mut impl Sink,
+    ) -> Result<Reply, RpcError> {
         let args = call.args;
         let mut reply = Reply::new();
         match call.name {
@@ -735,37 +605,22 @@ impl TestDevice {
                 self.device.identity.desc =
                     UPGRADED_DESC.try_into().map_err(|_| RpcError::Internal)?;
             }
-            "test.amplitude" => {
-                self.params.amplitude = nonnegative_f64(args, self.params.amplitude)?;
-                put(&mut reply, &self.params.amplitude.to_le_bytes())?;
-            }
-            "test.frequency" => {
-                self.params.frequency = nonnegative_f64(args, self.params.frequency)?;
-                put(&mut reply, &self.params.frequency.to_le_bytes())?;
-            }
-            "test.noise" => {
-                self.params.noise = nonnegative_f64(args, self.params.noise)?;
-                put(&mut reply, &self.params.noise.to_le_bytes())?;
-            }
-            "test.status" => {
-                self.status = u8_property(args, self.status)?;
-                put(&mut reply, &[self.status])?;
-            }
-            "test.enable" => {
-                self.enable = u8_property(args, self.enable)?;
-                put(&mut reply, &[self.enable])?;
-            }
+            "test.amplitude" => return self.device.apply(&mut self.settings.amplitude, args, out),
+            "test.frequency" => return self.device.apply(&mut self.settings.frequency, args, out),
+            "test.noise" => return self.device.apply(&mut self.settings.noise, args, out),
+            "test.status" => return self.device.apply(&mut self.settings.status, args, out),
+            "test.enable" => return self.device.apply(&mut self.settings.enable, args, out),
             "test.go" => {
                 if !args.is_empty() {
                     return Err(RpcError::ArgsSize);
                 }
-                terminal_println!("test.go action invoked");
+                self.notes.push("test.go action invoked".to_string());
             }
             "test.capture" => {
                 let selector = Selector::parse(args)?;
                 self.capture.view().reply(selector, &mut reply)?;
                 if selector == Selector::Trigger {
-                    self.trigger_capture();
+                    self.trigger_capture(now);
                 }
             }
             _ => return Err(RpcError::NotFound),
@@ -773,22 +628,25 @@ impl TestDevice {
         Ok(reply)
     }
 
-    fn trigger_capture(&mut self) {
+    fn trigger_capture(&mut self, now: u64) {
         let (data, info) = self.generate_capture_data();
         self.capture
-            .begin_capture(data, info, Instant::now() + CAPTURE_TRIGGER_DELAY);
-        terminal_println!(
+            .begin_capture(data, info, now + CAPTURE_TRIGGER_DELAY_MS);
+        self.notes.push(format!(
             "test.capture triggered ({} samples); data available in ~{:.1}s",
             info.length,
-            CAPTURE_TRIGGER_DELAY.as_secs_f64()
-        );
+            CAPTURE_TRIGGER_DELAY_MS as f64 / 1000.0
+        ));
     }
 
-    fn update_capture(&mut self) {
+    fn update_capture(&mut self, now: u64) {
         let was_locked = self.capture.locked();
-        self.capture.update(Instant::now());
+        self.capture.update(now);
         if was_locked && !self.capture.locked() {
-            terminal_println!("test.capture done ({} bytes)", self.capture.export_size());
+            self.notes.push(format!(
+                "test.capture done ({} bytes)",
+                self.capture.export_size()
+            ));
         }
     }
 
@@ -797,13 +655,13 @@ impl TestDevice {
         let mut data = Vec::with_capacity(sample_count * CAPTURE_SAMPLE_BYTES);
 
         let rate = self.sample_rate().get();
-        let noise_sigma = self.params.noise * (f64::from(rate) / 2.0).sqrt();
+        let noise_sigma = self.settings.noise.get() * (f64::from(rate) / 2.0).sqrt();
         let start_sample = self.clocks[WAVE_CLOCK].generated;
         for offset in 0..sample_count as u64 {
             let t = (start_sample + offset) as f64 / f64::from(rate);
-            let phase = std::f64::consts::TAU * self.params.frequency * t;
-            let value =
-                self.params.amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
+            let phase = std::f64::consts::TAU * self.settings.frequency.get() * t;
+            let value = self.settings.amplitude.get() * phase.sin()
+                + noise_sigma * self.rng.next_gaussian();
             data.extend((value as f32).to_le_bytes());
         }
 
@@ -817,53 +675,26 @@ impl TestDevice {
         (data, info)
     }
 
-    fn send_periodic_packets(&mut self) -> io::Result<()> {
-        self.update_capture();
-        let Some(client) = self.client else {
-            return Ok(());
-        };
-
-        let now = self.now_ms();
-        let mut sink = UdpSink::new(&self.socket, client.addr);
-        self.device.tick(now, &mut sink);
-        sink.finish()?;
-
-        self.send_log_message_if_due(client.addr)?;
-        self.send_due_samples(client.addr)
-    }
-
-    fn send_log_message_if_due(&mut self, addr: SocketAddr) -> io::Result<()> {
-        if Instant::now() < self.next_log_message_at {
-            return Ok(());
+    fn log_if_due(&mut self, now: u64, out: &mut impl Sink) {
+        if now < self.next_log_at {
+            return;
         }
 
         let level = self.next_log_level();
         let lucky_number = (self.rng.next_u64() % 10_000) as u32;
         let message = self.random_log_message(lucky_number);
-        let entry = log::LogMessage {
-            level,
-            data: lucky_number,
-            message: message.as_bytes(),
-        };
-        let mut buf = [0u8; proto::packet::Packet::MAX_SIZE];
-        let len = entry
-            .write(&mut buf)
-            .ok_or_else(|| invalid_input("log message does not fit a packet"))?;
-        let mut sink = UdpSink::new(&self.socket, addr);
-        sink.send(&buf[..len]);
-        sink.finish()?;
-        self.next_log_message_at = Instant::now() + next_log_delay(&mut self.rng);
-        Ok(())
+        self.device.log(level, lucky_number, &message, out);
+        self.next_log_at = now + next_log_delay(&mut self.rng);
     }
 
-    fn send_due_samples(&mut self, addr: SocketAddr) -> io::Result<()> {
-        (0..self.clocks.len()).try_for_each(|clock| self.send_clock_samples(clock, addr))
+    fn send_due_samples(&mut self, now: u64, out: &mut impl Sink) {
+        (0..self.clocks.len()).for_each(|clock| self.send_clock_samples(clock, now, out));
     }
 
     /// The samples one clock owes: its streams roll over at a segment
     /// boundary, skip the sample it owes a gap, and publish the rest.
-    fn send_clock_samples(&mut self, clock: usize, addr: SocketAddr) -> io::Result<()> {
-        for _ in 0..self.clocks[clock].due(self.started_at) {
+    fn send_clock_samples(&mut self, clock: usize, now: u64, out: &mut impl Sink) {
+        for _ in 0..self.clocks[clock].due(now.saturating_sub(self.started_ms)) {
             if self.clocks[clock].rolls_over() {
                 self.rollover(clock);
             }
@@ -871,30 +702,25 @@ impl TestDevice {
                 self.drop_sample(clock);
                 continue;
             }
-            self.push_samples(clock, addr)?;
+            self.push_samples(clock, out);
             self.clocks[clock].generated += 1;
         }
-        self.flush_streams(clock, addr)
+        self.flush_streams(clock, out);
     }
 
     /// One sample into each stream the clock drives.
-    fn push_samples(&mut self, clock: usize, addr: SocketAddr) -> io::Result<()> {
+    fn push_samples(&mut self, clock: usize, out: &mut impl Sink) {
         for &signal in self.clocks[clock].streams {
             let sample = self.sample(signal);
             let size = self.streams[signal as usize].def().sample_size();
-            let mut sink = UdpSink::new(&self.socket, addr);
-            self.streams[signal as usize].push(&sample[..size], &mut sink);
-            sink.finish()?;
+            self.streams[signal as usize].push(&sample[..size], out);
         }
-        Ok(())
     }
 
-    fn flush_streams(&mut self, clock: usize, addr: SocketAddr) -> io::Result<()> {
-        let mut sink = UdpSink::new(&self.socket, addr);
+    fn flush_streams(&mut self, clock: usize, out: &mut impl Sink) {
         for &signal in self.clocks[clock].streams {
-            self.streams[signal as usize].flush(&mut sink);
+            self.streams[signal as usize].flush(out);
         }
-        sink.finish()
     }
 
     fn rollover(&mut self, clock: usize) {
@@ -910,7 +736,7 @@ impl TestDevice {
             Signal::Sine => self.sine_sample(),
             Signal::Status => {
                 let mut sample = [0u8; 16];
-                sample[..2].copy_from_slice(&[self.status, SIGNAL_LEVEL]);
+                sample[..2].copy_from_slice(&[self.settings.status.get(), SIGNAL_LEVEL]);
                 sample
             }
             Signal::Aux => self.aux_sample(),
@@ -925,10 +751,11 @@ impl TestDevice {
     fn sine_sample(&mut self) -> [u8; 16] {
         let rate = f64::from(self.sample_rate().get());
         let t = self.clocks[WAVE_CLOCK].generated as f64 / rate;
-        let phase = std::f64::consts::TAU * self.params.frequency * t;
-        let noise_sigma = self.params.noise * (rate / 2.0).sqrt();
-        let sine = self.params.amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
-        let cosine = self.params.amplitude * phase.cos() + noise_sigma * self.rng.next_gaussian();
+        let phase = std::f64::consts::TAU * self.settings.frequency.get() * t;
+        let noise_sigma = self.settings.noise.get() * (rate / 2.0).sqrt();
+        let amplitude = self.settings.amplitude.get();
+        let sine = amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
+        let cosine = amplitude * phase.cos() + noise_sigma * self.rng.next_gaussian();
         let mut sample = [0u8; 16];
         sample[..8].copy_from_slice(&sine.to_le_bytes());
         sample[8..].copy_from_slice(&cosine.to_le_bytes());
@@ -954,24 +781,15 @@ impl TestDevice {
             .map(|&signal| self.streams[signal as usize].id().to_string())
             .collect::<Vec<String>>()
             .join("/");
-        terminal_println!(
+        self.notes.push(format!(
             "dropped sample {} from stream {ids}",
             self.clocks[clock].generated
-        );
+        ));
         for &signal in self.clocks[clock].streams {
             self.streams[signal as usize].skip(1);
         }
         self.clocks[clock].generated += 1;
         self.clocks[clock].next_drop = self.next_drop(clock);
-    }
-
-    fn drop_samples_now(&mut self) {
-        for clock in 0..self.clocks.len() {
-            if self.clocks[clock].rolls_over() {
-                self.rollover(clock);
-            }
-            self.drop_sample(clock);
-        }
     }
 
     /// The sample a clock drops next, `None` while `--no-drop` holds.
@@ -1023,6 +841,182 @@ impl TestDevice {
     }
 }
 
+/// What runs the simulated device: the socket it answers on, the client it
+/// answers to, the clock it steps with, and the keyboard.
+struct Runtime {
+    socket: UdpSocket,
+    client: Option<Client>,
+    epoch: Instant,
+    sim: Sim,
+}
+
+impl Runtime {
+    fn new(cli: SimulateCli) -> io::Result<Self> {
+        let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            client: None,
+            epoch: Instant::now(),
+            sim: Sim::new(&cli)?,
+        })
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        let raw_mode = match RawModeGuard::enable() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                terminal_eprintln!("keyboard shortcuts disabled: {err}");
+                None
+            }
+        };
+        self.banner(raw_mode.is_some())?;
+
+        loop {
+            if raw_mode.is_some() && !self.handle_keyboard()? {
+                terminal_println!("stopping tio test");
+                return Ok(());
+            }
+            self.receive_packets()?;
+            self.expire_client();
+            if self.client.is_some() {
+                self.step(|sim, now, sink| sim.tick(now, sink))?;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// What the device is, as the terminal sees it at startup.
+    fn banner(&self, keyboard: bool) -> io::Result<()> {
+        let port = self.socket.local_addr()?.port();
+        let settings = &self.sim.settings;
+        terminal_println!("tio test listening on udp://0.0.0.0:{port}");
+        terminal_println!(
+            "  stream 1: 2 waveform channels, amplitude={} V frequency={} Hz noise={} V/sqrt(Hz) samplerate={} Hz segment={} s",
+            settings.amplitude.get(),
+            settings.frequency.get(),
+            settings.noise.get(),
+            self.sim.sample_rate(),
+            self.sim.segment_seconds
+        );
+        terminal_println!(
+            "  stream 2: status={} signal_level={}",
+            settings.status.get(),
+            SIGNAL_LEVEL
+        );
+        terminal_println!(
+            "  stream 3: aux triangle/sawtooth at {} Hz sampled at {} Hz",
+            AUX_WAVE_FREQUENCY,
+            AUX_SAMPLE_RATE
+        );
+        if self.sim.no_drop {
+            terminal_println!("  random sample drops disabled (--no-drop)");
+        } else {
+            terminal_println!(
+                "  randomly dropping one sample from each sample clock about once per minute"
+            );
+        }
+        terminal_println!(
+            "  capture buffer: test.capture(-1) trigger, test.capture(-2) status, \
+             test.capture(-3) metadata, {}-{} f32 samples, ~{:.1}s delay",
+            CAPTURE_SAMPLE_COUNT_MIN,
+            CAPTURE_SAMPLE_COUNT_MAX,
+            CAPTURE_TRIGGER_DELAY_MS as f64 / 1000.0
+        );
+        if keyboard {
+            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
+        }
+        terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
+        Ok(())
+    }
+
+    /// Step the simulation, with the connected client as its sink.
+    fn step(&mut self, act: impl FnOnce(&mut Sim, u64, &mut UdpSink<'_>)) -> io::Result<()> {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        let mut sink = UdpSink::new(&self.socket, self.client.map(|client| client.addr));
+        act(&mut self.sim, now, &mut sink);
+        self.sim
+            .notes
+            .drain(..)
+            .for_each(|note| terminal_println!("{note}"));
+        sink.finish()
+    }
+
+    fn handle_keyboard(&mut self) -> io::Result<bool> {
+        while event::poll(Duration::from_millis(0))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('d') => self.step(|sim, _, _| sim.drop_now())?,
+                    KeyCode::Char('r') => self.step(|sim, now, sink| sim.reboot(now, sink))?,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn receive_packets(&mut self) -> io::Result<()> {
+        let mut buf = [0u8; 1024];
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((size, addr)) => {
+                    if !self.accept_packet_from(addr)? {
+                        continue;
+                    }
+                    match PacketView::parse_prefix(&buf[..size]) {
+                        Ok((packet, parsed_size)) if parsed_size == size => {
+                            self.step(|sim, now, sink| sim.handle(packet, now, sink))?;
+                        }
+                        Ok(_) => {
+                            terminal_eprintln!(
+                                "Ignoring UDP datagram with trailing bytes from {addr}"
+                            );
+                        }
+                        Err(err) => {
+                            terminal_eprintln!("Ignoring malformed packet from {addr}: {err:?}");
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn accept_packet_from(&mut self, addr: SocketAddr) -> io::Result<bool> {
+        let now = Instant::now();
+        match self.client {
+            Some(mut client) if client.addr == addr => {
+                client.last_rx = now;
+                self.client = Some(client);
+                Ok(true)
+            }
+            Some(client) if now.duration_since(client.last_rx) < CLIENT_TIMEOUT => Ok(false),
+            _ => {
+                self.client = Some(Client { addr, last_rx: now });
+                terminal_println!("client connected: {addr}");
+                self.step(|sim, now, sink| sim.connected(now, sink))?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn expire_client(&mut self) {
+        if let Some(client) = self.client {
+            if Instant::now().duration_since(client.last_rx) > CLIENT_TIMEOUT {
+                terminal_println!("client disconnected: {}", client.addr);
+                self.client = None;
+            }
+        }
+    }
+}
+
 /// The streams a boot starts: no decimation, a cutoff at Nyquist, and a
 /// fresh segment ring on each.
 fn boot_streams(rate: NonZeroU32) -> io::Result<[Stream<SEGMENTS>; 3]> {
@@ -1043,34 +1037,19 @@ fn boot_streams(rate: NonZeroU32) -> io::Result<[Stream<SEGMENTS>; 3]> {
     ])
 }
 
-/// A non-negative f64 property: no argument reads it, eight bytes write it.
-fn nonnegative_f64(args: &[u8], current: f64) -> Result<f64, RpcError> {
-    let value = match args.len() {
-        0 => current,
-        8 => f64::from_le_bytes(args.try_into().unwrap()),
-        _ => return Err(RpcError::ArgsSize),
-    };
+/// A level the simulated hardware could actually produce.
+fn nonnegative(value: f64) -> Result<f64, RpcError> {
     (value.is_finite() && value >= 0.0)
         .then_some(value)
         .ok_or(RpcError::Invalid)
-}
-
-/// A u8 property: no argument reads it, one byte writes it.
-fn u8_property(args: &[u8], current: u8) -> Result<u8, RpcError> {
-    match args {
-        [] => Ok(current),
-        [value] => Ok(*value),
-        _ => Err(RpcError::ArgsSize),
-    }
 }
 
 fn invalid_input(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
 
-fn next_log_delay(rng: &mut GaussianRng) -> Duration {
-    let jitter = LOG_MESSAGE_JITTER.mul_f64(rng.next_unit());
-    LOG_MESSAGE_MIN_INTERVAL + jitter
+fn next_log_delay(rng: &mut GaussianRng) -> u64 {
+    LOG_MESSAGE_MIN_INTERVAL_MS + (LOG_MESSAGE_JITTER_MS as f64 * rng.next_unit()) as u64
 }
 
 fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
@@ -1089,25 +1068,129 @@ mod tests {
     use super::*;
     use clap::Parser;
     use twinleaf::proto::data::CURRENT_SEGMENT;
+    use twinleaf::proto::packet::{Packet, PacketType};
+    use twinleaf::proto::rpc::Answer;
+    use twinleaf::proto::settings::Setting as Announcement;
+    use twinleaf::proto::RpcRequestId;
     use twinleaf_device::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
 
+    /// Every packet the simulation sent.
+    #[derive(Default)]
+    struct Sent(Vec<Vec<u8>>);
+
+    impl Sink for Sent {
+        fn send(&mut self, packet: &[u8]) {
+            self.0.push(packet.to_vec());
+        }
+    }
+
+    impl Sent {
+        fn views(&self) -> Vec<PacketView<'_>> {
+            self.0
+                .iter()
+                .map(|packet| PacketView::parse_prefix(packet).unwrap().0)
+                .collect()
+        }
+    }
+
     /// The segment the sine stream is acquiring.
-    fn sine(device: &TestDevice) -> &twinleaf_device::segments::Segment {
-        device.streams[Signal::Sine as usize].current()
+    fn sine(sim: &Sim) -> &twinleaf_device::segments::Segment {
+        sim.streams[Signal::Sine as usize].current()
     }
 
     /// A device with its streams acquiring, as a connecting client leaves it.
-    fn device(args: &[&str]) -> TestDevice {
+    fn sim(args: &[&str]) -> Sim {
         let cli = SimulateCli::parse_from([&["tio-simulate", "--port", "0"], args].concat());
-        let mut device = TestDevice::new(cli).unwrap();
-        device.reset_run();
-        device
+        let mut sim = Sim::new(&cli).unwrap();
+        sim.reset_run(0);
+        sim
+    }
+
+    /// The reply the simulation answered an RPC with.
+    fn call(sim: &mut Sim, name: &[u8], args: &[u8], sent: &mut Sent) -> Vec<u8> {
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let method = twinleaf::proto::rpc::Method::ByName(name);
+        let len = twinleaf::proto::rpc::write_request(&mut buf, RpcRequestId::new(1), method, args)
+            .unwrap();
+        let (view, _) = PacketView::parse_prefix(&buf[..len]).unwrap();
+        sim.handle(view, 0, sent);
+        let view = *sent.views().last().expect("a reply");
+        match Answer::parse(view.header.ptype, view.payload) {
+            Some(Answer::Reply(reply)) => reply.value.to_vec(),
+            Some(Answer::Error(error)) => panic!("{:?}", error.error()),
+            None => panic!("an answer"),
+        }
+    }
+
+    #[test]
+    fn the_table_describes_the_settings_it_answers() {
+        let sim = sim(&[]);
+        let settings = &sim.settings;
+        let specs = [
+            settings.amplitude.spec(),
+            settings.frequency.spec(),
+            settings.noise.spec(),
+            settings.status.spec(),
+            settings.enable.spec(),
+        ];
+        let listed: Vec<_> = RPCS
+            .iter()
+            .filter(|spec| specs.iter().any(|derived| derived.name == spec.name))
+            .cloned()
+            .collect();
+        assert_eq!(listed, specs);
+    }
+
+    #[test]
+    fn a_setting_write_is_announced_and_counted() {
+        let mut sim = sim(&[]);
+        let mut sent = Sent::default();
+
+        let value = 2.5f64.to_le_bytes();
+        assert_eq!(call(&mut sim, b"test.amplitude", &value, &mut sent), value);
+        assert_eq!(sim.settings.amplitude.get(), 2.5);
+
+        let announcements: Vec<_> = sent
+            .views()
+            .iter()
+            .filter(|view| view.header.ptype == PacketType::SETTING)
+            .map(|view| Announcement::parse(view.payload).unwrap())
+            .map(|setting| (setting.name.to_vec(), setting.reply.to_vec()))
+            .collect();
+        assert_eq!(
+            announcements,
+            [(b"test.amplitude".to_vec(), value.to_vec())]
+        );
+
+        let mut sent = Sent::default();
+        let version = call(&mut sim, b"settings.version", &[], &mut sent);
+        assert_eq!(version, 1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn a_reboot_restores_the_settings_a_boot_starts_from() {
+        let mut sim = sim(&["--amplitude", "1"]);
+        let mut sent = Sent::default();
+        call(
+            &mut sim,
+            b"test.amplitude",
+            &7.5f64.to_le_bytes(),
+            &mut sent,
+        );
+        call(&mut sim, b"test.enable", &[0], &mut sent);
+
+        sim.reboot(0, &mut sent);
+        assert_eq!(sim.settings.amplitude.get(), 1.0);
+        assert!(sim.settings.enable.get());
+
+        let mut sent = Sent::default();
+        let version = call(&mut sim, b"settings.version", &[], &mut sent);
+        assert_eq!(version, 0u32.to_le_bytes());
     }
 
     #[test]
     fn capture_buffer_exports_indexed_blocks_after_delay() {
-        let now = Instant::now();
         let mut capture = CaptureBuffer::new();
         capture.block_size = 4;
         capture.begin_capture(
@@ -1116,16 +1199,16 @@ mod tests {
                 length: 10,
                 ..CaptureInfo::default()
             },
-            now + Duration::from_millis(500),
+            500,
         );
 
         assert!(capture.locked());
         assert_eq!(capture.status(), capture::Status::Capturing);
 
-        capture.update(now + Duration::from_millis(499));
+        capture.update(499);
         assert!(capture.locked());
 
-        capture.update(now + Duration::from_millis(500));
+        capture.update(500);
         assert!(!capture.locked());
         assert_eq!(capture.status(), capture::Status::Done);
         assert_eq!(capture.export_size(), 10);
@@ -1140,25 +1223,24 @@ mod tests {
 
     #[test]
     fn every_stream_fits_one_metadata_bootstrap() {
-        let device = device(&[]);
-        let streams = &device.streams[..];
+        let sim = sim(&[]);
+        let streams = &sim.streams[..];
         let mut out = Reply::new();
-        metadata::reply(device.device.record(streams), streams, &[], &mut out).unwrap();
+        metadata::reply(sim.device.record(streams), streams, &[], &mut out).unwrap();
         let kinds: Vec<_> = data::MetadataReply::parse(&out)
             .unwrap()
             .map(|(kind, _)| kind)
             .collect();
         assert_eq!(kinds[0], data::MetadataType::Device);
-        assert_eq!(kinds.len(), 1 + device.streams.len() * 4);
+        assert_eq!(kinds.len(), 1 + sim.streams.len() * 4);
     }
 
     #[test]
     fn metadata_reports_the_ring_and_the_current_segment() {
-        let mut device = device(&["--samplerate", "4", "--segment-seconds", "1"]);
-        let addr = "127.0.0.1:1".parse().unwrap();
-        device.send_due_samples(addr).unwrap();
+        let mut sim = sim(&["--samplerate", "4", "--segment-seconds", "1"]);
+        sim.send_due_samples(0, &mut Sent::default());
 
-        let streams = &device.streams[..];
+        let streams = &sim.streams[..];
         let record = streams.stream(1).unwrap();
         assert_eq!(record.n_segments, SEGMENTS as u8);
         assert_eq!(record.buf_samples, 0);
@@ -1175,34 +1257,34 @@ mod tests {
 
     #[test]
     fn a_clock_reaching_its_segment_length_rolls_over() {
-        let mut device = device(&["--samplerate", "4", "--segment-seconds", "1"]);
-        let addr = "127.0.0.1:1".parse().unwrap();
-        let start_time = sine(&device).timeref().start_time;
-        for _ in 0..=device.clocks[WAVE_CLOCK].segment_samples {
-            if device.clocks[WAVE_CLOCK].rolls_over() {
-                device.rollover(WAVE_CLOCK);
+        let mut sim = sim(&["--samplerate", "4", "--segment-seconds", "1"]);
+        let mut sent = Sent::default();
+        let start_time = sine(&sim).timeref().start_time;
+        for _ in 0..=sim.clocks[WAVE_CLOCK].segment_samples {
+            if sim.clocks[WAVE_CLOCK].rolls_over() {
+                sim.rollover(WAVE_CLOCK);
             }
-            device.push_samples(WAVE_CLOCK, addr).unwrap();
-            device.clocks[WAVE_CLOCK].generated += 1;
+            sim.push_samples(WAVE_CLOCK, &mut sent);
+            sim.clocks[WAVE_CLOCK].generated += 1;
         }
 
-        assert_eq!(sine(&device).id().value(), 1);
-        assert_eq!(sine(&device).timeref().start_time, start_time + 1);
+        assert_eq!(sine(&sim).id().value(), 1);
+        assert_eq!(sine(&sim).timeref().start_time, start_time + 1);
     }
 
     #[test]
     fn a_reboot_starts_a_fresh_ring_where_a_reconnect_takes_the_next_segment() {
-        let mut device = device(&["--samplerate", "4", "--segment-seconds", "1"]);
-        let addr = "127.0.0.1:1".parse().unwrap();
-        device.push_samples(WAVE_CLOCK, addr).unwrap();
+        let mut sim = sim(&["--samplerate", "4", "--segment-seconds", "1"]);
+        let mut sent = Sent::default();
+        sim.push_samples(WAVE_CLOCK, &mut sent);
 
-        device.reset_run();
-        assert_eq!(sine(&device).id().value(), 1);
+        sim.reset_run(0);
+        assert_eq!(sine(&sim).id().value(), 1);
 
-        let session = device.device.session;
-        device.reboot().unwrap();
-        assert_ne!(device.device.session, session);
-        assert!(device
+        let session = sim.device.session;
+        sim.reboot(0, &mut sent);
+        assert_ne!(sim.device.session, session);
+        assert!(sim
             .streams
             .iter()
             .all(|stream| stream.current().id().value() == 0));
@@ -1210,7 +1292,7 @@ mod tests {
 
     #[test]
     fn capture_data_uses_current_sine_parameters() {
-        let mut device = device(&[
+        let mut sim = sim(&[
             "--samplerate",
             "4",
             "--frequency",
@@ -1221,7 +1303,7 @@ mod tests {
             "0",
         ]);
 
-        let (data, info) = device.generate_capture_data();
+        let (data, info) = sim.generate_capture_data();
 
         assert!(
             (CAPTURE_SAMPLE_COUNT_MIN as u32..=CAPTURE_SAMPLE_COUNT_MAX as u32)
@@ -1240,19 +1322,14 @@ mod tests {
 
     #[test]
     fn capture_metadata_uses_tl_chibi_type_and_y_calibration() {
-        let mut device = device(&[]);
-        let (data, info) = device.generate_capture_data();
+        let mut sim = sim(&[]);
+        let (data, info) = sim.generate_capture_data();
         let data_len = data.len();
-        device
-            .capture
-            .begin_capture(data, info, Instant::now() + Duration::from_millis(1));
-        device
-            .capture
-            .update(Instant::now() + Duration::from_millis(1));
+        sim.capture.begin_capture(data, info, 1);
+        sim.capture.update(1);
 
         let mut out = Reply::new();
-        device
-            .capture
+        sim.capture
             .view()
             .reply(Selector::Metadata, &mut out)
             .unwrap();
@@ -1263,6 +1340,24 @@ mod tests {
         assert_eq!(metadata.data_size, u32::try_from(data_len).unwrap());
         assert_eq!(metadata.length, info.length);
         assert_eq!(metadata.y_calibration, CAPTURE_Y_CALIBRATION);
+    }
+
+    #[test]
+    fn a_log_message_is_due_on_its_own_schedule() {
+        let mut sim = sim(&[]);
+        let mut sent = Sent::default();
+        sim.log_if_due(sim.next_log_at - 1, &mut sent);
+        assert!(sent.0.is_empty());
+
+        sim.log_if_due(sim.next_log_at, &mut sent);
+        let [view] = sent.views()[..] else {
+            panic!("one packet");
+        };
+        assert_eq!(view.header.ptype, PacketType::LOG);
+        let entry = log::LogMessage::parse(view.payload).unwrap();
+        assert_eq!(entry.level, log::LogLevel::CRITICAL);
+        let lucky = format!("lucky number {}", entry.data);
+        assert!(std::str::from_utf8(entry.message).unwrap().contains(&lucky));
     }
 
     #[test]

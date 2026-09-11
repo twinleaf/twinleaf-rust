@@ -10,6 +10,7 @@ pub mod metadata;
 pub mod publisher;
 pub mod rpc;
 pub mod segments;
+pub mod settings;
 pub mod stream;
 
 /// Where a device's packets go.
