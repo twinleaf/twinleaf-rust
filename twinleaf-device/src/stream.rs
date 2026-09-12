@@ -96,6 +96,12 @@ impl<const N: usize> Stream<N> {
         self.segments.rollover();
     }
 
+    /// Mark every segment opened from here on as begun while the time
+    /// reference's pulses were absent.
+    pub fn set_holdover(&mut self, holdover: bool) {
+        self.segments.set_holdover(holdover);
+    }
+
     /// Publish one sample of [`StreamDef::sample_size`] bytes, packed in
     /// column order.
     pub fn push(&mut self, sample: &[u8], out: &mut impl Sink) {
@@ -358,6 +364,25 @@ mod tests {
         let samples = data::Samples::parse(view.header, view.payload).unwrap();
         assert_eq!(samples.segment_id.value(), 1);
         assert_eq!(samples.first.value(), 0);
+        assert_eq!(streams[0].current().timeref().start_time, 1001);
+    }
+
+    /// D8: no segment spans a change of traceability, and the one begun
+    /// without it is flagged.
+    #[test]
+    fn a_holdover_rollover_flags_the_segment_it_opens() {
+        let mut streams = started();
+        let mut sent = Sent::default();
+        (0..10).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+        streams[0].set_holdover(true);
+        streams[0].rollover();
+        (0..11).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+
+        assert_eq!(streams[0].segment(0).unwrap().flags, SegmentFlags::VALID);
+        assert_eq!(
+            streams[0].segment(1).unwrap().flags,
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
+        );
         assert_eq!(streams[0].current().timeref().start_time, 1001);
     }
 

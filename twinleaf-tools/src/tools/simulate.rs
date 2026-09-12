@@ -12,16 +12,20 @@ use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
-use twinleaf::proto::packet::PacketView;
+use twinleaf::proto::packet::{PacketType, PacketView};
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::device::{Call, Device, Handled, Identity};
-use twinleaf_device::rpc::{Access, Kind, Reply, RpcSpec};
+use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec};
 use twinleaf_device::segments::{Params, Timeref};
 use twinleaf_device::settings::Setting;
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
+use twinleaf_device::sync::{
+    ticks, AcquisitionAction, AcquisitionError, Actions, CounterDomain, PulseConfig, Reference,
+    ReferenceIdentity, ScheduledEdge, Synchronizer,
+};
 use twinleaf_device::Sink;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -70,6 +74,15 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const LOG_MESSAGE_MIN_INTERVAL_NS: u64 = 1_500_000_000;
 const LOG_MESSAGE_JITTER_NS: u64 = 4_000_000_000;
 const CAPTURE_TRIGGER_DELAY_NS: u64 = 500_000_000;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// The simulated capture counter: one megahertz, with the fake PPS always on
+/// the same tick of it.
+const PPS_PERIOD: u32 = 1_000_000;
+const PPS_EDGE: u32 = 0;
+/// A millisecond, which is as close as a software pulse lands.
+const PPS_TOLERANCE_NS: u32 = 1_000_000;
+/// Seconds from boot to an automatic start, as `dev.autostart` has it.
+const AUTOSTART_SECONDS: u8 = 2;
 const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
 const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
 const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
@@ -138,7 +151,7 @@ const AUX_DEF: StreamDef = StreamDef {
 
 /// The RPC table. Introspection first, like tl-chibi, and the order fixes
 /// the ids `rpc.list` reports and the `rpc.hash`.
-static RPCS: [RpcSpec; 22] = [
+static RPCS: [RpcSpec; 26] = [
     RpcSpec::std("rpc.name", Access::RW),
     RpcSpec::std("rpc.id", Access::RW),
     RpcSpec::std("rpc.info", Access::RW),
@@ -149,11 +162,15 @@ static RPCS: [RpcSpec; 22] = [
     RpcSpec::prop("dev.desc", Kind::String, Access::READ),
     RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
     RpcSpec::prop("dev.loglevel", Kind::Uint(1), Access::RW),
+    RpcSpec::action("dev.start"),
     RpcSpec::action("dev.stop"),
+    RpcSpec::action("dev.restart"),
+    RpcSpec::prop("dev.autostart", Kind::Uint(1), Access::RW),
     RpcSpec::std("dev.firmware.upload", Access::WRITE),
     RpcSpec::action("dev.firmware.upgrade"),
     RpcSpec::std("dev.metadata", Access::RW),
     RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("sync.status", Kind::Uint(1), Access::READ),
     RpcSpec::prop("test.amplitude", Kind::Float(8), Access::RW),
     RpcSpec::prop("test.frequency", Kind::Float(8), Access::RW),
     RpcSpec::prop("test.noise", Kind::Float(8), Access::RW),
@@ -171,6 +188,7 @@ struct Settings {
     noise: Setting<f64>,
     status: Setting<u8>,
     enable: Setting<bool>,
+    autostart: Setting<u8>,
 }
 
 impl Settings {
@@ -181,6 +199,7 @@ impl Settings {
             noise: Setting::new("test.noise", cli.noise).checked(nonnegative),
             status: Setting::new("test.status", 0),
             enable: Setting::new("test.enable", true),
+            autostart: Setting::new("dev.autostart", AUTOSTART_SECONDS),
         }
     }
 
@@ -191,6 +210,7 @@ impl Settings {
         self.noise.reset();
         self.status.reset();
         self.enable.reset();
+        self.autostart.reset();
     }
 }
 
@@ -459,9 +479,12 @@ impl GaussianRng {
     }
 }
 
+/// One acquisition RPC's effect on the synchronizer.
+type Acquisition = fn(&mut Synchronizer) -> Result<Actions, AcquisitionError>;
+
 /// The simulated device: what it is, what it holds, and what it publishes.
-/// Every method takes the nanoseconds since boot its runtime keeps, and
-/// every packet it sends goes to that runtime's sink.
+/// Every method takes the monotonic nanoseconds its runtime keeps, which here
+/// are UNIX nanoseconds, and every packet it sends goes to that runtime's sink.
 struct Sim {
     device: Device<'static>,
     settings: Settings,
@@ -469,6 +492,16 @@ struct Sim {
     clocks: [Clock; 2],
     capture: CaptureBuffer,
     rng: GaussianRng,
+    sync: Synchronizer,
+    /// Whether the fake PPS is being fed to the synchronizer.
+    pps: bool,
+    /// When the next fake pulse lands, on the wall-clock second.
+    next_pulse_ns: u64,
+    /// The plan the synchronizer last armed, which a start acknowledges.
+    plan: Option<u16>,
+    acquiring: bool,
+    /// What the streams were last told, which a change rolls them over.
+    traceable: bool,
     segment_seconds: u32,
     started_ns: u64,
     next_log_at: u64,
@@ -478,8 +511,8 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(cli: &SimulateCli) -> io::Result<Self> {
-        let seed = unix_duration().as_nanos() as u64 ^ u64::from(cli.port).rotate_left(32);
+    fn new(cli: &SimulateCli, now: u64) -> io::Result<Self> {
+        let seed = now ^ u64::from(cli.port).rotate_left(32);
         let session_id = (seed as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
@@ -496,16 +529,23 @@ impl Sim {
         let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, DEVICE_SERIAL, DEVICE_FIRMWARE)
             .ok_or_else(|| invalid_input("identity too long"))?;
 
+        let session = SessionId::new(session_id);
         let mut rng = GaussianRng::new(seed | 1);
         Ok(Self {
-            device: Device::new(identity, SessionId::new(session_id), &RPCS),
+            device: Device::new(identity, session, &RPCS),
             settings: Settings::new(cli),
             streams: boot_streams(sample_rate)?,
             clocks,
             capture: CaptureBuffer::new(),
+            pps: !cli.no_pps,
+            next_pulse_ns: next_second_ns(now),
+            plan: None,
+            acquiring: false,
+            traceable: true,
+            sync: synchronizer(session, now),
             segment_seconds: cli.segment_seconds,
-            started_ns: 0,
-            next_log_at: next_log_delay(&mut rng),
+            started_ns: now,
+            next_log_at: now + next_log_delay(&mut rng),
             next_log_level: 0,
             no_drop: cli.no_drop,
             notes: Vec::new(),
@@ -513,16 +553,25 @@ impl Sim {
         })
     }
 
-    /// A host has connected: acquisition restarts and the device describes
-    /// itself.
+    /// A host has connected: the device describes itself. Acquisition is the
+    /// device's own business and a reconnecting host does not disturb it.
     fn connected(&mut self, now: u64, out: &mut impl Sink) {
-        self.reset_run(now);
         self.device.connected(&self.streams[..], now, out);
     }
 
-    /// Answer one packet from the host.
+    /// Answer one packet from the host, which for a SYNC packet means taking
+    /// its time reference as a parent's. The pulse due this second is fed
+    /// first, so an edge beats a packet about the same second.
     fn handle(&mut self, packet: PacketView<'_>, now: u64, out: &mut impl Sink) {
         self.update_capture(now);
+        self.advance_sync(now);
+        if packet.header.ptype == PacketType::SYNC {
+            if let Some(timeref) = sync::Timeref::parse(packet.payload) {
+                self.sync
+                    .observe_packet(timeref, sync::Timeref::pad(packet.payload), now);
+            }
+            return;
+        }
         let Handled::Rpc(call) = self.device.handle(&self.streams[..], packet, out) else {
             return;
         };
@@ -530,22 +579,32 @@ impl Sim {
         call.reply(result.as_deref().map_err(|error| *error), out);
     }
 
-    /// Send everything due at `now`: the heartbeat, a log message, samples.
+    /// Send everything due at `now`: the pulse, the heartbeat, a log message,
+    /// samples.
     fn tick(&mut self, now: u64, out: &mut impl Sink) {
         self.update_capture(now);
+        self.advance_sync(now);
         self.device.tick(now, out);
         self.log_if_due(now, out);
         self.send_due_samples(now, out);
     }
 
-    /// Power-cycle: a new session, the settings a device boots with, and a
-    /// fresh segment ring on every stream.
+    /// Power-cycle: a new session, the settings a device boots with, a fresh
+    /// segment ring on every stream, and a timebase to bootstrap again.
     fn reboot(&mut self, now: u64, out: &mut impl Sink) {
         let session = SessionId::new(self.next_session_id());
         self.device.reboot(session);
         self.settings.reset();
         self.streams =
             boot_streams(self.sample_rate()).expect("streams that booted once boot again");
+        self.sync = synchronizer(session, now);
+        self.next_pulse_ns = next_second_ns(now);
+        self.plan = None;
+        self.acquiring = false;
+        self.traceable = true;
+        self.capture.clear();
+        self.next_log_at = now + next_log_delay(&mut self.rng);
+        self.next_log_level = 0;
         self.notes.push(format!(
             "rebooted test device; new session id {}",
             self.device.session.value()
@@ -563,17 +622,47 @@ impl Sim {
         }
     }
 
-    /// Restart acquisition: every stream stops and starts again at a fresh
-    /// time reference, so its samples begin at zero in a new segment.
-    fn reset_run(&mut self, now: u64) {
-        self.started_ns = now;
-        let timeref = Timeref::new(
-            sync::Epoch::UNIX,
-            u32::try_from(unix_duration().as_secs()).unwrap_or(u32::MAX),
-            self.device.session,
-            DEVICE_SERIAL,
-        )
-        .expect("the device serial fits a time reference");
+    /// Feed the synchronizer every pulse due by `now`, then the wake it asked
+    /// for. Without a pulse the wake is what bootstraps the local timebase,
+    /// so it is taken on the second boundary either way.
+    fn advance_sync(&mut self, now: u64) {
+        while self.next_pulse_ns <= now {
+            let at = self.next_pulse_ns;
+            self.next_pulse_ns += NANOS_PER_SECOND;
+            let actions = match self.pps {
+                true => self.sync.capture(PPS_EDGE, at),
+                false => self.sync.wake(PPS_EDGE, at),
+            };
+            self.apply(actions, at);
+        }
+        if self.sync.status().counter_edge.is_some() && now >= self.sync.next_wake_deadline_ns(now)
+        {
+            let actions = self.sync.wake(counter_at(now), now);
+            self.apply(actions, now);
+        }
+    }
+
+    /// Carry out one round of synchronization work.
+    fn apply(&mut self, actions: Actions, at: u64) {
+        match actions.local {
+            AcquisitionAction::None => {}
+            AcquisitionAction::Arm(plan) | AcquisitionAction::Rearm(plan) => {
+                self.plan = Some(plan.id)
+            }
+            AcquisitionAction::Disarm => self.plan = None,
+            AcquisitionAction::Start(edge) => self.start_run(edge, at),
+            AcquisitionAction::Stop => self.stop_run(),
+        }
+        if let Some(status) = actions.status_changed {
+            self.follow_traceability(status.traceable);
+        }
+    }
+
+    /// Begin acquiring at `edge`, whose second every stream's sample zero
+    /// sits at.
+    fn start_run(&mut self, edge: ScheduledEdge, at: u64) {
+        let timeref = timeref_of(edge.reference);
+        self.started_ns = at;
         for stream in &mut self.streams {
             stream.stop();
             stream
@@ -584,9 +673,58 @@ impl Sim {
             self.clocks[clock].generated = 0;
             self.clocks[clock].next_drop = self.next_drop(clock);
         }
-        self.next_log_at = now + next_log_delay(&mut self.rng);
-        self.next_log_level = 0;
-        self.capture.clear();
+        self.acquiring = true;
+        let plan = self
+            .plan
+            .take()
+            .expect("a start follows the arm that staged it");
+        self.sync
+            .mark_running(plan)
+            .expect("a start is acknowledged out of Starting");
+        self.notes
+            .push(format!("acquiring from second {}", edge.reference.second));
+    }
+
+    fn stop_run(&mut self) {
+        for stream in &mut self.streams {
+            stream.stop();
+        }
+        self.acquiring = false;
+        self.plan = None;
+        self.sync
+            .finish_stop()
+            .expect("a stop is acknowledged out of Stopping");
+        self.notes.push("acquisition stopped".to_string());
+    }
+
+    /// A change of traceability ends the segment it happened in, and the one
+    /// that opens says whether the pulses were there.
+    fn follow_traceability(&mut self, traceable: bool) {
+        if self.traceable == traceable {
+            return;
+        }
+        self.traceable = traceable;
+        for stream in &mut self.streams {
+            stream.set_holdover(!traceable);
+            stream.rollover();
+        }
+    }
+
+    /// One acquisition RPC, answered at once from the state machine and then
+    /// carried out.
+    fn acquire(&mut self, request: Acquisition, now: u64) -> Result<Reply, RpcError> {
+        let actions = request(&mut self.sync).map_err(|_| RpcError::State)?;
+        self.apply(actions, now);
+        Ok(Reply::new())
+    }
+
+    /// Turn the fake pulse train on or off, as the keyboard asks.
+    fn toggle_pps(&mut self) {
+        self.pps = !self.pps;
+        self.notes.push(match self.pps {
+            true => "PPS restored".to_string(),
+            false => "PPS removed; the device falls into holdover".to_string(),
+        });
     }
 
     /// The RPCs this device adds to the standard ones.
@@ -599,7 +737,22 @@ impl Sim {
         let args = call.args;
         let mut reply = Reply::new();
         match call.name {
-            "dev.stop" | "dev.firmware.upload" => {}
+            "dev.firmware.upload" => {}
+            "dev.start" => return self.acquire(Synchronizer::start, now),
+            "dev.stop" => return self.acquire(Synchronizer::stop, now),
+            "dev.restart" => return self.acquire(Synchronizer::restart, now),
+            "dev.autostart" => {
+                let answered = self.device.apply(&mut self.settings.autostart, args, out)?;
+                self.sync
+                    .set_autostart_seconds(self.settings.autostart.get());
+                return Ok(answered);
+            }
+            "sync.status" => {
+                if !args.is_empty() {
+                    return Err(RpcError::ReadOnly);
+                }
+                put(&mut reply, &[self.sync.status().announced.code()])?;
+            }
             "dev.firmware.upgrade" => {
                 self.device.identity.desc =
                     UPGRADED_DESC.try_into().map_err(|_| RpcError::Internal)?;
@@ -687,6 +840,9 @@ impl Sim {
     }
 
     fn send_due_samples(&mut self, now: u64, out: &mut impl Sink) {
+        if !self.acquiring {
+            return;
+        }
         (0..self.clocks.len()).for_each(|clock| self.send_clock_samples(clock, now, out));
     }
 
@@ -845,7 +1001,6 @@ impl Sim {
 struct Runtime {
     socket: UdpSocket,
     client: Option<Client>,
-    epoch: Instant,
     sim: Sim,
 }
 
@@ -856,8 +1011,7 @@ impl Runtime {
         Ok(Self {
             socket,
             client: None,
-            epoch: Instant::now(),
-            sim: Sim::new(&cli)?,
+            sim: Sim::new(&cli, now_ns())?,
         })
     }
 
@@ -878,9 +1032,7 @@ impl Runtime {
             }
             self.receive_packets()?;
             self.expire_client();
-            if self.client.is_some() {
-                self.step(|sim, now, sink| sim.tick(now, sink))?;
-            }
+            self.step(|sim, now, sink| sim.tick(now, sink))?;
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -923,15 +1075,23 @@ impl Runtime {
             CAPTURE_TRIGGER_DELAY_NS as f64 / 1_000_000_000.0
         );
         if keyboard {
-            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
+            terminal_println!(
+                "  press d to drop one sample now, p to toggle the PPS, r to reboot, \
+                 Ctrl-C to quit"
+            );
         }
+        terminal_println!(
+            "  {} PPS, acquiring {} s after boot; dev.start, dev.stop, dev.restart",
+            if self.sim.pps { "simulated" } else { "no" },
+            self.sim.settings.autostart.get()
+        );
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
         Ok(())
     }
 
     /// Step the simulation, with the connected client as its sink.
     fn step(&mut self, act: impl FnOnce(&mut Sim, u64, &mut UdpSink<'_>)) -> io::Result<()> {
-        let now = self.epoch.elapsed().as_nanos() as u64;
+        let now = now_ns();
         let mut sink = UdpSink::new(&self.socket, self.client.map(|client| client.addr));
         act(&mut self.sim, now, &mut sink);
         self.sim
@@ -949,6 +1109,7 @@ impl Runtime {
                 }
                 match key.code {
                     KeyCode::Char('d') => self.step(|sim, _, _| sim.drop_now())?,
+                    KeyCode::Char('p') => self.step(|sim, _, _| sim.toggle_pps())?,
                     KeyCode::Char('r') => self.step(|sim, now, sink| sim.reboot(now, sink))?,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(false);
@@ -1016,6 +1177,43 @@ impl Runtime {
     }
 }
 
+/// A child's synchronizer: its own wall clock to start from, a fake PPS to
+/// follow, and no oscillator to steer.
+fn synchronizer(session: SessionId, now: u64) -> Synchronizer {
+    Synchronizer::new(
+        CounterDomain::new(PPS_PERIOD),
+        PulseConfig::with_edge_tolerance(ticks(PPS_TOLERANCE_NS, PPS_PERIOD)),
+        Reference {
+            identity: ReferenceIdentity::new(sync::Epoch::UNIX, session, DEVICE_SERIAL.as_bytes()),
+            second: (now / NANOS_PER_SECOND) as u32,
+        },
+        None,
+        AUTOSTART_SECONDS,
+    )
+}
+
+/// Where a segment's sample zero sits, as the synchronizer names it.
+fn timeref_of(reference: Reference) -> Timeref {
+    let serial = std::str::from_utf8(reference.identity.serial.as_bytes()).unwrap_or(DEVICE_SERIAL);
+    Timeref::new(
+        reference.identity.epoch,
+        reference.second,
+        reference.identity.session,
+        serial,
+    )
+    .expect("a timeref serial fits a segment")
+}
+
+/// The capture counter at `now`, which the fake pulse divides.
+fn counter_at(now: u64) -> u32 {
+    (now % NANOS_PER_SECOND * u64::from(PPS_PERIOD) / NANOS_PER_SECOND) as u32
+}
+
+/// The wall-clock second after `now`, where the next fake pulse lands.
+fn next_second_ns(now: u64) -> u64 {
+    (now / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND
+}
+
 /// The streams a boot starts: no decimation, a cutoff at Nyquist, and a
 /// fresh segment ring on each.
 fn boot_streams(rate: NonZeroU32) -> io::Result<[Stream<SEGMENTS>; 3]> {
@@ -1056,6 +1254,11 @@ fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
     CAPTURE_SAMPLE_COUNT_MIN + (rng.next_u64() as usize % span)
 }
 
+/// The device's clock, which here is the wall clock in nanoseconds.
+fn now_ns() -> u64 {
+    unix_duration().as_nanos() as u64
+}
+
 fn unix_duration() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1073,6 +1276,14 @@ mod tests {
     use twinleaf::proto::RpcRequestId;
     use twinleaf_device::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
+    use twinleaf_device::sync::{ReferenceState, TimeStatus};
+
+    /// A round wall-clock second to boot the simulated device at.
+    const BOOT: u64 = 1_800_000_000 * NANOS_PER_SECOND;
+    const PARENT_SERIAL: &str = "PARENT01";
+    const PARENT_SESSION: u32 = 4242;
+    /// Seconds between the parent's timeline and the simulator's own.
+    const PARENT_OFFSET: u32 = 1_000;
 
     /// Every packet the simulation sent.
     #[derive(Default)]
@@ -1098,12 +1309,33 @@ mod tests {
         sim.streams[Signal::Sine as usize].current()
     }
 
-    /// A device with its streams acquiring, as a connecting client leaves it.
+    /// What the sine stream's current segment says about itself on the wire.
+    fn sine_flags(sim: &Sim) -> data::SegmentFlags {
+        sim.streams[Signal::Sine as usize]
+            .segment(CURRENT_SEGMENT)
+            .expect("a current segment")
+            .flags
+    }
+
+    /// A device at the instant it booted.
     fn sim(args: &[&str]) -> Sim {
         let cli = SimulateCli::parse_from([&["tio-simulate", "--port", "0"], args].concat());
-        let mut sim = Sim::new(&cli).unwrap();
-        sim.reset_run(0);
-        sim
+        Sim::new(&cli, BOOT).unwrap()
+    }
+
+    /// A device at the second its autostart began acquiring, having locked
+    /// to its PPS first.
+    fn acquiring(args: &[&str]) -> (Sim, u64) {
+        let mut sim = sim(args);
+        let mut sent = Sent::default();
+        let started = (1..=10u64)
+            .map(|second| BOOT + second * NANOS_PER_SECOND)
+            .find(|&now| {
+                sim.tick(now, &mut sent);
+                sim.acquiring
+            })
+            .expect("the simulator never autostarted");
+        (sim, started)
     }
 
     /// The reply the simulation answered an RPC with.
@@ -1113,7 +1345,7 @@ mod tests {
         let len = twinleaf::proto::rpc::write_request(&mut buf, RpcRequestId::new(1), method, args)
             .unwrap();
         let (view, _) = PacketView::parse_prefix(&buf[..len]).unwrap();
-        sim.handle(view, 0, sent);
+        sim.handle(view, BOOT, sent);
         let view = *sent.views().last().expect("a reply");
         match Answer::parse(view.header.ptype, view.payload) {
             Some(Answer::Reply(reply)) => reply.value.to_vec(),
@@ -1179,7 +1411,7 @@ mod tests {
         );
         call(&mut sim, b"test.enable", &[0], &mut sent);
 
-        sim.reboot(0, &mut sent);
+        sim.reboot(BOOT, &mut sent);
         assert_eq!(sim.settings.amplitude.get(), 1.0);
         assert!(sim.settings.enable.get());
 
@@ -1236,8 +1468,8 @@ mod tests {
 
     #[test]
     fn metadata_reports_the_ring_and_the_current_segment() {
-        let mut sim = sim(&["--samplerate", "4", "--segment-seconds", "1"]);
-        sim.send_due_samples(0, &mut Sent::default());
+        let (mut sim, now) = acquiring(&["--samplerate", "4", "--segment-seconds", "10"]);
+        sim.tick(now + NANOS_PER_SECOND, &mut Sent::default());
 
         let streams = &sim.streams[..];
         let record = streams.stream(1).unwrap();
@@ -1245,20 +1477,28 @@ mod tests {
         assert_eq!(record.buf_samples, 0);
         assert_eq!(record.sample_size, 16);
         let segment = streams.segment(1, CURRENT_SEGMENT).unwrap();
-        assert_eq!(segment.segment_id.value(), 0);
         assert_eq!(segment.sampling_rate, 4);
         assert_eq!(segment.filter_cutoff, 2.0);
-        assert_eq!(streams.segment(1, 0), Some(segment));
-        assert_eq!(streams.segment(1, 1), None);
+        assert_eq!(segment.epoch, sync::Epoch::UNIX);
+        assert_eq!(segment.timeref_serial, DEVICE_SERIAL);
+        assert_eq!(
+            segment.flags,
+            data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE
+        );
+        assert_eq!(
+            streams.segment(1, segment.segment_id.value()),
+            Some(segment)
+        );
         assert!(streams.stream(99).is_none());
         assert!(streams.segment(99, CURRENT_SEGMENT).is_none());
     }
 
     #[test]
     fn a_clock_reaching_its_segment_length_rolls_over() {
-        let mut sim = sim(&["--samplerate", "4", "--segment-seconds", "1"]);
+        let (mut sim, _) = acquiring(&["--samplerate", "4", "--segment-seconds", "1"]);
         let mut sent = Sent::default();
         let start_time = sine(&sim).timeref().start_time;
+        assert_eq!(sim.clocks[WAVE_CLOCK].generated, 0);
         for _ in 0..=sim.clocks[WAVE_CLOCK].segment_samples {
             if sim.clocks[WAVE_CLOCK].rolls_over() {
                 sim.rollover(WAVE_CLOCK);
@@ -1271,22 +1511,143 @@ mod tests {
         assert_eq!(sine(&sim).timeref().start_time, start_time + 1);
     }
 
+    /// A reconnecting host is not a reboot: it disturbs neither the run nor
+    /// the segment it is in.
     #[test]
-    fn a_reboot_starts_a_fresh_ring_where_a_reconnect_takes_the_next_segment() {
-        let mut sim = sim(&["--samplerate", "4", "--segment-seconds", "1"]);
+    fn a_reconnect_leaves_the_run_alone_and_a_reboot_starts_a_fresh_ring() {
+        let (mut sim, now) = acquiring(&["--samplerate", "4", "--segment-seconds", "1"]);
         let mut sent = Sent::default();
-        sim.push_samples(WAVE_CLOCK, &mut sent);
+        let segment = sine(&sim).id().value();
+        let start_time = sine(&sim).timeref().start_time;
 
-        sim.reset_run(0);
-        assert_eq!(sine(&sim).id().value(), 1);
+        sim.connected(now, &mut sent);
+        assert!(sim.acquiring);
+        assert_eq!(sine(&sim).id().value(), segment);
+        assert_eq!(sine(&sim).timeref().start_time, start_time);
 
         let session = sim.device.session;
-        sim.reboot(0, &mut sent);
+        sim.reboot(now, &mut sent);
         assert_ne!(sim.device.session, session);
+        assert!(!sim.acquiring);
         assert!(sim
             .streams
             .iter()
             .all(|stream| stream.current().id().value() == 0));
+    }
+
+    /// The simulator in the child role: a parent's SYNC packets take it onto
+    /// the parent's timeline, and the segment that opens says so.
+    #[test]
+    fn a_parents_sync_packets_are_adopted_and_name_the_new_segment() {
+        let (mut sim, now) = acquiring(&["--samplerate", "4"]);
+        let mut sent = Sent::default();
+        let mut at = now;
+        for sequence in 1..=6u8 {
+            at += NANOS_PER_SECOND;
+            sim.tick(at, &mut sent);
+            let timeref = sync::Timeref {
+                epoch: sync::Epoch::UNIX,
+                time: (at / NANOS_PER_SECOND) as u32 + PARENT_OFFSET,
+                session: SessionId::new(PARENT_SESSION),
+                serial: PARENT_SERIAL.as_bytes(),
+            };
+            let mut buf = [0u8; 64];
+            let len = timeref
+                .write_with_pad(&mut buf, TimeStatus::Locked.bits() | sequence)
+                .unwrap();
+            let (view, _) = PacketView::parse_prefix(&buf[..len]).unwrap();
+            sim.handle(view, at, &mut sent);
+        }
+        assert_eq!(sim.sync.status().reference, ReferenceState::Upstream);
+        assert_eq!(sim.sync.status().upstream, TimeStatus::Locked);
+
+        // Adoption restarts the run, which then begins on the parent's time.
+        for _ in 0..4 {
+            at += NANOS_PER_SECOND;
+            sim.tick(at, &mut sent);
+        }
+        assert!(sim.acquiring);
+        assert_eq!(sine(&sim).timeref().serial, PARENT_SERIAL);
+        assert_eq!(sine(&sim).timeref().session, SessionId::new(PARENT_SESSION));
+        assert!(sine(&sim).timeref().start_time > PARENT_OFFSET);
+        assert!(sim.traceable);
+    }
+
+    /// The 'p' key's demonstration: the pulses go away, the segment ends, and
+    /// the one that opens carries the holdover flag.
+    #[test]
+    fn losing_the_pulses_rolls_over_and_flags_the_segment() {
+        let (mut sim, now) = acquiring(&["--samplerate", "4"]);
+        let mut sent = Sent::default();
+        let mut at = now + NANOS_PER_SECOND;
+        sim.tick(at, &mut sent);
+        assert!(sim.traceable);
+        assert_eq!(
+            sine_flags(&sim),
+            data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE
+        );
+
+        sim.toggle_pps();
+        for _ in 0..4 {
+            at += NANOS_PER_SECOND;
+            sim.tick(at, &mut sent);
+        }
+        assert!(!sim.traceable);
+        assert_eq!(sim.sync.status().announced, TimeStatus::Holdover);
+        assert_eq!(
+            sine_flags(&sim),
+            data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE | data::SegmentFlags::HOLDOVER
+        );
+        assert_eq!(sine(&sim).id().value(), 1);
+    }
+
+    /// D8: a device whose pulses never arrived says so in the segments it
+    /// opens, not only in the ones a later change rolls over to.
+    #[test]
+    fn a_device_that_never_had_pulses_flags_its_first_segment() {
+        let (mut sim, now) = acquiring(&["--samplerate", "4", "--no-pps"]);
+        sim.tick(now + NANOS_PER_SECOND, &mut Sent::default());
+        assert!(!sim.traceable);
+        assert_eq!(
+            sine_flags(&sim),
+            data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE | data::SegmentFlags::HOLDOVER
+        );
+    }
+
+    /// D9: every acquisition RPC is answered from the state machine at once,
+    /// and a stop from idle is not an error.
+    #[test]
+    fn the_acquisition_rpcs_answer_at_once_and_take_effect() {
+        let (mut sim, now) = acquiring(&["--samplerate", "4"]);
+        let mut sent = Sent::default();
+        let mut at = now + NANOS_PER_SECOND;
+        sim.tick(at, &mut sent);
+
+        assert!(call(&mut sim, b"dev.stop", &[], &mut sent).is_empty());
+        assert!(!sim.acquiring);
+        assert!(call(&mut sim, b"dev.stop", &[], &mut sent).is_empty());
+
+        call(&mut sim, b"dev.start", &[], &mut sent);
+        for _ in 0..3 {
+            at += NANOS_PER_SECOND;
+            sim.tick(at, &mut sent);
+        }
+        assert!(sim.acquiring);
+
+        call(&mut sim, b"dev.restart", &[], &mut sent);
+        assert!(!sim.acquiring);
+        for _ in 0..3 {
+            at += NANOS_PER_SECOND;
+            sim.tick(at, &mut sent);
+        }
+        assert!(sim.acquiring);
+
+        assert_eq!(
+            call(&mut sim, b"sync.status", &[], &mut sent),
+            [TimeStatus::Locked.code()]
+        );
+        assert_eq!(call(&mut sim, b"dev.autostart", &[5], &mut sent), [5]);
+        assert_eq!(sim.sync.autostart_seconds(), 5);
     }
 
     #[test]

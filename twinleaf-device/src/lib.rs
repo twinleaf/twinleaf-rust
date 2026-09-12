@@ -12,6 +12,7 @@ pub mod rpc;
 pub mod segments;
 pub mod settings;
 pub mod stream;
+pub mod sync;
 
 /// Where a device's packets go.
 pub trait Sink {

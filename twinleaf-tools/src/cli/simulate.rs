@@ -41,4 +41,8 @@ pub struct SimulateCli {
     /// Never randomly drop samples (the 'd' key still drops one manually)
     #[arg(long = "no-drop")]
     pub(crate) no_drop: bool,
+
+    /// Never feed the device a simulated PPS (the 'p' key still toggles it)
+    #[arg(long = "no-pps")]
+    pub(crate) no_pps: bool,
 }

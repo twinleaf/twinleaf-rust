@@ -154,6 +154,8 @@ impl SegmentFlags {
     pub const VALID: Self = Self(1);
     /// New samples are still being generated for this segment.
     pub const ACTIVE: Self = Self(2);
+    /// The time reference's pulses were absent when this segment began.
+    pub const HOLDOVER: Self = Self(4);
 
     /// Flags from their byte.
     pub const fn from_bits(bits: u8) -> Self {

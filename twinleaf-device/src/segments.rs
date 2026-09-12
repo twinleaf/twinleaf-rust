@@ -98,6 +98,7 @@ pub struct Segment {
     state: SegmentState,
     params: Params,
     timeref: Timeref,
+    holdover: bool,
     next_issue: u32,
     next_output: u32,
 }
@@ -109,6 +110,7 @@ impl Segment {
             state: SegmentState::Invalid,
             params,
             timeref: Timeref::default(),
+            holdover: false,
             next_issue: 0,
             next_output: 0,
         }
@@ -154,12 +156,17 @@ impl Segment {
     /// A segment is valid on the wire once it has published a sample, and
     /// active until the next segment takes over.
     fn flags(&self) -> SegmentFlags {
+        let holdover = if self.holdover {
+            SegmentFlags::HOLDOVER
+        } else {
+            SegmentFlags::default()
+        };
         match self.state {
             SegmentState::Invalid | SegmentState::Next => SegmentFlags::default(),
             SegmentState::Issuing | SegmentState::Done => {
-                SegmentFlags::VALID | SegmentFlags::ACTIVE
+                SegmentFlags::VALID | SegmentFlags::ACTIVE | holdover
             }
-            SegmentState::Inactive => SegmentFlags::VALID,
+            SegmentState::Inactive => SegmentFlags::VALID | holdover,
         }
     }
 }
@@ -192,6 +199,7 @@ enum Phase {
 pub struct Segments<const N: usize> {
     entries: [Segment; N],
     phase: Phase,
+    holdover: bool,
 }
 
 impl<const N: usize> Segments<N> {
@@ -205,6 +213,7 @@ impl<const N: usize> Segments<N> {
         Self {
             entries,
             phase: Phase::Stopped { next: 0 },
+            holdover: false,
         }
     }
 
@@ -213,7 +222,9 @@ impl<const N: usize> Segments<N> {
         let Phase::Stopped { next } = self.phase else {
             return Err(Busy);
         };
-        self.entries[usize::from(next)].timeref = timeref;
+        let entry = &mut self.entries[usize::from(next)];
+        entry.timeref = timeref;
+        entry.holdover = self.holdover;
         self.phase = Phase::Issuing { current: next };
         Ok(())
     }
@@ -233,6 +244,12 @@ impl<const N: usize> Segments<N> {
             }
         };
         self.phase = Phase::Stopped { next };
+    }
+
+    /// Mark every segment opened from here on as begun while the time
+    /// reference's pulses were absent.
+    pub fn set_holdover(&mut self, holdover: bool) {
+        self.holdover = holdover;
     }
 
     /// Acquire with `params` from the next segment on.
@@ -373,6 +390,7 @@ impl<const N: usize> Segments<N> {
         entry.state = SegmentState::Next;
         entry.params = params;
         entry.timeref = timeref;
+        entry.holdover = self.holdover;
         entry.next_issue = 0;
         entry.next_output = 0;
         to
@@ -605,6 +623,33 @@ mod tests {
         assert_eq!(segments.get(id(0)).unwrap().state(), SegmentState::Inactive);
         assert_eq!(segments.get(id(0)).unwrap().flags(), SegmentFlags::VALID);
         assert_eq!(segments.get(id(1)).unwrap().state(), SegmentState::Issuing);
+    }
+
+    /// D8: a segment begun while the pulses were absent says so, and the one
+    /// the runtime rolls over to when they come back does not.
+    #[test]
+    fn a_segment_opened_in_holdover_carries_the_flag() {
+        let mut segments: Segments<4> = Segments::new(params(10));
+        segments.set_holdover(true);
+        segments.start(timeref(1000)).unwrap();
+        issue(&mut segments, 1);
+        assert_eq!(
+            segments.current().flags(),
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
+        );
+
+        segments.set_holdover(false);
+        segments.rollover();
+        issue(&mut segments, 10);
+        assert_eq!(segments.current().id().value(), 1);
+        assert_eq!(
+            segments.current().flags(),
+            SegmentFlags::VALID | SegmentFlags::ACTIVE
+        );
+        assert_eq!(
+            segments.get(id(0)).unwrap().flags(),
+            SegmentFlags::VALID | SegmentFlags::HOLDOVER
+        );
     }
 
     #[test]

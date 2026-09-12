@@ -87,9 +87,20 @@ impl<'a> Timeref<'a> {
         })
     }
 
+    /// The pad byte of a SYNC payload, which a hub's sequence and status
+    /// ride in. Zero on a payload that carries neither.
+    pub fn pad(payload: &[u8]) -> u8 {
+        payload.get(3).copied().unwrap_or(0)
+    }
+
     /// Write a full SYNC packet into `buf`. Returns its length, or None if it
     /// does not fit or the serial exceeds [`MAX_SERIAL_SIZE`].
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
+        self.write_with_pad(buf, 0)
+    }
+
+    /// Write a full SYNC packet whose pad byte carries `pad`.
+    pub fn write_with_pad(&self, buf: &mut [u8], pad: u8) -> Option<usize> {
         if self.serial.len() > MAX_SERIAL_SIZE {
             return None;
         }
@@ -103,7 +114,7 @@ impl<'a> Timeref<'a> {
         buf[4] = 0; // timeref type
         buf[5] = self.epoch.value();
         buf[6] = self.serial.len() as u8;
-        buf[7] = 0; // pad
+        buf[7] = pad;
         buf[8..12].copy_from_slice(&self.time.to_le_bytes());
         buf[12..16].copy_from_slice(&self.session.to_le_bytes());
         buf[16..total].copy_from_slice(self.serial);
@@ -148,6 +159,25 @@ mod tests {
             0x0D, 0x0C, 0x0B, 0x0A,     // session, little-endian
             b'A', b'B',
         ]);
+    }
+
+    #[test]
+    fn a_pad_byte_rides_beside_the_serial_length() {
+        let timeref = Timeref {
+            epoch: Epoch::UNIX,
+            time: 7,
+            session: SessionId::new(1),
+            serial: b"AB",
+        };
+        let mut buf = [0u8; 32];
+        let len = timeref.write_with_pad(&mut buf, 0xC5).unwrap();
+        let payload = &buf[Header::SIZE..len];
+        assert_eq!(Timeref::pad(payload), 0xC5);
+        assert_eq!(Timeref::parse(payload), Some(timeref));
+
+        let mut plain = [0u8; 32];
+        assert_eq!(timeref.write(&mut plain), Some(len));
+        assert_eq!(Timeref::pad(&plain[Header::SIZE..len]), 0);
     }
 
     #[test]
