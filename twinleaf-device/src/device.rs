@@ -23,8 +23,8 @@ use crate::rpc::{self as table, put, Reply, RpcSpec};
 use crate::settings::{Changed, Scalar, Setting};
 use crate::Sink;
 
-/// Milliseconds between heartbeats.
-pub const HEARTBEAT_INTERVAL: u64 = 200;
+/// Nanoseconds between heartbeats.
+pub const HEARTBEAT_INTERVAL: u64 = 200_000_000;
 
 /// The level `dev.loglevel` boots at, as tl-chibi's `logThreshold` does.
 pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
@@ -132,9 +132,14 @@ impl<'t> Device<'t> {
 
     /// Tell a host that has just connected everything it needs: the table
     /// hash, a heartbeat, and every metadata record.
-    pub fn connected(&mut self, streams: &(impl Streams + ?Sized), now: u64, out: &mut impl Sink) {
+    pub fn connected(
+        &mut self,
+        streams: &(impl Streams + ?Sized),
+        now_ns: u64,
+        out: &mut impl Sink,
+    ) {
         announcement(out, "rpc.hash", &self.hash.to_le_bytes());
-        self.beat(now, out);
+        self.beat(now_ns, out);
         let mut records = self.records(streams).peekable();
         while let Some(record) = records.next() {
             let flags = match records.peek() {
@@ -247,10 +252,10 @@ impl<'t> Device<'t> {
         self.settings_version = 0;
     }
 
-    /// Send whatever is due at `now`.
-    pub fn tick(&mut self, now: u64, out: &mut impl Sink) {
-        if now >= self.next_beat {
-            self.beat(now, out);
+    /// Send whatever is due at `now_ns`.
+    pub fn tick(&mut self, now_ns: u64, out: &mut impl Sink) {
+        if now_ns >= self.next_beat {
+            self.beat(now_ns, out);
         }
     }
 
@@ -259,10 +264,10 @@ impl<'t> Device<'t> {
         self.next_beat
     }
 
-    fn beat(&mut self, now: u64, out: &mut impl Sink) {
+    fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
         let beat = Heartbeat::Session(self.session);
         send(out, &[], |buf| beat.write(buf));
-        self.next_beat = now + HEARTBEAT_INTERVAL;
+        self.next_beat = now_ns + HEARTBEAT_INTERVAL;
     }
 
     /// Every metadata record, in sweep order.
@@ -456,7 +461,7 @@ mod tests {
     fn connecting_sends_the_hash_a_heartbeat_and_the_sweep() {
         let mut device = device();
         let mut sent = Sent::default();
-        device.connected(&OneStream, 1000, &mut sent);
+        device.connected(&OneStream, 1_000_000_000, &mut sent);
 
         let views = sent.views();
         let types: Vec<_> = views.iter().map(|view| view.header.ptype).collect();
@@ -498,21 +503,21 @@ mod tests {
                 (Column, true)
             ]
         );
-        assert_eq!(device.deadline(), 1000 + HEARTBEAT_INTERVAL);
+        assert_eq!(device.deadline(), 1_000_000_000 + HEARTBEAT_INTERVAL);
     }
 
     #[test]
     fn heartbeats_are_due_every_interval() {
         let mut device = device();
         let mut sent = Sent::default();
-        device.connected(&OneStream, 1000, &mut sent);
+        device.connected(&OneStream, 1_000_000_000, &mut sent);
         sent.0.clear();
 
-        device.tick(1100, &mut sent);
+        device.tick(1_100_000_000, &mut sent);
         assert!(sent.0.is_empty());
-        device.tick(1200, &mut sent);
+        device.tick(1_200_000_000, &mut sent);
         assert_eq!(sent.views()[0].header.ptype, PacketType::HEARTBEAT);
-        assert_eq!(device.deadline(), 1400);
+        assert_eq!(device.deadline(), 1_400_000_000);
     }
 
     #[test]

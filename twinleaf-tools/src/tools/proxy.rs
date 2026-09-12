@@ -934,11 +934,11 @@ impl ProxyServer {
             let _departure = departure;
             let mut slow = SlowTracker::default();
             let epoch = Instant::now();
-            let now_ms = || epoch.elapsed().as_millis() as u64;
+            let now_ns = || epoch.elapsed().as_nanos() as u64;
             let mut outbox = Outbox::default();
             let mut hub = hub.map(|hub| Device::new(hub.identity, hub.session, &HUB_RPCS));
             if let Some(hub) = hub.as_mut() {
-                hub.connected(&(), now_ms(), &mut outbox);
+                hub.connected(&(), now_ns(), &mut outbox);
             }
 
             // Slot 0 is the client's own traffic; slot 1 + i is ports[i].
@@ -959,11 +959,11 @@ impl ProxyServer {
                 let oper = match hub.as_mut() {
                     None => sel.select(),
                     Some(hub) => {
-                        let wait = hub.deadline().saturating_sub(now_ms());
-                        match sel.select_timeout(Duration::from_millis(wait)) {
+                        let wait = hub.deadline().saturating_sub(now_ns());
+                        match sel.select_timeout(Duration::from_nanos(wait)) {
                             Ok(oper) => oper,
                             Err(_) => {
-                                hub.tick(now_ms(), &mut outbox);
+                                hub.tick(now_ns(), &mut outbox);
                                 continue;
                             }
                         }

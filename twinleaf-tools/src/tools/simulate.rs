@@ -67,9 +67,9 @@ const AUX_WAVE_FREQUENCY: f64 = 0.25;
 const SAMPLE_DROP_INTERVAL_SECONDS: f64 = 60.0;
 const SAMPLE_DROP_JITTER_SECONDS: f64 = 30.0;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
-const LOG_MESSAGE_MIN_INTERVAL_MS: u64 = 1500;
-const LOG_MESSAGE_JITTER_MS: u64 = 4000;
-const CAPTURE_TRIGGER_DELAY_MS: u64 = 500;
+const LOG_MESSAGE_MIN_INTERVAL_NS: u64 = 1_500_000_000;
+const LOG_MESSAGE_JITTER_NS: u64 = 4_000_000_000;
+const CAPTURE_TRIGGER_DELAY_NS: u64 = 500_000_000;
 const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
 const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
 const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
@@ -222,9 +222,9 @@ impl Clock {
         })
     }
 
-    /// How many samples it owes after `elapsed` milliseconds of the run.
+    /// How many samples it owes after `elapsed` nanoseconds of the run.
     fn due(&self, elapsed: u64) -> u64 {
-        let seconds = elapsed as f64 / 1000.0;
+        let seconds = elapsed as f64 / 1_000_000_000.0;
         ((seconds * f64::from(self.rate.get())).floor() as u64).saturating_sub(self.generated)
     }
 
@@ -460,7 +460,7 @@ impl GaussianRng {
 }
 
 /// The simulated device: what it is, what it holds, and what it publishes.
-/// Every method takes the milliseconds since boot its runtime keeps, and
+/// Every method takes the nanoseconds since boot its runtime keeps, and
 /// every packet it sends goes to that runtime's sink.
 struct Sim {
     device: Device<'static>,
@@ -470,7 +470,7 @@ struct Sim {
     capture: CaptureBuffer,
     rng: GaussianRng,
     segment_seconds: u32,
-    started_ms: u64,
+    started_ns: u64,
     next_log_at: u64,
     next_log_level: usize,
     no_drop: bool,
@@ -504,7 +504,7 @@ impl Sim {
             clocks,
             capture: CaptureBuffer::new(),
             segment_seconds: cli.segment_seconds,
-            started_ms: 0,
+            started_ns: 0,
             next_log_at: next_log_delay(&mut rng),
             next_log_level: 0,
             no_drop: cli.no_drop,
@@ -566,7 +566,7 @@ impl Sim {
     /// Restart acquisition: every stream stops and starts again at a fresh
     /// time reference, so its samples begin at zero in a new segment.
     fn reset_run(&mut self, now: u64) {
-        self.started_ms = now;
+        self.started_ns = now;
         let timeref = Timeref::new(
             sync::Epoch::UNIX,
             u32::try_from(unix_duration().as_secs()).unwrap_or(u32::MAX),
@@ -630,11 +630,11 @@ impl Sim {
     fn trigger_capture(&mut self, now: u64) {
         let (data, info) = self.generate_capture_data();
         self.capture
-            .begin_capture(data, info, now + CAPTURE_TRIGGER_DELAY_MS);
+            .begin_capture(data, info, now + CAPTURE_TRIGGER_DELAY_NS);
         self.notes.push(format!(
             "test.capture triggered ({} samples); data available in ~{:.1}s",
             info.length,
-            CAPTURE_TRIGGER_DELAY_MS as f64 / 1000.0
+            CAPTURE_TRIGGER_DELAY_NS as f64 / 1_000_000_000.0
         ));
     }
 
@@ -693,7 +693,7 @@ impl Sim {
     /// The samples one clock owes: its streams roll over at a segment
     /// boundary, skip the sample it owes a gap, and publish the rest.
     fn send_clock_samples(&mut self, clock: usize, now: u64, out: &mut impl Sink) {
-        for _ in 0..self.clocks[clock].due(now.saturating_sub(self.started_ms)) {
+        for _ in 0..self.clocks[clock].due(now.saturating_sub(self.started_ns)) {
             if self.clocks[clock].rolls_over() {
                 self.rollover(clock);
             }
@@ -920,7 +920,7 @@ impl Runtime {
              test.capture(-3) metadata, {}-{} f32 samples, ~{:.1}s delay",
             CAPTURE_SAMPLE_COUNT_MIN,
             CAPTURE_SAMPLE_COUNT_MAX,
-            CAPTURE_TRIGGER_DELAY_MS as f64 / 1000.0
+            CAPTURE_TRIGGER_DELAY_NS as f64 / 1_000_000_000.0
         );
         if keyboard {
             terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
@@ -931,7 +931,7 @@ impl Runtime {
 
     /// Step the simulation, with the connected client as its sink.
     fn step(&mut self, act: impl FnOnce(&mut Sim, u64, &mut UdpSink<'_>)) -> io::Result<()> {
-        let now = self.epoch.elapsed().as_millis() as u64;
+        let now = self.epoch.elapsed().as_nanos() as u64;
         let mut sink = UdpSink::new(&self.socket, self.client.map(|client| client.addr));
         act(&mut self.sim, now, &mut sink);
         self.sim
@@ -1048,7 +1048,7 @@ fn invalid_input(message: &str) -> io::Error {
 }
 
 fn next_log_delay(rng: &mut GaussianRng) -> u64 {
-    LOG_MESSAGE_MIN_INTERVAL_MS + (LOG_MESSAGE_JITTER_MS as f64 * rng.next_unit()) as u64
+    LOG_MESSAGE_MIN_INTERVAL_NS + (LOG_MESSAGE_JITTER_NS as f64 * rng.next_unit()) as u64
 }
 
 fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
