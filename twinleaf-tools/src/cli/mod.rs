@@ -38,6 +38,17 @@ pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
     }
 }
 
+pub(crate) fn finite_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err("must be finite".into())
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "tio",

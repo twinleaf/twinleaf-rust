@@ -4,8 +4,10 @@
 #![deny(missing_docs)]
 #![warn(rustdoc::all)]
 
+pub mod calls;
 pub mod capture;
 pub mod device;
+pub mod hub;
 pub mod metadata;
 pub mod publisher;
 pub mod rpc;

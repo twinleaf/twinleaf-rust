@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use super::nonneg_f64;
+use super::{finite_f64, nonneg_f64};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Simulate a Twinleaf device over UDP")]
@@ -45,4 +45,37 @@ pub struct SimulateCli {
     /// Never feed the device a simulated PPS (the 'p' key still toggles it)
     #[arg(long = "no-pps")]
     pub(crate) no_pps: bool,
+
+    /// Hub the root device over this many simulated children, at /1../N
+    #[arg(
+        long = "children",
+        default_value = "0",
+        value_parser = clap::value_parser!(u8).range(0..=9)
+    )]
+    pub(crate) children: u8,
+
+    /// Never give the hub a simulated GPS second, so its children inherit its
+    /// free-running time
+    #[arg(long = "no-gps")]
+    pub(crate) no_gps: bool,
+
+    /// Milliseconds a child's cable takes to deliver the hub's time reference
+    #[arg(
+        long = "sync-delay",
+        default_value = "100",
+        value_parser = clap::value_parser!(u64).range(0..=10_000)
+    )]
+    pub(crate) sync_delay: u64,
+
+    /// Percentage of the hub's time references each cable loses
+    #[arg(
+        long = "sync-drop",
+        default_value = "0",
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
+    pub(crate) sync_drop: u8,
+
+    /// Parts per million each child's counter runs away from the hub's
+    #[arg(long = "drift", default_value = "0", value_parser = finite_f64)]
+    pub(crate) drift: f64,
 }

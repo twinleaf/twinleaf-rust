@@ -1,12 +1,14 @@
 //! tio simulate
 //!
-//! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1.
+//! Simulates a small Twinleaf device that publishes a noisy sine wave on
+//! stream 1, or, with `--children`, a hub and the tree of them below it.
 
 use crate::SimulateCli;
 use ratatui::crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
@@ -18,13 +20,14 @@ use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::device::{Call, Device, Handled, Identity};
+use twinleaf_device::hub::{CallError, Event, Events, Hub, Input, PortSink};
 use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec};
 use twinleaf_device::segments::{Params, Timeref};
 use twinleaf_device::settings::Setting;
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
 use twinleaf_device::sync::{
-    ticks, AcquisitionAction, AcquisitionError, Actions, CounterDomain, PulseConfig, Reference,
-    ReferenceIdentity, ScheduledEdge, Synchronizer,
+    ticks, AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig,
+    Reference, ReferenceIdentity, ScheduledEdge, Synchronizer,
 };
 use twinleaf_device::Sink;
 
@@ -65,6 +68,14 @@ const DEVICE_NAME: &str = "tio-test";
 const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]";
 const DEVICE_SERIAL: &str = "SIM0001";
 const DEVICE_FIRMWARE: &str = "twinleaf-rust-test";
+const HUB_NAME: &str = "tio-hub";
+const HUB_DESC: &str = "Twinleaf tio-hub R1 ((null)) [2026-06-08/000001-DEV]";
+const HUB_SERIAL: &str = "HUB-SIM";
+/// Hops a hub recognizes: port `n` is the route `/n`, and the children hang
+/// off `/1` to `/9` as a proxy's mounts do, which leaves port 0 empty.
+const MAX_PORTS: usize = 10;
+/// How long a cable takes to carry the hub's pulse to a child.
+const PPS_DELAY_NS: u64 = 800;
 const SIGNAL_LEVEL: u8 = 234;
 const AUX_SAMPLE_RATE: NonZeroU32 = NonZeroU32::new(25).expect("a positive rate");
 const AUX_WAVE_FREQUENCY: f64 = 0.25;
@@ -192,14 +203,14 @@ struct Settings {
 }
 
 impl Settings {
-    fn new(cli: &SimulateCli) -> Self {
+    fn new(cli: &SimulateCli, autostart: u8) -> Self {
         Self {
             amplitude: Setting::new("test.amplitude", cli.amplitude).checked(nonnegative),
             frequency: Setting::new("test.frequency", cli.frequency).checked(nonnegative),
             noise: Setting::new("test.noise", cli.noise).checked(nonnegative),
             status: Setting::new("test.status", 0),
             enable: Setting::new("test.enable", true),
-            autostart: Setting::new("dev.autostart", AUTOSTART_SECONDS),
+            autostart: Setting::new("dev.autostart", autostart),
         }
     }
 
@@ -482,26 +493,92 @@ impl GaussianRng {
 /// One acquisition RPC's effect on the synchronizer.
 type Acquisition = fn(&mut Synchronizer) -> Result<Actions, AcquisitionError>;
 
+/// What a simulated device is in the tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A device with the test streams, alone or on a child port.
+    Sensor,
+    /// The root of a tree: no streams, and the time its children follow.
+    Hub,
+}
+
+/// Where a device's second edges come from.
+#[derive(Clone, Copy)]
+enum Pulses {
+    /// Its own simulated pulse, on each wall-clock second.
+    Own {
+        /// When the next one lands.
+        next_ns: u64,
+    },
+    /// None at all: each second is closed by a wake instead.
+    None {
+        /// When the next second closes.
+        next_ns: u64,
+    },
+    /// The hub's, down a cable.
+    Cable,
+}
+
+impl Pulses {
+    /// A device's own pulse train, present or not.
+    fn own(present: bool, now: u64) -> Self {
+        let next_ns = next_second_ns(now);
+        match present {
+            true => Self::Own { next_ns },
+            false => Self::None { next_ns },
+        }
+    }
+
+    /// The next self-made second boundary at or before `now`, taking it.
+    fn next(&mut self, now: u64) -> Option<u64> {
+        match self {
+            Self::Cable => None,
+            Self::Own { next_ns } | Self::None { next_ns } if *next_ns <= now => {
+                let at = *next_ns;
+                *next_ns += NANOS_PER_SECOND;
+                Some(at)
+            }
+            Self::Own { .. } | Self::None { .. } => None,
+        }
+    }
+
+    /// Whether those boundaries carry a pulse.
+    fn pulsing(&self) -> bool {
+        matches!(self, Self::Own { .. })
+    }
+
+    /// The same source, restarted at the second after `now`.
+    fn restarted(&self, now: u64) -> Self {
+        match self {
+            Self::Cable => Self::Cable,
+            Self::Own { .. } => Self::own(true, now),
+            Self::None { .. } => Self::own(false, now),
+        }
+    }
+}
+
 /// The simulated device: what it is, what it holds, and what it publishes.
 /// Every method takes the monotonic nanoseconds its runtime keeps, which here
 /// are UNIX nanoseconds, and every packet it sends goes to that runtime's sink.
 struct Sim {
+    role: Role,
     device: Device<'static>,
     settings: Settings,
-    streams: [Stream<SEGMENTS>; 3],
-    clocks: [Clock; 2],
+    streams: Vec<Stream<SEGMENTS>>,
+    clocks: Vec<Clock>,
     capture: CaptureBuffer,
     rng: GaussianRng,
     sync: Synchronizer,
-    /// Whether the fake PPS is being fed to the synchronizer.
-    pps: bool,
-    /// When the next fake pulse lands, on the wall-clock second.
-    next_pulse_ns: u64,
+    /// Where its second edges come from.
+    pulses: Pulses,
+    /// The second the synchronizer just closed, for whoever passes it on.
+    announced: Option<(u64, Announce)>,
     /// The plan the synchronizer last armed, which a start acknowledges.
     plan: Option<u16>,
     acquiring: bool,
     /// What the streams were last told, which a change rolls them over.
     traceable: bool,
+    rate: NonZeroU32,
     segment_seconds: u32,
     started_ns: u64,
     next_log_at: u64,
@@ -511,38 +588,32 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(cli: &SimulateCli, now: u64) -> io::Result<Self> {
-        let seed = now ^ u64::from(cli.port).rotate_left(32);
+    /// The device at `port`, with 0 the root, as `role` has it.
+    fn new(cli: &SimulateCli, role: Role, port: u8, pulses: Pulses, now: u64) -> io::Result<Self> {
+        let seed = now ^ u64::from(cli.port).rotate_left(32) ^ u64::from(port) << 8;
         let session_id = (seed as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
-        let sample_rate = NonZeroU32::new(cli.samplerate)
+        let rate = NonZeroU32::new(cli.samplerate)
             .ok_or_else(|| invalid_input("sample rate must be at least one hertz"))?;
-        let clocks = [
-            Clock::new(
-                sample_rate,
-                cli.segment_seconds,
-                &[Signal::Sine, Signal::Status],
-            )?,
-            Clock::new(AUX_SAMPLE_RATE, cli.segment_seconds, &[Signal::Aux])?,
-        ];
-        let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, DEVICE_SERIAL, DEVICE_FIRMWARE)
-            .ok_or_else(|| invalid_input("identity too long"))?;
+        let identity = identity(role, &serial_of(role, port))?;
 
         let session = SessionId::new(session_id);
         let mut rng = GaussianRng::new(seed | 1);
         Ok(Self {
+            role,
             device: Device::new(identity, session, &RPCS),
-            settings: Settings::new(cli),
-            streams: boot_streams(sample_rate)?,
-            clocks,
+            settings: Settings::new(cli, autostart_of(role)),
+            streams: boot_streams(role, rate)?,
+            clocks: boot_clocks(role, rate, cli.segment_seconds)?,
             capture: CaptureBuffer::new(),
-            pps: !cli.no_pps,
-            next_pulse_ns: next_second_ns(now),
+            pulses,
+            announced: None,
             plan: None,
             acquiring: false,
             traceable: true,
-            sync: synchronizer(session, now),
+            sync: synchronizer(role, session, &serial_of(role, port), now),
+            rate,
             segment_seconds: cli.segment_seconds,
             started_ns: now,
             next_log_at: now + next_log_delay(&mut rng),
@@ -551,6 +622,12 @@ impl Sim {
             notes: Vec::new(),
             rng,
         })
+    }
+
+    /// One pulse arriving from outside, down the cable from a hub.
+    fn pulse(&mut self, edge: u32, at: u64) {
+        let actions = self.sync.capture(edge, at);
+        self.apply(actions, at);
     }
 
     /// A host has connected: the device describes itself. Acquisition is the
@@ -593,12 +670,14 @@ impl Sim {
     /// segment ring on every stream, and a timebase to bootstrap again.
     fn reboot(&mut self, now: u64, out: &mut impl Sink) {
         let session = SessionId::new(self.next_session_id());
+        let serial = self.device.identity.serial.clone();
         self.device.reboot(session);
         self.settings.reset();
         self.streams =
-            boot_streams(self.sample_rate()).expect("streams that booted once boot again");
-        self.sync = synchronizer(session, now);
-        self.next_pulse_ns = next_second_ns(now);
+            boot_streams(self.role, self.rate).expect("streams that booted once boot again");
+        self.sync = synchronizer(self.role, session, &serial, now);
+        self.pulses = self.pulses.restarted(now);
+        self.announced = None;
         self.plan = None;
         self.acquiring = false;
         self.traceable = true;
@@ -606,7 +685,7 @@ impl Sim {
         self.next_log_at = now + next_log_delay(&mut self.rng);
         self.next_log_level = 0;
         self.notes.push(format!(
-            "rebooted test device; new session id {}",
+            "rebooted; new session id {}",
             self.device.session.value()
         ));
         self.connected(now, out);
@@ -626,10 +705,8 @@ impl Sim {
     /// for. Without a pulse the wake is what bootstraps the local timebase,
     /// so it is taken on the second boundary either way.
     fn advance_sync(&mut self, now: u64) {
-        while self.next_pulse_ns <= now {
-            let at = self.next_pulse_ns;
-            self.next_pulse_ns += NANOS_PER_SECOND;
-            let actions = match self.pps {
+        while let Some(at) = self.pulses.next(now) {
+            let actions = match self.pulses.pulsing() {
                 true => self.sync.capture(PPS_EDGE, at),
                 false => self.sync.wake(PPS_EDGE, at),
             };
@@ -655,6 +732,9 @@ impl Sim {
         }
         if let Some(status) = actions.status_changed {
             self.follow_traceability(status.traceable);
+        }
+        if let Some(announce) = actions.announce {
+            self.announced = Some((at, announce));
         }
     }
 
@@ -718,10 +798,14 @@ impl Sim {
         Ok(Reply::new())
     }
 
-    /// Turn the fake pulse train on or off, as the keyboard asks.
+    /// Turn the simulated pulse train on or off, as the keyboard asks.
     fn toggle_pps(&mut self) {
-        self.pps = !self.pps;
-        self.notes.push(match self.pps {
+        self.pulses = match self.pulses {
+            Pulses::Own { next_ns } => Pulses::None { next_ns },
+            Pulses::None { next_ns } => Pulses::Own { next_ns },
+            Pulses::Cable => Pulses::Cable,
+        };
+        self.notes.push(match self.pulses.pulsing() {
             true => "PPS restored".to_string(),
             false => "PPS removed; the device falls into holdover".to_string(),
         });
@@ -900,7 +984,7 @@ impl Sim {
 
     /// The rate of the streams the wave clock drives.
     fn sample_rate(&self) -> NonZeroU32 {
-        self.clocks[WAVE_CLOCK].rate
+        self.rate
     }
 
     fn sine_sample(&mut self) -> [u8; 16] {
@@ -996,12 +1080,421 @@ impl Sim {
     }
 }
 
-/// What runs the simulated device: the socket it answers on, the client it
+/// Whether a child's cable is connected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Plug {
+    In,
+    Out,
+}
+
+/// The wire to one child: how late the hub's time arrives, how much of it is
+/// lost, and how far the child's own counter walks away from it.
+#[derive(Clone, Copy)]
+struct Cable {
+    pps_delay_ns: u64,
+    sync_delay_ns: u64,
+    sync_drop: u8,
+    pps_present: bool,
+    drift_ppm: f64,
+}
+
+/// One child device and the cable it hangs off.
+struct Child {
+    sim: Sim,
+    cable: Cable,
+    plug: Plug,
+    /// The time references on the cable, each due at the instant it lands: a
+    /// wire delays what it carries, it does not throw it away.
+    inflight: VecDeque<(u64, Vec<u8>)>,
+    booted_ns: u64,
+}
+
+impl Child {
+    fn new(cli: &SimulateCli, port: u8, cable: Cable, now: u64) -> io::Result<Self> {
+        let pulses = match cable.pps_present {
+            true => Pulses::Cable,
+            false => Pulses::own(false, now),
+        };
+        Ok(Self {
+            sim: Sim::new(cli, Role::Sensor, port, pulses, now)?,
+            cable,
+            plug: Plug::In,
+            inflight: VecDeque::new(),
+            booted_ns: now,
+        })
+    }
+
+    /// The counter value this child reads when the hub's pulse reaches it: the
+    /// cable's delay, and however far its own counter has walked since boot.
+    fn edge_at(&self, at: u64) -> u32 {
+        let drift = at.saturating_sub(self.booted_ns) as f64 * self.cable.drift_ppm / 1e6;
+        let delay = self.cable.pps_delay_ns as i64 + drift as i64;
+        counter_at(delay.rem_euclid(NANOS_PER_SECOND as i64) as u64)
+    }
+}
+
+/// Packets on their way up a child's cable.
+#[derive(Default)]
+struct Wire(Vec<Vec<u8>>);
+
+impl Sink for Wire {
+    fn send(&mut self, packet: &[u8]) {
+        self.0.push(packet.to_vec());
+    }
+}
+
+/// Packets the hub is sending down to its children.
+#[derive(Default)]
+struct Downlink(Vec<(u8, Vec<u8>)>);
+
+impl PortSink for Downlink {
+    fn send(&mut self, port: u8, packet: &[u8]) {
+        self.0.push((port, packet.to_vec()));
+    }
+}
+
+/// What the hub asks a child on its own behalf.
+#[derive(Clone, Copy)]
+enum Ask {
+    Name(u8),
+}
+
+/// What the hub noticed, as the tree keeps it.
+enum Noticed {
+    Plugged(u8),
+    Unplugged(u8),
+    Named(u8, Result<String, RpcError>),
+}
+
+#[derive(Default)]
+struct Seen(Vec<Noticed>);
+
+impl Events<Ask> for Seen {
+    fn event(&mut self, event: Event<'_, Ask>) {
+        self.0.push(match event {
+            Event::Plugged(port) => Noticed::Plugged(port),
+            Event::Unplugged(port) => Noticed::Unplugged(port),
+            Event::Answered(Ask::Name(port), answer) => Noticed::Named(
+                port,
+                answer.map(|value| String::from_utf8_lossy(value).into_owned()),
+            ),
+        });
+    }
+}
+
+/// The simulated device tree: the root, the children on its ports, and the
+/// cables between them. It owns no socket and no terminal.
+struct Tree {
+    root: Sim,
+    hub: Hub<Ask, MAX_PORTS>,
+    children: Vec<Child>,
+    rng: GaussianRng,
+    notes: Vec<String>,
+}
+
+impl Tree {
+    fn new(cli: &SimulateCli, now: u64) -> io::Result<Self> {
+        let role = match cli.children {
+            0 => Role::Sensor,
+            _ => Role::Hub,
+        };
+        let pulses = match role {
+            Role::Hub => Pulses::own(!cli.no_gps, now),
+            Role::Sensor => Pulses::own(!cli.no_pps, now),
+        };
+        let cable = Cable {
+            pps_delay_ns: PPS_DELAY_NS,
+            sync_delay_ns: cli.sync_delay * 1_000_000,
+            sync_drop: cli.sync_drop,
+            pps_present: !cli.no_pps,
+            drift_ppm: cli.drift,
+        };
+        Ok(Self {
+            root: Sim::new(cli, role, 0, pulses, now)?,
+            hub: Hub::new(),
+            children: (1..=cli.children)
+                .map(|port| Child::new(cli, port, cable, now))
+                .collect::<io::Result<Vec<_>>>()?,
+            rng: GaussianRng::new(now | 1),
+            notes: Vec::new(),
+        })
+    }
+
+    /// A host has connected: every device in the tree describes itself.
+    fn connected(&mut self, now: u64, out: &mut impl Sink) {
+        self.root.connected(now, out);
+        self.each_child(now, out, |sim, now, wire| sim.connected(now, wire));
+    }
+
+    /// Put every child to work, and route what each one sends up.
+    fn each_child(
+        &mut self,
+        now: u64,
+        out: &mut impl Sink,
+        act: impl Fn(&mut Sim, u64, &mut Wire),
+    ) {
+        for index in 0..self.children.len() {
+            let mut wire = Wire::default();
+            act(&mut self.children[index].sim, now, &mut wire);
+            self.child_sent(index, wire, now, out);
+        }
+    }
+
+    /// One packet from the host: the root answers what is addressed to it, and
+    /// the hub routes the rest.
+    fn handle(&mut self, packet: PacketView<'_>, now: u64, out: &mut impl Sink) {
+        if packet.routing.is_empty() {
+            self.root.handle(packet, now, out);
+            return;
+        }
+        let mut down = Downlink::default();
+        let mut seen = Seen::default();
+        self.hub
+            .handle(Input::FromHost(packet), now, out, &mut down, &mut seen);
+        self.deliver(down, now, out);
+        self.absorb(seen, now, out);
+    }
+
+    /// Everything due at `now`: the root's own work, its time on every cable,
+    /// each child's work, and what the ports and calls have left.
+    fn tick(&mut self, now: u64, out: &mut impl Sink) {
+        self.root.tick(now, out);
+        if let Some((at, announce)) = self.root.announced.take() {
+            self.pulse_children(at);
+            self.announce(&announce, at);
+        }
+        self.deliver_inflight(now, out);
+        self.each_child(now, out, |sim, now, wire| sim.tick(now, wire));
+        let mut down = Downlink::default();
+        let mut seen = Seen::default();
+        self.hub.handle(Input::Tick, now, out, &mut down, &mut seen);
+        self.deliver(down, now, out);
+        self.absorb(seen, now, out);
+    }
+
+    /// Power-cycle every device in the tree.
+    fn reboot(&mut self, now: u64, out: &mut impl Sink) {
+        self.root.reboot(now, out);
+        self.each_child(now, out, |sim, now, wire| sim.reboot(now, wire));
+    }
+
+    /// Power-cycle the root alone, which the children then have to re-adopt.
+    fn reboot_root(&mut self, now: u64, out: &mut impl Sink) {
+        self.root.reboot(now, out);
+    }
+
+    /// Drop one sample from every device's clocks, as the keyboard asks.
+    fn drop_now(&mut self) {
+        self.root.drop_now();
+        self.children
+            .iter_mut()
+            .for_each(|child| child.sim.drop_now());
+    }
+
+    /// Turn the simulated pulses on or off: every cable's, or the root's own
+    /// when it stands alone.
+    fn toggle_pps(&mut self) {
+        let Some(first) = self.children.first() else {
+            return self.root.toggle_pps();
+        };
+        let present = !first.cable.pps_present;
+        for child in &mut self.children {
+            child.cable.pps_present = present;
+        }
+        self.notes.push(match present {
+            true => "PPS restored on every cable".to_string(),
+            false => "PPS removed from every cable; the children fall into holdover".to_string(),
+        });
+    }
+
+    /// Pull a child's cable out, or push it back in.
+    fn toggle_plug(&mut self, port: u8) {
+        let Some(index) = self.index_of(port) else {
+            return;
+        };
+        let child = &mut self.children[index];
+        child.plug = match child.plug {
+            Plug::In => Plug::Out,
+            Plug::Out => Plug::In,
+        };
+        child.inflight.clear();
+        self.notes.push(match child.plug {
+            Plug::In => format!("/{port}: cable plugged back in"),
+            Plug::Out => format!("/{port}: cable pulled out"),
+        });
+    }
+
+    /// Every note the tree has to print, each child's tagged with its route.
+    fn drain_notes(&mut self) -> Vec<String> {
+        let mut notes: Vec<String> = self
+            .notes
+            .drain(..)
+            .chain(self.root.notes.drain(..))
+            .collect();
+        notes.extend(
+            self.children
+                .iter_mut()
+                .enumerate()
+                .flat_map(|(index, child)| {
+                    let port = port_of(index);
+                    child
+                        .sim
+                        .notes
+                        .drain(..)
+                        .map(move |note| format!("/{port}: {note}"))
+                }),
+        );
+        notes
+    }
+
+    /// Deliver the root's pulse to every child, landing on whatever phase of
+    /// its counter the cable and its own drift put it at.
+    fn pulse_children(&mut self, at: u64) {
+        for child in &mut self.children {
+            if let (Plug::In, true) = (child.plug, child.cable.pps_present) {
+                let edge = child.edge_at(at);
+                child.sim.pulse(edge, at);
+            }
+        }
+    }
+
+    /// Put the root's time reference on each cable, as late and as lossy as
+    /// the cable is.
+    fn announce(&mut self, announce: &Announce, at: u64) {
+        let mut down = Downlink::default();
+        self.hub.announce(announce, &mut down);
+        for (port, packet) in down.0 {
+            let Some(index) = self.index_of(port) else {
+                continue;
+            };
+            let Plug::In = self.children[index].plug else {
+                continue;
+            };
+            let cable = self.children[index].cable;
+            if self.rng.next_u64() % 100 < u64::from(cable.sync_drop) {
+                continue;
+            }
+            self.children[index]
+                .inflight
+                .push_back((at + cable.sync_delay_ns, packet));
+        }
+    }
+
+    /// Hand each child every time reference the cable has got to it by now.
+    fn deliver_inflight(&mut self, now: u64, out: &mut impl Sink) {
+        for index in 0..self.children.len() {
+            while let Some((at, packet)) = self.children[index].inflight.pop_front() {
+                if at > now {
+                    self.children[index].inflight.push_front((at, packet));
+                    break;
+                }
+                self.hand(index, &packet, now, out);
+            }
+        }
+    }
+
+    /// Everything one child sent, on its way up through the hub.
+    fn child_sent(&mut self, index: usize, wire: Wire, now: u64, out: &mut impl Sink) {
+        let Plug::In = self.children[index].plug else {
+            return;
+        };
+        let port = port_of(index);
+        let mut down = Downlink::default();
+        let mut seen = Seen::default();
+        for packet in &wire.0 {
+            let Ok((view, _)) = PacketView::parse_prefix(packet) else {
+                continue;
+            };
+            self.hub.handle(
+                Input::FromChild { port, packet: view },
+                now,
+                out,
+                &mut down,
+                &mut seen,
+            );
+        }
+        self.deliver(down, now, out);
+        self.absorb(seen, now, out);
+    }
+
+    /// Give each packet the hub routed to the child whose port it names.
+    fn deliver(&mut self, down: Downlink, now: u64, out: &mut impl Sink) {
+        for (port, packet) in down.0 {
+            let Some(index) = self.index_of(port) else {
+                continue;
+            };
+            let Plug::In = self.children[index].plug else {
+                continue;
+            };
+            self.hand(index, &packet, now, out);
+        }
+    }
+
+    /// Put one packet into a child, and route whatever it sends back up.
+    fn hand(&mut self, index: usize, packet: &[u8], now: u64, out: &mut impl Sink) {
+        let Ok((view, _)) = PacketView::parse_prefix(packet) else {
+            return;
+        };
+        let mut wire = Wire::default();
+        self.children[index].sim.handle(view, now, &mut wire);
+        self.child_sent(index, wire, now, out);
+    }
+
+    /// Act on what the hub noticed: a child that appears is asked what it is.
+    fn absorb(&mut self, seen: Seen, now: u64, out: &mut impl Sink) {
+        for noticed in seen.0 {
+            match noticed {
+                Noticed::Plugged(port) => {
+                    self.notes.push(format!("/{port}: plugged in"));
+                    self.ask_name(port, now, out);
+                }
+                Noticed::Unplugged(port) => self.notes.push(format!("/{port}: unplugged")),
+                Noticed::Named(port, Ok(name)) => self.notes.push(format!("/{port}: is a {name}")),
+                Noticed::Named(port, Err(error)) => self
+                    .notes
+                    .push(format!("/{port}: did not answer dev.name ({error})")),
+            }
+        }
+    }
+
+    /// Ask a child that has just appeared what it is.
+    fn ask_name(&mut self, port: u8, now: u64, out: &mut impl Sink) {
+        let mut down = Downlink::default();
+        let refused = match self
+            .hub
+            .call(port, "dev.name", &[], Ask::Name(port), now, &mut down)
+        {
+            Ok(()) => {
+                self.deliver(down, now, out);
+                return;
+            }
+            Err(CallError::Absent) => "nothing is plugged into it",
+            Err(CallError::Full) => "no call slot is free",
+            Err(CallError::TooLong) => "the request does not fit a packet",
+        };
+        self.notes
+            .push(format!("/{port}: not asked its name, {refused}"));
+    }
+
+    /// The child on a port, if there is one.
+    fn index_of(&self, port: u8) -> Option<usize> {
+        usize::from(port)
+            .checked_sub(1)
+            .filter(|index| *index < self.children.len())
+    }
+}
+
+/// The port a child sits on: the first is at `/1`, as a proxy's mounts are.
+fn port_of(index: usize) -> u8 {
+    index as u8 + 1
+}
+
+/// What runs the simulated tree: the socket it answers on, the client it
 /// answers to, the clock it steps with, and the keyboard.
 struct Runtime {
     socket: UdpSocket,
     client: Option<Client>,
-    sim: Sim,
+    tree: Tree,
 }
 
 impl Runtime {
@@ -1011,7 +1504,7 @@ impl Runtime {
         Ok(Self {
             socket,
             client: None,
-            sim: Sim::new(&cli, now_ns())?,
+            tree: Tree::new(&cli, now_ns())?,
         })
     }
 
@@ -1032,23 +1525,45 @@ impl Runtime {
             }
             self.receive_packets()?;
             self.expire_client();
-            self.step(|sim, now, sink| sim.tick(now, sink))?;
+            self.step(|tree, now, sink| tree.tick(now, sink))?;
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    /// What the device is, as the terminal sees it at startup.
+    /// What the tree is, as the terminal sees it at startup.
     fn banner(&self, keyboard: bool) -> io::Result<()> {
         let port = self.socket.local_addr()?.port();
-        let settings = &self.sim.settings;
+        let root = &self.tree.root;
+        let settings = &root.settings;
         terminal_println!("tio test listening on udp://0.0.0.0:{port}");
+        match self.tree.children.first() {
+            None => terminal_println!("  one device at /: {DEVICE_NAME} ({DEVICE_SERIAL})"),
+            Some(first) => {
+                terminal_println!(
+                    "  a hub at /: {HUB_NAME} ({HUB_SERIAL}), {} second, announced once a second",
+                    if root.pulses.pulsing() {
+                        "a simulated GPS"
+                    } else {
+                        "no reference"
+                    }
+                );
+                terminal_println!(
+                    "  {} children at /1../{}, cables {} ms late, dropping {}%, drifting {} ppm",
+                    self.tree.children.len(),
+                    self.tree.children.len(),
+                    first.cable.sync_delay_ns / 1_000_000,
+                    first.cable.sync_drop,
+                    first.cable.drift_ppm
+                );
+            }
+        }
         terminal_println!(
             "  stream 1: 2 waveform channels, amplitude={} V frequency={} Hz noise={} V/sqrt(Hz) samplerate={} Hz segment={} s",
             settings.amplitude.get(),
             settings.frequency.get(),
             settings.noise.get(),
-            self.sim.sample_rate(),
-            self.sim.segment_seconds
+            root.sample_rate(),
+            root.segment_seconds
         );
         terminal_println!(
             "  stream 2: status={} signal_level={}",
@@ -1060,7 +1575,7 @@ impl Runtime {
             AUX_WAVE_FREQUENCY,
             AUX_SAMPLE_RATE
         );
-        if self.sim.no_drop {
+        if root.no_drop {
             terminal_println!("  random sample drops disabled (--no-drop)");
         } else {
             terminal_println!(
@@ -1076,41 +1591,51 @@ impl Runtime {
         );
         if keyboard {
             terminal_println!(
-                "  press d to drop one sample now, p to toggle the PPS, r to reboot, \
-                 Ctrl-C to quit"
+                "  press d to drop one sample now, p to toggle the PPS, r to reboot everything, \
+                 h to reboot the root, 1-9 to unplug a child, Ctrl-C to quit"
             );
         }
         terminal_println!(
             "  {} PPS, acquiring {} s after boot; dev.start, dev.stop, dev.restart",
-            if self.sim.pps { "simulated" } else { "no" },
-            self.sim.settings.autostart.get()
+            if root.pulses.pulsing() {
+                "simulated"
+            } else {
+                "no"
+            },
+            AUTOSTART_SECONDS
         );
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
         Ok(())
     }
 
     /// Step the simulation, with the connected client as its sink.
-    fn step(&mut self, act: impl FnOnce(&mut Sim, u64, &mut UdpSink<'_>)) -> io::Result<()> {
+    fn step(&mut self, act: impl FnOnce(&mut Tree, u64, &mut UdpSink<'_>)) -> io::Result<()> {
         let now = now_ns();
         let mut sink = UdpSink::new(&self.socket, self.client.map(|client| client.addr));
-        act(&mut self.sim, now, &mut sink);
-        self.sim
-            .notes
-            .drain(..)
+        act(&mut self.tree, now, &mut sink);
+        self.tree
+            .drain_notes()
+            .into_iter()
             .for_each(|note| terminal_println!("{note}"));
         sink.finish()
     }
 
     fn handle_keyboard(&mut self) -> io::Result<bool> {
         while event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
+            if let event::Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('d') => self.step(|sim, _, _| sim.drop_now())?,
-                    KeyCode::Char('p') => self.step(|sim, _, _| sim.toggle_pps())?,
-                    KeyCode::Char('r') => self.step(|sim, now, sink| sim.reboot(now, sink))?,
+                    KeyCode::Char('d') => self.step(|tree, _, _| tree.drop_now())?,
+                    KeyCode::Char('p') => self.step(|tree, _, _| tree.toggle_pps())?,
+                    KeyCode::Char('r') => self.step(|tree, now, sink| tree.reboot(now, sink))?,
+                    KeyCode::Char('h') => {
+                        self.step(|tree, now, sink| tree.reboot_root(now, sink))?
+                    }
+                    KeyCode::Char(child @ '1'..='9') => {
+                        self.step(move |tree, _, _| tree.toggle_plug(child as u8 - b'0'))?
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(false);
                     }
@@ -1131,7 +1656,7 @@ impl Runtime {
                     }
                     match PacketView::parse_prefix(&buf[..size]) {
                         Ok((packet, parsed_size)) if parsed_size == size => {
-                            self.step(|sim, now, sink| sim.handle(packet, now, sink))?;
+                            self.step(|tree, now, sink| tree.handle(packet, now, sink))?;
                         }
                         Ok(_) => {
                             terminal_eprintln!(
@@ -1161,7 +1686,7 @@ impl Runtime {
             _ => {
                 self.client = Some(Client { addr, last_rx: now });
                 terminal_println!("client connected: {addr}");
-                self.step(|sim, now, sink| sim.connected(now, sink))?;
+                self.step(|tree, now, sink| tree.connected(now, sink))?;
                 Ok(true)
             }
         }
@@ -1177,19 +1702,46 @@ impl Runtime {
     }
 }
 
-/// A child's synchronizer: its own wall clock to start from, a fake PPS to
-/// follow, and no oscillator to steer.
-fn synchronizer(session: SessionId, now: u64) -> Synchronizer {
+/// A device's synchronizer: its own wall clock to start from, a simulated
+/// pulse to follow, and no oscillator to steer.
+fn synchronizer(role: Role, session: SessionId, serial: &str, now: u64) -> Synchronizer {
     Synchronizer::new(
         CounterDomain::new(PPS_PERIOD),
         PulseConfig::with_edge_tolerance(ticks(PPS_TOLERANCE_NS, PPS_PERIOD)),
         Reference {
-            identity: ReferenceIdentity::new(sync::Epoch::UNIX, session, DEVICE_SERIAL.as_bytes()),
+            identity: ReferenceIdentity::new(sync::Epoch::UNIX, session, serial.as_bytes()),
             second: (now / NANOS_PER_SECOND) as u32,
         },
         None,
-        AUTOSTART_SECONDS,
+        autostart_of(role),
     )
+}
+
+/// What a device of this role calls itself.
+fn identity(role: Role, serial: &str) -> io::Result<Identity> {
+    let (name, desc) = match role {
+        Role::Hub => (HUB_NAME, HUB_DESC),
+        Role::Sensor => (DEVICE_NAME, DEVICE_DESC),
+    };
+    Identity::new(name, desc, serial, DEVICE_FIRMWARE)
+        .ok_or_else(|| invalid_input("identity too long"))
+}
+
+/// The serial of the device at `port`, with 0 the root.
+fn serial_of(role: Role, port: u8) -> String {
+    match role {
+        Role::Hub => HUB_SERIAL.to_string(),
+        Role::Sensor if port == 0 => DEVICE_SERIAL.to_string(),
+        Role::Sensor => format!("SIM{port:04}"),
+    }
+}
+
+/// Seconds from boot to an automatic start. A hub has nothing to acquire.
+fn autostart_of(role: Role) -> u8 {
+    match role {
+        Role::Hub => 0,
+        Role::Sensor => AUTOSTART_SECONDS,
+    }
 }
 
 /// Where a segment's sample zero sits, as the synchronizer names it.
@@ -1214,9 +1766,9 @@ fn next_second_ns(now: u64) -> u64 {
     (now / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND
 }
 
-/// The streams a boot starts: no decimation, a cutoff at Nyquist, and a
-/// fresh segment ring on each.
-fn boot_streams(rate: NonZeroU32) -> io::Result<[Stream<SEGMENTS>; 3]> {
+/// The streams a boot starts: none on a hub, and on a sensor no decimation, a
+/// cutoff at Nyquist, and a fresh segment ring on each.
+fn boot_streams(role: Role, rate: NonZeroU32) -> io::Result<Vec<Stream<SEGMENTS>>> {
     let stream = |id: u8, def: &'static StreamDef, rate: NonZeroU32| {
         let params = Params {
             rate,
@@ -1227,11 +1779,25 @@ fn boot_streams(rate: NonZeroU32) -> io::Result<[Stream<SEGMENTS>; 3]> {
         Stream::new(StreamId::new(id), def, params)
             .ok_or_else(|| invalid_input("stream sample is too large for a TIO packet"))
     };
-    Ok([
-        stream(1, &SINE_DEF, rate)?,
-        stream(2, &STATUS_DEF, rate)?,
-        stream(3, &AUX_DEF, AUX_SAMPLE_RATE)?,
-    ])
+    match role {
+        Role::Hub => Ok(Vec::new()),
+        Role::Sensor => Ok(vec![
+            stream(1, &SINE_DEF, rate)?,
+            stream(2, &STATUS_DEF, rate)?,
+            stream(3, &AUX_DEF, AUX_SAMPLE_RATE)?,
+        ]),
+    }
+}
+
+/// The sample clocks a boot starts, which a hub has none of.
+fn boot_clocks(role: Role, rate: NonZeroU32, seconds: u32) -> io::Result<Vec<Clock>> {
+    match role {
+        Role::Hub => Ok(Vec::new()),
+        Role::Sensor => Ok(vec![
+            Clock::new(rate, seconds, &[Signal::Sine, Signal::Status])?,
+            Clock::new(AUX_SAMPLE_RATE, seconds, &[Signal::Aux])?,
+        ]),
+    }
 }
 
 /// A level the simulated hardware could actually produce.
@@ -1317,10 +1883,15 @@ mod tests {
             .flags
     }
 
-    /// A device at the instant it booted.
+    /// A lone device at the instant it booted.
     fn sim(args: &[&str]) -> Sim {
-        let cli = SimulateCli::parse_from([&["tio-simulate", "--port", "0"], args].concat());
-        Sim::new(&cli, BOOT).unwrap()
+        let cli = cli(args);
+        let pulses = Pulses::own(!cli.no_pps, BOOT);
+        Sim::new(&cli, Role::Sensor, 0, pulses, BOOT).unwrap()
+    }
+
+    fn cli(args: &[&str]) -> SimulateCli {
+        SimulateCli::parse_from([&["tio-simulate", "--port", "0"], args].concat())
     }
 
     /// A device at the second its autostart began acquiring, having locked
@@ -1732,5 +2303,186 @@ mod tests {
             .iter()
             .all(|count| (CAPTURE_SAMPLE_COUNT_MIN..=CAPTURE_SAMPLE_COUNT_MAX).contains(count)));
         assert!(counts.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    /// A hub with `children` sensors under it, at the instant it booted.
+    fn tree(args: &[&str]) -> Tree {
+        let cli = cli(&[&["--children", "2"], args].concat());
+        Tree::new(&cli, BOOT).unwrap()
+    }
+
+    /// Step the whole tree for `seconds`, a hundred times a second, and
+    /// return the instant it reached.
+    fn run(tree: &mut Tree, from: u64, seconds: u64) -> u64 {
+        let mut sent = Sent::default();
+        let mut at = from;
+        for _ in 0..seconds * 100 {
+            at += NANOS_PER_SECOND / 100;
+            tree.tick(at, &mut sent);
+        }
+        at
+    }
+
+    /// What the tree replied to an RPC addressed along `hops`, if anything.
+    fn ask(tree: &mut Tree, hops: &[u8], name: &[u8], now: u64) -> Option<Vec<u8>> {
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let method = twinleaf::proto::rpc::Method::ByName(name);
+        let mut len =
+            twinleaf::proto::rpc::write_request(&mut buf, RpcRequestId::new(5), method, &[])
+                .unwrap();
+        for &hop in hops {
+            len = twinleaf::proto::route::push_hop(&mut buf, hop).unwrap();
+        }
+        let (view, _) = PacketView::parse_prefix(&buf[..len]).unwrap();
+        let mut sent = Sent::default();
+        tree.handle(view, now, &mut sent);
+        sent.views().iter().find_map(
+            |view| match Answer::parse(view.header.ptype, view.payload) {
+                Some(Answer::Reply(reply)) if reply.req_id == RpcRequestId::new(5) => {
+                    Some(reply.value.to_vec())
+                }
+                Some(Answer::Reply(_)) | Some(Answer::Error(_)) | None => None,
+            },
+        )
+    }
+
+    /// The tree answers for itself at the root and for each child at its own
+    /// route, under the id the host chose.
+    #[test]
+    fn a_route_reaches_the_child_that_answers_it() {
+        let mut tree = tree(&[]);
+        let at = run(&mut tree, BOOT, 1);
+
+        assert_eq!(
+            ask(&mut tree, &[], b"dev.name", at),
+            Some(b"tio-hub".to_vec())
+        );
+        assert_eq!(
+            ask(&mut tree, &[1], b"dev.name", at),
+            Some(b"tio-test".to_vec())
+        );
+        assert_eq!(
+            ask(&mut tree, &[2], b"dev.session", at),
+            Some(tree.children[1].sim.device.session.to_le_bytes().to_vec())
+        );
+        assert_eq!(ask(&mut tree, &[3], b"dev.name", at), None);
+    }
+
+    /// The children follow the hub's second: they adopt its timeline, and the
+    /// segments they open carry its serial and session.
+    #[test]
+    fn the_children_adopt_the_hubs_timeline_and_name_it_in_their_segments() {
+        let mut tree = tree(&["--samplerate", "4"]);
+        let at = run(&mut tree, BOOT, 6);
+        for child in &tree.children {
+            assert_eq!(child.sim.sync.status().reference, ReferenceState::Upstream);
+        }
+
+        run(&mut tree, at, 6);
+        let session = tree.root.device.session;
+        for child in &tree.children {
+            assert!(child.sim.acquiring);
+            assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
+            assert_eq!(sine(&child.sim).timeref().session, session);
+            assert!(child.sim.traceable);
+        }
+    }
+
+    /// A hub reboot is a new timebase: the children flag the segment they are
+    /// in as holdover, then adopt the session the hub came back with.
+    #[test]
+    fn a_hub_reboot_flags_holdover_and_the_children_re_adopt() {
+        let mut tree = tree(&["--samplerate", "4"]);
+        let at = run(&mut tree, BOOT, 10);
+        let rebooted = tree.root.device.session;
+
+        let mut sent = Sent::default();
+        tree.reboot_root(at, &mut sent);
+        let at = run(&mut tree, at, 3);
+        assert_ne!(tree.root.device.session, rebooted);
+        assert!(tree
+            .children
+            .iter()
+            .all(|child| sine_flags(&child.sim).contains(data::SegmentFlags::HOLDOVER)));
+
+        run(&mut tree, at, 12);
+        let session = tree.root.device.session;
+        for child in &tree.children {
+            assert_eq!(sine(&child.sim).timeref().session, session);
+            assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
+        }
+    }
+
+    /// A tree whose cables are `delay_ms` long, run until its children have
+    /// made up their minds, and the second its hub is on at that instant.
+    fn cabled(delay_ms: &str) -> (Tree, u32) {
+        let mut tree = tree(&["--samplerate", "4", "--sync-delay", delay_ms]);
+        run(&mut tree, BOOT, 14);
+        let hub_second = tree.root.sync.status().active.second;
+        (tree, hub_second)
+    }
+
+    /// R11: the arrival window catches a cable most of a second long, and
+    /// nothing catches one past it: the child adopts a timeline a second off.
+    #[test]
+    fn a_cable_past_one_second_adopts_a_timeline_one_second_off() {
+        let (tree, hub_second) = cabled("100");
+        for child in &tree.children {
+            let status = child.sim.sync.status();
+            assert_eq!(status.reference, ReferenceState::Upstream);
+            assert_eq!(status.late_references, 0);
+            assert_eq!(status.active.second, hub_second);
+            assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
+        }
+
+        let (tree, _) = cabled("950");
+        for (index, child) in tree.children.iter().enumerate() {
+            let status = child.sim.sync.status();
+            assert!(status.late_references > 0);
+            assert_eq!(status.reference, ReferenceState::Local);
+            assert_eq!(
+                sine(&child.sim).timeref().serial.as_str(),
+                format!("SIM{:04}", index + 1)
+            );
+        }
+
+        let (tree, hub_second) = cabled("1200");
+        for child in &tree.children {
+            let status = child.sim.sync.status();
+            assert_eq!(status.reference, ReferenceState::Upstream);
+            assert_eq!(status.late_references, 0);
+            assert_eq!(status.active.second, hub_second - 1);
+            assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
+        }
+    }
+
+    /// An unplugged child is gone: nothing answers its route, and two missed
+    /// heartbeats later the hub says so.
+    #[test]
+    fn an_unplugged_child_answers_nothing_and_is_reported_gone() {
+        let mut tree = tree(&["--samplerate", "4"]);
+        let at = run(&mut tree, BOOT, 2);
+        tree.drain_notes();
+
+        tree.toggle_plug(1);
+        assert_eq!(ask(&mut tree, &[1], b"dev.name", at), None);
+
+        let at = run(&mut tree, at, 1);
+        assert!(tree
+            .drain_notes()
+            .iter()
+            .any(|note| note == "/1: unplugged"));
+        assert_eq!(ask(&mut tree, &[1], b"dev.name", at), None);
+        assert_eq!(
+            ask(&mut tree, &[2], b"dev.name", at),
+            Some(b"tio-test".to_vec())
+        );
+
+        tree.toggle_plug(1);
+        let at = run(&mut tree, at, 1);
+        assert_eq!(
+            ask(&mut tree, &[1], b"dev.name", at),
+            Some(b"tio-test".to_vec())
+        );
     }
 }
