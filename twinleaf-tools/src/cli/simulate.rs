@@ -59,13 +59,13 @@ pub struct SimulateCli {
     #[arg(long = "no-gps")]
     pub(crate) no_gps: bool,
 
-    /// Milliseconds a child's cable takes to deliver the hub's time reference
+    /// Milliseconds from the hub's edge until a child processes its time reference
     #[arg(
-        long = "sync-delay",
+        long = "sync-latency",
         default_value = "100",
         value_parser = clap::value_parser!(u64).range(0..=10_000)
     )]
-    pub(crate) sync_delay: u64,
+    pub(crate) sync_latency: u64,
 
     /// Percentage of the hub's time references each cable loses
     #[arg(

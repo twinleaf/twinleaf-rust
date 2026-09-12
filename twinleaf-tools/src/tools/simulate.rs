@@ -1060,7 +1060,7 @@ enum Plug {
 #[derive(Clone, Copy)]
 struct Cable {
     pps_delay_ns: u64,
-    sync_delay_ns: u64,
+    sync_latency_ns: u64,
     sync_drop: u8,
     pps_present: bool,
     drift_ppm: f64,
@@ -1172,7 +1172,7 @@ impl Tree {
         };
         let cable = Cable {
             pps_delay_ns: PPS_DELAY_NS,
-            sync_delay_ns: cli.sync_delay * 1_000_000,
+            sync_latency_ns: cli.sync_latency * 1_000_000,
             sync_drop: cli.sync_drop,
             pps_present: !cli.no_pps,
             drift_ppm: cli.drift,
@@ -1344,7 +1344,7 @@ impl Tree {
             }
             self.children[index]
                 .inflight
-                .push_back((at + cable.sync_delay_ns, packet));
+                .push_back((at + cable.sync_latency_ns, packet));
         }
     }
 
@@ -1516,10 +1516,10 @@ impl Runtime {
                     }
                 );
                 terminal_println!(
-                    "  {} children at /1../{}, cables {} ms late, dropping {}%, drifting {} ppm",
+                    "  {} children at /1../{}, time references {} ms late, dropping {}%, drifting {} ppm",
                     self.tree.children.len(),
                     self.tree.children.len(),
-                    first.cable.sync_delay_ns / 1_000_000,
+                    first.cable.sync_latency_ns / 1_000_000,
                     first.cable.sync_drop,
                     first.cable.drift_ppm
                 );
@@ -2380,10 +2380,10 @@ mod tests {
         }
     }
 
-    /// A tree whose cables are `delay_ms` long, run until its children have
+    /// A tree whose time references arrive `latency_ms` late, run until its children have
     /// made up their minds, and the second its hub is on at that instant.
-    fn cabled(delay_ms: &str) -> (Tree, u32) {
-        let mut tree = tree(&["--samplerate", "4", "--sync-delay", delay_ms]);
+    fn cabled(latency_ms: &str) -> (Tree, u32) {
+        let mut tree = tree(&["--samplerate", "4", "--sync-latency", latency_ms]);
         run(&mut tree, BOOT, 14);
         let hub_second = tree.root.sync.status().active.second;
         (tree, hub_second)
