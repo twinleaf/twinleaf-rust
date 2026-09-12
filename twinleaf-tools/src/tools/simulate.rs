@@ -4,11 +4,16 @@
 //! stream 1, or, with `--children`, a hub and the tree of them below it.
 
 use crate::SimulateCli;
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
+use rand_distr::StandardNormal;
 use ratatui::crossterm::{
     event::{self, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use std::collections::hash_map::RandomState;
 use std::collections::VecDeque;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
@@ -449,45 +454,13 @@ fn terminal_error_line(args: std::fmt::Arguments<'_>) {
     let _ = stderr.flush();
 }
 
-struct GaussianRng {
-    state: u64,
-    cached: Option<f64>,
+/// A generator seeded from the operating system, so every device and run differs.
+fn seeded() -> SmallRng {
+    SmallRng::seed_from_u64(RandomState::new().build_hasher().finish())
 }
 
-impl GaussianRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed,
-            cached: None,
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    fn next_unit(&mut self) -> f64 {
-        let raw = self.next_u64() >> 11;
-        ((raw as f64) + 1.0) / ((1u64 << 53) as f64 + 1.0)
-    }
-
-    fn next_gaussian(&mut self) -> f64 {
-        if let Some(value) = self.cached.take() {
-            return value;
-        }
-
-        let u1 = self.next_unit();
-        let u2 = self.next_unit();
-        let radius = (-2.0 * u1.ln()).sqrt();
-        let phase = std::f64::consts::TAU * u2;
-        self.cached = Some(radius * phase.sin());
-        radius * phase.cos()
-    }
+fn gaussian(rng: &mut SmallRng) -> f64 {
+    rng.sample(StandardNormal)
 }
 
 /// One acquisition RPC's effect on the synchronizer.
@@ -567,7 +540,7 @@ struct Sim {
     streams: Vec<Stream<SEGMENTS>>,
     clocks: Vec<Clock>,
     capture: CaptureBuffer,
-    rng: GaussianRng,
+    rng: SmallRng,
     sync: Synchronizer,
     /// Where its second edges come from.
     pulses: Pulses,
@@ -590,16 +563,13 @@ struct Sim {
 impl Sim {
     /// The device at `port`, with 0 the root, as `role` has it.
     fn new(cli: &SimulateCli, role: Role, port: u8, pulses: Pulses, now: u64) -> io::Result<Self> {
-        let seed = now ^ u64::from(cli.port).rotate_left(32) ^ u64::from(port) << 8;
-        let session_id = (seed as u32)
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
+        let mut rng = seeded();
+        let session_id: u32 = rng.random();
         let rate = NonZeroU32::new(cli.samplerate)
             .ok_or_else(|| invalid_input("sample rate must be at least one hertz"))?;
         let identity = identity(role, &serial_of(role, port))?;
 
         let session = SessionId::new(session_id);
-        let mut rng = GaussianRng::new(seed | 1);
         Ok(Self {
             role,
             device: Device::new(identity, session, &RPCS),
@@ -896,8 +866,8 @@ impl Sim {
         for offset in 0..sample_count as u64 {
             let t = (start_sample + offset) as f64 / f64::from(rate);
             let phase = std::f64::consts::TAU * self.settings.frequency.get() * t;
-            let value = self.settings.amplitude.get() * phase.sin()
-                + noise_sigma * self.rng.next_gaussian();
+            let value =
+                self.settings.amplitude.get() * phase.sin() + noise_sigma * gaussian(&mut self.rng);
             data.extend((value as f32).to_le_bytes());
         }
 
@@ -917,7 +887,7 @@ impl Sim {
         }
 
         let level = self.next_log_level();
-        let lucky_number = (self.rng.next_u64() % 10_000) as u32;
+        let lucky_number: u32 = self.rng.random_range(0..10_000);
         let message = self.random_log_message(lucky_number);
         self.device.log(level, lucky_number, &message, out);
         self.next_log_at = now + next_log_delay(&mut self.rng);
@@ -993,8 +963,8 @@ impl Sim {
         let phase = std::f64::consts::TAU * self.settings.frequency.get() * t;
         let noise_sigma = self.settings.noise.get() * (rate / 2.0).sqrt();
         let amplitude = self.settings.amplitude.get();
-        let sine = amplitude * phase.sin() + noise_sigma * self.rng.next_gaussian();
-        let cosine = amplitude * phase.cos() + noise_sigma * self.rng.next_gaussian();
+        let sine = amplitude * phase.sin() + noise_sigma * gaussian(&mut self.rng);
+        let cosine = amplitude * phase.cos() + noise_sigma * gaussian(&mut self.rng);
         let mut sample = [0u8; 16];
         sample[..8].copy_from_slice(&sine.to_le_bytes());
         sample[8..].copy_from_slice(&cosine.to_le_bytes());
@@ -1038,15 +1008,13 @@ impl Sim {
         }
         let (generated, rate) = (self.clocks[clock].generated, self.clocks[clock].rate.get());
         let seconds = SAMPLE_DROP_INTERVAL_SECONDS - SAMPLE_DROP_JITTER_SECONDS
-            + self.rng.next_unit() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
+            + self.rng.random::<f64>() * SAMPLE_DROP_JITTER_SECONDS * 2.0;
         let interval = (seconds * f64::from(rate)).round().max(1.0) as u64;
         Some(generated.saturating_add(interval))
     }
 
     fn next_session_id(&mut self) -> u32 {
-        let mut session_id = (self.rng.next_u64() as u32)
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
+        let mut session_id: u32 = self.rng.random();
         if session_id == self.device.session.value() {
             session_id = session_id.wrapping_add(1);
         }
@@ -1075,7 +1043,7 @@ impl Sim {
             "operator marker recorded lucky number {lucky}",
             "background diagnostic index settled at lucky number {lucky}",
         ];
-        let template = templates[(self.rng.next_u64() as usize) % templates.len()];
+        let template = templates[self.rng.random_range(0..templates.len())];
         template.replace("{lucky}", &lucky_number.to_string())
     }
 }
@@ -1188,7 +1156,7 @@ struct Tree {
     root: Sim,
     hub: Hub<Ask, MAX_PORTS>,
     children: Vec<Child>,
-    rng: GaussianRng,
+    rng: SmallRng,
     notes: Vec<String>,
 }
 
@@ -1215,7 +1183,7 @@ impl Tree {
             children: (1..=cli.children)
                 .map(|port| Child::new(cli, port, cable, now))
                 .collect::<io::Result<Vec<_>>>()?,
-            rng: GaussianRng::new(now | 1),
+            rng: seeded(),
             notes: Vec::new(),
         })
     }
@@ -1371,7 +1339,7 @@ impl Tree {
                 continue;
             };
             let cable = self.children[index].cable;
-            if self.rng.next_u64() % 100 < u64::from(cable.sync_drop) {
+            if self.rng.random_range(0..100) < cable.sync_drop {
                 continue;
             }
             self.children[index]
@@ -1811,13 +1779,12 @@ fn invalid_input(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
 
-fn next_log_delay(rng: &mut GaussianRng) -> u64 {
-    LOG_MESSAGE_MIN_INTERVAL_NS + (LOG_MESSAGE_JITTER_NS as f64 * rng.next_unit()) as u64
+fn next_log_delay(rng: &mut SmallRng) -> u64 {
+    LOG_MESSAGE_MIN_INTERVAL_NS + (LOG_MESSAGE_JITTER_NS as f64 * rng.random::<f64>()) as u64
 }
 
-fn next_capture_sample_count(rng: &mut GaussianRng) -> usize {
-    let span = CAPTURE_SAMPLE_COUNT_MAX - CAPTURE_SAMPLE_COUNT_MIN + 1;
-    CAPTURE_SAMPLE_COUNT_MIN + (rng.next_u64() as usize % span)
+fn next_capture_sample_count(rng: &mut SmallRng) -> usize {
+    rng.random_range(CAPTURE_SAMPLE_COUNT_MIN..=CAPTURE_SAMPLE_COUNT_MAX)
 }
 
 /// The device's clock, which here is the wall clock in nanoseconds.
@@ -2293,7 +2260,7 @@ mod tests {
 
     #[test]
     fn capture_sample_count_varies_within_range() {
-        let mut rng = GaussianRng::new(1);
+        let mut rng = SmallRng::seed_from_u64(1);
         let mut counts = Vec::new();
         for _ in 0..8 {
             counts.push(next_capture_sample_count(&mut rng));
