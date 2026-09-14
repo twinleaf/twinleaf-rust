@@ -120,6 +120,11 @@ impl<'t> Device<'t> {
         self.hash
     }
 
+    /// The threshold `dev.loglevel` holds, for a runtime that gates its own logging on it.
+    pub fn loglevel(&self) -> LogLevel {
+        LogLevel::new(self.loglevel.get())
+    }
+
     /// The device record: identity, session, and how many streams.
     pub fn record(&self, streams: &(impl Streams + ?Sized)) -> data::Device<'_> {
         data::Device {
