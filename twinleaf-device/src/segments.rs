@@ -375,7 +375,9 @@ impl<const N: usize> Segments<N> {
                 to
             }
         };
-        &mut self.entries[usize::from(index)]
+        let entry = &mut self.entries[usize::from(index)];
+        entry.holdover = self.holdover;
+        entry
     }
 
     /// Prepare the entry after `from` to take over at its sample `at`, which
@@ -649,6 +651,19 @@ mod tests {
         assert_eq!(
             segments.get(id(0)).unwrap().flags(),
             SegmentFlags::VALID | SegmentFlags::HOLDOVER
+        );
+    }
+
+    #[test]
+    fn holdover_set_before_a_segment_issues_reaches_it_at_the_rollover() {
+        let mut segments: Segments<4> = started(params(10));
+        segments.set_holdover(true);
+        segments.rollover();
+        issue(&mut segments, 1);
+        assert_eq!(segments.current().id().value(), 0);
+        assert_eq!(
+            segments.current().flags(),
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
         );
     }
 
