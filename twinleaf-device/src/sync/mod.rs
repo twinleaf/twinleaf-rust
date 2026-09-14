@@ -712,7 +712,9 @@ impl PhaseServo {
         self.integral_ppm += self.config.kp * self.config.ki * error * self.config.interval_seconds;
 
         let requested = proportional + self.integral_ppm;
-        self.output_ppm = requested.clamp(self.config.min_output_ppm, self.config.max_output_ppm);
+        self.output_ppm = requested
+            .max(self.config.min_output_ppm)
+            .min(self.config.max_output_ppm);
         self.saturated = self.output_ppm != requested;
         if self.saturated {
             self.integral_ppm = self.output_ppm - proportional;
