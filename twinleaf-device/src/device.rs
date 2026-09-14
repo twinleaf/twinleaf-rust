@@ -255,6 +255,12 @@ impl<'t> Device<'t> {
         Ok(reply)
     }
 
+    /// Announce and count a setting the application answered itself, with the
+    /// value its reply carries.
+    pub fn announce(&mut self, name: &str, reply: &[u8], out: &mut impl Sink) {
+        announce(&mut self.settings_version, out, name, reply);
+    }
+
     /// Answer `dev.conf.save`: the log threshold the device keeps itself and
     /// every setting the application persists, for the platform to write.
     pub fn save<'i, const N: usize>(
@@ -294,10 +300,7 @@ impl<'t> Device<'t> {
             let mut reply = Reply::new();
             match setting.load(entry.value, &mut reply) {
                 Ok(Changed::Unchanged) => {}
-                Ok(Changed::Changed) => {
-                    *settings_version = settings_version.wrapping_add(1);
-                    announcement(out, setting.name(), &reply);
-                }
+                Ok(Changed::Changed) => announce(settings_version, out, setting.name(), &reply),
                 Err(_) => outcome = Err(RpcError::Load),
             }
         }
@@ -371,12 +374,15 @@ fn write<T: Scalar>(
 ) -> Result<(), RpcError> {
     match setting.rpc(args, reply)? {
         Changed::Unchanged => {}
-        Changed::Changed => {
-            *version = version.wrapping_add(1);
-            announcement(out, setting.name(), reply);
-        }
+        Changed::Changed => announce(version, out, setting.name(), reply),
     }
     Ok(())
+}
+
+/// Count a change and announce it.
+fn announce(version: &mut u32, out: &mut impl Sink, name: &str, reply: &[u8]) {
+    *version = version.wrapping_add(1);
+    announcement(out, name, reply);
 }
 
 /// Send a SETTING packet carrying a value as the RPC of `name` replies it.
