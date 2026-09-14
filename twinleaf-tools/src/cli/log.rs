@@ -24,7 +24,7 @@ pub struct LogCli {
     #[arg(long)]
     pub raw: bool,
 
-    /// Routing depth (only used in --raw mode)
+    /// Routing depth limit (default: unlimited)
     #[arg(long = "depth")]
     pub depth: Option<usize>,
 
