@@ -139,7 +139,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
     }
 
     /// Ask a child a question of the hub's own, whose answer comes back as
-    /// [`Event::Answered`] carrying `purpose`.
+    /// [`Event::Answered`] carrying `purpose`, and return the id it went under.
     pub fn call(
         &mut self,
         port: u8,
@@ -148,7 +148,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         purpose: P,
         now_ns: u64,
         down: &mut impl PortSink,
-    ) -> Result<(), CallError> {
+    ) -> Result<RpcRequestId, CallError> {
         if !self.present(port) {
             return Err(CallError::Absent);
         }
@@ -164,7 +164,16 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         let len = rpc::write_request(&mut buf, id, method, args)
             .expect("a request that fits a payload fits a packet");
         down.send(port, &buf[..len]);
-        Ok(())
+        Ok(id)
+    }
+
+    /// Give up on a call of the hub's own, returning what it carried, or
+    /// `None` if it was already answered, timed out, or cancelled.
+    pub fn cancel(&mut self, port: u8, id: RpcRequestId) -> Option<P> {
+        match self.calls.release(port, id)? {
+            Origin::Internal(purpose) => Some(purpose),
+            Origin::Forwarded { .. } => None,
+        }
     }
 
     /// Send one second's time reference to every present child.

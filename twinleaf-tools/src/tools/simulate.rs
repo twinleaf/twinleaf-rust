@@ -1529,7 +1529,7 @@ impl Tree {
             .hub
             .call(port, "dev.name", &[], Ask::Name(port), now, &mut down)
         {
-            Ok(()) => {
+            Ok(_) => {
                 self.deliver(down, now, out);
                 return;
             }

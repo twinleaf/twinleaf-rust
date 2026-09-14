@@ -125,18 +125,25 @@ impl<P, const N: usize> Calls<P, N> {
     /// Take the entry an answer from `port` names, if one is live under the id
     /// and generation it carries. Anything else is counted and dropped.
     pub fn answered(&mut self, port: u8, answer: Answer<'_>) -> Option<Origin<P>> {
-        let id = answer.req_id();
-        let slot = &mut self.slots[Self::slot_of(id)];
-        let claimed = (slot.generation == Self::generation_of(id))
-            .then(|| slot.live.take_if(|live| live.port == port))
-            .flatten();
-        match claimed {
-            Some(live) => Some(live.origin),
-            None => {
-                self.unmatched = self.unmatched.saturating_add(1);
-                None
-            }
+        let claimed = self.claim(port, answer.req_id());
+        if claimed.is_none() {
+            self.unmatched = self.unmatched.saturating_add(1);
         }
+        claimed
+    }
+
+    /// Give up on the request sent to `port` under `id`; a late answer to it
+    /// is then unmatched.
+    pub fn release(&mut self, port: u8, id: RpcRequestId) -> Option<Origin<P>> {
+        self.claim(port, id)
+    }
+
+    fn claim(&mut self, port: u8, id: RpcRequestId) -> Option<Origin<P>> {
+        let slot = &mut self.slots[Self::slot_of(id)];
+        (slot.generation == Self::generation_of(id))
+            .then(|| slot.live.take_if(|live| live.port == port))
+            .flatten()
+            .map(|live| live.origin)
     }
 
     /// Free one entry whose deadline has passed. Call until it returns `None`.
