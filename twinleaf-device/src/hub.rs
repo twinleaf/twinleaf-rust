@@ -24,7 +24,8 @@ use crate::Sink;
 /// Silence after which a child is unplugged: two heartbeats' worth.
 pub const UNPLUG_NS: u64 = 2 * HEARTBEAT_INTERVAL;
 
-/// Requests a hub can have in flight at once, as tl-chibi's remap has.
+/// Requests a hub has in flight at once unless sized otherwise, as tl-chibi's
+/// remap has.
 pub const CALL_SLOTS: usize = 32;
 
 /// Where a hub's downward packets go, one child port at a time.
@@ -105,15 +106,16 @@ pub struct HubCounters {
 }
 
 /// A device's child ports and the requests it is waiting on. Port `n` is the
-/// route `/n`, and `P` is what a call of the hub's own carries.
-pub struct Hub<P, const PORTS: usize> {
+/// route `/n`, `P` is what a call of the hub's own carries, and `SLOTS` (a
+/// power of two) is how many requests can be waiting.
+pub struct Hub<P, const PORTS: usize, const SLOTS: usize = CALL_SLOTS> {
     ports: [Presence; PORTS],
-    calls: Calls<P, CALL_SLOTS>,
+    calls: Calls<P, SLOTS>,
     dropped_down: u32,
     dropped_up: u32,
 }
 
-impl<P, const PORTS: usize> Hub<P, PORTS> {
+impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
     /// A hub with nothing plugged into it.
     pub const fn new() -> Self {
         Self {
@@ -379,7 +381,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
     }
 }
 
-impl<P, const PORTS: usize> Default for Hub<P, PORTS> {
+impl<P, const PORTS: usize, const SLOTS: usize> Default for Hub<P, PORTS, SLOTS> {
     fn default() -> Self {
         Self::new()
     }
@@ -530,7 +532,11 @@ mod tests {
         log: Log,
     }
 
-    fn deliver(hub: &mut Hub<Ask, 4>, input: Input<'_>, now_ns: u64) -> Out {
+    fn deliver<const SLOTS: usize>(
+        hub: &mut Hub<Ask, 4, SLOTS>,
+        input: Input<'_>,
+        now_ns: u64,
+    ) -> Out {
         let mut out = Out::default();
         hub.handle(input, now_ns, &mut out.up, &mut out.down, &mut out.log);
         out
@@ -748,6 +754,20 @@ mod tests {
             hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default()),
             Err(CallError::Full)
         );
+    }
+
+    #[test]
+    fn a_hub_sized_to_two_calls_is_full_at_the_third() {
+        let mut hub: Hub<Ask, 4, 2> = Hub::new();
+        deliver(&mut hub, child(1, &heartbeat(7)), NOW);
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let outcomes: Vec<_> = (0..3)
+            .map(|_| {
+                hub.request(1, "dev.name", &[], Ask::Name, NOW, &mut buf)
+                    .map(|(_, len)| len > 0)
+            })
+            .collect();
+        assert_eq!(outcomes, [Ok(true), Ok(true), Err(CallError::Full)]);
     }
 
     #[test]
