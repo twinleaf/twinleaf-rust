@@ -4,13 +4,17 @@ use super::cache;
 use super::codec::RpcReply;
 use super::error::CallError;
 use super::reply::{pipelined, PendingReply};
-use crate::proto::rpc::RpcMeta;
+use crate::proto::rpc::{RpcError, RpcMeta};
 use std::collections::BTreeMap;
 use std::io;
 
 /// Most `rpc.listinfo` fetches in flight at once during a walk, bounding the
 /// request burst a memory-tight device must absorb.
 const WALK_WINDOW: usize = 8;
+
+/// The counter a device raises on every setting change, absent from firmware
+/// older than the announcements.
+pub(super) const SETTINGS_VERSION: &str = "settings.version";
 
 /// Why a device's RPC table could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +54,9 @@ pub struct RpcRegistry {
     rpcs: BTreeMap<String, RpcDescriptor>,
     /// The device's `rpc.hash`, when the table came from a device.
     pub hash: Option<u32>,
+    /// The device's `settings.version` when the table was read, `None` where
+    /// its firmware has no such counter.
+    pub settings_version: Option<u32>,
 }
 
 impl RpcRegistry {
@@ -59,7 +66,11 @@ impl RpcRegistry {
             .into_iter()
             .map(|spec| (spec.full_name.clone(), spec))
             .collect();
-        Self { rpcs, hash: None }
+        Self {
+            rpcs,
+            hash: None,
+            settings_version: None,
+        }
     }
 
     /// Walk one device's RPC table through `submit`, [`WALK_WINDOW`] fetches in
@@ -69,11 +80,13 @@ impl RpcRegistry {
     ) -> Result<Self, RpcRegistryError> {
         let name_reply = submit("dev.name", &[]);
         let hash_reply = submit("rpc.hash", &[]);
+        let version_reply = submit(SETTINGS_VERSION, &[]);
         let dev_name: String = decode(name_reply.wait()?)?;
         let hash: u32 = decode(hash_reply.wait()?)?;
+        let version = settings_version(version_reply.wait())?;
         let path = cache::path(&dev_name, hash).ok_or(RpcRegistryError::CacheDirError)?;
         if let Some(entries) = cache::load(&path)? {
-            return Ok(Self::from_entries(entries, hash));
+            return Ok(Self::from_entries(entries, hash, version));
         }
         let total: u16 = decode(submit("rpc.listinfo", &[]).wait()?)?;
         let descriptors = (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
@@ -81,16 +94,17 @@ impl RpcRegistry {
             .map(|reply| decode::<(u16, String)>(reply?).map(|(meta, name)| (name, meta)))
             .collect::<Result<cache::Entries, _>>()?;
         cache::store(&path, &entries);
-        Ok(Self::from_entries(entries, hash))
+        Ok(Self::from_entries(entries, hash, version))
     }
 
-    fn from_entries(entries: cache::Entries, hash: u32) -> Self {
+    fn from_entries(entries: cache::Entries, hash: u32, settings_version: Option<u32>) -> Self {
         let specs = entries
             .into_iter()
             .map(|(name, meta)| RpcDescriptor::from_meta(meta, name))
             .collect();
         let mut registry = Self::new(specs);
         registry.hash = Some(hash);
+        registry.settings_version = settings_version;
         registry
     }
 
@@ -110,6 +124,16 @@ impl RpcRegistry {
     }
 }
 
+/// The counter the device answered, or `None` when its table has no
+/// `settings.version` and its announcements are therefore uncounted.
+fn settings_version(reply: Result<Vec<u8>, CallError>) -> Result<Option<u32>, RpcRegistryError> {
+    match reply {
+        Ok(reply) => decode(reply).map(Some),
+        Err(CallError::DeviceError(payload)) if payload.error == RpcError::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn decode<T: RpcReply>(reply: Vec<u8>) -> Result<T, RpcRegistryError> {
     T::decode_reply(&reply)
         .map_err(|error| RpcRegistryError::DeviceRpcError(CallError::InvalidReply(error)))
@@ -117,6 +141,7 @@ fn decode<T: RpcReply>(reply: Vec<u8>) -> Result<T, RpcRegistryError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::RpcErrorPayload;
     use super::super::reply::resolved;
     use super::*;
 
@@ -141,11 +166,12 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_asks_for_the_name_the_hash_then_each_descriptor() {
+    fn the_walk_asks_for_the_name_the_hash_the_version_then_each_descriptor() {
         // A hash nothing has cached, so the walk has to enumerate.
         let (asked, error) = walk_recording(vec![
             b"test-device".to_vec(),
             0xdead_beefu32.to_le_bytes().to_vec(),
+            7u32.to_le_bytes().to_vec(),
             2u16.to_le_bytes().to_vec(),
             descriptor("dev.name"),
         ]);
@@ -155,6 +181,7 @@ mod tests {
             [
                 ("dev.name".to_string(), Vec::new()),
                 ("rpc.hash".to_string(), Vec::new()),
+                (SETTINGS_VERSION.to_string(), Vec::new()),
                 ("rpc.listinfo".to_string(), Vec::new()),
                 ("rpc.listinfo".to_string(), vec![0, 0]),
                 ("rpc.listinfo".to_string(), vec![1, 0]),
@@ -170,10 +197,29 @@ mod tests {
     fn a_reply_that_does_not_decode_fails_the_walk() {
         let (asked, error) = walk_recording(vec![b"test-device".to_vec(), vec![0, 1]]);
 
-        assert_eq!(asked.len(), 2, "a two-byte hash should not decode");
+        assert_eq!(asked.len(), 3, "a two-byte hash should not decode");
         assert!(matches!(
             error,
             RpcRegistryError::DeviceRpcError(CallError::InvalidReply(_))
+        ));
+    }
+
+    /// Firmware older than the announcements has no counter, and a walk of it
+    /// still succeeds: the host simply never counts or resyncs.
+    #[test]
+    fn a_device_without_the_counter_refuses_it_and_the_walk_goes_on() {
+        let refused = Err(CallError::DeviceError(RpcErrorPayload {
+            error: RpcError::NotFound,
+            extra: Vec::new(),
+        }));
+        assert!(matches!(settings_version(refused), Ok(None)));
+        assert!(matches!(
+            settings_version(Ok(9u32.to_le_bytes().to_vec())),
+            Ok(Some(9))
+        ));
+        assert!(matches!(
+            settings_version(Err(CallError::Timeout)),
+            Err(RpcRegistryError::DeviceRpcError(CallError::Timeout))
         ));
     }
 }

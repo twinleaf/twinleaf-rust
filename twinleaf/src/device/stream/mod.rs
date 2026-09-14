@@ -205,9 +205,18 @@ impl StreamState {
                     );
                 }
             }
-            packet::Payload::Setting(setting) => {
-                if let (true, Some(hash)) = (covered, rpc_hash(&setting)) {
+            packet::Payload::Setting(setting) if covered => {
+                if let Some(hash) = rpc_hash(&setting) {
                     self.device_event(route, DeviceEvent::NewHash(Some(hash)));
+                }
+                if let Some(name) = setting.name_str() {
+                    self.device_event(
+                        route,
+                        DeviceEvent::Setting {
+                            name: name.to_string(),
+                            reply: setting.reply.to_vec(),
+                        },
+                    );
                 }
             }
             packet::Payload::Samples(_) if !covered => return,
@@ -664,6 +673,22 @@ mod tests {
 
     fn samples(first: u32, route: DeviceRoute) -> Packet {
         Packet::samples(1, 0, first, &[0; 4], route).expect("valid samples")
+    }
+
+    /// One SETTING announcement, as a device sends it.
+    fn announcement(name: &str, reply: &[u8], route: DeviceRoute) -> Packet {
+        let mut raw = [0u8; 64];
+        let len = crate::proto::settings::Setting {
+            name: name.as_bytes(),
+            flags: 0,
+            reply,
+        }
+        .write(&mut raw)
+        .expect("the announcement fits");
+        Packet::from_slice_prefix(&raw[..len])
+            .expect("a valid packet")
+            .0
+            .with_route(route)
     }
 
     /// The four records that let the parser decode one f32 stream, as the
@@ -1612,5 +1637,57 @@ mod tests {
             stream.batches(everything()).recv(),
             Err(RecvError::Disconnected)
         ));
+    }
+
+    /// Every announcement reaches the views covering the device that sent it.
+    #[test]
+    fn an_announcement_becomes_an_event_on_its_own_route() {
+        let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());
+        let (_subscriptions, deliver, _commands, _endpoint, _worker) = pump(PumpSink::Events(sink));
+        let route: DeviceRoute = "/1".parse().expect("a valid route");
+        deliver
+            .send(announcement("test.amplitude", &[1, 2, 3, 4], route))
+            .expect("the pump takes the packet");
+
+        wait_for(&events, |event| {
+            matches!(
+                event,
+                Event::Device {
+                    route: from,
+                    event: DeviceEvent::Setting { name, reply },
+                } if *from == route && name == "test.amplitude" && reply == &[1, 2, 3, 4]
+            )
+        });
+    }
+
+    /// The table hash travels as an announcement, so it is heard twice: as the
+    /// refresh signal, and as the announcement it is.
+    #[test]
+    fn the_table_hash_is_both_a_new_hash_and_an_announcement() {
+        let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());
+        let (_subscriptions, deliver, _commands, _endpoint, _worker) = pump(PumpSink::Events(sink));
+        let root = DeviceRoute::root();
+        deliver
+            .send(announcement("rpc.hash", &7u32.to_le_bytes(), root))
+            .expect("the pump takes the packet");
+
+        wait_for(&events, |event| {
+            matches!(
+                event,
+                Event::Device {
+                    event: DeviceEvent::NewHash(Some(7)),
+                    ..
+                }
+            )
+        });
+        wait_for(&events, |event| {
+            matches!(
+                event,
+                Event::Device {
+                    event: DeviceEvent::Setting { name, .. },
+                    ..
+                } if name == "rpc.hash"
+            )
+        });
     }
 }

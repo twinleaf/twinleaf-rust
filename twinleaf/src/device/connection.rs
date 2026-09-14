@@ -1,6 +1,8 @@
 //! Stateful access to one device or a routed device tree.
 
-use super::rpc::{CallError, PendingReply, RpcArgs, RpcRegistry, RpcRegistryError, RpcReply};
+use super::rpc::{
+    CallError, PendingReply, RpcArgs, RpcRegistry, RpcRegistryError, RpcReply, SettingsCache,
+};
 use super::stream::{
     DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, Stream, TreeEvent,
 };
@@ -229,7 +231,9 @@ impl DeviceTree {
                 Event::Device { route: from, event } if from == route => match event {
                     DeviceEvent::Metadata(snapshot) => return Ok(snapshot),
                     DeviceEvent::MetadataUnavailable => return Err(MetadataError::Unsupported),
-                    DeviceEvent::Heartbeat { .. } | DeviceEvent::NewHash(_) => {}
+                    DeviceEvent::Heartbeat { .. }
+                    | DeviceEvent::NewHash(_)
+                    | DeviceEvent::Setting { .. } => {}
                 },
                 Event::Device { .. } | Event::Tree { .. } | Event::Link { .. } => {}
             }
@@ -403,6 +407,13 @@ impl Device {
     /// `rpc.hash` still matches, otherwise by walking `rpc.listinfo`.
     pub fn rpc_registry(&self) -> Result<RpcRegistry, RpcRegistryError> {
         self.tree.rpc_registry(self.route())
+    }
+
+    /// Re-read `cache`'s settings when this device reports a `settings.version`
+    /// its announcements do not add up to; true when it did. Apply the
+    /// announcements in hand first: one left pending is counted twice.
+    pub fn resync_settings(&self, cache: &mut SettingsCache) -> Result<bool, CallError> {
+        cache.resync_with(|name, arg| self.submit(name, arg))
     }
 
     /// Test-only device with no proxy behind it. Returns the device, the far

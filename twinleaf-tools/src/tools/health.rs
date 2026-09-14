@@ -811,6 +811,7 @@ impl HealthState {
                         registries.fetch(route);
                     }
                 }
+                DeviceEvent::Setting { .. } => {}
             },
         }
     }

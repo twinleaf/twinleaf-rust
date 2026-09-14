@@ -44,6 +44,15 @@ pub enum DeviceEvent {
     /// `Some(hash)` comes from a settings packet. `None` requests a refresh
     /// after reconnection.
     NewHash(Option<u32>),
+    /// A setting changed, as the device announced it. `rpc.hash` is announced
+    /// this way too, arriving here as well as in `NewHash`; a name that is not
+    /// UTF-8 is dropped rather than made lossy, being a key.
+    Setting {
+        /// The setting's RPC name.
+        name: String,
+        /// Its new value, the bytes that RPC would reply.
+        reply: Vec<u8>,
+    },
 }
 
 /// One fact from the connection, scoped by subject. Every view subscribes to

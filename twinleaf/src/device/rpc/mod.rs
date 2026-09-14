@@ -13,6 +13,11 @@
 //!     - [`RpcValueTypeExt`] then encodes and decodes an owned [`RpcValue`] of that type.
 //!     - An interactive tool or a GUI may prefer this way.
 //!
+//! A device announces every setting change, which
+//! [`DeviceEvent::Setting`](crate::DeviceEvent::Setting) carries and
+//! [`SettingsCache`] holds, re-reading its values when `settings.version` shows
+//! announcements were missed.
+//!
 //! Either way, a call may be issued with [`submit`](crate::device::Device::submit)
 //! and answered through a [`PendingReply`] (blocking or awaited). Using
 //! [`pipelined`] instead keeps a window of them in flight. Every failure is a
@@ -29,6 +34,7 @@ mod codec;
 mod error;
 mod registry;
 mod reply;
+mod settings;
 mod value;
 
 #[doc(no_inline)]
@@ -38,4 +44,5 @@ pub use codec::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
 pub use error::{CallError, RpcErrorPayload};
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
 pub use reply::{pipelined, PendingReply, ReplyFuture};
+pub use settings::SettingsCache;
 pub use value::{RpcMetaExt, RpcValue, RpcValueDecodeError, RpcValueEncodeError, RpcValueTypeExt};

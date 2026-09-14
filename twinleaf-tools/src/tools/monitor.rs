@@ -1007,7 +1007,7 @@ impl MonitorState {
                 DeviceEvent::Metadata(snapshot) => {
                     self.device_metadata.insert(route, snapshot);
                 }
-                DeviceEvent::MetadataUnavailable => {}
+                DeviceEvent::MetadataUnavailable | DeviceEvent::Setting { .. } => {}
             },
         }
     }
