@@ -18,9 +18,10 @@ use twinleaf_proto::rpc::{self, Method, Request, RpcError};
 use twinleaf_proto::settings::Setting as Announcement;
 use twinleaf_proto::{RpcRequestId, SessionId};
 
+use crate::conf::{self, Image};
 use crate::metadata::{self, Streams};
 use crate::rpc::{self as table, put, Reply, RpcSpec};
-use crate::settings::{Changed, Scalar, Setting};
+use crate::settings::{Changed, Persisted, Scalar, Setting};
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
@@ -104,7 +105,7 @@ impl<'t> Device<'t> {
             table,
             hash: table::hash(table),
             next_beat: 0,
-            loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()),
+            loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()).persistent(),
             settings_version: 0,
         }
     }
@@ -150,7 +151,8 @@ impl<'t> Device<'t> {
         }
     }
 
-    /// Act on one packet from the host.
+    /// Act on one packet from the host. A method the table declares an action
+    /// refuses an argument, as libtio firmware does.
     pub fn handle<'p>(
         &mut self,
         streams: &(impl Streams + ?Sized),
@@ -176,7 +178,12 @@ impl<'t> Device<'t> {
             answer(out, routing, request.id, Err(RpcError::NotFound));
             return Handled::Done;
         };
-        let (name, args) = (self.table[index].name, request.args);
+        let spec = &self.table[index];
+        let (name, args) = (spec.name, request.args);
+        if spec.method == table::Method::Action && !args.is_empty() {
+            answer(out, routing, request.id, Err(RpcError::ArgsSize));
+            return Handled::Done;
+        }
         let mut reply = Reply::new();
         let result = match name {
             "rpc.name" => table::name(self.table, args, &mut reply),
@@ -241,6 +248,55 @@ impl<'t> Device<'t> {
         let mut reply = Reply::new();
         write(&mut self.settings_version, setting, args, &mut reply, out)?;
         Ok(reply)
+    }
+
+    /// Answer `dev.conf.save`: the log threshold the device keeps itself and
+    /// every setting the application persists, for the platform to write.
+    pub fn save<'i, const N: usize>(
+        &mut self,
+        settings: &mut [&mut dyn Persisted],
+        image: &'i mut Image<N>,
+    ) -> Result<&'i [u8], RpcError> {
+        image.clear();
+        conf::encode(&mut [&mut self.loglevel], image)?;
+        conf::encode(settings, image)?;
+        Ok(image)
+    }
+
+    /// Answer `dev.conf.load`, or a boot: take every stored value the image
+    /// names, announcing each one that moved. A name no setting answers is
+    /// left behind, and a value refused leaves [`RpcError::Load`].
+    pub fn load(
+        &mut self,
+        settings: &mut [&mut dyn Persisted],
+        image: &[u8],
+        out: &mut impl Sink,
+    ) -> Result<(), RpcError> {
+        let Self {
+            loglevel,
+            settings_version,
+            ..
+        } = self;
+        let mut outcome = Ok(());
+        for entry in conf::entries(image) {
+            let entry = entry?;
+            let found = core::iter::once(&mut *loglevel as &mut dyn Persisted)
+                .chain(settings.iter_mut().map(|setting| &mut **setting))
+                .find(|setting| setting.name().as_bytes() == entry.name);
+            let Some(setting) = found else {
+                continue;
+            };
+            let mut reply = Reply::new();
+            match setting.load(entry.value, &mut reply) {
+                Ok(Changed::Unchanged) => {}
+                Ok(Changed::Changed) => {
+                    *settings_version = settings_version.wrapping_add(1);
+                    announcement(out, setting.name(), &reply);
+                }
+                Err(_) => outcome = Err(RpcError::Load),
+            }
+        }
+        outcome
     }
 
     /// Power-cycle: a new session, and the heartbeat, log threshold, and
@@ -355,7 +411,7 @@ mod tests {
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 
-    static TABLE: [RpcSpec; 7] = [
+    static TABLE: [RpcSpec; 8] = [
         RpcSpec::std("rpc.list", Access::RW),
         RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
         RpcSpec::prop("dev.name", Kind::String, Access::READ),
@@ -363,6 +419,7 @@ mod tests {
         RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
         RpcSpec::std("dev.metadata", Access::RW),
         RpcSpec::prop("app.gain", Kind::Uint(1), Access::RW),
+        RpcSpec::action("app.go"),
     ];
 
     struct OneStream;
@@ -566,6 +623,12 @@ mod tests {
         );
 
         let mut sent = Sent::default();
+        deliver(&mut device, b"app.go", &[1], &mut sent);
+        assert!(
+            matches!(answered(&sent), Answer::Error(error) if error.error() == RpcError::ArgsSize)
+        );
+
+        let mut sent = Sent::default();
         let mut packet = request(Method::ByName(b"dev.name"), &[], &[]);
         packet.truncate(Packet::MAX_SIZE.min(6));
         packet[2..4].copy_from_slice(&2u16.to_le_bytes());
@@ -725,6 +788,79 @@ mod tests {
         let setting = Announcement::parse(view.payload).unwrap();
         assert_eq!(setting.name, b"app.gain");
         assert_eq!(setting.reply, [9]);
+    }
+
+    #[test]
+    fn a_saved_configuration_comes_back_with_every_value_it_moved_announced() {
+        let mut device = device();
+        let mut gain = Setting::new("app.gain", 1u8).persistent();
+        let mut sent = Sent::default();
+        deliver(
+            &mut device,
+            b"dev.loglevel",
+            &[LogLevel::DEBUG.value()],
+            &mut sent,
+        );
+        device.apply(&mut gain, &[9], &mut sent).unwrap();
+
+        let mut image = Image::<64>::new();
+        let stored = device.save(&mut [&mut gain], &mut image).unwrap().to_vec();
+
+        device.reboot(SessionId::new(10));
+        gain.reset();
+
+        let mut sent = Sent::default();
+        assert_eq!(device.load(&mut [&mut gain], &stored, &mut sent), Ok(()));
+        assert_eq!(gain.get(), 9);
+        let announced: Vec<_> = sent
+            .views()
+            .iter()
+            .map(|view| Announcement::parse(view.payload).unwrap())
+            .map(|setting| (setting.name.to_vec(), setting.reply.to_vec()))
+            .collect();
+        assert_eq!(
+            announced,
+            [
+                (b"dev.loglevel".to_vec(), vec![LogLevel::DEBUG.value()]),
+                (b"app.gain".to_vec(), vec![9]),
+            ]
+        );
+
+        let mut sent = Sent::default();
+        assert_eq!(device.load(&mut [&mut gain], &stored, &mut sent), Ok(()));
+        assert!(sent.0.is_empty());
+
+        let mut sent = Sent::default();
+        deliver(&mut device, b"settings.version", &[], &mut sent);
+        assert!(
+            matches!(answered(&sent), Answer::Reply(reply) if reply.value == 2u32.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn a_stored_value_no_setting_takes_is_left_behind_or_left_as_a_load_error() {
+        let mut device = device();
+        let mut rate = Setting::new("app.rate", 1.0f64)
+            .checked(|value| (value > 0.0).then_some(value).ok_or(RpcError::Invalid))
+            .persistent();
+        let mut sent = Sent::default();
+
+        let unknown = [&[7u8, 1][..], b"app.old", &[3]].concat();
+        assert_eq!(device.load(&mut [&mut rate], &unknown, &mut sent), Ok(()));
+
+        let refused = [&[8u8, 8][..], b"app.rate", &(-1.0f64).to_le_bytes()].concat();
+        assert_eq!(
+            device.load(&mut [&mut rate], &refused, &mut sent),
+            Err(RpcError::Load)
+        );
+        assert_eq!(rate.get(), 1.0);
+
+        let truncated = &refused[..refused.len() - 1];
+        assert_eq!(
+            device.load(&mut [&mut rate], truncated, &mut sent),
+            Err(RpcError::Load)
+        );
+        assert!(sent.0.is_empty());
     }
 
     #[test]

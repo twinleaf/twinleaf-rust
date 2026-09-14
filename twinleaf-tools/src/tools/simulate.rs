@@ -24,16 +24,18 @@ use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
+use twinleaf_device::conf::Image;
 use twinleaf_device::device::{Call, Device, Handled, Identity};
 use twinleaf_device::hub::{CallError, Event, Events, Hub, Input, PortSink};
 use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec};
 use twinleaf_device::segments::{Params, Timeref};
-use twinleaf_device::settings::Setting;
+use twinleaf_device::settings::{Persisted, Setting};
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
 use twinleaf_device::sync::{
     ticks, AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig,
     Reference, ReferenceIdentity, ScheduledEdge, Synchronizer,
 };
+use twinleaf_device::update::{Envelope, Upload};
 use twinleaf_device::Sink;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -167,7 +169,7 @@ const AUX_DEF: StreamDef = StreamDef {
 
 /// The RPC table. Introspection first, like tl-chibi, and the order fixes
 /// the ids `rpc.list` reports and the `rpc.hash`.
-static RPCS: [RpcSpec; 26] = [
+static RPCS: [RpcSpec; 29] = [
     RpcSpec::std("rpc.name", Access::RW),
     RpcSpec::std("rpc.id", Access::RW),
     RpcSpec::std("rpc.info", Access::RW),
@@ -177,19 +179,38 @@ static RPCS: [RpcSpec; 26] = [
     RpcSpec::prop("dev.name", Kind::String, Access::READ),
     RpcSpec::prop("dev.desc", Kind::String, Access::READ),
     RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
-    RpcSpec::prop("dev.loglevel", Kind::Uint(1), Access::RW),
+    RpcSpec::prop(
+        "dev.loglevel",
+        Kind::Uint(1),
+        Access::RW.union(Access::PERSISTENT),
+    ),
     RpcSpec::action("dev.start"),
     RpcSpec::action("dev.stop"),
     RpcSpec::action("dev.restart"),
     RpcSpec::prop("dev.autostart", Kind::Uint(1), Access::RW),
-    RpcSpec::std("dev.firmware.upload", Access::WRITE),
+    RpcSpec::std("dev.firmware.upload", Access::RW),
     RpcSpec::action("dev.firmware.upgrade"),
+    RpcSpec::action("dev.conf.save"),
+    RpcSpec::action("dev.conf.load"),
+    RpcSpec::action("dev.conf.reset"),
     RpcSpec::std("dev.metadata", Access::RW),
     RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
     RpcSpec::prop("sync.status", Kind::Uint(1), Access::READ),
-    RpcSpec::prop("test.amplitude", Kind::Float(8), Access::RW),
-    RpcSpec::prop("test.frequency", Kind::Float(8), Access::RW),
-    RpcSpec::prop("test.noise", Kind::Float(8), Access::RW),
+    RpcSpec::prop(
+        "test.amplitude",
+        Kind::Float(8),
+        Access::RW.union(Access::PERSISTENT),
+    ),
+    RpcSpec::prop(
+        "test.frequency",
+        Kind::Float(8),
+        Access::RW.union(Access::PERSISTENT),
+    ),
+    RpcSpec::prop(
+        "test.noise",
+        Kind::Float(8),
+        Access::RW.union(Access::PERSISTENT),
+    ),
     RpcSpec::prop("test.status", Kind::Uint(1), Access::RW),
     RpcSpec::prop("test.enable", Kind::Bool, Access::RW),
     RpcSpec::action("test.go"),
@@ -210,13 +231,24 @@ struct Settings {
 impl Settings {
     fn new(cli: &SimulateCli, autostart: u8) -> Self {
         Self {
-            amplitude: Setting::new("test.amplitude", cli.amplitude).checked(nonnegative),
-            frequency: Setting::new("test.frequency", cli.frequency).checked(nonnegative),
-            noise: Setting::new("test.noise", cli.noise).checked(nonnegative),
+            amplitude: Setting::new("test.amplitude", cli.amplitude)
+                .checked(nonnegative)
+                .persistent(),
+            frequency: Setting::new("test.frequency", cli.frequency)
+                .checked(nonnegative)
+                .persistent(),
+            noise: Setting::new("test.noise", cli.noise)
+                .checked(nonnegative)
+                .persistent(),
             status: Setting::new("test.status", 0),
             enable: Setting::new("test.enable", true),
             autostart: Setting::new("dev.autostart", autostart),
         }
+    }
+
+    /// The settings the configuration keeps, in the order it lists them.
+    fn persistent(&mut self) -> [&mut dyn Persisted; 3] {
+        [&mut self.amplitude, &mut self.frequency, &mut self.noise]
     }
 
     /// Go back to the values a boot starts from.
@@ -530,6 +562,18 @@ impl Pulses {
     }
 }
 
+/// The platform's flash: the firmware image an upload writes, whether one has
+/// taken, and the configuration a save left behind.
+#[derive(Default)]
+struct Flash {
+    image: Vec<u8>,
+    upgraded: bool,
+    conf: Option<Vec<u8>>,
+}
+
+/// As much flash as a stored configuration may take.
+const CONF_MAX: usize = 1024;
+
 /// The simulated device: what it is, what it holds, and what it publishes.
 /// Every method takes the monotonic nanoseconds its runtime keeps, which here
 /// are UNIX nanoseconds, and every packet it sends goes to that runtime's sink.
@@ -540,6 +584,11 @@ struct Sim {
     streams: Vec<Stream<SEGMENTS>>,
     clocks: Vec<Clock>,
     capture: CaptureBuffer,
+    /// What the platform keeps across a reboot.
+    flash: Flash,
+    /// How much of a firmware image `dev.firmware.upload` has taken. The
+    /// simulator holds no device key, so a chunk's ciphertext is its plaintext.
+    upload: Upload,
     rng: SmallRng,
     sync: Synchronizer,
     /// Where its second edges come from.
@@ -577,6 +626,8 @@ impl Sim {
             streams: boot_streams(role, rate)?,
             clocks: boot_clocks(role, rate, cli.segment_seconds)?,
             capture: CaptureBuffer::new(),
+            flash: Flash::default(),
+            upload: Upload::new(),
             pulses,
             announced: None,
             plan: None,
@@ -643,6 +694,8 @@ impl Sim {
         let serial = self.device.identity.serial.clone();
         self.device.reboot(session);
         self.settings.reset();
+        self.upload = Upload::new();
+        self.take_desc();
         self.streams =
             boot_streams(self.role, self.rate).expect("streams that booted once boot again");
         self.sync = synchronizer(self.role, session, &serial, now);
@@ -659,6 +712,27 @@ impl Sim {
             self.device.session.value()
         ));
         self.connected(now, out);
+        if self.load_conf(out).is_err() {
+            self.notes
+                .push("stored configuration did not load".to_string());
+        }
+    }
+
+    /// Take `dev.desc` from what is in flash: the upgraded build once an
+    /// image has taken.
+    fn take_desc(&mut self) {
+        self.device.identity.desc = desc_of(self.role, self.flash.upgraded)
+            .try_into()
+            .expect("a description that fits");
+    }
+
+    /// Take the stored configuration, announcing every value it moves.
+    fn load_conf(&mut self, out: &mut impl Sink) -> Result<(), RpcError> {
+        let Some(bytes) = self.flash.conf.as_deref() else {
+            return Ok(());
+        };
+        self.device
+            .load(&mut self.settings.persistent(), bytes, out)
     }
 
     /// Drop one sample from every clock, as the keyboard asks.
@@ -791,7 +865,14 @@ impl Sim {
         let args = call.args;
         let mut reply = Reply::new();
         match call.name {
-            "dev.firmware.upload" => {}
+            "dev.firmware.upload" => {
+                if !args.is_empty() {
+                    let chunk = self.upload.chunk(Envelope::parse(args)?.cipher)?;
+                    self.flash.image.truncate(chunk.offset as usize);
+                    self.flash.image.extend_from_slice(chunk.bytes);
+                }
+                put(&mut reply, &self.upload.cursor().to_le_bytes())?;
+            }
             "dev.start" => return self.acquire(Synchronizer::start, now),
             "dev.stop" => return self.acquire(Synchronizer::stop, now),
             "dev.restart" => return self.acquire(Synchronizer::restart, now),
@@ -808,20 +889,36 @@ impl Sim {
                 put(&mut reply, &[self.sync.status().announced.code()])?;
             }
             "dev.firmware.upgrade" => {
-                self.device.identity.desc =
-                    UPGRADED_DESC.try_into().map_err(|_| RpcError::Internal)?;
+                self.upload.commit()?;
+                self.flash.upgraded = true;
+                self.take_desc();
+                self.notes
+                    .push("firmware image committed; it survives a reboot".to_string());
+            }
+            "dev.conf.save" => {
+                let mut image = Image::<CONF_MAX>::new();
+                let stored = self
+                    .device
+                    .save(&mut self.settings.persistent(), &mut image)?;
+                self.flash.conf = Some(stored.to_vec());
+                self.notes.push(format!(
+                    "configuration saved ({} bytes to flash)",
+                    stored.len()
+                ));
+            }
+            "dev.conf.load" => self.load_conf(out)?,
+            "dev.conf.reset" => {
+                self.flash.conf = None;
+                self.notes
+                    .push("stored configuration cleared; rebooting on the defaults".to_string());
+                self.reboot(now, out);
             }
             "test.amplitude" => return self.device.apply(&mut self.settings.amplitude, args, out),
             "test.frequency" => return self.device.apply(&mut self.settings.frequency, args, out),
             "test.noise" => return self.device.apply(&mut self.settings.noise, args, out),
             "test.status" => return self.device.apply(&mut self.settings.status, args, out),
             "test.enable" => return self.device.apply(&mut self.settings.enable, args, out),
-            "test.go" => {
-                if !args.is_empty() {
-                    return Err(RpcError::ArgsSize);
-                }
-                self.notes.push("test.go action invoked".to_string());
-            }
+            "test.go" => self.notes.push("test.go action invoked".to_string()),
             "test.capture" => {
                 let selector = Selector::parse(args)?;
                 self.capture.view().reply(selector, &mut reply)?;
@@ -1572,6 +1669,11 @@ impl Runtime {
             },
             AUTOSTART_SECONDS
         );
+        terminal_println!(
+            "  simulated flash: dev.conf.save keeps test.amplitude, test.frequency, \
+             test.noise and dev.loglevel across a reboot, dev.conf.reset erases them; \
+             dev.firmware.upload takes chunks at its cursor, dev.firmware.upgrade commits"
+        );
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
         Ok(())
     }
@@ -1687,12 +1789,21 @@ fn synchronizer(role: Role, session: SessionId, serial: &str, now: u64) -> Synch
 
 /// What a device of this role calls itself.
 fn identity(role: Role, serial: &str) -> io::Result<Identity> {
-    let (name, desc) = match role {
-        Role::Hub => (HUB_NAME, HUB_DESC),
-        Role::Sensor => (DEVICE_NAME, DEVICE_DESC),
+    let name = match role {
+        Role::Hub => HUB_NAME,
+        Role::Sensor => DEVICE_NAME,
     };
-    Identity::new(name, desc, serial, DEVICE_FIRMWARE)
+    Identity::new(name, desc_of(role, false), serial, DEVICE_FIRMWARE)
         .ok_or_else(|| invalid_input("identity too long"))
+}
+
+/// What `dev.desc` says, before an uploaded image has taken and after.
+fn desc_of(role: Role, upgraded: bool) -> &'static str {
+    match (role, upgraded) {
+        (Role::Hub, false) | (Role::Hub, true) => HUB_DESC,
+        (Role::Sensor, false) => DEVICE_DESC,
+        (Role::Sensor, true) => UPGRADED_DESC,
+    }
 }
 
 /// The serial of the device at `port`, with 0 the root.
@@ -1810,6 +1921,7 @@ mod tests {
     use twinleaf_device::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
     use twinleaf_device::sync::{ReferenceState, TimeStatus};
+    use twinleaf_device::update::{Header, BLOCK_SIZE, DATA_MAX};
 
     /// A round wall-clock second to boot the simulated device at.
     const BOOT: u64 = 1_800_000_000 * NANOS_PER_SECOND;
@@ -1876,8 +1988,14 @@ mod tests {
         (sim, started)
     }
 
-    /// The reply the simulation answered an RPC with.
-    fn call(sim: &mut Sim, name: &[u8], args: &[u8], sent: &mut Sent) -> Vec<u8> {
+    /// What the simulation answered an RPC with: a reply, or the error it
+    /// refused the call with.
+    fn answer(
+        sim: &mut Sim,
+        name: &[u8],
+        args: &[u8],
+        sent: &mut Sent,
+    ) -> Result<Vec<u8>, RpcError> {
         let mut buf = [0u8; Packet::MAX_SIZE];
         let method = twinleaf::proto::rpc::Method::ByName(name);
         let len = twinleaf::proto::rpc::write_request(&mut buf, RpcRequestId::new(1), method, args)
@@ -1886,10 +2004,188 @@ mod tests {
         sim.handle(view, BOOT, sent);
         let view = *sent.views().last().expect("a reply");
         match Answer::parse(view.header.ptype, view.payload) {
-            Some(Answer::Reply(reply)) => reply.value.to_vec(),
-            Some(Answer::Error(error)) => panic!("{:?}", error.error()),
+            Some(Answer::Reply(reply)) => Ok(reply.value.to_vec()),
+            Some(Answer::Error(error)) => Err(error.error()),
             None => panic!("an answer"),
         }
+    }
+
+    /// The reply the simulation answered an RPC with.
+    fn call(sim: &mut Sim, name: &[u8], args: &[u8], sent: &mut Sent) -> Vec<u8> {
+        answer(sim, name, args, sent).unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
+    /// Which image the upload tests send, and how big it is.
+    const IMAGE_ID: u32 = 0x5EED_1234;
+    const IMAGE_SIZE: u32 = 2 * DATA_MAX as u32;
+
+    /// One `dev.firmware.upload` chunk: the initialization vector a real
+    /// device decrypts against, the header it checks, and the image bytes.
+    fn chunk(offset: u32, id: u32, bytes: &[u8]) -> Vec<u8> {
+        let header = Header {
+            size: IMAGE_SIZE,
+            offset,
+            crc: twinleaf::proto::serial::CRC32.checksum(bytes),
+            id,
+        };
+        [&[0u8; BLOCK_SIZE][..], &header.bytes(), bytes].concat()
+    }
+
+    /// The bytes of the image chunk at `offset`.
+    fn image_bytes(offset: u32) -> Vec<u8> {
+        vec![(offset / DATA_MAX as u32) as u8 + 1; DATA_MAX]
+    }
+
+    /// The SETTING announcements the simulation sent, in order.
+    fn announcements(sent: &Sent) -> Vec<(Vec<u8>, Vec<u8>)> {
+        sent.views()
+            .iter()
+            .filter(|view| view.header.ptype == PacketType::SETTING)
+            .map(|view| Announcement::parse(view.payload).unwrap())
+            .map(|setting| (setting.name.to_vec(), setting.reply.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn a_chunk_that_is_not_at_the_cursor_is_refused_and_leaves_it_alone() {
+        let mut sim = sim(&[]);
+        let mut sent = Sent::default();
+        let cursor = b"dev.firmware.upload";
+
+        assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
+        let ahead = chunk(DATA_MAX as u32, IMAGE_ID, &image_bytes(DATA_MAX as u32));
+        assert_eq!(
+            answer(&mut sim, cursor, &ahead, &mut sent),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
+        assert!(sim.flash.image.is_empty());
+
+        let first = chunk(0, IMAGE_ID, &image_bytes(0));
+        assert_eq!(
+            call(&mut sim, cursor, &first, &mut sent),
+            (DATA_MAX as u32).to_le_bytes()
+        );
+        assert_eq!(sim.flash.image, image_bytes(0));
+
+        let elsewhere = chunk(0, IMAGE_ID + 1, &image_bytes(0));
+        assert_eq!(
+            answer(&mut sim, cursor, &elsewhere, &mut sent),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(
+            answer(&mut sim, cursor, &first[..BLOCK_SIZE], &mut sent),
+            Err(RpcError::ArgsSize)
+        );
+        assert_eq!(
+            call(&mut sim, cursor, &[], &mut sent),
+            (DATA_MAX as u32).to_le_bytes()
+        );
+    }
+
+    /// What `flash` does when an acknowledgement is lost: it resends a chunk
+    /// the device already took, is refused, and reads the cursor to find the
+    /// one to send next.
+    #[test]
+    fn a_resent_chunk_is_refused_and_the_cursor_recovers_the_host() {
+        let mut sim = sim(&[]);
+        let mut sent = Sent::default();
+        let cursor = b"dev.firmware.upload";
+        let first = chunk(0, IMAGE_ID, &image_bytes(0));
+
+        call(&mut sim, cursor, &first, &mut sent);
+        assert_eq!(
+            answer(&mut sim, cursor, &first, &mut sent),
+            Err(RpcError::Invalid)
+        );
+
+        let resume = call(&mut sim, cursor, &[], &mut sent);
+        assert_eq!(resume, (DATA_MAX as u32).to_le_bytes());
+        let second = chunk(DATA_MAX as u32, IMAGE_ID, &image_bytes(DATA_MAX as u32));
+        assert_eq!(
+            call(&mut sim, cursor, &second, &mut sent),
+            IMAGE_SIZE.to_le_bytes()
+        );
+        assert_eq!(
+            sim.flash.image,
+            [image_bytes(0), image_bytes(DATA_MAX as u32)].concat()
+        );
+    }
+
+    #[test]
+    fn an_upgrade_needs_the_whole_image_and_the_reboot_comes_up_on_it() {
+        let mut sim = sim(&[]);
+        let mut sent = Sent::default();
+        let cursor = b"dev.firmware.upload";
+
+        assert_eq!(
+            answer(&mut sim, b"dev.firmware.upgrade", &[], &mut sent),
+            Err(RpcError::State)
+        );
+        call(
+            &mut sim,
+            cursor,
+            &chunk(0, IMAGE_ID, &image_bytes(0)),
+            &mut sent,
+        );
+        assert_eq!(
+            answer(&mut sim, b"dev.firmware.upgrade", &[], &mut sent),
+            Err(RpcError::State)
+        );
+
+        let offset = DATA_MAX as u32;
+        call(
+            &mut sim,
+            cursor,
+            &chunk(offset, IMAGE_ID, &image_bytes(offset)),
+            &mut sent,
+        );
+        call(&mut sim, b"dev.firmware.upgrade", &[], &mut sent);
+        assert_eq!(
+            call(&mut sim, b"dev.desc", &[], &mut sent),
+            UPGRADED_DESC.as_bytes()
+        );
+
+        sim.reboot(BOOT, &mut sent);
+        assert_eq!(
+            call(&mut sim, b"dev.desc", &[], &mut sent),
+            UPGRADED_DESC.as_bytes()
+        );
+        assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn a_saved_setting_comes_back_after_a_reboot_and_an_unsaved_one_does_not() {
+        let mut sim = sim(&["--amplitude", "1"]);
+        let mut sent = Sent::default();
+        let amplitude = 7.5f64.to_le_bytes();
+        call(&mut sim, b"test.amplitude", &amplitude, &mut sent);
+        call(&mut sim, b"test.enable", &[0], &mut sent);
+        call(&mut sim, b"dev.conf.save", &[], &mut sent);
+
+        let mut sent = Sent::default();
+        sim.reboot(BOOT, &mut sent);
+        assert_eq!(sim.settings.amplitude.get(), 7.5);
+        assert!(sim.settings.enable.get());
+        assert_eq!(
+            announcements(&sent),
+            [
+                (
+                    b"rpc.hash".to_vec(),
+                    sim.device.hash().to_le_bytes().to_vec()
+                ),
+                (b"test.amplitude".to_vec(), amplitude.to_vec()),
+            ]
+        );
+
+        let mut sent = Sent::default();
+        assert_eq!(
+            call(&mut sim, b"settings.version", &[], &mut sent),
+            1u32.to_le_bytes()
+        );
+
+        call(&mut sim, b"dev.conf.reset", &[], &mut sent);
+        assert_eq!(sim.settings.amplitude.get(), 1.0);
     }
 
     #[test]
@@ -1920,15 +2216,8 @@ mod tests {
         assert_eq!(call(&mut sim, b"test.amplitude", &value, &mut sent), value);
         assert_eq!(sim.settings.amplitude.get(), 2.5);
 
-        let announcements: Vec<_> = sent
-            .views()
-            .iter()
-            .filter(|view| view.header.ptype == PacketType::SETTING)
-            .map(|view| Announcement::parse(view.payload).unwrap())
-            .map(|setting| (setting.name.to_vec(), setting.reply.to_vec()))
-            .collect();
         assert_eq!(
-            announcements,
+            announcements(&sent),
             [(b"test.amplitude".to_vec(), value.to_vec())]
         );
 

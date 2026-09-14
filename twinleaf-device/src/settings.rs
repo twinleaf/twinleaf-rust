@@ -7,10 +7,10 @@
 
 use twinleaf_proto::rpc::RpcError;
 
-use crate::rpc::{self, put, Reply, RpcSpec};
+use crate::rpc::{self, put, Access, Reply, RpcSpec};
 
 /// A value a setting holds, encoded as its RPC reads and writes it.
-pub trait Scalar: Copy {
+pub trait Scalar: Copy + PartialEq {
     /// The kind of value the table declares for it.
     const KIND: rpc::Kind;
 
@@ -60,13 +60,26 @@ impl Scalar for bool {
     }
 }
 
-/// Whether an RPC wrote the setting. Every write is announced.
+/// Whether a call left the setting holding a value to announce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Changed {
-    /// The RPC read the value.
+    /// Nothing to announce: the RPC read, or a load found the value held.
     Unchanged,
-    /// The RPC wrote the value.
+    /// A value to announce.
     Changed,
+}
+
+/// A setting a device keeps across a reboot, stored under its own name.
+pub trait Persisted {
+    /// The name its RPC and its stored entry carry.
+    fn name(&self) -> &'static str;
+
+    /// Encode the value as its RPC replies it, and take it as stored.
+    fn save(&mut self, out: &mut Reply) -> Result<(), RpcError>;
+
+    /// Take a stored value through the setting's check, and encode what it
+    /// now holds.
+    fn load(&mut self, value: &[u8], out: &mut Reply) -> Result<Changed, RpcError>;
 }
 
 /// One value an RPC property reads and writes.
@@ -74,6 +87,7 @@ pub struct Setting<T: Scalar> {
     name: &'static str,
     value: T,
     initial: T,
+    access: Access,
     check: fn(T) -> Result<T, RpcError>,
 }
 
@@ -84,6 +98,7 @@ impl<T: Scalar> Setting<T> {
             name,
             value: initial,
             initial,
+            access: Access::RW,
             check: Ok,
         }
     }
@@ -91,6 +106,14 @@ impl<T: Scalar> Setting<T> {
     /// The same setting, taking only the values `check` passes.
     pub const fn checked(self, check: fn(T) -> Result<T, RpcError>) -> Self {
         Self { check, ..self }
+    }
+
+    /// The same setting, saved to flash and taken back from it at a boot.
+    pub const fn persistent(self) -> Self {
+        Self {
+            access: Access::RW.union(Access::PERSISTENT),
+            ..self
+        }
     }
 
     /// The name its RPC and its announcements carry.
@@ -103,7 +126,7 @@ impl<T: Scalar> Setting<T> {
         self.value
     }
 
-    /// Go back to the value a boot starts from.
+    /// Go back to the value a boot starts from, stored or not.
     pub fn reset(&mut self) {
         self.value = self.initial;
     }
@@ -123,7 +146,28 @@ impl<T: Scalar> Setting<T> {
 
     /// The table entry it answers.
     pub fn spec(&self) -> RpcSpec {
-        RpcSpec::prop(self.name, T::KIND, rpc::Access::RW)
+        RpcSpec::prop(self.name, T::KIND, self.access)
+    }
+}
+
+impl<T: Scalar> Persisted for Setting<T> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn save(&mut self, out: &mut Reply) -> Result<(), RpcError> {
+        self.value.encode(out)
+    }
+
+    fn load(&mut self, value: &[u8], out: &mut Reply) -> Result<Changed, RpcError> {
+        let value = (self.check)(T::decode(value)?)?;
+        let changed = match value == self.value {
+            true => Changed::Unchanged,
+            false => Changed::Changed,
+        };
+        self.value = value;
+        self.value.encode(out)?;
+        Ok(changed)
     }
 }
 
@@ -195,12 +239,53 @@ mod tests {
     }
 
     #[test]
+    fn a_setting_saves_what_it_holds_and_loads_what_was_stored() {
+        let mut gain = Setting::new("app.gain", 3u16).persistent();
+        answer(&mut gain, &7u16.to_le_bytes()).unwrap();
+
+        let mut out = Reply::new();
+        gain.save(&mut out).unwrap();
+        assert_eq!(out.to_vec(), vec![7, 0]);
+
+        let mut out = Reply::new();
+        assert_eq!(
+            gain.load(&9u16.to_le_bytes(), &mut out),
+            Ok(Changed::Changed)
+        );
+        assert_eq!(out.to_vec(), vec![9, 0]);
+        assert_eq!(
+            gain.load(&9u16.to_le_bytes(), &mut Reply::new()),
+            Ok(Changed::Unchanged)
+        );
+        assert_eq!(gain.load(&[9], &mut Reply::new()), Err(RpcError::ArgsSize));
+
+        gain.reset();
+        assert_eq!(gain.get(), 3);
+    }
+
+    #[test]
+    fn a_stored_value_a_check_refuses_leaves_the_one_held() {
+        let mut rate = Setting::new("app.rate", 1.0f64)
+            .checked(positive)
+            .persistent();
+        assert_eq!(
+            rate.load(&(-1.0f64).to_le_bytes(), &mut Reply::new()),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(rate.get(), 1.0);
+    }
+
+    #[test]
     fn a_spec_describes_the_property_the_setting_answers() {
         let spec = Setting::new("app.rate", 1.0f64).spec();
         assert_eq!(spec.method, Method::Prop);
         assert_eq!(spec.kind, Kind::Float(8));
         assert_eq!(spec.access, Access::RW);
         assert_eq!(Setting::new("app.enable", true).spec().kind, Kind::Bool);
+        assert_eq!(
+            Setting::new("app.rate", 1.0f64).persistent().spec().access,
+            Access::RW | Access::PERSISTENT
+        );
 
         let kinds = [
             Setting::new("u8", 0u8).spec().kind,

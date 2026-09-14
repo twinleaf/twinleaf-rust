@@ -6,6 +6,7 @@
 
 pub mod calls;
 pub mod capture;
+pub mod conf;
 pub mod device;
 pub mod hub;
 pub mod metadata;
@@ -15,6 +16,7 @@ pub mod segments;
 pub mod settings;
 pub mod stream;
 pub mod sync;
+pub mod update;
 
 /// Where a device's packets go.
 pub trait Sink {
