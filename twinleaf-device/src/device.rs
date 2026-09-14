@@ -105,7 +105,7 @@ impl<'t> Device<'t> {
             table,
             hash: table::hash(table),
             next_beat: 0,
-            loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()).persistent(),
+            loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()),
             settings_version: 0,
         }
     }
@@ -261,15 +261,14 @@ impl<'t> Device<'t> {
         announce(&mut self.settings_version, out, name, reply);
     }
 
-    /// Answer `dev.conf.save`: the log threshold the device keeps itself and
-    /// every setting the application persists, for the platform to write.
+    /// Answer `dev.conf.save`: every setting the application persists, for
+    /// the platform to write.
     pub fn save<'i, const N: usize>(
         &mut self,
         settings: &mut [&mut dyn Persisted],
         image: &'i mut Image<N>,
     ) -> Result<&'i [u8], RpcError> {
         image.clear();
-        conf::encode(&mut [&mut self.loglevel], image)?;
         conf::encode(settings, image)?;
         Ok(image)
     }
@@ -283,16 +282,12 @@ impl<'t> Device<'t> {
         image: &[u8],
         out: &mut impl Sink,
     ) -> Result<(), RpcError> {
-        let Self {
-            loglevel,
-            settings_version,
-            ..
-        } = self;
         let mut outcome = Ok(());
         for entry in conf::entries(image) {
             let entry = entry?;
-            let found = core::iter::once(&mut *loglevel as &mut dyn Persisted)
-                .chain(settings.iter_mut().map(|setting| &mut **setting))
+            let found = settings
+                .iter_mut()
+                .map(|setting| &mut **setting)
                 .find(|setting| setting.name().as_bytes() == entry.name);
             let Some(setting) = found else {
                 continue;
@@ -300,7 +295,9 @@ impl<'t> Device<'t> {
             let mut reply = Reply::new();
             match setting.load(entry.value, &mut reply) {
                 Ok(Changed::Unchanged) => {}
-                Ok(Changed::Changed) => announce(settings_version, out, setting.name(), &reply),
+                Ok(Changed::Changed) => {
+                    announce(&mut self.settings_version, out, setting.name(), &reply)
+                }
                 Err(_) => outcome = Err(RpcError::Load),
             }
         }
@@ -829,13 +826,7 @@ mod tests {
             .map(|view| Announcement::parse(view.payload).unwrap())
             .map(|setting| (setting.name.to_vec(), setting.reply.to_vec()))
             .collect();
-        assert_eq!(
-            announced,
-            [
-                (b"dev.loglevel".to_vec(), vec![LogLevel::DEBUG.value()]),
-                (b"app.gain".to_vec(), vec![9]),
-            ]
-        );
+        assert_eq!(announced, [(b"app.gain".to_vec(), vec![9])]);
 
         let mut sent = Sent::default();
         assert_eq!(device.load(&mut [&mut gain], &stored, &mut sent), Ok(()));
@@ -844,7 +835,7 @@ mod tests {
         let mut sent = Sent::default();
         deliver(&mut device, b"settings.version", &[], &mut sent);
         assert!(
-            matches!(answered(&sent), Answer::Reply(reply) if reply.value == 2u32.to_le_bytes())
+            matches!(answered(&sent), Answer::Reply(reply) if reply.value == 1u32.to_le_bytes())
         );
     }
 
