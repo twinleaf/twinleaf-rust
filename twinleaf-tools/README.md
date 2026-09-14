@@ -29,7 +29,8 @@ default `auto`, and `-s {route}` for a sensor in the tree, default
 `/`. Run `tio {command} --help` for the full options.
 
 With `auto`, a tool connects to the device already in use, whether by another
-tool or a `tio list` selection, or else to the only device attached. A device, serial or network, is shared through a background holder: the
+tool, a running `tio proxy`, or a `tio list` selection, or else to the only
+device attached. A device, serial or network, is shared through a background holder: the
 first tool starts it, later tools join it, and it exits ten seconds after the
 last tool disconnects. Loopback URLs, an existing proxy or holder, connect
 directly. To keep a holder around, or to build one from several devices, pin

@@ -1,5 +1,6 @@
 //! Detached holders: one background `tio proxy` per serial device, found
-//! through a per-user registry so every tool can share the port.
+//! through a per-user registry so every tool can share the port. A `tio proxy`
+//! in the foreground registers there too, and is the default while it runs.
 //!
 //! A holder owns `<key>.lock` for its lifetime and advertises its loopback
 //! endpoint in `<key>.url`. `<key>.pin` keeps it alive without clients.
@@ -324,7 +325,7 @@ pub fn shared_endpoint(url: &str) -> Option<String> {
     live_endpoint(&runtime_dir().ok()?, &device_key(url))
 }
 
-/// A hosted hub, else the one device in use, else the only device attached.
+/// A hosted proxy, else the one device in use, else the only device attached.
 fn candidate(root: &Path) -> io::Result<(String, String)> {
     let (hubs, devices): (Vec<_>, Vec<_>) = live_holders(root)?
         .into_iter()
@@ -364,14 +365,30 @@ pub fn detach(url: &str) -> io::Result<String> {
     Ok(endpoint)
 }
 
-/// The registry key under which `mounts` are hosted together.
-pub fn composition_key(mounts: &[(String, crate::DeviceRoute)]) -> String {
-    let identity = mounts
+fn mount_identity(mounts: &[(String, crate::DeviceRoute)]) -> String {
+    mounts
         .iter()
         .map(|(url, route)| format!("{}={route}", device_key(url)))
         .collect::<Vec<_>>()
-        .join("+");
-    key_from(&format!("mount:{identity}"))
+        .join("+")
+}
+
+/// The registry key under which `mounts` are hosted together.
+fn composition_key(mounts: &[(String, crate::DeviceRoute)]) -> String {
+    key_from(&format!("mount:{}", mount_identity(mounts)))
+}
+
+/// The registry key of a proxy serving `mounts` through `subtree` on `port`.
+/// Each front door is its own key, so two of them are two candidates.
+pub fn front_door_key(
+    mounts: &[(String, crate::DeviceRoute)],
+    subtree: crate::DeviceRoute,
+    port: u16,
+) -> String {
+    key_from(&format!(
+        "mount:{}@{subtree}:{port}",
+        mount_identity(mounts)
+    ))
 }
 
 /// Start a pinned holder mounting `mounts`, each through its own holder.
@@ -462,5 +479,18 @@ mod tests {
         assert!(key_from("mount:usb/1=/1+tcp://h:1=/2")
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'));
+    }
+
+    #[test]
+    fn front_doors_differ_by_subtree_and_port() {
+        let root = crate::DeviceRoute::root();
+        let mounts = [("tcp://192.0.2.1:7855".to_string(), root)];
+        let key = front_door_key(&mounts, root, 7855);
+        assert!(key.starts_with("mount-"));
+        let subtree = front_door_key(&mounts, "/1".parse().unwrap(), 7855);
+        assert_ne!(key, subtree);
+        assert_ne!(key, front_door_key(&mounts, root, 7856));
+        let mounted = [("tcp://192.0.2.1:7855".to_string(), "/1".parse().unwrap())];
+        assert_ne!(subtree, front_door_key(&mounted, root, 7855));
     }
 }

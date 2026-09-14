@@ -24,9 +24,9 @@ use twinleaf::proto::log::LogLevel;
 use twinleaf::tio::{self, packet, proxy};
 
 /// Holders log their own lifecycle in full and never relay device logs.
-fn init_proxy_logging(verbose: bool, debug: bool, holder: bool) {
+fn init_proxy_logging(verbose: bool, debug: bool, detached: bool) {
     use std::io::Write;
-    let level_filter = if holder {
+    let level_filter = if detached {
         "info,twinleaf=debug,twinleaf_tools=debug,device=off"
     } else if debug {
         "trace"
@@ -79,16 +79,14 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
             if proxy_cli.enumerate {
                 return list::list_devices_deprecated(true);
             }
-            let holder = match proxy_cli.holder_key.as_deref().map(runtime::Holder::claim) {
-                None => None,
-                Some(Ok(holder)) => Some(holder),
-                Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Some(Err(e)) => return Err(e.into()),
-            };
             let mounts = std::mem::take(&mut proxy_cli.mounts);
             let layout = Layout::from_cli(mounts, proxy_cli.sensor_url.take())?;
 
-            init_proxy_logging(proxy_cli.verbose, proxy_cli.debug, holder.is_some());
+            init_proxy_logging(
+                proxy_cli.verbose,
+                proxy_cli.debug,
+                proxy_cli.holder_key.is_some(),
+            );
             if proxy_cli.timestamp_format != "%T%.3f " {
                 log::warn!(
                     "--timestamp is deprecated and no longer applied; \
@@ -101,11 +99,19 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
                 );
             }
 
-            let server = ProxyServer {
-                config: ProxyConfig::from(&proxy_cli),
-                layout,
-                holder,
-                hosted: false,
+            let config = ProxyConfig::from(&proxy_cli);
+            let server = match proxy_cli.holder_key.as_deref() {
+                None => ProxyServer::foreground(config, layout)?,
+                Some(key) => match runtime::Holder::claim(key) {
+                    Ok(holder) => ProxyServer {
+                        config,
+                        layout,
+                        holder,
+                        foreground: false,
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                },
             };
             server.run()
         }
@@ -131,20 +137,9 @@ pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyr
     }
     let cli = ProxyCli::parse_from(["tio-proxy"]);
     init_proxy_logging(cli.verbose, cli.debug, false);
-    let mounts: Vec<_> = picked
-        .iter()
-        .map(|(device, prefix)| (device.url.clone(), *prefix))
-        .collect();
-    let holder = match runtime::Holder::claim(&runtime::composition_key(&mounts)) {
-        Ok(holder) => holder,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            eyre::bail!("the selection is already in use by another tio process")
-        }
-        Err(e) => return Err(e.into()),
-    };
-    ProxyServer {
-        config: ProxyConfig::from(&cli),
-        layout: Layout {
+    ProxyServer::foreground(
+        ProxyConfig::from(&cli),
+        Layout {
             mounts: picked
                 .into_iter()
                 .map(|(device, prefix)| Mount {
@@ -155,9 +150,7 @@ pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyr
                 })
                 .collect(),
         },
-        holder: Some(holder),
-        hosted: true,
-    }
+    )?
     .run()
 }
 
@@ -360,9 +353,10 @@ impl SlowTracker {
 struct ProxyServer {
     config: ProxyConfig,
     layout: Layout,
-    holder: Option<runtime::Holder>,
-    /// A selection the user is hosting from the terminal: it never idles out.
-    hosted: bool,
+    holder: runtime::Holder,
+    /// A proxy the user runs in the terminal: it serves its configured port,
+    /// relays device logs, and never idles out.
+    foreground: bool,
 }
 
 /// Counts a client thread until it exits.
@@ -375,6 +369,48 @@ impl Drop for Departure {
 }
 
 impl ProxyServer {
+    /// Claim the registry key of the front door the user opened, so that
+    /// `auto` resolves to this proxy while it runs.
+    fn foreground(config: ProxyConfig, layout: Layout) -> eyre::Result<ProxyServer> {
+        use color_eyre::Help;
+
+        let mounts: Vec<_> = layout
+            .mounts
+            .iter()
+            .map(|mount| (mount.locator.clone(), mount.prefix))
+            .collect();
+        let key = runtime::front_door_key(&mounts, config.subtree, config.tcp_port);
+        match runtime::Holder::claim(&key) {
+            Ok(holder) => Ok(ProxyServer {
+                config,
+                layout,
+                holder,
+                foreground: true,
+            }),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(eyre::eyre!(
+                "these sensors are already served on port {} by another tio process",
+                config.tcp_port
+            )
+            .suggestion("serve them again alongside it with --port <N>")),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The sensors this proxy fronts, and the subtree when it is not the root.
+    fn front_door(&self) -> String {
+        let sensors = self
+            .layout
+            .mounts
+            .iter()
+            .map(|mount| mount.picked_name.as_deref().unwrap_or(&mount.locator))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self.config.subtree.is_empty() {
+            true => sensors,
+            false => format!("{sensors} at {}", self.config.subtree),
+        }
+    }
+
     fn run(self) -> eyre::Result<()> {
         use color_eyre::{Help, SectionExt};
         use eyre::bail;
@@ -382,11 +418,16 @@ impl ProxyServer {
         self.print_startup();
 
         let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
-        let endpoint = match &self.holder {
-            Some(_) => create_listener_thread(SocketAddr::from(([127, 0, 0, 1], 0)), client_send)?,
-            None => self.start_listeners(client_send)?,
+        let endpoint = match self.foreground {
+            true => {
+                self.start_listeners(client_send)?;
+                format!("tcp://127.0.0.1:{}", self.config.tcp_port)
+            }
+            false => format!(
+                "tcp://{}",
+                create_listener_thread(SocketAddr::from(([127, 0, 0, 1], 0)), client_send)?
+            ),
         };
-        let endpoint = format!("tcp://{endpoint}");
 
         // Phase 1: open each upstream interface. No monitor port is created yet,
         // so the sensor discovery in phase 2 runs without an undrained port: the
@@ -401,9 +442,9 @@ impl ProxyServer {
         }
         let mut pending = Vec::with_capacity(self.layout.mounts.len());
         for mount in &self.layout.mounts {
-            let locator = match (&self.holder, self.hosted) {
-                (Some(_), false) => mount.locator.clone(),
-                (Some(_), true) | (None, _) => runtime::resolve(&mount.locator)?,
+            let locator = match self.foreground {
+                true => runtime::resolve(&mount.locator)?,
+                false => mount.locator.clone(),
             };
             let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
             let interface = proxy::Connection::open_with(
@@ -465,7 +506,7 @@ impl ProxyServer {
             });
         }
 
-        if let Some(holder) = &self.holder {
+        if !self.foreground {
             for link in &links {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
@@ -485,15 +526,17 @@ impl ProxyServer {
                     }
                 }
             }
-            holder.publish(&endpoint)?;
-            if self.hosted {
-                println!("Serving the selection as the default for every tool. Ctrl-C to stop.");
-            } else {
-                log::info!(
-                    "holder ready at {endpoint} ({})",
-                    std::env::current_exe().unwrap_or_default().display()
-                );
-            }
+        }
+        self.holder.publish(&endpoint)?;
+        match self.foreground {
+            true => println!(
+                "Using {} as the default while this runs. Ctrl-C to stop.",
+                self.front_door()
+            ),
+            false => log::info!(
+                "holder ready at {endpoint} ({})",
+                std::env::current_exe().unwrap_or_default().display()
+            ),
         }
 
         let mut sel = crossbeam::channel::Select::new();
@@ -511,31 +554,31 @@ impl ProxyServer {
         let mut idle_since = Instant::now();
         let mut next_tick = Instant::now();
         loop {
-            if let Some(holder) = self.holder.as_ref().filter(|_| Instant::now() >= next_tick) {
+            if Instant::now() >= next_tick {
                 next_tick = Instant::now() + Duration::from_millis(250);
                 if clients.load(Ordering::Relaxed) > 0 {
                     idle_since = Instant::now();
                 }
-                if !holder.published() {
+                if !self.holder.published() {
                     log::info!("stopped by tio proxy stop");
                     break;
                 }
-                if idle_since.elapsed() >= runtime::IDLE && !holder.pinned() && !self.hosted {
-                    holder.withdraw()?;
+                if !self.foreground
+                    && !self.holder.pinned()
+                    && idle_since.elapsed() >= runtime::IDLE
+                {
+                    self.holder.withdraw()?;
                     std::thread::sleep(runtime::WITHDRAWAL);
                     if clients.load(Ordering::Relaxed) == 0 && new_client.is_empty() {
                         log::info!("no clients for {:?}; exiting", runtime::IDLE);
                         break;
                     }
-                    holder.publish(&endpoint)?;
+                    self.holder.publish(&endpoint)?;
                 }
             }
-            let oper = match &self.holder {
-                None => sel.select(),
-                Some(_) => match sel.select_deadline(next_tick) {
-                    Ok(oper) => oper,
-                    Err(_) => continue,
-                },
+            let oper = match sel.select_deadline(next_tick) {
+                Ok(oper) => oper,
+                Err(_) => continue,
             };
             match sources[oper.index()] {
                 Source::NewClient => {
@@ -631,7 +674,7 @@ impl ProxyServer {
                 }
             }
         }
-        if self.holder.is_none() {
+        if self.foreground {
             println!("  TCP port: {}", self.config.tcp_port);
         }
         println!("  Subtree: {}", self.config.subtree);
@@ -658,7 +701,7 @@ impl ProxyServer {
     fn start_listeners(
         &self,
         client_send: crossbeam::channel::Sender<std::net::TcpStream>,
-    ) -> eyre::Result<SocketAddr> {
+    ) -> eyre::Result<()> {
         use color_eyre::Help;
 
         let started_v6 = create_listener_thread(
@@ -669,8 +712,8 @@ impl ProxyServer {
             client_send.clone(),
         );
         // Outside windows a v6 socket also accepts v4 clients.
-        if let (Ok(addr), false) = (&started_v6, cfg!(windows)) {
-            return Ok(*addr);
+        if started_v6.is_ok() && !cfg!(windows) {
+            return Ok(());
         }
         let started_v4 = create_listener_thread(
             std::net::SocketAddr::new(
@@ -680,7 +723,7 @@ impl ProxyServer {
             client_send,
         );
         match (started_v6, started_v4) {
-            (Ok(addr), Ok(_)) | (Ok(addr), Err(_)) | (Err(_), Ok(addr)) => Ok(addr),
+            (Ok(_), Ok(_)) | (Ok(_), Err(_)) | (Err(_), Ok(_)) => Ok(()),
             (Err(e1), Err(e2)) => {
                 let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
                     || matches!(e2.kind(), io::ErrorKind::AddrInUse);
