@@ -31,15 +31,14 @@ impl ScheduledEdge {
     }
 }
 
-/// The two edges involved in a legacy-compatible start.
+/// What a board programs for a legacy-compatible start: the compare one
+/// second after the edge the plan was made at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartPlan {
     /// Identifies this plan in the acknowledgements it draws.
     pub id: u16,
-    /// The edge at which the plan was made.
-    pub staging: ScheduledEdge,
-    /// The following edge, at which sample zero belongs.
-    pub target: ScheduledEdge,
+    /// Counter value of the staging edge, and of the target edge a second on.
+    pub counter_edge: u32,
     /// Monotonic nanosecond of the staging edge.
     pub staging_ns: u64,
 }
@@ -49,7 +48,7 @@ impl StartPlan {
     /// program the target edge. The counter alone cannot tell a board an
     /// eighth of a second late from one a whole second late.
     pub fn armable(&self, counter_now: u32, now_ns: u64, domain: CounterDomain) -> bool {
-        let since = domain.signed_delta(counter_now, self.staging.counter_edge);
+        let since = domain.signed_delta(counter_now, self.counter_edge);
         (0..(domain.period() / ARM_WINDOW_DIVISOR) as i64).contains(&since)
             && now_ns.saturating_sub(self.staging_ns) < ARM_WINDOW_NS
     }
@@ -338,8 +337,7 @@ impl AcquisitionMachine {
         self.plan = self.plan.wrapping_add(1);
         let plan = StartPlan {
             id: self.plan,
-            staging,
-            target,
+            counter_edge: staging.counter_edge,
             staging_ns,
         };
         self.target = Some(target.reference);
@@ -392,8 +390,7 @@ mod tests {
             AcquisitionAction::Arm(plan) => plan,
             action => panic!("unexpected action: {action:?}"),
         };
-        assert_eq!(plan.staging, staging);
-        assert_eq!(plan.target, edge(101));
+        assert_eq!(plan.counter_edge, staging.counter_edge);
         assert_eq!(plan.staging_ns, 7_000_000_000);
         assert_eq!(machine.state(), AcquisitionState::Armed);
 
@@ -473,8 +470,6 @@ mod tests {
             AcquisitionAction::Rearm(plan) => plan,
             action => panic!("unexpected action: {action:?}"),
         };
-        assert_eq!(replacement.staging, edge(50));
-        assert_eq!(replacement.target, edge(51));
         assert_ne!(replacement.id, plan.id);
         assert_eq!(machine.superseded_plans(), 1);
     }
@@ -549,7 +544,6 @@ mod tests {
             AcquisitionAction::Arm(plan) => plan,
             action => panic!("unexpected action: {action:?}"),
         };
-        assert_eq!(next.staging, edge(11));
         assert_ne!(next.id, plan.id);
         assert_eq!(machine.superseded_plans(), 0);
     }
@@ -568,7 +562,7 @@ mod tests {
         assert_eq!(machine.state(), AcquisitionState::Armed);
         assert_eq!(machine.stale_acks(), 2);
 
-        machine.on_edge(second.target, 0);
+        machine.on_edge(edge(12), 0);
         assert_eq!(machine.mark_running(second.id), Ok(()));
         assert_eq!(machine.state(), AcquisitionState::Running);
     }
@@ -580,8 +574,7 @@ mod tests {
         let domain = CounterDomain::new(PERIOD);
         let plan = StartPlan {
             id: 1,
-            staging: at(10, PERIOD - 10),
-            target: at(11, PERIOD - 10),
+            counter_edge: PERIOD - 10,
             staging_ns: 5_000_000_000,
         };
         assert!(plan.armable(PERIOD - 10, 5_000_000_000, domain));
