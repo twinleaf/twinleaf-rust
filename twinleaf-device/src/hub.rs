@@ -95,9 +95,11 @@ pub enum CallError {
 /// What the hub refused or dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubCounters {
-    /// Packets dropped: an absent port, an unmatched answer, or a route with
-    /// no room for another hop.
-    pub dropped: u32,
+    /// Host packets dropped: no route, or a port with nothing on it.
+    pub dropped_down: u32,
+    /// Child packets dropped: an unknown port, an unmatched answer, or a route
+    /// with no room for another hop.
+    pub dropped_up: u32,
     /// What the call table refused or dropped.
     pub calls: CallCounters,
 }
@@ -107,7 +109,8 @@ pub struct HubCounters {
 pub struct Hub<P, const PORTS: usize> {
     ports: [Presence; PORTS],
     calls: Calls<P, CALL_SLOTS>,
-    dropped: u32,
+    dropped_down: u32,
+    dropped_up: u32,
 }
 
 impl<P, const PORTS: usize> Hub<P, PORTS> {
@@ -116,7 +119,8 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         Self {
             ports: [Presence::Absent; PORTS],
             calls: Calls::new(),
-            dropped: 0,
+            dropped_down: 0,
+            dropped_up: 0,
         }
     }
 
@@ -224,7 +228,8 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
     /// What the hub refused or dropped.
     pub fn counters(&self) -> HubCounters {
         HubCounters {
-            dropped: self.dropped,
+            dropped_down: self.dropped_down,
+            dropped_up: self.dropped_up,
             calls: self.calls.counters(),
         }
     }
@@ -239,11 +244,11 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         down: &mut impl PortSink,
     ) {
         let Some((&port, hops)) = view.routing.split_last() else {
-            self.dropped = self.dropped.saturating_add(1);
+            self.dropped_down = self.dropped_down.saturating_add(1);
             return;
         };
         if !self.present(port) {
-            self.dropped = self.dropped.saturating_add(1);
+            self.dropped_down = self.dropped_down.saturating_add(1);
             return;
         }
         let request = (view.header.ptype == PacketType::RPC_REQ)
@@ -273,7 +278,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         events: &mut impl Events<P>,
     ) {
         if usize::from(port) >= PORTS {
-            self.dropped = self.dropped.saturating_add(1);
+            self.dropped_up = self.dropped_up.saturating_add(1);
             return;
         }
         if let (PacketType::HEARTBEAT, true, Some(session)) = (
@@ -290,7 +295,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         let Some(answer) = Answer::parse(view.header.ptype, view.payload) else {
             let hop = view.routing.len();
             if hop == DeviceRoute::MAX_HOPS {
-                self.dropped = self.dropped.saturating_add(1);
+                self.dropped_up = self.dropped_up.saturating_add(1);
                 return;
             }
             hops[..hop].copy_from_slice(view.routing);
@@ -300,7 +305,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         };
         let (id, route) = match self.calls.answered(port, answer) {
             None => {
-                self.dropped = self.dropped.saturating_add(1);
+                self.dropped_up = self.dropped_up.saturating_add(1);
                 return;
             }
             Some(Origin::Internal(purpose)) => {
@@ -592,7 +597,7 @@ mod tests {
             assert!(out.down.0.is_empty());
             assert!(out.up.0.is_empty());
         }
-        assert_eq!(hub.counters().dropped, 3);
+        assert_eq!(hub.counters().dropped_down, 3);
     }
 
     #[test]
@@ -633,7 +638,7 @@ mod tests {
         let answer = reply(RpcRequestId::new(3), b"whose?");
         let out = deliver(&mut hub, child(1, &answer), NOW);
         assert!(out.up.0.is_empty());
-        assert_eq!(hub.counters().dropped, 1);
+        assert_eq!(hub.counters().dropped_up, 1);
         assert_eq!(hub.counters().calls.unmatched, 1);
     }
 
