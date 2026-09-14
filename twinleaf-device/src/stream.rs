@@ -66,6 +66,17 @@ impl<const N: usize> Stream<N> {
             })
     }
 
+    /// Send a packet once it holds `bytes` of samples rather than when full.
+    pub fn batched(mut self, bytes: usize) -> Self {
+        self.publisher = Publisher::with_capacity(bytes);
+        self
+    }
+
+    /// Sample bytes in the packet being filled.
+    pub fn staged(&self) -> usize {
+        self.publisher.staged()
+    }
+
     /// The stream id.
     pub fn id(&self) -> StreamId {
         self.id
@@ -266,8 +277,12 @@ mod tests {
         ]
     }
 
+    fn timeref() -> Timeref {
+        Timeref::new(Epoch::UNIX, 1000, SessionId::new(3), "S1").unwrap()
+    }
+
     fn started() -> [Stream<4>; 2] {
-        let timeref = Timeref::new(Epoch::UNIX, 1000, SessionId::new(3), "S1").unwrap();
+        let timeref = timeref();
         let mut streams = streams();
         streams
             .iter_mut()
@@ -308,6 +323,18 @@ mod tests {
         let samples = data::Samples::parse(view.header, view.payload).unwrap();
         assert_eq!(samples.stream_id, StreamId::new(1));
         assert_eq!(samples.data.len(), 32);
+    }
+
+    #[test]
+    fn a_batched_stream_sends_short_packets() {
+        let mut stream = Stream::<4>::new(StreamId::new(1), &SINE, params(10))
+            .unwrap()
+            .batched(32);
+        stream.start(timeref()).unwrap();
+        let mut sent = Sent::default();
+        (0..3).for_each(|_| stream.push(&[0; 16], &mut sent));
+        assert_eq!(stream.staged(), 16);
+        assert_eq!(sent.types(), [PacketType::METADATA, stream_packet(1)]);
     }
 
     #[test]

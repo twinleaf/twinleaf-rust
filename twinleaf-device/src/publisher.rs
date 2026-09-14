@@ -18,6 +18,7 @@ pub const MAX_SAMPLE_BYTES: usize = Packet::MAX_PAYLOAD - SAMPLE_HEADER_SIZE;
 pub struct Publisher {
     buf: [u8; Packet::MAX_SIZE],
     open: Option<Open>,
+    capacity: usize,
 }
 
 /// What the staged packet holds so far.
@@ -31,12 +32,28 @@ struct Open {
 }
 
 impl Publisher {
-    /// A publisher with nothing staged.
+    /// A publisher with nothing staged, closing a packet when it is full.
     pub const fn new() -> Self {
+        Self::with_capacity(MAX_SAMPLE_BYTES)
+    }
+
+    /// A publisher closing a packet once it holds `capacity` sample bytes; a
+    /// packet always takes at least one sample.
+    pub const fn with_capacity(capacity: usize) -> Self {
         Self {
             buf: [0; Packet::MAX_SIZE],
             open: None,
+            capacity: if capacity < MAX_SAMPLE_BYTES {
+                capacity
+            } else {
+                MAX_SAMPLE_BYTES
+            },
         }
+    }
+
+    /// Sample bytes in the packet being filled.
+    pub fn staged(&self) -> usize {
+        self.open.map_or(0, |open| open.len)
     }
 
     /// Stage one issued sample, sending packets as they close. A sample too
@@ -105,7 +122,7 @@ impl Publisher {
             open.stream == stream
                 && open.segment == segment
                 && open.first.value() + open.samples == number.value()
-                && open.len + bytes <= MAX_SAMPLE_BYTES
+                && open.len + bytes <= self.capacity
         })
     }
 
@@ -274,6 +291,21 @@ mod tests {
                 Err((0, 0, usize::try_from(per_packet).unwrap() * 4)),
             ]
         );
+    }
+
+    #[test]
+    fn a_packet_closes_at_the_capacity_chosen() {
+        let mut publisher = Publisher::with_capacity(8);
+        let mut sent = Sent::default();
+        (0..3).for_each(|number| {
+            push(
+                &mut publisher,
+                issued(0, number, number == 0, false),
+                &mut sent,
+            )
+        });
+        assert_eq!(publisher.staged(), 4);
+        assert_eq!(sent.packets(), [Ok(MetadataType::Segment), Err((0, 0, 8))]);
     }
 
     #[test]
