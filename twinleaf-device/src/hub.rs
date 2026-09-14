@@ -153,6 +153,23 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         now_ns: u64,
         down: &mut impl PortSink,
     ) -> Result<RpcRequestId, CallError> {
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let (id, len) = self.request(port, method, args, purpose, now_ns, &mut buf)?;
+        down.send(port, &buf[..len]);
+        Ok(id)
+    }
+
+    /// Compose a call of the hub's own into `buf`, for a caller that sends it
+    /// on a wire of its own; the id and the packet length come back.
+    pub fn request(
+        &mut self,
+        port: u8,
+        method: &str,
+        args: &[u8],
+        purpose: P,
+        now_ns: u64,
+        buf: &mut [u8; Packet::MAX_SIZE],
+    ) -> Result<(RpcRequestId, usize), CallError> {
         if !self.present(port) {
             return Err(CallError::Absent);
         }
@@ -164,11 +181,9 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
             .calls
             .call(port, purpose, now_ns)
             .map_err(|Full| CallError::Full)?;
-        let mut buf = [0u8; Packet::MAX_SIZE];
-        let len = rpc::write_request(&mut buf, id, method, args)
+        let len = rpc::write_request(buf, id, method, args)
             .expect("a request that fits a payload fits a packet");
-        down.send(port, &buf[..len]);
-        Ok(id)
+        Ok((id, len))
     }
 
     /// Give up on a call of the hub's own, returning what it carried, or
@@ -733,6 +748,22 @@ mod tests {
             hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default()),
             Err(CallError::Full)
         );
+    }
+
+    #[test]
+    fn a_composed_request_is_the_packet_a_call_sends() {
+        let mut composed = hub();
+        let mut sent = hub();
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let (id, len) = composed
+            .request(1, "dev.name", &[], Ask::Name, NOW, &mut buf)
+            .unwrap();
+        let mut down = Down::default();
+        assert_eq!(
+            sent.call(1, "dev.name", &[], Ask::Name, NOW, &mut down),
+            Ok(id)
+        );
+        assert_eq!(down.0, [(1, buf[..len].to_vec())]);
     }
 
     #[test]
