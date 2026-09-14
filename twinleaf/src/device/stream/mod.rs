@@ -3,15 +3,15 @@
 //! out to owned receivers, each filtered to the subtree its view covers.
 
 mod event;
+mod metadata;
 mod subscription;
 
 pub use event::{DeviceEvent, Event, LinkEvent, NamedRoute, TreeEvent};
+pub(crate) use metadata::{Completed, Discovery};
 pub(crate) use subscription::Scope;
 pub use subscription::{Receiver, RecvError};
 
-use crate::data::{DeviceMetadataSnapshot, MetadataQuery, PacketParser, SampleBatch};
-use crate::proto::data as wire;
-use crate::proto::rpc as wire_rpc;
+use crate::data::{DeviceMetadataSnapshot, PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use crate::tio::packet;
@@ -39,10 +39,6 @@ const PACKET_QUEUE_LEN: usize = 8192;
 const REGISTER_BUDGET: Duration = Duration::from_secs(2);
 const REGISTER_POLL: Duration = Duration::from_millis(50);
 
-/// Wait before the first metadata retry, and the ceiling it doubles up to.
-const METADATA_RETRY_FIRST: Duration = Duration::from_millis(250);
-const METADATA_RETRY_MAX: Duration = Duration::from_secs(8);
-
 /// The one setting a host reads as more than opaque bytes: its value is the
 /// device's RPC table hash, a u32le.
 fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
@@ -53,24 +49,12 @@ fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
     Some(u32::from_le_bytes(value.try_into().ok()?))
 }
 
-/// Why a route is not being asked for metadata right now.
-enum Discovery {
-    /// The last query failed. Ask again once `until` passes.
-    Backoff { until: Instant, delay: Duration },
-    /// A backed-off route that has come due: eligible again, and remembering
-    /// the delay the next failure doubles.
-    Due { delay: Duration },
-    /// The device answered `NotFound`: its firmware has no `dev.metadata`.
-    Unsupported,
-}
-
 /// What keeps the stream live: the parser, known routes and their metadata
-/// revisions, discovery progress, and the latest link status per subtree.
+/// revisions, and the latest link status per subtree.
 struct StreamState {
     parser: PacketParser,
     known_routes: HashSet<DeviceRoute>,
     metadata_seen: HashMap<DeviceRoute, u32>,
-    discovery: HashMap<DeviceRoute, Discovery>,
     /// Latest status per subtree, replayed root-first to late subscribers. A new
     /// status supersedes every entry under it.
     link_state: HashMap<DeviceRoute, packet::ProxyStatus>,
@@ -84,7 +68,6 @@ impl StreamState {
             parser: PacketParser::new(DeviceRoute::root(), false),
             known_routes: HashSet::new(),
             metadata_seen: HashMap::new(),
-            discovery: HashMap::new(),
             link_state: HashMap::new(),
             batches: VecDeque::new(),
             events: VecDeque::new(),
@@ -150,91 +133,10 @@ impl StreamState {
         })
     }
 
-    /// Routes whose metadata may be asked for now, expiring the backoffs that
-    /// bring them due so no elapsed deadline is left to wake the pump again.
-    fn take_due_routes(&mut self, now: Instant) -> Vec<DeviceRoute> {
-        let due: Vec<_> = self
-            .known_routes
-            .iter()
-            .copied()
-            .filter(|route| match self.discovery.get(route) {
-                None | Some(Discovery::Due { .. }) => true,
-                Some(Discovery::Backoff { until, .. }) => *until <= now,
-                Some(Discovery::Unsupported) => false,
-            })
-            .collect();
-        for route in &due {
-            if let Some(Discovery::Backoff { delay, .. }) = self.discovery.get(route) {
-                self.discovery
-                    .insert(*route, Discovery::Due { delay: *delay });
-            }
-        }
-        due
-    }
-
-    /// The earliest moment a backed-off route wants to be asked again.
-    fn next_retry(&self) -> Option<Instant> {
-        self.discovery
-            .values()
-            .filter_map(|state| match state {
-                Discovery::Backoff { until, .. } => Some(*until),
-                Discovery::Due { .. } | Discovery::Unsupported => None,
-            })
-            .min()
-    }
-
-    fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
-        let route = query.route;
-        self.parser.apply_metadata_reply(query, reply);
-        self.discovery.remove(&route);
-        self.publish_metadata(route);
-    }
-
-    /// Give up on a query and hold its route off for a growing delay, unless a
-    /// reset or a new session already overtook the query.
-    fn back_off(&mut self, query: MetadataQuery) {
-        let route = query.route;
-        if !self.parser.fail_metadata_query(query) {
-            return;
-        }
-        let delay = match self.discovery.get(&route) {
-            None => METADATA_RETRY_FIRST,
-            Some(Discovery::Backoff { delay, .. }) | Some(Discovery::Due { delay }) => {
-                (*delay * 2).min(METADATA_RETRY_MAX)
-            }
-            Some(Discovery::Unsupported) => return,
-        };
-        self.discovery.insert(
-            route,
-            Discovery::Backoff {
-                until: Instant::now() + delay,
-                delay,
-            },
-        );
-    }
-
-    /// Stop asking a route whose firmware does not implement `dev.metadata`.
-    fn give_up(&mut self, query: MetadataQuery) {
-        let route = query.route;
-        if !self.parser.fail_metadata_query(query) {
-            return;
-        }
-        if matches!(
-            self.discovery.insert(route, Discovery::Unsupported),
-            Some(Discovery::Unsupported)
-        ) {
-            return;
-        }
-        log::warn!("{route} has no dev.metadata; its streams cannot be decoded");
-        self.device_event(route, DeviceEvent::MetadataUnavailable);
-    }
-
     /// Forget what the current session taught us about `subtree`, so the next
     /// session there rediscovers.
     fn forget_metadata(&mut self, subtree: DeviceRoute) {
         self.metadata_seen
-            .retain(|route, _| !route.starts_with(&subtree));
-        self.discovery
             .retain(|route, _| !route.starts_with(&subtree));
         self.parser.reset_subtree(subtree);
     }
@@ -392,8 +294,7 @@ struct Pump {
     commands: channel::Receiver<PumpSink>,
     commands_open: bool,
     state: StreamState,
-    replies: channel::Receiver<(MetadataQuery, proxy::RawCallResult)>,
-    resolve: channel::Sender<(MetadataQuery, proxy::RawCallResult)>,
+    discovery: Discovery,
     batches: Vec<Sink<SampleBatch>>,
     events: Vec<Sink<Event>>,
     packets: Vec<Sink<tio::Packet>>,
@@ -405,15 +306,13 @@ impl Pump {
     fn start(root: &proxy::RpcEndpoint) -> Option<channel::Sender<PumpSink>> {
         let data = Pump::register(root)?;
         let (commands, received) = channel::unbounded();
-        let (resolve, replies) = channel::unbounded();
         let pump = Pump {
             state: StreamState::new(),
+            discovery: Discovery::new(root.clone()),
             root: root.clone(),
             data,
             commands: received,
             commands_open: true,
-            replies,
-            resolve,
             batches: Vec::new(),
             events: Vec::new(),
             packets: Vec::new(),
@@ -498,6 +397,11 @@ impl Pump {
             match self.data.try_recv() {
                 Ok(packet) => {
                     self.tap(&packet);
+                    if let packet::Payload::ProxyStatus(packet::ProxyStatus::SensorDisconnected) =
+                        packet.payload()
+                    {
+                        self.discovery.forget(packet.route());
+                    }
                     let covered = self.covers(packet.route());
                     self.state.process_packet(&packet, covered);
                 }
@@ -563,50 +467,33 @@ impl Pump {
         }
     }
 
+    /// Take every finished `dev.metadata` call, publishing what each taught the
+    /// parser and reporting the routes that can never answer.
     fn drain_metadata_replies(&mut self) {
-        while let Ok((query, result)) = self.replies.try_recv() {
-            self.complete_metadata(query, result);
-        }
-    }
-
-    /// Apply a finished `dev.metadata` call, or decide when to ask again.
-    fn complete_metadata(&mut self, query: MetadataQuery, result: proxy::RawCallResult) {
-        match result {
-            Ok(reply) => self.state.apply_metadata_reply(query, &reply),
-            Err(proxy::RawCallError::Device {
-                error: wire_rpc::RpcError::NotFound,
-                ..
-            }) => self.state.give_up(query),
-            Err(proxy::RawCallError::Device { .. })
-            | Err(proxy::RawCallError::InvalidRoute(_))
-            | Err(proxy::RawCallError::RequestNotSubmitted)
-            | Err(proxy::RawCallError::Timeout)
-            | Err(proxy::RawCallError::DeviceDisconnected)
-            | Err(proxy::RawCallError::ProxyClosed) => self.state.back_off(query),
+        while let Ok((query, result)) = self.discovery.replies().try_recv() {
+            let route = query.route;
+            match self
+                .discovery
+                .complete(&mut self.state.parser, query, result)
+            {
+                Completed::Applied => self.state.publish_metadata(route),
+                Completed::Unsupported => self
+                    .state
+                    .device_event(route, DeviceEvent::MetadataUnavailable),
+                Completed::BackedOff => {}
+            }
         }
     }
 
     /// Ask each covered route that is due for whatever metadata the parser
     /// still wants.
     fn submit_metadata_queries(&mut self) {
-        let due: Vec<_> = self
-            .state
-            .take_due_routes(Instant::now())
-            .into_iter()
-            .filter(|route| self.covers(*route))
-            .collect();
+        let due = self
+            .discovery
+            .due(self.state.known_routes.iter().copied(), Instant::now());
         for route in due {
-            for query in self.state.parser.take_metadata_queries_for(route) {
-                let resolve = self.resolve.clone();
-                let args = query.args();
-                self.root.submit_with(
-                    route,
-                    wire::METADATA_RPC_METHOD,
-                    &args,
-                    Box::new(move |result| {
-                        let _ = resolve.send((query, result));
-                    }),
-                );
+            if self.covers(route) {
+                self.discovery.submit(&mut self.state.parser, route);
             }
         }
     }
@@ -634,7 +521,7 @@ impl Pump {
     fn wait(&self) {
         let mut select = channel::Select::new();
         select.recv(self.data.receiver());
-        select.recv(&self.replies);
+        select.recv(self.discovery.replies());
         for sink in &self.batches {
             select.recv(&sink.alive);
         }
@@ -648,7 +535,7 @@ impl Pump {
             select.recv(&self.commands);
         }
         select.recv(self.root.worker_alive());
-        match self.state.next_retry() {
+        match self.discovery.next_retry() {
             Some(deadline) => {
                 let _ = select.ready_deadline(deadline);
             }
@@ -662,7 +549,9 @@ impl Pump {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::data as wire;
     use crate::proto::data::DataType;
+    use crate::proto::rpc as wire_rpc;
     use crate::proto::rpc::Method;
     use crate::proto::sync::Epoch;
     use crate::proto::SessionId as WireSessionId;
@@ -699,15 +588,13 @@ mod tests {
             proxy::RpcEndpoint::test_pair(DeviceRoute::root(), DeviceRoute::MAX_HOPS);
         let (data, _sent, deliver) = proxy::Port::test_pair();
         let (subscriptions, received) = channel::unbounded();
-        let (resolve, replies) = channel::unbounded();
         let mut pump = Pump {
             state: StreamState::new(),
+            discovery: Discovery::new(endpoint.clone()),
             root: endpoint.clone(),
             data,
             commands: received,
             commands_open: true,
-            replies,
-            resolve,
             batches: Vec::new(),
             events: Vec::new(),
             packets: Vec::new(),
@@ -1216,38 +1103,6 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("the pump outlived every view of its connection");
-    }
-
-    /// An elapsed deadline that stayed in the map would make every `wait`
-    /// return at once, spinning for as long as the route stayed uncovered.
-    #[test]
-    fn a_route_that_comes_due_stops_asking_the_pump_to_wake() {
-        let mut state = StreamState::new();
-        let route = DeviceRoute::root();
-        state.known_routes.insert(route);
-        state.discovery.insert(
-            route,
-            Discovery::Backoff {
-                until: Instant::now() - Duration::from_millis(1),
-                delay: METADATA_RETRY_FIRST,
-            },
-        );
-
-        assert_eq!(state.take_due_routes(Instant::now()), [route]);
-        assert!(
-            state.next_retry().is_none(),
-            "an elapsed deadline never wakes the pump again"
-        );
-        let query = state
-            .parser
-            .take_metadata_queries_for(route)
-            .pop()
-            .expect("the route is still bootstrapping");
-        state.back_off(query);
-        assert!(
-            matches!(state.discovery.get(&route), Some(Discovery::Backoff { delay, .. }) if *delay == METADATA_RETRY_FIRST * 2),
-            "coming due keeps the delay the next failure doubles"
-        );
     }
 
     /// A refusal answering a query the reset already overtook belongs to the
