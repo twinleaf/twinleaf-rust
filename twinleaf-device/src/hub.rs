@@ -21,7 +21,7 @@ use crate::device::HEARTBEAT_INTERVAL;
 use crate::sync::Announce;
 use crate::Sink;
 
-/// Silence after which a child is unplugged: two missed heartbeats.
+/// Silence after which a child is unplugged: two heartbeats' worth.
 pub const UNPLUG_NS: u64 = 2 * HEARTBEAT_INTERVAL;
 
 /// Requests a hub can have in flight at once, as tl-chibi's remap has.
@@ -45,12 +45,12 @@ pub trait Events<P> {
 pub enum Presence {
     /// No child is answering on this port.
     Absent,
-    /// A child announced `session` and was last heard at `last_heartbeat_ns`.
+    /// A child announced `session` and was last heard at `last_heard_ns`.
     Present {
         /// Which boot of the child this is.
         session: SessionId,
-        /// When its last heartbeat arrived.
-        last_heartbeat_ns: u64,
+        /// When its last packet arrived.
+        last_heard_ns: u64,
     },
 }
 
@@ -212,9 +212,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
             .iter()
             .filter_map(|presence| match presence {
                 Presence::Absent => None,
-                Presence::Present {
-                    last_heartbeat_ns, ..
-                } => Some(last_heartbeat_ns + UNPLUG_NS),
+                Presence::Present { last_heard_ns, .. } => Some(last_heard_ns + UNPLUG_NS),
             })
             .min();
         [self.calls.deadline_ns(), unplug]
@@ -285,6 +283,9 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         ) {
             self.observe(port, session, now_ns, events);
         }
+        if let Presence::Present { last_heard_ns, .. } = &mut self.ports[usize::from(port)] {
+            *last_heard_ns = now_ns;
+        }
         let mut hops = [0u8; DeviceRoute::MAX_HOPS];
         let Some(answer) = Answer::parse(view.header.ptype, view.payload) else {
             let hop = view.routing.len();
@@ -318,13 +319,10 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
     /// answered.
     fn tick(&mut self, now_ns: u64, up: &mut impl Sink, events: &mut impl Events<P>) {
         for port in 0..PORTS {
-            let Presence::Present {
-                last_heartbeat_ns, ..
-            } = self.ports[port]
-            else {
+            let Presence::Present { last_heard_ns, .. } = self.ports[port] else {
                 continue;
             };
-            if now_ns.saturating_sub(last_heartbeat_ns) >= UNPLUG_NS {
+            if now_ns.saturating_sub(last_heard_ns) >= UNPLUG_NS {
                 self.ports[port] = Presence::Absent;
                 events.event(Event::Unplugged(port as u8));
             }
@@ -352,7 +350,7 @@ impl<P, const PORTS: usize> Hub<P, PORTS> {
         }
         self.ports[usize::from(port)] = Presence::Present {
             session,
-            last_heartbeat_ns: now_ns,
+            last_heard_ns: now_ns,
         };
     }
 
@@ -652,20 +650,26 @@ mod tests {
             hub.presence(1),
             Presence::Present {
                 session: SessionId::new(8),
-                last_heartbeat_ns: NOW
+                last_heard_ns: NOW
             }
         );
     }
 
     #[test]
-    fn two_missed_heartbeats_unplug_a_port() {
+    fn silence_unplugs_a_port_and_any_packet_keeps_it() {
         let mut hub = hub();
         assert_eq!(hub.deadline_ns(), Some(NOW + UNPLUG_NS));
 
         let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS - 1);
         assert!(out.log.0.is_empty());
 
+        let answer = reply(RpcRequestId::new(3), b"whose?");
+        deliver(&mut hub, child(1, &answer), NOW + UNPLUG_NS - 1);
+        assert_eq!(hub.deadline_ns(), Some(NOW + 2 * UNPLUG_NS - 1));
         let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS);
+        assert!(out.log.0.is_empty());
+
+        let out = deliver(&mut hub, Input::Tick, NOW + 2 * UNPLUG_NS - 1);
         assert_eq!(out.log.0, [Seen::Unplugged(1)]);
         assert_eq!(hub.presence(1), Presence::Absent);
         assert_eq!(hub.deadline_ns(), None);
@@ -724,6 +728,24 @@ mod tests {
             hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default()),
             Err(CallError::Full)
         );
+    }
+
+    #[test]
+    fn a_cancelled_call_gives_back_its_purpose_and_its_answer_is_unmatched() {
+        let mut hub = hub();
+        let mut down = Down::default();
+        let id = hub
+            .call(1, "dev.name", &[], Ask::Name, NOW, &mut down)
+            .unwrap();
+        assert_eq!(id, minted(&down));
+        assert_eq!(hub.cancel(1, id), Some(Ask::Name));
+        assert_eq!(hub.cancel(1, id), None);
+
+        let answer = reply(id, b"tio-hub");
+        let out = deliver(&mut hub, child(1, &answer), NOW);
+        assert!(out.log.0.is_empty());
+        assert_eq!(hub.counters().calls.unmatched, 1);
+        assert_eq!(hub.deadline_ns(), Some(NOW + UNPLUG_NS));
     }
 
     #[test]
