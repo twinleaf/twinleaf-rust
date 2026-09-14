@@ -206,6 +206,12 @@ impl DeviceTree {
         self.stream.packets(Scope::of(&self.endpoint))
     }
 
+    /// The RPC capability behind this view, for a subscriber that submits calls
+    /// of its own.
+    pub(super) fn endpoint(&self) -> &proxy::RpcEndpoint {
+        &self.endpoint
+    }
+
     /// Collect complete metadata for `route`, waiting up to `METADATA_TIMEOUT`.
     /// A route outside this view is rejected before waiting.
     pub fn metadata(&self, route: DeviceRoute) -> Result<DeviceMetadataSnapshot, MetadataError> {

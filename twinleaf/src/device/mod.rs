@@ -43,6 +43,8 @@
 //!   on the network.
 //! - [`capture`] triggers and reads out a device-side buffer capture through its
 //!   array RPC.
+//! - [`record`] writes a tree to a log file the
+//!   [`data`](crate::data) reader decodes the same way.
 //! - [`firmware`](crate::firmware) queries and updates firmware over a
 //!   [`Device`].
 //!
@@ -86,6 +88,7 @@
 pub mod capture;
 mod connection;
 pub mod discovery;
+pub mod record;
 pub mod rpc;
 pub mod runtime;
 mod stream;
