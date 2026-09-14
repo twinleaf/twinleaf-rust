@@ -269,7 +269,7 @@ impl<'t> Device<'t> {
         image: &'i mut Image<N>,
     ) -> Result<&'i [u8], RpcError> {
         image.clear();
-        conf::encode(settings, image)?;
+        conf::encode(settings.iter_mut().map(|setting| &mut **setting), image)?;
         Ok(image)
     }
 
@@ -282,26 +282,10 @@ impl<'t> Device<'t> {
         image: &[u8],
         out: &mut impl Sink,
     ) -> Result<(), RpcError> {
-        let mut outcome = Ok(());
-        for entry in conf::entries(image) {
-            let entry = entry?;
-            let found = settings
-                .iter_mut()
-                .map(|setting| &mut **setting)
-                .find(|setting| setting.name().as_bytes() == entry.name);
-            let Some(setting) = found else {
-                continue;
-            };
-            let mut reply = Reply::new();
-            match setting.load(entry.value, &mut reply) {
-                Ok(Changed::Unchanged) => {}
-                Ok(Changed::Changed) => {
-                    announce(&mut self.settings_version, out, setting.name(), &reply)
-                }
-                Err(_) => outcome = Err(RpcError::Load),
-            }
-        }
-        outcome
+        let settings = settings.iter_mut().map(|setting| &mut **setting);
+        conf::load(settings, image, |name, reply| {
+            announce(&mut self.settings_version, out, name, reply)
+        })
     }
 
     /// Power-cycle: a new session, and the heartbeat, log threshold, and
