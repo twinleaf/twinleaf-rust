@@ -42,6 +42,7 @@ impl PulseConfig {
 }
 
 /// Qualification state of the electrical pulse train.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PulseState {
     /// No external pulse train has been established.

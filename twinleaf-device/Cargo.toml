@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["twinleaf", "protocol", "no-std", "sensor", "firmware"]
 categories = ["embedded", "no-std"]
 
+[features]
+defmt = ["dep:defmt", "twinleaf-proto/defmt"]
+
 [dependencies]
+defmt = { version = "1.1", optional = true }
 heapless = "0.9"
 twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }

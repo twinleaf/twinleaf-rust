@@ -3124,6 +3124,7 @@ dependencies = [
 name = "twinleaf-device"
 version = "0.1.0"
 dependencies = [
+ "defmt",
  "heapless",
  "twinleaf-proto",
 ]

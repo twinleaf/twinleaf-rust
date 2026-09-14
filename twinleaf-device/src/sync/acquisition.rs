@@ -56,6 +56,7 @@ impl StartPlan {
 }
 
 /// Acquisition lifecycle state.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquisitionState {
     /// Boot-time delay before an automatic start or transition to idle.
@@ -94,6 +95,7 @@ pub enum AcquisitionAction {
 
 /// The requested transition is not valid in the reported state. It is the only
 /// runtime error here, and maps to the `State` RPC error.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcquisitionError(pub AcquisitionState);
 

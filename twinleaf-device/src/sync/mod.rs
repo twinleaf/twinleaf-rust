@@ -84,6 +84,7 @@ pub struct Announce {
 }
 
 /// What a device says its own time is worth, in the SYNC pad byte.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeStatus {
     /// A hub that predates the pad byte, 0. It says nothing either way.
@@ -350,6 +351,7 @@ impl Reference {
 }
 
 /// Qualification state of packet-provided time.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceState {
     /// The device's own timeline.
