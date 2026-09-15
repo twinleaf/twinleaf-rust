@@ -64,7 +64,7 @@ pub struct Call<'p, 't> {
     pub name: &'t str,
     /// Argument bytes.
     pub args: &'p [u8],
-    routing: &'p [u8],
+    pub(crate) routing: &'p [u8],
 }
 
 impl Call<'_, '_> {

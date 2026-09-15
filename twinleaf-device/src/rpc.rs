@@ -275,6 +275,67 @@ pub fn list(
     put(out, spec.name.as_bytes())
 }
 
+/// `rpc.match`: autocomplete over the method names, for a host completing what
+/// a user typed.
+///
+/// The argument is a name prefix, optionally followed by `|N` selecting the
+/// `N`-th (0-based) match:
+///
+/// - `dev.na` — the unique completion `dev.name` as a string when exactly one
+///   name starts with the prefix, and a `u16` match count otherwise, zero when
+///   nothing matches. A caller tells the two apart by whether the reply starts
+///   with the prefix it sent.
+/// - `dev.na|0` — the 0-th matching name, so a caller can cycle through them
+///   all. Past the last match it is [`RpcError::Invalid`].
+///
+/// An empty argument is [`RpcError::Invalid`]. Byte-compatible with tl-chibi's
+/// `rpc_match`, down to its parser: only the first `|` separates, and a
+/// non-numeric tail after it still cuts the prefix but selects nothing.
+pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+    if args.is_empty() {
+        return Err(RpcError::Invalid);
+    }
+    let (prefix, select) = match args.iter().position(|&byte| byte == b'|') {
+        Some(bar) => (&args[..bar], match_index(&args[bar + 1..])),
+        None => (args, None),
+    };
+    let mut matches = table
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| name.as_bytes().starts_with(prefix));
+
+    if let Some(index) = select {
+        let name = matches.nth(index).ok_or(RpcError::Invalid)?;
+        return put(out, name.as_bytes());
+    }
+
+    let mut count: u16 = 0;
+    let mut unique = "";
+    for name in matches {
+        count = count.saturating_add(1);
+        unique = name;
+    }
+    match count {
+        1 => put(out, unique.as_bytes()),
+        _ => put(out, &count.to_le_bytes()),
+    }
+}
+
+/// The decimal index after `|`, or `None` when the tail is not all digits. An
+/// empty tail is index zero, as tl-chibi's parser leaves it.
+fn match_index(digits: &[u8]) -> Option<usize> {
+    let mut index: usize = 0;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        index = index
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as usize);
+    }
+    Some(index)
+}
+
 fn index(arg: &[u8]) -> Result<usize, RpcError> {
     let bytes: [u8; 2] = arg.try_into().map_err(|_| RpcError::ArgsSize)?;
     Ok(usize::from(u16::from_le_bytes(bytes)))
@@ -439,5 +500,74 @@ mod tests {
         let mut out = Reply::new();
         assert_eq!(put(&mut out, &[0; REPLY_MAX]), Ok(()));
         assert_eq!(put(&mut out, &[0]), Err(RpcError::NoBufs));
+    }
+
+    /// A table shaped like a device's: the standard entries, then two of a
+    /// board's own.
+    fn named() -> Vec<RpcSpec> {
+        STANDARD
+            .iter()
+            .cloned()
+            .chain([
+                RpcSpec::prop("board.first", Kind::Uint(4), Access::RW),
+                RpcSpec::prop("board.second", Kind::Uint(4), Access::RW),
+            ])
+            .collect()
+    }
+
+    fn matched(args: &[u8]) -> Result<Reply, RpcError> {
+        let mut out = Reply::new();
+        match_name(&named(), args, &mut out).map(|()| out)
+    }
+
+    #[test]
+    fn match_returns_the_unique_completion() {
+        assert_eq!(matched(b"dev.na").unwrap().as_slice(), b"dev.name");
+        // An exact name is still a match, and still the only one.
+        assert_eq!(matched(b"dev.uptime").unwrap().as_slice(), b"dev.uptime");
+    }
+
+    #[test]
+    fn match_counts_an_ambiguous_prefix() {
+        let expected = named()
+            .iter()
+            .filter(|spec| spec.name.starts_with("dev.conf."))
+            .count() as u16;
+        assert!(expected > 1, "the prefix has to be ambiguous to be a test");
+        assert_eq!(
+            matched(b"dev.conf.").unwrap().as_slice(),
+            &expected.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn match_reports_zero_for_no_match() {
+        assert_eq!(
+            matched(b"nonsense.").unwrap().as_slice(),
+            &0u16.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn match_selects_by_index_and_sees_board_rpcs() {
+        assert_eq!(matched(b"board.|0").unwrap().as_slice(), b"board.first");
+        assert_eq!(matched(b"board.|1").unwrap().as_slice(), b"board.second");
+        assert_eq!(
+            matched(b"board.|2").unwrap_err(),
+            RpcError::Invalid,
+            "past the last match"
+        );
+        // An empty index is index zero, and a non-numeric tail selects nothing
+        // but still cuts the prefix — both as tl-chibi's parser leaves them.
+        assert_eq!(matched(b"board.|").unwrap().as_slice(), b"board.first");
+        assert_eq!(
+            matched(b"board.|x").unwrap().as_slice(),
+            &2u16.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn match_rejects_an_empty_argument() {
+        assert_eq!(matched(&[]).unwrap_err(), RpcError::Invalid);
     }
 }

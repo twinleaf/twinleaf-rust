@@ -7,6 +7,7 @@
 pub mod calls;
 pub mod capture;
 pub mod conf;
+pub mod control;
 pub mod device;
 pub mod hub;
 pub mod metadata;
