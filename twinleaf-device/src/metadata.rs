@@ -20,24 +20,21 @@ pub trait Streams {
     fn ids(&self) -> impl Iterator<Item = u8>;
     /// The shape of a stream.
     fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>>;
-    /// A segment of a stream, with [`CURRENT_SEGMENT`] naming the one acquiring.
-    fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>>;
     /// A column of a stream.
     fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>>;
 
-    /// The same segment, handed to `f` under the borrow it was read through.
+    /// A segment of a stream, handed to `f` under the borrow it was read
+    /// through, with [`CURRENT_SEGMENT`] naming the one acquiring.
     ///
-    /// This is what every reply below asks for, so a device that keeps a
-    /// stream behind a lock describes it from the record itself rather than
+    /// Every record a device sends comes through here, so a device that keeps
+    /// a stream behind a lock describes it from the record itself rather than
     /// from a copy taken out of one.
     fn with_segment<R>(
         &self,
         stream_id: u8,
         index: u8,
         f: impl FnOnce(data::Segment<'_>) -> R,
-    ) -> Option<R> {
-        Some(f(self.segment(stream_id, index)?))
-    }
+    ) -> Option<R>;
 }
 
 /// A device with no streams.
@@ -50,11 +47,16 @@ impl Streams for () {
         None
     }
 
-    fn segment(&self, _stream_id: u8, _index: u8) -> Option<data::Segment<'_>> {
+    fn column(&self, _stream_id: u8, _index: u8) -> Option<data::Column<'_>> {
         None
     }
 
-    fn column(&self, _stream_id: u8, _index: u8) -> Option<data::Column<'_>> {
+    fn with_segment<R>(
+        &self,
+        _stream_id: u8,
+        _index: u8,
+        _f: impl FnOnce(data::Segment<'_>) -> R,
+    ) -> Option<R> {
         None
     }
 }
@@ -74,78 +76,79 @@ pub fn reply(
         return bootstrap(device, streams, out);
     }
     for selector in query.selectors() {
-        let appended = match selector.mtype {
+        let MetadataSelector {
+            mtype,
+            stream_id,
+            index,
+        } = selector;
+        let appended = match mtype {
+            MetadataType::Device => append(out, Metadata::Device(device))?,
+            MetadataType::Stream => {
+                let stream = streams.stream(stream_id).ok_or(RpcError::Invalid)?;
+                append(out, Metadata::Stream(stream))?
+            }
             MetadataType::Segment => streams
-                .with_segment(selector.stream_id, selector.index, |segment| {
+                .with_segment(stream_id, index, |segment| {
                     append(out, Metadata::Segment(segment))
                 })
-                .ok_or(RpcError::Invalid)?,
-            MetadataType::Device
-            | MetadataType::Stream
-            | MetadataType::Column
-            | MetadataType::Unknown(_) => append(
-                out,
-                select(device, streams, selector).ok_or(RpcError::Invalid)?,
-            ),
+                .ok_or(RpcError::Invalid)??,
+            MetadataType::Column => {
+                let column = streams.column(stream_id, index).ok_or(RpcError::Invalid)?;
+                append(out, Metadata::Column(column))?
+            }
+            MetadataType::Unknown(_) => return Err(RpcError::Invalid),
         };
-        if !appended? {
+        if !appended {
             break;
         }
     }
     Ok(())
 }
 
-/// The record a selector names.
-pub fn select<'a>(
-    device: data::Device<'a>,
-    streams: &'a (impl Streams + ?Sized),
-    selector: MetadataSelector,
-) -> Option<Metadata<'a>> {
-    let MetadataSelector {
-        mtype,
-        stream_id,
-        index,
-    } = selector;
-    match mtype {
-        MetadataType::Device => Some(Metadata::Device(device)),
-        MetadataType::Stream => streams.stream(stream_id).map(Metadata::Stream),
-        MetadataType::Segment => streams.segment(stream_id, index).map(Metadata::Segment),
-        MetadataType::Column => streams.column(stream_id, index).map(Metadata::Column),
-        MetadataType::Unknown(_) => None,
-    }
-}
-
-/// A listed stream the device cannot describe is an internal error.
-fn bootstrap(
+/// Every record a device describes itself with, in bootstrap order: the
+/// device, then each stream with its current segment and its columns.
+///
+/// The sweep stops where `describe` says it has no more room, and a listed
+/// stream the device cannot describe is an internal error.
+pub fn sweep(
     device: data::Device<'_>,
     streams: &(impl Streams + ?Sized),
-    out: &mut Reply,
+    describe: &mut dyn FnMut(Metadata<'_>) -> Result<bool, RpcError>,
 ) -> Result<(), RpcError> {
-    if !append(out, Metadata::Device(device))? {
+    if !describe(Metadata::Device(device))? {
         return Ok(());
     }
     for stream_id in streams.ids() {
         let stream = streams.stream(stream_id).ok_or(RpcError::Internal)?;
         let columns = stream.n_columns;
-        if !append(out, Metadata::Stream(stream))? {
+        if !describe(Metadata::Stream(stream))? {
             return Ok(());
         }
-        let segment = streams
+        let described = streams
             .with_segment(stream_id, CURRENT_SEGMENT, |segment| {
-                append(out, Metadata::Segment(segment))
+                describe(Metadata::Segment(segment))
             })
             .ok_or(RpcError::Internal)?;
-        if !segment? {
+        if !described? {
             return Ok(());
         }
         for index in 0..columns {
             let column = streams.column(stream_id, index).ok_or(RpcError::Internal)?;
-            if !append(out, Metadata::Column(column))? {
+            if !describe(Metadata::Column(column))? {
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+/// The bootstrap set, as far as one reply holds.
+fn bootstrap(
+    device: data::Device<'_>,
+    streams: &(impl Streams + ?Sized),
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    sweep(device, streams, &mut |record| append(out, record))
 }
 
 /// Append one `[type][length][record]` frame, whole or not at all: proto's
@@ -175,6 +178,8 @@ mod tests {
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, SessionId, StreamId};
 
+    /// A device whose segments are behind a lock, which every device here is:
+    /// there is no record to hand out, only one to read in place.
     struct Fixture;
 
     fn device(name: &str) -> data::Device<'_> {
@@ -203,14 +208,19 @@ mod tests {
             })
         }
 
-        fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>> {
+        fn with_segment<R>(
+            &self,
+            stream_id: u8,
+            index: u8,
+            f: impl FnOnce(data::Segment<'_>) -> R,
+        ) -> Option<R> {
             let segment_id = match index {
                 CURRENT_SEGMENT => 3,
                 0..=3 => index,
                 _ => return None,
             };
             self.stream(stream_id)?;
-            Some(data::Segment {
+            Some(f(data::Segment {
                 stream_id: StreamId::new(stream_id),
                 segment_id: SegmentId::new(segment_id),
                 flags: SegmentFlags::VALID,
@@ -222,7 +232,7 @@ mod tests {
                 decimation: 1,
                 filter_cutoff: 0.0,
                 filter_type: FilterType::NONE,
-            })
+            }))
         }
 
         fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
@@ -235,37 +245,6 @@ mod tests {
                 units: "",
                 description: "",
             })
-        }
-    }
-
-    /// The same device, with its segments behind a lock: it has no record to
-    /// hand out, so [`Streams::with_segment`] is the only way into one.
-    struct Locked(Fixture);
-
-    impl Streams for Locked {
-        fn ids(&self) -> impl Iterator<Item = u8> {
-            self.0.ids()
-        }
-
-        fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>> {
-            self.0.stream(stream_id)
-        }
-
-        fn segment(&self, _stream_id: u8, _index: u8) -> Option<data::Segment<'_>> {
-            None
-        }
-
-        fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
-            self.0.column(stream_id, index)
-        }
-
-        fn with_segment<R>(
-            &self,
-            stream_id: u8,
-            index: u8,
-            f: impl FnOnce(data::Segment<'_>) -> R,
-        ) -> Option<R> {
-            Some(f(self.0.segment(stream_id, index)?))
         }
     }
 
@@ -341,27 +320,6 @@ mod tests {
             reply(device("d"), &Fixture, &no_such_segment, &mut out),
             Err(RpcError::Invalid)
         );
-    }
-
-    /// Every reply a device gives is the reply it gives when its records have
-    /// to be read in place, which is what lets a firmware keep its streams
-    /// behind a lock.
-    #[test]
-    fn a_locked_device_replies_what_a_handed_out_record_does() {
-        let queries = [
-            Vec::new(),
-            MetadataSelector::segment(1, CURRENT_SEGMENT)
-                .encode()
-                .into(),
-            MetadataSelector::segment(2, 0).encode().into(),
-        ];
-        for query in queries {
-            let (mut handed, mut locked) = (Reply::new(), Reply::new());
-            reply(device("d"), &Fixture, &query, &mut handed).unwrap();
-            reply(device("d"), &Locked(Fixture), &query, &mut locked).unwrap();
-            assert_eq!(handed, locked);
-            assert!(kinds(&locked).contains(&MetadataType::Segment));
-        }
     }
 
     #[test]

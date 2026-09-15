@@ -9,7 +9,7 @@
 //! to answer.
 
 use heapless::String;
-use twinleaf_proto::data::{self, Metadata, MetadataFlags, CURRENT_SEGMENT};
+use twinleaf_proto::data::{self, MetadataFlags};
 use twinleaf_proto::heartbeat::Heartbeat;
 use twinleaf_proto::log::{LogLevel, LogMessage, MAX_MESSAGE_SIZE};
 use twinleaf_proto::packet::{Packet, PacketType, PacketView};
@@ -146,14 +146,21 @@ impl<'t> Device<'t> {
     ) {
         announcement(out, "rpc.hash", &self.hash.to_le_bytes());
         self.beat(now_ns, out);
-        let mut records = self.records(streams).peekable();
-        while let Some(record) = records.next() {
-            let flags = match records.peek() {
-                Some(_) => MetadataFlags::UPDATE,
-                None => MetadataFlags::UPDATE | MetadataFlags::LAST,
+        let record = self.record(streams);
+        let mut left = 0;
+        let _ = metadata::sweep(record, streams, &mut |_| {
+            left += 1;
+            Ok(true)
+        });
+        let _ = metadata::sweep(record, streams, &mut |item| {
+            left -= 1;
+            let flags = match left {
+                0 => MetadataFlags::UPDATE | MetadataFlags::LAST,
+                _ => MetadataFlags::UPDATE,
             };
-            send(out, &[], |buf| record.write(flags, buf));
-        }
+            send(out, &[], |buf| item.write(flags, buf));
+            Ok(true)
+        });
     }
 
     /// Act on one packet from the host. A method the table declares an action
@@ -314,26 +321,6 @@ impl<'t> Device<'t> {
         send(out, &[], |buf| beat.write(buf));
         self.next_beat = now_ns + HEARTBEAT_INTERVAL;
     }
-
-    /// Every metadata record, in sweep order.
-    fn records<'s, S: Streams + ?Sized>(
-        &'s self,
-        streams: &'s S,
-    ) -> impl Iterator<Item = Metadata<'s>> + 's {
-        let per_stream = streams.ids().flat_map(move |id| {
-            let stream = streams.stream(id);
-            let columns = stream.map_or(0, |stream| stream.n_columns);
-            stream
-                .map(Metadata::Stream)
-                .into_iter()
-                .chain(streams.segment(id, CURRENT_SEGMENT).map(Metadata::Segment))
-                .chain(
-                    (0..columns)
-                        .filter_map(move |index| streams.column(id, index).map(Metadata::Column)),
-                )
-        });
-        core::iter::once(Metadata::Device(self.record(streams))).chain(per_stream)
-    }
 }
 
 /// A read-only property: an argument is a write.
@@ -425,19 +412,26 @@ mod tests {
             })
         }
 
-        fn segment(&self, stream_id: u8, _index: u8) -> Option<data::Segment<'_>> {
-            (stream_id == 1).then_some(data::Segment {
-                stream_id: StreamId::new(1),
-                segment_id: SegmentId::new(0),
-                flags: SegmentFlags::VALID,
-                epoch: Epoch::UNIX,
-                timeref_serial: "S",
-                timeref_session: SessionId::new(9),
-                start_time: 0,
-                sampling_rate: 10,
-                decimation: 1,
-                filter_cutoff: 0.0,
-                filter_type: FilterType::NONE,
+        fn with_segment<R>(
+            &self,
+            stream_id: u8,
+            _index: u8,
+            f: impl FnOnce(data::Segment<'_>) -> R,
+        ) -> Option<R> {
+            (stream_id == 1).then(|| {
+                f(data::Segment {
+                    stream_id: StreamId::new(1),
+                    segment_id: SegmentId::new(0),
+                    flags: SegmentFlags::VALID,
+                    epoch: Epoch::UNIX,
+                    timeref_serial: "S",
+                    timeref_session: SessionId::new(9),
+                    start_time: 0,
+                    sampling_rate: 10,
+                    decimation: 1,
+                    filter_cutoff: 0.0,
+                    filter_type: FilterType::NONE,
+                })
             })
         }
 

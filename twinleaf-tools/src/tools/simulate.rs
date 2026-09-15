@@ -2285,21 +2285,31 @@ mod tests {
         assert_eq!(record.n_segments, SEGMENTS as u8);
         assert_eq!(record.buf_samples, 0);
         assert_eq!(record.sample_size, 16);
-        let segment = streams.segment(1, CURRENT_SEGMENT).unwrap();
-        assert_eq!(segment.sampling_rate, 4);
-        assert_eq!(segment.filter_cutoff, 2.0);
-        assert_eq!(segment.epoch, sync::Epoch::UNIX);
-        assert_eq!(segment.timeref_serial, DEVICE_SERIAL);
+        let described = |index| {
+            streams.with_segment(1, index, |record| {
+                (
+                    record.segment_id.value(),
+                    record.sampling_rate,
+                    record.filter_cutoff,
+                    record.epoch,
+                    record.timeref_serial.to_owned(),
+                    record.flags,
+                )
+            })
+        };
+        let (segment_id, rate, cutoff, epoch, serial, flags) =
+            described(CURRENT_SEGMENT).expect("a current segment");
+        assert_eq!(rate, 4);
+        assert_eq!(cutoff, 2.0);
+        assert_eq!(epoch, sync::Epoch::UNIX);
+        assert_eq!(serial, DEVICE_SERIAL);
         assert_eq!(
-            segment.flags,
+            flags,
             data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE
         );
-        assert_eq!(
-            streams.segment(1, segment.segment_id.value()),
-            Some(segment)
-        );
+        assert_eq!(described(segment_id), described(CURRENT_SEGMENT));
         assert!(streams.stream(99).is_none());
-        assert!(streams.segment(99, CURRENT_SEGMENT).is_none());
+        assert!(streams.with_segment(99, CURRENT_SEGMENT, |_| ()).is_none());
     }
 
     #[test]
