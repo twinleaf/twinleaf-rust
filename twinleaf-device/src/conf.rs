@@ -217,6 +217,33 @@ mod tests {
     }
 
     #[test]
+    fn a_load_leaves_a_stored_name_no_setting_takes_and_a_value_already_held() {
+        let mut gain = Setting::new("app.gain", 9u8).persistent();
+        let stored = image(&mut [
+            &mut Setting::new("app.old", 3u8).persistent(),
+            &mut Setting::new("app.gain", 9u8).persistent(),
+        ]);
+        let outcome = load([&mut gain as &mut dyn Persisted], &stored, |_, _| {
+            panic!("nothing moves")
+        });
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(gain.get(), 9);
+    }
+
+    #[test]
+    fn a_load_refuses_a_value_the_setting_refuses_and_keeps_the_one_held() {
+        let mut rate = Setting::new("app.rate", 1.0f64)
+            .checked(|value| (value > 0.0).then_some(value).ok_or(RpcError::Invalid))
+            .persistent();
+        let stored = image(&mut [&mut Setting::new("app.rate", -1.0f64).persistent()]);
+        let outcome = load([&mut rate as &mut dyn Persisted], &stored, |_, _| {
+            panic!("nothing moves")
+        });
+        assert_eq!(outcome, Err(RpcError::Load));
+        assert_eq!(rate.get(), 1.0);
+    }
+
+    #[test]
     fn a_load_refuses_a_malformed_image_before_touching_a_setting() {
         let mut gain = Setting::new("app.gain", 1u8).persistent();
         let mut stored = image(&mut [&mut Setting::new("app.gain", 9u8).persistent()]).to_vec();

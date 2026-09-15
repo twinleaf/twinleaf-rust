@@ -18,10 +18,9 @@ use twinleaf_proto::rpc::{self, Method, Request, RpcError};
 use twinleaf_proto::settings::Setting as Announcement;
 use twinleaf_proto::{RpcRequestId, SessionId};
 
-use crate::conf::{self, Image};
 use crate::metadata::{self, Streams};
 use crate::rpc::{self as table, read, Reply, RpcSpec};
-use crate::settings::{Changed, Persisted, Scalar, Setting};
+use crate::settings::{Changed, Scalar, Setting};
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
@@ -266,33 +265,6 @@ impl<'t> Device<'t> {
     /// value its reply carries.
     pub fn announce(&mut self, name: &str, reply: &[u8], out: &mut impl Sink) {
         announce(&mut self.settings_version, out, name, reply);
-    }
-
-    /// Answer `dev.conf.save`: every setting the application persists, for
-    /// the platform to write.
-    pub fn save<'i, const N: usize>(
-        &mut self,
-        settings: &mut [&mut dyn Persisted],
-        image: &'i mut Image<N>,
-    ) -> Result<&'i [u8], RpcError> {
-        image.clear();
-        conf::encode(settings.iter_mut().map(|setting| &mut **setting), image)?;
-        Ok(image)
-    }
-
-    /// Answer `dev.conf.load`, or a boot: take every stored value the image
-    /// names, announcing each one that moved. A name no setting answers is
-    /// left behind, and a value refused leaves [`RpcError::Load`].
-    pub fn load(
-        &mut self,
-        settings: &mut [&mut dyn Persisted],
-        image: &[u8],
-        out: &mut impl Sink,
-    ) -> Result<(), RpcError> {
-        let settings = settings.iter_mut().map(|setting| &mut **setting);
-        conf::load(settings, image, |name, reply| {
-            announce(&mut self.settings_version, out, name, reply)
-        })
     }
 
     /// Power-cycle: a new session, and the heartbeat, log threshold, and
@@ -784,73 +756,6 @@ mod tests {
         let setting = Announcement::parse(view.payload).unwrap();
         assert_eq!(setting.name, b"app.gain");
         assert_eq!(setting.reply, [9]);
-    }
-
-    #[test]
-    fn a_saved_configuration_comes_back_with_every_value_it_moved_announced() {
-        let mut device = device();
-        let mut gain = Setting::new("app.gain", 1u8).persistent();
-        let mut sent = Sent::default();
-        deliver(
-            &mut device,
-            b"dev.loglevel",
-            &[LogLevel::DEBUG.value()],
-            &mut sent,
-        );
-        device.apply(&mut gain, &[9], &mut sent).unwrap();
-
-        let mut image = Image::<64>::new();
-        let stored = device.save(&mut [&mut gain], &mut image).unwrap().to_vec();
-
-        device.reboot(SessionId::new(10));
-        gain.reset();
-
-        let mut sent = Sent::default();
-        assert_eq!(device.load(&mut [&mut gain], &stored, &mut sent), Ok(()));
-        assert_eq!(gain.get(), 9);
-        let announced: Vec<_> = sent
-            .views()
-            .iter()
-            .map(|view| Announcement::parse(view.payload).unwrap())
-            .map(|setting| (setting.name.to_vec(), setting.reply.to_vec()))
-            .collect();
-        assert_eq!(announced, [(b"app.gain".to_vec(), vec![9])]);
-
-        let mut sent = Sent::default();
-        assert_eq!(device.load(&mut [&mut gain], &stored, &mut sent), Ok(()));
-        assert!(sent.0.is_empty());
-
-        let mut sent = Sent::default();
-        deliver(&mut device, b"settings.version", &[], &mut sent);
-        assert!(
-            matches!(answered(&sent), Answer::Reply(reply) if reply.value == 1u32.to_le_bytes())
-        );
-    }
-
-    #[test]
-    fn a_stored_value_no_setting_takes_is_left_behind_or_left_as_a_load_error() {
-        let mut device = device();
-        let mut rate = Setting::new("app.rate", 1.0f64)
-            .checked(|value| (value > 0.0).then_some(value).ok_or(RpcError::Invalid))
-            .persistent();
-        let mut sent = Sent::default();
-
-        let unknown = [&[7u8, 1][..], b"app.old", &[3]].concat();
-        assert_eq!(device.load(&mut [&mut rate], &unknown, &mut sent), Ok(()));
-
-        let refused = [&[8u8, 8][..], b"app.rate", &(-1.0f64).to_le_bytes()].concat();
-        assert_eq!(
-            device.load(&mut [&mut rate], &refused, &mut sent),
-            Err(RpcError::Load)
-        );
-        assert_eq!(rate.get(), 1.0);
-
-        let truncated = &refused[..refused.len() - 1];
-        assert_eq!(
-            device.load(&mut [&mut rate], truncated, &mut sent),
-            Err(RpcError::Load)
-        );
-        assert!(sent.0.is_empty());
     }
 
     #[test]
