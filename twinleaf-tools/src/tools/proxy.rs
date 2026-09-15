@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::device::runtime;
@@ -27,24 +27,18 @@ use twinleaf::proto::rpc::RpcError;
 use twinleaf::proto::SessionId;
 use twinleaf::tio::{self, packet, proxy};
 use twinleaf_device::device::{Device, Handled, Identity};
-use twinleaf_device::rpc::{Access, Kind, RpcSpec};
+use twinleaf_device::rpc::{RpcSpec, CORE, STANDARD};
 use twinleaf_device::Sink;
 
-/// What the virtual hub answers: identity and introspection, nothing more.
-static HUB_RPCS: [RpcSpec; 12] = [
-    RpcSpec::std("rpc.name", Access::RW),
-    RpcSpec::std("rpc.id", Access::RW),
-    RpcSpec::std("rpc.info", Access::RW),
-    RpcSpec::std("rpc.list", Access::RW),
-    RpcSpec::std("rpc.listinfo", Access::RW),
-    RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
-    RpcSpec::prop("dev.name", Kind::String, Access::READ),
-    RpcSpec::prop("dev.desc", Kind::String, Access::READ),
-    RpcSpec::prop("dev.serial", Kind::String, Access::READ),
-    RpcSpec::prop("dev.firmware.serial", Kind::String, Access::READ),
-    RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
-    RpcSpec::std("dev.metadata", Access::RW),
-];
+/// What the virtual hub declares: the standard RPCs a device answers itself,
+/// since a proxy has no firmware, no flash, and nothing to acquire.
+static HUB_RPCS: LazyLock<Vec<RpcSpec>> = LazyLock::new(|| {
+    STANDARD
+        .iter()
+        .filter(|spec| CORE.contains(&spec.name))
+        .cloned()
+        .collect()
+});
 
 /// Holders log their own lifecycle in full and never relay device logs.
 fn init_proxy_logging(verbose: bool, debug: bool, detached: bool) {
@@ -990,7 +984,7 @@ impl ProxyServer {
                                     let (view, _) = PacketView::parse_prefix(pkt.as_bytes())
                                         .expect("a host packet is a wire packet");
                                     if let Handled::Rpc(call) = hub.handle(&(), view, &mut outbox) {
-                                        call.reply(Err(RpcError::NotFound), &mut outbox);
+                                        call.reply(Err(RpcError::State), &mut outbox);
                                     }
                                 }
                                 _ => log::debug!(

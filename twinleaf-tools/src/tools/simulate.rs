@@ -17,6 +17,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
 use twinleaf::proto::packet::{PacketType, PacketView};
@@ -27,7 +28,7 @@ use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::conf::Image;
 use twinleaf_device::device::{Call, Device, Handled, Identity};
 use twinleaf_device::hub::{CallError, Event, Events, Hub, Input, PortSink};
-use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec};
+use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec, STANDARD};
 use twinleaf_device::segments::{Params, Timeref};
 use twinleaf_device::settings::{Persisted, Setting};
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
@@ -167,56 +168,37 @@ const AUX_DEF: StreamDef = StreamDef {
     ],
 };
 
-/// The RPC table. Introspection first, like tl-chibi, and the order fixes
-/// the ids `rpc.list` reports and the `rpc.hash`.
-static RPCS: [RpcSpec; 29] = [
-    RpcSpec::std("rpc.name", Access::RW),
-    RpcSpec::std("rpc.id", Access::RW),
-    RpcSpec::std("rpc.info", Access::RW),
-    RpcSpec::std("rpc.list", Access::RW),
-    RpcSpec::std("rpc.listinfo", Access::RW),
-    RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
-    RpcSpec::prop("dev.name", Kind::String, Access::READ),
-    RpcSpec::prop("dev.desc", Kind::String, Access::READ),
-    RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
-    RpcSpec::prop(
-        "dev.loglevel",
-        Kind::Uint(1),
-        Access::RW.union(Access::PERSISTENT),
-    ),
-    RpcSpec::action("dev.start"),
-    RpcSpec::action("dev.stop"),
-    RpcSpec::action("dev.restart"),
-    RpcSpec::prop("dev.autostart", Kind::Uint(1), Access::RW),
-    RpcSpec::std("dev.firmware.upload", Access::RW),
-    RpcSpec::action("dev.firmware.upgrade"),
-    RpcSpec::action("dev.conf.save"),
-    RpcSpec::action("dev.conf.load"),
-    RpcSpec::action("dev.conf.reset"),
-    RpcSpec::std("dev.metadata", Access::RW),
-    RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
-    RpcSpec::prop("sync.status", Kind::Uint(1), Access::READ),
-    RpcSpec::prop(
-        "test.amplitude",
-        Kind::Float(8),
-        Access::RW.union(Access::PERSISTENT),
-    ),
-    RpcSpec::prop(
-        "test.frequency",
-        Kind::Float(8),
-        Access::RW.union(Access::PERSISTENT),
-    ),
-    RpcSpec::prop(
-        "test.noise",
-        Kind::Float(8),
-        Access::RW.union(Access::PERSISTENT),
-    ),
-    RpcSpec::prop("test.status", Kind::Uint(1), Access::RW),
-    RpcSpec::prop("test.enable", Kind::Bool, Access::RW),
-    RpcSpec::action("test.go"),
-    RpcSpec::std("test.capture", Access::READ)
-        .with_extra_meta(RpcMetaFlags::READABLE.union(RpcMetaFlags::CAPTURE).bits()),
-];
+/// The RPC table: the standard entries every platform declares, then the
+/// simulator's own.
+static RPCS: LazyLock<Vec<RpcSpec>> = LazyLock::new(|| {
+    STANDARD
+        .iter()
+        .cloned()
+        .chain([
+            RpcSpec::prop("dev.autostart", Kind::Uint(1), Access::RW),
+            RpcSpec::prop(
+                "test.amplitude",
+                Kind::Float(8),
+                Access::RW.union(Access::PERSISTENT),
+            ),
+            RpcSpec::prop(
+                "test.frequency",
+                Kind::Float(8),
+                Access::RW.union(Access::PERSISTENT),
+            ),
+            RpcSpec::prop(
+                "test.noise",
+                Kind::Float(8),
+                Access::RW.union(Access::PERSISTENT),
+            ),
+            RpcSpec::prop("test.status", Kind::Uint(1), Access::RW),
+            RpcSpec::prop("test.enable", Kind::Bool, Access::RW),
+            RpcSpec::action("test.go"),
+            RpcSpec::std("test.capture", Access::READ)
+                .with_extra_meta(RpcMetaFlags::READABLE.union(RpcMetaFlags::CAPTURE).bits()),
+        ])
+        .collect()
+});
 
 /// The values the `test.*` RPCs read and write.
 struct Settings {
@@ -926,7 +908,7 @@ impl Sim {
                     self.trigger_capture(now);
                 }
             }
-            _ => return Err(RpcError::NotFound),
+            _ => return Err(RpcError::State),
         }
         Ok(reply)
     }
@@ -1671,7 +1653,7 @@ impl Runtime {
         );
         terminal_println!(
             "  simulated flash: dev.conf.save keeps test.amplitude, test.frequency, \
-             test.noise and dev.loglevel across a reboot, dev.conf.reset erases them; \
+             test.noise across a reboot, dev.conf.reset erases them; \
              dev.firmware.upload takes chunks at its cursor, dev.firmware.upgrade commits"
         );
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
