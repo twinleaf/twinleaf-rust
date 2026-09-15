@@ -600,6 +600,23 @@ mod tests {
     }
 
     #[test]
+    fn the_standard_table_lists_every_name_the_device_answers_itself() {
+        let identity = Identity::new("dev", "Dev R1 (S) [fw]", "S", "fw").unwrap();
+        for name in table::CORE {
+            let mut device = Device::new(identity.clone(), SessionId::new(9), table::STANDARD);
+            let mut sent = Sent::default();
+            let packet = request(Method::ByName(name.as_bytes()), &[], &[]);
+            let (view, _) = PacketView::parse_prefix(&packet).unwrap();
+            let handled = device.handle(&OneStream, view, &mut sent);
+            assert!(matches!(handled, Handled::Done), "{name} was handed back");
+            assert!(
+                !matches!(answered(&sent), Answer::Error(error) if error.error() == RpcError::NotFound),
+                "{name} is missing from STANDARD"
+            );
+        }
+    }
+
+    #[test]
     fn bad_requests_are_refused() {
         let mut device = device();
         let mut sent = Sent::default();

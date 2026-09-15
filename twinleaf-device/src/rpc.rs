@@ -178,6 +178,54 @@ impl RpcSpec {
     }
 }
 
+/// The RPCs every Twinleaf platform declares, in the id order that is on the
+/// wire: tl-chibi's `tl_firmware_start`, then what it does not fix.
+///
+/// A platform that does not implement a listed RPC answers [`RpcError::State`].
+pub static STANDARD: &[RpcSpec] = &[
+    RpcSpec::std("dev.metadata", Access::RW),
+    RpcSpec::prop("dev.systime", Kind::Uint(8), Access::READ),
+    RpcSpec::action("dev.reboot"),
+    RpcSpec::prop("dev.loglevel", Kind::Uint(1), Access::RW),
+    RpcSpec::prop("dev.name", Kind::String, Access::READ),
+    RpcSpec::prop("dev.model", Kind::String, Access::READ),
+    RpcSpec::std("dev.uid", Access::READ),
+    RpcSpec::prop("dev.serial", Kind::String, Access::READ),
+    RpcSpec::prop("dev.revision", Kind::Uint(2), Access::READ),
+    RpcSpec::prop("dev.desc", Kind::String, Access::READ),
+    RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("dev.mcu.model", Kind::String, Access::READ),
+    RpcSpec::prop("dev.firmware.serial", Kind::String, Access::READ),
+    RpcSpec::action("dev.conf.load"),
+    RpcSpec::action("dev.conf.save"),
+    RpcSpec::action("dev.conf.reset"),
+    RpcSpec::prop("dev.uptime", Kind::Uint(4), Access::READ),
+    RpcSpec::std("dev.firmware.upload", Access::RW),
+    RpcSpec::action("dev.firmware.upgrade"),
+    RpcSpec::std("rpc.name", Access::RW),
+    RpcSpec::std("rpc.id", Access::RW),
+    RpcSpec::std("rpc.info", Access::RW),
+    RpcSpec::std("rpc.list", Access::RW),
+    RpcSpec::std("rpc.listinfo", Access::RW),
+    RpcSpec::std("rpc.match", Access::RW),
+    RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
+    RpcSpec::action("dev.start"),
+    RpcSpec::action("dev.stop"),
+    RpcSpec::action("dev.restart"),
+    RpcSpec::action("dev.firmware.abort"),
+    RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
+    RpcSpec::prop("sync.status", Kind::Uint(1), Access::READ),
+];
+
+/// The [`STANDARD`] names [`Device`](crate::device::Device) answers itself, so
+/// a platform that is only a device declares these and no more.
+#[rustfmt::skip]
+pub const CORE: &[&str] = &[
+    "dev.metadata", "dev.loglevel", "dev.name", "dev.serial", "dev.desc",
+    "dev.session", "dev.firmware.serial", "rpc.name", "rpc.id", "rpc.info",
+    "rpc.list", "rpc.listinfo", "rpc.hash", "settings.version",
+];
+
 /// `rpc.hash`: a CRC32 over each entry's name, flags, description, and
 /// signature, in table order.
 pub fn hash(table: &[RpcSpec]) -> u32 {
@@ -315,6 +363,14 @@ mod tests {
         let mut resig = table;
         resig[0].signature = "u32";
         assert_ne!(base, hash(&resig));
+    }
+
+    #[test]
+    fn the_standard_table_order_is_pinned() {
+        assert_eq!(STANDARD.len(), 32);
+        assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
+        assert_eq!(STANDARD.last().unwrap().name, "sync.status");
+        assert_eq!(hash(STANDARD), 0xde3e_d53f);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 What a Twinleaf device does with the packets it receives and the samples it
-takes: the RPC table and its introspection, stream segments, metadata,
+takes: the standard RPC table and its introspection, stream segments, metadata,
 settings, log messages, and heartbeats.
 [`twinleaf-proto`](https://docs.rs/twinleaf-proto) encodes the packets; this
 crate is the state between them.
