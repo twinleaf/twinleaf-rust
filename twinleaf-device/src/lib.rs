@@ -23,3 +23,9 @@ pub trait Sink {
     /// Send one complete packet.
     fn send(&mut self, packet: &[u8]);
 }
+
+impl<S: Sink + ?Sized> Sink for &mut S {
+    fn send(&mut self, packet: &[u8]) {
+        (**self).send(packet);
+    }
+}
