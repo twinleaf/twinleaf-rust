@@ -20,7 +20,7 @@ use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::conf::{self, Image};
 use crate::metadata::{self, Streams};
-use crate::rpc::{self as table, put, Reply, RpcSpec};
+use crate::rpc::{self as table, read, Reply, RpcSpec};
 use crate::settings::{Changed, Persisted, Scalar, Setting};
 use crate::Sink;
 
@@ -196,12 +196,12 @@ impl<'t> Device<'t> {
             "rpc.info" => table::info(self.table, args, &mut reply),
             "rpc.list" => table::list(self.table, args, false, &mut reply),
             "rpc.listinfo" => table::list(self.table, args, true, &mut reply),
-            "rpc.hash" => read(args, &self.hash.to_le_bytes(), &mut reply),
-            "dev.name" => read(args, self.identity.name.as_bytes(), &mut reply),
-            "dev.desc" => read(args, self.identity.desc.as_bytes(), &mut reply),
-            "dev.serial" => read(args, self.identity.serial.as_bytes(), &mut reply),
-            "dev.firmware.serial" => read(args, self.identity.firmware.as_bytes(), &mut reply),
-            "dev.session" => read(args, &self.session.to_le_bytes(), &mut reply),
+            "rpc.hash" => read(&mut reply, args, &self.hash.to_le_bytes()),
+            "dev.name" => read(&mut reply, args, self.identity.name.as_bytes()),
+            "dev.desc" => read(&mut reply, args, self.identity.desc.as_bytes()),
+            "dev.serial" => read(&mut reply, args, self.identity.serial.as_bytes()),
+            "dev.firmware.serial" => read(&mut reply, args, self.identity.firmware.as_bytes()),
+            "dev.session" => read(&mut reply, args, &self.session.to_le_bytes()),
             "dev.loglevel" => write(
                 &mut self.settings_version,
                 &mut self.loglevel,
@@ -209,7 +209,7 @@ impl<'t> Device<'t> {
                 &mut reply,
                 out,
             ),
-            "settings.version" => read(args, &self.settings_version.to_le_bytes(), &mut reply),
+            "settings.version" => read(&mut reply, args, &self.settings_version.to_le_bytes()),
             "dev.metadata" => metadata::reply(self.record(streams), streams, args, &mut reply),
             _ => {
                 return Handled::Rpc(Call {
@@ -337,13 +337,6 @@ impl<'t> Device<'t> {
 }
 
 /// A read-only property: an argument is a write.
-fn read(args: &[u8], value: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    if !args.is_empty() {
-        return Err(RpcError::ReadOnly);
-    }
-    put(out, value)
-}
-
 /// Answer a setting's RPC, announcing the value a write left and counting it
 /// in `settings.version`.
 fn write<T: Scalar>(

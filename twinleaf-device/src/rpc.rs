@@ -295,6 +295,14 @@ pub fn put(out: &mut Reply, bytes: &[u8]) -> Result<(), RpcError> {
     out.extend_from_slice(bytes).map_err(|_| RpcError::NoBufs)
 }
 
+/// Answer a read-only property with `value`, refusing a write.
+pub fn read(out: &mut Reply, args: &[u8], value: &[u8]) -> Result<(), RpcError> {
+    if !args.is_empty() {
+        return Err(RpcError::ReadOnly);
+    }
+    put(out, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
