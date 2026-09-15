@@ -74,6 +74,10 @@ tio list
 tio list --local   # serial ports only
 ```
 
+Use ↑/↓ to browse the tree and ←/→ to collapse or expand nodes.
+Tab/Shift+Tab switch devices. Enter uses the selected subtree; Space
+marks multiple subtrees to serve together.
+
 Serve several devices from one proxy by mounting each at a route prefix, or
 narrow a hub to one subtree:
 

@@ -9,6 +9,7 @@ mod nmea;
 
 pub use list::run_list;
 
+use crate::tui::selector::PickedSubtree;
 use crate::{MountArg, ProxyCli, ProxySubcommands};
 #[cfg(feature = "mdns")]
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use twinleaf::device::discovery::{self, DiscoveredDevice, PortInterface};
+use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::device::runtime;
 use twinleaf::proto;
 use twinleaf::proto::log::LogLevel;
@@ -121,10 +122,15 @@ pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
 /// Make the devices picked in `tio proxy list` the default for every tool
 /// until Ctrl-C: one device by staying connected to it, several by hosting a
 /// hub of them.
-pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyre::Result<()> {
+pub fn run_proxy_for(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     use clap::Parser;
-    if let [(device, route)] = picked.as_slice() {
-        if route.is_empty() {
+    if let [PickedSubtree {
+        device,
+        source,
+        prefix,
+    }] = picked.as_slice()
+    {
+        if source.is_empty() && prefix.is_empty() {
             let _connection = twinleaf::Connection::open(&device.url)?;
             println!(
                 "Using {} as the default while this runs. Ctrl-C to stop.",
@@ -142,12 +148,19 @@ pub fn run_proxy_for(picked: Vec<(DiscoveredDevice, proto::DeviceRoute)>) -> eyr
         Layout {
             mounts: picked
                 .into_iter()
-                .map(|(device, prefix)| Mount {
-                    locator: device.url,
-                    prefix,
-                    auto_detected: false,
-                    picked_name: device.name,
-                })
+                .map(
+                    |PickedSubtree {
+                         device,
+                         source,
+                         prefix,
+                     }| Mount {
+                        locator: device.url,
+                        source,
+                        prefix,
+                        auto_detected: false,
+                        picked_name: device.name,
+                    },
+                )
                 .collect(),
         },
     )?
@@ -195,6 +208,7 @@ impl From<&ProxyCli> for ProxyConfig {
 #[derive(Debug, Clone)]
 struct Mount {
     locator: String,
+    source: proto::DeviceRoute,
     prefix: proto::DeviceRoute,
     auto_detected: bool,
     /// Device name when chosen through the `tio proxy list` picker.
@@ -224,6 +238,7 @@ impl Layout {
                 .into_iter()
                 .map(|arg| Mount {
                     locator: arg.locator,
+                    source: proto::DeviceRoute::root(),
                     prefix: arg.prefix,
                     auto_detected: false,
                     picked_name: None,
@@ -244,6 +259,7 @@ fn resolve_root_mount(sensor_url: Option<String>) -> eyre::Result<Mount> {
 
     Ok(Mount {
         locator,
+        source: proto::DeviceRoute::root(),
         prefix: proto::DeviceRoute::root(),
         auto_detected,
         picked_name: None,
@@ -286,7 +302,8 @@ fn auto_detect_serial() -> eyre::Result<String> {
 /// events, and the server's own monitoring port on it.
 struct DeviceLink {
     prefix: proto::DeviceRoute,
-    interface: proxy::Connection,
+    source: proto::DeviceRoute,
+    interface: Arc<proxy::Connection>,
     status_rx: crossbeam::channel::Receiver<proxy::Event>,
     monitor_port: proxy::Port,
 }
@@ -377,7 +394,14 @@ impl ProxyServer {
         let mounts: Vec<_> = layout
             .mounts
             .iter()
-            .map(|mount| (mount.locator.clone(), mount.prefix))
+            .map(|mount| {
+                let identity = if mount.source.is_empty() {
+                    mount.locator.clone()
+                } else {
+                    format!("{}#subtree={}", mount.locator, mount.source)
+                };
+                (identity, mount.prefix)
+            })
             .collect();
         let key = runtime::front_door_key(&mounts, config.subtree, config.tcp_port);
         match runtime::Holder::claim(&key) {
@@ -402,7 +426,14 @@ impl ProxyServer {
             .layout
             .mounts
             .iter()
-            .map(|mount| mount.picked_name.as_deref().unwrap_or(&mount.locator))
+            .map(|mount| {
+                format!(
+                    "{} ({} → {})",
+                    mount.picked_name.as_deref().unwrap_or(&mount.locator),
+                    mount.source,
+                    mount.prefix
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         match self.config.subtree.is_empty() {
@@ -436,24 +467,35 @@ impl ProxyServer {
         // (used by discovery) waits on — which would deadlock advertising.
         struct PendingLink {
             prefix: proto::DeviceRoute,
+            source: proto::DeviceRoute,
             locator: String,
-            interface: proxy::Connection,
+            interface: Arc<proxy::Connection>,
             status_rx: crossbeam::channel::Receiver<proxy::Event>,
         }
         let mut pending = Vec::with_capacity(self.layout.mounts.len());
+        let mut interfaces = std::collections::HashMap::<String, Arc<proxy::Connection>>::new();
         for mount in &self.layout.mounts {
             let locator = match self.foreground {
                 true => runtime::resolve(&mount.locator)?,
                 false => mount.locator.clone(),
             };
-            let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
-            let interface = proxy::Connection::open_with(
-                &locator,
-                self.config.reconnect_timeout,
-                Some(status_send),
-            );
+            // Several disjoint subtrees can share one physical transport.
+            // Only the first link receives connection-wide status events.
+            let (interface, status_rx) = if let Some(interface) = interfaces.get(&locator) {
+                (interface.clone(), crossbeam::channel::never())
+            } else {
+                let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
+                let interface = Arc::new(proxy::Connection::open_with(
+                    &locator,
+                    self.config.reconnect_timeout,
+                    Some(status_send),
+                ));
+                interfaces.insert(locator, interface.clone());
+                (interface, status_rx)
+            };
             pending.push(PendingLink {
                 prefix: mount.prefix,
+                source: mount.source.absolute_route(&self.config.subtree)?,
                 locator: mount.locator.clone(),
                 interface,
                 status_rx,
@@ -467,7 +509,7 @@ impl ProxyServer {
         #[cfg(feature = "mdns")]
         let _mdns = {
             let interfaces: Vec<&proxy::Connection> =
-                pending.iter().map(|p| &p.interface).collect();
+                pending.iter().map(|p| p.interface.as_ref()).collect();
             self.advertise_mdns(&interfaces)
         };
 
@@ -476,30 +518,25 @@ impl ProxyServer {
         // loop below drains these immediately, so they never back up.
         let mut links = Vec::with_capacity(pending.len());
         for p in pending {
-            let monitor_port = match proxy::open_port(
-                &p.interface,
-                None,
-                self.config.subtree,
-                usize::MAX,
-                true,
-                true,
-            ) {
-                Ok(port) => port,
-                Err(e) => {
-                    let last_status = p.status_rx.iter().last();
-                    let err = eyre::Report::new(e)
-                        .wrap_err(format!("could not open port on {}", p.locator));
-                    return Err(if let Some(status) = last_status {
-                        err.with_section(move || {
-                            format!("{:?}", status).header("Last proxy event:")
-                        })
-                    } else {
-                        err
-                    });
-                }
-            };
+            let monitor_port =
+                match proxy::open_port(&p.interface, None, p.source, usize::MAX, true, true) {
+                    Ok(port) => port,
+                    Err(e) => {
+                        let last_status = p.status_rx.try_iter().last();
+                        let err = eyre::Report::new(e)
+                            .wrap_err(format!("could not open port on {}", p.locator));
+                        return Err(if let Some(status) = last_status {
+                            err.with_section(move || {
+                                format!("{:?}", status).header("Last proxy event:")
+                            })
+                        } else {
+                            err
+                        });
+                    }
+                };
             links.push(DeviceLink {
                 prefix: p.prefix,
+                source: p.source,
                 interface: p.interface,
                 status_rx: p.status_rx,
                 monitor_port,
@@ -507,7 +544,11 @@ impl ProxyServer {
         }
 
         if !self.foreground {
+            let mut ready = std::collections::HashSet::new();
             for link in &links {
+                if !ready.insert(Arc::as_ptr(&link.interface)) {
+                    continue;
+                }
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     match link.status_rx.recv_deadline(deadline) {
@@ -665,13 +706,22 @@ impl ProxyServer {
                     ""
                 }
             );
+            if !mounts[0].source.is_empty() {
+                println!(
+                    "  Mapping: {} → / (including descendants)",
+                    mounts[0].source
+                );
+            }
         } else {
             println!("  Mounts:");
             for mount in mounts {
-                match mount.picked_name.as_deref() {
-                    Some(name) => println!("    {}  {}  ({})", mount.prefix, mount.locator, name),
-                    None => println!("    {}  {}", mount.prefix, mount.locator),
-                }
+                println!(
+                    "    {}  {} → {}  ({})",
+                    mount.locator,
+                    mount.source,
+                    mount.prefix,
+                    mount.picked_name.as_deref().unwrap_or("device")
+                );
             }
         }
         if self.foreground {
@@ -779,7 +829,7 @@ impl ProxyServer {
             let port = proxy::open_port(
                 &link.interface,
                 Some(Duration::from_millis(2000)),
-                self.config.subtree,
+                link.source,
                 usize::MAX,
                 true,
                 true,
