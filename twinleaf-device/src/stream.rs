@@ -394,8 +394,8 @@ mod tests {
         assert_eq!(streams[0].current().timeref().start_time, 1001);
     }
 
-    /// D8: no segment spans a change of traceability, and the one begun
-    /// without it is flagged.
+    /// D8: no segment spans a change of holdover, and the one begun in it is
+    /// flagged.
     #[test]
     fn a_holdover_rollover_flags_the_segment_it_opens() {
         let mut streams = started();

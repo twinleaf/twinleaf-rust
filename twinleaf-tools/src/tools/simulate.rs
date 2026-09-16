@@ -36,7 +36,7 @@ use twinleaf_device::settings::Setting;
 use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
 use twinleaf_device::sync::{
     ticks, AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig,
-    Reference, ReferenceIdentity, ScheduledEdge, Synchronizer,
+    Reference, ReferenceIdentity, ScheduledEdge, Synchronizer, TimeStatus,
 };
 use twinleaf_device::update::{Envelope, Upload};
 use twinleaf_device::Sink;
@@ -588,7 +588,7 @@ struct Sim {
     plan: Option<u16>,
     acquiring: bool,
     /// What the streams were last told, which a change rolls them over.
-    traceable: bool,
+    holdover: bool,
     rate: NonZeroU32,
     segment_seconds: u32,
     started_ns: u64,
@@ -626,7 +626,7 @@ impl Sim {
             announced: None,
             plan: None,
             acquiring: false,
-            traceable: true,
+            holdover: false,
             sync: synchronizer(role, session, &serial_of(role, port), now),
             rate,
             segment_seconds: cli.segment_seconds,
@@ -774,7 +774,7 @@ impl Sim {
         self.announced = None;
         self.plan = None;
         self.acquiring = false;
-        self.traceable = true;
+        self.holdover = false;
         self.capture.clear();
         self.next_log_at = now + next_log_delay(&mut self.rng);
         self.next_log_level = 0;
@@ -836,7 +836,7 @@ impl Sim {
             AcquisitionAction::Stop => self.stop_run(),
         }
         if let Some(status) = actions.status_changed {
-            self.follow_traceability(status.traceable);
+            self.follow_holdover(status.announced == TimeStatus::Holdover);
         }
         if let Some(announce) = actions.announce {
             self.announced = Some((at, announce));
@@ -882,15 +882,15 @@ impl Sim {
         self.notes.push("acquisition stopped".to_string());
     }
 
-    /// A change of traceability ends the segment it happened in, and the one
-    /// that opens says whether the pulses were there.
-    fn follow_traceability(&mut self, traceable: bool) {
-        if self.traceable == traceable {
+    /// A change of holdover ends the segment it happened in, and the one that
+    /// opens says whether the pulses that named its seconds were there.
+    fn follow_holdover(&mut self, holdover: bool) {
+        if self.holdover == holdover {
             return;
         }
-        self.traceable = traceable;
+        self.holdover = holdover;
         for stream in &mut self.streams {
-            stream.set_holdover(!traceable);
+            stream.set_holdover(holdover);
             stream.rollover();
         }
     }
@@ -1961,7 +1961,7 @@ mod tests {
     use twinleaf::proto::RpcRequestId;
     use twinleaf_device::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
-    use twinleaf_device::sync::{ReferenceState, TimeStatus};
+    use twinleaf_device::sync::ReferenceState;
     use twinleaf_device::update::{Header, BLOCK_SIZE, DATA_MAX};
 
     /// A round wall-clock second to boot the simulated device at.
@@ -2497,7 +2497,7 @@ mod tests {
         assert_eq!(sine(&sim).timeref().serial, PARENT_SERIAL);
         assert_eq!(sine(&sim).timeref().session, SessionId::new(PARENT_SESSION));
         assert!(sine(&sim).timeref().start_time > PARENT_OFFSET);
-        assert!(sim.traceable);
+        assert!(!sim.holdover);
     }
 
     /// The 'p' key's demonstration: the pulses go away, the segment ends, and
@@ -2508,7 +2508,7 @@ mod tests {
         let mut sent = Sent::default();
         let mut at = now + NANOS_PER_SECOND;
         sim.tick(at, &mut sent);
-        assert!(sim.traceable);
+        assert!(!sim.holdover);
         assert_eq!(
             sine_flags(&sim),
             data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE
@@ -2519,7 +2519,7 @@ mod tests {
             at += NANOS_PER_SECOND;
             sim.tick(at, &mut sent);
         }
-        assert!(!sim.traceable);
+        assert!(sim.holdover);
         assert_eq!(sim.sync.status().announced, TimeStatus::Holdover);
         assert_eq!(
             sine_flags(&sim),
@@ -2528,16 +2528,17 @@ mod tests {
         assert_eq!(sine(&sim).id().value(), 1);
     }
 
-    /// D8: a device whose pulses never arrived says so in the segments it
-    /// opens, not only in the ones a later change rolls over to.
+    /// D8: a device whose pulses never arrived has nothing to hold over from,
+    /// so the segments it opens carry no flag.
     #[test]
-    fn a_device_that_never_had_pulses_flags_its_first_segment() {
+    fn a_device_that_never_had_pulses_opens_unflagged_segments() {
         let (mut sim, now) = acquiring(&["--samplerate", "4", "--no-pps"]);
         sim.tick(now + NANOS_PER_SECOND, &mut Sent::default());
-        assert!(!sim.traceable);
+        assert!(!sim.holdover);
+        assert_eq!(sim.sync.status().announced, TimeStatus::FreeRun);
         assert_eq!(
             sine_flags(&sim),
-            data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE | data::SegmentFlags::HOLDOVER
+            data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE
         );
     }
 
@@ -2748,7 +2749,7 @@ mod tests {
             assert!(child.sim.acquiring);
             assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
             assert_eq!(sine(&child.sim).timeref().session, session);
-            assert!(child.sim.traceable);
+            assert!(!child.sim.holdover);
         }
     }
 
@@ -2764,10 +2765,10 @@ mod tests {
         tree.reboot_root(at, &mut sent);
         let at = run(&mut tree, at, 3);
         assert_ne!(tree.root.control.device().session, rebooted);
-        assert!(tree
-            .children
-            .iter()
-            .all(|child| sine_flags(&child.sim).contains(data::SegmentFlags::HOLDOVER)));
+        assert!(tree.children.iter().all(|child| {
+            child.sim.sync.status().announced == TimeStatus::Holdover
+                && sine_flags(&child.sim).contains(data::SegmentFlags::HOLDOVER)
+        }));
 
         run(&mut tree, at, 12);
         let session = tree.root.control.device().session;

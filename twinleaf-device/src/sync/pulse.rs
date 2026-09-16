@@ -103,6 +103,9 @@ enum Mode {
 #[derive(Debug, Clone, Copy)]
 struct Train {
     mode: Mode,
+    /// Whether an outside pulse has been accepted: the synthetic bootstrap
+    /// edge anchors the counter without establishing a train.
+    external: bool,
     /// Displacement since this train's last accepted pulse, whole seconds plus
     /// a residual under half a period. It accumulates across rejected spurs.
     pending_seconds: u32,
@@ -119,6 +122,7 @@ impl Train {
     const fn new() -> Self {
         Self {
             mode: Mode::Empty,
+            external: false,
             pending_seconds: 0,
             pending_delta: 0,
             spurious_count: 0,
@@ -180,6 +184,7 @@ impl Train {
             Mode::Empty => Mode::Fresh,
             _ => Mode::Tracking,
         };
+        self.external = true;
 
         if self.spurious_count == 0 {
             self.good_pulse_count = self.good_pulse_count.saturating_add(1);
@@ -254,6 +259,9 @@ impl PulseTracker {
     }
 
     pub(crate) fn state(&self) -> PulseState {
+        if !self.main.external {
+            return PulseState::FreeRunning;
+        }
         let good = self.main.good_pulse_count;
         match self.main.mode {
             Mode::Empty => PulseState::FreeRunning,
@@ -312,8 +320,11 @@ impl PulseTracker {
         self.main = Train::new();
         self.tentative = Train::new();
         self.last_raw_time_ns = None;
-        self.capture(pulse_edge, monotonic_ns)
-            .expect("an empty pulse tracker accepts its first edge")
+        let event = self
+            .capture(pulse_edge, monotonic_ns)
+            .expect("an empty pulse tracker accepts its first edge");
+        self.main.external = false;
+        event
     }
 
     /// Capture a raw rising edge. `monotonic_ns` need not share a frequency
@@ -599,6 +610,18 @@ mod tests {
         );
         assert_eq!(tracker.target_edge(), Some(500_000));
         assert_eq!(tracker.next_poll_deadline_ns(), Some(2_010_000_001));
+    }
+
+    #[test]
+    fn a_bootstrap_edge_never_establishes_a_train() {
+        let mut tracker = new_tracker();
+        tracker.bootstrap(500_000, 0);
+        assert_eq!(tracker.state(), PulseState::FreeRunning);
+        assert_eq!(tracker.poll(1_500_000_000), Some(SecondEvent::Missed));
+        assert_eq!(tracker.state(), PulseState::FreeRunning);
+
+        assert_eq!(captured(tracker.capture(500_000, 2_020_000_000)), 0);
+        assert_eq!(tracker.state(), PulseState::Acquiring { good_pulses: 1 });
     }
 
     /// The pre-refactor implementation, kept verbatim as a differential oracle.
@@ -1033,7 +1056,14 @@ mod tests {
             }
 
             fn agree(&self, what: &str) {
-                assert_eq!(self.new.state(), self.old.state(), "state after {what}");
+                assert_eq!(
+                    self.new.state(),
+                    match self.new.main.external {
+                        true => self.old.state(),
+                        false => PulseState::FreeRunning,
+                    },
+                    "state after {what}"
+                );
                 assert_eq!(
                     self.new.target_edge(),
                     self.old.target_edge(),

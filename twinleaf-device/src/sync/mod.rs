@@ -123,12 +123,6 @@ impl TimeStatus {
         self.code() << 6
     }
 
-    /// Whether seconds from a source in this state are traceable. A legacy
-    /// hub said nothing, and is taken at its word.
-    pub const fn traceable(self) -> bool {
-        matches!(self, Self::Legacy | Self::Locked)
-    }
-
     /// The poorer of two statuses, which is what a hub passes on.
     pub const fn worse(self, other: Self) -> Self {
         if other.rank() < self.rank() {
@@ -171,8 +165,6 @@ pub struct Status {
     pub correction_ppm: Option<f32>,
     /// Whether the servo is against its pull limit.
     pub correction_saturated: bool,
-    /// Whether the active seconds are traceable to the source naming them.
-    pub traceable: bool,
     /// What this device's pad byte says its own time is worth, and what
     /// `sync.status` reports.
     pub announced: TimeStatus,
@@ -414,12 +406,6 @@ impl ReferenceTracker {
 
     pub(crate) const fn active(&self) -> Reference {
         self.active
-    }
-
-    /// Whether the active reference came from a source rather than from the
-    /// device's own timeline.
-    pub(crate) const fn is_upstream(&self) -> bool {
-        self.active_is_upstream
     }
 
     pub(crate) fn state(&self) -> ReferenceState {
@@ -782,7 +768,7 @@ struct Summary {
     pulse: Discriminant<PulseState>,
     reference: Discriminant<ReferenceState>,
     acquisition: AcquisitionState,
-    traceable: bool,
+    announced: TimeStatus,
 }
 
 /// Everything a device needs to follow a PPS input and schedule acquisitions.
@@ -799,6 +785,9 @@ pub struct Synchronizer {
     divergences: u32,
     late_references: u32,
     upstream: TimeStatus,
+    /// Whether a pulse train ever qualified: without one there is nothing to
+    /// hold over, and a later absence is still free-run.
+    qualified_once: bool,
     sequence: Option<Sequence>,
     reported: Option<Summary>,
     /// Second events processed since construction. Bootstrap happens on the
@@ -828,6 +817,7 @@ impl Synchronizer {
             divergences: 0,
             late_references: 0,
             upstream: TimeStatus::Legacy,
+            qualified_once: false,
             sequence: None,
             reported: None,
             seconds: 0,
@@ -847,7 +837,6 @@ impl Synchronizer {
             phase_error_ns: self.pulses.phase_error_ns(),
             correction_ppm: self.servo.map(|servo| servo.output_ppm()),
             correction_saturated: self.servo.is_some_and(|servo| servo.saturated()),
-            traceable: self.traceable(),
             announced: self.announced(),
             upstream: self.upstream,
             spurs: self.pulses.spur_count(),
@@ -862,15 +851,6 @@ impl Synchronizer {
     /// The counter the pulses are measured against.
     pub const fn domain(&self) -> CounterDomain {
         self.pulses.domain()
-    }
-
-    /// Whether the active seconds are traceable to the source naming them. Its
-    /// own timescale needs no proof; anything else must be locked to what it
-    /// follows.
-    pub fn traceable(&self) -> bool {
-        let own_timescale = !self.references.is_upstream()
-            && self.references.active().identity.epoch != Epoch::UNIX;
-        own_timescale || (self.pulses.state().is_locked() && self.upstream.traceable())
     }
 
     /// Earliest monotonic nanosecond at which [`Self::poll`] can advance the
@@ -1047,6 +1027,7 @@ impl Synchronizer {
             SecondEvent::Switched => (1, false),
         };
 
+        self.qualified_once |= qualified;
         self.seconds = self.seconds.saturating_add(steps);
         self.last_second_ns = Some(monotonic_ns);
         for _ in 1..steps {
@@ -1092,12 +1073,14 @@ impl Synchronizer {
     }
 
     /// What this device announces its time is worth: the poorer of what its
-    /// pulses are worth and what upstream said.
+    /// own seconds are worth and what upstream said.
     fn announced(&self) -> TimeStatus {
-        let own = match self.pulses.state() {
-            PulseState::Locked => TimeStatus::Locked,
-            PulseState::Holdover { .. } => TimeStatus::Holdover,
-            PulseState::FreeRunning | PulseState::Acquiring { .. } => TimeStatus::FreeRun,
+        let own = if self.pulses.state().is_locked() {
+            TimeStatus::Locked
+        } else if self.qualified_once {
+            TimeStatus::Holdover
+        } else {
+            TimeStatus::FreeRun
         };
         own.worse(self.upstream)
     }
@@ -1138,7 +1121,7 @@ impl Synchronizer {
             pulse: discriminant(&self.pulses.state()),
             reference: discriminant(&self.references.state()),
             acquisition: self.acquisition.state(),
-            traceable: self.traceable(),
+            announced: self.announced(),
         };
         if self.reported != Some(summary) {
             self.reported = Some(summary);
@@ -1426,7 +1409,7 @@ mod synchronizer_tests {
             let actions = sync.poll(second * NANOS_PER_SECOND + 500_000_000);
             assert!(actions.second);
             assert_eq!(actions.set_edge, None);
-            assert!(matches!(sync.status().pulse, PulseState::Holdover { .. }));
+            assert_eq!(sync.status().pulse, PulseState::FreeRunning);
             assert_eq!(sync.bootstrap(0, second * NANOS_PER_SECOND), Actions::NONE);
             if let AcquisitionAction::Start(edge) = actions.local {
                 assert_eq!(edge.counter_edge, 100_000);
@@ -1471,10 +1454,7 @@ mod synchronizer_tests {
 
         let actions = sync.poll(9_500_000_000);
         assert!(actions.second);
-        assert_eq!(
-            sync.status().pulse,
-            PulseState::Holdover { missed_pulses: 4 }
-        );
+        assert_eq!(sync.status().pulse, PulseState::FreeRunning);
         assert_eq!(sync.status().active.second, 9);
     }
 
@@ -1488,10 +1468,6 @@ mod synchronizer_tests {
         assert_eq!(sync.next_poll_deadline_ns(), Some(deadline));
         assert_eq!(sync.poll(deadline - 1), Actions::NONE);
         assert!(sync.poll(deadline).second);
-        assert_eq!(
-            sync.status().pulse,
-            PulseState::Holdover { missed_pulses: 1 }
-        );
         assert_eq!(
             sync.next_poll_deadline_ns(),
             Some(deadline + NANOS_PER_SECOND)
@@ -1715,69 +1691,106 @@ mod synchronizer_tests {
         assert_eq!(after.active.identity, adopted.active.identity);
         assert_eq!(after.active.second, adopted.active.second + 1000);
         assert_eq!(after.pulse, PulseState::Holdover { missed_pulses: 255 });
-        assert!(!after.traceable);
+        assert_eq!(after.announced, TimeStatus::Holdover);
     }
 
-    /// D8: what the recording is flagged by, and what tells the runtime to
-    /// roll a segment over.
+    /// D8: a synthetic bootstrap edge is not a train to hold over from, so a
+    /// device that never saw a pulse keeps announcing free-run.
     #[test]
-    fn traceability_follows_the_pulses_and_is_reported_when_it_changes() {
+    fn a_device_with_no_pulse_train_announces_free_run_forever() {
         let mut sync = synchronizer();
-        assert!(
-            sync.traceable(),
-            "the epoch already says a systime device keeps its own time"
-        );
+        assert_eq!(sync.status().announced, TimeStatus::FreeRun);
 
-        for second in 3..7u64 {
-            let now = second * NANOS_PER_SECOND;
-            sync.poll(now);
-            sync.capture(EDGE, now);
-            sync.observe_packet(packet(500 + second as u32), pad(0, TimeStatus::Legacy), now);
+        assert_eq!(sync.wake(EDGE, 0).set_edge, Some(EDGE));
+        let bootstrapped = sync.status().active.second;
+        for second in 1..200u64 {
+            sync.poll(second * NANOS_PER_SECOND + NANOS_PER_SECOND / 2);
         }
-        assert_eq!(sync.status().reference, ReferenceState::Upstream);
-        assert!(sync.traceable());
+        assert_eq!(sync.status().pulse, PulseState::FreeRunning);
+        assert_eq!(sync.status().announced, TimeStatus::FreeRun);
+        assert_eq!(sync.status().active.second, bootstrapped + 199);
+    }
 
-        let lost = (7..10u64)
+    /// D8: an established train that goes away is what holdover means, and the
+    /// change is reported once so the runtime can roll its segments over.
+    #[test]
+    fn a_train_that_goes_silent_announces_holdover_and_says_so_once() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+        assert_eq!(sync.status().announced, TimeStatus::Locked);
+
+        let lost = (4..8u64)
             .map(|second| sync.poll(second * NANOS_PER_SECOND + NANOS_PER_SECOND / 2))
             .find_map(|actions| actions.status_changed)
             .expect("holdover is a status change");
-        assert!(!lost.traceable);
+        assert_eq!(lost.announced, TimeStatus::Holdover);
         assert_eq!(lost.pulse, PulseState::Holdover { missed_pulses: 1 });
+        assert!((8..12u64).all(|second| sync
+            .poll(second * NANOS_PER_SECOND)
+            .status_changed
+            .is_none()));
+    }
 
-        let mut hub = synchronizer();
-        run(&mut hub, 3);
-        for second in 3..7u64 {
-            let now = second * NANOS_PER_SECOND;
-            hub.poll(now);
-            hub.capture(EDGE, now);
-            hub.observe_packet(
-                packet(500 + second as u32),
-                pad(second as u8, TimeStatus::Holdover),
-                now,
-            );
-        }
-        assert_eq!(hub.status().pulse, PulseState::Locked);
-        assert!(!hub.traceable());
+    /// D8: pulses that come back are not a reference until they qualify, so a
+    /// train that lapsed is held over until it locks again.
+    #[test]
+    fn a_re_acquiring_train_stays_in_holdover_until_it_locks() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+        sync.poll(4 * NANOS_PER_SECOND + NANOS_PER_SECOND / 2);
+        assert_eq!(sync.status().announced, TimeStatus::Holdover);
 
-        let mut child = synchronizer();
-        run(&mut child, 3);
-        for second in 3..7u64 {
-            let now = second * NANOS_PER_SECOND;
-            child.poll(now);
-            child.capture(EDGE, now);
-            child.observe_packet(
-                Timeref {
-                    epoch: Epoch::SYSTIME,
-                    ..packet(500 + second as u32)
-                },
-                0,
-                now,
+        for second in 5..7u64 {
+            sync.capture(EDGE, second * NANOS_PER_SECOND);
+            assert_eq!(
+                sync.status().pulse,
+                PulseState::Acquiring {
+                    good_pulses: second as u8 - 4
+                }
             );
+            assert_eq!(sync.status().announced, TimeStatus::Holdover);
         }
-        assert_eq!(child.status().reference, ReferenceState::Upstream);
-        assert!(child.traceable());
-        child.poll(8 * NANOS_PER_SECOND);
-        assert!(!child.traceable());
+
+        sync.capture(EDGE, 7 * NANOS_PER_SECOND);
+        assert_eq!(sync.status().announced, TimeStatus::Locked);
+    }
+
+    /// D8: a first acquisition has no qualified train behind it, so it is
+    /// free-running until its own pulses lock.
+    #[test]
+    fn a_first_acquisition_announces_free_run_until_it_locks() {
+        let mut sync = synchronizer();
+        for second in 0..2u64 {
+            sync.capture(EDGE, second * NANOS_PER_SECOND);
+            assert_eq!(sync.status().announced, TimeStatus::FreeRun);
+        }
+        sync.capture(EDGE, 2 * NANOS_PER_SECOND);
+        assert_eq!(sync.status().announced, TimeStatus::Locked);
+    }
+
+    /// D8: a child following its parent's pulses is no better than the parent
+    /// says its own seconds are.
+    #[test]
+    fn a_child_announces_the_poorer_of_its_pulses_and_its_parent() {
+        let child_of = |upstream| {
+            let mut sync = synchronizer();
+            run(&mut sync, 3);
+            for second in 3..7u64 {
+                let now = second * NANOS_PER_SECOND;
+                sync.poll(now);
+                sync.capture(EDGE, now);
+                sync.observe_packet(
+                    packet(500 + second as u32),
+                    pad(second as u8, upstream),
+                    now,
+                );
+            }
+            assert_eq!(sync.status().pulse, PulseState::Locked);
+            sync.status().announced
+        };
+        assert_eq!(child_of(TimeStatus::FreeRun), TimeStatus::FreeRun);
+        assert_eq!(child_of(TimeStatus::Holdover), TimeStatus::Holdover);
+        assert_eq!(child_of(TimeStatus::Locked), TimeStatus::Locked);
     }
 
     /// D6: a GPS second qualifies like a packet, and its pad byte then carries
@@ -1824,8 +1837,6 @@ mod synchronizer_tests {
             TimeStatus::Locked.worse(TimeStatus::Legacy),
             TimeStatus::Locked
         );
-        assert!(TimeStatus::Legacy.traceable() && TimeStatus::Locked.traceable());
-        assert!(!TimeStatus::FreeRun.traceable() && !TimeStatus::Holdover.traceable());
         assert_eq!(
             TimeStatus::from_pad(TimeStatus::Holdover.bits() | 5),
             TimeStatus::Holdover
