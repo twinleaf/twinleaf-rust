@@ -188,17 +188,12 @@ impl<const N: usize> Streams for [Stream<N>] {
         Some(find(self, stream_id)?.record())
     }
 
-    fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
-        find(self, stream_id)?.column(index)
+    fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>> {
+        find(self, stream_id)?.segment(index)
     }
 
-    fn with_segment<R>(
-        &self,
-        stream_id: u8,
-        index: u8,
-        f: impl FnOnce(data::Segment<'_>) -> R,
-    ) -> Option<R> {
-        Some(f(find(self, stream_id)?.segment(index)?))
+    fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
+        find(self, stream_id)?.column(index)
     }
 }
 
@@ -432,19 +427,13 @@ mod tests {
         assert_eq!(record.buf_samples, 0);
         assert_eq!(record.name, "sine");
 
-        let held = |stream_id, index| {
-            streams.with_segment(stream_id, index, |record| {
-                (record.segment_id.value(), record.flags)
-            })
-        };
-        assert_eq!(
-            held(1, CURRENT_SEGMENT),
-            Some((0, SegmentFlags::VALID | SegmentFlags::ACTIVE))
-        );
-        assert_eq!(held(1, 0), held(1, CURRENT_SEGMENT));
-        assert_eq!(held(1, 1), None);
-        assert_eq!(held(1, 4), None);
-        assert_eq!(held(9, CURRENT_SEGMENT), None);
+        let current = streams.segment(1, CURRENT_SEGMENT).unwrap();
+        assert_eq!(current.segment_id.value(), 0);
+        assert_eq!(current.flags, SegmentFlags::VALID | SegmentFlags::ACTIVE);
+        assert_eq!(streams.segment(1, 0).unwrap(), current);
+        assert_eq!(streams.segment(1, 1), None);
+        assert_eq!(streams.segment(1, 4), None);
+        assert_eq!(streams.segment(9, CURRENT_SEGMENT), None);
 
         assert_eq!(streams.column(2, 0).unwrap().name, "status");
         assert_eq!(streams.column(2, 1), None);

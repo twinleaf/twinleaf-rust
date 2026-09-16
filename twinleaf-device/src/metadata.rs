@@ -20,21 +20,10 @@ pub trait Streams {
     fn ids(&self) -> impl Iterator<Item = u8>;
     /// The shape of a stream.
     fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>>;
+    /// A segment of a stream, with [`CURRENT_SEGMENT`] naming the one acquiring.
+    fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>>;
     /// A column of a stream.
     fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>>;
-
-    /// A segment of a stream, handed to `f` under the borrow it was read
-    /// through, with [`CURRENT_SEGMENT`] naming the one acquiring.
-    ///
-    /// Every record a device sends comes through here, so a device that keeps
-    /// a stream behind a lock describes it from the record itself rather than
-    /// from a copy taken out of one.
-    fn with_segment<R>(
-        &self,
-        stream_id: u8,
-        index: u8,
-        f: impl FnOnce(data::Segment<'_>) -> R,
-    ) -> Option<R>;
 }
 
 /// A device with no streams.
@@ -47,16 +36,11 @@ impl Streams for () {
         None
     }
 
-    fn column(&self, _stream_id: u8, _index: u8) -> Option<data::Column<'_>> {
+    fn segment(&self, _stream_id: u8, _index: u8) -> Option<data::Segment<'_>> {
         None
     }
 
-    fn with_segment<R>(
-        &self,
-        _stream_id: u8,
-        _index: u8,
-        _f: impl FnOnce(data::Segment<'_>) -> R,
-    ) -> Option<R> {
+    fn column(&self, _stream_id: u8, _index: u8) -> Option<data::Column<'_>> {
         None
     }
 }
@@ -87,11 +71,10 @@ pub fn reply(
                 let stream = streams.stream(stream_id).ok_or(RpcError::Invalid)?;
                 append(out, Metadata::Stream(stream))?
             }
-            MetadataType::Segment => streams
-                .with_segment(stream_id, index, |segment| {
-                    append(out, Metadata::Segment(segment))
-                })
-                .ok_or(RpcError::Invalid)??,
+            MetadataType::Segment => {
+                let segment = streams.segment(stream_id, index).ok_or(RpcError::Invalid)?;
+                append(out, Metadata::Segment(segment))?
+            }
             MetadataType::Column => {
                 let column = streams.column(stream_id, index).ok_or(RpcError::Invalid)?;
                 append(out, Metadata::Column(column))?
@@ -124,12 +107,10 @@ pub fn sweep(
         if !describe(Metadata::Stream(stream))? {
             return Ok(());
         }
-        let described = streams
-            .with_segment(stream_id, CURRENT_SEGMENT, |segment| {
-                describe(Metadata::Segment(segment))
-            })
+        let segment = streams
+            .segment(stream_id, CURRENT_SEGMENT)
             .ok_or(RpcError::Internal)?;
-        if !described? {
+        if !describe(Metadata::Segment(segment))? {
             return Ok(());
         }
         for index in 0..columns {
@@ -178,8 +159,6 @@ mod tests {
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, SessionId, StreamId};
 
-    /// A device whose segments are behind a lock, which every device here is:
-    /// there is no record to hand out, only one to read in place.
     struct Fixture;
 
     fn device(name: &str) -> data::Device<'_> {
@@ -208,19 +187,14 @@ mod tests {
             })
         }
 
-        fn with_segment<R>(
-            &self,
-            stream_id: u8,
-            index: u8,
-            f: impl FnOnce(data::Segment<'_>) -> R,
-        ) -> Option<R> {
+        fn segment(&self, stream_id: u8, index: u8) -> Option<data::Segment<'_>> {
             let segment_id = match index {
                 CURRENT_SEGMENT => 3,
                 0..=3 => index,
                 _ => return None,
             };
             self.stream(stream_id)?;
-            Some(f(data::Segment {
+            Some(data::Segment {
                 stream_id: StreamId::new(stream_id),
                 segment_id: SegmentId::new(segment_id),
                 flags: SegmentFlags::VALID,
@@ -232,7 +206,7 @@ mod tests {
                 decimation: 1,
                 filter_cutoff: 0.0,
                 filter_type: FilterType::NONE,
-            }))
+            })
         }
 
         fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {

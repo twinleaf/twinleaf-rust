@@ -384,26 +384,19 @@ mod tests {
             })
         }
 
-        fn with_segment<R>(
-            &self,
-            stream_id: u8,
-            _index: u8,
-            f: impl FnOnce(data::Segment<'_>) -> R,
-        ) -> Option<R> {
-            (stream_id == 1).then(|| {
-                f(data::Segment {
-                    stream_id: StreamId::new(1),
-                    segment_id: SegmentId::new(0),
-                    flags: SegmentFlags::VALID,
-                    epoch: Epoch::UNIX,
-                    timeref_serial: "S",
-                    timeref_session: SessionId::new(9),
-                    start_time: 0,
-                    sampling_rate: 10,
-                    decimation: 1,
-                    filter_cutoff: 0.0,
-                    filter_type: FilterType::NONE,
-                })
+        fn segment(&self, stream_id: u8, _index: u8) -> Option<data::Segment<'_>> {
+            (stream_id == 1).then_some(data::Segment {
+                stream_id: StreamId::new(1),
+                segment_id: SegmentId::new(0),
+                flags: SegmentFlags::VALID,
+                epoch: Epoch::UNIX,
+                timeref_serial: "S",
+                timeref_session: SessionId::new(9),
+                start_time: 0,
+                sampling_rate: 10,
+                decimation: 1,
+                filter_cutoff: 0.0,
+                filter_type: FilterType::NONE,
             })
         }
 
