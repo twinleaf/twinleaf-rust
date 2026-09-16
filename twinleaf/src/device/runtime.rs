@@ -241,8 +241,7 @@ fn launch(root: &Path, key: &str, args: &[String]) -> io::Result<Child> {
     command
         .arg("proxy")
         .args(args)
-        .arg("--holder-key")
-        .arg(key)
+        .arg(format!("--holder-key={key}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
