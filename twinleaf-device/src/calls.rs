@@ -9,8 +9,9 @@
 use twinleaf_proto::rpc::Answer;
 use twinleaf_proto::{DeviceRoute, RpcRequestId};
 
-/// How long an entry waits for its answer, as tl-chibi's remap does.
-pub const DEADLINE_NS: u64 = 10_000_000_000;
+/// How long an entry waits for its answer, as tl-chibi's
+/// `TL_RPC_USOURCE_TIMEOUT_MS` does: five seconds.
+pub const DEADLINE_NS: u64 = 5_000_000_000;
 
 /// Every slot holds a request still waiting for its answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
