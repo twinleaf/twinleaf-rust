@@ -8,6 +8,7 @@ pub mod calls;
 pub mod capture;
 pub mod conf;
 pub mod device;
+pub mod filter;
 pub mod hub;
 pub mod metadata;
 pub mod publisher;

@@ -7,6 +7,7 @@
 use twinleaf_proto::data::{self, DataType, CURRENT_SEGMENT};
 use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 
+use crate::filter::{Filter, MAX_COLUMNS};
 use crate::metadata::Streams;
 use crate::publisher::{Publisher, MAX_SAMPLE_BYTES};
 use crate::segments::{Busy, Params, Segment, Segments, Timeref};
@@ -43,6 +44,19 @@ impl StreamDef {
         }
         size
     }
+
+    /// Columns the anti-alias filter holds state for.
+    pub const fn float_columns(&self) -> usize {
+        let mut count = 0;
+        let mut index = 0;
+        while index < self.columns.len() {
+            if self.columns[index].data_type.value() == DataType::F32.value() {
+                count += 1;
+            }
+            index += 1;
+        }
+        count
+    }
 }
 
 /// One data stream with `N` segments.
@@ -51,18 +65,22 @@ pub struct Stream<const N: usize> {
     def: &'static StreamDef,
     segments: Segments<N>,
     publisher: Publisher,
+    filter: Filter,
+    tuned: Option<SegmentId>,
 }
 
 impl<const N: usize> Stream<N> {
-    /// A stopped stream, `None` if one of its samples does not fit a packet.
+    /// A stopped stream, `None` if one of its samples does not fit a packet or
+    /// it carries more than [`MAX_COLUMNS`] float columns.
     pub fn new(id: StreamId, def: &'static StreamDef, params: Params) -> Option<Self> {
-        (1..=MAX_SAMPLE_BYTES)
-            .contains(&def.sample_size())
+        ((1..=MAX_SAMPLE_BYTES).contains(&def.sample_size()) && def.float_columns() <= MAX_COLUMNS)
             .then(|| Self {
                 id,
                 def,
                 segments: Segments::new(params),
                 publisher: Publisher::new(),
+                filter: Filter::new(),
+                tuned: None,
             })
     }
 
@@ -89,6 +107,8 @@ impl<const N: usize> Stream<N> {
 
     /// Begin acquiring, with sample zero at `timeref`.
     pub fn start(&mut self, timeref: Timeref) -> Result<(), Busy> {
+        self.filter = Filter::new();
+        self.tuned = None;
         self.segments.start(timeref)
     }
 
@@ -113,17 +133,27 @@ impl<const N: usize> Stream<N> {
         self.segments.set_holdover(holdover);
     }
 
-    /// Publish one sample of [`StreamDef::sample_size`] bytes, packed in
-    /// column order.
+    /// Publish one sample of [`StreamDef::sample_size`] bytes, packed in column
+    /// order. A decimated segment publishes the anti-alias filter's output for
+    /// its [`DataType::F32`] columns; `F64` and integer columns go out as they
+    /// came.
     pub fn push(&mut self, sample: &[u8], out: &mut impl Sink) {
         let Some(issued) = self.segments.issue() else {
             return;
         };
-        let record = self
+        let segment = self
             .segments
             .get(issued.segment)
-            .expect("the segment issuing is in the ring")
-            .record(self.id);
+            .expect("the segment issuing is in the ring");
+        let params = *segment.params();
+        let record = segment.record(self.id);
+        if self.tuned != Some(issued.segment) {
+            self.tuned = Some(issued.segment);
+            self.filter
+                .setup(params.cutoff() / params.rate.get() as f32);
+        }
+        let mut buf = [0u8; MAX_SAMPLE_BYTES];
+        let sample = filtered(&mut self.filter, self.def, sample, &mut buf);
         self.publisher.push(issued, record, sample, out);
     }
 
@@ -197,6 +227,32 @@ impl<const N: usize> Streams for [Stream<N>] {
     }
 }
 
+/// Filter a sample's float columns into `buf`, and hand back what to publish.
+fn filtered<'a>(
+    filter: &mut Filter,
+    def: &StreamDef,
+    sample: &'a [u8],
+    buf: &'a mut [u8; MAX_SAMPLE_BYTES],
+) -> &'a [u8] {
+    if !filter.running() || sample.len() != def.sample_size() {
+        return sample;
+    }
+    buf[..sample.len()].copy_from_slice(sample);
+    let mut offset = 0;
+    let mut channel = 0;
+    for column in def.columns {
+        let size = column.data_type.size();
+        let slot = &mut buf[offset..offset + size];
+        if column.data_type == DataType::F32 {
+            let value = f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+            slot.copy_from_slice(&filter.sample(channel, value).to_le_bytes());
+            channel += 1;
+        }
+        offset += size;
+    }
+    &buf[..sample.len()]
+}
+
 fn find<const N: usize>(streams: &[Stream<N>], stream_id: u8) -> Option<&Stream<N>> {
     streams.iter().find(|stream| stream.id.value() == stream_id)
 }
@@ -206,7 +262,7 @@ mod tests {
     use super::*;
     use crate::segments::SegmentState;
     use core::num::NonZeroU32;
-    use twinleaf_proto::data::{MetadataType, SegmentFlags};
+    use twinleaf_proto::data::{FilterType, MetadataType, SegmentFlags};
     use twinleaf_proto::packet::{PacketType, PacketView};
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::SessionId;
@@ -225,6 +281,42 @@ mod tests {
                 units: "V",
                 data_type: DataType::F64,
                 description: "Noisy quadrature wave",
+            },
+        ],
+    };
+
+    const LEVEL: ColumnDef = ColumnDef {
+        name: "level",
+        units: "V",
+        data_type: DataType::F32,
+        description: "A level",
+    };
+
+    static STEP: StreamDef = StreamDef {
+        name: "step",
+        columns: &[LEVEL],
+    };
+
+    static WIDE: StreamDef = StreamDef {
+        name: "wide",
+        columns: &[LEVEL; MAX_COLUMNS + 1],
+    };
+
+    static MIXED: StreamDef = StreamDef {
+        name: "mixed",
+        columns: &[
+            ColumnDef {
+                name: "count",
+                units: "",
+                data_type: DataType::U32,
+                description: "A count",
+            },
+            LEVEL,
+            ColumnDef {
+                name: "reference",
+                units: "V",
+                data_type: DataType::F64,
+                description: "A wider level",
             },
         ],
     };
@@ -253,6 +345,27 @@ mod tests {
     }
 
     impl Sent {
+        /// Every sample packet as its segment and the floats it carries.
+        fn floats(&self) -> Vec<(u8, Vec<f32>)> {
+            self.0
+                .iter()
+                .filter_map(|packet| {
+                    let (view, _) = PacketView::parse_prefix(packet).unwrap();
+                    let samples = data::Samples::parse(view.header, view.payload)?;
+                    Some((
+                        samples.segment_id.value(),
+                        samples
+                            .data
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|bytes| f32::from_le_bytes(*bytes))
+                            .collect(),
+                    ))
+                })
+                .collect()
+        }
+
         fn types(&self) -> Vec<PacketType> {
             self.0
                 .iter()
@@ -265,7 +378,6 @@ mod tests {
         Params {
             rate: NonZeroU32::new(rate).unwrap(),
             decimation: NonZeroU32::MIN,
-            cutoff: 0.0,
             enabled: true,
         }
     }
@@ -275,6 +387,16 @@ mod tests {
             Stream::new(StreamId::new(1), &SINE, params(10)).unwrap(),
             Stream::new(StreamId::new(2), &STATUS, params(10)).unwrap(),
         ]
+    }
+
+    fn decimated(decimation: u32) -> Stream<4> {
+        let params = Params {
+            decimation: NonZeroU32::new(decimation).unwrap(),
+            ..params(10)
+        };
+        let mut stream = Stream::new(StreamId::new(1), &STEP, params).unwrap();
+        stream.start(timeref()).unwrap();
+        stream
     }
 
     fn timeref() -> Timeref {
@@ -411,6 +533,113 @@ mod tests {
             SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
         );
         assert_eq!(streams[0].current().timeref().start_time, 1001);
+    }
+
+    #[test]
+    fn a_decimated_float_column_is_the_filter_output() {
+        let mut stream = decimated(4);
+        let mut sent = Sent::default();
+        stream.push(&0.0f32.to_le_bytes(), &mut sent);
+        (0..400).for_each(|_| stream.push(&1.0f32.to_le_bytes(), &mut sent));
+        stream.flush(&mut sent);
+
+        let published: Vec<f32> = sent.floats().into_iter().flat_map(|(_, v)| v).collect();
+        assert_eq!(published.len(), 100);
+        assert!(
+            (0.0..0.2).contains(&published[0]),
+            "the first decimated sample {} is the filter's, not the raw 1.0",
+            published[0]
+        );
+        assert_eq!(*published.last().unwrap(), 1.0);
+
+        let record = stream.segment(CURRENT_SEGMENT).unwrap();
+        assert_eq!(record.filter_cutoff, 0.8);
+        assert_eq!(record.filter_type, FilterType::IIR_BW_LPF4);
+    }
+
+    #[test]
+    fn an_undecimated_stream_publishes_the_bytes_it_was_given() {
+        let mut stream = decimated(1);
+        let mut sent = Sent::default();
+        [[0xDE, 0xAD, 0xBE, 0xEF], [1, 2, 3, 4]]
+            .iter()
+            .for_each(|sample| stream.push(sample, &mut sent));
+        stream.flush(&mut sent);
+
+        let (view, _) = PacketView::parse_prefix(&sent.0[1]).unwrap();
+        let samples = data::Samples::parse(view.header, view.payload).unwrap();
+        assert_eq!(samples.data, [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4]);
+
+        let record = stream.segment(CURRENT_SEGMENT).unwrap();
+        assert_eq!(record.filter_cutoff, 0.0);
+        assert_eq!(record.filter_type, FilterType::NONE);
+    }
+
+    /// A retune only recomputes coefficients, as tl-chibi's `setup` does, so
+    /// the new segment carries on from where the old one settled.
+    #[test]
+    fn a_retune_carries_the_filter_across_the_segment_switch() {
+        let mut stream = decimated(4);
+        let mut sent = Sent::default();
+        stream.push(&0.0f32.to_le_bytes(), &mut sent);
+        (0..400).for_each(|_| stream.push(&1.0f32.to_le_bytes(), &mut sent));
+        stream.retune(Params {
+            decimation: NonZeroU32::new(2).unwrap(),
+            ..params(10)
+        });
+        (0..9).for_each(|_| stream.push(&1.0f32.to_le_bytes(), &mut sent));
+        (0..20).for_each(|_| stream.push(&5.0f32.to_le_bytes(), &mut sent));
+        stream.flush(&mut sent);
+
+        let opened: Vec<f32> = sent
+            .floats()
+            .into_iter()
+            .filter(|(segment, _)| *segment == 1)
+            .flat_map(|(_, values)| values)
+            .collect();
+        assert!(
+            (1.0..5.0).contains(&opened[0]),
+            "the new segment opens at {}, not the raw 5.0 a re-prime would give",
+            opened[0]
+        );
+    }
+
+    #[test]
+    fn a_decimated_stream_filters_its_f32_columns_and_no_others() {
+        let params = Params {
+            decimation: NonZeroU32::new(2).unwrap(),
+            ..params(10)
+        };
+        let mut stream = Stream::<4>::new(StreamId::new(1), &MIXED, params).unwrap();
+        stream.start(timeref()).unwrap();
+        let mut sent = Sent::default();
+        let mut sample = [0u8; 16];
+        sample[..4].copy_from_slice(&7u32.to_le_bytes());
+        sample[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+        sample[8..].copy_from_slice(&2.0f64.to_le_bytes());
+        stream.push(&sample, &mut sent);
+        sample[4..8].copy_from_slice(&5.0f32.to_le_bytes());
+        stream.push(&sample, &mut sent);
+        stream.flush(&mut sent);
+
+        let (view, _) = PacketView::parse_prefix(&sent.0[1]).unwrap();
+        let data = data::Samples::parse(view.header, view.payload)
+            .unwrap()
+            .data;
+        assert_eq!(data[..4], 7u32.to_le_bytes());
+        assert_eq!(data[8..], 2.0f64.to_le_bytes());
+        let level = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        assert!(
+            (1.0..5.0).contains(&level),
+            "the float column reads {level}"
+        );
+    }
+
+    #[test]
+    fn a_stream_with_more_float_columns_than_the_filter_holds_is_refused() {
+        assert_eq!(WIDE.float_columns(), MAX_COLUMNS + 1);
+        assert!(WIDE.sample_size() <= MAX_SAMPLE_BYTES);
+        assert!(Stream::<4>::new(StreamId::new(1), &WIDE, params(10)).is_none());
     }
 
     #[test]

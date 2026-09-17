@@ -1893,14 +1893,13 @@ fn next_second_ns(now: u64) -> u64 {
     (now / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND
 }
 
-/// The streams a boot starts: none on a hub, and on a sensor no decimation, a
-/// cutoff at Nyquist, and a fresh segment ring on each.
+/// The streams a boot starts: none on a hub, and on a sensor no decimation and
+/// a fresh segment ring on each.
 fn boot_streams(role: Role, rate: NonZeroU32) -> io::Result<Vec<Stream<SEGMENTS>>> {
     let stream = |id: u8, def: &'static StreamDef, rate: NonZeroU32| {
         let params = Params {
             rate,
             decimation: NonZeroU32::MIN,
-            cutoff: rate.get() as f32 / 2.0,
             enabled: true,
         };
         Stream::new(StreamId::new(id), def, params)
@@ -2425,7 +2424,7 @@ mod tests {
         assert_eq!(record.sample_size, 16);
         let segment = streams.segment(1, CURRENT_SEGMENT).unwrap();
         assert_eq!(segment.sampling_rate, 4);
-        assert_eq!(segment.filter_cutoff, 2.0);
+        assert_eq!(segment.filter_cutoff, 0.0);
         assert_eq!(segment.epoch, sync::Epoch::UNIX);
         assert_eq!(segment.timeref_serial, DEVICE_SERIAL);
         assert_eq!(

@@ -13,6 +13,8 @@ use twinleaf_proto::data::{self, FilterType, SegmentFlags};
 use twinleaf_proto::sync::Epoch;
 use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
 
+use crate::filter;
+
 /// Input samples one segment issues before a rollover is forced, short of a
 /// `u32` by more than any plausible rate.
 const MAX_INPUT_SAMPLES: u32 = 4_000_000_000;
@@ -70,10 +72,28 @@ pub struct Params {
     pub rate: NonZeroU32,
     /// Input samples averaged into one output sample.
     pub decimation: NonZeroU32,
-    /// Anti-alias filter cutoff, in hertz.
-    pub cutoff: f32,
     /// Whether output samples are published.
     pub enabled: bool,
+}
+
+impl Params {
+    /// Anti-alias corner in hertz, [`filter::CORNER`] of the output Nyquist
+    /// frequency, and zero when nothing is decimated.
+    pub fn cutoff(&self) -> f32 {
+        match self.decimation.get() {
+            1 => 0.0,
+            decimation => filter::CORNER * 0.5 * (self.rate.get() / decimation) as f32,
+        }
+    }
+
+    /// The filter a sample's float columns pass through.
+    pub fn filter_type(&self) -> FilterType {
+        if self.cutoff() > 0.0 {
+            FilterType::IIR_BW_LPF4
+        } else {
+            FilterType::NONE
+        }
+    }
 }
 
 /// Where one entry of the ring stands.
@@ -148,8 +168,8 @@ impl Segment {
             start_time: self.timeref.start_time,
             sampling_rate: self.params.rate.get(),
             decimation: self.params.decimation.get(),
-            filter_cutoff: self.params.cutoff,
-            filter_type: FilterType::NONE,
+            filter_cutoff: self.params.cutoff(),
+            filter_type: self.params.filter_type(),
         }
     }
 
@@ -418,7 +438,6 @@ mod tests {
         Params {
             rate: NonZeroU32::new(rate).unwrap(),
             decimation: NonZeroU32::MIN,
-            cutoff: 0.0,
             enabled: true,
         }
     }
@@ -471,7 +490,7 @@ mod tests {
         let mut segments: Segments<4> = started(params(10));
         issue(&mut segments, 13);
         segments.retune(Params {
-            cutoff: 5.0,
+            decimation: NonZeroU32::new(2).unwrap(),
             ..params(10)
         });
 
@@ -685,7 +704,6 @@ mod tests {
     #[test]
     fn a_record_describes_the_segment_for_its_stream() {
         let mut segments: Segments<4> = started(Params {
-            cutoff: 5.0,
             decimation: NonZeroU32::new(2).unwrap(),
             ..params(10)
         });
@@ -700,8 +718,8 @@ mod tests {
         assert_eq!(record.start_time, 1000);
         assert_eq!(record.sampling_rate, 10);
         assert_eq!(record.decimation, 2);
-        assert_eq!(record.filter_cutoff, 5.0);
-        assert_eq!(record.filter_type, FilterType::NONE);
+        assert_eq!(record.filter_cutoff, 2.0);
+        assert_eq!(record.filter_type, FilterType::IIR_BW_LPF4);
     }
 
     #[test]

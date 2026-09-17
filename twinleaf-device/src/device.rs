@@ -1197,7 +1197,6 @@ mod tests {
         let params = Params {
             rate: NonZeroU32::new(10).unwrap(),
             decimation: NonZeroU32::new(4).unwrap(),
-            cutoff: 0.0,
             enabled: true,
         };
         Harness {

@@ -207,6 +207,8 @@ impl FilterType {
     pub const IIR_SP_LPF1: Self = Self(1);
     /// Second order IIR low-pass, 2.
     pub const IIR_SP_LPF2: Self = Self(2);
+    /// Fourth order IIR Butterworth low-pass, 3.
+    pub const IIR_BW_LPF4: Self = Self(3);
 
     /// Filter from its byte.
     pub const fn new(value: u8) -> Self {
@@ -225,6 +227,7 @@ impl core::fmt::Display for FilterType {
             Self::NONE => f.write_str("none"),
             Self::IIR_SP_LPF1 => f.write_str("iir-sp-lpf1"),
             Self::IIR_SP_LPF2 => f.write_str("iir-sp-lpf2"),
+            Self::IIR_BW_LPF4 => f.write_str("iir-bw-lpf4"),
             Self(value) => write!(f, "filter{value}"),
         }
     }
@@ -1399,5 +1402,13 @@ mod tests {
         assert_eq!(DataType::I24.to_string(), "i24");
         assert_eq!(DataType::F64.to_string(), "f64");
         assert_eq!(DataType::new(0x35).to_string(), "raw53");
+    }
+
+    #[test]
+    fn filter_type_names_the_known_filters_and_falls_back_to_its_byte() {
+        assert_eq!(FilterType::IIR_BW_LPF4.value(), 3);
+        assert_eq!(FilterType::IIR_BW_LPF4.to_string(), "iir-bw-lpf4");
+        assert_eq!(FilterType::NONE.to_string(), "none");
+        assert_eq!(FilterType::new(9).to_string(), "filter9");
     }
 }
