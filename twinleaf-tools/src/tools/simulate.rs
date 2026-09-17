@@ -2292,11 +2292,16 @@ mod tests {
             call(&mut sim, b"dev.model", &[], &mut sent),
             DEVICE_NAME.as_bytes()
         );
+        assert_eq!(call(&mut sim, b"dev.revision", &[], &mut sent), [1, 0]);
+        assert_eq!(
+            answer(&mut sim, b"dev.mcu.model", &[], &mut sent),
+            Err(RpcError::NotFound)
+        );
+        call(&mut sim, b"dev.priv", b"895895", &mut sent);
         assert_eq!(
             call(&mut sim, b"dev.mcu.model", &[], &mut sent),
             DEVICE_MCU.as_bytes()
         );
-        assert_eq!(call(&mut sim, b"dev.revision", &[], &mut sent), [1, 0]);
     }
 
     /// `dev.reboot` is answered before the device goes away, and what comes

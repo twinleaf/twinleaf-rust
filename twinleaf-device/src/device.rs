@@ -1339,8 +1339,14 @@ mod tests {
         let mut device = harness();
         assert_eq!(device.ask("dev.uid", &[]).value(), &[0xAB; 12]);
         assert_eq!(device.ask("dev.model", &[]).value(), b"COMM-USB");
-        assert_eq!(device.ask("dev.mcu.model", &[]).value(), b"STM32G484xE");
         assert_eq!(device.ask("dev.revision", &[]).value(), &8u16.to_le_bytes());
+        assert_eq!(
+            device.ask("dev.mcu.model", &[]).error(),
+            RpcError::NotFound,
+            "the part number is a developer entry"
+        );
+        device.ask("dev.priv", PASSWORD.as_bytes());
+        assert_eq!(device.ask("dev.mcu.model", &[]).value(), b"STM32G484xE");
         assert_eq!(
             device.ask("dev.mcu.model", b"STM32F4").error(),
             RpcError::ReadOnly,
@@ -1354,6 +1360,7 @@ mod tests {
     fn hardware_a_platform_does_not_name_is_the_state_error() {
         let mut device = harness();
         device.device = Device::new(identity(), SESSION, table(), Board::new(), PASSWORD, BOOT);
+        device.ask("dev.priv", PASSWORD.as_bytes());
         for name in ["dev.uid", "dev.model", "dev.mcu.model", "dev.revision"] {
             assert_eq!(device.ask(name, &[]).error(), RpcError::State, "{name}");
         }
@@ -1384,8 +1391,8 @@ mod tests {
         let mut device = harness();
         assert_eq!(
             device.listed(),
-            device.table().len() - 5,
-            "the three `dev.priv` entries and the board's own two"
+            device.table().len() - 6,
+            "`dev.mcu.model`, the three `dev.priv` entries, and the board's own two"
         );
         device.ask("dev.priv", PASSWORD.as_bytes());
         assert_eq!(device.listed(), device.table().len());

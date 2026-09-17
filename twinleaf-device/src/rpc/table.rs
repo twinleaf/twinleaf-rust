@@ -269,7 +269,7 @@ standard! {
     Revision "dev.revision" prop(Kind::Uint(2), Access::READ),
     Desc "dev.desc" prop(Kind::String, Access::READ),
     Session "dev.session" prop(Kind::Uint(4), Access::READ),
-    Mcu "dev.mcu.model" prop(Kind::String, Access::READ),
+    Mcu "dev.mcu.model" prop(Kind::String, Access::READ).privileged(),
     FirmwareSerial "dev.firmware.serial" prop(Kind::String, Access::READ),
     ConfLoad "dev.conf.load" action(),
     ConfSave "dev.conf.save" action(),
@@ -479,7 +479,7 @@ mod tests {
     use super::*;
 
     /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x9c1c_90b7;
+    const HASH: u32 = 0x2918_d331;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -555,13 +555,13 @@ mod tests {
         assert_eq!(hash(STANDARD, true), HASH);
         assert_eq!(
             hash(STANDARD, false),
-            0xde3e_d53f,
-            "the three developer entries are invisible, so a customer's hash stands"
+            0xe97c_3076,
+            "the four developer entries are invisible to a customer"
         );
     }
 
     #[test]
-    fn the_developer_entries_are_the_last_three() {
+    fn the_priv_entries_are_the_last_three() {
         let [unlock, lock, password] = [
             &STANDARD[STANDARD.len() - 3],
             &STANDARD[STANDARD.len() - 2],
