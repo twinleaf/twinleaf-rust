@@ -8,7 +8,7 @@
 use twinleaf_proto::rpc::RpcError;
 
 use crate::rpc::Reply;
-use crate::settings::{Changed, Persisted};
+use crate::rpc::{Changed, Persisted};
 
 /// The bytes a configuration is stored as, in flash the platform sizes.
 pub type Image<const N: usize> = heapless::Vec<u8, N>;
@@ -111,7 +111,7 @@ impl<'a> Iterator for Entries<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::Setting;
+    use crate::rpc::Setting;
 
     /// As much flash as the tests give a configuration.
     const FLASH: usize = 1024;

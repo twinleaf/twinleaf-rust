@@ -23,10 +23,10 @@ use twinleaf_proto::rpc::{self, Method, Request, RpcError};
 use twinleaf_proto::settings::Setting as Announcement;
 use twinleaf_proto::{RpcRequestId, SessionId};
 
-use crate::conf::{self, Image};
-use crate::metadata::{self, Streams};
+use crate::data::metadata::{self, Streams};
 use crate::rpc::{self as table, put, read, Access, Reply, RpcSpec, Std, STANDARD};
-use crate::settings::{Changed, Persisted, Scalar, Setting, Text};
+use crate::rpc::{Changed, Persisted, Scalar, Setting, Text};
+use crate::storage::conf::{self, Image};
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
@@ -952,9 +952,9 @@ impl Announcer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::Params;
+    use crate::data::{ColumnDef, Stream, StreamDef};
     use crate::rpc::{put, Kind};
-    use crate::segments::Params;
-    use crate::stream::{ColumnDef, Stream, StreamDef};
     use core::num::NonZeroU32;
     use std::string::String;
     use twinleaf_proto::data::{MetadataReply, MetadataType};

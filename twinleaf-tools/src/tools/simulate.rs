@@ -24,20 +24,19 @@ use twinleaf::proto::packet::{PacketType, PacketView};
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{BoardId, FirmwareMagic, HwRev, SessionId, StreamId};
-use twinleaf_device::capture::{self, Capture, Selector};
+use twinleaf_device::data::{ColumnDef, Params, Stream, StreamDef, Timeref};
 use twinleaf_device::device::{
     self, Deferred, Device, Entry, FlashOp, Group, Identity, OneLane, SyncRequest,
 };
 use twinleaf_device::hub::{CallError, Event, Events, Hub, Input, PortSink};
-use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec, STANDARD};
-use twinleaf_device::segments::{Params, Timeref};
-use twinleaf_device::settings::Setting;
-use twinleaf_device::stream::{ColumnDef, Stream, StreamDef};
+use twinleaf_device::rpc::{
+    put, Access, Capture, Kind, Reply, RpcSpec, Selector, Setting, Status, STANDARD,
+};
+use twinleaf_device::storage::update::{Package, Take, Upload};
 use twinleaf_device::sync::{
     ticks, AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig,
     Reference, ReferenceIdentity, ScheduledEdge, Synchronizer, TimeStatus,
 };
-use twinleaf_device::update::{Package, Take, Upload};
 use twinleaf_device::Sink;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -404,13 +403,13 @@ impl CaptureBuffer {
         self.capturing.is_some()
     }
 
-    fn status(&self) -> capture::Status {
+    fn status(&self) -> Status {
         if self.capturing.is_some() {
-            capture::Status::Capturing
+            Status::Capturing
         } else if self.data.is_empty() {
-            capture::Status::Idle
+            Status::Idle
         } else {
-            capture::Status::Done
+            Status::Done
         }
     }
 
@@ -1965,10 +1964,10 @@ mod tests {
     use twinleaf::proto::rpc::Answer;
     use twinleaf::proto::settings::Setting as Announcement;
     use twinleaf::proto::RpcRequestId;
-    use twinleaf_device::metadata::{self, Streams};
+    use twinleaf_device::data::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
+    use twinleaf_device::storage::update::{FORMAT_VERSION, HEADER_SIZE};
     use twinleaf_device::sync::ReferenceState;
-    use twinleaf_device::update::{FORMAT_VERSION, HEADER_SIZE};
 
     /// A round wall-clock second to boot the simulated device at.
     const BOOT: u64 = 1_800_000_000 * NANOS_PER_SECOND;
@@ -1997,7 +1996,7 @@ mod tests {
     }
 
     /// The segment the sine stream is acquiring.
-    fn sine(sim: &Sim) -> &twinleaf_device::segments::Segment {
+    fn sine(sim: &Sim) -> &twinleaf_device::data::Segment {
         sim.streams[Signal::Sine as usize].current()
     }
 
@@ -2380,14 +2379,14 @@ mod tests {
         );
 
         assert!(capture.locked());
-        assert_eq!(capture.status(), capture::Status::Capturing);
+        assert_eq!(capture.status(), Status::Capturing);
 
         capture.update(499);
         assert!(capture.locked());
 
         capture.update(500);
         assert!(!capture.locked());
-        assert_eq!(capture.status(), capture::Status::Done);
+        assert_eq!(capture.status(), Status::Done);
         assert_eq!(capture.export_size(), 10);
         assert_eq!(capture.info().length, 10);
         assert_eq!(capture.view().block(2), Some(&[8, 9][..]));

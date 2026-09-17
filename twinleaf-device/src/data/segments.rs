@@ -13,7 +13,7 @@ use twinleaf_proto::data::{self, FilterType, SegmentFlags};
 use twinleaf_proto::sync::Epoch;
 use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
 
-use crate::filter;
+use super::filter;
 
 /// Input samples one segment issues before a rollover is forced, short of a
 /// `u32` by more than any plausible rate.

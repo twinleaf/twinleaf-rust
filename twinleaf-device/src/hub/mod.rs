@@ -9,6 +9,10 @@
 //! The downward SYNC packet is not produced here. The hub role's
 //! `Synchronizer` is the one emitter, and [`Hub::announce`] writes what it
 //! yields to every present port.
+//!
+//! [`Calls`] is below it: the table of requests still waiting for an answer.
+
+mod calls;
 
 use twinleaf_proto::heartbeat::Heartbeat;
 use twinleaf_proto::packet::{Packet, PacketType, PacketView};
@@ -16,10 +20,11 @@ use twinleaf_proto::route::{pop_hop, push_hop};
 use twinleaf_proto::rpc::{self, Answer, Method, Request, RpcError};
 use twinleaf_proto::{DeviceRoute, RpcRequestId, SessionId};
 
-use crate::calls::{CallCounters, Calls, Full, Origin};
 use crate::device::HEARTBEAT_INTERVAL;
 use crate::sync::Announce;
 use crate::Sink;
+
+pub use calls::{CallCounters, Calls, Full, Origin, DEADLINE_NS};
 
 /// Silence after which a child is unplugged, as tl-chibi's
 /// `TL_HEARTBEAT_KEEPALIVE` is: two heartbeats and room for a late one.
@@ -721,7 +726,7 @@ mod tests {
         hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default())
             .unwrap();
 
-        let out = deliver(&mut hub, Input::Tick, NOW + crate::calls::DEADLINE_NS);
+        let out = deliver(&mut hub, Input::Tick, NOW + calls::DEADLINE_NS);
         let view = out.up.one();
         assert_eq!(view.routing, [1]);
         let Answer::Error(error) = answered(view) else {

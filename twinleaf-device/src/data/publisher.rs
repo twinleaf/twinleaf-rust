@@ -8,7 +8,7 @@ use twinleaf_proto::data::{self, Metadata, MetadataFlags, SAMPLE_HEADER_SIZE};
 use twinleaf_proto::packet::Packet;
 use twinleaf_proto::{SampleNumber, SegmentId, StreamId};
 
-use crate::segments::Issued;
+use super::segments::Issued;
 use crate::Sink;
 
 /// Sample bytes one packet carries.

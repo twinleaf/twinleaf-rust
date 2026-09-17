@@ -7,10 +7,10 @@
 use twinleaf_proto::data::{self, DataType, CURRENT_SEGMENT};
 use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 
-use crate::filter::{Filter, MAX_COLUMNS};
-use crate::metadata::Streams;
-use crate::publisher::{Publisher, MAX_SAMPLE_BYTES};
-use crate::segments::{Busy, Params, Segment, Segments, Timeref};
+use super::filter::{Filter, MAX_COLUMNS};
+use super::metadata::Streams;
+use super::publisher::{Publisher, MAX_SAMPLE_BYTES};
+use super::segments::{Busy, Params, Segment, Segments, Timeref};
 use crate::Sink;
 
 /// One column of a stream's sample.
@@ -260,7 +260,7 @@ fn find<const N: usize>(streams: &[Stream<N>], stream_id: u8) -> Option<&Stream<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segments::SegmentState;
+    use crate::data::segments::SegmentState;
     use core::num::NonZeroU32;
     use twinleaf_proto::data::{FilterType, MetadataType, SegmentFlags};
     use twinleaf_proto::packet::{PacketType, PacketView};
@@ -680,7 +680,7 @@ mod tests {
             serial: "S1",
             firmware: "fw",
         };
-        crate::metadata::reply(device, &streams[..], &[], &mut out).unwrap();
+        crate::data::metadata::reply(device, &streams[..], &[], &mut out).unwrap();
         let kinds: Vec<MetadataType> = data::MetadataReply::parse(&out)
             .unwrap()
             .map(|(kind, _)| kind)
