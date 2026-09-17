@@ -4,13 +4,35 @@
 //! whose first byte is its own length, then four strings whose lengths the
 //! head records: `name`, `units`, `x_name`, `x_units`.
 
+use zerocopy::byteorder::little_endian::{F32, U16, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
 use crate::data::{DataType, RecordReader, RecordWriter};
 
 /// `TL_CAPTURE_METADATA_VERSION`: the layout described here.
 pub const METADATA_VERSION: u8 = 1;
 /// `TL_CAPTURE_METADATA_FIXED_LEN`: the head this build reads; a device may
 /// declare a longer one.
-pub const METADATA_FIXED_LEN: usize = 30;
+pub const METADATA_FIXED_LEN: usize = size_of::<MetadataHead>();
+
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+struct MetadataHead {
+    head_len: u8,
+    version: u8,
+    data_type: u8,
+    reserved: u8,
+    data_size: U32,
+    block_size: U16,
+    length: U32,
+    y_calibration: F32,
+    x_offset: F32,
+    x_stride: F32,
+    name_len: u8,
+    units_len: u8,
+    x_name_len: u8,
+    x_units_len: u8,
+}
 
 /// What one capture holds and how to read it (`capture_metadata_fixed`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,44 +68,45 @@ impl<'a> CaptureMetadata<'a> {
     /// are truncated to fit whatever room remains after the head.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let mut record = RecordWriter::new(buf, METADATA_FIXED_LEN)?;
-        let name = record.push(self.name);
-        let units = record.push(self.units);
-        let x_name = record.push(self.x_name);
-        let x_units = record.push(self.x_units);
-        let head = record.head();
-        head[1] = self.version;
-        head[2] = self.data_type.value();
-        head[4..8].copy_from_slice(&self.data_size.to_le_bytes());
-        head[8..10].copy_from_slice(&self.block_size.to_le_bytes());
-        head[10..14].copy_from_slice(&self.length.to_le_bytes());
-        head[14..18].copy_from_slice(&self.y_calibration.to_le_bytes());
-        head[18..22].copy_from_slice(&self.x_offset.to_le_bytes());
-        head[22..26].copy_from_slice(&self.x_stride.to_le_bytes());
-        head[26] = name;
-        head[27] = units;
-        head[28] = x_name;
-        head[29] = x_units;
-        Some(record.finish())
+        let name_len = record.push(self.name);
+        let units_len = record.push(self.units);
+        let x_name_len = record.push(self.x_name);
+        let x_units_len = record.push(self.x_units);
+        Some(record.finish(MetadataHead {
+            head_len: METADATA_FIXED_LEN as u8,
+            version: self.version,
+            data_type: self.data_type.value(),
+            reserved: 0,
+            data_size: self.data_size.into(),
+            block_size: self.block_size.into(),
+            length: self.length.into(),
+            y_calibration: self.y_calibration.into(),
+            x_offset: self.x_offset.into(),
+            x_stride: self.x_stride.into(),
+            name_len,
+            units_len,
+            x_name_len,
+            x_units_len,
+        }))
     }
 
     /// Parse an RPC reply payload. [`Self::version`] is reported rather than
     /// checked: only the caller knows which versions it can act on.
     pub fn parse(payload: &'a [u8]) -> Option<Self> {
-        let mut record = RecordReader::new(payload, METADATA_FIXED_LEN)?;
-        let head = record.head;
+        let (head, mut strings) = RecordReader::split::<MetadataHead>(payload)?;
         Some(Self {
-            version: head[1],
-            data_type: DataType::new(head[2]),
-            data_size: u32::from_le_bytes(head[4..8].try_into().unwrap()),
-            block_size: u16::from_le_bytes(head[8..10].try_into().unwrap()),
-            length: u32::from_le_bytes(head[10..14].try_into().unwrap()),
-            y_calibration: f32::from_le_bytes(head[14..18].try_into().unwrap()),
-            x_offset: f32::from_le_bytes(head[18..22].try_into().unwrap()),
-            x_stride: f32::from_le_bytes(head[22..26].try_into().unwrap()),
-            name: record.take(head[26])?,
-            units: record.take(head[27])?,
-            x_name: record.take(head[28])?,
-            x_units: record.take(head[29])?,
+            version: head.version,
+            data_type: DataType::new(head.data_type),
+            data_size: head.data_size.get(),
+            block_size: head.block_size.get(),
+            length: head.length.get(),
+            y_calibration: head.y_calibration.get(),
+            x_offset: head.x_offset.get(),
+            x_stride: head.x_stride.get(),
+            name: strings.take(head.name_len)?,
+            units: strings.take(head.units_len)?,
+            x_name: strings.take(head.x_name_len)?,
+            x_units: strings.take(head.x_units_len)?,
         })
     }
 }
