@@ -88,8 +88,71 @@ pub fn reply(
     Ok(())
 }
 
-/// Every record a device describes itself with, in bootstrap order: the
-/// device, then each stream with its current segment and its columns.
+/// Round-robin cursor over a device's metadata: the device, then for each
+/// stream its shape, its current segment, and its columns.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sweep {
+    position: Position,
+}
+
+impl Sweep {
+    /// A sweep starting at the device record.
+    pub const fn new() -> Self {
+        Self {
+            position: Position::Device,
+        }
+    }
+
+    /// The next record, and whether it closes a pass. `None` is a stream the
+    /// device lists but cannot describe.
+    pub fn step<'a>(
+        &mut self,
+        device: data::Device<'a>,
+        streams: &'a (impl Streams + ?Sized),
+    ) -> Option<(Metadata<'a>, bool)> {
+        let id = |index: u8| streams.ids().nth(usize::from(index));
+        let columns = |index: u8| Some(streams.stream(id(index)?)?.n_columns);
+        let gone = match self.position {
+            Position::Device => false,
+            Position::Stream(s) | Position::Segment(s) => id(s).is_none(),
+            Position::Column(s, c) => c >= columns(s).unwrap_or(0),
+        };
+        let here = match gone {
+            true => Position::Device,
+            false => self.position,
+        };
+        let record = match here {
+            Position::Device => Metadata::Device(device),
+            Position::Stream(s) => Metadata::Stream(streams.stream(id(s)?)?),
+            Position::Segment(s) => Metadata::Segment(streams.segment(id(s)?, CURRENT_SEGMENT)?),
+            Position::Column(s, c) => Metadata::Column(streams.column(id(s)?, c)?),
+        };
+        self.position = match here {
+            Position::Device if id(0).is_some() => Position::Stream(0),
+            Position::Device => Position::Device,
+            Position::Stream(s) => Position::Segment(s),
+            Position::Segment(s) if columns(s)? > 0 => Position::Column(s, 0),
+            Position::Column(s, c) if c + 1 < columns(s)? => Position::Column(s, c + 1),
+            Position::Segment(s) | Position::Column(s, _) => match id(s + 1) {
+                Some(_) => Position::Stream(s + 1),
+                None => Position::Device,
+            },
+        };
+        Some((record, matches!(self.position, Position::Device)))
+    }
+}
+
+/// Where a sweep stands, by zero-based stream and column position.
+#[derive(Debug, Clone, Copy, Default)]
+enum Position {
+    #[default]
+    Device,
+    Stream(u8),
+    Segment(u8),
+    Column(u8, u8),
+}
+
+/// Every record a device describes itself with, in bootstrap order.
 ///
 /// The sweep stops where `describe` says it has no more room, and a listed
 /// stream the device cannot describe is an internal error.
@@ -98,29 +161,13 @@ pub fn sweep(
     streams: &(impl Streams + ?Sized),
     describe: &mut dyn FnMut(Metadata<'_>) -> Result<bool, RpcError>,
 ) -> Result<(), RpcError> {
-    if !describe(Metadata::Device(device))? {
-        return Ok(());
-    }
-    for stream_id in streams.ids() {
-        let stream = streams.stream(stream_id).ok_or(RpcError::Internal)?;
-        let columns = stream.n_columns;
-        if !describe(Metadata::Stream(stream))? {
+    let mut sweep = Sweep::new();
+    loop {
+        let (record, last) = sweep.step(device, streams).ok_or(RpcError::Internal)?;
+        if !describe(record)? || last {
             return Ok(());
         }
-        let segment = streams
-            .segment(stream_id, CURRENT_SEGMENT)
-            .ok_or(RpcError::Internal)?;
-        if !describe(Metadata::Segment(segment))? {
-            return Ok(());
-        }
-        for index in 0..columns {
-            let column = streams.column(stream_id, index).ok_or(RpcError::Internal)?;
-            if !describe(Metadata::Column(column))? {
-                return Ok(());
-            }
-        }
     }
-    Ok(())
 }
 
 /// The bootstrap set, as far as one reply holds.
@@ -159,7 +206,12 @@ mod tests {
     use twinleaf_proto::sync::Epoch;
     use twinleaf_proto::{ColumnId, SegmentId, SessionId, StreamId};
 
-    struct Fixture;
+    /// A device whose streams are numbered 1..=n with the given column counts.
+    struct Shape(Vec<u8>);
+
+    fn fixture() -> Shape {
+        Shape(vec![2, 2])
+    }
 
     fn device(name: &str) -> data::Device<'_> {
         data::Device {
@@ -171,15 +223,16 @@ mod tests {
         }
     }
 
-    impl Streams for Fixture {
+    impl Streams for Shape {
         fn ids(&self) -> impl Iterator<Item = u8> {
-            [1, 2].into_iter()
+            1..=self.0.len() as u8
         }
 
         fn stream(&self, stream_id: u8) -> Option<data::Stream<'_>> {
-            matches!(stream_id, 1 | 2).then_some(data::Stream {
+            let n_columns = *self.0.get(usize::from(stream_id.checked_sub(1)?))?;
+            Some(data::Stream {
                 stream_id: StreamId::new(stream_id),
-                n_columns: 2,
+                n_columns,
                 n_segments: 4,
                 sample_size: 8,
                 buf_samples: 0,
@@ -210,8 +263,7 @@ mod tests {
         }
 
         fn column(&self, stream_id: u8, index: u8) -> Option<data::Column<'_>> {
-            self.stream(stream_id)?;
-            (index < 2).then_some(data::Column {
+            (index < self.stream(stream_id)?.n_columns).then_some(data::Column {
                 stream_id: StreamId::new(stream_id),
                 index: ColumnId::new(index),
                 data_type: DataType::F32,
@@ -229,10 +281,87 @@ mod tests {
             .collect()
     }
 
+    fn walk(shape: &[u8], steps: usize) -> Vec<(MetadataType, u8, u8, bool)> {
+        let streams = Shape(shape.to_vec());
+        let mut sweep = Sweep::new();
+        (0..steps)
+            .map(|_| {
+                let (record, last) = sweep.step(device("d"), &streams).unwrap();
+                match record {
+                    Metadata::Device(_) => (MetadataType::Device, 0, 0, last),
+                    Metadata::Stream(s) => (MetadataType::Stream, s.stream_id.value(), 0, last),
+                    Metadata::Segment(s) => (
+                        MetadataType::Segment,
+                        s.stream_id.value(),
+                        s.segment_id.value(),
+                        last,
+                    ),
+                    Metadata::Column(c) => (
+                        MetadataType::Column,
+                        c.stream_id.value(),
+                        c.index.value(),
+                        last,
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sweep_walks_the_device_then_each_stream_with_its_columns() {
+        use MetadataType::*;
+        #[rustfmt::skip]
+        assert_eq!(walk(&[2, 3], 11), vec![
+            (Device, 0, 0, false),
+            (Stream, 1, 0, false),
+            (Segment, 1, 3, false),
+            (Column, 1, 0, false),
+            (Column, 1, 1, false),
+            (Stream, 2, 0, false),
+            (Segment, 2, 3, false),
+            (Column, 2, 0, false),
+            (Column, 2, 1, false),
+            (Column, 2, 2, true),
+            (Device, 0, 0, false),
+        ]);
+    }
+
+    #[test]
+    fn a_sweep_of_a_device_with_no_streams_is_the_device_record() {
+        assert_eq!(walk(&[], 2), vec![(MetadataType::Device, 0, 0, true); 2]);
+    }
+
+    #[test]
+    fn a_sweep_skips_a_stream_with_no_columns() {
+        use MetadataType::*;
+        #[rustfmt::skip]
+        assert_eq!(walk(&[0, 1], 6), vec![
+            (Device, 0, 0, false),
+            (Stream, 1, 0, false),
+            (Segment, 1, 3, false),
+            (Stream, 2, 0, false),
+            (Segment, 2, 3, false),
+            (Column, 2, 0, true),
+        ]);
+    }
+
+    #[test]
+    fn a_sweep_restarts_when_its_position_disappears() {
+        let mut sweep = Sweep::new();
+        let two = Shape(vec![2, 3]);
+        for _ in 0..4 {
+            sweep.step(device("d"), &two).unwrap();
+        }
+        let one = Shape(vec![1]);
+        let (record, last) = sweep.step(device("d"), &one).unwrap();
+        assert!(matches!(record, Metadata::Device(_)));
+        assert!(!last);
+    }
+
     #[test]
     fn bootstrap_replies_in_sweep_order() {
         let mut out = Reply::new();
-        reply(device("d"), &Fixture, &[], &mut out).unwrap();
+        reply(device("d"), &fixture(), &[], &mut out).unwrap();
         use MetadataType::*;
         assert_eq!(
             kinds(&out),
@@ -244,7 +373,7 @@ mod tests {
     fn a_full_reply_stops_at_a_frame_boundary() {
         let frame = |selector: MetadataSelector| {
             let mut one = Reply::new();
-            reply(device("d"), &Fixture, &selector.encode(), &mut one).unwrap();
+            reply(device("d"), &fixture(), &selector.encode(), &mut one).unwrap();
             one.len()
         };
         let room_for_one = REPLY_MAX - frame(MetadataSelector::stream(1)) + 1;
@@ -252,7 +381,7 @@ mod tests {
         let mut out = Reply::new();
         let padding = room_for_one - frame(MetadataSelector::device());
         out.resize_default(padding).unwrap();
-        bootstrap(device("d"), &Fixture, &mut out).unwrap();
+        bootstrap(device("d"), &fixture(), &mut out).unwrap();
         assert_eq!(kinds(&out[padding..]), [MetadataType::Device]);
     }
 
@@ -263,7 +392,7 @@ mod tests {
         arg.extend(MetadataSelector::segment(1, CURRENT_SEGMENT).encode());
         arg.extend(MetadataSelector::device().encode());
         let mut out = Reply::new();
-        reply(device("d"), &Fixture, &arg, &mut out).unwrap();
+        reply(device("d"), &fixture(), &arg, &mut out).unwrap();
         use MetadataType::*;
         assert_eq!(kinds(&out), [Column, Segment, Device]);
         let (_, segment) = MetadataReply::parse(&out).unwrap().nth(1).unwrap();
@@ -274,24 +403,24 @@ mod tests {
     fn a_bad_request_is_refused() {
         let mut out = Reply::new();
         assert_eq!(
-            reply(device("d"), &Fixture, &[1, 2], &mut out),
+            reply(device("d"), &fixture(), &[1, 2], &mut out),
             Err(RpcError::ArgsSize)
         );
         let too_many: Vec<u8> = (0..17)
             .flat_map(|_| MetadataSelector::device().encode())
             .collect();
         assert_eq!(
-            reply(device("d"), &Fixture, &too_many, &mut out),
+            reply(device("d"), &fixture(), &too_many, &mut out),
             Err(RpcError::Invalid)
         );
         let unknown = MetadataSelector::stream(9).encode();
         assert_eq!(
-            reply(device("d"), &Fixture, &unknown, &mut out),
+            reply(device("d"), &fixture(), &unknown, &mut out),
             Err(RpcError::Invalid)
         );
         let no_such_segment = MetadataSelector::segment(1, 4).encode();
         assert_eq!(
-            reply(device("d"), &Fixture, &no_such_segment, &mut out),
+            reply(device("d"), &fixture(), &no_such_segment, &mut out),
             Err(RpcError::Invalid)
         );
     }
@@ -301,7 +430,7 @@ mod tests {
         let long = "n".repeat(300);
         let mut out = Reply::new();
         assert_eq!(
-            reply(device(&long), &Fixture, &[], &mut out),
+            reply(device(&long), &fixture(), &[], &mut out),
             Err(RpcError::Internal)
         );
     }
