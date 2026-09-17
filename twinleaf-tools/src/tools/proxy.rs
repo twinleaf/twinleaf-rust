@@ -9,6 +9,7 @@ mod nmea;
 
 pub use list::run_list;
 
+use crate::tools::log_line;
 use crate::tui::selector::PickedSubtree;
 use crate::{MountArg, ProxyCli, ProxySubcommands};
 #[cfg(feature = "mdns")]
@@ -1072,8 +1073,8 @@ impl ProxyServer {
                 LogLevel::DEBUG => log::Level::Debug,
                 _ => log::Level::Info,
             };
-            let text = String::from_utf8_lossy(message.message);
-            log::log!(target: &format!("device::{routing}"), level, "{text}");
+            let line = log_line(&message);
+            log::log!(target: &format!("device::{routing}"), level, "{line}");
         }
     }
 }

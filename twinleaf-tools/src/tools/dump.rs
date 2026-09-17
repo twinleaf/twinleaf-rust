@@ -1,4 +1,4 @@
-use crate::tools::recv_before;
+use crate::tools::{log_line, recv_before};
 use crate::{DumpCli, TioOpts};
 use std::time::Instant;
 use twinleaf::data::{ColumnFilter, SampleBatch, SampleRow};
@@ -50,7 +50,12 @@ pub fn dump(
             while let Some(pkt) =
                 recv_before(&packets, deadline, "packets").wrap_err("stream ended")?
             {
-                println!("{:?}", pkt);
+                match pkt.payload() {
+                    tio::packet::Payload::Log(message) => {
+                        println!("{} LOG {}", pkt.route(), log_line(&message))
+                    }
+                    _ => println!("{:?}", pkt),
+                }
             }
         }
 
