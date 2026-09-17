@@ -178,53 +178,69 @@ impl RpcSpec {
     }
 }
 
-/// The RPCs every Twinleaf platform declares, in the id order that is on the
-/// wire: tl-chibi's `tl_firmware_start`, then what it does not fix.
-///
-/// A platform that does not implement a listed RPC answers [`RpcError::State`].
-pub static STANDARD: &[RpcSpec] = &[
-    RpcSpec::std("dev.metadata", Access::RW),
-    RpcSpec::prop("dev.systime", Kind::Uint(8), Access::READ),
-    RpcSpec::action("dev.reboot"),
-    RpcSpec::prop("dev.loglevel", Kind::Uint(1), Access::RW),
-    RpcSpec::prop("dev.name", Kind::String, Access::READ),
-    RpcSpec::prop("dev.model", Kind::String, Access::READ),
-    RpcSpec::std("dev.uid", Access::READ),
-    RpcSpec::prop("dev.serial", Kind::String, Access::READ),
-    RpcSpec::prop("dev.revision", Kind::Uint(2), Access::READ),
-    RpcSpec::prop("dev.desc", Kind::String, Access::READ),
-    RpcSpec::prop("dev.session", Kind::Uint(4), Access::READ),
-    RpcSpec::prop("dev.mcu.model", Kind::String, Access::READ),
-    RpcSpec::prop("dev.firmware.serial", Kind::String, Access::READ),
-    RpcSpec::action("dev.conf.load"),
-    RpcSpec::action("dev.conf.save"),
-    RpcSpec::action("dev.conf.reset"),
-    RpcSpec::prop("dev.uptime", Kind::Uint(4), Access::READ),
-    RpcSpec::std("dev.firmware.upload", Access::RW),
-    RpcSpec::action("dev.firmware.upgrade"),
-    RpcSpec::std("rpc.name", Access::RW),
-    RpcSpec::std("rpc.id", Access::RW),
-    RpcSpec::std("rpc.info", Access::RW),
-    RpcSpec::std("rpc.list", Access::RW),
-    RpcSpec::std("rpc.listinfo", Access::RW),
-    RpcSpec::std("rpc.match", Access::RW),
-    RpcSpec::prop("rpc.hash", Kind::Uint(4), Access::READ),
-    RpcSpec::action("dev.start"),
-    RpcSpec::action("dev.stop"),
-    RpcSpec::action("dev.restart"),
-    RpcSpec::action("dev.firmware.abort"),
-    RpcSpec::prop("settings.version", Kind::Uint(4), Access::READ),
-    RpcSpec::prop("sync.status", Kind::Uint(1), Access::READ),
-];
+/// Declare the standard table once: the variant [`Std`] answers by, the name
+/// the entry carries, and the [`RpcSpec`] constructor that describes it.
+macro_rules! standard {
+    ($($variant:ident $name:literal $method:ident($($arg:expr),*),)*) => {
+        /// One entry of [`STANDARD`], in the id order that is on the wire.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Std {
+            $(#[doc = $name] $variant,)*
+        }
 
-/// The [`STANDARD`] names [`Device`](crate::device::Device) answers itself, so
-/// a platform that is only a device declares these and no more.
-#[rustfmt::skip]
-pub const CORE: &[&str] = &[
-    "dev.metadata", "dev.loglevel", "dev.name", "dev.serial", "dev.desc",
-    "dev.session", "dev.firmware.serial", "rpc.name", "rpc.id", "rpc.info",
-    "rpc.list", "rpc.listinfo", "rpc.hash", "settings.version",
-];
+        impl Std {
+            /// The entry a table position names, or `None` past the standard
+            /// table, where a board's own entries begin.
+            pub fn at(index: usize) -> Option<Self> {
+                const ALL: &[Std] = &[$(Std::$variant,)*];
+                ALL.get(index).copied()
+            }
+        }
+
+        /// The RPCs every Twinleaf platform declares, in the id order that is
+        /// on the wire: tl-chibi's `tl_firmware_start`, then what it does not
+        /// fix.
+        ///
+        /// A platform that does not implement a listed RPC answers
+        /// [`RpcError::State`].
+        pub static STANDARD: &[RpcSpec] = &[$(RpcSpec::$method($name $(, $arg)*),)*];
+    };
+}
+
+standard! {
+    Metadata "dev.metadata" std(Access::RW),
+    Systime "dev.systime" prop(Kind::Uint(8), Access::READ),
+    Reboot "dev.reboot" action(),
+    Loglevel "dev.loglevel" prop(Kind::Uint(1), Access::RW),
+    Name "dev.name" prop(Kind::String, Access::READ),
+    Model "dev.model" prop(Kind::String, Access::READ),
+    Uid "dev.uid" std(Access::READ),
+    Serial "dev.serial" prop(Kind::String, Access::READ),
+    Revision "dev.revision" prop(Kind::Uint(2), Access::READ),
+    Desc "dev.desc" prop(Kind::String, Access::READ),
+    Session "dev.session" prop(Kind::Uint(4), Access::READ),
+    Mcu "dev.mcu.model" prop(Kind::String, Access::READ),
+    FirmwareSerial "dev.firmware.serial" prop(Kind::String, Access::READ),
+    ConfLoad "dev.conf.load" action(),
+    ConfSave "dev.conf.save" action(),
+    ConfReset "dev.conf.reset" action(),
+    Uptime "dev.uptime" prop(Kind::Uint(4), Access::READ),
+    Upload "dev.firmware.upload" std(Access::RW),
+    Upgrade "dev.firmware.upgrade" action(),
+    RpcName "rpc.name" std(Access::RW),
+    RpcId "rpc.id" std(Access::RW),
+    RpcInfo "rpc.info" std(Access::RW),
+    RpcList "rpc.list" std(Access::RW),
+    RpcListInfo "rpc.listinfo" std(Access::RW),
+    RpcMatch "rpc.match" std(Access::RW),
+    RpcHash "rpc.hash" prop(Kind::Uint(4), Access::READ),
+    Start "dev.start" action(),
+    Stop "dev.stop" action(),
+    Restart "dev.restart" action(),
+    Abort "dev.firmware.abort" action(),
+    SettingsVersion "settings.version" prop(Kind::Uint(4), Access::READ),
+    SyncStatus "sync.status" prop(Kind::Uint(1), Access::READ),
+}
 
 /// `rpc.hash`: a CRC32 over each entry's name, flags, description, and
 /// signature, in table order.
@@ -440,6 +456,13 @@ mod tests {
         assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
         assert_eq!(STANDARD.last().unwrap().name, "sync.status");
         assert_eq!(hash(STANDARD), 0xde3e_d53f);
+    }
+
+    #[test]
+    fn every_position_of_the_standard_table_names_an_entry() {
+        assert_eq!(Std::at(0), Some(Std::Metadata));
+        assert_eq!(Std::at(STANDARD.len() - 1), Some(Std::SyncStatus));
+        assert_eq!(Std::at(STANDARD.len()), None);
     }
 
     #[test]

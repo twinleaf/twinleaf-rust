@@ -25,10 +25,9 @@ use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
-use twinleaf_device::control::{
-    self, Control, Deferred, Entry, FlashOp, Group, OneLane, Platform, SyncRequest,
+use twinleaf_device::device::{
+    self, Deferred, Device, Entry, FlashOp, Group, Identity, OneLane, SyncRequest,
 };
-use twinleaf_device::device::{Call, Device, Identity};
 use twinleaf_device::hub::{CallError, Event, Events, Hub, Input, PortSink};
 use twinleaf_device::rpc::{put, Access, Kind, Reply, RpcSpec, STANDARD};
 use twinleaf_device::segments::{Params, Timeref};
@@ -569,7 +568,7 @@ struct Flash {
 /// are UNIX nanoseconds, and every packet it sends goes to that runtime's sink.
 struct Sim {
     role: Role,
-    control: Control<Settings>,
+    device: Device<Settings>,
     streams: Vec<Stream<SEGMENTS>>,
     clocks: Vec<Clock>,
     capture: CaptureBuffer,
@@ -611,10 +610,11 @@ impl Sim {
         let session = SessionId::new(session_id);
         Ok(Self {
             role,
-            control: Control::new(
-                Device::new(identity, session, &RPCS),
+            device: Device::new(
+                identity,
+                session,
+                &RPCS,
                 Settings::new(cli, autostart_of(role)),
-                platform(role, serial),
                 now,
             ),
             streams: boot_streams(role, rate)?,
@@ -648,9 +648,7 @@ impl Sim {
     /// A host has connected: the device describes itself. Acquisition is the
     /// device's own business and a reconnecting host does not disturb it.
     fn connected(&mut self, now: u64, out: &mut impl Sink) {
-        self.control
-            .device_mut()
-            .connected(&self.streams[..], now, out);
+        self.device.connected(&self.streams[..], now, out);
     }
 
     /// Answer one packet from the host, which for a SYNC packet means taking
@@ -666,22 +664,22 @@ impl Sim {
             }
             return;
         }
-        let control::Actions {
+        let device::Actions {
             call,
             deferred,
             reboot,
             loglevel: _,
             log,
-        } = self.control.handle(
+        } = self.device.handle(
             &self.streams[..],
-            control::Input::Packet(packet),
+            device::Input::Packet(packet),
             now,
             &mut OneLane(&mut *out),
         );
         self.note(log);
-        if let Some(call) = call {
-            let result = self.app_rpc(&call, now);
-            call.reply(result.as_deref().map_err(|error| *error), out);
+        if let Some((pending, name, args)) = call {
+            let result = self.app_rpc(name, args, now);
+            device::answer(pending, result.as_deref().map_err(|error| *error), out);
         }
         if let Some((pending, work)) = deferred {
             self.serve(pending, work, now, out);
@@ -690,14 +688,14 @@ impl Sim {
             self.reboot(now, out);
         }
         self.sync
-            .set_autostart_seconds(self.control.settings().autostart.get());
+            .set_autostart_seconds(self.device.settings().autostart.get());
     }
 
     /// Carry out an RPC whose answer is not the control machine's, and answer
     /// it where the request that asked says.
     fn serve(
         &mut self,
-        pending: control::Pending<'_>,
+        pending: device::Pending<'_>,
         work: Deferred,
         now: u64,
         out: &mut impl Sink,
@@ -726,16 +724,16 @@ impl Sim {
             }
             Deferred::Flash(FlashOp::ConfLoad) => return self.restore(Some(pending), now, out),
         };
-        control::answer(pending, result.as_deref().map_err(|error| *error), out);
+        device::answer(pending, result.as_deref().map_err(|error| *error), out);
     }
 
     /// Hand the control machine what is in flash, for the `dev.conf.load` that
     /// asked for it or for the boot that restores unasked.
-    fn restore(&mut self, pending: Option<control::Pending<'_>>, now: u64, out: &mut impl Sink) {
+    fn restore(&mut self, pending: Option<device::Pending<'_>>, now: u64, out: &mut impl Sink) {
         let stored = self.flash.conf.as_deref().ok_or(RpcError::State);
-        let actions = self.control.handle(
+        let actions = self.device.handle(
             &self.streams[..],
-            control::Input::Loaded(pending, stored),
+            device::Input::Loaded(pending, stored),
             now,
             &mut OneLane(out),
         );
@@ -753,7 +751,7 @@ impl Sim {
     fn tick(&mut self, now: u64, out: &mut impl Sink) {
         self.update_capture(now);
         self.advance_sync(now);
-        self.control.device_mut().tick(now, out);
+        self.device.tick(now, out);
         self.log_if_due(now, out);
         self.send_due_samples(now, out);
     }
@@ -762,9 +760,9 @@ impl Sim {
     /// segment ring on every stream, and a timebase to bootstrap again.
     fn reboot(&mut self, now: u64, out: &mut impl Sink) {
         let session = SessionId::new(self.next_session_id());
-        let serial = self.control.device().identity.serial.clone();
-        self.control.reboot(session, now);
-        self.control.settings_mut().reset();
+        let serial = self.device.identity.serial.clone();
+        self.device.reboot(session, now);
+        self.device.settings_mut().reset();
         self.upload = Upload::new();
         self.take_desc();
         self.streams =
@@ -780,7 +778,7 @@ impl Sim {
         self.next_log_level = 0;
         self.notes.push(format!(
             "rebooted; new session id {}",
-            self.control.device().session.value()
+            self.device.session.value()
         ));
         self.connected(now, out);
         self.restore(None, now, out);
@@ -789,7 +787,7 @@ impl Sim {
     /// Take `dev.desc` from what is in flash: the upgraded build once an
     /// image has taken.
     fn take_desc(&mut self) {
-        self.control.device_mut().identity.desc = desc_of(self.role, self.flash.upgraded)
+        self.device.identity.desc = desc_of(self.role, self.flash.upgraded)
             .try_into()
             .expect("a description that fits");
     }
@@ -820,7 +818,7 @@ impl Sim {
             let actions = self.sync.wake(counter_at(now), now);
             self.apply(actions, now);
         }
-        self.control
+        self.device
             .set_time_status(self.sync.status().announced.code());
     }
 
@@ -917,10 +915,9 @@ impl Sim {
     }
 
     /// The RPCs this device answers that no table entry does.
-    fn app_rpc(&mut self, call: &Call<'_, '_>, now: u64) -> Result<Reply, RpcError> {
-        let args = call.args;
+    fn app_rpc(&mut self, name: &str, args: &[u8], now: u64) -> Result<Reply, RpcError> {
         let mut reply = Reply::new();
-        match call.name {
+        match name {
             "test.go" => self.notes.push("test.go action invoked".to_string()),
             "test.capture" => {
                 let selector = Selector::parse(args)?;
@@ -983,12 +980,12 @@ impl Sim {
         let mut data = Vec::with_capacity(sample_count * CAPTURE_SAMPLE_BYTES);
 
         let rate = self.sample_rate().get();
-        let noise_sigma = self.control.settings().noise.get() * (f64::from(rate) / 2.0).sqrt();
+        let noise_sigma = self.device.settings().noise.get() * (f64::from(rate) / 2.0).sqrt();
         let start_sample = self.clocks[WAVE_CLOCK].generated;
         for offset in 0..sample_count as u64 {
             let t = (start_sample + offset) as f64 / f64::from(rate);
-            let phase = std::f64::consts::TAU * self.control.settings().frequency.get() * t;
-            let value = self.control.settings().amplitude.get() * phase.sin()
+            let phase = std::f64::consts::TAU * self.device.settings().frequency.get() * t;
+            let value = self.device.settings().amplitude.get() * phase.sin()
                 + noise_sigma * gaussian(&mut self.rng);
             data.extend((value as f32).to_le_bytes());
         }
@@ -1011,9 +1008,7 @@ impl Sim {
         let level = self.next_log_level();
         let lucky_number: u32 = self.rng.random_range(0..10_000);
         let message = self.random_log_message(lucky_number);
-        self.control
-            .device()
-            .log(level, lucky_number, &message, out);
+        self.device.log(level, lucky_number, &message, out);
         self.next_log_at = now + next_log_delay(&mut self.rng);
     }
 
@@ -1069,7 +1064,7 @@ impl Sim {
             Signal::Sine => self.sine_sample(),
             Signal::Status => {
                 let mut sample = [0u8; 16];
-                sample[..2].copy_from_slice(&[self.control.settings().status.get(), SIGNAL_LEVEL]);
+                sample[..2].copy_from_slice(&[self.device.settings().status.get(), SIGNAL_LEVEL]);
                 sample
             }
             Signal::Aux => self.aux_sample(),
@@ -1084,9 +1079,9 @@ impl Sim {
     fn sine_sample(&mut self) -> [u8; 16] {
         let rate = f64::from(self.sample_rate().get());
         let t = self.clocks[WAVE_CLOCK].generated as f64 / rate;
-        let phase = std::f64::consts::TAU * self.control.settings().frequency.get() * t;
-        let noise_sigma = self.control.settings().noise.get() * (rate / 2.0).sqrt();
-        let amplitude = self.control.settings().amplitude.get();
+        let phase = std::f64::consts::TAU * self.device.settings().frequency.get() * t;
+        let noise_sigma = self.device.settings().noise.get() * (rate / 2.0).sqrt();
+        let amplitude = self.device.settings().amplitude.get();
         let sine = amplitude * phase.sin() + noise_sigma * gaussian(&mut self.rng);
         let cosine = amplitude * phase.cos() + noise_sigma * gaussian(&mut self.rng);
         let mut sample = [0u8; 16];
@@ -1139,7 +1134,7 @@ impl Sim {
 
     fn next_session_id(&mut self) -> u32 {
         let mut session_id: u32 = self.rng.random();
-        if session_id == self.control.device().session.value() {
+        if session_id == self.device.session.value() {
             session_id = session_id.wrapping_add(1);
         }
         session_id
@@ -1626,7 +1621,7 @@ impl Runtime {
     fn banner(&self, keyboard: bool) -> io::Result<()> {
         let port = self.socket.local_addr()?.port();
         let root = &self.tree.root;
-        let settings = root.control.settings();
+        let settings = root.device.settings();
         terminal_println!("tio test listening on udp://0.0.0.0:{port}");
         match self.tree.children.first() {
             None => terminal_println!("  one device at /: {DEVICE_NAME} ({DEVICE_SERIAL})"),
@@ -1814,28 +1809,16 @@ fn synchronizer(role: Role, session: SessionId, serial: &str, now: u64) -> Synch
     )
 }
 
-/// What a device of this role calls itself.
+/// What a device of this role calls itself. Its serial stands in for the
+/// unique id a real board reads out of its MCU.
 fn identity(role: Role, serial: &str) -> io::Result<Identity> {
     let name = match role {
         Role::Hub => HUB_NAME,
         Role::Sensor => DEVICE_NAME,
     };
     Identity::new(name, desc_of(role, false), serial, DEVICE_FIRMWARE)
+        .map(|identity| identity.hardware(name, DEVICE_MCU, serial.to_owned().leak().as_bytes(), 1))
         .ok_or_else(|| invalid_input("identity too long"))
-}
-
-/// The hardware half of what a simulated device says it is. Its serial stands
-/// in for the unique id a real board reads out of its MCU.
-fn platform(role: Role, serial: String) -> Platform {
-    Platform {
-        model: Some(match role {
-            Role::Hub => HUB_NAME,
-            Role::Sensor => DEVICE_NAME,
-        }),
-        mcu: Some(DEVICE_MCU),
-        uid: Some(serial.leak().as_bytes()),
-        hw_rev: Some(1),
-    }
 }
 
 /// What `dev.desc` says, before an uploaded image has taken and after.
@@ -2206,14 +2189,14 @@ mod tests {
 
         let mut sent = Sent::default();
         sim.reboot(BOOT, &mut sent);
-        assert_eq!(sim.control.settings().amplitude.get(), 7.5);
-        assert!(sim.control.settings().enable.get());
+        assert_eq!(sim.device.settings().amplitude.get(), 7.5);
+        assert!(sim.device.settings().enable.get());
         assert_eq!(
             announcements(&sent),
             [
                 (
                     b"rpc.hash".to_vec(),
-                    sim.control.device().hash().to_le_bytes().to_vec()
+                    sim.device.hash().to_le_bytes().to_vec()
                 ),
                 (b"test.amplitude".to_vec(), amplitude.to_vec()),
             ]
@@ -2226,7 +2209,7 @@ mod tests {
         );
 
         call(&mut sim, b"dev.conf.reset", &[], &mut sent);
-        assert_eq!(sim.control.settings().amplitude.get(), 1.0);
+        assert_eq!(sim.device.settings().amplitude.get(), 1.0);
     }
 
     /// The walk that answers a name is the walk the table is declared from,
@@ -2287,7 +2270,7 @@ mod tests {
     fn dev_reboot_replies_and_comes_back_on_a_new_session() {
         let mut sim = sim(&[]);
         let mut sent = Sent::default();
-        let session = sim.control.device().session;
+        let session = sim.device.session;
         let mut buf = [0u8; Packet::MAX_SIZE];
         let method = twinleaf::proto::rpc::Method::ByName(b"dev.reboot");
         let len = twinleaf::proto::rpc::write_request(&mut buf, RpcRequestId::new(1), method, &[])
@@ -2303,7 +2286,7 @@ mod tests {
             matches!(Answer::parse(views[1].header.ptype, views[1].payload), Some(Answer::Reply(reply)) if reply.value.is_empty())
         );
         assert_eq!(views[2].header.ptype, PacketType::SETTING, "rpc.hash");
-        assert_ne!(sim.control.device().session, session);
+        assert_ne!(sim.device.session, session);
         assert!(!sim.acquiring);
     }
 
@@ -2314,7 +2297,7 @@ mod tests {
 
         let value = 2.5f64.to_le_bytes();
         assert_eq!(call(&mut sim, b"test.amplitude", &value, &mut sent), value);
-        assert_eq!(sim.control.settings().amplitude.get(), 2.5);
+        assert_eq!(sim.device.settings().amplitude.get(), 2.5);
 
         assert_eq!(
             announcements(&sent),
@@ -2339,8 +2322,8 @@ mod tests {
         call(&mut sim, b"test.enable", &[0], &mut sent);
 
         sim.reboot(BOOT, &mut sent);
-        assert_eq!(sim.control.settings().amplitude.get(), 1.0);
-        assert!(sim.control.settings().enable.get());
+        assert_eq!(sim.device.settings().amplitude.get(), 1.0);
+        assert!(sim.device.settings().enable.get());
 
         let mut sent = Sent::default();
         let version = call(&mut sim, b"settings.version", &[], &mut sent);
@@ -2384,7 +2367,7 @@ mod tests {
         let sim = sim(&[]);
         let streams = &sim.streams[..];
         let mut out = Reply::new();
-        metadata::reply(sim.control.device().record(streams), streams, &[], &mut out).unwrap();
+        metadata::reply(sim.device.record(streams), streams, &[], &mut out).unwrap();
         let kinds: Vec<_> = data::MetadataReply::parse(&out)
             .unwrap()
             .map(|(kind, _)| kind)
@@ -2452,9 +2435,9 @@ mod tests {
         assert_eq!(sine(&sim).id().value(), segment);
         assert_eq!(sine(&sim).timeref().start_time, start_time);
 
-        let session = sim.control.device().session;
+        let session = sim.device.session;
         sim.reboot(now, &mut sent);
-        assert_ne!(sim.control.device().session, session);
+        assert_ne!(sim.device.session, session);
         assert!(!sim.acquiring);
         assert!(sim
             .streams
@@ -2720,15 +2703,7 @@ mod tests {
         );
         assert_eq!(
             ask(&mut tree, &[2], b"dev.session", at),
-            Some(
-                tree.children[1]
-                    .sim
-                    .control
-                    .device()
-                    .session
-                    .to_le_bytes()
-                    .to_vec()
-            )
+            Some(tree.children[1].sim.device.session.to_le_bytes().to_vec())
         );
         assert_eq!(ask(&mut tree, &[3], b"dev.name", at), None);
     }
@@ -2744,7 +2719,7 @@ mod tests {
         }
 
         run(&mut tree, at, 6);
-        let session = tree.root.control.device().session;
+        let session = tree.root.device.session;
         for child in &tree.children {
             assert!(child.sim.acquiring);
             assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
@@ -2759,19 +2734,19 @@ mod tests {
     fn a_hub_reboot_flags_holdover_and_the_children_re_adopt() {
         let mut tree = tree(&["--samplerate", "4"]);
         let at = run(&mut tree, BOOT, 10);
-        let rebooted = tree.root.control.device().session;
+        let rebooted = tree.root.device.session;
 
         let mut sent = Sent::default();
         tree.reboot_root(at, &mut sent);
         let at = run(&mut tree, at, 3);
-        assert_ne!(tree.root.control.device().session, rebooted);
+        assert_ne!(tree.root.device.session, rebooted);
         assert!(tree.children.iter().all(|child| {
             child.sim.sync.status().announced == TimeStatus::Holdover
                 && sine_flags(&child.sim).contains(data::SegmentFlags::HOLDOVER)
         }));
 
         run(&mut tree, at, 12);
-        let session = tree.root.control.device().session;
+        let session = tree.root.device.session;
         for child in &tree.children {
             assert_eq!(sine(&child.sim).timeref().session, session);
             assert_eq!(sine(&child.sim).timeref().serial, HUB_SERIAL);
