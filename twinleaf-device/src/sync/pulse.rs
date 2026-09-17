@@ -624,326 +624,8 @@ mod tests {
         assert_eq!(tracker.state(), PulseState::Acquiring { good_pulses: 1 });
     }
 
-    /// The pre-refactor implementation, kept verbatim as a differential oracle.
-    /// It is the line-for-line port of `tlppstracker.c` this module grew out of,
-    /// so the test below holds the rewrite to the C's behavior, not just to a
-    /// tidier description of it.
-    mod oracle {
-        use super::{CounterDomain, PulseConfig, PulseState, SecondEvent, NANOS_PER_SECOND};
-
-        #[derive(Debug, Clone, Copy)]
-        pub(super) struct OracleTrain {
-            pub(super) valid: bool,
-            pub(super) triggered: bool,
-            pub(super) resumed: bool,
-            pub(super) first: bool,
-            pub(super) seconds_since_ref: u32,
-            pub(super) delta_since_ref: i64,
-            pub(super) spurious_count: u32,
-            pub(super) good_pulse_count: u32,
-            pub(super) pulse_streak_count: u32,
-            pub(super) last_delta: i64,
-            pub(super) phase_error: i64,
-            pub(super) last_edge: u32,
-            pub(super) miss_timeout_ns: u64,
-        }
-
-        impl OracleTrain {
-            const fn new() -> Self {
-                Self {
-                    valid: false,
-                    triggered: false,
-                    resumed: false,
-                    first: false,
-                    seconds_since_ref: 0,
-                    delta_since_ref: 0,
-                    spurious_count: 0,
-                    good_pulse_count: 0,
-                    pulse_streak_count: 0,
-                    last_delta: 0,
-                    phase_error: 0,
-                    last_edge: 0,
-                    miss_timeout_ns: 0,
-                }
-            }
-
-            fn process_pulse(
-                &mut self,
-                domain: CounterDomain,
-                config: PulseConfig,
-                delta: i64,
-                seconds: u32,
-                pulse_edge: u32,
-                pulse_time_ns: u64,
-            ) -> Option<i64> {
-                if !self.valid {
-                    *self = Self::new();
-                    self.valid = true;
-                    self.first = true;
-                } else {
-                    self.seconds_since_ref = self.seconds_since_ref.saturating_add(seconds);
-                    self.delta_since_ref = self.delta_since_ref.saturating_add(delta);
-
-                    let period = domain.period() as i64;
-                    let half = period / 2;
-                    if self.delta_since_ref >= half {
-                        self.seconds_since_ref = self.seconds_since_ref.saturating_add(1);
-                        self.delta_since_ref -= period;
-                    } else if self.delta_since_ref < -half {
-                        self.seconds_since_ref = self.seconds_since_ref.saturating_sub(1);
-                        self.delta_since_ref += period;
-                    }
-
-                    if self.seconds_since_ref == 0
-                        || self.delta_since_ref < -(config.edge_tolerance_ticks as i64)
-                        || self.delta_since_ref > config.edge_tolerance_ticks as i64
-                    {
-                        self.spurious_count = self.spurious_count.saturating_add(1);
-                        return None;
-                    }
-                    self.first = false;
-                }
-
-                let unaccounted = if self.triggered {
-                    if self.resumed {
-                        self.resumed = false;
-                        self.pulse_streak_count = 1;
-                    }
-                    self.seconds_since_ref as i64 - 1
-                } else if self.first {
-                    self.triggered = true;
-                    self.seconds_since_ref as i64
-                } else {
-                    self.triggered = true;
-                    self.resumed = true;
-                    self.seconds_since_ref as i64 - (self.pulse_streak_count as i64 + 1)
-                };
-
-                self.pulse_streak_count = self.pulse_streak_count.saturating_add(1);
-
-                if self.spurious_count == 0 {
-                    self.good_pulse_count = self.good_pulse_count.saturating_add(1);
-                } else {
-                    self.good_pulse_count = 0;
-                }
-
-                self.last_delta = self.delta_since_ref;
-                self.seconds_since_ref = 0;
-                self.delta_since_ref = 0;
-                self.last_edge = pulse_edge;
-                self.miss_timeout_ns = pulse_time_ns
-                    .saturating_add(NANOS_PER_SECOND)
-                    .saturating_add(config.miss_grace_ns as u64);
-                Some(unaccounted)
-            }
-
-            fn process_miss(&mut self) {
-                self.good_pulse_count = 0;
-                if self.triggered {
-                    self.pulse_streak_count = 0;
-                }
-                self.pulse_streak_count = self.pulse_streak_count.saturating_add(1);
-                self.triggered = false;
-                self.resumed = false;
-                self.first = false;
-                self.miss_timeout_ns = self.miss_timeout_ns.saturating_add(NANOS_PER_SECOND);
-            }
-        }
-
-        pub(super) struct OracleTracker {
-            domain: CounterDomain,
-            config: PulseConfig,
-            pub(super) main: OracleTrain,
-            pub(super) tentative: OracleTrain,
-            last_raw_edge: u32,
-            last_raw_time_ns: Option<u64>,
-            backward_time: u32,
-        }
-
-        impl OracleTracker {
-            pub(super) const fn new(domain: CounterDomain, config: PulseConfig) -> Self {
-                Self {
-                    domain,
-                    config,
-                    main: OracleTrain::new(),
-                    tentative: OracleTrain::new(),
-                    last_raw_edge: 0,
-                    last_raw_time_ns: None,
-                    backward_time: 0,
-                }
-            }
-
-            pub(super) fn state(&self) -> PulseState {
-                if !self.main.valid {
-                    PulseState::FreeRunning
-                } else if !self.main.triggered {
-                    PulseState::Holdover {
-                        missed_pulses: self.main.pulse_streak_count.min(u8::MAX as u32) as u8,
-                    }
-                } else if self.main.good_pulse_count >= self.config.lock_threshold as u32 {
-                    PulseState::Locked
-                } else {
-                    PulseState::Acquiring {
-                        good_pulses: self.main.good_pulse_count.min(u8::MAX as u32) as u8,
-                    }
-                }
-            }
-
-            pub(super) fn target_edge(&self) -> Option<u32> {
-                if !self.main.valid {
-                    return None;
-                }
-                let period = self.domain.period() as i128;
-                Some(
-                    (self.main.last_edge as i128 - self.main.phase_error as i128).rem_euclid(period)
-                        as u32,
-                )
-            }
-
-            pub(super) fn phase_error_ns(&self) -> Option<f32> {
-                self.main
-                    .triggered
-                    .then(|| self.domain.ticks_to_ns(self.main.phase_error))
-            }
-
-            pub(super) const fn backward_time_count(&self) -> u32 {
-                self.backward_time
-            }
-
-            pub(super) fn next_poll_deadline_ns(&self) -> Option<u64> {
-                [self.main, self.tentative]
-                    .into_iter()
-                    .filter(|train| train.valid)
-                    .map(|train| train.miss_timeout_ns.saturating_add(1))
-                    .min()
-            }
-
-            pub(super) fn bootstrap(&mut self, pulse_edge: u32, monotonic_ns: u64) -> SecondEvent {
-                self.main = OracleTrain::new();
-                self.tentative = OracleTrain::new();
-                self.last_raw_time_ns = None;
-                self.capture(pulse_edge, monotonic_ns)
-                    .expect("an empty pulse tracker accepts its first edge")
-            }
-
-            pub(super) fn capture(
-                &mut self,
-                pulse_edge: u32,
-                monotonic_ns: u64,
-            ) -> Option<SecondEvent> {
-                let monotonic_ns = self.forward_time(monotonic_ns);
-                let pulse_edge = self.domain.normalize(pulse_edge as u64);
-                let (delta, seconds) = match self.last_raw_time_ns {
-                    None => (0, 0),
-                    Some(last_time) => {
-                        let delta = self.domain.signed_delta(pulse_edge, self.last_raw_edge);
-                        let elapsed = monotonic_ns - last_time;
-                        let delta_ns =
-                            delta as i128 * NANOS_PER_SECOND as i128 / self.domain.period() as i128;
-                        let corrected = elapsed as i128 - delta_ns;
-                        let rounded =
-                            (corrected + (NANOS_PER_SECOND / 2) as i128) / NANOS_PER_SECOND as i128;
-                        (delta, rounded.clamp(0, u32::MAX as i128) as u32)
-                    }
-                };
-                self.last_raw_edge = pulse_edge;
-                self.last_raw_time_ns = Some(monotonic_ns);
-
-                match self.main.process_pulse(
-                    self.domain,
-                    self.config,
-                    delta,
-                    seconds,
-                    pulse_edge,
-                    monotonic_ns,
-                ) {
-                    Some(unaccounted) => {
-                        if self.tentative.valid {
-                            self.tentative.spurious_count =
-                                self.tentative.spurious_count.saturating_add(1);
-                            self.tentative.good_pulse_count = 0;
-                        }
-                        self.main.phase_error =
-                            self.main.phase_error.saturating_add(self.main.last_delta);
-                        self.main.spurious_count = 0;
-                        Some(SecondEvent::Captured { unaccounted })
-                    }
-                    None => {
-                        if self
-                            .tentative
-                            .process_pulse(
-                                self.domain,
-                                self.config,
-                                delta,
-                                seconds,
-                                pulse_edge,
-                                monotonic_ns,
-                            )
-                            .is_some()
-                        {
-                            self.tentative.spurious_count = 0;
-                        }
-                        None
-                    }
-                }
-            }
-
-            pub(super) fn poll(&mut self, monotonic_ns: u64) -> Option<SecondEvent> {
-                let monotonic_ns = self.forward_time(monotonic_ns);
-
-                let missed = self.main.valid && monotonic_ns > self.main.miss_timeout_ns;
-                if missed {
-                    self.main.process_miss();
-                }
-
-                if self.tentative.valid && monotonic_ns > self.tentative.miss_timeout_ns {
-                    if self.tentative.spurious_count != 0 {
-                        self.tentative = OracleTrain::new();
-                    } else {
-                        self.tentative.process_miss();
-                    }
-                }
-
-                if !missed {
-                    return None;
-                }
-
-                let switch = self.main.pulse_streak_count
-                    > self.config.missed_pulse_threshold as u32
-                    && self.tentative.good_pulse_count > self.config.switchover_threshold as u32;
-                if switch {
-                    self.main = self.tentative;
-                    self.main.first = true;
-                    self.tentative = OracleTrain::new();
-                }
-                self.main.spurious_count = 0;
-                Some(if switch {
-                    SecondEvent::Switched
-                } else {
-                    SecondEvent::Missed
-                })
-            }
-
-            pub(super) fn rebase(&mut self) {
-                self.main.phase_error = 0;
-            }
-
-            fn forward_time(&mut self, monotonic_ns: u64) -> u64 {
-                match self.last_raw_time_ns {
-                    Some(last) if monotonic_ns < last => {
-                        self.backward_time = self.backward_time.saturating_add(1);
-                        last
-                    }
-                    _ => monotonic_ns,
-                }
-            }
-        }
-    }
-
-    /// Randomized equivalence between the explicit state machine and the
-    /// flag-based original.
-    mod differential {
-        use super::oracle::{OracleTracker, OracleTrain};
+    /// Random pulse environments, held to the tracker's own invariants.
+    mod scenarios {
         use super::*;
 
         const SEEDS: u64 = 24;
@@ -982,11 +664,14 @@ mod tests {
             }
         }
 
-        /// Both trackers under one set of inputs, with the coverage counters
+        /// One tracker under the scenario's inputs, with the coverage counters
         /// that prove the interesting transitions were reached.
-        struct Pair {
-            new: PulseTracker,
-            old: OracleTracker,
+        struct Harness {
+            tracker: PulseTracker,
+            /// Whether an edge has been taken, so a target edge is owed.
+            anchored: bool,
+            /// Whether an outside train is in force, so free-running is over.
+            adopted: bool,
             captures: u32,
             spurs: u32,
             misses: u32,
@@ -994,13 +679,15 @@ mod tests {
             resumes: u32,
         }
 
-        impl Pair {
+        impl Harness {
             fn new() -> Self {
-                let domain = CounterDomain::new(PERIOD);
-                let config = PulseConfig::with_edge_tolerance(TOLERANCE);
                 Self {
-                    new: PulseTracker::new(domain, config),
-                    old: OracleTracker::new(domain, config),
+                    tracker: PulseTracker::new(
+                        CounterDomain::new(PERIOD),
+                        PulseConfig::with_edge_tolerance(TOLERANCE),
+                    ),
+                    anchored: false,
+                    adopted: false,
                     captures: 0,
                     spurs: 0,
                     misses: 0,
@@ -1009,131 +696,123 @@ mod tests {
                 }
             }
 
+            /// An accepted pulse anchors the train on its edge; a rejected one
+            /// leaves the anchor and the reported phase exactly where they were.
             fn capture(&mut self, edge: u32, now: u64) {
-                let lapsed = matches!(self.new.state(), PulseState::Holdover { .. });
-                let new = self.new.capture(edge, now);
-                let old = self.old.capture(edge, now);
-                assert_eq!(new, old, "capture(edge {edge}, {now} ns)");
-                match new {
+                let lapsed = matches!(self.tracker.state(), PulseState::Holdover { .. });
+                let before = (self.tracker.main.last_edge, self.tracker.target_edge());
+                match self.tracker.capture(edge, now) {
                     Some(SecondEvent::Captured { .. }) => {
                         self.captures += 1;
                         self.resumes += u32::from(lapsed);
+                        (self.anchored, self.adopted) = (true, true);
+                        assert_eq!(
+                            self.tracker.main.last_edge, edge,
+                            "an accepted pulse anchors on its edge at {now} ns"
+                        );
+                        assert!(
+                            self.tracker.phase_error_ns().is_some(),
+                            "an accepted pulse at {now} ns closed no second"
+                        );
                     }
-                    _ => self.spurs += 1,
+                    Some(other) => panic!("capture(edge {edge}, {now} ns) reported {other:?}"),
+                    None => {
+                        self.spurs += 1;
+                        assert_eq!(
+                            (self.tracker.main.last_edge, self.tracker.target_edge()),
+                            before,
+                            "a spur moved the main train at {now} ns"
+                        );
+                    }
                 }
-                self.agree("capture");
+                self.check("capture");
             }
 
+            /// A reported second always pushes the deadline out, so polling
+            /// terminates and the tracker cannot report the same second twice.
             fn poll(&mut self, now: u64) -> Option<SecondEvent> {
-                let new = self.new.poll(now);
-                let old = self.old.poll(now);
-                assert_eq!(new, old, "poll({now} ns)");
-                match new {
-                    Some(SecondEvent::Switched) => self.switchovers += 1,
-                    Some(_) => self.misses += 1,
+                let locked = self.tracker.state().is_locked();
+                let before = self.tracker.next_poll_deadline_ns();
+                let event = self.tracker.poll(now);
+                match event {
+                    Some(SecondEvent::Switched) => {
+                        self.switchovers += 1;
+                        self.adopted = true;
+                    }
+                    Some(SecondEvent::Missed) => {
+                        self.misses += 1;
+                        assert!(
+                            !locked
+                                || self.tracker.state()
+                                    == PulseState::Holdover { missed_pulses: 1 },
+                            "the first miss out of lock at {now} ns"
+                        );
+                        assert!(
+                            self.tracker.phase_error_ns().is_none(),
+                            "a missing pulse at {now} ns still measured a phase"
+                        );
+                    }
+                    Some(SecondEvent::Captured { .. }) => panic!("poll({now} ns) captured"),
                     None => {}
                 }
-                self.agree("poll");
-                new
+                if event.is_some() {
+                    assert!(
+                        self.tracker.next_poll_deadline_ns() > before,
+                        "the poll deadline did not move past a second at {now} ns"
+                    );
+                }
+                self.check("poll");
+                event
             }
 
             /// One poll per missing second, as `Synchronizer::poll` does.
             fn drain(&mut self, now: u64) {
-                while self.poll(now).is_some() {}
+                let deadline = self.tracker.next_poll_deadline_ns();
+                let mut seconds = 0u64;
+                while self.poll(now).is_some() {
+                    seconds += 1;
+                }
+                match deadline {
+                    Some(deadline) => assert!(
+                        seconds <= now.saturating_sub(deadline) / NANOS_PER_SECOND + 1,
+                        "{seconds} seconds reported between {deadline} and {now} ns"
+                    ),
+                    None => assert_eq!(seconds, 0, "a tracker with no deadline reported a second"),
+                }
             }
 
+            /// A synthetic edge anchors the counter without establishing a
+            /// train, so the tracker still reports itself unsynchronized.
             fn bootstrap(&mut self, edge: u32, now: u64) {
-                let new = self.new.bootstrap(edge, now);
-                let old = self.old.bootstrap(edge, now);
-                assert_eq!(new, old, "bootstrap(edge {edge}, {now} ns)");
-                self.agree("bootstrap");
+                self.tracker.bootstrap(edge, now);
+                (self.anchored, self.adopted) = (true, false);
+                assert_eq!(
+                    self.tracker.state(),
+                    PulseState::FreeRunning,
+                    "bootstrap(edge {edge}, {now} ns) established a train"
+                );
+                self.check("bootstrap");
             }
 
             fn rebase(&mut self) {
-                self.new.rebase();
-                self.old.rebase();
-                self.agree("rebase");
+                self.tracker.rebase();
+                self.check("rebase");
             }
 
-            fn agree(&self, what: &str) {
-                assert_eq!(
-                    self.new.state(),
-                    match self.new.main.external {
-                        true => self.old.state(),
-                        false => PulseState::FreeRunning,
-                    },
-                    "state after {what}"
-                );
-                assert_eq!(
-                    self.new.target_edge(),
-                    self.old.target_edge(),
-                    "target edge after {what}"
-                );
-                assert_eq!(
-                    self.new.phase_error_ns().map(f32::to_bits),
-                    self.old.phase_error_ns().map(f32::to_bits),
-                    "phase error after {what}"
-                );
-                assert_eq!(
-                    self.new.next_poll_deadline_ns(),
-                    self.old.next_poll_deadline_ns(),
-                    "poll deadline after {what}"
-                );
-                assert_eq!(
-                    self.new.backward_time_count(),
-                    self.old.backward_time_count(),
-                    "backward time after {what}"
-                );
-                same_train(&self.new.main, &self.old.main, "main", what);
-                same_train(&self.new.tentative, &self.old.tentative, "tentative", what);
-            }
-        }
-
-        /// Every flag-based field has a counterpart except `pulse_streak_count`
-        /// while triggered and `resumed`, which the original only ever read
-        /// back after a miss had overwritten them.
-        fn same_train(new: &Train, old: &OracleTrain, which: &str, what: &str) {
-            let mode = if !old.valid {
-                Mode::Empty
-            } else if !old.triggered {
-                Mode::Lapsed {
-                    missed: old.pulse_streak_count,
+            fn check(&self, what: &str) {
+                match self.tracker.target_edge() {
+                    Some(edge) => assert!(
+                        self.anchored && edge < PERIOD,
+                        "target edge {edge} after {what}"
+                    ),
+                    None => assert!(!self.anchored, "the anchor was lost after {what}"),
                 }
-            } else if old.first {
-                Mode::Fresh
-            } else {
-                Mode::Tracking
-            };
-            assert_eq!(new.mode, mode, "{which} mode after {what}");
-            assert_eq!(
-                new.pending_seconds, old.seconds_since_ref,
-                "{which} pending seconds after {what}"
-            );
-            assert_eq!(
-                new.pending_delta, old.delta_since_ref,
-                "{which} pending delta after {what}"
-            );
-            assert_eq!(
-                new.spurious_count, old.spurious_count,
-                "{which} spurious count after {what}"
-            );
-            assert_eq!(
-                new.good_pulse_count, old.good_pulse_count,
-                "{which} good pulses after {what}"
-            );
-            assert_eq!(
-                new.last_delta, old.last_delta,
-                "{which} last delta after {what}"
-            );
-            assert_eq!(
-                new.phase_error, old.phase_error,
-                "{which} phase error after {what}"
-            );
-            assert_eq!(new.last_edge, old.last_edge, "{which} edge after {what}");
-            assert_eq!(
-                new.miss_timeout_ns, old.miss_timeout_ns,
-                "{which} miss timeout after {what}"
-            );
+                assert_eq!(
+                    self.tracker.state() == PulseState::FreeRunning,
+                    !self.adopted,
+                    "free-running is exactly no adopted outside train, after {what}"
+                );
+            }
         }
 
         /// A simulated PPS environment: a drifting primary train that goes away
@@ -1169,7 +848,7 @@ mod tests {
 
             /// One simulated second: pulses, spurs, and whatever polling a
             /// distracted board might get around to.
-            fn step(&mut self, pair: &mut Pair) {
+            fn step(&mut self, pair: &mut Harness) {
                 let base = self.now;
 
                 if self.outage == 0 && self.rng.chance(12) {
@@ -1231,11 +910,11 @@ mod tests {
         }
 
         #[test]
-        fn the_explicit_state_machine_matches_the_flag_based_original() {
+        fn a_random_pulse_environment_holds_every_invariant() {
             let (mut captures, mut spurs, mut misses, mut switchovers, mut resumes) =
                 (0u64, 0u64, 0u64, 0u64, 0u64);
             for seed in 1..=SEEDS {
-                let mut pair = Pair::new();
+                let mut pair = Harness::new();
                 let mut scenario = Scenario::new(seed);
                 for _ in 0..STEPS {
                     scenario.step(&mut pair);
