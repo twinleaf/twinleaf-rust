@@ -691,7 +691,7 @@ impl Sim {
             device::answer(pending, result.as_deref().map_err(|error| *error), out);
         }
         if let Some((pending, work)) = deferred {
-            self.serve(pending, work, now, out);
+            self.serve(Some(pending), work, now, out);
         }
         if reboot {
             self.reboot(now, out);
@@ -704,7 +704,7 @@ impl Sim {
     /// it where the request that asked says.
     fn serve(
         &mut self,
-        pending: device::Pending<'_>,
+        pending: Option<device::Pending<'_>>,
         work: Deferred,
         now: u64,
         out: &mut impl Sink,
@@ -731,9 +731,11 @@ impl Sim {
                 self.reboot(now, out);
                 Ok(Reply::new())
             }
-            Deferred::Flash(FlashOp::ConfLoad) => return self.restore(Some(pending), now, out),
+            Deferred::Flash(FlashOp::ConfLoad) => return self.restore(pending, now, out),
         };
-        device::answer(pending, result.as_deref().map_err(|error| *error), out);
+        if let Some(pending) = pending {
+            device::answer(pending, result.as_deref().map_err(|error| *error), out);
+        }
     }
 
     /// Hand the control machine what is in flash, for the `dev.conf.load` that
@@ -760,7 +762,10 @@ impl Sim {
     fn tick(&mut self, now: u64, out: &mut impl Sink) {
         self.update_capture(now);
         self.advance_sync(now);
-        self.device.tick(now, out);
+        if let Some(image) = self.device.tick(now, out) {
+            self.serve(None, Deferred::Flash(FlashOp::ConfSave(image)), now, out);
+            self.device.saved();
+        }
         self.log_if_due(now, out);
         self.send_due_samples(now, out);
     }

@@ -32,6 +32,10 @@ use crate::Sink;
 /// Nanoseconds between heartbeats.
 pub const HEARTBEAT_INTERVAL: u64 = 200_000_000;
 
+/// Nanoseconds a changed configuration waits before it saves itself, as
+/// tl-chibi's `dev.conf.autosave` defaults to.
+pub const AUTOSAVE_INTERVAL: u64 = 60_000_000_000;
+
 /// The level `dev.loglevel` boots at, as tl-chibi's `logThreshold` does.
 pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 
@@ -258,6 +262,8 @@ pub struct Device<S: Group> {
     booted_ns: u64,
     loglevel: Setting<u8>,
     settings_version: u32,
+    /// When a persistent cell last moved with no save since.
+    dirty_since: Option<u64>,
     /// What `sync.status` answers, as the platform last published it.
     time_status: u8,
 }
@@ -282,6 +288,7 @@ impl<S: Group> Device<S> {
             booted_ns: now_ns,
             loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()),
             settings_version: 0,
+            dirty_since: None,
             time_status: 0,
         }
     }
@@ -434,7 +441,7 @@ impl<S: Group> Device<S> {
         let hw_rev = self.identity.hw_rev.map(u16::to_le_bytes);
         let mut reply = Reply::new();
         let result = match Std::at(index) {
-            None => match self.entry(index - STANDARD.len(), args, &mut reply, lanes) {
+            None => match self.entry(index - STANDARD.len(), args, now_ns, &mut reply, lanes) {
                 Some(result) => result,
                 None => return actions.call = Some((pending, spec.name, args)),
             },
@@ -475,8 +482,9 @@ impl<S: Group> Device<S> {
                     let mut image = Entries::new();
                     match self.save(&mut image) {
                         Ok(()) => {
+                            self.dirty_since = None;
                             return actions
-                                .defer(pending, Deferred::Flash(FlashOp::ConfSave(image)))
+                                .defer(pending, Deferred::Flash(FlashOp::ConfSave(image)));
                         }
                         Err(error) => Err(error),
                     }
@@ -523,6 +531,7 @@ impl<S: Group> Device<S> {
         &mut self,
         position: usize,
         args: &[u8],
+        now_ns: u64,
         out: &mut Reply,
         lanes: &mut (impl Lanes + ?Sized),
     ) -> Option<Result<(), RpcError>> {
@@ -534,6 +543,7 @@ impl<S: Group> Device<S> {
         let mut seen = 0;
         let mut found = None;
         let mut moved = false;
+        let mut dirty = false;
         settings.entries(&mut |entry| {
             let at = seen;
             seen += 1;
@@ -545,6 +555,7 @@ impl<S: Group> Device<S> {
                     found = Some(match cell.rpc(args, out) {
                         Ok(Changed::Changed) => {
                             moved = true;
+                            dirty |= cell.spec().access.contains(Access::PERSISTENT);
                             announce(settings_version, &mut to(&mut *lanes), cell.name(), out);
                             Ok(())
                         }
@@ -563,6 +574,7 @@ impl<S: Group> Device<S> {
                     let mut lane = events(&mut *lanes);
                     found = Some(action.run(&mut Announcer {
                         version: settings_version,
+                        dirty: &mut dirty,
                         events: &mut lane,
                     }));
                 }
@@ -570,6 +582,9 @@ impl<S: Group> Device<S> {
         });
         if moved {
             settings.publish();
+        }
+        if dirty {
+            self.dirty_since = Some(now_ns);
         }
         found
     }
@@ -654,18 +669,40 @@ impl<S: Group> Device<S> {
         self.booted_ns = now_ns;
         self.loglevel.reset();
         self.settings_version = 0;
+        self.dirty_since = None;
     }
 
-    /// Send whatever is due at `now_ns`.
-    pub fn tick(&mut self, now_ns: u64, out: &mut impl Sink) {
+    /// Send whatever is due at `now_ns`, and hand back the configuration a
+    /// change left unsaved for a period, owed until [`Device::saved`].
+    pub fn tick(&mut self, now_ns: u64, out: &mut impl Sink) -> Option<Entries> {
         if now_ns >= self.next_beat {
             self.beat(now_ns, out);
         }
+        if now_ns < self.dirty_since? + AUTOSAVE_INTERVAL {
+            return None;
+        }
+        let mut image = Entries::new();
+        match self.save(&mut image) {
+            Ok(()) => Some(image),
+            Err(_) => {
+                self.dirty_since = Some(now_ns);
+                None
+            }
+        }
     }
 
-    /// When [`Device::tick`] next has something to send.
+    /// The configuration reached the flash, so nothing is owed until a cell
+    /// moves again.
+    pub fn saved(&mut self) {
+        self.dirty_since = None;
+    }
+
+    /// When [`Device::tick`] next has something to send or save.
     pub fn deadline(&self) -> u64 {
-        self.next_beat
+        let save = self
+            .dirty_since
+            .map_or(u64::MAX, |at| at + AUTOSAVE_INTERVAL);
+        self.next_beat.min(save)
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
@@ -830,6 +867,7 @@ pub trait Action {
 /// drains, because one call may move a whole group.
 pub struct Announcer<'a> {
     version: &'a mut u32,
+    dirty: &'a mut bool,
     events: &'a mut dyn Sink,
 }
 
@@ -840,6 +878,7 @@ impl Announcer<'_> {
         value.encode(&mut args)?;
         let mut announced = Reply::new();
         if setting.rpc(&args, &mut announced)? == Changed::Changed {
+            *self.dirty |= Setting::spec(setting).access.contains(Access::PERSISTENT);
             announce(self.version, &mut self.events, setting.name(), &announced);
         }
         Ok(())
@@ -943,6 +982,19 @@ mod tests {
         fn publish(&self) {
             self.published.set(self.published.get() + 1);
         }
+    }
+
+    /// More settings than an image holds, for the save that cannot encode.
+    struct Fat(Vec<Setting<u32>>);
+
+    impl Group for Fat {
+        fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
+            self.0
+                .iter_mut()
+                .for_each(|cell| Group::entries(cell, visit));
+        }
+
+        fn publish(&self) {}
     }
 
     /// The names a board adds after the standard table.
@@ -1151,6 +1203,14 @@ mod tests {
         fn table(&self) -> &'static [RpcSpec] {
             self.device.table()
         }
+
+        /// Drive the clock to `now_ns` and store what the device decided to
+        /// save on its own account, as a platform whose flash took it does.
+        fn tick(&mut self, now_ns: u64) -> Option<Entries> {
+            let image = self.device.tick(now_ns, &mut Sent::default())?;
+            self.device.saved();
+            Some(image)
+        }
     }
 
     #[test]
@@ -1340,9 +1400,15 @@ mod tests {
         device.connect(BOOT);
         let mut sent = Sent::default();
 
-        device.device.tick(BOOT + HEARTBEAT_INTERVAL / 2, &mut sent);
+        assert!(device
+            .device
+            .tick(BOOT + HEARTBEAT_INTERVAL / 2, &mut sent)
+            .is_none());
         assert!(sent.0.is_empty());
-        device.device.tick(BOOT + HEARTBEAT_INTERVAL, &mut sent);
+        assert!(device
+            .device
+            .tick(BOOT + HEARTBEAT_INTERVAL, &mut sent)
+            .is_none());
         assert_eq!(sent.views()[0].header.ptype, PacketType::HEARTBEAT);
         assert_eq!(device.device.deadline(), BOOT + 2 * HEARTBEAT_INTERVAL);
     }
@@ -1836,6 +1902,168 @@ mod tests {
                 LogLevel::WARNING,
                 "some saved settings could not be restored"
             )]
+        );
+    }
+
+    /// tl-chibi's autosave (`lib/firmware/tlfw_persist.c:305`): a written
+    /// setting is saved a period after the write, once, and the heartbeat is
+    /// still the sooner deadline.
+    #[test]
+    fn a_written_setting_saves_itself_a_period_later() {
+        let mut device = harness();
+        assert!(device.tick(BOOT).is_none());
+        assert_eq!(device.device.deadline(), BOOT + HEARTBEAT_INTERVAL);
+
+        device.ask_at("board.second", &42u32.to_le_bytes(), BOOT);
+        assert_eq!(
+            device.device.deadline(),
+            BOOT + HEARTBEAT_INTERVAL,
+            "the heartbeat comes first"
+        );
+        assert!(device.tick(BOOT + AUTOSAVE_INTERVAL - 1).is_none());
+        assert_eq!(
+            device.device.deadline(),
+            BOOT + AUTOSAVE_INTERVAL,
+            "and then the save the write owes"
+        );
+
+        let image = device.tick(BOOT + AUTOSAVE_INTERVAL).expect("the save");
+        let stored: Vec<(&[u8], &[u8])> = conf::entries(&image)
+            .map(|entry| entry.unwrap())
+            .map(|entry| (entry.name, entry.value))
+            .collect();
+        assert_eq!(stored[1], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
+        assert!(
+            device.tick(BOOT + 3 * AUTOSAVE_INTERVAL).is_none(),
+            "one save, not a save every period"
+        );
+    }
+
+    /// Each further change puts the save off by another period, so a host
+    /// writing a whole configuration stores it once.
+    #[test]
+    fn a_second_change_puts_the_save_off_by_another_period() {
+        let mut device = harness();
+        let half = AUTOSAVE_INTERVAL / 2;
+        device.ask_at("board.first", &1u32.to_le_bytes(), BOOT);
+        device.ask_at("board.second", &2u32.to_le_bytes(), BOOT + half);
+        assert!(device.tick(BOOT + AUTOSAVE_INTERVAL).is_none());
+        assert!(device.tick(BOOT + half + AUTOSAVE_INTERVAL).is_some());
+    }
+
+    /// An action that moves a stored cell owes the save a write does.
+    #[test]
+    fn an_action_that_moves_a_stored_setting_owes_a_save() {
+        let mut device = harness();
+        device.ask_at("board.rewind", &[], BOOT);
+        assert!(device.tick(BOOT + AUTOSAVE_INTERVAL).is_some());
+    }
+
+    /// tl-chibi stores no `dev.loglevel`, so writing it owes nothing.
+    #[test]
+    fn a_write_to_a_setting_that_is_not_stored_owes_no_save() {
+        let mut device = harness();
+        device.ask_at("dev.loglevel", &[LogLevel::DEBUG.value()], BOOT);
+        assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+    }
+
+    /// `dev.conf.save` stores what the write left, so the autosave it owed is
+    /// cancelled rather than repeated.
+    #[test]
+    fn an_explicit_save_cancels_the_one_a_change_owed() {
+        let mut device = harness();
+        device.ask_at("board.second", &42u32.to_le_bytes(), BOOT);
+        device.ask_at("dev.conf.save", &[], BOOT + 1);
+        let Some((_, Deferred::Flash(FlashOp::ConfSave(_)))) = device.deferred.take() else {
+            panic!("the save reached the flash");
+        };
+        assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+    }
+
+    /// A restore says what the flash already stores, whether a boot or a host
+    /// asked for it, so tl-chibi's `tl_persist_load` leaves nothing owing.
+    #[test]
+    fn a_restored_configuration_owes_no_save() {
+        let mut device = harness();
+        let mut image = Entries::new();
+        let mut stored = Setting::new("board.second", 42u32).persistent();
+        conf::encode([&mut stored as &mut dyn Persisted], &mut image).unwrap();
+
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+
+        let later = BOOT + 2 * AUTOSAVE_INTERVAL;
+        let pending = Pending::local(RpcRequestId::new(7));
+        device.drive(Input::Loaded(Some(pending), Ok(&image)), later);
+        assert!(device.tick(later + 2 * AUTOSAVE_INTERVAL).is_none());
+    }
+
+    /// A read leaves `Changed::Unchanged`, which tl-chibi does not stamp.
+    #[test]
+    fn a_read_of_a_stored_setting_owes_no_save() {
+        let mut device = harness();
+        assert_eq!(
+            device.ask_at("board.first", &[], BOOT).value(),
+            &7u32.to_le_bytes()
+        );
+        assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+    }
+
+    /// The save is owed until the flash takes it, so a platform too busy to
+    /// store one is offered it again rather than losing the change.
+    #[test]
+    fn a_save_the_flash_did_not_take_is_offered_again() {
+        let mut device = harness();
+        device.ask_at("board.second", &42u32.to_le_bytes(), BOOT);
+        let mut sent = Sent::default();
+        let due = BOOT + AUTOSAVE_INTERVAL;
+        assert!(device.device.tick(due, &mut sent).is_some(), "the save");
+        assert!(
+            device.device.tick(due + 1, &mut sent).is_some(),
+            "still owed"
+        );
+        device.device.saved();
+        assert!(device.device.tick(due + 2, &mut sent).is_none());
+    }
+
+    /// A save that does not fit its image is owed for another period, as
+    /// tl-chibi's systick retries the one its storage refused.
+    #[test]
+    fn a_save_too_large_for_its_image_is_owed_for_another_period() {
+        let cells = (0..IMAGE_MAX / 16)
+            .map(|at| Box::leak(format!("board.filler{at:03}").into_boxed_str()))
+            .map(|name| Setting::new(name, 0u32).persistent())
+            .collect();
+        let mut board = Fat(cells);
+        let mut specs = STANDARD.to_vec();
+        board.entries(&mut |entry| specs.push(entry.spec()));
+        let mut device = Device::new(
+            identity(),
+            SESSION,
+            Box::leak(specs.into_boxed_slice()),
+            board,
+            BOOT,
+        );
+
+        let asked = asking(Method::ByName(b"board.filler000"), &1u32.to_le_bytes(), &[]);
+        let (view, _) = PacketView::parse_prefix(&asked).unwrap();
+        let none: [Stream<4>; 0] = [];
+        let mut lanes = Both::default();
+        device.handle(&none[..], Input::Packet(view), BOOT, &mut lanes);
+        assert_eq!(lanes.to.value(), &1u32.to_le_bytes(), "the write it owes");
+
+        let mut sent = Sent::default();
+        assert!(
+            device.tick(BOOT + AUTOSAVE_INTERVAL, &mut sent).is_none(),
+            "the image has no room for them"
+        );
+        assert!(device
+            .tick(BOOT + 2 * AUTOSAVE_INTERVAL - 1, &mut sent)
+            .is_none());
+        assert_eq!(
+            device.deadline(),
+            BOOT + 2 * AUTOSAVE_INTERVAL,
+            "owed for another period"
         );
     }
 }
