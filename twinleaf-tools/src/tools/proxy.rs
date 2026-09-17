@@ -921,8 +921,16 @@ impl ProxyServer {
             let epoch = Instant::now();
             let now_ns = || epoch.elapsed().as_nanos() as u64;
             let mut outbox = Outbox::default();
-            let mut hub = hub
-                .map(|hub| Device::new(hub.identity, hub.session, STANDARD, NoSettings, now_ns()));
+            let mut hub = hub.map(|hub| {
+                Device::new(
+                    hub.identity,
+                    hub.session,
+                    STANDARD,
+                    NoSettings,
+                    "",
+                    now_ns(),
+                )
+            });
             if let Some(hub) = hub.as_mut() {
                 hub.connected(&(), now_ns(), &mut outbox);
             }

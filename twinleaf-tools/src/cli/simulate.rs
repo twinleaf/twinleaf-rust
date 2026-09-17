@@ -78,4 +78,9 @@ pub struct SimulateCli {
     /// Parts per million each child's counter runs away from the hub's
     #[arg(long = "drift", default_value = "0", value_parser = finite_f64)]
     pub(crate) drift: f64,
+
+    /// Password `dev.priv` takes to unlock a simulated device's developer
+    /// entries; empty leaves it with none to unlock
+    #[arg(long = "password", default_value = "895895")]
+    pub(crate) password: String,
 }

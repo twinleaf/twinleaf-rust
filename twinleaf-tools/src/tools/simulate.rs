@@ -624,6 +624,7 @@ impl Sim {
                 session,
                 &RPCS,
                 Settings::new(cli, autostart_of(role)),
+                &cli.password,
                 now,
             ),
             streams: boot_streams(role, rate)?,

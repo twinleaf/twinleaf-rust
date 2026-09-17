@@ -47,6 +47,59 @@ number! {
     f64 => Float,
 }
 
+/// A short string a setting holds, bounded as tl-chibi's `password[16]` is:
+/// `N - 1` bytes, since the NUL that ends them is one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Text<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Default for Text<N> {
+    fn default() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+}
+
+impl<const N: usize> Text<N> {
+    /// The bytes it holds, which a write cut at the first NUL.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// A string too long for the cell leaves it empty, which no write can match.
+impl<const N: usize> From<&str> for Text<N> {
+    fn from(value: &str) -> Self {
+        Self::decode(value.as_bytes()).unwrap_or_default()
+    }
+}
+
+impl<const N: usize> Scalar for Text<N> {
+    const KIND: rpc::Kind = rpc::Kind::String;
+
+    fn decode(args: &[u8]) -> Result<Self, RpcError> {
+        let len = args
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(args.len());
+        if len >= N {
+            return Err(RpcError::ArgsSize);
+        }
+        let mut text = Self::default();
+        text.bytes[..len].copy_from_slice(&args[..len]);
+        text.len = len;
+        Ok(text)
+    }
+
+    fn encode(self, out: &mut Reply) -> Result<(), RpcError> {
+        put(out, self.as_bytes())
+    }
+}
+
 /// A flag, one byte on the wire like every other libtio bool.
 impl Scalar for bool {
     const KIND: rpc::Kind = rpc::Kind::Bool;
@@ -111,7 +164,23 @@ impl<T: Scalar> Setting<T> {
     /// The same setting, saved to flash and taken back from it at a boot.
     pub const fn persistent(self) -> Self {
         Self {
-            access: Access::RW.union(Access::PERSISTENT),
+            access: self.access.union(Access::PERSISTENT),
+            ..self
+        }
+    }
+
+    /// The same setting, callable but left out of what a locked session lists.
+    pub const fn hidden(self) -> Self {
+        Self {
+            access: self.access.union(Access::HIDDEN),
+            ..self
+        }
+    }
+
+    /// The same setting, reached only by a session `dev.priv` has unlocked.
+    pub const fn privileged(self) -> Self {
+        Self {
+            access: self.access.privileged(),
             ..self
         }
     }
@@ -273,6 +342,53 @@ mod tests {
             Err(RpcError::Invalid)
         );
         assert_eq!(rate.get(), 1.0);
+    }
+
+    #[test]
+    fn a_developer_setting_declares_the_bits_that_hide_it() {
+        let cal = Setting::new("imu.cal.x", 0.0f64).persistent().privileged();
+        assert!(cal.spec().access.is_privileged());
+        assert!(cal.spec().access.contains(Access::PERSISTENT));
+        assert!(!cal.spec().access.visible(false));
+        assert!(Setting::new("dev.secret", 0u8)
+            .hidden()
+            .spec()
+            .access
+            .visible(true));
+        assert!(!Setting::new("dev.secret", 0u8)
+            .hidden()
+            .spec()
+            .access
+            .visible(false));
+    }
+
+    #[test]
+    fn a_text_cell_holds_as_much_as_it_is_given() {
+        let mut password = Setting::new("dev.priv.password", Text::<16>::from("895895"));
+        assert_eq!(password.get().as_bytes(), b"895895");
+        assert_eq!(
+            answer(&mut password, b"hunter2"),
+            Ok((Changed::Changed, b"hunter2".to_vec()))
+        );
+        assert_eq!(
+            answer(&mut password, b"opensesame\0\0"),
+            Ok((Changed::Changed, b"opensesame".to_vec())),
+            "a write is cut at the first NUL, as tl-chibi cuts it"
+        );
+        assert_eq!(
+            answer(&mut password, &[b'x'; 15]),
+            Ok((Changed::Changed, vec![b'x'; 15]))
+        );
+        assert_eq!(
+            answer(&mut password, &[b'x'; 16]),
+            Err(RpcError::ArgsSize),
+            "a cell of sixteen holds fifteen bytes and the NUL that ends them"
+        );
+        assert_eq!(password.get().as_bytes(), &[b'x'; 15]);
+        assert_eq!(
+            Text::<16>::from("a string too long for the cell").as_bytes(),
+            b""
+        );
     }
 
     #[test]

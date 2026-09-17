@@ -25,8 +25,8 @@ use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::conf::{self, Image};
 use crate::metadata::{self, Streams};
-use crate::rpc::{self as table, read, Access, Reply, RpcSpec, Std, STANDARD};
-use crate::settings::{Changed, Persisted, Scalar, Setting};
+use crate::rpc::{self as table, put, read, Access, Reply, RpcSpec, Std, STANDARD};
+use crate::settings::{Changed, Persisted, Scalar, Setting, Text};
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
@@ -41,6 +41,9 @@ pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 
 /// As much flash as a stored configuration may take.
 pub const IMAGE_MAX: usize = 1024;
+
+/// As big a cell as `dev.priv.password` keeps, NUL and all, as tl-chibi's is.
+pub const PASSWORD_MAX: usize = 16;
 
 /// The bytes a stored configuration is built in and read back into.
 pub type Entries = Image<IMAGE_MAX>;
@@ -254,7 +257,14 @@ pub struct Device<S: Group> {
     /// Which boot this is.
     pub session: SessionId,
     table: &'static [RpcSpec],
-    hash: u32,
+    /// `rpc.hash` over the whole table, and over what a locked session sees.
+    full_hash: u32,
+    public_hash: u32,
+    /// Whether `dev.priv` has unlocked this session: not persisted, and false
+    /// at every boot.
+    privileged: bool,
+    /// The password `dev.priv` takes, which is never announced or broadcast.
+    password: Setting<Text<PASSWORD_MAX>>,
     settings: S,
     next_beat: u64,
     /// The nanosecond the device came up, which `dev.systime` and `dev.uptime`
@@ -270,19 +280,24 @@ pub struct Device<S: Group> {
 
 impl<S: Group> Device<S> {
     /// A device come up at `now_ns`, answering `table`: [`STANDARD`] first,
-    /// then what `settings` declares.
+    /// then what `settings` declares, and `dev.priv` taking `password` until
+    /// `dev.priv.password` overrides it.
     pub fn new(
         identity: Identity,
         session: SessionId,
         table: &'static [RpcSpec],
         settings: S,
+        password: &str,
         now_ns: u64,
     ) -> Self {
         Self {
             identity,
             session,
             table,
-            hash: table::hash(table),
+            full_hash: table::hash(table, true),
+            public_hash: table::hash(table, false),
+            privileged: false,
+            password: Setting::new("dev.priv.password", Text::from(password)).persistent(),
             settings,
             next_beat: 0,
             booted_ns: now_ns,
@@ -298,9 +313,12 @@ impl<S: Group> Device<S> {
         self.table
     }
 
-    /// `rpc.hash`.
+    /// `rpc.hash`, over the entries this session sees.
     pub fn hash(&self) -> u32 {
-        self.hash
+        match self.privileged {
+            true => self.full_hash,
+            false => self.public_hash,
+        }
     }
 
     /// The board's own entries, for the tasks that read them.
@@ -342,7 +360,7 @@ impl<S: Group> Device<S> {
         now_ns: u64,
         out: &mut impl Sink,
     ) {
-        announcement(out, "rpc.hash", &self.hash.to_le_bytes());
+        announcement(out, "rpc.hash", &self.hash().to_le_bytes());
         self.beat(now_ns, out);
         let record = self.record(streams);
         let mut sweep = metadata::Sweep::new();
@@ -429,7 +447,9 @@ impl<S: Group> Device<S> {
             Method::ById(id) => Some(usize::from(id.value())).filter(|&i| i < table.len()),
             Method::ByName(name) => table.iter().position(|spec| spec.name.as_bytes() == name),
         };
-        let Some(index) = index else {
+        let Some(index) =
+            index.filter(|&index| self.privileged || !table[index].access.is_privileged())
+        else {
             return answer(pending, Err(RpcError::NotFound), &mut to(lanes));
         };
         let spec = &table[index];
@@ -503,13 +523,13 @@ impl<S: Group> Device<S> {
                     Err(_) => Err(RpcError::ArgsSize),
                 },
                 Std::Upgrade => return actions.defer(pending, Deferred::Flash(FlashOp::Upgrade)),
-                Std::RpcName => table::name(table, args, &mut reply),
-                Std::RpcId => table::id(table, args, &mut reply),
-                Std::RpcInfo => table::info(table, args, &mut reply),
-                Std::RpcList => table::list(table, args, false, &mut reply),
-                Std::RpcListInfo => table::list(table, args, true, &mut reply),
-                Std::RpcMatch => table::match_name(table, args, &mut reply),
-                Std::RpcHash => read(&mut reply, args, &self.hash.to_le_bytes()),
+                Std::RpcName => table::name(table, self.privileged, args, &mut reply),
+                Std::RpcId => table::id(table, self.privileged, args, &mut reply),
+                Std::RpcInfo => table::info(table, self.privileged, args, &mut reply),
+                Std::RpcList => table::list(table, self.privileged, args, false, &mut reply),
+                Std::RpcListInfo => table::list(table, self.privileged, args, true, &mut reply),
+                Std::RpcMatch => table::match_name(table, self.privileged, args, &mut reply),
+                Std::RpcHash => read(&mut reply, args, &self.hash().to_le_bytes()),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
                 Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
                 Std::Restart => {
@@ -520,9 +540,50 @@ impl<S: Group> Device<S> {
                     read(&mut reply, args, &self.settings_version.to_le_bytes())
                 }
                 Std::SyncStatus => read(&mut reply, args, &[self.time_status]),
+                Std::Priv => self.unlock(args, &mut reply, &mut events(lanes)),
+                Std::PrivLock => {
+                    self.privileged = false;
+                    announcement(&mut events(lanes), "rpc.hash", &self.hash().to_le_bytes());
+                    Ok(())
+                }
+                Std::PrivPassword => match self.password.rpc(args, &mut reply) {
+                    Ok(Changed::Changed) => {
+                        self.dirty_since = Some(now_ns);
+                        Ok(())
+                    }
+                    Ok(Changed::Unchanged) => Ok(()),
+                    Err(error) => Err(error),
+                },
             },
         };
         answer(pending, result.map(|()| reply.as_slice()), &mut to(lanes));
+    }
+
+    /// `dev.priv`: a read says whether the session is unlocked, a write takes
+    /// the password, and a wrong one conceals the method from a locked session
+    /// as tl-chibi does. A board that names no password opens no session.
+    fn unlock(
+        &mut self,
+        args: &[u8],
+        out: &mut Reply,
+        events: &mut impl Sink,
+    ) -> Result<(), RpcError> {
+        let password = self.password.get();
+        if args.is_empty() {
+            return put(out, &[u8::from(self.privileged)]);
+        }
+        if password.as_bytes().is_empty() {
+            return Err(RpcError::State);
+        }
+        if args != password.as_bytes() {
+            return Err(match self.privileged {
+                true => RpcError::Invalid,
+                false => RpcError::NotFound,
+            });
+        }
+        self.privileged = true;
+        announcement(events, "rpc.hash", &self.hash().to_le_bytes());
+        Ok(())
     }
 
     /// Answer the board's own entry at `position`, announcing a write to the
@@ -591,7 +652,7 @@ impl<S: Group> Device<S> {
 
     /// Every persistent cell, as `dev.conf.save` hands them to the flash.
     fn save(&mut self, image: &mut Entries) -> Result<(), RpcError> {
-        let mut outcome = Ok(());
+        let mut outcome = conf::encode([&mut self.password as &mut dyn Persisted], image);
         self.settings.entries(&mut |entry| {
             let Entry::Setting(cell) = entry else {
                 return;
@@ -612,9 +673,10 @@ impl<S: Group> Device<S> {
         let Self {
             settings,
             settings_version,
+            password,
             ..
         } = self;
-        let mut outcome = Ok(());
+        let mut outcome = conf::load([password as &mut dyn Persisted], image, |_, _| {});
         settings.entries(&mut |entry| {
             let Entry::Setting(cell) = entry else {
                 return;
@@ -668,6 +730,8 @@ impl<S: Group> Device<S> {
         self.next_beat = 0;
         self.booted_ns = now_ns;
         self.loglevel.reset();
+        self.password.reset();
+        self.privileged = false;
         self.settings_version = 0;
         self.dirty_since = None;
     }
@@ -951,11 +1015,14 @@ mod tests {
         }
     }
 
-    /// Two plain settings, then a group of its own: the whole vocabulary.
+    /// Two plain settings, then a group of its own: the whole vocabulary, and
+    /// the two tiers a developer build adds to it.
     struct Board {
         first: Setting<u32>,
         second: Setting<u32>,
         counter: Counter,
+        quiet: Setting<u32>,
+        secret: Setting<u32>,
         published: core::cell::Cell<u32>,
     }
 
@@ -967,6 +1034,8 @@ mod tests {
                 counter: Counter {
                     value: Setting::new("board.count", 5).persistent(),
                 },
+                quiet: Setting::new("board.quiet", 9).hidden(),
+                secret: Setting::new("board.secret", 11).privileged(),
                 published: core::cell::Cell::new(0),
             }
         }
@@ -977,6 +1046,8 @@ mod tests {
             Group::entries(&mut self.first, visit);
             Group::entries(&mut self.second, visit);
             Group::entries(&mut self.counter, visit);
+            Group::entries(&mut self.quiet, visit);
+            Group::entries(&mut self.secret, visit);
         }
 
         fn publish(&self) {
@@ -1004,6 +1075,8 @@ mod tests {
         "board.count",
         "board.doubled",
         "board.rewind",
+        "board.quiet",
+        "board.secret",
     ];
 
     /// Every packet one lane took.
@@ -1102,6 +1175,9 @@ mod tests {
         Box::leak(specs.into_boxed_slice())
     }
 
+    /// The developer password the tests' board names.
+    const PASSWORD: &str = "895895";
+
     fn identity() -> Identity {
         Identity::new(
             "COMM-USB",
@@ -1114,7 +1190,7 @@ mod tests {
 
     fn device(table: &'static [RpcSpec]) -> Device<Board> {
         let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
-        Device::new(identity, SESSION, table, Board::new(), BOOT)
+        Device::new(identity, SESSION, table, Board::new(), PASSWORD, BOOT)
     }
 
     fn harness() -> Harness {
@@ -1204,6 +1280,22 @@ mod tests {
             self.device.table()
         }
 
+        /// How many entries `rpc.list` says this session has.
+        fn listed(&mut self) -> usize {
+            let count = self.ask("rpc.list", &[]).value().try_into().unwrap();
+            usize::from(u16::from_le_bytes(count))
+        }
+
+        /// Every name `rpc.list` enumerates for this session.
+        fn listing(&mut self) -> Vec<String> {
+            let mut names = Vec::new();
+            for at in 0..self.listed() as u16 {
+                let name = self.ask("rpc.list", &at.to_le_bytes()).value().to_vec();
+                names.push(String::from_utf8(name).unwrap());
+            }
+            names
+        }
+
         /// Drive the clock to `now_ns` and store what the device decided to
         /// save on its own account, as a platform whose flash took it does.
         fn tick(&mut self, now_ns: u64) -> Option<Entries> {
@@ -1262,7 +1354,7 @@ mod tests {
     #[test]
     fn hardware_a_platform_does_not_name_is_the_state_error() {
         let mut device = harness();
-        device.device = Device::new(identity(), SESSION, table(), Board::new(), BOOT);
+        device.device = Device::new(identity(), SESSION, table(), Board::new(), PASSWORD, BOOT);
         for name in ["dev.uid", "dev.model", "dev.mcu.model", "dev.revision"] {
             assert_eq!(device.ask(name, &[]).error(), RpcError::State, "{name}");
         }
@@ -1291,8 +1383,150 @@ mod tests {
     #[test]
     fn rpc_list_reports_the_method_count() {
         let mut device = harness();
-        let count = u16::from_le_bytes(device.ask("rpc.list", &[]).value().try_into().unwrap());
-        assert_eq!(count as usize, device.table().len());
+        assert_eq!(
+            device.listed(),
+            device.table().len() - 5,
+            "the three `dev.priv` entries and the board's own two"
+        );
+        device.ask("dev.priv", PASSWORD.as_bytes());
+        assert_eq!(device.listed(), device.table().len());
+    }
+
+    /// The developer tier: a locked session calls a hidden entry but never
+    /// sees it, and cannot reach a privileged one at all.
+    #[test]
+    fn a_locked_session_hides_what_a_board_marked_developer() {
+        let mut device = harness();
+        assert_eq!(device.ask("board.quiet", &[]).value(), &9u32.to_le_bytes());
+        assert_eq!(device.ask("board.secret", &[]).error(), RpcError::NotFound);
+        assert_eq!(device.ask("dev.priv.lock", &[]).error(), RpcError::NotFound);
+        assert_eq!(
+            device.ask("dev.priv.password", &[]).error(),
+            RpcError::NotFound
+        );
+
+        for name in ["board.quiet", "board.secret", "dev.priv", "dev.priv.lock"] {
+            assert_eq!(
+                device.ask("rpc.id", name.as_bytes()).error(),
+                RpcError::Invalid,
+                "{name} does not exist to a locked session"
+            );
+            assert_eq!(
+                device.ask("rpc.info", name.as_bytes()).error(),
+                RpcError::Invalid
+            );
+        }
+        let listed = device.listing();
+        assert!(!listed.iter().any(|name| name.starts_with("dev.priv")));
+        assert!(!listed.contains(&"board.quiet".to_string()));
+        assert!(!listed.contains(&"board.secret".to_string()));
+        assert!(listed.contains(&"board.first".to_string()));
+
+        let public = table::hash(device.table(), false);
+        assert_eq!(
+            device.ask("rpc.hash", &[]).value(),
+            public.to_le_bytes(),
+            "the hash a locked session caches covers the table it was shown"
+        );
+        assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
+    }
+
+    /// An id is a declaration position, so a hidden entry keeps its own and
+    /// the enumeration simply steps over it.
+    #[test]
+    fn a_hidden_entry_keeps_its_id_and_answers_by_it() {
+        let mut device = harness();
+        let id = device
+            .table()
+            .iter()
+            .position(|spec| spec.name == "board.quiet")
+            .unwrap() as u16;
+        let asked = asking(Method::ById(twinleaf_proto::RpcMethodId::new(id)), &[], &[]);
+        assert_eq!(device.send(&asked, BOOT).value(), &9u32.to_le_bytes());
+        assert_eq!(
+            device.ask("rpc.name", &id.to_le_bytes()).error(),
+            RpcError::Invalid
+        );
+    }
+
+    #[test]
+    fn the_password_unlocks_the_session_and_locks_it_again() {
+        let mut device = harness();
+        assert_eq!(device.ask("dev.priv", b"wrong").error(), RpcError::NotFound);
+        assert_eq!(device.ask("dev.priv", PASSWORD.as_bytes()).value(), b"");
+        assert_eq!(device.ask("dev.priv", &[]).value(), &[1]);
+
+        assert_eq!(
+            device.ask("board.secret", &[]).value(),
+            &11u32.to_le_bytes()
+        );
+        assert_eq!(device.listed(), device.table().len());
+        assert!(device.listing().contains(&"board.secret".to_string()));
+        let full = table::hash(device.table(), true);
+        assert_eq!(device.ask("rpc.hash", &[]).value(), full.to_le_bytes());
+        assert_eq!(
+            device.lanes.events.announced().last().unwrap(),
+            &("rpc.hash".to_string(), full.to_le_bytes().to_vec()),
+            "an unlocked session is told the table it may now cache"
+        );
+        assert_eq!(
+            device.ask("dev.priv", b"wrong").error(),
+            RpcError::Invalid,
+            "a session that already knows the method is told it typed it wrong"
+        );
+
+        assert_eq!(device.ask("dev.priv.lock", &[]).value(), b"");
+        assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
+        assert_eq!(device.ask("board.secret", &[]).error(), RpcError::NotFound);
+    }
+
+    /// The board's password is a compiled default the developer overrides,
+    /// stored like any other persistent setting.
+    #[test]
+    fn a_written_password_is_saved_and_unlocks_the_next_boot() {
+        let mut device = harness();
+        device.ask("dev.priv", PASSWORD.as_bytes());
+        assert_eq!(
+            device.ask("dev.priv.password", &[]).value(),
+            PASSWORD.as_bytes()
+        );
+        assert_eq!(
+            device.ask("dev.priv.password", b"hunter2").value(),
+            b"hunter2"
+        );
+        device.ask("dev.conf.save", &[]);
+        let Some((_, Deferred::Flash(FlashOp::ConfSave(image)))) = device.deferred.take() else {
+            panic!("a save carries the image");
+        };
+
+        device.device.reboot(SessionId::new(2), BOOT);
+        assert_eq!(device.ask("dev.priv", &[]).value(), &[0], "a boot locks");
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert_eq!(
+            device.ask("dev.priv", PASSWORD.as_bytes()).error(),
+            RpcError::NotFound,
+            "the compiled default no longer opens it"
+        );
+        assert_eq!(device.ask("dev.priv", b"hunter2").value(), b"");
+        assert!(
+            !device
+                .lanes
+                .events
+                .announced()
+                .iter()
+                .any(|(name, _)| name == "dev.priv.password"),
+            "a password is never broadcast"
+        );
+    }
+
+    /// A device that names no password has no developer session to open, as
+    /// the proxy's virtual hub does not.
+    #[test]
+    fn a_device_with_no_password_answers_the_state_error() {
+        let mut device = harness();
+        device.device = Device::new(identity(), SESSION, table(), Board::new(), "", BOOT);
+        assert_eq!(device.ask("dev.priv", b"895895").error(), RpcError::State);
+        assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
     }
 
     #[test]
@@ -1579,7 +1813,7 @@ mod tests {
         let device = harness();
         let names: Vec<&str> = device.table().iter().map(|spec| spec.name).collect();
         assert_eq!(names[0], "dev.metadata", "the standard table comes first");
-        assert_eq!(names[STANDARD.len() - 1], "sync.status");
+        assert_eq!(names[STANDARD.len() - 1], "dev.priv.password");
         assert_eq!(&names[STANDARD.len()..], BOARD_NAMES);
     }
 
@@ -1704,6 +1938,7 @@ mod tests {
             SESSION,
             Box::leak(specs.into_boxed_slice()),
             Board::new(),
+            PASSWORD,
             BOOT,
         );
 
@@ -1738,6 +1973,7 @@ mod tests {
     #[test]
     fn every_name_declared_is_one_that_is_answered() {
         let mut device = harness();
+        device.ask("dev.priv", PASSWORD.as_bytes());
         for name in BOARD_NAMES {
             assert_ne!(
                 device.ask(name, &[]).answer().err(),
@@ -1811,10 +2047,15 @@ mod tests {
         let names: Vec<&[u8]> = stored.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            [&b"board.first"[..], b"board.second", b"board.count"],
+            [
+                &b"dev.priv.password"[..],
+                b"board.first",
+                b"board.second",
+                b"board.count"
+            ],
             "every persistent cell, in table order"
         );
-        assert_eq!(stored[1].1, 42u32.to_le_bytes());
+        assert_eq!(stored[2].1, 42u32.to_le_bytes());
     }
 
     /// The boot restore: every stored value is taken, announced where every
@@ -1932,7 +2173,7 @@ mod tests {
             .map(|entry| entry.unwrap())
             .map(|entry| (entry.name, entry.value))
             .collect();
-        assert_eq!(stored[1], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
+        assert_eq!(stored[2], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
         assert!(
             device.tick(BOOT + 3 * AUTOSAVE_INTERVAL).is_none(),
             "one save, not a save every period"
@@ -2042,6 +2283,7 @@ mod tests {
             SESSION,
             Box::leak(specs.into_boxed_slice()),
             board,
+            PASSWORD,
             BOOT,
         );
 

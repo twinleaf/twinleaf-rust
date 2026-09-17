@@ -2,6 +2,14 @@
 //!
 //! An entry carries the flags word libtio firmware uses, since `rpc.hash` is a
 //! CRC over that encoding, and the wire metadata is derived from it.
+//!
+//! An entry a board marks hidden or privileged is a developer entry: it stays
+//! out of what a locked session lists and out of the hash that session reads,
+//! until `dev.priv` takes the board's password. tl-chibi sorts its table so
+//! each tier is a run of ids and one bound decides everything; here ids stay
+//! declaration positions and every entry is checked on its own. That is the
+//! one divergence: `rpc.list` enumerates the entries a session sees, while
+//! `rpc.name` and `rpc.id` go on speaking in ids.
 
 use twinleaf_proto::packet::Packet;
 use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
@@ -71,6 +79,8 @@ impl Access {
     pub const WRITE: Self = Self(0x2);
     /// Readable and writable.
     pub const RW: Self = Self(0x3);
+    /// Callable by name or id, but left out of what a locked session lists.
+    pub const HIDDEN: Self = Self(0x10);
     /// Persisted across reboots.
     pub const PERSISTENT: Self = Self(0x20);
 
@@ -82,6 +92,29 @@ impl Access {
     /// Both sets of bits.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// The same access granted to a privileged session only: read and write
+    /// move into the bits tl-chibi keeps them in, `0x4` and `0x8`.
+    pub const fn privileged(self) -> Self {
+        Self((self.0 & Self::RW.0) << 2 | self.0 & !Self::RW.0)
+    }
+
+    /// The read and write it grants, privileged or not, as `rpc.info` reports
+    /// them to a session that sees the entry at all.
+    pub const fn granted(self) -> Self {
+        Self(self.0 | (self.0 & 0xC) >> 2)
+    }
+
+    /// Whether only a privileged session may call it.
+    pub const fn is_privileged(self) -> bool {
+        self.0 & Self::RW.0 == 0
+    }
+
+    /// Whether a session lists it: everything once unlocked, and otherwise
+    /// what is neither hidden nor privileged.
+    pub const fn visible(self, privileged: bool) -> bool {
+        privileged || !(self.contains(Self::HIDDEN) || self.is_privileged())
     }
 }
 
@@ -146,6 +179,22 @@ impl RpcSpec {
         Self { extra_meta, ..self }
     }
 
+    /// The same entry, callable but left out of what a locked session lists.
+    pub const fn hidden(self) -> Self {
+        Self {
+            access: self.access.union(Access::HIDDEN),
+            ..self
+        }
+    }
+
+    /// The same entry, reached only by a session `dev.priv` has unlocked.
+    pub const fn privileged(self) -> Self {
+        Self {
+            access: self.access.privileged(),
+            ..self
+        }
+    }
+
     /// The flags word libtio firmware keeps for the entry, which `rpc.hash`
     /// covers: method kind, value type and size, then access in the top byte.
     pub const fn flags(&self) -> u32 {
@@ -166,13 +215,14 @@ impl RpcSpec {
         if size > 0xF {
             return self.extra_meta;
         }
+        let granted = self.access.granted();
         let access = [
             (Access::READ, RpcMetaFlags::READABLE),
             (Access::WRITE, RpcMetaFlags::WRITABLE),
             (Access::PERSISTENT, RpcMetaFlags::PERSISTENT),
         ]
         .into_iter()
-        .filter(|(bit, _)| self.access.contains(*bit))
+        .filter(|(bit, _)| granted.contains(*bit))
         .fold(0, |meta, (_, flag)| meta | flag.bits());
         0x8000 | size << 4 | kind | access | marks | self.extra_meta
     }
@@ -181,7 +231,7 @@ impl RpcSpec {
 /// Declare the standard table once: the variant [`Std`] answers by, the name
 /// the entry carries, and the [`RpcSpec`] constructor that describes it.
 macro_rules! standard {
-    ($($variant:ident $name:literal $method:ident($($arg:expr),*),)*) => {
+    ($($variant:ident $name:literal $method:ident($($arg:expr),*) $(.$build:ident())*,)*) => {
         /// One entry of [`STANDARD`], in the id order that is on the wire.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Std {
@@ -203,7 +253,7 @@ macro_rules! standard {
         ///
         /// A platform that does not implement a listed RPC answers
         /// [`RpcError::State`].
-        pub static STANDARD: &[RpcSpec] = &[$(RpcSpec::$method($name $(, $arg)*),)*];
+        pub static STANDARD: &[RpcSpec] = &[$(RpcSpec::$method($name $(, $arg)*)$(.$build())*,)*];
     };
 }
 
@@ -240,13 +290,17 @@ standard! {
     Abort "dev.firmware.abort" action(),
     SettingsVersion "settings.version" prop(Kind::Uint(4), Access::READ),
     SyncStatus "sync.status" prop(Kind::Uint(1), Access::READ),
+    Priv "dev.priv" std(Access::RW).hidden(),
+    PrivLock "dev.priv.lock" action().privileged(),
+    PrivPassword "dev.priv.password"
+        prop(Kind::String, Access::RW.union(Access::PERSISTENT)).privileged(),
 }
 
-/// `rpc.hash`: a CRC32 over each entry's name, flags, description, and
-/// signature, in table order.
-pub fn hash(table: &[RpcSpec]) -> u32 {
+/// `rpc.hash`: a CRC32 over the name, flags, description, and signature of
+/// every entry the session sees, so a host caches the table it was shown.
+pub fn hash(table: &[RpcSpec], privileged: bool) -> u32 {
     let mut digest = CRC32.digest();
-    for spec in table {
+    for spec in seen(table, privileged) {
         digest.update(spec.name.as_bytes());
         digest.update(&spec.flags().to_le_bytes());
         digest.update(spec.desc.as_bytes());
@@ -255,36 +309,67 @@ pub fn hash(table: &[RpcSpec]) -> u32 {
     digest.finalize()
 }
 
-/// `rpc.name`: the name of the method at an index.
-pub fn name(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
+/// The entries a session sees.
+fn seen(table: &[RpcSpec], privileged: bool) -> impl Iterator<Item = &RpcSpec> {
+    table
+        .iter()
+        .filter(move |spec| spec.access.visible(privileged))
+}
+
+/// `rpc.name`: the name of the method at an id, which a session that cannot
+/// see the entry is answered as if it did not exist.
+pub fn name(
+    table: &[RpcSpec],
+    privileged: bool,
+    arg: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    let spec = table
+        .get(index(arg)?)
+        .filter(|spec| spec.access.visible(privileged))
+        .ok_or(RpcError::Invalid)?;
     put(out, spec.name.as_bytes())
 }
 
-/// `rpc.id`: the index of the method with a name.
-pub fn id(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    let index = find(table, arg)?;
+/// `rpc.id`: the id of the method with a name.
+pub fn id(
+    table: &[RpcSpec],
+    privileged: bool,
+    arg: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    let (index, _) = find(table, privileged, arg)?;
     put(out, &(index as u16).to_le_bytes())
 }
 
 /// `rpc.info`: the metadata of the method with a name.
-pub fn info(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
-    let spec = &table[find(table, arg)?];
+pub fn info(
+    table: &[RpcSpec],
+    privileged: bool,
+    arg: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
+    let (_, spec) = find(table, privileged, arg)?;
     put(out, &spec.legacy_metadata().to_le_bytes())
 }
 
-/// `rpc.list` and `rpc.listinfo`: the table size with no argument, or the name
-/// of the method at an index, preceded by its metadata for `rpc.listinfo`.
+/// `rpc.list` and `rpc.listinfo`: how many entries the session sees with no
+/// argument, or the name of the one at a position in that enumeration,
+/// preceded by its metadata for `rpc.listinfo`.
 pub fn list(
     table: &[RpcSpec],
+    privileged: bool,
     arg: &[u8],
     with_info: bool,
     out: &mut Reply,
 ) -> Result<(), RpcError> {
     if arg.is_empty() {
-        return put(out, &(table.len() as u16).to_le_bytes());
+        let count = seen(table, privileged).count() as u16;
+        return put(out, &count.to_le_bytes());
     }
-    let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
+    let spec = seen(table, privileged)
+        .nth(index(arg)?)
+        .ok_or(RpcError::Invalid)?;
     if with_info {
         put(out, &spec.legacy_metadata().to_le_bytes())?;
     }
@@ -307,7 +392,12 @@ pub fn list(
 /// An empty argument is [`RpcError::Invalid`]. Byte-compatible with tl-chibi's
 /// `rpc_match`, down to its parser: only the first `|` separates, and a
 /// non-numeric tail after it still cuts the prefix but selects nothing.
-pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+pub fn match_name(
+    table: &[RpcSpec],
+    privileged: bool,
+    args: &[u8],
+    out: &mut Reply,
+) -> Result<(), RpcError> {
     if args.is_empty() {
         return Err(RpcError::Invalid);
     }
@@ -315,8 +405,7 @@ pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(),
         Some(bar) => (&args[..bar], match_index(&args[bar + 1..])),
         None => (args, None),
     };
-    let mut matches = table
-        .iter()
+    let mut matches = seen(table, privileged)
         .map(|spec| spec.name)
         .filter(|name| name.as_bytes().starts_with(prefix));
 
@@ -357,13 +446,18 @@ fn index(arg: &[u8]) -> Result<usize, RpcError> {
     Ok(usize::from(u16::from_le_bytes(bytes)))
 }
 
-fn find(table: &[RpcSpec], name: &[u8]) -> Result<usize, RpcError> {
+fn find<'t>(
+    table: &'t [RpcSpec],
+    privileged: bool,
+    name: &[u8],
+) -> Result<(usize, &'t RpcSpec), RpcError> {
     if name.is_empty() {
         return Err(RpcError::Invalid);
     }
     table
         .iter()
-        .position(|spec| spec.name.as_bytes() == name)
+        .enumerate()
+        .find(|(_, spec)| spec.access.visible(privileged) && spec.name.as_bytes() == name)
         .ok_or(RpcError::Invalid)
 }
 
@@ -383,6 +477,9 @@ pub fn read(out: &mut Reply, args: &[u8], value: &[u8]) -> Result<(), RpcError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What [`STANDARD`] hashes to, over every entry.
+    const HASH: u32 = 0x9c1c_90b7;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -430,45 +527,87 @@ mod tests {
     #[test]
     fn hash_covers_name_flags_desc_signature() {
         let table = table();
-        let base = hash(&table);
-        assert_eq!(base, hash(&table.clone()));
+        let base = hash(&table, true);
+        assert_eq!(base, hash(&table.clone(), true));
 
         let mut renamed = table.clone();
         renamed[0].name = "a.x";
-        assert_ne!(base, hash(&renamed));
+        assert_ne!(base, hash(&renamed, true));
 
         let mut reflagged = table.clone();
         reflagged[1].access = reflagged[1].access | Access::PERSISTENT;
-        assert_ne!(base, hash(&reflagged));
+        assert_ne!(base, hash(&reflagged, true));
 
         let mut redesc = table.clone();
         redesc[0].desc = "described";
-        assert_ne!(base, hash(&redesc));
+        assert_ne!(base, hash(&redesc, true));
 
         let mut resig = table;
         resig[0].signature = "u32";
-        assert_ne!(base, hash(&resig));
+        assert_ne!(base, hash(&resig, true));
     }
 
     #[test]
     fn the_standard_table_order_is_pinned() {
-        assert_eq!(STANDARD.len(), 32);
+        assert_eq!(STANDARD.len(), 35);
         assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
-        assert_eq!(STANDARD.last().unwrap().name, "sync.status");
-        assert_eq!(hash(STANDARD), 0xde3e_d53f);
+        assert_eq!(STANDARD.last().unwrap().name, "dev.priv.password");
+        assert_eq!(hash(STANDARD, true), HASH);
+        assert_eq!(
+            hash(STANDARD, false),
+            0xde3e_d53f,
+            "the three developer entries are invisible, so a customer's hash stands"
+        );
+    }
+
+    #[test]
+    fn the_developer_entries_are_the_last_three() {
+        let [unlock, lock, password] = [
+            &STANDARD[STANDARD.len() - 3],
+            &STANDARD[STANDARD.len() - 2],
+            &STANDARD[STANDARD.len() - 1],
+        ];
+        assert_eq!(unlock.name, "dev.priv");
+        assert!(unlock.access.contains(Access::HIDDEN) && !unlock.access.is_privileged());
+        assert_eq!(lock.name, "dev.priv.lock");
+        assert!(lock.access.is_privileged());
+        assert_eq!(password.name, "dev.priv.password");
+        assert!(password.access.is_privileged() && password.access.contains(Access::PERSISTENT));
+    }
+
+    #[test]
+    fn privileged_access_moves_the_read_and_write_bits_as_tl_chibi_does() {
+        assert_eq!(Access::RW.privileged(), Access(0xC));
+        assert_eq!(Access::WRITE.privileged(), Access(0x8));
+        assert_eq!(
+            Access::RW.union(Access::PERSISTENT).privileged(),
+            Access(0x2C)
+        );
+        assert_eq!(Access::RW.privileged().granted(), Access(0xF));
+        assert!(Access::NONE.is_privileged());
+        assert!(!Access::READ.is_privileged());
+        assert!(!Access::RW.union(Access::HIDDEN).visible(false));
+        assert!(Access::RW.union(Access::HIDDEN).visible(true));
+        assert_eq!(
+            RpcSpec::prop("p", Kind::Uint(4), Access::RW)
+                .privileged()
+                .legacy_metadata(),
+            RpcSpec::prop("p", Kind::Uint(4), Access::RW).legacy_metadata(),
+            "a session that sees a privileged entry reads it as readable and writable"
+        );
     }
 
     #[test]
     fn every_position_of_the_standard_table_names_an_entry() {
         assert_eq!(Std::at(0), Some(Std::Metadata));
-        assert_eq!(Std::at(STANDARD.len() - 1), Some(Std::SyncStatus));
+        assert_eq!(Std::at(STANDARD.len() - 1), Some(Std::PrivPassword));
         assert_eq!(Std::at(STANDARD.len()), None);
     }
 
     #[test]
     fn hash_is_the_iso_hdlc_crc_of_the_entries() {
         let table = [RpcSpec::std("a", Access::NONE)];
-        assert_eq!(hash(&table), CRC32.checksum(b"a\x01\0\0\0"));
+        assert_eq!(hash(&table, true), CRC32.checksum(b"a\x01\0\0\0"));
     }
 
     fn answer(call: impl FnOnce(&mut Reply) -> Result<(), RpcError>) -> Result<Vec<u8>, RpcError> {
@@ -481,39 +620,42 @@ mod tests {
         let table = table();
 
         assert_eq!(
-            answer(|out| list(&table, &[], false, out)),
+            answer(|out| list(&table, true, &[], false, out)),
             Ok(3u16.to_le_bytes().to_vec())
         );
 
         assert_eq!(
-            answer(|out| name(&table, &1u16.to_le_bytes(), out)),
+            answer(|out| name(&table, true, &1u16.to_le_bytes(), out)),
             Ok(b"dev.stop".to_vec())
         );
         assert_eq!(
-            answer(|out| name(&table, &3u16.to_le_bytes(), out)),
+            answer(|out| name(&table, true, &3u16.to_le_bytes(), out)),
             Err(RpcError::Invalid)
         );
         assert_eq!(
-            answer(|out| name(&table, &[1], out)),
+            answer(|out| name(&table, true, &[1], out)),
             Err(RpcError::ArgsSize)
         );
 
         assert_eq!(
-            answer(|out| id(&table, b"test.enable", out)),
+            answer(|out| id(&table, true, b"test.enable", out)),
             Ok(2u16.to_le_bytes().to_vec())
         );
-        assert_eq!(answer(|out| id(&table, b"", out)), Err(RpcError::Invalid));
         assert_eq!(
-            answer(|out| id(&table, b"nope", out)),
+            answer(|out| id(&table, true, b"", out)),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(
+            answer(|out| id(&table, true, b"nope", out)),
             Err(RpcError::Invalid)
         );
 
         assert_eq!(
-            answer(|out| info(&table, b"dev.stop", out)),
+            answer(|out| info(&table, true, b"dev.stop", out)),
             Ok(0x8000u16.to_le_bytes().to_vec())
         );
 
-        let listed = answer(|out| list(&table, &2u16.to_le_bytes(), true, out)).unwrap();
+        let listed = answer(|out| list(&table, true, &2u16.to_le_bytes(), true, out)).unwrap();
         assert_eq!(&listed[..2], &table[2].legacy_metadata().to_le_bytes());
         assert_eq!(&listed[2..], b"test.enable");
     }
@@ -540,7 +682,7 @@ mod tests {
 
     fn matched(args: &[u8]) -> Result<Reply, RpcError> {
         let mut out = Reply::new();
-        match_name(&named(), args, &mut out).map(|()| out)
+        match_name(&named(), true, args, &mut out).map(|()| out)
     }
 
     #[test]
