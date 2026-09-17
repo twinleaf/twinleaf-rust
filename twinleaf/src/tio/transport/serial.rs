@@ -161,7 +161,7 @@ impl Port {
 /// Turns a deserialized frame into a packet, or into the error it represents.
 fn decode_frame(frame: &wire::Frame) -> Result<Packet, RecvError> {
     use wire::FrameErrors;
-    let data = frame.data;
+    let data = frame.data();
     if let Some(packet) = frame.packet() {
         return match Packet::from_slice_prefix(packet) {
             Ok((tio_pkt, size)) => {

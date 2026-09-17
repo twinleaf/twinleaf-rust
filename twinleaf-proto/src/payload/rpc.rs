@@ -203,7 +203,15 @@ pub fn write_request(
     }
     let hdr = Header::new(PacketType::RPC_REQ, payload_len as u16);
     hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
-    write_request_payload(&mut buf[Header::SIZE..total], id, method, args)?;
+    let (method_id, name) = match method {
+        Method::ById(id) => (id.value(), &[][..]),
+        Method::ByName(name) => (REQUEST_BY_NAME | name.len() as u16, name),
+    };
+    let out = &mut buf[Header::SIZE..total];
+    out[0..2].copy_from_slice(&id.to_le_bytes());
+    out[2..4].copy_from_slice(&method_id.to_le_bytes());
+    out[4..4 + name.len()].copy_from_slice(name);
+    out[4 + name.len()..payload_len].copy_from_slice(args);
     Some(total)
 }
 
@@ -217,28 +225,6 @@ pub fn request_payload_len(method: Method<'_>, args: &[u8]) -> Option<usize> {
         return None;
     }
     Some(4 + name_len + args.len())
-}
-
-/// Write just the request payload (no header) into `out`; returns its length.
-pub fn write_request_payload(
-    out: &mut [u8],
-    id: RpcRequestId,
-    method: Method<'_>,
-    args: &[u8],
-) -> Option<usize> {
-    let len = request_payload_len(method, args)?;
-    if out.len() < len {
-        return None;
-    }
-    let (method_id, name) = match method {
-        Method::ById(id) => (id.value(), &[][..]),
-        Method::ByName(name) => (REQUEST_BY_NAME | name.len() as u16, name),
-    };
-    out[0..2].copy_from_slice(&id.to_le_bytes());
-    out[2..4].copy_from_slice(&method_id.to_le_bytes());
-    out[4..4 + name.len()].copy_from_slice(name);
-    out[4 + name.len()..len].copy_from_slice(args);
-    Some(len)
 }
 
 /// Overwrite the request id at the start of a request, reply, or error
@@ -281,19 +267,10 @@ pub fn write_reply(buf: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option
     }
     let hdr = Header::new(PacketType::RPC_REP, payload_len as u16);
     hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
-    write_reply_payload(&mut buf[Header::SIZE..total], req_id, value)?;
-    Some(total)
-}
-
-/// Write just the reply payload (no header) into `out`; returns its length.
-pub fn write_reply_payload(out: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option<usize> {
-    let len = 2 + value.len();
-    if out.len() < len {
-        return None;
-    }
+    let out = &mut buf[Header::SIZE..total];
     out[0..2].copy_from_slice(&req_id.to_le_bytes());
-    out[2..len].copy_from_slice(value);
-    Some(len)
+    out[2..payload_len].copy_from_slice(value);
+    Some(total)
 }
 
 /// A refused request: the code, kept raw, and whatever message followed it.
@@ -332,26 +309,10 @@ pub fn write_error(buf: &mut [u8], req_id: RpcRequestId, code: RpcError) -> Opti
     }
     let hdr = Header::new(PacketType::RPC_ERROR, 4);
     hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
-    write_error_payload(&mut buf[Header::SIZE..total], req_id, code.value(), &[])?;
-    Some(total)
-}
-
-/// Write just the error payload (no header) into `out`; returns its length.
-/// The code is raw so a hub can forward codes this crate has no name for.
-pub fn write_error_payload(
-    out: &mut [u8],
-    req_id: RpcRequestId,
-    code: u16,
-    message: &[u8],
-) -> Option<usize> {
-    let len = 4 + message.len();
-    if out.len() < len {
-        return None;
-    }
+    let out = &mut buf[Header::SIZE..total];
     out[0..2].copy_from_slice(&req_id.to_le_bytes());
-    out[2..4].copy_from_slice(&code.to_le_bytes());
-    out[4..len].copy_from_slice(message);
-    Some(len)
+    out[2..4].copy_from_slice(&code.value().to_le_bytes());
+    Some(total)
 }
 
 /// A reply or an error, told apart by the packet type.

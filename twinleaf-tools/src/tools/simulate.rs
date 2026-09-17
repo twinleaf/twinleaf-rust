@@ -1237,13 +1237,14 @@ impl Child {
     }
 }
 
-/// Packets on their way up a child's cable.
+/// Packets on their way up a child's cable, each with room for the hop the
+/// hub writes on it.
 #[derive(Default)]
 struct Wire(Vec<Vec<u8>>);
 
 impl Sink for Wire {
     fn send(&mut self, packet: &[u8]) {
-        self.0.push(packet.to_vec());
+        self.0.push(packet.iter().copied().chain([0]).collect());
     }
 }
 
@@ -1345,11 +1346,13 @@ impl Tree {
     }
 
     /// One packet from the host: the root answers what is addressed to it, and
-    /// the hub routes the rest.
-    fn handle(&mut self, packet: PacketView<'_>, now: u64, out: &mut impl Sink) {
-        if packet.routing.is_empty() {
-            self.root.handle(packet, now, out);
+    /// the hub routes the rest, editing it where it lies.
+    fn handle(&mut self, packet: &mut [u8], now: u64, out: &mut impl Sink) {
+        let Ok((view, _)) = PacketView::parse_prefix(packet) else {
             return;
+        };
+        if view.routing.is_empty() {
+            return self.root.handle(view, now, out);
         }
         let mut down = Downlink::default();
         let mut seen = Seen::default();
@@ -1498,19 +1501,16 @@ impl Tree {
     }
 
     /// Everything one child sent, on its way up through the hub.
-    fn child_sent(&mut self, index: usize, wire: Wire, now: u64, out: &mut impl Sink) {
+    fn child_sent(&mut self, index: usize, mut wire: Wire, now: u64, out: &mut impl Sink) {
         let Plug::In = self.children[index].plug else {
             return;
         };
         let port = port_of(index);
         let mut down = Downlink::default();
         let mut seen = Seen::default();
-        for packet in &wire.0 {
-            let Ok((view, _)) = PacketView::parse_prefix(packet) else {
-                continue;
-            };
+        for packet in &mut wire.0 {
             self.hub.handle(
-                Input::FromChild { port, packet: view },
+                Input::FromChild { port, packet },
                 now,
                 out,
                 &mut down,
@@ -1764,9 +1764,9 @@ impl Runtime {
                     if !self.accept_packet_from(addr)? {
                         continue;
                     }
-                    match PacketView::parse_prefix(&buf[..size]) {
-                        Ok((packet, parsed_size)) if parsed_size == size => {
-                            self.step(|tree, now, sink| tree.handle(packet, now, sink))?;
+                    match PacketView::parse_prefix(&buf[..size]).map(|(_, parsed)| parsed) {
+                        Ok(parsed) if parsed == size => {
+                            self.step(|tree, now, sink| tree.handle(&mut buf[..size], now, sink))?;
                         }
                         Ok(_) => {
                             terminal_eprintln!(
@@ -2704,9 +2704,8 @@ mod tests {
         for &hop in hops {
             len = twinleaf::proto::route::push_hop(&mut buf, hop).unwrap();
         }
-        let (view, _) = PacketView::parse_prefix(&buf[..len]).unwrap();
         let mut sent = Sent::default();
-        tree.handle(view, now, &mut sent);
+        tree.handle(&mut buf[..len], now, &mut sent);
         sent.views().iter().find_map(
             |view| match Answer::parse(view.header.ptype, view.payload) {
                 Some(Answer::Reply(reply)) if reply.req_id == RpcRequestId::new(5) => {

@@ -251,17 +251,6 @@ impl Packet {
         &self.buf[..self.len as usize]
     }
 
-    /// The payload bytes, writable. The header and routing bytes stay as they are.
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        // Every constructor parses, and pop/push_hop only edit routing, so a
-        // `Packet` always has a readable header.
-        let range = match Header::parse_prefix(self.as_slice()) {
-            Ok(header) => header.payload_range(),
-            Err(_) => 0..0,
-        };
-        &mut self.buf[range]
-    }
-
     /// Remove the next hop, for a router deciding where a packet goes.
     pub fn pop_hop(&mut self) -> Result<u8, ForwardError> {
         let (hop, len) = crate::route::pop_hop(&mut self.buf[..self.len as usize])?;
@@ -316,21 +305,6 @@ mod tests {
         assert_eq!(packet.header.ttl, 1);
         assert_eq!(packet.payload, [10, 11, 12]);
         assert_eq!(packet.routing, [7, 99]);
-    }
-
-    /// A router edits the payload and nothing else: the header and the hops
-    /// tagged after it stay where they were.
-    #[test]
-    fn payload_mut_reaches_the_payload_alone() {
-        let raw = [PacketType::RPC_REP.value(), 0, 3, 0, 10, 11, 12];
-        let mut packet = Packet::from_slice(&raw).unwrap();
-        packet.push_hop(4).unwrap();
-        packet.payload_mut().copy_from_slice(&[1, 2, 3]);
-
-        let (view, _) = PacketView::parse_prefix(packet.as_slice()).unwrap();
-        assert_eq!(view.payload, [1, 2, 3]);
-        assert_eq!(view.routing, [4]);
-        assert_eq!(view.header.ptype, PacketType::RPC_REP);
     }
 
     #[test]

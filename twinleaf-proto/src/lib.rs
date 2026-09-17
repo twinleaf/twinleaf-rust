@@ -20,7 +20,3 @@ pub use route::{DeviceRoute, RouteError};
 
 /// Default TCP port of a proxy or a networked device, packets back to back.
 pub const TCP_DEFAULT_PORT: u16 = 7855;
-/// Default UDP port, one packet per datagram.
-pub const UDP_DEFAULT_PORT: u16 = 7855;
-/// Default WebSocket port, one packet per binary message.
-pub const WS_DEFAULT_PORT: u16 = 7853;

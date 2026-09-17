@@ -11,8 +11,8 @@
 //! yields to every present port.
 
 use twinleaf_proto::heartbeat::Heartbeat;
-use twinleaf_proto::packet::{Header, Packet, PacketType, PacketView};
-use twinleaf_proto::route::push_hop;
+use twinleaf_proto::packet::{Packet, PacketType, PacketView};
+use twinleaf_proto::route::{pop_hop, push_hop};
 use twinleaf_proto::rpc::{self, Answer, Method, Request, RpcError};
 use twinleaf_proto::{DeviceRoute, RpcRequestId, SessionId};
 
@@ -55,17 +55,18 @@ pub enum Presence {
     },
 }
 
-/// One thing that reached the hub.
+/// One thing that reached the hub. A packet is edited where it lies, so both
+/// buffers are the caller's and come back shorter or longer by one hop.
 #[derive(Debug)]
 pub enum Input<'p> {
     /// A packet from the host, routed at one of the children.
-    FromHost(PacketView<'p>),
+    FromHost(&'p mut [u8]),
     /// A packet a child sent up.
     FromChild {
         /// The port it arrived on.
         port: u8,
-        /// The packet, as the child wrote it.
-        packet: PacketView<'p>,
+        /// The packet, in a buffer with room for the hop the hub adds.
+        packet: &'p mut [u8],
     },
     /// Nothing arrived; expire what is due.
     Tick,
@@ -251,53 +252,61 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
         }
     }
 
-    /// Route one host packet to the port its route names, taking a request
-    /// through the call table so its answer can be matched.
+    /// Route one host packet to the port its route names, striking that hop
+    /// off where it lies and taking a request through the call table.
     fn host_packet(
         &mut self,
-        view: PacketView<'_>,
+        buf: &mut [u8],
         now_ns: u64,
         up: &mut impl Sink,
         down: &mut impl PortSink,
     ) {
-        let Some((&port, hops)) = view.routing.split_last() else {
-            self.dropped_down = self.dropped_down.saturating_add(1);
-            return;
+        let Ok((view, _)) = PacketView::parse_prefix(buf) else {
+            return self.drop_down();
+        };
+        let Some(&port) = view.routing.last() else {
+            return self.drop_down();
         };
         if !self.present(port) {
-            self.dropped_down = self.dropped_down.saturating_add(1);
-            return;
+            return self.drop_down();
         }
-        let request = (view.header.ptype == PacketType::RPC_REQ)
-            .then(|| Request::parse(view.payload))
-            .flatten();
         let route = route_of(view.routing);
-        let minted = match request {
-            None => None,
-            Some(request) => match self.calls.forward(port, request.id, route, now_ns) {
-                Ok(minted) => Some(minted),
-                Err(Full) => return answer_up(up, route, request.id, RpcError::NoBufs),
-            },
+        let payload = view.header.payload_range();
+        let requested = (view.header.ptype == PacketType::RPC_REQ)
+            .then(|| Request::parse(view.payload))
+            .flatten()
+            .map(|request| request.id);
+        let Ok((_, len)) = pop_hop(buf) else {
+            return self.drop_down();
         };
-        let mut buf = [0u8; Packet::MAX_SIZE];
-        let len = relay(&mut buf, view, hops, minted);
+        match requested {
+            None => {}
+            Some(id) => match self.calls.forward(port, id, route, now_ns) {
+                Ok(minted) => {
+                    rpc::set_req_id(&mut buf[payload], minted);
+                }
+                Err(Full) => return answer_up(up, route, id, RpcError::NoBufs),
+            },
+        }
         down.send(port, &buf[..len]);
     }
 
-    /// Take one packet from a child: what it says about the child, and where
-    /// it goes next.
+    /// Take one packet from a child: what it says about the child, and the
+    /// arrival port it goes up wearing, in the room its buffer keeps for it.
     fn child_packet(
         &mut self,
         port: u8,
-        view: PacketView<'_>,
+        buf: &mut [u8],
         now_ns: u64,
         up: &mut impl Sink,
         events: &mut impl Events<P>,
     ) {
         if usize::from(port) >= PORTS {
-            self.dropped_up = self.dropped_up.saturating_add(1);
-            return;
+            return self.drop_up();
         }
+        let Ok((view, _)) = PacketView::parse_prefix(buf) else {
+            return self.drop_up();
+        };
         if let (PacketType::HEARTBEAT, true, Some(session)) = (
             view.header.ptype,
             view.routing.is_empty(),
@@ -308,33 +317,24 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
         if let Presence::Present { last_heard_ns, .. } = &mut self.ports[usize::from(port)] {
             *last_heard_ns = now_ns;
         }
-        let mut hops = [0u8; DeviceRoute::MAX_HOPS];
-        let Some(answer) = Answer::parse(view.header.ptype, view.payload) else {
-            let hop = view.routing.len();
-            if hop == DeviceRoute::MAX_HOPS {
-                self.dropped_up = self.dropped_up.saturating_add(1);
-                return;
-            }
-            hops[..hop].copy_from_slice(view.routing);
-            hops[hop] = port;
-            send_up(view, &hops[..hop + 1], None, up);
-            return;
+        let payload = view.header.payload_range();
+        let restored = match Answer::parse(view.header.ptype, view.payload) {
+            None => None,
+            Some(answer) => match self.calls.answered(port, answer) {
+                None => return self.drop_up(),
+                Some(Origin::Internal(purpose)) => {
+                    return events.event(Event::Answered(purpose, value_of(answer)))
+                }
+                Some(Origin::Forwarded { id, .. }) => Some(id),
+            },
         };
-        let (id, route) = match self.calls.answered(port, answer) {
-            None => {
-                self.dropped_up = self.dropped_up.saturating_add(1);
-                return;
-            }
-            Some(Origin::Internal(purpose)) => {
-                events.event(Event::Answered(purpose, value_of(answer)));
-                return;
-            }
-            Some(Origin::Forwarded { id, route }) => (id, route),
+        if let Some(id) = restored {
+            rpc::set_req_id(&mut buf[payload], id);
+        }
+        let Ok(len) = push_hop(buf, port) else {
+            return self.drop_up();
         };
-        let len = route
-            .write_wire(&mut hops)
-            .expect("a route fits its own hops");
-        send_up(view, &hops[..len], Some(id), up);
+        up.send(&buf[..len]);
     }
 
     /// Unplug the ports that have gone quiet and time out the calls nobody
@@ -379,42 +379,20 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
     fn present(&self, port: u8) -> bool {
         matches!(self.presence(port), Presence::Present { .. })
     }
+
+    fn drop_down(&mut self) {
+        self.dropped_down = self.dropped_down.saturating_add(1);
+    }
+
+    fn drop_up(&mut self) {
+        self.dropped_up = self.dropped_up.saturating_add(1);
+    }
 }
 
 impl<P, const PORTS: usize, const SLOTS: usize> Default for Hub<P, PORTS, SLOTS> {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Send one packet up to the host, with `routing` in place of the hops it
-/// carried and, for an answer, the id its requester used.
-fn send_up(view: PacketView<'_>, routing: &[u8], id: Option<RpcRequestId>, up: &mut impl Sink) {
-    let mut buf = [0u8; Packet::MAX_SIZE];
-    let len = relay(&mut buf, view, routing, id);
-    up.send(&buf[..len]);
-}
-
-/// Rebuild `view` with `routing` in place of the hops it carried, and, for an
-/// RPC, `id` in place of the id it named. Returns the packet's length.
-fn relay(
-    buf: &mut [u8; Packet::MAX_SIZE],
-    view: PacketView<'_>,
-    routing: &[u8],
-    id: Option<RpcRequestId>,
-) -> usize {
-    let header = Header {
-        routing_size: routing.len() as u8,
-        ..view.header
-    };
-    header.write((&mut buf[..Header::SIZE]).try_into().unwrap());
-    let payload = header.payload_range();
-    buf[payload.clone()].copy_from_slice(view.payload);
-    buf[payload.end..payload.end + routing.len()].copy_from_slice(routing);
-    if let Some(id) = id {
-        rpc::set_req_id(&mut buf[payload], id);
-    }
-    header.packet_len()
 }
 
 /// Answer a request the hub could not see through, along the route it came.
@@ -542,16 +520,12 @@ mod tests {
         out
     }
 
-    fn view(packet: &[u8]) -> PacketView<'_> {
-        PacketView::parse_prefix(packet).unwrap().0
-    }
-
     fn heartbeat(session: u32) -> Vec<u8> {
         let mut buf = [0u8; 32];
         let len = Heartbeat::Session(SessionId::new(session))
             .write(&mut buf)
             .unwrap();
-        buf[..len].to_vec()
+        buf[..len + 1].to_vec()
     }
 
     /// A request for `hops`, which are in wire order: the next hop last.
@@ -562,13 +536,13 @@ mod tests {
         for &hop in hops {
             len = push_hop(&mut buf, hop).unwrap();
         }
-        buf[..len].to_vec()
+        buf[..len + 1].to_vec()
     }
 
     fn reply(id: RpcRequestId, value: &[u8]) -> Vec<u8> {
         let mut buf = [0u8; Packet::MAX_SIZE];
         let len = rpc::write_reply(&mut buf, id, value).unwrap();
-        buf[..len].to_vec()
+        buf[..len + 1].to_vec()
     }
 
     fn answered(view: PacketView<'_>) -> Answer<'_> {
@@ -578,17 +552,16 @@ mod tests {
     /// A hub with a child on port 1.
     fn hub() -> Hub<Ask, 4> {
         let mut hub = Hub::new();
-        let beat = heartbeat(7);
-        let out = deliver(&mut hub, child(1, &beat), NOW);
+        let mut beat = heartbeat(7);
+        let out = deliver(&mut hub, child(1, &mut beat), NOW);
         assert_eq!(out.log.0, [Seen::Plugged(1)]);
         hub
     }
 
-    fn child<'p>(port: u8, packet: &'p [u8]) -> Input<'p> {
-        Input::FromChild {
-            port,
-            packet: view(packet),
-        }
+    /// A child's packet as a port lends it: the bytes, and room for one more
+    /// hop, which is what every builder here leaves after the packet.
+    fn child(port: u8, packet: &mut [u8]) -> Input<'_> {
+        Input::FromChild { port, packet }
     }
 
     /// The id the hub minted for the request it sent down.
@@ -600,8 +573,8 @@ mod tests {
     #[test]
     fn a_host_packet_reaches_the_port_its_route_names_with_that_hop_gone() {
         let mut hub = hub();
-        let packet = request(7, b"dev.name", &[3, 1]);
-        let out = deliver(&mut hub, Input::FromHost(view(&packet)), NOW);
+        let mut packet = request(7, b"dev.name", &[3, 1]);
+        let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
 
         let (port, view) = out.down.one();
         assert_eq!(port, 1);
@@ -613,8 +586,8 @@ mod tests {
     fn a_packet_for_an_absent_port_is_dropped_and_counted() {
         let mut hub = hub();
         for hops in [&[2][..], &[9][..], &[][..]] {
-            let packet = request(7, b"dev.name", hops);
-            let out = deliver(&mut hub, Input::FromHost(view(&packet)), NOW);
+            let mut packet = request(7, b"dev.name", hops);
+            let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
             assert!(out.down.0.is_empty());
             assert!(out.up.0.is_empty());
         }
@@ -624,13 +597,13 @@ mod tests {
     #[test]
     fn a_forwarded_request_goes_out_remapped_and_comes_back_restored() {
         let mut hub = hub();
-        let packet = request(7, b"dev.name", &[1]);
-        let out = deliver(&mut hub, Input::FromHost(view(&packet)), NOW);
+        let mut packet = request(7, b"dev.name", &[1]);
+        let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
         let minted = minted(&out.down);
         assert_ne!(minted, RpcRequestId::new(7));
 
-        let answer = reply(minted, b"tio-test");
-        let out = deliver(&mut hub, child(1, &answer), NOW);
+        let mut answer = reply(minted, b"tio-test");
+        let out = deliver(&mut hub, child(1, &mut answer), NOW);
         let view = out.up.one();
         assert_eq!(view.routing, [1]);
         let Answer::Reply(reply) = answered(view) else {
@@ -642,11 +615,37 @@ mod tests {
         );
     }
 
+    /// The bytes on both wires, as the hub that rebuilt every packet wrote
+    /// them: forwarding in place may not move a byte it did not have to.
+    #[test]
+    fn a_forwarded_packet_is_byte_for_byte_what_it_always_was() {
+        let mut hub = hub();
+        let mut packet = request(7, b"dev.name", &[3, 1]);
+        let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
+        let down: Vec<u8> = [2, 1, 12, 0, 32, 0, 8, 128]
+            .into_iter()
+            .chain(*b"dev.name")
+            .chain([3])
+            .collect();
+        assert_eq!(out.down.0, [(1, down)]);
+
+        let mut answer = reply(minted(&out.down), b"tio-test");
+        answer.push(0);
+        push_hop(&mut answer, 3).unwrap();
+        let out = deliver(&mut hub, child(1, &mut answer), NOW);
+        let up: Vec<u8> = [3, 2, 10, 0, 7, 0]
+            .into_iter()
+            .chain(*b"tio-test")
+            .chain([3, 1])
+            .collect();
+        assert_eq!(out.up.0, [up]);
+    }
+
     #[test]
     fn a_child_packet_goes_up_wearing_the_port_it_came_from() {
         let mut hub = hub();
-        let beat = heartbeat(7);
-        let out = deliver(&mut hub, child(1, &beat), NOW);
+        let mut beat = heartbeat(7);
+        let out = deliver(&mut hub, child(1, &mut beat), NOW);
         let view = out.up.one();
         assert_eq!(view.header.ptype, PacketType::HEARTBEAT);
         assert_eq!(view.routing, [1]);
@@ -656,21 +655,33 @@ mod tests {
     #[test]
     fn an_answer_to_no_request_of_the_hubs_is_dropped_and_counted() {
         let mut hub = hub();
-        let answer = reply(RpcRequestId::new(3), b"whose?");
-        let out = deliver(&mut hub, child(1, &answer), NOW);
+        let mut answer = reply(RpcRequestId::new(3), b"whose?");
+        let out = deliver(&mut hub, child(1, &mut answer), NOW);
         assert!(out.up.0.is_empty());
         assert_eq!(hub.counters().dropped_up, 1);
         assert_eq!(hub.counters().calls.unmatched, 1);
     }
 
+    /// The room for the hop is the caller's to leave: without it the packet is
+    /// dropped and counted, not truncated.
+    #[test]
+    fn a_child_packet_with_no_room_for_its_hop_is_dropped_and_counted() {
+        let mut hub = hub();
+        let mut beat = heartbeat(7);
+        beat.pop();
+        let out = deliver(&mut hub, child(1, &mut beat), NOW);
+        assert!(out.up.0.is_empty());
+        assert_eq!(hub.counters().dropped_up, 1);
+    }
+
     #[test]
     fn a_new_session_on_a_port_is_a_replug() {
         let mut hub = hub();
-        let same = heartbeat(7);
-        assert!(deliver(&mut hub, child(1, &same), NOW).log.0.is_empty());
+        let mut same = heartbeat(7);
+        assert!(deliver(&mut hub, child(1, &mut same), NOW).log.0.is_empty());
 
-        let rebooted = heartbeat(8);
-        let out = deliver(&mut hub, child(1, &rebooted), NOW);
+        let mut rebooted = heartbeat(8);
+        let out = deliver(&mut hub, child(1, &mut rebooted), NOW);
         assert_eq!(out.log.0, [Seen::Unplugged(1), Seen::Plugged(1)]);
         assert_eq!(
             hub.presence(1),
@@ -689,8 +700,8 @@ mod tests {
         let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS - 1);
         assert!(out.log.0.is_empty());
 
-        let answer = reply(RpcRequestId::new(3), b"whose?");
-        deliver(&mut hub, child(1, &answer), NOW + UNPLUG_NS - 1);
+        let mut answer = reply(RpcRequestId::new(3), b"whose?");
+        deliver(&mut hub, child(1, &mut answer), NOW + UNPLUG_NS - 1);
         assert_eq!(hub.deadline_ns(), Some(NOW + 2 * UNPLUG_NS - 1));
         let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS);
         assert!(out.log.0.is_empty());
@@ -704,8 +715,8 @@ mod tests {
     #[test]
     fn a_call_nobody_answers_times_out_for_the_host_and_for_the_hub() {
         let mut hub = hub();
-        let packet = request(7, b"dev.name", &[1]);
-        deliver(&mut hub, Input::FromHost(view(&packet)), NOW);
+        let mut packet = request(7, b"dev.name", &[1]);
+        deliver(&mut hub, Input::FromHost(&mut packet), NOW);
         hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default())
             .unwrap();
 
@@ -733,12 +744,12 @@ mod tests {
     fn a_full_table_refuses_the_host_with_nobufs_and_the_hub_with_full() {
         let mut hub = hub();
         for id in 0..CALL_SLOTS as u16 {
-            let packet = request(id, b"dev.name", &[1]);
-            deliver(&mut hub, Input::FromHost(view(&packet)), NOW);
+            let mut packet = request(id, b"dev.name", &[1]);
+            deliver(&mut hub, Input::FromHost(&mut packet), NOW);
         }
 
-        let packet = request(99, b"dev.name", &[1]);
-        let out = deliver(&mut hub, Input::FromHost(view(&packet)), NOW);
+        let mut packet = request(99, b"dev.name", &[1]);
+        let out = deliver(&mut hub, Input::FromHost(&mut packet), NOW);
         assert!(out.down.0.is_empty());
         let view = out.up.one();
         assert_eq!(view.routing, [1]);
@@ -759,7 +770,7 @@ mod tests {
     #[test]
     fn a_hub_sized_to_two_calls_is_full_at_the_third() {
         let mut hub: Hub<Ask, 4, 2> = Hub::new();
-        deliver(&mut hub, child(1, &heartbeat(7)), NOW);
+        deliver(&mut hub, child(1, &mut heartbeat(7)), NOW);
         let mut buf = [0u8; Packet::MAX_SIZE];
         let outcomes: Vec<_> = (0..3)
             .map(|_| {
@@ -797,8 +808,8 @@ mod tests {
         assert_eq!(hub.cancel(1, id), Some(Ask::Name));
         assert_eq!(hub.cancel(1, id), None);
 
-        let answer = reply(id, b"tio-hub");
-        let out = deliver(&mut hub, child(1, &answer), NOW);
+        let mut answer = reply(id, b"tio-hub");
+        let out = deliver(&mut hub, child(1, &mut answer), NOW);
         assert!(out.log.0.is_empty());
         assert_eq!(hub.counters().calls.unmatched, 1);
         assert_eq!(hub.deadline_ns(), Some(NOW + UNPLUG_NS));
@@ -818,8 +829,8 @@ mod tests {
         let (port, view) = down.one();
         assert_eq!((port, view.header.ptype), (1, PacketType::RPC_REQ));
 
-        let answer = reply(minted(&down), b"tio-hub");
-        let out = deliver(&mut hub, child(1, &answer), NOW);
+        let mut answer = reply(minted(&down), b"tio-hub");
+        let out = deliver(&mut hub, child(1, &mut answer), NOW);
         assert!(out.up.0.is_empty());
         assert_eq!(
             out.log.0,
@@ -830,8 +841,8 @@ mod tests {
     #[test]
     fn an_announcement_reaches_every_present_port() {
         let mut hub = hub();
-        let beat = heartbeat(11);
-        deliver(&mut hub, child(3, &beat), NOW);
+        let mut beat = heartbeat(11);
+        deliver(&mut hub, child(3, &mut beat), NOW);
 
         let announce = Announce {
             timeref: Reference {
