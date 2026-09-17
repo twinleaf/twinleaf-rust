@@ -21,9 +21,15 @@ pub mod github;
 
 /// Firmware images are uploaded to the device in fixed-size chunks.
 const UPLOAD_CHUNK_SIZE: usize = 288;
-/// Bytes of every chunk that are envelope rather than image data: the AES IV
-/// and the size/offset/crc/id header the device checks before appending.
+/// Bytes of every tl-chibi chunk that are envelope rather than image data: the
+/// AES IV and the size/offset/crc/id header the device checks before appending.
 const CHUNK_ENVELOPE: usize = 32;
+/// Bytes of header a signed package opens with, before its image; mirrors
+/// `twinleaf_device::update::HEADER_SIZE`, which this crate does not depend on.
+const PACKAGE_HEADER: usize = 288;
+/// The signed-package layout this host knows how to resume; mirrors that
+/// module's `FORMAT_VERSION`.
+const PACKAGE_FORMAT: u16 = 1;
 /// Maximum number of upload chunks awaiting acknowledgement at once.
 const MAX_CHUNKS_IN_FLIGHT: usize = 2;
 /// Consecutive resumptions that leave the device's upload cursor where it was
@@ -456,7 +462,8 @@ pub fn flash(
     on_event(FlashEvent::Stopped(stop_outcome));
 
     let total_chunks = firmware_data.len().div_ceil(UPLOAD_CHUNK_SIZE);
-    let mut resume_at = 0;
+    let packaging = Packaging::of(firmware_data);
+    let mut resume_at = packaging.start_at(device, firmware_data);
     let mut stalls = 0;
     loop {
         let sends = firmware_data
@@ -475,7 +482,7 @@ pub fn flash(
             });
         let Err(error) = outcome else { break };
         let next = match device.get::<u32>("dev.firmware.upload") {
-            Ok(cursor) => chunk_at(cursor, firmware_data).ok_or_else(|| {
+            Ok(cursor) => packaging.chunk_at(cursor, firmware_data).ok_or_else(|| {
                 FirmwareError::Upload(format!(
                     "the device's upload cursor ({cursor} bytes) is not a chunk boundary of this image"
                 ))
@@ -511,20 +518,89 @@ pub fn flash(
     Ok(())
 }
 
-/// The chunk of `image` starting at the device's upload cursor, `image`'s chunk
-/// count when the cursor is at its end, or None when this image has no chunk
-/// boundary there.
-fn chunk_at(cursor: u32, image: &[u8]) -> Option<usize> {
-    let total_chunks = image.len().div_ceil(UPLOAD_CHUNK_SIZE);
-    let data_per_chunk = UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE;
-    let data = image.len().saturating_sub(total_chunks * CHUNK_ENVELOPE);
-    let cursor = cursor as usize;
-    if cursor == data {
-        Some(total_chunks)
-    } else if cursor.is_multiple_of(data_per_chunk) && cursor / data_per_chunk < total_chunks {
-        Some(cursor / data_per_chunk)
-    } else {
-        None
+/// How a firmware file is packaged, which is what its upload cursor means.
+///
+/// Both go over the wire the same way — the file in [`UPLOAD_CHUNK_SIZE`]
+/// pieces — but a tl-chibi device counts the image bytes it has appended out of
+/// chunks that each carry their own envelope, while a device running the Rust
+/// firmware counts the image bytes behind one signed header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Packaging {
+    /// tl-chibi's AES-CBC chunks, each with its own IV and header.
+    Chibi,
+    /// A signed package: a header naming the board, then the raw image.
+    Signed,
+}
+
+impl Packaging {
+    /// What `image` is, read off the header a signed package opens with: eight
+    /// bytes of printable magic, the layout version, and the header's own size.
+    fn of(image: &[u8]) -> Self {
+        let word = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
+        let signed = image.len() > PACKAGE_HEADER
+            && image[..8]
+                .iter()
+                .all(|byte| matches!(byte, 0 | 0x21..=0x7e))
+            && word(8) == PACKAGE_FORMAT
+            && usize::from(word(10)) == PACKAGE_HEADER;
+        match signed {
+            true => Self::Signed,
+            false => Self::Chibi,
+        }
+    }
+
+    /// Which chunk of `image` to send first.
+    ///
+    /// A tl-chibi device refuses a chunk that is not at its cursor, so sending
+    /// chunk zero is what puts the resume path in motion and there is nothing
+    /// to ask. A device holding part of a signed package accepts anything —
+    /// including a package header, as image data — so it is asked where it
+    /// stands, and a cursor that names no chunk of this file (zero among them,
+    /// since it cannot say whether the header landed) is thrown away first.
+    fn start_at(self, device: &Device, image: &[u8]) -> usize {
+        let resume = match self {
+            Self::Chibi => None,
+            Self::Signed => match device.get::<u32>("dev.firmware.upload") {
+                Ok(0) | Err(_) => None,
+                Ok(cursor) => self.chunk_at(cursor, image),
+            },
+        };
+        match resume {
+            Some(chunk) => chunk,
+            None => {
+                let _ = device.action("dev.firmware.abort");
+                0
+            }
+        }
+    }
+
+    /// The chunk of `image` starting at the device's upload cursor, `image`'s
+    /// chunk count when the cursor is at its end, or None when this image has
+    /// no chunk boundary there.
+    fn chunk_at(self, cursor: u32, image: &[u8]) -> Option<usize> {
+        let total_chunks = image.len().div_ceil(UPLOAD_CHUNK_SIZE);
+        let cursor = cursor as usize;
+        let (per_chunk, header_chunks, data) = match self {
+            Self::Chibi => (
+                UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE,
+                0,
+                image.len().saturating_sub(total_chunks * CHUNK_ENVELOPE),
+            ),
+            Self::Signed => (
+                UPLOAD_CHUNK_SIZE,
+                1,
+                image.len().saturating_sub(PACKAGE_HEADER),
+            ),
+        };
+        if cursor == data {
+            Some(total_chunks)
+        } else if cursor.is_multiple_of(per_chunk)
+            && cursor / per_chunk + header_chunks < total_chunks
+        {
+            Some(cursor / per_chunk + header_chunks)
+        } else {
+            None
+        }
     }
 }
 
@@ -880,13 +956,155 @@ mod tests {
     #[test]
     fn the_cursor_maps_to_a_chunk_only_on_a_boundary_of_this_image() {
         let image = image(THREE_CHUNKS);
+        let chibi = Packaging::Chibi;
         let data_per_chunk = (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE) as u32;
 
-        assert_eq!(chunk_at(0, &image), Some(0));
-        assert_eq!(chunk_at(data_per_chunk, &image), Some(1));
-        assert_eq!(chunk_at(THREE_CHUNKS_DATA, &image), Some(3));
-        assert_eq!(chunk_at(data_per_chunk + 1, &image), None);
-        assert_eq!(chunk_at(THREE_CHUNKS_DATA + 256, &image), None);
+        assert_eq!(chibi.chunk_at(0, &image), Some(0));
+        assert_eq!(chibi.chunk_at(data_per_chunk, &image), Some(1));
+        assert_eq!(chibi.chunk_at(THREE_CHUNKS_DATA, &image), Some(3));
+        assert_eq!(chibi.chunk_at(data_per_chunk + 1, &image), None);
+        assert_eq!(chibi.chunk_at(THREE_CHUNKS_DATA + 256, &image), None);
+    }
+
+    /// A signed package's cursor counts image bytes only, so the chunk it names
+    /// is one further along the file than the same count would be in tl-chibi.
+    #[test]
+    fn a_signed_cursor_names_the_chunk_after_the_package_header() {
+        let package = signed(2 * UPLOAD_CHUNK_SIZE);
+        let signed = Packaging::Signed;
+
+        assert_eq!(signed.chunk_at(0, &package), Some(1));
+        assert_eq!(signed.chunk_at(UPLOAD_CHUNK_SIZE as u32, &package), Some(2));
+        assert_eq!(
+            signed.chunk_at(2 * UPLOAD_CHUNK_SIZE as u32, &package),
+            Some(3)
+        );
+        assert_eq!(
+            signed.chunk_at(UPLOAD_CHUNK_SIZE as u32 + 1, &package),
+            None
+        );
+        assert_eq!(
+            signed.chunk_at(3 * UPLOAD_CHUNK_SIZE as u32, &package),
+            None
+        );
+    }
+
+    /// The file says which protocol the device on the other end speaks; a
+    /// tl-chibi package opens with a random AES initialization vector.
+    #[test]
+    fn packaging_is_read_off_the_file_itself() {
+        assert_eq!(Packaging::of(&signed(64)), Packaging::Signed);
+        assert_eq!(Packaging::of(&image(THREE_CHUNKS)), Packaging::Chibi);
+
+        let mut truncated = signed(64);
+        truncated.truncate(PACKAGE_HEADER);
+        assert_eq!(Packaging::of(&truncated), Packaging::Chibi);
+
+        let mut wrong_version = signed(64);
+        wrong_version[8..10].copy_from_slice(&(PACKAGE_FORMAT + 1).to_le_bytes());
+        assert_eq!(Packaging::of(&wrong_version), Packaging::Chibi);
+    }
+
+    /// A signed package: a header this host can recognise, then the image.
+    fn signed(len: usize) -> Vec<u8> {
+        let mut package: Vec<u8> = (0..PACKAGE_HEADER + len).map(|byte| byte as u8).collect();
+        package[..8].copy_from_slice(b"SANDIFW\0");
+        package[8..10].copy_from_slice(&PACKAGE_FORMAT.to_le_bytes());
+        package[10..12].copy_from_slice(&(PACKAGE_HEADER as u16).to_le_bytes());
+        package[24..28].copy_from_slice(&(len as u32).to_le_bytes());
+        package
+    }
+
+    /// Run [`flash`] against a fake device that keeps a signed package's upload
+    /// cursor the way the device crate does: a header starts an image, every
+    /// later chunk appends to it, and one that would run past the end is
+    /// refused. `held` is how much of the image it already has. Returns the
+    /// image it ends up with, how many chunks it was sent, and whether the host
+    /// threw its session away first.
+    fn signed_flash_against(package: &[u8], held: usize) -> (Vec<u8>, usize, bool) {
+        let (device, calls, _worker) = crate::device::Device::test_pair();
+        let image_len = package.len() - PACKAGE_HEADER;
+        let start = package[PACKAGE_HEADER..PACKAGE_HEADER + held].to_vec();
+        let responder = std::thread::spawn(move || {
+            let (mut image, mut taking, mut sent, mut aborted) = (start, held > 0, 0usize, false);
+            for call in calls.iter() {
+                let ProxyCommand::Call {
+                    request,
+                    complete: result,
+                    ..
+                } = call
+                else {
+                    panic!("flash only submits direct RPC calls");
+                };
+                let Payload::RpcRequest(request) = request.payload() else {
+                    panic!("expected an RPC request");
+                };
+                let wire_rpc::Method::ByName(name) = request.method else {
+                    panic!("expected a call by name");
+                };
+                let invalid = |error| RawCallError::Device {
+                    error,
+                    message: Vec::new(),
+                };
+                match (name, request.args.is_empty()) {
+                    (b"dev.firmware.abort", _) => {
+                        (image, taking, aborted) = (Vec::new(), false, true);
+                        result(Ok(Vec::new()));
+                    }
+                    (b"dev.firmware.upload", true) => {
+                        result(Ok((image.len() as u32).to_le_bytes().to_vec()))
+                    }
+                    (b"dev.firmware.upload", false) => {
+                        sent += 1;
+                        match taking {
+                            false if request.args.len() == PACKAGE_HEADER => {
+                                (image, taking) = (Vec::new(), true);
+                                result(Ok(0u32.to_le_bytes().to_vec()));
+                            }
+                            false => result(Err(invalid(wire_rpc::RpcError::Invalid))),
+                            true if request.args.len() > image_len - image.len() => {
+                                result(Err(invalid(wire_rpc::RpcError::ArgsSize)))
+                            }
+                            true => {
+                                image.extend_from_slice(request.args);
+                                result(Ok((image.len() as u32).to_le_bytes().to_vec()));
+                            }
+                        }
+                    }
+                    _ => result(Ok(Vec::new())),
+                }
+            }
+            (image, sent, aborted)
+        });
+
+        flash(&device, package, |_| {}).unwrap();
+        drop(device);
+        responder.join().unwrap()
+    }
+
+    /// The fix: a device part-way through a signed package is asked where it
+    /// stands and sent the rest, rather than being handed the package header
+    /// again — which it would take as image data.
+    #[test]
+    fn a_signed_upload_resumes_at_the_devices_cursor() {
+        let package = signed(3 * UPLOAD_CHUNK_SIZE);
+        let (image, sent, aborted) = signed_flash_against(&package, UPLOAD_CHUNK_SIZE);
+
+        assert_eq!(image, package[PACKAGE_HEADER..]);
+        assert_eq!(sent, 2, "the header and the first chunk were not resent");
+        assert!(!aborted, "there was a cursor to resume from");
+    }
+
+    /// A cursor of zero says nothing about whether the header landed, so the
+    /// session goes before the header does.
+    #[test]
+    fn a_signed_upload_with_nothing_to_resume_from_starts_over() {
+        let package = signed(2 * UPLOAD_CHUNK_SIZE);
+        let (image, sent, aborted) = signed_flash_against(&package, 0);
+
+        assert_eq!(image, package[PACKAGE_HEADER..]);
+        assert_eq!(sent, 3, "the header and both chunks");
+        assert!(aborted);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
 use twinleaf::proto::packet::{PacketType, PacketView};
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
-use twinleaf::proto::{SessionId, StreamId};
+use twinleaf::proto::{BoardId, FirmwareMagic, HwRev, SessionId, StreamId};
 use twinleaf_device::capture::{self, Capture, Selector};
 use twinleaf_device::device::{
     self, Deferred, Device, Entry, FlashOp, Group, Identity, OneLane, SyncRequest,
@@ -37,7 +37,7 @@ use twinleaf_device::sync::{
     ticks, AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig,
     Reference, ReferenceIdentity, ScheduledEdge, Synchronizer, TimeStatus,
 };
-use twinleaf_device::update::{Envelope, Upload};
+use twinleaf_device::update::{Package, Take, Upload};
 use twinleaf_device::Sink;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
@@ -554,6 +554,16 @@ impl Pulses {
     }
 }
 
+/// The package the simulator takes, which is the one `just package sandi`
+/// signs, so `tio upgrade` against the simulator sends what a Sandi is sent.
+const PACKAGE: Package = Package {
+    magic: FirmwareMagic::new(*b"SANDIFW\0"),
+    board_id: BoardId::from_ascii("COMM-USB"),
+    hw_rev: HwRev::new(8),
+    development: true,
+    image_max: 224 * 1024,
+};
+
 /// The platform's flash: the firmware image an upload writes, whether one has
 /// taken, and the configuration a save left behind.
 #[derive(Default)]
@@ -574,8 +584,7 @@ struct Sim {
     capture: CaptureBuffer,
     /// What the platform keeps across a reboot.
     flash: Flash,
-    /// How much of a firmware image `dev.firmware.upload` has taken. The
-    /// simulator holds no device key, so a chunk's ciphertext is its plaintext.
+    /// How much of a firmware image `dev.firmware.upload` has taken.
     upload: Upload,
     rng: SmallRng,
     sync: Synchronizer,
@@ -704,9 +713,9 @@ impl Sim {
             Deferred::Acquire(SyncRequest::Start) => self.acquire(Synchronizer::start, now),
             Deferred::Acquire(SyncRequest::Stop) => self.acquire(Synchronizer::stop, now),
             Deferred::Acquire(SyncRequest::Restart) => self.acquire(Synchronizer::restart, now),
-            Deferred::Flash(FlashOp::Upload(chunk)) => self.take_chunk(&chunk),
-            Deferred::Flash(FlashOp::Upgrade) => self.commit_image(),
-            Deferred::Flash(FlashOp::Abort) => Err(RpcError::State),
+            Deferred::Flash(FlashOp::Upload(chunk)) => self.take_chunk(&chunk, now),
+            Deferred::Flash(FlashOp::Upgrade) => self.commit_image(now),
+            Deferred::Flash(FlashOp::Abort) => self.upload.abort().map(|()| Reply::new()),
             Deferred::Flash(FlashOp::ConfSave(image)) => {
                 self.flash.conf = Some(image.to_vec());
                 self.notes.push(format!(
@@ -931,21 +940,29 @@ impl Sim {
         Ok(reply)
     }
 
-    /// One chunk of a firmware image at the cursor, or a read of the cursor.
-    fn take_chunk(&mut self, chunk: &[u8]) -> Result<Reply, RpcError> {
+    /// One chunk of an update package at the cursor, or a read of the cursor.
+    fn take_chunk(&mut self, chunk: &[u8], now: u64) -> Result<Reply, RpcError> {
         if !chunk.is_empty() {
-            let taken = self.upload.chunk(Envelope::parse(chunk)?.cipher)?;
-            self.flash.image.truncate(taken.offset as usize);
-            self.flash.image.extend_from_slice(taken.bytes);
+            match self.upload.chunk(&PACKAGE, chunk, now)? {
+                Take::Header { discarded: true } => self.flash.image.clear(),
+                Take::Header { discarded: false } => {}
+                Take::Image(image) => {
+                    self.flash.image.truncate(image.offset() as usize);
+                    self.flash.image.extend_from_slice(image.bytes());
+                    image.written();
+                }
+            }
         }
         let mut reply = Reply::new();
-        put(&mut reply, &self.upload.cursor().to_le_bytes())?;
+        put(&mut reply, &self.upload.cursor(now).to_le_bytes())?;
         Ok(reply)
     }
 
-    /// Take the uploaded image, which then survives a reboot.
-    fn commit_image(&mut self) -> Result<Reply, RpcError> {
-        self.upload.commit()?;
+    /// Take the uploaded image, which then survives a reboot. The simulator
+    /// holds no key, so the manifest's signature is taken on trust.
+    fn commit_image(&mut self, now: u64) -> Result<Reply, RpcError> {
+        self.upload.upgrade(now)?;
+        self.upload.armed();
         self.flash.upgraded = true;
         self.take_desc();
         self.notes
@@ -1694,7 +1711,8 @@ impl Runtime {
         terminal_println!(
             "  simulated flash: dev.conf.save keeps test.amplitude, test.frequency, \
              test.noise across a reboot, dev.conf.reset erases them; \
-             dev.firmware.upload takes chunks at its cursor, dev.firmware.upgrade commits"
+             dev.firmware.upload takes a signed package for COMM-USB rev 8 at its \
+             cursor, dev.firmware.upgrade commits"
         );
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
         Ok(())
@@ -1945,7 +1963,7 @@ mod tests {
     use twinleaf_device::metadata::{self, Streams};
     use twinleaf_device::rpc::REPLY_MAX;
     use twinleaf_device::sync::ReferenceState;
-    use twinleaf_device::update::{Header, BLOCK_SIZE, DATA_MAX};
+    use twinleaf_device::update::{FORMAT_VERSION, HEADER_SIZE};
 
     /// A round wall-clock second to boot the simulated device at.
     const BOOT: u64 = 1_800_000_000 * NANOS_PER_SECOND;
@@ -2039,25 +2057,28 @@ mod tests {
         answer(sim, name, args, sent).unwrap_or_else(|error| panic!("{error:?}"))
     }
 
-    /// Which image the upload tests send, and how big it is.
-    const IMAGE_ID: u32 = 0x5EED_1234;
-    const IMAGE_SIZE: u32 = 2 * DATA_MAX as u32;
+    /// What `tio upgrade` sends in one `dev.firmware.upload`, and how big an
+    /// image the tests package: two whole chunks of it.
+    const CHUNK: usize = 288;
+    const IMAGE_SIZE: usize = 2 * CHUNK;
 
-    /// One `dev.firmware.upload` chunk: the initialization vector a real
-    /// device decrypts against, the header it checks, and the image bytes.
-    fn chunk(offset: u32, id: u32, bytes: &[u8]) -> Vec<u8> {
-        let header = Header {
-            size: IMAGE_SIZE,
-            offset,
-            crc: twinleaf::proto::serial::CRC32.checksum(bytes),
-            id,
-        };
-        [&[0u8; BLOCK_SIZE][..], &header.bytes(), bytes].concat()
+    /// The image a package carries.
+    fn image() -> Vec<u8> {
+        (0..IMAGE_SIZE).map(|byte| byte as u8).collect()
     }
 
-    /// The bytes of the image chunk at `offset`.
-    fn image_bytes(offset: u32) -> Vec<u8> {
-        vec![(offset / DATA_MAX as u32) as u8 + 1; DATA_MAX]
+    /// A signed package for the board the simulator answers as, as
+    /// `firmware-pack` writes one: the header, then the image.
+    fn package() -> Vec<u8> {
+        let mut header = vec![0u8; HEADER_SIZE];
+        header[..8].copy_from_slice(PACKAGE.magic.as_bytes());
+        header[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        header[10..12].copy_from_slice(&(HEADER_SIZE as u16).to_le_bytes());
+        header[12..20].copy_from_slice(PACKAGE.board_id.as_bytes());
+        header[20..22].copy_from_slice(&PACKAGE.hw_rev.to_le_bytes());
+        header[22..24].copy_from_slice(&1u16.to_le_bytes());
+        header[24..28].copy_from_slice(&(IMAGE_SIZE as u32).to_le_bytes());
+        [header, image()].concat()
     }
 
     /// The SETTING announcements the simulation sent, in order.
@@ -2070,70 +2091,77 @@ mod tests {
             .collect()
     }
 
+    /// A package for another board is refused at its header, before any of it
+    /// is written.
     #[test]
-    fn a_chunk_that_is_not_at_the_cursor_is_refused_and_leaves_it_alone() {
+    fn a_package_the_board_is_not_for_is_refused_at_its_header() {
         let mut sim = sim(&[]);
         let mut sent = Sent::default();
         let cursor = b"dev.firmware.upload";
+        let mut package = package();
+        package[..8].copy_from_slice(b"ETHANFW\0");
 
-        assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
-        let ahead = chunk(DATA_MAX as u32, IMAGE_ID, &image_bytes(DATA_MAX as u32));
         assert_eq!(
-            answer(&mut sim, cursor, &ahead, &mut sent),
+            answer(&mut sim, cursor, &package[..HEADER_SIZE], &mut sent),
             Err(RpcError::Invalid)
         );
         assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
         assert!(sim.flash.image.is_empty());
-
-        let first = chunk(0, IMAGE_ID, &image_bytes(0));
-        assert_eq!(
-            call(&mut sim, cursor, &first, &mut sent),
-            (DATA_MAX as u32).to_le_bytes()
-        );
-        assert_eq!(sim.flash.image, image_bytes(0));
-
-        let elsewhere = chunk(0, IMAGE_ID + 1, &image_bytes(0));
-        assert_eq!(
-            answer(&mut sim, cursor, &elsewhere, &mut sent),
-            Err(RpcError::Invalid)
-        );
-        assert_eq!(
-            answer(&mut sim, cursor, &first[..BLOCK_SIZE], &mut sent),
-            Err(RpcError::ArgsSize)
-        );
-        assert_eq!(
-            call(&mut sim, cursor, &[], &mut sent),
-            (DATA_MAX as u32).to_le_bytes()
-        );
     }
 
-    /// What `flash` does when an acknowledgement is lost: it resends a chunk
-    /// the device already took, is refused, and reads the cursor to find the
-    /// one to send next.
+    /// The header counts as no image bytes, and every chunk after it moves the
+    /// cursor by its own length — which is what a resuming host reads back.
     #[test]
-    fn a_resent_chunk_is_refused_and_the_cursor_recovers_the_host() {
+    fn the_cursor_counts_the_image_bytes_the_chunks_carried() {
         let mut sim = sim(&[]);
         let mut sent = Sent::default();
         let cursor = b"dev.firmware.upload";
-        let first = chunk(0, IMAGE_ID, &image_bytes(0));
+        let package = package();
 
-        call(&mut sim, cursor, &first, &mut sent);
+        assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
+        for (sent_chunks, chunk) in package.chunks(CHUNK).enumerate() {
+            assert_eq!(
+                call(&mut sim, cursor, chunk, &mut sent),
+                ((sent_chunks * CHUNK) as u32).to_le_bytes(),
+                "after chunk {sent_chunks}"
+            );
+        }
         assert_eq!(
-            answer(&mut sim, cursor, &first, &mut sent),
-            Err(RpcError::Invalid)
+            call(&mut sim, cursor, &[], &mut sent),
+            (IMAGE_SIZE as u32).to_le_bytes()
+        );
+        assert_eq!(sim.flash.image, image());
+    }
+
+    /// `dev.firmware.abort` throws the part-taken package away, so the next
+    /// host's header is read as a header rather than as image data.
+    #[test]
+    fn abort_puts_the_cursor_back_for_the_next_host() {
+        let mut sim = sim(&[]);
+        let mut sent = Sent::default();
+        let cursor = b"dev.firmware.upload";
+        let package = package();
+
+        call(&mut sim, cursor, &package[..HEADER_SIZE], &mut sent);
+        call(
+            &mut sim,
+            cursor,
+            &package[HEADER_SIZE..HEADER_SIZE + CHUNK],
+            &mut sent,
+        );
+        assert_eq!(
+            call(&mut sim, cursor, &package[..HEADER_SIZE], &mut sent),
+            (IMAGE_SIZE as u32).to_le_bytes(),
+            "a header resent mid-upload is image data, which is why a host \
+             that cannot place its cursor aborts before starting over"
         );
 
-        let resume = call(&mut sim, cursor, &[], &mut sent);
-        assert_eq!(resume, (DATA_MAX as u32).to_le_bytes());
-        let second = chunk(DATA_MAX as u32, IMAGE_ID, &image_bytes(DATA_MAX as u32));
-        assert_eq!(
-            call(&mut sim, cursor, &second, &mut sent),
-            IMAGE_SIZE.to_le_bytes()
-        );
-        assert_eq!(
-            sim.flash.image,
-            [image_bytes(0), image_bytes(DATA_MAX as u32)].concat()
-        );
+        call(&mut sim, b"dev.firmware.abort", &[], &mut sent);
+        assert_eq!(call(&mut sim, cursor, &[], &mut sent), 0u32.to_le_bytes());
+        for chunk in package.chunks(CHUNK) {
+            call(&mut sim, cursor, chunk, &mut sent);
+        }
+        assert_eq!(sim.flash.image, image(), "the next header cleared the slot");
     }
 
     #[test]
@@ -2141,33 +2169,36 @@ mod tests {
         let mut sim = sim(&[]);
         let mut sent = Sent::default();
         let cursor = b"dev.firmware.upload";
+        let package = package();
 
         assert_eq!(
             answer(&mut sim, b"dev.firmware.upgrade", &[], &mut sent),
             Err(RpcError::State)
         );
-        call(
-            &mut sim,
-            cursor,
-            &chunk(0, IMAGE_ID, &image_bytes(0)),
-            &mut sent,
-        );
+        for chunk in package[..package.len() - CHUNK].chunks(CHUNK) {
+            call(&mut sim, cursor, chunk, &mut sent);
+        }
         assert_eq!(
             answer(&mut sim, b"dev.firmware.upgrade", &[], &mut sent),
-            Err(RpcError::State)
+            Err(RpcError::State),
+            "the last chunk is still missing"
         );
 
-        let offset = DATA_MAX as u32;
         call(
             &mut sim,
             cursor,
-            &chunk(offset, IMAGE_ID, &image_bytes(offset)),
+            &package[package.len() - CHUNK..],
             &mut sent,
         );
         call(&mut sim, b"dev.firmware.upgrade", &[], &mut sent);
         assert_eq!(
             call(&mut sim, b"dev.desc", &[], &mut sent),
             UPGRADED_DESC.as_bytes()
+        );
+        assert_eq!(
+            answer(&mut sim, b"dev.firmware.abort", &[], &mut sent),
+            Err(RpcError::State),
+            "an armed swap is not taken back"
         );
 
         sim.reboot(BOOT, &mut sent);
