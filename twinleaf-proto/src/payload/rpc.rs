@@ -258,11 +258,11 @@ impl<'a> Reply<'a> {
 }
 
 /// Serialize a full reply packet (header included) into `buf`; returns length.
-/// Returns None if `buf` is too small.
+/// Returns None if `buf` is too small, or the value past what a packet carries.
 pub fn write_reply(buf: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option<usize> {
     let payload_len = 2 + value.len();
     let total = Header::SIZE + payload_len;
-    if buf.len() < total || payload_len > u16::MAX as usize {
+    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
     let hdr = Header::new(PacketType::RPC_REP, payload_len as u16);
@@ -801,6 +801,23 @@ mod tests {
             ),
             None,
             "payload past what a header can describe"
+        );
+    }
+
+    #[test]
+    fn a_reply_past_what_a_packet_carries_is_refused_rather_than_emitted() {
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let longest = [0u8; Packet::MAX_PAYLOAD - 2];
+        assert_eq!(
+            write_reply(&mut buf, RpcRequestId::new(1), &longest),
+            Some(Header::SIZE + Packet::MAX_PAYLOAD),
+            "the longest value a reply carries"
+        );
+        let past = [0u8; Packet::MAX_PAYLOAD - 1];
+        assert_eq!(
+            write_reply(&mut buf, RpcRequestId::new(1), &past),
+            None,
+            "one byte more is a payload of 501, which no packet carries"
         );
     }
 
