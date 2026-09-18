@@ -241,6 +241,14 @@ pub struct Port {
     kind: TransportKind,
 }
 
+impl Drop for Port {
+    fn drop(&mut self) {
+        // Disconnect the sender before waking the poller so it observes shutdown.
+        drop(self.tx.take());
+        let _ = self.waker.wake();
+    }
+}
+
 /// Default size of the rx channel when receiving to a crossbeam channel.
 pub(crate) static DEFAULT_RX_CHANNEL_SIZE: usize = 32768;
 
@@ -731,5 +739,42 @@ impl Port {
             ControlResult::Success => Ok(()),
             ControlResult::SetRateError(err) => Err(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        time::Duration,
+    };
+
+    use super::*;
+
+    #[test]
+    fn dropping_idle_port_closes_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (received, ready) = mpsc::channel();
+        let port = Port::new(&url, move |packet| {
+            assert!(packet.is_ok());
+            received
+                .send(())
+                .map_err(|_| io::ErrorKind::BrokenPipe.into())
+        })
+        .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // Confirm the poller is receiving, without waking its transmit queue.
+        peer.write_all(Packet::heartbeat(proto::DeviceRoute::root()).as_bytes())
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(port);
+
+        // The peer stays connected and sends nothing else to wake the poller.
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 }
