@@ -1,26 +1,37 @@
 //! The anti-alias low pass a decimated stream's float columns pass through.
 //!
-//! Two trapezoidal state variable Butterworth sections with Kahan compensated
-//! integrators, ported from tl-chibi's `filter/tl_lpf_bw4`: the state variable
-//! form reproduces a constant input exactly in single precision at the low
-//! normalized corners decimation asks for, where a direct form biquad stalls
-//! short of it.
+//! A stream names its filter in its declaration and holds that one, so the
+//! kinds a device never declares cost it neither flash nor RAM.
+//!
+//! [`Butterworth4`] is two trapezoidal state variable sections with Kahan
+//! compensated integrators, ported from tl-chibi's `filter/tl_lpf_bw4`: the
+//! state variable form reproduces a constant input exactly in single precision
+//! at the low normalized corners decimation asks for, where a direct form
+//! biquad stalls short of it.
 
-/// Which anti-alias low pass a stream declares. Every stream holds a
-/// [`Butterworth`] whichever it names, so the state costs the same RAM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Filter {
-    /// Decimated samples are picked as they come.
-    None,
-    /// The fourth order [`Butterworth`] low pass.
-    Butterworth4,
+use twinleaf_proto::data::FilterType;
+
+/// What a decimated stream's float columns pass through.
+pub trait Filter {
+    /// Set the corner, normalized to the sampling rate, leaving every column
+    /// where it was. A corner outside `(0, 0.5)` bypasses the filter.
+    fn setup(&mut self, cutoff: f32);
+
+    /// Start every column afresh at the next sample it is given.
+    fn prime(&mut self);
+
+    /// Filter one sample's float columns in place, in column order.
+    fn sample(&mut self, columns: &mut [f32]);
+
+    /// What a segment record calls it.
+    fn kind(&self) -> FilterType;
 }
 
 /// Corner of the filter, as a fraction of the output Nyquist frequency.
 pub const CORNER: f32 = 0.8;
 
-/// Float columns of one stream the filter holds state for; the widest stream
-/// any board declares carries six.
+/// Float columns one sample carries at most, which bounds what a ring gathers
+/// for a filter; the widest stream any board declares carries six.
 pub const MAX_COLUMNS: usize = 8;
 
 /// Cascaded second order sections.
@@ -32,6 +43,21 @@ const LEVELS: usize = 10;
 /// Section dampings `1/Q = 2 cos(theta)`, for `theta = pi/8` and `3 pi/8`.
 const DAMPING: [f64; SECTIONS] = [1.8477590650225735, 0.7653668647301796];
 
+/// Decimated samples are picked as they come.
+pub struct None;
+
+impl Filter for None {
+    fn setup(&mut self, _cutoff: f32) {}
+
+    fn prime(&mut self) {}
+
+    fn sample(&mut self, _columns: &mut [f32]) {}
+
+    fn kind(&self) -> FilterType {
+        FilterType::NONE
+    }
+}
+
 /// The trapezoidal coefficients of one section.
 #[derive(Clone, Copy)]
 struct Coefficients {
@@ -40,7 +66,7 @@ struct Coefficients {
     a3: f32,
 }
 
-/// One section's two integrator states for one channel, and the compensation
+/// One section's two integrator states for one column, and the compensation
 /// the second integrator sums with.
 #[derive(Clone, Copy)]
 struct Integrators {
@@ -49,43 +75,47 @@ struct Integrators {
     c2: f32,
 }
 
-/// A fourth order Butterworth low pass over up to [`MAX_COLUMNS`] channels.
-pub struct Butterworth {
+/// One column's own state: whether it is settled, which tl-chibi reads off a
+/// non-finite state instead so that a filter at rest here is all zeros.
+#[derive(Clone, Copy)]
+struct Channel {
+    integrators: [Integrators; SECTIONS],
+    primed: bool,
+}
+
+impl Channel {
+    const fn new() -> Self {
+        Self {
+            integrators: [Integrators {
+                ic1: 0.0,
+                ic2: 0.0,
+                c2: 0.0,
+            }; SECTIONS],
+            primed: false,
+        }
+    }
+}
+
+/// The coefficients every column of a stream shares. Columns are independent,
+/// so nothing here is generic over how many a stream has.
+struct Cascade {
     coefficients: [Coefficients; SECTIONS],
-    state: [[Integrators; SECTIONS]; MAX_COLUMNS],
-    /// Whether a channel is settled, which tl-chibi reads off a non-finite
-    /// state instead so that a filter at rest here is all zeros.
-    primed: [bool; MAX_COLUMNS],
     running: bool,
 }
 
-impl Butterworth {
-    /// A bypassed filter with no state, which is all zeros.
-    pub const fn new() -> Self {
+impl Cascade {
+    const fn new() -> Self {
         Self {
             coefficients: [Coefficients {
                 a1: 0.0,
                 a2: 0.0,
                 a3: 0.0,
             }; SECTIONS],
-            state: [[Integrators {
-                ic1: 0.0,
-                ic2: 0.0,
-                c2: 0.0,
-            }; SECTIONS]; MAX_COLUMNS],
-            primed: [false; MAX_COLUMNS],
             running: false,
         }
     }
 
-    /// Whether samples are filtered rather than passed through.
-    pub fn running(&self) -> bool {
-        self.running
-    }
-
-    /// Set the corner, normalized to the sampling rate, leaving every channel
-    /// where it was. A corner outside `(0, 0.5)` bypasses the filter.
-    pub fn setup(&mut self, cutoff: f32) {
+    fn setup(&mut self, cutoff: f32) {
         self.running = (cutoff > 0.0) && (cutoff < 0.5);
         if !self.running {
             return;
@@ -101,23 +131,19 @@ impl Butterworth {
         });
     }
 
-    /// Filter one channel's next value. Channels are independent, and an
-    /// unsettled one starts settled at this value; a non-finite value
-    /// unsettles the channel again.
-    pub fn sample(&mut self, channel: usize, value: f32) -> f32 {
-        if !self.running {
-            return value;
-        }
-        if !self.primed[channel] {
-            self.state[channel] = [Integrators {
+    /// Filter one column's next value. An unsettled column starts settled at
+    /// this value; a non-finite value unsettles it again.
+    fn sample(&self, channel: &mut Channel, value: f32) -> f32 {
+        if !channel.primed {
+            channel.integrators = [Integrators {
                 ic1: 0.0,
                 ic2: value,
                 c2: 0.0,
             }; SECTIONS];
-            self.primed[channel] = value.is_finite();
+            channel.primed = value.is_finite();
             return value;
         }
-        let out = self.coefficients.iter().zip(&mut self.state[channel]).fold(
+        let out = self.coefficients.iter().zip(&mut channel.integrators).fold(
             value,
             |v0, (coefficients, state)| {
                 let v3 = v0 - state.ic2;
@@ -132,15 +158,59 @@ impl Butterworth {
                 v2
             },
         );
-        self.primed[channel] = out.is_finite();
+        channel.primed = out.is_finite();
         out
     }
 }
 
+/// A fourth order Butterworth low pass over a stream's `C` float columns.
+pub struct Butterworth4<const C: usize> {
+    cascade: Cascade,
+    channels: [Channel; C],
+}
+
+impl<const C: usize> Butterworth4<C> {
+    /// A bypassed filter with no state, which is all zeros.
+    pub const fn new() -> Self {
+        Self {
+            cascade: Cascade::new(),
+            channels: [Channel::new(); C],
+        }
+    }
+
+    /// Whether samples are filtered rather than passed through.
+    pub fn running(&self) -> bool {
+        self.cascade.running
+    }
+}
+
 /// A bypassed filter with no state.
-impl Default for Butterworth {
+impl<const C: usize> Default for Butterworth4<C> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<const C: usize> Filter for Butterworth4<C> {
+    fn setup(&mut self, cutoff: f32) {
+        self.cascade.setup(cutoff);
+    }
+
+    fn prime(&mut self) {
+        self.channels = [Channel::new(); C];
+    }
+
+    fn sample(&mut self, columns: &mut [f32]) {
+        if !self.cascade.running {
+            return;
+        }
+        for (value, channel) in columns.iter_mut().zip(&mut self.channels) {
+            *value = self.cascade.sample(channel, *value);
+        }
+    }
+
+    fn kind(&self) -> FilterType {
+        FilterType::IIR_BW_LPF4
     }
 }
 
@@ -168,10 +238,17 @@ mod tests {
         1.0 / (1.0 + r.powi(8)).sqrt()
     }
 
+    /// One column through the filter, which is how a one-column stream uses it.
+    fn step(filter: &mut Butterworth4<1>, value: f32) -> f32 {
+        let mut columns = [value];
+        filter.sample(&mut columns);
+        columns[0]
+    }
+
     /// Steady state gain of a tone at `cycles / period`, by quadrature
     /// projection over `periods` periods after `settle` of them.
     fn measure_gain(
-        filter: &mut Butterworth,
+        filter: &mut Butterworth4<1>,
         cycles: u32,
         period: u32,
         settle: u32,
@@ -181,7 +258,7 @@ mod tests {
         let (mut re, mut im) = (0.0, 0.0);
         for i in 0..(settle + periods) * period {
             let phase = 2.0 * PI * f * f64::from(i);
-            let y = f64::from(filter.sample(0, phase.sin() as f32));
+            let y = f64::from(step(filter, phase.sin() as f32));
             if i >= settle * period {
                 re += y * phase.sin();
                 im += y * phase.cos();
@@ -191,17 +268,17 @@ mod tests {
         2.0 * (re * re + im * im).sqrt() / n
     }
 
-    fn tuned(cutoff: f32) -> Butterworth {
-        let mut filter = Butterworth::new();
+    fn tuned(cutoff: f32) -> Butterworth4<1> {
+        let mut filter = Butterworth4::new();
         filter.setup(cutoff);
         filter
     }
 
     /// Drive `filter` to a settled state at zero, as tl-chibi's `initval(0.0)`
     /// leaves it.
-    fn settled(cutoff: f32) -> Butterworth {
+    fn settled(cutoff: f32) -> Butterworth4<1> {
         let mut filter = tuned(cutoff);
-        filter.sample(0, 0.0);
+        step(&mut filter, 0.0);
         filter
     }
 
@@ -255,8 +332,8 @@ mod tests {
     #[test]
     fn a_constant_input_survives_the_lowest_corner_exactly() {
         let mut filter = tuned(0.4 / 2560.0);
-        filter.sample(0, 0.0);
-        let settled = (0..200_000).map(|_| filter.sample(0, 1.0)).last().unwrap();
+        step(&mut filter, 0.0);
+        let settled = (0..200_000).map(|_| step(&mut filter, 1.0)).last().unwrap();
         assert!(
             (settled - 1.0).abs() < 1e-6,
             "DC after a step: {settled}, error {}",
@@ -266,7 +343,7 @@ mod tests {
         let (mut sum, mut sum2, mut n) = (0.0f64, 0.0f64, 0u32);
         for i in 0..400_000 {
             let x = 1.0 + 1e-3 * (2.0 * PI * 0.05 * f64::from(i)).sin() as f32;
-            let y = f64::from(filter.sample(0, x)) - 1.0;
+            let y = f64::from(step(&mut filter, x)) - 1.0;
             if i >= 200_000 {
                 sum += y;
                 sum2 += y * y;
@@ -283,44 +360,59 @@ mod tests {
     fn a_corner_outside_the_band_passes_every_sample_through() {
         let mut filter = tuned(0.0);
         assert!(!filter.running());
-        let out: Vec<f32> = (0..10).map(|i| filter.sample(0, i as f32 * 1.5)).collect();
+        let out: Vec<f32> = (0..10).map(|i| step(&mut filter, i as f32 * 1.5)).collect();
         assert_eq!(out, (0..10).map(|i| i as f32 * 1.5).collect::<Vec<f32>>());
 
         filter.setup(0.5);
         assert!(!filter.running());
-        assert_eq!(filter.sample(0, 3.0), 3.0);
+        assert_eq!(step(&mut filter, 3.0), 3.0);
     }
 
     #[test]
     fn an_unsettled_channel_starts_at_its_first_value() {
         let mut filter = tuned(0.1);
-        assert_eq!(filter.sample(0, 5.0), 5.0);
-        let settled = (0..100).map(|_| filter.sample(0, 5.0)).last().unwrap();
+        assert_eq!(step(&mut filter, 5.0), 5.0);
+        let settled = (0..100).map(|_| step(&mut filter, 5.0)).last().unwrap();
         assert_eq!(settled, 5.0);
 
-        assert!(filter.sample(0, f32::NAN).is_nan());
-        assert_eq!(filter.sample(0, 7.0), 7.0);
-        let next = filter.sample(0, 8.0);
+        assert!(step(&mut filter, f32::NAN).is_nan());
+        assert_eq!(step(&mut filter, 7.0), 7.0);
+        let next = step(&mut filter, 8.0);
         assert!((7.0..8.0).contains(&next), "after re-priming: {next}");
     }
 
     #[test]
-    fn channels_are_independent() {
-        let mut multi = tuned(0.05);
-        let mut single: Vec<Butterworth> = (0..3).map(|_| tuned(0.05)).collect();
+    fn columns_are_independent() {
+        let mut multi = Butterworth4::<3>::new();
+        multi.setup(0.05);
+        let mut single: Vec<Butterworth4<1>> = (0..3).map(|_| tuned(0.05)).collect();
         for i in 0..1000 {
-            let values = [
+            let mut values = [
                 (0.1 * f64::from(i)).sin() as f32,
                 (0.03 * f64::from(i)).cos() as f32,
                 (i % 7) as f32,
             ];
-            for (channel, value) in values.iter().enumerate() {
-                assert_eq!(
-                    multi.sample(channel, *value),
-                    single[channel].sample(0, *value)
-                );
-            }
+            let apart: Vec<f32> = single
+                .iter_mut()
+                .zip(values)
+                .map(|(filter, value)| step(filter, value))
+                .collect();
+            multi.sample(&mut values);
+            assert_eq!(values.to_vec(), apart);
         }
+    }
+
+    /// A start primes every column afresh, and leaves the corner where it was.
+    #[test]
+    fn a_prime_starts_every_column_at_its_next_value() {
+        let mut filter = Butterworth4::<2>::new();
+        filter.setup(0.05);
+        (0..100).for_each(|_| filter.sample(&mut [5.0, 9.0]));
+        filter.prime();
+        let mut values = [1.0, 2.0];
+        filter.sample(&mut values);
+        assert_eq!(values, [1.0, 2.0]);
+        assert!(filter.running());
     }
 
     /// tl-chibi's `setup` recomputes coefficients and leaves the state alone,
@@ -329,10 +421,10 @@ mod tests {
     fn a_setup_leaves_every_channel_where_it_was() {
         let mut filter = tuned(0.1);
         (0..100).for_each(|_| {
-            filter.sample(0, 5.0);
+            step(&mut filter, 5.0);
         });
         filter.setup(0.2);
-        let next = filter.sample(0, 9.0);
+        let next = step(&mut filter, 9.0);
         assert!((5.0..6.0).contains(&next), "after a retune: {next}");
     }
 

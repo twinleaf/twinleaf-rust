@@ -13,7 +13,7 @@ use twinleaf_proto::data::{self, FilterType, SegmentFlags};
 use twinleaf_proto::sync::Epoch;
 use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
 
-use super::filter::{self, Filter};
+use super::filter;
 
 /// Input samples one segment issues before a rollover is forced, short of a
 /// `u32` by more than any plausible rate.
@@ -79,19 +79,17 @@ pub struct Params {
 impl Params {
     /// Anti-alias corner in hertz, [`filter::CORNER`] of the output Nyquist
     /// frequency, and zero when nothing is filtered or decimated.
-    pub fn cutoff(&self, kind: Filter) -> f32 {
+    pub fn cutoff(&self, kind: FilterType) -> f32 {
         match (kind, self.decimation.get()) {
-            (Filter::None, _) | (Filter::Butterworth4, 1) => 0.0,
-            (Filter::Butterworth4, decimation) => {
-                filter::CORNER * 0.5 * (self.rate.get() / decimation) as f32
-            }
+            (FilterType::NONE, _) | (_, 1) => 0.0,
+            (_, decimation) => filter::CORNER * 0.5 * (self.rate.get() / decimation) as f32,
         }
     }
 
     /// The filter a sample's float columns pass through.
-    pub fn filter_type(&self, kind: Filter) -> FilterType {
+    pub fn filter_type(&self, kind: FilterType) -> FilterType {
         if self.cutoff(kind) > 0.0 {
-            FilterType::IIR_BW_LPF4
+            kind
         } else {
             FilterType::NONE
         }
@@ -159,7 +157,7 @@ impl Segment {
     }
 
     /// Its metadata record, as part of `stream_id`, filtered by `kind`.
-    pub fn record(&self, stream_id: StreamId, kind: Filter) -> data::Segment<'_> {
+    pub fn record(&self, stream_id: StreamId, kind: FilterType) -> data::Segment<'_> {
         data::Segment {
             stream_id,
             segment_id: self.id,
@@ -712,7 +710,7 @@ mod tests {
         issue(&mut segments, 2);
         let record = segments
             .current()
-            .record(StreamId::new(2), Filter::Butterworth4);
+            .record(StreamId::new(2), FilterType::IIR_BW_LPF4);
         assert_eq!(record.stream_id, StreamId::new(2));
         assert_eq!(record.segment_id, SegmentId::new(0));
         assert_eq!(record.flags, SegmentFlags::VALID | SegmentFlags::ACTIVE);

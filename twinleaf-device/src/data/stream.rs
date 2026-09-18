@@ -4,10 +4,10 @@
 //! publisher turns issued samples into packets. A slice of streams is what a
 //! device describes itself with.
 
-use twinleaf_proto::data::{self, DataType, CURRENT_SEGMENT};
+use twinleaf_proto::data::{self, DataType, FilterType, CURRENT_SEGMENT};
 use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 
-use super::filter::{Butterworth, Filter, MAX_COLUMNS};
+use super::filter::{Filter, MAX_COLUMNS};
 use super::metadata::Streams;
 use super::publisher::{Publisher, MAX_SAMPLE_BYTES};
 use super::segments::{Busy, Params, Segment, Segments, Timeref};
@@ -47,16 +47,22 @@ impl StreamDef {
 
     /// Columns the anti-alias filter holds state for.
     pub const fn float_columns(&self) -> usize {
-        let mut count = 0;
-        let mut index = 0;
-        while index < self.columns.len() {
-            if self.columns[index].data_type.value() == DataType::F32.value() {
-                count += 1;
-            }
-            index += 1;
-        }
-        count
+        float_columns(self.columns)
     }
+}
+
+/// Columns a filter holds state for, which is how a board sizes the one its
+/// stream declares.
+pub const fn float_columns(columns: &[ColumnDef]) -> usize {
+    let mut count = 0;
+    let mut index = 0;
+    while index < columns.len() {
+        if columns[index].data_type.value() == DataType::F32.value() {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
 }
 
 /// One data stream with `N` segments.
@@ -65,8 +71,7 @@ pub struct Stream<const N: usize> {
     def: &'static StreamDef,
     segments: Segments<N>,
     publisher: Publisher,
-    filter: Filter,
-    butterworth: Butterworth,
+    filter: &'static mut dyn Filter,
     tuned: Option<SegmentId>,
 }
 
@@ -76,7 +81,7 @@ impl<const N: usize> Stream<N> {
     pub fn new(
         id: StreamId,
         def: &'static StreamDef,
-        filter: Filter,
+        filter: &'static mut dyn Filter,
         params: Params,
     ) -> Option<Self> {
         ((1..=MAX_SAMPLE_BYTES).contains(&def.sample_size()) && def.float_columns() <= MAX_COLUMNS)
@@ -86,7 +91,6 @@ impl<const N: usize> Stream<N> {
                 segments: Segments::new(params),
                 publisher: Publisher::new(),
                 filter,
-                butterworth: Butterworth::new(),
                 tuned: None,
             })
     }
@@ -113,13 +117,13 @@ impl<const N: usize> Stream<N> {
     }
 
     /// The decimation filter its declaration names.
-    pub fn filter(&self) -> Filter {
-        self.filter
+    pub fn filter(&self) -> FilterType {
+        self.filter.kind()
     }
 
     /// Begin acquiring, with sample zero at `timeref`.
     pub fn start(&mut self, timeref: Timeref) -> Result<(), Busy> {
-        self.butterworth = Butterworth::new();
+        self.filter.prime();
         self.tuned = None;
         self.segments.start(timeref)
     }
@@ -157,21 +161,19 @@ impl<const N: usize> Stream<N> {
             .segments
             .get(issued.segment)
             .expect("the segment issuing is in the ring");
-        let record = segment.record(self.id, self.filter);
-        match self.filter {
-            Filter::None => self.publisher.push(issued, record, sample, out),
-            Filter::Butterworth4 => {
-                if self.tuned != Some(issued.segment) {
-                    self.tuned = Some(issued.segment);
-                    let params = segment.params();
-                    self.butterworth
-                        .setup(params.cutoff(self.filter) / params.rate.get() as f32);
-                }
-                let mut buf = [0u8; MAX_SAMPLE_BYTES];
-                let sample = filtered(&mut self.butterworth, self.def, sample, &mut buf);
-                self.publisher.push(issued, record, sample, out);
-            }
+        let record = segment.record(self.id, self.filter.kind());
+        if self.tuned != Some(issued.segment) {
+            self.tuned = Some(issued.segment);
+            self.filter
+                .setup(record.filter_cutoff / segment.params().rate.get() as f32);
         }
+        if record.filter_cutoff <= 0.0 {
+            self.publisher.push(issued, record, sample, out);
+            return;
+        }
+        let mut buf = [0u8; MAX_SAMPLE_BYTES];
+        let sample = filtered(self.filter, self.def, sample, &mut buf);
+        self.publisher.push(issued, record, sample, out);
     }
 
     /// Advance past `count` samples without publishing them.
@@ -206,11 +208,11 @@ impl<const N: usize> Stream<N> {
     /// A segment record, with [`CURRENT_SEGMENT`] naming the one acquiring.
     pub fn segment(&self, index: u8) -> Option<data::Segment<'_>> {
         match index {
-            CURRENT_SEGMENT => Some(self.segments.current().record(self.id, self.filter)),
+            CURRENT_SEGMENT => Some(self.segments.current().record(self.id, self.filter.kind())),
             index => Some(
                 self.segments
                     .get(SegmentId::new(index))?
-                    .record(self.id, self.filter),
+                    .record(self.id, self.filter.kind()),
             ),
         }
     }
@@ -250,26 +252,33 @@ impl<const N: usize> Streams for [Stream<N>] {
 
 /// Filter a sample's float columns into `buf`, and hand back what to publish.
 fn filtered<'a>(
-    filter: &mut Butterworth,
+    filter: &mut dyn Filter,
     def: &StreamDef,
     sample: &'a [u8],
     buf: &'a mut [u8; MAX_SAMPLE_BYTES],
 ) -> &'a [u8] {
-    if !filter.running() || sample.len() != def.sample_size() {
+    if sample.len() != def.sample_size() {
         return sample;
     }
     buf[..sample.len()].copy_from_slice(sample);
-    let mut offset = 0;
-    let mut channel = 0;
-    for column in def.columns {
-        let size = column.data_type.size();
-        let slot = &mut buf[offset..offset + size];
-        if column.data_type == DataType::F32 {
-            let value = f32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
-            slot.copy_from_slice(&filter.sample(channel, value).to_le_bytes());
-            channel += 1;
-        }
-        offset += size;
+    let floats = || {
+        def.columns
+            .iter()
+            .scan(0, |offset, column| {
+                let at = *offset;
+                *offset += column.data_type.size();
+                Some((at, column.data_type))
+            })
+            .filter(|(_, data_type)| *data_type == DataType::F32)
+            .map(|(at, _)| at)
+    };
+    let mut columns = [0.0; MAX_COLUMNS];
+    for (value, at) in columns.iter_mut().zip(floats()) {
+        *value = f32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+    }
+    filter.sample(&mut columns[..def.float_columns()]);
+    for (value, at) in columns.iter().zip(floats()) {
+        buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
     &buf[..sample.len()]
 }
@@ -281,6 +290,7 @@ fn find<const N: usize>(streams: &[Stream<N>], stream_id: u8) -> Option<&Stream<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::filter::{self, Butterworth4};
     use crate::data::segments::SegmentState;
     use core::num::NonZeroU32;
     use twinleaf_proto::data::{FilterType, MetadataType, SegmentFlags};
@@ -365,6 +375,15 @@ mod tests {
         PacketType::stream(stream_id).unwrap()
     }
 
+    /// One stream's own filter, as a board's static lends it to a ring.
+    fn butterworth<const C: usize>() -> &'static mut dyn Filter {
+        Box::leak(Box::new(Butterworth4::<C>::new()))
+    }
+
+    fn unfiltered() -> &'static mut dyn Filter {
+        Box::leak(Box::new(filter::None))
+    }
+
     impl Sent {
         /// Every sample packet as its segment and the floats it carries.
         fn floats(&self) -> Vec<(u8, Vec<f32>)> {
@@ -405,12 +424,12 @@ mod tests {
 
     fn streams() -> [Stream<4>; 2] {
         [
-            Stream::new(StreamId::new(1), &SINE, Filter::Butterworth4, params(10)).unwrap(),
-            Stream::new(StreamId::new(2), &STATUS, Filter::Butterworth4, params(10)).unwrap(),
+            Stream::new(StreamId::new(1), &SINE, butterworth::<0>(), params(10)).unwrap(),
+            Stream::new(StreamId::new(2), &STATUS, butterworth::<0>(), params(10)).unwrap(),
         ]
     }
 
-    fn decimated(filter: Filter, decimation: u32) -> Stream<4> {
+    fn decimated(filter: &'static mut dyn Filter, decimation: u32) -> Stream<4> {
         let params = Params {
             decimation: NonZeroU32::new(decimation).unwrap(),
             ..params(10)
@@ -450,9 +469,9 @@ mod tests {
             columns: &[],
         };
         assert_eq!(SINE.sample_size(), 16);
-        let kind = Filter::Butterworth4;
-        assert!(Stream::<4>::new(StreamId::new(1), &WIDE, kind, params(10)).is_none());
-        assert!(Stream::<4>::new(StreamId::new(1), &EMPTY, kind, params(10)).is_none());
+        let params = params(10);
+        assert!(Stream::<4>::new(StreamId::new(1), &WIDE, butterworth::<0>(), params).is_none());
+        assert!(Stream::<4>::new(StreamId::new(1), &EMPTY, butterworth::<0>(), params).is_none());
     }
 
     #[test]
@@ -471,10 +490,9 @@ mod tests {
 
     #[test]
     fn a_batched_stream_sends_short_packets() {
-        let mut stream =
-            Stream::<4>::new(StreamId::new(1), &SINE, Filter::Butterworth4, params(10))
-                .unwrap()
-                .batched(32);
+        let mut stream = Stream::<4>::new(StreamId::new(1), &SINE, butterworth::<0>(), params(10))
+            .unwrap()
+            .batched(32);
         stream.start(timeref()).unwrap();
         let mut sent = Sent::default();
         (0..3).for_each(|_| stream.push(&[0; 16], &mut sent));
@@ -560,7 +578,7 @@ mod tests {
 
     #[test]
     fn a_decimated_float_column_is_the_filter_output() {
-        let mut stream = decimated(Filter::Butterworth4, 4);
+        let mut stream = decimated(butterworth::<1>(), 4);
         let mut sent = Sent::default();
         stream.push(&0.0f32.to_le_bytes(), &mut sent);
         (0..400).for_each(|_| stream.push(&1.0f32.to_le_bytes(), &mut sent));
@@ -582,25 +600,27 @@ mod tests {
 
     #[test]
     fn an_undecimated_stream_publishes_the_bytes_it_was_given() {
-        let mut stream = decimated(Filter::Butterworth4, 1);
-        let mut sent = Sent::default();
-        [[0xDE, 0xAD, 0xBE, 0xEF], [1, 2, 3, 4]]
-            .iter()
-            .for_each(|sample| stream.push(sample, &mut sent));
-        stream.flush(&mut sent);
+        for filter in [unfiltered(), butterworth::<1>()] {
+            let mut stream = decimated(filter, 1);
+            let mut sent = Sent::default();
+            [[0xDE, 0xAD, 0xBE, 0xEF], [1, 2, 3, 4]]
+                .iter()
+                .for_each(|sample| stream.push(sample, &mut sent));
+            stream.flush(&mut sent);
 
-        let (view, _) = PacketView::parse_prefix(&sent.0[1]).unwrap();
-        let samples = data::Samples::parse(view.header, view.payload).unwrap();
-        assert_eq!(samples.data, [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4]);
+            let (view, _) = PacketView::parse_prefix(&sent.0[1]).unwrap();
+            let samples = data::Samples::parse(view.header, view.payload).unwrap();
+            assert_eq!(samples.data, [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4]);
 
-        let record = stream.segment(CURRENT_SEGMENT).unwrap();
-        assert_eq!(record.filter_cutoff, 0.0);
-        assert_eq!(record.filter_type, FilterType::NONE);
+            let record = stream.segment(CURRENT_SEGMENT).unwrap();
+            assert_eq!(record.filter_cutoff, 0.0);
+            assert_eq!(record.filter_type, FilterType::NONE);
+        }
     }
 
     #[test]
     fn an_unfiltered_stream_publishes_the_samples_it_decimates_to() {
-        let mut stream = decimated(Filter::None, 10);
+        let mut stream = decimated(unfiltered(), 10);
         let mut sent = Sent::default();
         (0..30).for_each(|i| stream.push(&(i as f32).to_le_bytes(), &mut sent));
         stream.flush(&mut sent);
@@ -617,7 +637,7 @@ mod tests {
     /// the new segment carries on from where the old one settled.
     #[test]
     fn a_retune_carries_the_filter_across_the_segment_switch() {
-        let mut stream = decimated(Filter::Butterworth4, 4);
+        let mut stream = decimated(butterworth::<1>(), 4);
         let mut sent = Sent::default();
         stream.push(&0.0f32.to_le_bytes(), &mut sent);
         (0..400).for_each(|_| stream.push(&1.0f32.to_le_bytes(), &mut sent));
@@ -642,6 +662,41 @@ mod tests {
         );
     }
 
+    /// A segment index the ring comes round to again is tuned for the corner
+    /// it carries now, not the one it carried the first time.
+    #[test]
+    fn a_reused_segment_retunes_the_filter() {
+        let mut stream = Stream::<3>::new(
+            StreamId::new(1),
+            &STEP,
+            butterworth::<1>(),
+            Params {
+                decimation: NonZeroU32::new(2).unwrap(),
+                ..params(10)
+            },
+        )
+        .unwrap();
+        stream.start(timeref()).unwrap();
+        let mut sent = Sent::default();
+        stream.push(&0.0f32.to_le_bytes(), &mut sent);
+        for decimation in [1, 1, 4] {
+            stream.retune(Params {
+                decimation: NonZeroU32::new(decimation).unwrap(),
+                ..params(10)
+            });
+            (0..10).for_each(|_| stream.push(&0.0f32.to_le_bytes(), &mut sent));
+        }
+
+        let mut sent = Sent::default();
+        (0..8).for_each(|_| stream.push(&1.0f32.to_le_bytes(), &mut sent));
+        stream.flush(&mut sent);
+        let opened = sent.floats()[0].1[0];
+        assert!(
+            opened < 0.1,
+            "the reused segment opens at {opened}, the corner it carried before"
+        );
+    }
+
     #[test]
     fn a_decimated_stream_filters_its_f32_columns_and_no_others() {
         let params = Params {
@@ -649,7 +704,7 @@ mod tests {
             ..params(10)
         };
         let mut stream =
-            Stream::<4>::new(StreamId::new(1), &MIXED, Filter::Butterworth4, params).unwrap();
+            Stream::<4>::new(StreamId::new(1), &MIXED, butterworth::<1>(), params).unwrap();
         stream.start(timeref()).unwrap();
         let mut sent = Sent::default();
         let mut sample = [0u8; 16];
@@ -679,7 +734,7 @@ mod tests {
         assert_eq!(WIDE.float_columns(), MAX_COLUMNS + 1);
         assert!(WIDE.sample_size() <= MAX_SAMPLE_BYTES);
         assert!(
-            Stream::<4>::new(StreamId::new(1), &WIDE, Filter::Butterworth4, params(10)).is_none()
+            Stream::<4>::new(StreamId::new(1), &WIDE, butterworth::<9>(), params(10)).is_none()
         );
     }
 

@@ -6,15 +6,15 @@
 //! [`metadata`] reply a host asks for. A board implements [`Streams`] over the
 //! streams it has; nothing here decides when a sample is taken.
 
-mod filter;
 mod publisher;
 mod segments;
 mod stream;
 
+pub mod filter;
 pub mod metadata;
 
-pub use filter::{Butterworth, Filter, CORNER, MAX_COLUMNS};
+pub use filter::Filter;
 pub use metadata::Streams;
 pub use publisher::{Publisher, MAX_SAMPLE_BYTES};
 pub use segments::{Busy, Issued, Params, Segment, SegmentState, Segments, Timeref};
-pub use stream::{ColumnDef, Stream, StreamDef};
+pub use stream::{float_columns, ColumnDef, Stream, StreamDef};

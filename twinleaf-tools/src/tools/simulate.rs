@@ -24,7 +24,7 @@ use twinleaf::proto::packet::{PacketType, PacketView};
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{BoardId, FirmwareMagic, HwRev, SessionId, StreamId};
-use twinleaf_device::data::{ColumnDef, Filter, Params, Stream, StreamDef, Timeref};
+use twinleaf_device::data::{filter, ColumnDef, Params, Stream, StreamDef, Timeref};
 use twinleaf_device::device::{
     self, Deferred, Device, Entry, FlashOp, Group, Identity, OneLane, SyncRequest,
 };
@@ -1901,8 +1901,13 @@ fn boot_streams(role: Role, rate: NonZeroU32) -> io::Result<Vec<Stream<SEGMENTS>
             decimation: NonZeroU32::MIN,
             enabled: true,
         };
-        Stream::new(StreamId::new(id), def, Filter::None, params)
-            .ok_or_else(|| invalid_input("stream sample is too large for a TIO packet"))
+        Stream::new(
+            StreamId::new(id),
+            def,
+            Box::leak(Box::new(filter::None)),
+            params,
+        )
+        .ok_or_else(|| invalid_input("stream sample is too large for a TIO packet"))
     };
     match role {
         Role::Hub => Ok(Vec::new()),
