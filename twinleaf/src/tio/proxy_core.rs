@@ -68,7 +68,7 @@ pub(crate) enum ProxyCommand {
     },
     Call {
         request: Packet,
-        timeout: Duration,
+        deadline: Instant,
         complete: Completion,
     },
 }
@@ -262,7 +262,7 @@ enum RpcOrigin {
     Port(u64),
     Direct {
         complete: Completion,
-        timeout: Duration,
+        deadline: Instant,
     },
     Internal,
 }
@@ -333,9 +333,9 @@ pub(crate) struct ProxyCore {
     rpc_map: HashMap<u16, RpcMapEntry>,
     rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
 
-    /// Disconnects when the worker stops, so a client holding a port the
-    /// worker never adopted can still tell that it is gone.
-    _alive: channel::Sender<()>,
+    /// Disconnects when the worker stops, which it does before refusing the
+    /// commands its handles can still submit.
+    alive: Option<channel::Sender<()>>,
 }
 
 /// How long a device that has already sent a packet may stay silent before
@@ -381,7 +381,7 @@ impl ProxyCore {
             next_rpc_id: 0,
             rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
-            _alive: alive,
+            alive: Some(alive),
         }
     }
 
@@ -466,8 +466,7 @@ impl ProxyCore {
 
     // RPC failures are returned so the caller can notify the requesting client.
     fn forward_to_device(&mut self, mut pkt: Packet, origin: RpcOrigin) -> Result<(), RpcError> {
-        let mut rpc_mapped_id: Option<u16> = None;
-        let mut timeout = Instant::now();
+        let mut mapped: Option<(u16, Instant)> = None;
         let port_client = match &origin {
             RpcOrigin::Port(client_id) => Some(*client_id),
             RpcOrigin::Direct { .. } | RpcOrigin::Internal => None,
@@ -481,29 +480,24 @@ impl ProxyCore {
             let Some(wire_id) = self.next_wire_rpc_id() else {
                 return Err(origin.refuse(RpcError::NoBufs));
             };
-            let target = match origin {
-                RpcOrigin::Port(client_id) => {
-                    timeout += self
-                        .clients
-                        .get(&client_id)
-                        .expect("Invalid client when forwarding RPC")
-                        .rpc_timeout;
+            let (target, timeout) = match origin {
+                RpcOrigin::Port(client_id) => (
                     RpcTarget::Port {
                         client_id,
                         original_id: client_rpc_id,
-                    }
-                }
-                RpcOrigin::Direct {
-                    complete,
-                    timeout: call_timeout,
-                } => {
-                    timeout += call_timeout;
-                    RpcTarget::Direct(complete)
-                }
-                RpcOrigin::Internal => {
-                    timeout += Duration::from_secs(1);
-                    RpcTarget::Internal(client_rpc_id)
-                }
+                    },
+                    Instant::now()
+                        + self
+                            .clients
+                            .get(&client_id)
+                            .expect("Invalid client when forwarding RPC")
+                            .rpc_timeout,
+                ),
+                RpcOrigin::Direct { complete, deadline } => (RpcTarget::Direct(complete), deadline),
+                RpcOrigin::Internal => (
+                    RpcTarget::Internal(client_rpc_id),
+                    Instant::now() + Duration::from_secs(1),
+                ),
             };
             self.rpc_map.insert(
                 wire_id,
@@ -518,13 +512,13 @@ impl ProxyCore {
                     .send(Event::RpcRemap((client_id, client_rpc_id), wire_id));
             }
             pkt = pkt.with_rpc_id(wire_id);
-            rpc_mapped_id = Some(wire_id);
+            mapped = Some((wire_id, timeout));
         } else if port_client.is_none() {
             return Err(origin.refuse(RpcError::Malformed));
         }
         if let Some(dev) = &self.device {
             if let Ok(()) = dev.tio_port.send(pkt) {
-                if let Some(rpc_id) = rpc_mapped_id {
+                if let Some((rpc_id, timeout)) = mapped {
                     self.rpc_timeouts.entry(timeout).or_default().insert(rpc_id);
                 }
                 return Ok(());
@@ -534,7 +528,7 @@ impl ProxyCore {
         // there is something wrong with the device we'll notice in the main
         // loop soon but remove the rpc from the map and send back an error to
         // the client.
-        if let Some(rpc_id) = rpc_mapped_id {
+        if let Some((rpc_id, _)) = mapped {
             let entry = self
                 .rpc_map
                 .remove(&rpc_id)
@@ -859,6 +853,7 @@ impl ProxyCore {
             log::debug!("failed to open {}: {error}", self.url);
             self.status_queue.send(Event::FailedToConnect);
             self.broadcast_status(packet::ProxyStatus::FailedToConnect);
+            self.shutdown();
             return;
         }
         let mut device_timeout = self.reconnect_timeout.map(|t| Instant::now() + t);
@@ -1038,13 +1033,17 @@ impl ProxyCore {
                         }
                         Ok(ProxyCommand::Call {
                             request,
-                            timeout,
+                            deadline,
                             complete,
                         }) => {
-                            let _ = self.forward_to_device(
-                                request,
-                                RpcOrigin::Direct { complete, timeout },
-                            );
+                            if Instant::now() < deadline {
+                                let _ = self.forward_to_device(
+                                    request,
+                                    RpcOrigin::Direct { complete, deadline },
+                                );
+                            } else {
+                                complete(Err(RawCallError::Timeout));
+                            }
                         }
                         Err(TryRecvError::Empty) => {
                             break;
@@ -1108,12 +1107,20 @@ impl ProxyCore {
             }
         }
 
+        self.shutdown();
+    }
+
+    /// Stop, then outlive the handles: a command accepted after the worker
+    /// gave up is still refused rather than left waiting for a reply.
+    fn shutdown(&mut self) {
         self.dispatch_rpc_errors(RpcFailure::ProxyClosed, None);
-        while let Ok(command) = self.command_queue.try_recv() {
-            if let ProxyCommand::Call { complete, .. } = command {
-                complete(Err(RawCallError::ProxyClosed));
-            }
-        }
+        self.device = None;
+        self.clients.clear();
+        self.alive.take();
+        self.command_queue.iter().for_each(|command| match command {
+            ProxyCommand::OpenPort { .. } => {}
+            ProxyCommand::Call { complete, .. } => complete(Err(RawCallError::ProxyClosed)),
+        });
     }
 }
 
@@ -1175,6 +1182,70 @@ mod tests {
             .or_default()
             .insert(wire_id);
         receiver
+    }
+
+    /// The worker outlives every handle that can submit, so a call left in the
+    /// lane and one accepted after it gave up are both refused, not stranded.
+    #[test]
+    fn a_call_accepted_after_the_worker_stops_is_still_completed() {
+        let (endpoint, commands, alive) =
+            crate::tio::proxy::RpcEndpoint::test_pair(DeviceRoute::root(), 0);
+        let (status_tx, _status_rx) = channel::bounded(16);
+        let queued = endpoint.submit(DeviceRoute::root(), "dev.name", b"");
+        let worker = std::thread::spawn(move || {
+            ProxyCore::new(String::new(), None, commands, status_tx, false, alive).run()
+        });
+
+        assert!(endpoint.worker_alive().recv().is_err());
+        let accepted = endpoint.submit(DeviceRoute::root(), "dev.name", b"");
+
+        for reply in [queued, accepted] {
+            assert!(matches!(
+                reply.recv_timeout(Duration::from_secs(5)),
+                Ok(Err(RawCallError::ProxyClosed))
+            ));
+        }
+        drop(endpoint);
+        worker.join().unwrap();
+    }
+
+    /// A caller's budget covers its wait in the command lane, so a call that
+    /// spent it while the worker was busy never reaches the device.
+    #[test]
+    fn a_call_whose_deadline_passed_is_refused_when_it_is_dequeued() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (commands, command_queue) = channel::bounded(4);
+        let (status_tx, _status_rx) = channel::bounded(16);
+        let (alive, _worker_alive) = channel::bounded(0);
+        let worker = std::thread::spawn(move || {
+            ProxyCore::new(url, None, command_queue, status_tx, false, alive).run()
+        });
+
+        let (resolve, reply) = oneshot::channel();
+        commands
+            .send(ProxyCommand::Call {
+                request: Packet::rpc_request("dev.name", b"", 0, DeviceRoute::root()).unwrap(),
+                deadline: Instant::now() - Duration::from_millis(1),
+                complete: Box::new(move |outcome| {
+                    let _ = resolve.send(outcome);
+                }),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_secs(5)),
+            Ok(Err(RawCallError::Timeout))
+        ));
+        let (mut device, _) = listener.accept().unwrap();
+        device
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(device.read(&mut [0; 1]).is_err(), "the request was sent");
+        drop(commands);
+        worker.join().unwrap();
     }
 
     #[test]

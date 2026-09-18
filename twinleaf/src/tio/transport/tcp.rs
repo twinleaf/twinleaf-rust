@@ -10,6 +10,11 @@ use mio::net::TcpStream;
 use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::time::Duration;
+
+/// How long to wait for the handshake: one RTO plus slack, the same budget the
+/// proxy gives a TCP link that has gone silent.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// RawPort to communicate via TCP
 pub struct Port {
@@ -38,7 +43,7 @@ impl Port {
         // connection is established, which would let callers run as if
         // connected to a dead address. Connect via std first so failures
         // surface synchronously, then switch to mio for non-blocking I/O.
-        let std_stream = std::net::TcpStream::connect(*address)?;
+        let std_stream = std::net::TcpStream::connect_timeout(address, CONNECT_TIMEOUT)?;
         std_stream.set_nonblocking(true)?;
         // TIO packets are small and latency-sensitive (RPCs, heartbeats);
         // Nagle + delayed ACK would serialize a burst of requests.

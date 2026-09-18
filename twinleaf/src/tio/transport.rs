@@ -255,6 +255,10 @@ pub(crate) static DEFAULT_RX_CHANNEL_SIZE: usize = 32768;
 /// Default size of the tx channel when sending to a crossbeam channel.
 pub(crate) static DEFAULT_TX_CHANNEL_SIZE: usize = 32768;
 
+/// How long a port waits for a wedged peer to accept the bytes it owes it
+/// before giving the link up, whoever still holds the port.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl Port {
     #[cfg(feature = "serial")]
     fn open_serial<RXT: Fn(ReceiveResult) -> io::Result<()> + Send + 'static>(
@@ -292,10 +296,7 @@ impl Port {
         use crossbeam::channel::TryRecvError;
 
         let mut events = mio::Events::with_capacity(1);
-        let mut needs_draining = false;
-
-        // This gets set in cases where we ignore tx packets due to
-        // the port queue being full.
+        let mut draining_until: Option<Instant> = None;
         let mut needs_tx_queue_check = false;
 
         poll.registry()
@@ -307,8 +308,12 @@ impl Port {
         let mut startup = raw_port.startup_holdoff();
 
         'ioloop: loop {
-            let timeout = if needs_draining {
-                None
+            let timeout = if let Some(deadline) = draining_until {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break 'ioloop;
+                }
+                Some(remaining)
             } else if let Some(max_interval) = raw_port.max_send_interval() {
                 // Note: we exempt mode-switch/link-maintenance heartbeats from startup_holdoff,
                 // since losing them is not a big deal, and usually they allow to switch to binary
@@ -319,7 +324,7 @@ impl Port {
                     if (until_hb == Duration::ZERO) | startup {
                         match raw_port.send(&Packet::heartbeat(proto::DeviceRoute::root())) {
                             Err(SendError::MustDrain) => {
-                                needs_draining = true;
+                                draining_until = Some(Instant::now() + DRAIN_TIMEOUT);
                                 poll.registry()
                                     .reregister(
                                         &mut raw_port,
@@ -360,7 +365,7 @@ impl Port {
                 match event.token() {
                     mio::Token(0) => {
                         // One or more packets were sent on the tx queue, or the tx queue was closed.
-                        if needs_draining || startup {
+                        if draining_until.is_some() || startup {
                             needs_tx_queue_check = true;
                         } else {
                             check_tx_channel = true;
@@ -368,12 +373,12 @@ impl Port {
                     }
                     mio::Token(1) => {
                         if event.is_writable() {
-                            if needs_draining {
+                            if draining_until.is_some() {
                                 // Note: we'll never get here while in startup state, since
                                 // we won't send out anything until the holdoff is over.
                                 match raw_port.drain() {
                                     Ok(_) => {
-                                        needs_draining = false;
+                                        draining_until = None;
                                         poll.registry()
                                             .reregister(
                                                 &mut raw_port,
@@ -433,7 +438,7 @@ impl Port {
                 }
             }
 
-            if !needs_draining && !startup && needs_tx_queue_check {
+            if draining_until.is_none() && !startup && needs_tx_queue_check {
                 check_tx_channel = true;
                 needs_tx_queue_check = false;
             }
@@ -442,32 +447,26 @@ impl Port {
                 // Dequeue and send to the device port, or break out.
                 loop {
                     match tx.try_recv() {
-                        Ok(PacketOrControl::Pkt(pkt)) => {
-                            match raw_port.send(&pkt) {
-                                Err(SendError::MustDrain) => {
-                                    needs_draining = true;
-                                    poll.registry()
-                                        .reregister(
-                                            &mut raw_port,
-                                            mio::Token(1),
-                                            mio::Interest::READABLE.add(mio::Interest::WRITABLE),
-                                        )
-                                        .expect("Writable interest set failed (TX)");
-                                }
-                                Err(SendError::Full) => {
-                                    // This should never happen. The `RawPort`s will always
-                                    // return MustDrain before Full, and the code in the
-                                    // ioloop will ensure that a port in that state is
-                                    // drained successfully before receiving anything on tx.
-                                }
-                                Err(_) => {
-                                    break 'ioloop;
-                                }
-                                Ok(_) => {
-                                    last_sent = Instant::now();
-                                }
+                        Ok(PacketOrControl::Pkt(pkt)) => match raw_port.send(&pkt) {
+                            Err(SendError::MustDrain) => {
+                                draining_until = Some(Instant::now() + DRAIN_TIMEOUT);
+                                poll.registry()
+                                    .reregister(
+                                        &mut raw_port,
+                                        mio::Token(1),
+                                        mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+                                    )
+                                    .expect("Writable interest set failed (TX)");
+                                needs_tx_queue_check = true;
+                                break;
                             }
-                        }
+                            Err(_) => {
+                                break 'ioloop;
+                            }
+                            Ok(_) => {
+                                last_sent = Instant::now();
+                            }
+                        },
                         Ok(PacketOrControl::SetRate(rate)) => {
                             if ctl_result
                                 .send(match raw_port.set_rate(rate) {
@@ -776,5 +775,104 @@ mod tests {
 
         // The peer stays connected and sends nothing else to wake the poller.
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    /// Backpressure delays packets, it never eats them: every packet a caller
+    /// queued reaches the peer once the peer starts reading again.
+    #[test]
+    fn a_peer_that_stops_reading_loses_no_queued_packet() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let port = Port::new(&url, |_| Ok(())).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+
+        let packet = Packet::rpc_reply(0, &[0u8; 498], proto::DeviceRoute::root()).unwrap();
+        let queued = 4000;
+        for _ in 0..queued {
+            port.send(packet.clone()).unwrap();
+        }
+        drop(port);
+
+        let mut sunk = Vec::new();
+        peer.read_to_end(&mut sunk).unwrap();
+        assert_eq!(sunk.len(), queued * packet.as_bytes().len());
+    }
+
+    /// A peer that never takes another byte cannot pin the I/O thread, whoever
+    /// still holds the port.
+    #[cfg(unix)]
+    #[test]
+    fn a_port_stuck_draining_gives_up_on_its_write_budget() {
+        struct NeverWritable {
+            stream: mio::net::UnixStream,
+            _released: mpsc::Sender<()>,
+        }
+
+        impl RawPort for NeverWritable {
+            fn kind(&self) -> TransportKind {
+                TransportKind::Tcp
+            }
+
+            fn recv(&mut self) -> Result<Packet, RecvError> {
+                Err(RecvError::NotReady)
+            }
+
+            fn send(&mut self, _: &Packet) -> Result<(), SendError> {
+                Err(SendError::MustDrain)
+            }
+
+            fn drain(&mut self) -> Result<(), SendError> {
+                Err(SendError::MustDrain)
+            }
+
+            fn has_data_to_drain(&self) -> bool {
+                true
+            }
+        }
+
+        impl mio::event::Source for NeverWritable {
+            fn register(
+                &mut self,
+                registry: &mio::Registry,
+                token: mio::Token,
+                interests: mio::Interest,
+            ) -> io::Result<()> {
+                self.stream.register(registry, token, interests)
+            }
+
+            fn reregister(
+                &mut self,
+                registry: &mio::Registry,
+                token: mio::Token,
+                interests: mio::Interest,
+            ) -> io::Result<()> {
+                self.stream.reregister(registry, token, interests)
+            }
+
+            fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
+                self.stream.deregister(registry)
+            }
+        }
+
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        while (&socket).write(&[0; 4096]).is_ok() {}
+        let (_released, gone) = mpsc::channel::<()>();
+        let port = Port::from_raw(
+            NeverWritable {
+                stream: mio::net::UnixStream::from_std(socket),
+                _released,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        port.send(Packet::heartbeat(proto::DeviceRoute::root()))
+            .unwrap();
+
+        assert!(matches!(
+            gone.recv_timeout(DRAIN_TIMEOUT + Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

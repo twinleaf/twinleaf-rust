@@ -318,8 +318,8 @@ pub(crate) enum RawCallError {
 #[derive(Clone)]
 pub(crate) struct ProxyHandle {
     commands: channel::Sender<ProxyCommand>,
-    /// Disconnects when the worker stops. A queued command outlives the
-    /// worker's receiver, so a stranded port never disconnects on its own.
+    /// Disconnects when the worker stops, which it does before refusing every
+    /// command these handles can still submit.
     worker_alive: channel::Receiver<()>,
     client_rx_channel_size: usize,
     client_tx_channel_size: usize,
@@ -430,7 +430,7 @@ impl RpcEndpoint {
         };
         let command = ProxyCommand::Call {
             request,
-            timeout: self.timeout,
+            deadline: Instant::now() + self.timeout,
             complete,
         };
         let (refused, error) = match self.commands().try_send(command) {
@@ -713,16 +713,17 @@ mod tests {
         let route: DeviceRoute = "/1/2".parse().unwrap();
         let (endpoint, commands, _worker) = RpcEndpoint::test_pair(scope, 1);
 
+        let submitted = Instant::now();
         let _pending = endpoint.submit(route, "dev.name", b"arg");
         let ProxyCommand::Call {
-            request, timeout, ..
+            request, deadline, ..
         } = commands.recv().unwrap()
         else {
             panic!("expected a direct RPC command");
         };
 
         assert_eq!(request.route(), route);
-        assert_eq!(timeout, Duration::from_secs(3));
+        assert!(deadline >= submitted + Duration::from_secs(3));
         let packet::Payload::RpcRequest(request) = request.payload() else {
             panic!("expected an RPC request");
         };
