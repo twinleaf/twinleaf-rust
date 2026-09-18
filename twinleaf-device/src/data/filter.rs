@@ -6,6 +6,16 @@
 //! normalized corners decimation asks for, where a direct form biquad stalls
 //! short of it.
 
+/// Which anti-alias low pass a stream declares. Every stream holds a
+/// [`Butterworth`] whichever it names, so the state costs the same RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// Decimated samples are picked as they come.
+    None,
+    /// The fourth order [`Butterworth`] low pass.
+    Butterworth4,
+}
+
 /// Corner of the filter, as a fraction of the output Nyquist frequency.
 pub const CORNER: f32 = 0.8;
 
@@ -40,7 +50,7 @@ struct Integrators {
 }
 
 /// A fourth order Butterworth low pass over up to [`MAX_COLUMNS`] channels.
-pub struct Filter {
+pub struct Butterworth {
     coefficients: [Coefficients; SECTIONS],
     state: [[Integrators; SECTIONS]; MAX_COLUMNS],
     /// Whether a channel is settled, which tl-chibi reads off a non-finite
@@ -49,7 +59,7 @@ pub struct Filter {
     running: bool,
 }
 
-impl Filter {
+impl Butterworth {
     /// A bypassed filter with no state, which is all zeros.
     pub const fn new() -> Self {
         Self {
@@ -128,7 +138,7 @@ impl Filter {
 }
 
 /// A bypassed filter with no state.
-impl Default for Filter {
+impl Default for Butterworth {
     fn default() -> Self {
         Self::new()
     }
@@ -161,7 +171,7 @@ mod tests {
     /// Steady state gain of a tone at `cycles / period`, by quadrature
     /// projection over `periods` periods after `settle` of them.
     fn measure_gain(
-        filter: &mut Filter,
+        filter: &mut Butterworth,
         cycles: u32,
         period: u32,
         settle: u32,
@@ -181,15 +191,15 @@ mod tests {
         2.0 * (re * re + im * im).sqrt() / n
     }
 
-    fn tuned(cutoff: f32) -> Filter {
-        let mut filter = Filter::new();
+    fn tuned(cutoff: f32) -> Butterworth {
+        let mut filter = Butterworth::new();
         filter.setup(cutoff);
         filter
     }
 
     /// Drive `filter` to a settled state at zero, as tl-chibi's `initval(0.0)`
     /// leaves it.
-    fn settled(cutoff: f32) -> Filter {
+    fn settled(cutoff: f32) -> Butterworth {
         let mut filter = tuned(cutoff);
         filter.sample(0, 0.0);
         filter
@@ -297,7 +307,7 @@ mod tests {
     #[test]
     fn channels_are_independent() {
         let mut multi = tuned(0.05);
-        let mut single: Vec<Filter> = (0..3).map(|_| tuned(0.05)).collect();
+        let mut single: Vec<Butterworth> = (0..3).map(|_| tuned(0.05)).collect();
         for i in 0..1000 {
             let values = [
                 (0.1 * f64::from(i)).sin() as f32,

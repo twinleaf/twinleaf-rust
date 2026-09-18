@@ -24,7 +24,7 @@ use twinleaf::proto::packet::{PacketType, PacketView};
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::{data, log, sync};
 use twinleaf::proto::{BoardId, FirmwareMagic, HwRev, SessionId, StreamId};
-use twinleaf_device::data::{ColumnDef, Params, Stream, StreamDef, Timeref};
+use twinleaf_device::data::{ColumnDef, Filter, Params, Stream, StreamDef, Timeref};
 use twinleaf_device::device::{
     self, Deferred, Device, Entry, FlashOp, Group, Identity, OneLane, SyncRequest,
 };
@@ -1892,8 +1892,8 @@ fn next_second_ns(now: u64) -> u64 {
     (now / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND
 }
 
-/// The streams a boot starts: none on a hub, and on a sensor no decimation and
-/// a fresh segment ring on each.
+/// The streams a boot starts: none on a hub, and on a sensor no decimation, no
+/// anti-alias filter, and a fresh segment ring on each.
 fn boot_streams(role: Role, rate: NonZeroU32) -> io::Result<Vec<Stream<SEGMENTS>>> {
     let stream = |id: u8, def: &'static StreamDef, rate: NonZeroU32| {
         let params = Params {
@@ -1901,7 +1901,7 @@ fn boot_streams(role: Role, rate: NonZeroU32) -> io::Result<Vec<Stream<SEGMENTS>
             decimation: NonZeroU32::MIN,
             enabled: true,
         };
-        Stream::new(StreamId::new(id), def, params)
+        Stream::new(StreamId::new(id), def, Filter::None, params)
             .ok_or_else(|| invalid_input("stream sample is too large for a TIO packet"))
     };
     match role {

@@ -13,7 +13,7 @@ mod stream;
 
 pub mod metadata;
 
-pub use filter::{Filter, CORNER, MAX_COLUMNS};
+pub use filter::{Butterworth, Filter, CORNER, MAX_COLUMNS};
 pub use metadata::Streams;
 pub use publisher::{Publisher, MAX_SAMPLE_BYTES};
 pub use segments::{Busy, Issued, Params, Segment, SegmentState, Segments, Timeref};

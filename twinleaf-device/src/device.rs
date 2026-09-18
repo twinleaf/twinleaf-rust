@@ -953,7 +953,7 @@ impl Announcer<'_> {
 mod tests {
     use super::*;
     use crate::data::Params;
-    use crate::data::{ColumnDef, Stream, StreamDef};
+    use crate::data::{ColumnDef, Filter, Stream, StreamDef};
     use crate::rpc::{put, Kind};
     use core::num::NonZeroU32;
     use std::string::String;
@@ -1201,7 +1201,7 @@ mod tests {
         };
         Harness {
             device: device(table()),
-            streams: [Stream::new(StreamId::new(1), &AUX, params).unwrap()],
+            streams: [Stream::new(StreamId::new(1), &AUX, Filter::Butterworth4, params).unwrap()],
             lanes: Both::default(),
             reboot: false,
             deferred: None,
