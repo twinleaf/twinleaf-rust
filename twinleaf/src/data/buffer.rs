@@ -1,811 +1,705 @@
-use crate::data::{ColumnData, CursorPosition, Sample};
-use crate::tio::proto::identifiers::*;
-use crate::tio::proto::meta::MetadataEpoch;
-use crate::tio::proto::{BufferType, ColumnMetadata, DeviceRoute, SegmentMetadata, StreamMetadata};
+//! Bounded retention of the newest samples of every live stream.
+//!
+//! [`Buffer`] keeps one [`Run`] per stream, and a run retains its rows as
+//! frozen [`SampleBatch`]es: incoming batches are merged into chunks by a
+//! [`BatchCoalescer`], and retention drops the oldest rows by slicing the
+//! front chunk. Reads hand back slices of the retained chunks and copy at
+//! most the still-accumulating rows they ask for.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use super::coalesce::BatchCoalescer;
+use super::metadata::{ColumnRecord, SegmentRecord, StreamRecord};
+use super::sample::{ColumnKey, Generations, SampleBatch, StreamKey};
+use crate::proto::data as wire;
+use crate::proto::{ColumnId, SampleNumber};
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
+use std::time::Instant;
 
-pub type RunId = u64;
-
-#[derive(Debug, Clone)]
-pub enum ColumnBatch {
-    F64(Vec<f64>),
-    I64(Vec<i64>),
-    U64(Vec<u64>),
-}
-
-impl ColumnBatch {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::F64(v) => v.len(),
-            Self::I64(v) => v.len(),
-            Self::U64(v) => v.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AlignedWindow {
-    pub sample_numbers: HashMap<StreamKey, Vec<SampleNumber>>,
-    pub timestamps: Vec<f64>,
-    pub columns: HashMap<ColumnKey, ColumnBatch>,
-    pub stream_metadata: HashMap<StreamKey, Arc<StreamMetadata>>,
-    pub segment_metadata: HashMap<StreamKey, Arc<SegmentMetadata>>,
-    pub column_metadata: HashMap<ColumnKey, Arc<ColumnMetadata>>,
-    pub session_ids: HashMap<StreamKey, SessionId>,
-    pub run_ids: HashMap<StreamKey, RunId>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReadError {
-    #[error("no columns requested")]
-    NoColumnsRequested,
-    #[error("no cursor for stream {stream_key:?}")]
-    NoCursorForStream { stream_key: StreamKey },
-    #[error("no active run for stream {stream_key:?}")]
-    NoActiveRun { stream_key: StreamKey },
-    #[error(
-        "insufficient data for stream {stream_key:?}: requested {requested}, available {available}"
-    )]
-    InsufficientData {
-        stream_key: StreamKey,
-        requested: usize,
-        available: usize,
-    },
-    #[error("no data in time range [{requested_start}, {requested_end}]")]
-    NoDataInTimeRange {
-        requested_start: f64,
-        requested_end: f64,
-    },
-    #[error("requested range [{requested_start}, {requested_end}] exceeds retention window [{available_start}, {available_end}]")]
-    RequestedRangeExceedsRetention {
-        requested_start: f64,
-        requested_end: f64,
-        available_start: f64,
-        available_end: f64,
-    },
-    #[error("column {column_id:?} not found in stream {stream_key:?}")]
-    ColumnNotFound {
-        stream_key: StreamKey,
-        column_id: ColumnId,
-    },
-    #[error("sampling rate mismatch across streams {streams:?} at rates {rates:?}")]
-    SamplingRateMismatch {
-        streams: Vec<StreamKey>,
-        rates: Vec<f64>,
-    },
-    #[error("cursor invalidated for stream {stream_key:?}: cursor at run {cursor_run:?}, current run is {current_run:?}")]
-    CursorInvalidated {
-        stream_key: StreamKey,
-        cursor_run: RunId,
-        current_run: RunId,
-    },
-    #[error("cursor out of buffer for stream {stream_key:?}: at sample {cursor_sample:?}, earliest available is {earliest_available:?}")]
-    CursorOutOfBuffer {
-        stream_key: StreamKey,
-        cursor_sample: SampleNumber,
-        earliest_available: SampleNumber,
-    },
-}
-
-#[derive(Debug)]
-enum ColumnBuffer {
-    F64 {
-        metadata: Arc<ColumnMetadata>,
-        data: VecDeque<f64>,
-    },
-    I64 {
-        metadata: Arc<ColumnMetadata>,
-        data: VecDeque<i64>,
-    },
-    U64 {
-        metadata: Arc<ColumnMetadata>,
-        data: VecDeque<u64>,
-    },
-}
-
-impl ColumnBuffer {
-    fn new(metadata: Arc<ColumnMetadata>, capacity: usize) -> Self {
-        let alloc = capacity.min(65_536);
-        match metadata.data_type.buffer_type() {
-            BufferType::Float => Self::F64 {
-                metadata,
-                data: VecDeque::with_capacity(alloc),
-            },
-            BufferType::Int => Self::I64 {
-                metadata,
-                data: VecDeque::with_capacity(alloc),
-            },
-            BufferType::UInt => Self::U64 {
-                metadata,
-                data: VecDeque::with_capacity(alloc),
-            },
-        }
-    }
-
-    fn metadata(&self) -> &Arc<ColumnMetadata> {
-        match self {
-            Self::F64 { metadata, .. }
-            | Self::I64 { metadata, .. }
-            | Self::U64 { metadata, .. } => metadata,
-        }
-    }
-
-    fn push(&mut self, value: ColumnData) {
-        match (self, value) {
-            (Self::F64 { data, .. }, ColumnData::Float(v)) => data.push_back(v),
-            (Self::F64 { data, .. }, ColumnData::Int(v)) => data.push_back(v as f64),
-            (Self::I64 { data, .. }, ColumnData::Int(v)) => data.push_back(v),
-            (Self::U64 { data, .. }, ColumnData::UInt(v)) => data.push_back(v),
-            _ => {}
-        }
-    }
-
-    fn pop_front(&mut self) {
-        match self {
-            Self::F64 { data, .. } => {
-                data.pop_front();
-            }
-            Self::I64 { data, .. } => {
-                data.pop_front();
-            }
-            Self::U64 { data, .. } => {
-                data.pop_front();
-            }
-        }
-    }
-
-    fn get_range(&self, start: usize, count: usize) -> ColumnBatch {
-        match self {
-            Self::F64 { data, .. } => {
-                ColumnBatch::F64(data.iter().skip(start).take(count).copied().collect())
-            }
-            Self::I64 { data, .. } => {
-                ColumnBatch::I64(data.iter().skip(start).take(count).copied().collect())
-            }
-            Self::U64 { data, .. } => {
-                ColumnBatch::U64(data.iter().skip(start).take(count).copied().collect())
-            }
-        }
-    }
-}
-
-struct RunBuffer {
-    run_id: RunId,
-    session_id: SessionId,
-    stream_metadata: Arc<StreamMetadata>,
-    segment_metadata: Arc<SegmentMetadata>,
-    sample_numbers: VecDeque<SampleNumber>,
-    timestamps: VecDeque<f64>,
-    columns: HashMap<ColumnId, ColumnBuffer>,
-    capacity: usize,
-}
-
-impl RunBuffer {
-    fn new(run_id: RunId, sample: &Sample, capacity: usize) -> Self {
-        let alloc = capacity.min(65_536);
-        Self {
-            run_id,
-            session_id: sample.device.session_id,
-            stream_metadata: sample.stream.clone(),
-            segment_metadata: sample.segment.clone(),
-            sample_numbers: VecDeque::with_capacity(alloc),
-            timestamps: VecDeque::with_capacity(alloc),
-            columns: HashMap::new(),
-            capacity,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.sample_numbers.len()
-    }
-
-    fn push(&mut self, sample: &Sample) {
-        self.sample_numbers.push_back(sample.n);
-        self.timestamps.push_back(sample.timestamp_end());
-        self.segment_metadata = sample.segment.clone();
-
-        for col in &sample.columns {
-            self.columns
-                .entry(col.desc.index)
-                .or_insert_with(|| ColumnBuffer::new(col.desc.clone(), self.capacity))
-                .push(col.value.clone());
-        }
-    }
-
-    fn pop_front(&mut self) {
-        self.sample_numbers.pop_front();
-        self.timestamps.pop_front();
-        for col in self.columns.values_mut() {
-            col.pop_front();
-        }
-    }
-
-    fn sample_number_wraps(&self) -> bool {
-        match (self.sample_numbers.front(), self.sample_numbers.back()) {
-            (Some(first), Some(last)) => first > last,
-            _ => false,
-        }
-    }
-
-    fn find_start_after_sample(&self, sample_number: SampleNumber) -> Option<usize> {
-        if self.sample_numbers.is_empty() {
-            return None;
-        }
-
-        if !self.sample_number_wraps() {
-            let start = self
-                .sample_numbers
-                .partition_point(|&sn| sn <= sample_number);
-            if start == 0 || self.sample_numbers.get(start - 1).copied()? != sample_number {
-                return None;
-            }
-            return Some(start);
-        }
-
-        self.sample_numbers
-            .iter()
-            .rposition(|&sn| sn == sample_number)
-            .map(|idx| idx + 1)
-    }
-
-    fn timestamps_range(&self, start: usize, count: usize) -> Vec<f64> {
-        self.timestamps
-            .iter()
-            .skip(start)
-            .take(count)
-            .copied()
-            .collect()
-    }
-}
-
-pub struct ActiveRun {
-    pub run_id: RunId,
-    pub session_id: SessionId,
-    pub segment_id: SegmentId,
-    pub effective_rate: f64,
-    pub time_ref_epoch: MetadataEpoch,
-    pub last_sample_number: SampleNumber,
-    pub last_timestamp: f64,
-    buffer: RunBuffer,
-}
-
-impl ActiveRun {
-    fn new(run_id: RunId, sample: &Sample, capacity: usize) -> Self {
-        let segment = &sample.segment;
-        Self {
-            run_id,
-            session_id: sample.device.session_id,
-            segment_id: segment.segment_id,
-            effective_rate: segment.sampling_rate as f64 / segment.decimation as f64,
-            time_ref_epoch: segment.time_ref_epoch.clone(),
-            last_sample_number: sample.n,
-            last_timestamp: sample.timestamp_end(),
-            buffer: RunBuffer::new(run_id, sample, capacity),
-        }
-    }
-}
-
+/// The newest samples of every stream that has delivered data, each capped at
+/// `capacity` rows.
 pub struct Buffer {
     capacity: usize,
-    active_runs: HashMap<StreamKey, ActiveRun>,
-    next_run_id: RunId,
-}
-
-enum AlignmentMode<'a> {
-    LastN(usize),
-    FromCursors {
-        cursors: &'a HashMap<StreamKey, CursorPosition>,
-        n: usize,
-    },
-    CommonTail,
-    TimeRange {
-        start: f64,
-        end: f64,
-    },
+    runs: HashMap<StreamKey, Run>,
 }
 
 impl Buffer {
-    pub fn new(capacity: usize) -> Self {
-        Self {
+    /// A buffer retaining at most `capacity` rows of each stream.
+    pub fn new(capacity: usize) -> Buffer {
+        Buffer {
             capacity,
-            active_runs: HashMap::new(),
-            next_run_id: 0,
+            runs: HashMap::new(),
         }
     }
 
-    pub fn process_sample(&mut self, sample: Sample, stream_key: StreamKey) {
-        let needs_new_run = !sample.is_continuous() || !self.active_runs.contains_key(&stream_key);
-
-        if needs_new_run {
-            let new_run_id = self.next_run_id;
-            self.next_run_id += 1;
-            self.active_runs.insert(
-                stream_key.clone(),
-                ActiveRun::new(new_run_id, &sample, self.capacity),
-            );
+    /// Retain `batch`'s rows, starting a new run when the parser stamped a new
+    /// per-stream generation. Empty batches are ignored.
+    pub fn process_batch(&mut self, batch: &SampleBatch) {
+        if batch.is_empty() {
+            return;
         }
-
-        let active = self.active_runs.get_mut(&stream_key).unwrap();
-        active.buffer.push(&sample);
-        active.last_sample_number = sample.n;
-        active.last_timestamp = sample.timestamp_end();
-        active.segment_id = sample.segment.segment_id;
-
-        if active.buffer.len() > self.capacity {
-            active.buffer.pop_front();
-        }
-    }
-
-    pub fn get_run(&self, stream_key: &StreamKey) -> Option<&ActiveRun> {
-        self.active_runs.get(stream_key)
-    }
-
-    pub fn read_aligned_window(
-        &self,
-        columns: &[ColumnKey],
-        n: usize,
-    ) -> Result<AlignedWindow, ReadError> {
-        let by_stream = self.prepare_stream_selection(columns)?;
-        let (slices, timestamps) =
-            self.compute_aligned_slices(&by_stream, AlignmentMode::LastN(n))?;
-        self.build_window_from_slices(&by_stream, &slices, timestamps)
-    }
-
-    pub fn read_from_cursor(
-        &self,
-        columns: &[ColumnKey],
-        cursors: &HashMap<StreamKey, CursorPosition>,
-        n: usize,
-    ) -> Result<AlignedWindow, ReadError> {
-        let by_stream = self.prepare_stream_selection(columns)?;
-        let (slices, timestamps) =
-            self.compute_aligned_slices(&by_stream, AlignmentMode::FromCursors { cursors, n })?;
-        self.build_window_from_slices(&by_stream, &slices, timestamps)
-    }
-
-    pub fn read_aligned_tail(&self, columns: &[ColumnKey]) -> Result<AlignedWindow, ReadError> {
-        let by_stream = self.prepare_stream_selection(columns)?;
-        let (slices, timestamps) =
-            self.compute_aligned_slices(&by_stream, AlignmentMode::CommonTail)?;
-        self.build_window_from_slices(&by_stream, &slices, timestamps)
-    }
-
-    pub fn read_aligned_time_range(
-        &self,
-        columns: &[ColumnKey],
-        start_time: f64,
-        end_time: f64,
-    ) -> Result<AlignedWindow, ReadError> {
-        let by_stream = self.prepare_stream_selection(columns)?;
-        let (slices, timestamps) = self.compute_aligned_slices(
-            &by_stream,
-            AlignmentMode::TimeRange {
-                start: start_time,
-                end: end_time,
-            },
-        )?;
-        self.build_window_from_slices(&by_stream, &slices, timestamps)
-            .map_err(|err| match err {
-                ReadError::InsufficientData { .. } => ReadError::NoDataInTimeRange {
-                    requested_start: start_time.min(end_time),
-                    requested_end: start_time.max(end_time),
-                },
-                other => other,
-            })
-    }
-
-    fn compute_aligned_slices(
-        &self,
-        by_stream: &HashMap<StreamKey, Vec<ColumnId>>,
-        mode: AlignmentMode<'_>,
-    ) -> Result<(HashMap<StreamKey, (usize, usize)>, Vec<f64>), ReadError> {
-        match mode {
-            AlignmentMode::LastN(n) => {
-                let ref_key = Self::reference_stream_key(by_stream);
-                let ref_buf = self.active_buffer(ref_key)?;
-                let available = ref_buf.len();
-                if available == 0 {
-                    return Err(ReadError::InsufficientData {
-                        stream_key: ref_key.clone(),
-                        requested: n,
-                        available: 0,
-                    });
-                }
-                let count = n.min(available);
-                let start = available.saturating_sub(count);
-                let timestamps = ref_buf.timestamps_range(start, count);
-                let slices = by_stream
-                    .keys()
-                    .map(|k| (k.clone(), (start, count)))
-                    .collect();
-                Ok((slices, timestamps))
-            }
-
-            AlignmentMode::FromCursors { cursors, n } => {
-                let mut start = 0;
-                let mut reference_key: Option<StreamKey> = None;
-
-                for stream_key in by_stream.keys() {
-                    let active = self.active_run(stream_key)?;
-                    let cursor = cursors
-                        .get(stream_key)
-                        .ok_or(ReadError::NoCursorForStream {
-                            stream_key: stream_key.clone(),
-                        })?;
-                    if cursor.run_id != active.run_id {
-                        return Err(ReadError::CursorInvalidated {
-                            stream_key: stream_key.clone(),
-                            cursor_run: cursor.run_id,
-                            current_run: active.run_id,
-                        });
-                    }
-                    let buf = &active.buffer;
-                    if buf.sample_numbers.is_empty() {
-                        return Err(ReadError::InsufficientData {
-                            stream_key: stream_key.clone(),
-                            requested: n,
-                            available: 0,
-                        });
-                    }
-                    let s = buf
-                        .find_start_after_sample(cursor.last_sample_number)
-                        .ok_or(ReadError::CursorOutOfBuffer {
-                            stream_key: stream_key.clone(),
-                            cursor_sample: cursor.last_sample_number,
-                            earliest_available: *buf.sample_numbers.front().unwrap(),
-                        })?;
-                    if s + n > buf.len() {
-                        return Err(ReadError::InsufficientData {
-                            stream_key: stream_key.clone(),
-                            requested: n,
-                            available: buf.len().saturating_sub(s),
-                        });
-                    }
-                    if reference_key.is_none() {
-                        start = s;
-                        reference_key = Some(stream_key.clone());
-                    }
-                }
-
-                let ref_key = reference_key.unwrap();
-                let ref_buf = self.active_buffer(&ref_key)?;
-                let timestamps = ref_buf.timestamps_range(start, n);
-                let slices = by_stream.keys().map(|k| (k.clone(), (start, n))).collect();
-                Ok((slices, timestamps))
-            }
-
-            AlignmentMode::CommonTail => {
-                let mut global_start = f64::MIN;
-                let mut global_end = f64::MAX;
-
-                for stream_key in by_stream.keys() {
-                    let buf = self.active_buffer(stream_key)?;
-                    if buf.timestamps.is_empty() {
-                        return Err(ReadError::InsufficientData {
-                            stream_key: stream_key.clone(),
-                            requested: 0,
-                            available: 0,
-                        });
-                    }
-                    let first = *buf.timestamps.front().unwrap();
-                    let last = *buf.timestamps.back().unwrap();
-                    global_start = global_start.max(first);
-                    global_end = global_end.min(last);
-                }
-
-                if global_start >= global_end {
-                    return Err(ReadError::InsufficientData {
-                        stream_key: StreamKey::new(DeviceRoute::root(), 0),
-                        requested: 0,
-                        available: 0,
-                    });
-                }
-
-                let ref_key = Self::reference_stream_key(by_stream);
-                let ref_buf = self.active_buffer(ref_key)?;
-                let start = ref_buf
-                    .timestamps
-                    .iter()
-                    .position(|&t| t >= global_start)
-                    .unwrap_or(0);
-                let end = ref_buf
-                    .timestamps
-                    .iter()
-                    .rposition(|&t| t <= global_end)
-                    .unwrap_or(ref_buf.len().saturating_sub(1));
-                let count = end.saturating_sub(start) + 1;
-                let timestamps = ref_buf.timestamps_range(start, count);
-                let slices = by_stream
-                    .keys()
-                    .map(|k| (k.clone(), (start, count)))
-                    .collect();
-                Ok((slices, timestamps))
-            }
-
-            AlignmentMode::TimeRange {
-                start: start_time,
-                end: end_time,
-            } => {
-                let (requested_start, requested_end) = normalize_time_bounds(start_time, end_time);
-
-                let (available_start, available_end) = self
-                    .aligned_retained_time_bounds(by_stream)?
-                    .ok_or(ReadError::NoDataInTimeRange {
-                        requested_start,
-                        requested_end,
-                    })?;
-
-                if requested_start < available_start || requested_end > available_end {
-                    return Err(ReadError::RequestedRangeExceedsRetention {
-                        requested_start,
-                        requested_end,
-                        available_start,
-                        available_end,
-                    });
-                }
-
-                let ref_key = Self::reference_stream_key(by_stream);
-                let ref_buf = self.active_buffer(ref_key)?;
-                let ref_start = ref_buf.timestamps.partition_point(|&t| t < requested_start);
-                let ref_end = ref_buf.timestamps.partition_point(|&t| t <= requested_end);
-                if ref_start >= ref_end {
-                    return Err(ReadError::NoDataInTimeRange {
-                        requested_start,
-                        requested_end,
-                    });
-                }
-
-                let ref_count = ref_end - ref_start;
-                let timestamps = ref_buf.timestamps_range(ref_start, ref_count);
-                if timestamps.is_empty() {
-                    return Err(ReadError::NoDataInTimeRange {
-                        requested_start,
-                        requested_end,
-                    });
-                }
-
-                let mut slices = HashMap::new();
-                slices.insert(ref_key.clone(), (ref_start, ref_count));
-
-                for stream_key in by_stream.keys() {
-                    if stream_key == ref_key {
-                        continue;
-                    }
-                    let buf = self.active_buffer(stream_key)?;
-                    let s = buf.timestamps.partition_point(|&t| t < requested_start);
-                    let e = buf.timestamps.partition_point(|&t| t <= requested_end);
-                    if s >= e {
-                        return Err(ReadError::NoDataInTimeRange {
-                            requested_start,
-                            requested_end,
-                        });
-                    }
-                    let count = e - s;
-                    if count != ref_count {
-                        return Err(ReadError::NoDataInTimeRange {
-                            requested_start,
-                            requested_end,
-                        });
-                    }
-                    let stream_timestamps = buf.timestamps.iter().skip(s).take(count).copied();
-                    if !timestamps_match_iter(&timestamps, stream_timestamps) {
-                        return Err(ReadError::NoDataInTimeRange {
-                            requested_start,
-                            requested_end,
-                        });
-                    }
-                    slices.insert(stream_key.clone(), (s, count));
-                }
-
-                Ok((slices, timestamps))
+        let stream_key = batch.stream_key();
+        match self.runs.get_mut(&stream_key) {
+            Some(run) if run.generations.stream == batch.generations().stream => run.append(batch),
+            _ => {
+                self.runs.insert(stream_key, Run::new(batch, self.capacity));
             }
         }
     }
 
-    fn aligned_retained_time_bounds(
-        &self,
-        by_stream: &HashMap<StreamKey, Vec<ColumnId>>,
-    ) -> Result<Option<(f64, f64)>, ReadError> {
-        let mut global_start = f64::MIN;
-        let mut global_end = f64::MAX;
-
-        for stream_key in by_stream.keys() {
-            let buf = self.active_buffer(stream_key)?;
-            let (Some(&first), Some(&last)) = (buf.timestamps.front(), buf.timestamps.back())
-            else {
-                return Ok(None);
-            };
-
-            global_start = global_start.max(first);
-            global_end = global_end.min(last);
-        }
-
-        if global_start > global_end {
-            return Ok(None);
-        }
-
-        Ok(Some((global_start, global_end)))
+    /// The stream's current run, or `None` if it has delivered no data.
+    pub fn get_run(&self, stream_key: &StreamKey) -> Option<&Run> {
+        self.runs.get(stream_key)
     }
 
-    fn build_window_from_slices(
-        &self,
-        by_stream: &HashMap<StreamKey, Vec<ColumnId>>,
-        slices: &HashMap<StreamKey, (usize, usize)>,
-        timestamps: Vec<f64>,
-    ) -> Result<AlignedWindow, ReadError> {
-        let expected_len = timestamps.len();
-        let mut sample_numbers = HashMap::new();
-        let mut columns = HashMap::new();
-        let mut stream_metadata = HashMap::new();
-        let mut segment_metadata = HashMap::new();
-        let mut column_metadata = HashMap::new();
-        let mut session_ids = HashMap::new();
-        let mut run_ids = HashMap::new();
+    /// Iterate the streams currently holding a run, for callers sizing UI
+    /// state (e.g. column widths) across all streams.
+    pub fn stream_keys(&self) -> impl Iterator<Item = &StreamKey> {
+        self.runs.keys()
+    }
 
-        for (stream_key, col_ids) in by_stream {
-            let buf = self.active_buffer(stream_key)?;
-            let (start, count) =
-                slices
-                    .get(stream_key)
-                    .copied()
-                    .ok_or(ReadError::InsufficientData {
-                        stream_key: stream_key.clone(),
-                        requested: expected_len,
-                        available: 0,
-                    })?;
+    /// The stream's newest retained sample as a one-row batch: its metadata
+    /// plus every column's last value, cheap enough to build once per render
+    /// frame. `None` if the stream has no run or the run retains no rows.
+    pub fn latest_row(&self, stream_key: &StreamKey) -> Option<SampleBatch> {
+        self.runs.get(stream_key)?.last_row()
+    }
 
-            let stream_sample_numbers: Vec<_> = buf
-                .sample_numbers
+    /// A column's metadata as of its stream's newest schema.
+    pub fn column_metadata(&self, col: &ColumnKey) -> Option<wire::Column<'_>> {
+        self.runs
+            .get(&col.stream_key())?
+            .column_metadata(col.column_id)
+    }
+}
+
+/// One stream's samples since the parser last split its run, oldest row first.
+///
+/// Rows are appended into a `BatchCoalescer`, which merges the small live
+/// batches into chunks of about `capacity / 16` rows; the rows it still holds
+/// are the run's tail, readable without completing them.
+pub struct Run {
+    /// The continuity generations stamped on every batch of this run.
+    generations: Generations,
+    stream: StreamRecord,
+    segment: SegmentRecord,
+    /// Column metadata in schema order, constant within a run.
+    columns: Vec<ColumnRecord>,
+    /// Completed chunks in row order; the coalescer holds the rows after them.
+    chunks: VecDeque<SampleBatch>,
+    coalescer: BatchCoalescer,
+    /// Exclusive logical position of the next row appended to this run.
+    next_row: u64,
+    /// Retained rows, the tail included.
+    rows: usize,
+    capacity: usize,
+    last_seen: Instant,
+}
+
+impl Run {
+    fn new(batch: &SampleBatch, capacity: usize) -> Run {
+        let (_, stream, segment) = batch.records();
+        let mut run = Run {
+            generations: batch.generations(),
+            stream: stream.clone(),
+            segment: segment.clone(),
+            columns: batch
+                .schema()
                 .iter()
-                .skip(start)
-                .take(count)
-                .copied()
-                .collect();
-            if stream_sample_numbers.len() != expected_len {
-                return Err(ReadError::InsufficientData {
-                    stream_key: stream_key.clone(),
-                    requested: expected_len,
-                    available: stream_sample_numbers.len(),
-                });
-            }
-            sample_numbers.insert(stream_key.clone(), stream_sample_numbers);
-
-            stream_metadata.insert(stream_key.clone(), buf.stream_metadata.clone());
-            segment_metadata.insert(stream_key.clone(), buf.segment_metadata.clone());
-            session_ids.insert(stream_key.clone(), buf.session_id);
-            run_ids.insert(stream_key.clone(), buf.run_id);
-
-            for &col_id in col_ids {
-                let col_buf = buf.columns.get(&col_id).ok_or(ReadError::ColumnNotFound {
-                    stream_key: stream_key.clone(),
-                    column_id: col_id,
-                })?;
-
-                let key = ColumnKey::new(stream_key.route.clone(), stream_key.stream_id, col_id);
-                let batch = col_buf.get_range(start, count);
-                if batch.len() != expected_len {
-                    return Err(ReadError::InsufficientData {
-                        stream_key: stream_key.clone(),
-                        requested: expected_len,
-                        available: batch.len(),
-                    });
-                }
-                columns.insert(key.clone(), batch);
-                column_metadata.insert(key, col_buf.metadata().clone());
-            }
-        }
-
-        Ok(AlignedWindow {
-            sample_numbers,
-            timestamps,
-            columns,
-            stream_metadata,
-            segment_metadata,
-            column_metadata,
-            session_ids,
-            run_ids,
-        })
+                .map(|column| column.record().clone())
+                .collect(),
+            chunks: VecDeque::new(),
+            coalescer: BatchCoalescer::new(Some((capacity / 16).clamp(256, 65_536))),
+            next_row: 0,
+            rows: 0,
+            capacity,
+            last_seen: Instant::now(),
+        };
+        run.append(batch);
+        run
     }
 
-    fn prepare_stream_selection(
-        &self,
-        columns: &[ColumnKey],
-    ) -> Result<HashMap<StreamKey, Vec<ColumnId>>, ReadError> {
-        if columns.is_empty() {
-            return Err(ReadError::NoColumnsRequested);
-        }
-        let by_stream = group_columns_by_stream(columns);
-        self.validate_rates(&by_stream)?;
-        Ok(by_stream)
+    fn append(&mut self, batch: &SampleBatch) {
+        debug_assert_eq!(
+            batch.schema().len(),
+            self.columns.len(),
+            "the parser guarantees a constant schema within a run"
+        );
+        self.coalescer.push_batch(batch);
+        self.take_completed_chunks();
+
+        let (_, stream, segment) = batch.records();
+        self.stream = stream.clone();
+        self.segment = segment.clone();
+        self.next_row += batch.len() as u64;
+        self.rows += batch.len();
+        self.last_seen = Instant::now();
+        self.evict();
     }
 
-    fn validate_rates(
-        &self,
-        by_stream: &HashMap<StreamKey, Vec<ColumnId>>,
-    ) -> Result<(), ReadError> {
-        let mut rate: Option<f64> = None;
-        let mut rates = Vec::new();
+    fn take_completed_chunks(&mut self) {
+        while let Some(chunk) = self.coalescer.next_completed_batch() {
+            self.chunks.push_back(chunk);
+        }
+    }
 
-        for stream_key in by_stream.keys() {
-            let active = self
-                .active_runs
-                .get(stream_key)
-                .ok_or(ReadError::NoActiveRun {
-                    stream_key: stream_key.clone(),
-                })?;
-
-            let r = active.effective_rate;
-            rates.push(r);
-
-            if let Some(first_rate) = rate {
-                if (r - first_rate).abs() > 0.001 {
-                    return Err(ReadError::SamplingRateMismatch {
-                        streams: by_stream.keys().cloned().collect(),
-                        rates,
-                    });
-                }
+    /// Drop the oldest rows down to `capacity`, slicing the front chunk so
+    /// retention stays row-exact.
+    fn evict(&mut self) {
+        let Some(mut excess) = self.rows.checked_sub(self.capacity) else {
+            return;
+        };
+        if self.rows - self.coalescer.buffered_len() < excess {
+            // The rows to drop reach into the tail, so freeze it first.
+            self.coalescer.finish_buffered_batch();
+            self.take_completed_chunks();
+        }
+        while excess > 0 {
+            let front = self.chunks.front_mut().expect("chunks cover the excess");
+            let dropped = excess.min(front.len());
+            if dropped == front.len() {
+                self.chunks.pop_front();
             } else {
-                rate = Some(r);
+                *front = front.slice(dropped..front.len());
+            }
+            self.rows -= dropped;
+            excess -= dropped;
+        }
+    }
+
+    /// The retained rows within `rows`, as contiguous spans in row order.
+    pub(super) fn row_spans(&self, rows: Range<u64>) -> Vec<SampleBatch> {
+        let retained = self.retained_rows();
+        let (first, last) = (rows.start.max(retained.start), rows.end.min(retained.end));
+        if first >= last {
+            return Vec::new();
+        }
+        let start = (first - retained.start) as usize;
+        let end = (last - retained.start) as usize;
+
+        let mut spans = Vec::new();
+        let mut offset = 0;
+        for batch in &self.chunks {
+            let from = start.max(offset);
+            let to = end.min(offset + batch.len());
+            if from < to {
+                spans.push(batch.slice(from - offset..to - offset));
+            }
+            offset += batch.len();
+        }
+        let buffered = self.coalescer.buffered_len();
+        if buffered > 0 {
+            let (from, to) = (start.max(offset), end.min(offset + buffered));
+            if from < to {
+                spans.push(
+                    self.coalescer
+                        .buffered_rows(from - offset..to - offset)
+                        .expect("a nonempty buffered tail"),
+                );
+            }
+        }
+        spans
+    }
+
+    /// The newest retained row, as a one-row batch.
+    fn last_row(&self) -> Option<SampleBatch> {
+        let buffered = self.coalescer.buffered_len();
+        if buffered > 0 {
+            return self.coalescer.buffered_rows(buffered - 1..buffered);
+        }
+        let chunk = self.chunks.back()?;
+        Some(chunk.slice(chunk.len() - 1..chunk.len()))
+    }
+
+    fn column_metadata(&self, column_id: ColumnId) -> Option<wire::Column<'_>> {
+        self.columns
+            .iter()
+            .find(|column| column.get().index == column_id)
+            .map(ColumnRecord::get)
+    }
+
+    /// The continuity generations stamped on every batch of this run.
+    pub fn generations(&self) -> Generations {
+        self.generations
+    }
+
+    /// Wall-clock time this run last received a batch, refreshed on every
+    /// [`Buffer::process_batch`] update. Drives staleness display for callers
+    /// like the monitor TUI.
+    pub fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
+
+    /// This run's stream descriptor, as of its newest batch.
+    pub fn stream(&self) -> wire::Stream<'_> {
+        self.stream.get()
+    }
+
+    /// The run's newest segment metadata (sampling rate, decimation, ...),
+    /// e.g. for callers that need the raw ints rather than
+    /// [`Self::effective_rate`].
+    pub fn segment(&self) -> wire::Segment<'_> {
+        self.segment.get()
+    }
+
+    /// Samples per second after decimation.
+    pub fn effective_rate(&self) -> f64 {
+        let segment = self.segment();
+        segment.sampling_rate as f64 / segment.decimation as f64
+    }
+
+    /// End-of-sample time of the newest retained row.
+    pub fn last_timestamp(&self) -> Option<f64> {
+        self.last_row().map(|row| row.timestamps()[0])
+    }
+
+    /// Sample number of the newest retained row, or `None` if none remain.
+    pub fn last_sample_number(&self) -> Option<SampleNumber> {
+        self.last_row().map(|row| row.sample_numbers()[0])
+    }
+
+    /// The logical positions of the rows still retained, counted from the
+    /// run's first row.
+    pub fn retained_rows(&self) -> Range<u64> {
+        self.next_row - self.rows as u64..self.next_row
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::fixtures;
+    use crate::data::metadata::{buffer_type, DeviceRecord};
+    use crate::data::pipeline::{ColumnOp, ColumnProcessor};
+    use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
+    use crate::proto::data::DataType;
+    use crate::proto::DeviceRoute;
+
+    /// Records every sample it is fed, plus the length of each span it was fed as,
+    /// so tests can see where the buffer's chunk boundaries fall.
+    #[derive(Default)]
+    struct Collect {
+        samples: Vec<(f64, f64)>,
+        spans: Vec<usize>,
+        resets: usize,
+    }
+
+    impl ColumnOp for Collect {
+        type Output = Vec<(f64, f64)>;
+
+        fn reset(&mut self) {
+            self.samples.clear();
+            self.spans.clear();
+            self.resets += 1;
+        }
+
+        fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
+            assert_eq!(
+                timestamps.len(),
+                values.len(),
+                "spans must line up row-wise"
+            );
+            self.spans.push(timestamps.len());
+            for (row, &t) in timestamps.iter().enumerate() {
+                let value = values.get(row).try_as_f64().expect("a numeric column");
+                self.samples.push((t, value));
             }
         }
 
-        Ok(())
+        fn output(&self) -> &Self::Output {
+            &self.samples
+        }
     }
 
-    fn active_run(&self, stream_key: &StreamKey) -> Result<&ActiveRun, ReadError> {
-        self.active_runs
-            .get(stream_key)
-            .ok_or(ReadError::NoActiveRun {
-                stream_key: stream_key.clone(),
+    struct Fixture {
+        stream_key: StreamKey,
+        columns: Vec<ColumnRecord>,
+        column_keys: Vec<ColumnKey>,
+        device: DeviceRecord,
+        stream: StreamRecord,
+        segment: SegmentRecord,
+    }
+
+    impl Fixture {
+        /// Push one batch stamped with `stream_generation`; a change of generation is what
+        /// starts a new run.
+        fn push_rows(
+            &self,
+            buffer: &mut Buffer,
+            stream_generation: u32,
+            rows: &[(u32, Vec<ColumnData>)],
+        ) {
+            self.push_in_segment(buffer, stream_generation, &self.segment, rows);
+        }
+
+        fn push_in_segment(
+            &self,
+            buffer: &mut Buffer,
+            stream_generation: u32,
+            segment: &SegmentRecord,
+            rows: &[(u32, Vec<ColumnData>)],
+        ) {
+            let mut builder = SampleBatchBuilder::new(
+                BatchContext::new(
+                    self.stream_key,
+                    None,
+                    Generations {
+                        stream: stream_generation,
+                        device: 0,
+                        global: 0,
+                    },
+                    segment.clone(),
+                    self.stream.clone(),
+                    self.device.clone(),
+                ),
+                self.columns
+                    .iter()
+                    .map(|metadata| (metadata.clone(), buffer_type(metadata.get().data_type))),
+                rows.len(),
+            );
+            for &(sample_number, ref row) in rows {
+                assert_eq!(row.len(), self.columns.len());
+                builder.push_row(SampleNumber::new(sample_number), row.iter().cloned());
+            }
+            let batch = builder.finish();
+            buffer.process_batch(&batch);
+        }
+
+        /// Push `samples` as one batch of a single float column whose values are
+        /// the sample numbers.
+        fn push_floats(&self, buffer: &mut Buffer, stream_generation: u32, samples: Range<u32>) {
+            let rows: Vec<_> = samples
+                .map(|n| (n, vec![ColumnData::Float(f64::from(n))]))
+                .collect();
+            self.push_rows(buffer, stream_generation, &rows);
+        }
+    }
+
+    /// One stream sampled at 1 Hz from time zero, so a row's timestamp is its
+    /// sample number plus one.
+    fn test_fixture(column_types: &[DataType]) -> Fixture {
+        let route = DeviceRoute::root();
+        let stream_id = 1;
+
+        let columns: Vec<ColumnRecord> = column_types
+            .iter()
+            .enumerate()
+            .map(|(index, data_type)| {
+                let index = index as u8;
+                ColumnRecord::encode(wire::Column {
+                    name: &format!("col_{index}"),
+                    units: &format!("u{index}"),
+                    description: &format!("column {index}"),
+                    ..fixtures::column(stream_id, index, *data_type)
+                })
+                .unwrap()
             })
+            .collect();
+
+        Fixture {
+            stream_key: StreamKey::new(route, crate::proto::StreamId::new(stream_id)),
+            column_keys: (0..columns.len())
+                .map(|index| {
+                    ColumnKey::new(
+                        route,
+                        crate::proto::StreamId::new(stream_id),
+                        ColumnId::new(u8::try_from(index).unwrap()),
+                    )
+                })
+                .collect(),
+            device: DeviceRecord::encode(fixtures::device()).unwrap(),
+            stream: StreamRecord::encode(wire::Stream {
+                n_columns: columns.len() as u8,
+                sample_size: 0,
+                buf_samples: 1024,
+                ..fixtures::stream(stream_id)
+            })
+            .unwrap(),
+            segment: SegmentRecord::encode(fixtures::segment(stream_id)).unwrap(),
+            columns,
+        }
     }
 
-    fn active_buffer(&self, stream_key: &StreamKey) -> Result<&RunBuffer, ReadError> {
-        Ok(&self.active_run(stream_key)?.buffer)
+    /// The samples a float run should hold for sample numbers `samples`.
+    fn expected(samples: Range<u32>) -> Vec<(f64, f64)> {
+        samples
+            .map(|n| (f64::from(n) + 1.0, f64::from(n)))
+            .collect()
     }
 
-    fn reference_stream_key<'a>(by_stream: &'a HashMap<StreamKey, Vec<ColumnId>>) -> &'a StreamKey {
-        by_stream
-            .keys()
-            .min()
-            .expect("reference stream requires at least one stream")
-    }
-}
+    #[test]
+    fn a_run_retains_every_row_until_capacity_is_reached() {
+        let mut buffer = Buffer::new(1024);
+        let fx = test_fixture(&[DataType::F64]);
 
-fn group_columns_by_stream(columns: &[ColumnKey]) -> HashMap<StreamKey, Vec<ColumnId>> {
-    let mut by_stream: HashMap<StreamKey, Vec<ColumnId>> = HashMap::new();
-    for col in columns {
-        by_stream
-            .entry(col.stream_key())
-            .or_default()
-            .push(col.column_id);
-    }
-    by_stream
-}
+        for start in (0..300).step_by(100) {
+            fx.push_floats(&mut buffer, 1, start..start + 100);
+        }
 
-fn normalize_time_bounds(start_time: f64, end_time: f64) -> (f64, f64) {
-    if start_time <= end_time {
-        (start_time, end_time)
-    } else {
-        (end_time, start_time)
-    }
-}
+        let run = buffer.get_run(&fx.stream_key).expect("the run");
+        assert_eq!(run.retained_rows(), 0..300);
+        assert_eq!(run.last_timestamp(), Some(300.0));
+        assert_eq!(run.last_sample_number(), Some(SampleNumber::new(299)));
+        assert_eq!(run.effective_rate(), 1.0);
 
-fn timestamps_match_iter<I>(reference: &[f64], candidate: I) -> bool
-where
-    I: Iterator<Item = f64>,
-{
-    reference
-        .iter()
-        .copied()
-        .zip(candidate)
-        .all(|(a, b)| (a - b).abs() <= 1e-9)
+        let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
+        assert_eq!(processor.catch_up(&buffer), &expected(0..300));
+    }
+
+    #[test]
+    fn reads_span_the_frozen_chunks_and_the_unfrozen_tail() {
+        let mut buffer = Buffer::new(4096);
+        let fx = test_fixture(&[DataType::F64]);
+
+        // The chunk target is capacity / 16, so every third batch of 100 rows
+        // completes a chunk and the rest stay in the tail.
+        for start in (0..650).step_by(100) {
+            fx.push_floats(&mut buffer, 1, start..(start + 100).min(650));
+        }
+
+        let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
+        assert_eq!(processor.catch_up(&buffer), &expected(0..650));
+        assert_eq!(
+            processor.op().spans,
+            vec![300, 300, 50],
+            "two frozen chunks then the buffered tail"
+        );
+        assert_eq!(processor.op().resets, 1);
+
+        // Rows appended after the read continue the same run, tail included.
+        fx.push_floats(&mut buffer, 1, 650..660);
+        assert_eq!(processor.catch_up(&buffer), &expected(0..660));
+        assert_eq!(
+            processor.op().resets,
+            1,
+            "an append must not force a replay"
+        );
+    }
+
+    #[test]
+    fn eviction_is_row_exact_across_chunk_boundaries() {
+        let mut buffer = Buffer::new(1000);
+        let fx = test_fixture(&[DataType::F64]);
+
+        for start in (0..3000).step_by(100) {
+            fx.push_floats(&mut buffer, 1, start..start + 100);
+        }
+
+        let run = buffer.get_run(&fx.stream_key).expect("the run");
+        assert_eq!(
+            run.retained_rows(),
+            2000..3000,
+            "retention drops whole rows, not whole chunks"
+        );
+        assert_eq!(run.last_timestamp(), Some(3000.0));
+
+        let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
+        assert_eq!(processor.catch_up(&buffer), &expected(2000..3000));
+        assert!(
+            processor.op().spans.len() > 1,
+            "1000 rows must span several chunks, got {:?}",
+            processor.op().spans
+        );
+        assert_eq!(processor.op().spans.iter().sum::<usize>(), 1000);
+    }
+
+    #[test]
+    fn a_segment_rollover_keeps_the_run_and_delivers_both_sides() {
+        let mut buffer = Buffer::new(1024);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..4);
+
+        // A seamless rollover keeps the stream generation, so the run continues even
+        // though the new segment starts a new chunk.
+        let rolled = SegmentRecord::encode(wire::Segment {
+            segment_id: crate::proto::SegmentId::new(1),
+            start_time: 4,
+            ..fx.segment.get()
+        })
+        .unwrap();
+        let rows: Vec<_> = (0..3)
+            .map(|n| (n, vec![ColumnData::Float(f64::from(n) + 100.0)]))
+            .collect();
+        fx.push_in_segment(&mut buffer, 1, &rolled, &rows);
+
+        let run = buffer.get_run(&fx.stream_key).expect("the run");
+        assert_eq!(run.retained_rows(), 0..7);
+        assert_eq!(run.segment(), rolled.get(), "the newest segment");
+
+        let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
+        let out = processor.catch_up(&buffer).clone();
+        assert_eq!(
+            out,
+            vec![
+                (1.0, 0.0),
+                (2.0, 1.0),
+                (3.0, 2.0),
+                (4.0, 3.0),
+                (5.0, 100.0),
+                (6.0, 101.0),
+                (7.0, 102.0),
+            ]
+        );
+        assert_eq!(processor.op().spans, vec![4, 3], "one span per segment");
+        assert_eq!(processor.op().resets, 1);
+    }
+
+    #[test]
+    fn a_new_stream_generation_starts_a_run_that_discards_the_old_rows() {
+        let mut buffer = Buffer::new(1024);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..500);
+        assert_eq!(
+            buffer.get_run(&fx.stream_key).unwrap().retained_rows(),
+            0..500
+        );
+
+        fx.push_floats(&mut buffer, 2, 0..3);
+        let run = buffer.get_run(&fx.stream_key).expect("the new run");
+        assert_eq!(run.generations().stream, 2);
+        assert_eq!(
+            run.retained_rows(),
+            0..3,
+            "row positions restart with the run"
+        );
+        assert_eq!(run.last_sample_number(), Some(SampleNumber::new(2)));
+
+        let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
+        assert_eq!(processor.catch_up(&buffer), &expected(0..3));
+    }
+
+    #[test]
+    fn latest_row_is_the_newest_retained_row_with_its_typed_values() {
+        let mut buffer = Buffer::new(16);
+        let fx = test_fixture(&[DataType::F64, DataType::I64, DataType::U64]);
+
+        fx.push_rows(
+            &mut buffer,
+            1,
+            &[
+                (
+                    0,
+                    vec![
+                        ColumnData::Float(0.5),
+                        ColumnData::Int(-1),
+                        ColumnData::UInt(10),
+                    ],
+                ),
+                (
+                    1,
+                    vec![
+                        ColumnData::Float(1.5),
+                        ColumnData::Int(-2),
+                        ColumnData::UInt(11),
+                    ],
+                ),
+            ],
+        );
+        // A later, separate batch must overwrite the newest row.
+        fx.push_rows(
+            &mut buffer,
+            1,
+            &[(
+                2,
+                vec![
+                    ColumnData::Float(2.5),
+                    ColumnData::Int(-3),
+                    ColumnData::UInt(12),
+                ],
+            )],
+        );
+
+        let row = buffer.latest_row(&fx.stream_key).expect("the newest row");
+        assert_eq!(row.len(), 1);
+        assert_eq!(row.sample_numbers(), [2]);
+        assert_eq!(row.timestamps(), [3.0]);
+        assert_eq!(row.stream(), fx.stream.get());
+        assert_eq!(row.segment(), fx.segment.get());
+
+        // Values come back in schema order, each in its column's own variant.
+        let values: Vec<ColumnData> = row.row(0).expect("the only row").values().collect();
+        assert_eq!(values.len(), 3);
+        assert!(matches!(values[0], ColumnData::Float(v) if v == 2.5));
+        assert!(matches!(values[1], ColumnData::Int(-3)));
+        assert!(matches!(values[2], ColumnData::UInt(12)));
+
+        // No run for a stream that never received data.
+        let other = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(99));
+        assert!(buffer.latest_row(&other).is_none());
+        assert!(buffer.get_run(&other).is_none());
+    }
+
+    #[test]
+    fn latest_row_follows_the_newest_row_out_of_the_tail_and_across_eviction() {
+        let mut buffer = Buffer::new(64);
+        let fx = test_fixture(&[DataType::F64]);
+
+        fx.push_floats(&mut buffer, 1, 0..1);
+        let row = buffer.latest_row(&fx.stream_key).expect("the buffered row");
+        assert_eq!(row.sample_numbers(), [0]);
+
+        fx.push_floats(&mut buffer, 1, 1..200);
+        let row = buffer.latest_row(&fx.stream_key).expect("the newest row");
+        assert_eq!(row.sample_numbers(), [199]);
+        assert_eq!(row.timestamps(), [200.0]);
+        assert_eq!(
+            buffer.get_run(&fx.stream_key).unwrap().retained_rows(),
+            136..200
+        );
+    }
+
+    #[test]
+    fn column_metadata_comes_from_the_newest_schema() {
+        let mut buffer = Buffer::new(16);
+        let fx = test_fixture(&[DataType::F64]);
+        assert!(buffer.column_metadata(&fx.column_keys[0]).is_none());
+
+        fx.push_floats(&mut buffer, 1, 0..2);
+        let metadata = buffer
+            .column_metadata(&fx.column_keys[0])
+            .expect("the column");
+        assert_eq!(metadata.description, "column 0");
+        assert_eq!(metadata.units, "u0");
+
+        // A schema change rides a new stream generation, and the new run's columns
+        // replace the old ones.
+        let changed = test_fixture(&[DataType::F64, DataType::U64]);
+        changed.push_rows(
+            &mut buffer,
+            2,
+            &[(0, vec![ColumnData::Float(1.0), ColumnData::UInt(2)])],
+        );
+        assert_eq!(
+            buffer
+                .column_metadata(&changed.column_keys[1])
+                .expect("the added column")
+                .data_type,
+            DataType::U64
+        );
+        assert!(buffer
+            .column_metadata(&ColumnKey::new(
+                DeviceRoute::root(),
+                crate::proto::StreamId::new(1),
+                ColumnId::new(7),
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn stream_keys_lists_every_stream_that_delivered_data() {
+        let mut buffer = Buffer::new(16);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..2);
+
+        let keys: Vec<_> = buffer.stream_keys().copied().collect();
+        assert_eq!(keys, vec![fx.stream_key]);
+    }
+
+    #[test]
+    fn an_empty_batch_never_starts_a_run() {
+        let mut buffer = Buffer::new(16);
+        let fx = test_fixture(&[DataType::F64]);
+        fx.push_floats(&mut buffer, 1, 0..0);
+        assert!(buffer.get_run(&fx.stream_key).is_none());
+        assert_eq!(buffer.stream_keys().count(), 0);
+    }
 }

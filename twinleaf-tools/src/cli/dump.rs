@@ -16,6 +16,11 @@ pub struct DumpCli {
     #[arg(short = 'm', long = "meta")]
     pub meta: bool,
 
+    /// Filter streams/columns using a glob pattern (e.g. "sync", "/0/vector").
+    /// Requires -d.
+    #[arg(short = 'g', long = "glob", requires = "data")]
+    pub glob: Option<String>,
+
     /// Routing depth limit (default: unlimited)
     #[arg(long = "depth")]
     pub depth: Option<usize>,

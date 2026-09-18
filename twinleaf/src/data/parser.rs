@@ -1,673 +1,1318 @@
-use super::sample::{Boundary, BoundaryReason, Column, PriorState, Sample};
+//! Incremental conversion from routed TIO packets to columnar sample batches.
+//!
+//! [`PacketParser`] applies packets in arrival order. Shared metadata and
+//! continuity state validates each stream payload, after which this module
+//! decodes its rows and accumulates them into [`SampleBatch`] values.
+
+use super::coalesce::BatchCoalescer;
+use super::metadata::{DeviceMetadataSnapshot, MetadataQuery};
+use super::sample::{SampleBatch, StreamKey};
+use super::state::{PacketError, PacketEvent, ParseState, ScannedRows};
+use crate::proto::DeviceRoute;
 use crate::tio;
-use proto::meta::MetadataType;
-use proto::DeviceRoute;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tio::proto::meta::{
-    ColumnMetadata, DeviceMetadata, MetadataContent, SegmentMetadata, StreamMetadata,
-};
-use tio::{proto, util};
+use std::collections::{HashMap, VecDeque};
 
-static TL_STREAMRPC_MAX_META: usize = 16;
-const META_RPC_ID: u16 = 7855;
-
-#[derive(Debug, Clone)]
-struct StreamRpcMetaReq {
-    mtype: MetadataType,
-    stream_id: u8,
-    index: u8,
+/// Incremental, route-aware parser for TIO packets.
+///
+/// The caller owns packet I/O and supplies packets in arrival order. By
+/// default each decodable stream-data packet emits one [`SampleBatch`].
+/// [`PacketParser::with_batch_rows`] instead accumulates compatible packets for
+/// bulk consumers. Boundaries and schema changes always end the current batch.
+///
+/// Stream data can arrive before the metadata describing it. Such packets
+/// produce no rows; [`PacketParser::take_metadata_queries`] returns the
+/// metadata the caller must fetch before subsequent packets decode.
+pub struct PacketParser {
+    state: ParseState,
+    batcher: Batcher,
 }
 
-impl StreamRpcMetaReq {
-    pub fn device() -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Device,
-            stream_id: 0,
-            index: 0,
-        }
-    }
-    pub fn stream(id: u8) -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Stream,
-            stream_id: id,
-            index: 0,
-        }
-    }
-    pub fn segment(index: u8, stream_id: u8) -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Segment,
-            stream_id: stream_id,
-            index: index,
-        }
-    }
-    pub fn column(index: u8, stream_id: u8) -> StreamRpcMetaReq {
-        StreamRpcMetaReq {
-            mtype: MetadataType::Column,
-            stream_id: stream_id,
-            index: index,
+/// State transition produced by pushing one packet into a [`PacketParser`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketOutcome {
+    /// A control packet was applied without producing sample rows.
+    Applied,
+    /// Stream data is valid so far but cannot be decoded until metadata arrives.
+    WaitingForMetadata,
+    /// A disconnect reset metadata and continuity state.
+    Reset,
+    /// The packet contained this many validated sample rows.
+    Rows(usize),
+}
+
+impl PacketOutcome {
+    /// Number of sample rows validated by this transition.
+    pub fn row_count(self) -> usize {
+        match self {
+            Self::Rows(count) => count,
+            _ => 0,
         }
     }
 }
 
-fn make_metareq(reqs: Vec<StreamRpcMetaReq>) -> Vec<u8> {
-    let mut ret = vec![];
-    if reqs.len() > TL_STREAMRPC_MAX_META {
-        panic!("too many requests")
-    }
-    for req in reqs {
-        ret.push(req.mtype.clone().into());
-        ret.push(req.stream_id);
-        ret.push(req.index);
-    }
-    ret
-}
+/// A parser's decoding state at one point in a packet sequence.
+///
+/// Taken with [`PacketParser::checkpoint`] and resumed with
+/// [`PacketParser::replay_from`], so a long log can be re-read from the middle
+/// without replaying everything before it.
+#[derive(Clone)]
+pub(crate) struct ParserCheckpoint(ParseState);
 
-// Convert a number of metadata requests to RPC request packets.
-fn metareqs_to_rpcs(metareqs: &Vec<StreamRpcMetaReq>) -> Vec<tio::Packet> {
-    let mut ret = vec![];
-    let mut reqs = &metareqs[..];
-    loop {
-        if reqs.len() == 0 {
-            break;
+impl PacketParser {
+    fn from_state(state: ParseState) -> Self {
+        Self {
+            state,
+            batcher: Batcher::new(),
         }
-        let n_reqs = if reqs.len() > TL_STREAMRPC_MAX_META {
-            TL_STREAMRPC_MAX_META
-        } else if reqs.len() == 1 {
-            // If we don't know anything about the device, send zero
-            // arguments to get an automatic reply fitting as many things
-            // as possible at the beginning, to bootstrap the process
-            // more efficiently
-            if let MetadataType::Device = reqs[0].mtype {
-                reqs = &reqs[1..];
-                0
-            } else {
-                1
+    }
+
+    /// Create a parser for packets whose routes are relative to `root_route`.
+    ///
+    /// When `ignore_session` is false, a heartbeat session change invalidates
+    /// cached metadata and starts metadata discovery again.
+    pub fn new(root_route: DeviceRoute, ignore_session: bool) -> Self {
+        Self::from_state(ParseState::new(root_route, ignore_session))
+    }
+
+    /// Accumulate approximately `rows` decoded samples per stream before
+    /// emitting a batch. Boundaries and schema changes always end a batch.
+    pub fn with_batch_rows(mut self, rows: usize) -> Self {
+        assert!(rows > 0, "batch row target must be nonzero");
+        self.batcher.target_rows = Some(rows);
+        self
+    }
+
+    /// Ingest one port-relative packet and advance the decoding state.
+    ///
+    /// Missing metadata is reported as [`PacketOutcome::WaitingForMetadata`];
+    /// call [`PacketParser::take_metadata_queries`] to learn what to fetch.
+    /// Invalid stream data returns [`PacketError`]. Completed batches are
+    /// available through [`PacketParser::pop_batch`].
+    pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, PacketError> {
+        Ok(match self.state.apply_packet(packet)? {
+            PacketEvent::Applied => PacketOutcome::Applied,
+            PacketEvent::WaitingForMetadata => PacketOutcome::WaitingForMetadata,
+            PacketEvent::Reset => {
+                self.flush();
+                PacketOutcome::Reset
             }
-        } else {
-            reqs.len()
-        };
-        ret.push(util::PacketBuilder::make_rpc_request(
-            "dev.metadata",
-            &make_metareq((&reqs[0..n_reqs]).to_vec()),
-            META_RPC_ID,
-            DeviceRoute::root(),
-        ));
-        reqs = &reqs[n_reqs..];
-    }
-    ret
-}
-
-fn parse_metarep(rep: Vec<u8>) -> Vec<tio::proto::meta::MetadataContent> {
-    use tio::proto::meta;
-    let mut ret = vec![];
-    let mut offset: usize = 0;
-    while (offset + 2) <= rep.len() {
-        let mtype = MetadataType::from(rep[offset]);
-        let varlen = usize::from(rep[offset + 1]);
-        let metadata = &rep[offset + 2..offset + 2 + varlen];
-        offset += varlen + 2;
-        match mtype {
-            MetadataType::Device => {
-                let (dm, _, _) = meta::DeviceMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Device(dm));
-            }
-            MetadataType::Stream => {
-                let (sm, _, _) = meta::StreamMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Stream(sm));
-            }
-            MetadataType::Segment => {
-                let (sm, _, _) = meta::SegmentMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Segment(sm));
-            }
-            MetadataType::Column => {
-                let (cm, _, _) = meta::ColumnMetadata::deserialize(metadata, &[]).unwrap();
-                ret.push(meta::MetadataContent::Column(cm));
-            }
-            _ => {}
-        }
-    }
-    ret
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceStreamMetadata {
-    pub stream: Arc<StreamMetadata>,
-    pub segment: Arc<SegmentMetadata>,
-    pub columns: Vec<Arc<ColumnMetadata>>,
-}
-
-#[derive(Debug)]
-struct DeviceColumn {
-    metadata: Arc<ColumnMetadata>,
-    offset: usize,
-}
-
-#[derive(Debug)]
-struct DeviceStream {
-    stream: Option<Arc<StreamMetadata>>,
-    segment: Option<Arc<SegmentMetadata>>,
-    columns: Vec<DeviceColumn>,
-
-    id: u8,
-    current_data_seg: u8,
-
-    // State tracking for boundary detection
-    established: bool,
-    last_seg: u8,
-    last_sample_number: u32,
-    last_timestamp: f64,
-    last_session_id: u32,
-    last_time_ref_session_id: u32,
-    effective_rate: f64,
-}
-
-impl DeviceStream {
-    fn new(id: u8) -> Self {
-        DeviceStream {
-            stream: None,
-            segment: None,
-            columns: vec![],
-            id,
-            current_data_seg: 0,
-            established: false,
-            last_seg: 0,
-            last_sample_number: 0,
-            last_timestamp: 0.0,
-            last_session_id: 0,
-            last_time_ref_session_id: 0,
-            effective_rate: 0.0,
-        }
-    }
-
-    fn requests(&self) -> Vec<StreamRpcMetaReq> {
-        let mut ret = vec![];
-        match self.stream.as_ref() {
-            Some(stream) => {
-                let n_cols = stream.n_columns;
-                for i in self.columns.len()..n_cols {
-                    ret.push(StreamRpcMetaReq::column(i as u8, self.id))
-                }
-            }
-            None => {
-                ret.push(StreamRpcMetaReq::stream(self.id));
-            }
-        }
-        if match self.segment.as_ref() {
-            Some(seg) => seg.segment_id != self.current_data_seg,
-            None => true,
-        } {
-            ret.push(StreamRpcMetaReq::segment(self.current_data_seg, self.id));
-        }
-        ret
-    }
-
-    fn parse_sample(&self, data: &[u8]) -> Vec<Column> {
-        let mut ret = vec![];
-        for col in &self.columns {
-            ret.push(Column::from_le_bytes(
-                &data[col.offset..],
-                col.metadata.clone(),
-            ));
-        }
-        ret
-    }
-
-    fn capture_prior_state(&self) -> Option<PriorState> {
-        if !self.established {
-            return None;
-        }
-        Some(PriorState {
-            session_id: self.last_session_id,
-            segment_id: self.last_seg,
-            time_ref_session_id: self.last_time_ref_session_id,
-            sample_number: self.last_sample_number,
-            timestamp: self.last_timestamp,
-            effective_rate: self.effective_rate,
+            PacketEvent::Rows(rows) => PacketOutcome::Rows(self.batcher.queue(rows)),
         })
     }
 
-    fn detect_boundary(
-        &self,
-        first_sample_n: u32,
-        first_timestamp: f64,
-        dev: &Arc<DeviceMetadata>,
-        segment: &Arc<SegmentMetadata>,
-        new_rate: f64,
-        is_segment_rollover: bool,
-    ) -> Option<Boundary> {
-        let prior = self.capture_prior_state();
-
-        // First sample ever from this stream?
-        if !self.established {
-            return Some(Boundary {
-                reason: BoundaryReason::Initial,
-                prior: None,
-            });
-        }
-
-        // Session changed?
-        if dev.session_id != self.last_session_id {
-            return Some(Boundary {
-                reason: BoundaryReason::SessionChanged {
-                    old: self.last_session_id,
-                    new: dev.session_id,
-                },
-                prior,
-            });
-        }
-
-        // Time reference session changed?
-        if segment.time_ref_session_id != self.last_time_ref_session_id {
-            return Some(Boundary {
-                reason: BoundaryReason::TimeRefSessionChanged {
-                    old: self.last_time_ref_session_id,
-                    new: segment.time_ref_session_id,
-                },
-                prior,
-            });
-        }
-
-        // Rate changed?
-        if (new_rate - self.effective_rate).abs() > 1e-9 {
-            return Some(Boundary {
-                reason: BoundaryReason::RateChanged {
-                    old_rate: self.effective_rate,
-                    new_rate,
-                },
-                prior,
-            });
-        }
-
-        let half_period = 0.5 / new_rate;
-
-        // Time went backward?
-        if first_timestamp < self.last_timestamp - half_period {
-            return Some(Boundary {
-                reason: BoundaryReason::TimeBackward {
-                    gap_seconds: self.last_timestamp - first_timestamp,
-                },
-                prior,
-            });
-        }
-
-        // Segment changed?
-        if segment.segment_id != self.last_seg {
-            return Some(Boundary {
-                reason: if is_segment_rollover {
-                    BoundaryReason::SegmentRollover {
-                        old_id: self.last_seg,
-                        new_id: segment.segment_id,
-                    }
-                } else {
-                    BoundaryReason::SegmentChanged {
-                        old_id: self.last_seg,
-                        new_id: segment.segment_id,
-                    }
-                },
-                prior,
-            });
-        }
-
-        // Samples skipped?
-        let expected_sample = self.last_sample_number.wrapping_add(1);
-        if first_sample_n != expected_sample {
-            let ts_gap = (first_timestamp - self.last_timestamp).abs();
-            // Check if this is just a sample number rollover with continuous time
-            let is_benign_rollover =
-                first_sample_n < self.last_sample_number && ts_gap < half_period;
-
-            if !is_benign_rollover && ts_gap > half_period {
-                return Some(Boundary {
-                    reason: BoundaryReason::SamplesLost {
-                        expected: expected_sample,
-                        received: first_sample_n,
-                    },
-                    prior,
-                });
-            }
-        }
-
-        // No boundary - continuous with previous samples
-        None
+    /// Ingest one packet, validating it without decoding sample values.
+    ///
+    /// The counterpart to [`push_packet`](Self::push_packet) for a scanning
+    /// pass that only summarizes a log; no batch is ever produced.
+    pub(crate) fn scan_packet<'a>(
+        &'a mut self,
+        packet: &'a tio::Packet,
+    ) -> Result<Option<ScannedRows<'a>>, PacketError> {
+        Ok(match self.state.apply_packet(packet)? {
+            PacketEvent::Rows(rows) => Some(rows),
+            PacketEvent::Applied | PacketEvent::WaitingForMetadata | PacketEvent::Reset => None,
+        })
     }
 
-    fn process_samples(
-        &mut self,
-        data: &tio::proto::StreamDataPayload,
-        dev: Arc<DeviceMetadata>,
-    ) -> Vec<Sample> {
-        self.current_data_seg = data.segment_id;
+    /// Capture the decoding state reached so far.
+    pub(crate) fn checkpoint(&self) -> ParserCheckpoint {
+        ParserCheckpoint(self.state.clone())
+    }
 
-        if self.stream.is_none() || self.segment.is_none() {
-            return vec![];
+    /// Start a parser from a captured state, as if it had read every packet
+    /// that preceded the checkpoint.
+    pub(crate) fn replay_from(checkpoint: &ParserCheckpoint) -> Self {
+        Self::from_state(checkpoint.0.clone())
+    }
+
+    /// Pop the oldest completed batch currently buffered.
+    pub fn pop_batch(&mut self) -> Option<SampleBatch> {
+        self.batcher.ready.pop_front()
+    }
+
+    /// End every partially accumulated stream batch without resetting metadata.
+    pub fn flush(&mut self) {
+        self.batcher.flush();
+    }
+
+    /// Drain batches that are already ready without flushing partial batches.
+    pub fn drain_batches(&mut self) -> Vec<SampleBatch> {
+        self.batcher.ready.drain(..).collect()
+    }
+
+    /// Flush accumulated samples and return every completed batch.
+    pub fn finish(mut self) -> Vec<SampleBatch> {
+        self.flush();
+        self.drain_batches()
+    }
+
+    /// Forget device metadata. Any decoded rows already accumulated remain
+    /// available through `pop_batch`.
+    pub fn reset(&mut self) {
+        self.reset_subtree(DeviceRoute::root());
+    }
+
+    /// Forget device metadata at and below the absolute route `subtree`. Every
+    /// partial batch ends — the generation bump would flush them on the next
+    /// packet anyway — but only the subtree's routes rediscover.
+    pub fn reset_subtree(&mut self, subtree: DeviceRoute) {
+        self.flush();
+        self.state.reset_subtree(subtree);
+    }
+
+    /// Metadata still missing, as one query per route that lacks any. The
+    /// caller answers each with [`apply_metadata_reply`](Self::apply_metadata_reply)
+    /// or [`fail_metadata_query`](Self::fail_metadata_query).
+    pub fn take_metadata_queries(&mut self) -> Vec<MetadataQuery> {
+        self.state.take_metadata_queries()
+    }
+
+    /// Ensure a route has parser state and take its pending metadata query.
+    pub fn take_metadata_queries_for(&mut self, route: DeviceRoute) -> Vec<MetadataQuery> {
+        self.state.take_metadata_queries_for(route)
+    }
+
+    /// Apply a `dev.metadata` reply. A reply carrying fewer records than the
+    /// query selected leaves the rest missing, for the next query to ask for.
+    pub fn apply_metadata_reply(&mut self, query: MetadataQuery, reply: &[u8]) {
+        self.state.apply_metadata_reply(query, reply)
+    }
+
+    /// Give up on a query, arming discovery for its route again. False if the
+    /// query was already stale, having been overtaken by a reset or a new
+    /// session.
+    pub fn fail_metadata_query(&mut self, query: MetadataQuery) -> bool {
+        self.state.fail_metadata_query(query)
+    }
+
+    /// Return complete metadata for an absolute route once it is available.
+    pub fn metadata(&self, route: DeviceRoute) -> Option<DeviceMetadataSnapshot> {
+        self.state.metadata(route)
+    }
+
+    /// The route's current metadata revision, without building a snapshot.
+    pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
+        self.state.metadata_revision(route)
+    }
+
+    /// Absolute routes for which this parser has observed state.
+    pub fn routes(&self) -> Vec<DeviceRoute> {
+        self.state.routes()
+    }
+}
+
+/// The batching half of the parser, deliberately outside [`ParserCheckpoint`]:
+/// a replay starts accumulating fresh.
+struct Batcher {
+    target_rows: Option<usize>,
+    pending: HashMap<StreamKey, BatchCoalescer>,
+    ready: VecDeque<SampleBatch>,
+}
+
+impl Batcher {
+    fn new() -> Self {
+        Self {
+            target_rows: None,
+            pending: HashMap::new(),
+            ready: VecDeque::new(),
+        }
+    }
+
+    /// Decode validated rows into their stream's coalescer and collect whatever
+    /// it completes.
+    fn queue(&mut self, input: ScannedRows<'_>) -> usize {
+        let rows = input.row_count();
+        let key = input.stream_key();
+        let global_generation = input.generations().global;
+        // A stream's own continuity is the coalescer's business; the parser only
+        // enforces the rule spanning streams: a pending batch must never straddle a
+        // bump of the shared generations, so everything from the older generation emits
+        // first, preserving arrival order at the bump.
+        if self.pending.values().any(|c| {
+            c.buffered_generations()
+                .is_some_and(|e| e.global != global_generation)
+        }) {
+            self.flush();
         }
 
-        let stream = self.stream.as_ref().unwrap().clone();
-        if stream.n_columns != self.columns.len() {
-            return vec![];
-        }
+        let target_rows = self.target_rows;
+        self.pending
+            .entry(key)
+            .or_insert_with(|| BatchCoalescer::new(target_rows))
+            .push(&input);
+        self.drain(key);
 
-        let expected_sample_size = self
-            .columns
-            .last()
-            .map(|col| col.offset + col.metadata.data_type.size())
-            .unwrap_or(0);
-        if expected_sample_size > stream.sample_size {
-            return vec![];
-        }
-        if stream.sample_size == 0 {
-            return vec![];
-        }
-        if data.data.len() % stream.sample_size != 0 {
-            return vec![];
-        }
+        rows
+    }
 
-        let segment = self.segment.as_ref().unwrap().clone();
-        if segment.decimation == 0 || segment.sampling_rate == 0 {
-            return vec![];
+    /// End every partially accumulated stream batch, in key order.
+    fn flush(&mut self) {
+        let mut keys: Vec<_> = self.pending.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            self.pending
+                .get_mut(&key)
+                .expect("key came from the map")
+                .finish_buffered_batch();
+            self.drain(key);
         }
-        if stream.n_segments == 0 {
-            return vec![];
-        }
-        let new_rate = segment.sampling_rate as f64 / segment.decimation as f64;
+    }
 
-        let (segment, is_segment_rollover) = if segment.segment_id != data.segment_id {
-            let next_sample = self.last_sample_number.wrapping_add(1);
-            let next_segment = (segment.segment_id + 1).rem_euclid(stream.n_segments as u8);
-            let rate = segment.sampling_rate / segment.decimation;
-
-            if (data.first_sample_n == 0)
-                && ((next_sample % rate) == 0)
-                && (data.segment_id == next_segment)
-            {
-                // Benign rollover - synthesize updated segment metadata
-                let mut new_seg = (*segment).clone();
-                new_seg.segment_id = data.segment_id;
-                new_seg.start_time += next_sample / rate;
-                (Arc::new(new_seg), true)
-            } else {
-                return vec![];
-            }
-        } else {
-            (segment, false)
+    fn drain(&mut self, key: StreamKey) {
+        let Some(coalescer) = self.pending.get_mut(&key) else {
+            return;
         };
+        while let Some(batch) = coalescer.next_completed_batch() {
+            self.ready.push_back(batch);
+        }
+    }
+}
 
-        // Calculate timestamp of first sample in this batch
-        let period = 1.0 / new_rate;
-        let first_timestamp =
-            f64::from(segment.start_time) + period * f64::from(data.first_sample_n);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::buffer::Buffer;
+    use crate::data::fixtures;
+    use crate::data::sample::{BoundaryClass, BoundaryReason, ColumnArray, ColumnKey, Generations};
+    use crate::data::state::StreamDataError;
+    use crate::proto::data as wire;
+    use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
+    use crate::tio::packet::ProxyStatus;
 
-        // Detect boundary for the first sample
-        let boundary = self.detect_boundary(
-            data.first_sample_n,
-            first_timestamp,
-            &dev,
-            &segment,
-            new_rate,
-            is_segment_rollover,
+    const STREAM_ID: u8 = 1;
+
+    fn metadata_packet(record: wire::Metadata<'_>) -> tio::Packet {
+        tio::Packet::metadata(record, wire::MetadataFlags::default(), DeviceRoute::root())
+            .expect("a valid metadata record")
+    }
+
+    fn announce(parser: &mut PacketParser, record: wire::Metadata<'_>) {
+        parser
+            .push_packet(&metadata_packet(record))
+            .expect("valid metadata");
+    }
+
+    /// Announce a device with one stream whose columns have `column_types`, then
+    /// return a parser holding that metadata.
+    fn parser_with_schema(column_types: &[DataType], sample_size: u16) -> PacketParser {
+        parser_with_clock(column_types, sample_size, 1, 1, 1)
+    }
+
+    /// As [`parser_with_schema`], with an explicit segment ring and clock. Only
+    /// segment 0 is announced, so later segments must be synthesized.
+    fn parser_with_clock(
+        column_types: &[DataType],
+        sample_size: u16,
+        n_segments: u8,
+        sampling_rate: u32,
+        decimation: u32,
+    ) -> PacketParser {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        announce_schema(
+            &mut parser,
+            column_types,
+            sample_size,
+            n_segments,
+            sampling_rate,
+            decimation,
+        );
+        parser
+    }
+
+    /// Push one device's metadata records into an existing parser, as the
+    /// device re-announces them after a reconnect.
+    fn announce_schema(
+        parser: &mut PacketParser,
+        column_types: &[DataType],
+        sample_size: u16,
+        n_segments: u8,
+        sampling_rate: u32,
+        decimation: u32,
+    ) {
+        announce_schema_for(
+            parser,
+            fixtures::device(),
+            column_types,
+            sample_size,
+            n_segments,
+            sampling_rate,
+            decimation,
+        );
+    }
+
+    fn announce_schema_for(
+        parser: &mut PacketParser,
+        device: wire::Device<'_>,
+        column_types: &[DataType],
+        sample_size: u16,
+        n_segments: u8,
+        sampling_rate: u32,
+        decimation: u32,
+    ) {
+        announce(parser, wire::Metadata::Device(device));
+        announce(
+            parser,
+            wire::Metadata::Stream(wire::Stream {
+                n_columns: column_types.len() as u8,
+                n_segments,
+                sample_size,
+                ..fixtures::stream(STREAM_ID)
+            }),
+        );
+        announce(
+            parser,
+            wire::Metadata::Segment(wire::Segment {
+                sampling_rate,
+                decimation,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        for (index, data_type) in column_types.iter().enumerate() {
+            announce(
+                parser,
+                wire::Metadata::Column(wire::Column {
+                    name: &format!("col_{index}"),
+                    ..fixtures::column(STREAM_ID, index as u8, *data_type)
+                }),
+            );
+        }
+    }
+
+    /// Announce a device with `n_streams` single-`Float32`-column streams,
+    /// numbered from 1.
+    fn parser_with_streams(n_streams: u8) -> PacketParser {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        announce(
+            &mut parser,
+            wire::Metadata::Device(wire::Device {
+                n_streams,
+                ..fixtures::device()
+            }),
+        );
+        for stream_id in 1..=n_streams {
+            announce(
+                &mut parser,
+                wire::Metadata::Stream(wire::Stream {
+                    name: &format!("stream-{stream_id}"),
+                    ..fixtures::stream(stream_id)
+                }),
+            );
+            announce(
+                &mut parser,
+                wire::Metadata::Segment(fixtures::segment(stream_id)),
+            );
+            announce(
+                &mut parser,
+                wire::Metadata::Column(fixtures::column(stream_id, 0, DataType::F32)),
+            );
+        }
+        parser
+    }
+
+    fn stream_data_packet_for(stream_id: u8, first_sample_n: u32, rows: usize) -> tio::Packet {
+        tio::Packet::samples(
+            stream_id,
+            0,
+            first_sample_n,
+            &vec![0; 4 * rows],
+            DeviceRoute::root(),
+        )
+        .expect("valid samples")
+    }
+
+    fn stream_data_packet_in_segment(
+        segment_id: u8,
+        first_sample_n: u32,
+        data: Vec<u8>,
+    ) -> tio::Packet {
+        tio::Packet::samples(
+            STREAM_ID,
+            segment_id,
+            first_sample_n,
+            &data,
+            DeviceRoute::root(),
+        )
+        .expect("valid samples")
+    }
+
+    fn stream_data_packet(first_sample_n: u32, data: Vec<u8>) -> tio::Packet {
+        stream_data_packet_in_segment(0, first_sample_n, data)
+    }
+
+    /// A data packet can switch the current segment without any metadata
+    /// record changing; the snapshot revision must move with it.
+    #[test]
+    fn a_data_packet_switching_segments_revises_the_metadata() {
+        let route = DeviceRoute::root();
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
+        // Cache both segments, then let data select which one it uses.
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet_in_segment(0, 0, vec![0; 4]))
+            .expect("valid samples");
+        let before = parser.metadata_revision(route);
+
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .expect("valid samples");
+
+        assert_ne!(parser.metadata_revision(route), before);
+        let snapshot = parser.metadata(route).expect("complete metadata");
+        let stream = snapshot
+            .stream(crate::proto::StreamId::new(STREAM_ID))
+            .expect("the described stream");
+        assert_eq!(stream.segment().segment_id.value(), 1);
+    }
+
+    /// One `dev.metadata` reply carrying `records`, in wire framing.
+    fn metadata_reply(records: &[wire::Metadata<'_>]) -> Vec<u8> {
+        let mut reply = vec![0u8; wire::MAX_METADATA_REPLY_SIZE];
+        let mut written = 0;
+        for record in records {
+            written += record
+                .write_reply_frame(&mut reply[written..])
+                .expect("the fixtures fit one reply");
+        }
+        reply.truncate(written);
+        reply
+    }
+
+    /// Take the query for the root route, asserting there is exactly one.
+    fn take_query(parser: &mut PacketParser) -> MetadataQuery {
+        let mut queries = parser.take_metadata_queries_for(DeviceRoute::root());
+        assert_eq!(
+            queries.len(),
+            1,
+            "one query per route with anything missing"
+        );
+        queries.pop().expect("the query")
+    }
+
+    #[test]
+    fn a_query_stays_outstanding_until_it_completes() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+        assert!(
+            query.selectors.is_empty(),
+            "an unknown device bootstraps with a device-chosen prefix"
+        );
+        assert!(parser
+            .take_metadata_queries_for(DeviceRoute::root())
+            .is_empty());
+
+        parser.fail_metadata_query(query);
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            Vec::new(),
+            "a failure arms discovery again"
+        );
+    }
+
+    #[test]
+    fn a_completed_query_cannot_complete_twice() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+
+        parser.apply_metadata_reply(
+            query.clone(),
+            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+        );
+        let next = take_query(&mut parser);
+        assert_eq!(next.selectors, [wire::MetadataSelector::stream(STREAM_ID)]);
+
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+        );
+        assert!(
+            parser
+                .take_metadata_queries_for(DeviceRoute::root())
+                .is_empty(),
+            "a stale completion does not free the outstanding query's slot"
+        );
+        parser.fail_metadata_query(next);
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::stream(STREAM_ID)],
+            "only the live query re-arms discovery"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_before_a_reset_cannot_apply_after_it() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+        parser.reset();
+
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+        );
+        assert!(
+            parser.metadata(DeviceRoute::root()).is_none(),
+            "the stale reply's records were not applied"
+        );
+        assert!(
+            take_query(&mut parser).selectors.is_empty(),
+            "the route is still bootstrapping"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_before_a_session_change_cannot_apply_after_it() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let bootstrap = take_query(&mut parser);
+        parser.apply_metadata_reply(
+            bootstrap,
+            &metadata_reply(&[wire::Metadata::Device(fixtures::device())]),
+        );
+        let query = take_query(&mut parser);
+        assert_eq!(query.selectors, [wire::MetadataSelector::stream(STREAM_ID)]);
+
+        announce(
+            &mut parser,
+            wire::Metadata::Device(wire::Device {
+                session: crate::proto::SessionId::new(43),
+                ..fixtures::device()
+            }),
+        );
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[
+                wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+                wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+                wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
+            ]),
+        );
+        assert!(parser.metadata(DeviceRoute::root()).is_none());
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::stream(STREAM_ID)],
+            "the new session starts its stream metadata over"
+        );
+    }
+
+    #[test]
+    fn a_capacity_limited_reply_leaves_the_rest_to_ask_for() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[
+                wire::Metadata::Device(fixtures::device()),
+                wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+                wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+            ]),
         );
 
-        // Parse all samples in the packet
-        let mut ret = vec![];
-        let mut sample_n = data.first_sample_n;
-        let mut offset = 0;
-        let mut is_first = true;
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::column(STREAM_ID, 0)],
+            "the record the reply stopped short of is still missing"
+        );
+    }
 
-        while offset < data.data.len() {
-            let raw_sample = &data.data.get(offset..(offset + stream.sample_size));
-            let columns = if let Some(r) = raw_sample {
-                self.parse_sample(r)
-            } else {
-                return Vec::new();
-            };
+    #[test]
+    fn a_query_carries_at_most_one_requests_worth_of_selectors() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Device(wire::Device {
+                n_streams: 40,
+                ..fixtures::device()
+            })]),
+        );
 
-            let sample = Sample {
-                n: sample_n,
-                columns: columns,
-                segment: segment.clone(),
-                stream: stream.clone(),
-                device: dev.clone(),
-                source: data.clone(),
-                // Only first sample gets the boundary marker
-                boundary: if is_first { boundary.clone() } else { None },
-            };
+        let query = take_query(&mut parser);
+        assert_eq!(query.selectors.len(), wire::MAX_METADATA_SELECTORS);
+        assert_eq!(
+            query.args().len(),
+            wire::MAX_METADATA_SELECTORS * wire::MetadataSelector::SIZE
+        );
+    }
 
-            // Update tracking state after each sample
-            self.last_sample_number = sample_n;
-            self.last_timestamp = sample.timestamp_end();
-            self.last_session_id = dev.session_id;
-            self.last_time_ref_session_id = segment.time_ref_session_id;
-            self.last_seg = segment.segment_id;
-            self.effective_rate = new_rate;
-            self.established = true;
+    #[test]
+    fn a_malformed_reply_arms_discovery_again() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let query = take_query(&mut parser);
 
-            ret.push(sample);
-            offset += stream.sample_size;
-            sample_n = sample_n.wrapping_add(1);
-            is_first = false;
+        parser.apply_metadata_reply(query, &[wire::MetadataType::Device.into(), 200]);
+        assert!(parser.metadata(DeviceRoute::root()).is_none());
+        assert!(take_query(&mut parser).selectors.is_empty());
+    }
+
+    #[test]
+    fn unknown_column_type_is_absent_from_the_batch() {
+        // A newer firmware reports a type this build predates, between two
+        // columns it understands.
+        let unknown = DataType::new(0x35);
+        assert_eq!(unknown.size(), 3);
+        let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
+
+        let mut data = Vec::new();
+        for (value, raw) in [(1.0f32, -3i16), (2.0f32, -4i16)] {
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+            data.extend_from_slice(&raw.to_le_bytes());
         }
+        assert_eq!(
+            parser.push_packet(&stream_data_packet(0, data)).unwrap(),
+            PacketOutcome::Rows(2)
+        );
+        let batch = parser.pop_batch().expect("known columns still decode");
 
-        ret
+        assert_eq!(batch.len(), 2);
+        let names: Vec<&str> = batch
+            .schema()
+            .iter()
+            .map(|series| series.metadata().name)
+            .collect();
+        assert_eq!(names, ["col_0", "col_2"]);
+        match (batch.schema()[0].values(), batch.schema()[1].values()) {
+            (ColumnArray::F64(floats), ColumnArray::I64(ints)) => {
+                assert_eq!(&floats[..], [1.0, 2.0]);
+                assert_eq!(&ints[..], [-3, -4]);
+            }
+            other => panic!("unexpected column buffers: {other:?}"),
+        }
     }
 
-    fn invalidate_metadata(&mut self) {
-        self.stream = None;
-        self.segment = None;
-        self.columns.clear();
-    }
-
-    fn get_metadata(&self) -> Result<DeviceStreamMetadata, Vec<StreamRpcMetaReq>> {
-        let reqs = self.requests();
-        if reqs.is_empty() {
-            Ok(DeviceStreamMetadata {
-                stream: self.stream.as_ref().unwrap().clone(),
-                segment: self.segment.as_ref().unwrap().clone(),
-                columns: self.columns.iter().map(|x| x.metadata.clone()).collect(),
+    #[test]
+    fn segment_id_outside_the_ring_is_rejected() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        // The stream advertises a single segment, so any other id is corrupt and
+        // must not become the state the next packet is validated against.
+        assert!(matches!(
+            parser.push_packet(&stream_data_packet_in_segment(255, 0, vec![0; 4])),
+            Err(PacketError::Stream {
+                source: StreamDataError::SegmentOutOfRange { .. },
+                ..
             })
-        } else {
-            Err(reqs)
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceFullMetadata {
-    pub device: Arc<DeviceMetadata>,
-    pub streams: HashMap<u8, DeviceStreamMetadata>,
-}
-
-pub struct DeviceDataParser {
-    device: Option<Arc<DeviceMetadata>>,
-    streams: HashMap<u8, DeviceStream>,
-    ignore_session: bool,
-}
-
-impl DeviceDataParser {
-    pub fn new(ignore_session: bool) -> DeviceDataParser {
-        DeviceDataParser {
-            device: None,
-            streams: HashMap::new(),
-            ignore_session,
-        }
+        ));
+        assert_eq!(
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .unwrap(),
+            PacketOutcome::Rows(1)
+        );
+        assert!(parser.pop_batch().is_some());
     }
 
-    fn get_stream(&mut self, stream_id: u8) -> &mut DeviceStream {
-        if !self.streams.contains_key(&stream_id) {
-            self.streams.insert(stream_id, DeviceStream::new(stream_id));
-        }
-        self.streams.get_mut(&stream_id).unwrap()
+    #[test]
+    fn rows_past_the_24_bit_sample_field_are_rejected() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+
+        assert!(matches!(
+            parser.push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 8])),
+            Err(PacketError::Stream {
+                source: StreamDataError::SampleNumberOverflow { .. },
+                ..
+            })
+        ));
+
+        parser
+            .push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 4]))
+            .expect("the largest representable sample itself is valid");
+        let batch = parser.pop_batch().expect("a batch is ready");
+        assert_eq!(batch.sample_numbers(), [MAX_SAMPLE_NUMBER]);
     }
 
-    fn process_metadata(&mut self, metadata: &MetadataContent, from_update: bool) {
-        match metadata {
-            MetadataContent::Device(dm) => {
-                if let Some(cur) = &self.device {
-                    if cur.serial_number != dm.serial_number {
-                        self.streams.clear();
-                    } else if (cur.session_id != dm.session_id)
-                        || (cur.firmware_hash != dm.firmware_hash)
-                    {
-                        for stream in self.streams.values_mut() {
-                            stream.invalidate_metadata();
-                        }
-                    }
-                }
-                self.device.replace(Arc::new(dm.clone()));
+    #[test]
+    fn all_columns_unknown_yields_rows_without_columns() {
+        let mut parser = parser_with_schema(&[DataType::new(0x35)], 3);
+        parser
+            .push_packet(&stream_data_packet(7, vec![0; 6]))
+            .expect("rows are still counted");
+        let batch = parser.pop_batch().expect("a batch is ready");
+        assert!(batch.schema().is_empty());
+        assert_eq!(batch.sample_numbers(), vec![7, 8]);
+    }
+
+    /// Drive a forced rollover: `output_rows` samples of segment 0, then the
+    /// first sample of segment 1 whose metadata has not arrived.
+    fn rollover_batch(sampling_rate: u32, decimation: u32, output_rows: usize) -> SampleBatch {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, sampling_rate, decimation);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4 * output_rows]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the rollover batch")
+    }
+
+    #[test]
+    fn forced_rollover_follows_the_undecimated_clock() {
+        // 10 Hz sampled, decimated by 3: the device switches at undecimated
+        // sample 20 (t = 2 s), which follows the 7th output sample.
+        let batch = rollover_batch(10, 3, 7);
+        assert_eq!(batch.segment().start_time, 2);
+        assert!(matches!(
+            batch.boundary().map(BoundaryReason::class),
+            Some(BoundaryClass::Seamless)
+        ));
+    }
+
+    #[test]
+    fn forced_rollover_is_unchanged_when_decimation_divides_the_rate() {
+        // 10 Hz sampled, decimated by 2: the switch at undecimated sample 10
+        // (t = 1 s) is also the 5th output sample.
+        let batch = rollover_batch(10, 2, 5);
+        assert_eq!(batch.segment().start_time, 1);
+        assert!(matches!(
+            batch.boundary().map(BoundaryReason::class),
+            Some(BoundaryClass::Seamless)
+        ));
+    }
+
+    #[test]
+    fn a_rollover_continues_the_current_run() {
+        let batch = rollover_batch(10, 2, 5);
+        assert_eq!(
+            batch.generations(),
+            Generations {
+                stream: 1,
+                device: 0,
+                global: 0
             }
-            MetadataContent::Stream(sm) => {
-                if let Some(dev) = &self.device {
-                    if usize::from(sm.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                }
-                let dstream = self.get_stream(sm.stream_id);
-                if let Some(stream) = &dstream.stream {
-                    if stream.as_ref() != sm {
-                        // This should never happen: stream metadata is constant.
-                        // To be safe, reload the whole thing:
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                } else {
-                    dstream.stream.replace(Arc::new(sm.clone()));
-                }
+        );
+    }
+
+    #[test]
+    fn startup_opens_a_run_without_disturbing_the_shared_generations() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        let mut generations = Vec::new();
+        // Contiguous samples, then a gap the timeline confirms as data loss.
+        for first_sample_n in [0, 1, 10] {
+            parser
+                .push_packet(&stream_data_packet(first_sample_n, vec![0; 4]))
+                .expect("valid rows");
+            generations.push(parser.pop_batch().expect("a batch is ready").generations());
+        }
+        assert_eq!(
+            generations,
+            [
+                Generations {
+                    stream: 1,
+                    device: 0,
+                    global: 0
+                },
+                Generations {
+                    stream: 1,
+                    device: 0,
+                    global: 0
+                },
+                Generations {
+                    stream: 2,
+                    device: 1,
+                    global: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn generations_are_constant_within_an_accumulated_batch() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4).with_batch_rows(4);
+        for first_sample_n in [0, 2, 4] {
+            parser
+                .push_packet(&stream_data_packet(first_sample_n, vec![0; 8]))
+                .expect("valid rows");
+        }
+        // The boundary ends a batch, so the last two packets are the ones that
+        // accumulate together.
+        parser.pop_batch().expect("the boundary batch");
+        let batch = parser.pop_batch().expect("two packets share one batch");
+        assert_eq!(batch.len(), 4);
+        assert_eq!(
+            batch.generations(),
+            Generations {
+                stream: 1,
+                device: 0,
+                global: 0
             }
-            MetadataContent::Segment(sm) => {
-                if let Some(dev) = &self.device {
-                    if usize::from(sm.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                }
-                let dstream = self.get_stream(sm.stream_id);
-                if let Some(segment) = &dstream.segment {
-                    if segment.as_ref() != sm {
-                        dstream.segment.replace(Arc::new(sm.clone()));
-                        if from_update {
-                            dstream.current_data_seg = sm.segment_id;
-                        }
-                    }
-                } else {
-                    dstream.segment.replace(Arc::new(sm.clone()));
-                    if from_update {
-                        dstream.current_data_seg = sm.segment_id;
-                    }
-                }
+        );
+    }
+
+    #[test]
+    fn pending_batches_never_straddle_a_shared_generation_bump() {
+        let mut parser = parser_with_streams(2).with_batch_rows(4);
+        parser
+            .push_packet(&stream_data_packet_for(2, 0, 2))
+            .expect("valid rows");
+        assert_eq!(parser.drain_batches().len(), 1);
+        parser
+            .push_packet(&stream_data_packet_for(2, 2, 2))
+            .expect("valid rows");
+        assert!(parser.pop_batch().is_none(), "stream 2 holds half a batch");
+
+        // Stream 1's startup boundary leaves the shared generations alone, so
+        // stream 2 keeps accumulating.
+        parser
+            .push_packet(&stream_data_packet_for(1, 0, 2))
+            .expect("valid rows");
+        let initial = parser.pop_batch().expect("the initial batch");
+        assert_eq!(initial.stream().stream_id, crate::proto::StreamId::new(1));
+        assert!(parser.pop_batch().is_none(), "stream 2 still accumulates");
+
+        // A gap on stream 1 bumps the shared generations: stream 2's held rows
+        // emit first with their older stamps, then the boundary batch.
+        parser
+            .push_packet(&stream_data_packet_for(1, 10, 2))
+            .expect("valid rows");
+        let held = parser.pop_batch().expect("the flushed pre-bump batch");
+        assert_eq!(held.stream().stream_id, crate::proto::StreamId::new(2));
+        assert_eq!(
+            held.generations(),
+            Generations {
+                stream: 1,
+                device: 0,
+                global: 0
             }
-            MetadataContent::Column(cm) => {
-                if let Some(dev) = &self.device {
-                    if usize::from(cm.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                }
-                let dstream = self.get_stream(cm.stream_id);
-                if usize::from(cm.index) < dstream.columns.len() {
-                    if dstream.columns[cm.index].metadata.as_ref() != cm {
-                        // This should never happen: columns are constant.
-                        // To be safe, reload everything.
-                        self.device.take();
-                        self.streams.clear();
-                    }
-                } else if usize::from(cm.index) == dstream.columns.len() {
-                    // Next column to append
-                    // TODO: make sure it agrees with the rest of the metadata
-                    let offset = if cm.index == 0 {
-                        0
-                    } else {
-                        let prev_col = &dstream.columns[cm.index - 1];
-                        prev_col.offset + prev_col.metadata.data_type.size()
-                    };
-                    dstream.columns.push(DeviceColumn {
-                        metadata: Arc::new(cm.clone()),
-                        offset: offset,
-                    })
-                }
+        );
+        let boundary_batch = parser.pop_batch().expect("the boundary batch");
+        assert_eq!(
+            boundary_batch.stream().stream_id,
+            crate::proto::StreamId::new(1)
+        );
+        assert_eq!(
+            boundary_batch.generations(),
+            Generations {
+                stream: 2,
+                device: 1,
+                global: 1
             }
-            _ => {}
+        );
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_cannot_restamp_the_generations_it_used_before() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the first batch").generations();
+
+        parser
+            .push_packet(&tio::Packet::proxy_status(ProxyStatus::SensorDisconnected))
+            .expect("a disconnect resets the parser");
+
+        // The device comes back and re-announces exactly the same schema.
+        announce_schema(&mut parser, &[DataType::F32], 4, 1, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the first batch after reconnect");
+
+        assert_eq!(
+            before,
+            Generations {
+                stream: 1,
+                device: 0,
+                global: 0
+            }
+        );
+        assert_eq!(
+            after.generations(),
+            Generations {
+                stream: 2,
+                device: 1,
+                global: 1
+            }
+        );
+        assert!(after.is_initial(), "the reconnect opens a new run");
+    }
+
+    /// A routed disconnect — one mount bouncing behind `tio proxy --mount`, as
+    /// a recorded log replays it — resets only the subtree at its route.
+    #[test]
+    fn a_routed_disconnect_resets_only_its_subtree() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        let steady: DeviceRoute = "/1".parse().unwrap();
+        let bounced: DeviceRoute = "/2".parse().unwrap();
+        for route in [steady, bounced] {
+            for record in [
+                wire::Metadata::Device(fixtures::device()),
+                wire::Metadata::Stream(fixtures::stream(STREAM_ID)),
+                wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+                wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
+            ] {
+                parser
+                    .push_packet(&metadata_packet(record).with_route(route))
+                    .expect("valid metadata");
+            }
+        }
+
+        parser
+            .push_packet(
+                &tio::Packet::proxy_status(ProxyStatus::SensorDisconnected).with_route(bounced),
+            )
+            .expect("a routed disconnect applies");
+
+        assert!(
+            parser.metadata(steady).is_some(),
+            "the steady mount kept its description"
+        );
+        assert!(
+            parser.metadata(bounced).is_none(),
+            "the bounced mount rediscovers"
+        );
+    }
+
+    #[test]
+    fn a_replacement_device_cannot_join_the_previous_devices_buffer_run() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        let mut buffer = Buffer::new(128);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the first device's batch");
+        let before_generations = before.generations();
+        buffer.process_batch(&before);
+
+        announce_schema_for(
+            &mut parser,
+            wire::Device {
+                name: "replacement-device",
+                serial: "SN456",
+                firmware: "replacement-fw",
+                ..fixtures::device()
+            },
+            &[DataType::F32],
+            4,
+            1,
+            1,
+            1,
+        );
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid replacement rows");
+        let after = parser.pop_batch().expect("the replacement device's batch");
+
+        assert_eq!(
+            after.generations(),
+            Generations {
+                stream: before_generations.stream + 1,
+                device: before_generations.device + 1,
+                global: before_generations.global + 1,
+            }
+        );
+        assert!(after.is_initial(), "a replacement device opens a new run");
+        buffer.process_batch(&after);
+
+        let key = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(STREAM_ID));
+        let run = buffer.get_run(&key).expect("the replacement run");
+        assert_eq!(run.retained_rows(), 0..1);
+        assert_eq!(
+            buffer
+                .latest_row(&key)
+                .expect("the replacement row")
+                .device()
+                .serial,
+            "SN456"
+        );
+    }
+
+    #[test]
+    fn firmware_change_without_a_session_change_opens_a_new_run() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the old firmware's batch");
+
+        announce_schema_for(
+            &mut parser,
+            wire::Device {
+                firmware: "new-fw",
+                ..fixtures::device()
+            },
+            &[DataType::F32],
+            4,
+            1,
+            1,
+            1,
+        );
+        parser
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .expect("valid rows under the new firmware");
+        let after = parser.pop_batch().expect("the new firmware's batch");
+
+        assert_eq!(after.generations().stream, before.generations().stream + 1);
+        assert_eq!(after.generations().device, before.generations().device + 1);
+        assert_eq!(after.generations().global, before.generations().global + 1);
+        assert!(after.is_initial(), "the firmware schema starts a new run");
+    }
+
+    #[test]
+    fn session_change_keeps_its_specific_boundary_and_opens_a_new_run() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the old session's batch");
+
+        announce_schema_for(
+            &mut parser,
+            wire::Device {
+                session: crate::proto::SessionId::new(43),
+                ..fixtures::device()
+            },
+            &[DataType::F32],
+            4,
+            1,
+            1,
+            1,
+        );
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows in the new session");
+        let after = parser.pop_batch().expect("the new session's batch");
+
+        assert_eq!(after.generations().stream, before.generations().stream + 1);
+        assert_eq!(after.generations().device, before.generations().device + 1);
+        assert_eq!(after.generations().global, before.generations().global + 1);
+        assert!(matches!(
+            after.boundary(),
+            Some(BoundaryReason::SessionChanged { old, new })
+                if old.value() == 42 && new.value() == 43
+        ));
+    }
+
+    #[test]
+    fn reboot_from_a_nonzero_segment_does_not_rediscover_metadata_per_sample() {
+        let route = DeviceRoute::root();
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                start_time: 1000,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+            .unwrap();
+        let before = parser.pop_batch().unwrap();
+        announce_schema_for(
+            &mut parser,
+            wire::Device {
+                session: crate::proto::SessionId::new(43),
+                ..fixtures::device()
+            },
+            &[DataType::F32],
+            4,
+            4,
+            1,
+            1,
+        );
+        let revision = parser.metadata_revision(route);
+        for first in 0..10 {
+            parser
+                .push_packet(&stream_data_packet(first, vec![0; 4]))
+                .unwrap();
+            let batch = parser
+                .pop_batch()
+                .expect("rebooted samples must decode immediately");
+            if first == 0 {
+                assert!(matches!(
+                    batch.boundary(),
+                    Some(BoundaryReason::SessionChanged { .. })
+                ));
+                assert_eq!(batch.generations().stream, before.generations().stream + 1);
+            }
+            assert!(parser.take_metadata_queries().is_empty());
+            assert_eq!(parser.metadata_revision(route), revision);
         }
     }
 
-    pub fn process_packet(&mut self, pkt: &tio::Packet) -> Vec<Sample> {
-        match &pkt.payload {
-            tio::proto::Payload::RpcReply(rep) => {
-                for metadata in parse_metarep(rep.reply.clone()) {
-                    self.process_metadata(&metadata, false)
-                }
-            }
-            tio::proto::Payload::Metadata(mp) => self.process_metadata(&mp.content, true),
-            tio::proto::Payload::Heartbeat(hb) => {
-                if let tio::proto::HeartbeatPayload::Session(session_id) = hb {
-                    if let Some(dev) = &self.device {
-                        if (dev.session_id != *session_id) && !self.ignore_session {
-                            for stream in self.streams.values_mut() {
-                                stream.invalidate_metadata();
-                            }
-                            self.device.take();
-                        }
-                    }
-                }
-            }
-            tio::proto::Payload::StreamData(data) => {
-                // Attempt to parse samples
-                if let Some(dev) = &self.device {
-                    if usize::from(data.stream_id) > dev.n_streams {
-                        // Should never happen, but force a reload.
-                        self.device.take();
-                        self.streams.clear();
-                    } else {
-                        let ndev = dev.clone();
-                        let dstream = self.get_stream(data.stream_id);
-                        return dstream.process_samples(data, ndev);
-                    }
-                }
-            }
-            _ => {
-                // TODO: something about rpc errors? at least hold off to not
-                // issue too many requests.
-            }
-        }
-        return vec![];
+    #[test]
+    fn a_new_time_reference_can_start_before_the_previous_clock() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(1000, vec![0; 4]))
+            .unwrap();
+        parser.pop_batch().unwrap();
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                timeref_session: crate::proto::SessionId::new(99),
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+            .unwrap();
+        let batch = parser
+            .pop_batch()
+            .expect("timestamps in different time references are not comparable");
+        assert!(matches!(
+            batch.boundary(),
+            Some(BoundaryReason::TimeRefSessionChanged { .. })
+        ));
+        assert!(parser.take_metadata_queries().is_empty());
     }
 
-    pub fn requests(&self) -> Vec<tio::Packet> {
-        // Determine all the metadata requests to issue.
-        let mut reqs = vec![];
-        match self.device.as_ref() {
-            Some(device) => {
-                for i in 0..device.n_streams {
-                    let stream_id = (i + 1) as u8;
-                    if let Some(stream) = self.streams.get(&stream_id) {
-                        reqs.extend(stream.requests())
-                    } else {
-                        reqs.push(StreamRpcMetaReq::stream(stream_id));
-                    }
-                }
-            }
-            None => {
-                reqs.push(StreamRpcMetaReq::device());
-            }
-        }
-        metareqs_to_rpcs(&reqs)
+    #[test]
+    fn a_broadcast_selects_a_nonzero_segment_without_samples() {
+        let route = DeviceRoute::root();
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        assert_eq!(
+            parser
+                .metadata(route)
+                .unwrap()
+                .stream(crate::proto::StreamId::new(STREAM_ID))
+                .unwrap()
+                .segment()
+                .segment_id
+                .value(),
+            1
+        );
     }
 
-    pub fn get_metadata(&self) -> Result<DeviceFullMetadata, Vec<tio::Packet>> {
-        let reqs = self.requests();
-        if !reqs.is_empty() {
-            return Err(reqs);
-        }
-        let mut streams = HashMap::new();
-        for (id, stream) in &self.streams {
-            streams.insert(*id, stream.get_metadata().unwrap());
-        }
-        Ok(DeviceFullMetadata {
-            device: self.device.as_ref().unwrap().clone(),
-            streams: streams,
-        })
+    #[test]
+    fn a_stale_ring_entry_in_the_same_clock_is_still_evicted() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet(1000, vec![0; 4]))
+            .unwrap();
+        parser.pop_batch().unwrap();
+        // Not sample zero, so synthesis cannot hide the missing descriptor.
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .unwrap();
+        assert!(parser.pop_batch().is_none());
+        let query = take_query(&mut parser);
+        assert_eq!(
+            query.selectors,
+            vec![wire::MetadataSelector::segment(STREAM_ID, 1)]
+        );
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                start_time: 1000,
+                ..fixtures::segment(STREAM_ID)
+            })]),
+        );
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .unwrap();
+        assert!(parser.pop_batch().is_some());
+    }
+
+    #[test]
+    fn a_metadata_reply_does_not_override_the_broadcast_current_segment() {
+        let route = DeviceRoute::root();
+        let mut parser = PacketParser::new(route, false);
+        let query = take_query(&mut parser);
+        announce_schema(&mut parser, &[DataType::F32], 4, 4, 1, 1);
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Segment(fixtures::segment(STREAM_ID))]),
+        );
+        assert_eq!(
+            parser
+                .metadata(route)
+                .unwrap()
+                .stream(crate::proto::StreamId::new(STREAM_ID))
+                .unwrap()
+                .segment()
+                .segment_id
+                .value(),
+            1
+        );
+    }
+
+    #[test]
+    fn changed_schema_cannot_reuse_the_previous_run_identity() {
+        let mut parser = parser_with_schema(&[DataType::F32], 4);
+        let mut buffer = Buffer::new(128);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the old schema's batch");
+        let before_generations = before.generations();
+        buffer.process_batch(&before);
+
+        // Contradicting an already-used column invalidates the route. The
+        // device then re-announces the complete replacement schema.
+        parser
+            .push_packet(&metadata_packet(wire::Metadata::Column(wire::Column {
+                name: "wide",
+                ..fixtures::column(STREAM_ID, 0, DataType::F64)
+            })))
+            .expect("the changed column triggers rediscovery");
+        announce_schema(&mut parser, &[DataType::F64], 8, 1, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 8]))
+            .expect("valid rows under the new schema");
+        let after = parser.pop_batch().expect("the new schema's batch");
+
+        assert_eq!(after.generations().stream, before_generations.stream + 1);
+        assert_eq!(after.generations().device, before_generations.device + 1);
+        assert_eq!(after.generations().global, before_generations.global + 1);
+        buffer.process_batch(&after);
+        let key = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(STREAM_ID));
+        let run = buffer.get_run(&key).expect("the new schema's run");
+        assert_eq!(run.retained_rows(), 0..1);
+        assert_eq!(run.stream().sample_size, 8);
+        assert_eq!(
+            buffer
+                .column_metadata(&ColumnKey::new(
+                    DeviceRoute::root(),
+                    crate::proto::StreamId::new(STREAM_ID),
+                    crate::proto::ColumnId::new(0),
+                ))
+                .expect("the new column")
+                .data_type,
+            DataType::F64
+        );
+    }
+
+    #[test]
+    fn missing_metadata_is_a_state_not_an_error() {
+        let mut parser = PacketParser::new(DeviceRoute::root(), true);
+        assert_eq!(
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .unwrap(),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert!(parser.pop_batch().is_none());
+        assert_eq!(parser.take_metadata_queries().len(), 1);
     }
 }
