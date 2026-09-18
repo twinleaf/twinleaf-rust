@@ -711,7 +711,7 @@ pub struct MetadataQuery<'a> {
 impl<'a> MetadataQuery<'a> {
     /// Selectors from a request argument.
     pub fn parse(arg: &'a [u8]) -> Result<Self, MetadataQueryError> {
-        if arg.len() % MetadataSelector::SIZE != 0 {
+        if !arg.len().is_multiple_of(MetadataSelector::SIZE) {
             return Err(MetadataQueryError::Misaligned);
         }
         if arg.len() / MetadataSelector::SIZE > MAX_METADATA_SELECTORS {
@@ -727,12 +727,14 @@ impl<'a> MetadataQuery<'a> {
 
     /// The selectors in request order.
     pub fn selectors(&self) -> impl Iterator<Item = MetadataSelector> + 'a {
-        self.arg
-            .chunks_exact(MetadataSelector::SIZE)
-            .map(|selector| MetadataSelector {
-                mtype: selector[0].into(),
-                stream_id: selector[1],
-                index: selector[2],
+        let (selectors, _) = self.arg.as_chunks::<{ MetadataSelector::SIZE }>();
+
+        selectors
+            .iter()
+            .map(|&[record_type, stream_id, index]| MetadataSelector {
+                mtype: record_type.into(),
+                stream_id,
+                index,
             })
     }
 }
