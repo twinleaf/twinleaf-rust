@@ -1,10 +1,22 @@
-#[derive(Debug, Clone)]
+//! Dynamic RPC values, for hosts that learn an RPC's type from its metadata
+//! at run time rather than from a Rust type at compile time.
+
+use crate::proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcValueType};
+
+/// An RPC value whose type was learned at run time.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RpcValue {
+    /// No value: an action, or a reply with nothing in it.
     Unit,
+    /// Any unsigned integer type, widened.
     U64(u64),
+    /// Any signed integer type, widened.
     I64(i64),
+    /// Any float type, widened.
     F64(f64),
+    /// A string.
     Str(String),
+    /// Raw bytes, for a type with no better reading.
     Bytes(Vec<u8>),
 }
 
@@ -26,103 +38,278 @@ impl std::fmt::Display for RpcValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RpcValueType {
-    Unit,
-    Int { signed: bool, size: u8 },
-    Float { size: u8 },
-    String { max_len: Option<u16> },
-    Raw { meta: u16 },
+/// Host-side codecs between the shared value-type tag and owned [`RpcValue`]s.
+pub trait RpcValueTypeExt {
+    /// Encode `value` as this type.
+    fn encode(self, value: &RpcValue) -> Result<Vec<u8>, RpcValueEncodeError>;
+    /// Decode `bytes` as this type.
+    fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError>;
 }
 
-impl RpcValueType {
-    const TYPE_UINT: u8 = 0;
-    const TYPE_INT: u8 = 1;
-    const TYPE_FLOAT: u8 = 2;
-    const TYPE_STRING: u8 = 3;
-
-    pub const fn from_low_byte(byte: u8) -> Option<Self> {
-        let data_type = byte & 0x0F;
-        let data_size = (byte >> 4) & 0x0F;
-        let kind = match data_type {
-            Self::TYPE_UINT => match data_size {
-                0 => RpcValueType::Unit,
-                1 | 2 | 4 | 8 => RpcValueType::Int {
+impl RpcValueTypeExt for RpcValueType {
+    fn encode(self, value: &RpcValue) -> Result<Vec<u8>, RpcValueEncodeError> {
+        match (self, value) {
+            (RpcValueType::Unit, RpcValue::Unit) => Ok(Vec::new()),
+            (
+                target @ RpcValueType::Int {
                     signed: false,
-                    size: data_size,
+                    size,
                 },
-                _ => return None,
-            },
-            Self::TYPE_INT => match data_size {
-                0 => RpcValueType::Unit,
-                1 | 2 | 4 | 8 => RpcValueType::Int {
-                    signed: true,
-                    size: data_size,
-                },
-                _ => return None,
-            },
-            Self::TYPE_FLOAT => match data_size {
-                4 | 8 => RpcValueType::Float { size: data_size },
-                0 => RpcValueType::Unit,
-                _ => return None,
-            },
-            Self::TYPE_STRING => RpcValueType::String {
-                max_len: if data_size == 0 {
-                    None
-                } else {
-                    Some(data_size as u16)
-                },
-            },
-            _ => return None,
-        };
-        Some(kind)
+                RpcValue::U64(value),
+            ) => encode_unsigned(*value, size, target),
+            (target @ RpcValueType::Int { signed: true, size }, RpcValue::I64(value)) => {
+                encode_signed(*value, size, target)
+            }
+            (RpcValueType::Float { size: 4 }, RpcValue::F64(value)) => {
+                Ok((*value as f32).to_le_bytes().to_vec())
+            }
+            (RpcValueType::Float { size: 8 }, RpcValue::F64(value)) => {
+                Ok(value.to_le_bytes().to_vec())
+            }
+            (RpcValueType::Float { size }, RpcValue::F64(_)) => {
+                Err(RpcValueEncodeError::UnsupportedFloatSize(size))
+            }
+            (RpcValueType::String { max_len }, RpcValue::Str(value)) => {
+                if let Some(max) = max_len {
+                    if value.len() > usize::from(max.get()) {
+                        return Err(RpcValueEncodeError::StringTooLong {
+                            max: max.get(),
+                            actual: value.len(),
+                        });
+                    }
+                }
+                Ok(value.as_bytes().to_vec())
+            }
+            (RpcValueType::Raw { .. }, RpcValue::Bytes(value)) => Ok(value.clone()),
+            (expected, actual) => Err(RpcValueEncodeError::TypeMismatch {
+                expected,
+                actual: actual.kind_name(),
+            }),
+        }
     }
 
-    pub const fn low_byte(self) -> u8 {
+    fn decode(self, bytes: &[u8]) -> Result<RpcValue, RpcValueDecodeError> {
         match self {
-            RpcValueType::Unit => 0,
+            RpcValueType::Unit => Ok(RpcValue::Unit),
             RpcValueType::Int {
                 signed: false,
                 size,
-            } => (size << 4) | Self::TYPE_UINT,
-            RpcValueType::Int { signed: true, size } => (size << 4) | Self::TYPE_INT,
-            RpcValueType::Float { size } => (size << 4) | Self::TYPE_FLOAT,
-            RpcValueType::String { max_len } => {
-                let n = match max_len {
-                    Some(n) => n,
-                    None => 0,
-                };
-                (((n & 0x0F) as u8) << 4) | Self::TYPE_STRING
+            } => decode_unsigned(bytes, size),
+            RpcValueType::Int { signed: true, size } => decode_signed(bytes, size),
+            RpcValueType::Float { size: 4 } => {
+                let raw = take_array::<4>(bytes)?;
+                Ok(RpcValue::F64(f32::from_le_bytes(raw).into()))
             }
-            RpcValueType::Raw { meta } => (meta & 0x00FF) as u8,
+            RpcValueType::Float { size: 8 } => {
+                let raw = take_array::<8>(bytes)?;
+                Ok(RpcValue::F64(f64::from_le_bytes(raw)))
+            }
+            RpcValueType::Float { size } => Err(RpcValueDecodeError::UnsupportedFloatSize(size)),
+            RpcValueType::String { .. } => match std::str::from_utf8(bytes) {
+                Ok(value) => Ok(RpcValue::Str(value.to_owned())),
+                Err(_) => Ok(RpcValue::Bytes(bytes.to_vec())),
+            },
+            RpcValueType::Raw { .. } => Ok(RpcValue::Bytes(bytes.to_vec())),
         }
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum EncodeError {
-    #[error("invalid integer: {0}")]
-    ParseInt(#[from] std::num::ParseIntError),
-    #[error("invalid float: {0}")]
-    ParseFloat(#[from] std::num::ParseFloatError),
-    #[error("string too long ({actual} bytes, max {max})")]
-    StringTooLong { max: u16, actual: usize },
-    #[error("unsupported integer size: {0} bytes")]
-    UnsupportedIntSize(u8),
-    #[error("unsupported float size: {0} bytes")]
-    UnsupportedFloatSize(u8),
-    #[error("value not encodable for kind '{0}'")]
-    NotEncodableForKind(&'static str),
+impl RpcValue {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            RpcValue::Unit => "unit",
+            RpcValue::U64(_) => "unsigned integer",
+            RpcValue::I64(_) => "signed integer",
+            RpcValue::F64(_) => "float",
+            RpcValue::Str(_) => "string",
+            RpcValue::Bytes(_) => "bytes",
+        }
+    }
 }
 
+fn encode_unsigned(
+    value: u64,
+    size: u8,
+    target: RpcValueType,
+) -> Result<Vec<u8>, RpcValueEncodeError> {
+    let out_of_range = || RpcValueEncodeError::OutOfRange {
+        value: value.to_string(),
+        target,
+    };
+    match size {
+        1 => u8::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .map_err(|_| out_of_range()),
+        2 => u16::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .map_err(|_| out_of_range()),
+        4 => u32::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .map_err(|_| out_of_range()),
+        8 => Ok(value.to_le_bytes().to_vec()),
+        _ => Err(RpcValueEncodeError::UnsupportedIntegerSize(size)),
+    }
+}
+
+fn encode_signed(
+    value: i64,
+    size: u8,
+    target: RpcValueType,
+) -> Result<Vec<u8>, RpcValueEncodeError> {
+    let out_of_range = || RpcValueEncodeError::OutOfRange {
+        value: value.to_string(),
+        target,
+    };
+    match size {
+        1 => i8::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .map_err(|_| out_of_range()),
+        2 => i16::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .map_err(|_| out_of_range()),
+        4 => i32::try_from(value)
+            .map(|value| value.to_le_bytes().to_vec())
+            .map_err(|_| out_of_range()),
+        8 => Ok(value.to_le_bytes().to_vec()),
+        _ => Err(RpcValueEncodeError::UnsupportedIntegerSize(size)),
+    }
+}
+
+fn take_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], RpcValueDecodeError> {
+    if bytes.len() < N {
+        return Err(RpcValueDecodeError::InsufficientBytes {
+            expected: N,
+            actual: bytes.len(),
+        });
+    }
+    Ok(bytes[..N]
+        .try_into()
+        .expect("slice length was checked before conversion"))
+}
+
+fn decode_unsigned(bytes: &[u8], size: u8) -> Result<RpcValue, RpcValueDecodeError> {
+    let value = match size {
+        1 => u8::from_le_bytes(take_array::<1>(bytes)?) as u64,
+        2 => u16::from_le_bytes(take_array::<2>(bytes)?) as u64,
+        4 => u32::from_le_bytes(take_array::<4>(bytes)?) as u64,
+        8 => u64::from_le_bytes(take_array::<8>(bytes)?),
+        _ => return Err(RpcValueDecodeError::UnsupportedIntegerSize(size)),
+    };
+    Ok(RpcValue::U64(value))
+}
+
+fn decode_signed(bytes: &[u8], size: u8) -> Result<RpcValue, RpcValueDecodeError> {
+    let value = match size {
+        1 => i8::from_le_bytes(take_array::<1>(bytes)?) as i64,
+        2 => i16::from_le_bytes(take_array::<2>(bytes)?) as i64,
+        4 => i32::from_le_bytes(take_array::<4>(bytes)?) as i64,
+        8 => i64::from_le_bytes(take_array::<8>(bytes)?),
+        _ => return Err(RpcValueDecodeError::UnsupportedIntegerSize(size)),
+    };
+    Ok(RpcValue::I64(value))
+}
+
+/// Why a value could not be encoded as the type an RPC takes.
 #[derive(Debug, thiserror::Error)]
-pub enum DecodeError {
-    #[error("expected {expected} bytes, got {got}")]
-    InsufficientBytes { expected: usize, got: usize },
-    #[error("invalid UTF-8: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
+pub enum RpcValueEncodeError {
+    /// The value's kind is not the type's.
+    #[error("cannot encode {actual} as {expected:?}")]
+    TypeMismatch {
+        /// The type the RPC takes.
+        expected: RpcValueType,
+        /// The kind of value offered.
+        actual: &'static str,
+    },
+    /// The value does not fit the type.
+    #[error("value {value} is out of range for {target:?}")]
+    OutOfRange {
+        /// The value, as written.
+        value: String,
+        /// The type it had to fit.
+        target: RpcValueType,
+    },
+    /// The string exceeds the type's length.
+    #[error("string too long ({actual} bytes, max {max})")]
+    StringTooLong {
+        /// Bytes the type allows.
+        max: u8,
+        /// Bytes in the string.
+        actual: usize,
+    },
+    /// An integer width this build cannot handle.
     #[error("unsupported integer size: {0} bytes")]
-    UnsupportedIntSize(u8),
+    UnsupportedIntegerSize(u8),
+    /// A float width this build cannot handle.
     #[error("unsupported float size: {0} bytes")]
     UnsupportedFloatSize(u8),
+}
+
+/// Why reply bytes could not be read as the type an RPC returns.
+#[derive(Debug, thiserror::Error)]
+pub enum RpcValueDecodeError {
+    /// Fewer bytes than the type needs.
+    #[error("expected {expected} bytes, got {actual}")]
+    InsufficientBytes {
+        /// Bytes the type needs.
+        expected: usize,
+        /// Bytes in the reply.
+        actual: usize,
+    },
+    /// An integer width this build cannot handle.
+    #[error("unsupported integer size: {0} bytes")]
+    UnsupportedIntegerSize(u8),
+    /// A float width this build cannot handle.
+    #[error("unsupported float size: {0} bytes")]
+    UnsupportedFloatSize(u8),
+}
+
+/// Host-side display helpers over the shared metadata word.
+pub trait RpcMetaExt {
+    /// Access as three letters, read, write, persistent, with `-` for each the RPC lacks.
+    fn perm_str(&self) -> String;
+    /// The value type's name, or `capture` or `bool` when a flag refines it.
+    fn type_str(&self) -> String;
+}
+
+impl RpcMetaExt for RpcMeta {
+    fn perm_str(&self) -> String {
+        if self.is_unknown() {
+            return "???".to_string();
+        }
+        let (r, w) = match self.access() {
+            RpcAccess::ReadWrite => ("R", "W"),
+            RpcAccess::ReadOnly => ("R", "-"),
+            RpcAccess::WriteOnly => ("-", "W"),
+            RpcAccess::Action => ("-", "-"),
+        };
+        let p = if self.is_persistent() { "P" } else { "-" };
+        format!("{r}{w}{p}")
+    }
+
+    fn type_str(&self) -> String {
+        let flags = self.flags();
+        if flags.contains(RpcMetaFlags::CAPTURE) {
+            return "capture".to_string();
+        }
+        if flags.contains(RpcMetaFlags::BOOL) {
+            return "bool".to_string();
+        }
+        match self.kind() {
+            RpcValueType::Unit => String::new(),
+            RpcValueType::Int { signed, size } => {
+                let bits = (size as usize) * 8;
+                if signed {
+                    format!("i{bits}")
+                } else {
+                    format!("u{bits}")
+                }
+            }
+            RpcValueType::Float { size } => format!("f{}", (size as usize) * 8),
+            RpcValueType::String { max_len } => match max_len {
+                Some(n) => format!("string<{n}>"),
+                None => "string".to_string(),
+            },
+            RpcValueType::Raw { .. } => String::new(),
+        }
+    }
 }

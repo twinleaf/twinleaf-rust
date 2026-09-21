@@ -2,9 +2,54 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser, ValueHint},
     Args, Subcommand,
 };
-use twinleaf::device::{util, RpcValueType};
+use twinleaf::device::rpc::RpcValueType;
 
 use crate::TioOpts;
+
+const RPC_TYPE_NAMES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "string",
+];
+
+pub(crate) fn parse_rpc_type(input: &str) -> Option<RpcValueType> {
+    Some(match input {
+        "u8" => RpcValueType::Int {
+            signed: false,
+            size: 1,
+        },
+        "u16" => RpcValueType::Int {
+            signed: false,
+            size: 2,
+        },
+        "u32" => RpcValueType::Int {
+            signed: false,
+            size: 4,
+        },
+        "u64" => RpcValueType::Int {
+            signed: false,
+            size: 8,
+        },
+        "i8" => RpcValueType::Int {
+            signed: true,
+            size: 1,
+        },
+        "i16" => RpcValueType::Int {
+            signed: true,
+            size: 2,
+        },
+        "i32" => RpcValueType::Int {
+            signed: true,
+            size: 4,
+        },
+        "i64" => RpcValueType::Int {
+            signed: true,
+            size: 8,
+        },
+        "f32" => RpcValueType::Float { size: 4 },
+        "f64" => RpcValueType::Float { size: 8 },
+        "string" => RpcValueType::String { max_len: None },
+        _ => return None,
+    })
+}
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
@@ -32,8 +77,8 @@ pub struct RpcCli {
     #[arg(
         short = 't',
         long = "req-type",
-        value_parser = PossibleValuesParser::new(util::RPC_TYPE_NAMES)
-            .map(|s: String| util::parse_rpc_type(&s).expect("validated by possible-values")),
+        value_parser = PossibleValuesParser::new(RPC_TYPE_NAMES)
+            .map(|s: String| parse_rpc_type(&s).expect("validated by possible-values")),
         help_heading = "Type Options",
     )]
     pub req_type: Option<RpcValueType>,
@@ -42,8 +87,8 @@ pub struct RpcCli {
     #[arg(
         short = 'T',
         long = "rep-type",
-        value_parser = PossibleValuesParser::new(util::RPC_TYPE_NAMES)
-            .map(|s: String| util::parse_rpc_type(&s).expect("validated by possible-values")),
+        value_parser = PossibleValuesParser::new(RPC_TYPE_NAMES)
+            .map(|s: String| parse_rpc_type(&s).expect("validated by possible-values")),
         help_heading = "Type Options",
     )]
     pub rep_type: Option<RpcValueType>,

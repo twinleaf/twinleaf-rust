@@ -3,10 +3,9 @@ use twinleaf_tools::tools::{
     capture::run_capture,
     dump::run_dump,
     health::{run_health, HealthConfig},
-    list::run_list,
     log::run_log,
     monitor::{run_monitor, MonitorConfig},
-    proxy::run_proxy,
+    proxy::{run_list, run_proxy},
     rpc::run_rpc,
     simulate::run_simulate,
     upgrade::run_upgrade,
@@ -17,16 +16,16 @@ fn main() -> eyre::Result<()> {
     twinleaf_tools::install_error_handler()?;
     let cli = TioCli::parse();
 
-    // Health, Monitor, and Proxy manage their own logging (TUI / custom filter)
+    // Health, Monitor, Proxy, and List manage their own logging (TUI / custom filter)
     if !matches!(
         cli.command,
-        Commands::Health(_) | Commands::Monitor(_) | Commands::Proxy(_)
+        Commands::Health(_) | Commands::Monitor(_) | Commands::Proxy(_) | Commands::List(_)
     ) {
         twinleaf_tools::init_logging();
     }
 
     match cli.command {
-        Commands::List { all } => run_list(all),
+        Commands::List(list_cli) => run_list(list_cli),
         Commands::Proxy(proxy_cli) => run_proxy(proxy_cli),
         Commands::Simulate(simulate_cli) => run_simulate(simulate_cli),
         Commands::Test(simulate_cli) => {

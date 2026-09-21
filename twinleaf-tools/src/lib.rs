@@ -2,8 +2,7 @@ use clap::Parser;
 use indicatif::MultiProgress;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use twinleaf::device::DeviceRoute;
-use twinleaf::tio::util;
+use twinleaf::DeviceRoute;
 pub mod cli;
 pub mod tools;
 pub mod tui;
@@ -46,13 +45,14 @@ pub trait ProxyHelp<T> {
 impl<T> ProxyHelp<T> for eyre::Result<T> {
     fn with_proxy_help(self) -> eyre::Result<T> {
         use color_eyre::Help;
-        self.suggestion("start `tio proxy` first if using with multiple applications")
+        self.suggestion("run `tio list` to discover devices and host a selection")
             .suggestion("or specify a source with -r <url>")
     }
 }
 
 fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
-    DeviceRoute::from_str(s).map_err(|_| format!("invalid sensor route: {s:?}"))
+    s.parse::<DeviceRoute>()
+        .map_err(|_| format!("invalid sensor route: {s:?}"))
 }
 
 fn parse_existing_file(s: &str) -> Result<PathBuf, String> {
@@ -70,9 +70,9 @@ pub struct TioOpts {
     #[arg(
         short = 'r',
         long = "root",
-        default_value_t = util::default_proxy_url().to_string(),
+        default_value = "auto",
         value_hint = clap::ValueHint::Url,
-        help = "Sensor root address"
+        help = "Sensor root address (auto selects the default or only device)"
     )]
     pub root: String,
 
