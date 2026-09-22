@@ -48,6 +48,9 @@ pub struct DiscoveredDevice {
 pub struct DiscoveryConfig {
     /// Include serial ports with unrecognized USB VID/PID.
     pub include_unknown: bool,
+    /// Also probe the ports `include_unknown` adds. When false they are listed
+    /// but never opened, so discovery stays off hardware that is not ours.
+    pub probe_unknown: bool,
     /// Browse the local network for mDNS-advertised devices.
     pub network: bool,
     /// Briefly connect to each device to resolve its `dev.name` and enumerate
@@ -61,10 +64,18 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             include_unknown: false,
+            probe_unknown: false,
             network: true,
             probe_names: true,
             prefer_udp: false,
         }
+    }
+}
+
+impl DiscoveryConfig {
+    /// Whether `dev` gets a probe connection.
+    fn probes(&self, dev: &DiscoveredDevice) -> bool {
+        self.probe_unknown || !matches!(dev.interface, PortInterface::Unknown(..))
     }
 }
 
@@ -121,6 +132,11 @@ impl Discovery {
         // Serial ports are a point-in-time snapshot, reported right away.
         let serial = enumerate_serial(config.include_unknown);
         let serial_urls: Vec<String> = serial.iter().map(|d| d.url.clone()).collect();
+        let probe_urls: Vec<String> = serial
+            .iter()
+            .filter(|d| config.probes(d))
+            .map(|d| d.url.clone())
+            .collect();
         for dev in serial {
             let _ = tx.send(DiscoveryEvent::Added(dev));
         }
@@ -129,14 +145,13 @@ impl Discovery {
         // devices by the mDNS browser as they resolve.
         let (probe_tx, probe_rx) = channel::unbounded::<String>();
         if config.probe_names {
-            for url in serial_urls {
+            for url in probe_urls {
                 let _ = probe_tx.send(url);
             }
             let tx = tx.clone();
             let stop = stop.clone();
-            let include_unknown = config.include_unknown;
             workers.push(std::thread::spawn(move || {
-                probe_devices(&probe_rx, include_unknown, &tx, &stop)
+                probe_devices(&probe_rx, serial_urls, config, &tx, &stop)
             }));
         }
 
@@ -247,14 +262,15 @@ const ROUTE_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
 const REPROBE_PERIOD: Duration = Duration::from_secs(2);
 
 /// [`Discovery`]'s probe worker: probe each queued URL, then keep re-scanning
-/// serial ports every [`REPROBE_PERIOD`]. Bails promptly when `stop` is set.
+/// serial ports every [`REPROBE_PERIOD`]. `serial_urls` are the ports already
+/// reported. Bails promptly when `stop` is set.
 fn probe_devices(
     urls: &channel::Receiver<String>,
-    include_unknown: bool,
+    mut serial_urls: Vec<String>,
+    config: DiscoveryConfig,
     tx: &channel::Sender<DiscoveryEvent>,
     stop: &AtomicBool,
 ) {
-    let mut serial_urls: Vec<String> = Vec::new();
     let mut queue_open = true;
     let mut next_reprobe = Instant::now() + REPROBE_PERIOD;
     while !stop.load(Ordering::Relaxed) {
@@ -263,9 +279,6 @@ fn probe_devices(
                 Ok(url) => {
                     if probe_device(&url, tx).is_err() {
                         return;
-                    }
-                    if url.starts_with("serial://") {
-                        serial_urls.push(url);
                     }
                     continue;
                 }
@@ -277,7 +290,7 @@ fn probe_devices(
         }
 
         if Instant::now() >= next_reprobe {
-            if reprobe_serial(&mut serial_urls, include_unknown, tx, stop).is_err() {
+            if reprobe_serial(&mut serial_urls, config, tx, stop).is_err() {
                 return;
             }
             next_reprobe = Instant::now() + REPROBE_PERIOD;
@@ -286,14 +299,15 @@ fn probe_devices(
 }
 
 /// One serial round: diff the current ports against `known` (emitting
-/// `Removed`/`Added`), then probe each. Errors when the event channel closed.
+/// `Removed`/`Added`), then probe each one `config` allows. Errors when the
+/// event channel closed.
 fn reprobe_serial(
     known: &mut Vec<String>,
-    include_unknown: bool,
+    config: DiscoveryConfig,
     tx: &channel::Sender<DiscoveryEvent>,
     stop: &AtomicBool,
 ) -> Result<(), ()> {
-    let current = enumerate_serial(include_unknown);
+    let current = enumerate_serial(config.include_unknown);
     for url in known
         .iter()
         .filter(|u| !current.iter().any(|d| &d.url == *u))
@@ -302,17 +316,18 @@ fn reprobe_serial(
             .map_err(|_| ())?;
     }
     known.retain(|u| current.iter().any(|d| &d.url == u));
-    for dev in current {
+    for dev in &current {
         if !known.contains(&dev.url) {
             known.push(dev.url.clone());
-            tx.send(DiscoveryEvent::Added(dev)).map_err(|_| ())?;
+            tx.send(DiscoveryEvent::Added(dev.clone()))
+                .map_err(|_| ())?;
         }
     }
-    for url in known.iter() {
+    for dev in current.iter().filter(|d| config.probes(d)) {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        probe_device(url, tx)?;
+        probe_device(&dev.url, tx)?;
     }
     Ok(())
 }

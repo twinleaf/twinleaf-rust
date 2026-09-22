@@ -14,6 +14,7 @@ use twinleaf::device::discovery::DiscoveryConfig;
 pub fn run_list(cli: ListCli) -> eyre::Result<()> {
     let config = DiscoveryConfig {
         include_unknown: cli.all,
+        probe_unknown: true,
         network: !cli.local,
         probe_names: true,
         prefer_udp: cli.udp,
@@ -33,6 +34,7 @@ pub(super) fn list_devices_deprecated(all: bool) -> eyre::Result<()> {
     eprintln!("warning: 'tio proxy --enumerate' is deprecated; use 'tio proxy list' instead");
     let config = DiscoveryConfig {
         include_unknown: all,
+        probe_unknown: true,
         network: true,
         probe_names: true,
         prefer_udp: false,
