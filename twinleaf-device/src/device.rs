@@ -270,6 +270,8 @@ pub struct Device<S: Group> {
     /// The nanosecond the device came up, which `dev.systime` and `dev.uptime`
     /// count from.
     booted_ns: u64,
+    /// Whole powered-on hours restored once at boot.
+    lifetime_hours: u32,
     loglevel: Setting<u8>,
     settings_version: u32,
     /// When a persistent cell last moved with no save since.
@@ -301,11 +303,17 @@ impl<S: Group> Device<S> {
             settings,
             next_beat: 0,
             booted_ns: now_ns,
+            lifetime_hours: 0,
             loglevel: Setting::new("dev.loglevel", DEFAULT_LOGLEVEL.value()),
             settings_version: 0,
             dirty_since: None,
             time_status: 0,
         }
+    }
+
+    /// Restores lifetime powered-on hours without changing the current boot clock.
+    pub fn restore_uptime(&mut self, hours: u32) {
+        self.lifetime_hours = hours;
     }
 
     /// The RPC table.
@@ -513,7 +521,9 @@ impl<S: Group> Device<S> {
                     return actions.defer(pending, Deferred::Flash(FlashOp::ConfReset))
                 }
                 Std::Uptime => {
-                    let hours = (since_boot_ns / NANOS_PER_HOUR) as u32;
+                    let hours = self.lifetime_hours.saturating_add(
+                        u32::try_from(since_boot_ns / NANOS_PER_HOUR).unwrap_or(u32::MAX),
+                    );
                     read(&mut reply, args, &hours.to_le_bytes())
                 }
                 Std::Upload => match Reply::from_slice(args) {
@@ -1374,6 +1384,32 @@ mod tests {
     }
 
     #[test]
+    fn restored_lifetime_hours_keep_the_boot_clock_separate_and_saturate() {
+        let mut device = harness();
+        device.device.restore_uptime(123);
+        let later = BOOT + 2 * NANOS_PER_HOUR + 1;
+        assert_eq!(
+            device.ask_at("dev.uptime", &[], later).value(),
+            &125u32.to_le_bytes()
+        );
+        assert_eq!(
+            device.ask_at("dev.systime", &[], later).value(),
+            &(later - BOOT).to_le_bytes()
+        );
+        device.device.restore_uptime(u32::MAX);
+        assert_eq!(
+            device.ask_at("dev.uptime", &[], later).value(),
+            &u32::MAX.to_le_bytes()
+        );
+        let mut rebooted = harness();
+        rebooted.device.restore_uptime(125);
+        assert_eq!(
+            rebooted.ask("dev.uptime", &[]).value(),
+            &125u32.to_le_bytes()
+        );
+    }
+
+    #[test]
     fn systime_and_uptime_count_from_the_first_call_and_refuse_a_write() {
         let mut device = harness();
         assert_eq!(
@@ -1744,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn an_applied_setting_is_announced_once_per_write() {
+    fn an_applied_setting_is_announced_once_per_change() {
         let mut device = harness();
         let mut gain = Setting::new("app.gain", 1u8);
         let mut sent = Sent::default();
@@ -1883,6 +1919,10 @@ mod tests {
             "a write one port asked for is not an event"
         );
         assert_eq!(version(&mut device), 1, "the write is counted");
+
+        // Repeating an accepted value is also quiet.
+        assert_eq!(device.ask("board.second", &42u32.to_le_bytes()).0.len(), 1);
+        assert_eq!(version(&mut device), 1);
 
         // Reading it back neither announces nor counts.
         assert_eq!(device.ask("board.second", &[]).0.len(), 1);

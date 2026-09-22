@@ -3,7 +3,7 @@
 //!
 //! An application declares one per property and answers its RPC with
 //! [`crate::device::Device::apply`], which broadcasts a SETTING packet on
-//! every write and counts it in `settings.version`.
+//! each value change and counts it in `settings.version`.
 
 use twinleaf_proto::rpc::RpcError;
 
@@ -205,8 +205,14 @@ impl<T: Scalar> Setting<T> {
         let changed = match args {
             [] => Changed::Unchanged,
             value => {
-                self.value = (self.check)(T::decode(value)?)?;
-                Changed::Changed
+                let value = (self.check)(T::decode(value)?)?;
+                let changed = if value == self.value {
+                    Changed::Unchanged
+                } else {
+                    Changed::Changed
+                };
+                self.value = value;
+                changed
             }
         };
         self.value.encode(out)?;
@@ -273,6 +279,32 @@ mod tests {
         assert_eq!(answer(&mut gain, &[1]), Err(RpcError::ArgsSize));
         assert_eq!(answer(&mut gain, &[1, 0, 0]), Err(RpcError::ArgsSize));
         assert_eq!(gain.get(), 7);
+    }
+
+    #[test]
+    fn normalized_writes_only_report_effective_changes() {
+        fn normalize(value: u16) -> Result<u16, RpcError> {
+            if value > 100 {
+                return Err(RpcError::Invalid);
+            }
+            Ok(value / 10 * 10)
+        }
+        let mut setting = Setting::new("gain", 20u16).checked(normalize);
+        assert_eq!(
+            answer(&mut setting, &29u16.to_le_bytes()),
+            Ok((Changed::Unchanged, vec![20, 0]))
+        );
+        assert_eq!(
+            answer(&mut setting, &31u16.to_le_bytes()),
+            Ok((Changed::Changed, vec![30, 0]))
+        );
+        assert_eq!(
+            answer(&mut setting, &101u16.to_le_bytes()),
+            Err(RpcError::Invalid)
+        );
+        assert_eq!(setting.get(), 30);
+        let mut flag = Setting::new("flag", true);
+        assert_eq!(answer(&mut flag, &[2]), Ok((Changed::Unchanged, vec![1])));
     }
 
     #[test]
