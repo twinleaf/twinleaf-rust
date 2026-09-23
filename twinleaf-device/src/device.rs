@@ -39,6 +39,9 @@ pub const AUTOSAVE_INTERVAL: u64 = 60_000_000_000;
 /// The level `dev.loglevel` boots at, as tl-chibi's `logThreshold` does.
 pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 
+/// Seconds `dev.autostart` waits at boot before acquiring, as tl-chibi's `TL_AUTOSTART_AFTER_SEC`.
+pub const DEFAULT_AUTOSTART: u8 = 5;
+
 /// As much flash as a stored configuration may take.
 pub const IMAGE_MAX: usize = 1024;
 
@@ -265,6 +268,8 @@ pub struct Device<S: Group> {
     privileged: bool,
     /// The password `dev.priv` takes, which is never announced or broadcast.
     password: Setting<Text<PASSWORD_MAX>>,
+    /// Seconds after boot the acquisition starts on its own, or never at zero.
+    autostart: Setting<u8>,
     settings: S,
     next_beat: u64,
     /// The nanosecond the device came up, which `dev.systime` and `dev.uptime`
@@ -300,6 +305,7 @@ impl<S: Group> Device<S> {
             public_hash: table::hash(table, false),
             privileged: false,
             password: Setting::new("dev.priv.password", Text::from(password)).persistent(),
+            autostart: Setting::new("dev.autostart", DEFAULT_AUTOSTART).persistent(),
             settings,
             next_beat: 0,
             booted_ns: now_ns,
@@ -342,6 +348,11 @@ impl<S: Group> Device<S> {
     /// The threshold `dev.loglevel` holds, for a runtime that gates its own logging on it.
     pub fn loglevel(&self) -> LogLevel {
         LogLevel::new(self.loglevel.get())
+    }
+
+    /// `dev.autostart`, for the platform's acquisition to wait out.
+    pub fn autostart(&self) -> u8 {
+        self.autostart.get()
     }
 
     /// Publish what this device's own time is now worth, for `sync.status`.
@@ -493,7 +504,8 @@ impl<S: Group> Device<S> {
                     args,
                     &mut reply,
                     &mut to(lanes),
-                ),
+                )
+                .map(drop),
                 Std::Name => read(&mut reply, args, self.identity.name.as_bytes()),
                 Std::Model => declared(&mut reply, args, self.identity.model.map(str::as_bytes)),
                 Std::Uid => declared(&mut reply, args, self.identity.uid),
@@ -540,6 +552,18 @@ impl<S: Group> Device<S> {
                 Std::RpcListInfo => table::list(table, self.privileged, args, true, &mut reply),
                 Std::RpcMatch => table::match_name(table, self.privileged, args, &mut reply),
                 Std::RpcHash => read(&mut reply, args, &self.hash().to_le_bytes()),
+                Std::Autostart => write(
+                    &mut self.settings_version,
+                    &mut self.autostart,
+                    args,
+                    &mut reply,
+                    &mut to(lanes),
+                )
+                .map(|changed| {
+                    if changed == Changed::Changed {
+                        self.dirty_since = Some(now_ns);
+                    }
+                }),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
                 Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
                 Std::Restart => {
@@ -662,7 +686,13 @@ impl<S: Group> Device<S> {
 
     /// Every persistent cell, as `dev.conf.save` hands them to the flash.
     fn save(&mut self, image: &mut Entries) -> Result<(), RpcError> {
-        let mut outcome = conf::encode([&mut self.password as &mut dyn Persisted], image);
+        let mut outcome = conf::encode(
+            [
+                &mut self.password as &mut dyn Persisted,
+                &mut self.autostart,
+            ],
+            image,
+        );
         self.settings.entries(&mut |entry| {
             let Entry::Setting(cell) = entry else {
                 return;
@@ -684,9 +714,14 @@ impl<S: Group> Device<S> {
             settings,
             settings_version,
             password,
+            autostart,
             ..
         } = self;
-        let mut outcome = conf::load([password as &mut dyn Persisted], image, |_, _| {});
+        let mut outcome = conf::load([password as &mut dyn Persisted], image, |_, _| {}).and(
+            conf::load([autostart as &mut dyn Persisted], image, |name, reply| {
+                announce(settings_version, &mut events(&mut *lanes), name, reply)
+            }),
+        );
         settings.entries(&mut |entry| {
             let Entry::Setting(cell) = entry else {
                 return;
@@ -741,6 +776,7 @@ impl<S: Group> Device<S> {
         self.booted_ns = now_ns;
         self.loglevel.reset();
         self.password.reset();
+        self.autostart.reset();
         self.privileged = false;
         self.settings_version = 0;
         self.dirty_since = None;
@@ -811,12 +847,13 @@ fn write<T: Scalar>(
     args: &[u8],
     reply: &mut Reply,
     out: &mut impl Sink,
-) -> Result<(), RpcError> {
-    match setting.rpc(args, reply)? {
+) -> Result<Changed, RpcError> {
+    let changed = setting.rpc(args, reply)?;
+    match changed {
         Changed::Unchanged => {}
         Changed::Changed => announce(version, out, setting.name(), reply),
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Count a change and announce it.
@@ -1529,6 +1566,30 @@ mod tests {
         assert_eq!(device.ask("board.secret", &[]).error(), RpcError::NotFound);
     }
 
+    /// `dev.autostart` boots at tl-chibi's five seconds, and a written value
+    /// is announced and restored at the next boot.
+    #[test]
+    fn a_written_autostart_is_announced_and_restored_at_the_next_boot() {
+        let mut device = harness();
+        assert_eq!(
+            device.ask("dev.autostart", &[]).value(),
+            [DEFAULT_AUTOSTART]
+        );
+        assert_eq!(
+            device.ask("dev.autostart", &[0]).announced(),
+            [("dev.autostart".to_owned(), vec![0])]
+        );
+        device.ask("dev.conf.save", &[]);
+        let Some((_, Deferred::Flash(FlashOp::ConfSave(image)))) = device.deferred.take() else {
+            panic!("a save carries the image");
+        };
+
+        device.device.reboot(SessionId::new(2), BOOT);
+        assert_eq!(device.device.autostart(), DEFAULT_AUTOSTART);
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert_eq!(device.device.autostart(), 0);
+    }
+
     /// The board's password is a compiled default the developer overrides,
     /// stored like any other persistent setting.
     #[test]
@@ -2102,13 +2163,14 @@ mod tests {
             names,
             [
                 &b"dev.priv.password"[..],
+                b"dev.autostart",
                 b"board.first",
                 b"board.second",
                 b"board.count"
             ],
             "every persistent cell, in table order"
         );
-        assert_eq!(stored[2].1, 42u32.to_le_bytes());
+        assert_eq!(stored[3].1, 42u32.to_le_bytes());
     }
 
     /// The boot restore: every stored value is taken, announced where every
@@ -2226,7 +2288,7 @@ mod tests {
             .map(|entry| entry.unwrap())
             .map(|entry| (entry.name, entry.value))
             .collect();
-        assert_eq!(stored[2], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
+        assert_eq!(stored[3], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
         assert!(
             device.tick(BOOT + 3 * AUTOSAVE_INTERVAL).is_none(),
             "one save, not a save every period"

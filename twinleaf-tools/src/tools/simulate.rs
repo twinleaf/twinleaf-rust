@@ -27,6 +27,7 @@ use twinleaf::proto::{BoardId, FirmwareMagic, HwRev, SessionId, StreamId};
 use twinleaf_device::data::{filter, ColumnDef, Params, Stream, StreamDef, Timeref};
 use twinleaf_device::device::{
     self, Deferred, Device, Entry, FlashOp, Group, Identity, OneLane, SyncRequest,
+    DEFAULT_AUTOSTART,
 };
 use twinleaf_device::hub::{CallError, Event, Events, Hub, Input, PortSink};
 use twinleaf_device::rpc::{
@@ -101,8 +102,6 @@ const PPS_PERIOD: u32 = 1_000_000;
 const PPS_EDGE: u32 = 0;
 /// A millisecond, which is as close as a software pulse lands.
 const PPS_TOLERANCE_NS: u32 = 1_000_000;
-/// Seconds from boot to an automatic start, as `dev.autostart` has it.
-const AUTOSTART_SECONDS: u8 = 2;
 const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
 const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
 const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
@@ -176,7 +175,6 @@ static RPCS: LazyLock<Vec<RpcSpec>> = LazyLock::new(|| {
         .iter()
         .cloned()
         .chain([
-            RpcSpec::prop("dev.autostart", Kind::Uint(1), Access::RW),
             RpcSpec::prop(
                 "test.amplitude",
                 Kind::Float(8),
@@ -208,11 +206,10 @@ struct Settings {
     noise: Setting<f64>,
     status: Setting<u8>,
     enable: Setting<bool>,
-    autostart: Setting<u8>,
 }
 
 impl Settings {
-    fn new(cli: &SimulateCli, autostart: u8) -> Self {
+    fn new(cli: &SimulateCli) -> Self {
         Self {
             amplitude: Setting::new("test.amplitude", cli.amplitude)
                 .checked(nonnegative)
@@ -225,7 +222,6 @@ impl Settings {
                 .persistent(),
             status: Setting::new("test.status", 0),
             enable: Setting::new("test.enable", true),
-            autostart: Setting::new("dev.autostart", autostart),
         }
     }
 
@@ -236,7 +232,6 @@ impl Settings {
         self.noise.reset();
         self.status.reset();
         self.enable.reset();
-        self.autostart.reset();
     }
 }
 
@@ -244,7 +239,6 @@ impl Settings {
 /// standard entries'.
 impl Group for Settings {
     fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
-        Group::entries(&mut self.autostart, visit);
         Group::entries(&mut self.amplitude, visit);
         Group::entries(&mut self.frequency, visit);
         Group::entries(&mut self.noise, visit);
@@ -622,7 +616,7 @@ impl Sim {
                 identity,
                 session,
                 &RPCS,
-                Settings::new(cli, autostart_of(role)),
+                Settings::new(cli),
                 &cli.password,
                 now,
             ),
@@ -636,7 +630,7 @@ impl Sim {
             plan: None,
             acquiring: false,
             holdover: false,
-            sync: synchronizer(role, session, &serial_of(role, port), now),
+            sync: synchronizer(session, &serial_of(role, port), now),
             rate,
             segment_seconds: cli.segment_seconds,
             started_ns: now,
@@ -696,8 +690,7 @@ impl Sim {
         if reboot {
             self.reboot(now, out);
         }
-        self.sync
-            .set_autostart_seconds(self.device.settings().autostart.get());
+        self.sync.set_autostart_seconds(self.device.autostart());
     }
 
     /// Carry out an RPC whose answer is not the control machine's, and answer
@@ -781,7 +774,7 @@ impl Sim {
         self.take_desc();
         self.streams =
             boot_streams(self.role, self.rate).expect("streams that booted once boot again");
-        self.sync = synchronizer(self.role, session, &serial, now);
+        self.sync = synchronizer(session, &serial, now);
         self.pulses = self.pulses.restarted(now);
         self.announced = None;
         self.plan = None;
@@ -1711,7 +1704,7 @@ impl Runtime {
             } else {
                 "no"
             },
-            AUTOSTART_SECONDS
+            root.device.autostart()
         );
         terminal_println!(
             "  simulated flash: dev.conf.save keeps test.amplitude, test.frequency, \
@@ -1819,7 +1812,7 @@ impl Runtime {
 
 /// A device's synchronizer: its own wall clock to start from, a simulated
 /// pulse to follow, and no oscillator to steer.
-fn synchronizer(role: Role, session: SessionId, serial: &str, now: u64) -> Synchronizer {
+fn synchronizer(session: SessionId, serial: &str, now: u64) -> Synchronizer {
     Synchronizer::new(
         CounterDomain::new(PPS_PERIOD),
         PulseConfig::with_edge_tolerance(ticks(PPS_TOLERANCE_NS, PPS_PERIOD)),
@@ -1828,7 +1821,7 @@ fn synchronizer(role: Role, session: SessionId, serial: &str, now: u64) -> Synch
             second: (now / NANOS_PER_SECOND) as u32,
         },
         None,
-        autostart_of(role),
+        DEFAULT_AUTOSTART,
     )
 }
 
@@ -1859,14 +1852,6 @@ fn serial_of(role: Role, port: u8) -> String {
         Role::Hub => HUB_SERIAL.to_string(),
         Role::Sensor if port == 0 => DEVICE_SERIAL.to_string(),
         Role::Sensor => format!("SIM{port:04}"),
-    }
-}
-
-/// Seconds from boot to an automatic start. A hub has nothing to acquire.
-fn autostart_of(role: Role) -> u8 {
-    match role {
-        Role::Hub => 0,
-        Role::Sensor => AUTOSTART_SECONDS,
     }
 }
 
@@ -2257,7 +2242,7 @@ mod tests {
     /// order its ids follow the standard entries'.
     #[test]
     fn the_table_describes_the_settings_it_answers() {
-        let mut settings = Settings::new(&cli(&[]), AUTOSTART_SECONDS);
+        let mut settings = Settings::new(&cli(&[]));
         let mut declared = Vec::new();
         settings.entries(&mut |entry| declared.push(entry.spec()));
         assert_eq!(

@@ -284,6 +284,7 @@ standard! {
     RpcListInfo "rpc.listinfo" std(Access::RW),
     RpcMatch "rpc.match" std(Access::RW),
     RpcHash "rpc.hash" prop(Kind::Uint(4), Access::READ),
+    Autostart "dev.autostart" prop(Kind::Uint(1), Access::RW.union(Access::PERSISTENT)),
     Start "dev.start" action(),
     Stop "dev.stop" action(),
     Restart "dev.restart" action(),
@@ -479,7 +480,7 @@ mod tests {
     use super::*;
 
     /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x2918_d331;
+    const HASH: u32 = 0x305f_18ad;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -549,13 +550,13 @@ mod tests {
 
     #[test]
     fn the_standard_table_order_is_pinned() {
-        assert_eq!(STANDARD.len(), 35);
+        assert_eq!(STANDARD.len(), 36);
         assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
         assert_eq!(STANDARD.last().unwrap().name, "dev.priv.password");
         assert_eq!(hash(STANDARD, true), HASH);
         assert_eq!(
             hash(STANDARD, false),
-            0xe97c_3076,
+            0x3088_a6fa,
             "the four developer entries are invisible to a customer"
         );
     }
