@@ -440,7 +440,8 @@ pub fn download_cached(
 /// device's cursor and resumes from that chunk, giving up only after three
 /// resumptions in a row that move the cursor nowhere. The function blocks for
 /// a short settle period after committing (see [`FlashEvent::Finalizing`]) so
-/// the device is not power-cycled mid-write.
+/// the device is not power-cycled mid-write. A commit reply lost to the reboot
+/// counts as sent, so the caller confirms the result with `dev.desc`.
 pub fn flash(
     device: &Device,
     firmware_data: &[u8],
@@ -509,7 +510,11 @@ pub fn flash(
     }
 
     on_event(FlashEvent::Committing);
-    device.action("dev.firmware.upgrade")?;
+    match device.action("dev.firmware.upgrade") {
+        Ok(()) | Err(CallError::DeviceDisconnected) => {}
+        Err(CallError::DeviceError(ref e)) if matches!(e.error, wire_rpc::RpcError::Undefined) => {}
+        Err(e) => return Err(e.into()),
+    }
 
     on_event(FlashEvent::Finalizing);
     std::thread::sleep(COMMIT_SETTLE_TIME);
@@ -876,6 +881,47 @@ mod tests {
         assert_eq!(acked(&events), [1, 2, 3]);
         assert_eq!(cursor, THREE_CHUNKS_DATA);
         assert!(events.contains(&FlashEvent::Complete));
+    }
+
+    /// The proxy reports a device that rebooted mid-commit as Undefined, a
+    /// direct link as a disconnect; neither is a failure, but a refusal is.
+    #[test]
+    fn a_commit_lost_to_the_reboot_is_not_a_failure() {
+        let commit = |error: RawCallError| {
+            let (device, calls, _worker) = crate::device::Device::test_pair();
+            let responder = std::thread::spawn(move || {
+                let mut error = Some(error);
+                for call in calls.iter() {
+                    let ProxyCommand::Call {
+                        request, complete, ..
+                    } = call
+                    else {
+                        panic!("flash only submits direct RPC calls");
+                    };
+                    let Payload::RpcRequest(request) = request.payload() else {
+                        panic!("expected an RPC request");
+                    };
+                    match request.method {
+                        wire_rpc::Method::ByName(b"dev.firmware.upgrade") => {
+                            complete(Err(error.take().unwrap()))
+                        }
+                        _ => complete(Ok(Vec::new())),
+                    }
+                }
+            });
+            let result = flash(&device, &image(THREE_CHUNKS), |_| {});
+            drop(device);
+            responder.join().unwrap();
+            result
+        };
+        let device = |error| RawCallError::Device {
+            error,
+            message: Vec::new(),
+        };
+
+        commit(RawCallError::DeviceDisconnected).unwrap();
+        commit(device(wire_rpc::RpcError::Undefined)).unwrap();
+        assert!(commit(device(wire_rpc::RpcError::Invalid)).is_err());
     }
 
     /// Losing chunk 1 also gets chunk 2, already in flight, rejected for its
