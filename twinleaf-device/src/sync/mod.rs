@@ -638,27 +638,45 @@ pub struct PiConfig {
 }
 
 impl PiConfig {
-    /// Critically damped type-2 loop for the SiT5356: plant 1 ppm -> 1000 ns/s,
-    /// wn = 0.1 rad/s, and the part's ±50 ppm pull range.
-    pub const SIT5356: Self = Self {
-        kp: 2.0e-4,
-        ki: 0.05,
-        interval_seconds: 1.0,
-        min_output_ppm: -50.0,
-        max_output_ppm: 50.0,
-    };
+    /// Critically damped type-2 loop at wn = 0.1 rad/s on a 1 Hz pulse, where
+    /// 1 ppm moves the phase 1000 ns/s, for an actuator pulling ±`max_pull_ppm`.
+    pub const fn within(max_pull_ppm: f32) -> Self {
+        Self {
+            kp: 2.0e-4,
+            ki: 0.05,
+            interval_seconds: 1.0,
+            min_output_ppm: -max_pull_ppm,
+            max_output_ppm: max_pull_ppm,
+        }
+    }
+}
+
+/// The operator's hold on a servo: its gains, and whether it steers or holds a pull.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tuning {
+    /// Whether the loop steers; a disabled servo holds `pull_ppm`.
+    pub enabled: bool,
+    /// Proportional gain, as [`PiConfig::kp`].
+    pub kp: f32,
+    /// Integral ratio, as [`PiConfig::ki`].
+    pub ki: f32,
+    /// The correction held while disabled, and the one an enabled loop starts from.
+    pub pull_ppm: f32,
 }
 
 /// A dedicated phase-to-frequency PI servo.
 #[derive(Debug, Clone, Copy)]
 pub struct PhaseServo {
     config: PiConfig,
+    enabled: bool,
     integral_ppm: f32,
     output_ppm: f32,
     saturated: bool,
 }
 
 impl PhaseServo {
+    /// Holds 0 ppm until [`Self::tune`] enables it.
+    ///
     /// # Panics
     ///
     /// On unusable gains, which are a board constant. The comparisons double
@@ -672,6 +690,7 @@ impl PhaseServo {
         );
         Self {
             config,
+            enabled: false,
             integral_ppm: 0.0,
             output_ppm: 0.0,
             saturated: false,
@@ -688,10 +707,28 @@ impl PhaseServo {
         self.saturated
     }
 
+    /// Takes the gains, and starts from or holds the pull unless the loop was already steering.
+    pub fn tune(&mut self, tuning: Tuning) {
+        self.config.kp = tuning.kp;
+        self.config.ki = tuning.ki;
+        match (self.enabled, tuning.enabled) {
+            (true, true) => {}
+            (true, false) | (false, true | false) => {
+                self.output_ppm = tuning
+                    .pull_ppm
+                    .max(self.config.min_output_ppm)
+                    .min(self.config.max_output_ppm);
+                self.saturated = self.output_ppm != tuning.pull_ppm;
+                self.integral_ppm = self.output_ppm;
+            }
+        }
+        self.enabled = tuning.enabled;
+    }
+
     /// Process one phase observation. A non-finite value means a missing PPS
-    /// and holds the correction unchanged.
+    /// and holds the correction unchanged, as a disabled servo does.
     pub fn observe(&mut self, phase_error_ns: f32) -> f32 {
-        if !phase_error_ns.is_finite() {
+        if !self.enabled || !phase_error_ns.is_finite() {
             return self.output_ppm;
         }
 
@@ -715,19 +752,31 @@ impl PhaseServo {
 mod discipline_tests {
     use super::*;
 
+    /// A servo steering with `config`'s gains from 0 ppm.
+    pub(super) fn steering(config: PiConfig) -> PhaseServo {
+        let mut servo = PhaseServo::new(config);
+        servo.tune(Tuning {
+            enabled: true,
+            kp: config.kp,
+            ki: config.ki,
+            pull_ppm: 0.0,
+        });
+        servo
+    }
+
     #[test]
     fn gain_form_matches_tl_control_pid() {
-        let mut servo = PhaseServo::new(PiConfig::SIT5356);
+        let mut servo = steering(PiConfig::within(50.0));
         assert!((servo.observe(1000.0) - -0.21).abs() < 1.0e-6);
         assert!((servo.observe(1000.0) - -0.22).abs() < 1.0e-6);
     }
 
     #[test]
     fn saturation_back_calculates_the_integrator() {
-        let mut servo = PhaseServo::new(PiConfig {
+        let mut servo = steering(PiConfig {
             min_output_ppm: -1.0,
             max_output_ppm: 1.0,
-            ..PiConfig::SIT5356
+            ..PiConfig::within(50.0)
         });
         assert_eq!(servo.observe(-1_000_000.0), 1.0);
         assert!(servo.saturated());
@@ -736,10 +785,49 @@ mod discipline_tests {
 
     #[test]
     fn a_missing_pulse_holds_the_frequency_estimate() {
-        let mut servo = PhaseServo::new(PiConfig::SIT5356);
+        let mut servo = steering(PiConfig::within(50.0));
         let acquired = servo.observe(-500.0);
         assert_eq!(servo.observe(f32::NAN), acquired);
         assert_eq!(servo.output_ppm(), acquired);
+    }
+
+    #[test]
+    fn an_untuned_or_disabled_servo_holds_its_pull_whatever_the_phase() {
+        let mut servo = PhaseServo::new(PiConfig::within(50.0));
+        assert_eq!(servo.observe(1000.0), 0.0);
+        let held = Tuning {
+            enabled: false,
+            kp: PiConfig::within(50.0).kp,
+            ki: PiConfig::within(50.0).ki,
+            pull_ppm: 3.0,
+        };
+        servo.tune(held);
+        assert_eq!(servo.observe(1000.0), 3.0);
+        servo.tune(Tuning {
+            pull_ppm: 80.0,
+            ..held
+        });
+        assert_eq!(servo.observe(1000.0), 50.0);
+        assert!(servo.saturated());
+    }
+
+    #[test]
+    fn enabling_starts_from_the_pull_and_retuning_keeps_the_loop_running() {
+        let mut servo = PhaseServo::new(PiConfig::within(50.0));
+        let tuning = Tuning {
+            enabled: true,
+            kp: PiConfig::within(50.0).kp,
+            ki: PiConfig::within(50.0).ki,
+            pull_ppm: 3.0,
+        };
+        servo.tune(tuning);
+        assert!((servo.observe(1000.0) - 2.79).abs() < 1.0e-5);
+        servo.tune(Tuning {
+            kp: 0.0,
+            pull_ppm: -7.0,
+            ..tuning
+        });
+        assert!((servo.observe(1000.0) - 2.99).abs() < 1.0e-5);
     }
 
     #[test]
@@ -748,7 +836,7 @@ mod discipline_tests {
         PhaseServo::new(PiConfig {
             min_output_ppm: 1.0,
             max_output_ppm: -1.0,
-            ..PiConfig::SIT5356
+            ..PiConfig::within(50.0)
         });
     }
 }
@@ -971,6 +1059,11 @@ impl Synchronizer {
         self.acquisition.set_autostart_seconds(seconds);
     }
 
+    /// Hand the operator's tuning to the servo, on a board that has one.
+    pub fn tune(&mut self, tuning: Tuning) {
+        self.servo.iter_mut().for_each(|servo| servo.tune(tuning));
+    }
+
     /// `dev.start`.
     pub fn start(&mut self) -> Result<Actions, AcquisitionError> {
         let actions = self.acquisition.request_start()?;
@@ -1150,7 +1243,7 @@ mod synchronizer_tests {
             CounterDomain::new(PERIOD),
             PulseConfig::with_edge_tolerance(100),
             local(),
-            Some(PhaseServo::new(PiConfig::SIT5356)),
+            Some(discipline_tests::steering(PiConfig::within(50.0))),
             0,
         )
     }

@@ -113,6 +113,17 @@ impl Scalar for bool {
     }
 }
 
+/// A setting check that rejects NaN as [`RpcError::Invalid`] and infinity as [`RpcError::Range`].
+pub fn finite(value: f32) -> Result<f32, RpcError> {
+    if value.is_nan() {
+        return Err(RpcError::Invalid);
+    }
+    if value.is_infinite() {
+        return Err(RpcError::Range);
+    }
+    Ok(value)
+}
+
 /// Whether a call left the setting holding a value to announce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Changed {
@@ -250,6 +261,13 @@ impl<T: Scalar> Persisted for Setting<T> {
 mod tests {
     use super::*;
     use crate::rpc::{Access, Kind, Method};
+
+    #[test]
+    fn a_value_that_is_not_a_number_is_refused() {
+        assert_eq!(finite(f32::NAN), Err(RpcError::Invalid));
+        assert_eq!(finite(f32::INFINITY), Err(RpcError::Range));
+        assert_eq!(finite(-0.5), Ok(-0.5));
+    }
 
     fn positive(value: f64) -> Result<f64, RpcError> {
         (value.is_finite() && value > 0.0)
