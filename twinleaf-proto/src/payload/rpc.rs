@@ -303,15 +303,28 @@ impl<'a> ErrorReply<'a> {
 
 /// Serialize a full error packet (header included) into `buf`; returns length.
 pub fn write_error(buf: &mut [u8], req_id: RpcRequestId, code: RpcError) -> Option<usize> {
-    let total = Header::SIZE + 4;
-    if buf.len() < total {
+    write_error_with(buf, req_id, code, &[])
+}
+
+/// Serialize an error packet carrying `message` after its code; returns length.
+/// Returns None if `buf` is too small, or the message past what a packet carries.
+pub fn write_error_with(
+    buf: &mut [u8],
+    req_id: RpcRequestId,
+    code: RpcError,
+    message: &[u8],
+) -> Option<usize> {
+    let payload_len = 4 + message.len();
+    let total = Header::SIZE + payload_len;
+    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
-    let hdr = Header::new(PacketType::RPC_ERROR, 4);
+    let hdr = Header::new(PacketType::RPC_ERROR, payload_len as u16);
     hdr.write((&mut buf[..Header::SIZE]).try_into().unwrap());
     let out = &mut buf[Header::SIZE..total];
     out[0..2].copy_from_slice(&req_id.to_le_bytes());
     out[2..4].copy_from_slice(&code.value().to_le_bytes());
+    out[4..].copy_from_slice(message);
     Some(total)
 }
 
@@ -709,6 +722,8 @@ mod tests {
         assert_eq!(&buf[..n], &[3, 0, 4, 0, 0x34, 0x12, b'o', b'k']);
         let n = write_error(&mut buf, RpcRequestId::new(1), RpcError::NotFound).unwrap();
         assert_eq!(&buf[..n], &[4, 0, 4, 0, 1, 0, 2, 0]);
+        let n = write_error_with(&mut buf, RpcRequestId::new(1), RpcError::Range, b"no").unwrap();
+        assert_eq!(&buf[..n], &[4, 0, 6, 0, 1, 0, 17, 0, b'n', b'o']);
     }
 
     /// The request layout on the wire: header, id, `BY_NAME | len`, the

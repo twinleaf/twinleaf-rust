@@ -414,14 +414,24 @@ impl<S: Group> Device<S> {
         match input {
             Input::Loaded(pending, image) => {
                 let outcome = image.and_then(|image| self.restore(image, lanes));
+                let repaired = self.settings.repair(&mut Announcer {
+                    version: &mut self.settings_version,
+                    dirty: &mut false,
+                    events: &mut events(&mut *lanes),
+                });
                 self.settings.publish();
-                actions.log = Some(match outcome {
-                    Ok(()) => (LogLevel::INFO, "restored the saved configuration"),
-                    Err(RpcError::State) => (
+                actions.log = Some(match (outcome, repaired) {
+                    (Ok(()), Err(Refusal { why: "", .. })) => (
+                        LogLevel::WARNING,
+                        "a saved group broke its rule and is back at its defaults",
+                    ),
+                    (Ok(()), Err(Refusal { why, .. })) => (LogLevel::WARNING, why),
+                    (Ok(()), Ok(())) => (LogLevel::INFO, "restored the saved configuration"),
+                    (Err(RpcError::State), _) => (
                         LogLevel::INFO,
                         "no saved configuration; using compiled defaults",
                     ),
-                    Err(_) => (
+                    (Err(_), _) => (
                         LogLevel::WARNING,
                         "some saved settings could not be restored",
                     ),
@@ -479,7 +489,7 @@ impl<S: Group> Device<S> {
         let since_boot_ns = now_ns.saturating_sub(self.booted_ns);
         let hw_rev = self.identity.hw_rev.map(u16::to_le_bytes);
         let mut reply = Reply::new();
-        let result = match Std::at(index) {
+        let result: Result<(), Refusal> = match Std::at(index) {
             None => match self.entry(index - STANDARD.len(), args, now_ns, &mut reply, lanes) {
                 Some(result) => result,
                 None => return actions.call = Some((pending, spec.name, args)),
@@ -588,7 +598,8 @@ impl<S: Group> Device<S> {
                     Ok(Changed::Unchanged) => Ok(()),
                     Err(error) => Err(error),
                 },
-            },
+            }
+            .map_err(Refusal::from),
         };
         answer(pending, result.map(|()| reply.as_slice()), &mut to(lanes));
     }
@@ -622,6 +633,7 @@ impl<S: Group> Device<S> {
 
     /// Answer the board's own entry at `position`, announcing a write to the
     /// asking port ahead of its reply. `None` is a position it does not reach.
+    /// A write the group's rule refuses is taken back before anyone sees it.
     fn entry(
         &mut self,
         position: usize,
@@ -629,59 +641,66 @@ impl<S: Group> Device<S> {
         now_ns: u64,
         out: &mut Reply,
         lanes: &mut (impl Lanes + ?Sized),
-    ) -> Option<Result<(), RpcError>> {
+    ) -> Option<Result<(), Refusal>> {
         let Self {
             settings,
             settings_version,
             ..
         } = self;
-        let mut seen = 0;
+        let mut before = Reply::new();
         let mut found = None;
+        let mut wrote = None;
         let mut moved = false;
         let mut dirty = false;
-        settings.entries(&mut |entry| {
-            let at = seen;
-            seen += 1;
-            if at != position {
-                return;
+        nth(settings, position, &mut |entry| match entry {
+            Entry::Setting(cell) => {
+                found = Some(
+                    cell.save(&mut before)
+                        .and_then(|()| cell.rpc(args, out))
+                        .map(|changed| {
+                            if changed == Changed::Changed {
+                                wrote = Some((cell.name(), cell.spec().access));
+                            }
+                        }),
+                );
             }
-            match entry {
-                Entry::Setting(cell) => {
-                    found = Some(match cell.rpc(args, out) {
-                        Ok(Changed::Changed) => {
-                            moved = true;
-                            dirty |= cell.spec().access.contains(Access::PERSISTENT);
-                            announce(settings_version, &mut to(&mut *lanes), cell.name(), out);
-                            Ok(())
-                        }
-                        Ok(Changed::Unchanged) => Ok(()),
-                        Err(error) => Err(error),
-                    });
-                }
-                Entry::Reading(reading) => {
-                    found = Some(match args {
-                        [] => reading.read(out),
-                        _ => Err(RpcError::ReadOnly),
-                    });
-                }
-                Entry::Action(action) => {
-                    moved = true;
-                    let mut lane = events(&mut *lanes);
-                    found = Some(action.run(&mut Announcer {
-                        version: settings_version,
-                        dirty: &mut dirty,
-                        events: &mut lane,
-                    }));
-                }
+            Entry::Reading(reading) => {
+                found = Some(match args {
+                    [] => reading.read(out),
+                    _ => Err(RpcError::ReadOnly),
+                });
+            }
+            Entry::Action(action) => {
+                moved = true;
+                let mut lane = events(&mut *lanes);
+                found = Some(action.run(&mut Announcer {
+                    version: settings_version,
+                    dirty: &mut dirty,
+                    events: &mut lane,
+                }));
             }
         });
+        if let Some((name, access)) = wrote {
+            if let Err(refusal) = settings.check() {
+                let mut restored = Ok(Changed::Unchanged);
+                nth(settings, position, &mut |entry| {
+                    if let Entry::Setting(cell) = entry {
+                        restored = cell.load(&before, &mut Reply::new());
+                    }
+                });
+                return Some(restored.map_err(Refusal::from).and(Err(refusal)));
+            }
+            moved = true;
+            dirty |= access.contains(Access::PERSISTENT);
+            announce(settings_version, &mut to(&mut *lanes), name, out);
+        }
         if moved {
             settings.publish();
         }
         if dirty {
             self.dirty_since = Some(now_ns);
         }
-        found
+        found.map(|result| result.map_err(Refusal::from))
     }
 
     /// Every persistent cell, as `dev.conf.save` hands them to the flash.
@@ -823,15 +842,26 @@ impl<S: Group> Device<S> {
 }
 
 /// Answer a request where the request that asked says.
-pub fn answer(pending: Pending<'_>, result: Result<&[u8], RpcError>, to: &mut impl Sink) {
-    match result {
+pub fn answer(pending: Pending<'_>, result: Result<&[u8], impl Into<Refusal>>, to: &mut impl Sink) {
+    match result.map_err(Into::into) {
         Ok(value) => send(to, pending.routing, |buf| {
             rpc::write_reply(buf, pending.id, value)
         }),
-        Err(error) => send(to, pending.routing, |buf| {
-            rpc::write_error(buf, pending.id, error)
+        Err(Refusal { error, why }) => send(to, pending.routing, |buf| {
+            rpc::write_error_with(buf, pending.id, error, why.as_bytes())
         }),
     }
+}
+
+/// Visit the entry at `position` in `group`'s table order, if it reaches that far.
+fn nth(group: &mut (impl Group + ?Sized), position: usize, visit: &mut dyn FnMut(Entry<'_>)) {
+    let mut seen = 0;
+    group.entries(&mut |entry| {
+        if seen == position {
+            visit(entry);
+        }
+        seen += 1;
+    });
 }
 
 /// A read-only property a platform may not have.
@@ -900,6 +930,41 @@ pub trait Group {
 
     /// Hand every task that reads one of these what they now say.
     fn publish(&self) {}
+
+    /// Refuse a combination of these settings no hardware can run, naming what limits it.
+    fn check(&self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
+    /// Put a group whose restored settings its rule refuses back at its defaults.
+    /// A group of groups repairs each child, so one broken rule resets only its own.
+    fn repair(&mut self, to: &mut Announcer<'_>) -> Result<(), Refusal> {
+        let refused = self.check();
+        let mut reset = Ok(());
+        if refused.is_err() {
+            self.entries(&mut |entry| {
+                if let Entry::Setting(cell) = entry {
+                    reset = reset.and(to.reset(cell));
+                }
+            });
+        }
+        refused.and(reset.map_err(Refusal::from))
+    }
+}
+
+/// Why a write was refused, as its error reply carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The code a host matches on.
+    pub error: RpcError,
+    /// The reason a host shows beside it, naming the setting that limits it.
+    pub why: &'static str,
+}
+
+impl From<RpcError> for Refusal {
+    fn from(error: RpcError) -> Self {
+        Self { error, why: "" }
+    }
 }
 
 /// A device that adds nothing to the standard table and the streams'.
@@ -943,6 +1008,9 @@ pub trait Cell: Persisted {
 
     /// Answer its RPC into `out`, saying whether the value moved.
     fn rpc(&mut self, args: &[u8], out: &mut Reply) -> Result<Changed, RpcError>;
+
+    /// Go back to its compiled default, encoding it into `out`.
+    fn reset(&mut self, out: &mut Reply) -> Result<Changed, RpcError>;
 }
 
 impl<T: Scalar> Cell for Setting<T> {
@@ -952,6 +1020,16 @@ impl<T: Scalar> Cell for Setting<T> {
 
     fn rpc(&mut self, args: &[u8], out: &mut Reply) -> Result<Changed, RpcError> {
         Setting::rpc(self, args, out)
+    }
+
+    fn reset(&mut self, out: &mut Reply) -> Result<Changed, RpcError> {
+        let before = self.get();
+        Setting::reset(self);
+        self.get().encode(out)?;
+        Ok(match before == self.get() {
+            true => Changed::Unchanged,
+            false => Changed::Changed,
+        })
     }
 }
 
@@ -991,6 +1069,16 @@ impl Announcer<'_> {
         if setting.rpc(&args, &mut announced)? == Changed::Changed {
             *self.dirty |= Setting::spec(setting).access.contains(Access::PERSISTENT);
             announce(self.version, &mut self.events, setting.name(), &announced);
+        }
+        Ok(())
+    }
+
+    /// Put a cell back at its compiled default, announcing it if it moved.
+    pub fn reset(&mut self, cell: &mut dyn Cell) -> Result<(), RpcError> {
+        let mut announced = Reply::new();
+        if cell.reset(&mut announced)? == Changed::Changed {
+            *self.dirty |= cell.spec().access.contains(Access::PERSISTENT);
+            announce(self.version, &mut self.events, cell.name(), &announced);
         }
         Ok(())
     }
@@ -1036,6 +1124,16 @@ mod tests {
             visit(Entry::Setting(&mut self.value));
             visit(Entry::Reading(&Doubled(self.value.get())));
             visit(Entry::Action(&mut Rewind(self)));
+        }
+
+        fn check(&self) -> Result<(), Refusal> {
+            match self.value.get() {
+                0..=100 => Ok(()),
+                _ => Err(Refusal {
+                    error: RpcError::Range,
+                    why: "board.count is at most 100",
+                }),
+            }
         }
     }
 
@@ -1100,6 +1198,14 @@ mod tests {
 
         fn publish(&self) {
             self.published.set(self.published.get() + 1);
+        }
+
+        fn check(&self) -> Result<(), Refusal> {
+            self.counter.check()
+        }
+
+        fn repair(&mut self, to: &mut Announcer<'_>) -> Result<(), Refusal> {
+            self.counter.repair(to)
         }
     }
 
@@ -2026,6 +2132,26 @@ mod tests {
         assert_eq!(device.ask("board.count", &[]).value(), &0u32.to_le_bytes());
     }
 
+    /// A write the group's rule refuses is taken back unannounced, and its
+    /// error reply carries the reason after the code.
+    #[test]
+    fn a_refused_write_is_taken_back_and_says_why() {
+        let mut device = harness();
+        let refused = device.ask("board.count", &101u32.to_le_bytes());
+        let header = Header::parse_prefix(&refused.0[0]).unwrap();
+        let Some(Answer::Error(error)) =
+            Answer::parse(header.ptype, &refused.0[0][header.payload_range()])
+        else {
+            panic!("an error, not a reply");
+        };
+        assert_eq!(error.error(), RpcError::Range);
+        assert_eq!(error.message, b"board.count is at most 100");
+        assert_eq!(refused.announced(), []);
+        assert_eq!(device.device.settings().published.get(), 0);
+        assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+        assert_eq!(device.ask("board.count", &[]).value(), &5u32.to_le_bytes());
+    }
+
     /// A move is published to the tasks that read it, and a read is not.
     #[test]
     fn a_move_publishes_the_group_and_a_read_does_not() {
@@ -2200,6 +2326,36 @@ mod tests {
             device.ask("board.second", &[]).value(),
             &42u32.to_le_bytes()
         );
+    }
+
+    /// A stored image the rule refuses puts back only the group that broke
+    /// it, so a setting stored beside it survives.
+    #[test]
+    fn a_restore_the_rule_refuses_resets_only_the_group_that_broke_it() {
+        let mut device = harness();
+        let mut image = Entries::new();
+        let mut second = Setting::new("board.second", 42u32).persistent();
+        let mut count = Setting::new("board.count", 500u32).persistent();
+        conf::encode([&mut second as &mut dyn Persisted, &mut count], &mut image).unwrap();
+
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert_eq!(
+            device.lanes.events.announced(),
+            [
+                ("board.second".to_owned(), 42u32.to_le_bytes().to_vec()),
+                ("board.count".to_owned(), 500u32.to_le_bytes().to_vec()),
+                ("board.count".to_owned(), 5u32.to_le_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(
+            device.logged,
+            [(LogLevel::WARNING, "board.count is at most 100")]
+        );
+        assert_eq!(
+            device.ask("board.second", &[]).value(),
+            &42u32.to_le_bytes()
+        );
+        assert_eq!(device.ask("board.count", &[]).value(), &5u32.to_le_bytes());
     }
 
     /// A blank device owes its tasks the compiled defaults just the same.
