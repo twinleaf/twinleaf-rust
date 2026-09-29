@@ -4,8 +4,7 @@ use crate::proto::RouteError;
 use crate::tio::proxy;
 
 /// A device's refusal, owned so a client can carry it out of the receive loop.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{error}")]
+#[derive(Debug, Clone)]
 pub struct RpcErrorPayload {
     /// The code.
     pub error: wire::RpcError,
@@ -22,6 +21,19 @@ impl RpcErrorPayload {
         }
     }
 }
+
+/// The code, then the device's reason when it sent one as text.
+impl std::fmt::Display for RpcErrorPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match std::str::from_utf8(&self.extra) {
+            Ok("") => write!(f, "{}", self.error),
+            Ok(why) => write!(f, "{}: {why}", self.error),
+            Err(_) => write!(f, "{}", self.error),
+        }
+    }
+}
+
+impl std::error::Error for RpcErrorPayload {}
 
 /// Why one RPC call did not produce a value: it was never submitted, no reply
 /// came back, the device refused, or the reply did not decode.
@@ -63,5 +75,29 @@ impl From<proxy::RawCallError> for CallError {
                 extra: message,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reason the device sent follows its code, and bytes that are not text do not.
+    #[test]
+    fn a_refusal_shows_the_reason_the_device_sent() {
+        let shown = |extra: &[u8]| {
+            RpcErrorPayload {
+                error: wire::RpcError::Range,
+                extra: extra.to_vec(),
+            }
+            .to_string()
+        };
+        let code = wire::RpcError::Range.to_string();
+        assert_eq!(shown(b""), code);
+        assert_eq!(
+            shown(b"board.count is at most 100"),
+            format!("{code}: board.count is at most 100")
+        );
+        assert_eq!(shown(&[0xff]), code);
     }
 }
