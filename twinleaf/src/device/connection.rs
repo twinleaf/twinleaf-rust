@@ -523,7 +523,8 @@ impl DeviceTree {
     ///
     /// # Errors
     ///
-    /// Returns [`RpcRegistryError::DeviceRpcError`] if a call fails.
+    /// Returns [`RpcRegistryError::DeviceRpcError`] if a call fails, and
+    /// [`RpcRegistryError::TableChanged`] if the table changed during every walk.
     pub fn rpc_registry(&self, route: DeviceRoute) -> Result<RpcRegistry, RpcRegistryError> {
         RpcRegistry::load_with(|name, arg| self.submit(route, name, arg))
     }

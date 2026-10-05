@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 /// The most `rpc.listinfo` calls in flight at once during a walk.
 const WALK_WINDOW: usize = 8;
 
+/// The most walks one load makes of a table that keeps changing.
+const WALK_ATTEMPTS: usize = 3;
+
 /// The counter a device raises on every setting change. Firmware older than
 /// setting announcements lacks it.
 pub(super) const SETTINGS_VERSION: &str = "settings.version";
@@ -21,6 +24,10 @@ pub enum RpcRegistryError {
     /// A call during the walk failed.
     #[error("RPC error: {0}")]
     DeviceRpcError(#[from] CallError),
+    /// `rpc.hash` changed during every walk, as `dev.priv` and `dev.priv.lock`
+    /// change it. Loading again once it settles succeeds.
+    #[error("the RPC table changed during the walk")]
+    TableChanged,
 }
 
 /// One RPC a device offers.
@@ -70,8 +77,10 @@ impl RpcRegistry {
     /// Loads one device's RPC table through `submit`.
     ///
     /// Reads `dev.name`, `rpc.hash`, and `settings.version` first. On a cache
-    /// miss it walks `rpc.listinfo` with [`WALK_WINDOW`] calls in flight and
-    /// caches the result.
+    /// miss it walks `rpc.listinfo` with [`WALK_WINDOW`] calls in flight. A
+    /// walk counts only when `rpc.hash` reads the same after it, and only
+    /// then is it cached. Otherwise the table is walked again under the new
+    /// hash, up to [`WALK_ATTEMPTS`] times.
     pub(crate) fn load_with(
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<Self, RpcRegistryError> {
@@ -79,21 +88,31 @@ impl RpcRegistry {
         let hash_reply = submit("rpc.hash", &[]);
         let version_reply = submit(SETTINGS_VERSION, &[]);
         let dev_name: String = decode(name_reply.wait()?)?;
-        let hash: u32 = decode(hash_reply.wait()?)?;
+        let mut hash: u32 = decode(hash_reply.wait()?)?;
         let version = settings_version(version_reply.wait())?;
-        let path = cache::path(&dev_name, hash);
-        if let Some(entries) = path.as_deref().and_then(cache::load) {
-            return Ok(Self::from_entries(entries, hash, version));
+        for _ in 0..WALK_ATTEMPTS {
+            let path = cache::path(&dev_name, hash);
+            if let Some(entries) = path.as_deref().and_then(cache::load) {
+                return Ok(Self::from_entries(entries, hash, version));
+            }
+            let total: u16 = decode(submit("rpc.listinfo", &[]).wait()?)?;
+            let descriptors = (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
+            let entries = pipelined(descriptors, WALK_WINDOW)
+                .map(|reply| decode::<(u16, String)>(reply?).map(|(meta, name)| (name, meta)))
+                .collect::<Result<cache::Entries, _>>()?;
+            // Locking or unlocking the device mid-walk (`dev.priv`,
+            // `dev.priv.lock`) answers part of one table and part of the
+            // other, which belongs under neither hash.
+            let after: u32 = decode(submit("rpc.hash", &[]).wait()?)?;
+            if after == hash {
+                if let Some(path) = &path {
+                    cache::store(path, &entries);
+                }
+                return Ok(Self::from_entries(entries, hash, version));
+            }
+            hash = after;
         }
-        let total: u16 = decode(submit("rpc.listinfo", &[]).wait()?)?;
-        let descriptors = (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
-        let entries = pipelined(descriptors, WALK_WINDOW)
-            .map(|reply| decode::<(u16, String)>(reply?).map(|(meta, name)| (name, meta)))
-            .collect::<Result<cache::Entries, _>>()?;
-        if let Some(path) = &path {
-            cache::store(path, &entries);
-        }
-        Ok(Self::from_entries(entries, hash, version))
+        Err(RpcRegistryError::TableChanged)
     }
 
     fn from_entries(entries: cache::Entries, hash: u32, settings_version: Option<u32>) -> Self {
@@ -190,6 +209,57 @@ mod tests {
             error,
             RpcRegistryError::DeviceRpcError(CallError::ResponseLost)
         ));
+    }
+
+    /// `dev.priv` mid-walk: the descriptors came partly from each table, so
+    /// the walk is neither cached nor returned, and the new table is walked.
+    #[test]
+    fn a_hash_that_moves_during_the_walk_walks_the_new_table() {
+        let (before, after) = (0x0bad_c0deu32, 0x0bad_c0dfu32);
+        let (asked, error) = walk_recording(vec![
+            b"test-device".to_vec(),
+            before.to_le_bytes().to_vec(),
+            7u32.to_le_bytes().to_vec(),
+            1u16.to_le_bytes().to_vec(),
+            descriptor("dev.name"),
+            after.to_le_bytes().to_vec(),
+        ]);
+
+        assert_eq!(
+            asked,
+            [
+                ("dev.name".to_string(), Vec::new()),
+                ("rpc.hash".to_string(), Vec::new()),
+                (SETTINGS_VERSION.to_string(), Vec::new()),
+                ("rpc.listinfo".to_string(), Vec::new()),
+                ("rpc.listinfo".to_string(), vec![0, 0]),
+                ("rpc.hash".to_string(), Vec::new()),
+                ("rpc.listinfo".to_string(), Vec::new()),
+            ]
+        );
+        assert!(matches!(
+            error,
+            RpcRegistryError::DeviceRpcError(CallError::ResponseLost)
+        ));
+        let stale = cache::path("test-device", before).expect("a cache directory");
+        assert!(!stale.exists(), "the mixed walk was cached");
+    }
+
+    #[test]
+    fn a_hash_that_never_settles_fails_the_load() {
+        let mut replies = vec![
+            b"test-device".to_vec(),
+            0x0bad_d00du32.to_le_bytes().to_vec(),
+            7u32.to_le_bytes().to_vec(),
+        ];
+        for attempt in 1..=WALK_ATTEMPTS as u32 {
+            replies.push(0u16.to_le_bytes().to_vec());
+            replies.push((0x0bad_d00d + attempt).to_le_bytes().to_vec());
+        }
+        let (asked, error) = walk_recording(replies);
+
+        assert_eq!(asked.len(), 3 + 2 * WALK_ATTEMPTS);
+        assert!(matches!(error, RpcRegistryError::TableChanged));
     }
 
     #[test]
