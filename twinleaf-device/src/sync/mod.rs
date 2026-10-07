@@ -36,6 +36,10 @@ const REFERENCE_WINDOW_NS: u64 = 900_000_000;
 /// The pad byte counts seconds modulo 64.
 const SEQUENCE_MASK: u8 = 0x3f;
 
+/// Seconds a child that lost its qualified train refuses a free-running
+/// upstream, its packets and the pulses they come with, before following it.
+const HOLDOVER_TIMEOUT: u8 = 60;
+
 /// Work for the runtime after one [`Synchronizer`] call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Actions {
@@ -972,6 +976,17 @@ impl Synchronizer {
     /// counted; a sequence that skipped is a divergence, and discards whatever
     /// the source had qualified so far.
     pub fn observe_packet(&mut self, timeref: Timeref<'_>, pad: u8, arrival_ns: u64) {
+        let status = TimeStatus::from_pad(pad);
+        let holding = match self.pulses.state() {
+            PulseState::Holdover { missed_pulses } => {
+                self.qualified_once && missed_pulses < HOLDOVER_TIMEOUT
+            }
+            PulseState::FreeRunning | PulseState::Acquiring { .. } | PulseState::Locked => false,
+        };
+        if holding && status == TimeStatus::FreeRun {
+            self.pulses.discard_tentative();
+            return;
+        }
         let in_window = self
             .last_second_ns
             .is_some_and(|last| arrival_ns.saturating_sub(last) < REFERENCE_WINDOW_NS);
@@ -980,7 +995,6 @@ impl Synchronizer {
             return;
         }
         let identity = ReferenceIdentity::new(timeref.epoch, timeref.session, timeref.serial);
-        let status = TimeStatus::from_pad(pad);
         if !self.sequenced(identity, status, pad & SEQUENCE_MASK) {
             return;
         }
@@ -1893,6 +1907,143 @@ mod synchronizer_tests {
         assert_eq!(child_of(TimeStatus::FreeRun), TimeStatus::FreeRun);
         assert_eq!(child_of(TimeStatus::Holdover), TimeStatus::Holdover);
         assert_eq!(child_of(TimeStatus::Locked), TimeStatus::Locked);
+    }
+
+    /// Every poll a runtime makes up to `until`, each as its deadline comes due.
+    fn wake_until(sync: &mut Synchronizer, until: u64) -> Vec<Actions> {
+        core::iter::from_fn(|| {
+            sync.next_poll_deadline_ns()
+                .filter(|&deadline| deadline <= until)
+                .map(|deadline| sync.poll(deadline))
+        })
+        .collect()
+    }
+
+    /// A child acquiring from a locked parent that reboots at second 12: three
+    /// silent seconds, `free_run` at another phase whose last two already
+    /// announce its lock, then its pulses at `returned`. Returns the child and
+    /// each acquisition action it took from the reboot on, by second and the
+    /// status its parent sent then.
+    fn parent_reboot(
+        free_run: u32,
+        returned: u32,
+    ) -> (
+        Synchronizer,
+        Vec<(u32, Option<TimeStatus>, AcquisitionAction)>,
+    ) {
+        let booted = |time| Timeref {
+            epoch: Epoch::SYSTIME,
+            session: SessionId::new(100),
+            ..packet(time)
+        };
+        let relocked = |time| Timeref {
+            session: SessionId::new(100),
+            ..packet(time)
+        };
+        let booting = |time| match time + 2 < free_run {
+            true => TimeStatus::FreeRun,
+            false => TimeStatus::Locked,
+        };
+        let schedule = (0..12)
+            .map(|time| Some((EDGE, packet(500 + time), TimeStatus::Locked)))
+            .chain((0..3).map(|_| None))
+            .chain((0..free_run).map(|time| Some((PERIOD * 2 / 5, booted(time), booting(time)))))
+            .chain(
+                (0..20).map(|time| {
+                    Some((returned, relocked(1_700_000_000 + time), TimeStatus::Locked))
+                }),
+            );
+
+        let mut sync = plain();
+        sync.start().unwrap();
+        let mut plan = 0;
+        let mut taken = Vec::new();
+        for (second, sent) in (0u32..).zip(schedule) {
+            let now = second as u64 * NANOS_PER_SECOND;
+            let mut actions = Vec::new();
+            if let Some((edge, timeref, status)) = sent {
+                let at = now + edge as u64 * 1_000;
+                actions.extend(wake_until(&mut sync, at));
+                actions.push(sync.capture(edge, at));
+                actions.extend(wake_until(&mut sync, at + 1_000_000));
+                sync.observe_packet(timeref, pad(second as u8, status), at + 1_000_000);
+            }
+            actions.extend(wake_until(&mut sync, now + NANOS_PER_SECOND - 1));
+            for action in actions.into_iter().map(|actions| actions.local) {
+                match action {
+                    AcquisitionAction::None => continue,
+                    AcquisitionAction::Arm(staged) | AcquisitionAction::Rearm(staged) => {
+                        plan = staged.id
+                    }
+                    AcquisitionAction::Start(_) => sync.mark_running(plan).unwrap(),
+                    AcquisitionAction::Stop => sync.finish_stop().unwrap(),
+                    AcquisitionAction::Disarm | AcquisitionAction::Relabel { .. } => {}
+                }
+                if second >= 12 {
+                    taken.push((second, sent.map(|(_, _, status)| status), action));
+                }
+            }
+        }
+        assert_eq!(sync.status().acquisition, AcquisitionState::Running);
+        (sync, taken)
+    }
+
+    /// A free-running parent is held over, and its pulses returning within
+    /// tolerance resume the old anchor, so the segment only takes the new label.
+    #[test]
+    fn a_child_holds_over_a_rebooting_parent_and_resumes_its_returning_pulses() {
+        let (sync, taken) = parent_reboot(6, EDGE + 40);
+        assert!(
+            matches!(
+                taken[..],
+                [] | [(
+                    _,
+                    Some(TimeStatus::Locked),
+                    AcquisitionAction::Relabel { .. }
+                )]
+            ),
+            "{taken:?}"
+        );
+        let status = sync.status();
+        assert_eq!(status.counter_edge, Some(EDGE));
+        assert_eq!(status.generation, 1);
+        assert_eq!(status.active.identity.session, SessionId::new(100));
+        assert_eq!(status.announced, TimeStatus::Locked);
+    }
+
+    /// Pulses returning outside tolerance are a real discontinuity, followed
+    /// once the parent is locked again.
+    #[test]
+    fn a_child_restarts_once_on_a_relocked_parents_moved_pulses() {
+        let (sync, taken) = parent_reboot(6, EDGE + 300);
+        let restarts: Vec<_> = taken
+            .iter()
+            .filter(|(_, _, action)| *action == AcquisitionAction::Stop)
+            .collect();
+        assert!(
+            matches!(restarts[..], [(second, Some(TimeStatus::Locked), _)] if *second >= 21),
+            "{taken:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(EDGE + 300));
+        assert_eq!(sync.status().generation, 2);
+    }
+
+    /// A parent that stays free-running is followed once the holdover times out.
+    #[test]
+    fn a_child_follows_a_parent_free_running_past_the_holdover_timeout() {
+        let (sync, taken) = parent_reboot(90, PERIOD * 2 / 5);
+        let restarts: Vec<_> = taken
+            .iter()
+            .filter(|(_, _, action)| *action == AcquisitionAction::Stop)
+            .collect();
+        assert!(
+            matches!(
+                restarts[..],
+                [(second, Some(TimeStatus::FreeRun), _)] if *second > 11 + HOLDOVER_TIMEOUT as u32
+            ),
+            "{taken:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(PERIOD * 2 / 5));
     }
 
     /// A GPS label names the PPS edge after it, whatever phase the free-running timebase booted at.

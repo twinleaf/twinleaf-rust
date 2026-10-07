@@ -436,6 +436,11 @@ impl PulseTracker {
         self.main.phase_error = 0;
     }
 
+    /// Forget the alternate train, so a switchover qualifies only on pulses after this.
+    pub(crate) fn discard_tentative(&mut self) {
+        self.tentative = Train::new();
+    }
+
     /// Clamp a timestamp that went backwards, so a stalled or re-based clock
     /// source makes the affected pulse look like a spur instead of corrupting
     /// the second count.
