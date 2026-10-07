@@ -989,9 +989,12 @@ impl Synchronizer {
     }
 
     /// Observe a second from the device's own receiver rather than a packet,
-    /// labelling the second just closed as [`Self::observe_packet`] does.
+    /// labelling the locked pulse just closed; before a lock it discards what was qualified.
     pub fn observe_local(&mut self, second: u32, epoch: Epoch) {
-        self.references.observe_local(second, epoch);
+        match self.pulses.state().is_locked() {
+            true => self.references.observe_local(second, epoch),
+            false => self.references.discard_candidate(),
+        }
     }
 
     /// Capture an electrical PPS rising edge.
@@ -1884,6 +1887,41 @@ mod synchronizer_tests {
         assert_eq!(child_of(TimeStatus::FreeRun), TimeStatus::FreeRun);
         assert_eq!(child_of(TimeStatus::Holdover), TimeStatus::Holdover);
         assert_eq!(child_of(TimeStatus::Locked), TimeStatus::Locked);
+    }
+
+    /// A GPS label names the PPS edge after it, whatever phase the free-running timebase booted at.
+    #[test]
+    fn a_gps_second_is_adopted_on_the_edge_it_names_from_any_boot_phase() {
+        const UNIX: u32 = 1_700_000_000;
+        const LABEL_LATENCY_NS: u64 = 300_000_000;
+        const STEP_NS: u64 = 10_000_000;
+
+        fn first_wrong_adoption(boot_ns: u64) -> Option<(u64, i64)> {
+            let mut sync = synchronizer();
+            sync.wake(EDGE + (boot_ns / 1_000) as u32, boot_ns);
+            (boot_ns / STEP_NS + 1..40 * NANOS_PER_SECOND / STEP_NS)
+                .map(|step| step * STEP_NS)
+                .find_map(|now| {
+                    sync.poll(now);
+                    let (second, phase) = (now / NANOS_PER_SECOND, now % NANOS_PER_SECOND);
+                    match phase {
+                        0 => drop(sync.capture(EDGE, now)),
+                        LABEL_LATENCY_NS => sync.observe_local(UNIX + second as u32, Epoch::UNIX),
+                        _ => {}
+                    }
+                    let status = sync.status();
+                    (phase == 0 && status.reference == ReferenceState::Upstream)
+                        .then(|| status.active.second as i64 - (UNIX as u64 + second) as i64)
+                        .filter(|&error| error != 0)
+                        .map(|error| (second, error))
+                })
+        }
+
+        let wrong: Vec<(u64, (u64, i64))> = (1..10u64)
+            .map(|tenth| tenth * 100_000_000)
+            .filter_map(|boot_ns| first_wrong_adoption(boot_ns).map(|wrong| (boot_ns, wrong)))
+            .collect();
+        assert!(wrong.is_empty(), "boot ns -> (second, error s): {wrong:?}");
     }
 
     /// D6: a GPS second qualifies like a packet, and its pad byte then carries
