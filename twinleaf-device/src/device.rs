@@ -709,6 +709,7 @@ impl<S: Group> Device<S> {
             [
                 &mut self.password as &mut dyn Persisted,
                 &mut self.autostart,
+                &mut self.loglevel,
             ],
             image,
         );
@@ -734,13 +735,15 @@ impl<S: Group> Device<S> {
             settings_version,
             password,
             autostart,
+            loglevel,
             ..
         } = self;
-        let mut outcome = conf::load([password as &mut dyn Persisted], image, |_, _| {}).and(
-            conf::load([autostart as &mut dyn Persisted], image, |name, reply| {
-                announce(settings_version, &mut events(&mut *lanes), name, reply)
-            }),
-        );
+        let mut outcome =
+            conf::load([password as &mut dyn Persisted], image, |_, _| {}).and(conf::load(
+                [autostart as &mut dyn Persisted, loglevel],
+                image,
+                |name, reply| announce(settings_version, &mut events(&mut *lanes), name, reply),
+            ));
         settings.entries(&mut |entry| {
             let Entry::Setting(cell) = entry else {
                 return;
@@ -2290,13 +2293,14 @@ mod tests {
             [
                 &b"dev.priv.password"[..],
                 b"dev.autostart",
+                b"dev.loglevel",
                 b"board.first",
                 b"board.second",
                 b"board.count"
             ],
             "every persistent cell, in table order"
         );
-        assert_eq!(stored[3].1, 42u32.to_le_bytes());
+        assert_eq!(stored[4].1, 42u32.to_le_bytes());
     }
 
     /// The boot restore: every stored value is taken, announced where every
@@ -2444,7 +2448,7 @@ mod tests {
             .map(|entry| entry.unwrap())
             .map(|entry| (entry.name, entry.value))
             .collect();
-        assert_eq!(stored[3], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
+        assert_eq!(stored[4], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
         assert!(
             device.tick(BOOT + 3 * AUTOSAVE_INTERVAL).is_none(),
             "one save, not a save every period"
@@ -2471,12 +2475,24 @@ mod tests {
         assert!(device.tick(BOOT + AUTOSAVE_INTERVAL).is_some());
     }
 
-    /// tl-chibi stores no `dev.loglevel`, so writing it owes nothing.
+    /// tl-chibi stores `dev.loglevel` with whatever else a save writes, but writing it owes none.
     #[test]
-    fn a_write_to_a_setting_that_is_not_stored_owes_no_save() {
+    fn a_write_to_dev_loglevel_owes_no_save() {
         let mut device = harness();
         device.ask_at("dev.loglevel", &[LogLevel::DEBUG.value()], BOOT);
         assert!(device.tick(BOOT + 2 * AUTOSAVE_INTERVAL).is_none());
+    }
+
+    /// A stored `dev.loglevel` is the threshold the platform boots on.
+    #[test]
+    fn a_restored_loglevel_reaches_the_platform() {
+        let mut device = harness();
+        let mut image = Entries::new();
+        let mut stored = Setting::new("dev.loglevel", LogLevel::DEBUG.value()).persistent();
+        conf::encode([&mut stored as &mut dyn Persisted], &mut image).unwrap();
+
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert_eq!(device.loglevel, LogLevel::DEBUG);
     }
 
     /// `dev.conf.save` stores what the write left, so the autosave it owed is
