@@ -219,6 +219,7 @@ enum Phase {
 pub struct Segments<const N: usize> {
     entries: [Segment; N],
     phase: Phase,
+    published: u8,
     holdover: bool,
 }
 
@@ -233,6 +234,7 @@ impl<const N: usize> Segments<N> {
         Self {
             entries,
             phase: Phase::Stopped { next: 0 },
+            published: 0,
             holdover: false,
         }
     }
@@ -308,15 +310,10 @@ impl<const N: usize> Segments<N> {
         });
     }
 
-    /// What a host asks about: the segment a change is pending on, or the
-    /// one issuing.
+    /// What a host asks about: the segment whose first sample was published
+    /// last, which is the one its samples arrive on.
     pub fn current(&self) -> &Segment {
-        let index = match self.phase {
-            Phase::Stopped { next } => next,
-            Phase::Issuing { current } => current,
-            Phase::Switching { to, .. } => to,
-        };
-        &self.entries[usize::from(index)]
+        &self.entries[usize::from(self.published)]
     }
 
     /// The segment `id` names, `None` if the ring holds none.
@@ -343,6 +340,7 @@ impl<const N: usize> Segments<N> {
         let first = published.is_some() && entry.state == SegmentState::Next;
         if first {
             entry.state = SegmentState::Issuing;
+            self.published = current;
         }
         let (issued, generated) = (entry.next_issue, entry.next_output);
         match self.phase {
@@ -506,9 +504,14 @@ mod tests {
             ..params(10)
         });
 
-        let pending = segments.current();
-        assert_eq!(pending.id().value(), 1);
+        let pending = segments.get(id(1)).unwrap();
+        assert_eq!(pending.state(), SegmentState::Next);
         assert_eq!(pending.timeref().start_time, 1002);
+        assert_eq!(segments.current(), segments.get(id(0)).unwrap());
+        assert_eq!(
+            segments.current().flags(),
+            SegmentFlags::VALID | SegmentFlags::ACTIVE
+        );
         assert_eq!(segments.get(id(0)).unwrap().timeref().start_time, 1000);
 
         let issued = issue(&mut segments, 8);
@@ -539,7 +542,7 @@ mod tests {
         segments.retune(params(100));
 
         assert_eq!(segments.get(id(0)).unwrap().params().rate.get(), 10);
-        assert_eq!(segments.current().params().rate.get(), 100);
+        assert_eq!(segments.get(id(1)).unwrap().params().rate.get(), 100);
         let issued = issue(&mut segments, 5);
         assert!(issued.iter().all(|issued| issued.segment.value() == 0));
         assert_eq!(segments.get(id(0)).unwrap().params().rate.get(), 10);
@@ -583,7 +586,7 @@ mod tests {
         (0..MAX_OUTPUT_SAMPLES).for_each(|_| {
             segments.issue();
         });
-        assert_eq!(segments.current().id().value(), 1);
+        assert_eq!(segments.get(id(1)).unwrap().state(), SegmentState::Next);
 
         let issued = segments.issue().unwrap();
         assert_eq!(issued.segment.value(), 1);
@@ -743,7 +746,8 @@ mod tests {
         issue(&mut segments, 5);
         segments.stop();
         assert_eq!(segments.get(id(0)).unwrap().state(), SegmentState::Inactive);
-        assert_eq!(segments.current().id().value(), 1);
+        assert_eq!(segments.current(), segments.get(id(0)).unwrap());
+        assert_eq!(segments.get(id(1)).unwrap().state(), SegmentState::Next);
 
         segments.start(timeref(2000)).unwrap();
         let issued = segments.issue().unwrap();
@@ -801,6 +805,7 @@ mod tests {
                     let entry = segments.get(sample.segment).unwrap();
                     let output = sample.output.unwrap().value();
                     assert_eq!(output, entry.next_issue - 1);
+                    assert_eq!(segments.current().id(), sample.segment);
                     assert!(output <= SampleNumber::MAX);
                     match previous {
                         Some(id) if id == sample.segment.value() => assert!(!ended),

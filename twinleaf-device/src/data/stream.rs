@@ -192,8 +192,7 @@ impl<const N: usize> Stream<N> {
         self.publisher.flush(out);
     }
 
-    /// The segment a host asks about: the one a change is pending on, or the
-    /// one acquiring.
+    /// The segment a host asks about: the one its samples arrive on.
     pub fn current(&self) -> &Segment {
         self.segments.current()
     }
@@ -297,7 +296,6 @@ fn find<const N: usize>(streams: &[Stream<N>], stream_id: u8) -> Option<&Stream<
 mod tests {
     use super::*;
     use crate::data::filter::{self, Butterworth4};
-    use crate::data::segments::SegmentState;
     use core::num::NonZeroU32;
     use twinleaf_proto::data::{FilterType, MetadataType, SegmentFlags};
     use twinleaf_proto::packet::{PacketType, PacketView};
@@ -563,6 +561,32 @@ mod tests {
         assert_eq!(streams[0].current().timeref().start_time, 1001);
     }
 
+    /// As tl-chibi's `sample_index`: a host hears of a pending segment with
+    /// its first sample, and until then of the one its samples are on.
+    #[test]
+    fn a_pending_segment_is_current_from_its_first_sample() {
+        let mut streams = started();
+        let mut sent = Sent::default();
+        (0..5).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+        streams[0].retune(params(20));
+        let current = |streams: &[Stream<4>]| {
+            let record = streams.segment(1, CURRENT_SEGMENT).unwrap();
+            (
+                record.segment_id.value(),
+                record.sampling_rate,
+                record.flags,
+            )
+        };
+        let issuing = SegmentFlags::VALID | SegmentFlags::ACTIVE;
+
+        (0..5).for_each(|_| {
+            streams[0].push(&[0; 16], &mut sent);
+            assert_eq!(current(&streams), (0, 10, issuing));
+        });
+        streams[0].push(&[0; 16], &mut sent);
+        assert_eq!(current(&streams), (1, 20, issuing));
+    }
+
     /// D8: no segment spans a change of holdover, and the one begun in it is
     /// flagged.
     #[test]
@@ -799,7 +823,7 @@ mod tests {
         let mut streams = started();
         streams[0].push(&[0; 16], &mut Sent::default());
         streams[0].stop();
-        assert_eq!(streams[0].current().state(), SegmentState::Next);
+        assert_eq!(streams[0].segment(CURRENT_SEGMENT), streams[0].segment(0));
         assert_eq!(streams[0].segment(0).unwrap().segment_id.value(), 0);
         assert_eq!(streams[0].segment(0).unwrap().flags, SegmentFlags::VALID);
     }
