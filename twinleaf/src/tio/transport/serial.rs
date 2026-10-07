@@ -110,7 +110,9 @@ impl Port {
         {
             // Windows requires some custom settings to replicate the unix behavior.
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Devices::Communication::{SetCommTimeouts, COMMTIMEOUTS};
+            use windows_sys::Win32::Devices::Communication::{
+                EscapeCommFunction, SetCommTimeouts, COMMTIMEOUTS, SETDTR,
+            };
             use windows_sys::Win32::Foundation::HANDLE;
             let handle: HANDLE = mio_port.as_raw_handle() as HANDLE;
             let mut timeouts = COMMTIMEOUTS {
@@ -121,6 +123,9 @@ impl Port {
                 WriteTotalTimeoutConstant: 0,
             };
             if unsafe { SetCommTimeouts(handle, &mut timeouts) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { EscapeCommFunction(handle, SETDTR) } == 0 {
                 return Err(io::Error::last_os_error());
             }
         }
