@@ -283,6 +283,18 @@ impl<const N: usize> Segments<N> {
         self.next();
     }
 
+    /// Name second `from` of the current time reference `to` from the next
+    /// segment on, wherever that segment begins.
+    pub fn relabel(&mut self, from: u32, to: Timeref) {
+        let next = self.next();
+        next.timeref = Timeref {
+            start_time: to
+                .start_time
+                .wrapping_add(next.timeref.start_time.wrapping_sub(from)),
+            ..to
+        };
+    }
+
     /// Issue the next sample number, `None` while stopped.
     pub fn issue(&mut self) -> Option<Issued> {
         self.advance(true)
@@ -684,6 +696,45 @@ mod tests {
             segments.current().flags(),
             SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
         );
+    }
+
+    /// Two streams switch on different seconds yet agree on every edge.
+    #[test]
+    fn a_relabel_offsets_each_stream_from_its_own_switch() {
+        let gps = Timeref::new(Epoch::UNIX, 1_700_000_000, SessionId::new(9), "GPS").unwrap();
+        let switched = |rate: u32, samples: u32| {
+            let mut segments: Segments<4> = started(params(rate));
+            issue(&mut segments, samples);
+            segments.relabel(1002, gps.clone());
+            let issued = issue(&mut segments, 3 * rate);
+            let first = issued.iter().position(|issued| issued.first).unwrap() as u32;
+            (samples + first, segments.current().timeref().clone())
+        };
+
+        let (slow_at, slow) = switched(10, 25);
+        let (fast_at, fast) = switched(1000, 1001);
+        assert_eq!((slow_at, fast_at), (30, 2000));
+        assert_eq!(slow.start_time, 1_700_000_001);
+        assert_eq!(fast.start_time, 1_700_000_000);
+        assert_eq!(
+            Timeref {
+                start_time: 0,
+                ..slow
+            },
+            Timeref {
+                start_time: 0,
+                ..gps
+            }
+        );
+    }
+
+    #[test]
+    fn a_relabel_before_any_sample_renames_the_segment_in_place() {
+        let mut segments: Segments<4> = started(params(10));
+        segments.relabel(1000, timeref(5000));
+        let issued = segments.issue().unwrap();
+        assert_eq!(issued.segment.value(), 0);
+        assert_eq!(segments.current().timeref().start_time, 5000);
     }
 
     #[test]

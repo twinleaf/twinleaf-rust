@@ -90,6 +90,14 @@ pub enum AcquisitionAction {
     Start(ScheduledEdge),
     /// Stop or drain the hardware acquisition path.
     Stop,
+    /// A new reference names the same edges; streams relabel from their next
+    /// segment without stopping.
+    Relabel {
+        /// The second the replaced reference gave the edge.
+        from: u32,
+        /// The new reference of that edge.
+        to: Reference,
+    },
 }
 
 /// The requested transition is not valid in the reported state. It is the only
@@ -290,8 +298,8 @@ impl AcquisitionMachine {
         }
     }
 
-    /// React to a time-reference or phase-anchor change: an armed start is
-    /// re-planned, and a running acquisition stops and stages a new segment.
+    /// React to a phase-anchor change: an armed start is re-planned, and a
+    /// running acquisition stops and stages a new segment.
     pub fn synchronization_changed(&mut self) -> Actions {
         self.target = None;
         match self.state {
@@ -310,6 +318,21 @@ impl AcquisitionMachine {
                 Actions::NONE
             }
             AcquisitionState::Autostart | AcquisitionState::Idle => Actions::NONE,
+        }
+    }
+
+    /// React to a new reference naming the same edges, `from` becoming `to`:
+    /// an armed start is re-planned, and a running acquisition relabels.
+    pub fn reference_changed(&mut self, from: u32, to: Reference) -> Actions {
+        match self.state {
+            AcquisitionState::Armed => self.synchronization_changed(),
+            AcquisitionState::Starting | AcquisitionState::Running => {
+                Actions::local(AcquisitionAction::Relabel { from, to })
+            }
+            AcquisitionState::Autostart
+            | AcquisitionState::Idle
+            | AcquisitionState::WaitingForEdge
+            | AcquisitionState::Stopping => Actions::NONE,
         }
     }
 
@@ -461,6 +484,25 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_change_relabels_an_active_segment_and_nothing_else() {
+        let mut machine = AcquisitionMachine::new(0);
+        machine.request_start().unwrap();
+        let plan = armed(&mut machine, 10);
+        machine.on_edge(edge(11), 0);
+        let to = edge(500).reference;
+        let relabel = Actions::local(AcquisitionAction::Relabel { from: 12, to });
+        assert_eq!(machine.reference_changed(12, to), relabel);
+        machine.mark_running(plan.id).unwrap();
+        assert_eq!(machine.reference_changed(12, to), relabel);
+        assert_eq!(machine.state(), AcquisitionState::Running);
+
+        machine.request_stop().unwrap();
+        assert_eq!(machine.reference_changed(12, to), Actions::NONE);
+        machine.finish_stop().unwrap();
+        assert_eq!(machine.state(), AcquisitionState::Idle);
+    }
+
+    #[test]
     fn a_skipped_target_second_is_reported_as_a_rearm() {
         let mut machine = AcquisitionMachine::new(0);
         machine.request_start().unwrap();
@@ -518,10 +560,11 @@ mod tests {
     /// R1: a board that programmed a compare at `Arm` is told to cancel it.
     #[test]
     fn every_way_out_of_armed_disarms_the_board() {
-        let disarming: [fn(&mut AcquisitionMachine) -> Actions; 3] = [
+        let disarming: [fn(&mut AcquisitionMachine) -> Actions; 4] = [
             |machine| machine.request_stop().unwrap(),
             |machine| machine.request_restart().unwrap(),
             AcquisitionMachine::synchronization_changed,
+            |machine| machine.reference_changed(10, edge(500).reference),
         ];
         for leave in disarming {
             let mut machine = AcquisitionMachine::new(0);

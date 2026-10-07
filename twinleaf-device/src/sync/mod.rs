@@ -155,8 +155,8 @@ pub struct Status {
     pub active: Reference,
     /// Counter value of the drift-compensated second edge.
     pub counter_edge: Option<u32>,
-    /// Bumped when the edge anchor moves or the timeref is replaced. A change
-    /// restarts an active acquisition.
+    /// Bumped when the edge anchor moves, which restarts an active
+    /// acquisition; a replaced timeref only relabels it.
     pub generation: u32,
     /// Measured phase, absent while no pulse is closing the second.
     pub phase_error_ns: Option<f32>,
@@ -1129,20 +1129,16 @@ impl Synchronizer {
         for _ in 1..steps {
             self.references.on_edge(false);
         }
+        let displaced = self.references.active().advance(1);
         let adopted = steps > 0 && self.references.on_edge(qualified);
 
-        let mut resynchronized = adopted;
-        if qualified {
-            let target = self.pulses.target_edge();
-            if target != self.anchor {
-                self.anchor = target;
-                resynchronized = true;
-            }
-        }
-
-        let mut actions = if resynchronized {
+        let mut actions = if qualified && self.pulses.target_edge() != self.anchor {
+            self.anchor = self.pulses.target_edge();
             self.generation = self.generation.wrapping_add(1);
             self.acquisition.synchronization_changed()
+        } else if adopted {
+            self.acquisition
+                .reference_changed(displaced.second, self.references.active())
         } else if let Some(counter_edge) = self.anchor {
             self.acquisition.on_edge(
                 ScheduledEdge {
@@ -1384,11 +1380,12 @@ mod synchronizer_tests {
         assert_eq!(status.reference, ReferenceState::Upstream);
         assert_eq!(status.active.second, 506);
         assert_eq!(status.active.identity.epoch, Epoch::UNIX);
-        assert_eq!(status.generation, 2);
+        assert_eq!(status.generation, 1);
     }
 
+    /// The new reference names the edges the running segment already sits on.
     #[test]
-    fn a_reference_change_restarts_a_running_acquisition() {
+    fn a_reference_change_relabels_a_running_acquisition() {
         let mut sync = synchronizer();
         run(&mut sync, 3);
         sync.start().unwrap();
@@ -1405,9 +1402,10 @@ mod synchronizer_tests {
                     plan = staged.id
                 }
                 AcquisitionAction::Start(_) => break,
-                AcquisitionAction::None | AcquisitionAction::Disarm | AcquisitionAction::Stop => {
-                    assert!(second < 8, "never started")
-                }
+                AcquisitionAction::None
+                | AcquisitionAction::Disarm
+                | AcquisitionAction::Stop
+                | AcquisitionAction::Relabel { .. } => assert!(second < 8, "never started"),
             }
         }
         sync.mark_running(plan).unwrap();
@@ -1422,10 +1420,18 @@ mod synchronizer_tests {
         }
         let now = second * NANOS_PER_SECOND;
         sync.poll(now);
+        let from = sync.status().active.second + 1;
         let actions = sync.capture(EDGE, now);
-        assert_eq!(actions.local, AcquisitionAction::Stop);
-        sync.finish_stop().unwrap();
-        assert_eq!(sync.status().acquisition, AcquisitionState::WaitingForEdge);
+        assert_eq!(
+            actions.local,
+            AcquisitionAction::Relabel {
+                from,
+                to: sync.status().active,
+            }
+        );
+        assert_eq!(sync.status().active.second, 900 + second as u32);
+        assert_eq!(sync.status().acquisition, AcquisitionState::Running);
+        assert_eq!(sync.status().generation, 1);
     }
 
     /// A healthy train never moves the drift-compensated anchor; a switchover

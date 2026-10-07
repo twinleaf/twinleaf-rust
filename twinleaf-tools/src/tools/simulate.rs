@@ -839,6 +839,12 @@ impl Sim {
             AcquisitionAction::Disarm => self.plan = None,
             AcquisitionAction::Start(edge) => self.start_run(edge, at),
             AcquisitionAction::Stop => self.stop_run(),
+            AcquisitionAction::Relabel { from, to } => {
+                let to = timeref_of(to);
+                self.streams
+                    .iter_mut()
+                    .for_each(|stream| stream.relabel(from, to.clone()));
+            }
         }
         if let Some(status) = actions.status_changed {
             self.follow_holdover(status.announced == TimeStatus::Holdover);

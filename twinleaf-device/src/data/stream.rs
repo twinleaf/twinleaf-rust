@@ -149,6 +149,12 @@ impl<const N: usize> Stream<N> {
         self.segments.set_holdover(holdover);
     }
 
+    /// Name second `from` of the current time reference `to` from the next
+    /// segment on.
+    pub fn relabel(&mut self, from: u32, to: Timeref) {
+        self.segments.relabel(from, to);
+    }
+
     /// Publish one sample of [`StreamDef::sample_size`] bytes, packed in column
     /// order. A decimated segment of a filtered stream publishes the anti-alias
     /// output for its [`DataType::F32`] columns; everything else goes out as it
