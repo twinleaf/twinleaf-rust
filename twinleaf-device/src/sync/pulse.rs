@@ -83,8 +83,9 @@ pub(crate) enum SecondEvent {
     },
     /// The expected pulse did not arrive.
     Missed,
-    /// A coherent alternate train replaced the missing main train.
-    Switched,
+    /// A coherent alternate train replaced the missing main train. The swap
+    /// itself closes this many seconds, the nearest to the new train's phase.
+    Switched { seconds: u32 },
 }
 
 /// Where one pulse train is in its life cycle.
@@ -416,17 +417,24 @@ impl PulseTracker {
         };
         let switch = absent > self.config.missed_pulse_threshold as u32
             && self.tentative.good_pulse_count > self.config.switchover_threshold as u32;
-        if switch {
-            self.main = self.tentative;
-            self.main.mode = Mode::Fresh;
-            self.tentative = Train::new();
+        if !switch {
+            self.main.spurious_count = 0;
+            return Some(SecondEvent::Missed);
         }
-        self.main.spurious_count = 0;
-        Some(if switch {
-            SecondEvent::Switched
-        } else {
-            SecondEvent::Missed
-        })
+        let seconds = (self
+            .tentative
+            .miss_timeout_ns
+            .saturating_add(NANOS_PER_SECOND)
+            .saturating_sub(self.main.miss_timeout_ns)
+            .saturating_add(NANOS_PER_SECOND / 2)
+            / NANOS_PER_SECOND) as u32;
+        self.main = Train {
+            mode: Mode::Fresh,
+            spurious_count: 0,
+            ..self.tentative
+        };
+        self.tentative = Train::new();
+        Some(SecondEvent::Switched { seconds })
     }
 
     /// Move the phase anchor to the latest observed edge while preserving all
@@ -559,7 +567,7 @@ mod tests {
             let now = second * 1_000_000_000;
             assert_eq!(tracker.capture(500_000, now + 500_000_000), None);
             while let Some(event) = tracker.poll(now + 1_000_000_000) {
-                if event == SecondEvent::Switched {
+                if let SecondEvent::Switched { .. } = event {
                     assert_eq!(tracker.target_edge(), Some(500_000));
                     return;
                 }
@@ -740,7 +748,7 @@ mod tests {
                 let before = self.tracker.next_poll_deadline_ns();
                 let event = self.tracker.poll(now);
                 match event {
-                    Some(SecondEvent::Switched) => {
+                    Some(SecondEvent::Switched { .. }) => {
                         self.switchovers += 1;
                         self.adopted = true;
                     }
@@ -773,15 +781,25 @@ mod tests {
             /// One poll per missing second, as `Synchronizer::poll` does.
             fn drain(&mut self, now: u64) {
                 let deadline = self.tracker.next_poll_deadline_ns();
-                let mut seconds = 0u64;
-                while self.poll(now).is_some() {
-                    seconds += 1;
-                }
+                let seconds: u64 = core::iter::from_fn(|| self.poll(now))
+                    .map(|event| match event {
+                        SecondEvent::Switched { seconds } => seconds as u64,
+                        SecondEvent::Missed | SecondEvent::Captured { .. } => 1,
+                    })
+                    .sum();
                 match deadline {
-                    Some(deadline) => assert!(
-                        seconds <= now.saturating_sub(deadline) / NANOS_PER_SECOND + 1,
-                        "{seconds} seconds reported between {deadline} and {now} ns"
-                    ),
+                    Some(deadline) => {
+                        let counted = deadline
+                            - NANOS_PER_SECOND
+                            - self.tracker.config.miss_grace_ns as u64
+                            - 1;
+                        assert!(
+                            seconds
+                                <= (now.saturating_sub(counted) + NANOS_PER_SECOND / 2)
+                                    / NANOS_PER_SECOND,
+                            "{seconds} seconds reported from the boundary at {counted} to {now} ns"
+                        )
+                    }
                     None => assert_eq!(seconds, 0, "a tracker with no deadline reported a second"),
                 }
             }

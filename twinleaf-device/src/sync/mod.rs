@@ -1038,7 +1038,7 @@ impl Synchronizer {
                 actions.local = next.local;
             }
             actions.second |= next.second;
-            actions.correction_ppm = next.correction_ppm;
+            actions.correction_ppm = next.correction_ppm.or(actions.correction_ppm);
             actions.announce = next.announce.or(actions.announce);
             actions.set_edge = next.set_edge.or(actions.set_edge);
             actions.status_changed = next.status_changed.or(actions.status_changed);
@@ -1134,8 +1134,14 @@ impl Synchronizer {
                 ((1 + unaccounted).max(0) as u32, false)
             }
             SecondEvent::Missed => (1, false),
-            SecondEvent::Switched => (1, false),
+            SecondEvent::Switched { seconds } => {
+                self.references.discard_candidate();
+                (seconds, false)
+            }
         };
+        if steps == 0 {
+            return self.report(Actions::NONE);
+        }
 
         self.qualified_once |= qualified;
         self.seconds = self.seconds.saturating_add(steps);
@@ -1144,7 +1150,7 @@ impl Synchronizer {
             self.references.on_edge(false);
         }
         let displaced = self.references.active().advance(1);
-        let adopted = steps > 0 && self.references.on_edge(qualified);
+        let adopted = self.references.on_edge(qualified);
 
         let mut actions = if qualified && self.pulses.target_edge() != self.anchor {
             self.anchor = self.pulses.target_edge();
@@ -1354,6 +1360,26 @@ mod synchronizer_tests {
         assert_eq!(polled.status().divergences, 0);
     }
 
+    /// A pulse arriving after the poll that counted it missing closes no second.
+    #[test]
+    fn a_late_capture_after_its_miss_announces_nothing() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        assert!(sync.poll(3_020_000_000).announce.is_some());
+        let second = sync.status().active.second;
+
+        let late = sync.capture(EDGE, 3_030_000_000);
+        assert_eq!((late.second, late.announce), (false, None));
+        assert_eq!(sync.status().active.second, second);
+        assert_eq!(sync.status().divergences, 1);
+
+        let next = sync.capture(EDGE, 4 * NANOS_PER_SECOND).announce;
+        assert_eq!(
+            next.map(|announce| announce.timeref.second),
+            Some(second + 1)
+        );
+    }
+
     #[test]
     fn a_spur_beside_the_second_boundary_does_not_skew_the_timeline() {
         let mut sync = synchronizer();
@@ -1457,11 +1483,11 @@ mod synchronizer_tests {
         sync.start().unwrap();
         let generation = sync.status().generation;
 
-        let alternate = PERIOD / 2;
+        let alternate = PERIOD * 2 / 5;
         let mut switched = None;
         for second in 3..16u64 {
             let now = second * NANOS_PER_SECOND;
-            sync.capture(alternate, now + NANOS_PER_SECOND / 2);
+            sync.capture(alternate, now + NANOS_PER_SECOND * 2 / 5);
             sync.poll(now + NANOS_PER_SECOND);
             if sync.status().counter_edge == Some(alternate) {
                 switched = Some(second);
@@ -1476,6 +1502,172 @@ mod synchronizer_tests {
             local().second + second as u32 + 1
         );
         assert_eq!(sync.status().divergences, 0);
+    }
+
+    /// A child bootstrapped either side of half a second after its hub's pulses
+    /// qualifies the hub's second on them once switched, never the replaced train's.
+    #[test]
+    fn a_switch_onto_a_hubs_pulses_qualifies_its_second_from_either_phase() {
+        const HUB: u32 = 1_000;
+        for (edge_ms, adopted_ms, divergences) in [(295, 8_295, 0), (524, 9_524, 1)] {
+            let mut sync = plain();
+            let timeline: Vec<(u64, ReferenceState, u32)> = (14..12_000u64)
+                .map(|ms| {
+                    let (now, second) = (ms * 1_000_000, (ms / 1_000) as u32);
+                    sync.wake((ms * 1_000 % PERIOD as u64) as u32, now);
+                    match (ms + 1_000 - edge_ms) % 1_000 {
+                        0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
+                        3 => sync.observe_packet(
+                            packet(HUB + second),
+                            pad(second as u8, TimeStatus::Locked),
+                            now,
+                        ),
+                        _ => {}
+                    }
+                    let status = sync.status();
+                    (ms, status.reference, status.active.second)
+                })
+                .collect();
+            let adopted = timeline
+                .iter()
+                .position(|&(_, reference, _)| reference == ReferenceState::Upstream)
+                .expect("never adopted");
+            assert_eq!(
+                (timeline[adopted].0, sync.status().divergences),
+                (adopted_ms, divergences),
+                "{edge_ms} ms"
+            );
+            let wrong: Vec<_> = timeline[adopted..]
+                .iter()
+                .filter(|&&(ms, reference, second)| {
+                    reference != ReferenceState::Upstream
+                        || second != HUB + ((ms - edge_ms) / 1_000) as u32
+                })
+                .collect();
+            assert!(wrong.is_empty(), "{edge_ms} ms: {wrong:?}");
+        }
+    }
+
+    /// An adopted hub whose pulses step under half a second either way keeps
+    /// the child on its second through the switch, without requalifying.
+    #[test]
+    fn a_switch_under_an_adopted_hub_keeps_its_second() {
+        const HUB: u32 = 1_000;
+        let label = |edge_ms: u64| HUB + ((edge_ms + 500) / 1_000) as u32;
+        for step_ms in [400, 600] {
+            let mut sync = plain();
+            let timeline: Vec<(u64, Status)> = (0..24_000u64)
+                .map(|ms| {
+                    let now = ms * 1_000_000;
+                    let edge_ms = match ms < 11_500 {
+                        true => 0,
+                        false => step_ms,
+                    };
+                    sync.poll(now);
+                    match (ms + 1_000 - edge_ms) % 1_000 {
+                        0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
+                        3 => sync.observe_packet(
+                            packet(label(ms - 3)),
+                            pad(label(ms - 3) as u8, TimeStatus::Locked),
+                            now,
+                        ),
+                        _ => {}
+                    }
+                    (ms, sync.status())
+                })
+                .collect();
+            let adopted = timeline
+                .iter()
+                .position(|(_, status)| status.reference == ReferenceState::Upstream)
+                .expect("never adopted");
+            let steps: Vec<(u64, u32)> = timeline[adopted..]
+                .windows(2)
+                .filter_map(|pair| {
+                    let ((_, before), (ms, after)) = (pair[0], pair[1]);
+                    (after.active.second != before.active.second)
+                        .then(|| (ms, after.active.second.wrapping_sub(before.active.second)))
+                })
+                .collect();
+            assert!(
+                steps.iter().all(|&(_, step)| step == 1)
+                    && steps
+                        .windows(2)
+                        .all(|pair| (500..1_500).contains(&(pair[1].0 - pair[0].0))),
+                "{step_ms} ms: {steps:?}"
+            );
+            let requalified: Vec<_> = timeline
+                .iter()
+                .filter(|(_, status)| {
+                    status.counter_edge == Some(step_ms as u32 * 1_000)
+                        && status.reference != ReferenceState::Upstream
+                })
+                .collect();
+            assert!(requalified.is_empty(), "{step_ms} ms: {requalified:?}");
+            assert_eq!(
+                (timeline[adopted].0, sync.status().active.second),
+                (3_000, label(23_000 + step_ms)),
+                "{step_ms} ms"
+            );
+        }
+    }
+
+    /// Pulses just before the bootstrapped boundaries take over the second
+    /// they are nearest to: one, closed by the switch itself.
+    #[test]
+    fn a_switch_onto_an_earlier_phase_closes_one_second() {
+        let mut sync = plain();
+        sync.wake(14_000, 14_000_000);
+        let steps: Vec<(u64, u32)> = (15..12_000u64)
+            .filter_map(|ms| {
+                let before = sync.status().active.second;
+                sync.wake((ms * 1_000 % PERIOD as u64) as u32, ms * 1_000_000);
+                if ms % 1_000 == 900 {
+                    sync.capture(900_000, ms * 1_000_000);
+                }
+                let second = sync.status().active.second;
+                (second != before).then(|| (ms, second.wrapping_sub(before)))
+            })
+            .collect();
+        assert!(
+            steps.iter().all(|&(_, step)| step == 1)
+                && steps
+                    .windows(2)
+                    .all(|pair| (500..1_500).contains(&(pair[1].0 - pair[0].0))),
+            "{steps:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(900_000));
+        assert_eq!(sync.status().pulse, PulseState::Locked);
+    }
+
+    /// A child labels its next edge from each announcement, so a switch that
+    /// closes no second announces none.
+    #[test]
+    fn a_hub_announces_each_second_once_across_a_switch() {
+        let mut sync = plain();
+        sync.wake(14_000, 14_000_000);
+        let announced: Vec<(u64, Announce)> = (15..12_000u64)
+            .flat_map(|ms| {
+                let now = ms * 1_000_000;
+                let polled = sync.wake((ms * 1_000 % PERIOD as u64) as u32, now);
+                let captured = match ms % 1_000 {
+                    295 => sync.capture(295_000, now),
+                    _ => Actions::NONE,
+                };
+                [polled, captured]
+                    .into_iter()
+                    .filter_map(move |actions| actions.announce.map(|announce| (ms, announce)))
+            })
+            .collect();
+        assert!(
+            announced.windows(2).all(|pair| {
+                let ((at, first), (next_at, next)) = (pair[0], pair[1]);
+                next.timeref.second == first.timeref.second + 1
+                    && next.pad.wrapping_sub(first.pad) & SEQUENCE_MASK == 1
+                    && (500..1_500).contains(&(next_at - at))
+            }),
+            "{announced:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(295_000));
     }
 
     #[test]
