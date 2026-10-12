@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use std::time::Duration;
-use twinleaf::device::DeviceRoute;
+use twinleaf::legacy::device::DeviceRoute;
 
 use crate::{parse_device_route, TioOpts};
 
@@ -212,7 +212,7 @@ pub enum SplitPolicy {
 }
 
 #[cfg(feature = "hdf5")]
-impl From<SplitPolicy> for twinleaf::data::export::SplitPolicy {
+impl From<SplitPolicy> for twinleaf::legacy::data::export::SplitPolicy {
     fn from(policy: SplitPolicy) -> Self {
         match policy {
             SplitPolicy::Continuous => Self::Continuous,
@@ -236,7 +236,7 @@ pub enum SplitLevel {
 }
 
 #[cfg(feature = "hdf5")]
-impl From<SplitLevel> for twinleaf::data::export::RunSplitLevel {
+impl From<SplitLevel> for twinleaf::legacy::data::export::RunSplitLevel {
     fn from(level: SplitLevel) -> Self {
         match level {
             SplitLevel::None => Self::None,

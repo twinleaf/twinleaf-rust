@@ -2,11 +2,11 @@ use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
 use tio::proxy;
-use twinleaf::device::{
+use twinleaf::legacy::device::{
     util::{rpc_decode_reply, rpc_encode_arg},
     RpcClient, RpcRegistry, RpcValue, RpcValueType,
 };
-use twinleaf::tio;
+use twinleaf::legacy::tio;
 
 pub fn run_rpc(rpc_cli: RpcCli) -> eyre::Result<()> {
     match rpc_cli.subcommands {
@@ -57,7 +57,7 @@ fn infer_rpc_type(name: &str, device: &proxy::Port, kind: &str) -> RpcValueType 
     if meta.is_none() {
         println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
     }
-    twinleaf::device::util::resolve_arg_type(meta, name)
+    twinleaf::legacy::device::util::resolve_arg_type(meta, name)
 }
 
 pub fn rpc(

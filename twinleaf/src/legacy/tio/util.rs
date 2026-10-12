@@ -1,4 +1,4 @@
-use crate::tio::proto::{self, DeviceRoute, Packet, Payload};
+use crate::legacy::tio::proto::{self, DeviceRoute, Packet, Payload};
 
 pub fn default_proxy_url() -> &'static str {
     "tcp://localhost"

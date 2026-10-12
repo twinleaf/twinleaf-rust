@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueHint};
-use twinleaf::device::DeviceRoute;
+use twinleaf::legacy::device::DeviceRoute;
 
 use crate::{parse_device_route, TioOpts};
 

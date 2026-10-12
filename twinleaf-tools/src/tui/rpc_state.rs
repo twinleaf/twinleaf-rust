@@ -1,4 +1,4 @@
-use twinleaf::{
+use twinleaf::legacy::{
     device::{RpcList, RpcRegistry},
     tio::proto::{identifiers::SessionId, ProxyStatus},
 };

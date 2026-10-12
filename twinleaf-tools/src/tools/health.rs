@@ -26,7 +26,7 @@ use std::{
     io,
     time::{Duration, Instant, SystemTime},
 };
-use twinleaf::{
+use twinleaf::legacy::{
     data::{BoundaryReason, StreamKey},
     device::{DeviceEvent, DeviceRoute, DeviceTree, RpcClient, RpcList, TreeEvent, TreeItem},
     tio,
@@ -436,7 +436,12 @@ impl HealthState {
             .count()
     }
 
-    fn handle_sample(&mut self, sample: twinleaf::data::Sample, route: DeviceRoute, now: Instant) {
+    fn handle_sample(
+        &mut self,
+        sample: twinleaf::legacy::data::Sample,
+        route: DeviceRoute,
+        now: Instant,
+    ) {
         let sid = sample.stream.stream_id;
 
         if let Some(filter) = &self.streams_filter {

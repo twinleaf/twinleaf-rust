@@ -2,8 +2,8 @@ use crate::{ProxyHelp, TioOpts};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use twinleaf::device::Device;
-use twinleaf::tio;
+use twinleaf::legacy::device::Device;
+use twinleaf::legacy::tio;
 
 pub fn run_nmea_proxy(tio: TioOpts, tcp_port: u16) -> eyre::Result<()> {
     use color_eyre::Help;
@@ -73,10 +73,10 @@ fn broadcast_to_client(mut stream: TcpStream, port: tio::proxy::Port) {
         let mut fields = vec![time_str];
         for col in &sample.columns {
             let value = match col.value {
-                twinleaf::data::ColumnData::Int(x) => format!("{}", x),
-                twinleaf::data::ColumnData::UInt(x) => format!("{}", x),
-                twinleaf::data::ColumnData::Float(x) => format!("{:.2}", x),
-                twinleaf::data::ColumnData::Unknown => "?".to_string(),
+                twinleaf::legacy::data::ColumnData::Int(x) => format!("{}", x),
+                twinleaf::legacy::data::ColumnData::UInt(x) => format!("{}", x),
+                twinleaf::legacy::data::ColumnData::Float(x) => format!("{:.2}", x),
+                twinleaf::legacy::data::ColumnData::Unknown => "?".to_string(),
             };
             fields.push(value);
         }

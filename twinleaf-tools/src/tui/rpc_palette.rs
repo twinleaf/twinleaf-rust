@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 use tui_prompts::{State, TextState};
-use twinleaf::device::{util, DeviceRoute, RpcDescriptor, RpcRegistry, RpcValueType};
+use twinleaf::legacy::device::{util, DeviceRoute, RpcDescriptor, RpcRegistry, RpcValueType};
 
 const RPCLIST_MAX_LEN: usize = 12;
 

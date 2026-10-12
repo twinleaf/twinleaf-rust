@@ -9,9 +9,9 @@
 //! can plug in their own source. A ready-made GitHub-backed catalog is provided
 //! in [`github`] behind the `firmware-update` feature.
 
-use crate::tio::proto::{DeviceRoute, Payload, RpcErrorCode};
-use crate::tio::proxy::{Port, RecvError, RpcError};
-use crate::tio::util::PacketBuilder;
+use crate::legacy::tio::proto::{DeviceRoute, Payload, RpcErrorCode};
+use crate::legacy::tio::proxy::{Port, RecvError, RpcError};
+use crate::legacy::tio::util::PacketBuilder;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

@@ -1,5 +1,5 @@
-use crate::data::{DeviceDataParser, DeviceFullMetadata, Sample};
-use crate::tio;
+use crate::legacy::data::{DeviceDataParser, DeviceFullMetadata, Sample};
+use crate::legacy::tio;
 use proto::DeviceRoute;
 use tio::{proto, proxy, util};
 

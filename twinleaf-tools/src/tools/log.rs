@@ -7,9 +7,9 @@ use crate::{
     parse_csv_target, LogCli, LogSubcommands, MetaSubcommands, ProxyHelp, SplitLevel, SplitPolicy,
     StreamSel, TioOpts,
 };
-use twinleaf::data::DeviceDataParser;
-use twinleaf::device::{Device, DeviceRoute, DeviceTree};
-use twinleaf::tio::{self, proxy};
+use twinleaf::legacy::data::DeviceDataParser;
+use twinleaf::legacy::device::{Device, DeviceRoute, DeviceTree};
+use twinleaf::legacy::tio::{self, proxy};
 
 pub fn run_log(log_cli: LogCli) -> eyre::Result<()> {
     match log_cli.subcommands {
@@ -150,7 +150,7 @@ pub fn log(
     use indicatif::{ProgressBar, ProgressStyle};
     use std::path::Path;
     use std::time::{Duration, Instant};
-    use twinleaf::data::BoundaryReason;
+    use twinleaf::legacy::data::BoundaryReason;
 
     let proxy = proxy::Interface::new(&tio.root);
     let route = tio.route.clone();
@@ -651,7 +651,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
     use std::collections::BTreeMap;
-    use twinleaf::data::{BoundaryReason, DeviceDataParser, StreamId};
+    use twinleaf::legacy::data::{BoundaryReason, DeviceDataParser, StreamId};
 
     let file = File::open(path).wrap_err_with(|| format!("could not open {}", path))?;
     let mmap = unsafe { Mmap::map(&file) }.wrap_err_with(|| format!("could not mmap {}", path))?;
@@ -1135,7 +1135,7 @@ pub fn log_hdf(
     use indicatif::{ProgressBar, ProgressStyle};
     use memmap2::Mmap;
     use std::path::Path;
-    use twinleaf::data::{export, ColumnFilter, StreamKey};
+    use twinleaf::legacy::data::{export, ColumnFilter, StreamKey};
 
     // Determine output filename
     let output = match output {

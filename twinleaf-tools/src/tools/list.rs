@@ -4,9 +4,9 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use twinleaf::device::discovery::{self, PortInterface};
-use twinleaf::device::DeviceRoute;
-use twinleaf::tio::proxy;
+use twinleaf::legacy::device::discovery::{self, PortInterface};
+use twinleaf::legacy::device::DeviceRoute;
+use twinleaf::legacy::tio::proxy;
 
 pub fn run_list(all: bool) -> eyre::Result<()> {
     use color_eyre::Help;

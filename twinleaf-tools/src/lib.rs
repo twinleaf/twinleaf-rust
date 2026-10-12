@@ -1,9 +1,13 @@
+// The 1.x tools keep the lints they were written under until each moves to
+// the 2.0 library.
+#![allow(clippy::all, rustdoc::all)]
+
 use clap::Parser;
 use indicatif::MultiProgress;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use twinleaf::device::DeviceRoute;
-use twinleaf::tio::util;
+use twinleaf::legacy::device::DeviceRoute;
+use twinleaf::legacy::tio::util;
 pub mod cli;
 pub mod tools;
 pub mod tui;

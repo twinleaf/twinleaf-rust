@@ -10,8 +10,8 @@ use ratatui::crossterm::{
 use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twinleaf::device::RpcMetaFlags;
-use twinleaf::tio::proto::{self, meta};
+use twinleaf::legacy::device::RpcMetaFlags;
+use twinleaf::legacy::tio::proto::{self, meta};
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
     let mut device = TestDevice::new(cli)?;

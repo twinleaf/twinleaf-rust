@@ -1,7 +1,7 @@
-use crate::data::sample::Sample;
-use crate::data::ColumnFilter;
-use crate::tio::proto::identifiers::{ColumnId, DeviceRoute, SampleNumber, StreamKey};
-use crate::tio::proto::{BufferType, ColumnMetadata, SegmentMetadata, StreamMetadata};
+use crate::legacy::data::sample::Sample;
+use crate::legacy::data::ColumnFilter;
+use crate::legacy::tio::proto::identifiers::{ColumnId, DeviceRoute, SampleNumber, StreamKey};
+use crate::legacy::tio::proto::{BufferType, ColumnMetadata, SegmentMetadata, StreamMetadata};
 use hdf5::filters::{Blosc, BloscShuffle};
 use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
 use hdf5::{Dataset, Dataspace, File, H5Type, Location, Result, SimpleExtents};
@@ -90,7 +90,7 @@ impl PendingBatch {
     }
 
     fn push(&mut self, sample: &Sample) {
-        use crate::data::sample::ColumnData;
+        use crate::legacy::data::sample::ColumnData;
 
         self.sample_numbers.push(sample.n);
         self.timestamps.push(sample.timestamp_end());

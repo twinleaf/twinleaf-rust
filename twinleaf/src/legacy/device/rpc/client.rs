@@ -1,4 +1,4 @@
-use crate::tio::{proto::DeviceRoute, proxy, util as tio_util};
+use crate::legacy::tio::{proto::DeviceRoute, proxy, util as tio_util};
 use std::collections::HashMap;
 
 use directories::BaseDirs;
@@ -62,8 +62,8 @@ impl RpcClient {
         loop {
             let pkt = self.port.recv()?;
             match pkt.payload {
-                crate::tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
-                crate::tio::proto::Payload::RpcError(err) => {
+                crate::legacy::tio::proto::Payload::RpcReply(rep) => return Ok(rep.reply),
+                crate::legacy::tio::proto::Payload::RpcError(err) => {
                     return Err(proxy::RpcError::ExecError(err))
                 }
                 _ => continue,

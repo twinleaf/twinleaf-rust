@@ -1,5 +1,8 @@
-use twinleaf::data::ColumnFilter;
-use twinleaf::tio::proto::DeviceRoute;
+// The 1.x tests keep the lints they were written under.
+#![allow(clippy::all)]
+
+use twinleaf::legacy::data::ColumnFilter;
+use twinleaf::legacy::tio::proto::DeviceRoute;
 
 fn route(s: &str) -> DeviceRoute {
     DeviceRoute::from_str(s).unwrap()

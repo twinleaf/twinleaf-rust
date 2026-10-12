@@ -3,8 +3,8 @@
 //! on `tree.next_item()`.
 
 use crossbeam::channel::{self, Receiver};
-use twinleaf::device::{DeviceTree, TreeItem};
-use twinleaf::tio::proxy::RpcError;
+use twinleaf::legacy::device::{DeviceTree, TreeItem};
+use twinleaf::legacy::tio::proxy::RpcError;
 
 /// Spawn a worker thread that owns the given [`DeviceTree`] and streams its
 /// items through the returned [`Receiver`]. Each successful item arrives as

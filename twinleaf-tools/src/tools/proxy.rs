@@ -8,8 +8,8 @@ use crate::{MountArg, ProxyCli, ProxySubcommands};
 use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
-use twinleaf::device::discovery::{self, PortInterface};
-use twinleaf::tio::{self, proto, proxy};
+use twinleaf::legacy::device::discovery::{self, PortInterface};
+use twinleaf::legacy::tio::{self, proto, proxy};
 
 fn init_proxy_logging(verbose: bool, debug: bool) {
     use std::io::Write;

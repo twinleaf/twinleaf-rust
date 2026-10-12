@@ -1,7 +1,9 @@
-use crate::data::{ColumnData, CursorPosition, Sample};
-use crate::tio::proto::identifiers::*;
-use crate::tio::proto::meta::MetadataEpoch;
-use crate::tio::proto::{BufferType, ColumnMetadata, DeviceRoute, SegmentMetadata, StreamMetadata};
+use crate::legacy::data::{ColumnData, CursorPosition, Sample};
+use crate::legacy::tio::proto::identifiers::*;
+use crate::legacy::tio::proto::meta::MetadataEpoch;
+use crate::legacy::tio::proto::{
+    BufferType, ColumnMetadata, DeviceRoute, SegmentMetadata, StreamMetadata,
+};
 
 use std::{
     collections::{HashMap, VecDeque},

@@ -1,4 +1,4 @@
-use crate::tio::proto::DeviceRoute;
+use crate::legacy::tio::proto::DeviceRoute;
 use glob::Pattern;
 
 /// Column filter using glob patterns against paths of the form `/{route}/{stream}/{column}`.

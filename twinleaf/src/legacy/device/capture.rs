@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use crate::device::RpcClient;
-use crate::tio;
-use crate::tio::proto::DataType;
-use crate::tio::proxy;
+use crate::legacy::device::RpcClient;
+use crate::legacy::tio;
+use crate::legacy::tio::proto::DataType;
+use crate::legacy::tio::proxy;
 
 pub const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const CAPTURE_TRIGGER_INDEX: i16 = -1;

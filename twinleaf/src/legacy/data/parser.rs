@@ -1,5 +1,5 @@
 use super::sample::{Boundary, BoundaryReason, Column, PriorState, Sample};
-use crate::tio;
+use crate::legacy::tio;
 use proto::meta::MetadataType;
 use proto::DeviceRoute;
 use std::collections::HashMap;

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use crate::{CaptureCli, TioOpts};
-use twinleaf::device::capture::{read_capture, CaptureReadout};
-use twinleaf::device::RpcClient;
-use twinleaf::tio::proxy;
+use twinleaf::legacy::device::capture::{read_capture, CaptureReadout};
+use twinleaf::legacy::device::RpcClient;
+use twinleaf::legacy::tio::proxy;
 
 pub fn run_capture(capture_cli: CaptureCli) -> eyre::Result<()> {
     capture(&capture_cli.tio, capture_cli.rpc_name, capture_cli.timeout)

@@ -1,12 +1,17 @@
+// The 1.x tests keep the lints they were written under.
+#![allow(clippy::all)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use twinleaf::data::{Buffer, Column, ColumnBatch, ColumnData, CursorPosition, ReadError, Sample};
-use twinleaf::tio::proto::identifiers::{ColumnKey, SampleNumber, StreamKey};
-use twinleaf::tio::proto::meta::{
+use twinleaf::legacy::data::{
+    Buffer, Column, ColumnBatch, ColumnData, CursorPosition, ReadError, Sample,
+};
+use twinleaf::legacy::tio::proto::identifiers::{ColumnKey, SampleNumber, StreamKey};
+use twinleaf::legacy::tio::proto::meta::{
     ColumnMetadata, DeviceMetadata, MetadataEpoch, MetadataFilter, SegmentMetadata, StreamMetadata,
 };
-use twinleaf::tio::proto::{DataType, DeviceRoute, StreamDataPayload};
+use twinleaf::legacy::tio::proto::{DataType, DeviceRoute, StreamDataPayload};
 
 fn test_fixture(
     column_types: &[DataType],

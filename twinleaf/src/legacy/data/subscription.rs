@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::data::{AlignedWindow, Buffer};
-use crate::tio::proto::identifiers::ColumnKey;
+use crate::legacy::data::{AlignedWindow, Buffer};
+use crate::legacy::tio::proto::identifiers::ColumnKey;
 
 pub type SubscriptionId = usize;
 pub struct SubscriptionManager {

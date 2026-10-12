@@ -1,4 +1,4 @@
-use crate::tio;
+use crate::legacy::tio;
 
 use std::sync::Arc;
 use tio::proto::identifiers::{SampleNumber, SegmentId, SessionId, TimeRefSessionId};

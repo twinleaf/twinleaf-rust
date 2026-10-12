@@ -4,7 +4,7 @@
 //! local serial ports; future mechanisms (mDNS, UDP broadcast) will live
 //! alongside as additional entry points in this module.
 
-use crate::tio::{proto::DeviceRoute, proxy};
+use crate::legacy::tio::{proto::DeviceRoute, proxy};
 use std::time::Duration;
 
 /// The USB interface a discovered device uses.

@@ -1,7 +1,7 @@
-use crate::device::rpc::{
+use crate::legacy::device::rpc::{
     DecodeError, EncodeError, RpcDescriptor, RpcMeta, RpcValue, RpcValueType,
 };
-use crate::tio::proxy;
+use crate::legacy::tio::proxy;
 
 pub fn load_rpc_specs(device: &proxy::Port) -> Result<Vec<RpcDescriptor>, proxy::RpcError> {
     let nrpcs: u16 = device.get("rpc.listinfo")?;

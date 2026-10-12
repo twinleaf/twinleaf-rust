@@ -1,6 +1,6 @@
 use crate::{DumpCli, ProxyHelp, TioOpts};
-use twinleaf::device::{DeviceRoute, DeviceTree};
-use twinleaf::tio::{self, proxy};
+use twinleaf::legacy::device::{DeviceRoute, DeviceTree};
+use twinleaf::legacy::tio::{self, proxy};
 
 pub fn run_dump(dump_cli: DumpCli) -> eyre::Result<()> {
     dump(
@@ -90,7 +90,7 @@ pub fn dump(
 }
 
 pub fn print_sample(
-    sample: &twinleaf::data::Sample,
+    sample: &twinleaf::legacy::data::Sample,
     route: Option<&DeviceRoute>,
     print_meta: bool,
     print_data: bool,

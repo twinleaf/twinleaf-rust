@@ -1,7 +1,7 @@
 //! `tio upgrade` porcelain.
 //!
 //! All firmware logic (querying the device, checking the catalog, downloading,
-//! and flashing) lives in `twinleaf::firmware`. This module only handles user
+//! and flashing) lives in `twinleaf::legacy::firmware`. This module only handles user
 //! interaction: presenting the installed-vs-latest comparison, prompting, and
 //! rendering progress.
 
@@ -12,10 +12,10 @@ use eyre::WrapErr;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Duration;
-use twinleaf::firmware::{
+use twinleaf::legacy::firmware::{
     self, github::GithubCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
 };
-use twinleaf::tio::proxy;
+use twinleaf::legacy::tio::proxy;
 
 pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
     match (upgrade_cli.firmware_path, upgrade_cli.downgrade) {

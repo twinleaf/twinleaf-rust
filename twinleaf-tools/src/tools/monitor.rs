@@ -26,7 +26,7 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use toml_edit::{DocumentMut, InlineTable, Value};
-use twinleaf::{
+use twinleaf::legacy::{
     data::{
         AlignedWindow, Buffer, ColumnBatch, ColumnData, ColumnKey, DeviceFullMetadata, Sample,
         StreamKey,
