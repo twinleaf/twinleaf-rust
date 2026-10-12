@@ -10,6 +10,7 @@
 #![warn(rustdoc::all)]
 
 pub mod legacy;
+pub mod tio;
 
 /// The wire protocol, shared with device firmware.
 pub use twinleaf_proto as proto;
