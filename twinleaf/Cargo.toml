@@ -2,11 +2,22 @@
 name = "twinleaf"
 version = "2.0.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 description = "Library for working with the Twinleaf I/O protocol and Twinleaf quantum sensors."
 homepage = "https://twinleaf.com"
 repository = "https://github.com/twinleaf/twinleaf-rust"
 readme = "README.md"
+keywords = ["twinleaf", "sensor", "protocol", "quantum", "daq"]
+categories = ["hardware-support", "science"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
 
 [features]
 default = ["serial", "firmware-update"]
