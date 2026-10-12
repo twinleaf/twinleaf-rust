@@ -377,8 +377,6 @@ impl DeviceTree {
     }
 
     /// Returns the session handle behind this view.
-    // The recorder reads the session through it.
-    #[allow(dead_code)]
     pub(super) fn handle(&self) -> &Handle {
         &self.handle
     }

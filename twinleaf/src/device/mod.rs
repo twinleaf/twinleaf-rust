@@ -42,6 +42,10 @@
 //!
 //! - [`discovery`] finds devices on serial ports and, with the `mdns` feature,
 //!   on the network.
+//! - [`capture`] triggers and reads out a device's buffer capture through its
+//!   array RPC.
+//! - [`record`] writes a tree to a log file that the [`data`](crate::data)
+//!   reader decodes.
 //!
 //! # Examples
 //!
@@ -87,8 +91,10 @@
 //! # }
 //! ```
 
+pub mod capture;
 mod connection;
 pub mod discovery;
+pub mod record;
 pub mod rpc;
 pub(crate) mod runtime;
 mod session;
