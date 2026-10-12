@@ -138,9 +138,6 @@ pub(crate) fn is_local_tcp(url: &str) -> bool {
 }
 
 /// How a discovered device is reached.
-// Its names follow the chips' own, and some variants go unused, until
-// discovery exports it.
-#[allow(clippy::upper_case_acronyms, dead_code)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum PortInterface {
@@ -155,8 +152,6 @@ pub enum PortInterface {
 }
 
 /// A device found during discovery.
-// Its name goes unread until discovery exports it.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
     /// The locator [`Connection::open`](crate::Connection::open) takes.

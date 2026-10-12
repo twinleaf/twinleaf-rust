@@ -38,6 +38,11 @@
 //! [`rpc::pipelined`] keeps a window of them in flight.
 //! [`rpc_registry`](Device::rpc_registry) lists a device's RPCs.
 //!
+//! The other modules build on the views.
+//!
+//! - [`discovery`] finds devices on serial ports and, with the `mdns` feature,
+//!   on the network.
+//!
 //! # Examples
 //!
 //! Name every device behind a hub, then follow the link's status until the
@@ -83,6 +88,7 @@
 //! ```
 
 mod connection;
+pub mod discovery;
 pub mod rpc;
 pub(crate) mod runtime;
 mod session;

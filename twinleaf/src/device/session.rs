@@ -161,8 +161,6 @@ impl Session {
     /// proxy there first. Fails with the proxy's message when it refuses the
     /// open. Fails with how to reach the peer when it does not answer as a
     /// 2.0 proxy within two seconds, as a proxy older than tio 2.0 does not.
-    // Discovery probes through it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open(
         proxy: &ProxyAddress,
         target: &str,

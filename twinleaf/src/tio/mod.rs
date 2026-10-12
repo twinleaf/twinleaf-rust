@@ -18,6 +18,8 @@
 //! which a task on the crate's I/O runtime drives. A
 //! [`Connection`](crate::Connection) opens one to the proxy, and the proxy
 //! opens one to each device and one for each client.
+//! [`enumerate_serial`](crate::device::discovery::enumerate_serial) lists
+//! the Twinleaf devices on serial ports.
 
 pub(crate) mod os;
 pub mod packet;
