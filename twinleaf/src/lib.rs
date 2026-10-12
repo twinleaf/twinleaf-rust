@@ -12,6 +12,7 @@
 
 pub mod data;
 pub mod device;
+pub mod firmware;
 pub mod legacy;
 pub mod proxy;
 mod rt;

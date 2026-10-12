@@ -46,6 +46,8 @@
 //!   array RPC.
 //! - [`record`] writes a tree to a log file that the [`data`](crate::data)
 //!   reader decodes.
+//! - [`firmware`](crate::firmware) queries and updates firmware over a
+//!   [`Device`].
 //!
 //! # Examples
 //!
