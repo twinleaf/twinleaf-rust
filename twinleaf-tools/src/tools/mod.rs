@@ -1,11 +1,9 @@
 pub mod capture;
 pub mod dump;
 pub mod health;
-pub mod list;
 pub mod log;
 pub mod monitor;
 pub mod proxy;
-pub mod proxy_nmea;
 pub mod rpc;
 pub mod simulate;
 pub mod upgrade;

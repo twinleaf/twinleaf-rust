@@ -590,6 +590,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix 0.31.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "darling"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -738,6 +749,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.1",
+ "block2",
+ "libc",
  "objc2",
 ]
 
@@ -973,6 +986,16 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "gethostname"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
+dependencies = [
+ "rustix",
+ "windows-link",
 ]
 
 [[package]]
@@ -3130,20 +3153,23 @@ dependencies = [
 name = "twinleaf-tools"
 version = "2.4.0"
 dependencies = [
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",
  "color-eyre",
  "console",
- "crossbeam",
+ "ctrlc",
  "dialoguer",
  "env_logger",
  "eyre",
+ "gethostname",
  "humantime",
  "indicatif",
  "indicatif-log-bridge",
+ "libc",
  "log",
- "memmap2",
+ "mdns-sd",
  "nucleo-matcher",
  "ratatui",
  "serialport",
@@ -3151,7 +3177,6 @@ dependencies = [
  "toml_edit",
  "tui-prompts",
  "twinleaf",
- "welch-sde",
 ]
 
 [[package]]
@@ -3394,17 +3419,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "welch-sde"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cf9e00ede58031fc5fefd05329aeb93ffbc195ca5416e35144f1eff3c196067"
-dependencies = [
- "num-complex",
- "num-traits",
- "rustfft",
 ]
 
 [[package]]
