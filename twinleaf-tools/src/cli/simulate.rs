@@ -1,9 +1,10 @@
+//! The arguments of `tio simulate`.
+
 use clap::Parser;
 
 use super::nonneg_f64;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Simulate a Twinleaf device over UDP")]
 pub struct SimulateCli {
     /// Sample rate in Hz
     #[arg(
@@ -37,4 +38,8 @@ pub struct SimulateCli {
     /// UDP port to listen on
     #[arg(long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Disable random sample drops (the 'd' key still drops one manually)
+    #[arg(long = "no-drop")]
+    pub(crate) no_drop: bool,
 }
