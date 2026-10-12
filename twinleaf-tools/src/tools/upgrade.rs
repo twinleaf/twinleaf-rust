@@ -1,9 +1,8 @@
-//! `tio upgrade` porcelain.
+//! The `tio upgrade` subcommand, run by [`run_upgrade`].
 //!
-//! All firmware logic (querying the device, checking the catalog, downloading,
-//! and flashing) lives in `twinleaf::legacy::firmware`. This module only handles user
-//! interaction: presenting the installed-vs-latest comparison, prompting, and
-//! rendering progress.
+//! This module presents the installed and latest firmware, prompts, and
+//! renders progress. [`twinleaf::firmware`] queries the device, checks the
+//! catalog, downloads and flashes.
 
 use crate::{ProxyHelp, TioOpts, UpgradeCli};
 use color_eyre::Help;
@@ -12,12 +11,16 @@ use eyre::WrapErr;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Duration;
-use twinleaf::legacy::firmware::{
+use twinleaf::device::Device;
+use twinleaf::firmware::{
     self, github::GithubCatalog, FlashEvent, StopOutcome, UpdateReport, UpdateStatus,
 };
-use twinleaf::legacy::tio::proxy;
+use twinleaf::Connection;
 
 pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
+    if upgrade_cli.all {
+        return firmware_upgrade_all(&upgrade_cli.tio, upgrade_cli.yes);
+    }
     match (upgrade_cli.firmware_path, upgrade_cli.downgrade) {
         (Some(path), _) => firmware_upgrade(&upgrade_cli.tio, path, upgrade_cli.yes),
         (None, true) => firmware_select(&upgrade_cli.tio),
@@ -25,7 +28,73 @@ pub fn run_upgrade(upgrade_cli: UpgradeCli) -> eyre::Result<()> {
     }
 }
 
-/// Flash a firmware image from a local file.
+/// Discovers every device active on the hub at `tio.root`, and upgrades each
+/// one that has a newer release.
+fn firmware_upgrade_all(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
+    // A single connection to the hub is reused for discovery and every device;
+    // per-device RPC ports are opened on it rather than new connections.
+    let hub = Connection::open(&tio.root)?;
+
+    let tree = hub.tree(twinleaf::DeviceRoute::root());
+    let routes = tree.discover_routes(ROUTE_DISCOVERY_WINDOW);
+    if routes.is_empty() {
+        return Err(eyre::eyre!("no active devices found on {}", tio.root)
+            .suggestion("check that the device is plugged in and powered"));
+    }
+
+    let total = routes.len();
+    println!(
+        "Found {} device{} on {}; checking for firmware updates...",
+        total,
+        if total == 1 { "" } else { "s" },
+        tio.root
+    );
+
+    let mut failures = 0usize;
+    for (i, route) in routes.into_iter().enumerate() {
+        let label = if route.is_empty() {
+            "/ (root)".to_string()
+        } else {
+            route.to_string()
+        };
+        println!();
+        println!(
+            "{}",
+            style(format!("[{}/{}] {}", i + 1, total, label)).bold()
+        );
+
+        // One device's failure shouldn't stop the rest.
+        let result = match tree.device(route) {
+            Ok(device) => check_and_upgrade(&device, skip_confirm),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(e) = result {
+            failures += 1;
+            println!("{}", style(format!("  error: {:#}", e)).red());
+        }
+    }
+
+    if failures > 0 {
+        return Err(eyre::eyre!(
+            "{} of {} device(s) could not be checked",
+            failures,
+            total
+        ));
+    }
+    Ok(())
+}
+
+/// How long to listen for heartbeats to enumerate the active routes on a hub.
+// Heartbeats fire at 5 Hz, so this covers several per device.
+const ROUTE_DISCOVERY_WINDOW: Duration = Duration::from_millis(600);
+
+/// Flashes the firmware image at `firmware_path` to the device at `tio`,
+/// after asking unless `skip_confirm`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, the device cannot be opened,
+/// the prompt fails, or the flash fails.
 pub fn firmware_upgrade(
     tio: &TioOpts,
     firmware_path: PathBuf,
@@ -33,7 +102,7 @@ pub fn firmware_upgrade(
 ) -> eyre::Result<()> {
     let firmware_data = std::fs::read(&firmware_path)
         .wrap_err_with(|| format!("could not read firmware file {:?}", firmware_path))?;
-    log::info!("loaded {} bytes firmware", firmware_data.len());
+    log::debug!("loaded {} bytes firmware", firmware_data.len());
 
     let label = firmware_path
         .file_name()
@@ -62,13 +131,19 @@ pub fn firmware_upgrade(
     flash_with_progress(&device, &firmware_data)
 }
 
-/// Detect the sensor, compare against the latest published firmware, and (if
-/// newer) download and flash it.
+/// Detects the sensor at `tio`, compares it against the latest published
+/// firmware, and downloads and flashes a newer one.
 fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()> {
     let (_proxy, device) = open_device(tio)?;
+    check_and_upgrade(&device, skip_confirm)
+}
 
-    let installed =
-        firmware::query_installed(&device).wrap_err("could not read installed firmware info")?;
+/// Checks one open device against the catalog and, if a newer release
+/// exists, downloads and flashes it.
+fn check_and_upgrade(device: &Device, skip_confirm: bool) -> eyre::Result<()> {
+    let installed = firmware::query_installed(device)
+        .wrap_err("could not read installed firmware info")
+        .with_proxy_help()?;
     let catalog = GithubCatalog::twinleaf();
     let report =
         firmware::check_for_update(installed, &catalog).wrap_err("firmware update check failed")?;
@@ -146,16 +221,17 @@ fn firmware_upgrade_latest(tio: &TioOpts, skip_confirm: bool) -> eyre::Result<()
         return Ok(());
     }
 
-    download_and_flash(&device, &catalog, &release)
+    download_and_flash(device, &catalog, &release)
 }
 
-/// Detect the sensor, list every published firmware, and let the user pick one
-/// to install (including older releases than what is running).
+/// Detects the sensor, lists every published firmware, and lets the user pick
+/// one to install, older releases included.
 fn firmware_select(tio: &TioOpts) -> eyre::Result<()> {
     let (_proxy, device) = open_device(tio)?;
 
-    let installed =
-        firmware::query_installed(&device).wrap_err("could not read installed firmware info")?;
+    let installed = firmware::query_installed(&device)
+        .wrap_err("could not read installed firmware info")
+        .with_proxy_help()?;
     let catalog = GithubCatalog::twinleaf();
     let report =
         firmware::check_for_update(installed, &catalog).wrap_err("firmware lookup failed")?;
@@ -215,7 +291,8 @@ fn firmware_select(tio: &TioOpts) -> eyre::Result<()> {
     download_and_flash(&device, &catalog, release)
 }
 
-/// Print the `Sensor`/`Device` and `Installed` header lines for a device.
+/// Prints the `Sensor` or `Device` and the `Installed` header lines for a
+/// device.
 fn present_installed(installed: &firmware::InstalledFirmware) {
     let label = |s: &str| style(format!("{:11}", s)).bold().cyan();
     println!();
@@ -252,30 +329,26 @@ fn print_dev_build_notice() {
     );
 }
 
-/// Download a release (using the cache) and flash it, with progress.
+/// Downloads a release through the cache and flashes it, with progress.
 fn download_and_flash(
-    device: &proxy::Port,
+    device: &Device,
     catalog: &GithubCatalog,
     release: &firmware::FirmwareRelease,
 ) -> eyre::Result<()> {
     let cache_root = firmware::default_cache_dir()
         .ok_or_else(|| eyre::eyre!("could not determine a cache directory"))?;
     let firmware_data = download_with_progress(catalog, release, &cache_root)?;
-    log::info!("loaded {} bytes firmware", firmware_data.len());
+    log::debug!("loaded {} bytes firmware", firmware_data.len());
 
     flash_with_progress(device, &firmware_data)
 }
 
-/// Open a device RPC port. The returned [`proxy::Interface`] owns the
-/// connection and must be kept alive for as long as the [`proxy::Port`] is
-/// used, otherwise the proxy is torn down and the port disconnects.
-fn open_device(tio: &TioOpts) -> eyre::Result<(proxy::Interface, proxy::Port)> {
-    let proxy = proxy::Interface::new(&tio.root);
-    let device = proxy
-        .device_rpc(tio.route.clone())
-        .wrap_err_with(|| format!("could not open device at {}", tio.root))
-        .with_proxy_help()?;
-    Ok((proxy, device))
+/// Opens a session on the device at `tio`. The returned [`Connection`] must
+/// be kept alive for as long as the device is used.
+fn open_device(tio: &TioOpts) -> eyre::Result<(Connection, Device)> {
+    let connection = Connection::open(&tio.root)?;
+    let device = connection.device(tio.route);
+    Ok((connection, device))
 }
 
 fn confirm(prompt: &str, skip_confirm: bool) -> eyre::Result<bool> {
@@ -294,7 +367,7 @@ fn download_with_progress(
     release: &firmware::FirmwareRelease,
     cache_root: &std::path::Path,
 ) -> eyre::Result<Vec<u8>> {
-    let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
+    let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
@@ -316,8 +389,8 @@ fn download_with_progress(
     Ok(data)
 }
 
-/// Drive [`firmware::flash`], rendering each phase, then re-read `dev.desc`.
-fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Result<()> {
+/// Drives [`firmware::flash`], rendering each phase, then re-reads `dev.desc`.
+fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()> {
     let power_cycle_hint =
         "power cycle the device before retrying and check if dev.stop exists as an rpc";
     // Wide enough to align the longest RPC name (dev.firmware.upgrade).
@@ -341,7 +414,7 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
         }
         FlashEvent::Uploading { chunk, total } => {
             let bar = upload.get_or_insert_with(|| {
-                let b = crate::multi_progress().add(ProgressBar::new(total as u64));
+                let b = crate::logging::multi_progress().add(ProgressBar::new(total as u64));
                 b.set_style(
                     ProgressStyle::default_bar()
                         .template(
@@ -354,6 +427,17 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
             });
             bar.set_length(total as u64);
             bar.set_position(chunk as u64);
+        }
+        FlashEvent::Resuming {
+            chunk,
+            total,
+            error,
+        } => {
+            let _ = crate::logging::multi_progress().println(format!(
+                " {} {}",
+                label("dev.firmware.upload"),
+                style(format!("{error}; resuming from chunk {chunk}/{total}")).yellow()
+            ));
         }
         FlashEvent::Committing => {
             // Persist the upload result (the bar above is transient).
@@ -369,7 +453,7 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
             println!(" {} committing...", label("dev.firmware.upgrade"));
         }
         FlashEvent::Finalizing => {
-            let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
+            let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
             spinner.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.green} {msg}")
@@ -384,6 +468,7 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
                 spinner.finish_and_clear();
             }
         }
+        _ => {}
     });
 
     if let Some(bar) = upload.take() {
@@ -407,13 +492,13 @@ fn flash_with_progress(device: &proxy::Port, firmware_data: &[u8]) -> eyre::Resu
     Ok(())
 }
 
-/// After a successful flash, re-read `dev.desc` (retrying while the device
-/// reboots) to confirm the new firmware booted. Best-effort: never fails.
-fn verify_new_firmware(device: &proxy::Port) {
+/// Re-reads `dev.desc` after a flash, retrying while the device reboots, and
+/// prints the firmware now running. Prints a warning if it cannot be read.
+fn verify_new_firmware(device: &Device) {
     const ATTEMPTS: usize = 6;
     const INTERVAL: Duration = Duration::from_millis(1500);
 
-    let spinner = crate::multi_progress().add(ProgressBar::new_spinner());
+    let spinner = crate::logging::multi_progress().add(ProgressBar::new_spinner());
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")

@@ -1,8 +1,9 @@
+//! The arguments of `tio log` and its subcommands.
+
+use super::{parse_device_route, TioOpts};
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use std::time::Duration;
-use twinleaf::legacy::device::DeviceRoute;
-
-use crate::{parse_device_route, TioOpts};
+use twinleaf::DeviceRoute;
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -21,11 +22,11 @@ pub struct LogCli {
     #[arg(short = 'u')]
     pub unbuffered: bool,
 
-    /// Raw mode: skip metadata request and dump all packets
+    /// Raw mode, skipping the metadata request and dumping all packets
     #[arg(long)]
     pub raw: bool,
 
-    /// Routing depth (only used in --raw mode)
+    /// Routing depth limit (unlimited by default)
     #[arg(long = "depth")]
     pub depth: Option<usize>,
 
@@ -38,118 +39,141 @@ pub struct LogCli {
 pub enum LogSubcommands {
     /// Log metadata to a file. See "tio log meta --help" for more options
     #[command(args_conflicts_with_subcommands = true)]
-    Meta {
-        #[command(flatten)]
-        tio: TioOpts,
-
-        #[command(subcommand)]
-        subcommands: Option<MetaSubcommands>,
-
-        /// Output metadata file path
-        #[arg(short = 'f', default_value = "meta.tio")]
-        file: String,
-    },
+    Meta(LogMetaCli),
 
     /// Dump data from binary log file(s)
-    Dump {
-        /// Input log file(s)
-        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
-        files: Vec<String>,
-
-        /// Show parsed data samples
-        #[arg(short = 'd', long = "data")]
-        data: bool,
-
-        /// Show metadata on boundaries
-        #[arg(short = 'm', long = "meta")]
-        meta: bool,
-
-        /// Sensor path in the sensor tree (e.g., /, /0, /0/1)
-        #[arg(short = 's', long = "sensor", default_value = "/", value_parser = parse_device_route)]
-        sensor: DeviceRoute,
-
-        /// Routing depth limit (default: unlimited)
-        #[arg(long = "depth")]
-        depth: Option<usize>,
-    },
+    Dump(LogDumpCli),
 
     /// Summarize the contents of binary log file(s)
-    Inspect {
-        /// Input log file(s)
-        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
-        files: Vec<String>,
-    },
+    Inspect(LogInspectCli),
 
     /// Convert binary log data to CSV
-    Csv {
-        /// Stream selector (name or id, optionally with a route prefix like
-        /// /0/field) and input .tio files (order-independent)
-        #[arg(value_hint = ValueHint::FilePath)]
-        args: Vec<String>,
-
-        /// Sensor route in the device tree (default: /); overridden by a route
-        /// prefix in the selector
-        #[arg(short = 's', value_parser = parse_device_route)]
-        sensor: Option<DeviceRoute>,
-
-        /// Output filename prefix
-        #[arg(short = 'o')]
-        output: Option<String>,
-
-        /// Overwrite the output file if it already exists
-        #[arg(short = 'f', long)]
-        force: bool,
-    },
+    Csv(LogCsvCli),
 
     /// Convert binary log files to HDF5 format
     #[command(alias = "hdf5")]
-    Hdf {
-        /// Input log file(s)
-        #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
-        files: Vec<String>,
+    Hdf(LogHdfCli),
+}
 
-        /// Output file path (defaults to input filename with .h5 extension)
-        #[arg(short = 'o')]
-        output: Option<String>,
+#[derive(Args, Debug)]
+pub struct LogMetaCli {
+    #[command(flatten)]
+    pub tio: TioOpts,
 
-        /// Filter streams using a glob pattern (e.g. "/*/vector")
-        #[arg(short = 'g', long = "glob")]
-        filter: Option<String>,
+    #[command(subcommand)]
+    pub subcommands: Option<MetaSubcommands>,
 
-        /// Enable deflate compression (saves space, slows down write significantly)
-        #[arg(short = 'c', long = "compress")]
-        compress: bool,
+    /// Output metadata file path
+    #[arg(short = 'f', default_value = "meta.tio")]
+    pub file: String,
+}
 
-        /// Enable debug output for glob matching
-        #[arg(short = 'd', long)]
-        debug: bool,
+#[derive(Args, Debug)]
+pub struct LogDumpCli {
+    /// Input log file(s)
+    #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
+    pub files: Vec<String>,
 
-        /// How to organize runs in the output (none=flat, stream=per-stream, device=per-device, global=all-shared)
-        #[arg(short = 'l', long = "split", default_value = "none")]
-        split_level: SplitLevel,
+    /// Show parsed data samples
+    #[arg(short = 'd', long = "data")]
+    pub data: bool,
 
-        /// When to detect discontinuities (continuous=any gap, monotonic=only time backward)
-        #[arg(short = 'p', long = "policy", default_value = "continuous")]
-        split_policy: SplitPolicy,
-    },
+    /// Show metadata on boundaries
+    #[arg(short = 'm', long = "meta")]
+    pub meta: bool,
+
+    /// Sensor path in the sensor tree (e.g., /, /0, /0/1)
+    #[arg(short = 's', long = "sensor", default_value = "/", value_parser = parse_device_route)]
+    pub sensor: DeviceRoute,
+
+    /// Filter streams/columns using a glob pattern (e.g. "sync", "/0/vector").
+    /// Requires -d.
+    #[arg(short = 'g', long = "glob", requires = "data")]
+    pub glob: Option<String>,
+
+    /// Routing depth limit (unlimited by default)
+    #[arg(long = "depth")]
+    pub depth: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub struct LogInspectCli {
+    /// Input log file(s)
+    #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
+    pub files: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct LogCsvCli {
+    /// Stream selector (name or id, optionally with a route prefix like
+    /// /0/field) and input .tio files (order-independent)
+    #[arg(value_hint = ValueHint::FilePath)]
+    pub args: Vec<String>,
+
+    /// Sensor route in the device tree (defaults to /), overridden by a route
+    /// prefix in the selector
+    #[arg(short = 's', value_parser = parse_device_route)]
+    pub sensor: Option<DeviceRoute>,
+
+    /// Output filename prefix
+    #[arg(short = 'o')]
+    pub output: Option<String>,
+
+    /// Overwrite the output file if it already exists
+    #[arg(short = 'f', long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LogHdfCli {
+    /// Input log file(s)
+    #[arg(value_hint = ValueHint::FilePath, required = true, num_args = 1..)]
+    pub files: Vec<String>,
+
+    /// Output file path (defaults to input filename with .h5 extension)
+    #[arg(short = 'o')]
+    pub output: Option<String>,
+
+    /// Filter streams using a glob pattern (e.g. "/*/vector")
+    #[arg(short = 'g', long = "glob")]
+    pub filter: Option<String>,
+
+    /// Enable deflate compression (saves space, slows down write significantly)
+    #[arg(short = 'c', long = "compress")]
+    pub compress: bool,
+
+    /// Enable debug output for glob matching
+    #[arg(short = 'd', long)]
+    pub debug: bool,
+
+    /// How to organize runs in the output (none=flat, stream=per-stream, device=per-device, global=all-shared)
+    #[arg(short = 'l', long = "split", default_value = "none")]
+    pub split_level: SplitLevel,
+
+    /// When to detect discontinuities (continuous=any gap, monotonic=only time backward)
+    #[arg(short = 'p', long = "policy", default_value = "continuous")]
+    pub split_policy: SplitPolicy,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum MetaSubcommands {
     /// Reroute metadata packets in a metadata file
-    Reroute {
-        /// Input metadata file path
-        #[arg(value_hint = ValueHint::FilePath)]
-        input: String,
+    Reroute(MetaRerouteCli),
+}
 
-        /// New device route (e.g., /0/1)
-        #[arg(short = 's', long = "sensor", value_parser = parse_device_route)]
-        route: DeviceRoute,
+#[derive(Args, Debug)]
+pub struct MetaRerouteCli {
+    /// Input metadata file path
+    #[arg(value_hint = ValueHint::FilePath)]
+    pub input: String,
 
-        /// Output metadata file path (defaults to <input>_rerouted.tio)
-        #[arg(short = 'o', long = "output")]
-        output: Option<String>,
-    },
+    /// New device route (e.g., /0/1)
+    #[arg(short = 's', long = "sensor", value_parser = parse_device_route)]
+    pub route: DeviceRoute,
+
+    /// Output metadata file path (defaults to <input>_rerouted.tio)
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<String>,
 }
 
 /// How the user referred to a stream on the `log csv` command line.
@@ -161,11 +185,12 @@ pub enum StreamSel {
     Name(String),
 }
 
-/// A parsed `log csv` stream selector: an optional route prefix plus the stream.
+/// A parsed `log csv` stream selector, an optional route prefix plus the
+/// stream.
 ///
-/// The last `/`-separated segment is the stream (id or name); anything before it
-/// is the route. So `field` and `1` carry no route, while `/0/field` and `/0/1`
-/// pin the route to `/0`.
+/// The last `/`-separated segment is the stream, by id or name, and anything
+/// before it is the route. `field` and `1` carry no route, while `/0/field`
+/// and `/0/1` pin the route to `/0`.
 #[derive(Clone, Debug)]
 pub struct CsvTarget {
     pub route: Option<DeviceRoute>,
@@ -201,7 +226,7 @@ fn default_log_path() -> String {
         .to_string()
 }
 
-/// Controls when discontinuities trigger run splits
+/// When a discontinuity splits a run in the HDF5 output.
 #[derive(ValueEnum, Clone, Debug, Default)]
 pub enum SplitPolicy {
     /// Split on any discontinuity (gaps, rate changes, etc.)
@@ -212,7 +237,7 @@ pub enum SplitPolicy {
 }
 
 #[cfg(feature = "hdf5")]
-impl From<SplitPolicy> for twinleaf::legacy::data::export::SplitPolicy {
+impl From<SplitPolicy> for twinleaf::data::export::SplitPolicy {
     fn from(policy: SplitPolicy) -> Self {
         match policy {
             SplitPolicy::Continuous => Self::Continuous,
@@ -221,10 +246,10 @@ impl From<SplitPolicy> for twinleaf::legacy::data::export::SplitPolicy {
     }
 }
 
-/// Controls how runs are organized in the HDF5 output
+/// How runs are organized in the HDF5 output.
 #[derive(ValueEnum, Clone, Debug, Default)]
 pub enum SplitLevel {
-    /// No run splitting - one table per stream: /{route}/{stream}
+    /// No run splitting, one table per stream at /{route}/{stream}
     #[default]
     None,
     /// Each stream has independent run counter (separate table per run)
@@ -236,7 +261,7 @@ pub enum SplitLevel {
 }
 
 #[cfg(feature = "hdf5")]
-impl From<SplitLevel> for twinleaf::legacy::data::export::RunSplitLevel {
+impl From<SplitLevel> for twinleaf::data::export::RunSplitLevel {
     fn from(level: SplitLevel) -> Self {
         match level {
             SplitLevel::None => Self::None,

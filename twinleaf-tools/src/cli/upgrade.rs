@@ -1,7 +1,9 @@
+//! The arguments of `tio upgrade`.
+
 use clap::{Args, ValueHint};
 use std::path::PathBuf;
 
-use crate::{parse_existing_file, TioOpts};
+use super::{parse_existing_file, TioOpts};
 
 #[derive(Args, Debug)]
 pub struct UpgradeCli {
@@ -17,6 +19,11 @@ pub struct UpgradeCli {
     /// pick one to install (allows installing an older release).
     #[arg(long, conflicts_with = "firmware_path")]
     pub downgrade: bool,
+
+    /// Check every device active on the hub (at -r, default localhost) for a
+    /// firmware update and upgrade each one that has a newer release.
+    #[arg(long = "all", conflicts_with_all = ["firmware_path", "downgrade"])]
+    pub all: bool,
 
     /// Skip confirmation prompt
     #[arg(short = 'y', long = "yes")]

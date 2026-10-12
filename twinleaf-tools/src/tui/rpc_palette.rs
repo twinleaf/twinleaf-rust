@@ -1,27 +1,37 @@
-//! Interactive RPC palette widget for embedding in ratatui TUIs.
+//! The interactive RPC palette that [`RpcConsole`](super::RpcConsole) holds.
 //!
-//! Hosts (e.g. `tio monitor`, `tio health`) own an [`RpcPalette`], route key
-//! events to [`RpcPalette::handle_key`], and render it with
-//! [`RpcPalette::render`]. The palette emits [`PaletteEvent`]s for submit /
-//! exit / route-switch; the host owns the RPC worker plumbing and mode
-//! transitions.
+//! The console hands key and mouse events to [`RpcPalette::handle_key`] and
+//! [`RpcPalette::handle_mouse`], and draws the palette with
+//! [`RpcPalette::render`]. The palette answers each event with a
+//! [`PaletteEvent`], which asks the console to make a call, switch routes or
+//! close.
 
 use std::cmp::min;
+use std::time::{Duration, Instant};
 
+use super::rpc_console::RouteRpcState;
+use crate::tui::scroll::{follow_scroll, wheel_scroll, NAV_MARGIN};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Direction, Layout, Rect},
+    crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     prelude::Stylize,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, Paragraph},
+    widgets::{Block, Borders, List, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use tui_prompts::{State, TextState};
-use twinleaf::legacy::device::{util, DeviceRoute, RpcDescriptor, RpcRegistry, RpcValueType};
-
+use twinleaf::device::rpc::{
+    RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueType, RpcValueTypeExt,
+};
+use twinleaf::DeviceRoute;
 const RPCLIST_MAX_LEN: usize = 12;
+/// The close hint in the title of the input block. Clicking it closes the
+/// palette.
+const CLOSE_HINT: &str = " <Esc/Ctrl+C> ";
 
 #[derive(Debug, Clone)]
 pub struct RpcReq {
@@ -50,7 +60,7 @@ struct ParsedLine {
     roles: Vec<(std::ops::Range<usize>, TokRole)>,
 }
 
-/// Split `line` into (byte-range, text) tokens on whitespace.
+/// Splits `line` into (byte range, text) tokens on whitespace.
 fn tokenize(line: &str) -> Vec<(std::ops::Range<usize>, &str)> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
@@ -94,7 +104,7 @@ fn parse_palette_line(line: &str) -> ParsedLine {
                 match toks.get(i + 1) {
                     Some((vrange, vtok)) => {
                         roles.push((vrange.clone(), TokRole::FlagVal));
-                        match util::parse_rpc_type(vtok) {
+                        match RpcValueType::from_name(vtok) {
                             Some(t) if is_req => req_type = Some(t),
                             Some(t) => rep_type = Some(t),
                             None => bad_type = Some((*vtok).to_string()),
@@ -125,33 +135,12 @@ fn parse_palette_line(line: &str) -> ParsedLine {
     }
 }
 
-#[derive(Debug)]
-pub struct RpcResp {
-    pub result: Result<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RpcPaletteStatus {
-    Ready,
-    Fetching,
-    Refreshing,
-    Disconnected,
-    WaitingForRpc,
-    Failed,
-    FailedUsingPrevious,
-}
-
-/// Outcome of [`RpcPalette::handle_key`]. The host interprets this to decide
-/// whether to dispatch an RPC, switch routes, exit palette mode, or do nothing.
+/// The outcome of [`RpcPalette::handle_key`]. It tells the host to dispatch
+/// an RPC, switch routes, exit palette mode, or do nothing.
 pub enum PaletteEvent {
-    /// Key was consumed; no host-level action.
     Consumed,
-    /// User asked to execute this RPC.
     Submit(RpcReq),
-    /// User picked a different route from the route picker; host should
-    /// navigate its selection cursor to that device.
     SelectRoute(DeviceRoute),
-    /// User asked to exit the palette (Esc on empty input, or Ctrl+C).
     Exit,
 }
 
@@ -162,34 +151,61 @@ enum Zone {
     Arg,
 }
 
+/// Which list the captured [`HitZones`] geometry describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ListKind {
+    #[default]
+    None,
+    Suggestions,
+    RoutePicker,
+}
+
+/// Screen geometry captured during `render` for mouse hit-testing.
+/// Zero-sized rects mean the element isn't currently shown.
+#[derive(Debug, Default)]
+struct HitZones {
+    list: Rect,
+    list_kind: ListKind,
+    /// First visible row of the rendered list.
+    list_start: usize,
+    /// The `[route]` prefix in the input line.
+    route: Rect,
+    /// The `CLOSE_HINT` title.
+    close: Rect,
+    visible_rows: usize,
+}
+
 struct Suggestion {
     name: String,
     positions: Vec<u32>,
 }
 
-/// One pre-accept snapshot. `accepted_name` is the suggestion that was
-/// accepted; on pop we re-select it in the restored list so users land
-/// exactly where they were.
+/// One snapshot from before a suggestion was accepted. `accepted_name` is the
+/// suggestion that was accepted. Popping the entry re-selects it in the
+/// restored list.
 struct UndoEntry {
     input: String,
     accepted_name: String,
 }
 
 pub struct RpcPalette {
-    pub input_state: TextState<'static>,
+    input_state: TextState<'static>,
     suggestions: Vec<Suggestion>,
     selected: Option<usize>,
     scroll: usize,
-    pub last_rpc_result: Option<(String, Color)>,
-    pub last_rpc_command: String,
+    last_rpc_result: Option<(String, Color)>,
+    last_rpc_command: String,
     in_flight: bool,
     history: Vec<String>,
     picker: Option<HistoryPicker>,
     route_picker: Option<RoutePicker>,
-    /// Snapshots of input state pushed by each accept (Right/Tab). Left pops
-    /// one to step back to a prior filter view.
     undo_stack: Vec<UndoEntry>,
     matcher: Matcher,
+    zones: HitZones,
+    last_click: Option<(Instant, usize)>,
+    hovered: Option<usize>,
+    hover_route: bool,
+    hover_close: bool,
 }
 
 impl Default for RpcPalette {
@@ -207,11 +223,17 @@ impl Default for RpcPalette {
             route_picker: None,
             undo_stack: Vec::new(),
             matcher: Matcher::new(Config::DEFAULT),
+            zones: HitZones::default(),
+            last_click: None,
+            hovered: None,
+            hover_route: false,
+            hover_close: false,
         }
     }
 }
 
-/// Sub-mode: Ctrl+R opens a filterable list of past submitted commands.
+/// The history sub-mode, a filterable list of past submitted commands that
+/// Ctrl+R opens.
 #[derive(Debug, Default)]
 struct HistoryPicker {
     /// Query text typed into the picker's own filter line.
@@ -243,40 +265,61 @@ impl HistoryPicker {
     }
 }
 
-/// Sub-mode: Left on empty input opens this to pick an active device route.
+/// The route sub-mode, which Left on empty input opens to pick an active
+/// device route.
 struct RoutePicker {
     routes: Vec<DeviceRoute>,
     selected: usize,
+    /// Index of the first visible row.
+    scroll: usize,
+}
+
+impl RoutePicker {
+    fn commit(&self) -> PaletteEvent {
+        PaletteEvent::SelectRoute(self.routes[self.selected])
+    }
+
+    fn step(&mut self, forward: bool) {
+        if forward {
+            let last = self.routes.len().saturating_sub(1);
+            self.selected = (self.selected + 1).min(last);
+        } else {
+            self.selected = self.selected.saturating_sub(1);
+        }
+    }
 }
 
 impl RpcPalette {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Focus the input and repopulate suggestions. Call when entering RPC mode.
+    /// Focuses the input and repopulates the suggestions. Call it when
+    /// entering RPC mode.
     pub fn enter(&mut self, registry: Option<&RpcRegistry>) {
         self.input_state.focus();
         self.update_suggestions(registry);
     }
 
-    /// Blur the input. Call when leaving RPC mode.
+    /// Blurs the input. Call it when leaving RPC mode.
     pub fn exit(&mut self) {
         self.input_state.blur();
         self.route_picker = None;
         self.undo_stack.clear();
+        self.clear_hover();
     }
 
-    /// Number of suggestion rows to display (without borders). Reflects the
-    /// active sub-picker if one is open.
+    /// Drops the hover highlights. Call it when the mouse leaves the palette.
+    pub fn clear_hover(&mut self) {
+        self.hovered = None;
+        self.hover_route = false;
+        self.hover_close = false;
+    }
+
+    /// Returns the number of suggestion rows to display, without borders. An
+    /// open sub-picker sets it.
     pub fn suggestion_rows(&self) -> u16 {
         let len = if let Some(picker) = &self.picker {
-            picker.filtered.len().max(1).min(RPCLIST_MAX_LEN)
+            picker.filtered.len().clamp(1, RPCLIST_MAX_LEN)
         } else if let Some(rp) = &self.route_picker {
-            rp.routes.len().max(1).min(RPCLIST_MAX_LEN)
-        } else if self.current_zone() == Zone::Arg {
-            1
-        } else if self.suggestions.is_empty() {
+            rp.routes.len().clamp(1, RPCLIST_MAX_LEN)
+        } else if self.current_zone() == Zone::Arg || self.suggestions.is_empty() {
             1
         } else {
             self.suggestions.len().min(RPCLIST_MAX_LEN)
@@ -293,9 +336,9 @@ impl RpcPalette {
         self.in_flight = false;
     }
 
-    /// Dispatch a key event. The host should call this for every key while the
-    /// palette is active; unhandled readline-style edits are routed through to
-    /// the underlying [`TextState`].
+    /// Handles a key event. The host calls this for every key while the
+    /// palette is active. Readline-style edits that the palette does not
+    /// handle go to the underlying [`TextState`].
     pub fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -345,6 +388,18 @@ impl RpcPalette {
                 }
                 PaletteEvent::Consumed
             }
+            KeyCode::PageUp => {
+                if zone != Zone::Arg {
+                    self.select_page(footer_height, false);
+                }
+                PaletteEvent::Consumed
+            }
+            KeyCode::PageDown => {
+                if zone != Zone::Arg {
+                    self.select_page(footer_height, true);
+                }
+                PaletteEvent::Consumed
+            }
             KeyCode::Left => match zone {
                 Zone::Empty => {
                     self.open_route_picker(available_routes, route);
@@ -358,15 +413,14 @@ impl RpcPalette {
                     PaletteEvent::Consumed
                 }
                 Zone::Arg => {
-                    if self.has_arg_content() {
-                        self.clear_arg(registry);
-                    } else if !self.pop_undo(registry) {
+                    let restored = !self.has_arg_content() && self.pop_undo(registry);
+                    if !restored {
                         self.clear_arg(registry);
                     }
                     PaletteEvent::Consumed
                 }
             },
-            KeyCode::Right | KeyCode::Tab => match zone {
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char(' ') => match zone {
                 Zone::Empty | Zone::RpcName => {
                     self.commit_to_arg(registry);
                     PaletteEvent::Consumed
@@ -394,6 +448,145 @@ impl RpcPalette {
         }
     }
 
+    /// Handles a mouse event. The host calls this for mouse events within the
+    /// palette's rendered area while the palette is active.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        registry: Option<&RpcRegistry>,
+        route: &DeviceRoute,
+        available_routes: &[DeviceRoute],
+        footer_height: u16,
+    ) -> PaletteEvent {
+        self.hover_route = hit(self.zones.route, mouse);
+        self.hover_close = hit(self.zones.close, mouse);
+        self.hovered = self.hovered_row(mouse);
+        // The history picker (Ctrl+R) is out of scope for mouse support.
+        if self.picker.is_some() {
+            return PaletteEvent::Consumed;
+        }
+        let left_click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+        if left_click && self.hover_close {
+            return PaletteEvent::Exit;
+        }
+        if left_click && self.hover_route {
+            // A second click on the route button cancels the picker, like Esc.
+            if self.route_picker.is_none() {
+                self.open_route_picker(available_routes, route);
+            } else {
+                self.route_picker = None;
+            }
+            return PaletteEvent::Consumed;
+        }
+        if self.route_picker.is_some() {
+            return match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+                    let visible = self.visible_rows(footer_height);
+                    if let Some(picker) = self.route_picker.as_mut() {
+                        picker.scroll =
+                            wheel_scroll(picker.scroll, down, visible, picker.routes.len());
+                        self.zones.list_start = picker.scroll;
+                    }
+                    self.hovered = self.hovered_row(mouse);
+                    PaletteEvent::Consumed
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.click_route_picker_row(mouse),
+                _ => PaletteEvent::Consumed,
+            };
+        }
+        if registry.is_none() || self.current_zone() == Zone::Arg {
+            return PaletteEvent::Consumed;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+                let visible = self.visible_rows(footer_height);
+                self.scroll = wheel_scroll(self.scroll, down, visible, self.suggestions.len());
+                self.zones.list_start = self.scroll;
+                self.hovered = self.hovered_row(mouse);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self.click_suggestion(mouse, registry, route)
+            }
+            _ => {}
+        }
+        PaletteEvent::Consumed
+    }
+
+    /// Returns the row of the active list under the cursor, or `None` if the
+    /// geometry captured at the last render no longer matches the open list.
+    fn hovered_row(&self, mouse: MouseEvent) -> Option<usize> {
+        let len = match self.zones.list_kind {
+            ListKind::None => return None,
+            ListKind::Suggestions => self.suggestions.len(),
+            ListKind::RoutePicker => self.route_picker.as_ref()?.routes.len(),
+        };
+        self.row_at(mouse, self.zones.list_kind)
+            .filter(|&i| i < len)
+    }
+
+    /// Returns the absolute row index at `mouse`, if the last render drew a
+    /// `kind` list there.
+    fn row_at(&self, mouse: MouseEvent, kind: ListKind) -> Option<usize> {
+        if self.zones.list_kind != kind || !hit(self.zones.list, mouse) {
+            return None;
+        }
+        Some(self.zones.list_start + (mouse.row - self.zones.list.y) as usize)
+    }
+
+    /// Selects the clicked suggestion row and leaves the input text as it is.
+    /// A second click on the same row within 400 ms submits it with no
+    /// argument.
+    fn click_suggestion(
+        &mut self,
+        mouse: MouseEvent,
+        registry: Option<&RpcRegistry>,
+        route: &DeviceRoute,
+    ) -> PaletteEvent {
+        let Some(idx) = self.row_at(mouse, ListKind::Suggestions) else {
+            return PaletteEvent::Consumed;
+        };
+        if idx >= self.suggestions.len() {
+            return PaletteEvent::Consumed;
+        }
+        self.selected = Some(idx);
+
+        let now = Instant::now();
+        let is_double = matches!(self.last_click.take(),
+            Some((t, prev)) if prev == idx && now.duration_since(t) < Duration::from_millis(400));
+        if is_double {
+            let name = self.suggestions[idx].name.clone();
+            let req = RpcReq {
+                route: *route,
+                meta: None,
+                method: name.clone(),
+                arg: None,
+                req_type: None,
+                rep_type: None,
+            };
+            return PaletteEvent::Submit(self.dispatch(registry, req, name));
+        }
+        self.last_click = Some((now, idx));
+        PaletteEvent::Consumed
+    }
+
+    /// Selects and commits the clicked route picker row, as Enter does.
+    fn click_route_picker_row(&mut self, mouse: MouseEvent) -> PaletteEvent {
+        let Some(idx) = self.row_at(mouse, ListKind::RoutePicker) else {
+            return PaletteEvent::Consumed;
+        };
+        let Some(mut picker) = self.route_picker.take() else {
+            return PaletteEvent::Consumed;
+        };
+        if idx >= picker.routes.len() {
+            self.route_picker = Some(picker);
+            return PaletteEvent::Consumed;
+        }
+        picker.selected = idx;
+        picker.commit()
+    }
+
     fn current_zone(&self) -> Zone {
         let input = self.input_state.value();
         if input.is_empty() {
@@ -410,9 +603,8 @@ impl RpcPalette {
         input.split_whitespace().next().unwrap_or("")
     }
 
-    /// Trim the trailing dotted segment. `dev.foo.bar` → `dev.foo.`, then
-    /// → `dev.`, then → `` — letting a user back out of a wrong prefix
-    /// without many backspaces.
+    /// Trims the trailing dotted segment. Repeated, it takes `dev.foo.bar` to
+    /// `dev.foo.`, then to `dev.`, then to an empty input.
     fn delete_segment(&mut self) {
         let input = self.input_state.value();
         let new_val = if let Some(stripped) = input.strip_suffix('.') {
@@ -488,7 +680,18 @@ impl RpcPalette {
         }
         let routes = routes.to_vec();
         let selected = routes.iter().position(|r| r == current).unwrap_or(0);
-        self.route_picker = Some(RoutePicker { routes, selected });
+        let scroll = follow_scroll(
+            0,
+            selected,
+            self.zones.visible_rows,
+            routes.len(),
+            NAV_MARGIN,
+        );
+        self.route_picker = Some(RoutePicker {
+            routes,
+            selected,
+            scroll,
+        });
     }
 
     fn handle_route_picker_key(&mut self, key: KeyEvent) -> PaletteEvent {
@@ -498,18 +701,16 @@ impl RpcPalette {
         };
         match key.code {
             KeyCode::Esc => PaletteEvent::Consumed,
-            KeyCode::Enter | KeyCode::Right => {
-                let route = picker.routes[picker.selected].clone();
-                PaletteEvent::SelectRoute(route)
-            }
-            KeyCode::Up => {
-                picker.selected = picker.selected.saturating_sub(1);
-                self.route_picker = Some(picker);
-                PaletteEvent::Consumed
-            }
-            KeyCode::Down => {
-                let last = picker.routes.len().saturating_sub(1);
-                picker.selected = (picker.selected + 1).min(last);
+            KeyCode::Enter | KeyCode::Right => picker.commit(),
+            KeyCode::Up | KeyCode::Down => {
+                picker.step(key.code == KeyCode::Down);
+                picker.scroll = follow_scroll(
+                    picker.scroll,
+                    picker.selected,
+                    self.zones.visible_rows,
+                    picker.routes.len(),
+                    NAV_MARGIN,
+                );
                 self.route_picker = Some(picker);
                 PaletteEvent::Consumed
             }
@@ -520,18 +721,23 @@ impl RpcPalette {
         }
     }
 
-    /// Render the palette into `area`. Caller is responsible for reserving
-    /// enough vertical space (see [`suggestion_rows`]).
+    /// Renders the palette into `area`. The caller reserves its vertical
+    /// space, sized from [`Self::suggestion_rows`].
     pub fn render(
-        &self,
+        &mut self,
         f: &mut Frame,
         area: Rect,
         route: &DeviceRoute,
-        registry: Option<&RpcRegistry>,
-        status: RpcPaletteStatus,
+        rpc: &RouteRpcState,
         blink: bool,
     ) {
+        let registry = rpc.registry();
+        let (loading_message, status) = rpc.status();
         let footer_height = area.height;
+        self.zones = HitZones {
+            visible_rows: self.visible_rows(footer_height),
+            ..HitZones::default()
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -580,18 +786,24 @@ impl RpcPalette {
                     )
                 } else if let Some(rp) = &self.route_picker {
                     let visible_rows = self.visible_rows(footer_height);
-                    let end = visible_rows.min(rp.routes.len());
-                    let items = rp.routes[..end]
+                    let start = rp.scroll.min(rp.routes.len().saturating_sub(visible_rows));
+                    let end = (start + visible_rows).min(rp.routes.len());
+                    let items = rp.routes[start..end]
                         .iter()
                         .enumerate()
                         .map(|(i, r)| {
+                            let idx = start + i;
                             let text = format!("{}", r);
-                            let line = Line::from(Span::raw(text));
-                            if i == rp.selected {
-                                line.bold()
-                            } else {
-                                line.dim()
+                            let mut line = Line::from(Span::raw(text));
+                            if idx == rp.selected {
+                                line = line.bold();
+                            } else if self.hovered != Some(idx) {
+                                line = line.dim();
                             }
+                            if self.hovered == Some(idx) {
+                                line = line.bg(Color::DarkGray);
+                            }
+                            line
                         })
                         .collect::<Vec<_>>();
                     let rows = if items.is_empty() {
@@ -643,13 +855,14 @@ impl RpcPalette {
                             .enumerate()
                             .map(|(i, sugg)| {
                                 let is_sel = Some(start + i) == self.selected;
-                                self.render_suggestion_line(sugg, registry, is_sel)
+                                let is_hover = Some(start + i) == self.hovered;
+                                self.render_suggestion_line(sugg, registry, is_sel, is_hover)
                             })
                             .collect()
                     } else {
                         vec![Line::from(vec![
                             Span::styled(spinner_frame(blink), Style::default().fg(Color::Cyan)),
-                            Span::raw(format!(" {}", status.loading_message())),
+                            Span::raw(format!(" {}", loading_message)),
                         ])]
                     };
                     let rows = if items.is_empty() {
@@ -660,7 +873,7 @@ impl RpcPalette {
                     (
                         rows,
                         Line::from(" RPCs ").left_aligned(),
-                        Line::from(status.title_right()).right_aligned(),
+                        Line::from(suggestions_title(status)).right_aligned(),
                     )
                 };
 
@@ -668,7 +881,44 @@ impl RpcPalette {
                 .borders(Borders::ALL)
                 .title(title_left)
                 .title(title_right);
+            let inner = rpc_block.inner(chunks[0]);
             f.render_widget(List::new(rows).block(rpc_block), chunks[0]);
+
+            let showing_suggestions = self.picker.is_none()
+                && self.route_picker.is_none()
+                && self.current_zone() != Zone::Arg
+                && registry.is_some();
+            if showing_suggestions {
+                let visible_rows = self.visible_rows(footer_height);
+                let start = self.effective_scroll(visible_rows);
+                self.zones.list = inner;
+                self.zones.list_kind = ListKind::Suggestions;
+                self.zones.list_start = start;
+                if self.suggestions.len() > visible_rows {
+                    let mut sb_state =
+                        ScrollbarState::new(self.suggestions.len() - visible_rows + 1)
+                            .viewport_content_length(visible_rows)
+                            .position(start);
+                    f.render_stateful_widget(
+                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                            .begin_symbol(None)
+                            .end_symbol(None)
+                            .thumb_style(Style::default().fg(Color::DarkGray))
+                            .track_style(Style::default().fg(Color::DarkGray)),
+                        chunks[0].inner(Margin {
+                            vertical: 1,
+                            horizontal: 0,
+                        }),
+                        &mut sb_state,
+                    );
+                }
+            } else if let Some(rp) = &self.route_picker {
+                let visible_rows = self.visible_rows(footer_height);
+                let start = rp.scroll.min(rp.routes.len().saturating_sub(visible_rows));
+                self.zones.list = inner;
+                self.zones.list_kind = ListKind::RoutePicker;
+                self.zones.list_start = start;
+            }
         }
 
         if footer_height > 1 {
@@ -729,10 +979,16 @@ impl RpcPalette {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
+        } else if self.hover_route {
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Blue)
         };
-        spans.push(Span::styled(format!("[{}] ", display_route), route_style));
+        let route_text = format!("[{}] ", display_route);
+        let route_width = route_text.chars().count() as u16;
+        spans.push(Span::styled(route_text, route_style));
 
         // Cursor is REVERSED on, plain off — so it actually blinks.
         let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
@@ -788,22 +1044,52 @@ impl RpcPalette {
             Block::default()
                 .borders(Borders::TOP)
                 .title(Line::from(title_left).left_aligned())
-                .title(Line::from(" <Esc/Ctrl+C> ").right_aligned())
+                .title(if self.hover_close {
+                    Line::from(CLOSE_HINT).bold().right_aligned()
+                } else {
+                    Line::from(CLOSE_HINT).right_aligned()
+                })
         };
+
+        let input_inner = block.inner(chunks[2]);
+        if input_inner.width > 0 && input_inner.height > 0 {
+            self.zones.route = Rect {
+                x: input_inner.x,
+                y: input_inner.y,
+                width: route_width.min(input_inner.width),
+                height: 1,
+            };
+        }
+        if footer_height >= 3 {
+            let hint_width = CLOSE_HINT.chars().count() as u16;
+            let x = chunks[2]
+                .right()
+                .saturating_sub(hint_width)
+                .max(chunks[2].left());
+            self.zones.close = Rect {
+                x,
+                y: chunks[2].y,
+                width: hint_width.min(chunks[2].width),
+                height: 1,
+            };
+        }
 
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), chunks[2]);
     }
 
-    /// Render one suggestion row with fuzzy-match char highlights and (when
-    /// known) the registry's perm+type signature trailing in dim.
+    /// Renders one suggestion row with fuzzy-match highlights and, when
+    /// known, the registry's permission and type signature trailing in dim.
     fn render_suggestion_line<'a>(
         &self,
         sugg: &'a Suggestion,
         registry: Option<&RpcRegistry>,
         is_selected: bool,
+        is_hovered: bool,
     ) -> Line<'a> {
         let base_style = if is_selected {
             Style::default().add_modifier(Modifier::BOLD)
+        } else if is_hovered {
+            Style::default()
         } else {
             Style::default().add_modifier(Modifier::DIM)
         };
@@ -821,37 +1107,38 @@ impl RpcPalette {
         if let Some(desc) = registry.and_then(|r| r.find(&sugg.name)) {
             let sig = rpc_signature(desc);
             if !sig.is_empty() {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    sig,
+                // DarkGray fg would vanish on the DarkGray hover tint.
+                let sig_style = if is_hovered {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
                     Style::default()
                         .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ));
+                        .add_modifier(Modifier::DIM)
+                };
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(sig, sig_style));
             }
         }
 
-        Line::from(spans)
+        if is_hovered {
+            Line::from(spans).bg(Color::DarkGray)
+        } else {
+            Line::from(spans)
+        }
     }
 
     fn visible_rows(&self, footer_height: u16) -> usize {
         min(RPCLIST_MAX_LEN, footer_height.saturating_sub(5) as usize)
     }
 
+    /// Returns the stored offset clamped to the content. The view does not
+    /// follow the selection.
+    // Following the selection would snap the view back mid wheel-peek.
     fn effective_scroll(&self, visible_rows: usize) -> usize {
         if visible_rows == 0 || self.suggestions.len() <= visible_rows {
             return 0;
         }
-        let max_scroll = self.suggestions.len() - visible_rows;
-        let mut scroll = self.scroll.min(max_scroll);
-        if let Some(sel) = self.selected {
-            if sel < scroll {
-                scroll = sel;
-            } else if sel >= scroll + visible_rows {
-                scroll = sel + 1 - visible_rows;
-            }
-        }
-        scroll
+        self.scroll.min(self.suggestions.len() - visible_rows)
     }
 
     fn ensure_selection_visible(&mut self, footer_height: u16) {
@@ -860,15 +1147,13 @@ impl RpcPalette {
             return;
         };
         let visible_rows = self.visible_rows(footer_height);
-        if visible_rows == 0 || self.suggestions.len() <= visible_rows {
-            self.scroll = 0;
-            return;
-        }
-        if selected < self.scroll {
-            self.scroll = selected;
-        } else if selected >= self.scroll + visible_rows {
-            self.scroll = selected + 1 - visible_rows;
-        }
+        self.scroll = follow_scroll(
+            self.scroll,
+            selected,
+            visible_rows,
+            self.suggestions.len(),
+            NAV_MARGIN,
+        );
     }
 
     fn select_next(&mut self, footer_height: u16) {
@@ -890,6 +1175,22 @@ impl RpcPalette {
         let next = match self.selected {
             Some(0) | None => self.suggestions.len() - 1,
             Some(idx) => idx - 1,
+        };
+        self.selected = Some(next);
+        self.ensure_selection_visible(footer_height);
+    }
+
+    fn select_page(&mut self, footer_height: u16, forward: bool) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        let page = self.visible_rows(footer_height).max(1);
+        let last = self.suggestions.len() - 1;
+        let cur = self.selected.unwrap_or(0);
+        let next = if forward {
+            (cur + page).min(last)
+        } else {
+            cur.saturating_sub(page)
         };
         self.selected = Some(next);
         self.ensure_selection_visible(footer_height);
@@ -943,7 +1244,17 @@ impl RpcPalette {
         self.selected = prev_name
             .and_then(|n| self.suggestions.iter().position(|s| s.name == n))
             .or_else(|| (!self.suggestions.is_empty()).then_some(0));
-        self.scroll = 0;
+        // Reveal a preserved-by-name selection deep in the refiltered list.
+        self.scroll = match self.selected {
+            Some(sel) => follow_scroll(
+                0,
+                sel,
+                self.zones.visible_rows,
+                self.suggestions.len(),
+                NAV_MARGIN,
+            ),
+            None => 0,
+        };
     }
 
     fn commit_to_arg(&mut self, registry: Option<&RpcRegistry>) {
@@ -967,7 +1278,7 @@ impl RpcPalette {
         self.update_suggestions(registry);
     }
 
-    /// True iff there is non-whitespace text after the first space.
+    /// Returns `true` if there is non-whitespace text after the first space.
     fn has_arg_content(&self) -> bool {
         self.input_state
             .value()
@@ -987,8 +1298,8 @@ impl RpcPalette {
         }
     }
 
-    /// Restore the most recent pre-accept input and re-select the suggestion
-    /// that was accepted. Returns true if something was popped.
+    /// Restores the input from before the last accept and re-selects the
+    /// suggestion that was accepted. Returns `true` if something was popped.
     fn pop_undo(&mut self, registry: Option<&RpcRegistry>) -> bool {
         let Some(entry) = self.undo_stack.pop() else {
             return false;
@@ -1023,26 +1334,37 @@ impl RpcPalette {
             return None;
         }
         let method = parsed.method?;
-        self.last_rpc_command = method.clone();
-
-        let meta = registry
-            .and_then(|r| r.find(&method))
-            .map(|d| d.meta.bits());
-        self.last_rpc_result = Some((format!("Sent to {}", route), Color::Yellow));
-        self.in_flight = true;
-
         let req = RpcReq {
-            route: route.clone(),
-            meta,
+            route: *route,
+            meta: None,
             method,
             arg: parsed.arg,
             req_type: parsed.req_type,
             rep_type: parsed.rep_type,
         };
-        if self.history.last() != Some(&line) {
-            self.history.push(line);
+        Some(self.dispatch(registry, req, line))
+    }
+
+    /// Finishes a submit from Enter or a double-click. Fills in the registry
+    /// metadata, records the status, pushes the history, and returns the
+    /// request.
+    fn dispatch(
+        &mut self,
+        registry: Option<&RpcRegistry>,
+        mut req: RpcReq,
+        history_line: String,
+    ) -> RpcReq {
+        self.last_rpc_command = req.method.clone();
+        req.meta = registry
+            .and_then(|r| r.find(&req.method))
+            .map(|d| d.meta.bits());
+        self.last_rpc_result = Some((format!("Sent to {}", req.route), Color::Yellow));
+        self.in_flight = true;
+
+        if self.history.last() != Some(&history_line) {
+            self.history.push(history_line);
         }
-        Some(req)
+        req
     }
 
     fn clear_input(&mut self, registry: Option<&RpcRegistry>) {
@@ -1053,36 +1375,18 @@ impl RpcPalette {
     }
 }
 
-impl RpcPaletteStatus {
-    fn loading_message(self) -> &'static str {
-        match self {
-            RpcPaletteStatus::Ready => "",
-            RpcPaletteStatus::Fetching => "Generating RPC list...",
-            RpcPaletteStatus::Refreshing => "Refreshing RPC list...",
-            RpcPaletteStatus::Disconnected => "Device disconnected",
-            RpcPaletteStatus::WaitingForRpc => "Waiting for RPCs...",
-            RpcPaletteStatus::Failed => "RPC list unavailable",
-            RpcPaletteStatus::FailedUsingPrevious => "RPC list failed; using previous list",
-        }
+/// Returns the title of the suggestion list beside the keys it takes, led by
+/// `status` when there is one.
+fn suggestions_title(status: &str) -> String {
+    if status.is_empty() {
+        " ↑ | ↓ | ^R ".to_string()
+    } else {
+        format!(" {} | ↑ | ↓ | ^R ", status)
     }
+}
 
-    fn title_right(self) -> String {
-        let status = match self {
-            RpcPaletteStatus::Ready => "",
-            RpcPaletteStatus::Fetching => "Generating",
-            RpcPaletteStatus::Refreshing => "Refreshing",
-            RpcPaletteStatus::Disconnected => "Disconnected",
-            RpcPaletteStatus::WaitingForRpc => "Waiting",
-            RpcPaletteStatus::Failed => "Unavailable",
-            RpcPaletteStatus::FailedUsingPrevious => "Using previous",
-        };
-
-        if status.is_empty() {
-            " ↑ | ↓ | ^R ".to_string()
-        } else {
-            format!(" {} | ↑ | ↓ | ^R ", status)
-        }
-    }
+fn hit(rect: Rect, mouse: MouseEvent) -> bool {
+    rect.contains(Position::new(mouse.column, mouse.row))
 }
 
 fn spinner_frame(blink: bool) -> &'static str {

@@ -1,7 +1,9 @@
+//! The arguments of `tio capture`.
+
 use clap::{Args, ValueHint};
 use std::time::Duration;
 
-use crate::TioOpts;
+use super::TioOpts;
 
 #[derive(Args, Debug)]
 pub struct CaptureCli {
