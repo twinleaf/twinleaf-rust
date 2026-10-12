@@ -2947,8 +2947,18 @@ dependencies = [
  "serde_json",
  "serialport",
  "thiserror 2.0.20",
+ "twinleaf-proto",
  "ureq",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "twinleaf-proto"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "defmt",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
