@@ -167,6 +167,12 @@ impl FakeDevice {
         self.state.dead.store(true, Ordering::SeqCst);
     }
 
+    /// Delays each answer to `dev.name` by `delay`. Heartbeats continue
+    /// meanwhile.
+    pub(crate) fn delay_replies(&self, delay: Duration) {
+        *self.state.reply_delay.lock().unwrap() = delay;
+    }
+
     /// Sends `pkt` on the device's connection.
     pub(crate) fn send(&self, pkt: Packet) {
         self.state.outbox.lock().unwrap().push(pkt);
@@ -321,6 +327,12 @@ fn reset(stream: TcpStream, state: &DeviceState) {
 // A TCP port freed for the purpose could be taken by another test before it
 // is dialed.
 pub(crate) const UNREACHABLE: &str = "serial:///dev/twinleaf-test-unreachable";
+
+/// Returns how many Twinleaf serial devices are attached to this machine.
+/// `auto` considers them too.
+pub(crate) fn attached() -> usize {
+    super::auto::attached().len()
+}
 
 /// Asserts that `took` is `expected`, to the millisecond that timers round
 /// to.

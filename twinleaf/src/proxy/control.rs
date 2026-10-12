@@ -119,6 +119,16 @@ pub(crate) enum Purpose {
     Probe,
 }
 
+impl Purpose {
+    /// Returns the control method that binds a connection for this purpose.
+    pub(crate) fn method(self) -> &'static str {
+        match self {
+            Purpose::Use => OPEN,
+            Purpose::Probe => PROBE,
+        }
+    }
+}
+
 /// The id a [`handshake`] tags its hello with.
 const HELLO_ID: u16 = 1;
 /// The id a [`handshake`] tags its request with.

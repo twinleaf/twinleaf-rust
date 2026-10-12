@@ -990,8 +990,6 @@ impl ParseState {
             .metadata_snapshot(route)
     }
 
-    // The device stream reads it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.devices
             .iter()

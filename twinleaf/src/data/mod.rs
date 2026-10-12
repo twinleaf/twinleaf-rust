@@ -9,6 +9,10 @@
 //!                    metadata + runs
 //! ```
 //!
+//! Live connections expose this pipeline through
+//! [`Device::samples`](crate::device::Device::samples). Most applications
+//! receive batches from there and do not construct a parser.
+//!
 //! Restarts, rate changes, and packet loss start a new run. The run's first
 //! batch carries a [`BoundaryReason`]. Every batch carries the [`Generations`]
 //! of the run it belongs to.
@@ -30,6 +34,58 @@
 )]
 //!
 //! # Examples
+//!
+//! Retain a bounded history of a live stream and run an incremental
+//! computation over one of its columns.
+//!
+//! ```no_run
+//! use twinleaf::data::{Buffer, ColumnArray, ColumnKey, ColumnOp, ColumnProcessor};
+//! use twinleaf::{ColumnId, Connection, DeviceRoute, StreamId};
+//!
+//! /// Running mean of every sample since the run began.
+//! #[derive(Default)]
+//! struct Mean {
+//!     sum: f64,
+//!     count: usize,
+//!     mean: f64,
+//! }
+//!
+//! impl ColumnOp for Mean {
+//!     type Output = f64;
+//!
+//!     fn reset(&mut self) {
+//!         *self = Mean::default();
+//!     }
+//!
+//!     fn update_batch(&mut self, _timestamps: &[f64], values: &ColumnArray) {
+//!         if let ColumnArray::F64(values) = values {
+//!             self.sum += values.iter().sum::<f64>();
+//!             self.count += values.len();
+//!             self.mean = self.sum / self.count as f64;
+//!         }
+//!     }
+//!
+//!     fn output(&self) -> &f64 {
+//!         &self.mean
+//!     }
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let connection = Connection::connect()?;
+//! let device = connection.device(DeviceRoute::root());
+//! let samples = device.samples();
+//!
+//! let mut buffer = Buffer::new(100_000);
+//! let key = ColumnKey::new(DeviceRoute::root(), StreamId::new(1), ColumnId::new(0));
+//! let mut mean = ColumnProcessor::new(key, Mean::default());
+//!
+//! while let Ok(batch) = samples.recv() {
+//!     buffer.process_batch(&batch);
+//!     println!("mean = {}", mean.catch_up(&buffer));
+//! }
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! Scan a recorded log for its structure, then decode it in batches.
 //!

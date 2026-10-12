@@ -60,6 +60,15 @@
 //! statuses in the legacy form, type 64. It is disconnected if `auto` opens
 //! nothing.
 //!
+//! # Choosing a proxy
+//!
+//! A [`Connection`](crate::Connection) goes through the proxy at
+//! `tcp://127.0.0.1:7855`, and starts one if none answers there. The
+//! `TWINLEAF_PROXY` environment variable names another proxy as
+//! `tcp://host:port`, such as `tcp://127.0.0.1:17855` for a
+//! `tio proxy --port 17855`. A proxy named this way is not started, and a
+//! connection to it fails if nothing answers there.
+//!
 //! # Logging
 //!
 //! The proxy logs through the `log` crate. Each device's events are logged
@@ -74,14 +83,14 @@ mod link;
 mod server;
 mod worker;
 
-pub(crate) use control::{call, executable_name};
+pub(crate) use control::{call, executable_name, handshake, Purpose};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::tio::transport::LOOPBACK_CONNECT_TIMEOUT;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How long [`stop`] waits for the proxy to reply.
@@ -122,6 +131,21 @@ pub(crate) fn endpoint_at(port: u16) -> String {
 pub(crate) fn answers(port: u16) -> bool {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     TcpStream::connect_timeout(&address, LOOPBACK_CONNECT_TIMEOUT).is_ok()
+}
+
+/// Returns `true` if anything answers a connection to `port` of
+/// `127.0.0.1`, without blocking. Must be awaited on a tokio runtime.
+pub(crate) async fn answers_async(port: u16) -> bool {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let connecting = tokio::net::TcpStream::connect(address);
+    let connected = tokio::time::timeout(LOOPBACK_CONNECT_TIMEOUT, connecting).await;
+    matches!(connected, Ok(Ok(_)))
+}
+
+/// Locks `mutex`, even if a thread panicked while holding it. It suits locks
+/// that guard no change a panic could leave half made.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Where a proxy accepts clients.
@@ -254,8 +278,9 @@ pub struct Proxy {
 }
 
 /// Stops the background proxy at `proxy`, a `tcp://host:port`. With `None`
-/// it stops the proxy on `127.0.0.1:7855`. Only a proxy with
-/// [`HostOptions::stoppable`] set stops this way. Waits at most
+/// it stops the proxy [`Connection::open`](crate::Connection::open) goes
+/// through. Only a proxy with [`HostOptions::stoppable`] set stops this way,
+/// such as the one a connection starts in the background. Waits at most
 /// three seconds for the reply.
 ///
 /// # Errors
@@ -373,7 +398,7 @@ impl Drop for Proxy {
 }
 
 #[cfg(test)]
-use control::Introduction;
+pub(crate) use control::{client_name, Introduction};
 
 #[cfg(test)]
 pub(crate) mod fixtures;

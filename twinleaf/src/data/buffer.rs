@@ -20,8 +20,9 @@ use std::time::Instant;
 ///
 /// # Examples
 ///
-/// This example replays a recorded log of three samples into a buffer that
-/// keeps two.
+/// Batches usually come from
+/// [`Device::samples`](crate::device::Device::samples). This example replays a
+/// recorded log of three samples into a buffer that keeps two.
 ///
 /// ```
 /// use twinleaf::data::{Buffer, LogFile};

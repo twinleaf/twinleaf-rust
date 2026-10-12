@@ -243,16 +243,12 @@ impl PacketParser {
 
     /// Returns the route's current metadata revision without building a
     /// snapshot.
-    // The device stream reads it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn metadata_revision(&self, route: DeviceRoute) -> Option<u32> {
         self.state.metadata_revision(route)
     }
 
     /// Returns the route's complete metadata and its revision, or `None` if
     /// the revision is still `seen` or the metadata is incomplete.
-    // The device stream reads it.
-    #[allow(dead_code)]
     pub(crate) fn revised_metadata(
         &self,
         route: DeviceRoute,
