@@ -11,8 +11,12 @@
 #![deny(clippy::await_holding_lock)]
 
 pub mod legacy;
+pub mod proxy;
 mod rt;
 pub mod tio;
 
 /// The wire protocol, shared with device firmware.
 pub use twinleaf_proto as proto;
+
+#[doc(no_inline)]
+pub use proto::{ColumnId, DeviceRoute, SampleNumber, SegmentId, SessionId, StreamId};

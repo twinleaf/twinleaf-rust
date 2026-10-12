@@ -11,8 +11,6 @@
 //! reads with `recv_async` and a thread with `recv`. What leaves goes through
 //! [`try_send`](Port::try_send), or [`send_async`](Port::send_async) from a
 //! task.
-// Nothing uses the transport until the proxy arrives.
-#![allow(dead_code, unused_imports)]
 
 mod codec;
 #[cfg(test)]
@@ -33,7 +31,7 @@ use crate::rt::Supervisor;
 use std::fmt::Display;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use task::{Rules, Task};
 use tokio::sync::mpsc;
@@ -123,25 +121,10 @@ impl AddrFamilyRestrict {
     }
 }
 
-/// Returns `true` if `url` is a TCP URL whose host is this machine, by
-/// [`IpAddr::is_loopback`] or the name `localhost`. Resolves nothing.
-pub(crate) fn is_local_tcp(url: &str) -> bool {
-    let Some(("tcp" | "tcp4" | "tcp6", addr)) = url.split_once("://") else {
-        return false;
-    };
-    let ip = addr
-        .parse::<SocketAddr>()
-        .map(|sa| sa.ip())
-        .or_else(|_| addr.trim_matches(['[', ']']).parse::<IpAddr>());
-    match ip {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => addr.rsplit_once(':').map_or(addr, |(host, _)| host) == "localhost",
-    }
-}
-
 /// How a discovered device is reached.
-// Its names follow the chips' own until discovery exports it.
-#[allow(clippy::upper_case_acronyms)]
+// Its names follow the chips' own, and some variants go unused, until
+// discovery exports it.
+#[allow(clippy::upper_case_acronyms, dead_code)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum PortInterface {
@@ -156,6 +139,8 @@ pub enum PortInterface {
 }
 
 /// A device found during discovery.
+// Its name goes unread until discovery exports it.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
     /// The locator [`Connection::open`](crate::Connection::open) takes.
@@ -460,6 +445,8 @@ impl Port {
     ///   IPv6.
     ///
     /// Returns an error if `url` is not valid or the link cannot be opened.
+    // A connection opens its port to the proxy with it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(url: &str, rx: Delivery) -> io::Result<Port> {
         Port::new_on(url, rx, &Supervisor::new())
     }
@@ -666,32 +653,6 @@ mod tests {
 
     use super::*;
     use crate::rt;
-
-    /// A TCP URL on this machine is local by address or by `localhost`. Any
-    /// other scheme or host is not.
-    #[test]
-    fn only_a_tcp_url_on_this_machine_is_local_tcp() {
-        for url in [
-            "tcp://127.0.0.1:7855",
-            "tcp://localhost",
-            "tcp4://localhost:17855",
-            "tcp6://[::1]:7855",
-            "tcp6://::1",
-        ] {
-            assert!(is_local_tcp(url), "{url}");
-        }
-        for url in [
-            "udp://127.0.0.1:7855",
-            "udp4://localhost",
-            "tcp://192.0.2.1:7855",
-            "tcp://sensor.local",
-            "127.0.0.1:7855",
-            "serial:///dev/ttyACM0",
-            "auto",
-        ] {
-            assert!(!is_local_tcp(url), "{url}");
-        }
-    }
 
     /// A connection to a loopback address gives up long before one to a
     /// remote device does, here on a port whose queue is full, where the

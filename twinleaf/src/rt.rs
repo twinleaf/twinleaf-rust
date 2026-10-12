@@ -18,8 +18,6 @@
 //!
 //! A child process forked after the runtime started has none of its
 //! threads. The child panics on its first use of the runtime.
-// Nothing uses the runtime until the proxy arrives.
-#![allow(dead_code)]
 
 // The public API is synchronous and may be called from inside an
 // application's own tokio runtime, where `block_on`, `blocking_recv` and
