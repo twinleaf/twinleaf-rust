@@ -69,6 +69,28 @@
 //! `tio proxy --port 17855`. A proxy named this way is not started, and a
 //! connection to it fails if nothing answers there.
 //!
+//! # Sandboxed apps
+//!
+//! In a sandboxed macOS app, the library hosts the proxy in the app's process
+//! instead of starting `tio`. The app needs these entitlements.
+//!
+//! - `com.apple.security.network.client` to connect to the proxy and to
+//!   network devices.
+//! - `com.apple.security.network.server` to host the proxy.
+//! - `com.apple.security.device.serial` for serial devices.
+//!
+//! On macOS 15 and later, reaching network devices and discovering them asks
+//! the user for local network access. The app needs an
+//! `NSLocalNetworkUsageDescription` in its `Info.plist` for that. Loopback
+//! traffic to the proxy does not need this access.
+//!
+//! An app may host the proxy itself at startup with [`Proxy::host`]. Before
+//! it quits, [`Proxy::clients`] shows who else uses the proxy.
+//!
+//! Other sandboxes, such as Flatpak, Snap and packaged Windows apps, also
+//! need permission for the local network and for serial devices. Where an
+//! app's network is isolated from the host, its proxy serves only that app.
+//!
 //! # Logging
 //!
 //! The proxy logs through the `log` crate. Each device's events are logged

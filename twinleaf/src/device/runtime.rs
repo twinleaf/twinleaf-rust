@@ -7,7 +7,8 @@
 //! connection starts `tio proxy --background` and connects again. That proxy
 //! exits ten seconds after its last client is gone. When `tio` cannot be
 //! started, or exits at once as a `tio` older than 2.0 does, the connection
-//! hosts the proxy in this process.
+//! hosts the proxy in this process. A sandboxed macOS app hosts the proxy in
+//! its own process at once, without starting `tio`.
 //!
 //! A background proxy logs to `proxy.log` in `$XDG_RUNTIME_DIR/twinleaf` or
 //! the local data directory, unless `TWINLEAF_RUNTIME_DIR` names another.
@@ -192,17 +193,25 @@ static EMBEDDED: OnceLock<Proxy> = OnceLock::new();
 ///
 /// When nothing does, starts `tio proxy --background` and waits for it. When
 /// `tio` cannot be started, or exits with an error before the proxy answers,
-/// hosts the proxy in this process until it exits. The future must run on a
-/// tokio runtime.
+/// hosts the proxy in this process until it exits. A process in the macOS
+/// App Sandbox hosts the proxy without starting `tio`. The future must run on
+/// a tokio runtime.
 pub(crate) fn ensure_proxy() -> BoxFuture<'static, io::Result<()>> {
-    Box::pin(ensure_proxy_at(TCP_DEFAULT_PORT, &EMBEDDED))
+    Box::pin(ensure_proxy_at(TCP_DEFAULT_PORT, &EMBEDDED, sandboxed()))
 }
 
 /// Ensures a proxy answers on `port` as [`ensure_proxy`] does, keeping a
-/// hosted proxy in `embedded`.
-async fn ensure_proxy_at(port: u16, embedded: &OnceLock<Proxy>) -> io::Result<()> {
+/// hosted proxy in `embedded`. Hosts the proxy without starting `tio` when
+/// `sandboxed` is set.
+async fn ensure_proxy_at(port: u16, embedded: &OnceLock<Proxy>, sandboxed: bool) -> io::Result<()> {
     if proxy::answers_async(port).await {
         return Ok(());
+    }
+    if sandboxed {
+        // A sandboxed app's children inherit its sandbox, so the app hosts
+        // the proxy itself.
+        log::debug!("hosting the proxy in this process, as it runs in the App Sandbox");
+        return embed(port, embedded).await;
     }
     let spawning = Supervisor::new().spawn_blocking(move || spawn_proxy(port));
     let waited = match spawning.await.map_err(io::Error::other)? {
@@ -253,6 +262,111 @@ async fn embed(port: u16, embedded: &OnceLock<Proxy>) -> io::Result<()> {
             wait_for_proxy(port, None, STARTUP).await
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Returns `true` if this process runs in the macOS App Sandbox.
+#[cfg(target_os = "macos")]
+fn sandboxed() -> bool {
+    sandbox::sandboxed()
+}
+
+/// Returns `true` if this process runs in the macOS App Sandbox. On this
+/// system it returns `false`.
+#[cfg(not(target_os = "macos"))]
+fn sandboxed() -> bool {
+    false
+}
+
+/// Detects the macOS App Sandbox.
+// Apple's recommended check reads the process's own
+// `com.apple.security.app-sandbox` entitlement. The App Store requires the
+// sandbox.
+#[cfg(target_os = "macos")]
+mod sandbox {
+    use std::ffi::{c_char, c_ulong, c_void};
+    use std::ptr;
+    use std::sync::OnceLock;
+
+    type CFTypeRef = *const c_void;
+    type CFAllocatorRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFErrorRef = *mut c_void;
+    type CFTypeID = c_ulong;
+    type CFStringEncoding = u32;
+    type Boolean = u8;
+    type SecTaskRef = *const c_void;
+
+    /// The `kCFStringEncodingUTF8` encoding.
+    const UTF8: CFStringEncoding = 0x0800_0100;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+        fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
+        fn CFBooleanGetTypeID() -> CFTypeID;
+        fn CFBooleanGetValue(boolean: CFTypeRef) -> Boolean;
+        fn CFStringCreateWithCString(
+            alloc: CFAllocatorRef,
+            c_str: *const c_char,
+            encoding: CFStringEncoding,
+        ) -> CFStringRef;
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecTaskCreateFromSelf(allocator: CFAllocatorRef) -> SecTaskRef;
+        fn SecTaskCopyValueForEntitlement(
+            task: SecTaskRef,
+            entitlement: CFStringRef,
+            error: *mut CFErrorRef,
+        ) -> CFTypeRef;
+    }
+
+    /// Returns `true` if the process has the entitlement
+    /// `com.apple.security.app-sandbox` set to true. Reads it once and keeps
+    /// the answer.
+    pub(super) fn sandboxed() -> bool {
+        static SANDBOXED: OnceLock<bool> = OnceLock::new();
+        *SANDBOXED.get_or_init(read_entitlement)
+    }
+
+    /// Reads the process's `com.apple.security.app-sandbox` entitlement.
+    /// Returns `false` if the task or the entitlement cannot be read.
+    fn read_entitlement() -> bool {
+        // SAFETY: a null allocator selects the default allocator. The task
+        // returned is owned here, and released below.
+        let task = unsafe { SecTaskCreateFromSelf(ptr::null()) };
+        if task.is_null() {
+            return false;
+        }
+        let entitlement = c"com.apple.security.app-sandbox";
+        // SAFETY: the string is NUL-terminated UTF-8 that outlives the call,
+        // and a null allocator selects the default one. The string returned
+        // is owned here, and released below.
+        let name = unsafe { CFStringCreateWithCString(ptr::null(), entitlement.as_ptr(), UTF8) };
+        let mut value: CFTypeRef = ptr::null();
+        if !name.is_null() {
+            // SAFETY: `task` and `name` are live objects owned here, and a
+            // null error pointer asks for no error. The value returned is
+            // owned here, and released below.
+            value = unsafe { SecTaskCopyValueForEntitlement(task, name, ptr::null_mut()) };
+            // SAFETY: `name` was created above and is released once.
+            unsafe { CFRelease(name) };
+        }
+        // SAFETY: `task` was created above and is released once.
+        unsafe { CFRelease(task) };
+        if value.is_null() {
+            return false;
+        }
+        // SAFETY: `value` is a live object owned here. Its type is checked
+        // before it is read as a boolean, and it is released once.
+        unsafe {
+            let sandboxed =
+                CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value) != 0;
+            CFRelease(value);
+            sandboxed
+        }
     }
 }
 
@@ -315,10 +429,10 @@ mod tests {
 
     /// Runs [`ensure_proxy_at`] for `port` with nothing embedded yet.
     /// Returns its outcome and what it embedded.
-    fn ensure_at(port: u16) -> (io::Result<()>, OnceLock<Proxy>) {
+    fn ensure_at(port: u16, sandboxed: bool) -> (io::Result<()>, OnceLock<Proxy>) {
         let ensuring = async move {
             let embedded = OnceLock::new();
-            let ensured = ensure_proxy_at(port, &embedded).await;
+            let ensured = ensure_proxy_at(port, &embedded, sandboxed).await;
             Ok((ensured, embedded))
         };
         Supervisor::new().run("ensure", ensuring).unwrap()
@@ -364,7 +478,7 @@ mod tests {
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
         let attempt = fixtures::on_free_port(|port| {
-            let (ensured, embedded) = ensure_at(port);
+            let (ensured, embedded) = ensure_at(port, false);
             embedded
                 .get()
                 .is_some()
@@ -381,7 +495,7 @@ mod tests {
         let reply = proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
         let host = proxy::Introduction::decode_reply(&reply).unwrap();
         assert!(host.name.ends_with("(embedded)"), "{host}");
-        let (ensured, again) = ensure_at(port);
+        let (ensured, again) = ensure_at(port, false);
         ensured.unwrap();
         assert!(again.get().is_none(), "a second proxy was embedded");
     }
@@ -404,7 +518,7 @@ mod tests {
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
         let attempt = fixtures::on_free_port(|port| {
-            let (ensured, embedded) = ensure_at(port);
+            let (ensured, embedded) = ensure_at(port, false);
             embedded.into_inner().map(|hosted| (port, ensured, hosted))
         });
 
@@ -415,6 +529,41 @@ mod tests {
         assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
         let log = fs::read_to_string(dir.path().join(PROXY_LOG)).unwrap();
         assert!(log.contains("unexpected argument"), "{log}");
+    }
+
+    /// A sandboxed process hosts the proxy itself without starting `tio`,
+    /// even one that would start.
+    #[cfg(unix)]
+    #[test]
+    fn a_sandboxed_process_embeds_the_proxy_without_starting_tio() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let tio = dir.path().join("tio");
+        fs::write(&tio, "#!/bin/sh\ntouch \"$0.ran\"\nexit 2\n").unwrap();
+        fs::set_permissions(&tio, fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("TWINLEAF_TIO", &tio);
+        std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
+
+        let attempt = fixtures::on_free_port(|port| {
+            let (ensured, embedded) = ensure_at(port, true);
+            embedded.into_inner().map(|hosted| (port, ensured, hosted))
+        });
+
+        std::env::remove_var("TWINLEAF_TIO");
+        std::env::remove_var("TWINLEAF_RUNTIME_DIR");
+        let (port, ensured, hosted) = attempt.expect("no proxy was embedded");
+        ensured.unwrap();
+        assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
+        assert!(!dir.path().join("tio.ran").exists(), "tio was started");
+    }
+
+    /// Only macOS has the App Sandbox.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn no_process_is_sandboxed_off_macos() {
+        assert!(!sandboxed());
     }
 
     /// Of two proxies started at once, the one that finds the other hosting

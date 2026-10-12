@@ -96,7 +96,8 @@ impl Connection {
     /// When no proxy answers, this starts `tio proxy --background` from
     /// `twinleaf-tools`, and that proxy exits ten seconds after its last
     /// client leaves. When `tio` cannot be started, or is too old to run the
-    /// proxy, this process hosts the proxy itself.
+    /// proxy, this process hosts the proxy itself. A sandboxed macOS app
+    /// hosts the proxy itself without starting `tio`.
     ///
     /// The accepted locators are listed below.
     ///
