@@ -1,45 +1,60 @@
 # Twinleaf I/O Tools in Rust
 
-This repository contains two Rust crates, a library (`twinleaf`) and a set of tools (`twinleaf-tools`) that are useful for working with Twinleaf quantum sensors and accessories.
+This repository contains three Rust crates: a library ([`twinleaf`](https://crates.io/crates/twinleaf)), a set of tools ([`twinleaf-tools`](https://crates.io/crates/twinleaf-tools)) that are useful for working with Twinleaf quantum sensors and accessories, and a Rust protocol implementation ([`twinleaf-proto`](https://crates.io/crates/twinleaf-proto)) of TIO.
 
-**Note**: In versions <2.0.0, this crate contained binaries named `tio-proxy`, `tio-monitor`, `tio-health`, and `tio-tool`. These commands have been packaged into subcommands under the single binary `tio`. The former three original commands can be simply used without the `-`, while `tio-tool {toolname}` calls have largely been replaced with `tio {toolname}`.
-
-## Basic Usage
-### See `twinleaf-tools/README.md` for more usage details
-
-Connect a proxy to the device to communicate with the other tools:
-
-		tio proxy
-
-Terminal interface (TUI) to monitor sample data and issue commands with tab completion:
-
-		tio monitor
-
-Dump data to terminal:
-
-		tio dump --data --meta
-
-Issue commands from terminal:
-
-		tio rpc {command name} [arg]
-
-Log data to csv:
-
-		tio log -f {file.tio} # blocking
-		tio log csv {stream name} {file.tio}
+It is highly recommended to install `twinleaf-tools` when using the `twinleaf` library.
 
 ## Installation
 
 With rust language tools, install the tools using:
 
-		cargo install twinleaf-tools
+```sh
+cargo install twinleaf-tools
+```
 
 It can be installed with the ability to convert to HDF5 using
 
-		cargo install twinleaf-tools --features hdf5
+```sh
+cargo install twinleaf-tools --features hdf5
+```
 
-It is convenient to add the cargo binary directory to the default search paths. Cargo will report where the binaries and installed and which path to add to your environment, if necessary.
+## Basic Usage
+
+<details open>
+<summary><code>tio list</code></summary>
+
+Interactive picker for `tio proxy` (press space to mount multiple Twinleaf devices).
+
+![tio list](docs/tio-list.gif)
+
+</details>
+
+<details>
+<summary><code>tio monitor</code></summary>
+
+Live sample data with in-terminal graphs. Press `:` to issue commands with tab completion.
+
+![tio monitor](docs/tio-monitor.gif)
+
+</details>
+
+<details>
+<summary><code>tio health</code></summary>
+
+Live sample rate, jitter, and drift diagnostics with an event log. Press `:` to issue commands with tab completion.
+
+![tio health](docs/tio-health.gif)
+
+</details>
+
+Run `tio --help` for the full command list, and see [`twinleaf-tools/README.md`](twinleaf-tools/README.md) for logging, conversion, and proxy details.
+
+## Further Installation
+
+It is convenient to add the cargo binary directory to the default search paths. Cargo will report where the binaries are installed and which path to add to your environment, if necessary.
 
 The `serialport` library depends on `libudev` that is not included on certain linux distributions. To install it use:
 
-		sudo apt install libudev-dev # debian linux
+```sh
+sudo apt install libudev-dev # debian linux
+```
