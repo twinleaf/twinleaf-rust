@@ -121,6 +121,42 @@ impl AddrFamilyRestrict {
     }
 }
 
+/// Returns the host of `addr` if it is a `.local` name, in lower case and
+/// without a trailing dot, with the port `addr` gives or else the default
+/// port. Returns `None` for any other host or for a port that does not
+/// parse.
+#[cfg_attr(not(feature = "mdns"), allow(dead_code))]
+fn local_name(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().ok()?),
+        None => (addr, proto::TCP_DEFAULT_PORT),
+    };
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let label = host.strip_suffix(".local")?;
+    let valid = !label.is_empty() && !label.contains([':', '[', ']']);
+    valid.then_some((host, port))
+}
+
+/// Returns the address to connect to of those mDNS `found` for a name. Takes
+/// only an address of a version `family` allows. Prefers a routable address,
+/// IPv4 first, then a link-local one, then loopback. Takes the lowest address
+/// of the best kind. Returns `None` if no address fits.
+#[cfg_attr(not(feature = "mdns"), allow(dead_code))]
+fn preferred(found: Vec<SocketAddr>, family: &AddrFamilyRestrict) -> Option<SocketAddr> {
+    let rank = |addr: &SocketAddr| match addr.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => 4,
+        IpAddr::V6(ip) if ip.is_loopback() => 4,
+        IpAddr::V4(ip) if ip.is_link_local() => 2,
+        IpAddr::V6(ip) if ip.is_unicast_link_local() => 3,
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(_) => 1,
+    };
+    found
+        .into_iter()
+        .filter(|addr| family.allows(addr) && !addr.ip().is_unspecified())
+        .min_by_key(|addr| (rank(addr), addr.ip()))
+}
+
 /// Returns `true` if `url` is a TCP URL whose host is this machine, by
 /// [`IpAddr::is_loopback`] or the name `localhost`. Resolves nothing.
 pub(crate) fn is_local_tcp(url: &str) -> bool {
@@ -209,12 +245,53 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
 
 /// Resolves `addr` to a socket address of the IP version `family` allows.
 /// Adds the default port, which TCP and UDP share, if `addr` has none.
+///
+/// With the `mdns` feature, a `.local` name in any case, with or without a
+/// trailing dot, is resolved over mDNS first. That takes at most 1.5 s. The
+/// system's resolver resolves the name when mDNS finds no address that
+/// fits.
+///
 /// Returns an error if nothing resolves.
 fn find_addr(addr: &str, family: AddrFamilyRestrict) -> Result<SocketAddr, io::Error> {
+    #[cfg(feature = "mdns")]
+    if let Some((host, port)) = local_name(addr) {
+        match preferred(super::mdns::resolve(&host, port), &family) {
+            Some(found) => return Ok(found),
+            None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
+        }
+    }
+    look_up(addr, family)
+}
+
+/// Resolves `addr` as [`find_addr`] does, without blocking a worker of the
+/// runtime. A `.local` name resolves over mDNS as a future. The system's
+/// resolver looks up any other name on a blocking thread.
+///
+/// Returns an error if nothing resolves.
+async fn find_addr_async(addr: &str, family: AddrFamilyRestrict) -> io::Result<SocketAddr> {
+    #[cfg(feature = "mdns")]
+    if let Some((host, port)) = local_name(addr) {
+        match preferred(super::mdns::resolve_async(&host, port).await, &family) {
+            Some(found) => return Ok(found),
+            None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
+        }
+    }
+    // A lookup cannot be stopped, and holds nothing once it is dropped. The
+    // supervisor of its thread is its own, so no stop waits for it.
+    let addr = addr.to_string();
+    let lookup = Supervisor::new().spawn_blocking(move || look_up(&addr, family));
+    lookup.await.map_err(io::Error::other)?
+}
+
+/// Resolves `addr` with the system's resolver to a socket address of the IP
+/// version `family` allows, as [`find_addr`] does.
+///
+/// Returns an error if nothing resolves.
+fn look_up(addr: &str, family: AddrFamilyRestrict) -> io::Result<SocketAddr> {
     // If the port is missing, append the default. It would
     // be possible to determine if it's needed, but it's simpler
     // to try to parse as-is, and if it fails try again with the port.
-    let iter = match addr.to_socket_addrs() {
+    let mut iter = match addr.to_socket_addrs() {
         Ok(iter) => iter,
         Err(err) => {
             // Attempt to append the port number
@@ -235,34 +312,8 @@ fn find_addr(addr: &str, family: AddrFamilyRestrict) -> Result<SocketAddr, io::E
             }
         }
     };
-    for sa in iter {
-        match sa {
-            SocketAddr::V4(_) => {
-                if let AddrFamilyRestrict::V6 = family {
-                    continue;
-                }
-            }
-            SocketAddr::V6(_) => {
-                if let AddrFamilyRestrict::V4 = family {
-                    continue;
-                }
-            }
-        }
-        return Ok(sa);
-    }
-    Err(io::Error::other("address resolution failed"))
-}
-
-/// Resolves `addr` as [`find_addr`] does, on a blocking thread, without
-/// blocking a worker of the runtime.
-///
-/// Returns an error if nothing resolves.
-async fn find_addr_async(addr: &str, family: AddrFamilyRestrict) -> io::Result<SocketAddr> {
-    // A lookup cannot be stopped, and holds nothing once it is dropped. The
-    // supervisor of its thread is its own, so no stop waits for it.
-    let addr = addr.to_string();
-    let lookup = Supervisor::new().spawn_blocking(move || find_addr(&addr, family));
-    lookup.await.map_err(io::Error::other)?
+    iter.find(|sa| family.allows(sa))
+        .ok_or_else(|| io::Error::other("address resolution failed"))
 }
 
 /// Returns the address part of a TCP `url`, with the IP version its scheme
@@ -687,6 +738,79 @@ mod tests {
         ] {
             assert!(!is_local_tcp(url), "{url}");
         }
+    }
+
+    /// A `.local` name is found in any case, with or without its trailing
+    /// dot, and with or without a port. Nothing else is a `.local` name.
+    #[test]
+    fn a_local_name_is_found_in_any_case_with_or_without_its_dot() {
+        let found = |host: &str, port| Some((host.to_string(), port));
+        assert_eq!(local_name("Sensor.LOCAL"), found("sensor.local", 7855));
+        assert_eq!(
+            local_name("sensor.local.:7000"),
+            found("sensor.local", 7000)
+        );
+        assert_eq!(local_name("sensor.local:7000"), found("sensor.local", 7000));
+        assert_eq!(local_name("sensor.local."), found("sensor.local", 7855));
+
+        for other in [
+            ".local",
+            "local",
+            "sensor.local:port",
+            "sensor.example.com:7855",
+            "192.168.1.2:7855",
+            "[fe80::1]:7855",
+            "fe80::1",
+        ] {
+            assert_eq!(local_name(other), None, "{other}");
+        }
+    }
+
+    /// Of the addresses mDNS finds, the one taken is of the version the URL
+    /// allows, routable before link-local and IPv4 before IPv6. A link-local
+    /// IPv6 address keeps its scope.
+    #[test]
+    fn an_mdns_address_is_chosen_by_version_and_reach() {
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|addr| addr.parse().unwrap()).collect()
+        };
+        let all = addrs(&[
+            "127.0.0.1:7855",
+            "169.254.3.4:7855",
+            "[fe80::1%3]:7855",
+            "[fd00::5]:7855",
+            "192.168.1.20:7855",
+            "10.0.0.9:7855",
+            "0.0.0.0:7855",
+        ]);
+        let chosen = |found: &[SocketAddr], family| preferred(found.to_vec(), &family);
+
+        assert_eq!(
+            chosen(&all, AddrFamilyRestrict::Either),
+            Some("10.0.0.9:7855".parse().unwrap())
+        );
+        assert_eq!(
+            chosen(&all, AddrFamilyRestrict::V4),
+            Some("10.0.0.9:7855".parse().unwrap())
+        );
+        assert_eq!(
+            chosen(&all, AddrFamilyRestrict::V6),
+            Some("[fd00::5]:7855".parse().unwrap())
+        );
+
+        let local = addrs(&["[fe80::1%3]:7855", "169.254.3.4:7855", "127.0.0.1:7855"]);
+        assert_eq!(
+            chosen(&local, AddrFamilyRestrict::Either),
+            Some("169.254.3.4:7855".parse().unwrap())
+        );
+        let Some(SocketAddr::V6(scoped)) = chosen(&local, AddrFamilyRestrict::V6) else {
+            panic!("no IPv6 address was chosen");
+        };
+        assert_eq!((scoped.ip().segments()[0], scoped.scope_id()), (0xfe80, 3));
+
+        let v4_only = addrs(&["192.168.1.20:7855", "0.0.0.0:7855"]);
+        assert_eq!(chosen(&v4_only, AddrFamilyRestrict::V6), None);
+        assert_eq!(chosen(&[], AddrFamilyRestrict::Either), None);
     }
 
     /// A connection to a loopback address gives up long before one to a

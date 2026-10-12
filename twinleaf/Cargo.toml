@@ -16,7 +16,8 @@ hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 # The core firmware plumbing (types, update check, flashing) is always
 # available; this feature only adds `firmware::github`.
 firmware-update = ["dep:ureq", "dep:serde_json"]
-# mDNS/DNS-SD discovery of networked devices advertising `_twinleaf._tcp`.
+# mDNS/DNS-SD discovery of networked devices advertising `_twinleaf._tcp`,
+# and mDNS resolution of `.local` host names.
 mdns = ["dep:mdns-sd"]
 # Signal processing ops over a column: decimation and spectral estimates.
 processing = ["dep:rustfft"]

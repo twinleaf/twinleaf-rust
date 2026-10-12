@@ -18,6 +18,8 @@ use crate::rt::{BoxFuture, Supervisor};
 pub use crate::tio::transport::{enumerate_serial, DiscoveredDevice, PortInterface};
 use std::collections::{BTreeSet, HashMap};
 use std::io;
+#[cfg(feature = "mdns")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -680,29 +682,29 @@ fn sync_instance(
 /// instances as they resolve, move, or leave, and probes each with `probes`.
 #[cfg(feature = "mdns")]
 async fn browse_network(tx: flume::Sender<DiscoveryEvent>, mut probes: Probes, prefer_udp: bool) {
-    use mdns_sd::{ServiceDaemon, ServiceEvent};
+    use mdns_sd::ServiceEvent;
 
     let (tasks, stop) = (probes.tasks.clone(), probes.stop.clone());
 
     let started = tasks.spawn_blocking(|| {
-        let mdns = ServiceDaemon::new().map_err(|error| format!("mDNS daemon: {error}"))?;
+        let browser = Browser::start().map_err(|error| format!("mDNS daemon: {error}"))?;
         let receivers: Vec<_> = TWINLEAF_MDNS_SERVICES
             .iter()
-            .filter_map(|service| mdns.browse(service).ok())
+            .filter_map(|service| browser.daemon.browse(service).ok())
             .collect();
-        if receivers.is_empty() {
-            let _ = mdns.shutdown();
-            return Err("no mDNS service type could be browsed".to_string());
+        match receivers.is_empty() {
+            true => Err("no mDNS service type could be browsed".to_string()),
+            false => Ok((browser, receivers)),
         }
-        Ok((mdns, receivers))
     });
-    let (mdns, receivers) = match started.await {
+    let (browser, receivers) = match started.await {
         Ok(Ok(browsing)) => browsing,
         Ok(Err(reason)) => return network_unavailable(&tx, reason),
         Err(error) => return network_unavailable(&tx, error.to_string()),
     };
-    // The daemon blocks on a full listener, so a task drains each receiver
-    // into an unbounded queue until discovery stops.
+    // The daemon blocks on a full listener, and a probe may wait on the
+    // daemon to resolve its device. So a task drains each receiver into an
+    // unbounded queue until discovery stops.
     let (found, mut events) = mpsc::unbounded_channel();
     for receiver in receivers {
         let (found, stop) = (found.clone(), stop.clone());
@@ -761,7 +763,67 @@ async fn browse_network(tx: flume::Sender<DiscoveryEvent>, mut probes: Probes, p
             break;
         }
     }
-    let _ = mdns.shutdown();
+    tasks.spawn_blocking(move || drop(browser));
+}
+
+/// Set while a discovery session browses with the process's shared mDNS
+/// daemon.
+#[cfg(feature = "mdns")]
+static BROWSING: AtomicBool = AtomicBool::new(false);
+
+/// The mDNS daemon a discovery session browses with. Dropping it stops the
+/// browsing.
+#[cfg(feature = "mdns")]
+struct Browser {
+    daemon: mdns_sd::ServiceDaemon,
+    /// Whether the daemon is the process's shared one.
+    shared: bool,
+}
+
+#[cfg(feature = "mdns")]
+impl Browser {
+    /// Returns the process's shared daemon to browse with, or a daemon of
+    /// its own if another session browses with the shared one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon cannot start.
+    fn start() -> Result<Browser, mdns_sd::Error> {
+        // The daemon keeps one listener per service type, so two sessions
+        // browsing one daemon would steal each other's events.
+        let claimed = BROWSING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        if claimed.is_err() {
+            let daemon = mdns_sd::ServiceDaemon::new()?;
+            return Ok(Browser {
+                daemon,
+                shared: false,
+            });
+        }
+        match crate::tio::mdns::daemon() {
+            Ok(daemon) => Ok(Browser {
+                daemon,
+                shared: true,
+            }),
+            Err(error) => {
+                BROWSING.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mdns")]
+impl Drop for Browser {
+    fn drop(&mut self) {
+        if !self.shared {
+            let _ = self.daemon.shutdown();
+            return;
+        }
+        for service in TWINLEAF_MDNS_SERVICES {
+            let _ = self.daemon.stop_browse(service);
+        }
+        BROWSING.store(false, Ordering::Release);
+    }
 }
 
 /// Returns the instance name in a resolved fullname, without its service
@@ -778,6 +840,8 @@ fn instance_label(fullname: &str) -> String {
 
 /// Returns the host for a discovered device's URL. That is its advertised
 /// hostname, or else its lowest routable IPv4 address.
+// The hostname stays the same when the device's address changes, and a
+// person can read it. Each open of the URL resolves it again.
 #[cfg(feature = "mdns")]
 fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
     let hostname = info.get_hostname().trim_end_matches('.');

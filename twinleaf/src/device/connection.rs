@@ -108,7 +108,10 @@ impl Connection {
     /// - `auto`, or an empty `url`, for the default device that
     ///   [`connect`](Self::connect) opens.
     ///
-    /// TCP and UDP use port 7855 when no port is given.
+    /// TCP and UDP use port 7855 when no port is given. A proxy built with
+    /// the `mdns` feature resolves a host name that ends in `.local` over
+    /// mDNS. It falls back to the system's resolver when mDNS finds no
+    /// address within 1.5 s.
     ///
     /// A TCP URL whose host is this machine, such as `tcp://localhost`,
     /// names a running proxy, of tio 2.0 or older. The connection reaches it

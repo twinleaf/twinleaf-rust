@@ -21,6 +21,8 @@
 //! [`enumerate_serial`](crate::device::discovery::enumerate_serial) lists
 //! the Twinleaf devices on serial ports.
 
+#[cfg(feature = "mdns")]
+pub(crate) mod mdns;
 pub(crate) mod os;
 pub mod packet;
 pub mod rpc;
