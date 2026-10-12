@@ -8,8 +8,10 @@
     clippy::doc_markdown
 )]
 #![warn(rustdoc::all)]
+#![deny(clippy::await_holding_lock)]
 
 pub mod legacy;
+mod rt;
 pub mod tio;
 
 /// The wire protocol, shared with device firmware.
