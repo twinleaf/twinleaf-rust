@@ -8,7 +8,7 @@ use crate::proto::DeviceRoute;
 pub(crate) use crate::proxy::fixtures::{attached, FakeDevice, WAIT};
 use crate::proxy::{fixtures, Layout, Mount, Proxy, Purpose};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener};
 use std::sync::Mutex;
 
 /// Held by each test that sets the variables a proxy is found or started by,
@@ -46,24 +46,25 @@ pub(crate) fn open_through(proxy: &Proxy, url: &str) -> io::Result<Connection> {
     Session::open(&proxy, url, Purpose::Use, WAIT).map(Connection::over)
 }
 
-/// A port of `127.0.0.1` that refuses every connection. A socket holds it
-/// bound without listening, and no other test, in this process or another,
-/// can take the port while it lives.
-pub(crate) struct ClosedPort(socket2::Socket);
+/// A port of `127.0.0.1` that nothing listens on, so it refuses connections
+/// unless another process takes it after it was found free.
+pub(crate) struct ClosedPort(u16);
 
 impl ClosedPort {
-    /// Binds a free port without listening.
+    /// Finds a free port and leaves it unbound.
     pub(crate) fn new() -> ClosedPort {
-        use socket2::{Domain, Socket, Type};
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        socket.bind(&address.into()).unwrap();
-        ClosedPort(socket)
+        ClosedPort(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port(),
+        )
     }
 
     /// Returns the port number.
     pub(crate) fn port(&self) -> u16 {
-        self.0.local_addr().unwrap().as_socket().unwrap().port()
+        self.0
     }
 
     /// Returns its URL, such as `tcp://127.0.0.1:40000`.
@@ -71,11 +72,10 @@ impl ClosedPort {
         format!("tcp://127.0.0.1:{}", self.port())
     }
 
-    /// Starts listening on the port, which nothing else can have taken.
+    /// Starts listening on the port.
     #[cfg(unix)]
     pub(crate) fn listen(self) -> TcpListener {
-        self.0.listen(16).unwrap();
-        self.0.into()
+        TcpListener::bind((Ipv4Addr::LOCALHOST, self.0)).unwrap()
     }
 }
 
@@ -91,11 +91,7 @@ const PORT_ATTEMPTS: usize = 5;
 /// or every port tried was taken.
 pub(crate) fn on_free_port<T>(mut scenario: impl FnMut(u16) -> Option<T>) -> Option<T> {
     for _ in 0..PORT_ATTEMPTS {
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = ClosedPort::new().port();
         if let Some(done) = scenario(port) {
             return Some(done);
         }
