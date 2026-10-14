@@ -1544,6 +1544,40 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn an_async_receive_returns_a_queued_item() {
+        let (mut sink, receiver) = Sink::new(1, everything());
+        assert!(sink.send(7));
+
+        assert_eq!(receiver.recv_async().await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn an_async_receive_waits_for_an_item_another_thread_sends_later() {
+        let (mut sink, receiver) = Sink::new(1, everything());
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            sink.send(7)
+        });
+
+        assert_eq!(receiver.recv_async().await, Ok(7));
+        assert!(sender.join().unwrap());
+    }
+
+    /// An async receive ends as a blocking one does, so it too says the proxy
+    /// stopped rather than only that the stream ended.
+    #[tokio::test]
+    async fn an_async_receive_ends_as_a_blocking_one_does() {
+        let (stream, proxy) = stream();
+        let awaited = stream.batches(everything());
+        let blocked = stream.batches(everything());
+
+        proxy.send(Packet::link(packet::LinkStatus::Stopped));
+
+        assert_eq!(awaited.recv_async().await.err(), Some(RecvError::Stopped));
+        assert_eq!(blocked.recv().err(), Some(RecvError::Stopped));
+    }
+
     /// Every announcement reaches the views covering the device that sent it.
     #[test]
     fn an_announcement_becomes_an_event_on_its_own_route() {

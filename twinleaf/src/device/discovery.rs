@@ -564,11 +564,11 @@ async fn heard_routes(
     let mut heard = BTreeSet::new();
     loop {
         let received = tokio::select! {
-            received = packets.receiver().recv_async() => received,
+            received = packets.recv_async() => received,
             () = tokio::time::sleep_until(deadline) => return Ok(heard),
             () = stop.cancelled() => return Err(Interrupt::Stopped),
         };
-        match packets.resolve(received) {
+        match received {
             Ok(packet) if packet.link_status().is_none() => {
                 heard.insert(packet.route());
             }

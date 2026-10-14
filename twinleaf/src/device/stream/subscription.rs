@@ -71,6 +71,15 @@ impl<T> Receiver<T> {
         self.resolve(self.items.recv())
     }
 
+    /// Waits until the next item arrives, without blocking the thread.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`recv`](Self::recv) does.
+    pub async fn recv_async(&self) -> Result<T, RecvError> {
+        self.resolve(self.items.recv_async().await)
+    }
+
     /// Returns the next item if one is queued, or `Ok(None)` if none is.
     /// Does not block.
     ///
@@ -111,7 +120,7 @@ impl<T> Receiver<T> {
         self.resolve_timed(self.items.recv_deadline(deadline))
     }
 
-    /// Converts what a receive on [`receiver`](Self::receiver) yields into
+    /// Converts what a receive on [`as_flume`](Self::as_flume) yields into
     /// an item or a [`RecvError`].
     ///
     /// # Errors
@@ -148,9 +157,10 @@ impl<T> Receiver<T> {
     }
 
     /// Returns the underlying channel, to wait on alongside other sources
-    /// with a [`flume::Selector`] or `recv_async`. Pass what it yields to
-    /// [`resolve`](Self::resolve).
-    pub fn receiver(&self) -> &flume::Receiver<Queued<T>> {
+    /// with a [`flume::Selector`]. Pass what it yields to
+    /// [`resolve`](Self::resolve). To await it alone, use
+    /// [`recv_async`](Self::recv_async).
+    pub fn as_flume(&self) -> &flume::Receiver<Queued<T>> {
         &self.items
     }
 
