@@ -74,10 +74,10 @@ pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Resul
             }
         }
         let woken = Selector::new()
-            .recv(batches.receiver(), |batch| {
+            .recv(batches.as_flume(), |batch| {
                 batches.resolve(batch).map(Woken::Batch)
             })
-            .recv(events.receiver(), |event| {
+            .recv(events.as_flume(), |event| {
                 events.resolve(event).map(Woken::Event)
             })
             .recv(

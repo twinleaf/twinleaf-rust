@@ -271,7 +271,7 @@ impl<W: Write> Recorder<W> {
     /// metadata retry. Returns what woke it, or `None` once the time is up.
     fn wait(&self, deadline: Option<Instant>) -> Option<Woken> {
         let selector = flume::Selector::new()
-            .recv(self.tap.receiver(), |item| {
+            .recv(self.tap.as_flume(), |item| {
                 Woken::Tap(self.tap.resolve(item))
             })
             .recv(self.schedule.replies(), Woken::Reply);
