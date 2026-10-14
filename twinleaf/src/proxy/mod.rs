@@ -108,12 +108,21 @@ mod worker;
 pub(crate) use control::{call, executable_name, handshake, Purpose};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
-use crate::tio::transport::LOOPBACK_CONNECT_TIMEOUT;
+use crate::rt::Supervisor;
+use crate::tio::transport::CONNECT_TIMEOUT;
 use std::fmt;
+use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+
+/// How long to wait for the handshake on a loopback address. A running proxy
+/// completes it at once.
+// A listening socket completes the handshake in the kernel before it
+// accepts. A closed port can hang instead of refusing, as on WSL2 with
+// mirrored networking, or take about 2 s to refuse, as on Windows.
+const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long [`stop`] waits for the proxy to reply.
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -149,19 +158,35 @@ pub(crate) fn endpoint_at(port: u16) -> String {
 }
 
 /// Returns `true` if anything answers a connection to `port` of
-/// `127.0.0.1`.
+/// `127.0.0.1`. A connect that times out is tried once more for longer, and
+/// a refusal is final. Blocks the calling thread.
 pub(crate) fn answers(port: u16) -> bool {
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    TcpStream::connect_timeout(&address, LOOPBACK_CONNECT_TIMEOUT).is_ok()
+    let probing = async move { Ok(answers_async(port).await) };
+    matches!(Supervisor::new().run("proxy probe", probing), Ok(true))
 }
 
 /// Returns `true` if anything answers a connection to `port` of
-/// `127.0.0.1`, without blocking. Must be awaited on a tokio runtime.
+/// `127.0.0.1`, without blocking. A connect that times out is tried once
+/// more for longer, and a refusal is final. Must be awaited on a tokio
+/// runtime.
 pub(crate) async fn answers_async(port: u16) -> bool {
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let connecting = tokio::net::TcpStream::connect(address);
-    let connected = tokio::time::timeout(LOOPBACK_CONNECT_TIMEOUT, connecting).await;
-    matches!(connected, Ok(Ok(_)))
+    answers_on_retry(|| tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))).await
+}
+
+/// Returns `true` if `connect` completes within [`LOOPBACK_CONNECT_TIMEOUT`],
+/// or on a second try within [`CONNECT_TIMEOUT`] after a timeout.
+async fn answers_on_retry<F, T>(connect: impl Fn() -> F) -> bool
+where
+    F: Future<Output = io::Result<T>>,
+{
+    match tokio::time::timeout(LOOPBACK_CONNECT_TIMEOUT, connect()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(_refused)) => false,
+        Err(_elapsed) => matches!(
+            tokio::time::timeout(CONNECT_TIMEOUT, connect()).await,
+            Ok(Ok(_))
+        ),
+    }
 }
 
 /// Locks `mutex`, even if a thread panicked while holding it. It suits locks
@@ -435,6 +460,7 @@ mod tests {
     use crate::tio::rpc::{RpcArgs, RpcReply};
     use crate::tio::transport;
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     /// The `proxy.hello` of a client named `caller` with pid 4242.
@@ -616,6 +642,63 @@ mod tests {
         assert_eq!(named_by(Some(url.clone())), Some(url));
         assert_eq!(named_by(Some(String::new())), None);
         assert_eq!(named_by(None), None);
+    }
+
+    #[test]
+    fn a_listening_port_answers() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+
+        assert!(answers(listener.local_addr().unwrap().port()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_refused_port_does_not_answer_at_once() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let started = Instant::now();
+
+        assert!(!answers(port));
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "it took {took:?}");
+    }
+
+    /// A connect the machine stalls past the first try is given longer on a
+    /// second, which a running proxy then answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_times_out_once_answers_on_its_second_try() {
+        let tries = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+
+        let answered = answers_on_retry(|| {
+            let stalled = tries.fetch_add(1, Ordering::Relaxed) == 0;
+            async move {
+                if stalled {
+                    std::future::pending::<()>().await;
+                }
+                io::Result::Ok(())
+            }
+        })
+        .await;
+
+        assert!(answered);
+        assert_eq!(tries.into_inner(), 2);
+        assert_eq!(started.elapsed(), LOOPBACK_CONNECT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_connect_is_not_tried_again() {
+        let tries = AtomicUsize::new(0);
+
+        let answered = answers_on_retry(|| {
+            tries.fetch_add(1, Ordering::Relaxed);
+            async { io::Result::<()>::Err(io::ErrorKind::ConnectionRefused.into()) }
+        })
+        .await;
+
+        assert!(!answered);
+        assert_eq!(tries.into_inner(), 1);
     }
 
     #[test]

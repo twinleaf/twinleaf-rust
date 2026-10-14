@@ -17,14 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 /// How long to wait for the handshake. It is one RTO plus slack, as long as
 /// the proxy lets a TCP link stay silent.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// How long to wait for the handshake on a loopback address. A running proxy
-/// completes it at once.
-// A listening socket completes the handshake in the kernel before it
-// accepts. A closed port can hang instead of refusing, as on WSL2 with
-// mirrored networking, or take about 2 s to refuse, as on Windows.
-pub(crate) const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The rules of a TCP port's task. A TCP link has no heartbeat, holdoff or
 /// stale data.
@@ -42,8 +35,7 @@ pub(super) const CLIENT_RULES: Rules = Rules {
 };
 
 /// Connects to `address` and returns the stream. Waits at most
-/// [`LOOPBACK_CONNECT_TIMEOUT`] for a loopback address and
-/// [`CONNECT_TIMEOUT`] for any other.
+/// [`CONNECT_TIMEOUT`].
 ///
 /// # Errors
 ///
@@ -51,7 +43,7 @@ pub(super) const CLIENT_RULES: Rules = Rules {
 pub(super) fn connect(address: &SocketAddr) -> io::Result<TcpStream> {
     // Connecting here, before the port exists, lets a dead address fail
     // the open rather than a port that looks connected.
-    let stream = std::net::TcpStream::connect_timeout(address, connect_timeout(address))?;
+    let stream = std::net::TcpStream::connect_timeout(address, CONNECT_TIMEOUT)?;
     from_std(stream)
 }
 
@@ -64,12 +56,11 @@ pub(super) fn connect(address: &SocketAddr) -> io::Result<TcpStream> {
 /// Returns an error if the connection fails, and
 /// [`io::ErrorKind::TimedOut`] if it does not complete in time.
 pub(super) async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> {
-    let timeout = connect_timeout(&address);
     let task = format!("tcp connect {address}");
     let connecting = Supervisor::new().spawn(task, async move {
-        let connected = tokio::time::timeout(timeout, TcpStream::connect(address)).await;
+        let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await;
         connected.unwrap_or_else(|_| {
-            let message = format!("{address} did not answer within {timeout:?}");
+            let message = format!("{address} did not answer within {CONNECT_TIMEOUT:?}");
             Err(io::Error::new(io::ErrorKind::TimedOut, message))
         })
     });
@@ -81,14 +72,6 @@ pub(super) async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> 
     };
     stream.set_nodelay(true)?;
     Ok(stream)
-}
-
-/// Returns how long a connect to `address` waits for the handshake.
-fn connect_timeout(address: &SocketAddr) -> Duration {
-    match address.ip().is_loopback() {
-        true => LOOPBACK_CONNECT_TIMEOUT,
-        false => CONNECT_TIMEOUT,
-    }
 }
 
 /// Returns the connected `stream` as a stream a port's task can drive, with

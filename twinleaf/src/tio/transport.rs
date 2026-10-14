@@ -23,7 +23,7 @@ mod udp;
 
 #[cfg(test)]
 pub(crate) use fake::FakeEnd;
-pub(crate) use tcp::LOOPBACK_CONNECT_TIMEOUT;
+pub(crate) use tcp::CONNECT_TIMEOUT;
 
 use super::packet::{self, Packet};
 use crate::proto;
@@ -813,27 +813,23 @@ mod tests {
         assert_eq!(chosen(&[], AddrFamilyRestrict::Either), None);
     }
 
-    /// A connection to a loopback address gives up long before one to a
-    /// remote device does, here on a port whose queue is full, where the
-    /// kernel drops the handshake rather than refusing it.
+    /// A loopback connect waits for a handshake as long as any other, but a
+    /// port nothing listens on refuses it at once.
+    #[cfg(not(windows))]
     #[test]
-    fn a_loopback_connect_that_hangs_gives_up_quickly() {
-        use socket2::{Domain, Socket, Type};
-
-        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        let address = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
-        listener.bind(&address.into()).unwrap();
-        listener.listen(0).unwrap();
-        let address = listener.local_addr().unwrap().as_socket().unwrap();
-        // Nothing accepts these, so they fill the queue.
-        let _queued: Vec<_> = (0..2)
-            .map(|_| std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)))
-            .collect();
+    fn a_refused_loopback_connect_fails_at_once() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
 
         let started = Instant::now();
-        let _ = tcp::connect(&address);
+        let refused = tcp::connect(&address).map(drop);
 
         let took = started.elapsed();
+        assert_eq!(
+            refused.map_err(|error| error.kind()),
+            Err(io::ErrorKind::ConnectionRefused)
+        );
         assert!(took < Duration::from_secs(1), "it took {took:?}");
     }
 
