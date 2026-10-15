@@ -1749,6 +1749,7 @@ mod synchronizer_tests {
         let AcquisitionAction::Start(target) = started.local else {
             panic!("a start");
         };
+        assert_eq!(target.reference, plan.target);
         assert_eq!(target.counter_edge, plan.counter_edge);
         assert_eq!(sync.status().acquisition, AcquisitionState::Starting);
         sync.mark_running(plan.id).unwrap();

@@ -37,6 +37,8 @@ impl ScheduledEdge {
 pub struct StartPlan {
     /// Identifies this plan in the acknowledgements it draws.
     pub id: u16,
+    /// The second sample zero belongs to.
+    pub target: Reference,
     /// Counter value of the staging edge, and of the target edge a second on.
     pub counter_edge: u32,
     /// Monotonic nanosecond of the staging edge.
@@ -360,6 +362,7 @@ impl AcquisitionMachine {
         self.plan = self.plan.wrapping_add(1);
         let plan = StartPlan {
             id: self.plan,
+            target: target.reference,
             counter_edge: staging.counter_edge,
             staging_ns,
         };
@@ -413,6 +416,7 @@ mod tests {
             AcquisitionAction::Arm(plan) => plan,
             action => panic!("unexpected action: {action:?}"),
         };
+        assert_eq!(plan.target, edge(101).reference);
         assert_eq!(plan.counter_edge, staging.counter_edge);
         assert_eq!(plan.staging_ns, 7_000_000_000);
         assert_eq!(machine.state(), AcquisitionState::Armed);
@@ -512,6 +516,7 @@ mod tests {
             AcquisitionAction::Rearm(plan) => plan,
             action => panic!("unexpected action: {action:?}"),
         };
+        assert_eq!(replacement.target, edge(51).reference);
         assert_ne!(replacement.id, plan.id);
         assert_eq!(machine.superseded_plans(), 1);
     }
@@ -587,6 +592,7 @@ mod tests {
             AcquisitionAction::Arm(plan) => plan,
             action => panic!("unexpected action: {action:?}"),
         };
+        assert_eq!(next.target, edge(12).reference);
         assert_ne!(next.id, plan.id);
         assert_eq!(machine.superseded_plans(), 0);
     }
@@ -617,6 +623,7 @@ mod tests {
         let domain = CounterDomain::new(PERIOD);
         let plan = StartPlan {
             id: 1,
+            target: at(11, PERIOD - 10).reference,
             counter_edge: PERIOD - 10,
             staging_ns: 5_000_000_000,
         };
