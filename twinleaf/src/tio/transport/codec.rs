@@ -25,7 +25,7 @@ pub(crate) enum Error {
     TrailingBytes,
     /// A stream with no packet boundary left to find, after a header that
     /// did not decode.
-    LostFraming,
+    LostFraming(packet::DecodeError),
 }
 
 /// Decodes `raw`, a whole frame or datagram, as exactly one packet.

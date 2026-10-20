@@ -9,7 +9,8 @@ use crate::proto::TCP_DEFAULT_PORT;
 use crate::rt::Supervisor;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply};
-use crate::tio::transport::{self, ReceiveResult, RecvError};
+use crate::tio::transport::{self, ReceiveResult, RecvError, TransportEvent};
+use futures_util::StreamExt;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -313,24 +314,40 @@ pub(crate) async fn handshake(
     // Whether the peer has sent any PROXY_RX, which only a 2.0 proxy does.
     let mut answered = false;
     let mut host = None;
+    let mut incoming = received.stream();
     loop {
         let until = if answered { deadline } else { hello_deadline };
-        let packet = match timeout_at(until, received.recv_async()).await {
-            Ok(Ok(Ok(packet))) => packet,
-            Ok(Ok(Err(RecvError::Text(_) | RecvError::Protocol(_)))) => continue,
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!("the proxy at {endpoint} closed the connection before it could {goal}"),
-                ))
-            }
-            Err(_) if answered => {
-                return Err(io::Error::new(
+        let timed_out = || {
+            if answered {
+                io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("the proxy at {endpoint} did not {goal} within {timeout:?}"),
-                ))
+                )
+            } else {
+                not_a_proxy(endpoint)
             }
-            Err(_) => return Err(not_a_proxy(endpoint)),
+        };
+        if Instant::now() >= until {
+            return Err(timed_out());
+        }
+        let event = timeout_at(until, incoming.next())
+            .await
+            .map_err(|_| timed_out())?
+            .unwrap_or(Err(RecvError::Disconnected))
+            .map_err(|error| io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("the proxy at {endpoint} closed the connection before it could {goal}: {error}"),
+            ))?;
+        let packet = match event {
+            TransportEvent::Packet(packet) => packet,
+            TransportEvent::Text(text) => {
+                log::debug!("the proxy sent text: {text}");
+                continue;
+            }
+            TransportEvent::RejectedFrame(error) => {
+                log::debug!("the proxy sent a rejected frame: {error}");
+                continue;
+            }
         };
         let Payload::ProxyRx(rx) = packet.payload() else {
             continue;
@@ -443,6 +460,70 @@ pub(crate) fn client_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Events skipped during the handshake do not restart its absolute deadline.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_noise_does_not_extend_the_deadline() {
+        let (send, received) = flume::unbounded();
+        let (port, _peer) =
+            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let started = Instant::now();
+        let within = Duration::from_millis(10);
+        let greeting = handshake(
+            &port,
+            &received,
+            "tcp://127.0.0.1:7855",
+            OPEN,
+            &[],
+            "open the device",
+            within,
+        );
+        let noise = async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                send.send(Ok(TransportEvent::Text("boot".into()))).unwrap();
+                send.send(Ok(TransportEvent::RejectedFrame(
+                    crate::tio::packet::DecodeError::CRC32,
+                )))
+                .unwrap();
+            }
+        };
+        tokio::select! {
+            outcome = greeting => assert!(outcome.is_err()),
+            () = noise => unreachable!(),
+        }
+        assert_eq!(started.elapsed(), within);
+    }
+
+    /// A handshake skips recoverable events and accepts the following reply
+    /// through the channel's ordinary stream adapter.
+    #[tokio::test]
+    async fn handshake_accepts_a_reply_after_rejected_frames() {
+        let (send, received) = flume::unbounded();
+        let (port, _peer) =
+            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        send.send(Ok(TransportEvent::Text("boot".into()))).unwrap();
+        send.send(Ok(TransportEvent::RejectedFrame(
+            crate::tio::packet::DecodeError::CRC32,
+        )))
+        .unwrap();
+        send.send(Ok(TransportEvent::Packet(
+            Packet::proxy_reply(REQUEST_ID, b"opened").unwrap(),
+        )))
+        .unwrap();
+        let (_, reply) = handshake(
+            &port,
+            &received,
+            "tcp://127.0.0.1:7855",
+            OPEN,
+            &[],
+            "open the device",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, b"opened");
+    }
 
     /// A request as the proxy decodes it from the packet a client sends.
     fn sent(request: &Request) -> Result<Request, Refusal> {

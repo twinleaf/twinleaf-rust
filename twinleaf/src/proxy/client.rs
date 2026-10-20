@@ -13,7 +13,8 @@ use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::rpc::RpcArgs;
-use crate::tio::transport::{self, ReceiveResult, RecvError, CLOSE_TIMEOUT};
+use crate::tio::transport::{self, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
+use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::future::{self, Future};
 use std::net::SocketAddr;
@@ -146,7 +147,7 @@ pub(super) struct Session {
     addr: String,
     client: transport::Port,
     /// The packets the client sends.
-    incoming: flume::Receiver<ReceiveResult>,
+    incoming: flume::r#async::RecvStream<'static, ReceiveResult>,
     /// Cancelled once the proxy stops.
     stop: CancellationToken,
     /// When a client that has sent nothing is taken for a legacy client, or
@@ -183,7 +184,7 @@ impl Session {
             id,
             addr: peer.to_string(),
             client,
-            incoming,
+            incoming: incoming.into_stream(),
             stop,
             classify_until: Some(Instant::now() + CLASSIFY),
             backlog: VecDeque::new(),
@@ -241,10 +242,8 @@ impl Session {
             }
             tokio::select! {
                 () = self.stop.cancelled() => return Err(self.stopped()),
-                received = self.incoming.recv_async() => {
-                    let Ok(received) = received else {
-                        return Err(ClientError::HungUp);
-                    };
+                received = self.incoming.next() => {
+                    let Some(received) = received else { return Err(ClientError::HungUp); };
                     if let Some(pkt) = self.delivered(received)? {
                         if self.classify_until.is_some() {
                             self.classify(Some(&pkt));
@@ -287,12 +286,12 @@ impl Session {
     /// Returns [`ClientError::HungUp`] if the connection closed or failed.
     fn delivered(&self, received: ReceiveResult) -> Result<Option<Packet>, ClientError> {
         match received {
-            Ok(pkt) => Ok(Some(pkt)),
-            Err(error @ (RecvError::Protocol(_) | RecvError::Text(_))) => {
-                log::debug!("Skipped what client {} sent: {error}", self.addr);
+            Ok(TransportEvent::Packet(pkt)) => Ok(Some(pkt)),
+            Ok(event) => {
+                log::debug!("Skipped what client {} sent: {event:?}", self.addr);
                 Ok(None)
             }
-            Err(RecvError::IO(_) | RecvError::Disconnected) => Err(ClientError::HungUp),
+            Err(_) => Err(ClientError::HungUp),
         }
     }
 

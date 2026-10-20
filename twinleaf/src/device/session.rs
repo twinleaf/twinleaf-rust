@@ -31,7 +31,8 @@ use crate::proto::{DeviceRoute, RouteError};
 use crate::proxy::{handshake, lock, Purpose, MAX_RPC_TIMEOUT};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload};
-use crate::tio::transport::{self, ReceiveResult, RecvError};
+use crate::tio::transport::{self, ReceiveResult, TransportEvent};
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -244,7 +245,7 @@ impl Session {
         let stopped = Arc::new(AtomicBool::new(false));
         let worker = Worker {
             socket,
-            received,
+            received: received.into_stream(),
             peer,
             pending: HashMap::new(),
             next_id: 0,
@@ -376,7 +377,7 @@ impl fmt::Display for Ending {
 /// feeds the pump, and fails the calls that run out of time.
 struct Worker {
     socket: Socket,
-    received: flume::Receiver<ReceiveResult>,
+    received: flume::r#async::RecvStream<'static, ReceiveResult>,
     /// The proxy, as the log names it.
     peer: String,
     /// The calls waiting for a reply, by the id each went out with.
@@ -395,8 +396,9 @@ impl Worker {
     async fn run(mut self, mut calls: mpsc::UnboundedReceiver<Call>) {
         let ending = loop {
             tokio::select! {
-                received = self.received.recv_async() => {
-                    if let Some(ending) = self.drain(received) {
+                received = self.received.next() => {
+                    let Some(received) = received else { break Ending::SocketClosed; };
+                    if let Some(ending) = self.delivered(received) {
                         break ending;
                     }
                 }
@@ -453,34 +455,22 @@ impl Worker {
         None
     }
 
-    /// Takes `first` and whatever else the socket already delivered. Returns
-    /// why the session ends, if it does.
-    fn drain(&mut self, first: Result<ReceiveResult, flume::RecvError>) -> Option<Ending> {
-        let mut received = first;
-        loop {
-            match received {
-                Ok(Ok(packet)) => {
-                    if !self.packet(packet) {
-                        // Recorded before the inlet's sender drops with the
-                        // worker, so whoever sees the stream end sees why.
-                        self.stopped.store(true, Ordering::Release);
-                        return Some(Ending::Stopped);
-                    }
-                }
-                Ok(Err(RecvError::Text(text))) => log::debug!("the proxy sent text: {text}"),
-                Ok(Err(RecvError::Protocol(error))) => {
-                    log::debug!("the proxy sent a packet that did not decode: {error}")
-                }
-                Ok(Err(_)) | Err(flume::RecvError::Disconnected) => {
-                    return Some(Ending::SocketClosed)
+    /// Handles one transport event, leaving queued calls and deadlines a turn.
+    fn delivered(&mut self, received: ReceiveResult) -> Option<Ending> {
+        match received {
+            Ok(TransportEvent::Packet(packet)) => {
+                if !self.packet(packet) {
+                    self.stopped.store(true, Ordering::Release);
+                    return Some(Ending::Stopped);
                 }
             }
-            received = match self.received.try_recv() {
-                Ok(next) => Ok(next),
-                Err(flume::TryRecvError::Empty) => return None,
-                Err(flume::TryRecvError::Disconnected) => Err(flume::RecvError::Disconnected),
-            };
+            Ok(TransportEvent::Text(text)) => log::debug!("the proxy sent text: {text}"),
+            Ok(TransportEvent::RejectedFrame(error)) => {
+                log::debug!("the proxy sent a packet that did not decode: {error}");
+            }
+            Err(_) => return Some(Ending::SocketClosed),
         }
+        None
     }
 
     /// Takes one packet from the proxy. Returns `false` if the proxy
@@ -674,7 +664,7 @@ impl TestProxy {
     /// Hand the session `packet`, as from the proxy.
     pub(crate) fn send(&self, packet: Packet) {
         self.deliver
-            .send(Ok(packet))
+            .send(Ok(TransportEvent::Packet(packet)))
             .expect("the session reads its socket");
     }
 
@@ -1180,6 +1170,37 @@ mod tests {
             !proxy.arrives(Duration::from_secs(2)),
             "the session reconnected after its socket dropped"
         );
+    }
+
+    /// A rejected frame leaves an RPC pending, but a terminal transport error
+    /// fails pending calls even if the delivery channel's sender stays alive.
+    #[test]
+    fn rejected_frames_preserve_calls_and_transport_errors_fail_them() {
+        let (session, proxy) = Session::test_pair();
+        let root = Handle::root(session);
+        let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
+        let (_, _, _, id) = proxy.call();
+        proxy
+            .deliver
+            .send(Ok(TransportEvent::RejectedFrame(
+                crate::tio::packet::DecodeError::CRC32,
+            )))
+            .unwrap();
+        proxy.reply(id, b"sensor", DeviceRoute::root());
+        assert_eq!(waiting.recv_timeout(WAIT).unwrap().unwrap(), b"sensor");
+
+        let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
+        proxy.call();
+        proxy
+            .deliver
+            .send(Err(transport::RecvError::LostFraming(
+                crate::tio::packet::DecodeError::InvalidPacketType,
+            )))
+            .unwrap();
+        assert!(matches!(
+            waiting.recv_timeout(WAIT),
+            Ok(Err(CallError::ResponseLost))
+        ));
     }
 
     /// A loopback target is a proxy already, so its first packet from the

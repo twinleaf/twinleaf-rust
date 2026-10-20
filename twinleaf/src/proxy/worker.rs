@@ -43,8 +43,9 @@ use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::tio::packet::{self, Packet};
 use crate::tio::transport;
 use crate::tio::transport::Port as HardwarePort;
-use crate::tio::transport::{ReceiveResult, RecvError};
+use crate::tio::transport::{ReceiveResult, TransportEvent};
 
+use futures_util::{FutureExt, StreamExt};
 use std::fs;
 use std::future::{self, Future};
 use std::io;
@@ -255,7 +256,7 @@ enum RateChange {
 struct Device {
     port: HardwarePort,
     /// What the port receives.
-    results: flume::Receiver<ReceiveResult>,
+    results: flume::r#async::RecvStream<'static, ReceiveResult>,
     rate_change_state: RateChange,
     last_rx: Instant,
     seen_since_connect: bool,
@@ -277,7 +278,7 @@ impl Device {
         }
         Device {
             port,
-            results,
+            results: results.into_stream(),
             rate_change_state,
             last_rx: Instant::now(),
             seen_since_connect: false,
@@ -339,7 +340,7 @@ impl Device {
             .expect("Rates requested for unsupported device")
     }
 
-    /// Notes `result`, which the port received. Anything received refreshes
+    /// Notes `result`, which the port received. Packets and text refresh
     /// the device's liveness. A heartbeat of the root device moves the rate
     /// negotiation on, and marks the device restarted when its session
     /// changes.
@@ -347,13 +348,13 @@ impl Device {
         // Any received packet (text included) refreshes liveness, for every
         // device — the watchdog needs a timestamp regardless of rate state.
         match result {
-            Ok(_) | Err(RecvError::Text(_)) => {
+            Ok(TransportEvent::Packet(_) | TransportEvent::Text(_)) => {
                 self.last_rx = Instant::now();
             }
             _ => {}
         }
         if !self.has_static_rate() {
-            if let Ok(pkt) = result {
+            if let Ok(TransportEvent::Packet(pkt)) = result {
                 if let packet::Payload::Heartbeat(Heartbeat::Session(session)) = pkt.payload() {
                     let session = session.value();
                     if pkt.route().is_empty() {
@@ -719,8 +720,8 @@ impl Worker {
     async fn receive_device(&mut self) {
         while let Some(result) = self
             .device
-            .as_ref()
-            .and_then(|device| device.results.try_recv().ok())
+            .as_mut()
+            .and_then(|device| device.results.next().now_or_never().flatten())
         {
             self.device_received(result).await;
         }
@@ -734,7 +735,7 @@ impl Worker {
         };
         device.received(&result);
         match result {
-            Ok(pkt) => {
+            Ok(TransportEvent::Packet(pkt)) => {
                 // First packet since (re)connect: the device is live, announce it.
                 let first_packet = !std::mem::replace(&mut device.seen_since_connect, true);
                 if first_packet {
@@ -752,15 +753,15 @@ impl Worker {
                 log_device_packet(&pkt, self.dump);
                 self.dispatch_device_packet(pkt).await;
             }
-            Err(RecvError::Text(text)) => {
+            Ok(TransportEvent::Text(text)) => {
                 log::info!(target: &self.log_target, "Text: {text}");
             }
-            Err(RecvError::Protocol(perror)) => {
+            Ok(TransportEvent::RejectedFrame(perror)) => {
                 log::debug!(target: &self.log_target, "Protocol error: {perror:?}");
             }
             // A port that failed is lost as one that closed is, and the
             // device is reopened.
-            Err(err @ (RecvError::IO(_) | RecvError::Disconnected)) => {
+            Err(err) => {
                 log::debug!("lost {}: {err}", self.url);
                 self.lose_device();
             }
@@ -1164,6 +1165,7 @@ impl Worker {
         // The ports' packets wait in their queues while the device's rate
         // changes. Without a device, forwarding answers requests with errors.
         let forwarding = self.device.as_ref().is_none_or(Device::safe_to_forward);
+        let connected = self.device.is_some();
         tokio::select! {
             () = self.stop.cancelled() => {
                 log::trace!(target: &self.log_target, "The link closed");
@@ -1182,13 +1184,10 @@ impl Worker {
                     None => self.drop_subscriber(port),
                 }
             }
-            received = recv_device(&self.device) => match received {
-                Ok(result) => self.device_received(result).await,
-                Err(flume::RecvError::Disconnected) => {
-                    log::debug!("lost {}: the transport closed", self.url);
-                    self.lose_device();
-                }
-            },
+            received = async { self.device.as_mut().expect("a device is present").results.next().await }, if connected => {
+                let received = received.unwrap_or(Err(transport::RecvError::Disconnected));
+                self.device_received(received).await;
+            }
             opened = finish(&mut self.attempt) => match opened {
                 Ok(device) => self.device = Some(device),
                 Err(error) => {
@@ -1249,20 +1248,6 @@ fn next_sent<'a>(
         }
         Poll::Pending
     })
-}
-
-/// Waits for the next result the device's port delivers. Never returns
-/// while there is no device.
-///
-/// # Errors
-///
-/// Returns an error once the port's task has ended and delivered
-/// everything.
-async fn recv_device(device: &Option<Device>) -> Result<ReceiveResult, flume::RecvError> {
-    match device {
-        Some(device) => device.results.recv_async().await,
-        None => future::pending().await,
-    }
 }
 
 /// Marks the link failed when the worker stops, unless the worker already

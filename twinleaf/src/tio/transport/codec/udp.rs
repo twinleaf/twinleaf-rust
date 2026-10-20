@@ -20,6 +20,43 @@ pub(crate) fn encode(packet: &Packet) -> &[u8] {
     packet.as_bytes()
 }
 
+/// Exactly one TIO packet per datagram, including a rejected empty datagram.
+#[derive(Debug, Default)]
+pub(crate) struct Codec {
+    decoded: bool,
+}
+
+impl tokio_util::codec::Decoder for Codec {
+    type Item = super::super::TransportEvent;
+    type Error = super::super::RecvError;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.decode_eof(src)
+    }
+
+    fn decode_eof(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if std::mem::replace(&mut self.decoded, true) {
+            self.decoded = false;
+            return Ok(None);
+        }
+        let decoded = decode(src);
+        src.clear();
+        match decoded {
+            Ok(packet) => Ok(Some(Self::Item::Packet(packet))),
+            Err(error) => super::super::rejected_frame(error).map(Some),
+        }
+    }
+}
+
+impl tokio_util::codec::Encoder<Packet> for Codec {
+    type Error = super::super::RecvError;
+
+    fn encode(&mut self, packet: Packet, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        dst.extend_from_slice(encode(&packet));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

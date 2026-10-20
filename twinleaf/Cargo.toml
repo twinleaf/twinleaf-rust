@@ -54,7 +54,8 @@ serialport = { version = "4.9", optional = true }
 socket2 = "0.6.5"
 rustfft = { version = "6.4.1", optional = true }
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "process"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "codec", "net"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select", "eventual-fairness"] }
 
 [dev-dependencies]
