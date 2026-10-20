@@ -12,7 +12,7 @@ use bytes::{Buf, BytesMut};
 #[derive(Debug, Default)]
 pub(crate) struct Codec {
     /// Set once the stream holds bytes no header explains.
-    lost_framing: bool,
+    lost_framing: Option<packet::DecodeError>,
 }
 
 impl Codec {
@@ -23,11 +23,11 @@ impl Codec {
     ///
     /// Returns [`Error::Invalid`] for a packet whose header decodes but
     /// whose body does not, and removes that packet. Returns
-    /// [`Error::Invalid`] for a header that does not decode, and leaves
-    /// `src` as it is. Every later call then returns [`Error::LostFraming`].
+    /// [`Error::LostFraming`] for a header that does not decode, and leaves
+    /// `src` as it is. Every later call returns the same terminal error.
     pub(crate) fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Packet>, Error> {
-        if self.lost_framing {
-            return Err(Error::LostFraming);
+        if let Some(error) = self.lost_framing {
+            return Err(Error::LostFraming(error));
         }
         match Packet::from_slice_prefix(src) {
             Ok((packet, size)) => {
@@ -40,10 +40,15 @@ impl Codec {
                 // packet is skipped. One that does not leaves no boundary to
                 // find, so decoding stops once this error is reported.
                 match Header::parse_prefix(src) {
-                    Ok(header) => src.advance(header.packet_len()),
-                    Err(_) => self.lost_framing = true,
+                    Ok(header) => {
+                        src.advance(header.packet_len());
+                        Err(Error::Invalid(error))
+                    }
+                    Err(_) => {
+                        self.lost_framing = Some(error);
+                        Err(Error::LostFraming(error))
+                    }
                 }
-                Err(Error::Invalid(error))
             }
         }
     }
@@ -51,6 +56,27 @@ impl Codec {
     /// Appends the wire bytes of `packet` to `dst`.
     pub(crate) fn encode(&mut self, packet: &Packet, dst: &mut BytesMut) {
         dst.extend_from_slice(packet.as_bytes());
+    }
+}
+
+impl tokio_util::codec::Decoder for Codec {
+    type Item = super::super::TransportEvent;
+    type Error = super::super::RecvError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match Codec::decode(self, src) {
+            Ok(packet) => Ok(packet.map(Self::Item::Packet)),
+            Err(error) => super::super::rejected_frame(error).map(Some),
+        }
+    }
+}
+
+impl tokio_util::codec::Encoder<Packet> for Codec {
+    type Error = super::super::RecvError;
+
+    fn encode(&mut self, packet: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        Codec::encode(self, &packet, dst);
+        Ok(())
     }
 }
 
@@ -85,7 +111,7 @@ mod tests {
         for piece in pieces {
             src.extend_from_slice(piece);
             while let Some(result) = codec.decode(&mut src).transpose() {
-                let lost = matches!(result, Err(Error::LostFraming));
+                let lost = matches!(result, Err(Error::LostFraming(_)));
                 decoded.push(result.map(|p| p.as_bytes().to_vec()));
                 if lost {
                     return decoded;
@@ -157,7 +183,7 @@ mod tests {
 
             assert_eq!(
                 decode_pieces([&wire[..]]),
-                [Err(Error::Invalid(error)), Err(Error::LostFraming)],
+                [Err(Error::LostFraming(error))],
                 "{header:?}"
             );
         }

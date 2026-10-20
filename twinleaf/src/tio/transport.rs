@@ -37,39 +37,45 @@ use task::{Rules, Task};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// An error receiving from a [`Port`].
+/// One item received from a port. Text and rejected frames leave the link usable.
+#[derive(Debug)]
+pub enum TransportEvent {
+    /// A complete, validated packet.
+    Packet(Packet),
+    /// Plain text outside the packet protocol, on a serial link.
+    #[cfg_attr(not(feature = "serial"), allow(dead_code))]
+    Text(String),
+    /// A malformed frame that was consumed. Decoding continues at the next boundary.
+    RejectedFrame(packet::DecodeError),
+}
+
+/// A terminal failure receiving from a port.
 #[derive(Debug, thiserror::Error)]
 pub enum RecvError {
-    /// The port disconnected.
+    /// The port's task ended and no more events remain.
     #[error("port disconnected")]
     Disconnected,
-    /// The data did not decode as a packet.
-    #[error("protocol error: {0}")]
-    Protocol(#[from] packet::DecodeError),
-    /// Plain text received outside the packet protocol, which only a serial
-    /// port reads.
-    #[cfg_attr(not(feature = "serial"), allow(dead_code))]
-    #[error("{0}")]
-    Text(String),
-    /// A low level I/O error.
+    /// A TCP header left no way to find the next packet boundary.
+    #[error("lost packet framing: {0}")]
+    LostFraming(packet::DecodeError),
+    /// A low level I/O error ended the link.
     #[error("I/O error: {0}")]
     IO(#[from] io::Error),
 }
 
-impl From<codec::Error> for RecvError {
-    fn from(error: codec::Error) -> Self {
-        match error {
-            codec::Error::Invalid(error) => RecvError::Protocol(error),
-            codec::Error::TrailingBytes => {
-                RecvError::IO(io::Error::from(io::ErrorKind::InvalidData))
-            }
-            codec::Error::LostFraming => RecvError::Disconnected,
-        }
+/// A received event, or a failure that ends this receive operation.
+pub type ReceiveResult = Result<TransportEvent, RecvError>;
+
+/// A consumed frame error is an event. Lost stream framing ends the link.
+fn rejected_frame(error: codec::Error) -> ReceiveResult {
+    match error {
+        codec::Error::Invalid(error) => Ok(TransportEvent::RejectedFrame(error)),
+        codec::Error::TrailingBytes => Ok(TransportEvent::RejectedFrame(
+            packet::DecodeError::PacketTooBig,
+        )),
+        codec::Error::LostFraming(error) => Err(RecvError::LostFraming(error)),
     }
 }
-
-/// A packet, or the error encountered while receiving it from a [`Port`].
-pub type ReceiveResult = Result<Packet, RecvError>;
 
 /// An error sending to a [`Port`].
 #[derive(Debug, thiserror::Error)]
@@ -433,7 +439,9 @@ impl Port {
             rx,
             DEFAULT_TX_CHANNEL_SIZE,
         );
-        let run = task.run_stream(stream, codec::serial::Codec::default());
+        let framing =
+            codec::serial::Codec::with_timing(serial::RULES.holdoff, serial::RULES.stale_after);
+        let run = task.run_stream(stream, framing);
         Ok(port.start(tasks, format_args!("twinleaf port {serial_config}"), run))
     }
 
@@ -460,7 +468,7 @@ impl Port {
         tasks: &Supervisor,
     ) -> io::Result<Port> {
         let peer = find_addr(address, family)?;
-        let socket = udp::connect(&peer)?;
+        let socket = udp::bind(&peer)?;
         let (port, task) = Port::with_task(
             TransportKind::Udp,
             None,
@@ -468,7 +476,7 @@ impl Port {
             rx,
             DEFAULT_TX_CHANNEL_SIZE,
         );
-        let run = task.run_datagram(socket);
+        let run = task.run_datagram(socket, peer);
         Ok(port.start(tasks, format_args!("twinleaf port udp://{peer}"), run))
     }
 
@@ -700,6 +708,7 @@ impl Port {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "serial")]
     use bytes::BytesMut;
     use fake::{FakeStream, PIPE_SIZE};
     use flume::{Receiver, RecvTimeoutError};
@@ -884,7 +893,14 @@ mod tests {
     /// runtime, follows `rules` and frames packets with `framing`. A `stuck`
     /// stream starts with its pipe full, so it writes nothing until the peer
     /// reads.
-    fn fake(rules: Rules, framing: impl task::Framing, stuck: bool) -> Fake {
+    fn fake<C>(rules: Rules, framing: C, stuck: bool) -> Fake
+    where
+        C: tokio_util::codec::Decoder<Item = TransportEvent, Error = RecvError>
+            + tokio_util::codec::Encoder<Packet, Error = RecvError>
+            + Send
+            + Unpin
+            + 'static,
+    {
         let (pipe, peer) = tokio::io::duplex(PIPE_SIZE);
         let (mut stream, gone, _) = FakeStream::new(pipe);
         let (rx, results) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
@@ -1015,6 +1031,164 @@ mod tests {
         ));
     }
 
+    /// A terminal read error is reported once and releases the link even
+    /// while the caller retains its port handle.
+    #[tokio::test]
+    async fn a_read_error_ends_the_transport_without_dropping_the_port() {
+        let (send, receive) = flume::unbounded();
+        let (port, mut peer) = Port::fake(TransportKind::Tcp, None, send);
+        peer.fail(io::ErrorKind::ConnectionReset);
+        assert!(matches!(
+            receive.recv_async().await.unwrap(),
+            Err(RecvError::IO(error)) if error.kind() == io::ErrorKind::ConnectionReset
+        ));
+        assert!(matches!(
+            receive.recv_async().await,
+            Err(flume::RecvError::Disconnected)
+        ));
+        assert!(peer.released());
+        assert!(matches!(
+            port.try_send(Packet::heartbeat(proto::DeviceRoute::root())),
+            Err(SendError::Disconnected)
+        ));
+    }
+
+    /// A stalled sink does not keep incoming packets from the framed source.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_framed_write_keeps_receiving() {
+        let Fake {
+            port,
+            results,
+            gone,
+            mut peer,
+        } = fake(Rules::NONE, codec::tcp::Codec::default(), true);
+        let packet = Packet::heartbeat_session(7, proto::DeviceRoute::root());
+        port.try_send(packet.clone()).unwrap();
+        peer.write_all(packet.as_bytes()).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), results.recv_async())
+            .await
+            .expect("a pending write must not block reads")
+            .unwrap()
+            .unwrap();
+        let TransportEvent::Packet(received) = received else {
+            panic!("expected the incoming heartbeat")
+        };
+        assert_eq!(received.as_bytes(), packet.as_bytes());
+        assert!(matches!(gone.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    /// Datagram framing rejects malformed and empty datagrams independently,
+    /// and sends each outgoing packet as exactly one datagram.
+    #[tokio::test]
+    async fn udp_framing_recovers_at_the_next_datagram() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let (send, received) = flume::unbounded();
+        let (port, task) = Port::with_task(
+            TransportKind::Udp,
+            None,
+            Rules::NONE,
+            send,
+            DEFAULT_TX_CHANNEL_SIZE,
+        );
+        let port = port.start(
+            &Supervisor::current(),
+            "a UDP framing test",
+            task.run_datagram(socket, peer.local_addr().unwrap()),
+        );
+        let packet = Packet::heartbeat_session(7, proto::DeviceRoute::root());
+        let mut trailing = packet.as_bytes().to_vec();
+        trailing.push(0);
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(
+                Packet::heartbeat_session(999, proto::DeviceRoute::root()).as_bytes(),
+                local,
+            )
+            .await
+            .unwrap();
+        peer.send_to(&trailing, local).await.unwrap();
+        peer.send_to(&[], local).await.unwrap();
+        peer.send_to(packet.as_bytes(), local).await.unwrap();
+        let arrivals = async {
+            assert!(matches!(
+                received.recv_async().await.unwrap(),
+                Ok(TransportEvent::RejectedFrame(
+                    packet::DecodeError::PacketTooBig
+                ))
+            ));
+            assert!(matches!(
+                received.recv_async().await.unwrap(),
+                Ok(TransportEvent::RejectedFrame(
+                    packet::DecodeError::PacketTooSmall
+                ))
+            ));
+            let Ok(TransportEvent::Packet(actual)) = received.recv_async().await.unwrap() else {
+                panic!("the following datagram did not decode")
+            };
+            assert_eq!(actual.as_bytes(), packet.as_bytes());
+        };
+        tokio::time::timeout(Duration::from_secs(2), arrivals)
+            .await
+            .unwrap();
+        port.try_send(packet.clone()).unwrap();
+        let mut raw = [0; 1024];
+        let size = tokio::time::timeout(Duration::from_secs(2), peer.recv(&mut raw))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "UDP send did not arrive, transport reported {:?}",
+                    received.try_recv()
+                )
+            })
+            .unwrap();
+        assert_eq!(&raw[..size], packet.as_bytes());
+    }
+
+    /// Both checksum failures and valid-checksum frames with trailing bytes
+    /// are consumed as rejected frames, and leave the next packet readable.
+    #[cfg(feature = "serial")]
+    #[tokio::test]
+    async fn rejected_serial_frames_leave_the_transport_open() {
+        use codec::serial::Codec;
+        let Fake {
+            port: _port,
+            results,
+            gone,
+            mut peer,
+        } = fake(Rules::NONE, Codec::default(), false);
+        let packet = Packet::heartbeat(proto::DeviceRoute::root());
+        let mut frame = BytesMut::new();
+        Codec::default().encode(&packet, &mut frame);
+        let mut bad_crc = frame.to_vec();
+        bad_crc[2] ^= 1;
+        peer.write_all(&bad_crc).await.unwrap();
+
+        let mut trailing = packet.as_bytes().to_vec();
+        trailing.push(0);
+        let mut encoded = vec![0; proto::serial::max_serialized_size(trailing.len())];
+        let size = proto::serial::serialize(&trailing, &mut encoded).unwrap();
+        peer.write_all(&encoded[..size]).await.unwrap();
+        peer.write_all(&frame).await.unwrap();
+
+        assert!(matches!(
+            results.recv_async().await.unwrap(),
+            Ok(TransportEvent::RejectedFrame(packet::DecodeError::CRC32))
+        ));
+        assert!(matches!(
+            results.recv_async().await.unwrap(),
+            Ok(TransportEvent::RejectedFrame(
+                packet::DecodeError::PacketTooBig
+            ))
+        ));
+        let Ok(TransportEvent::Packet(next)) = results.recv_async().await.unwrap() else {
+            panic!("the valid packet after the rejected frames did not arrive")
+        };
+        assert_eq!(next.as_bytes(), packet.as_bytes());
+        assert!(matches!(gone.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
     /// Reads one packet of `size` bytes from `peer`.
     async fn read_packet(peer: &mut DuplexStream, size: usize) -> Vec<u8> {
         let mut packet = vec![0; size];
@@ -1072,7 +1246,11 @@ mod tests {
             results,
             mut peer,
             ..
-        } = fake(serial::RULES, Codec::default(), false);
+        } = fake(
+            serial::RULES,
+            Codec::with_timing(serial::RULES.holdoff, serial::RULES.stale_after),
+            false,
+        );
         let opened = tokio::time::Instant::now();
         let frame = |route: &str| {
             let packet = Packet::heartbeat(route.parse().unwrap());
@@ -1106,8 +1284,10 @@ mod tests {
 
         peer.write_all(&frame("/3")).await.unwrap();
         tokio::time::sleep(step).await;
-        assert!(matches!(results.try_recv(), Ok(Err(RecvError::Text(text))) if text == "boot"));
-        let after = results.try_recv().unwrap().unwrap();
+        assert!(matches!(results.try_recv(), Ok(Ok(TransportEvent::Text(text))) if text == "boot"));
+        let TransportEvent::Packet(after) = results.try_recv().unwrap().unwrap() else {
+            panic!("expected a packet")
+        };
         assert_eq!(after.route(), "/3".parse().unwrap());
         assert!(results.try_recv().is_err());
     }
@@ -1186,7 +1366,10 @@ mod tests {
         peer.write_all(heartbeat.as_bytes()).unwrap();
 
         let arrived = results.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(arrived.unwrap().as_bytes(), heartbeat.as_bytes());
+        let TransportEvent::Packet(arrived) = arrived.unwrap() else {
+            panic!("expected a packet")
+        };
+        assert_eq!(arrived.as_bytes(), heartbeat.as_bytes());
     }
 
     /// A packet whose header parses but whose payload does not is skipped on
@@ -1204,12 +1387,14 @@ mod tests {
         let wait = Duration::from_secs(2);
         assert!(matches!(
             results.recv_timeout(wait).unwrap(),
-            Err(RecvError::Protocol(packet::DecodeError::PayloadTooShort))
+            Ok(TransportEvent::RejectedFrame(
+                packet::DecodeError::PayloadTooShort
+            ))
         ));
-        assert_eq!(
-            results.recv_timeout(wait).unwrap().unwrap().as_bytes(),
-            heartbeat.as_bytes()
-        );
+        let TransportEvent::Packet(next) = results.recv_timeout(wait).unwrap().unwrap() else {
+            panic!("expected the next packet")
+        };
+        assert_eq!(next.as_bytes(), heartbeat.as_bytes());
     }
 
     /// A header that does not parse leaves no way to find the next packet, so
@@ -1217,15 +1402,17 @@ mod tests {
     #[test]
     fn a_tcp_stream_that_loses_its_framing_closes() {
         let (_port, mut peer, results) = tcp_port_reporting();
-
-        peer.write_all(&[0, 0, 0, 0]).unwrap();
-        peer.write_all(Packet::heartbeat(proto::DeviceRoute::root()).as_bytes())
-            .unwrap();
-
         let wait = Duration::from_secs(2);
+        peer.set_read_timeout(Some(wait)).unwrap();
+
+        let mut wire = vec![0, 0, 0, 0];
+        wire.extend_from_slice(Packet::heartbeat(proto::DeviceRoute::root()).as_bytes());
+        peer.write_all(&wire).unwrap();
         assert!(matches!(
             results.recv_timeout(wait).unwrap(),
-            Err(RecvError::Protocol(packet::DecodeError::InvalidPacketType))
+            Err(RecvError::LostFraming(
+                packet::DecodeError::InvalidPacketType
+            ))
         ));
         assert!(matches!(
             results.recv_timeout(wait),
@@ -1233,7 +1420,6 @@ mod tests {
         ));
         // The port may close with the heartbeat still unread, which resets
         // the connection rather than ending it. Either way it is closed.
-        peer.set_read_timeout(Some(wait)).unwrap();
         match peer.read(&mut [0]) {
             Ok(0) => {}
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}

@@ -13,20 +13,22 @@
 //! [`run_datagram`](Task::run_datagram) drives a UDP socket.
 
 use super::codec::udp as datagram;
-use super::{udp, Delivery, PacketOrControl, ReceiveResult, RecvError, DRAIN_TIMEOUT};
+use super::{
+    udp, Delivery, PacketOrControl, ReceiveResult, RecvError, TransportEvent, DRAIN_TIMEOUT,
+};
 use crate::proto::DeviceRoute;
 use crate::rt::{self, sleep_until_some};
 use crate::tio::packet::Packet;
-use bytes::{Buf, BytesMut};
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use std::io;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{timeout_at, Instant};
-
-/// The most bytes a stream port reads at once.
-const READ_SIZE: usize = 4096;
+use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::udp::UdpFramed;
 
 /// What a port's task does beside moving packets, which depends on its link.
 pub(super) struct Rules {
@@ -39,6 +41,7 @@ pub(super) struct Rules {
     pub holdoff: Option<Duration>,
     /// How long received bytes wait for the rest of their frame. Bytes held
     /// longer are discarded when more arrive.
+    #[cfg_attr(not(feature = "serial"), allow(dead_code))]
     pub stale_after: Option<Duration>,
     /// How long the task waits for the peer to close, if the link closes in
     /// stages. Once the port is dropped and its queue is written, the task
@@ -86,17 +89,6 @@ pub(super) trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     }
 }
 
-/// The framing of packets on a [`ByteStream`].
-pub(super) trait Framing: Default + Send + 'static {
-    /// Decodes the next packet or error at the start of `buf`, and removes
-    /// the bytes it used. Returns `None` once `buf` holds nothing more to
-    /// decode.
-    fn decode(&mut self, buf: &mut BytesMut) -> Option<ReceiveResult>;
-
-    /// Appends the frame of `packet` to `buf`.
-    fn encode(&mut self, packet: &Packet, buf: &mut BytesMut);
-}
-
 /// The state of a port's task beside its link.
 pub(super) struct Task {
     /// Where the task delivers what the link receives.
@@ -109,8 +101,6 @@ pub(super) struct Task {
     next_heartbeat: Instant,
     /// When the startup holdoff ends, while it lasts.
     holdoff: Option<Instant>,
-    /// How long received bytes wait for the rest of their frame.
-    stale_after: Option<Duration>,
     /// How long the task waits for the peer to close, if the link closes in
     /// stages.
     half_close: Option<Duration>,
@@ -135,28 +125,25 @@ impl Task {
             heartbeat: rules.heartbeat,
             next_heartbeat,
             holdoff: rules.holdoff.map(|holdoff| now + holdoff),
-            stale_after: rules.stale_after,
             half_close: rules.half_close,
             _activity: rt::Activity::hold(),
         }
     }
 
     /// Hands `result` to the port's receiver, and drops it if the receiver's
-    /// channel is full. During the holdoff it drops everything but text and
-    /// a disconnect. Returns `false` once the link has disconnected or
-    /// nothing receives.
+    /// channel is full. During the holdoff it drops packets and rejected frames,
+    /// but passes text and terminal errors. Returns `false` after a terminal
+    /// error or once nothing receives.
     fn deliver(&self, result: ReceiveResult) -> bool {
-        let passes = matches!(result, Err(RecvError::Text(_) | RecvError::Disconnected));
-        if self.holdoff.is_some() && !passes {
+        let terminal = result.is_err();
+        if self.holdoff.is_some() && !terminal && !matches!(result, Ok(TransportEvent::Text(_))) {
             return true;
         }
-        if let Err(RecvError::Disconnected) = result {
-            return false;
-        }
-        !matches!(
+        let receiving = !matches!(
             self.rx.try_send(result),
             Err(flume::TrySendError::Disconnected(_))
-        )
+        );
+        receiving && !terminal
     }
 
     /// Returns `true` if a heartbeat is due at `now`.
@@ -187,88 +174,79 @@ impl Task {
         self.holdoff = self.holdoff.filter(|&end| end > now);
     }
 
-    /// Runs the port over `stream`, with packets framed by `framing`, until
-    /// the task ends.
-    pub(super) async fn run_stream<S: ByteStream, F: Framing>(mut self, stream: S, mut framing: F) {
-        let (mut reader, mut writer) = tokio::io::split(stream);
-        let mut received = BytesMut::new();
-        let mut sending = BytesMut::new();
-        // When the packet in `sending` must be written by.
+    /// Runs the link through Tokio's framed stream and sink. A queued packet
+    /// is fed once, then flushed while receiving remains responsive.
+    pub(super) async fn run_stream<S, C>(mut self, stream: S, codec: C)
+    where
+        S: ByteStream,
+        C: Decoder<Item = TransportEvent, Error = RecvError>
+            + Encoder<Packet, Error = RecvError>
+            + Send
+            + Unpin
+            + 'static,
+    {
+        let (mut sink, mut source) = Framed::new(stream, codec).split();
+        let mut writing = false;
         let mut write_by = Instant::now();
-        let mut last_read = Instant::now();
-        let mut first_read = true;
-        'run: loop {
+        loop {
             let now = Instant::now();
-            if sending.is_empty() && self.heartbeat_due(now) {
-                framing.encode(&Packet::heartbeat(DeviceRoute::root()), &mut sending);
+            if !writing && self.heartbeat_due(now) {
+                if let Err(error) = sink.feed(Packet::heartbeat(DeviceRoute::root())).await {
+                    self.deliver(Err(error));
+                    break;
+                }
+                writing = true;
                 write_by = now + DRAIN_TIMEOUT;
             }
-            let wake = self.next_wake(!sending.is_empty());
-            let held = received.len();
-            received.reserve(READ_SIZE);
+            let wake = self.next_wake(writing);
             tokio::select! {
-                read = reader.read_buf(&mut received) => {
-                    let now = Instant::now();
-                    match read {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(error) => {
-                            if !self.deliver(Err(S::read_error(error))) {
-                                break;
-                            }
-                            continue;
+                received = source.next() => {
+                    let result = match received {
+                        Some(Err(RecvError::IO(error))) => Err(S::read_error(error)),
+                        Some(result) => result,
+                        None => break,
+                    };
+                    if !self.deliver(result) {
+                        break;
+                    }
+                }
+                flushed = timeout_at(write_by, sink.flush()), if writing => {
+                    match flushed {
+                        Ok(Ok(())) => {
+                            writing = false;
+                            self.wrote(Instant::now());
                         }
-                    }
-                    if self.holdoff.is_some() {
-                        self.next_heartbeat = now;
-                    }
-                    if std::mem::take(&mut first_read) && self.holdoff.is_some() {
-                        // The first bytes are likely stale, or corrupted by
-                        // the driver as the port opened. Decoding them could
-                        // stall the decoder until a large frame fails.
-                        received.clear();
-                        framing = F::default();
-                        continue;
-                    }
-                    if self.stale_after.is_some_and(|stale| now.duration_since(last_read) > stale) {
-                        // What was held is left from before a pause, as when
-                        // a board is reprogrammed in the middle of a packet.
-                        received.advance(held);
-                        framing = F::default();
-                    }
-                    last_read = now;
-                    while let Some(result) = framing.decode(&mut received) {
-                        if !self.deliver(result) {
-                            break 'run;
+                        Ok(Err(error)) => {
+                            self.deliver(Err(error));
+                            break;
+                        }
+                        Err(_) => {
+                            self.deliver(Err(io::Error::new(io::ErrorKind::TimedOut, "port write deadline expired").into()));
+                            break;
                         }
                     }
                 }
-                written = timeout_at(write_by, writer.write_buf(&mut sending)), if !sending.is_empty() => {
-                    match written {
-                        Ok(Ok(size)) if size > 0 => {
-                            if sending.is_empty() {
-                                self.wrote(Instant::now());
-                            }
-                        }
-                        // A failed write, a stream that takes nothing, or a
-                        // packet not written in time gives up the link.
-                        _ => break,
-                    }
-                }
-                message = self.queue.recv(), if sending.is_empty() && self.holdoff.is_none() => {
+                message = self.queue.recv(), if !writing && self.holdoff.is_none() => {
                     match message {
                         Some(PacketOrControl::Pkt(packet)) => {
-                            framing.encode(&packet, &mut sending);
+                            // The preceding packet was flushed, so feed has room
+                            // immediately. Only flush waits for the peer to read.
+                            if let Err(error) = sink.feed(packet).await {
+                                self.deliver(Err(error));
+                                break;
+                            }
+                            writing = true;
                             write_by = Instant::now() + DRAIN_TIMEOUT;
                         }
                         Some(PacketOrControl::SetRate(rate, result)) => {
-                            let mut stream = reader.unsplit(writer);
-                            let _ = result.send(stream.set_rate(rate));
-                            (reader, writer) = tokio::io::split(stream);
+                            let mut framed = sink.reunite(source)
+                                .unwrap_or_else(|_| unreachable!("matching framed halves"));
+                            let _ = result.send(framed.get_mut().set_rate(rate));
+                            (sink, source) = framed.split();
                         }
                         None => {
                             if let Some(within) = self.half_close {
-                                close_in_stages(&mut reader, &mut writer, within).await;
+                                close_in_stages(&mut sink, &mut source, within).await;
                             }
                             break;
                         }
@@ -279,50 +257,64 @@ impl Task {
         }
     }
 
-    /// Runs the port over the connected UDP `socket` until the task ends.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the socket sends only part of a datagram.
-    pub(super) async fn run_datagram(mut self, socket: UdpSocket) {
-        let mut received = [0; udp::RX_SIZE];
-        // The datagram being sent, empty once it has gone.
-        let mut sending = BytesMut::new();
+    /// Runs a UDP link through Tokio's datagram stream and sink.
+    /// Advisory ICMP errors leave the device watchdog to judge the link.
+    pub(super) async fn run_datagram(mut self, socket: UdpSocket, peer: std::net::SocketAddr) {
+        let (mut sink, mut source) = UdpFramed::new(socket, datagram::Codec::default()).split();
+        let mut writing = false;
         let mut write_by = Instant::now();
         loop {
             let now = Instant::now();
-            if sending.is_empty() && self.heartbeat_due(now) {
-                let heartbeat = Packet::heartbeat(DeviceRoute::root());
-                sending.extend_from_slice(datagram::encode(&heartbeat));
+            if !writing && self.heartbeat_due(now) {
+                if let Err(error) = sink
+                    .feed((Packet::heartbeat(DeviceRoute::root()), peer))
+                    .await
+                {
+                    self.deliver(Err(error));
+                    break;
+                }
+                writing = true;
                 write_by = now + DRAIN_TIMEOUT;
             }
-            let wake = self.next_wake(!sending.is_empty());
+            let wake = self.next_wake(writing);
             tokio::select! {
-                read = socket.recv(&mut received) => {
-                    let result = match read {
-                        Ok(size) => datagram::decode(&received[..size]).map_err(RecvError::from),
-                        Err(error) if udp::is_advisory_network_error(&error) => continue,
-                        Err(error) => Err(RecvError::IO(error)),
+                received = source.next() => {
+                    let result = match received {
+                        Some(Ok((_, from))) if from != peer => continue,
+                        Some(Ok((event, _))) => Ok(event),
+                        Some(Err(RecvError::IO(error))) if udp::is_advisory_network_error(&error) => continue,
+                        Some(Err(error)) => Err(error),
+                        None => break,
                     };
-                    if !self.deliver(result) {
-                        break;
-                    }
+                    if !self.deliver(result) { break; }
                 }
-                sent = timeout_at(write_by, socket.send(&sending)), if !sending.is_empty() => {
-                    match sent {
-                        Ok(Ok(size)) => {
-                            assert_eq!(size, sending.len(), "Unexpected UDP short write");
+                flushed = timeout_at(write_by, sink.flush()), if writing => {
+                    match flushed {
+                        Ok(Ok(())) => {}
+                        Ok(Err(RecvError::IO(error))) if udp::is_advisory_network_error(&error) => {
+                            // UdpFramed retains an unsent datagram after an error.
+                            // Drop that datagram while keeping the socket.
+                            let socket = sink.reunite(source)
+                                .unwrap_or_else(|_| unreachable!("matching datagram halves"))
+                                .into_inner();
+                            (sink, source) = UdpFramed::new(socket, datagram::Codec::default()).split();
                         }
-                        Ok(Err(error)) if udp::is_advisory_network_error(&error) => {}
-                        _ => break,
+                        Ok(Err(error)) => { self.deliver(Err(error)); break; }
+                        Err(_) => {
+                            self.deliver(Err(io::Error::new(io::ErrorKind::TimedOut, "port write deadline expired").into()));
+                            break;
+                        }
                     }
-                    sending.clear();
+                    writing = false;
                     self.wrote(Instant::now());
                 }
-                message = self.queue.recv(), if sending.is_empty() && self.holdoff.is_none() => {
+                message = self.queue.recv(), if !writing && self.holdoff.is_none() => {
                     match message {
                         Some(PacketOrControl::Pkt(packet)) => {
-                            sending.extend_from_slice(datagram::encode(&packet));
+                            if let Err(error) = sink.feed((packet, peer)).await {
+                                self.deliver(Err(error)); break;
+                            }
+                            writing = true;
                             write_by = Instant::now() + DRAIN_TIMEOUT;
                         }
                         Some(PacketOrControl::SetRate(_, result)) => {
@@ -337,29 +329,18 @@ impl Task {
     }
 }
 
-/// Shuts down the sending side of the link that `reader` and `writer` split,
-/// then reads and discards what arrives until the peer closes its side, for
-/// at most `within`.
-// A close with input still unread resets the link, and the reset can
-// overtake what was written last. A peer that has closed has read all of
-// it, and sends nothing more.
-async fn close_in_stages<S: ByteStream>(
-    reader: &mut ReadHalf<S>,
-    writer: &mut WriteHalf<S>,
+/// Finishes the framed sink, then consumes the peer's stream until EOF or
+/// the close deadline. Tokio owns the flushing and socket shutdown.
+async fn close_in_stages<T>(
+    sink: &mut SplitSink<T, Packet>,
+    source: &mut SplitStream<T>,
     within: Duration,
-) {
-    let mut discarded = BytesMut::with_capacity(READ_SIZE);
+) where
+    T: Stream<Item = ReceiveResult> + Sink<Packet, Error = RecvError> + Unpin,
+{
     let closing = async {
-        if writer.shutdown().await.is_err() {
-            return;
-        }
-        loop {
-            discarded.clear();
-            discarded.reserve(READ_SIZE);
-            match reader.read_buf(&mut discarded).await {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
+        if sink.close().await.is_ok() {
+            source.for_each(|_| std::future::ready(())).await;
         }
     };
     let _ = timeout_at(Instant::now() + within, closing).await;

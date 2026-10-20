@@ -9,6 +9,8 @@ use crate::proto::packet::Packet as WirePacket;
 use crate::proto::serial as wire;
 use crate::tio::packet::{self, Packet};
 use bytes::{Buf, BufMut, BytesMut};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// The deserializer's capacity, the largest packet plus its trailing CRC32.
 const RX_CAPACITY: usize = WirePacket::MAX_SIZE + wire::CRC_SIZE;
@@ -27,9 +29,23 @@ pub(crate) enum Frame {
 pub(crate) struct Codec {
     /// The SLIP and CRC decoder, which holds a partly received frame.
     deserializer: wire::Deserializer<RX_CAPACITY>,
+    /// Before this time, discard the first read from a newly opened device.
+    discard_first_until: Option<Instant>,
+    /// A partial serial frame expires after this much silence.
+    stale_after: Option<Duration>,
+    last_read: Option<Instant>,
 }
 
 impl Codec {
+    /// Applies the startup discard and partial-frame timeout of a device link.
+    pub(crate) fn with_timing(holdoff: Option<Duration>, stale_after: Option<Duration>) -> Self {
+        Self {
+            discard_first_until: holdoff.map(|duration| Instant::now() + duration),
+            stale_after,
+            ..Self::default()
+        }
+    }
+
     /// Decodes bytes from the start of `src` until a frame completes, and
     /// removes the bytes it used. A frame still arriving is held in the
     /// codec. Returns `None` once `src` runs out with no frame complete.
@@ -46,6 +62,27 @@ impl Codec {
     /// [`Error::TrailingBytes`] for a frame that holds more bytes after its
     /// packet. Decoding goes on with the next frame after any error.
     pub(crate) fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, Error> {
+        if src.is_empty() {
+            return Ok(None);
+        }
+        let now = Instant::now();
+        if self
+            .discard_first_until
+            .take()
+            .is_some_and(|until| now < until)
+        {
+            src.clear();
+            self.last_read = Some(now);
+            return Ok(None);
+        }
+        if self
+            .stale_after
+            .zip(self.last_read)
+            .is_some_and(|(stale, last)| now.duration_since(last) > stale)
+        {
+            self.deserializer = wire::Deserializer::default();
+        }
+        self.last_read = Some(now);
         let (consumed, frame) = self.deserializer.push(src);
         let frame = frame.map(|frame| decode_frame(&frame)).transpose();
         src.advance(consumed);
@@ -85,10 +122,51 @@ fn decode_frame(frame: &wire::Frame) -> Result<Frame, Error> {
     }))
 }
 
+impl tokio_util::codec::Decoder for Codec {
+    type Item = super::super::TransportEvent;
+    type Error = super::super::RecvError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match Codec::decode(self, src) {
+            Ok(Some(Frame::Packet(packet))) => Ok(Some(Self::Item::Packet(packet))),
+            Ok(Some(Frame::Text(text))) => Ok(Some(Self::Item::Text(text))),
+            Ok(None) => Ok(None),
+            Err(error) => super::super::rejected_frame(error).map(Some),
+        }
+    }
+}
+
+impl tokio_util::codec::Encoder<Packet> for Codec {
+    type Error = super::super::RecvError;
+
+    fn encode(&mut self, packet: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        Codec::encode(self, &packet, dst);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::DeviceRoute;
+
+    /// A partly received serial frame does not survive the device's silence
+    /// budget. The next frame decodes without the stale prefix.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_frame_expires_before_the_next_read() {
+        let mut codec = Codec::with_timing(None, Some(Duration::from_millis(200)));
+        let packet = Packet::heartbeat_session(7, DeviceRoute::root());
+        let mut frame = BytesMut::new();
+        Codec::default().encode(&packet, &mut frame);
+        let mut received = BytesMut::from(&frame[..frame.len() / 2]);
+        assert!(codec.decode(&mut received).unwrap().is_none());
+        tokio::time::advance(Duration::from_millis(201)).await;
+        received.extend_from_slice(&frame);
+        let Some(Frame::Packet(actual)) = codec.decode(&mut received).unwrap() else {
+            panic!("the fresh frame must decode without the stale partial frame")
+        };
+        assert_eq!(actual.as_bytes(), packet.as_bytes());
+    }
 
     /// A frame as a test compares it, a packet as its bytes.
     #[derive(Debug, PartialEq)]

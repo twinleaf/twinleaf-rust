@@ -1,15 +1,14 @@
 //! The serial transport.
 //!
 //! Opens the serial ports that ports drive. Each TIO packet gets its CRC32
-//! appended and is SLIP encoded on the serial stream, as [`Codec`] does.
+//! appended and is SLIP encoded on the serial stream, as its
+//! [codec](super::codec::serial::Codec) does.
 //! Newline delimited ASCII text that arrives is returned as
-//! [`RecvError::Text`].
+//! [`super::TransportEvent::Text`].
 
-use super::codec::serial::{Codec, Frame};
-use super::task::{ByteStream, Framing, Rules};
-use super::{Packet, RateInfo, ReceiveResult, RecvError};
+use super::task::{ByteStream, Rules};
+use super::{RateInfo, RecvError};
 use crate::rt;
-use bytes::BytesMut;
 use std::io;
 use std::time::Duration;
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
@@ -134,20 +133,5 @@ impl ByteStream for SerialStream {
 
     fn read_error(error: io::Error) -> RecvError {
         disconnect_on_unplug(RecvError::IO(error))
-    }
-}
-
-impl Framing for Codec {
-    fn decode(&mut self, buf: &mut BytesMut) -> Option<ReceiveResult> {
-        match Codec::decode(self, buf) {
-            Ok(Some(Frame::Packet(packet))) => Some(Ok(packet)),
-            Ok(Some(Frame::Text(text))) => Some(Err(RecvError::Text(text))),
-            Ok(None) => None,
-            Err(error) => Some(Err(error.into())),
-        }
-    }
-
-    fn encode(&mut self, packet: &Packet, buf: &mut BytesMut) {
-        Codec::encode(self, packet, buf);
     }
 }

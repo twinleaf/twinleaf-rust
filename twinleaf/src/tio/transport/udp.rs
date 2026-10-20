@@ -1,11 +1,11 @@
 //! The UDP transport.
 //!
-//! Opens the connected UDP sockets that ports drive. Each TIO packet travels
+//! Opens the UDP sockets that ports drive. Each TIO packet travels
 //! unchanged in a datagram of its own, as
 //! [`codec::udp`](super::codec::udp) frames it.
 
 use super::task::Rules;
-use crate::rt;
+use crate::rt::Supervisor;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -17,30 +17,24 @@ pub(super) const RULES: Rules = Rules {
     ..Rules::NONE
 };
 
-/// The size of a UDP port's receive buffer, which holds one datagram.
-pub(super) const RX_SIZE: usize = 1024;
-
-/// Binds a UDP socket and connects it to `address`.
+/// Binds a UDP socket of the address family needed to reach `address`.
+/// UdpFramed supplies each destination. Leaving the socket unconnected
+/// supports its send-to operation on macOS, and the task filters the peer.
 ///
 /// # Errors
 ///
-/// Returns an error if binding or connecting fails.
-pub(super) fn connect(address: &SocketAddr) -> io::Result<UdpSocket> {
-    let bind_addr_str = match address {
-        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-        std::net::SocketAddr::V6(_) => "[::0]:0",
-    };
-    let bind_addr: SocketAddr = if let Ok(addr) = bind_addr_str.parse() {
-        addr
-    } else {
-        // This should never happen.
-        return Err(io::Error::from(io::ErrorKind::Other));
-    };
-    let sock = std::net::UdpSocket::bind(bind_addr)?;
-    sock.connect(address)?;
-    sock.set_nonblocking(true)?;
-    let _runtime = rt::handle().enter();
-    UdpSocket::from_std(sock)
+/// Returns an error if binding fails.
+pub(super) fn bind(address: &SocketAddr) -> io::Result<UdpSocket> {
+    let address = *address;
+    Supervisor::new().run("udp bind", async move {
+        let bind = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind).await?;
+        Ok(socket)
+    })
 }
 
 /// Returns `true` for an error that a connected UDP socket reports from ICMP,

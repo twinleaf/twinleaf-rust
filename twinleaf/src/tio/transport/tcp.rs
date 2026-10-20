@@ -2,13 +2,10 @@
 //!
 //! Connects the TCP streams that ports drive. TIO packets go on the stream
 //! unchanged. The receiving end splits the stream into packets by the size
-//! each header gives, as [`Codec`] does.
+//! each header gives, as its [codec](super::codec::tcp::Codec) does.
 
-use super::codec::tcp::Codec;
-use super::task::{ByteStream, Framing, Rules};
-use super::{Packet, ReceiveResult, RecvError};
+use super::task::{ByteStream, Rules};
 use crate::rt::{self, Supervisor};
-use bytes::BytesMut;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -41,10 +38,8 @@ pub(super) const CLIENT_RULES: Rules = Rules {
 ///
 /// Returns an error if the connection fails.
 pub(super) fn connect(address: &SocketAddr) -> io::Result<TcpStream> {
-    // Connecting here, before the port exists, lets a dead address fail
-    // the open rather than a port that looks connected.
-    let stream = std::net::TcpStream::connect_timeout(address, CONNECT_TIMEOUT)?;
-    from_std(stream)
+    let address = *address;
+    Supervisor::new().run("tcp connect", connect_stream(address))
 }
 
 /// Connects to `address` as [`connect`] does, without blocking. The connect
@@ -57,19 +52,26 @@ pub(super) fn connect(address: &SocketAddr) -> io::Result<TcpStream> {
 /// [`io::ErrorKind::TimedOut`] if it does not complete in time.
 pub(super) async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> {
     let task = format!("tcp connect {address}");
-    let connecting = Supervisor::new().spawn(task, async move {
-        let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await;
-        connected.unwrap_or_else(|_| {
-            let message = format!("{address} did not answer within {CONNECT_TIMEOUT:?}");
-            Err(io::Error::new(io::ErrorKind::TimedOut, message))
-        })
-    });
+    let connecting = Supervisor::new().spawn(task, connect_stream(address));
     let stream = match AbortOnDropHandle::new(connecting).await {
         Ok(Some(connected)) => connected?,
         // The supervisor logged the panic.
         Ok(None) => return Err(io::Error::other("the connect panicked")),
         Err(cancelled) => return Err(io::Error::other(cancelled)),
     };
+    Ok(stream)
+}
+
+/// Connects on the runtime that owns the link.
+async fn connect_stream(address: SocketAddr) -> io::Result<TcpStream> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{address} did not answer within {CONNECT_TIMEOUT:?}"),
+            )
+        })??;
     stream.set_nodelay(true)?;
     Ok(stream)
 }
@@ -91,15 +93,3 @@ pub(super) fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
 }
 
 impl ByteStream for TcpStream {}
-
-impl Framing for Codec {
-    fn decode(&mut self, buf: &mut BytesMut) -> Option<ReceiveResult> {
-        Codec::decode(self, buf)
-            .map_err(RecvError::from)
-            .transpose()
-    }
-
-    fn encode(&mut self, packet: &Packet, buf: &mut BytesMut) {
-        Codec::encode(self, packet, buf);
-    }
-}

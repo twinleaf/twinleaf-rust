@@ -522,11 +522,12 @@ mod tests {
             let deadline = Instant::now() + WAIT;
             loop {
                 match self.rx.recv_deadline(deadline) {
-                    Ok(Ok(pkt)) => {
+                    Ok(Ok(transport::TransportEvent::Packet(pkt))) => {
                         if let Some(found) = pick(&pkt) {
                             return found;
                         }
                     }
+                    Ok(Ok(event)) => panic!("unexpected transport event: {event:?}"),
                     Ok(Err(error)) => panic!("the client could not receive: {error}"),
                     Err(flume::RecvTimeoutError::Timeout) => {
                         panic!("nothing expected arrived within {WAIT:?}")
