@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
@@ -145,15 +145,16 @@ fn open_log(path: &Path) -> io::Result<File> {
 /// [`io::ErrorKind::TimedOut`] once `timeout` passes.
 async fn wait_for_proxy(
     port: u16,
-    spawned: Option<SpawnedProxy>,
+    mut spawned: Option<SpawnedProxy>,
     timeout: Duration,
 ) -> io::Result<()> {
     let waited = async {
-        if let Some(SpawnedProxy { mut child, log }) = spawned {
+        if let Some(SpawnedProxy { child, log }) = spawned.as_mut() {
             tokio::select! {
                 status = child.wait() => {
                     let status = status?;
                     if !status.success() {
+                        let log = log.clone();
                         let failed = move || failure(&log, status);
                         let reading = Supervisor::new().spawn_blocking(failed);
                         return Err(reading.await.unwrap_or_else(io::Error::other));
@@ -165,14 +166,20 @@ async fn wait_for_proxy(
         answered(port).await;
         Ok(())
     };
-    tokio::time::timeout(timeout, waited)
-        .await
-        .unwrap_or_else(|_| {
+    match tokio::time::timeout(timeout, waited).await {
+        Ok(waited) => waited,
+        Err(_) => {
+            if let Some(SpawnedProxy { mut child, .. }) = spawned {
+                if let Err(error) = child.start_kill() {
+                    log::warn!("cannot stop the proxy that never answered: {error}");
+                }
+            }
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("no proxy answered on 127.0.0.1:{port} within {timeout:?}"),
             ))
-        })
+        }
+    }
 }
 
 /// Connects to `port` of `127.0.0.1` until something answers. Waits
@@ -187,7 +194,7 @@ async fn answered(port: u16) {
 }
 
 /// The proxy this process hosts itself, when no `tio` could be started.
-static EMBEDDED: OnceLock<Proxy> = OnceLock::new();
+static EMBEDDED: Mutex<Option<Proxy>> = Mutex::new(None);
 
 /// Ensures the machine's proxy answers on `127.0.0.1:7855`.
 ///
@@ -203,7 +210,11 @@ pub(crate) fn ensure_proxy() -> BoxFuture<'static, io::Result<()>> {
 /// Ensures a proxy answers on `port` as [`ensure_proxy`] does, keeping a
 /// hosted proxy in `embedded`. Hosts the proxy without starting `tio` when
 /// `sandboxed` is set.
-async fn ensure_proxy_at(port: u16, embedded: &OnceLock<Proxy>, sandboxed: bool) -> io::Result<()> {
+async fn ensure_proxy_at(
+    port: u16,
+    embedded: &Mutex<Option<Proxy>>,
+    sandboxed: bool,
+) -> io::Result<()> {
     if proxy::answers_async(port).await {
         return Ok(());
     }
@@ -238,12 +249,9 @@ async fn ensure_proxy_at(port: u16, embedded: &OnceLock<Proxy>, sandboxed: bool)
     }
 }
 
-/// Hosts the proxy on `port` in this process, kept in `embedded`. If another
-/// process holds the port, waits for its proxy to answer.
-async fn embed(port: u16, embedded: &OnceLock<Proxy>) -> io::Result<()> {
-    if embedded.get().is_some() {
-        return Ok(());
-    }
+/// Hosts the proxy on `port` in this process, kept in `embedded` in place of
+/// one that stopped. If another process holds the port, waits for its proxy.
+async fn embed(port: u16, embedded: &Mutex<Option<Proxy>>) -> io::Result<()> {
     let options = HostOptions {
         port,
         name: format!("{} (embedded)", proxy::executable_name()),
@@ -254,8 +262,11 @@ async fn embed(port: u16, embedded: &OnceLock<Proxy>) -> io::Result<()> {
     let hosting = Supervisor::new().spawn_blocking(move || Proxy::host(options));
     match hosting.await.map_err(io::Error::other)? {
         Ok(proxy) => {
-            // One proxy at a time binds the port, so nothing else set it.
-            let _ = embedded.set(proxy);
+            let stopped = embedded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .replace(proxy);
+            Supervisor::new().spawn_blocking(move || drop(stopped));
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
@@ -425,13 +436,15 @@ mod tests {
     use super::*;
     use crate::device::fixtures::{self, ENVIRONMENT, WAIT};
     use crate::device::rpc::{RpcArgs, RpcReply};
-    use std::sync::PoisonError;
 
-    /// Runs [`ensure_proxy_at`] for `port` with nothing embedded yet.
-    /// Returns its outcome and what it embedded.
-    fn ensure_at(port: u16, sandboxed: bool) -> (io::Result<()>, OnceLock<Proxy>) {
+    /// Runs [`ensure_proxy_at`] for `port` with `embedded` as its slot.
+    /// Returns its outcome and the slot.
+    fn ensure_at(
+        port: u16,
+        sandboxed: bool,
+        embedded: Mutex<Option<Proxy>>,
+    ) -> (io::Result<()>, Mutex<Option<Proxy>>) {
         let ensuring = async move {
-            let embedded = OnceLock::new();
             let ensured = ensure_proxy_at(port, &embedded, sandboxed).await;
             Ok((ensured, embedded))
         };
@@ -478,26 +491,28 @@ mod tests {
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
         let attempt = fixtures::on_free_port(|port| {
-            let (ensured, embedded) = ensure_at(port, false);
+            let (ensured, embedded) = ensure_at(port, false, Mutex::default());
             embedded
-                .get()
-                .is_some()
-                .then_some((port, ensured, embedded))
+                .into_inner()
+                .unwrap()
+                .map(|hosted| (port, ensured, hosted))
         });
 
         std::env::remove_var("TWINLEAF_TIO");
         std::env::remove_var("TWINLEAF_RUNTIME_DIR");
-        let (port, ensured, embedded) = attempt.expect("no proxy was embedded");
+        let (port, ensured, hosted) = attempt.expect("no proxy was embedded");
         ensured.unwrap();
-        let hosted = embedded.get().unwrap();
         assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
         let hello = proxy::Introduction::of_this_process("test").encode_args();
         let reply = proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
         let host = proxy::Introduction::decode_reply(&reply).unwrap();
         assert!(host.name.ends_with("(embedded)"), "{host}");
-        let (ensured, again) = ensure_at(port, false);
+        let (ensured, again) = ensure_at(port, false, Mutex::default());
         ensured.unwrap();
-        assert!(again.get().is_none(), "a second proxy was embedded");
+        assert!(
+            again.into_inner().unwrap().is_none(),
+            "a second proxy was embedded"
+        );
     }
 
     /// A `tio` older than 2.0 starts, but exits unsuccessfully on the flag it
@@ -518,8 +533,11 @@ mod tests {
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
         let attempt = fixtures::on_free_port(|port| {
-            let (ensured, embedded) = ensure_at(port, false);
-            embedded.into_inner().map(|hosted| (port, ensured, hosted))
+            let (ensured, embedded) = ensure_at(port, false, Mutex::default());
+            embedded
+                .into_inner()
+                .unwrap()
+                .map(|hosted| (port, ensured, hosted))
         });
 
         std::env::remove_var("TWINLEAF_TIO");
@@ -547,8 +565,11 @@ mod tests {
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
         let attempt = fixtures::on_free_port(|port| {
-            let (ensured, embedded) = ensure_at(port, true);
-            embedded.into_inner().map(|hosted| (port, ensured, hosted))
+            let (ensured, embedded) = ensure_at(port, true, Mutex::default());
+            embedded
+                .into_inner()
+                .unwrap()
+                .map(|hosted| (port, ensured, hosted))
         });
 
         std::env::remove_var("TWINLEAF_TIO");
@@ -557,6 +578,30 @@ mod tests {
         ensured.unwrap();
         assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
         assert!(!dir.path().join("tio.ran").exists(), "tio was started");
+    }
+
+    /// A hosted proxy that has stopped is replaced by a new one that answers.
+    #[test]
+    fn a_stopped_embedded_proxy_is_hosted_again() {
+        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let attempt = fixtures::on_free_port(|port| {
+            let (ensured, embedded) = ensure_at(port, true, Mutex::default());
+            let hosted = embedded.lock().unwrap().is_some();
+            hosted.then_some((port, ensured, embedded))
+        });
+
+        let (port, ensured, embedded) = attempt.expect("no proxy was embedded");
+        ensured.unwrap();
+        embedded.lock().unwrap().as_ref().unwrap().shutdown();
+        assert!(!proxy::answers(port), "the stopped proxy still answers");
+        let (ensured, embedded) = ensure_at(port, true, embedded);
+        ensured.unwrap();
+        let hosted = embedded
+            .into_inner()
+            .unwrap()
+            .expect("no proxy was hosted again");
+        let hello = proxy::Introduction::of_this_process("test").encode_args();
+        proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
     }
 
     /// Only macOS has the App Sandbox.
@@ -601,6 +646,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(failed.to_string().contains("no tio here"), "{failed}");
+    }
+
+    /// A proxy that never answers within the wait is killed, not left running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_proxy_that_never_answers_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let closed = fixtures::ClosedPort::new();
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().unwrap().to_string();
+        let spawned = SpawnedProxy {
+            child,
+            log: dir.path().join(PROXY_LOG),
+        };
+
+        let failed = wait_for_proxy(closed.port(), Some(spawned), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(failed.kind(), io::ErrorKind::TimedOut, "{failed}");
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout);
+            if stat.trim().is_empty() || stat.trim_start().starts_with('Z') {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the proxy still runs");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A proxy that keeps running is ready once its port answers.
