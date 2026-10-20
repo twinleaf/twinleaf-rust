@@ -8,7 +8,7 @@ use crate::tio::rpc::RpcReply;
 use std::collections::BTreeMap;
 
 /// The most `rpc.listinfo` calls in flight at once during a walk.
-const WALK_WINDOW: usize = 8;
+const WALK_WINDOW: usize = 16;
 
 /// The most walks one load makes of a table that keeps changing.
 const WALK_ATTEMPTS: usize = 3;
