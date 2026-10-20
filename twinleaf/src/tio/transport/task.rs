@@ -210,18 +210,14 @@ impl Task {
                         break;
                     }
                 }
-                flushed = timeout_at(write_by, sink.flush()), if writing => {
+                flushed = flush_by(&mut sink, write_by), if writing => {
                     match flushed {
-                        Ok(Ok(())) => {
+                        Ok(()) => {
                             writing = false;
                             self.wrote(Instant::now());
                         }
-                        Ok(Err(error)) => {
+                        Err(error) => {
                             self.deliver(Err(error));
-                            break;
-                        }
-                        Err(_) => {
-                            self.deliver(Err(io::Error::new(io::ErrorKind::TimedOut, "port write deadline expired").into()));
                             break;
                         }
                     }
@@ -288,10 +284,10 @@ impl Task {
                     };
                     if !self.deliver(result) { break; }
                 }
-                flushed = timeout_at(write_by, sink.flush()), if writing => {
+                flushed = flush_by(&mut sink, write_by), if writing => {
                     match flushed {
-                        Ok(Ok(())) => {}
-                        Ok(Err(RecvError::IO(error))) if udp::is_advisory_network_error(&error) => {
+                        Ok(()) => {}
+                        Err(RecvError::IO(error)) if udp::is_advisory_network_error(&error) => {
                             // UdpFramed retains an unsent datagram after an error.
                             // Drop that datagram while keeping the socket.
                             let socket = sink.reunite(source)
@@ -299,11 +295,7 @@ impl Task {
                                 .into_inner();
                             (sink, source) = UdpFramed::new(socket, datagram::Codec::default()).split();
                         }
-                        Ok(Err(error)) => { self.deliver(Err(error)); break; }
-                        Err(_) => {
-                            self.deliver(Err(io::Error::new(io::ErrorKind::TimedOut, "port write deadline expired").into()));
-                            break;
-                        }
+                        Err(error) => { self.deliver(Err(error)); break; }
                     }
                     writing = false;
                     self.wrote(Instant::now());
@@ -327,6 +319,18 @@ impl Task {
             }
         }
     }
+}
+
+/// Flushes `sink`, failing as timed out once `write_by` passes.
+async fn flush_by<I>(
+    sink: &mut (impl Sink<I, Error = RecvError> + Unpin),
+    write_by: Instant,
+) -> Result<(), RecvError> {
+    timeout_at(write_by, sink.flush())
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "port write deadline expired").into())
+        })
 }
 
 /// Finishes the framed sink, then consumes the peer's stream until EOF or

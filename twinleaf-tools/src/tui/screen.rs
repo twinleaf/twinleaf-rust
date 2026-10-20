@@ -15,7 +15,7 @@ use std::{
 };
 use twinleaf::{
     device::{DeviceTree, Event, RecvError},
-    flume::{self, Receiver, Selector},
+    flume::{self, select::SelectError, Receiver, Selector},
     DeviceRoute, SampleBatch,
 };
 
@@ -75,41 +75,41 @@ pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Resul
         }
         let woken = Selector::new()
             .recv(batches.as_flume(), |batch| {
-                batches.resolve(batch).map(Woken::Batch)
+                batches
+                    .resolve(batch)
+                    .map_or_else(Woken::Failed, Woken::Batch)
             })
             .recv(events.as_flume(), |event| {
-                events.resolve(event).map(Woken::Event)
+                events
+                    .resolve(event)
+                    .map_or_else(Woken::Failed, Woken::Event)
             })
-            .recv(
-                &input,
-                |event| Ok(event.map_or(Woken::Closed, Woken::Input)),
-            )
+            .recv(&input, |event| event.map_or(Woken::Closed, Woken::Input))
             .recv(&loaded, |registry| {
-                Ok(registry.map_or(Woken::Closed, Woken::Loaded))
+                registry.map_or(Woken::Closed, Woken::Loaded)
             })
-            .recv(&replies, |reply| {
-                Ok(reply.map_or(Woken::Closed, Woken::Reply))
-            })
+            .recv(&replies, |reply| reply.map_or(Woken::Closed, Woken::Reply))
             .wait_deadline(next_frame);
         match woken {
-            Ok(Ok(Woken::Batch(batch))) => screen.on_batch(batch),
-            Ok(Ok(Woken::Event(event))) => {
+            Ok(Woken::Batch(batch)) => screen.on_batch(batch),
+            Ok(Woken::Event(event)) => {
                 screen.console().handle_event(&event);
                 screen.on_event(event);
             }
-            Ok(Ok(Woken::Input(event))) => {
+            Ok(Woken::Input(event)) => {
                 if screen.on_input(event) {
                     return Ok(());
                 }
             }
-            Ok(Ok(Woken::Loaded(registry))) => {
+            Ok(Woken::Loaded(registry)) => {
                 let default = screen.rpc_default();
                 screen.console().on_loaded(registry, default);
             }
-            Ok(Ok(Woken::Reply(reply))) => screen.console().on_reply(reply),
-            Ok(Err(error @ RecvError::Lagged(_))) => screen.on_lagged(error),
-            Ok(Err(error)) => return Err(error.into()),
-            Ok(Ok(Woken::Closed)) | Err(_) => {}
+            Ok(Woken::Reply(reply)) => screen.console().on_reply(reply),
+            Ok(Woken::Failed(error @ RecvError::Lagged(_))) => screen.on_lagged(error),
+            Ok(Woken::Failed(error)) => return Err(error.into()),
+            Ok(Woken::Closed) => {}
+            Err(SelectError::Timeout) => {}
         }
     }
 }
@@ -121,6 +121,8 @@ enum Woken {
     Input(term::Event),
     Loaded(LoadedRegistry),
     Reply(Reply),
+    /// The stream lagged or ended.
+    Failed(RecvError),
     /// The input reader or an RPC worker has stopped.
     Closed,
 }

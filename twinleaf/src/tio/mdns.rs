@@ -4,11 +4,10 @@
 use crate::rt::Supervisor;
 use mdns_sd::{HostnameResolutionEvent, Receiver, ScopedIp, ServiceDaemon};
 use std::collections::BTreeMap;
-use std::io;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::timeout;
 
 /// How long [`resolve`] waits for mDNS to answer.
 // The daemon sends its first query after a jitter of 20 to 120 ms and
@@ -58,13 +57,13 @@ pub(crate) async fn resolve_async(host: &str, port: u16) -> Vec<SocketAddr> {
     let _turn = turn.lock().await;
     // Starting the daemon binds its sockets and starts its thread.
     let started = Supervisor::new().spawn_blocking(daemon).await;
-    let daemon = match started.map_err(io::Error::other) {
+    let daemon = match started {
         Ok(Ok(daemon)) => daemon,
         Ok(Err(error)) => return unresolved(host, error),
-        Err(error) => return unresolved(host, error),
+        Err(panicked) => return unresolved(host, panicked),
     };
-    let timeout = u64::try_from(RESOLVE_TIMEOUT.as_millis()).ok();
-    let answers = match daemon.resolve_hostname(&name, timeout) {
+    let millis = u64::try_from(RESOLVE_TIMEOUT.as_millis()).ok();
+    let answers = match daemon.resolve_hostname(&name, millis) {
         Ok(answers) => answers,
         Err(error) => return unresolved(host, error),
     };
@@ -73,21 +72,27 @@ pub(crate) async fn resolve_async(host: &str, port: u16) -> Vec<SocketAddr> {
         name,
         answers: Some(answers),
     };
-    let deadline = Instant::now() + RESOLVE_TIMEOUT;
-    let mut found = Vec::new();
-    while found.is_empty() {
-        match timeout_at(deadline, search.answers().recv_async()).await {
-            Ok(Ok(HostnameResolutionEvent::AddressesFound(_, addresses))) => {
-                found = addresses
-                    .iter()
-                    .filter_map(|address| socket_addr(address, port))
-                    .collect();
+    let searching = async {
+        while let Ok(event) = search.answers().recv_async().await {
+            match event {
+                HostnameResolutionEvent::AddressesFound(_, addresses) => {
+                    let found: Vec<_> = addresses
+                        .iter()
+                        .filter_map(|address| socket_addr(address, port))
+                        .collect();
+                    if !found.is_empty() {
+                        return found;
+                    }
+                }
+                HostnameResolutionEvent::SearchStopped(_) => break,
+                _ => {}
             }
-            Ok(Ok(HostnameResolutionEvent::SearchStopped(_)) | Err(_)) | Err(_) => break,
-            Ok(Ok(_)) => {}
         }
-    }
-    found
+        Vec::new()
+    };
+    timeout(RESOLVE_TIMEOUT, searching)
+        .await
+        .unwrap_or_default()
 }
 
 /// Logs why `host` cannot be resolved, and returns no address.
