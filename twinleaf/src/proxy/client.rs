@@ -16,12 +16,11 @@ use crate::tio::rpc::RpcArgs;
 use crate::tio::transport::{self, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::StreamExt;
 use std::collections::VecDeque;
-use std::future::{self, Future};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
+use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
 use tokio_util::sync::CancellationToken;
 
 /// How long a new client has to send a control request before it is taken
@@ -111,13 +110,15 @@ impl SlowTracker {
 /// where the client sees it.
 struct Mounted {
     prefix: DeviceRoute,
-    port: link::Port,
+    port: link::PortSender,
 }
 
 /// What a client opened. It holds a lease on each mount's link until dropped.
 struct Binding {
     target: String,
     mounts: Vec<Mounted>,
+    /// Packets from mounted links, keyed by their stable mount index.
+    incoming: StreamMap<usize, StreamNotifyClose<ReceiverStream<Packet>>>,
     /// The lease on the link of each mount, in the order of `mounts`.
     leases: Vec<Lease>,
 }
@@ -159,8 +160,6 @@ pub(super) struct Session {
     slow: SlowTracker,
     binding: Option<Binding>,
     opening: Option<Opening>,
-    /// Where in the mounts the next wait for a mount's packet starts.
-    next_mount: usize,
     /// Whether the client is a legacy client, whose first packet was not a
     /// control request. A legacy client reads link statuses in the legacy
     /// form. It is `true` until the client is classified.
@@ -191,7 +190,6 @@ impl Session {
             slow: SlowTracker::default(),
             binding: None,
             opening: None,
-            next_mount: 0,
             legacy: true,
         }
     }
@@ -240,6 +238,10 @@ impl Session {
                 };
                 self.client_packet(pkt).await?;
             }
+            let mounted = self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| !binding.incoming.is_empty());
             tokio::select! {
                 () = self.stop.cancelled() => return Err(self.stopped()),
                 received = self.incoming.next() => {
@@ -251,7 +253,9 @@ impl Session {
                         self.backlog.push_back(pkt);
                     }
                 }
-                (index, pkt) = next_mounted(&mut self.binding, &mut self.next_mount) => {
+                Some((index, pkt)) = async {
+                    self.binding.as_mut().expect("a mount is bound").incoming.next().await
+                }, if mounted => {
                     let Some(pkt) = pkt else {
                         let binding = self.binding.as_ref();
                         return Err(binding.expect("a mount is bound").closed(index));
@@ -565,11 +569,17 @@ async fn bind(
         return Err(Refusal::new(RpcError::Load, message));
     }
     let mut mounts = Vec::with_capacity(layout.mounts.len());
+    let mut incoming = StreamMap::with_capacity(layout.mounts.len());
     for (mount, lease) in layout.mounts.iter().zip(&leases) {
         let port = lease
             .link()
             .open_port(mount.source)
             .map_err(|reason| Refusal::new(RpcError::Load, reason))?;
+        let (port, received) = port.into_split();
+        incoming.insert(
+            mounts.len(),
+            StreamNotifyClose::new(ReceiverStream::new(received)),
+        );
         mounts.push(Mounted {
             prefix: mount.prefix,
             port,
@@ -587,6 +597,7 @@ async fn bind(
     Ok(Binding {
         target,
         mounts,
+        incoming,
         leases,
     })
 }
@@ -636,30 +647,6 @@ fn failed(error: &tokio::task::JoinError) -> Refusal {
     Refusal::new(RpcError::Internal, format!("the open failed: {error}"))
 }
 
-/// Waits for the next packet from a mount of `binding`. Returns the mount's
-/// index with the packet, or with `None` once the mount's port has closed.
-/// Never returns while nothing is bound. Each wait starts at the mount after
-/// the one that last delivered, at the position `next` keeps.
-fn next_mounted<'a>(
-    binding: &'a mut Option<Binding>,
-    next: &'a mut usize,
-) -> impl Future<Output = (usize, Option<Packet>)> + 'a {
-    future::poll_fn(move |cx| {
-        let Some(binding) = binding.as_mut() else {
-            return Poll::Pending;
-        };
-        let count = binding.mounts.len();
-        for offset in 0..count {
-            let index = (*next + offset) % count;
-            if let Poll::Ready(pkt) = binding.mounts[index].port.poll_recv(cx) {
-                *next = index + 1;
-                return Poll::Ready((index, pkt));
-            }
-        }
-        Poll::Pending
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,6 +690,7 @@ mod tests {
         let binding = Binding {
             target: device.url.clone(),
             mounts: Vec::new(),
+            incoming: StreamMap::new(),
             leases: vec![links.acquire_blocking(&device.url).unwrap()],
         };
         assert_eq!(

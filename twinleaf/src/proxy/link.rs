@@ -31,12 +31,11 @@ use crate::tio::transport::{self, CLOSE_TIMEOUT};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tokio::task::{self, AbortHandle, JoinError, JoinSet};
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::JoinMap;
 
 /// How long a new link may take to deliver its first packet.
 pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,8 +57,13 @@ pub(super) struct LinkId(u64);
 /// A client's port on a link. It carries the packets of one subtree of the
 /// device, with routes relative to that subtree.
 pub(super) struct Port {
-    tx: mpsc::Sender<Packet>,
+    sender: PortSender,
     rx: mpsc::Receiver<Packet>,
+}
+
+/// The sending half of a client's port, with routes relative to its scope.
+pub(super) struct PortSender {
+    tx: mpsc::Sender<Packet>,
     scope: DeviceRoute,
 }
 
@@ -77,7 +81,7 @@ pub(super) enum SendError {
     InvalidRoute(Packet),
 }
 
-impl Port {
+impl PortSender {
     /// Sends `packet` to the port without blocking.
     ///
     /// Returns the packet back in a [`SendError`] if the queue is full, the
@@ -93,11 +97,12 @@ impl Port {
             Err(mpsc::error::TrySendError::Closed(pkt)) => Err(SendError::ProxyDisconnected(pkt)),
         }
     }
+}
 
-    /// Polls for the next packet the worker delivers to the port. Returns
-    /// `None` once the worker has dropped the port.
-    pub(super) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Packet>> {
-        self.rx.poll_recv(cx)
+impl Port {
+    /// Separates outgoing routing from the channel of packets the link delivers.
+    pub(super) fn into_split(self) -> (PortSender, mpsc::Receiver<Packet>) {
+        (self.sender, self.rx)
     }
 }
 
@@ -188,9 +193,11 @@ impl Link {
         let reason = match self.commands.try_send(Command::OpenPort(subscriber)) {
             Ok(()) => {
                 return Ok(Port {
-                    tx: to_worker,
+                    sender: PortSender {
+                        tx: to_worker,
+                        scope: source,
+                    },
                     rx: from_worker,
-                    scope: source,
                 })
             }
             // Transient, as the worker still runs.
@@ -292,7 +299,7 @@ impl Links {
             leases: requests.downgrade(),
             links: HashMap::new(),
             waiting: HashMap::new(),
-            workers: JoinSet::new(),
+            workers: JoinMap::new(),
             closed: false,
             next_id: 0,
             tasks: tasks.clone(),
@@ -372,8 +379,6 @@ struct Entry {
     link: Link,
     /// The key the link is filed under.
     key: String,
-    /// The handle that aborts the link's task.
-    task: AbortHandle,
     /// The number of leases on the link.
     users: usize,
     /// When the last lease dropped.
@@ -419,7 +424,7 @@ struct Registry {
     /// The acquires of each device key held until its earlier links end.
     waiting: HashMap<String, Vec<Waiter>>,
     /// The task of each link.
-    workers: JoinSet<Option<()>>,
+    workers: JoinMap<LinkId, Option<()>>,
     /// Set once every link is closed. No link opens after that.
     closed: bool,
     next_id: u64,
@@ -441,7 +446,7 @@ impl Registry {
                     Some(request) => self.handle(request).await,
                     None => break,
                 },
-                Some(joined) = self.workers.join_next_with_id() => self.ended(joined),
+                Some((id, _outcome)) = self.workers.join_next() => self.ended(id),
                 () = sleep_until_some(due) => self.expire(),
             }
         }
@@ -589,7 +594,7 @@ impl Registry {
                 entry.link.url,
                 RELEASE_TIMEOUT
             );
-            entry.task.abort();
+            self.workers.abort(&id);
             entry.abort_at = None;
         }
     }
@@ -603,9 +608,8 @@ impl Registry {
         let open = (self.opens)(url);
         let (commands, readiness, run) =
             worker::new(url, self.reconnect_timeout, self.dump, open, closed.clone());
-        let task = self
-            .tasks
-            .spawn_in(&mut self.workers, format_args!("proxy link {url}"), run);
+        self.tasks
+            .spawn_in_map(&mut self.workers, id, format_args!("proxy link {url}"), run);
         let link = Link {
             id,
             url: url.into(),
@@ -616,7 +620,6 @@ impl Registry {
         let entry = Entry {
             link,
             key,
-            task,
             users: 0,
             idle_since: Instant::now(),
             chosen: false,
@@ -639,17 +642,12 @@ impl Registry {
         entry.link.closed.cancel();
     }
 
-    /// Forgets the link whose task ended with `joined`, and opens a new link
-    /// for the acquires that waited for it.
-    fn ended(&mut self, joined: Result<(task::Id, Option<()>), JoinError>) {
-        let task = match &joined {
-            Ok((task, _)) => *task,
-            Err(error) => error.id(),
-        };
-        let Some((&id, _)) = self.links.iter().find(|(_, entry)| entry.task.id() == task) else {
+    /// Forgets the link whose task ended, and opens a new link for the
+    /// acquires that waited for its device.
+    fn ended(&mut self, id: LinkId) {
+        let Some(entry) = self.links.remove(&id) else {
             return;
         };
-        let entry = self.links.remove(&id).expect("a link found is held");
         if let Readiness::Failed(reason) = entry.link.readiness() {
             log::debug!("Closed {}: {reason}", entry.link.url);
         }
@@ -699,8 +697,8 @@ impl Registry {
 
     /// Waits until every link's task has ended.
     async fn join_all(&mut self) {
-        while let Some(joined) = self.workers.join_next_with_id().await {
-            self.ended(joined);
+        while let Some((id, _outcome)) = self.workers.join_next().await {
+            self.ended(id);
         }
     }
 }
@@ -873,7 +871,7 @@ mod tests {
     #[test]
     fn a_port_rejects_routes_that_reach_too_deep() {
         let (link, _commands) = idle_link();
-        let port = link.open_port("/1".parse().unwrap()).unwrap();
+        let (port, _received) = link.open_port("/1".parse().unwrap()).unwrap().into_split();
 
         let too_deep = Packet::heartbeat("/2/3/4/5/6/7/8/9".parse().unwrap());
         assert!(matches!(

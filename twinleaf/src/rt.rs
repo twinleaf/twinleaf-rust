@@ -25,6 +25,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::hash::Hash;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
@@ -32,10 +33,10 @@ use std::process;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 use tokio::runtime::{Builder, Handle, Runtime};
-use tokio::task::{AbortHandle, JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{JoinMap, TaskTracker};
 
 /// Returns the handle of the runtime, and starts the runtime on first use.
 ///
@@ -114,21 +115,21 @@ impl Supervisor {
         self.tracker.spawn_on(supervised, &self.handle)
     }
 
-    /// Spawns `future` as the task named `task` into `set`. Returns the
-    /// handle that aborts the task. The task resolves to `None` in `set` if
-    /// it panicked or was ended.
-    pub(crate) fn spawn_in<F>(
+    /// Spawns a supervised task under its application key. Tracking, panic
+    /// reporting and cancellation use the same supervisor as other tasks.
+    pub(crate) fn spawn_in_map<K, F>(
         &self,
-        set: &mut JoinSet<Option<F::Output>>,
+        map: &mut JoinMap<K, Option<F::Output>>,
+        key: K,
         task: impl Display,
         future: F,
-    ) -> AbortHandle
-    where
+    ) where
+        K: Hash + Eq,
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         let supervised = Supervised::new(task, future, &self.ending);
-        set.spawn_on(self.tracker.track_future(supervised), &self.handle)
+        map.spawn_on(key, self.tracker.track_future(supervised), &self.handle);
     }
 
     /// Runs `future` as the task named `task`, and blocks the calling thread
@@ -394,6 +395,61 @@ mod tests {
 
         assert_eq!(answered.await.unwrap(), Some(7));
         assert_eq!(panicked.await.unwrap(), None::<()>);
+    }
+
+    /// Completion, panic and cancellation retain the application's task
+    /// key and release the supervisor's tracked task.
+    #[tokio::test]
+    async fn keyed_tasks_keep_their_identity_and_supervision() {
+        use std::time::Duration;
+        use tokio_util::task::JoinMap;
+
+        let tasks = Supervisor::current();
+        let mut running = JoinMap::new();
+        tasks.spawn_in_map(&mut running, "answer", "answering", async { 7 });
+        tasks.spawn_in_map(&mut running, "panic", "panicking", async {
+            panic!("a test panic")
+        });
+        tasks.spawn_in_map(
+            &mut running,
+            "abort",
+            "waiting",
+            std::future::pending::<usize>(),
+        );
+        assert!(running.abort(&"abort"));
+        let completed = async {
+            let mut seen = std::collections::HashSet::new();
+            while let Some((key, result)) = running.join_next().await {
+                assert!(seen.insert(key));
+                match key {
+                    "answer" => assert_eq!(result.unwrap(), Some(7)),
+                    "panic" => assert_eq!(result.unwrap(), None),
+                    "abort" => assert!(result.unwrap_err().is_cancelled()),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(seen.len(), 3);
+        };
+        tokio::time::timeout(Duration::from_secs(1), completed)
+            .await
+            .expect("keyed tasks did not finish");
+
+        tasks.spawn_in_map(
+            &mut running,
+            "end",
+            "ending",
+            std::future::pending::<usize>(),
+        );
+        tasks.end_all();
+        let (key, result) = tokio::time::timeout(Duration::from_secs(1), running.join_next())
+            .await
+            .expect("supervisor did not end its keyed task")
+            .unwrap();
+        assert_eq!(key, "end");
+        assert_eq!(result.unwrap(), None);
+        tokio::time::timeout(Duration::from_secs(1), tasks.wait())
+            .await
+            .expect("a keyed task stayed tracked");
     }
 
     /// The first hold begins the activity, later holds share it, and the

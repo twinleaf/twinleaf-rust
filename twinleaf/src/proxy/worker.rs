@@ -47,17 +47,17 @@ use crate::tio::transport::{ReceiveResult, TransportEvent};
 
 use futures_util::{FutureExt, StreamExt};
 use std::fs;
-use std::future::{self, Future};
+use std::future::Future;
 use std::io;
 use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
 use tokio_util::sync::CancellationToken;
 
 /// Whether a link's worker has heard from its device, and whether it has
@@ -73,15 +73,17 @@ pub(super) enum Readiness {
     Failed(String),
 }
 
-/// The worker's record of one port.
+/// The two channels of a port before the worker adopts it.
 #[derive(Debug)]
 pub(super) struct Subscriber {
-    /// The sender that delivers packets to the port.
-    tx: mpsc::Sender<Packet>,
-    /// The packets the port sends.
+    sender: SubscriberSender,
     rx: mpsc::Receiver<Packet>,
-    /// The subtree the port sees. Routes are relative to it on the port, and
-    /// absolute here.
+}
+
+/// Delivers packets to one port, with routes relative to its subtree.
+#[derive(Debug)]
+struct SubscriberSender {
+    tx: mpsc::Sender<Packet>,
     scope: DeviceRoute,
 }
 
@@ -99,9 +101,14 @@ impl Subscriber {
         rx: mpsc::Receiver<Packet>,
         scope: DeviceRoute,
     ) -> Subscriber {
-        Subscriber { tx, rx, scope }
+        Subscriber {
+            sender: SubscriberSender { tx, scope },
+            rx,
+        }
     }
+}
 
+impl SubscriberSender {
     /// Delivers `pkt` to the port with its route relative to the port's
     /// subtree. Skips a packet outside the subtree. A link status whose route
     /// is above the subtree reaches the port at its root. Returns `false` if
@@ -115,20 +122,6 @@ impl Subscriber {
             Err(_) => return true,
         };
         self.tx.try_send(pkt.with_route(route)).is_ok()
-    }
-
-    /// Polls for a packet the port sent, with its route made absolute.
-    /// Returns `None` once the port has closed.
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Packet>> {
-        self.rx.poll_recv(cx).map(|received| {
-            received.map(|pkt| {
-                let absolute = self
-                    .scope
-                    .absolute_route(&pkt.route())
-                    .expect("Port validates scoped routes before enqueueing them");
-                pkt.with_route(absolute)
-            })
-        })
     }
 }
 
@@ -441,11 +434,11 @@ struct Worker {
 
     /// The number to give the next port.
     next_port: u64,
-    subscribers: HashMap<u64, Subscriber>,
+    subscribers: HashMap<u64, SubscriberSender>,
+    /// Packet sources report their port ID and notify when the port closes.
+    inputs: StreamMap<u64, StreamNotifyClose<ReceiverStream<Packet>>>,
     /// The ports to drop before the next wait.
     leaving: HashSet<u64>,
-    /// Where in `subscribers` the next wait for a port's packet starts.
-    first_polled: usize,
 
     next_rpc_id: u16,
     rpc_map: HashMap<u16, RpcMapEntry>,
@@ -502,7 +495,7 @@ impl Worker {
             next_port: 1,
             subscribers: HashMap::new(),
             leaving: HashSet::new(),
-            first_polled: 0,
+            inputs: StreamMap::new(),
             next_rpc_id: 0,
             rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
@@ -560,6 +553,7 @@ impl Worker {
     /// Adopts a new port. A port that joins while the device is lost hears
     /// so first, as the others did, and then hears it come back with them.
     fn adopt(&mut self, subscriber: Subscriber) {
+        let Subscriber { sender, rx } = subscriber;
         let port = self.next_port;
         self.next_port += 1;
         let answering = self
@@ -568,9 +562,11 @@ impl Worker {
             .is_some_and(|device| device.seen_since_connect);
         if self.ever_connected && !answering {
             let lost = Packet::link(packet::LinkStatus::SensorDisconnected);
-            subscriber.try_send(&lost);
+            sender.try_send(&lost);
         }
-        self.subscribers.insert(port, subscriber);
+        self.inputs
+            .insert(port, StreamNotifyClose::new(ReceiverStream::new(rx)));
+        self.subscribers.insert(port, sender);
         log::trace!(target: &self.log_target, "Port {port} opened");
     }
 
@@ -1148,7 +1144,8 @@ impl Worker {
             self.cancel_active_rpcs();
         }
         for port in self.leaving.drain() {
-            drop(self.subscribers.remove(&port));
+            self.subscribers.remove(&port);
+            self.inputs.remove(&port);
         }
         // A step falls due when what the device sent was just handled, or
         // when the trial of a new rate runs out, which `next_deadline` wakes
@@ -1178,9 +1175,14 @@ impl Worker {
                     return ControlFlow::Break(());
                 }
             },
-            (port, sent) = next_sent(&mut self.subscribers, &mut self.first_polled), if forwarding => {
+            Some((port, sent)) = self.inputs.next(), if forwarding && !self.inputs.is_empty() => {
                 match sent {
-                    Some(pkt) => self.port_packet(port, pkt).await,
+                    Some(pkt) => {
+                        let scope = self.subscribers[&port].scope;
+                        let absolute = scope.absolute_route(&pkt.route())
+                            .expect("Port validates scoped routes before enqueueing them");
+                        self.port_packet(port, pkt.with_route(absolute)).await;
+                    }
                     None => self.drop_subscriber(port),
                 }
             }
@@ -1222,32 +1224,9 @@ impl Worker {
                 );
             }
         }
+        self.inputs.clear();
         self.subscribers.clear();
     }
-}
-
-/// Waits for the next packet a port in `subscribers` sends. Returns the
-/// port's number with the packet, or with `None` once the port has closed.
-/// Never returns while there is no port. Each wait starts at the port after
-/// the one that last sent, at the position `next` keeps.
-fn next_sent<'a>(
-    subscribers: &'a mut HashMap<u64, Subscriber>,
-    next: &'a mut usize,
-) -> impl Future<Output = (u64, Option<Packet>)> + 'a {
-    future::poll_fn(move |cx| {
-        let count = subscribers.len();
-        let start = *next % count.max(1);
-        for (from, to) in [(start, count), (0, start)] {
-            let ports = subscribers.iter_mut().enumerate().take(to).skip(from);
-            for (index, (&port, subscriber)) in ports {
-                if let Poll::Ready(sent) = subscriber.poll_recv(cx) {
-                    *next = index + 1;
-                    return Poll::Ready((port, sent));
-                }
-            }
-        }
-        Poll::Pending
-    })
 }
 
 /// Marks the link failed when the worker stops, unless the worker already
@@ -1381,6 +1360,7 @@ mod tests {
     use crate::proxy::fixtures::{assert_took, UNREACHABLE, WAIT};
     use crate::rt;
     use crate::tio::transport::{FakeEnd, RateInfo, TransportKind};
+    use std::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio::sync::Notify;
@@ -1412,10 +1392,9 @@ mod tests {
     const DELIVERED: usize = 64;
 
     /// A port at `scope`, and what it is delivered.
-    fn subscriber(scope: DeviceRoute) -> (Subscriber, mpsc::Receiver<Packet>) {
+    fn subscriber(scope: DeviceRoute) -> (SubscriberSender, mpsc::Receiver<Packet>) {
         let (to_port, delivered) = mpsc::channel(DELIVERED);
-        let (_from_port, rx) = mpsc::channel(1);
-        (Subscriber::new(to_port, rx, scope), delivered)
+        (SubscriberSender { tx: to_port, scope }, delivered)
     }
 
     fn insert_rpc(
@@ -1616,9 +1595,7 @@ mod tests {
         let (to_port, mut delivered) = mpsc::channel(1);
         let (_from_port, rx) = mpsc::channel(1);
         let port = 1;
-        worker
-            .subscribers
-            .insert(port, Subscriber::new(to_port, rx, DeviceRoute::root()));
+        worker.adopt(Subscriber::new(to_port, rx, DeviceRoute::root()));
 
         let wire_id = 12;
         let original_id = 7855;
@@ -1829,6 +1806,67 @@ mod tests {
     /// The type of [`heartbeat`], as [`delivered`] gives it.
     fn beat() -> String {
         format!("{:?}", heartbeat().ptype())
+    }
+
+    /// A closed input drains its queued packets and releases its port.
+    /// Other inputs retain their scopes and keep forwarding both ways.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_input_drains_without_disrupting_other_scoped_ports() {
+        let (open, mut ends) = fakes(TransportKind::Tcp);
+        let mut worker = Running::start(open, None);
+        let mut device = opened(&mut ends).await;
+        device.send(&heartbeat()).await;
+        assert_eq!(worker.settled(Readiness::Pending).await, Readiness::Ready);
+
+        let (first_output, mut first_port) = mpsc::channel(DELIVERED);
+        let (first_input, first_rx) = mpsc::channel(4);
+        let (second_output, mut second_port) = mpsc::channel(DELIVERED);
+        let (second_input, second_rx) = mpsc::channel(4);
+        for (tx, rx, scope) in [
+            (first_output, first_rx, "/1"),
+            (second_output, second_rx, "/2"),
+        ] {
+            worker
+                .commands
+                .send(Command::OpenPort(Subscriber::new(
+                    tx,
+                    rx,
+                    scope.parse().unwrap(),
+                )))
+                .await
+                .unwrap();
+        }
+        first_input.send(heartbeat()).await.unwrap();
+        first_input
+            .send(heartbeat().with_route("/3".parse().unwrap()))
+            .await
+            .unwrap();
+        drop(first_input);
+        second_input
+            .send(heartbeat().with_route("/4".parse().unwrap()))
+            .await
+            .unwrap();
+
+        let mut routes = Vec::new();
+        for _ in 0..3 {
+            let sent = timeout(WAIT, device.recv()).await.unwrap().unwrap();
+            routes.push(sent.route().to_string());
+        }
+        routes.sort();
+        assert_eq!(routes, ["/1", "/1/3", "/2/4"]);
+        assert!(timeout(WAIT, first_port.recv()).await.unwrap().is_none());
+
+        second_input
+            .send(heartbeat().with_route("/5".parse().unwrap()))
+            .await
+            .unwrap();
+        let sent = timeout(WAIT, device.recv()).await.unwrap().unwrap();
+        assert_eq!(sent.route(), "/2/5".parse().unwrap());
+        device
+            .send(&heartbeat().with_route("/2/6".parse().unwrap()))
+            .await;
+        assert_eq!(next(&mut second_port).await.route(), "/6".parse().unwrap());
+        worker.stop().await;
     }
 
     /// A port that fails with an I/O error loses the device as one that
