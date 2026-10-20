@@ -400,9 +400,9 @@ pub(crate) static DEFAULT_TX_CHANNEL_SIZE: usize = 32768;
 /// the link.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a closed port's task may take to end. It covers a write to a
-/// stalled peer that the task gives up after [`DRAIN_TIMEOUT`].
-pub(crate) const CLOSE_TIMEOUT: Duration = DRAIN_TIMEOUT.saturating_add(Duration::from_millis(500));
+/// How long a closed port's task may take to write what was queued and let
+/// go of its link. A peer that reads none of it in that time is cut off.
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl Port {
     /// Returns a port of the given `kind` and `rates` that has not started,

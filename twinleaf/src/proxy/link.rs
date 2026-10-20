@@ -14,37 +14,35 @@
 //! and are disconnected. The next open of the device makes a new link, and
 //! the registry forgets the old one once its task ends.
 //!
-//! A new link to a device opens only once the task of every earlier link to
-//! it has ended, and with it the worker's hold on the device. Links to other
-//! devices open meanwhile. The registry aborts a task that still runs
-//! [`RELEASE_TIMEOUT`] after its link closed.
+//! The registry holds the only sender of each worker's commands, and closes
+//! a link by dropping it. A new link to a device opens only once the task of
+//! every earlier link to it has ended, and with it the worker's hold on the
+//! device, however long that takes. Links to other devices open meanwhile.
+//! The registry runs until its [`Owner`] drops. It then closes every link
+//! and waits [`LEAVE_TIMEOUT`] for their tasks before it ends.
 
 use super::auto::Candidate;
 use super::control::Refusal;
 use super::worker::{self, Command, Opener, Readiness, Subscriber};
-use super::{DumpFlags, IDLE};
+use super::{DumpFlags, IDLE, LEAVE_TIMEOUT};
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::Packet;
-use crate::tio::transport::{self, CLOSE_TIMEOUT};
+use crate::tio::transport;
+use futures_util::future::{Fuse, FusedFuture};
+use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
-use tokio_util::sync::CancellationToken;
 use tokio_util::task::JoinMap;
 
 /// How long a new link may take to deliver its first packet.
 pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long the task of a closed link may run before the registry aborts it.
-// A serial port opens once at a time, and so do devices that take one TCP
-// connection. The worker may take up to CLOSE_TIMEOUT to close its
-// transport.
-const RELEASE_TIMEOUT: Duration = CLOSE_TIMEOUT.saturating_add(Duration::from_millis(500));
 
 /// What opens the device of each new link. It takes the link's URL and
 /// returns the opener its worker opens the device with.
@@ -133,12 +131,10 @@ pub(super) fn client_tx_channel_size() -> usize {
 pub(super) struct Link {
     id: LinkId,
     url: Arc<str>,
-    /// The sender of the worker's commands.
-    commands: mpsc::Sender<Command>,
+    /// The worker's commands, which the registry alone keeps open.
+    commands: mpsc::WeakSender<Command>,
     /// The link's readiness, as its worker reports it.
     readiness: watch::Receiver<Readiness>,
-    /// Cancelled once the link is closed, which stops the worker.
-    closed: CancellationToken,
 }
 
 impl Link {
@@ -157,16 +153,12 @@ impl Link {
         self.readiness.borrow().clone()
     }
 
-    /// Returns `true` if the link's worker has stopped.
-    fn stopped(&self) -> bool {
-        matches!(self.readiness(), Readiness::Failed(_))
-    }
-
     /// Waits until the link's device has answered.
     ///
     /// # Errors
     ///
-    /// Returns why the link's worker stopped, if it stops first.
+    /// Returns why the first open failed, or that the worker ended, if either
+    /// comes first.
     pub(super) async fn ready(&self) -> Result<(), String> {
         let mut readiness = self.readiness.clone();
         let settled = readiness.wait_for(|readiness| *readiness != Readiness::Pending);
@@ -184,13 +176,13 @@ impl Link {
     /// Returns an error message if the link is closed, the worker's queue is
     /// full, or the worker is gone.
     pub(super) fn open_port(&self, source: DeviceRoute) -> Result<Port, String> {
-        if self.closed.is_cancelled() {
+        let Some(commands) = self.commands.upgrade() else {
             return Err(format!("the link to {} closed", self.url));
-        }
+        };
         let (to_worker, from_port) = mpsc::channel(client_tx_channel_size());
         let (to_port, from_worker) = mpsc::channel(client_rx_channel_size());
         let subscriber = Subscriber::new(to_port, from_port, source);
-        let reason = match self.commands.try_send(Command::OpenPort(subscriber)) {
+        let reason = match commands.try_send(Command::OpenPort(subscriber)) {
             Ok(()) => {
                 return Ok(Port {
                     sender: PortSender {
@@ -212,8 +204,8 @@ impl Link {
 /// lease that drops releases its use.
 pub(super) struct Lease {
     link: Link,
-    /// The registry's mailbox.
-    requests: mpsc::UnboundedSender<Request>,
+    /// The registry's mailbox, which a lease does not keep open.
+    requests: mpsc::WeakUnboundedSender<Request>,
 }
 
 impl Lease {
@@ -225,7 +217,9 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let _ = self.requests.send(Request::Release { link: self.link.id });
+        if let Some(requests) = self.requests.upgrade() {
+            let _ = requests.send(Request::Release { link: self.link.id });
+        }
     }
 }
 
@@ -250,25 +244,41 @@ enum Request {
     Choose { links: Vec<LinkId> },
     /// The end of a lease on `link`.
     Release { link: LinkId },
-    /// The close of every link, waiting at most `within` for their tasks.
-    CloseAll {
-        within: Duration,
-        reply: oneshot::Sender<bool>,
-    },
     /// A test's look at the registry.
     #[cfg(test)]
     Inspect(Box<dyn FnOnce(&mut Registry) + Send>),
 }
 
-/// The refusal of a request made once every link is closed.
+/// The refusal of a request made once the registry is ending.
 fn stopping() -> Refusal {
     Refusal::new(RpcError::State, "the proxy is stopping")
 }
 
-/// The handle of the registry of links. Clones share one registry.
+/// A handle of the registry of links, which does not keep it running.
+/// Clones share one registry.
 #[derive(Clone)]
 pub(super) struct Links {
-    requests: mpsc::UnboundedSender<Request>,
+    requests: mpsc::WeakUnboundedSender<Request>,
+}
+
+/// The registry's task and the one sender that keeps it running. Dropping
+/// the owner ends the registry, which closes every link first.
+pub(super) struct Owner {
+    _requests: mpsc::UnboundedSender<Request>,
+    /// The registry's task, which resolves to `None` if it panicked.
+    pub(super) task: Fuse<JoinHandle<Option<()>>>,
+}
+
+impl Owner {
+    /// Ends the registry, and waits until it has ended unless it already
+    /// had.
+    pub(super) async fn close(self) {
+        let Owner { _requests, task } = self;
+        drop(_requests);
+        if !task.is_terminated() {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Links {
@@ -279,7 +289,7 @@ impl Links {
         tasks: &Supervisor,
         reconnect_timeout: Option<Duration>,
         dump: DumpFlags,
-    ) -> Links {
+    ) -> (Links, Owner) {
         let opening = tasks.clone();
         let opens = Box::new(move |url: &str| worker::opener(&opening, url));
         Links::on(tasks, reconnect_timeout, dump, opens)
@@ -292,42 +302,50 @@ impl Links {
         reconnect_timeout: Option<Duration>,
         dump: DumpFlags,
         opens: Opens,
-    ) -> Links {
+    ) -> (Links, Owner) {
         let (requests, mailbox) = mpsc::unbounded_channel();
+        let links = Links {
+            requests: requests.downgrade(),
+        };
         let registry = Registry {
             requests: mailbox,
-            leases: requests.downgrade(),
+            leases: links.requests.clone(),
             links: HashMap::new(),
             waiting: HashMap::new(),
             workers: JoinMap::new(),
-            closed: false,
             next_id: 0,
             tasks: tasks.clone(),
             reconnect_timeout,
             dump,
             opens,
         };
-        tasks.spawn("proxy links", registry.run());
-        Links { requests }
+        let task = tasks.spawn("proxy links", registry.run()).fuse();
+        let owner = Owner {
+            _requests: requests,
+            task,
+        };
+        (links, owner)
     }
 
     /// Sends the registry the request `ask` makes with a reply sender, and
     /// returns the receiver of the reply. The reply never comes if the
-    /// registry has ended.
+    /// registry is ending.
     fn ask<T>(&self, ask: impl FnOnce(oneshot::Sender<T>) -> Request) -> oneshot::Receiver<T> {
         let (reply, replied) = oneshot::channel();
-        let _ = self.requests.send(ask(reply));
+        if let Some(requests) = self.requests.upgrade() {
+            let _ = requests.send(ask(reply));
+        }
         replied
     }
 
     /// Returns a lease on the link to `url`, whose device key is `key`. Opens
     /// a new link if none is open or the open one has stopped. A new link
     /// opens only once the task of every earlier link to the device has
-    /// ended, or was aborted after [`RELEASE_TIMEOUT`].
+    /// ended.
     ///
     /// # Errors
     ///
-    /// Returns a [`Refusal`] if every link is closed.
+    /// Returns a [`Refusal`] if the registry is ending.
     pub(super) async fn acquire(&self, url: &str, key: String) -> Result<Lease, Refusal> {
         let url = url.to_string();
         let acquired = self.ask(|reply| Request::Acquire { url, key, reply });
@@ -339,7 +357,7 @@ impl Links {
     /// # Errors
     ///
     /// Returns a [`Refusal`] if the link has closed in the meantime, or if
-    /// every link is closed.
+    /// the registry is ending.
     pub(super) async fn share(&self, link: &Link) -> Result<Lease, Refusal> {
         let link = link.clone();
         let shared = self.ask(|reply| Request::Share { link, reply });
@@ -356,27 +374,17 @@ impl Links {
     /// Marks `links` as chosen by a client. A chosen link is a candidate for
     /// `auto`, and stays open for [`IDLE`] after its last user leaves.
     pub(super) fn choose(&self, links: Vec<LinkId>) {
-        let _ = self.requests.send(Request::Choose { links });
-    }
-
-    /// Closes every link, and waits until their tasks have ended. Aborts the
-    /// tasks still running after `within`. No link opens after this, and the
-    /// registry ends. Returns `true` if every task ended in time, as when the
-    /// registry has ended.
-    pub(super) async fn close_all(&self, within: Duration) -> bool {
-        let closed = self.ask(|reply| Request::CloseAll { within, reply });
-        closed.await.unwrap_or(true)
-    }
-
-    /// Waits until the registry has ended.
-    pub(super) async fn ended(&self) {
-        self.requests.closed().await;
+        if let Some(requests) = self.requests.upgrade() {
+            let _ = requests.send(Request::Choose { links });
+        }
     }
 }
 
 /// The registry's record of one link whose task has not ended.
 struct Entry {
     link: Link,
+    /// The only sender of the worker's commands, dropped to close the link.
+    commands: Option<mpsc::Sender<Command>>,
     /// The key the link is filed under.
     key: String,
     /// The number of leases on the link.
@@ -387,21 +395,21 @@ struct Entry {
     /// probes have. A link that is not chosen closes as soon as it has no
     /// users.
     chosen: bool,
-    /// When the registry aborts the link's task, once the link is closed and
-    /// until the task is aborted.
-    abort_at: Option<Instant>,
-    /// Whether the link is closed.
-    closed: bool,
 }
 
 impl Entry {
-    /// Returns when the link is due to close or its task to be aborted, if
-    /// either is due. A chosen open link with no users is due [`IDLE`] after
-    /// its last lease dropped.
+    /// Returns `true` while the link is open and its worker takes ports.
+    fn open(&self) -> bool {
+        self.commands
+            .as_ref()
+            .is_some_and(|commands| !commands.is_closed())
+    }
+
+    /// Returns when a chosen open link with no users is due to close, which
+    /// is [`IDLE`] after its last lease dropped.
     fn due(&self) -> Option<Instant> {
-        let idle = !self.closed && self.chosen && self.users == 0;
-        let idle = idle.then(|| self.idle_since + IDLE);
-        idle.into_iter().chain(self.abort_at).min()
+        let idle = self.commands.is_some() && self.chosen && self.users == 0;
+        idle.then(|| self.idle_since + IDLE)
     }
 }
 
@@ -425,8 +433,6 @@ struct Registry {
     waiting: HashMap<String, Vec<Waiter>>,
     /// The task of each link.
     workers: JoinMap<LinkId, Option<()>>,
-    /// Set once every link is closed. No link opens after that.
-    closed: bool,
     next_id: u64,
     /// The spawner of the links' tasks.
     tasks: Supervisor,
@@ -436,25 +442,24 @@ struct Registry {
 }
 
 impl Registry {
-    /// Serves requests until every link is closed, or until every handle and
-    /// lease is gone, which closes every link.
+    /// Serves requests until its owner drops, then closes every link.
     async fn run(mut self) {
-        while !self.closed {
+        loop {
             let due = self.links.values().filter_map(Entry::due).min();
             tokio::select! {
                 request = self.requests.recv() => match request {
-                    Some(request) => self.handle(request).await,
+                    Some(request) => self.handle(request),
                     None => break,
                 },
                 Some((id, _outcome)) = self.workers.join_next() => self.ended(id),
                 () = sleep_until_some(due) => self.expire(),
             }
         }
-        self.close_all(CLOSE_TIMEOUT).await;
+        self.close_all().await;
     }
 
     /// Handles one request.
-    async fn handle(&mut self, request: Request) {
+    fn handle(&mut self, request: Request) {
         match request {
             Request::Acquire { url, key, reply } => self.acquire(url, key, reply),
             Request::Share { link, reply } => {
@@ -471,9 +476,6 @@ impl Registry {
                 }
             }
             Request::Release { link } => self.release(link),
-            Request::CloseAll { within, reply } => {
-                let _ = reply.send(self.close_all(within).await);
-            }
             #[cfg(test)]
             Request::Inspect(inspect) => inspect(self),
         }
@@ -488,32 +490,28 @@ impl Registry {
         key: String,
         reply: oneshot::Sender<Result<Lease, Refusal>>,
     ) {
-        if self.closed {
-            let _ = reply.send(Err(stopping()));
-            return;
-        }
         let Some((&id, entry)) = self.links.iter().find(|(_, entry)| entry.key == key) else {
             let id = self.start(&url, key);
-            let _ = reply.send(self.lease(id));
+            let _ = reply.send(Ok(self.lease(id)));
             return;
         };
-        if !entry.closed && !entry.link.stopped() {
-            let _ = reply.send(self.lease(id));
+        if entry.open() {
+            let _ = reply.send(Ok(self.lease(id)));
             return;
         }
-        self.close(id);
+        self.links
+            .get_mut(&id)
+            .expect("a link found is held")
+            .commands = None;
         let waiter = Waiter { url, reply };
         self.waiting.entry(key).or_default().push(waiter);
     }
 
     /// Returns a lease on `link`, an open link that `auto` chose.
     fn share(&mut self, link: &Link) -> Result<Lease, Refusal> {
-        if self.closed {
-            return Err(stopping());
-        }
         match self.links.get(&link.id) {
-            Some(entry) if !entry.closed => self.lease(link.id),
-            _ => {
+            Some(entry) if entry.open() => Ok(self.lease(link.id)),
+            Some(_) | None => {
                 let message = format!("the link to {} closed", link.url);
                 Err(Refusal::new(RpcError::Load, message))
             }
@@ -526,7 +524,7 @@ impl Registry {
         let mut answered: Vec<_> = self
             .links
             .values()
-            .filter(|entry| !entry.closed && entry.link.readiness() == Readiness::Ready)
+            .filter(|entry| entry.open() && entry.link.readiness() == Readiness::Ready)
             .map(|entry| Candidate {
                 link: entry.link.clone(),
                 chosen: entry.chosen,
@@ -537,16 +535,13 @@ impl Registry {
     }
 
     /// Returns a new lease on link `id`.
-    ///
-    /// Returns a [`Refusal`] if every handle of the registry is gone.
-    fn lease(&mut self, id: LinkId) -> Result<Lease, Refusal> {
-        let requests = self.leases.upgrade().ok_or_else(stopping)?;
+    fn lease(&mut self, id: LinkId) -> Lease {
         let entry = self.links.get_mut(&id).expect("a link leased is held");
         entry.users += 1;
-        Ok(Lease {
+        Lease {
             link: entry.link.clone(),
-            requests,
-        })
+            requests: self.leases.clone(),
+        }
     }
 
     /// Counts the end of a lease on link `id`. A link with no users left is
@@ -557,45 +552,29 @@ impl Registry {
             return;
         };
         entry.users = entry.users.saturating_sub(1);
-        if entry.users > 0 || entry.closed {
+        if entry.users > 0 || entry.commands.is_none() {
             return;
         }
         if entry.chosen {
             entry.idle_since = Instant::now();
             return;
         }
-        if !entry.link.stopped() {
+        if entry.open() {
             log::debug!("Closing {}, as its probes are done", entry.link.url);
         }
-        self.close(id);
+        entry.commands = None;
     }
 
-    /// Closes each chosen link that has had no users for [`IDLE`], and
-    /// aborts each task still running [`RELEASE_TIMEOUT`] after its link
-    /// closed.
+    /// Closes each chosen link that has had no users for [`IDLE`].
     fn expire(&mut self) {
         let now = Instant::now();
-        let due: Vec<LinkId> = self
+        let due = self
             .links
-            .iter()
-            .filter(|(_, entry)| entry.due().is_some_and(|due| due <= now))
-            .map(|(&id, _)| id)
-            .collect();
-        for id in due {
-            let entry = &self.links[&id];
-            if !entry.closed {
-                log::info!("Closing {}, unused for {:?}", entry.link.url, IDLE);
-                self.close(id);
-                continue;
-            }
-            let entry = self.links.get_mut(&id).expect("a link due is held");
-            log::warn!(
-                "Aborted the link to {}, whose worker still held the device {:?} after it closed",
-                entry.link.url,
-                RELEASE_TIMEOUT
-            );
-            self.workers.abort(&id);
-            entry.abort_at = None;
+            .values_mut()
+            .filter(|entry| entry.due().is_some_and(|due| due <= now));
+        for entry in due {
+            log::info!("Closing {}, unused for {:?}", entry.link.url, IDLE);
+            entry.commands = None;
         }
     }
 
@@ -604,42 +583,26 @@ impl Registry {
         log::info!("Opening {url}");
         let id = LinkId(self.next_id);
         self.next_id += 1;
-        let closed = CancellationToken::new();
         let open = (self.opens)(url);
-        let (commands, readiness, run) =
-            worker::new(url, self.reconnect_timeout, self.dump, open, closed.clone());
+        let (commands, readiness, run) = worker::new(url, self.reconnect_timeout, self.dump, open);
         self.tasks
             .spawn_in_map(&mut self.workers, id, format_args!("proxy link {url}"), run);
         let link = Link {
             id,
             url: url.into(),
-            commands,
+            commands: commands.downgrade(),
             readiness,
-            closed,
         };
         let entry = Entry {
             link,
+            commands: Some(commands),
             key,
             users: 0,
             idle_since: Instant::now(),
             chosen: false,
-            abort_at: None,
-            closed: false,
         };
         self.links.insert(id, entry);
         id
-    }
-
-    /// Closes link `id`, which stops its worker. The registry aborts its task
-    /// if it still runs [`RELEASE_TIMEOUT`] from now.
-    fn close(&mut self, id: LinkId) {
-        let entry = self.links.get_mut(&id).expect("a link closed is held");
-        if entry.closed {
-            return;
-        }
-        entry.closed = true;
-        entry.abort_at = Some(Instant::now() + RELEASE_TIMEOUT);
-        entry.link.closed.cancel();
     }
 
     /// Forgets the link whose task ended, and opens a new link for the
@@ -671,34 +634,27 @@ impl Registry {
         };
         let id = self.start(&first.url, key);
         for waiter in [first].into_iter().chain(waiters) {
-            let _ = waiter.reply.send(self.lease(id));
+            let _ = waiter.reply.send(Ok(self.lease(id)));
         }
     }
 
-    /// Closes every link and refuses every acquire still waiting. No link
-    /// opens after this. Waits at most `within` for the links' tasks to end,
-    /// then aborts the rest. Returns `true` if every task ended in time.
-    async fn close_all(&mut self, within: Duration) -> bool {
-        self.closed = true;
-        for waiter in self.waiting.drain().flat_map(|(_, waiters)| waiters) {
-            let _ = waiter.reply.send(Err(stopping()));
+    /// Refuses every acquire waiting, closes every link, and waits at most
+    /// [`LEAVE_TIMEOUT`] for their tasks. A blocking open runs to its end.
+    async fn close_all(mut self) {
+        self.waiting.clear();
+        for entry in self.links.values_mut() {
+            entry.commands = None;
         }
-        let ids: Vec<_> = self.links.keys().copied().collect();
-        for id in ids {
-            self.close(id);
-        }
-        let ended = timeout(within, self.join_all()).await.is_ok();
-        if !ended {
-            self.workers.abort_all();
-            self.join_all().await;
-        }
-        ended
-    }
-
-    /// Waits until every link's task has ended.
-    async fn join_all(&mut self) {
-        while let Some((id, _outcome)) = self.workers.join_next().await {
-            self.ended(id);
+        let joined = timeout(LEAVE_TIMEOUT, async {
+            while let Some((id, _outcome)) = self.workers.join_next().await {
+                self.ended(id);
+            }
+        });
+        if joined.await.is_err() {
+            log::warn!(
+                "{} links still held their devices {LEAVE_TIMEOUT:?} after the proxy stopped",
+                self.workers.len()
+            );
         }
     }
 }
@@ -715,25 +671,24 @@ mod tests {
 
     impl Link {
         /// Creates a link to `url` with no worker. Returns it with the
-        /// receiver of the commands it sends.
-        pub(crate) fn idle(url: &str) -> (Link, mpsc::Receiver<Command>) {
+        /// sender that keeps its commands open, and their receiver.
+        pub(crate) fn idle(url: &str) -> (Link, mpsc::Sender<Command>, mpsc::Receiver<Command>) {
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let (commands, receiver) = mpsc::channel(16);
             let link = Link {
                 id: LinkId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
                 url: url.into(),
-                commands,
+                commands: commands.downgrade(),
                 readiness: watch::channel(Readiness::Pending).1,
-                closed: CancellationToken::new(),
             };
-            (link, receiver)
+            (link, commands, receiver)
         }
     }
 
     impl Registry {
         /// Returns the URLs of the open links, in order.
         fn urls(&self) -> Vec<String> {
-            let open = self.links.values().filter(|entry| !entry.closed);
+            let open = self.links.values().filter(|entry| entry.commands.is_some());
             let mut urls: Vec<_> = open.map(|entry| entry.link.url.to_string()).collect();
             urls.sort();
             urls
@@ -754,11 +709,15 @@ mod tests {
             })
         }
 
-        /// Closes every link as [`close_all`](Self::close_all) does,
-        /// blocking until it is done.
-        pub(crate) fn close_all_blocking(&self, within: Duration) -> bool {
-            let closed = self.ask(|reply| Request::CloseAll { within, reply });
-            closed.blocking_recv().unwrap_or(true)
+        /// Closes the link to `url`, as a link left idle is closed. Returns
+        /// the receiver of whether one was open.
+        pub(crate) fn close(&self, url: &str) -> oneshot::Receiver<bool> {
+            let key = worker::device_key(url);
+            self.inspect(move |registry| {
+                let entries = registry.links.values_mut();
+                let open = entries.filter(|entry| entry.key == key && entry.commands.is_some());
+                open.map(|entry| entry.commands = None).count() > 0
+            })
         }
 
         /// Makes the registry panic.
@@ -783,7 +742,10 @@ mod tests {
         /// Returns the total number of leases on the open links.
         pub(crate) fn users(&self) -> usize {
             let users = self.inspect(|registry| {
-                let open = registry.links.values().filter(|entry| !entry.closed);
+                let open = registry
+                    .links
+                    .values()
+                    .filter(|entry| entry.commands.is_some());
                 open.map(|entry| entry.users).sum()
             });
             users.blocking_recv().unwrap_or_default()
@@ -799,7 +761,10 @@ mod tests {
         pub(crate) fn rekey(&self, url: &str, key: &str) {
             let (from, to) = (worker::device_key(url), key.to_string());
             let rekeyed = self.inspect(move |registry| {
-                let mut open = registry.links.values_mut().filter(|entry| !entry.closed);
+                let mut open = registry
+                    .links
+                    .values_mut()
+                    .filter(|entry| entry.commands.is_some());
                 let entry = open.find(|entry| entry.key == from);
                 entry.map(|entry| entry.key = to).is_some()
             });
@@ -824,9 +789,9 @@ mod tests {
         }
     }
 
-    /// A link to nothing whose worker never runs, with the far end of the
-    /// commands it sends.
-    fn idle_link() -> (Link, mpsc::Receiver<Command>) {
+    /// A link to nothing whose worker never runs, with the sender that
+    /// keeps its commands open and their far end.
+    fn idle_link() -> (Link, mpsc::Sender<Command>, mpsc::Receiver<Command>) {
         Link::idle(UNREACHABLE)
     }
 
@@ -834,7 +799,7 @@ mod tests {
     /// up a client waiting for its port.
     #[test]
     fn opening_a_port_does_not_wait_for_a_worker_that_never_answers() {
-        let (link, mut commands) = idle_link();
+        let (link, _open, mut commands) = idle_link();
 
         let _port = link
             .open_port(DeviceRoute::root())
@@ -847,7 +812,7 @@ mod tests {
     /// so it must never be reported as the worker being gone.
     #[test]
     fn a_full_command_lane_is_distinct_from_a_stopped_worker() {
-        let (link, commands) = idle_link();
+        let (link, _open, commands) = idle_link();
         while link.open_port(DeviceRoute::root()).is_ok() {}
 
         let busy = link.open_port(DeviceRoute::root()).err().unwrap();
@@ -864,7 +829,7 @@ mod tests {
     /// deeper than a route can.
     #[test]
     fn a_port_rejects_routes_that_reach_too_deep() {
-        let (link, _commands) = idle_link();
+        let (link, _open, _commands) = idle_link();
         let (port, _received) = link.open_port("/1".parse().unwrap()).unwrap().into_split();
 
         let too_deep = Packet::heartbeat("/2/3/4/5/6/7/8/9".parse().unwrap());
@@ -884,11 +849,11 @@ mod tests {
 
     /// A registry on the test's runtime whose links open fake devices, the
     /// first link to each URL in `first` as it says. Returns it with the
-    /// receiver of each device port it opens.
-    fn registry(first: Vec<(&str, First)>) -> (Links, mpsc::UnboundedReceiver<Opened>) {
+    /// owner and the receiver of each device port it opens.
+    fn registry(first: Vec<(&str, First)>) -> (Links, Owner, mpsc::UnboundedReceiver<Opened>) {
         let (opens, opened) = fakes(first);
-        let links = Links::on(&Supervisor::current(), None, DumpFlags::default(), opens);
-        (links, opened)
+        let (links, owner) = Links::on(&Supervisor::current(), None, DumpFlags::default(), opens);
+        (links, owner, opened)
     }
 
     /// Returns a lease on the link to `url`.
@@ -915,7 +880,7 @@ mod tests {
     /// its last user leaves.
     #[tokio::test(start_paused = true)]
     async fn a_link_only_probes_used_closes_as_soon_as_they_leave() {
-        let (links, mut devices) = registry(Vec::new());
+        let (links, _owner, mut devices) = registry(Vec::new());
         let probe = acquire(&links, DEVICE).await;
         let mut device = opened(&mut devices).await;
         assert_eq!(urls(&links).await, [DEVICE]);
@@ -936,7 +901,7 @@ mod tests {
     /// had no user for [`IDLE`].
     #[tokio::test(start_paused = true)]
     async fn a_link_a_probe_shared_with_an_open_keeps_its_grace() {
-        let (links, mut devices) = registry(Vec::new());
+        let (links, _owner, mut devices) = registry(Vec::new());
         let probe = acquire(&links, DEVICE).await;
         let open = acquire(&links, DEVICE).await;
         assert_eq!(probe.link().id(), open.link().id());
@@ -954,12 +919,12 @@ mod tests {
     }
 
     /// A new link waits while the task of an earlier link to its device
-    /// runs, here one still in its first open. A link to another device
-    /// opens meanwhile.
+    /// runs, here one whose first open cannot be dropped, however long that
+    /// takes. A link to another device opens meanwhile.
     #[tokio::test(start_paused = true)]
     async fn a_new_link_waits_for_an_earlier_worker_of_its_own_device_alone() {
         let gate = Arc::new(Notify::new());
-        let (links, mut devices) = registry(vec![(DEVICE, First::Waits(gate.clone()))]);
+        let (links, _owner, mut devices) = registry(vec![(DEVICE, First::Waits(gate.clone()))]);
         drop(acquire(&links, DEVICE).await);
 
         let reopening = tokio::spawn({
@@ -970,7 +935,7 @@ mod tests {
         // Its device stays, as a device that hung up would be reopened.
         let other = opened(&mut devices).await;
         assert_eq!(other.url, OTHER);
-        tokio::time::sleep(RELEASE_TIMEOUT / 2).await;
+        tokio::time::sleep(LEAVE_TIMEOUT * 4).await;
         assert!(
             !reopening.is_finished(),
             "the link opened as the worker ran"
@@ -988,31 +953,49 @@ mod tests {
         assert_eq!(urls(&links).await, [DEVICE, OTHER]);
     }
 
-    /// A worker that never lets go holds up a new link to its device for
-    /// [`RELEASE_TIMEOUT`] from its close. Then its task is aborted, and the
-    /// new link opens and is ready once its device answers.
+    /// A registry whose owner drops lets each worker write what was queued for
+    /// its device first, though the device takes half a second to read it.
     #[tokio::test(start_paused = true)]
-    async fn a_new_link_opens_once_a_worker_that_never_lets_go_is_aborted() {
-        let (links, mut devices) = registry(vec![(DEVICE, First::Hangs)]);
-        drop(acquire(&links, DEVICE).await);
-        let closed = Instant::now();
-
-        let reopened = acquire(&links, DEVICE).await;
-
-        assert_took(closed.elapsed(), RELEASE_TIMEOUT, "the abort");
+    async fn an_ending_registry_lets_its_workers_write_what_was_queued() {
+        let (links, owner, mut devices) = registry(Vec::new());
+        let lease = acquire(&links, DEVICE).await;
         let mut device = opened(&mut devices).await;
-        assert_eq!(device.url, DEVICE);
-        let answer = Packet::heartbeat(DeviceRoute::root());
-        device.end.send(&answer).await;
-        assert_eq!(reopened.link().ready().await, Ok(()));
-        assert_eq!(urls(&links).await, [DEVICE]);
+        device
+            .end
+            .send(&Packet::heartbeat(DeviceRoute::root()))
+            .await;
+        assert_eq!(lease.link().ready().await, Ok(()));
+        let (port, _received) = lease
+            .link()
+            .open_port(DeviceRoute::root())
+            .unwrap()
+            .into_split();
+        let queued = 2000;
+        for _ in 0..queued {
+            port.try_send(Packet::heartbeat(DeviceRoute::root()))
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop((port, lease));
+        let ending = Instant::now();
+
+        let ended = tokio::spawn(owner.close());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut written = 0;
+        while let Some(_pkt) = timeout(PAUSED_WAIT, device.end.recv()).await.unwrap() {
+            written += 1;
+        }
+
+        assert_eq!(written, queued);
+        ended.await.unwrap();
+        assert!(ending.elapsed() < LEAVE_TIMEOUT, "{:?}", ending.elapsed());
     }
 
     /// A link whose task panics has stopped, and the next open of its
     /// device makes a new link.
     #[tokio::test(start_paused = true)]
     async fn a_panic_in_a_link_task_frees_its_key() {
-        let (links, mut devices) = registry(vec![(DEVICE, First::Panics)]);
+        let (links, _owner, mut devices) = registry(vec![(DEVICE, First::Panics)]);
         let first = acquire(&links, DEVICE).await;
         let failed = first.link().ready().await;
         assert_eq!(failed, Err("the link closed".to_string()));
@@ -1044,7 +1027,7 @@ mod tests {
     fn a_device_reopened_as_its_link_closes_waits_for_the_old_worker() {
         let device = FakeDevice::start();
         device.exclusive();
-        let links = Links::new(&Supervisor::new(), None, DumpFlags::default());
+        let (links, owner) = Links::new(&Supervisor::new(), None, DumpFlags::default());
         let probe = links.acquire_blocking(&device.url).unwrap();
         assert_eq!(settled(probe.link()), Readiness::Ready);
         drop(probe);
@@ -1054,15 +1037,15 @@ mod tests {
         assert_eq!(settled(open.link()), Readiness::Ready);
         assert_eq!((device.accepted(), device.refused()), (2, 0));
         drop(open);
-        assert!(links.close_all_blocking(WAIT));
         assert!(links.wait_finished(WAIT));
+        crate::rt::handle().block_on(owner.close());
     }
 
     #[test]
-    fn nothing_opens_once_every_link_is_closed() {
-        let links = Links::new(&Supervisor::new(), None, DumpFlags::default());
+    fn nothing_opens_once_the_registry_has_ended() {
+        let (links, owner) = Links::new(&Supervisor::new(), None, DumpFlags::default());
 
-        links.close_all_blocking(WAIT);
+        crate::rt::handle().block_on(owner.close());
 
         let refusal = links.acquire_blocking(UNREACHABLE).err().unwrap();
         assert_eq!(refusal.code, RpcError::State);
