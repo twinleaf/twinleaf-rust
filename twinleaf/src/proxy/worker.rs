@@ -1438,7 +1438,7 @@ mod tests {
 
     /// Waits for a worker's `task` to end, and checks that it did not panic.
     fn join(task: JoinHandle<Option<()>>) {
-        let (ended, outcome) = oneshot::channel();
+        let (ended, outcome) = flume::bounded(1);
         rt::handle().spawn(async move {
             let _ = ended.send(task.await);
         });
