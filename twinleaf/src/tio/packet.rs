@@ -77,6 +77,8 @@ pub enum ProxyRx<'a> {
     Error(wire_rpc::ErrorReply<'a>),
     /// The link status of the subtree the packet's route names, kind 2.
     Link(LinkStatus),
+    /// A sign that the proxy is alive, kind 3, sent when nothing else was.
+    Alive,
     /// A kind this build does not know, with the body after its kind byte.
     Unknown(u8, &'a [u8]),
 }
@@ -87,6 +89,8 @@ const PROXY_RX_REPLY: u8 = 0;
 const PROXY_RX_ERROR: u8 = 1;
 /// `PROXY_RX` kind byte of a link status.
 const PROXY_RX_LINK: u8 = 2;
+/// `PROXY_RX` kind byte of a sign of life.
+const PROXY_RX_ALIVE: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -240,6 +244,7 @@ fn parse_proxy_rx(payload: &[u8]) -> Result<ProxyRx<'_>, DecodeError> {
         PROXY_RX_REPLY => ProxyRx::Reply(wire_rpc::Reply::parse(body).ok_or(too_short)?),
         PROXY_RX_ERROR => ProxyRx::Error(wire_rpc::ErrorReply::parse(body).ok_or(too_short)?),
         PROXY_RX_LINK => ProxyRx::Link(LinkStatus::from(*body.first().ok_or(too_short)?)),
+        PROXY_RX_ALIVE => ProxyRx::Alive,
         _ => ProxyRx::Unknown(kind, body),
     })
 }
@@ -385,6 +390,14 @@ impl Packet {
             Some(1)
         })
         .expect("a link status always fits")
+    }
+
+    /// Creates the sign of life a proxy sends a client. The packet has no
+    /// route.
+    // An empty body always fits a packet.
+    #[allow(clippy::missing_panics_doc)]
+    pub fn alive() -> Packet {
+        proxy_rx(PROXY_RX_ALIVE, 0, |_| Some(0)).expect("a sign of life always fits")
     }
 
     /// Creates a control request to the proxy itself, calling `name` with
@@ -902,6 +915,8 @@ mod tests {
         let link = received(&Packet::link(LinkStatus::Stopped).with_route(route("/1/2")));
         assert_eq!(proxy_rx_of(&link), ProxyRx::Link(LinkStatus::Stopped));
         assert_eq!(link.route(), route("/1/2"));
+
+        assert_eq!(proxy_rx_of(&received(&Packet::alive())), ProxyRx::Alive);
 
         // Kind 9, which this build does not know, with a two byte body.
         let unknown = Packet::from_wire(Bytes::from_static(&[67, 0, 3, 0, 9, 0xaa, 0xbb])).unwrap();

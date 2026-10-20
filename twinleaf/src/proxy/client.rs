@@ -249,7 +249,7 @@ impl Session {
                     let Some(received) = received else { return Err(ClientError::HungUp); };
                     if let Some(pkt) = self.delivered(received)? {
                         if self.classify_until.is_some() {
-                            self.classify(Some(&pkt));
+                            self.classify(Some(&pkt)).await;
                         }
                         self.backlog.push_back(pkt);
                     }
@@ -266,7 +266,7 @@ impl Session {
                 (request, outcome) = finish(&mut self.opening) => {
                     self.opened(request, outcome).await?;
                 }
-                () = sleep_until_some(self.classify_until) => self.classify(None),
+                () = sleep_until_some(self.classify_until) => self.classify(None).await,
             }
         }
     }
@@ -276,12 +276,13 @@ impl Session {
     /// packet is a control request is a control client, and any other is a
     /// legacy client. Packets that do not decode are skipped. A legacy
     /// client opens `auto` at once, and its packets wait until the open is
-    /// done.
-    fn classify(&mut self, first: Option<&Packet>) {
+    /// done. A control client's link is kept alive from then on.
+    async fn classify(&mut self, first: Option<&Packet>) {
         self.classify_until = None;
         self.legacy = first.is_none_or(|pkt| pkt.ptype() != PacketType::PROXY_TX);
-        if self.legacy {
-            self.open(None, auto::AUTO.to_string(), Purpose::Use);
+        match self.legacy {
+            true => self.open(None, auto::AUTO.to_string(), Purpose::Use),
+            false => self.client.keep_alive(control::PROXY_KEEPALIVE).await,
         }
     }
 
@@ -319,6 +320,7 @@ impl Session {
         }
         match pkt.ptype() {
             PacketType::PROXY_TX => return self.control(&pkt).await,
+            PacketType::HEARTBEAT if !self.legacy && pkt.route().is_empty() => return Ok(()),
             PacketType::PROXY_RX => {
                 log::debug!("Dropping a control reply from client {}", self.addr);
                 return Ok(());
@@ -756,11 +758,19 @@ mod tests {
         Packet::proxy_request("proxy.open", &target.encode_args(), id).unwrap()
     }
 
-    /// Waits for the next packet the client is sent.
+    /// Waits for the next packet the client is sent, skipping the proxy's
+    /// signs of life and keeping the link alive as a client does meanwhile.
     async fn next(end: &mut FakeEnd) -> Packet {
-        let next = timeout(PAUSED_WAIT, end.recv()).await;
-        next.expect("nothing arrived")
-            .expect("the connection closed")
+        let deadline = Instant::now() + PAUSED_WAIT;
+        loop {
+            assert!(Instant::now() < deadline, "nothing arrived");
+            match timeout(Duration::from_secs(1), end.recv()).await {
+                Ok(Some(pkt)) if matches!(pkt.payload(), Payload::ProxyRx(ProxyRx::Alive)) => {}
+                Ok(Some(pkt)) => return pkt,
+                Ok(None) => panic!("the connection closed"),
+                Err(_quiet) => end.send(&Packet::heartbeat(DeviceRoute::root())).await,
+            }
+        }
     }
 
     /// Returns the id of the control request `pkt` answers, with the answer.
@@ -791,6 +801,40 @@ mod tests {
 
         assert_eq!(device.url, DEVICE);
         assert_took(device.at - connected, CLASSIFY, "classifying");
+    }
+
+    /// A control client that sends nothing for longer than the keepalive
+    /// allows is given up, though it heard the proxy's signs of life.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_control_client_is_given_up() {
+        let mut client = connect(None);
+        client.end.send(&open(DEVICE, 2)).await;
+        let quiet = Instant::now();
+
+        let mut alive = 0;
+        while let Some(pkt) = timeout(PAUSED_WAIT, client.end.recv()).await.unwrap() {
+            assert!(matches!(pkt.payload(), Payload::ProxyRx(ProxyRx::Alive)));
+            alive += 1;
+        }
+
+        assert_eq!(quiet.elapsed(), control::PROXY_KEEPALIVE.quiet);
+        assert_eq!(alive, 4);
+    }
+
+    /// A legacy client hears nothing in the control protocol, signs of life
+    /// included, and stays connected however long it is quiet.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_legacy_client_is_kept() {
+        let mut client = connect(Some(Layout::single(DEVICE)));
+        let mut device = opened(&mut client.devices).await;
+        let beat = Packet::heartbeat(DeviceRoute::root());
+        device.end.send(&beat).await;
+
+        let deadline = Instant::now() + control::PROXY_KEEPALIVE.quiet * 4;
+        while let Ok(heard) = timeout_at(deadline, client.end.recv()).await {
+            let pkt = heard.expect("the legacy client was kept");
+            assert_ne!(pkt.ptype(), PacketType::PROXY_RX, "{:?}", pkt.payload());
+        }
     }
 
     /// An open of a device that sends nothing is refused once

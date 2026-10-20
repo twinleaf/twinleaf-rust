@@ -5,11 +5,11 @@
 
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
-use crate::proto::TCP_DEFAULT_PORT;
+use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply};
-use crate::tio::transport::{self, ReceiveResult, RecvError, TransportEvent};
+use crate::tio::transport::{self, KeepAlive, ReceiveResult, RecvError, TransportEvent};
 use futures_util::StreamExt;
 use std::fmt;
 use std::io;
@@ -30,6 +30,20 @@ pub(super) const STOP: &str = "proxy.stop";
 
 /// The version of the control protocol this build speaks.
 pub(super) const VERSION: u8 = 1;
+
+/// How a client keeps its link to the proxy alive once the hello is done.
+pub(crate) const CLIENT_KEEPALIVE: KeepAlive = KeepAlive {
+    beat: || Packet::heartbeat(DeviceRoute::root()),
+    every: Duration::from_secs(1),
+    quiet: Duration::from_secs(5),
+};
+
+/// How the proxy keeps its link to a client alive once the client is known
+/// to speak the control protocol.
+pub(super) const PROXY_KEEPALIVE: KeepAlive = KeepAlive {
+    beat: Packet::alive,
+    ..CLIENT_KEEPALIVE
+};
 
 /// What one side of `proxy.hello` says about itself. A client sends its own,
 /// and the proxy replies with its own.

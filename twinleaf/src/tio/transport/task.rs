@@ -14,7 +14,8 @@
 
 use super::codec::udp as datagram;
 use super::{
-    udp, Delivery, PacketOrControl, ReceiveResult, RecvError, TransportEvent, DRAIN_TIMEOUT,
+    udp, Delivery, KeepAlive, PacketOrControl, ReceiveResult, RecvError, TransportEvent,
+    DRAIN_TIMEOUT,
 };
 use crate::proto::DeviceRoute;
 use crate::rt::{self, sleep_until_some};
@@ -35,6 +36,9 @@ pub(super) struct Rules {
     /// The longest the link may go without sending, if it has a limit. A
     /// heartbeat goes out when it passes.
     pub heartbeat: Option<Duration>,
+    /// The longest the link may go without receiving, if it has a limit. The
+    /// link is given up when it passes.
+    pub quiet: Option<Duration>,
     /// How long after the port opens it discards what it receives, but for
     /// text, and writes nothing but heartbeats. The first bytes to arrive in
     /// that time are discarded whole.
@@ -56,10 +60,16 @@ impl Rules {
     /// stages.
     pub const NONE: Rules = Rules {
         heartbeat: None,
+        quiet: None,
         holdoff: None,
         stale_after: None,
         half_close: None,
     };
+}
+
+/// Returns the keepalive a host sends to hold a link open.
+fn host_heartbeat() -> Packet {
+    Packet::heartbeat(DeviceRoute::root())
 }
 
 /// Returns the error of a link whose rate cannot change.
@@ -97,8 +107,14 @@ pub(super) struct Task {
     queue: mpsc::Receiver<PacketOrControl>,
     /// The longest the link may go without sending, if it has a limit.
     heartbeat: Option<Duration>,
+    /// What goes out when the link has gone without sending too long.
+    beat: fn() -> Packet,
     /// When the next heartbeat is due, if the link has a heartbeat.
     next_heartbeat: Instant,
+    /// The longest the link may go without receiving, if it has a limit.
+    quiet: Option<Duration>,
+    /// When the link last received anything.
+    heard: Instant,
     /// When the startup holdoff ends, while it lasts.
     holdoff: Option<Instant>,
     /// How long the task waits for the peer to close, if the link closes in
@@ -123,7 +139,10 @@ impl Task {
             rx,
             queue,
             heartbeat: rules.heartbeat,
+            beat: host_heartbeat,
             next_heartbeat,
+            quiet: rules.quiet,
+            heard: now,
             holdoff: rules.holdoff.map(|holdoff| now + holdoff),
             half_close: rules.half_close,
             _activity: rt::Activity::hold(),
@@ -158,20 +177,42 @@ impl Task {
         }
     }
 
-    /// Returns when the task must wake to end the holdoff or send a
-    /// heartbeat. No heartbeat is due while `writing`.
+    /// Has the link send `keep_alive`'s heartbeats from now on, and give up
+    /// when it hears nothing for as long as `keep_alive` allows.
+    fn keep_alive(&mut self, keep_alive: KeepAlive) {
+        let now = Instant::now();
+        self.heartbeat = Some(keep_alive.every);
+        self.beat = keep_alive.beat;
+        self.next_heartbeat = now + keep_alive.every;
+        self.quiet = Some(keep_alive.quiet);
+        self.heard = now;
+    }
+
+    /// Returns when the task must wake to end the holdoff, send a heartbeat
+    /// or give up a quiet link. No heartbeat is due while `writing`.
     fn next_wake(&self, writing: bool) -> Option<Instant> {
         let heartbeat = self
             .heartbeat
             .filter(|_| !writing)
             .map(|_| self.next_heartbeat);
-        heartbeat.into_iter().chain(self.holdoff).min()
+        let quiet = self.quiet.map(|quiet| self.heard + quiet);
+        heartbeat.into_iter().chain(self.holdoff).chain(quiet).min()
     }
 
-    /// Ends the holdoff once its time has come.
-    fn wake(&mut self) {
+    /// Ends the holdoff once its time has come. Returns `false` after giving
+    /// up a link that has heard nothing for too long.
+    fn wake(&mut self) -> bool {
         let now = Instant::now();
         self.holdoff = self.holdoff.filter(|&end| end > now);
+        let Some(quiet) = self.quiet.filter(|&quiet| self.heard + quiet <= now) else {
+            return true;
+        };
+        let silent = io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("heard nothing for {quiet:?}"),
+        );
+        self.deliver(Err(silent.into()));
+        false
     }
 
     /// Runs the link through Tokio's framed stream and sink. A queued packet
@@ -191,7 +232,7 @@ impl Task {
         loop {
             let now = Instant::now();
             if !writing && self.heartbeat_due(now) {
-                if let Err(error) = sink.feed(Packet::heartbeat(DeviceRoute::root())).await {
+                if let Err(error) = sink.feed((self.beat)()).await {
                     self.deliver(Err(error));
                     break;
                 }
@@ -201,6 +242,7 @@ impl Task {
             let wake = self.next_wake(writing);
             tokio::select! {
                 received = source.next() => {
+                    self.heard = Instant::now();
                     let result = match received {
                         Some(Err(RecvError::IO(error))) => Err(S::read_error(error)),
                         Some(result) => result,
@@ -240,6 +282,7 @@ impl Task {
                             let _ = result.send(framed.get_mut().set_rate(rate));
                             (sink, source) = framed.split();
                         }
+                        Some(PacketOrControl::KeepAlive(keep_alive)) => self.keep_alive(keep_alive),
                         None => {
                             if let Some(within) = self.half_close {
                                 close_in_stages(&mut sink, &mut source, within).await;
@@ -248,7 +291,7 @@ impl Task {
                         }
                     }
                 }
-                () = sleep_until_some(wake) => self.wake(),
+                () = sleep_until_some(wake) => if !self.wake() { break; },
             }
         }
     }
@@ -262,10 +305,7 @@ impl Task {
         loop {
             let now = Instant::now();
             if !writing && self.heartbeat_due(now) {
-                if let Err(error) = sink
-                    .feed((Packet::heartbeat(DeviceRoute::root()), peer))
-                    .await
-                {
+                if let Err(error) = sink.feed(((self.beat)(), peer)).await {
                     self.deliver(Err(error));
                     break;
                 }
@@ -277,7 +317,10 @@ impl Task {
                 received = source.next() => {
                     let result = match received {
                         Some(Ok((_, from))) if from != peer => continue,
-                        Some(Ok((event, _))) => Ok(event),
+                        Some(Ok((event, _))) => {
+                            self.heard = Instant::now();
+                            Ok(event)
+                        }
                         Some(Err(RecvError::IO(error))) if udp::is_advisory_network_error(&error) => continue,
                         Some(Err(error)) => Err(error),
                         None => break,
@@ -312,10 +355,11 @@ impl Task {
                         Some(PacketOrControl::SetRate(_, result)) => {
                             let _ = result.send(Err(rate_unsupported()));
                         }
+                        Some(PacketOrControl::KeepAlive(keep_alive)) => self.keep_alive(keep_alive),
                         None => break,
                     }
                 }
-                () = sleep_until_some(wake) => self.wake(),
+                () = sleep_until_some(wake) => if !self.wake() { break; },
             }
         }
     }

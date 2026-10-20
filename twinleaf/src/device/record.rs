@@ -124,6 +124,7 @@ impl<W: Write> Transcript<W> {
             | packet::Payload::ProxyRx(
                 packet::ProxyRx::Reply(_)
                 | packet::ProxyRx::Error(_)
+                | packet::ProxyRx::Alive
                 | packet::ProxyRx::Unknown(..),
             )
             | packet::Payload::Log(_)

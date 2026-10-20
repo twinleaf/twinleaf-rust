@@ -105,7 +105,7 @@ mod link;
 mod server;
 mod worker;
 
-pub(crate) use control::{call, executable_name, handshake, Purpose};
+pub(crate) use control::{call, executable_name, handshake, Purpose, CLIENT_KEEPALIVE};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;

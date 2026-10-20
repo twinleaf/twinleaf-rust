@@ -28,9 +28,9 @@
 use super::runtime::ProxyAddress;
 use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{handshake, lock, Purpose, MAX_RPC_TIMEOUT};
+use crate::proxy::{handshake, lock, Purpose, CLIENT_KEEPALIVE, MAX_RPC_TIMEOUT};
 use crate::rt::{sleep_until_some, Supervisor};
-use crate::tio::packet::{LinkStatus, Packet, Payload};
+use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -193,6 +193,7 @@ impl Session {
         let url = &proxy.url;
         let (host, opened) =
             handshake(&port, &received, url, method, &args, &goal, timeout).await?;
+        port.keep_alive(CLIENT_KEEPALIVE).await;
         log::debug!(
             "the proxy at {url} opened {}",
             String::from_utf8_lossy(&opened)
@@ -489,6 +490,9 @@ impl Worker {
                 Some(pending) => (pending.complete)(outcome),
                 None => log::debug!("dropping a reply to {id}, which no call waits for"),
             }
+            return true;
+        }
+        if let Payload::ProxyRx(ProxyRx::Alive) = packet.payload() {
             return true;
         }
         let stopped =
@@ -1343,6 +1347,36 @@ mod tests {
         proxy.accept().accept_open(TARGET);
         assert!(opening.join().unwrap().is_ok());
         assert_eq!(ENSURED.load(Ordering::SeqCst), 1);
+    }
+
+    /// Once the proxy has said hello, a session beats while idle, and gives
+    /// up a proxy that goes quiet without closing its connection.
+    #[test]
+    fn a_session_beats_and_gives_up_a_quiet_proxy() {
+        let proxy = FakeProxy::start();
+        let address = ProxyAddress {
+            url: proxy.url(),
+            ensure: None,
+        };
+        let opening = thread::spawn(move || Session::open(&address, TARGET, Purpose::Use, WAIT));
+        let mut end = proxy.accept();
+        end.accept_open(TARGET);
+        let _session = opening.join().unwrap().unwrap();
+        let quiet = Instant::now();
+
+        let mut beats = 0;
+        while let Some(packet) = end.next_within(CLIENT_KEEPALIVE.every * 2) {
+            assert!(matches!(packet.payload(), Payload::Heartbeat(_)));
+            beats += 1;
+        }
+
+        let given_up = quiet.elapsed();
+        assert!(beats >= 3, "the session sent {beats} heartbeats");
+        assert!(
+            (CLIENT_KEEPALIVE.quiet..CLIENT_KEEPALIVE.quiet + CLIENT_KEEPALIVE.every)
+                .contains(&given_up),
+            "the session gave the proxy up after {given_up:?}"
+        );
     }
 
     /// Nothing reads the inlet before the pump takes it, so the session drops
