@@ -792,13 +792,19 @@ mod tests {
     use crate::device::session::TestProxy;
     use crate::proto::rpc::Method;
     use crate::proxy::fixtures::{assert_took, PAUSED_WAIT};
-    use crate::proxy::{lock, Proxy};
+    use crate::proxy::Proxy;
     use crate::tio::packet::Payload;
     use crate::tio::Packet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::thread;
     use std::time::Instant;
+
+    /// Locks `mutex`, even if a thread panicked while holding it. It suits locks
+    /// that guard no change a panic could leave half made.
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     /// A URL no test device listens at, which only a test's own opener
     /// handles.
@@ -1297,7 +1303,7 @@ mod tests {
         let ports = Arc::new(Mutex::new(vec![twinleaf(FIRST)]));
         let (opened, proxies) = flume::unbounded();
         let open: Opener = Arc::new(move |_, _| {
-            let (session, proxy) = Session::test_pair_on(&sessions, 64);
+            let (session, proxy) = Session::test_pair_on(&sessions);
             let _ = opened.send(proxy);
             Box::pin(async { Ok(Connection::over(session)) })
         });

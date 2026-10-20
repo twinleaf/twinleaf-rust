@@ -34,7 +34,7 @@ pub enum RecvError {
 pub enum Queued<T> {
     /// An item.
     Item(T),
-    /// The count of items the pump dropped while the subscriber was behind.
+    /// The count of items dropped while the receiver was behind.
     Gap(u64),
 }
 

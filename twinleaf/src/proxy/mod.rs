@@ -114,7 +114,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long to wait for the handshake on a loopback address. A running proxy
@@ -187,12 +187,6 @@ where
             Ok(Ok(_))
         ),
     }
-}
-
-/// Locks `mutex`, even if a thread panicked while holding it. It suits locks
-/// that guard no change a panic could leave half made.
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Where a proxy accepts clients.

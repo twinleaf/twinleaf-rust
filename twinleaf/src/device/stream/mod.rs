@@ -10,7 +10,7 @@ mod subscription;
 
 pub use event::{DeviceEvent, Event, LinkEvent, NamedRoute};
 pub(crate) use metadata::{Completed, MetadataSchedule};
-pub(crate) use subscription::Scope;
+pub(crate) use subscription::{Queued, Scope};
 pub use subscription::{Receiver, RecvError};
 
 use super::session::{Handle, Inlet, RawCallResult};
@@ -19,10 +19,10 @@ use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio;
 use crate::tio::packet;
+use crate::tio::transport;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{self, Future};
 use std::pin::Pin;
-use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use subscription::Sink;
@@ -39,6 +39,9 @@ const EVENT_QUEUE_LEN: usize = 4096;
 /// How many packets a raw tap's queue holds, enough for a recorder's disk
 /// stall.
 const PACKET_QUEUE_LEN: usize = 8192;
+
+/// How many packets the inlet holds, as many as a socket's own queue.
+const INLET_LEN: usize = transport::DEFAULT_RX_CHANNEL_SIZE;
 
 /// Returns the RPC table hash from an `rpc.hash` setting, a little-endian
 /// `u32`, or `None` for any other setting.
@@ -306,10 +309,10 @@ struct Pump {
 }
 
 impl Pump {
-    /// Takes the session's inlet and starts the task that drains it.
+    /// Attaches to the session and starts the task that drains its inlet.
     fn start(root: &Handle) -> mpsc::UnboundedSender<PumpSink> {
         let (commands, received) = mpsc::unbounded_channel();
-        let pump = Pump::new(root, root.session().take_inlet(), received);
+        let pump = Pump::new(root, root.session().attach(INLET_LEN), received);
         Supervisor::new().spawn("twinleaf stream", pump.run());
         commands
     }
@@ -347,7 +350,7 @@ impl Pump {
                     true
                 }
                 () = pruned(&mut self.batches, &mut self.events, &mut self.packets) => true,
-                received = self.inlet.receiver().recv_async() => self.take_input(received),
+                received = self.inlet.recv_async() => self.take_input(received),
                 () = sleep_until_some(retry) => true,
             };
             self.publish();
@@ -383,29 +386,26 @@ impl Pump {
     /// Takes `received` from the inlet, and what else the inlet held then.
     /// Returns `false` once the session has ended and its last packet is
     /// taken.
-    fn take_input(&mut self, received: Result<tio::Packet, flume::RecvError>) -> bool {
-        if self.inlet.overran() {
-            self.state.input_overrun();
-        }
-        let Ok(packet) = received else {
-            // The session recorded why it ended before the inlet
-            // disconnected. This fence orders that record ahead of the
-            // sinks dropping, for receivers that ask after.
-            atomic::fence(Ordering::Acquire);
+    fn take_input(&mut self, received: Result<Queued<tio::Packet>, flume::RecvError>) -> bool {
+        let Ok(queued) = received else {
             return false;
         };
-        self.take(&packet);
-        for _ in 0..self.inlet.receiver().len() {
-            let Ok(packet) = self.inlet.receiver().try_recv() else {
+        self.take(queued);
+        for _ in 0..self.inlet.len() {
+            let Ok(queued) = self.inlet.try_recv() else {
                 break;
             };
-            self.take(&packet);
+            self.take(queued);
         }
         true
     }
 
-    /// Takes one packet from the inlet.
-    fn take(&mut self, packet: &tio::Packet) {
+    /// Takes one packet from the inlet, or reports the gap the session left.
+    fn take(&mut self, queued: Queued<tio::Packet>) {
+        let packet = &match queued {
+            Queued::Item(packet) => packet,
+            Queued::Gap(_) => return self.state.input_overrun(),
+        };
         self.tap(packet);
         if let Some(packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped) =
             packet.link_status()
@@ -515,7 +515,6 @@ mod tests {
     use crate::proto::sync::Epoch;
     use crate::proto::SessionId as WireSessionId;
     use crate::tio::packet::Packet;
-    use crate::tio::transport;
     use std::time::{Duration, Instant};
 
     /// The whole tree, as a root tree view covers it.
@@ -539,7 +538,7 @@ mod tests {
     fn pump_with(sinks: Vec<PumpSink>) -> (mpsc::UnboundedSender<PumpSink>, TestProxy, Handle) {
         let (session, proxy) = Session::test_pair();
         let root = Handle::root(session);
-        let subscriptions = start_pump(&root, root.session().take_inlet(), sinks);
+        let subscriptions = start_pump(&root, root.session().attach(INLET_LEN), sinks);
         (subscriptions, proxy, root)
     }
 
@@ -923,12 +922,12 @@ mod tests {
     fn an_inlet_overrun_is_reported_and_the_stream_goes_on() {
         let (session, proxy) = Session::test_pair();
         let handle = Handle::root(session);
-        let inlet = handle.session().take_inlet();
-        let overflow = inlet.overflow_marker();
+        let (inlet, packets) = flume::unbounded();
+        let deliver = |packet| inlet.send(Queued::Item(packet)).unwrap();
         let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());
-        let _subscriptions = start_pump(&handle, inlet, vec![PumpSink::Events(sink)]);
+        let _subscriptions = start_pump(&handle, packets, vec![PumpSink::Events(sink)]);
         let root = DeviceRoute::root();
-        proxy.send(samples(0, root));
+        deliver(samples(0, root));
         let (route, _, id) = metadata_call(&proxy);
         proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
         wait_for(&events, |event| {
@@ -941,10 +940,7 @@ mod tests {
             )
         });
 
-        // The session dropped what the inlet had no room for, and the next
-        // packet wakes the pump to say so.
-        overflow();
-        proxy.send(samples(1, root));
+        inlet.send(Queued::Gap(1)).unwrap();
         wait_for(&events, |event| {
             matches!(
                 event,
@@ -955,13 +951,13 @@ mod tests {
             )
         });
 
-        proxy.send(samples(2, root));
+        deliver(samples(2, root));
         assert!(
             !wrote_within(&proxy, Duration::from_millis(500)),
             "the overrun did not forget that this route has no dev.metadata"
         );
         let child: DeviceRoute = "/1".parse().unwrap();
-        proxy.send(samples(0, child));
+        deliver(samples(0, child));
         wait_for(
             &events,
             |event| matches!(event, Event::RouteDiscovered { route } if *route == child),
@@ -1632,10 +1628,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_receiver_dropped_while_the_stream_is_silent_is_pruned() {
         let tasks = Supervisor::current();
-        let (session, proxy) = Session::test_pair_on(&tasks, transport::DEFAULT_RX_CHANNEL_SIZE);
+        let (session, proxy) = Session::test_pair_on(&tasks);
         let root = Handle::root(session);
         let (subscriptions, commands) = mpsc::unbounded_channel();
-        let pump = Pump::new(&root, root.session().take_inlet(), commands);
+        let pump = Pump::new(&root, root.session().attach(INLET_LEN), commands);
         tasks.spawn("twinleaf stream", pump.run());
         let child: DeviceRoute = "/1".parse().unwrap();
         let batches = subscribe(&subscriptions, exactly("/1"), PumpSink::Batches);
@@ -1659,10 +1655,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_metadata_query_is_asked_again_when_its_backoff_ends() {
         let tasks = Supervisor::current();
-        let (session, proxy) = Session::test_pair_on(&tasks, transport::DEFAULT_RX_CHANNEL_SIZE);
+        let (session, proxy) = Session::test_pair_on(&tasks);
         let root = Handle::root(session);
         let (subscriptions, commands) = mpsc::unbounded_channel();
-        let pump = Pump::new(&root, root.session().take_inlet(), commands);
+        let pump = Pump::new(&root, root.session().attach(INLET_LEN), commands);
         tasks.spawn("twinleaf stream", pump.run());
         let _events = subscribe(&subscriptions, everything(), PumpSink::Events);
         proxy.send(samples(0, DeviceRoute::root()));
