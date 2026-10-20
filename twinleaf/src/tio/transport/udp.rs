@@ -5,7 +5,6 @@
 //! [`codec::udp`](super::codec::udp) frames it.
 
 use super::task::Rules;
-use crate::rt::Supervisor;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,17 +23,12 @@ pub(super) const RULES: Rules = Rules {
 /// # Errors
 ///
 /// Returns an error if binding fails.
-pub(super) fn bind(address: &SocketAddr) -> io::Result<UdpSocket> {
-    let address = *address;
-    Supervisor::new().run("udp bind", async move {
-        let bind = if address.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let socket = UdpSocket::bind(bind).await?;
-        Ok(socket)
-    })
+pub(super) async fn bind(address: &SocketAddr) -> io::Result<UdpSocket> {
+    let any = match address {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    UdpSocket::bind(any).await
 }
 
 /// Returns `true` for an error that a connected UDP socket reports from ICMP,
