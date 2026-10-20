@@ -5,12 +5,11 @@
 //! each header gives, as its [codec](super::codec::tcp::Codec) does.
 
 use super::task::{ByteStream, Rules};
-use crate::rt::{self, Supervisor};
+use crate::rt;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_util::task::AbortOnDropHandle;
 
 /// How long to wait for the handshake. It is one RTO plus slack, as long as
 /// the proxy lets a TCP link stay silent.
@@ -31,38 +30,25 @@ pub(super) const CLIENT_RULES: Rules = Rules {
     ..Rules::NONE
 };
 
-/// Connects to `address` and returns the stream. Waits at most
-/// [`CONNECT_TIMEOUT`].
+/// Connects to the first of `addresses` that answers, trying each in turn
+/// for at most [`CONNECT_TIMEOUT`], and returns the stream. Must be awaited
+/// on the crate's runtime, which the stream belongs to.
 ///
 /// # Errors
 ///
-/// Returns an error if the connection fails.
-pub(super) fn connect(address: &SocketAddr) -> io::Result<TcpStream> {
-    let address = *address;
-    Supervisor::new().run("tcp connect", connect_stream(address))
+/// Returns the error of the last address if none answers.
+pub(super) async fn connect(addresses: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut failed = io::Error::new(io::ErrorKind::NotFound, "no address to connect to");
+    for &address in addresses {
+        match connect_stream(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failed = error,
+        }
+    }
+    Err(failed)
 }
 
-/// Connects to `address` as [`connect`] does, without blocking. The connect
-/// runs as a task of the crate's runtime, which the stream belongs to.
-/// Dropping the future aborts the task, which closes the socket.
-///
-/// # Errors
-///
-/// Returns an error if the connection fails, and
-/// [`io::ErrorKind::TimedOut`] if it does not complete in time.
-pub(super) async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> {
-    let task = format!("tcp connect {address}");
-    let connecting = Supervisor::new().spawn(task, connect_stream(address));
-    let stream = match AbortOnDropHandle::new(connecting).await {
-        Ok(Some(connected)) => connected?,
-        // The supervisor logged the panic.
-        Ok(None) => return Err(io::Error::other("the connect panicked")),
-        Err(cancelled) => return Err(io::Error::other(cancelled)),
-    };
-    Ok(stream)
-}
-
-/// Connects on the runtime that owns the link.
+/// Connects to `address`, waiting at most [`CONNECT_TIMEOUT`].
 async fn connect_stream(address: SocketAddr) -> io::Result<TcpStream> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
         .await

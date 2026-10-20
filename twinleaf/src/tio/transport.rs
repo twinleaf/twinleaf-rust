@@ -31,7 +31,7 @@ use crate::rt::Supervisor;
 use std::fmt::Display;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use task::{Rules, Task};
 use tokio::sync::{mpsc, oneshot};
@@ -249,103 +249,83 @@ pub fn enumerate_serial(include_unknown: bool) -> Vec<DiscoveredDevice> {
     }
 }
 
-/// Resolves `addr` to a socket address of the IP version `family` allows.
-/// Adds the default port, which TCP and UDP share, if `addr` has none.
+/// How long the system's resolver may take to look up a name.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Returns the socket addresses `addr` names, of the IP version `family`
+/// allows, in the order to try them. Adds the default port, which TCP and UDP
+/// share, if `addr` has none.
 ///
 /// With the `mdns` feature, a `.local` name in any case, with or without a
 /// trailing dot, is resolved over mDNS first. That takes at most 1.5 s. The
 /// system's resolver resolves the name when mDNS finds no address that
-/// fits.
+/// fits, and any other name, within [`LOOKUP_TIMEOUT`].
 ///
-/// Returns an error if nothing resolves.
-fn find_addr(addr: &str, family: AddrFamilyRestrict) -> Result<SocketAddr, io::Error> {
+/// Returns an error if nothing resolves in time.
+async fn resolve(addr: &str, family: AddrFamilyRestrict) -> io::Result<Vec<SocketAddr>> {
     #[cfg(feature = "mdns")]
     if let Some((host, port)) = local_name(addr) {
-        match preferred(super::mdns::resolve(&host, port), &family) {
-            Some(found) => return Ok(found),
+        match preferred(super::mdns::resolve(&host, port).await, &family) {
+            Some(found) => return Ok(vec![found]),
             None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
         }
     }
-    look_up(addr, family)
-}
-
-/// Resolves `addr` as [`find_addr`] does, without blocking a worker of the
-/// runtime. A `.local` name resolves over mDNS as a future. The system's
-/// resolver looks up any other name on a blocking thread.
-///
-/// Returns an error if nothing resolves.
-async fn find_addr_async(addr: &str, family: AddrFamilyRestrict) -> io::Result<SocketAddr> {
-    #[cfg(feature = "mdns")]
-    if let Some((host, port)) = local_name(addr) {
-        match preferred(super::mdns::resolve_async(&host, port).await, &family) {
-            Some(found) => return Ok(found),
-            None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
-        }
-    }
-    // A lookup cannot be stopped, and holds nothing once it is dropped. The
-    // supervisor of its thread is its own, so no stop waits for it.
-    let addr = addr.to_string();
-    let lookup = Supervisor::new().spawn_blocking(move || look_up(&addr, family));
-    lookup.await.map_err(io::Error::other)?
-}
-
-/// Resolves `addr` with the system's resolver to a socket address of the IP
-/// version `family` allows, as [`find_addr`] does.
-///
-/// Returns an error if nothing resolves.
-fn look_up(addr: &str, family: AddrFamilyRestrict) -> io::Result<SocketAddr> {
-    // If the port is missing, append the default. It would
-    // be possible to determine if it's needed, but it's simpler
-    // to try to parse as-is, and if it fails try again with the port.
-    let mut iter = match addr.to_socket_addrs() {
-        Ok(iter) => iter,
-        Err(err) => {
-            // Attempt to append the port number
-            let addr_port = format!("{}:{}", addr, proto::TCP_DEFAULT_PORT);
-            match addr_port.to_socket_addrs() {
-                Ok(iter) => iter,
-                Err(_) => {
-                    // Final attempt: if the address was a numeric IPv6 address
-                    // append the port in the right format.
-                    let addr_port = format!("[{}]:{}", addr, proto::TCP_DEFAULT_PORT);
-                    match addr_port.to_socket_addrs() {
-                        Ok(iter) => iter,
-                        _ => {
-                            return Err(err);
-                        }
-                    }
-                }
-            }
-        }
+    let looking_up = tokio::net::lookup_host(with_port(addr));
+    let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, looking_up).await;
+    let late = |_| {
+        let message = format!("{addr} did not resolve within {LOOKUP_TIMEOUT:?}");
+        io::Error::new(io::ErrorKind::TimedOut, message)
     };
-    iter.find(|sa| family.allows(sa))
-        .ok_or_else(|| io::Error::other("address resolution failed"))
-}
-
-/// Returns the address part of a TCP `url`, with the IP version its scheme
-/// allows. Returns `None` for any other URL.
-fn tcp_address(url: &str) -> Option<(&str, AddrFamilyRestrict)> {
-    match url.split_once("://")? {
-        ("tcp", address) => Some((address, AddrFamilyRestrict::Either)),
-        ("tcp4", address) => Some((address, AddrFamilyRestrict::V4)),
-        ("tcp6", address) => Some((address, AddrFamilyRestrict::V6)),
-        _ => None,
+    let found: Vec<_> = looked_up
+        .map_err(late)??
+        .filter(|found| family.allows(found))
+        .collect();
+    match found.is_empty() {
+        true => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{addr} has no address to use"),
+        )),
+        false => Ok(found),
     }
 }
 
-/// Returns the socket address that `addr` spells out, as [`find_addr`] reads
-/// it, if it is an IP address of the version `family` allows. Looks nothing
-/// up.
-fn literal_addr(addr: &str, family: AddrFamilyRestrict) -> Option<SocketAddr> {
+/// Returns `addr` with the default port if it names none. An IPv6 address
+/// gets the brackets a port needs.
+fn with_port(addr: &str) -> String {
     let port = proto::TCP_DEFAULT_PORT;
-    [
-        addr.to_string(),
-        format!("{addr}:{port}"),
-        format!("[{addr}]:{port}"),
-    ]
-    .iter()
-    .find_map(|candidate| candidate.parse::<SocketAddr>().ok())
-    .filter(|found| family.allows(found))
+    if addr.parse::<SocketAddr>().is_ok() {
+        return addr.to_string();
+    }
+    if let Ok(ip) = addr.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return SocketAddr::new(ip, port).to_string();
+    }
+    match addr.rsplit_once(':').map(|(_, given)| given.parse::<u16>()) {
+        Some(Ok(_)) => addr.to_string(),
+        Some(Err(_)) | None => format!("{addr}:{port}"),
+    }
+}
+
+/// The IP links a URL can name.
+#[derive(Clone, Copy)]
+enum IpLink {
+    Tcp,
+    Udp,
+}
+
+/// Returns the link and the address part of an IP `url`, with the IP version
+/// its scheme allows. Returns `None` for any other URL.
+fn ip_address(url: &str) -> Option<(IpLink, &str, AddrFamilyRestrict)> {
+    let (scheme, address) = url.split_once("://")?;
+    let (link, family) = match scheme {
+        "tcp" => (IpLink::Tcp, AddrFamilyRestrict::Either),
+        "tcp4" => (IpLink::Tcp, AddrFamilyRestrict::V4),
+        "tcp6" => (IpLink::Tcp, AddrFamilyRestrict::V6),
+        "udp" => (IpLink::Udp, AddrFamilyRestrict::Either),
+        "udp4" => (IpLink::Udp, AddrFamilyRestrict::V4),
+        "udp6" => (IpLink::Udp, AddrFamilyRestrict::V6),
+        _ => return None,
+    };
+    Some((link, address, family))
 }
 
 /// The channel a port's task delivers what its link receives to. The task
@@ -457,39 +437,41 @@ impl Port {
         Ok(port.start(tasks, format_args!("twinleaf port {serial_config}"), run))
     }
 
-    fn open_tcp(
+    /// Opens a [`Port`] over `link` to `address`, with its task on `tasks`.
+    /// Tries each address `address` resolves to in turn.
+    async fn open_ip(
+        link: IpLink,
         address: &str,
         family: AddrFamilyRestrict,
         rx: Delivery,
         tasks: &Supervisor,
     ) -> io::Result<Port> {
-        let stream = tcp::connect(&find_addr(address, family)?)?;
-        Ok(Port::start_tcp(
-            stream,
-            tcp::RULES,
-            rx,
-            DEFAULT_TX_CHANNEL_SIZE,
-            tasks,
-        ))
-    }
-
-    fn open_udp(
-        address: &str,
-        family: AddrFamilyRestrict,
-        rx: Delivery,
-        tasks: &Supervisor,
-    ) -> io::Result<Port> {
-        let peer = find_addr(address, family)?;
-        let socket = udp::bind(&peer)?;
-        let (port, task) = Port::with_task(
-            TransportKind::Udp,
-            None,
-            udp::RULES,
-            rx,
-            DEFAULT_TX_CHANNEL_SIZE,
-        );
-        let run = task.run_datagram(socket, peer);
-        Ok(port.start(tasks, format_args!("twinleaf port udp://{peer}"), run))
+        let found = resolve(address, family).await?;
+        match link {
+            IpLink::Tcp => {
+                let stream = tcp::connect(&found).await?;
+                Ok(Port::start_tcp(
+                    stream,
+                    tcp::RULES,
+                    rx,
+                    DEFAULT_TX_CHANNEL_SIZE,
+                    tasks,
+                ))
+            }
+            IpLink::Udp => {
+                let peer = found[0];
+                let socket = udp::bind(&peer).await?;
+                let (port, task) = Port::with_task(
+                    TransportKind::Udp,
+                    None,
+                    udp::RULES,
+                    rx,
+                    DEFAULT_TX_CHANNEL_SIZE,
+                );
+                let run = task.run_datagram(socket, peer);
+                Ok(port.start(tasks, format_args!("twinleaf port udp://{peer}"), run))
+            }
+        }
     }
 
     /// Starts the task of a port over the TCP `stream` by `rules` on `tasks`.
@@ -548,22 +530,21 @@ impl Port {
             return Self::open_serial(url, rx, tasks);
         }
 
-        let split_url: Vec<&str> = url.splitn(2, "://").collect();
-        match split_url[..] {
+        if Port::opens_as_future(url) {
+            let (url, on) = (url.to_string(), tasks.clone());
+            return Supervisor::new().run("twinleaf port open", async move {
+                Port::open(&url, rx, &on).await
+            });
+        }
+        match url.split_once("://") {
             #[cfg(feature = "serial")]
-            ["serial", port] => Self::open_serial(port, rx, tasks),
+            Some(("serial", port)) => Self::open_serial(port, rx, tasks),
             #[cfg(not(feature = "serial"))]
-            ["serial", _] => Err(io::Error::new(
+            Some(("serial", _)) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "serial support is disabled",
             )),
-            ["tcp", addr] => Self::open_tcp(addr, AddrFamilyRestrict::Either, rx, tasks),
-            ["udp", addr] => Self::open_udp(addr, AddrFamilyRestrict::Either, rx, tasks),
-            ["tcp4", addr] => Self::open_tcp(addr, AddrFamilyRestrict::V4, rx, tasks),
-            ["udp4", addr] => Self::open_udp(addr, AddrFamilyRestrict::V4, rx, tasks),
-            ["tcp6", addr] => Self::open_tcp(addr, AddrFamilyRestrict::V6, rx, tasks),
-            ["udp6", addr] => Self::open_udp(addr, AddrFamilyRestrict::V6, rx, tasks),
-            _ => Err(io::Error::new(
+            Some(_) | None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid TIO transport locator: {url}"),
             )),
@@ -571,38 +552,27 @@ impl Port {
     }
 
     /// Opens a [`Port`] for `url` as [`new`](Self::new) does, without
-    /// blocking a worker of the runtime. A TCP link resolves its address and
-    /// connects as a future, and dropping it at any await leaves nothing
-    /// open. Its task runs on `tasks`. Any other link opens on a blocking
+    /// blocking a worker of the runtime. A TCP or UDP link resolves its
+    /// address and opens as a future, and dropping it at any await leaves
+    /// nothing open. Its task runs on `tasks`. Any other link opens on a blocking
     /// thread of `tasks`.
     ///
     /// # Errors
     ///
     /// Returns an error if `url` is not valid or the link cannot be opened.
     pub(crate) async fn open(url: &str, rx: Delivery, tasks: &Supervisor) -> io::Result<Port> {
-        let Some((address, family)) = tcp_address(url) else {
+        let Some((link, address, family)) = ip_address(url) else {
             let (url, on) = (url.to_string(), tasks.clone());
             let opening = tasks.spawn_blocking(move || Port::new_on(&url, rx, &on));
             return opening.await.map_err(io::Error::other)?;
         };
-        let address = match literal_addr(address, family) {
-            Some(address) => address,
-            None => find_addr_async(address, family).await?,
-        };
-        let stream = tcp::connect_async(address).await?;
-        Ok(Port::start_tcp(
-            stream,
-            tcp::RULES,
-            rx,
-            DEFAULT_TX_CHANNEL_SIZE,
-            tasks,
-        ))
+        Port::open_ip(link, address, family, rx, tasks).await
     }
 
     /// Returns `true` if dropping an [`open`](Self::open) of `url` in flight
-    /// leaves nothing open, as for a TCP link.
+    /// leaves nothing open, as for a TCP or UDP link.
     pub(crate) fn opens_as_future(url: &str) -> bool {
-        tcp_address(url).is_some()
+        ip_address(url).is_some()
     }
 
     /// Closes the port. Waits until its task has written what was queued and
@@ -851,7 +821,7 @@ mod tests {
         drop(listener);
 
         let started = Instant::now();
-        let refused = tcp::connect(&address).map(drop);
+        let refused = rt::handle().block_on(tcp::connect(&[address])).map(drop);
 
         let took = started.elapsed();
         assert_eq!(
@@ -1382,18 +1352,41 @@ mod tests {
         (port, peer, results)
     }
 
-    /// An address written as an IP address resolves without a lookup, with
-    /// the default port when it names none. A name does not.
+    /// An address that names no port gets the default one, in brackets for
+    /// an IPv6 address. One that names a port keeps it.
     #[test]
-    fn a_literal_address_resolves_without_a_lookup() {
-        let either = AddrFamilyRestrict::Either;
-        let resolved = |address: &str| Some(address.parse::<SocketAddr>().unwrap());
-        assert_eq!(literal_addr("10.0.0.2", either), resolved("10.0.0.2:7855"));
-        assert_eq!(literal_addr("10.0.0.2:99", either), resolved("10.0.0.2:99"));
-        assert_eq!(literal_addr("::1", either), resolved("[::1]:7855"));
-        assert_eq!(literal_addr("[::1]:99", either), resolved("[::1]:99"));
-        assert_eq!(literal_addr("10.0.0.2", AddrFamilyRestrict::V6), None);
-        assert_eq!(literal_addr("sensor.local", either), None);
+    fn an_address_without_a_port_gets_the_default() {
+        assert_eq!(with_port("10.0.0.2"), "10.0.0.2:7855");
+        assert_eq!(with_port("10.0.0.2:99"), "10.0.0.2:99");
+        assert_eq!(with_port("::1"), "[::1]:7855");
+        assert_eq!(with_port("[::1]"), "[::1]:7855");
+        assert_eq!(with_port("[::1]:99"), "[::1]:99");
+        assert_eq!(with_port("sensor.example"), "sensor.example:7855");
+        assert_eq!(with_port("sensor.example:99"), "sensor.example:99");
+    }
+
+    /// A name resolves to every address of the IP version its scheme allows,
+    /// and a connect goes on to the next address when one refuses.
+    #[test]
+    fn a_connect_tries_each_address_the_name_resolves_to() {
+        let resolved = rt::handle().block_on(resolve("localhost:99", AddrFamilyRestrict::V4));
+        assert!(resolved
+            .unwrap()
+            .iter()
+            .all(|found| found.is_ipv4() && found.port() == 99));
+        let ip_v6 = rt::handle().block_on(resolve("127.0.0.1", AddrFamilyRestrict::V6));
+        assert_eq!(
+            ip_v6.map_err(|error| error.kind()),
+            Err(io::ErrorKind::NotFound)
+        );
+
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refusing = closed.local_addr().unwrap();
+        drop(closed);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let answering = listener.local_addr().unwrap();
+        let connected = rt::handle().block_on(tcp::connect(&[refusing, answering]));
+        assert_eq!(connected.unwrap().peer_addr().unwrap(), answering);
     }
 
     /// A TCP port opened as a future connects without a blocking thread, and

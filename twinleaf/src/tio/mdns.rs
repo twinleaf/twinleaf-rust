@@ -51,7 +51,7 @@ pub(crate) fn daemon() -> Result<ServiceDaemon, mdns_sd::Error> {
 /// nothing in time or the daemon cannot start. Skips an IPv6 link-local
 /// address that comes without its interface. Dropping the future stops the
 /// search. Must be called on the crate's runtime.
-pub(crate) async fn resolve_async(host: &str, port: u16) -> Vec<SocketAddr> {
+pub(crate) async fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
     let name = format!("{host}.");
     let turn = lock(&RESOLVING).entry(name.clone()).or_default().clone();
     let _turn = turn.lock().await;
@@ -99,16 +99,6 @@ pub(crate) async fn resolve_async(host: &str, port: u16) -> Vec<SocketAddr> {
 fn unresolved(host: &str, error: impl std::fmt::Display) -> Vec<SocketAddr> {
     log::debug!("cannot resolve {host} over mDNS: {error}");
     Vec::new()
-}
-
-/// Resolves `host` over mDNS as [`resolve_async`] does, and blocks the
-/// calling thread while it waits. The caller must not be a task of the
-/// runtime.
-pub(crate) fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
-    let host = host.to_string();
-    let resolving = async move { Ok(resolve_async(&host, port).await) };
-    let resolved = Supervisor::new().run("twinleaf mdns resolve", resolving);
-    resolved.unwrap_or_default()
 }
 
 /// One search of the daemon for a name, which stops once dropped.
@@ -174,10 +164,10 @@ mod tests {
     async fn a_resolution_dropped_while_it_waits_gives_up_its_turn() {
         let host = "twinleaf-test-nobody-answers.local";
         let short = Duration::from_millis(100);
-        let _ = tokio::time::timeout(short, resolve_async(host, 7855)).await;
+        let _ = tokio::time::timeout(short, resolve(host, 7855)).await;
 
         let began = std::time::Instant::now();
-        let next = tokio::time::timeout(RESOLVE_TIMEOUT * 2, resolve_async(host, 7855)).await;
+        let next = tokio::time::timeout(RESOLVE_TIMEOUT * 2, resolve(host, 7855)).await;
 
         assert_eq!(next, Ok(Vec::new()), "the dropped resolution kept its turn");
         assert!(began.elapsed() < RESOLVE_TIMEOUT + short);
