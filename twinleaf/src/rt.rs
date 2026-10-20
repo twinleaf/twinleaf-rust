@@ -14,7 +14,7 @@
 //!
 //! A [`Supervisor`] spawns tasks, logs a task that panics, waits for its
 //! tasks to end, and can end the ones still running. A caller outside the runtime waits for a task on a
-//! `oneshot` or flume channel that the task answers on or drops.
+//! flume channel that the task answers on or drops.
 //!
 //! A child process forked after the runtime started has none of its
 //! threads. The child panics on its first use of the runtime.
@@ -144,7 +144,7 @@ impl Supervisor {
         task: &str,
         future: impl Future<Output = io::Result<T>> + Send + 'static,
     ) -> io::Result<T> {
-        let (answer, answered) = oneshot::channel();
+        let (answer, answered) = flume::bounded(1);
         self.spawn(task, async move {
             let _ = answer.send(future.await);
         });

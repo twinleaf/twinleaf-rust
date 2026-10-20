@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::JoinMap;
@@ -758,35 +758,26 @@ mod tests {
         /// blocking until it is done.
         pub(crate) fn close_all_blocking(&self, within: Duration) -> bool {
             let closed = self.ask(|reply| Request::CloseAll { within, reply });
-            closed.recv().unwrap_or(true)
+            closed.blocking_recv().unwrap_or(true)
         }
 
         /// Makes the registry panic.
         pub(crate) fn panic(&self) {
-            let _ = self.inspect(|_| panic!("a test asked the registry to panic"));
+            drop(self.inspect(|_| panic!("a test asked the registry to panic")));
         }
 
         /// Returns a lease on the link to `url` as [`acquire`](Self::acquire)
         /// does, blocking until the registry answers.
-        ///
-        /// # Panics
-        ///
-        /// Panics if the registry does not answer within the time a test
-        /// waits.
         pub(crate) fn acquire_blocking(&self, url: &str) -> Result<Lease, Refusal> {
             let (url, key) = (url.to_string(), worker::device_key(url));
             let acquired = self.ask(|reply| Request::Acquire { url, key, reply });
-            match acquired.recv_timeout(WAIT) {
-                Ok(acquired) => acquired,
-                Err(oneshot::RecvTimeoutError::Disconnected) => Err(stopping()),
-                Err(oneshot::RecvTimeoutError::Timeout) => panic!("the registry did not answer"),
-            }
+            acquired.blocking_recv().unwrap_or_else(|_| Err(stopping()))
         }
 
         /// Returns the URLs of every open link, in order.
         pub(crate) fn urls(&self) -> Vec<String> {
             let urls = self.inspect(|registry| registry.urls());
-            urls.recv().unwrap_or_default()
+            urls.blocking_recv().unwrap_or_default()
         }
 
         /// Returns the total number of leases on the open links.
@@ -795,7 +786,7 @@ mod tests {
                 let open = registry.links.values().filter(|entry| !entry.closed);
                 open.map(|entry| entry.users).sum()
             });
-            users.recv().unwrap_or_default()
+            users.blocking_recv().unwrap_or_default()
         }
 
         /// Files the link to `url` under `key`, where `url` no longer finds
@@ -812,7 +803,7 @@ mod tests {
                 let entry = open.find(|entry| entry.key == from);
                 entry.map(|entry| entry.key = to).is_some()
             });
-            assert!(rekeyed.recv().unwrap_or(false), "no link to rekey");
+            assert!(rekeyed.blocking_recv().unwrap_or(false), "no link to rekey");
         }
 
         /// Blocks for at most `timeout` until no link's task is running.
@@ -820,7 +811,10 @@ mod tests {
         /// ended.
         pub(crate) fn wait_finished(&self, timeout: Duration) -> bool {
             let deadline = std::time::Instant::now() + timeout;
-            while let Ok(false) = self.inspect(|registry| registry.links.is_empty()).recv() {
+            while let Ok(false) = self
+                .inspect(|registry| registry.links.is_empty())
+                .blocking_recv()
+            {
                 if std::time::Instant::now() >= deadline {
                     return false;
                 }

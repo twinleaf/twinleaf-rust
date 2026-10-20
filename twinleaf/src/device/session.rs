@@ -563,15 +563,15 @@ impl Handle {
         &self.session
     }
 
-    /// Submits a call and returns a oneshot that receives its outcome. See
+    /// Submits a call and returns a channel that receives its outcome. See
     /// [`submit_with`](Self::submit_with) to run something else with it.
     pub(crate) fn submit(
         &self,
         route: DeviceRoute,
         name: &str,
         args: &[u8],
-    ) -> oneshot::Receiver<RawCallResult> {
-        let (resolve, reply) = oneshot::channel();
+    ) -> flume::Receiver<RawCallResult> {
+        let (resolve, reply) = flume::bounded(1);
         self.submit_with(
             route,
             name,
@@ -1443,7 +1443,10 @@ mod tests {
 
         let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
 
-        assert!(matches!(reply.await, Ok(Err(CallError::Timeout))));
+        assert!(matches!(
+            reply.recv_async().await,
+            Ok(Err(CallError::Timeout))
+        ));
         assert_took(started.elapsed(), DEFAULT_RPC_TIMEOUT, "the call");
     }
 
@@ -1469,15 +1472,24 @@ mod tests {
         let calls = [call(long), call(short), call(middle)];
 
         let [long_reply, short_reply, middle_reply] = calls;
-        assert!(matches!(short_reply.await, Ok(Err(CallError::Timeout))));
+        assert!(matches!(
+            short_reply.recv_async().await,
+            Ok(Err(CallError::Timeout))
+        ));
         assert_took(started.elapsed(), short, "the earliest call");
         assert!(matches!(
             long_reply.try_recv(),
-            Err(oneshot::TryRecvError::Empty)
+            Err(flume::TryRecvError::Empty)
         ));
-        assert!(matches!(middle_reply.await, Ok(Err(CallError::Timeout))));
+        assert!(matches!(
+            middle_reply.recv_async().await,
+            Ok(Err(CallError::Timeout))
+        ));
         assert_took(started.elapsed(), middle, "the middle call");
-        assert!(matches!(long_reply.await, Ok(Err(CallError::Timeout))));
+        assert!(matches!(
+            long_reply.recv_async().await,
+            Ok(Err(CallError::Timeout))
+        ));
         assert_took(started.elapsed(), long, "the latest call");
     }
 }
