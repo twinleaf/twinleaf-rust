@@ -11,7 +11,7 @@ use crate::rt::{self, sleep_until_some, Supervisor};
 use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::future::{self, Future};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -20,9 +20,9 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
-use tokio::task::{self, JoinError, JoinSet};
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::JoinMap;
 
 /// How long stopping waits for clients to close their transports.
 const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -162,8 +162,7 @@ impl Shared {
             notices: mailbox,
             clients: BTreeMap::new(),
             table,
-            sessions: JoinSet::new(),
-            ids: HashMap::new(),
+            sessions: JoinMap::new(),
             next_id: 1,
             idle_at: Instant::now() + IDLE,
             retry_at: None,
@@ -244,9 +243,7 @@ pub(super) struct Server {
     /// The publisher of `clients`.
     table: watch::Sender<Vec<ClientInfo>>,
     /// The task of each client.
-    sessions: JoinSet<Option<()>>,
-    /// The client of each task in `sessions`.
-    ids: HashMap<task::Id, u64>,
+    sessions: JoinMap<u64, Option<()>>,
     next_id: u64,
     /// When a proxy that exits once idle exits, if no client connects
     /// before.
@@ -296,7 +293,7 @@ impl Server {
                     Some(notice) => self.notice(notice),
                     None => return,
                 },
-                Some(joined) = self.sessions.join_next_with_id() => self.joined(joined),
+                Some((id, _outcome)) = self.sessions.join_next() => self.joined(id),
                 () = sleep_until_some(self.retry_at) => self.retry_at = None,
                 () = sleep_until_some(idle_at) => self.idle_out(),
                 () = sleep_until_some(self.abort_at) => {
@@ -331,17 +328,9 @@ impl Server {
         }
     }
 
-    /// Removes the client whose task ended with `joined` from the table. The
-    /// idle time of a proxy that exits once idle starts when the last client
-    /// leaves.
-    fn joined(&mut self, joined: Result<(task::Id, Option<()>), JoinError>) {
-        let task = match &joined {
-            Ok((task, _)) => *task,
-            Err(error) => error.id(),
-        };
-        let Some(id) = self.ids.remove(&task) else {
-            return;
-        };
+    /// Removes the client whose task ended. The idle time starts when the
+    /// last client's task leaves.
+    fn joined(&mut self, id: u64) {
         self.clients.remove(&id);
         self.publish();
         if self.clients.is_empty() {
@@ -388,11 +377,9 @@ impl Server {
         let stop = self.shared.stop.child_token();
         let session = Session::new(self.shared.clone(), id, peer, port, incoming, stop);
         let task = format_args!("proxy client {id}");
-        let task = self
-            .shared
+        self.shared
             .tasks
-            .spawn_in(&mut self.sessions, task, session.run());
-        self.ids.insert(task.id(), id);
+            .spawn_in_map(&mut self.sessions, id, task, session.run());
     }
 
     /// Exits a proxy that has had no client for [`IDLE`]. Each connection
