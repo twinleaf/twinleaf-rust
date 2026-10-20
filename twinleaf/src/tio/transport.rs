@@ -358,6 +358,18 @@ enum PacketOrControl {
     Pkt(Packet),
     /// A rate change, with where its result goes.
     SetRate(u32, oneshot::Sender<io::Result<()>>),
+    /// The start of the heartbeats and the quiet limit both ends agreed on.
+    KeepAlive(KeepAlive),
+}
+
+/// How a link proves both of its ends alive, once they agree to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeepAlive {
+    /// What this end sends after `every` without sending.
+    pub beat: fn() -> Packet,
+    pub every: Duration,
+    /// How long the link may go without receiving before it is given up.
+    pub quiet: Duration,
 }
 
 /// One link and the task that drives it. Packets arrive on a channel and
@@ -688,6 +700,13 @@ impl Port {
     /// change.
     pub(crate) fn rate_info(&self) -> Option<RateInfo> {
         self.rates.clone()
+    }
+
+    /// Has the link send heartbeats and give up a quiet peer from now on, as
+    /// `keep_alive` says. A port whose task has stopped has nothing to keep
+    /// alive, and its receiver hears that it ended.
+    pub(crate) async fn keep_alive(&self, keep_alive: KeepAlive) {
+        let _ = self.tx.send(PacketOrControl::KeepAlive(keep_alive)).await;
     }
 
     /// Sets the link's data rate on the host side, once the packets queued
@@ -1029,6 +1048,37 @@ mod tests {
             stuck.gone.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    /// A kept alive port sends its beat while idle, stays open while its peer
+    /// sends, and gives the peer up once it has been quiet too long.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_alive_port_beats_and_gives_up_a_quiet_peer() {
+        let (send, receive) = flume::unbounded();
+        let (port, mut peer) = Port::fake(TransportKind::Tcp, None, send);
+        let keep_alive = KeepAlive {
+            beat: Packet::alive,
+            every: Duration::from_secs(1),
+            quiet: Duration::from_secs(5),
+        };
+        port.keep_alive(keep_alive).await;
+        let kept = tokio::time::Instant::now();
+
+        for _ in 0..8 {
+            let beat = peer.recv().await.expect("the port beats");
+            assert!(matches!(
+                beat.payload(),
+                packet::Payload::ProxyRx(packet::ProxyRx::Alive)
+            ));
+            peer.send(&Packet::heartbeat(proto::DeviceRoute::root()))
+                .await;
+        }
+        assert_eq!(kept.elapsed(), Duration::from_secs(8));
+        let quiet = tokio::time::Instant::now();
+        while let Ok(Ok(_)) = receive.recv_async().await {}
+
+        assert_eq!(quiet.elapsed(), keep_alive.quiet);
+        assert!(peer.released());
     }
 
     /// A terminal read error is reported once and releases the link even

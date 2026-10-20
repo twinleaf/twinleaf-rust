@@ -62,6 +62,7 @@ static DEFAULT_RATE: u32 = 115200;
 /// 200 ms for the rest of their frame are discarded as stale.
 pub(super) const RULES: Rules = Rules {
     heartbeat: Some(Duration::from_millis(100)),
+    quiet: None,
     holdoff: Some(Duration::from_millis(50)),
     stale_after: Some(Duration::from_millis(200)),
     half_close: None,
