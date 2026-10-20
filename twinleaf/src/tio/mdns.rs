@@ -1,5 +1,5 @@
-//! The process's one mDNS daemon. Discovery browses with it, and the
-//! transports resolve `.local` names with it.
+//! The process's one mDNS daemon, which the transports resolve `.local`
+//! names with.
 
 use crate::rt::Supervisor;
 use mdns_sd::{HostnameResolutionEvent, Receiver, ScopedIp, ServiceDaemon};

@@ -17,14 +17,14 @@ use crate::rt::{BoxFuture, Supervisor};
 #[doc(inline)]
 pub use crate::tio::transport::{enumerate_serial, DiscoveredDevice, PortInterface};
 use std::collections::{BTreeSet, HashMap};
+use std::convert::Infallible;
 use std::io;
-#[cfg(feature = "mdns")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
-use tokio_util::sync::CancellationToken;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::{StreamExt, StreamMap};
 
 /// What a discovery session looks for and how far it probes.
 #[derive(Debug, Clone, Copy)]
@@ -99,8 +99,8 @@ pub enum DiscoveryEvent {
 #[derive(Debug)]
 pub struct Discovery {
     events: flume::Receiver<DiscoveryEvent>,
-    /// Stops every task of the session once cancelled.
-    stop: CancellationToken,
+    /// Ends the session's scan and browse once dropped.
+    lifelines: Vec<oneshot::Sender<Infallible>>,
     tasks: Supervisor,
 }
 
@@ -128,7 +128,6 @@ impl Discovery {
     /// `backend` to list ports and open probes, and its tasks on `tasks`.
     fn start_with(config: DiscoveryConfig, backend: Backend, tasks: &Supervisor) -> Discovery {
         let (tx, events) = flume::unbounded();
-        let stop = CancellationToken::new();
 
         let serial = (backend.list)();
         for device in &serial {
@@ -136,22 +135,28 @@ impl Discovery {
         }
         let probing = config.probe_names.then(|| backend.clone());
 
-        let probes = Probes::new(probing.clone(), tasks, &stop);
-        let scan = scan_serial(serial, backend, probes, tx.clone());
+        let (scanning, alive) = oneshot::channel();
+        let probes = Probes::new(probing.clone(), tasks);
+        let scan = scan_serial(serial, backend, probes, tx.clone(), alive);
         tasks.spawn("twinleaf discovery serial", scan);
 
         #[cfg(feature = "mdns")]
-        if config.network {
-            let probes = Probes::new(probing, tasks, &stop);
-            let browse = browse_network(tx, probes, config.prefer_udp);
+        let browsing = config.network.then(|| {
+            let (browsing, alive) = oneshot::channel();
+            let probes = Probes::new(probing, tasks);
+            let browse = browse_network(tx, probes, config.prefer_udp, alive);
             tasks.spawn("twinleaf discovery network", browse);
-        }
+            browsing
+        });
         #[cfg(not(feature = "mdns"))]
-        let _ = config.network;
+        let browsing = {
+            let _ = config.network;
+            None
+        };
 
         Discovery {
             events,
-            stop,
+            lifelines: [Some(scanning), browsing].into_iter().flatten().collect(),
             tasks: tasks.clone(),
         }
     }
@@ -165,7 +170,7 @@ impl Discovery {
 
 impl Drop for Discovery {
     fn drop(&mut self) {
-        self.stop.cancel();
+        self.lifelines.clear();
         let tasks = self.tasks.clone();
         let ended = Supervisor::new().run("twinleaf discovery stop", async move {
             let waited = tokio::time::timeout(STOP_TIMEOUT, tasks.wait()).await;
@@ -283,8 +288,9 @@ async fn scan_serial(
     backend: Backend,
     mut probes: Probes,
     tx: flume::Sender<DiscoveryEvent>,
+    mut alive: oneshot::Receiver<Infallible>,
 ) {
-    let (tasks, stop) = (probes.tasks.clone(), probes.stop.clone());
+    let tasks = probes.tasks.clone();
     let mut ports: Vec<String> = Vec::new();
     for device in known {
         if recognized(&device) {
@@ -296,7 +302,7 @@ async fn scan_serial(
     scans.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         let current = tokio::select! {
-            () = stop.cancelled() => return,
+            _ = &mut alive => return,
             event = probes.report() => {
                 if tx.send(event).is_err() {
                     return;
@@ -343,27 +349,19 @@ struct Probes {
     backend: Option<Backend>,
     /// Runs the owner and its probes.
     tasks: Supervisor,
-    /// The session's token. Each probe's token is a child of it.
-    stop: CancellationToken,
-    /// The token of each current probe, by URL.
-    running: HashMap<String, CancellationToken>,
-    /// Where the probes send their events, each with the probe's token.
-    reports: mpsc::UnboundedSender<(CancellationToken, DiscoveryEvent)>,
-    reported: mpsc::UnboundedReceiver<(CancellationToken, DiscoveryEvent)>,
+    /// The events of each current probe, by URL. A probe ends once its
+    /// events have no receiver.
+    running: StreamMap<String, UnboundedReceiverStream<DiscoveryEvent>>,
 }
 
 impl Probes {
-    /// Creates an empty set that probes with `backend` on `tasks` until
-    /// `stop` is cancelled, or starts no probe with `None`.
-    fn new(backend: Option<Backend>, tasks: &Supervisor, stop: &CancellationToken) -> Probes {
-        let (reports, reported) = mpsc::unbounded_channel();
+    /// Creates an empty set that probes with `backend` on `tasks`, or starts
+    /// no probe with `None`. Dropping it ends its probes.
+    fn new(backend: Option<Backend>, tasks: &Supervisor) -> Probes {
         Probes {
             backend,
             tasks: tasks.clone(),
-            stop: stop.clone(),
-            running: HashMap::new(),
-            reports,
-            reported,
+            running: StreamMap::new(),
         }
     }
 
@@ -373,45 +371,36 @@ impl Probes {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        let (reports, reported) = mpsc::unbounded_channel();
+        let unheard = reports.clone();
         let reporter = Reporter {
             url: url.to_string(),
-            probe: self.stop.child_token(),
-            reports: self.reports.clone(),
+            reports,
         };
-        let probe = reporter.probe.clone();
-        let task = format_args!("twinleaf probe {url}");
-        self.tasks.spawn(task, run_probe(backend, reporter));
-        if let Some(old) = self.running.insert(url.to_string(), probe) {
-            old.cancel();
-        }
+        let probe = async move {
+            tokio::select! {
+                () = unheard.closed() => {}
+                () = run_probe(backend, reporter) => {}
+            }
+        };
+        self.tasks
+            .spawn(format_args!("twinleaf probe {url}"), probe);
+        let reported = UnboundedReceiverStream::new(reported);
+        self.running.insert(url.to_string(), reported);
     }
 
     /// Retires the probe of `url`, if it has one. Nothing it reports is
     /// forwarded once this returns.
     fn retire(&mut self, url: &str) {
-        if let Some(probe) = self.running.remove(url) {
-            probe.cancel();
-        }
+        self.running.remove(url);
     }
 
-    /// Waits for the next report of a probe that is still current, and
-    /// returns its event. Drops the reports of retired probes.
+    /// Waits for the next report of a current probe, and returns its event.
+    /// Never returns while no probe runs.
     async fn report(&mut self) -> DiscoveryEvent {
-        while let Some((probe, event)) = self.reported.recv().await {
-            if !probe.is_cancelled() {
-                return event;
-            }
-        }
-        // `self` holds a sender, so the channel never closes.
-        std::future::pending().await
-    }
-}
-
-/// Retires every current probe when the owner ends.
-impl Drop for Probes {
-    fn drop(&mut self) {
-        for probe in self.running.values() {
-            probe.cancel();
+        match self.running.next().await {
+            Some((_, event)) => event,
+            None => std::future::pending().await,
         }
     }
 }
@@ -420,7 +409,7 @@ impl Drop for Probes {
 enum Interrupt {
     /// The connection ended. The probe opens another.
     Ended,
-    /// The probe was retired, or its owner ended. The probe ends.
+    /// Its owner retired it or ended. The probe ends.
     Stopped,
 }
 
@@ -428,18 +417,15 @@ enum Interrupt {
 struct Reporter {
     /// The device's URL.
     url: String,
-    /// The probe's token. Its owner cancels it to retire the probe.
-    probe: CancellationToken,
-    reports: mpsc::UnboundedSender<(CancellationToken, DiscoveryEvent)>,
+    reports: mpsc::UnboundedSender<DiscoveryEvent>,
 }
 
 impl Reporter {
     /// Sends `event` to the probe's owner.
     ///
-    /// Returns [`Interrupt::Stopped`] if its owner ended.
+    /// Returns [`Interrupt::Stopped`] if its owner retired it or ended.
     fn send(&self, event: DiscoveryEvent) -> Result<(), Interrupt> {
-        let report = (self.probe.clone(), event);
-        self.reports.send(report).map_err(|_| Interrupt::Stopped)
+        self.reports.send(event).map_err(|_| Interrupt::Stopped)
     }
 }
 
@@ -448,17 +434,13 @@ impl Reporter {
 /// the open fails or the connection ends. Each failed open doubles the delay
 /// and the time the next open may take, up to [`RETRY_MAX`].
 async fn run_probe(backend: Backend, reporter: Reporter) {
-    let (url, stop) = (&reporter.url, &reporter.probe);
+    let url = &reporter.url;
     let mut delay = backend.retry;
     // A link that only probes use closes when its probe gives up, so a
     // device that is slow to answer gets more time at each try.
     let mut patience = PROBE_TIMEOUT;
     loop {
-        let opening = (backend.open)(url.clone(), patience);
-        let Some(opened) = stop.run_until_cancelled(opening).await else {
-            return;
-        };
-        match opened {
+        match (backend.open)(url.clone(), patience).await {
             Ok(connection) => {
                 (delay, patience) = (backend.retry, PROBE_TIMEOUT);
                 match watch(&connection, backend.period, &reporter).await {
@@ -468,10 +450,7 @@ async fn run_probe(backend: Backend, reporter: Reporter) {
             }
             Err(error) => log::debug!("could not probe {url}: {error}"),
         }
-        let waited = stop.run_until_cancelled(tokio::time::sleep(delay)).await;
-        if waited.is_none() {
-            return;
-        }
+        tokio::time::sleep(delay).await;
         delay = (delay * 2).min(RETRY_MAX);
         patience = (patience * 2).min(RETRY_MAX);
     }
@@ -481,14 +460,13 @@ async fn run_probe(backend: Backend, reporter: Reporter) {
 /// every `period`, and reports the root's name and the subdevices to
 /// `reporter` when they change. Returns why it stopped.
 async fn watch(connection: &Connection, period: Duration, reporter: &Reporter) -> Interrupt {
-    let stop = &reporter.probe;
     let root = DeviceRoute::root();
     let tree = connection.tree(root).with_timeout(PROBE_TIMEOUT);
     let mut names: HashMap<DeviceRoute, String> = HashMap::new();
     let mut named: Option<String> = None;
     let mut reported: Option<Vec<NamedRoute>> = None;
     loop {
-        let mut heard = match heard_routes(connection, ROUTE_DISCOVERY_WINDOW, stop).await {
+        let mut heard = match heard_routes(connection, ROUTE_DISCOVERY_WINDOW).await {
             Ok(heard) => heard,
             Err(interrupt) => return interrupt,
         };
@@ -499,10 +477,7 @@ async fn watch(connection: &Connection, period: Duration, reporter: &Reporter) -
             if names.contains_key(route) {
                 continue;
             }
-            let Some(name) = stop.run_until_cancelled(device_name(&tree, *route)).await else {
-                return Interrupt::Stopped;
-            };
-            if let Some(name) = name {
+            if let Some(name) = device_name(&tree, *route).await {
                 names.insert(*route, name);
             }
         }
@@ -542,22 +517,17 @@ async fn watch(connection: &Connection, period: Duration, reporter: &Reporter) -
             reported = Some(routes);
         }
 
-        let waited = stop.run_until_cancelled(tokio::time::sleep(period)).await;
-        if waited.is_none() {
-            return Interrupt::Stopped;
-        }
+        tokio::time::sleep(period).await;
     }
 }
 
 /// Listens to `connection` for `window` and returns the routes it heard
 /// from.
 ///
-/// Returns an [`Interrupt`] if the connection ends or `stop` is cancelled
-/// first.
+/// Returns [`Interrupt::Ended`] if the connection ends first.
 async fn heard_routes(
     connection: &Connection,
     window: Duration,
-    stop: &CancellationToken,
 ) -> Result<BTreeSet<DeviceRoute>, Interrupt> {
     let packets = connection.packets();
     let deadline = Instant::now() + window;
@@ -566,7 +536,6 @@ async fn heard_routes(
         let received = tokio::select! {
             received = packets.recv_async() => received,
             () = tokio::time::sleep_until(deadline) => return Ok(heard),
-            () = stop.cancelled() => return Err(Interrupt::Stopped),
         };
         match received {
             Ok(packet) if packet.link_status().is_none() => {
@@ -681,16 +650,22 @@ fn sync_instance(
 /// receives events. Starts browsing on a blocking thread, announces
 /// instances as they resolve, move, or leave, and probes each with `probes`.
 #[cfg(feature = "mdns")]
-async fn browse_network(tx: flume::Sender<DiscoveryEvent>, mut probes: Probes, prefer_udp: bool) {
-    use mdns_sd::ServiceEvent;
+async fn browse_network(
+    tx: flume::Sender<DiscoveryEvent>,
+    mut probes: Probes,
+    prefer_udp: bool,
+    mut alive: oneshot::Receiver<Infallible>,
+) {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
 
-    let (tasks, stop) = (probes.tasks.clone(), probes.stop.clone());
+    let tasks = probes.tasks.clone();
 
     let started = tasks.spawn_blocking(|| {
-        let browser = Browser::start().map_err(|error| format!("mDNS daemon: {error}"))?;
+        let daemon = ServiceDaemon::new().map_err(|error| format!("mDNS daemon: {error}"))?;
+        let browser = Browser(daemon);
         let receivers: Vec<_> = TWINLEAF_MDNS_SERVICES
             .iter()
-            .filter_map(|service| browser.daemon.browse(service).ok())
+            .filter_map(|service| browser.0.browse(service).ok())
             .collect();
         match receivers.is_empty() {
             true => Err("no mDNS service type could be browsed".to_string()),
@@ -707,9 +682,9 @@ async fn browse_network(tx: flume::Sender<DiscoveryEvent>, mut probes: Probes, p
     // unbounded queue until discovery stops.
     let (found, mut events) = mpsc::unbounded_channel();
     for receiver in receivers {
-        let (found, stop) = (found.clone(), stop.clone());
+        let found = found.clone();
         tasks.spawn("twinleaf discovery mdns", async move {
-            while let Some(Ok(event)) = stop.run_until_cancelled(receiver.recv_async()).await {
+            while let Ok(event) = receiver.recv_async().await {
                 if found.send(event).is_err() {
                     break;
                 }
@@ -722,7 +697,7 @@ async fn browse_network(tx: flume::Sender<DiscoveryEvent>, mut probes: Probes, p
     let preferred = if prefer_udp { "udp" } else { "tcp" };
     loop {
         let event = tokio::select! {
-            () = stop.cancelled() => break,
+            _ = &mut alive => break,
             event = probes.report() => {
                 if tx.send(event).is_err() {
                     break;
@@ -766,63 +741,15 @@ async fn browse_network(tx: flume::Sender<DiscoveryEvent>, mut probes: Probes, p
     tasks.spawn_blocking(move || drop(browser));
 }
 
-/// Set while a discovery session browses with the process's shared mDNS
-/// daemon.
+/// The mDNS daemon of one discovery session's browse. Dropping it shuts the
+/// daemon down, which stops the browsing.
 #[cfg(feature = "mdns")]
-static BROWSING: AtomicBool = AtomicBool::new(false);
-
-/// The mDNS daemon a discovery session browses with. Dropping it stops the
-/// browsing.
-#[cfg(feature = "mdns")]
-struct Browser {
-    daemon: mdns_sd::ServiceDaemon,
-    /// Whether the daemon is the process's shared one.
-    shared: bool,
-}
-
-#[cfg(feature = "mdns")]
-impl Browser {
-    /// Returns the process's shared daemon to browse with, or a daemon of
-    /// its own if another session browses with the shared one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the daemon cannot start.
-    fn start() -> Result<Browser, mdns_sd::Error> {
-        // The daemon keeps one listener per service type, so two sessions
-        // browsing one daemon would steal each other's events.
-        let claimed = BROWSING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
-        if claimed.is_err() {
-            let daemon = mdns_sd::ServiceDaemon::new()?;
-            return Ok(Browser {
-                daemon,
-                shared: false,
-            });
-        }
-        match crate::tio::mdns::daemon() {
-            Ok(daemon) => Ok(Browser {
-                daemon,
-                shared: true,
-            }),
-            Err(error) => {
-                BROWSING.store(false, Ordering::Release);
-                Err(error)
-            }
-        }
-    }
-}
+struct Browser(mdns_sd::ServiceDaemon);
 
 #[cfg(feature = "mdns")]
 impl Drop for Browser {
     fn drop(&mut self) {
-        if !self.shared {
-            let _ = self.daemon.shutdown();
-            return;
-        }
-        for service in TWINLEAF_MDNS_SERVICES {
-            let _ = self.daemon.stop_browse(service);
-        }
-        BROWSING.store(false, Ordering::Release);
+        let _ = self.0.shutdown();
     }
 }
 
@@ -1293,8 +1220,8 @@ mod tests {
 
     /// Stops `discovery` and waits for its tasks to end. Unlike its drop, it
     /// does not block the test's runtime.
-    async fn stop(discovery: Discovery) {
-        discovery.stop.cancel();
+    async fn stop(mut discovery: Discovery) {
+        discovery.lifelines.clear();
         discovery.tasks.wait().await;
     }
 
