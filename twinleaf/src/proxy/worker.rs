@@ -15,13 +15,13 @@
 //! never answered on is a failed attempt, and the ports hear nothing of it.
 //! Attempts run beside the ports' traffic and are tried each second.
 //!
-//! The worker stops when its first open fails, when its link is closed, or
-//! when a reconnect gives up after the reconnect timeout. Its ports hear a
-//! reconnect that gives up as
+//! The worker stops when its first open fails, when its command sender
+//! drops, or when a reconnect gives up after the reconnect timeout. Its ports
+//! hear a reconnect that gives up as
 //! [`FailedToReconnect`](crate::tio::packet::LinkStatus::FailedToReconnect).
-//! The worker records why it stopped in its [`Readiness`]. Its task ends once
-//! the device's port has let go of the device. An open in flight on a
-//! blocking thread runs to its end first. A TCP open in flight is dropped.
+//! Its task ends once the device's port has let go of the device. An open in
+//! flight on a blocking thread runs to its end first. A TCP open in flight is
+//! dropped.
 //!
 //! The worker negotiates the serial rate and fans what arrives out to its
 //! ports, each restricted to a subtree. It renumbers the RPCs the ports make
@@ -58,10 +58,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
-use tokio_util::sync::CancellationToken;
 
-/// Whether a link's worker has heard from its device, and whether it has
-/// stopped. The worker sets it, and the proxy's link table reads it.
+/// Whether a link's device has answered. The worker sets it, and the
+/// proxy's link table reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) enum Readiness {
     /// Nothing has arrived yet.
@@ -69,7 +68,7 @@ pub(super) enum Readiness {
     Pending,
     /// The device sent its first packet.
     Ready,
-    /// The worker stopped, for this reason.
+    /// The first open failed, for this reason.
     Failed(String),
 }
 
@@ -170,16 +169,14 @@ const COMMAND_LANE: usize = 64;
 
 /// Creates the worker of the device at `url`, which `open` opens. A lost
 /// device is retried for `reconnect_timeout`, or forever with `None`. The
-/// worker logs the traffic `dump` asks for. It stops once `stop` is
-/// cancelled or every command sender has dropped. Returns the command
-/// sender, the receiver of the worker's readiness, and the future that runs
-/// the worker as its link's task.
+/// worker logs the traffic `dump` asks for. It stops once every command
+/// sender has dropped. Returns the command sender, the receiver of the
+/// worker's readiness, and the future that runs the worker as its link's task.
 pub(super) fn new(
     url: &str,
     reconnect_timeout: Option<Duration>,
     dump: DumpFlags,
     open: Opener,
-    stop: CancellationToken,
 ) -> (
     mpsc::Sender<Command>,
     watch::Receiver<Readiness>,
@@ -194,7 +191,6 @@ pub(super) fn new(
         dump,
         readiness,
         open,
-        stop,
     );
     (commands, watched, worker.run())
 }
@@ -417,8 +413,6 @@ struct Worker {
     readiness: watch::Sender<Readiness>,
     /// What opens the device's port.
     open: Opener,
-    /// Cancelled once the link is closed, which stops the worker.
-    stop: CancellationToken,
 
     device: Option<Device>,
     /// The attempt in flight to reopen the device.
@@ -467,7 +461,7 @@ static SET_RATE_RPC_ID: u16 = 0x102;
 impl Worker {
     /// Creates the worker of the device at `url`, which `open` opens. It
     /// adopts the ports `command_queue` brings, reports its state in
-    /// `readiness`, and stops once `stop` is cancelled.
+    /// `readiness`, and stops once every command sender has dropped.
     fn new(
         url: String,
         reconnect_timeout: Option<Duration>,
@@ -475,7 +469,6 @@ impl Worker {
         dump: DumpFlags,
         readiness: watch::Sender<Readiness>,
         open: Opener,
-        stop: CancellationToken,
     ) -> Worker {
         Worker {
             log_target: format!("proxy::{url}"),
@@ -485,7 +478,6 @@ impl Worker {
             dump,
             readiness,
             open,
-            stop,
             device: None,
             attempt: None,
             ever_connected: false,
@@ -500,17 +492,6 @@ impl Worker {
             rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
         }
-    }
-
-    /// Sets the link's readiness, unless the worker has already stopped.
-    fn settle(&self, readiness: Readiness) {
-        self.readiness.send_if_modified(|current| {
-            let changes = !matches!(current, Readiness::Failed(_)) && *current != readiness;
-            if changes {
-                *current = readiness;
-            }
-            changes
-        });
     }
 
     /// Returns a future that opens the device's port.
@@ -743,7 +724,7 @@ impl Worker {
                         // Initial connect needs no wire status broadcast.
                         self.ever_connected = true;
                         log::trace!(target: &self.log_target, "Sensor connected");
-                        self.settle(Readiness::Ready);
+                        self.readiness.send_replace(Readiness::Ready);
                     }
                 }
                 log_device_packet(&pkt, self.dump);
@@ -1072,15 +1053,19 @@ impl Worker {
     /// down. A stop during an open that the opener lets the worker drop
     /// shuts the worker down at once.
     async fn run(mut self) {
-        let opening = self.open_device();
+        let mut opening = self.open_device();
         let opened = match self.open.droppable {
-            true => tokio::select! {
-                opened = opening => opened,
-                () = self.stop.cancelled() => {
-                    log::trace!(target: &self.log_target, "The link closed while it opened");
-                    self.settle(Readiness::Failed("the link closed".to_string()));
-                    self.shutdown().await;
-                    return;
+            true => loop {
+                tokio::select! {
+                    opened = &mut opening => break opened,
+                    command = self.command_queue.recv() => match command {
+                        Some(Command::OpenPort(subscriber)) => self.adopt(subscriber),
+                        None => {
+                            log::trace!(target: &self.log_target, "The link closed while it opened");
+                            self.shutdown().await;
+                            return;
+                        }
+                    },
                 }
             },
             false => opening.await,
@@ -1089,7 +1074,8 @@ impl Worker {
             Ok(device) => self.device = Some(device),
             Err(error) => {
                 log::debug!(target: &self.log_target, "Failed to connect: {error}");
-                self.settle(Readiness::Failed("failed to connect".to_string()));
+                let failed = Readiness::Failed("failed to connect".to_string());
+                self.readiness.send_replace(failed);
                 self.shutdown().await;
                 return;
             }
@@ -1127,7 +1113,6 @@ impl Worker {
                 "Stopping reconnection attempts due to timeout"
             );
             self.broadcast_status(packet::LinkStatus::FailedToReconnect);
-            self.settle(Readiness::Failed("failed to reconnect".to_string()));
             return ControlFlow::Break(());
         }
         let liveness = self.device.as_ref().and_then(Device::liveness_deadline);
@@ -1164,10 +1149,6 @@ impl Worker {
         let forwarding = self.device.as_ref().is_none_or(Device::safe_to_forward);
         let connected = self.device.is_some();
         tokio::select! {
-            () = self.stop.cancelled() => {
-                log::trace!(target: &self.log_target, "The link closed");
-                return ControlFlow::Break(());
-            }
             command = self.command_queue.recv() => match command {
                 Some(Command::OpenPort(subscriber)) => self.adopt(subscriber),
                 None => {
@@ -1202,11 +1183,12 @@ impl Worker {
         ControlFlow::Continue(())
     }
 
-    /// Fails every request still waiting. Waits for an attempt in flight to
-    /// reopen the device, or drops it if the opener allows. Closes the
-    /// device's port and waits until it has let go of the device, for at
-    /// most [`transport::CLOSE_TIMEOUT`]. Then drops the ports.
+    /// Refuses new ports and fails every request still waiting. Waits for an
+    /// attempt in flight to reopen the device, or drops it if the opener
+    /// allows. Closes the device's port and waits until it has let go of the
+    /// device, for at most [`transport::CLOSE_TIMEOUT`]. Then drops the ports.
     async fn shutdown(&mut self) {
+        self.command_queue.close();
         self.dispatch_rpc_errors(RpcFailure::ProxyClosed, None);
         // An open on a blocking thread cannot be stopped, and the device it
         // opens must be closed before the next worker opens it.
@@ -1226,14 +1208,6 @@ impl Worker {
         }
         self.inputs.clear();
         self.subscribers.clear();
-    }
-}
-
-/// Marks the link failed when the worker stops, unless the worker already
-/// recorded why.
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.settle(Readiness::Failed("the link closed".to_string()));
     }
 }
 
@@ -1376,16 +1350,7 @@ mod tests {
         let (_commands, command_queue) = mpsc::channel(1);
         let (readiness, _) = watch::channel(Readiness::Pending);
         let dump = DumpFlags::default();
-        let stop = CancellationToken::new();
-        Worker::new(
-            String::new(),
-            None,
-            command_queue,
-            dump,
-            readiness,
-            never(),
-            stop,
-        )
+        Worker::new(String::new(), None, command_queue, dump, readiness, never())
     }
 
     /// The depth of the queue a test port is delivered to.
@@ -1460,7 +1425,7 @@ mod tests {
         let dump = DumpFlags::default();
         let tasks = Supervisor::new();
         let open = opener(&tasks, &url);
-        let (commands, _readiness, run) = new(&url, None, dump, open, CancellationToken::new());
+        let (commands, _readiness, run) = new(&url, None, dump, open);
         let worker = tasks.spawn("a test worker", run);
         let (mut device, _) = listener.accept().unwrap();
 
@@ -1701,8 +1666,6 @@ mod tests {
         to_device: mpsc::Sender<Packet>,
         /// What the port is delivered.
         port: mpsc::Receiver<Packet>,
-        /// Closes the link once cancelled.
-        stop: CancellationToken,
         task: JoinHandle<Option<()>>,
     }
 
@@ -1713,7 +1676,6 @@ mod tests {
         fn start(open: Opener, reconnect_timeout: Option<Duration>) -> Running {
             let (commands, command_queue) = mpsc::channel(4);
             let (readiness, watched) = watch::channel(Readiness::Pending);
-            let stop = CancellationToken::new();
             let mut worker = Worker::new(
                 "fake".to_string(),
                 reconnect_timeout,
@@ -1721,7 +1683,6 @@ mod tests {
                 DumpFlags::default(),
                 readiness,
                 open,
-                stop.clone(),
             );
             let (to_port, port) = mpsc::channel(DELIVERED);
             let (to_device, rx) = mpsc::channel(4);
@@ -1732,7 +1693,6 @@ mod tests {
                 readiness: watched,
                 to_device,
                 port,
-                stop,
                 task,
             }
         }
@@ -1934,7 +1894,7 @@ mod tests {
 
     /// A device lost for good ends the worker once the reconnect timeout
     /// passes, and its port hears that reconnecting failed before it closes.
-    /// The link learns why the worker stopped.
+    /// The link's readiness stays as it was.
     #[tokio::test(start_paused = true)]
     async fn a_device_that_never_comes_back_ends_the_worker_with_failed_to_reconnect() {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
@@ -1953,16 +1913,13 @@ mod tests {
         first.fail(io::ErrorKind::ConnectionReset);
         let lost = Instant::now();
 
-        assert_eq!(
-            worker.settled(Readiness::Ready).await,
-            Readiness::Failed("failed to reconnect".to_string())
-        );
+        ended(worker.task).await;
         assert_took(lost.elapsed(), reconnect_timeout, "giving up");
+        assert_eq!(*worker.readiness.borrow(), Readiness::Ready);
         assert_eq!(
             delivered(&mut worker.port, 3).await[1..],
             ["SensorDisconnected", "FailedToReconnect"]
         );
-        ended(worker.task).await;
         assert!(matches!(
             worker.port.try_recv(),
             Err(TryRecvError::Disconnected)
@@ -1997,11 +1954,8 @@ mod tests {
             ["SensorDisconnected", "FailedToReconnect"],
             "a failed attempt was reported to the port"
         );
-        assert_eq!(
-            *worker.readiness.borrow(),
-            Readiness::Failed("failed to reconnect".to_string())
-        );
         ended(worker.task).await;
+        assert_eq!(*worker.readiness.borrow(), Readiness::Ready);
     }
 
     /// A device that answers again clears the reconnect timeout, so the
@@ -2184,25 +2138,29 @@ mod tests {
 
     /// A worker whose opener lets it drop an open in flight, as a TCP opener
     /// does, ends at once when its link closes during the first open. The
-    /// open is dropped, and the link learns why the worker stopped.
+    /// open is dropped, and the link never became ready.
     #[tokio::test(start_paused = true)]
     async fn a_link_closed_during_a_droppable_first_open_ends_at_once() {
         let (ends, _opened_ends) = mpsc::unbounded_channel();
         let (open, mut dropped) = droppable_hang(false, ends);
-        let mut worker = Running::start(open, None);
+        let Running {
+            commands,
+            readiness,
+            task,
+            ..
+        } = Running::start(open, None);
         tokio::time::sleep(WAIT).await;
 
-        worker.stop.cancel();
+        drop(commands);
         let closed = Instant::now();
 
-        let stopped = worker.settled(Readiness::Pending).await;
-        ended(worker.task).await;
+        ended(task).await;
         assert_eq!(
             closed.elapsed(),
             Duration::ZERO,
             "the worker waited for the open"
         );
-        assert_eq!(stopped, Readiness::Failed("the link closed".to_string()));
+        assert_eq!(*readiness.borrow(), Readiness::Pending);
         assert!(dropped.try_recv().is_err(), "the open in flight was kept");
     }
 
@@ -2228,7 +2186,7 @@ mod tests {
             "no reopen is in flight"
         );
 
-        worker.stop.cancel();
+        drop(worker.commands);
         let closed = Instant::now();
 
         ended(worker.task).await;
@@ -2270,7 +2228,6 @@ mod tests {
             dump,
             readiness,
             open,
-            CancellationToken::new(),
         );
         worker.device = Some(worker.open_device().await.unwrap());
         // The device starts a session, and offers its default rate when it
@@ -2382,7 +2339,6 @@ mod tests {
             dump,
             readiness,
             open,
-            CancellationToken::new(),
         );
         worker.device = Some(worker.open_device().await.unwrap());
         worker.device.as_mut().unwrap().rate_change_state = RateChange::RateChanged;
@@ -2432,10 +2388,6 @@ mod tests {
                 ["SensorDisconnected", "FailedToReconnect"],
                 "{url}"
             );
-            assert_eq!(
-                worker.settled(Readiness::Ready).await,
-                Readiness::Failed("failed to reconnect".to_string())
-            );
             ended(worker.task).await;
         }
     }
@@ -2455,7 +2407,6 @@ mod tests {
             dump,
             readiness,
             open,
-            CancellationToken::new(),
         )
         .run()
         .await;

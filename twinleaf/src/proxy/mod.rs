@@ -109,13 +109,13 @@ pub(crate) use control::{call, executable_name, handshake, Purpose, CLIENT_KEEPA
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
-use crate::tio::transport::CONNECT_TIMEOUT;
+use crate::tio::transport::{CLOSE_TIMEOUT, CONNECT_TIMEOUT};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 
 /// How long to wait for the handshake on a loopback address. A running proxy
 /// completes it at once.
@@ -126,6 +126,10 @@ const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long [`stop`] waits for the proxy to reply.
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a stopping proxy waits for its clients and links, each of which
+/// closes its transport within [`CLOSE_TIMEOUT`].
+pub(super) const LEAVE_TIMEOUT: Duration = CLOSE_TIMEOUT.saturating_add(Duration::from_millis(500));
 
 /// How long a proxy keeps a device that a client opened with no client
 /// using it, and a background proxy keeps running with no client at all.
@@ -313,9 +317,16 @@ pub struct ClientInfo {
 
 /// A running proxy. It is shut down when dropped.
 pub struct Proxy {
-    shared: Arc<server::Shared>,
+    /// The server's mailbox, which keeps the proxy running.
+    server: mpsc::UnboundedSender<server::Notice>,
     /// The receiver that disconnects once the proxy has stopped.
     stopped: flume::Receiver<()>,
+    /// The client table, as the server publishes it.
+    clients: watch::Receiver<Vec<ClientInfo>>,
+    default: watch::Sender<Option<Layout>>,
+    endpoint: String,
+    #[cfg(test)]
+    links: link::Links,
 }
 
 /// Stops the background proxy at `proxy`, a `tcp://host:port`. With `None`
@@ -385,25 +396,28 @@ impl Proxy {
     /// # }
     /// ```
     pub fn host(options: HostOptions) -> io::Result<Proxy> {
-        let (shared, stopped) = server::Shared::host(options)?;
-        Ok(Proxy { shared, stopped })
+        server::host(options)
     }
 
     /// Returns the URL a client on this machine connects to, such as
     /// `tcp://127.0.0.1:7855`.
     pub fn endpoint(&self) -> String {
-        self.shared.endpoint().to_string()
+        self.endpoint.clone()
     }
 
     /// Replaces the layout `default` opens and `auto` prefers, or clears it
     /// with `None`. Clients that already opened one keep it.
     pub fn set_default(&self, layout: Option<Layout>) {
-        self.shared.set_default(layout);
+        self.default.send_replace(layout);
     }
 
-    /// Returns the clients connected now, in the order they connected.
+    /// Returns the clients connected now, in the order they connected. A
+    /// proxy that has stopped has none.
     pub fn clients(&self) -> Vec<ClientInfo> {
-        self.shared.clients()
+        match self.clients.has_changed() {
+            Ok(_) => self.clients.borrow().clone(),
+            Err(_stopped) => Vec::new(),
+        }
     }
 
     /// Blocks until the proxy has stopped, by `proxy.stop`, by idling out, or
@@ -415,10 +429,10 @@ impl Proxy {
     /// Stops the proxy and blocks until it has stopped. Each client hears the
     /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
     /// connection closes. The proxy stops accepting clients and closes every
-    /// device. A stop takes about 2 s at most, and then ends what still runs.
+    /// device. A stop takes about 1.5 s at most, and then ends what still runs.
     /// Calling it again does nothing.
     pub fn shutdown(&self) {
-        self.shared.stop.cancel();
+        let _ = self.server.send(server::Notice::Stop);
         self.wait();
     }
 }
@@ -427,7 +441,7 @@ impl fmt::Debug for Proxy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Proxy")
-            .field("endpoint", &self.shared.endpoint())
+            .field("endpoint", &self.endpoint)
             .finish()
     }
 }
@@ -455,6 +469,7 @@ mod tests {
     use crate::tio::transport;
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Instant;
 
     /// The `proxy.hello` of a client named `caller` with pid 4242.
@@ -767,7 +782,7 @@ mod tests {
         }
 
         let deadline = Instant::now() + WAIT;
-        while !proxy.shared.links.urls().is_empty() {
+        while !proxy.links.urls().is_empty() {
             assert!(
                 Instant::now() < deadline,
                 "a link that failed to open stayed open"
@@ -775,7 +790,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            proxy.shared.links.wait_finished(WAIT),
+            proxy.links.wait_finished(WAIT),
             "a link that failed to open was never closed"
         );
     }
@@ -817,7 +832,7 @@ mod tests {
         }
         assert_eq!(client.dev_name(9), "FAKE");
         assert_eq!(device.accepted(), 2);
-        assert_eq!(proxy.shared.links.urls(), [device.url.as_str()]);
+        assert_eq!(proxy.links.urls(), [device.url.as_str()]);
         assert_eq!(proxy.clients().len(), 1);
     }
 
@@ -863,12 +878,12 @@ mod tests {
         control.expect_closed();
         legacy.expect_closed();
         let deadline = Instant::now() + WAIT;
-        while !proxy.shared.links.urls().is_empty() || !proxy.clients().is_empty() {
+        while !proxy.links.urls().is_empty() || !proxy.clients().is_empty() {
             assert!(Instant::now() < deadline, "the link given up stayed open");
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            proxy.shared.links.wait_finished(WAIT),
+            proxy.links.wait_finished(WAIT),
             "the link given up was never closed"
         );
     }
@@ -1032,7 +1047,7 @@ mod tests {
         let open = Packet::proxy_request("proxy.open", &silent_url.encode_args(), 2);
         waiting.send(open.unwrap());
         let deadline = Instant::now() + WAIT;
-        while proxy.shared.links.urls().len() < 2 {
+        while proxy.links.urls().len() < 2 {
             assert!(Instant::now() < deadline, "the silent link never opened");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1055,14 +1070,14 @@ mod tests {
         opener.hello(4242, "opener");
         opener.open(&device.url).unwrap();
 
-        proxy.shared.links.rekey(&device.url, "usb:moved");
+        proxy.links.rekey(&device.url, "usb:moved");
 
         let auto = TestClient::connect(&proxy.endpoint());
         auto.hello(4243, "auto");
         assert_eq!(auto.open("auto"), Ok(device.url.clone()));
         assert_eq!(auto.dev_name(7), "FAKE");
         assert_eq!(device.accepted(), 1);
-        assert_eq!(proxy.shared.links.users(), 2);
+        assert_eq!(proxy.links.users(), 2);
     }
 
     /// A probe reaches its device as an open does, but a device only probes
@@ -1110,20 +1125,20 @@ mod tests {
         let opener = TestClient::connect(&proxy.endpoint());
         opener.hello(4243, "opener");
         assert_eq!(opener.open(&opened.url), Ok(opened.url.clone()));
-        assert_eq!(proxy.shared.links.urls().len(), 2);
+        assert_eq!(proxy.links.urls().len(), 2);
 
         drop(prober);
         drop(opener);
 
         // Well within the ten seconds an opened device stays open.
         let deadline = Instant::now() + WAIT;
-        while proxy.shared.links.urls() != [opened.url.clone()] {
-            let urls = proxy.shared.links.urls();
+        while proxy.links.urls() != [opened.url.clone()] {
+            let urls = proxy.links.urls();
             assert!(Instant::now() < deadline, "the links stayed {urls:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(proxy.shared.links.urls(), std::slice::from_ref(&opened.url));
+        assert_eq!(proxy.links.urls(), std::slice::from_ref(&opened.url));
     }
 
     /// A client that hangs up while its open or probe waits for the device
@@ -1142,7 +1157,7 @@ mod tests {
             let open = Packet::proxy_request(method, &silent_url.encode_args(), 2);
             leaving.send(open.unwrap());
             let deadline = Instant::now() + WAIT;
-            while proxy.shared.links.users() == 0 {
+            while proxy.links.users() == 0 {
                 assert!(Instant::now() < deadline, "{method} never began to wait");
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1150,7 +1165,7 @@ mod tests {
             drop(leaving);
 
             let deadline = Instant::now() + Duration::from_millis(1500);
-            while !proxy.clients().is_empty() || proxy.shared.links.users() > 0 {
+            while !proxy.clients().is_empty() || proxy.links.users() > 0 {
                 assert!(
                     Instant::now() < deadline,
                     "{method} still waits for a client that hung up"
@@ -1377,7 +1392,7 @@ mod tests {
             names,
             [Some("first".to_string()), Some("second".to_string())]
         );
-        assert_eq!(proxy.shared.links.users(), 1);
+        assert_eq!(proxy.links.users(), 1);
 
         assert!(shuts_down_in_time(proxy));
         first.expect_stopped(false);
@@ -1416,7 +1431,7 @@ mod tests {
         let device = FakeDevice::start();
         let (proxy, user, watcher) = hosted_with_clients(&device);
 
-        proxy.shared.links.panic();
+        proxy.links.panic();
 
         watcher.expect_stopped(false);
         // Its link ended with the registry, before or after the stop.
@@ -1432,12 +1447,13 @@ mod tests {
         let device = FakeDevice::start();
         let (proxy, user, watcher) = hosted_with_clients(&device);
 
-        let _ = proxy.shared.notices.send(server::Notice::Panic);
+        let _ = proxy.server.send(server::Notice::Panic);
 
         watcher.expect_closed();
         user.expect_closed();
         assert!(stops_in_time(proxy.clone()));
         assert_let_go(&proxy, &device);
+        assert!(proxy.clients().is_empty(), "the table outlived the server");
     }
 
     #[test]
@@ -1459,10 +1475,7 @@ mod tests {
             assert!(Instant::now() < deadline, "a client stayed listed");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            proxy.shared.links.wait_finished(WAIT),
-            "a link outlived the proxy"
-        );
+        assert!(proxy.links.wait_finished(WAIT), "a link outlived the proxy");
         proxy.shutdown();
         proxy.wait();
     }
@@ -1528,7 +1541,7 @@ mod tests {
         let open = Packet::proxy_request("proxy.open", &silent_url.encode_args(), 2);
         waiting.send(open.unwrap());
         let deadline = Instant::now() + WAIT;
-        while proxy.shared.links.urls().is_empty() {
+        while proxy.links.urls().is_empty() {
             assert!(Instant::now() < deadline, "the silent link never opened");
             std::thread::sleep(Duration::from_millis(10));
         }

@@ -1,46 +1,36 @@
-//! The proxy's shared state, its server and its supervisor. [`Shared`] holds
-//! what the proxy's tasks share. The server is the task that accepts
-//! clients, spawns a task for each, and keeps the client table. The
-//! supervisor is the task that runs the server and stops the proxy in order.
+//! The proxy's server, the task at the root of the proxy. It accepts
+//! clients, runs the task of each, keeps the client table, and owns the
+//! registry of links. [`Shared`] holds what every client's task reads.
 
 use super::client::Session;
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
-use super::link::{self, Links};
-use super::{answers, endpoint_at, ClientInfo, HostOptions, Layout, Listen, IDLE};
+use super::link::{self, Links, Owner};
+use super::{
+    answers, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
+};
 use crate::rt::{self, sleep_until_some, Supervisor};
 use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::future::{self, Future};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{timeout, timeout_at, Instant};
-use tokio_util::sync::CancellationToken;
+use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
-
-/// How long stopping waits for clients to close their transports.
-const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// How long a stop may take in all. Stopping then ends the proxy's tasks
-/// still running.
-const STOP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How long stopping waits for the tasks it ended.
-// An ended task finishes at its next await, but work on a blocking thread
-// runs to its end.
-const ENDED_GRACE: Duration = Duration::from_millis(100);
 
 /// How long the server waits after an accept fails before it accepts again.
 // An accept that fails for want of file descriptors fails again at once.
 const ACCEPT_RETRY: Duration = Duration::from_millis(20);
 
-/// What a client's task tells the server.
+/// What the server is told, by the proxy's handle and its clients' tasks.
 pub(super) enum Notice {
     /// A change to client `id`'s entry in the table. The server answers on
     /// `done` once the table shows it.
@@ -49,6 +39,8 @@ pub(super) enum Notice {
         update: Update,
         done: oneshot::Sender<()>,
     },
+    /// A stop of the proxy.
+    Stop,
     /// A panic of the server.
     #[cfg(test)]
     Panic,
@@ -62,175 +54,76 @@ pub(super) enum Update {
     Target(String),
 }
 
-/// What the proxy's tasks share.
+/// What every client's task reads, none of which keeps the proxy running.
 pub(super) struct Shared {
     /// How the proxy is hosted. Its default layout is held in `default`.
     pub(super) options: HostOptions,
+    pub(super) endpoint: String,
     pub(super) links: Links,
-    /// The spawner of the proxy's tasks. The proxy has stopped once each has
-    /// ended.
+    /// The spawner of the clients' transports and blocking steps.
     pub(super) tasks: Supervisor,
     /// The server's mailbox.
-    pub(super) notices: mpsc::UnboundedSender<Notice>,
-    /// Cancelled once the proxy begins to stop. Each client hears the stop,
-    /// and the server stops accepting.
-    pub(super) stop: CancellationToken,
-    endpoint: String,
-    default: watch::Sender<Option<Layout>>,
-    /// The client table, as the server publishes it.
-    clients: watch::Receiver<Vec<ClientInfo>>,
+    pub(super) server: mpsc::WeakUnboundedSender<Notice>,
+    pub(super) default: watch::Receiver<Option<Layout>>,
 }
 
 impl Shared {
-    /// Binds the listeners for `options`, and starts the proxy's tasks, which
-    /// serve clients until the proxy stops. Returns what the tasks share, and
-    /// the receiver that disconnects once the proxy has stopped.
-    ///
-    /// Returns an [`io::ErrorKind::AddrInUse`] error if anything already
-    /// answers on a nonzero port. The message calls it a Twinleaf proxy if it
-    /// answers `proxy.hello`. Also returns any error from binding the
-    /// listeners or registering them with the crate's runtime.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the crate's runtime cannot start.
-    pub(super) fn host(options: HostOptions) -> io::Result<(Arc<Shared>, flume::Receiver<()>)> {
-        if options.port != 0 && answers(options.port) {
-            let endpoint = endpoint_at(options.port);
-            let hello = Introduction::of_this_process(&options.name).encode_args();
-            let message = match control::call(&endpoint, HELLO, &hello, HELLO_TIMEOUT) {
-                Ok(reply) => match Introduction::decode_reply(&reply) {
-                    Ok(host) => {
-                        format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
-                    }
-                    Err(_) => format!("a Twinleaf proxy already runs at {endpoint}"),
-                },
-                Err(_) => control::not_a_proxy(&endpoint).to_string(),
-            };
-            return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
-        }
-        let listeners = bind(options.listen, options.port)?;
-        let port = listeners[0].local_addr()?.port();
-        let listeners = {
-            let _runtime = rt::handle().enter();
-            let listening = listeners.into_iter().map(|listener| {
-                listener.set_nonblocking(true)?;
-                TcpListener::from_std(listener)
-            });
-            listening.collect::<io::Result<Vec<_>>>()?
-        };
-        let tasks = Supervisor::new();
-        let links = Links::new(&tasks, options.reconnect_timeout, options.dump);
-        let (shared, server) = Shared::new(options, endpoint_at(port), tasks, links);
-        let (stopped, waited) = flume::bounded(0);
-        // The supervisor waits for every task on `tasks`, so it runs apart
-        // from them.
-        let task = format_args!("proxy {}", shared.endpoint);
-        Supervisor::new().spawn(task, supervise(server, listeners, stopped));
-        log::info!(
-            "Proxy hosted by {} at {}",
-            shared.options.name,
-            shared.endpoint
-        );
-        Ok((shared, waited))
-    }
-
-    /// Returns the state a proxy at `endpoint` hosted with `options` shares,
-    /// whose tasks run on `tasks` and whose links `links` holds. Returns it
-    /// with the server that serves it, still to run.
-    pub(super) fn new(
-        mut options: HostOptions,
-        endpoint: String,
-        tasks: Supervisor,
-        links: Links,
-    ) -> (Arc<Shared>, Server) {
-        let (notices, mailbox) = mpsc::unbounded_channel();
-        let (table, clients) = watch::channel(Vec::new());
-        let shared = Arc::new(Shared {
-            links,
-            tasks,
-            notices,
-            stop: CancellationToken::new(),
-            endpoint,
-            default: watch::Sender::new(options.default.take()),
-            options,
-            clients,
-        });
-        let server = Server {
-            shared: shared.clone(),
-            listeners: Vec::new(),
-            notices: mailbox,
-            clients: BTreeMap::new(),
-            table,
-            sessions: JoinMap::new(),
-            next_id: 1,
-            idle_at: Instant::now() + IDLE,
-            retry_at: None,
-            stopping: false,
-            abort_at: None,
-        };
-        (shared, server)
-    }
-
-    pub(super) fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
     /// Returns the layout `default` opens.
     pub(super) fn default(&self) -> Option<Layout> {
         self.default.borrow().clone()
     }
-
-    pub(super) fn set_default(&self, layout: Option<Layout>) {
-        self.default.send_replace(layout);
-    }
-
-    /// Returns every client in the table, in the order they connected.
-    pub(super) fn clients(&self) -> Vec<ClientInfo> {
-        self.clients.borrow().clone()
-    }
 }
 
-/// Supervises the proxy, and stops it in order. Spawns `server` to accept
-/// clients on `listeners`, and waits until the proxy begins to stop or its
-/// server or registry of links ends. The stop then has [`STOP_TIMEOUT`] in
-/// all. It waits for the server to end, which it does once its clients have
-/// heard the stop and left. It closes every link, and waits for every task of
-/// the proxy to end. Once the time runs out, it ends the tasks still running
-/// and waits [`ENDED_GRACE`] for them. `stopped` disconnects then, or if the
-/// supervisor panics.
-async fn supervise(server: Server, listeners: Vec<TcpListener>, stopped: flume::Sender<()>) {
-    let shared = server.shared.clone();
-    shared.tasks.spawn("proxy server", server.run(listeners));
-    tokio::select! {
-        // A server that ends once the proxy stops has not failed.
-        biased;
-        () = shared.stop.cancelled() => {}
-        () = shared.notices.closed() => {
-            log::error!("Stopping the proxy at {}, as its server ended", shared.endpoint);
-        }
-        () = shared.links.ended() => {
-            log::error!("Stopping the proxy at {}, as its links ended", shared.endpoint);
-        }
+/// Binds the listeners for `options`, and starts the server, which serves
+/// clients until the proxy stops. Returns the proxy's handle.
+///
+/// Returns an [`io::ErrorKind::AddrInUse`] error if anything already answers
+/// on a nonzero port. The message calls it a Twinleaf proxy if it answers
+/// `proxy.hello`. Also returns any error from binding the listeners or
+/// registering them with the crate's runtime.
+///
+/// # Panics
+///
+/// Panics if the crate's runtime cannot start.
+pub(super) fn host(options: HostOptions) -> io::Result<Proxy> {
+    if options.port != 0 && answers(options.port) {
+        let endpoint = endpoint_at(options.port);
+        let hello = Introduction::of_this_process(&options.name).encode_args();
+        let message = match control::call(&endpoint, HELLO, &hello, HELLO_TIMEOUT) {
+            Ok(reply) => match Introduction::decode_reply(&reply) {
+                Ok(host) => {
+                    format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
+                }
+                Err(_) => format!("a Twinleaf proxy already runs at {endpoint}"),
+            },
+            Err(_) => control::not_a_proxy(&endpoint).to_string(),
+        };
+        return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
     }
-    shared.stop.cancel();
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let _ = timeout_at(deadline, shared.notices.closed()).await;
-    let left = deadline.saturating_duration_since(Instant::now());
-    if !shared.links.close_all(left).await {
-        log::warn!("Some links did not close within the stop's {STOP_TIMEOUT:?}");
-    }
-    if timeout_at(deadline, shared.tasks.wait()).await.is_err() {
-        shared.tasks.end_all();
-        if timeout(ENDED_GRACE, shared.tasks.wait()).await.is_err() {
-            log::warn!("Work of the proxy on a blocking thread outlived its stop");
-        }
-    }
-    log::info!("Proxy at {} stopped", shared.endpoint);
-    drop(stopped);
+    let listeners = bind(options.listen, options.port)?;
+    let port = listeners[0].local_addr()?.port();
+    let listeners = {
+        let _runtime = rt::handle().enter();
+        let listening = listeners.into_iter().map(|listener| {
+            listener.set_nonblocking(true)?;
+            TcpListener::from_std(listener)
+        });
+        listening.collect::<io::Result<Vec<_>>>()?
+    };
+    let tasks = Supervisor::new();
+    let registry = Links::new(&tasks, options.reconnect_timeout, options.dump);
+    let (proxy, mut server) = Server::new(options, endpoint_at(port), tasks.clone(), registry);
+    server.listeners = listeners;
+    log::info!(
+        "Proxy hosted by {} at {}",
+        server.shared.options.name,
+        proxy.endpoint
+    );
+    tasks.spawn(format_args!("proxy {}", proxy.endpoint), server.run());
+    Ok(proxy)
 }
 
-/// The proxy's server, which runs as the task "proxy server". It accepts
+/// The proxy's server, which runs as the task "proxy <endpoint>". It accepts
 /// clients and spawns the task of each. It is the only owner of the client
 /// table, which it publishes on every change.
 pub(super) struct Server {
@@ -244,44 +137,81 @@ pub(super) struct Server {
     table: watch::Sender<Vec<ClientInfo>>,
     /// The task of each client.
     sessions: JoinMap<u64, Option<()>>,
+    /// The lifeline of each client's task, dropped to tell it the proxy stops.
+    lifelines: HashMap<u64, oneshot::Sender<Infallible>>,
+    registry: Owner,
+    /// Disconnects once the server has ended.
+    _stopped: flume::Sender<()>,
     next_id: u64,
     /// When a proxy that exits once idle exits, if no client connects
     /// before.
     idle_at: Instant,
     /// When accepting resumes after an accept failed.
     retry_at: Option<Instant>,
-    /// Whether the server has heard the proxy's stop.
-    stopping: bool,
-    /// When the clients that have not left are aborted, once the proxy
-    /// stops.
-    abort_at: Option<Instant>,
 }
 
 impl Server {
-    /// Accepts clients on `listeners` and keeps the table until the proxy
-    /// stops and its clients have left. Once the proxy stops, aborts the
-    /// clients still connected after [`DEPARTURE_TIMEOUT`]. Begins the stop
-    /// if the proxy idles out.
-    async fn run(mut self, listeners: Vec<TcpListener>) {
-        self.listeners = listeners;
+    /// Returns the handle of a proxy at `endpoint` hosted with `options`, whose
+    /// clients run on `tasks` and links in `registry`, with its server to run.
+    pub(super) fn new(
+        mut options: HostOptions,
+        endpoint: String,
+        tasks: Supervisor,
+        (links, registry): (Links, Owner),
+    ) -> (Proxy, Server) {
+        let (notices, mailbox) = mpsc::unbounded_channel();
+        let (table, clients) = watch::channel(Vec::new());
+        let (default, defaults) = watch::channel(options.default.take());
+        let (stopped, waited) = flume::bounded(0);
+        let proxy = Proxy {
+            server: notices.clone(),
+            stopped: waited,
+            clients,
+            default,
+            endpoint: endpoint.clone(),
+            #[cfg(test)]
+            links: links.clone(),
+        };
+        let shared = Arc::new(Shared {
+            options,
+            endpoint,
+            links,
+            tasks,
+            server: notices.downgrade(),
+            default: defaults,
+        });
+        let server = Server {
+            shared,
+            listeners: Vec::new(),
+            notices: mailbox,
+            clients: BTreeMap::new(),
+            table,
+            sessions: JoinMap::new(),
+            lifelines: HashMap::new(),
+            registry,
+            _stopped: stopped,
+            next_id: 1,
+            idle_at: Instant::now() + IDLE,
+            retry_at: None,
+        };
+        (proxy, server)
+    }
+
+    /// Accepts clients and keeps the table until a stop, the last handle's
+    /// drop, the idle exit or the end of the registry. Then stops the proxy.
+    async fn run(mut self) {
         loop {
-            if self.stopping && self.sessions.is_empty() {
-                self.clients.clear();
-                self.publish();
-                return;
-            }
             let accepting = self.retry_at.is_none();
             let idle = self.shared.options.idle_exit && self.clients.is_empty();
-            let idle_at = (idle && !self.listeners.is_empty()).then_some(self.idle_at);
             tokio::select! {
-                // The stop ends accepting at once. A connection waiting goes
-                // before the idle exit.
+                // A connection waiting goes before the idle exit.
                 biased;
-                () = self.shared.stop.cancelled(), if !self.stopping => {
-                    self.stopping = true;
-                    self.listeners.clear();
-                    self.abort_at = Some(Instant::now() + DEPARTURE_TIMEOUT);
-                }
+                notice = self.notices.recv() => match notice {
+                    Some(Notice::Update { id, update, done }) => self.update(id, update, done),
+                    Some(Notice::Stop) | None => break,
+                    #[cfg(test)]
+                    Some(Notice::Panic) => panic!("a test asked the server to panic"),
+                },
                 accepted = accept(&self.listeners), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),
                     Err(error) => {
@@ -289,49 +219,64 @@ impl Server {
                         self.retry_at = Some(Instant::now() + ACCEPT_RETRY);
                     }
                 },
-                notice = self.notices.recv() => match notice {
-                    Some(notice) => self.notice(notice),
-                    None => return,
-                },
                 Some((id, _outcome)) = self.sessions.join_next() => self.joined(id),
+                _ = &mut self.registry.task => {
+                    log::error!("Stopping the proxy at {}, as its links ended", self.shared.endpoint);
+                    break;
+                }
                 () = sleep_until_some(self.retry_at) => self.retry_at = None,
-                () = sleep_until_some(idle_at) => self.idle_out(),
-                () = sleep_until_some(self.abort_at) => {
-                    log::warn!("{} clients did not close in time", self.clients.len());
-                    self.sessions.abort_all();
-                    self.abort_at = None;
+                () = sleep_until_some(idle.then_some(self.idle_at)) => {
+                    if self.idle_out().is_break() {
+                        break;
+                    }
                 }
             }
         }
+        self.stop().await;
     }
 
-    /// Handles a notice from a client's task.
-    fn notice(&mut self, notice: Notice) {
-        match notice {
-            Notice::Update { id, update, done } => {
-                if let Some(info) = self.clients.get_mut(&id) {
-                    match update {
-                        Update::Hello(client) => {
-                            info.version = Some(client.version_text());
-                            info.own_process = client.pid == std::process::id();
-                            info.pid = Some(client.pid);
-                            info.name = Some(client.name);
-                        }
-                        Update::Target(target) => info.target = Some(target),
-                    }
-                    self.publish();
-                }
-                let _ = done.send(());
+    /// Stops accepting, and drops each client's lifeline and the registry of
+    /// links together. Waits [`LEAVE_TIMEOUT`] for the clients, as the
+    /// registry does for its links.
+    async fn stop(mut self) {
+        self.listeners.clear();
+        self.notices.close();
+        while self.notices.try_recv().is_ok() {}
+        self.lifelines.clear();
+        let sessions = &mut self.sessions;
+        let departing = async {
+            let departed = async { while sessions.join_next().await.is_some() {} };
+            if timeout(LEAVE_TIMEOUT, departed).await.is_err() {
+                log::warn!("{} clients did not close in time", sessions.len());
+                sessions.shutdown().await;
             }
-            #[cfg(test)]
-            Notice::Panic => panic!("a test asked the server to panic"),
+        };
+        tokio::join!(departing, self.registry.close());
+        log::info!("Proxy at {} stopped", self.shared.endpoint);
+    }
+
+    /// Changes client `id`'s entry in the table, and answers on `done`.
+    fn update(&mut self, id: u64, update: Update, done: oneshot::Sender<()>) {
+        if let Some(info) = self.clients.get_mut(&id) {
+            match update {
+                Update::Hello(client) => {
+                    info.version = Some(client.version_text());
+                    info.own_process = client.pid == std::process::id();
+                    info.pid = Some(client.pid);
+                    info.name = Some(client.name);
+                }
+                Update::Target(target) => info.target = Some(target),
+            }
+            self.publish();
         }
+        let _ = done.send(());
     }
 
     /// Removes the client whose task ended. The idle time starts when the
     /// last client's task leaves.
     fn joined(&mut self, id: u64) {
         self.clients.remove(&id);
+        self.lifelines.remove(&id);
         self.publish();
         if self.clients.is_empty() {
             self.idle_at = Instant::now() + IDLE;
@@ -374,17 +319,18 @@ impl Server {
         };
         self.clients.insert(id, info);
         self.publish();
-        let stop = self.shared.stop.child_token();
-        let session = Session::new(self.shared.clone(), id, peer, port, incoming, stop);
+        let (lifeline, alive) = oneshot::channel();
+        self.lifelines.insert(id, lifeline);
+        let session = Session::new(self.shared.clone(), id, peer, port, incoming, alive);
         let task = format_args!("proxy client {id}");
         self.shared
             .tasks
             .spawn_in_map(&mut self.sessions, id, task, session.run());
     }
 
-    /// Exits a proxy that has had no client for [`IDLE`]. Each connection
-    /// already waiting on a listener is served instead.
-    fn idle_out(&mut self) {
+    /// Breaks to exit a proxy that has had no client for [`IDLE`]. Each
+    /// connection already waiting on a listener is served instead.
+    fn idle_out(&mut self) -> ControlFlow<()> {
         let mut waiting = Vec::new();
         for listener in &self.listeners {
             loop {
@@ -400,8 +346,7 @@ impl Server {
         }
         if waiting.is_empty() {
             log::info!("no clients for {:?}; exiting", IDLE);
-            self.shared.stop.cancel();
-            return;
+            return ControlFlow::Break(());
         }
         for socket in waiting {
             let stream = std::net::TcpStream::from(socket);
@@ -414,6 +359,7 @@ impl Server {
                 Err(error) => log::warn!("Error accepting client: {error}"),
             }
         }
+        ControlFlow::Continue(())
     }
 }
 
@@ -471,6 +417,7 @@ mod tests {
     use crate::proxy::DumpFlags;
     use std::net::TcpListener;
     use std::thread;
+    use tokio::time::timeout;
 
     /// IPv4 is held on a socket of its own, as the lock and the endpoint,
     /// and IPv6 on another that takes no IPv4, in either mode.
@@ -510,9 +457,9 @@ mod tests {
             ..options()
         };
         let tasks = Supervisor::new();
-        let links = Links::new(&tasks, None, DumpFlags::default());
+        let registry = Links::new(&tasks, None, DumpFlags::default());
         let endpoint = endpoint_at(address.port());
-        let (shared, mut server) = Shared::new(options, endpoint, tasks, links);
+        let (proxy, mut server) = Server::new(options, endpoint, tasks, registry);
         let _runtime = rt::handle().enter();
         server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
         let _client = std::net::TcpStream::connect(address).unwrap();
@@ -520,39 +467,38 @@ mod tests {
         // returns, as with the mirrored networking of WSL2.
         thread::sleep(Duration::from_millis(100));
 
-        server.idle_out();
+        let idled = server.idle_out();
 
-        assert_eq!(shared.clients().len(), 1);
+        assert!(idled.is_continue());
+        assert_eq!(proxy.clients().len(), 1);
         assert_eq!(server.listeners.len(), 1);
-        assert!(!shared.stop.is_cancelled());
+        drop(server);
     }
 
-    /// Starts a proxy hosted with `options` on the test's runtime. Returns
-    /// what its tasks share, and the receiver that disconnects once it has
-    /// stopped.
-    fn started(options: HostOptions) -> (Arc<Shared>, flume::Receiver<()>) {
+    /// Starts a proxy hosted with `options` on the test's runtime, and
+    /// returns its handle.
+    fn started(options: HostOptions) -> Proxy {
         // Nothing connects to it, so the paused clock never waits on it.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = endpoint_at(listener.local_addr().unwrap().port());
         listener.set_nonblocking(true).unwrap();
-        let listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
         let tasks = Supervisor::current();
-        let links = Links::new(&tasks, None, DumpFlags::default());
-        let (shared, server) = Shared::new(options, endpoint, tasks, links);
-        let (stopped, waited) = flume::bounded(0);
-        let supervisor = supervise(server, listeners, stopped);
-        Supervisor::current().spawn("a test proxy", supervisor);
-        (shared, waited)
+        let registry = Links::new(&tasks, None, DumpFlags::default());
+        let (proxy, mut server) = Server::new(options, endpoint, tasks.clone(), registry);
+        server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
+        tasks.spawn("a test proxy", server.run());
+        proxy
     }
 
-    /// Waits until `waited` hears that its proxy stopped.
-    async fn stopped(waited: flume::Receiver<()>) {
-        let waited = timeout(PAUSED_WAIT, waited.recv_async()).await;
+    /// Waits until `proxy` has stopped.
+    async fn stopped(proxy: &Proxy) {
+        let waited = timeout(PAUSED_WAIT, proxy.stopped.recv_async()).await;
         assert_eq!(waited, Ok(Err(flume::RecvError::Disconnected)));
     }
 
     /// A proxy that exits once idle, and that no client connects to, stops
-    /// once [`IDLE`] has passed. Its waiters hear it then.
+    /// once [`IDLE`] has passed. Its waiters hear it then, and its table is
+    /// empty.
     #[tokio::test(start_paused = true)]
     async fn a_proxy_no_client_connects_to_exits_once_idle() {
         let started_at = Instant::now();
@@ -560,31 +506,27 @@ mod tests {
             idle_exit: true,
             ..options()
         };
-        let (shared, waited) = started(options);
+        let proxy = started(options);
 
-        stopped(waited).await;
+        stopped(&proxy).await;
 
         assert_took(started_at.elapsed(), IDLE, "the idle exit");
-        assert!(shared.stop.is_cancelled());
-        assert!(shared.clients().is_empty());
+        assert!(proxy.clients().is_empty());
     }
 
-    /// A task of the proxy that never ends holds up its stop for
-    /// [`STOP_TIMEOUT`] in all, and is then ended.
+    /// A stop with no client and no link to wait for ends the proxy at once.
     #[tokio::test(start_paused = true)]
-    async fn a_task_that_never_ends_is_ended_once_the_stop_runs_out_of_time() {
-        let (shared, waited) = started(options());
-        let (held, mut dropped) = tokio::sync::oneshot::channel::<()>();
-        shared.tasks.spawn("a stuck task", async move {
-            let _held = held;
-            future::pending::<()>().await
-        });
+    async fn a_stop_with_nothing_to_wait_for_ends_the_proxy_at_once() {
+        let proxy = started(options());
         let stopping = Instant::now();
 
-        shared.stop.cancel();
-        stopped(waited).await;
+        proxy
+            .server
+            .send(Notice::Stop)
+            .unwrap_or_else(|_| panic!("the server ended"));
+        stopped(&proxy).await;
 
-        assert_took(stopping.elapsed(), STOP_TIMEOUT, "the stop");
-        assert!(dropped.try_recv().is_err(), "the stuck task was not ended");
+        assert_eq!(stopping.elapsed(), Duration::ZERO);
+        assert!(proxy.clients().is_empty());
     }
 }

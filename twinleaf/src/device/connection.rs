@@ -1087,4 +1087,54 @@ mod tests {
         );
         assert_none_started(dir.path());
     }
+
+    /// Set in the process that counts the tasks left, so that no other test
+    /// runs tasks beside the count.
+    const COUNTING: &str = "TWINLEAF_COUNT_TASKS";
+
+    /// No task is left once a connection and its proxy are dropped, in
+    /// either order. The count runs in a process of its own.
+    #[test]
+    fn a_dropped_connection_and_proxy_leave_no_task() {
+        let counted = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "device::connection::tests::tasks_left",
+                "--test-threads=1",
+            ])
+            .env(COUNTING, "1")
+            .status()
+            .unwrap();
+        assert!(counted.success());
+    }
+
+    /// Counts the tasks left after each order of drops, when run alone.
+    #[test]
+    fn tasks_left() {
+        if std::env::var_os(COUNTING).is_none() {
+            return;
+        }
+        let device = FakeDevice::start();
+        for proxy_first in [false, true] {
+            let proxy = fixtures::proxy();
+            let connection = open_through(&proxy, &device.url).unwrap();
+            let samples = connection.samples();
+            assert_eq!(root_name(&connection), "FAKE");
+            match proxy_first {
+                true => drop((proxy, connection)),
+                false => drop((connection, proxy)),
+            }
+            drop(samples);
+
+            let deadline = Instant::now() + WAIT;
+            while crate::rt::handle().metrics().num_alive_tasks() > 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let left = crate::rt::handle().metrics().num_alive_tasks();
+            assert_eq!(
+                left, 0,
+                "tasks left with the proxy dropped first: {proxy_first}"
+            );
+        }
+    }
 }

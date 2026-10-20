@@ -349,8 +349,6 @@ pub(crate) fn assert_took(took: Duration, expected: Duration, what: impl Debug) 
 pub(crate) enum First {
     /// The open waits until the gate is notified.
     Waits(Arc<Notify>),
-    /// The open never ends.
-    Hangs,
     /// The open panics.
     Panics,
 }
@@ -393,7 +391,6 @@ pub(super) fn fakes(first: Vec<(&str, First)>) -> (Opens, mpsc::UnboundedReceive
                     gate.notified().await;
                     open()
                 }),
-                Some(First::Hangs) => Box::pin(future::pending()),
                 Some(First::Panics) => panic!("the opener of {url} panics"),
             }
         })

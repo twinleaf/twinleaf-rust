@@ -12,8 +12,8 @@
 //! Each open port holds an [`Activity`], which keeps the system from idle
 //! sleep on macOS and Windows.
 //!
-//! A [`Supervisor`] spawns tasks, logs a task that panics, waits for its
-//! tasks to end, and can end the ones still running. A caller outside the runtime waits for a task on a
+//! A [`Supervisor`] spawns tasks, logs a task that panics, and waits for its
+//! tasks to end. A caller outside the runtime waits for a task on a
 //! flume channel that the task answers on or drops.
 //!
 //! A child process forked after the runtime started has none of its
@@ -35,7 +35,6 @@ use std::task::{Context, Poll};
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tokio_util::task::{JoinMap, TaskTracker};
 
 /// Returns the handle of the runtime, and starts the runtime on first use.
@@ -76,13 +75,11 @@ fn start() -> Runtime {
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A spawner of tasks on one runtime. It tracks each task it spawns, and logs
-/// a task that panics or that it ends under the target `twinleaf::task`.
+/// a task that panics under the target `twinleaf::task`.
 #[derive(Clone, Debug)]
 pub(crate) struct Supervisor {
     handle: Handle,
     tracker: TaskTracker,
-    /// Ends the tasks it spawned once cancelled.
-    ending: CancellationToken,
 }
 
 impl Supervisor {
@@ -100,23 +97,22 @@ impl Supervisor {
         Supervisor {
             handle,
             tracker: TaskTracker::new(),
-            ending: CancellationToken::new(),
         }
     }
 
     /// Spawns `future` as the task named `task`. Returns the task's handle,
-    /// which resolves to `None` if the task panicked or was ended.
+    /// which resolves to `None` if the task panicked.
     pub(crate) fn spawn<F>(&self, task: impl Display, future: F) -> JoinHandle<Option<F::Output>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let supervised = Supervised::new(task, future, &self.ending);
+        let supervised = Supervised::new(task, future);
         self.tracker.spawn_on(supervised, &self.handle)
     }
 
-    /// Spawns a supervised task under its application key. Tracking, panic
-    /// reporting and cancellation use the same supervisor as other tasks.
+    /// Spawns a supervised task under its application key. Tracking and panic
+    /// reporting use the same supervisor as other tasks.
     pub(crate) fn spawn_in_map<K, F>(
         &self,
         map: &mut JoinMap<K, Option<F::Output>>,
@@ -128,7 +124,7 @@ impl Supervisor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let supervised = Supervised::new(task, future, &self.ending);
+        let supervised = Supervised::new(task, future);
         map.spawn_on(key, self.tracker.track_future(supervised), &self.handle);
     }
 
@@ -170,13 +166,6 @@ impl Supervisor {
         self.tracker.close();
         self.tracker.wait().await;
     }
-
-    /// Ends every task it spawned at the task's next await, and every task
-    /// it spawns from now on at its first. Logs the name of each task it
-    /// ends. Work on a blocking thread runs to its end.
-    pub(crate) fn end_all(&self) {
-        self.ending.cancel();
-    }
 }
 
 /// Waits until `deadline`, or forever if there is none.
@@ -199,24 +188,20 @@ pub(crate) async fn finish<T>(slot: &mut Option<BoxFuture<'static, T>>) -> T {
     output
 }
 
-/// A task's future, which resolves to `None` if the task panics or its
-/// supervisor ends it, once it has logged why.
+/// A task's future, which resolves to `None` if the task panics, once it
+/// has logged the panic.
 struct Supervised<F> {
     /// The task's name, which the log names it by.
     task: String,
     future: Pin<Box<F>>,
-    /// Resolves once the supervisor ends its tasks.
-    ending: Pin<Box<WaitForCancellationFutureOwned>>,
 }
 
 impl<F> Supervised<F> {
-    /// Returns the future of the task named `task`, which runs `future`
-    /// until `ending` is cancelled.
-    fn new(task: impl Display, future: F, ending: &CancellationToken) -> Supervised<F> {
+    /// Returns the future of the task named `task`, which runs `future`.
+    fn new(task: impl Display, future: F) -> Supervised<F> {
         Supervised {
             task: task.to_string(),
             future: Box::pin(future),
-            ending: Box::pin(ending.clone().cancelled_owned()),
         }
     }
 }
@@ -225,10 +210,6 @@ impl<F: Future> Future for Supervised<F> {
     type Output = Option<F::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.ending.as_mut().poll(cx).is_ready() {
-            log::warn!(target: "twinleaf::task", "Ended {}, which had not finished", self.task);
-            return Poll::Ready(None);
-        }
         let future = self.future.as_mut();
         match panic::catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
             Ok(polled) => polled.map(Some),
@@ -397,8 +378,8 @@ mod tests {
         assert_eq!(panicked.await.unwrap(), None::<()>);
     }
 
-    /// Completion, panic and cancellation retain the application's task
-    /// key and release the supervisor's tracked task.
+    /// Completion, panic and abort retain the application's task key and
+    /// release the supervisor's tracked task.
     #[tokio::test]
     async fn keyed_tasks_keep_their_identity_and_supervision() {
         use std::time::Duration;
@@ -433,20 +414,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), completed)
             .await
             .expect("keyed tasks did not finish");
-
-        tasks.spawn_in_map(
-            &mut running,
-            "end",
-            "ending",
-            std::future::pending::<usize>(),
-        );
-        tasks.end_all();
-        let (key, result) = tokio::time::timeout(Duration::from_secs(1), running.join_next())
-            .await
-            .expect("supervisor did not end its keyed task")
-            .unwrap();
-        assert_eq!(key, "end");
-        assert_eq!(result.unwrap(), None);
         tokio::time::timeout(Duration::from_secs(1), tasks.wait())
             .await
             .expect("a keyed task stayed tracked");
