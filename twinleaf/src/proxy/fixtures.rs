@@ -15,9 +15,9 @@ use std::future;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 /// The longest any step of a test waits.
 pub(crate) const WAIT: Duration = Duration::from_secs(5);
@@ -347,8 +347,8 @@ pub(crate) fn assert_took(took: Duration, expected: Duration, what: impl Debug) 
 /// How a fake opener opens the device of the first link to a URL.
 #[derive(Clone)]
 pub(crate) enum First {
-    /// The open waits until the gate is notified.
-    Waits(Arc<Notify>),
+    /// The open blocks a thread until the test meets it at the gate.
+    Blocks(Arc<Barrier>),
     /// The open panics.
     Panics,
 }
@@ -387,9 +387,12 @@ pub(super) fn fakes(first: Vec<(&str, First)>) -> (Opens, mpsc::UnboundedReceive
             };
             match how.clone() {
                 None => Box::pin(future::ready(open())),
-                Some(First::Waits(gate)) => Box::pin(async move {
-                    gate.notified().await;
-                    open()
+                Some(First::Blocks(gate)) => Box::pin(async move {
+                    let opening = tokio::task::spawn_blocking(move || {
+                        gate.wait();
+                        open()
+                    });
+                    opening.await.map_err(io::Error::other)?
                 }),
                 Some(First::Panics) => panic!("the opener of {url} panics"),
             }

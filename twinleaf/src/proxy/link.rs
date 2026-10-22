@@ -666,8 +666,8 @@ mod tests {
         assert_took, fakes, opened, FakeDevice, First, Opened, PAUSED_WAIT, UNREACHABLE, WAIT,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Barrier;
     use std::thread;
-    use tokio::sync::Notify;
 
     impl Link {
         /// Creates a link to `url` with no worker. Returns it with the
@@ -919,12 +919,12 @@ mod tests {
     }
 
     /// A new link waits while the task of an earlier link to its device
-    /// runs, here one whose first open cannot be dropped, however long that
+    /// runs, here one whose first open blocks a thread, however long that
     /// takes. A link to another device opens meanwhile.
     #[tokio::test(start_paused = true)]
     async fn a_new_link_waits_for_an_earlier_worker_of_its_own_device_alone() {
-        let gate = Arc::new(Notify::new());
-        let (links, _owner, mut devices) = registry(vec![(DEVICE, First::Waits(gate.clone()))]);
+        let gate = Arc::new(Barrier::new(2));
+        let (links, _owner, mut devices) = registry(vec![(DEVICE, First::Blocks(gate.clone()))]);
         drop(acquire(&links, DEVICE).await);
 
         let reopening = tokio::spawn({
@@ -935,14 +935,14 @@ mod tests {
         // Its device stays, as a device that hung up would be reopened.
         let other = opened(&mut devices).await;
         assert_eq!(other.url, OTHER);
-        tokio::time::sleep(LEAVE_TIMEOUT * 4).await;
+        tokio::time::advance(LEAVE_TIMEOUT * 4).await;
         assert!(
             !reopening.is_finished(),
             "the link opened as the worker ran"
         );
         assert_eq!(urls(&links).await, [OTHER]);
 
-        gate.notify_one();
+        gate.wait();
 
         let mut lingering = opened(&mut devices).await;
         assert_eq!(lingering.url, DEVICE);
