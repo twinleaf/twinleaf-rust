@@ -83,6 +83,8 @@ pub(super) struct Subscriber {
 #[derive(Debug)]
 struct SubscriberSender {
     tx: mpsc::Sender<Packet>,
+    /// The slot kept for the status that the worker gave up the device.
+    last: mpsc::OwnedPermit<Packet>,
     scope: DeviceRoute,
 }
 
@@ -100,8 +102,9 @@ impl Subscriber {
         rx: mpsc::Receiver<Packet>,
         scope: DeviceRoute,
     ) -> Subscriber {
+        let last = tx.clone().try_reserve_owned().expect("a new port has room");
         Subscriber {
-            sender: SubscriberSender { tx, scope },
+            sender: SubscriberSender { tx, last, scope },
             rx,
         }
     }
@@ -121,6 +124,13 @@ impl SubscriberSender {
             Err(_) => return true,
         };
         self.tx.try_send(pkt.with_route(route)).is_ok()
+    }
+
+    /// Delivers the status that the worker gave up the device, at the port's
+    /// root, however full its queue is.
+    fn give_up(self) {
+        self.last
+            .send(Packet::link(packet::LinkStatus::FailedToReconnect));
     }
 }
 
@@ -1112,7 +1122,9 @@ impl Worker {
                 target: &self.log_target,
                 "Stopping reconnection attempts due to timeout"
             );
-            self.broadcast_status(packet::LinkStatus::FailedToReconnect);
+            self.subscribers
+                .drain()
+                .for_each(|(_, subscriber)| subscriber.give_up());
             return ControlFlow::Break(());
         }
         let liveness = self.device.as_ref().and_then(Device::liveness_deadline);
@@ -1359,7 +1371,15 @@ mod tests {
     /// A port at `scope`, and what it is delivered.
     fn subscriber(scope: DeviceRoute) -> (SubscriberSender, mpsc::Receiver<Packet>) {
         let (to_port, delivered) = mpsc::channel(DELIVERED);
-        (SubscriberSender { tx: to_port, scope }, delivered)
+        let last = to_port.clone().try_reserve_owned().unwrap();
+        (
+            SubscriberSender {
+                tx: to_port,
+                last,
+                scope,
+            },
+            delivered,
+        )
     }
 
     fn insert_rpc(
@@ -1557,7 +1577,7 @@ mod tests {
     fn rpc_timeout_is_delivered_with_the_ports_request_id() {
         let mut worker = idle_worker();
 
-        let (to_port, mut delivered) = mpsc::channel(1);
+        let (to_port, mut delivered) = mpsc::channel(2);
         let (_from_port, rx) = mpsc::channel(1);
         let port = 1;
         worker.adopt(Subscriber::new(to_port, rx, DeviceRoute::root()));
@@ -1924,6 +1944,38 @@ mod tests {
             worker.port.try_recv(),
             Err(TryRecvError::Disconnected)
         ));
+    }
+
+    /// A port whose queue is full, though it has not fallen behind, when the
+    /// worker gives up its device still hears that reconnecting failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_port_with_a_full_queue_still_hears_failed_to_reconnect() {
+        let (ends, mut opened_ends) = mpsc::unbounded_channel();
+        let open = scripted(move |attempt, results| {
+            future::ready(match attempt {
+                0 => fake(TransportKind::Tcp, results, &ends),
+                _ => Err(io::ErrorKind::ConnectionRefused.into()),
+            })
+        });
+        let mut worker = Running::start(open, Some(Duration::from_millis(200)));
+        let mut first = opened(&mut opened_ends).await;
+        for _ in 1..DELIVERED {
+            first.send(&heartbeat()).await;
+        }
+        assert_eq!(worker.settled(Readiness::Pending).await, Readiness::Ready);
+
+        first.fail(io::ErrorKind::ConnectionReset);
+        ended(worker.task).await;
+
+        let mut queued = Vec::new();
+        while let Ok(pkt) = worker.port.try_recv() {
+            queued.push(pkt);
+        }
+        assert_eq!(queued.len(), DELIVERED);
+        assert_eq!(
+            queued.last().and_then(Packet::link_status),
+            Some(packet::LinkStatus::FailedToReconnect)
+        );
     }
 
     /// A port lost before its device answers on it is a failed attempt. The
