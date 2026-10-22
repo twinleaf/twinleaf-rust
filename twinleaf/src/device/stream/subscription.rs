@@ -36,6 +36,8 @@ pub enum Queued<T> {
     Item(T),
     /// The count of items dropped while the receiver was behind.
     Gap(u64),
+    /// The proxy stopped, which ended the stream. Nothing follows.
+    Stopped,
 }
 
 /// An owned subscription to one subtree's stream.
@@ -46,8 +48,8 @@ pub struct Receiver<T> {
     items: flume::Receiver<Queued<T>>,
     /// Dropped with the receiver, which wakes the pump to drop its sink.
     _lifeline: oneshot::Sender<Infallible>,
-    /// The stream this came from, which it keeps running and asks why it
-    /// ended. `None` only until [`tied_to`](Self::tied_to) sets it.
+    /// The stream this came from, which it keeps running. `None` only until
+    /// [`tied_to`](Self::tied_to) sets it.
     stream: Option<Arc<Stream>>,
 }
 
@@ -91,8 +93,9 @@ impl<T> Receiver<T> {
         match self.items.try_recv() {
             Ok(Queued::Item(item)) => Ok(Some(item)),
             Ok(Queued::Gap(skipped)) => Err(RecvError::Lagged(skipped)),
+            Ok(Queued::Stopped) => Err(RecvError::Stopped),
             Err(flume::TryRecvError::Empty) => Ok(None),
-            Err(flume::TryRecvError::Disconnected) => Err(self.ended()),
+            Err(flume::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
@@ -125,13 +128,14 @@ impl<T> Receiver<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`RecvError::Lagged`] for a gap, and [`RecvError::Stopped`] or
-    /// [`RecvError::Disconnected`] for a disconnected channel.
+    /// Returns [`RecvError::Lagged`] for a gap, [`RecvError::Stopped`] for
+    /// the stop, and [`RecvError::Disconnected`] for a disconnected channel.
     pub fn resolve(&self, received: Result<Queued<T>, flume::RecvError>) -> Result<T, RecvError> {
         match received {
             Ok(Queued::Item(item)) => Ok(item),
             Ok(Queued::Gap(skipped)) => Err(RecvError::Lagged(skipped)),
-            Err(flume::RecvError::Disconnected) => Err(self.ended()),
+            Ok(Queued::Stopped) => Err(RecvError::Stopped),
+            Err(flume::RecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
@@ -142,17 +146,7 @@ impl<T> Receiver<T> {
         match received {
             Ok(item) => self.resolve(Ok(item)),
             Err(flume::RecvTimeoutError::Timeout) => Err(RecvError::Timeout),
-            Err(flume::RecvTimeoutError::Disconnected) => Err(self.ended()),
-        }
-    }
-
-    /// Returns why the stream ended, once its channel has disconnected.
-    fn ended(&self) -> RecvError {
-        // The session records that the proxy stopped before the pump drops
-        // the sink, and the disconnect orders that record ahead of this read.
-        match &self.stream {
-            Some(stream) if stream.root.session().stopped() => RecvError::Stopped,
-            Some(_) | None => RecvError::Disconnected,
+            Err(flume::RecvTimeoutError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
@@ -214,52 +208,33 @@ impl Scope {
     }
 }
 
-/// One subscriber's queue, with its scope and the count of items it has
-/// missed.
-pub(super) struct Sink<T> {
+/// The sending end of a queue that counts the items it had no room for, and
+/// keeps one place for the stop.
+pub(crate) struct Lane<T> {
     items: flume::Sender<Queued<T>>,
-    /// Closes when the subscriber drops its receiver, waking the pump.
-    pub(super) alive: oneshot::Receiver<Infallible>,
-    pub(super) scope: Scope,
+    room: usize,
     skipped: u64,
 }
 
-impl<T> Sink<T> {
-    pub(super) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
-        let (items, received) = flume::bounded(capacity);
-        let (lifeline, alive) = oneshot::channel();
-        (
-            Sink {
-                items,
-                alive,
-                scope,
-                skipped: 0,
-            },
-            Receiver {
-                items: received,
-                _lifeline: lifeline,
-                stream: None,
-            },
-        )
-    }
-
-    /// Offers an item concerning `scope`, sent only if `scope` overlaps this
-    /// subscriber's scope. Returns `false` once the subscriber is gone.
-    pub(super) fn offer(&mut self, scope: Scope, item: impl FnOnce() -> T) -> bool {
-        if self.scope.intersects(&scope) {
-            self.send(item())
-        } else {
-            true
-        }
+impl<T> Lane<T> {
+    /// Returns a lane with room for `capacity` items, and its receiving end.
+    pub(crate) fn new(capacity: usize) -> (Lane<T>, flume::Receiver<Queued<T>>) {
+        let (items, received) = flume::bounded(capacity + 1);
+        let lane = Lane {
+            items,
+            room: capacity,
+            skipped: 0,
+        };
+        (lane, received)
     }
 
     /// Sends one item, or counts it as missed if the queue is full. Returns
-    /// `false` once the subscriber is gone.
-    pub(super) fn send(&mut self, item: T) -> bool {
+    /// `false` once the receiver is gone.
+    pub(crate) fn send(&mut self, item: T) -> bool {
         if !self.report_lag() {
             return false;
         }
-        match self.items.try_send(Queued::Item(item)) {
+        match self.push(Queued::Item(item)) {
             Ok(()) => true,
             Err(flume::TrySendError::Full(_)) => {
                 self.skipped += 1;
@@ -270,18 +245,63 @@ impl<T> Sink<T> {
     }
 
     /// Sends the count of missed items once the queue has room. Returns
-    /// `false` once the subscriber is gone.
-    pub(super) fn report_lag(&mut self) -> bool {
+    /// `false` once the receiver is gone.
+    pub(crate) fn report_lag(&mut self) -> bool {
         if self.skipped == 0 {
             return true;
         }
-        match self.items.try_send(Queued::Gap(self.skipped)) {
+        match self.push(Queued::Gap(self.skipped)) {
             Ok(()) => {
                 self.skipped = 0;
                 true
             }
             Err(flume::TrySendError::Full(_)) => true,
             Err(flume::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Ends the queue with the stop, for which it always has room.
+    pub(crate) fn stop(self) {
+        let _ = self.items.try_send(Queued::Stopped);
+    }
+
+    /// Sends `queued` if it leaves the place kept for the stop.
+    fn push(&self, queued: Queued<T>) -> Result<(), flume::TrySendError<Queued<T>>> {
+        if self.items.len() < self.room {
+            self.items.try_send(queued)
+        } else {
+            Err(flume::TrySendError::Full(queued))
+        }
+    }
+}
+
+/// One subscriber's queue, with its scope.
+pub(super) struct Sink<T> {
+    pub(super) lane: Lane<T>,
+    /// Closes when the subscriber drops its receiver, waking the pump.
+    pub(super) alive: oneshot::Receiver<Infallible>,
+    pub(super) scope: Scope,
+}
+
+impl<T> Sink<T> {
+    pub(super) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
+        let (lane, items) = Lane::new(capacity);
+        let (lifeline, alive) = oneshot::channel();
+        let receiver = Receiver {
+            items,
+            _lifeline: lifeline,
+            stream: None,
+        };
+        (Sink { lane, alive, scope }, receiver)
+    }
+
+    /// Offers an item concerning `scope`, sent only if `scope` overlaps this
+    /// subscriber's scope. Returns `false` once the subscriber is gone.
+    pub(super) fn offer(&mut self, scope: Scope, item: impl FnOnce() -> T) -> bool {
+        if self.scope.intersects(&scope) {
+            self.lane.send(item())
+        } else {
+            true
         }
     }
 }
