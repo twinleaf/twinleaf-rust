@@ -141,8 +141,9 @@ impl Connection {
     /// proxy stops, as `tio proxy` does at Ctrl-C. Then every subscription
     /// ends and every RPC fails. At a stop the views first see a
     /// [`Stopped`](crate::tio::packet::LinkStatus::Stopped) status, and
-    /// subscriptions end with [`RecvError::Stopped`]. Any other end gives
-    /// [`RecvError::Disconnected`].
+    /// subscriptions end with [`RecvError::Stopped`]. After
+    /// [`close`](Self::close) they end with [`RecvError::Closed`]. Any other
+    /// end gives [`RecvError::Disconnected`].
     ///
     /// # Errors
     ///
@@ -212,6 +213,17 @@ impl Connection {
             Session::mount_async(&proxy, &layout, open_timeout).await
         })?;
         Ok(Self::over(session))
+    }
+
+    /// Closes the connection for every clone, view and subscription, however
+    /// many remain. Subscriptions then end with [`RecvError::Closed`], and
+    /// RPCs fail. Returns at once, and the socket closes soon after.
+    ///
+    /// Dropping the last handle on the connection closes it too. Close it to
+    /// end it at a known moment, as an app does before it opens another
+    /// layout.
+    pub fn close(&self) {
+        self.tree.handle.session().close();
     }
 
     /// Opens `url` through `proxy` for `purpose`, waiting at most
@@ -443,7 +455,7 @@ impl DeviceTree {
                 Ok(event) => event,
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Timeout) => return Err(MetadataError::Timeout),
-                Err(RecvError::Disconnected | RecvError::Stopped) => {
+                Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
                     return Err(MetadataError::Disconnected)
                 }
             };
@@ -470,7 +482,12 @@ impl DeviceTree {
             match events.recv_deadline(deadline) {
                 Ok(Event::RouteDiscovered { route }) => routes.push(route),
                 Ok(Event::Device { .. }) | Ok(Event::Link { .. }) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Timeout | RecvError::Disconnected | RecvError::Stopped) => break,
+                Err(
+                    RecvError::Timeout
+                    | RecvError::Disconnected
+                    | RecvError::Stopped
+                    | RecvError::Closed,
+                ) => break,
             }
         }
         routes.sort();
@@ -949,6 +966,37 @@ mod tests {
         assert_eq!(root_name(&connection), "FAKE");
     }
 
+    /// Closing one clone ends every subscription and view of the connection,
+    /// though they outlive the clone, and the proxy lets the client go.
+    #[test]
+    fn a_close_ends_every_handle_on_the_connection() {
+        let device = FakeDevice::start();
+        let proxy = fixtures::proxy();
+        let connection = open_through(&proxy, &device.url).unwrap();
+        let (events, view) = (connection.events(), connection.device(DeviceRoute::root()));
+        assert_eq!(root_name(&connection), "FAKE");
+
+        connection.clone().close();
+        drop(connection);
+
+        let deadline = Instant::now() + WAIT;
+        let ended = loop {
+            match events.recv_deadline(deadline) {
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(ended) => break ended,
+            }
+        };
+        assert_eq!(ended, RecvError::Closed);
+        assert!(view.get::<String>("dev.name").is_err());
+        while !proxy.clients().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the proxy kept the closed client"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A layout opens each of its devices, each seen at its own prefix.
     #[test]
     fn a_layout_opens_each_device_at_its_prefix() {
@@ -1044,7 +1092,9 @@ mod tests {
                 }) => stopped = true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Stopped) => break,
-                Err(RecvError::Disconnected) => panic!("the events ended with no stop"),
+                Err(RecvError::Disconnected | RecvError::Closed) => {
+                    panic!("the events ended with no stop")
+                }
                 Err(RecvError::Timeout) => panic!("the connection outlived its proxy"),
             }
         }

@@ -10,7 +10,7 @@ mod subscription;
 
 pub use event::{DeviceEvent, Event, LinkEvent, NamedRoute};
 pub(crate) use metadata::{Completed, MetadataSchedule};
-pub(crate) use subscription::{Lane, Queued, Scope};
+pub(crate) use subscription::{End, Lane, Queued, Scope};
 pub use subscription::{Receiver, RecvError};
 
 use super::session::{Handle, Inlet, RawCallResult};
@@ -243,12 +243,12 @@ enum PumpSink {
 }
 
 impl PumpSink {
-    /// Ends the subscription with the stop.
-    fn stop(self) {
+    /// Ends the subscription saying why.
+    fn end(self, end: End) {
         match self {
-            PumpSink::Batches(sink) => sink.lane.stop(),
-            PumpSink::Events(sink) => sink.lane.stop(),
-            PumpSink::Packets(sink) => sink.lane.stop(),
+            PumpSink::Batches(sink) => sink.lane.end(end),
+            PumpSink::Events(sink) => sink.lane.end(end),
+            PumpSink::Packets(sink) => sink.lane.end(end),
         }
     }
 }
@@ -257,9 +257,9 @@ impl PumpSink {
 enum Turn {
     Running,
     /// The session or the stream is gone.
-    Ended,
-    /// The proxy stopped.
-    Stopped,
+    Gone,
+    /// The session ended saying why.
+    Ended(End),
 }
 
 /// The connection's one stream, shared by every view. Its pump starts at the
@@ -350,10 +350,10 @@ impl Pump {
     }
 
     /// Runs until the session ends or the stream is dropped. Drains and
-    /// discards packets while no sink is live. Once the proxy stopped, ends
-    /// every sink with the stop, and each new one until the stream drops.
+    /// discards packets while no sink is live. Once the session ended saying
+    /// why, ends every sink so, and each new one until the stream drops.
     async fn run(mut self) {
-        loop {
+        let end = loop {
             let retry = self.schedule.next_retry();
             // A sink takes the packets that arrive after it was made, so new
             // sinks, replies and pruning go ahead of the inlet.
@@ -364,7 +364,7 @@ impl Pump {
                         self.add_sink(sink);
                         Turn::Running
                     }
-                    None => Turn::Ended,
+                    None => Turn::Gone,
                 },
                 Ok(reply) = self.schedule.replies().recv_async() => {
                     self.take_metadata_replies(reply);
@@ -377,15 +377,15 @@ impl Pump {
             self.publish();
             match turn {
                 Turn::Running => self.submit_metadata_queries(),
-                Turn::Ended => return,
-                Turn::Stopped => break,
+                Turn::Gone => return,
+                Turn::Ended(end) => break end,
             }
-        }
-        self.batches.drain(..).for_each(|sink| sink.lane.stop());
-        self.events.drain(..).for_each(|sink| sink.lane.stop());
-        self.packets.drain(..).for_each(|sink| sink.lane.stop());
+        };
+        self.batches.drain(..).for_each(|sink| sink.lane.end(end));
+        self.events.drain(..).for_each(|sink| sink.lane.end(end));
+        self.packets.drain(..).for_each(|sink| sink.lane.end(end));
         while let Some(sink) = self.commands.recv().await {
-            sink.stop();
+            sink.end(end);
         }
     }
 
@@ -412,33 +412,29 @@ impl Pump {
     }
 
     /// Takes `received` from the inlet, and what else the inlet held then,
-    /// up to the stop.
+    /// up to the end.
     fn take_input(&mut self, received: Result<Queued<tio::Packet>, flume::RecvError>) -> Turn {
         let Ok(queued) = received else {
-            return Turn::Ended;
+            return Turn::Gone;
         };
         let inlet = self.inlet.clone();
         let held = inlet.try_iter().take(inlet.len());
-        if std::iter::once(queued)
+        let end = std::iter::once(queued)
             .chain(held)
-            .all(|queued| self.take(queued))
-        {
-            Turn::Running
-        } else {
-            Turn::Stopped
-        }
+            .find_map(|queued| self.take(queued));
+        end.map_or(Turn::Running, Turn::Ended)
     }
 
     /// Takes one packet from the inlet, or reports the gap the session left.
-    /// Returns `false` for the stop.
-    fn take(&mut self, queued: Queued<tio::Packet>) -> bool {
+    /// Returns why the session ended, at its end.
+    fn take(&mut self, queued: Queued<tio::Packet>) -> Option<End> {
         let packet = &match queued {
             Queued::Item(packet) => packet,
             Queued::Gap(_) => {
                 self.state.input_overrun();
-                return true;
+                return None;
             }
-            Queued::Stopped => return false,
+            Queued::Ended(end) => return Some(end),
         };
         self.tap(packet);
         if let Some(packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped) =
@@ -448,7 +444,7 @@ impl Pump {
         }
         let covered = self.covers(packet.route());
         self.state.process_packet(packet, covered);
-        true
+        None
     }
 
     /// Offers a packet to the raw taps, unparsed and with its absolute route.
@@ -943,7 +939,7 @@ mod tests {
             match batches.recv_deadline(deadline) {
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Disconnected) => break,
-                Err(RecvError::Stopped) => panic!("a closed socket is no stop"),
+                Err(RecvError::Stopped | RecvError::Closed) => panic!("a closed socket is no stop"),
                 Err(RecvError::Timeout) => panic!("the batches outlived the session"),
             }
         }
@@ -1035,7 +1031,7 @@ mod tests {
         let (mut sink, receiver) = Sink::new(2, everything());
         assert!((0..3).all(|item| sink.lane.send(item)));
 
-        sink.lane.stop();
+        sink.lane.end(End::Stopped);
 
         assert_eq!(receiver.try_recv(), Ok(Some(0)));
         assert_eq!(receiver.try_recv(), Ok(Some(1)));
