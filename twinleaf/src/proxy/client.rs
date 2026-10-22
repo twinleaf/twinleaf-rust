@@ -17,6 +17,7 @@ use crate::tio::transport::{self, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -283,7 +284,15 @@ impl Session {
         self.classify_until = None;
         self.legacy = first.is_none_or(|pkt| pkt.ptype() != PacketType::PROXY_TX);
         match self.legacy {
-            true => self.open(None, auto::AUTO.to_string(), Purpose::Use),
+            true => self.open(
+                None,
+                bind(
+                    self.shared.clone(),
+                    self.addr.clone(),
+                    auto::AUTO.to_string(),
+                    Purpose::Use,
+                ),
+            ),
             false => self.client.keep_alive(control::PROXY_KEEPALIVE).await,
         }
     }
@@ -469,6 +478,11 @@ impl Session {
             }
             Request::Open { target } => self.request_open(id, target, Purpose::Use),
             Request::Probe { url } => self.request_open(id, url, Purpose::Probe),
+            Request::Mount(layout) => {
+                let (shared, addr) = (self.shared.clone(), self.addr.clone());
+                let binding = attach(shared, addr, layout.to_string(), layout, None, Purpose::Use);
+                self.request(id, binding)
+            }
             Request::Stop if self.shared.options.stoppable => {
                 self.answer(id, Ok(Vec::new()))?;
                 log::info!("Stopped by proxy.stop from client {}", self.addr);
@@ -490,26 +504,39 @@ impl Session {
     }
 
     /// Begins the open of `target` for `purpose` that control request `id`
-    /// asks for. A connection binds once, so a second open is refused at
-    /// once.
+    /// asks for.
     fn request_open(
         &mut self,
         id: u16,
         target: String,
         purpose: Purpose,
     ) -> Result<(), ClientError> {
+        let binding = bind(self.shared.clone(), self.addr.clone(), target, purpose);
+        self.request(id, binding)
+    }
+
+    /// Begins the `binding` that control request `id` asks for. A connection
+    /// binds once, so a second request is refused at once.
+    fn request(
+        &mut self,
+        id: u16,
+        binding: impl Future<Output = Result<Binding, Refusal>> + Send + 'static,
+    ) -> Result<(), ClientError> {
         if let Some(binding) = &self.binding {
             let message = format!("this connection already opened {}", binding.target);
             return self.answer(id, Err(Refusal::new(RpcError::State, message)));
         }
-        self.open(Some(id), target, purpose);
+        self.open(Some(id), binding);
         Ok(())
     }
 
-    /// Begins binding the connection to `target` for `purpose`, to answer
-    /// control request `request`, or for a legacy client with `None`.
-    fn open(&mut self, request: Option<u16>, target: String, purpose: Purpose) {
-        let binding = bind(self.shared.clone(), self.addr.clone(), target, purpose);
+    /// Begins `binding` the connection, to answer control request `request`,
+    /// or for a legacy client with `None`.
+    fn open(
+        &mut self,
+        request: Option<u16>,
+        binding: impl Future<Output = Result<Binding, Refusal>> + Send + 'static,
+    ) {
         self.opening = Some(Box::pin(async move { (request, binding.await) }));
     }
 
@@ -560,6 +587,20 @@ async fn bind(
         Purpose::Use => resolve(&shared, target).await?,
         Purpose::Probe => (target.clone(), Layout::single(&target), None),
     };
+    attach(shared, addr, target, layout, chosen, purpose).await
+}
+
+/// Binds the connection to `layout`, named `target`, as [`bind`] does once
+/// it has resolved its target. A link `auto` chose is shared, and every
+/// other mount takes a lease of its own.
+async fn attach(
+    shared: Arc<Shared>,
+    addr: String,
+    target: String,
+    layout: Layout,
+    chosen: Option<Link>,
+    purpose: Purpose,
+) -> Result<Binding, Refusal> {
     let deadline = Instant::now() + link::READY_TIMEOUT;
     let mut leases = Vec::with_capacity(layout.mounts.len());
     for mount in &layout.mounts {

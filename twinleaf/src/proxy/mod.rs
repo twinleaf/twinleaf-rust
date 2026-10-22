@@ -42,6 +42,11 @@
 //!   that only probes have opened is not a choice for `auto`, and closes as
 //!   soon as the last probe leaves. A probe of a device a client opened
 //!   shares it.
+//! - `proxy.mount` takes a [`Layout`] and opens it as one tree, each mount
+//!   at its prefix, in place of `proxy.open`. A layout is a `u8` count of
+//!   mounts, then each mount's URL, source route and prefix route, each
+//!   after a `u8` length. Each mount's device becomes a choice for `auto`.
+//!   A layout that mounts nothing, or whose prefixes overlap, is refused.
 //! - `proxy.stop` takes nothing and replies nothing, then stops the proxy.
 //!   Only a proxy with [`HostOptions::stoppable`] set accepts it.
 //!
@@ -105,7 +110,7 @@ mod link;
 mod server;
 mod worker;
 
-pub(crate) use control::{call, executable_name, handshake, Purpose, CLIENT_KEEPALIVE};
+pub(crate) use control::{call, executable_name, handshake, Purpose, CLIENT_KEEPALIVE, MOUNT};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -219,6 +224,26 @@ pub struct Mount {
 pub struct Layout {
     /// Each mounted subtree.
     pub mounts: Vec<Mount>,
+}
+
+/// Shows the device's URL, the subtree when it is not the whole device, and
+/// where the client sees it, as `serial:///dev/ttyACM0 /2 at /1`.
+impl fmt::Display for Mount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.source.is_empty() {
+            write!(formatter, "{} at {}", self.url, self.prefix)
+        } else {
+            write!(formatter, "{} {} at {}", self.url, self.source, self.prefix)
+        }
+    }
+}
+
+/// Shows each mount, separated by commas.
+impl fmt::Display for Layout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mounts: Vec<String> = self.mounts.iter().map(Mount::to_string).collect();
+        formatter.write_str(&mounts.join(", "))
+    }
 }
 
 impl Layout {
@@ -1028,6 +1053,56 @@ mod tests {
         client.hello(4242, "late");
         assert_eq!(client.open("default").unwrap_err().0, RpcError::Invalid);
         assert_eq!(client.open("auto"), Ok(device.url.clone()));
+    }
+
+    /// A client mounts devices of its own choosing, each where it says, and
+    /// the table shows what it mounted. A layout whose prefixes overlap is
+    /// refused.
+    #[test]
+    fn a_client_mounts_the_layout_it_names() {
+        let (first, second) = (FakeDevice::start(), FakeDevice::start());
+        let proxy = Proxy::host(options()).unwrap();
+        let at = |prefix: &str| prefix.parse::<DeviceRoute>().unwrap();
+        let layout = Layout {
+            mounts: [(&first, "/1"), (&second, "/2")]
+                .map(|(device, prefix)| Mount {
+                    url: device.url.clone(),
+                    source: DeviceRoute::root(),
+                    prefix: at(prefix),
+                })
+                .to_vec(),
+        };
+        let client = TestClient::connect(&proxy.endpoint());
+        client.hello(4242, "mounting");
+
+        let reply = client.control("proxy.mount", &layout.encode_args(), 2);
+
+        assert_eq!(
+            reply.map(|reply| String::decode_reply(&reply).unwrap()),
+            Ok(layout.to_string())
+        );
+        assert_eq!(client.dev_name_at(at("/1"), 7), "FAKE");
+        assert_eq!(client.dev_name_at(at("/2"), 8), "FAKE");
+        let targets: Vec<_> = proxy
+            .clients()
+            .into_iter()
+            .map(|client| client.target)
+            .collect();
+        assert_eq!(targets, [Some(layout.to_string())]);
+
+        let overlapping = Layout {
+            mounts: vec![
+                layout.mounts[0].clone(),
+                Mount {
+                    prefix: at("/1/2"),
+                    ..layout.mounts[1].clone()
+                },
+            ],
+        };
+        let other = TestClient::connect(&proxy.endpoint());
+        other.hello(4242, "overlapping");
+        let refused = other.control("proxy.mount", &overlapping.encode_args(), 2);
+        assert_eq!(refused.unwrap_err().0, RpcError::Invalid);
     }
 
     /// A link still waiting for its device to answer is no candidate for

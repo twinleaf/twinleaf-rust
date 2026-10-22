@@ -3,6 +3,7 @@
 //! `PROXY_RX` packet. [`Request`] decodes a request, [`answer`] builds the
 //! reply, and [`call`] and [`handshake`] make requests as a client.
 
+use super::{Layout, Mount};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
@@ -25,6 +26,9 @@ pub(super) const OPEN: &str = "proxy.open";
 /// The method that binds a connection to a device to look it over. The
 /// device does not become a choice for `auto`.
 pub(super) const PROBE: &str = "proxy.probe";
+/// The method that binds a connection to a layout of mounts the client
+/// names, each of which becomes a choice for `auto`.
+pub(crate) const MOUNT: &str = "proxy.mount";
 /// The method that stops a background proxy.
 pub(super) const STOP: &str = "proxy.stop";
 
@@ -170,6 +174,8 @@ pub(super) enum Request {
         /// The device's URL.
         url: String,
     },
+    /// `proxy.mount`, naming the layout to open.
+    Mount(Layout),
     /// `proxy.stop`.
     Stop,
     /// `proxy.test.panic`, which makes the task serving the client panic.
@@ -194,6 +200,7 @@ impl Request {
             b"proxy.probe" => Ok(Request::Probe {
                 url: String::decode_reply(args).map_err(malformed)?,
             }),
+            b"proxy.mount" => Ok(Request::Mount(decode_layout(args)?)),
             b"proxy.stop" => Ok(Request::Stop),
             #[cfg(test)]
             b"proxy.test.panic" => Ok(Request::Panic),
@@ -210,11 +217,82 @@ impl Request {
             Request::Hello(introduction) => (HELLO, introduction.encode_args()),
             Request::Open { target } => (OPEN, target.encode_args()),
             Request::Probe { url } => (PROBE, url.encode_args()),
+            Request::Mount(layout) => (MOUNT, layout.encode_args()),
             Request::Stop => (STOP, Vec::new()),
             #[cfg(test)]
             Request::Panic => ("proxy.test.panic", Vec::new()),
         }
     }
+}
+
+/// Encodes a layout as `proxy.mount` sends it, a count of mounts and then
+/// each mount's URL, source and prefix, each after its length in a byte.
+impl RpcArgs for Layout {
+    fn encode_into(&self, output: &mut Vec<u8>) {
+        output.push(self.mounts.len() as u8);
+        for mount in &self.mounts {
+            for part in [
+                mount.url.as_bytes(),
+                mount.source.as_slice(),
+                mount.prefix.as_slice(),
+            ] {
+                output.push(part.len() as u8);
+                output.extend_from_slice(part);
+            }
+        }
+    }
+}
+
+/// Decodes the layout that `proxy.mount` sends.
+///
+/// Returns a [`Refusal`] if `args` do not decode, a route is not valid, the
+/// layout mounts nothing, or one prefix lies within another, as a packet's
+/// route would then fall under two mounts.
+fn decode_layout(mut args: &[u8]) -> Result<Layout, Refusal> {
+    let truncated = || Refusal::new(RpcError::ArgsSize, "the layout is cut short");
+    let part = |args: &mut &[u8]| -> Result<Vec<u8>, Refusal> {
+        let (&len, rest) = args.split_first().ok_or_else(truncated)?;
+        let (part, rest) = rest.split_at_checked(len.into()).ok_or_else(truncated)?;
+        *args = rest;
+        Ok(part.to_vec())
+    };
+    let route = |hops: Vec<u8>| {
+        DeviceRoute::from_hops(&hops)
+            .map_err(|error| Refusal::new(RpcError::Invalid, format!("a mount's route: {error}")))
+    };
+    let (&count, rest) = args.split_first().ok_or_else(truncated)?;
+    args = rest;
+    let mounts = (0..count)
+        .map(|_| {
+            let url = String::from_utf8_lossy(&part(&mut args)?).into_owned();
+            let source = route(part(&mut args)?)?;
+            let prefix = route(part(&mut args)?)?;
+            Ok(Mount {
+                url,
+                source,
+                prefix,
+            })
+        })
+        .collect::<Result<Vec<_>, Refusal>>()?;
+    if !args.is_empty() {
+        return Err(Refusal::new(
+            RpcError::ArgsSize,
+            "the layout has bytes left over",
+        ));
+    }
+    if mounts.is_empty() {
+        return Err(Refusal::new(RpcError::Invalid, "the layout mounts nothing"));
+    }
+    let overlap = mounts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| mounts[i + 1..].iter().map(move |b| (a, b)))
+        .find(|(a, b)| a.prefix.starts_with(&b.prefix) || b.prefix.starts_with(&a.prefix));
+    if let Some((a, b)) = overlap {
+        let message = format!("the mounts at {} and {} overlap", a.prefix, b.prefix);
+        return Err(Refusal::new(RpcError::Invalid, message));
+    }
+    Ok(Layout { mounts })
 }
 
 /// A control request refused, with a code and a message saying why.
@@ -569,6 +647,12 @@ mod tests {
             Request::Probe {
                 url: "tcp://192.0.2.1".to_string(),
             },
+            Request::Mount(Layout {
+                mounts: vec![
+                    mount("serial:///dev/ttyACM0", "/", "/1"),
+                    mount("tcp://192.0.2.1", "/2", "/3/4"),
+                ],
+            }),
             Request::Stop,
         ] {
             assert_eq!(sent(&request), Ok(request));
@@ -589,6 +673,48 @@ mod tests {
 
         assert_eq!(name, "proxy.hello");
         assert_eq!(args, [4, 3, 2, 1, 1, 2, 0, 4, 3, 5, 0, b'a', b'b']);
+    }
+
+    /// Returns the mount of `source` of the device at `url`, seen at `prefix`.
+    fn mount(url: &str, source: &str, prefix: &str) -> Mount {
+        Mount {
+            url: url.to_string(),
+            source: source.parse().unwrap(),
+            prefix: prefix.parse().unwrap(),
+        }
+    }
+
+    /// A layout is its count of mounts, then each URL, source and prefix after
+    /// its length.
+    #[test]
+    fn a_layout_matches_the_wire_layout() {
+        let layout = Layout {
+            mounts: vec![mount("ab", "/", "/7")],
+        };
+
+        assert_eq!(layout.encode_args(), [1, 2, b'a', b'b', 0, 1, 7]);
+    }
+
+    /// A layout that mounts nothing, or two prefixes of which one lies within
+    /// the other, is refused, as is one cut short.
+    #[test]
+    fn a_layout_whose_mounts_are_missing_or_overlap_is_refused() {
+        let refused =
+            |mounts: Vec<Mount>| decode_layout(&Layout { mounts }.encode_args()).unwrap_err();
+
+        assert_eq!(refused(Vec::new()).code, RpcError::Invalid);
+        let overlapping = vec![mount("a", "/", "/1"), mount("b", "/", "/1/2")];
+        assert_eq!(
+            refused(overlapping).message,
+            "the mounts at /1 and /1/2 overlap"
+        );
+        let at_the_root = vec![mount("a", "/", "/"), mount("b", "/", "/2")];
+        assert_eq!(refused(at_the_root).code, RpcError::Invalid);
+        let whole = Layout {
+            mounts: vec![mount("a", "/", "/1")],
+        };
+        let cut = &whole.encode_args()[..3];
+        assert_eq!(decode_layout(cut).unwrap_err().code, RpcError::ArgsSize);
     }
 
     #[test]
