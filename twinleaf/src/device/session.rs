@@ -29,7 +29,7 @@ use super::runtime::ProxyAddress;
 use super::stream::{Lane, Queued};
 use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{handshake, Purpose, CLIENT_KEEPALIVE, MAX_RPC_TIMEOUT};
+use crate::proxy::{handshake, Layout, Purpose, CLIENT_KEEPALIVE, MAX_RPC_TIMEOUT, MOUNT};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
@@ -141,13 +141,33 @@ impl Session {
             "" => AUTO,
             target => target,
         };
+        let request = (purpose.method(), target.encode_args());
+        Session::request_async(proxy, request, &format!("open {target}"), timeout).await
+    }
+
+    /// Opens a session that sees `layout`, as [`open_async`](Self::open_async)
+    /// opens a target.
+    pub(crate) async fn mount_async(
+        proxy: &ProxyAddress,
+        layout: &Layout,
+        timeout: Duration,
+    ) -> io::Result<Session> {
+        let request = (MOUNT, layout.encode_args());
+        Session::request_async(proxy, request, &format!("mount {layout}"), timeout).await
+    }
+
+    /// Connects to `proxy` and makes the control request `(method, args)`
+    /// that binds the connection, which fails as unable to `goal`.
+    async fn request_async(
+        proxy: &ProxyAddress,
+        (method, args): (&str, Vec<u8>),
+        goal: &str,
+        timeout: Duration,
+    ) -> io::Result<Session> {
         let tasks = Supervisor::new();
         let (port, received) = connect(proxy, &tasks).await?;
-        let (method, args) = (purpose.method(), target.encode_args());
-        let goal = format!("open {target}");
         let url = &proxy.url;
-        let (host, opened) =
-            handshake(&port, &received, url, method, &args, &goal, timeout).await?;
+        let (host, opened) = handshake(&port, &received, url, method, &args, goal, timeout).await?;
         port.keep_alive(CLIENT_KEEPALIVE).await;
         log::debug!(
             "the proxy at {url} opened {}",

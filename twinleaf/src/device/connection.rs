@@ -10,7 +10,7 @@ use super::stream::{DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, 
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
-use crate::proxy::Purpose;
+use crate::proxy::{Layout, Purpose};
 use crate::rt::Supervisor;
 use crate::tio;
 use crate::tio::transport::is_local_tcp;
@@ -172,6 +172,46 @@ impl Connection {
     /// ```
     pub fn open(url: &str) -> std::io::Result<Connection> {
         Self::open_at(&ProxyAddress::chosen(), url, Purpose::Use, OPEN_TIMEOUT)
+    }
+
+    /// Opens a connection that sees `layout` as one tree, each mount's
+    /// subtree at its prefix. A client so names its own combination of
+    /// devices, where [`connect`](Self::connect) takes the host's default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InvalidInput`](std::io::ErrorKind::InvalidInput) error if
+    /// a mount's URL is longer than 255 bytes or the layout has more than 255
+    /// mounts. Also fails with the proxy's message when it refuses the
+    /// layout, such as one whose prefixes overlap, and in every way
+    /// [`open`](Self::open) does.
+    pub fn open_layout(layout: &Layout) -> std::io::Result<Connection> {
+        let too_long = layout
+            .mounts
+            .iter()
+            .any(|mount| mount.url.len() > u8::MAX.into());
+        if too_long || layout.mounts.len() > u8::MAX.into() {
+            let message = format!("the layout {layout} does not fit one request");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ));
+        }
+        Self::mount_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+    }
+
+    /// Opens a connection through `proxy` that sees `layout`, waiting at most
+    /// `open_timeout` for the proxy to open it.
+    pub(crate) fn mount_at(
+        proxy: &ProxyAddress,
+        layout: &Layout,
+        open_timeout: Duration,
+    ) -> std::io::Result<Connection> {
+        let (proxy, layout) = (proxy.clone(), layout.clone());
+        let session = Supervisor::new().run("twinleaf connection mount", async move {
+            Session::mount_async(&proxy, &layout, open_timeout).await
+        })?;
+        Ok(Self::over(session))
     }
 
     /// Opens `url` through `proxy` for `purpose`, waiting at most
@@ -907,6 +947,36 @@ mod tests {
         let connection = open_through(&proxy, &device.url).unwrap();
 
         assert_eq!(root_name(&connection), "FAKE");
+    }
+
+    /// A layout opens each of its devices, each seen at its own prefix.
+    #[test]
+    fn a_layout_opens_each_device_at_its_prefix() {
+        let devices = [FakeDevice::start(), FakeDevice::start()];
+        let proxy = fixtures::proxy();
+        let address = ProxyAddress {
+            url: proxy.endpoint(),
+            ensure: None,
+        };
+        let prefixes: [DeviceRoute; 2] = ["/1".parse().unwrap(), "/2".parse().unwrap()];
+        let layout = Layout {
+            mounts: devices
+                .iter()
+                .zip(prefixes)
+                .map(|(device, prefix)| crate::proxy::Mount {
+                    url: device.url.clone(),
+                    source: DeviceRoute::root(),
+                    prefix,
+                })
+                .collect(),
+        };
+
+        let connection = Connection::mount_at(&address, &layout, WAIT).unwrap();
+
+        for prefix in prefixes {
+            let name: String = connection.device(prefix).get("dev.name").unwrap();
+            assert_eq!(name, "FAKE", "{prefix}");
+        }
     }
 
     /// A TCP URL on this machine names a proxy already, of tio 2.0 or older,
