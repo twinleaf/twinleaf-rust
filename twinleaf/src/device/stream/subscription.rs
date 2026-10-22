@@ -24,6 +24,10 @@ pub enum RecvError {
     /// The proxy stopped, which ended the stream. Terminal.
     #[error("the proxy stopped")]
     Stopped,
+    /// Its owner closed the connection with
+    /// [`Connection::close`](crate::device::Connection::close). Terminal.
+    #[error("the connection was closed")]
+    Closed,
     /// The time bound passed. Only the time-bounded receives report this.
     #[error("timed out waiting for an item")]
     Timeout,
@@ -36,8 +40,26 @@ pub enum Queued<T> {
     Item(T),
     /// The count of items dropped while the receiver was behind.
     Gap(u64),
-    /// The proxy stopped, which ended the stream. Nothing follows.
+    /// Why the stream ended. Nothing follows.
+    Ended(End),
+}
+
+/// Why a stream ended, as its last entry says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// The proxy stopped.
     Stopped,
+    /// Its owner closed the connection.
+    Closed,
+}
+
+impl From<End> for RecvError {
+    fn from(end: End) -> RecvError {
+        match end {
+            End::Stopped => RecvError::Stopped,
+            End::Closed => RecvError::Closed,
+        }
+    }
 }
 
 /// An owned subscription to one subtree's stream.
@@ -66,8 +88,9 @@ impl<T> Receiver<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`RecvError::Lagged`] after a gap, and [`RecvError::Stopped`]
-    /// or [`RecvError::Disconnected`] once the stream has ended. Does not return
+    /// Returns [`RecvError::Lagged`] after a gap, and [`RecvError::Stopped`],
+    /// [`RecvError::Closed`] or [`RecvError::Disconnected`] once the stream
+    /// has ended. Does not return
     /// [`RecvError::Timeout`].
     pub fn recv(&self) -> Result<T, RecvError> {
         self.resolve(self.items.recv())
@@ -87,13 +110,14 @@ impl<T> Receiver<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`RecvError::Lagged`] after a gap, and [`RecvError::Stopped`]
-    /// or [`RecvError::Disconnected`] once the stream has ended.
+    /// Returns [`RecvError::Lagged`] after a gap, and [`RecvError::Stopped`],
+    /// [`RecvError::Closed`] or [`RecvError::Disconnected`] once the stream
+    /// has ended.
     pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
         match self.items.try_recv() {
             Ok(Queued::Item(item)) => Ok(Some(item)),
             Ok(Queued::Gap(skipped)) => Err(RecvError::Lagged(skipped)),
-            Ok(Queued::Stopped) => Err(RecvError::Stopped),
+            Ok(Queued::Ended(end)) => Err(end.into()),
             Err(flume::TryRecvError::Empty) => Ok(None),
             Err(flume::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
@@ -128,13 +152,14 @@ impl<T> Receiver<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`RecvError::Lagged`] for a gap, [`RecvError::Stopped`] for
-    /// the stop, and [`RecvError::Disconnected`] for a disconnected channel.
+    /// Returns [`RecvError::Lagged`] for a gap, [`RecvError::Stopped`] or
+    /// [`RecvError::Closed`] for the end, and [`RecvError::Disconnected`] for
+    /// a disconnected channel.
     pub fn resolve(&self, received: Result<Queued<T>, flume::RecvError>) -> Result<T, RecvError> {
         match received {
             Ok(Queued::Item(item)) => Ok(item),
             Ok(Queued::Gap(skipped)) => Err(RecvError::Lagged(skipped)),
-            Ok(Queued::Stopped) => Err(RecvError::Stopped),
+            Ok(Queued::Ended(end)) => Err(end.into()),
             Err(flume::RecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
@@ -209,7 +234,7 @@ impl Scope {
 }
 
 /// The sending end of a queue that counts the items it had no room for, and
-/// keeps one place for the stop.
+/// keeps one place for the end.
 pub(crate) struct Lane<T> {
     items: flume::Sender<Queued<T>>,
     room: usize,
@@ -260,9 +285,9 @@ impl<T> Lane<T> {
         }
     }
 
-    /// Ends the queue with the stop, for which it always has room.
-    pub(crate) fn stop(self) {
-        let _ = self.items.try_send(Queued::Stopped);
+    /// Ends the queue saying why, for which it always has room.
+    pub(crate) fn end(self, end: End) {
+        let _ = self.items.try_send(Queued::Ended(end));
     }
 
     /// Sends `queued` if it leaves the place kept for the stop.

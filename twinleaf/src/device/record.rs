@@ -42,6 +42,9 @@ pub enum RecordError {
     /// The proxy stopped.
     #[error("the proxy stopped")]
     Stopped,
+    /// Its owner closed the connection.
+    #[error("the connection was closed")]
+    Closed,
 }
 
 /// The outcome of one [`Recorder::step`].
@@ -244,8 +247,9 @@ impl<W: Write> Recorder<W> {
     /// # Errors
     ///
     /// Returns [`RecordError::Write`] or [`RecordError::Encode`] if a packet
-    /// cannot be written. Returns [`RecordError::Stopped`] or
-    /// [`RecordError::Disconnected`] once the connection has ended.
+    /// cannot be written. Returns [`RecordError::Stopped`],
+    /// [`RecordError::Closed`] or [`RecordError::Disconnected`] once the
+    /// connection has ended.
     pub fn step(&mut self, deadline: Option<Instant>) -> Result<Step, RecordError> {
         // The schedule keeps tokio's clock, which is the system clock unless
         // a test pauses it.
@@ -331,6 +335,7 @@ impl<W: Write> Recorder<W> {
                     log::warn!("dropped {skipped} packets before they could be recorded")
                 }
                 Err(RecvError::Stopped) => return Err(RecordError::Stopped),
+                Err(RecvError::Closed) => return Err(RecordError::Closed),
                 Err(RecvError::Disconnected) => return Err(RecordError::Disconnected),
             }
             tapped = self.tap.try_recv();

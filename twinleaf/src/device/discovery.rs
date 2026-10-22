@@ -542,7 +542,9 @@ async fn heard_routes(
                 heard.insert(packet.route());
             }
             Ok(_) | Err(RecvError::Lagged(_) | RecvError::Timeout) => {}
-            Err(RecvError::Disconnected | RecvError::Stopped) => return Err(Interrupt::Ended),
+            Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
+                return Err(Interrupt::Ended)
+            }
         }
     }
 }

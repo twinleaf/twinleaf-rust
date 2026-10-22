@@ -26,7 +26,7 @@
 //! does.
 
 use super::runtime::ProxyAddress;
-use super::stream::{Lane, Queued};
+use super::stream::{End, Lane, Queued};
 use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
 use crate::proxy::{handshake, Layout, Purpose, CLIENT_KEEPALIVE, MAX_RPC_TIMEOUT, MOUNT};
@@ -95,6 +95,8 @@ enum Command {
     Call(Call),
     /// Feeds the pump through this inlet. A second inlet is dropped.
     Attach(Lane<Packet>),
+    /// Ends the session, as its owner closed it.
+    Close,
 }
 
 /// The pump's end of a session. It carries every packet from the proxy but
@@ -243,6 +245,11 @@ impl Session {
         }
     }
 
+    /// Ends the session for every handle on it, which closes its socket.
+    pub(crate) fn close(&self) {
+        let _ = self.commands.send(Command::Close);
+    }
+
     /// Attaches the pump, with room for `capacity` packets. The first inlet
     /// is live, and any later one has already ended.
     pub(crate) fn attach(&self, capacity: usize) -> Inlet {
@@ -300,6 +307,8 @@ enum Ending {
     SocketClosed,
     /// Every handle on the session is gone.
     HandlesGone,
+    /// Its owner closed it.
+    Closed,
 }
 
 impl fmt::Display for Ending {
@@ -308,6 +317,7 @@ impl fmt::Display for Ending {
             Ending::Stopped => "the proxy stopped",
             Ending::SocketClosed => "its socket closed",
             Ending::HandlesGone => "every handle on it is gone",
+            Ending::Closed => "its owner closed it",
         })
     }
 }
@@ -341,6 +351,7 @@ impl Worker {
                     Some(Command::Attach(inlet)) => {
                         self.inlet.get_or_insert(inlet);
                     }
+                    Some(Command::Close) => break Ending::Closed,
                     None => break Ending::HandlesGone,
                 },
                 received = self.received.next() => {
@@ -356,13 +367,21 @@ impl Worker {
             Ending::SocketClosed => log::warn!("{} closed the connection", self.peer),
             ending => log::debug!("the session with {} ended: {ending}", self.peer),
         }
+        let end = match ending {
+            Ending::Stopped => Some(End::Stopped),
+            Ending::Closed => Some(End::Closed),
+            Ending::SocketClosed | Ending::HandlesGone => None,
+        };
+        if let (Some(inlet), Some(end)) = (self.inlet.take(), end) {
+            inlet.end(end);
+        }
         // A call sent before the mailbox closed is failed here, and a later
         // one is failed by its caller.
         commands.close();
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Call(call) => (call.complete)(Err(CallError::ResponseLost)),
-                Command::Attach(_) => {}
+                Command::Attach(_) | Command::Close => {}
             }
         }
         for (_, pending) in self.pending.drain() {
@@ -406,9 +425,6 @@ impl Worker {
         match received {
             Ok(TransportEvent::Packet(packet)) => {
                 if !self.packet(packet) {
-                    if let Some(inlet) = self.inlet.take() {
-                        inlet.stop();
-                    }
                     return Some(Ending::Stopped);
                 }
             }
@@ -877,7 +893,7 @@ mod tests {
         match inlet.recv_timeout(WAIT)? {
             Queued::Item(packet) => Ok(packet),
             Queued::Gap(dropped) => panic!("the session dropped {dropped} packets"),
-            Queued::Stopped => panic!("the session ended its inlet with the stop"),
+            Queued::Ended(end) => panic!("the session ended its inlet: {end:?}"),
         }
     }
 
@@ -1061,7 +1077,10 @@ mod tests {
             next(&inlet).unwrap().link_status(),
             Some(LinkStatus::Stopped)
         );
-        assert!(matches!(inlet.recv_timeout(WAIT), Ok(Queued::Stopped)));
+        assert!(matches!(
+            inlet.recv_timeout(WAIT),
+            Ok(Queued::Ended(End::Stopped))
+        ));
         assert_eq!(
             inlet.recv_timeout(WAIT).err(),
             Some(flume::RecvTimeoutError::Disconnected)
