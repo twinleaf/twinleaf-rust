@@ -26,7 +26,7 @@
 //! does.
 
 use super::runtime::ProxyAddress;
-use super::stream::Queued;
+use super::stream::{Lane, Queued};
 use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
 use crate::proxy::{handshake, Purpose, CLIENT_KEEPALIVE, MAX_RPC_TIMEOUT};
@@ -37,8 +37,6 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -96,11 +94,11 @@ struct Pending {
 enum Command {
     Call(Call),
     /// Feeds the pump through this inlet. A second inlet is dropped.
-    Attach(flume::Sender<Queued<Packet>>),
+    Attach(Lane<Packet>),
 }
 
 /// The pump's end of a session. It carries every packet from the proxy but
-/// replies, in order, and a gap where the session had no room.
+/// replies, in order, a gap where the session had no room, and the stop.
 pub(crate) type Inlet = flume::Receiver<Queued<Packet>>;
 
 /// One session with a proxy. Every clone is the same session, and dropping
@@ -108,8 +106,6 @@ pub(crate) type Inlet = flume::Receiver<Queued<Packet>>;
 #[derive(Clone)]
 pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
-    /// Set once the proxy stopped, before the session's task ends.
-    stopped: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -187,7 +183,6 @@ impl Session {
         tasks: &Supervisor,
     ) -> Session {
         let (commands, mailbox) = mpsc::unbounded_channel();
-        let stopped = Arc::new(AtomicBool::new(false));
         let worker = Worker {
             socket,
             received: received.into_stream(),
@@ -196,18 +191,9 @@ impl Session {
             next_id: 0,
             next_deadline: None,
             inlet: None,
-            dropped: 0,
-            stopped: stopped.clone(),
         };
         tasks.spawn("twinleaf session", worker.run(mailbox));
-        Session { commands, stopped }
-    }
-
-    /// Returns `true` if the proxy stopped, ending the session. The session
-    /// records the stop before it ends. A caller that saw one of its channels
-    /// disconnect also sees the record.
-    pub(crate) fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        Session { commands }
     }
 
     /// Calls `name` at `route` with encoded `args`, giving up after
@@ -240,7 +226,7 @@ impl Session {
     /// Attaches the pump, with room for `capacity` packets. The first inlet
     /// is live, and any later one has already ended.
     pub(crate) fn attach(&self, capacity: usize) -> Inlet {
-        let (inlet, packets) = flume::bounded(capacity);
+        let (inlet, packets) = Lane::new(capacity);
         let _ = self.commands.send(Command::Attach(inlet));
         packets
     }
@@ -320,10 +306,7 @@ struct Worker {
     next_deadline: Option<Instant>,
     /// The pump's inlet, once it attached. Until then the session drops what
     /// it would queue.
-    inlet: Option<flume::Sender<Queued<Packet>>>,
-    /// How many packets the inlet had no room for since its last gap.
-    dropped: u64,
-    stopped: Arc<AtomicBool>,
+    inlet: Option<Lane<Packet>>,
 }
 
 impl Worker {
@@ -403,7 +386,9 @@ impl Worker {
         match received {
             Ok(TransportEvent::Packet(packet)) => {
                 if !self.packet(packet) {
-                    self.stopped.store(true, Ordering::Release);
+                    if let Some(inlet) = self.inlet.take() {
+                        inlet.stop();
+                    }
                     return Some(Ending::Stopped);
                 }
             }
@@ -446,22 +431,8 @@ impl Worker {
     /// Queues a packet for the pump, once the pump has attached, after a gap
     /// for those the inlet had no room for.
     fn forward(&mut self, packet: Packet) {
-        let Some(inlet) = &self.inlet else {
-            return;
-        };
-        if self.dropped > 0 {
-            match inlet.try_send(Queued::Gap(self.dropped)) {
-                Ok(()) => self.dropped = 0,
-                Err(flume::TrySendError::Full(_)) => {
-                    self.dropped += 1;
-                    return;
-                }
-                Err(flume::TrySendError::Disconnected(_)) => return,
-            }
-        }
-        match inlet.try_send(Queued::Item(packet)) {
-            Ok(()) | Err(flume::TrySendError::Disconnected(_)) => {}
-            Err(flume::TrySendError::Full(_)) => self.dropped += 1,
+        if let Some(inlet) = &mut self.inlet {
+            inlet.send(packet);
         }
     }
 
@@ -686,7 +657,7 @@ mod tests {
     use crate::rt::BoxFuture;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
 
@@ -886,6 +857,7 @@ mod tests {
         match inlet.recv_timeout(WAIT)? {
             Queued::Item(packet) => Ok(packet),
             Queued::Gap(dropped) => panic!("the session dropped {dropped} packets"),
+            Queued::Stopped => panic!("the session ended its inlet with the stop"),
         }
     }
 
@@ -1047,8 +1019,8 @@ mod tests {
         ));
     }
 
-    /// A stop reaches the pump, then the session ends with every call still
-    /// waiting, and nothing reconnects.
+    /// A stop reaches the pump, then ends its inlet, and the session ends
+    /// with every call still waiting, and nothing reconnects.
     #[test]
     fn a_stop_ends_the_session() {
         let proxy = FakeProxy::start();
@@ -1069,8 +1041,9 @@ mod tests {
             next(&inlet).unwrap().link_status(),
             Some(LinkStatus::Stopped)
         );
+        assert!(matches!(inlet.recv_timeout(WAIT), Ok(Queued::Stopped)));
         assert_eq!(
-            next(&inlet).err(),
+            inlet.recv_timeout(WAIT).err(),
             Some(flume::RecvTimeoutError::Disconnected)
         );
         assert!(matches!(

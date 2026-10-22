@@ -10,7 +10,7 @@ mod subscription;
 
 pub use event::{DeviceEvent, Event, LinkEvent, NamedRoute};
 pub(crate) use metadata::{Completed, MetadataSchedule};
-pub(crate) use subscription::{Queued, Scope};
+pub(crate) use subscription::{Lane, Queued, Scope};
 pub use subscription::{Receiver, RecvError};
 
 use super::session::{Handle, Inlet, RawCallResult};
@@ -242,6 +242,26 @@ enum PumpSink {
     Packets(Sink<tio::Packet>),
 }
 
+impl PumpSink {
+    /// Ends the subscription with the stop.
+    fn stop(self) {
+        match self {
+            PumpSink::Batches(sink) => sink.lane.stop(),
+            PumpSink::Events(sink) => sink.lane.stop(),
+            PumpSink::Packets(sink) => sink.lane.stop(),
+        }
+    }
+}
+
+/// What the pump does after a turn.
+enum Turn {
+    Running,
+    /// The session or the stream is gone.
+    Ended,
+    /// The proxy stopped.
+    Stopped,
+}
+
 /// The connection's one stream, shared by every view. Its pump starts at the
 /// first subscription and owns the session's inlet, the parser, and
 /// discovery.
@@ -330,34 +350,42 @@ impl Pump {
     }
 
     /// Runs until the session ends or the stream is dropped. Drains and
-    /// discards packets while no sink is live.
+    /// discards packets while no sink is live. Once the proxy stopped, ends
+    /// every sink with the stop, and each new one until the stream drops.
     async fn run(mut self) {
         loop {
             let retry = self.schedule.next_retry();
             // A sink takes the packets that arrive after it was made, so new
             // sinks, replies and pruning go ahead of the inlet.
-            let running = tokio::select! {
+            let turn = tokio::select! {
                 biased;
                 sink = self.commands.recv() => match sink {
                     Some(sink) => {
                         self.add_sink(sink);
-                        true
+                        Turn::Running
                     }
-                    None => false,
+                    None => Turn::Ended,
                 },
                 Ok(reply) = self.schedule.replies().recv_async() => {
                     self.take_metadata_replies(reply);
-                    true
+                    Turn::Running
                 }
-                () = pruned(&mut self.batches, &mut self.events, &mut self.packets) => true,
+                () = pruned(&mut self.batches, &mut self.events, &mut self.packets) => Turn::Running,
                 received = self.inlet.recv_async() => self.take_input(received),
-                () = sleep_until_some(retry) => true,
+                () = sleep_until_some(retry) => Turn::Running,
             };
             self.publish();
-            if !running {
-                return;
+            match turn {
+                Turn::Running => self.submit_metadata_queries(),
+                Turn::Ended => return,
+                Turn::Stopped => break,
             }
-            self.submit_metadata_queries();
+        }
+        self.batches.drain(..).for_each(|sink| sink.lane.stop());
+        self.events.drain(..).for_each(|sink| sink.lane.stop());
+        self.packets.drain(..).for_each(|sink| sink.lane.stop());
+        while let Some(sink) = self.commands.recv().await {
+            sink.stop();
         }
     }
 
@@ -383,28 +411,34 @@ impl Pump {
             .any(|scope| scope.covers(route))
     }
 
-    /// Takes `received` from the inlet, and what else the inlet held then.
-    /// Returns `false` once the session has ended and its last packet is
-    /// taken.
-    fn take_input(&mut self, received: Result<Queued<tio::Packet>, flume::RecvError>) -> bool {
+    /// Takes `received` from the inlet, and what else the inlet held then,
+    /// up to the stop.
+    fn take_input(&mut self, received: Result<Queued<tio::Packet>, flume::RecvError>) -> Turn {
         let Ok(queued) = received else {
-            return false;
+            return Turn::Ended;
         };
-        self.take(queued);
-        for _ in 0..self.inlet.len() {
-            let Ok(queued) = self.inlet.try_recv() else {
-                break;
-            };
-            self.take(queued);
+        let inlet = self.inlet.clone();
+        let held = inlet.try_iter().take(inlet.len());
+        if std::iter::once(queued)
+            .chain(held)
+            .all(|queued| self.take(queued))
+        {
+            Turn::Running
+        } else {
+            Turn::Stopped
         }
-        true
     }
 
     /// Takes one packet from the inlet, or reports the gap the session left.
-    fn take(&mut self, queued: Queued<tio::Packet>) {
+    /// Returns `false` for the stop.
+    fn take(&mut self, queued: Queued<tio::Packet>) -> bool {
         let packet = &match queued {
             Queued::Item(packet) => packet,
-            Queued::Gap(_) => return self.state.input_overrun(),
+            Queued::Gap(_) => {
+                self.state.input_overrun();
+                return true;
+            }
+            Queued::Stopped => return false,
         };
         self.tap(packet);
         if let Some(packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped) =
@@ -414,6 +448,7 @@ impl Pump {
         }
         let covered = self.covers(packet.route());
         self.state.process_packet(packet, covered);
+        true
     }
 
     /// Offers a packet to the raw taps, unparsed and with its absolute route.
@@ -477,9 +512,9 @@ impl Pump {
             self.events
                 .retain_mut(|sink| sink.offer(scope, || event.clone()));
         }
-        self.batches.retain_mut(Sink::report_lag);
-        self.events.retain_mut(Sink::report_lag);
-        self.packets.retain_mut(Sink::report_lag);
+        self.batches.retain_mut(|sink| sink.lane.report_lag());
+        self.events.retain_mut(|sink| sink.lane.report_lag());
+        self.packets.retain_mut(|sink| sink.lane.report_lag());
     }
 }
 
@@ -991,6 +1026,21 @@ mod tests {
         let late = stream.batches(everything());
         assert_eq!(late.recv_timeout(wait).err(), Some(RecvError::Stopped));
         drop(proxy);
+    }
+
+    /// A subscriber whose queue is full still hears the stop, after what was
+    /// queued.
+    #[test]
+    fn a_full_queue_still_ends_with_the_stop() {
+        let (mut sink, receiver) = Sink::new(2, everything());
+        assert!((0..3).all(|item| sink.lane.send(item)));
+
+        sink.lane.stop();
+
+        assert_eq!(receiver.try_recv(), Ok(Some(0)));
+        assert_eq!(receiver.try_recv(), Ok(Some(1)));
+        assert_eq!(receiver.try_recv(), Err(RecvError::Stopped));
+        assert_eq!(receiver.try_recv(), Err(RecvError::Disconnected));
     }
 
     /// The status saying why the link failed may be the last thing the
@@ -1505,8 +1555,8 @@ mod tests {
             event: LinkEvent::InputOverrun,
         };
         let (mut sink, receiver) = Sink::new(2, everything());
-        assert!(sink.send(overrun()));
-        assert!(sink.send(overrun()));
+        assert!(sink.lane.send(overrun()));
+        assert!(sink.lane.send(overrun()));
 
         assert!(matches!(
             receiver.recv_deadline(Instant::now()),
@@ -1543,7 +1593,7 @@ mod tests {
     #[tokio::test]
     async fn an_async_receive_returns_a_queued_item() {
         let (mut sink, receiver) = Sink::new(1, everything());
-        assert!(sink.send(7));
+        assert!(sink.lane.send(7));
 
         assert_eq!(receiver.recv_async().await, Ok(7));
     }
@@ -1553,7 +1603,7 @@ mod tests {
         let (mut sink, receiver) = Sink::new(1, everything());
         let sender = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            sink.send(7)
+            sink.lane.send(7)
         });
 
         assert_eq!(receiver.recv_async().await, Ok(7));
