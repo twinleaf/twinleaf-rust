@@ -13,9 +13,11 @@
 //! The records inside a reply are bare, with no `[type][flags]` header.
 //!
 //! [`Samples`] parses and writes sample packets. [`Metadata`] parses and
-//! writes records, and [`Sweep`] walks a device's records in broadcast order.
+//! writes records.
 
-use super::array_at;
+use zerocopy::byteorder::little_endian::{F32, U16, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
 use crate::packet::{Header, Packet, PacketType};
 use crate::sync::Epoch;
 use crate::{ColumnId, SampleNumber, SegmentId, SessionId, StreamId};
@@ -159,6 +161,8 @@ impl SegmentFlags {
     pub const VALID: Self = Self(1);
     /// New samples are still being generated for this segment.
     pub const ACTIVE: Self = Self(2);
+    /// The time reference's pulses were absent when this segment began.
+    pub const HOLDOVER: Self = Self(4);
 
     /// Creates flags from their byte.
     pub const fn from_bits(bits: u8) -> Self {
@@ -207,6 +211,8 @@ impl FilterType {
     pub const IIR_SP_LPF1: Self = Self(1);
     /// Second order IIR low-pass, 2.
     pub const IIR_SP_LPF2: Self = Self(2);
+    /// Fourth order IIR Butterworth low-pass, 3.
+    pub const IIR_BW_LPF4: Self = Self(3);
 
     /// Creates a filter type from its byte.
     pub const fn new(value: u8) -> Self {
@@ -225,6 +231,7 @@ impl core::fmt::Display for FilterType {
             Self::NONE => f.write_str("none"),
             Self::IIR_SP_LPF1 => f.write_str("iir-sp-lpf1"),
             Self::IIR_SP_LPF2 => f.write_str("iir-sp-lpf2"),
+            Self::IIR_BW_LPF4 => f.write_str("iir-bw-lpf4"),
             Self(value) => write!(f, "filter{value}"),
         }
     }
@@ -245,38 +252,49 @@ pub struct Device<'a> {
     pub firmware: &'a str,
 }
 
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+struct DeviceHead {
+    head_len: u8,
+    name_len: u8,
+    session: U32,
+    serial_len: u8,
+    firmware_len: u8,
+    n_streams: u8,
+}
+
 impl<'a> Device<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
-    pub const HEAD_SIZE: usize = 9;
+    pub const HEAD_SIZE: usize = size_of::<DeviceHead>();
 
     /// Writes the bare record, without a `[type][flags]` header, into `buf`.
     /// Returns its length, or `None` if `buf` cannot hold the head. Strings
     /// are truncated to the room left.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
-        let name = record.push(self.name);
-        let serial = record.push(self.serial);
-        let firmware = record.push(self.firmware);
-        let head = record.head();
-        head[1] = name;
-        head[2..6].copy_from_slice(&self.session.to_le_bytes());
-        head[6] = serial;
-        head[7] = firmware;
-        head[8] = self.n_streams;
-        Some(record.finish())
+        let name_len = record.push(self.name);
+        let serial_len = record.push(self.serial);
+        let firmware_len = record.push(self.firmware);
+        Some(record.finish(DeviceHead {
+            head_len: Self::HEAD_SIZE as u8,
+            name_len,
+            session: self.session.value().into(),
+            serial_len,
+            firmware_len,
+            n_streams: self.n_streams,
+        }))
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
     /// if the record or its head is too short or a string is not UTF-8.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
-        let head = record.head;
+        let (head, mut strings) = RecordReader::split::<DeviceHead>(buf)?;
         Some(Self {
-            session: SessionId::from_le_bytes(array_at(head, 2)?),
-            n_streams: head[8],
-            name: record.take(head[1])?,
-            serial: record.take(head[6])?,
-            firmware: record.take(head[7])?,
+            session: SessionId::new(head.session.get()),
+            n_streams: head.n_streams,
+            name: strings.take(head.name_len)?,
+            serial: strings.take(head.serial_len)?,
+            firmware: strings.take(head.firmware_len)?,
         })
     }
 }
@@ -298,39 +316,51 @@ pub struct Stream<'a> {
     pub name: &'a str,
 }
 
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+struct StreamHead {
+    head_len: u8,
+    stream_id: u8,
+    n_columns: u8,
+    n_segments: u8,
+    sample_size: U16,
+    buf_samples: U16,
+    name_len: u8,
+}
+
 impl<'a> Stream<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
-    pub const HEAD_SIZE: usize = 9;
+    pub const HEAD_SIZE: usize = size_of::<StreamHead>();
 
     /// Writes the bare record, without a `[type][flags]` header, into `buf`.
     /// Returns its length, or `None` if `buf` cannot hold the head. Strings
     /// are truncated to the room left.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
-        let name = record.push(self.name);
-        let head = record.head();
-        head[1] = self.stream_id.value();
-        head[2] = self.n_columns;
-        head[3] = self.n_segments;
-        head[4..6].copy_from_slice(&self.sample_size.to_le_bytes());
-        head[6..8].copy_from_slice(&self.buf_samples.to_le_bytes());
-        head[8] = name;
-        Some(record.finish())
+        let name_len = record.push(self.name);
+        Some(record.finish(StreamHead {
+            head_len: Self::HEAD_SIZE as u8,
+            stream_id: self.stream_id.value(),
+            n_columns: self.n_columns,
+            n_segments: self.n_segments,
+            sample_size: self.sample_size.into(),
+            buf_samples: self.buf_samples.into(),
+            name_len,
+        }))
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
     /// if the record or its head is too short, the stream id is outside 1 to
     /// 127, or a string is not UTF-8.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
-        let head = record.head;
+        let (head, mut strings) = RecordReader::split::<StreamHead>(buf)?;
         Some(Self {
-            stream_id: StreamId::try_new(head[1])?,
-            n_columns: head[2],
-            n_segments: head[3],
-            sample_size: u16::from_le_bytes(array_at(head, 4)?),
-            buf_samples: u16::from_le_bytes(array_at(head, 6)?),
-            name: record.take(head[8])?,
+            stream_id: StreamId::try_new(head.stream_id)?,
+            n_columns: head.n_columns,
+            n_segments: head.n_segments,
+            sample_size: head.sample_size.get(),
+            buf_samples: head.buf_samples.get(),
+            name: strings.take(head.name_len)?,
         })
     }
 }
@@ -363,49 +393,66 @@ pub struct Segment<'a> {
     pub filter_type: FilterType,
 }
 
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+struct SegmentHead {
+    head_len: u8,
+    stream_id: u8,
+    segment_id: u8,
+    flags: u8,
+    epoch: u8,
+    timeref_serial_len: u8,
+    timeref_session: U32,
+    start_time: U32,
+    sampling_rate: U32,
+    decimation: U32,
+    filter_cutoff: F32,
+    filter_type: u8,
+}
+
 impl<'a> Segment<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
-    pub const HEAD_SIZE: usize = 27;
+    pub const HEAD_SIZE: usize = size_of::<SegmentHead>();
 
     /// Writes the bare record, without a `[type][flags]` header, into `buf`.
     /// Returns its length, or `None` if `buf` cannot hold the head. Strings
     /// are truncated to the room left.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
-        let serial = record.push(self.timeref_serial);
-        let head = record.head();
-        head[1] = self.stream_id.value();
-        head[2] = self.segment_id.value();
-        head[3] = self.flags.bits();
-        head[4] = self.epoch.value();
-        head[5] = serial;
-        head[6..10].copy_from_slice(&self.timeref_session.to_le_bytes());
-        head[10..14].copy_from_slice(&self.start_time.to_le_bytes());
-        head[14..18].copy_from_slice(&self.sampling_rate.to_le_bytes());
-        head[18..22].copy_from_slice(&self.decimation.to_le_bytes());
-        head[22..26].copy_from_slice(&self.filter_cutoff.to_le_bytes());
-        head[26] = self.filter_type.value();
-        Some(record.finish())
+        let timeref_serial_len = record.push(self.timeref_serial);
+        Some(record.finish(SegmentHead {
+            head_len: Self::HEAD_SIZE as u8,
+            stream_id: self.stream_id.value(),
+            segment_id: self.segment_id.value(),
+            flags: self.flags.bits(),
+            epoch: self.epoch.value(),
+            timeref_serial_len,
+            timeref_session: self.timeref_session.value().into(),
+            start_time: self.start_time.into(),
+            sampling_rate: self.sampling_rate.into(),
+            decimation: self.decimation.into(),
+            filter_cutoff: self.filter_cutoff.into(),
+            filter_type: self.filter_type.value(),
+        }))
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
     /// if the record or its head is too short, the stream id is outside 1 to
     /// 127, or a string is not UTF-8.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
-        let head = record.head;
+        let (head, mut strings) = RecordReader::split::<SegmentHead>(buf)?;
         Some(Self {
-            stream_id: StreamId::try_new(head[1])?,
-            segment_id: SegmentId::new(head[2]),
-            flags: SegmentFlags::from_bits(head[3]),
-            epoch: Epoch::new(head[4]),
-            timeref_session: SessionId::from_le_bytes(array_at(head, 6)?),
-            start_time: u32::from_le_bytes(array_at(head, 10)?),
-            sampling_rate: u32::from_le_bytes(array_at(head, 14)?),
-            decimation: u32::from_le_bytes(array_at(head, 18)?),
-            filter_cutoff: f32::from_le_bytes(array_at(head, 22)?),
-            filter_type: FilterType::new(head[26]),
-            timeref_serial: record.take(head[5])?,
+            stream_id: StreamId::try_new(head.stream_id)?,
+            segment_id: SegmentId::new(head.segment_id),
+            flags: SegmentFlags::from_bits(head.flags),
+            epoch: Epoch::new(head.epoch),
+            timeref_session: SessionId::new(head.timeref_session.get()),
+            start_time: head.start_time.get(),
+            sampling_rate: head.sampling_rate.get(),
+            decimation: head.decimation.get(),
+            filter_cutoff: head.filter_cutoff.get(),
+            filter_type: FilterType::new(head.filter_type),
+            timeref_serial: strings.take(head.timeref_serial_len)?,
         })
     }
 }
@@ -427,41 +474,53 @@ pub struct Column<'a> {
     pub description: &'a str,
 }
 
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+struct ColumnHead {
+    head_len: u8,
+    stream_id: u8,
+    index: u8,
+    data_type: u8,
+    name_len: u8,
+    units_len: u8,
+    description_len: u8,
+}
+
 impl<'a> Column<'a> {
     /// Length of the head this build reads. A device may declare a longer one.
-    pub const HEAD_SIZE: usize = 7;
+    pub const HEAD_SIZE: usize = size_of::<ColumnHead>();
 
     /// Writes the bare record, without a `[type][flags]` header, into `buf`.
     /// Returns its length, or `None` if `buf` cannot hold the head. Strings
     /// are truncated to the room left.
     pub fn write(&self, buf: &mut [u8]) -> Option<usize> {
         let mut record = RecordWriter::new(buf, Self::HEAD_SIZE)?;
-        let name = record.push(self.name);
-        let units = record.push(self.units);
-        let description = record.push(self.description);
-        let head = record.head();
-        head[1] = self.stream_id.value();
-        head[2] = self.index.value();
-        head[3] = self.data_type.value();
-        head[4] = name;
-        head[5] = units;
-        head[6] = description;
-        Some(record.finish())
+        let name_len = record.push(self.name);
+        let units_len = record.push(self.units);
+        let description_len = record.push(self.description);
+        Some(record.finish(ColumnHead {
+            head_len: Self::HEAD_SIZE as u8,
+            stream_id: self.stream_id.value(),
+            index: self.index.value(),
+            data_type: self.data_type.value(),
+            name_len,
+            units_len,
+            description_len,
+        }))
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
     /// if the record or its head is too short, the stream id is outside 1 to
     /// 127, or a string is not UTF-8.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let mut record = RecordReader::new(buf, Self::HEAD_SIZE)?;
-        let head = record.head;
+        let (head, mut strings) = RecordReader::split::<ColumnHead>(buf)?;
         Some(Self {
-            stream_id: StreamId::try_new(head[1])?,
-            index: ColumnId::new(head[2]),
-            data_type: DataType::new(head[3]),
-            name: record.take(head[4])?,
-            units: record.take(head[5])?,
-            description: record.take(head[6])?,
+            stream_id: StreamId::try_new(head.stream_id)?,
+            index: ColumnId::new(head.index),
+            data_type: DataType::new(head.data_type),
+            name: strings.take(head.name_len)?,
+            units: strings.take(head.units_len)?,
+            description: strings.take(head.description_len)?,
         })
     }
 }
@@ -877,128 +936,17 @@ impl<'a> Samples<'a> {
     }
 }
 
-/// The record one step of a metadata sweep describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Subject {
-    /// The device record.
-    Device,
-    /// Stream record.
-    Stream {
-        /// Zero-based stream position.
-        stream: u8,
-    },
-    /// Current segment record.
-    Segment {
-        /// Zero-based stream position.
-        stream: u8,
-    },
-    /// Column record.
-    Column {
-        /// Zero-based stream position.
-        stream: u8,
-        /// Zero-based column position.
-        column: u8,
-    },
-}
-
-/// Round-robin walk over a device's metadata. It visits the device, then for
-/// each stream its shape, its current segment, and its columns. The step that
-/// closes a pass is flagged [`MetadataFlags::LAST`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Sweep {
-    position: Position,
-}
-
-impl Sweep {
-    /// Creates a sweep that starts at the device record.
-    pub const fn new() -> Self {
-        Self {
-            position: Position::Device,
-        }
-    }
-
-    /// Advances one step, given the column count of each stream in `columns`.
-    /// Returns the record to send, and `true` if it closes a pass.
-    pub fn step(&mut self, columns: &[u8]) -> (Subject, bool) {
-        if !self.position.exists_in(columns) {
-            self.position = Position::Device;
-        }
-        let subject = self.position.subject();
-        self.position = self.position.advance(columns);
-        (subject, matches!(self.position, Position::Device))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-enum Position {
-    #[default]
-    Device,
-    Stream(u8),
-    Segment(u8),
-    Column(u8, u8),
-}
-
-impl Position {
-    fn exists_in(self, columns: &[u8]) -> bool {
-        let stream = |stream: u8| (stream as usize) < columns.len();
-        match self {
-            Self::Device => true,
-            Self::Stream(s) | Self::Segment(s) => stream(s),
-            Self::Column(s, c) => stream(s) && c < columns[s as usize],
-        }
-    }
-
-    fn subject(self) -> Subject {
-        match self {
-            Self::Device => Subject::Device,
-            Self::Stream(stream) => Subject::Stream { stream },
-            Self::Segment(stream) => Subject::Segment { stream },
-            Self::Column(stream, column) => Subject::Column { stream, column },
-        }
-    }
-
-    fn advance(self, columns: &[u8]) -> Self {
-        // Streams with no columns are skipped rather than stalling the sweep.
-        let from_stream = |stream: u8| match columns.get(stream as usize + 1) {
-            Some(_) => Self::Stream(stream + 1),
-            None => Self::Device,
-        };
-        match self {
-            Self::Device if columns.is_empty() => Self::Device,
-            Self::Device => Self::Stream(0),
-            Self::Stream(stream) => Self::Segment(stream),
-            Self::Segment(stream) if columns[stream as usize] > 0 => Self::Column(stream, 0),
-            Self::Segment(stream) => from_stream(stream),
-            Self::Column(stream, column) if column + 1 < columns[stream as usize] => {
-                Self::Column(stream, column + 1)
-            }
-            Self::Column(stream, _) => from_stream(stream),
-        }
-    }
-}
-
 /// Writer of a record, a fixed-size head whose first byte is its own length
 /// followed by the strings the head measures. Strings are appended in call
 /// order and truncated on a character boundary when the buffer fills.
 pub(crate) struct RecordWriter<'a> {
     buf: &'a mut [u8],
-    head: usize,
     len: usize,
 }
 
 impl<'a> RecordWriter<'a> {
     pub(crate) fn new(buf: &'a mut [u8], head: usize) -> Option<Self> {
-        if buf.len() < head {
-            return None;
-        }
-        buf[..head].fill(0);
-        buf[0] = head as u8;
-        Some(Self {
-            buf,
-            head,
-            len: head,
-        })
+        (buf.len() >= head).then_some(Self { buf, len: head })
     }
 
     /// Appends `value` and returns how many of its bytes fit.
@@ -1015,11 +963,9 @@ impl<'a> RecordWriter<'a> {
         len as u8
     }
 
-    pub(crate) fn head(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.head]
-    }
-
-    pub(crate) fn finish(self) -> usize {
+    /// Lays `head` over the room reserved for it and returns the record length.
+    pub(crate) fn finish(self, head: impl IntoBytes + Immutable) -> usize {
+        self.buf[..size_of_val(&head)].copy_from_slice(head.as_bytes());
         self.len
     }
 }
@@ -1028,23 +974,18 @@ impl<'a> RecordWriter<'a> {
 /// length found on the wire. A record with head fields this build does not know
 /// still parses.
 pub(crate) struct RecordReader<'a> {
-    pub(crate) head: &'a [u8],
     strings: &'a [u8],
 }
 
 impl<'a> RecordReader<'a> {
-    /// Creates a reader for `record`. `head` is the head length this build
-    /// reads, and the record may declare more. Returns `None` if the record is
-    /// truncated or declares a shorter head.
-    pub(crate) fn new(record: &'a [u8], head: usize) -> Option<Self> {
+    /// Returns the head this build reads and a reader of the strings after the
+    /// head on the wire, which may be longer but never shorter.
+    pub(crate) fn split<H: FromBytes + KnownLayout + Immutable>(
+        record: &'a [u8],
+    ) -> Option<(&'a H, Self)> {
         let (declared, strings) = split_record(record)?;
-        if declared.len() < head {
-            return None;
-        }
-        Some(Self {
-            head: declared,
-            strings,
-        })
+        let (head, _) = H::ref_from_prefix(declared).ok()?;
+        Some((head, Self { strings }))
     }
 
     pub(crate) fn take(&mut self, len: u8) -> Option<&'a str> {
@@ -1500,56 +1441,11 @@ mod tests {
         assert_eq!(DataType::new(0x35).to_string(), "raw53");
     }
 
-    fn sweep(columns: &[u8], steps: usize) -> Vec<(Subject, bool)> {
-        let mut sweep = Sweep::new();
-        (0..steps).map(|_| sweep.step(columns)).collect()
-    }
-
     #[test]
-    fn sweep_walks_device_then_each_stream_with_its_columns() {
-        use Subject::*;
-        #[rustfmt::skip]
-        assert_eq!(sweep(&[2, 3], 11), vec![
-            (Device, false),
-            (Stream { stream: 0 }, false),
-            (Segment { stream: 0 }, false),
-            (Column { stream: 0, column: 0 }, false),
-            (Column { stream: 0, column: 1 }, false),
-            (Stream { stream: 1 }, false),
-            (Segment { stream: 1 }, false),
-            (Column { stream: 1, column: 0 }, false),
-            (Column { stream: 1, column: 1 }, false),
-            (Column { stream: 1, column: 2 }, true),
-            (Device, false),
-        ]);
-    }
-
-    #[test]
-    fn sweep_handles_a_device_with_no_streams() {
-        assert_eq!(sweep(&[], 2), vec![(Subject::Device, true); 2]);
-    }
-
-    #[test]
-    fn sweep_skips_a_stream_with_no_columns() {
-        use Subject::*;
-        #[rustfmt::skip]
-        assert_eq!(sweep(&[0, 1], 6), vec![
-            (Device, false),
-            (Stream { stream: 0 }, false),
-            (Segment { stream: 0 }, false),
-            (Stream { stream: 1 }, false),
-            (Segment { stream: 1 }, false),
-            (Column { stream: 1, column: 0 }, true),
-        ]);
-    }
-
-    #[test]
-    fn sweep_restarts_when_its_position_disappears() {
-        let mut sweep = Sweep::new();
-        for _ in 0..4 {
-            sweep.step(&[2, 3]); // ends on Column { stream: 0, column: 0 }
-        }
-        // The second stream went away and the first lost a column.
-        assert_eq!(sweep.step(&[1]), (Subject::Device, false));
+    fn filter_type_names_the_known_filters_and_falls_back_to_its_byte() {
+        assert_eq!(FilterType::IIR_BW_LPF4.value(), 3);
+        assert_eq!(FilterType::IIR_BW_LPF4.to_string(), "iir-bw-lpf4");
+        assert_eq!(FilterType::NONE.to_string(), "none");
+        assert_eq!(FilterType::new(9).to_string(), "filter9");
     }
 }

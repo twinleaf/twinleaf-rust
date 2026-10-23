@@ -100,20 +100,28 @@ impl FrameErrors {
 /// Decoded frame and any framing errors.
 #[derive(Debug)]
 pub struct Frame<'a> {
-    /// Frame contents, without the CRC once it verified.
-    pub data: &'a [u8],
+    buf: &'a mut [u8],
+    len: usize,
     /// Errors found while decoding.
     pub errors: FrameErrors,
 }
 
 impl<'a> Frame<'a> {
+    /// Returns the frame contents, without the CRC once it verified.
+    pub fn data(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
     /// Returns the packet bytes if the frame decoded without errors.
-    pub fn packet(&self) -> Option<&'a [u8]> {
-        if self.errors.is_empty() {
-            Some(self.data)
-        } else {
-            None
-        }
+    pub fn packet(&self) -> Option<&[u8]> {
+        self.errors.is_empty().then(|| self.data())
+    }
+
+    /// Returns the packet and its length in a buffer with the verified CRC's
+    /// room after it, which a router tags a hop into instead of copying the
+    /// packet, or `None` if the frame decoded with errors.
+    pub fn routable(self) -> Option<(&'a mut [u8], usize)> {
+        self.errors.is_empty().then_some((self.buf, self.len))
     }
 }
 
@@ -173,7 +181,8 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
                 if self.esc {
                     errors.insert(FrameErrors::DANGLING_ESC);
                 }
-                let mut size = self.len;
+                let end = self.len;
+                let mut size = end;
                 self.len = 0;
                 self.errors = FrameErrors::default();
                 self.esc = false;
@@ -193,7 +202,8 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
                 return (
                     consumed,
                     Some(Frame {
-                        data: &self.buf[..size],
+                        buf: &mut self.buf[..end],
+                        len: size,
                         errors,
                     }),
                 );
@@ -218,7 +228,8 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
                     return (
                         consumed,
                         Some(Frame {
-                            data: &self.buf[..size],
+                            buf: &mut self.buf[..size],
+                            len: size,
                             errors,
                         }),
                     );
@@ -255,7 +266,8 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
                 return (
                     consumed,
                     Some(Frame {
-                        data: &self.buf,
+                        buf: &mut self.buf,
+                        len: CAPACITY,
                         errors,
                     }),
                 );
@@ -281,7 +293,7 @@ mod tests {
         while !input.is_empty() {
             let (n, frame) = des.push(input);
             if let Some(f) = frame {
-                frames.push((f.data.to_vec(), f.errors.bits()));
+                frames.push((f.data().to_vec(), f.errors.bits()));
             }
             input = &input[n..];
         }
@@ -339,10 +351,24 @@ mod tests {
         let mut frames = Vec::new();
         for &b in &wire[..n] {
             if let (_, Some(f)) = des.push(&[b]) {
-                frames.push((f.data.to_vec(), f.errors.bits()));
+                frames.push((f.data().to_vec(), f.errors.bits()));
             }
         }
         assert_eq!(frames, vec![(packet.to_vec(), 0)]);
+    }
+
+    #[test]
+    fn a_clean_frame_lends_the_crc_as_room_and_a_broken_one_lends_nothing() {
+        let mut wire = vec![0; max_serialized_size(5)];
+        let n = serialize(b"hello", &mut wire).unwrap();
+        let mut des = Deserializer::<CAP>::new();
+        let (buf, len) = des.push(&wire[..n]).1.unwrap().routable().unwrap();
+        assert_eq!(&buf[..len], b"hello");
+        assert_eq!(buf.len(), len + CRC_SIZE);
+
+        wire[1] ^= 0xFF;
+        let mut des = Deserializer::<CAP>::new();
+        assert!(des.push(&wire[..n]).1.unwrap().routable().is_none());
     }
 
     #[test]
