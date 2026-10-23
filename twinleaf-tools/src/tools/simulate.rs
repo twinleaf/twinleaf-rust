@@ -1825,6 +1825,7 @@ fn synchronizer(session: SessionId, serial: &str, now: u64) -> Synchronizer {
         Reference {
             identity: ReferenceIdentity::new(sync::Epoch::UNIX, session, serial.as_bytes()),
             second: (now / NANOS_PER_SECOND) as u32,
+            clock: sync::Clock::root(sync::TimeSource::InternalOscillator),
         },
         None,
         DEFAULT_AUTOSTART,

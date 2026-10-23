@@ -19,7 +19,7 @@ pub use pulse::{ticks, PulseConfig, PulseState};
 
 use core::mem::{discriminant, Discriminant};
 
-use twinleaf_proto::sync::{Epoch, Timeref, MAX_SERIAL_SIZE};
+use twinleaf_proto::sync::{Clock, Epoch, TimeSource, Timeref, MAX_SERIAL_SIZE};
 use twinleaf_proto::SessionId;
 
 use pulse::{PulseTracker, SecondEvent};
@@ -39,6 +39,11 @@ const SEQUENCE_MASK: u8 = 0x3f;
 /// Seconds a child that lost its qualified train refuses a free-running
 /// upstream, its packets and the pulses they come with, before following it.
 const HOLDOVER_TIMEOUT: u8 = 60;
+
+/// Steps from its root at which an upstream reference is refused. PTP discards
+/// 255; a hub chain is a few cables deep, and a stale source counting up one a
+/// second around a loop of them is dropped in half a minute rather than four.
+const MAX_STEPS_REMOVED: u8 = 32;
 
 /// Work for the runtime after one [`Synchronizer`] call.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -178,6 +183,9 @@ pub struct Status {
     pub spurs: u32,
     /// SYNC packets that arrived too late to label an edge.
     pub late_references: u32,
+    /// SYNC packets refused for naming this device's own time, come back
+    /// around a loop, or a source 32 or more steps away.
+    pub refused_references: u32,
     /// Seconds that did not reconcile; see [`Synchronizer::poll`].
     pub divergences: u32,
     /// Acknowledgements that named a superseded start plan.
@@ -318,20 +326,31 @@ impl ReferenceIdentity {
 }
 
 /// A source identity and the second assigned to one particular edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct Reference {
     /// Whose timebase this is.
     pub identity: ReferenceIdentity,
     /// The second of the edge it names.
     pub second: u32,
+    /// Where this device stands relative to the source's root.
+    pub clock: Clock,
 }
+
+/// Equal when they name the same edge of the same source, by whatever path.
+impl PartialEq for Reference {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.second == other.second
+    }
+}
+
+impl Eq for Reference {}
 
 impl Reference {
     /// The same source, `seconds` later.
     pub const fn advance(self, seconds: u32) -> Self {
         Self {
-            identity: self.identity,
             second: self.second.wrapping_add(seconds),
+            ..self
         }
     }
 
@@ -342,7 +361,7 @@ impl Reference {
             time: self.second,
             session: self.identity.session,
             serial: self.identity.serial.as_bytes(),
-            clock: None,
+            clock: Some(self.clock),
         }
     }
 }
@@ -365,6 +384,7 @@ pub enum ReferenceState {
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     identity: ReferenceIdentity,
+    clock: Clock,
     base_edge: u64,
     base_second: u32,
     confirmations: u8,
@@ -378,6 +398,7 @@ impl Candidate {
             second: self
                 .base_second
                 .wrapping_add(edge.wrapping_sub(self.base_edge) as u32),
+            clock: self.clock,
         }
     }
 
@@ -392,6 +413,7 @@ impl Candidate {
 /// only adopted on a qualified electrical edge.
 pub(crate) struct ReferenceTracker {
     local: ReferenceIdentity,
+    own: Clock,
     active: Reference,
     active_is_upstream: bool,
     edge_sequence: u64,
@@ -402,6 +424,7 @@ impl ReferenceTracker {
     pub(crate) const fn new(local: Reference) -> Self {
         Self {
             local: local.identity,
+            own: local.clock,
             active: local,
             active_is_upstream: false,
             edge_sequence: 0,
@@ -428,12 +451,63 @@ impl ReferenceTracker {
         self.active.second = second;
     }
 
+    /// Name what this device's own seconds come from, for whenever it is the root.
+    pub(crate) fn set_time_source(&mut self, time_source: TimeSource) {
+        self.own.time_source = time_source;
+        if self.is_own(
+            self.active.identity.session,
+            self.active.identity.serial.as_bytes(),
+        ) {
+            self.active.clock = self.own;
+        }
+    }
+
+    /// Whether a packet is refused: one naming this device's own time, come
+    /// back around a loop, or one [`MAX_STEPS_REMOVED`] steps from its root.
+    /// Either returns the device to its own time, unless the loop's source
+    /// orders before it, as PTP breaks a tie between clocks on their identity.
+    pub(crate) fn refuses(&mut self, timeref: &Timeref<'_>) -> bool {
+        let looped = self.is_own(timeref.session, timeref.serial);
+        let distant = timeref
+            .clock
+            .is_some_and(|clock| clock.steps_removed >= MAX_STEPS_REMOVED);
+        let active = self.active.identity;
+        let resume = match (looped, distant) {
+            (false, false) => return false,
+            (true, true | false) => {
+                (self.local.serial.as_bytes(), self.local.session)
+                    < (active.serial.as_bytes(), active.session)
+            }
+            (false, true) => !self.is_own(active.session, active.serial.as_bytes()),
+        };
+        if resume {
+            let edge = self.edge_sequence.wrapping_add(1);
+            self.candidate = Some(Candidate {
+                identity: ReferenceIdentity {
+                    epoch: active.epoch,
+                    ..self.local
+                },
+                clock: self.own,
+                base_edge: edge,
+                base_second: self.active.second.wrapping_add(1),
+                confirmations: CONFIRMATIONS,
+                last_observed_edge: edge,
+            });
+        }
+        true
+    }
+
     /// Observe a packet received after the current edge. Its timeref applies to
-    /// the next edge.
+    /// the next edge, one step further from its root than the packet's sender;
+    /// a sender that names no clock is taken for a root of unknown source.
     pub(crate) fn observe(&mut self, timeref: Timeref<'_>) {
         self.qualify(Reference {
             identity: ReferenceIdentity::new(timeref.epoch, timeref.session, timeref.serial),
             second: timeref.time.wrapping_add(1),
+            clock: timeref
+                .clock
+                .unwrap_or(Clock::root(TimeSource::Other))
+                .forwarded(),
         });
     }
 
@@ -446,6 +520,7 @@ impl ReferenceTracker {
                 ..self.local
             },
             second: second.wrapping_add(1),
+            clock: self.own,
         });
     }
 
@@ -481,6 +556,7 @@ impl ReferenceTracker {
         let target_edge = self.edge_sequence.wrapping_add(1);
 
         if reference == self.active.advance(1) {
+            self.active.clock = reference.clock;
             self.candidate = None;
             return;
         }
@@ -491,16 +567,22 @@ impl ReferenceTracker {
                     candidate.confirmations = candidate.confirmations.saturating_add(1);
                     candidate.last_observed_edge = target_edge;
                 }
+                candidate.clock = reference.clock;
                 candidate
             }
             _ => Candidate {
                 identity: reference.identity,
+                clock: reference.clock,
                 base_edge: target_edge,
                 base_second: reference.second,
                 confirmations: 1,
                 last_observed_edge: target_edge,
             },
         });
+    }
+
+    fn is_own(&self, session: SessionId, serial: &[u8]) -> bool {
+        session == self.local.session && serial == self.local.serial.as_bytes()
     }
 }
 
@@ -512,6 +594,7 @@ mod reference_tests {
         Reference {
             identity: ReferenceIdentity::new(Epoch::SYSTIME, SessionId::new(1), b"local"),
             second: 10,
+            clock: Clock::root(TimeSource::InternalOscillator),
         }
     }
 
@@ -615,6 +698,91 @@ mod reference_tests {
         assert_eq!(tracker.active().second, 103);
         assert_eq!(tracker.active().identity.epoch, Epoch::UNIX);
         assert_eq!(tracker.active().identity.serial.as_bytes(), b"local");
+    }
+
+    #[test]
+    fn an_adopted_reference_is_one_step_further_from_its_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        let gps = Clock {
+            steps_removed: 2,
+            ..Clock::root(TimeSource::Gnss)
+        };
+        for time in 100..103 {
+            tracker.observe(Timeref {
+                clock: Some(gps),
+                ..packet(time)
+            });
+            tracker.on_edge(true);
+        }
+        assert_eq!(tracker.active().clock, gps.forwarded());
+        tracker.observe(Timeref {
+            clock: Some(Clock::root(TimeSource::Ptp)),
+            ..packet(103)
+        });
+        assert_eq!(
+            tracker.active().clock,
+            Clock::root(TimeSource::Ptp).forwarded()
+        );
+        assert_eq!(tracker.state(), ReferenceState::Upstream);
+    }
+
+    /// A deployed hub that sends no clock is a root, but of nothing it says,
+    /// and what follows it is never mistaken for one.
+    #[test]
+    fn a_source_with_no_clock_is_followed_one_step_from_an_unknown_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        for time in 100..103 {
+            tracker.observe(packet(time));
+            tracker.on_edge(true);
+        }
+        assert_eq!(tracker.active().clock.steps_removed, 1);
+        assert_eq!(tracker.active().clock.time_source, TimeSource::Other);
+        assert_eq!(
+            tracker.active().timeref().clock,
+            Some(tracker.active().clock)
+        );
+    }
+
+    #[test]
+    fn the_stated_time_source_is_announced_while_the_device_is_its_own_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        tracker.set_time_source(TimeSource::Gnss);
+        assert_eq!(tracker.active().clock, Clock::root(TimeSource::Gnss));
+        for time in 100..103 {
+            tracker.observe(packet(time));
+            tracker.on_edge(true);
+        }
+        tracker.set_time_source(TimeSource::Ptp);
+        assert_eq!(tracker.active().clock.time_source, TimeSource::Other);
+    }
+
+    #[test]
+    fn a_source_too_many_steps_from_its_root_is_refused() {
+        let mut tracker = ReferenceTracker::new(local());
+        let distant = |steps_removed| Timeref {
+            clock: Some(Clock {
+                steps_removed,
+                ..Clock::root(TimeSource::Gnss)
+            }),
+            ..packet(100)
+        };
+        assert!(tracker.refuses(&distant(MAX_STEPS_REMOVED)));
+        assert_eq!(tracker.state(), ReferenceState::Local);
+        assert!(!tracker.refuses(&distant(MAX_STEPS_REMOVED - 1)));
+    }
+
+    #[test]
+    fn a_device_hearing_its_own_time_refuses_it_and_stays_its_own_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        let echoed = local().advance(5);
+        let echo = Timeref {
+            epoch: Epoch::UNIX,
+            ..echoed.timeref()
+        };
+        assert!(tracker.refuses(&echo));
+        assert_eq!(tracker.state(), ReferenceState::Local);
+        assert!(!tracker.on_edge(true));
+        assert_eq!(tracker.active().identity, local().identity);
     }
 
     #[test]
@@ -878,6 +1046,7 @@ pub struct Synchronizer {
     generation: u32,
     divergences: u32,
     late_references: u32,
+    refused_references: u32,
     upstream: TimeStatus,
     /// Whether a pulse train ever qualified: without one there is nothing to
     /// hold over, and a later absence is still free-run.
@@ -910,6 +1079,7 @@ impl Synchronizer {
             generation: 0,
             divergences: 0,
             late_references: 0,
+            refused_references: 0,
             upstream: TimeStatus::Legacy,
             qualified_once: false,
             sequence: None,
@@ -935,6 +1105,7 @@ impl Synchronizer {
             upstream: self.upstream,
             spurs: self.pulses.spur_count(),
             late_references: self.late_references,
+            refused_references: self.refused_references,
             divergences: self.divergences,
             stale_acks: self.acquisition.stale_acks(),
             superseded_plans: self.acquisition.superseded_plans(),
@@ -974,8 +1145,8 @@ impl Synchronizer {
     }
 
     /// Observe a SYNC timeref that arrived at `arrival_ns`, labelling the
-    /// second just closed. One that missed its second's window is dropped and
-    /// counted; a sequence that skipped is a divergence, and discards whatever
+    /// second just closed. One that missed its second's window, or that names
+    /// this device's own time or too distant a root, is dropped and counted; a sequence that skipped is a divergence, and discards whatever
     /// the source had qualified so far.
     pub fn observe_packet(&mut self, timeref: Timeref<'_>, pad: u8, arrival_ns: u64) {
         let status = TimeStatus::from_pad(pad);
@@ -996,12 +1167,22 @@ impl Synchronizer {
             self.late_references = self.late_references.saturating_add(1);
             return;
         }
+        if self.references.refuses(&timeref) {
+            self.refused_references = self.refused_references.saturating_add(1);
+            return;
+        }
         let identity = ReferenceIdentity::new(timeref.epoch, timeref.session, timeref.serial);
         if !self.sequenced(identity, status, pad & SEQUENCE_MASK) {
             return;
         }
         self.upstream = status;
         self.references.observe(timeref);
+    }
+
+    /// Name what the device's own seconds come from: GNSS while a GPS receiver
+    /// labels them, PTP while PTP does, its internal oscillator otherwise.
+    pub fn set_time_source(&mut self, time_source: TimeSource) {
+        self.references.set_time_source(time_source);
     }
 
     /// Observe a second from the device's own receiver rather than a packet,
@@ -1256,6 +1437,7 @@ mod synchronizer_tests {
         Reference {
             identity: ReferenceIdentity::new(Epoch::SYSTIME, SessionId::new(1), b"local"),
             second: 10,
+            clock: Clock::root(TimeSource::InternalOscillator),
         }
     }
 
@@ -2325,5 +2507,111 @@ mod synchronizer_tests {
             TimeStatus::from_pad(TimeStatus::Holdover.bits() | 5),
             TimeStatus::Holdover
         );
+    }
+
+    /// A hub of a set: `index` names its session and serial, and all of them
+    /// boot on the same instant from the same oscillator.
+    fn hub(index: u8) -> Synchronizer {
+        Synchronizer::new(
+            CounterDomain::new(PERIOD),
+            PulseConfig::with_edge_tolerance(100),
+            Reference {
+                identity: ReferenceIdentity::new(
+                    Epoch::SYSTIME,
+                    SessionId::new(index.into()),
+                    &[b'h', b'0' + index],
+                ),
+                second: 10,
+                clock: Clock::root(TimeSource::InternalOscillator),
+            },
+            None,
+            0,
+        )
+    }
+
+    /// One second on a shared pulse, after which each hub hears the SYNC packet
+    /// of its `upstream`, as it travels the wire.
+    fn tick(hubs: &mut [Synchronizer], upstream: impl Fn(usize) -> Option<usize>, second: u64) {
+        let now = second * NANOS_PER_SECOND;
+        let announced: Vec<Option<Announce>> = hubs
+            .iter_mut()
+            .map(|hub| {
+                hub.poll(now);
+                hub.capture(EDGE, now).announce
+            })
+            .collect();
+        for (index, hub) in hubs.iter_mut().enumerate() {
+            let Some(announce) = upstream(index).and_then(|up| announced[up]) else {
+                continue;
+            };
+            let mut buf = [0u8; 64];
+            let len = announce
+                .timeref
+                .timeref()
+                .write_with_pad(&mut buf, announce.pad)
+                .unwrap();
+            let payload = &buf[twinleaf_proto::packet::Header::SIZE..len];
+            hub.observe_packet(
+                Timeref::parse(payload).unwrap(),
+                Timeref::pad(payload),
+                now + 1_000_000,
+            );
+        }
+    }
+
+    /// Each hub's source serial and steps from it.
+    fn roots(hubs: &[Synchronizer]) -> Vec<(Vec<u8>, u8)> {
+        hubs.iter()
+            .map(|hub| hub.status().active)
+            .map(|active| {
+                (
+                    active.identity.serial.as_bytes().to_vec(),
+                    active.clock.steps_removed,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_chain_of_hubs_counts_the_steps_from_its_root() {
+        let mut hubs: Vec<Synchronizer> = (0..5).map(hub).collect();
+        hubs[0].set_time_source(TimeSource::Gnss);
+        (0..40).for_each(|second| tick(&mut hubs, |index| index.checked_sub(1), second));
+        assert_eq!(
+            roots(&hubs),
+            (0..5)
+                .map(|steps| (b"h0".to_vec(), steps))
+                .collect::<Vec<_>>()
+        );
+        assert!(hubs
+            .iter()
+            .all(|hub| hub.status().active.clock.time_source == TimeSource::Gnss));
+        assert!(hubs.iter().all(|hub| hub.status().refused_references == 0));
+    }
+
+    /// Three hubs, each following the next around a ring with nothing above
+    /// it, start out as three roots and settle on one.
+    #[test]
+    fn a_ring_of_hubs_with_no_root_settles_on_exactly_one() {
+        let mut hubs: Vec<Synchronizer> = (0..3).map(hub).collect();
+        let upstream = |index: usize| Some((index + 2) % 3);
+        (0..60).for_each(|second| tick(&mut hubs, upstream, second));
+        let settled = roots(&hubs);
+        let root = settled.iter().position(|&(_, steps)| steps == 0).unwrap();
+        assert_eq!(
+            settled,
+            (0..3)
+                .map(|steps| (settled[root].0.clone(), steps as u8))
+                .cycle()
+                .skip(3 - root)
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(settled[root].0, [b'h', b'0' + root as u8]);
+        (60..180).for_each(|second| {
+            tick(&mut hubs, upstream, second);
+            assert_eq!(roots(&hubs), settled);
+        });
+        assert!(hubs[root].status().refused_references >= 120);
     }
 }

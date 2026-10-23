@@ -380,7 +380,7 @@ impl AcquisitionMachine {
 mod tests {
     use super::*;
     use crate::sync::ReferenceIdentity;
-    use twinleaf_proto::sync::Epoch;
+    use twinleaf_proto::sync::{Clock, Epoch, TimeSource};
     use twinleaf_proto::SessionId;
 
     const PERIOD: u32 = 1_000_000;
@@ -390,6 +390,7 @@ mod tests {
             reference: Reference {
                 identity: ReferenceIdentity::new(Epoch::UNIX, SessionId::new(42), b"parent"),
                 second,
+                clock: Clock::root(TimeSource::InternalOscillator),
             },
             counter_edge,
         }

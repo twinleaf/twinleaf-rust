@@ -432,7 +432,7 @@ fn value_of(answer: Answer<'_>) -> Result<&[u8], RpcError> {
 mod tests {
     use super::*;
     use crate::sync::{Reference, ReferenceIdentity};
-    use twinleaf_proto::sync::Epoch;
+    use twinleaf_proto::sync::{Clock, Epoch, TimeSource};
 
     /// What a hub asks a child for on its own behalf.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,6 +854,7 @@ mod tests {
             timeref: Reference {
                 identity: ReferenceIdentity::new(Epoch::UNIX, SessionId::new(5), b"HUB-SIM"),
                 second: 1_800_000_000,
+                clock: Clock::root(TimeSource::InternalOscillator),
             },
             pad: 0xC1,
         };
