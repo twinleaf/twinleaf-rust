@@ -792,9 +792,9 @@ mod reference_tests {
     }
 }
 
-/// Seconds the servo closes a train's estimated phase over. The tracker has
-/// already averaged the edges, so one constant is near-best from 20 ns to 3 µs.
-const STEERING_SECONDS: f32 = 2.0;
+/// Seconds the servo closes a train's estimated phase over: long enough that the
+/// sample clock's frequency holds steady at the cost of a few ns of time error.
+const STEERING_SECONDS: f32 = 10.0;
 
 /// The operator's hold on a servo: whether it steers or holds a pull.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -887,10 +887,10 @@ mod discipline_tests {
     }
 
     #[test]
-    fn the_correction_removes_the_frequency_and_half_the_phase_each_second() {
+    fn the_correction_removes_the_frequency_and_a_tenth_of_the_phase_each_second() {
         let mut servo = steering(50.0);
-        assert!((servo.observe(estimate(1_000.0, 2_000.0)) - -2.5).abs() < 1.0e-6);
-        assert!((servo.observe(estimate(-1_000.0, 2_000.0)) - -1.5).abs() < 1.0e-6);
+        assert!((servo.observe(estimate(1_000.0, 2_000.0)) - -2.1).abs() < 1.0e-6);
+        assert!((servo.observe(estimate(-1_000.0, 2_000.0)) - -1.9).abs() < 1.0e-6);
     }
 
     #[test]
@@ -936,12 +936,12 @@ mod discipline_tests {
         };
         servo.set_steering(steering);
         assert_eq!(servo.observe(None), 3.0);
-        assert!((servo.observe(estimate(1000.0, 0.0)) - -0.5).abs() < 1.0e-6);
+        assert!((servo.observe(estimate(1000.0, 0.0)) - -0.1).abs() < 1.0e-6);
         servo.set_steering(Steering {
             pull_ppm: -7.0,
             ..steering
         });
-        assert!((servo.output_ppm() - -0.5).abs() < 1.0e-6);
+        assert!((servo.output_ppm() - -0.1).abs() < 1.0e-6);
     }
 
     #[test]
