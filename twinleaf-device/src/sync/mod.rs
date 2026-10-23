@@ -792,70 +792,39 @@ mod reference_tests {
     }
 }
 
-/// Configuration for the 1 Hz servo steering out a train's estimated frequency
-/// and phase, output in ppm.
-///
-/// `correction = -(y / 1000 + kp * θ)`: the frequency estimate is what a PI
-/// loop's integrator learns, and `kp` closes the phase over `1 / (1000 kp)` s.
-#[derive(Debug, Clone, Copy)]
-pub struct PiConfig {
-    /// Phase gain, ppm per nanosecond of estimated phase.
-    pub kp: f32,
-    /// Most negative output the actuator accepts.
-    pub min_output_ppm: f32,
-    /// Most positive output the actuator accepts.
-    pub max_output_ppm: f32,
-}
+/// Seconds the servo closes a train's estimated phase over. The tracker has
+/// already averaged the edges, so one constant is near-best from 20 ns to 3 µs.
+const STEERING_SECONDS: f32 = 2.0;
 
-impl PiConfig {
-    /// A phase closed over 10 s, where 1 ppm moves the phase 1000 ns/s: slow
-    /// enough to average a microsecond-jittered PPS, fast enough to pull a
-    /// 50 ppm offset in well inside a minute, for an actuator pulling
-    /// ±`max_pull_ppm`.
-    pub const fn within(max_pull_ppm: f32) -> Self {
-        Self {
-            kp: 1.0e-4,
-            min_output_ppm: -max_pull_ppm,
-            max_output_ppm: max_pull_ppm,
-        }
-    }
-}
-
-/// The operator's hold on a servo: its gain, and whether it steers or holds a pull.
+/// The operator's hold on a servo: whether it steers or holds a pull.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Tuning {
+pub struct Steering {
     /// Whether the loop steers; a disabled servo holds `pull_ppm`.
     pub enabled: bool,
-    /// Phase gain, as [`PiConfig::kp`].
-    pub kp: f32,
     /// The correction held while disabled, and until an enabled loop has an estimate.
     pub pull_ppm: f32,
 }
 
-/// A servo from a pulse train's estimated state to an oscillator correction.
+/// A 1 Hz servo from a pulse train's estimated state to an oscillator
+/// correction, in ppm: `-(y + θ / STEERING_SECONDS) / 1000`.
 #[derive(Debug, Clone, Copy)]
 pub struct PhaseServo {
-    config: PiConfig,
+    max_pull_ppm: f32,
     enabled: bool,
     output_ppm: f32,
     saturated: bool,
 }
 
 impl PhaseServo {
-    /// Holds 0 ppm until [`Self::tune`] enables it.
+    /// Holds 0 ppm, within ±`max_pull_ppm`, until [`Self::set_steering`] enables it.
     ///
     /// # Panics
     ///
-    /// On an unusable gain or range, which are board constants. The
-    /// comparisons double as NaN traps: each one is false for a NaN operand.
-    pub const fn new(config: PiConfig) -> Self {
-        assert!(config.kp.is_finite(), "servo gain");
-        assert!(
-            config.min_output_ppm <= config.max_output_ppm,
-            "servo output range"
-        );
+    /// On a negative or NaN pull range, a board constant.
+    pub const fn new(max_pull_ppm: f32) -> Self {
+        assert!(max_pull_ppm >= 0.0, "servo pull range");
         Self {
-            config,
+            max_pull_ppm,
             enabled: false,
             output_ppm: 0.0,
             saturated: false,
@@ -872,29 +841,26 @@ impl PhaseServo {
         self.saturated
     }
 
-    /// Takes the gain, and starts from or holds the pull unless the loop was already steering.
-    pub fn tune(&mut self, tuning: Tuning) {
-        self.config.kp = tuning.kp;
-        match (self.enabled, tuning.enabled) {
+    /// Starts from or holds the pull, unless the loop was already steering.
+    pub fn set_steering(&mut self, steering: Steering) {
+        match (self.enabled, steering.enabled) {
             (true, true) => {}
-            (true, false) | (false, true | false) => self.clamp(tuning.pull_ppm),
+            (true, false) | (false, true | false) => self.clamp(steering.pull_ppm),
         }
-        self.enabled = tuning.enabled;
+        self.enabled = steering.enabled;
     }
 
     /// Steer by one second's estimate. With none, there is no train to follow
     /// and the correction holds, as a disabled servo's does.
     pub fn observe(&mut self, estimate: Option<PhaseEstimate>) -> f32 {
         if let (true, Some(estimate)) = (self.enabled, estimate) {
-            self.clamp(-(estimate.frequency_ppb / 1_000.0 + self.config.kp * estimate.phase_ns));
+            self.clamp(-(estimate.frequency_ppb + estimate.phase_ns / STEERING_SECONDS) / 1_000.0);
         }
         self.output_ppm
     }
 
     fn clamp(&mut self, requested_ppm: f32) {
-        self.output_ppm = requested_ppm
-            .max(self.config.min_output_ppm)
-            .min(self.config.max_output_ppm);
+        self.output_ppm = requested_ppm.max(-self.max_pull_ppm).min(self.max_pull_ppm);
         self.saturated = self.output_ppm != requested_ppm;
     }
 }
@@ -903,12 +869,11 @@ impl PhaseServo {
 mod discipline_tests {
     use super::*;
 
-    /// A servo steering with `config`'s gain from 0 ppm.
-    pub(super) fn steering(config: PiConfig) -> PhaseServo {
-        let mut servo = PhaseServo::new(config);
-        servo.tune(Tuning {
+    /// A servo steering from 0 ppm within ±`max_pull_ppm`.
+    pub(super) fn steering(max_pull_ppm: f32) -> PhaseServo {
+        let mut servo = PhaseServo::new(max_pull_ppm);
+        servo.set_steering(Steering {
             enabled: true,
-            kp: config.kp,
             pull_ppm: 0.0,
         });
         servo
@@ -922,15 +887,15 @@ mod discipline_tests {
     }
 
     #[test]
-    fn the_correction_removes_the_frequency_and_a_tenth_of_the_phase_each_second() {
-        let mut servo = steering(PiConfig::within(50.0));
-        assert!((servo.observe(estimate(1_000.0, 2_000.0)) - -2.1).abs() < 1.0e-6);
-        assert!((servo.observe(estimate(-1_000.0, 2_000.0)) - -1.9).abs() < 1.0e-6);
+    fn the_correction_removes_the_frequency_and_half_the_phase_each_second() {
+        let mut servo = steering(50.0);
+        assert!((servo.observe(estimate(1_000.0, 2_000.0)) - -2.5).abs() < 1.0e-6);
+        assert!((servo.observe(estimate(-1_000.0, 2_000.0)) - -1.5).abs() < 1.0e-6);
     }
 
     #[test]
     fn a_correction_past_the_pull_is_clamped_and_says_so() {
-        let mut servo = steering(PiConfig::within(1.0));
+        let mut servo = steering(1.0);
         assert_eq!(servo.observe(estimate(0.0, -43_000.0)), 1.0);
         assert!(servo.saturated());
         assert!(servo.observe(estimate(0.0, 500.0)) == -0.5 && !servo.saturated());
@@ -938,7 +903,7 @@ mod discipline_tests {
 
     #[test]
     fn no_estimate_holds_the_correction() {
-        let mut servo = steering(PiConfig::within(50.0));
+        let mut servo = steering(50.0);
         let acquired = servo.observe(estimate(-500.0, 3_000.0));
         assert_eq!(servo.observe(None), acquired);
         assert_eq!(servo.output_ppm(), acquired);
@@ -946,16 +911,15 @@ mod discipline_tests {
 
     #[test]
     fn an_untuned_or_disabled_servo_holds_its_pull_whatever_the_estimate() {
-        let mut servo = PhaseServo::new(PiConfig::within(50.0));
+        let mut servo = PhaseServo::new(50.0);
         assert_eq!(servo.observe(estimate(1000.0, 0.0)), 0.0);
-        let held = Tuning {
+        let held = Steering {
             enabled: false,
-            kp: PiConfig::within(50.0).kp,
             pull_ppm: 3.0,
         };
-        servo.tune(held);
+        servo.set_steering(held);
         assert_eq!(servo.observe(estimate(1000.0, 0.0)), 3.0);
-        servo.tune(Tuning {
+        servo.set_steering(Steering {
             pull_ppm: 80.0,
             ..held
         });
@@ -964,33 +928,26 @@ mod discipline_tests {
     }
 
     #[test]
-    fn enabling_starts_from_the_pull_and_retuning_keeps_the_loop_running() {
-        let mut servo = PhaseServo::new(PiConfig::within(50.0));
-        let tuning = Tuning {
+    fn enabling_starts_from_the_pull_and_enabling_again_keeps_the_loop_running() {
+        let mut servo = PhaseServo::new(50.0);
+        let steering = Steering {
             enabled: true,
-            kp: PiConfig::within(50.0).kp,
             pull_ppm: 3.0,
         };
-        servo.tune(tuning);
+        servo.set_steering(steering);
         assert_eq!(servo.observe(None), 3.0);
-        assert!((servo.observe(estimate(1000.0, 0.0)) - -0.1).abs() < 1.0e-6);
-        servo.tune(Tuning {
-            kp: 0.0,
+        assert!((servo.observe(estimate(1000.0, 0.0)) - -0.5).abs() < 1.0e-6);
+        servo.set_steering(Steering {
             pull_ppm: -7.0,
-            ..tuning
+            ..steering
         });
-        assert!((servo.output_ppm() - -0.1).abs() < 1.0e-6);
-        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 0.0);
+        assert!((servo.output_ppm() - -0.5).abs() < 1.0e-6);
     }
 
     #[test]
-    #[should_panic(expected = "servo output range")]
-    fn an_inverted_output_range_is_a_build_error() {
-        PhaseServo::new(PiConfig {
-            min_output_ppm: 1.0,
-            max_output_ppm: -1.0,
-            ..PiConfig::within(50.0)
-        });
+    #[should_panic(expected = "servo pull range")]
+    fn a_negative_pull_range_is_a_build_error() {
+        PhaseServo::new(-1.0);
     }
 }
 
@@ -1238,9 +1195,11 @@ impl Synchronizer {
         self.acquisition.set_autostart_seconds(seconds);
     }
 
-    /// Hand the operator's tuning to the servo, on a board that has one.
-    pub fn tune(&mut self, tuning: Tuning) {
-        self.servo.iter_mut().for_each(|servo| servo.tune(tuning));
+    /// Hand the operator's steering to the servo, on a board that has one.
+    pub fn set_steering(&mut self, steering: Steering) {
+        self.servo
+            .iter_mut()
+            .for_each(|servo| servo.set_steering(steering));
     }
 
     /// `dev.start`.
@@ -1428,7 +1387,7 @@ mod synchronizer_tests {
             CounterDomain::new(PERIOD),
             PulseConfig::DEFAULT,
             local(),
-            Some(discipline_tests::steering(PiConfig::within(50.0))),
+            Some(discipline_tests::steering(50.0)),
             0,
         )
     }
@@ -2722,7 +2681,7 @@ mod synchronizer_tests {
             CounterDomain::new(SANDI_HZ),
             PulseConfig::DEFAULT,
             local(),
-            Some(discipline_tests::steering(PiConfig::within(50.0))),
+            Some(discipline_tests::steering(50.0)),
             0,
         );
         let mut rng = pulse::tests::scenarios::Rng::new(7);
