@@ -282,11 +282,12 @@ impl<'a> Reply<'a> {
 }
 
 /// Writes a full `RPC_REP` packet with no routing into `buf`. Returns its
-/// length, or `None` if `buf` is too small.
+/// length, or `None` if `buf` is too small or the value is longer than a
+/// packet carries.
 pub fn write_reply(buf: &mut [u8], req_id: RpcRequestId, value: &[u8]) -> Option<usize> {
     let payload_len = 2 + value.len();
     let total = Header::SIZE + payload_len;
-    if buf.len() < total || payload_len > u16::MAX as usize {
+    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
     let hdr = Header::new(PacketType::RPC_REP, payload_len as u16);
@@ -340,13 +341,26 @@ impl<'a> ErrorReply<'a> {
 /// Writes a full `RPC_ERROR` packet with no routing and no message into
 /// `buf`. Returns its length, or `None` if `buf` is too small.
 pub fn write_error(buf: &mut [u8], req_id: RpcRequestId, code: RpcError) -> Option<usize> {
-    let total = Header::SIZE + 4;
-    if buf.len() < total {
+    write_error_with(buf, req_id, code, &[])
+}
+
+/// Writes a full `RPC_ERROR` packet with no routing into `buf`, with
+/// `message` after its code. Returns its length, or `None` if `buf` is too
+/// small or the message is longer than a packet carries.
+pub fn write_error_with(
+    buf: &mut [u8],
+    req_id: RpcRequestId,
+    code: RpcError,
+    message: &[u8],
+) -> Option<usize> {
+    let payload_len = 4 + message.len();
+    let total = Header::SIZE + payload_len;
+    if buf.len() < total || payload_len > Packet::MAX_PAYLOAD {
         return None;
     }
-    let hdr = Header::new(PacketType::RPC_ERROR, 4);
+    let hdr = Header::new(PacketType::RPC_ERROR, payload_len as u16);
     hdr.write(buf.first_chunk_mut()?);
-    write_error_payload(&mut buf[Header::SIZE..total], req_id, code.value(), &[])?;
+    write_error_payload(&mut buf[Header::SIZE..total], req_id, code.value(), message)?;
     Some(total)
 }
 
@@ -774,6 +788,8 @@ mod tests {
         assert_eq!(&buf[..n], &[3, 0, 4, 0, 0x34, 0x12, b'o', b'k']);
         let n = write_error(&mut buf, RpcRequestId::new(1), RpcError::NotFound).unwrap();
         assert_eq!(&buf[..n], &[4, 0, 4, 0, 1, 0, 2, 0]);
+        let n = write_error_with(&mut buf, RpcRequestId::new(1), RpcError::Range, b"no").unwrap();
+        assert_eq!(&buf[..n], &[4, 0, 6, 0, 1, 0, 17, 0, b'n', b'o']);
     }
 
     /// The request layout on the wire: header, id, `BY_NAME | len`, the
@@ -866,6 +882,23 @@ mod tests {
             ),
             None,
             "payload past what a header can describe"
+        );
+    }
+
+    #[test]
+    fn a_reply_past_what_a_packet_carries_is_refused_rather_than_emitted() {
+        let mut buf = [0u8; Packet::MAX_SIZE];
+        let longest = [0u8; Packet::MAX_PAYLOAD - 2];
+        assert_eq!(
+            write_reply(&mut buf, RpcRequestId::new(1), &longest),
+            Some(Header::SIZE + Packet::MAX_PAYLOAD),
+            "the longest value a reply carries"
+        );
+        let past = [0u8; Packet::MAX_PAYLOAD - 1];
+        assert_eq!(
+            write_reply(&mut buf, RpcRequestId::new(1), &past),
+            None,
+            "one byte more is a payload of 501, which no packet carries"
         );
     }
 

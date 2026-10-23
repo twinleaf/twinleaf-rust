@@ -110,7 +110,9 @@ fn decode_frame(frame: &wire::Frame) -> Result<Frame, Error> {
     }
     let errors = frame.errors;
     if errors.contains(FrameErrors::TEXT) {
-        return Ok(Frame::Text(String::from_utf8_lossy(frame.data).to_string()));
+        return Ok(Frame::Text(
+            String::from_utf8_lossy(frame.data()).to_string(),
+        ));
     }
     Err(Error::Invalid(if errors.contains(FrameErrors::TOO_BIG) {
         packet::DecodeError::PacketTooBig
