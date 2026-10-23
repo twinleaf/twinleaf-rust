@@ -2600,28 +2600,83 @@ mod synchronizer_tests {
     /// Sandi's TIM5 rate, from its board crate.
     const SANDI_HZ: u32 = 147_456_000;
 
-    /// A counter clocked by an oscillator `offset_ppm` fast of true seconds
-    /// before the servo's correction, which takes effect when it is returned.
+    /// A counter clocked by an oscillator whose own frequency through each true
+    /// second is `own_ppm`'s, its last holding after, fast of true seconds.
+    /// Each correction the servo returns is rounded to `step_ppm`, if any, and
+    /// takes effect `latency_ns` later.
+    #[derive(Clone)]
     struct Oscillator {
-        offset_ppm: f64,
+        own_ppm: Vec<f64>,
+        step_ppm: f64,
+        latency_ns: u64,
+        pending: Vec<(u64, f64)>,
         correction_ppm: f64,
         at_ns: u64,
         ticks: f64,
     }
 
     impl Oscillator {
+        /// One `offset_ppm` fast, taking each correction exactly and at once.
+        fn offset(offset_ppm: f64) -> Self {
+            Self::drifting(vec![offset_ppm], 0.0, 0)
+        }
+
+        fn drifting(own_ppm: Vec<f64>, step_ppm: f64, latency_ns: u64) -> Self {
+            Self {
+                own_ppm,
+                step_ppm,
+                latency_ns,
+                pending: Vec::new(),
+                correction_ppm: 0.0,
+                at_ns: 0,
+                ticks: 0.0,
+            }
+        }
+
+        /// Its frequency from true seconds now, ppm.
+        fn ppm(&self) -> f64 {
+            let second = (self.at_ns / NANOS_PER_SECOND) as usize;
+            self.own_ppm[second.min(self.own_ppm.len() - 1)] + self.correction_ppm
+        }
+
+        /// Ticks counted by `ns`, which never goes backwards.
+        fn ticks_at(&mut self, ns: u64) -> f64 {
+            loop {
+                if let Some(&(_, ppm)) = self.pending.first().filter(|&&(at, _)| at <= self.at_ns) {
+                    self.correction_ppm = ppm;
+                    self.pending.remove(0);
+                    continue;
+                }
+                if self.at_ns >= ns {
+                    return self.ticks;
+                }
+                let until = self
+                    .pending
+                    .first()
+                    .map_or(ns, |&(at, _)| at.min(ns))
+                    .min((self.at_ns / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND);
+                self.ticks += SANDI_HZ as f64
+                    * (1.0 + self.ppm() * 1e-6)
+                    * (until - self.at_ns) as f64
+                    * 1e-9;
+                self.at_ns = until;
+            }
+        }
+
         fn counter(&mut self, ns: u64) -> u32 {
-            let ppm = self.offset_ppm + self.correction_ppm;
-            self.ticks += SANDI_HZ as f64 * (1.0 + ppm * 1e-6) * (ns - self.at_ns) as f64 * 1e-9;
-            self.at_ns = ns;
-            (self.ticks as u64 % SANDI_HZ as u64) as u32
+            (self.ticks_at(ns) as u64 % SANDI_HZ as u64) as u32
         }
 
         fn steer(&mut self, ns: u64, actions: Actions) {
-            self.counter(ns);
-            self.correction_ppm = actions
-                .correction_ppm
-                .map_or(self.correction_ppm, f64::from);
+            self.ticks_at(ns);
+            if let Some(ppm) = actions.correction_ppm.map(f64::from) {
+                let ppm = if self.step_ppm > 0.0 {
+                    (ppm / self.step_ppm).round() * self.step_ppm
+                } else {
+                    ppm
+                };
+                self.pending.push((ns + self.latency_ns, ppm));
+            }
         }
     }
 
@@ -2640,8 +2695,29 @@ mod synchronizer_tests {
     fn sandi_under(
         offset_ppm: f64,
         seconds: u64,
-        mut pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
+        pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
     ) -> Vec<Status> {
+        sandi_on(Oscillator::offset(offset_ppm), seconds, pps)
+            .into_iter()
+            .map(|second| second.status)
+            .collect()
+    }
+
+    /// One true second of [`sandi_on`]: the status after it, how far the
+    /// counter was past its anchor at the true second, ns, and how far the
+    /// oscillator was off true frequency then, ppb.
+    struct Second {
+        status: Status,
+        time_error_ns: Option<f64>,
+        frequency_error_ppb: f64,
+    }
+
+    /// [`sandi_under`] on `oscillator`.
+    fn sandi_on(
+        mut oscillator: Oscillator,
+        seconds: u64,
+        mut pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
+    ) -> Vec<Second> {
         let mut sync = Synchronizer::new(
             CounterDomain::new(SANDI_HZ),
             PulseConfig::DEFAULT,
@@ -2649,21 +2725,17 @@ mod synchronizer_tests {
             Some(discipline_tests::steering(PiConfig::within(50.0))),
             0,
         );
-        let mut oscillator = Oscillator {
-            offset_ppm,
-            correction_ppm: 0.0,
-            at_ns: 0,
-            ticks: 0.0,
-        };
         let mut rng = pulse::tests::scenarios::Rng::new(7);
         let actions = sync.wake(oscillator.counter(0), 0);
         oscillator.steer(0, actions);
         let trace = std::env::var_os("SYNC_TRACE").is_some();
         (1..=seconds)
             .map(|second| {
+                let true_ns = second * NANOS_PER_SECOND + 300_000_000;
+                let mut at_true = oscillator.clone();
+                let true_ticks = at_true.ticks_at(true_ns);
                 let offset_ns = pps(second, &mut rng);
-                let edge_ns = (second * NANOS_PER_SECOND + 300_000_000)
-                    .saturating_add_signed(offset_ns.unwrap_or(0.0) as i64);
+                let edge_ns = true_ns.saturating_add_signed(offset_ns.unwrap_or(0.0) as i64);
                 while let Some(deadline) = sync.next_poll_deadline_ns().filter(|&d| d <= edge_ns) {
                     let actions = sync.poll(deadline);
                     oscillator.steer(deadline, actions);
@@ -2685,7 +2757,16 @@ mod synchronizer_tests {
                         status.correction_saturated
                     );
                 }
-                status
+                let period = SANDI_HZ as f64;
+                Second {
+                    status,
+                    time_error_ns: status.counter_edge.map(|edge| {
+                        ((true_ticks - edge as f64 + period / 2.0).rem_euclid(period) - period / 2.0)
+                            * 1e9
+                            / period
+                    }),
+                    frequency_error_ppb: at_true.ppm() * 1e3,
+                }
             })
             .collect()
     }
@@ -2852,5 +2933,89 @@ mod synchronizer_tests {
             trace[109].correction_ppm,
             trace[129].pulse
         );
+    }
+
+    /// The SiT5356's tuning step on its ±50 ppm range: one part in 2^25.
+    const SIT5356_STEP_PPM: f64 = 50.0 / (1u64 << 25) as f64;
+
+    /// An hour of own frequency, ppm, from `offset_ppm`: steady, ramping as a
+    /// warming board does, cycling as an HVAC does, or random-walking as a
+    /// TCXO does and as one ten times worse in Allan deviation.
+    fn drifts(offset_ppm: f64) -> [(&'static str, Vec<f64>); 7] {
+        let ramp = |ppm_per_minute: f64| {
+            (0..3600)
+                .map(|second| offset_ppm + ppm_per_minute * second as f64 / 60.0)
+                .collect()
+        };
+        let walk = |ppb_per_root_second: f64| {
+            let mut rng = pulse::tests::scenarios::Rng::new(11);
+            (0..3600)
+                .scan(offset_ppm, |ppm, _| {
+                    *ppm += rng.gaussian() * ppb_per_root_second * 1e-3;
+                    Some(*ppm)
+                })
+                .collect()
+        };
+        [
+            ("steady", vec![offset_ppm]),
+            ("ramp 0.01 ppm/min", ramp(0.01)),
+            ("ramp 0.05 ppm/min", ramp(0.05)),
+            ("ramp 0.2 ppm/min", ramp(0.2)),
+            (
+                "cycle ±0.5 ppm/20 min",
+                (0..3600)
+                    .map(|second| {
+                        offset_ppm + 0.5 * (core::f64::consts::TAU * second as f64 / 1200.0).sin()
+                    })
+                    .collect(),
+            ),
+            ("walk tcxo", walk(0.1)),
+            ("walk 10x tcxo", walk(1.0)),
+        ]
+    }
+
+    /// An hour of each drift under each jitter and latency, 0.5 ppm off to
+    /// start, with time and frequency errors taken against true seconds past
+    /// the first ten minutes.
+    #[test]
+    #[ignore = "a sweep that prints a table"]
+    fn drift_sweep() {
+        const SETTLE: usize = 600;
+        fn rms(values: impl Iterator<Item = f64>) -> f64 {
+            let (sum, count) = values.fold((0.0, 0), |(sum, count), v| (sum + v * v, count + 1));
+            (sum / count as f64).sqrt()
+        }
+        println!(
+            "{:<22} {:>6} {:>4} {:>6} {:>7} {:>9} {:>9} {:>9} {:>5}",
+            "drift", "jitter", "ms", "lock s", "locked", "rms ns", "max ns", "rms ppb", "spurs"
+        );
+        for jitter_ns in [20.0, 1_000.0, 3_000.0] {
+            for latency_ms in [0, 5, 50] {
+                for (name, own_ppm) in drifts(0.5) {
+                    let oscillator =
+                        Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, latency_ms * 1_000_000);
+                    let trace =
+                        sandi_on(oscillator, 3600, |_, rng| Some(rng.gaussian() * jitter_ns));
+                    let after = &trace[SETTLE..];
+                    println!(
+                        "{name:<22} {jitter_ns:>6} {latency_ms:>4} {:>6} {:>6.1}% {:>9.1} {:>9.1} {:>9.3} {:>5}",
+                        trace
+                            .iter()
+                            .position(|second| second.status.pulse.is_locked())
+                            .map_or(-1, |second| second as i64 + 1),
+                        100.0
+                            * after.iter().filter(|second| second.status.pulse.is_locked()).count() as f64
+                            / after.len() as f64,
+                        rms(after.iter().filter_map(|second| second.time_error_ns)),
+                        after
+                            .iter()
+                            .filter_map(|second| second.time_error_ns)
+                            .fold(0.0, |max: f64, ns| max.max(ns.abs())),
+                        rms(after.iter().map(|second| second.frequency_error_ppb)),
+                        trace[trace.len() - 1].status.spurs - trace[SETTLE - 1].status.spurs,
+                    );
+                }
+            }
+        }
     }
 }
