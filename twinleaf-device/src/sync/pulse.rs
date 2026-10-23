@@ -1,44 +1,66 @@
 //! Electrical PPS qualification and phase measurement.
 //!
-//! A main timebase that rejects spurs and measures phase, plus a tentative
-//! timebase that takes over when the main train disappears.
+//! Each pulse train is a two-state Kalman tracker of the edge's phase and the
+//! oscillator's frequency offset, gating every edge on its innovation. A main
+//! train rejects spurs and measures phase; a tentative train, fed the main
+//! train's rejected edges, takes over when they prove a coherent train of
+//! their own.
 
 use super::CounterDomain;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Accepted edges before a train can lock: two always fit a phase and a
+/// frequency exactly, so the third is the first that tests them.
+const ACQUISITION_RUN: u32 = 3;
 
 /// Counter ticks in `ns` nanoseconds of a timer running at `timer_hz`.
 pub const fn ticks(ns: u32, timer_hz: u32) -> u32 {
     (ns as u64 * timer_hz as u64 / NANOS_PER_SECOND) as u32
 }
 
-/// PPS tracker configuration.
+/// PPS tracker configuration: the gate, the oscillator model, and the priors a
+/// new train starts from.
 #[derive(Debug, Clone, Copy)]
 pub struct PulseConfig {
-    /// Largest period error accepted as part of one pulse train.
-    pub edge_tolerance_ticks: u32,
     /// Grace after the expected second before declaring a pulse missing.
     pub miss_grace_ns: u32,
-    /// Consecutive clean pulses required to report lock.
-    pub lock_threshold: u8,
-    /// Misses tolerated before considering a tentative alternate pulse train.
-    pub missed_pulse_threshold: u8,
-    /// Clean pulses required on the alternate train before switching to it.
-    pub switchover_threshold: u8,
+    /// Innovations accepted, in standard deviations of the predicted edge.
+    pub gate_sigmas: f64,
+    /// Hard ceiling on the gate however long the holdover, under half a second.
+    pub max_gate_ns: u32,
+    /// Frequency offset a new train may have from the oscillator, ppb (1σ).
+    pub frequency_prior_ppb: f64,
+    /// Edge noise a new train is assumed to have until its innovations say, ns (1σ).
+    pub edge_noise_prior_ns: f64,
+    /// White frequency noise of the oscillator, ns²/s.
+    pub white_fm: f64,
+    /// Random-walk frequency noise of the oscillator, ns²/s³.
+    pub random_walk_fm: f64,
+    /// Seconds of innovations the edge-noise estimate remembers.
+    pub noise_memory_seconds: f64,
+    /// Factor a rejected edge grows the edge-noise estimate by, so a train
+    /// noisier than assumed is still acquired.
+    pub rejected_noise_growth: f64,
+    /// Frequency uncertainty under which a train may lock, ppb (1σ).
+    pub lock_frequency_ppb: f64,
 }
 
 impl PulseConfig {
-    /// The edge tolerance is the one board-dependent threshold: it follows the
-    /// counter frequency and the oscillator specification.
-    pub const fn with_edge_tolerance(edge_tolerance_ticks: u32) -> Self {
-        Self {
-            edge_tolerance_ticks,
-            miss_grace_ns: 10_000_000,
-            lock_threshold: 3,
-            missed_pulse_threshold: 4,
-            switchover_threshold: 4,
-        }
-    }
+    /// A TCXO-class oscillator, σy(1 s) = 1e-9 white and σy(100 s) ≈ 6e-10
+    /// random walk, following a source within ±50 ppm of it.
+    pub const DEFAULT: Self = Self {
+        miss_grace_ns: 10_000_000,
+        gate_sigmas: 4.0,
+        max_gate_ns: 100_000_000,
+        frequency_prior_ppb: 50_000.0,
+        edge_noise_prior_ns: 1_000.0,
+        white_fm: 1.0,
+        random_walk_fm: 0.01,
+        noise_memory_seconds: 32.0,
+        rejected_noise_growth: 2.0,
+        lock_frequency_ppb: 1_000.0,
+    };
 }
 
 /// Qualification state of the electrical pulse train.
@@ -47,12 +69,12 @@ impl PulseConfig {
 pub enum PulseState {
     /// No external pulse train has been established.
     FreeRunning,
-    /// A plausible pulse train exists but has not met the lock threshold.
+    /// A plausible pulse train exists but its estimate has not converged.
     Acquiring {
-        /// Consecutive clean pulses so far.
+        /// Pulses accepted since the train was established or resumed.
         good_pulses: u8,
     },
-    /// Enough consecutive clean pulses have been observed.
+    /// The train's phase and frequency are known well enough to follow.
     Locked,
     /// A previously established pulse train is currently absent.
     Holdover {
@@ -81,11 +103,20 @@ pub(crate) enum SecondEvent {
         /// Nonzero is a divergence, and the capture is not anchored on.
         unaccounted: i64,
     },
-    /// The expected pulse did not arrive.
+    /// The expected pulse did not arrive, or arrived outside the gate.
     Missed,
     /// A coherent alternate train replaced the missing main train. The swap
     /// itself closes this many seconds, the nearest to the new train's phase.
     Switched { seconds: u32 },
+}
+
+/// The main train's estimate at the second just closed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhaseEstimate {
+    /// Phase of the edge from the anchor, ns.
+    pub phase_ns: f32,
+    /// Frequency offset of the unsteered oscillator from the train, ppb.
+    pub frequency_ppb: f32,
 }
 
 /// Where one pulse train is in its life cycle.
@@ -97,8 +128,106 @@ enum Mode {
     Fresh,
     /// Consecutive accepted pulses, each closing one second.
     Tracking,
+    /// Seconds closed on the prediction because their edges fell outside the gate.
+    Coasting { missed: u32 },
     /// A qualified train whose pulses are currently absent.
     Lapsed { missed: u32 },
+}
+
+/// Phase `θ` (ns) and unsteered frequency offset `y` (ns/s) of a train, with
+/// their covariance and the train's own edge-noise variance `r` (ns²).
+#[derive(Debug, Clone, Copy)]
+struct Filter {
+    phase: f64,
+    frequency: f64,
+    p00: f64,
+    p01: f64,
+    p11: f64,
+    r: f64,
+    innovations: f64,
+    /// Integrated steering at the last update, ns.
+    steered: f64,
+}
+
+impl Filter {
+    const EMPTY: Self = Self {
+        phase: 0.0,
+        frequency: 0.0,
+        p00: 0.0,
+        p01: 0.0,
+        p11: 0.0,
+        r: 0.0,
+        innovations: 0.0,
+        steered: 0.0,
+    };
+
+    fn fresh(config: PulseConfig, floor: f64, steered: f64) -> Self {
+        let r = (config.edge_noise_prior_ns * config.edge_noise_prior_ns).max(floor);
+        Self {
+            p00: r,
+            p11: config.frequency_prior_ppb * config.frequency_prior_ppb,
+            r,
+            innovations: 1.0,
+            steered,
+            ..Self::EMPTY
+        }
+    }
+
+    /// Propagated `n` seconds, under the steering integrated to `steered`.
+    fn predicted(self, config: PulseConfig, n: f64, steered: f64) -> Self {
+        let q = config.random_walk_fm;
+        Self {
+            phase: self.phase + self.frequency * n + steered - self.steered,
+            p00: self.p00
+                + 2.0 * n * self.p01
+                + n * n * self.p11
+                + config.white_fm * n
+                + q * n * n * n / 3.0,
+            p01: self.p01 + n * self.p11 + q * n * n / 2.0,
+            p11: self.p11 + q * n,
+            steered,
+            ..self
+        }
+    }
+
+    /// Updated by the phase `z` if it is inside the gate. The edge-noise
+    /// estimate is the fading average of `ε² + P₀₀⁺`, unbiased for `r`.
+    fn updated(self, config: PulseConfig, floor: f64, z: f64) -> Option<Self> {
+        let innovation = z - self.phase;
+        let s = self.p00 + self.r;
+        let gate = (config.gate_sigmas * config.gate_sigmas * s)
+            .min(config.max_gate_ns as f64 * config.max_gate_ns as f64);
+        if innovation * innovation > gate {
+            return None;
+        }
+        let (k0, k1, residual) = (self.p00 / s, self.p01 / s, innovation * self.r / s);
+        let p00 = self.p00 * self.r / s;
+        let innovations = (self.innovations + 1.0).min(config.noise_memory_seconds);
+        let weight = 1.0 / innovations;
+        Some(Self {
+            phase: self.phase + k0 * innovation,
+            frequency: self.frequency + k1 * innovation,
+            p00,
+            p01: self.p01 * self.r / s,
+            p11: self.p11 - k1 * self.p01,
+            r: ((1.0 - weight) * self.r + weight * (residual * residual + p00)).max(floor),
+            innovations,
+            ..self
+        })
+    }
+}
+
+/// One raw edge, as every train sees it.
+#[derive(Debug, Clone, Copy)]
+struct Edge {
+    /// Displacement from the previous raw edge, ticks.
+    delta: i64,
+    /// Seconds the monotonic clock puts since the previous raw edge.
+    seconds: u32,
+    counter: u32,
+    at_ns: u64,
+    /// Phase the corrections have moved the counter by `at_ns`.
+    steered: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,12 +240,15 @@ struct Train {
     /// a residual under half a period. It accumulates across rejected spurs.
     pending_seconds: u32,
     pending_delta: i64,
-    spurious_count: u32,
-    good_pulse_count: u32,
+    /// Whether an edge since the last closed second was not this train's.
+    rejected: bool,
+    /// Pulses accepted since the train was established or resumed.
+    run: u32,
     last_delta: i64,
     phase_error: i64,
     last_edge: u32,
     miss_timeout_ns: u64,
+    filter: Filter,
 }
 
 impl Train {
@@ -126,17 +258,50 @@ impl Train {
             external: false,
             pending_seconds: 0,
             pending_delta: 0,
-            spurious_count: 0,
-            good_pulse_count: 0,
+            rejected: false,
+            run: 0,
             last_delta: 0,
             phase_error: 0,
             last_edge: 0,
             miss_timeout_ns: 0,
+            filter: Filter::EMPTY,
         }
     }
 
     const fn is_valid(&self) -> bool {
         !matches!(self.mode, Mode::Empty)
+    }
+
+    /// Seconds closed since the last accepted pulse.
+    const fn unclosed(&self) -> u32 {
+        match self.mode {
+            Mode::Empty | Mode::Fresh | Mode::Tracking => 0,
+            Mode::Coasting { missed } | Mode::Lapsed { missed } => missed,
+        }
+    }
+
+    /// When the second just closed was due.
+    const fn closed_at_ns(&self, config: PulseConfig) -> u64 {
+        self.miss_timeout_ns
+            .saturating_sub(NANOS_PER_SECOND + config.miss_grace_ns as u64)
+    }
+
+    /// The filter at the second just closed.
+    fn estimate(&self, config: PulseConfig, steered: f64) -> Filter {
+        self.filter
+            .predicted(config, self.unclosed() as f64, steered)
+    }
+
+    /// A run long enough to test its fit, a frequency known well enough to
+    /// steer by, and a prediction no worse than one more edge would be.
+    fn is_locked(&self, config: PulseConfig) -> bool {
+        let estimate = self.estimate(config, self.filter.steered);
+        matches!(
+            self.mode,
+            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. }
+        ) && self.run >= ACQUISITION_RUN
+            && estimate.p11 <= config.lock_frequency_ppb * config.lock_frequency_ppb
+            && estimate.p00 <= estimate.r
     }
 
     /// Returns the seconds this pulse accounts for beyond the one it closes,
@@ -145,55 +310,70 @@ impl Train {
         &mut self,
         domain: CounterDomain,
         config: PulseConfig,
-        delta: i64,
-        seconds: u32,
-        pulse_edge: u32,
-        pulse_time_ns: u64,
+        edge: Edge,
     ) -> Option<i64> {
+        let Edge {
+            delta,
+            seconds,
+            counter: pulse_edge,
+            at_ns: pulse_time_ns,
+            steered,
+        } = edge;
+        let floor = domain.ticks_to_ns(1) * domain.ticks_to_ns(1);
         if !self.is_valid() {
-            *self = Self::new();
+            *self = Self {
+                filter: Filter::fresh(config, floor, steered),
+                ..Self::new()
+            };
         } else {
-            self.pending_seconds = self.pending_seconds.saturating_add(seconds);
-            self.pending_delta = self.pending_delta.saturating_add(delta);
-
+            let mut pending_seconds = self.pending_seconds.saturating_add(seconds);
+            let mut pending_delta = self.pending_delta.saturating_add(delta);
             let period = domain.period() as i64;
             let half = period / 2;
-            if self.pending_delta >= half {
-                self.pending_seconds = self.pending_seconds.saturating_add(1);
-                self.pending_delta -= period;
-            } else if self.pending_delta < -half {
-                self.pending_seconds = self.pending_seconds.saturating_sub(1);
-                self.pending_delta += period;
+            if pending_delta >= half {
+                pending_seconds = pending_seconds.saturating_add(1);
+                pending_delta -= period;
+            } else if pending_delta < -half {
+                pending_seconds = pending_seconds.saturating_sub(1);
+                pending_delta += period;
             }
+            (self.pending_seconds, self.pending_delta) = (pending_seconds, pending_delta);
 
-            if self.pending_seconds == 0
-                || self.pending_delta < -(config.edge_tolerance_ticks as i64)
-                || self.pending_delta > config.edge_tolerance_ticks as i64
-            {
-                self.spurious_count = self.spurious_count.saturating_add(1);
+            let phase = domain.ticks_to_ns(self.phase_error.saturating_add(pending_delta));
+            if pending_seconds == 0 {
+                self.rejected = true;
                 return None;
             }
+            let predicted = self
+                .filter
+                .predicted(config, pending_seconds as f64, steered);
+            let Some(filter) = predicted.updated(config, floor, phase) else {
+                let ceiling = config.max_gate_ns as f64 / config.gate_sigmas;
+                self.filter.r =
+                    (self.filter.r * config.rejected_noise_growth).min(ceiling * ceiling);
+                self.rejected = true;
+                return None;
+            };
+            self.filter = filter;
         }
 
         let accounted = match self.mode {
             Mode::Empty => 0,
             Mode::Fresh | Mode::Tracking => 1,
-            Mode::Lapsed { missed } => missed as i64 + 1,
+            Mode::Coasting { missed } | Mode::Lapsed { missed } => missed as i64 + 1,
         };
         let unaccounted = self.pending_seconds as i64 - accounted;
         self.mode = match self.mode {
             Mode::Empty => Mode::Fresh,
-            _ => Mode::Tracking,
+            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. } | Mode::Lapsed { .. } => {
+                Mode::Tracking
+            }
         };
         self.external = true;
-
-        if self.spurious_count == 0 {
-            self.good_pulse_count = self.good_pulse_count.saturating_add(1);
-        } else {
-            self.good_pulse_count = 0;
-        }
-
+        self.rejected = false;
+        self.run = self.run.saturating_add(1);
         self.last_delta = self.pending_delta;
+        self.phase_error = self.phase_error.saturating_add(self.pending_delta);
         self.pending_seconds = 0;
         self.pending_delta = 0;
         self.last_edge = pulse_edge;
@@ -203,17 +383,31 @@ impl Train {
         Some(unaccounted)
     }
 
-    /// Account for one expected pulse that did not arrive. Callers only invoke
-    /// this on a train that has qualified at least once.
+    /// Account for one expected pulse that did not arrive, or arrived outside
+    /// the gate. Callers only invoke this on a train that has qualified once.
     fn process_miss(&mut self) {
-        self.good_pulse_count = 0;
-        self.mode = match self.mode {
-            Mode::Lapsed { missed } => Mode::Lapsed {
+        self.mode = match (self.mode, self.rejected) {
+            (Mode::Empty | Mode::Fresh | Mode::Tracking, true) => Mode::Coasting { missed: 1 },
+            (Mode::Coasting { missed }, true) => Mode::Coasting {
                 missed: missed.saturating_add(1),
             },
-            _ => Mode::Lapsed { missed: 1 },
+            (Mode::Empty | Mode::Fresh | Mode::Tracking, false) => Mode::Lapsed { missed: 1 },
+            (Mode::Coasting { missed } | Mode::Lapsed { missed }, false)
+            | (Mode::Lapsed { missed }, true) => Mode::Lapsed {
+                missed: missed.saturating_add(1),
+            },
         };
+        if let Mode::Lapsed { .. } = self.mode {
+            self.run = 0;
+        }
+        self.rejected = false;
         self.miss_timeout_ns = self.miss_timeout_ns.saturating_add(NANOS_PER_SECOND);
+    }
+
+    /// Anchor on the latest accepted edge, keeping the estimate.
+    fn rebase(&mut self, domain: CounterDomain) {
+        self.filter.phase -= domain.ticks_to_ns(self.phase_error);
+        self.phase_error = 0;
     }
 }
 
@@ -227,21 +421,33 @@ pub(crate) struct PulseTracker {
     last_raw_time_ns: Option<u64>,
     spurs: u32,
     backward_time: u32,
+    /// The correction in force, ppb, since `steered_at_ns`.
+    steering_ppb: f64,
+    /// Phase the corrections have moved the counter by `steered_at_ns`.
+    steered_ns: f64,
+    steered_at_ns: u64,
 }
 
 impl PulseTracker {
     /// # Panics
     ///
-    /// Both are board constants. A tolerance of half a period or more would
-    /// make every pulse in the domain qualify.
+    /// Both are board constants. A gate of half a second or more would make
+    /// every pulse in the domain qualify.
     pub(crate) const fn new(domain: CounterDomain, config: PulseConfig) -> Self {
         assert!(
-            config.edge_tolerance_ticks < domain.period() / 2,
-            "edge tolerance must be under half the counter period"
+            config.max_gate_ns < NANOS_PER_SECOND as u32 / 2,
+            "the gate must be under half a second"
         );
         assert!(
-            config.lock_threshold != 0 && config.switchover_threshold != 0,
-            "pulse thresholds must be nonzero"
+            config.gate_sigmas > 0.0
+                && config.frequency_prior_ppb > 0.0
+                && config.edge_noise_prior_ns >= 0.0
+                && config.white_fm >= 0.0
+                && config.random_walk_fm >= 0.0
+                && config.noise_memory_seconds >= 1.0
+                && config.rejected_noise_growth >= 1.0
+                && config.lock_frequency_ppb > 0.0,
+            "pulse filter parameters"
         );
         Self {
             domain,
@@ -252,6 +458,9 @@ impl PulseTracker {
             last_raw_time_ns: None,
             spurs: 0,
             backward_time: 0,
+            steering_ppb: 0.0,
+            steered_ns: 0.0,
+            steered_at_ns: 0,
         }
     }
 
@@ -263,15 +472,18 @@ impl PulseTracker {
         if !self.main.external {
             return PulseState::FreeRunning;
         }
-        let good = self.main.good_pulse_count;
         match self.main.mode {
             Mode::Empty => PulseState::FreeRunning,
             Mode::Lapsed { missed } => PulseState::Holdover {
                 missed_pulses: missed.min(u8::MAX as u32) as u8,
             },
-            _ if good >= self.config.lock_threshold as u32 => PulseState::Locked,
-            _ => PulseState::Acquiring {
-                good_pulses: good.min(u8::MAX as u32) as u8,
+            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. }
+                if self.main.is_locked(self.config) =>
+            {
+                PulseState::Locked
+            }
+            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. } => PulseState::Acquiring {
+                good_pulses: self.main.run.min(u8::MAX as u32) as u8,
             },
         }
     }
@@ -290,7 +502,34 @@ impl PulseTracker {
     /// The measured phase, or `None` while no pulse is closing the second.
     pub(crate) fn phase_error_ns(&self) -> Option<f32> {
         matches!(self.main.mode, Mode::Fresh | Mode::Tracking)
-            .then(|| self.domain.ticks_to_ns(self.main.phase_error))
+            .then(|| self.domain.ticks_to_ns(self.main.phase_error) as f32)
+    }
+
+    /// The main train's estimate at the second just closed, while an outside
+    /// train is established.
+    pub(crate) fn estimate(&self) -> Option<PhaseEstimate> {
+        (self.main.external && self.main.is_valid()).then(|| {
+            let steered = self.steered(self.main.closed_at_ns(self.config));
+            let estimate = self.main.estimate(self.config, steered);
+            PhaseEstimate {
+                phase_ns: estimate.phase as f32,
+                frequency_ppb: estimate.frequency as f32,
+            }
+        })
+    }
+
+    /// Put `correction_ppm` in force from `monotonic_ns`: the filters predict
+    /// with it as a known control input.
+    pub(crate) fn steer(&mut self, correction_ppm: f32, monotonic_ns: u64) {
+        self.steered_ns = self.steered(monotonic_ns);
+        self.steered_at_ns = self.steered_at_ns.max(monotonic_ns);
+        self.steering_ppb = correction_ppm as f64 * 1_000.0;
+    }
+
+    /// Phase the corrections have moved the counter by `monotonic_ns`.
+    fn steered(&self, monotonic_ns: u64) -> f64 {
+        self.steered_ns
+            + self.steering_ppb * monotonic_ns.saturating_sub(self.steered_at_ns) as f64 * 1e-9
     }
 
     /// Edges the main train rejected.
@@ -349,40 +588,22 @@ impl PulseTracker {
         };
         self.last_raw_edge = pulse_edge;
         self.last_raw_time_ns = Some(monotonic_ns);
-
-        match self.main.process_pulse(
-            self.domain,
-            self.config,
+        let edge = Edge {
             delta,
             seconds,
-            pulse_edge,
-            monotonic_ns,
-        ) {
+            counter: pulse_edge,
+            at_ns: monotonic_ns,
+            steered: self.steered(monotonic_ns),
+        };
+
+        match self.main.process_pulse(self.domain, self.config, edge) {
             Some(unaccounted) => {
-                if self.tentative.is_valid() {
-                    self.tentative.spurious_count = self.tentative.spurious_count.saturating_add(1);
-                    self.tentative.good_pulse_count = 0;
-                }
-                self.main.phase_error = self.main.phase_error.saturating_add(self.main.last_delta);
-                self.main.spurious_count = 0;
+                self.tentative.rejected |= self.tentative.is_valid();
                 Some(SecondEvent::Captured { unaccounted })
             }
             None => {
                 self.spurs = self.spurs.saturating_add(1);
-                if self
-                    .tentative
-                    .process_pulse(
-                        self.domain,
-                        self.config,
-                        delta,
-                        seconds,
-                        pulse_edge,
-                        monotonic_ns,
-                    )
-                    .is_some()
-                {
-                    self.tentative.spurious_count = 0;
-                }
+                self.tentative.process_pulse(self.domain, self.config, edge);
                 None
             }
         }
@@ -400,7 +621,7 @@ impl PulseTracker {
         }
 
         if self.tentative.is_valid() && monotonic_ns > self.tentative.miss_timeout_ns {
-            if self.tentative.spurious_count != 0 {
+            if self.tentative.rejected {
                 self.tentative = Train::new();
             } else {
                 self.tentative.process_miss();
@@ -410,15 +631,7 @@ impl PulseTracker {
         if !missed {
             return None;
         }
-
-        let absent = match self.main.mode {
-            Mode::Lapsed { missed } => missed,
-            _ => 0,
-        };
-        let switch = absent > self.config.missed_pulse_threshold as u32
-            && self.tentative.good_pulse_count > self.config.switchover_threshold as u32;
-        if !switch {
-            self.main.spurious_count = 0;
+        if !self.tentative.is_locked(self.config) {
             return Some(SecondEvent::Missed);
         }
         let seconds = (self
@@ -430,9 +643,10 @@ impl PulseTracker {
             / NANOS_PER_SECOND) as u32;
         self.main = Train {
             mode: Mode::Fresh,
-            spurious_count: 0,
+            rejected: false,
             ..self.tentative
         };
+        self.main.rebase(self.domain);
         self.tentative = Train::new();
         Some(SecondEvent::Switched { seconds })
     }
@@ -441,7 +655,7 @@ impl PulseTracker {
     /// pulse qualification counters. Frequency discipline is separate and
     /// retains its learned correction.
     pub(crate) fn rebase(&mut self) {
-        self.main.phase_error = 0;
+        self.main.rebase(self.domain);
     }
 
     /// Forget the alternate train, so a switchover qualifies only on pulses after this.
@@ -470,10 +684,7 @@ pub(super) mod tests {
     const PERIOD: u32 = 1_000_000;
 
     fn new_tracker() -> PulseTracker {
-        PulseTracker::new(
-            CounterDomain::new(PERIOD),
-            PulseConfig::with_edge_tolerance(100),
-        )
+        PulseTracker::new(CounterDomain::new(PERIOD), PulseConfig::DEFAULT)
     }
 
     fn captured(event: Option<SecondEvent>) -> i64 {
@@ -508,13 +719,9 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_board_tolerance_is_stated_in_nanoseconds() {
+    fn a_duration_in_nanoseconds_is_counted_in_ticks() {
         assert_eq!(ticks(50, 98_304_000), 4);
         assert_eq!(ticks(1_000, 98_304_000), 98);
-        assert_eq!(
-            PulseConfig::with_edge_tolerance(ticks(1_000, 98_304_000)).edge_tolerance_ticks,
-            98
-        );
     }
 
     #[test]
@@ -643,7 +850,6 @@ pub(super) mod tests {
 
         const SEEDS: u64 = 24;
         const STEPS: u32 = 2000;
-        const TOLERANCE: u32 = 100;
 
         /// xorshift64: deterministic, dependency-free, good enough to shuffle
         /// event order.
@@ -702,10 +908,7 @@ pub(super) mod tests {
         impl Harness {
             fn new() -> Self {
                 Self {
-                    tracker: PulseTracker::new(
-                        CounterDomain::new(PERIOD),
-                        PulseConfig::with_edge_tolerance(TOLERANCE),
-                    ),
+                    tracker: PulseTracker::new(CounterDomain::new(PERIOD), PulseConfig::DEFAULT),
                     anchored: false,
                     adopted: false,
                     captures: 0,
@@ -752,6 +955,7 @@ pub(super) mod tests {
             /// terminates and the tracker cannot report the same second twice.
             fn poll(&mut self, now: u64) -> Option<SecondEvent> {
                 let locked = self.tracker.state().is_locked();
+                let unclosed = self.tracker.main.unclosed();
                 let before = self.tracker.next_poll_deadline_ns();
                 let event = self.tracker.poll(now);
                 match event {
@@ -762,10 +966,8 @@ pub(super) mod tests {
                     Some(SecondEvent::Missed) => {
                         self.misses += 1;
                         assert!(
-                            !locked
-                                || self.tracker.state()
-                                    == PulseState::Holdover { missed_pulses: 1 },
-                            "the first miss out of lock at {now} ns"
+                            !locked || self.tracker.main.unclosed() == unclosed + 1,
+                            "a miss out of lock closed other than one second at {now} ns"
                         );
                         assert!(
                             self.tracker.phase_error_ns().is_none(),

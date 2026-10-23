@@ -15,7 +15,7 @@ pub use acquisition::{
     AcquisitionAction, AcquisitionError, AcquisitionMachine, AcquisitionState, ScheduledEdge,
     StartPlan,
 };
-pub use pulse::{ticks, PulseConfig, PulseState};
+pub use pulse::{ticks, PhaseEstimate, PulseConfig, PulseState};
 
 use core::mem::{discriminant, Discriminant};
 
@@ -238,8 +238,8 @@ impl CounterDomain {
     }
 
     /// Convert counter ticks to nanoseconds without assuming a prescaler.
-    pub(crate) fn ticks_to_ns(self, ticks: i64) -> f32 {
-        ticks as f32 * (1_000_000_000.0f32 / self.period as f32)
+    pub(crate) fn ticks_to_ns(self, ticks: i64) -> f64 {
+        ticks as f64 * (1_000_000_000.0 / self.period as f64)
     }
 }
 
@@ -792,19 +792,15 @@ mod reference_tests {
     }
 }
 
-/// Configuration for the 1 Hz phase-to-frequency PI loop, output in ppm.
+/// Configuration for the 1 Hz servo steering out a train's estimated frequency
+/// and phase, output in ppm.
 ///
-/// `P = Kp * error`, `I += Kp * Ki * error * dt`, `error = -phase_error_ns`.
-/// `Ki` is a ratio in 1/s, not the independent coefficient most PID crates
-/// accept.
+/// `correction = -(y / 1000 + kp * θ)`: the frequency estimate is what a PI
+/// loop's integrator learns, and `kp` closes the phase over `1 / (1000 kp)` s.
 #[derive(Debug, Clone, Copy)]
 pub struct PiConfig {
-    /// Proportional gain, ppm per nanosecond of phase error.
+    /// Phase gain, ppm per nanosecond of estimated phase.
     pub kp: f32,
-    /// Integral ratio, in 1/s.
-    pub ki: f32,
-    /// Seconds between observations.
-    pub interval_seconds: f32,
     /// Most negative output the actuator accepts.
     pub min_output_ppm: f32,
     /// Most positive output the actuator accepts.
@@ -812,38 +808,35 @@ pub struct PiConfig {
 }
 
 impl PiConfig {
-    /// Critically damped type-2 loop at wn = 0.1 rad/s on a 1 Hz pulse, where
-    /// 1 ppm moves the phase 1000 ns/s, for an actuator pulling ±`max_pull_ppm`.
+    /// A phase closed over 10 s, where 1 ppm moves the phase 1000 ns/s: slow
+    /// enough to average a microsecond-jittered PPS, fast enough to pull a
+    /// 50 ppm offset in well inside a minute, for an actuator pulling
+    /// ±`max_pull_ppm`.
     pub const fn within(max_pull_ppm: f32) -> Self {
         Self {
-            kp: 2.0e-4,
-            ki: 0.05,
-            interval_seconds: 1.0,
+            kp: 1.0e-4,
             min_output_ppm: -max_pull_ppm,
             max_output_ppm: max_pull_ppm,
         }
     }
 }
 
-/// The operator's hold on a servo: its gains, and whether it steers or holds a pull.
+/// The operator's hold on a servo: its gain, and whether it steers or holds a pull.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     /// Whether the loop steers; a disabled servo holds `pull_ppm`.
     pub enabled: bool,
-    /// Proportional gain, as [`PiConfig::kp`].
+    /// Phase gain, as [`PiConfig::kp`].
     pub kp: f32,
-    /// Integral ratio, as [`PiConfig::ki`].
-    pub ki: f32,
-    /// The correction held while disabled, and the one an enabled loop starts from.
+    /// The correction held while disabled, and until an enabled loop has an estimate.
     pub pull_ppm: f32,
 }
 
-/// A dedicated phase-to-frequency PI servo.
+/// A servo from a pulse train's estimated state to an oscillator correction.
 #[derive(Debug, Clone, Copy)]
 pub struct PhaseServo {
     config: PiConfig,
     enabled: bool,
-    integral_ppm: f32,
     output_ppm: f32,
     saturated: bool,
 }
@@ -853,19 +846,17 @@ impl PhaseServo {
     ///
     /// # Panics
     ///
-    /// On unusable gains, which are a board constant. The comparisons double
-    /// as NaN traps: each one is false for a NaN operand.
+    /// On an unusable gain or range, which are board constants. The
+    /// comparisons double as NaN traps: each one is false for a NaN operand.
     pub const fn new(config: PiConfig) -> Self {
-        assert!(config.kp.is_finite() && config.ki.is_finite(), "PI gains");
-        assert!(config.interval_seconds > 0.0, "PI interval");
+        assert!(config.kp.is_finite(), "servo gain");
         assert!(
             config.min_output_ppm <= config.max_output_ppm,
-            "PI output range"
+            "servo output range"
         );
         Self {
             config,
             enabled: false,
-            integral_ppm: 0.0,
             output_ppm: 0.0,
             saturated: false,
         }
@@ -881,44 +872,30 @@ impl PhaseServo {
         self.saturated
     }
 
-    /// Takes the gains, and starts from or holds the pull unless the loop was already steering.
+    /// Takes the gain, and starts from or holds the pull unless the loop was already steering.
     pub fn tune(&mut self, tuning: Tuning) {
         self.config.kp = tuning.kp;
-        self.config.ki = tuning.ki;
         match (self.enabled, tuning.enabled) {
             (true, true) => {}
-            (true, false) | (false, true | false) => {
-                self.output_ppm = tuning
-                    .pull_ppm
-                    .max(self.config.min_output_ppm)
-                    .min(self.config.max_output_ppm);
-                self.saturated = self.output_ppm != tuning.pull_ppm;
-                self.integral_ppm = self.output_ppm;
-            }
+            (true, false) | (false, true | false) => self.clamp(tuning.pull_ppm),
         }
         self.enabled = tuning.enabled;
     }
 
-    /// Process one phase observation. A non-finite value means a missing PPS
-    /// and holds the correction unchanged, as a disabled servo does.
-    pub fn observe(&mut self, phase_error_ns: f32) -> f32 {
-        if !self.enabled || !phase_error_ns.is_finite() {
-            return self.output_ppm;
-        }
-
-        let error = -phase_error_ns;
-        let proportional = self.config.kp * error;
-        self.integral_ppm += self.config.kp * self.config.ki * error * self.config.interval_seconds;
-
-        let requested = proportional + self.integral_ppm;
-        self.output_ppm = requested
-            .max(self.config.min_output_ppm)
-            .min(self.config.max_output_ppm);
-        self.saturated = self.output_ppm != requested;
-        if self.saturated {
-            self.integral_ppm = self.output_ppm - proportional;
+    /// Steer by one second's estimate. With none, there is no train to follow
+    /// and the correction holds, as a disabled servo's does.
+    pub fn observe(&mut self, estimate: Option<PhaseEstimate>) -> f32 {
+        if let (true, Some(estimate)) = (self.enabled, estimate) {
+            self.clamp(-(estimate.frequency_ppb / 1_000.0 + self.config.kp * estimate.phase_ns));
         }
         self.output_ppm
+    }
+
+    fn clamp(&mut self, requested_ppm: f32) {
+        self.output_ppm = requested_ppm
+            .max(self.config.min_output_ppm)
+            .min(self.config.max_output_ppm);
+        self.saturated = self.output_ppm != requested_ppm;
     }
 }
 
@@ -926,62 +903,63 @@ impl PhaseServo {
 mod discipline_tests {
     use super::*;
 
-    /// A servo steering with `config`'s gains from 0 ppm.
+    /// A servo steering with `config`'s gain from 0 ppm.
     pub(super) fn steering(config: PiConfig) -> PhaseServo {
         let mut servo = PhaseServo::new(config);
         servo.tune(Tuning {
             enabled: true,
             kp: config.kp,
-            ki: config.ki,
             pull_ppm: 0.0,
         });
         servo
     }
 
-    #[test]
-    fn gain_form_matches_tl_control_pid() {
-        let mut servo = steering(PiConfig::within(50.0));
-        assert!((servo.observe(1000.0) - -0.21).abs() < 1.0e-6);
-        assert!((servo.observe(1000.0) - -0.22).abs() < 1.0e-6);
+    fn estimate(phase_ns: f32, frequency_ppb: f32) -> Option<PhaseEstimate> {
+        Some(PhaseEstimate {
+            phase_ns,
+            frequency_ppb,
+        })
     }
 
     #[test]
-    fn saturation_back_calculates_the_integrator() {
-        let mut servo = steering(PiConfig {
-            min_output_ppm: -1.0,
-            max_output_ppm: 1.0,
-            ..PiConfig::within(50.0)
-        });
-        assert_eq!(servo.observe(-1_000_000.0), 1.0);
+    fn the_correction_removes_the_frequency_and_a_tenth_of_the_phase_each_second() {
+        let mut servo = steering(PiConfig::within(50.0));
+        assert!((servo.observe(estimate(1_000.0, 2_000.0)) - -2.1).abs() < 1.0e-6);
+        assert!((servo.observe(estimate(-1_000.0, 2_000.0)) - -1.9).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_correction_past_the_pull_is_clamped_and_says_so() {
+        let mut servo = steering(PiConfig::within(1.0));
+        assert_eq!(servo.observe(estimate(0.0, -43_000.0)), 1.0);
         assert!(servo.saturated());
-        assert!(servo.observe(1_000.0) < 1.0);
+        assert!(servo.observe(estimate(0.0, 500.0)) == -0.5 && !servo.saturated());
     }
 
     #[test]
-    fn a_missing_pulse_holds_the_frequency_estimate() {
+    fn no_estimate_holds_the_correction() {
         let mut servo = steering(PiConfig::within(50.0));
-        let acquired = servo.observe(-500.0);
-        assert_eq!(servo.observe(f32::NAN), acquired);
+        let acquired = servo.observe(estimate(-500.0, 3_000.0));
+        assert_eq!(servo.observe(None), acquired);
         assert_eq!(servo.output_ppm(), acquired);
     }
 
     #[test]
-    fn an_untuned_or_disabled_servo_holds_its_pull_whatever_the_phase() {
+    fn an_untuned_or_disabled_servo_holds_its_pull_whatever_the_estimate() {
         let mut servo = PhaseServo::new(PiConfig::within(50.0));
-        assert_eq!(servo.observe(1000.0), 0.0);
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 0.0);
         let held = Tuning {
             enabled: false,
             kp: PiConfig::within(50.0).kp,
-            ki: PiConfig::within(50.0).ki,
             pull_ppm: 3.0,
         };
         servo.tune(held);
-        assert_eq!(servo.observe(1000.0), 3.0);
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 3.0);
         servo.tune(Tuning {
             pull_ppm: 80.0,
             ..held
         });
-        assert_eq!(servo.observe(1000.0), 50.0);
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 50.0);
         assert!(servo.saturated());
     }
 
@@ -991,21 +969,22 @@ mod discipline_tests {
         let tuning = Tuning {
             enabled: true,
             kp: PiConfig::within(50.0).kp,
-            ki: PiConfig::within(50.0).ki,
             pull_ppm: 3.0,
         };
         servo.tune(tuning);
-        assert!((servo.observe(1000.0) - 2.79).abs() < 1.0e-5);
+        assert_eq!(servo.observe(None), 3.0);
+        assert!((servo.observe(estimate(1000.0, 0.0)) - -0.1).abs() < 1.0e-6);
         servo.tune(Tuning {
             kp: 0.0,
             pull_ppm: -7.0,
             ..tuning
         });
-        assert!((servo.observe(1000.0) - 2.99).abs() < 1.0e-5);
+        assert!((servo.output_ppm() - -0.1).abs() < 1.0e-6);
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 0.0);
     }
 
     #[test]
-    #[should_panic(expected = "PI output range")]
+    #[should_panic(expected = "servo output range")]
     fn an_inverted_output_range_is_a_build_error() {
         PhaseServo::new(PiConfig {
             min_output_ppm: 1.0,
@@ -1356,9 +1335,12 @@ impl Synchronizer {
 
         self.acquisition.advance_autostart(self.seconds);
 
-        let phase_error_ns = self.pulses.phase_error_ns().unwrap_or(f32::NAN);
+        let estimate = self.pulses.estimate();
         actions.second = true;
-        actions.correction_ppm = self.servo.as_mut().map(|s| s.observe(phase_error_ns));
+        actions.correction_ppm = self.servo.as_mut().map(|servo| servo.observe(estimate));
+        if let Some(correction_ppm) = actions.correction_ppm {
+            self.pulses.steer(correction_ppm, monotonic_ns);
+        }
         actions.set_edge = self.anchor.filter(|edge| Some(*edge) != anchored_at);
         actions.announce = self.anchor.map(|_| Announce {
             timeref: self.references.active(),
@@ -1444,7 +1426,7 @@ mod synchronizer_tests {
     fn synchronizer() -> Synchronizer {
         Synchronizer::new(
             CounterDomain::new(PERIOD),
-            PulseConfig::with_edge_tolerance(100),
+            PulseConfig::DEFAULT,
             local(),
             Some(discipline_tests::steering(PiConfig::within(50.0))),
             0,
@@ -1454,7 +1436,7 @@ mod synchronizer_tests {
     fn plain() -> Synchronizer {
         Synchronizer::new(
             CounterDomain::new(PERIOD),
-            PulseConfig::with_edge_tolerance(100),
+            PulseConfig::DEFAULT,
             local(),
             None,
             0,
@@ -1694,7 +1676,7 @@ mod synchronizer_tests {
     #[test]
     fn a_switch_onto_a_hubs_pulses_qualifies_its_second_from_either_phase() {
         const HUB: u32 = 1_000;
-        for (edge_ms, adopted_ms, divergences) in [(295, 8_295, 0), (524, 9_524, 1)] {
+        for (edge_ms, adopted_ms, divergences) in [(295, 6_295, 0), (524, 7_524, 1)] {
             let mut sync = plain();
             let timeline: Vec<(u64, ReferenceState, u32)> = (14..12_000u64)
                 .map(|ms| {
@@ -1857,7 +1839,7 @@ mod synchronizer_tests {
 
     #[test]
     fn restart_rebases_the_anchor_without_a_generation_bump() {
-        let mut sync = synchronizer();
+        let mut sync = plain();
         for second in 0..5u64 {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
@@ -1993,7 +1975,7 @@ mod synchronizer_tests {
 
         let mut enabled = Synchronizer::new(
             CounterDomain::new(PERIOD),
-            PulseConfig::with_edge_tolerance(100),
+            PulseConfig::DEFAULT,
             local(),
             None,
             4,
@@ -2366,11 +2348,11 @@ mod synchronizer_tests {
         (sync, taken)
     }
 
-    /// A free-running parent is held over, and its pulses returning within
-    /// tolerance resume the old anchor, so the segment only takes the new label.
+    /// A free-running parent is held over, and its pulses returning inside
+    /// the prediction resume the old anchor, so the segment only takes the new label.
     #[test]
     fn a_child_holds_over_a_rebooting_parent_and_resumes_its_returning_pulses() {
-        let (sync, taken) = parent_reboot(6, EDGE + 40);
+        let (sync, taken) = parent_reboot(6, EDGE + 2);
         assert!(
             matches!(
                 taken[..],
@@ -2514,7 +2496,7 @@ mod synchronizer_tests {
     fn hub(index: u8) -> Synchronizer {
         Synchronizer::new(
             CounterDomain::new(PERIOD),
-            PulseConfig::with_edge_tolerance(100),
+            PulseConfig::DEFAULT,
             Reference {
                 identity: ReferenceIdentity::new(
                     Epoch::SYSTIME,
@@ -2648,9 +2630,21 @@ mod synchronizer_tests {
     /// deadline as `twinleaf_embassy::sync::run` does. One status per second;
     /// `SYNC_TRACE=1` prints them.
     fn sandi_following(offset_ppm: f64, jitter_ns: f64, seconds: u64) -> Vec<Status> {
+        sandi_under(offset_ppm, seconds, |_, rng| {
+            Some(rng.gaussian() * jitter_ns)
+        })
+    }
+
+    /// [`sandi_following`] a PPS whose edge in each second is `pps`'s offset
+    /// from 300 ms past it, or absent.
+    fn sandi_under(
+        offset_ppm: f64,
+        seconds: u64,
+        mut pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
+    ) -> Vec<Status> {
         let mut sync = Synchronizer::new(
             CounterDomain::new(SANDI_HZ),
-            PulseConfig::with_edge_tolerance(147),
+            PulseConfig::DEFAULT,
             local(),
             Some(discipline_tests::steering(PiConfig::within(50.0))),
             0,
@@ -2667,20 +2661,24 @@ mod synchronizer_tests {
         let trace = std::env::var_os("SYNC_TRACE").is_some();
         (1..=seconds)
             .map(|second| {
+                let offset_ns = pps(second, &mut rng);
                 let edge_ns = (second * NANOS_PER_SECOND + 300_000_000)
-                    .saturating_add_signed((rng.gaussian() * jitter_ns) as i64);
+                    .saturating_add_signed(offset_ns.unwrap_or(0.0) as i64);
                 while let Some(deadline) = sync.next_poll_deadline_ns().filter(|&d| d <= edge_ns) {
                     let actions = sync.poll(deadline);
                     oscillator.steer(deadline, actions);
                 }
-                let actions = sync.capture(oscillator.counter(edge_ns), edge_ns);
-                oscillator.steer(edge_ns, actions);
+                if offset_ns.is_some() {
+                    let actions = sync.capture(oscillator.counter(edge_ns), edge_ns);
+                    oscillator.steer(edge_ns, actions);
+                }
                 let status = sync.status();
                 if trace {
                     println!(
-                        "{second:4} {:?} {:?} spurs {} phase {:?} ns pull {:?} ppm saturated {}",
+                        "{second:4} {:?} {:?} edge {:?} spurs {} phase {:?} ns pull {:?} ppm saturated {}",
                         status.pulse,
                         status.reference,
+                        status.counter_edge,
                         status.spurs,
                         status.phase_error_ns,
                         status.correction_ppm,
@@ -2745,6 +2743,114 @@ mod synchronizer_tests {
             last.pulse,
             last.spurs,
             last.correction_ppm
+        );
+    }
+
+    /// RMS of the phase measured over `trace`, and the seconds it was measured.
+    fn phase_rms(trace: &[Status]) -> (f64, usize) {
+        let phases: Vec<f64> = trace
+            .iter()
+            .filter_map(|status| status.phase_error_ns.map(f64::from))
+            .collect();
+        let rms = (phases.iter().map(|ns| ns * ns).sum::<f64>() / phases.len() as f64).sqrt();
+        (rms, phases.len())
+    }
+
+    /// A GPS-grade PPS, on frequency with 20 ns of jitter, locks by its fifth
+    /// second and is held to 20.6 ns RMS, as the fixed ±1 µs gate did.
+    #[test]
+    fn a_gps_pps_locks_as_fast_and_as_tightly_as_a_fixed_gate_did() {
+        let trace = sandi_following(0.0, 20.0, 300);
+        let first_lock = trace.iter().position(|status| status.pulse.is_locked());
+        let (rms, measured) = phase_rms(&trace[60..]);
+        assert!(
+            first_lock.is_some_and(|second| second <= 5)
+                && trace[60..].iter().all(|status| status.pulse.is_locked())
+                && measured == 240
+                && rms <= 20.6,
+            "first lock {first_lock:?} s, phase {rms:.1} ns RMS over {measured} measured seconds"
+        );
+    }
+
+    /// One edge in a hundred 50 µs off a GPS-grade PPS is a spur: each is
+    /// counted, and none unlocks the train or disturbs its phase.
+    #[test]
+    fn sparse_large_outliers_are_counted_spurs_that_never_unlock() {
+        let outlier = |second: u64| second % 100 == 50;
+        let trace = sandi_under(0.0, 600, |second, rng| {
+            Some(match (outlier(second), second % 200 < 100) {
+                (true, true) => 50_000.0,
+                (true, false) => -50_000.0,
+                (false, true | false) => rng.gaussian() * 20.0,
+            })
+        });
+        let outliers = (61..=600).filter(|&second| outlier(second)).count() as u32;
+        let spurs = trace[599].spurs - trace[59].spurs;
+        let (rms, _) = phase_rms(&trace[60..]);
+        assert!(
+            trace[60..].iter().all(|status| status.pulse.is_locked())
+                && spurs == outliers
+                && rms <= 25.0,
+            "{spurs} spurs for {outliers} outliers, phase {rms:.1} ns RMS"
+        );
+    }
+
+    /// A PPS that steps 100 µs, far outside its prediction, is a new train:
+    /// its edges are spurs until a consistent run of them takes over within
+    /// a few seconds, with the anchor moved onto it.
+    #[test]
+    fn a_phase_step_is_followed_after_a_consistent_run_of_the_new_train() {
+        let trace = sandi_under(0.0, 200, |second, rng| {
+            Some(rng.gaussian() * 20.0 + if second > 100 { 100_000.0 } else { 0.0 })
+        });
+        let (before, after) = (trace[99], trace[199]);
+        let moved = after
+            .counter_edge
+            .zip(before.counter_edge)
+            .map(|(after, before)| CounterDomain::new(SANDI_HZ).signed_delta(after, before));
+        let spurs = after.spurs - before.spurs;
+        assert!(
+            trace[110..].iter().all(|status| status.pulse.is_locked())
+                && moved.is_some_and(|ticks| (ticks - 14_746).abs() <= 20)
+                && after.generation > before.generation
+                && spurs <= 5,
+            "anchor moved {moved:?} ticks, {spurs} spurs, at 110 s {:?}",
+            trace[110].pulse
+        );
+    }
+
+    /// A PPS 20 ppm off the oscillator that goes away for 30 s is held over at
+    /// the frequency it was steered to, and its returning edges, inside the
+    /// widened prediction, resume the train on its old anchor.
+    #[test]
+    fn thirty_missed_pulses_hold_the_frequency_and_resume_the_train() {
+        let trace = sandi_under(20.0, 180, |second, rng| {
+            (!(91..=120).contains(&second)).then(|| rng.gaussian() * 20.0)
+        });
+        let before = trace[89];
+        let held = before
+            .correction_ppm
+            .is_some_and(|ppm| (ppm + 20.0).abs() < 0.01)
+            && trace[92..119].iter().all(|status| {
+                matches!(status.pulse, PulseState::Holdover { .. })
+                    && status
+                        .correction_ppm
+                        .is_some_and(|ppm| (ppm + 20.0).abs() < 0.01)
+            });
+        let resumed = trace[125..].iter().all(|status| {
+            status.pulse.is_locked()
+                && (status.counter_edge, status.generation)
+                    == (before.counter_edge, before.generation)
+        });
+        let (rms, _) = phase_rms(&trace[125..]);
+        assert!(
+            held && resumed && rms <= 30.0,
+            "at 90 s {:?} pull {:?}; at 110 s {:?} pull {:?}; at 130 s {:?}; phase {rms:.1} ns RMS",
+            before.pulse,
+            before.correction_ppm,
+            trace[109].pulse,
+            trace[109].correction_ppm,
+            trace[129].pulse
         );
     }
 }

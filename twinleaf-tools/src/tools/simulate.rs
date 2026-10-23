@@ -35,8 +35,8 @@ use twinleaf_device::rpc::{
 };
 use twinleaf_device::storage::update::{Package, Take, Upload};
 use twinleaf_device::sync::{
-    ticks, AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig,
-    Reference, ReferenceIdentity, ScheduledEdge, Synchronizer, TimeStatus,
+    AcquisitionAction, AcquisitionError, Actions, Announce, CounterDomain, PulseConfig, Reference,
+    ReferenceIdentity, ScheduledEdge, Synchronizer, TimeStatus,
 };
 use twinleaf_device::Sink;
 
@@ -100,8 +100,6 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// the same tick of it.
 const PPS_PERIOD: u32 = 1_000_000;
 const PPS_EDGE: u32 = 0;
-/// A millisecond, which is as close as a software pulse lands.
-const PPS_TOLERANCE_NS: u32 = 1_000_000;
 const CAPTURE_DEFAULT_BLOCK_SIZE: u16 = 256;
 const CAPTURE_SAMPLE_COUNT_MIN: usize = 800;
 const CAPTURE_SAMPLE_COUNT_MAX: usize = 1200;
@@ -1821,7 +1819,7 @@ impl Runtime {
 fn synchronizer(session: SessionId, serial: &str, now: u64) -> Synchronizer {
     Synchronizer::new(
         CounterDomain::new(PPS_PERIOD),
-        PulseConfig::with_edge_tolerance(ticks(PPS_TOLERANCE_NS, PPS_PERIOD)),
+        PulseConfig::DEFAULT,
         Reference {
             identity: ReferenceIdentity::new(sync::Epoch::UNIX, session, serial.as_bytes()),
             second: (now / NANOS_PER_SECOND) as u32,
