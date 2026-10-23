@@ -19,7 +19,7 @@ pub use pulse::{ticks, PhaseEstimate, PulseConfig, PulseState};
 
 use core::mem::{discriminant, Discriminant};
 
-use twinleaf_proto::sync::{Clock, Epoch, TimeSource, Timeref, MAX_SERIAL_SIZE};
+use twinleaf_proto::sync::{Clock, ClockAccuracy, Epoch, TimeSource, Timeref, MAX_SERIAL_SIZE};
 use twinleaf_proto::SessionId;
 
 use pulse::{PulseTracker, SecondEvent};
@@ -169,6 +169,9 @@ pub struct Status {
     pub generation: u32,
     /// Measured phase, absent while no pulse is closing the second.
     pub phase_error_ns: Option<f32>,
+    /// Estimated RMS time error against the pulse train, 1σ, where a root announces
+    /// [`PhaseEstimate::accuracy_ns`]; absent while no outside train is established.
+    pub time_error_ns: Option<u64>,
     /// `None` on a board with no frequency actuator, so a held zero can never
     /// be mistaken for active discipline.
     pub correction_ppm: Option<f32>,
@@ -436,6 +439,10 @@ impl ReferenceTracker {
         self.active
     }
 
+    pub(crate) const fn own(&self) -> Clock {
+        self.own
+    }
+
     pub(crate) fn state(&self) -> ReferenceState {
         match self.candidate {
             Some(candidate) => ReferenceState::Candidate {
@@ -451,9 +458,10 @@ impl ReferenceTracker {
         self.active.second = second;
     }
 
-    /// Name what this device's own seconds come from, for whenever it is the root.
-    pub(crate) fn set_time_source(&mut self, time_source: TimeSource) {
-        self.own.time_source = time_source;
+    /// Name what this device's own seconds come from and how close they are to
+    /// it, for whenever it is the root.
+    pub(crate) fn set_own(&mut self, own: Clock) {
+        self.own = own;
         if self.is_own(
             self.active.identity.session,
             self.active.identity.serial.as_bytes(),
@@ -746,13 +754,13 @@ mod reference_tests {
     #[test]
     fn the_stated_time_source_is_announced_while_the_device_is_its_own_root() {
         let mut tracker = ReferenceTracker::new(local());
-        tracker.set_time_source(TimeSource::Gnss);
+        tracker.set_own(Clock::root(TimeSource::Gnss));
         assert_eq!(tracker.active().clock, Clock::root(TimeSource::Gnss));
         for time in 100..103 {
             tracker.observe(packet(time));
             tracker.on_edge(true);
         }
-        tracker.set_time_source(TimeSource::Ptp);
+        tracker.set_own(Clock::root(TimeSource::Ptp));
         assert_eq!(tracker.active().clock.time_source, TimeSource::Other);
     }
 
@@ -883,6 +891,8 @@ mod discipline_tests {
         Some(PhaseEstimate {
             phase_ns,
             frequency_ppb,
+            time_error_ns: 0,
+            accuracy_ns: 0,
         })
     }
 
@@ -1035,6 +1045,10 @@ impl Synchronizer {
             counter_edge: self.anchor,
             generation: self.generation,
             phase_error_ns: self.pulses.phase_error_ns(),
+            time_error_ns: self
+                .pulses
+                .estimate()
+                .map(|estimate| estimate.time_error_ns),
             correction_ppm: self.servo.map(|servo| servo.output_ppm()),
             correction_saturated: self.servo.is_some_and(|servo| servo.saturated()),
             announced: self.announced(),
@@ -1118,7 +1132,10 @@ impl Synchronizer {
     /// Name what the device's own seconds come from: GNSS while a GPS receiver
     /// labels them, PTP while PTP does, its internal oscillator otherwise.
     pub fn set_time_source(&mut self, time_source: TimeSource) {
-        self.references.set_time_source(time_source);
+        self.references.set_own(Clock {
+            time_source,
+            ..self.references.own()
+        });
     }
 
     /// Observe a second from the device's own receiver rather than a packet,
@@ -1295,6 +1312,12 @@ impl Synchronizer {
         self.acquisition.advance_autostart(self.seconds);
 
         let estimate = self.pulses.estimate();
+        self.references.set_own(Clock {
+            accuracy: estimate.map_or(ClockAccuracy::UNKNOWN, |estimate| {
+                ClockAccuracy::within_ns(estimate.accuracy_ns)
+            }),
+            ..self.references.own()
+        });
         actions.second = true;
         actions.correction_ppm = self.servo.as_mut().map(|servo| servo.observe(estimate));
         if let Some(correction_ppm) = actions.correction_ppm {
@@ -1547,6 +1570,45 @@ mod synchronizer_tests {
         assert_eq!(status.active.second, 506);
         assert_eq!(status.active.identity.epoch, Epoch::UNIX);
         assert_eq!(status.generation, 1);
+    }
+
+    /// A root announces its own estimate as its clock accuracy, unknown before
+    /// it has a train; a follower announces its root's, as PTP forwards it.
+    #[test]
+    fn a_root_announces_its_estimate_and_a_follower_its_roots_accuracy() {
+        let mut sync = synchronizer();
+        let booted = sync.wake(EDGE, 0).announce.unwrap();
+        assert_eq!(booted.timeref.clock.accuracy, ClockAccuracy::UNKNOWN);
+
+        run(&mut sync, 10);
+        let now = 10 * NANOS_PER_SECOND;
+        sync.poll(now);
+        let root = sync.capture(EDGE, now).announce.unwrap().timeref.clock;
+        let estimate = sync.pulses.estimate().unwrap().accuracy_ns;
+        assert_eq!(root.accuracy, ClockAccuracy::within_ns(estimate));
+
+        let upstream = Clock {
+            accuracy: ClockAccuracy::new(0x29),
+            ..Clock::root(TimeSource::Gnss)
+        };
+        let followed = (11..16u64)
+            .filter_map(|second| {
+                let now = second * NANOS_PER_SECOND;
+                sync.poll(now);
+                let announce = sync.capture(EDGE, now).announce;
+                sync.observe_packet(
+                    Timeref {
+                        clock: Some(upstream),
+                        ..packet(500 + second as u32)
+                    },
+                    0,
+                    now,
+                );
+                announce
+            })
+            .last()
+            .unwrap();
+        assert_eq!(followed.timeref.clock, upstream.forwarded());
     }
 
     /// The new reference names the edges the running segment already sits on.
@@ -2894,6 +2956,25 @@ mod synchronizer_tests {
         );
     }
 
+    /// The estimated time error grows through a 30 s outage as the covariance
+    /// does, and shrinks back once the pulses return.
+    #[test]
+    fn the_estimated_time_error_grows_in_holdover_and_shrinks_on_reacquisition() {
+        let trace = sandi_under(20.0, 180, |second, rng| {
+            (!(91..=120).contains(&second)).then(|| rng.gaussian() * 20.0)
+        });
+        let error = |second: usize| trace[second].time_error_ns.unwrap();
+        let held: Vec<u64> = (90..120).map(error).collect();
+        assert!(
+            held.windows(2).all(|pair| pair[0] < pair[1])
+                && error(179) * 4 < error(119)
+                && error(179) <= 2 * error(89),
+            "locked {} ns, held {held:?} ns, reacquired {} ns",
+            error(89),
+            error(179)
+        );
+    }
+
     /// The SiT5356's tuning step on its ±50 ppm range: one part in 2^25.
     const SIT5356_STEP_PPM: f64 = 50.0 / (1u64 << 25) as f64;
 
@@ -2994,8 +3075,17 @@ mod synchronizer_tests {
     fn drift_sweep() {
         const SETTLE: usize = 600;
         println!(
-            "{:<22} {:>6} {:>4} {:>6} {:>7} {:>9} {:>9} {:>9} {:>5}",
-            "drift", "jitter", "ms", "lock s", "locked", "rms ns", "max ns", "rms ppb", "spurs"
+            "{:<22} {:>6} {:>4} {:>6} {:>7} {:>9} {:>9} {:>9} {:>5} {:>9}",
+            "drift",
+            "jitter",
+            "ms",
+            "lock s",
+            "locked",
+            "rms ns",
+            "max ns",
+            "rms ppb",
+            "spurs",
+            "est ns"
         );
         for jitter_ns in [20.0, 1_000.0, 3_000.0] {
             for latency_ms in [0, 5, 50] {
@@ -3006,7 +3096,7 @@ mod synchronizer_tests {
                         sandi_on(oscillator, 3600, |_, rng| Some(rng.gaussian() * jitter_ns));
                     let after = &trace[SETTLE..];
                     println!(
-                        "{name:<22} {jitter_ns:>6} {latency_ms:>4} {:>6} {:>6.1}% {:>9.1} {:>9.1} {:>9.3} {:>5}",
+                        "{name:<22} {jitter_ns:>6} {latency_ms:>4} {:>6} {:>6.1}% {:>9.1} {:>9.1} {:>9.3} {:>5} {:>9.1}",
                         trace
                             .iter()
                             .position(|second| second.status.pulse.is_locked())
@@ -3021,6 +3111,7 @@ mod synchronizer_tests {
                             .fold(0.0, |max: f64, ns| max.max(ns.abs())),
                         rms(after.iter().map(|second| second.frequency_error_ppb)),
                         trace[trace.len() - 1].status.spurs - trace[SETTLE - 1].status.spurs,
+                        rms(after.iter().filter_map(|second| second.status.time_error_ns.map(|ns| ns as f64))),
                     );
                 }
             }

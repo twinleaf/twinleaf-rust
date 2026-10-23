@@ -123,6 +123,10 @@ pub struct PhaseEstimate {
     pub phase_ns: f32,
     /// Frequency offset of the unsteered oscillator from the train over the coming second, ppb.
     pub frequency_ppb: f32,
+    /// Expected RMS of the phase, `√(θ² + P₀₀)`, 1σ: how far the counter's second is off the train's, ns.
+    pub time_error_ns: u64,
+    /// Bound on the mean phase, `|θ| + 2√P₀₀`, as IEEE 1588-2019 §7.6.2.6 asks of a clockAccuracy, ns.
+    pub accuracy_ns: u64,
 }
 
 /// Where one pulse train is in its life cycle.
@@ -526,10 +530,12 @@ impl PulseTracker {
     pub(crate) fn estimate(&self) -> Option<PhaseEstimate> {
         (self.main.external && self.main.is_valid()).then(|| {
             let steered = self.steered(self.main.closed_at_ns(self.config));
-            let estimate = self.main.estimate(self.config, steered);
+            let Filter { x, p, .. } = self.main.estimate(self.config, steered);
             PhaseEstimate {
-                phase_ns: estimate.x[0] as f32,
-                frequency_ppb: (estimate.x[1] + estimate.x[2] / 2.0) as f32,
+                phase_ns: x[0] as f32,
+                frequency_ppb: (x[1] + x[2] / 2.0) as f32,
+                time_error_ns: ((x[0] * x[0] + p[0][0]) as u64).isqrt(),
+                accuracy_ns: x[0].abs() as u64 + 2 * (p[0][0] as u64).isqrt(),
             }
         })
     }
