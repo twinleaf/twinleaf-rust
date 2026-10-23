@@ -12,6 +12,8 @@
 //!   the [`Setting`](rpc::Setting) cells behind properties, and capture.
 //! - [`data`] — what a stream carries: its definition, its segment ring, the
 //!   sample packets it sends, and the `dev.metadata` records describing it.
+//! - [`sync`] — the reference timeline: pulse tracking, the oscillator servo,
+//!   and the acquisition scheduler, free of any counter peripheral.
 //! - [`storage`] — what outlives a boot: the configuration image and the
 //!   firmware upload cursor.
 
@@ -24,6 +26,7 @@ pub mod device;
 pub mod rpc;
 
 pub mod data;
+pub mod sync;
 
 pub mod storage;
 
