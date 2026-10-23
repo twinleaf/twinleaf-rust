@@ -2974,6 +2974,59 @@ mod synchronizer_tests {
         ]
     }
 
+    /// Root mean square of `values`.
+    fn rms(values: impl Iterator<Item = f64>) -> f64 {
+        let (sum, count) = values.fold((0.0, 0), |(sum, count), v| (sum + v * v, count + 1));
+        (sum / count as f64).sqrt()
+    }
+
+    /// The second hour of `drift` under a PPS jittering `jitter_ns`, on a
+    /// SiT5356 taking each correction 5 ms late: whether it stayed locked,
+    /// and its RMS and largest time error against true seconds.
+    fn drifting(drift: usize, jitter_ns: f64) -> (bool, f64, f64) {
+        let own_ppm = drifts(0.5)[drift].1.clone();
+        let trace = sandi_on(
+            Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, 5_000_000),
+            3600,
+            |_, rng| Some(rng.gaussian() * jitter_ns),
+        );
+        let errors = || {
+            trace[600..]
+                .iter()
+                .filter_map(|second| second.time_error_ns)
+        };
+        (
+            trace[600..]
+                .iter()
+                .all(|second| second.status.pulse.is_locked()),
+            rms(errors()),
+            errors().fold(0.0, |max: f64, ns| max.max(ns.abs())),
+        )
+    }
+
+    /// A GPS PPS on an oscillator warming 0.2 ppm a minute is held as tightly
+    /// as on a steady one: the drift is a state of the tracker, not a lag.
+    #[test]
+    fn a_warming_oscillator_is_held_to_a_gps_pps_as_tightly_as_a_steady_one() {
+        let (steady, warming) = (drifting(0, 20.0), drifting(3, 20.0));
+        assert!(
+            steady.0 && warming.0 && warming.1 <= 1.1 * steady.1 && warming.1 <= 8.0,
+            "steady {steady:?}, warming {warming:?}: locked, RMS and max ns"
+        );
+    }
+
+    /// An HVAC cycle of ±0.5 ppm every 20 minutes under a 1 µs PPS stays
+    /// locked and within a couple of microseconds, where a tracker blind to
+    /// its own lag would grow its noise estimate and drift off by milliseconds.
+    #[test]
+    fn an_hvac_cycle_under_a_microsecond_pps_is_followed_within_microseconds() {
+        let (locked, rms, max) = drifting(4, 1_000.0);
+        assert!(
+            locked && rms <= 1_000.0 && max <= 3_000.0,
+            "locked {locked}, {rms:.0} ns RMS, {max:.0} ns max"
+        );
+    }
+
     /// An hour of each drift under each jitter and latency, 0.5 ppm off to
     /// start, with time and frequency errors taken against true seconds past
     /// the first ten minutes.
@@ -2981,10 +3034,6 @@ mod synchronizer_tests {
     #[ignore = "a sweep that prints a table"]
     fn drift_sweep() {
         const SETTLE: usize = 600;
-        fn rms(values: impl Iterator<Item = f64>) -> f64 {
-            let (sum, count) = values.fold((0.0, 0), |(sum, count), v| (sum + v * v, count + 1));
-            (sum / count as f64).sqrt()
-        }
         println!(
             "{:<22} {:>6} {:>4} {:>6} {:>7} {:>9} {:>9} {:>9} {:>5}",
             "drift", "jitter", "ms", "lock s", "locked", "rms ns", "max ns", "rms ppb", "spurs"

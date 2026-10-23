@@ -1,7 +1,7 @@
 //! Electrical PPS qualification and phase measurement.
 //!
-//! Each pulse train is a two-state Kalman tracker of the edge's phase and the
-//! oscillator's frequency offset, gating every edge on its innovation. A main
+//! Each pulse train is a three-state Kalman tracker of the edge's phase and the
+//! oscillator's frequency offset and drift, gating every edge on its innovation. A main
 //! train rejects spurs and measures phase; a tentative train, fed the main
 //! train's rejected edges, takes over when they prove a coherent train of
 //! their own.
@@ -37,6 +37,11 @@ pub struct PulseConfig {
     pub white_fm: f64,
     /// Random-walk frequency noise of the oscillator, ns²/s³.
     pub random_walk_fm: f64,
+    /// Frequency drift a new train may have from the oscillator, ppb/s (1σ).
+    pub drift_prior_ppb_per_second: f64,
+    /// How far the innovations' fading mean may stray, in standard deviations
+    /// of its own spread, before the covariance is widened to follow.
+    pub bias_sigmas: f64,
     /// Seconds of innovations the edge-noise estimate remembers.
     pub noise_memory_seconds: f64,
     /// Factor a rejected edge grows the edge-noise estimate by, so a train
@@ -48,7 +53,7 @@ pub struct PulseConfig {
 
 impl PulseConfig {
     /// A TCXO-class oscillator, σy(1 s) = 1e-9 white and σy(100 s) ≈ 6e-10
-    /// random walk, following a source within ±50 ppm of it.
+    /// random walk, following a source within ±50 ppm of it drifting ~10 ppb/s.
     pub const DEFAULT: Self = Self {
         miss_grace_ns: 10_000_000,
         gate_sigmas: 4.0,
@@ -57,6 +62,8 @@ impl PulseConfig {
         edge_noise_prior_ns: 1_000.0,
         white_fm: 1.0,
         random_walk_fm: 0.01,
+        drift_prior_ppb_per_second: 10.0,
+        bias_sigmas: 3.0,
         noise_memory_seconds: 32.0,
         rejected_noise_growth: 2.0,
         lock_frequency_ppb: 1_000.0,
@@ -115,7 +122,7 @@ pub(crate) enum SecondEvent {
 pub struct PhaseEstimate {
     /// Phase of the edge from the anchor, ns.
     pub phase_ns: f32,
-    /// Frequency offset of the unsteered oscillator from the train, ppb.
+    /// Frequency offset of the unsteered oscillator from the train over the coming second, ppb.
     pub frequency_ppb: f32,
 }
 
@@ -134,38 +141,40 @@ enum Mode {
     Lapsed { missed: u32 },
 }
 
-/// Phase `θ` (ns) and unsteered frequency offset `y` (ns/s) of a train, with
-/// their covariance and the train's own edge-noise variance `r` (ns²).
+/// Phase `θ` (ns), unsteered frequency offset `y` (ns/s) and its drift `d`
+/// (ns/s²) of a train, their covariance, and its own edge-noise variance `r` (ns²).
 #[derive(Debug, Clone, Copy)]
 struct Filter {
-    phase: f64,
-    frequency: f64,
-    p00: f64,
-    p01: f64,
-    p11: f64,
+    x: [f64; 3],
+    p: [[f64; 3]; 3],
     r: f64,
     innovations: f64,
+    /// The last innovation, and the innovations' fading mean, ns.
+    innovation: f64,
+    bias: f64,
     /// Integrated steering at the last update, ns.
     steered: f64,
 }
 
 impl Filter {
     const EMPTY: Self = Self {
-        phase: 0.0,
-        frequency: 0.0,
-        p00: 0.0,
-        p01: 0.0,
-        p11: 0.0,
+        x: [0.0; 3],
+        p: [[0.0; 3]; 3],
         r: 0.0,
         innovations: 0.0,
+        innovation: 0.0,
+        bias: 0.0,
         steered: 0.0,
     };
 
     fn fresh(config: PulseConfig, floor: f64, steered: f64) -> Self {
         let r = (config.edge_noise_prior_ns * config.edge_noise_prior_ns).max(floor);
+        let (y, d) = (
+            config.frequency_prior_ppb,
+            config.drift_prior_ppb_per_second,
+        );
         Self {
-            p00: r,
-            p11: config.frequency_prior_ppb * config.frequency_prior_ppb,
+            p: [[r, 0.0, 0.0], [0.0, y * y, 0.0], [0.0, 0.0, d * d]],
             r,
             innovations: 1.0,
             steered,
@@ -175,43 +184,58 @@ impl Filter {
 
     /// Propagated `n` seconds, under the steering integrated to `steered`.
     fn predicted(self, config: PulseConfig, n: f64, steered: f64) -> Self {
-        let q = config.random_walk_fm;
+        let f = [[1.0, n, n * n / 2.0], [0.0, 1.0, n], [0.0, 0.0, 1.0]];
+        let (white, walk) = (config.white_fm, config.random_walk_fm);
+        let q = [
+            [white * n + walk * n * n * n / 3.0, walk * n * n / 2.0, 0.0],
+            [walk * n * n / 2.0, walk * n, 0.0],
+            [0.0; 3],
+        ];
+        let fp: [[f64; 3]; 3] = core::array::from_fn(|i| {
+            core::array::from_fn(|j| (0..3).map(|k| f[i][k] * self.p[k][j]).sum())
+        });
+        let mut x: [f64; 3] = core::array::from_fn(|i| (0..3).map(|k| f[i][k] * self.x[k]).sum());
+        x[0] += steered - self.steered;
         Self {
-            phase: self.phase + self.frequency * n + steered - self.steered,
-            p00: self.p00
-                + 2.0 * n * self.p01
-                + n * n * self.p11
-                + config.white_fm * n
-                + q * n * n * n / 3.0,
-            p01: self.p01 + n * self.p11 + q * n * n / 2.0,
-            p11: self.p11 + q * n,
+            x,
+            p: core::array::from_fn(|i| {
+                core::array::from_fn(|j| (0..3).map(|k| fp[i][k] * f[j][k]).sum::<f64>() + q[i][j])
+            }),
             steered,
             ..self
         }
     }
 
-    /// Updated by the phase `z` if it is inside the gate. The edge-noise
-    /// estimate is the fading average of `ε² + P₀₀⁺`, unbiased for `r`.
+    /// Updated by the phase `z` inside the gate, its covariance first widened by how far the
+    /// innovations' mean has strayed; `r` is half the squared change of innovation, less `P₀₀⁻`.
     fn updated(self, config: PulseConfig, floor: f64, z: f64) -> Option<Self> {
-        let innovation = z - self.phase;
-        let s = self.p00 + self.r;
+        let innovation = z - self.x[0];
+        let s = self.p[0][0] + self.r;
         let gate = (config.gate_sigmas * config.gate_sigmas * s)
             .min(config.max_gate_ns as f64 * config.max_gate_ns as f64);
         if innovation * innovation > gate {
             return None;
         }
-        let (k0, k1, residual) = (self.p00 / s, self.p01 / s, innovation * self.r / s);
-        let p00 = self.p00 * self.r / s;
         let innovations = (self.innovations + 1.0).min(config.noise_memory_seconds);
         let weight = 1.0 / innovations;
+        let bias = (1.0 - weight) * self.bias + weight * innovation;
+        let spread = s * weight / (2.0 - weight);
+        let widening = (bias * bias / (config.bias_sigmas * config.bias_sigmas * spread)).max(1.0);
+        let widened: [[f64; 3]; 3] =
+            core::array::from_fn(|i| core::array::from_fn(|j| self.p[i][j] * widening));
+        let s = widened[0][0] + self.r;
+        let k: [f64; 3] = core::array::from_fn(|i| widened[i][0] / s);
+        let change = innovation - self.innovation;
         Some(Self {
-            phase: self.phase + k0 * innovation,
-            frequency: self.frequency + k1 * innovation,
-            p00,
-            p01: self.p01 * self.r / s,
-            p11: self.p11 - k1 * self.p01,
-            r: ((1.0 - weight) * self.r + weight * (residual * residual + p00)).max(floor),
+            x: core::array::from_fn(|i| self.x[i] + k[i] * innovation),
+            p: core::array::from_fn(|i| {
+                core::array::from_fn(|j| widened[i][j] - k[i] * widened[0][j])
+            }),
+            r: ((1.0 - weight) * self.r + weight * (change * change / 2.0 - self.p[0][0]))
+                .max(floor),
             innovations,
+            innovation,
+            bias,
             ..self
         })
     }
@@ -300,8 +324,8 @@ impl Train {
             self.mode,
             Mode::Fresh | Mode::Tracking | Mode::Coasting { .. }
         ) && self.run >= ACQUISITION_RUN
-            && estimate.p11 <= config.lock_frequency_ppb * config.lock_frequency_ppb
-            && estimate.p00 <= estimate.r
+            && estimate.p[1][1] <= config.lock_frequency_ppb * config.lock_frequency_ppb
+            && estimate.p[0][0] <= estimate.r
     }
 
     /// Returns the seconds this pulse accounts for beyond the one it closes,
@@ -406,7 +430,7 @@ impl Train {
 
     /// Anchor on the latest accepted edge, keeping the estimate.
     fn rebase(&mut self, domain: CounterDomain) {
-        self.filter.phase -= domain.ticks_to_ns(self.phase_error);
+        self.filter.x[0] -= domain.ticks_to_ns(self.phase_error);
         self.phase_error = 0;
     }
 }
@@ -444,6 +468,8 @@ impl PulseTracker {
                 && config.edge_noise_prior_ns >= 0.0
                 && config.white_fm >= 0.0
                 && config.random_walk_fm >= 0.0
+                && config.drift_prior_ppb_per_second >= 0.0
+                && config.bias_sigmas > 0.0
                 && config.noise_memory_seconds >= 1.0
                 && config.rejected_noise_growth >= 1.0
                 && config.lock_frequency_ppb > 0.0,
@@ -512,8 +538,8 @@ impl PulseTracker {
             let steered = self.steered(self.main.closed_at_ns(self.config));
             let estimate = self.main.estimate(self.config, steered);
             PhaseEstimate {
-                phase_ns: estimate.phase as f32,
-                frequency_ppb: estimate.frequency as f32,
+                phase_ns: estimate.x[0] as f32,
+                frequency_ppb: (estimate.x[1] + estimate.x[2] / 2.0) as f32,
             }
         })
     }
