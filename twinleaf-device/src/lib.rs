@@ -14,6 +14,8 @@
 //!   sample packets it sends, and the `dev.metadata` records describing it.
 //! - [`sync`] — the reference timeline: pulse tracking, the oscillator servo,
 //!   and the acquisition scheduler, free of any counter peripheral.
+//! - [`hub`] — the child-facing half: routing, presence, and the table of
+//!   requests still waiting for an answer.
 //! - [`storage`] — what outlives a boot: the configuration image and the
 //!   firmware upload cursor.
 
@@ -28,6 +30,7 @@ pub mod rpc;
 pub mod data;
 pub mod sync;
 
+pub mod hub;
 pub mod storage;
 
 pub use device::Device;
