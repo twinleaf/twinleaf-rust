@@ -17,7 +17,7 @@ pub(super) const RULES: Rules = Rules {
 };
 
 /// Binds a UDP socket of the address family needed to reach `address`.
-/// UdpFramed supplies each destination. Leaving the socket unconnected
+/// `UdpFramed` supplies each destination. Leaving the socket unconnected
 /// supports its send-to operation on macOS, and the task filters the peer.
 ///
 /// # Errors
