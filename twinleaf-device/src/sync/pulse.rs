@@ -464,7 +464,7 @@ impl PulseTracker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const PERIOD: u32 = 1_000_000;
@@ -638,7 +638,7 @@ mod tests {
     }
 
     /// Random pulse environments, held to the tracker's own invariants.
-    mod scenarios {
+    pub(in crate::sync) mod scenarios {
         use super::*;
 
         const SEEDS: u64 = 24;
@@ -647,10 +647,10 @@ mod tests {
 
         /// xorshift64: deterministic, dependency-free, good enough to shuffle
         /// event order.
-        struct Rng(u64);
+        pub(in crate::sync) struct Rng(u64);
 
         impl Rng {
-            fn new(seed: u64) -> Self {
+            pub(in crate::sync) fn new(seed: u64) -> Self {
                 Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
             }
 
@@ -674,6 +674,13 @@ mod tests {
             /// Uniform in `[-span, span]`.
             fn spread(&mut self, span: i64) -> i64 {
                 self.below(2 * span as u64 + 1) as i64 - span
+            }
+
+            /// Standard normal, by Box-Muller.
+            pub(in crate::sync) fn gaussian(&mut self) -> f64 {
+                let mut uniform = || (self.next() >> 11) as f64 / (1u64 << 53) as f64;
+                let (u, v) = (1.0 - uniform(), uniform());
+                (-2.0 * u.ln()).sqrt() * (core::f64::consts::TAU * v).cos()
             }
         }
 

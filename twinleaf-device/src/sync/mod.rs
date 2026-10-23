@@ -2614,4 +2614,137 @@ mod synchronizer_tests {
         });
         assert!(hubs[root].status().refused_references >= 120);
     }
+
+    /// Sandi's TIM5 rate, from its board crate.
+    const SANDI_HZ: u32 = 147_456_000;
+
+    /// A counter clocked by an oscillator `offset_ppm` fast of true seconds
+    /// before the servo's correction, which takes effect when it is returned.
+    struct Oscillator {
+        offset_ppm: f64,
+        correction_ppm: f64,
+        at_ns: u64,
+        ticks: f64,
+    }
+
+    impl Oscillator {
+        fn counter(&mut self, ns: u64) -> u32 {
+            let ppm = self.offset_ppm + self.correction_ppm;
+            self.ticks += SANDI_HZ as f64 * (1.0 + ppm * 1e-6) * (ns - self.at_ns) as f64 * 1e-9;
+            self.at_ns = ns;
+            (self.ticks as u64 % SANDI_HZ as u64) as u32
+        }
+
+        fn steer(&mut self, ns: u64, actions: Actions) {
+            self.counter(ns);
+            self.correction_ppm = actions
+                .correction_ppm
+                .map_or(self.correction_ppm, f64::from);
+        }
+    }
+
+    /// Sandi's synchronizer, booted at 0 ns and fed a PPS at 300 ms past each
+    /// true second with `jitter_ns` RMS of Gaussian jitter, polled at every
+    /// deadline as `twinleaf_embassy::sync::run` does. One status per second;
+    /// `SYNC_TRACE=1` prints them.
+    fn sandi_following(offset_ppm: f64, jitter_ns: f64, seconds: u64) -> Vec<Status> {
+        let mut sync = Synchronizer::new(
+            CounterDomain::new(SANDI_HZ),
+            PulseConfig::with_edge_tolerance(147),
+            local(),
+            Some(discipline_tests::steering(PiConfig::within(50.0))),
+            0,
+        );
+        let mut oscillator = Oscillator {
+            offset_ppm,
+            correction_ppm: 0.0,
+            at_ns: 0,
+            ticks: 0.0,
+        };
+        let mut rng = pulse::tests::scenarios::Rng::new(7);
+        let actions = sync.wake(oscillator.counter(0), 0);
+        oscillator.steer(0, actions);
+        let trace = std::env::var_os("SYNC_TRACE").is_some();
+        (1..=seconds)
+            .map(|second| {
+                let edge_ns = (second * NANOS_PER_SECOND + 300_000_000)
+                    .saturating_add_signed((rng.gaussian() * jitter_ns) as i64);
+                while let Some(deadline) = sync.next_poll_deadline_ns().filter(|&d| d <= edge_ns) {
+                    let actions = sync.poll(deadline);
+                    oscillator.steer(deadline, actions);
+                }
+                let actions = sync.capture(oscillator.counter(edge_ns), edge_ns);
+                oscillator.steer(edge_ns, actions);
+                let status = sync.status();
+                if trace {
+                    println!(
+                        "{second:4} {:?} {:?} spurs {} phase {:?} ns pull {:?} ppm saturated {}",
+                        status.pulse,
+                        status.reference,
+                        status.spurs,
+                        status.phase_error_ns,
+                        status.correction_ppm,
+                        status.correction_saturated
+                    );
+                }
+                status
+            })
+            .collect()
+    }
+
+    /// A PPS on frequency but jittering 3 µs RMS is followed: it locks within
+    /// a minute and stays locked, few of its edges are called spurs, and the
+    /// measured phase stays within a couple of jitters.
+    #[test]
+    fn a_pps_on_frequency_with_microseconds_of_jitter_locks_and_stays_locked() {
+        const JITTER_NS: f64 = 3_000.0;
+        let trace = sandi_following(0.0, JITTER_NS, 600);
+        let first_lock = trace.iter().position(|status| status.pulse.is_locked());
+        let followed = &trace[60..];
+        let locked = followed
+            .iter()
+            .filter(|status| status.pulse.is_locked())
+            .count();
+        let phases: Vec<f64> = followed
+            .iter()
+            .filter_map(|status| status.phase_error_ns.map(f64::from))
+            .collect();
+        let rms = (phases.iter().map(|ns| ns * ns).sum::<f64>() / phases.len() as f64).sqrt();
+        let spurs = trace[trace.len() - 1].spurs;
+        assert!(
+            first_lock.is_some_and(|second| second < 60)
+                && locked * 10 >= followed.len() * 9
+                && spurs * 10 <= trace.len() as u32
+                && rms <= 2.0 * JITTER_NS,
+            "first lock {first_lock:?} s, locked {locked}/{} s after a minute, \
+             {spurs} spurs in {} edges, phase {rms:.0} ns RMS over {} measured seconds",
+            followed.len(),
+            trace.len(),
+            phases.len()
+        );
+    }
+
+    /// A clean PPS 43 ppm slow of the oscillator, inside Sandi's ±50 ppm pull,
+    /// is locked and steered out within a minute, and stays locked.
+    #[test]
+    fn a_clean_pps_forty_three_ppm_off_the_oscillator_is_pulled_in_within_a_minute() {
+        let trace = sandi_following(43.0, 30.0, 120);
+        let pulled = trace[59..].iter().all(|status| {
+            status.pulse.is_locked()
+                && status
+                    .correction_ppm
+                    .is_some_and(|ppm| (ppm + 43.0).abs() < 1.0)
+        });
+        let last = trace[trace.len() - 1];
+        assert!(
+            pulled,
+            "at 60 s: {:?}, {} spurs, pull {:?} ppm; at 120 s: {:?}, {} spurs, pull {:?} ppm",
+            trace[59].pulse,
+            trace[59].spurs,
+            trace[59].correction_ppm,
+            last.pulse,
+            last.spurs,
+            last.correction_ppm
+        );
+    }
 }
