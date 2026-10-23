@@ -2627,7 +2627,7 @@ mod synchronizer_tests {
     /// takes effect `latency_ns` later.
     #[derive(Clone)]
     struct Oscillator {
-        own_ppm: Vec<f64>,
+        own_ppm: std::rc::Rc<[f64]>,
         step_ppm: f64,
         latency_ns: u64,
         pending: Vec<(u64, f64)>,
@@ -2644,7 +2644,7 @@ mod synchronizer_tests {
 
         fn drifting(own_ppm: Vec<f64>, step_ppm: f64, latency_ns: u64) -> Self {
             Self {
-                own_ppm,
+                own_ppm: own_ppm.into(),
                 step_ppm,
                 latency_ns,
                 pending: Vec::new(),
@@ -2676,10 +2676,12 @@ mod synchronizer_tests {
                     .first()
                     .map_or(ns, |&(at, _)| at.min(ns))
                     .min((self.at_ns / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND);
-                self.ticks += SANDI_HZ as f64
-                    * (1.0 + self.ppm() * 1e-6)
-                    * (until - self.at_ns) as f64
-                    * 1e-9;
+                self.ticks = (self.ticks
+                    + SANDI_HZ as f64
+                        * (1.0 + self.ppm() * 1e-6)
+                        * (until - self.at_ns) as f64
+                        * 1e-9)
+                    % SANDI_HZ as f64;
                 self.at_ns = until;
             }
         }
@@ -2719,7 +2721,6 @@ mod synchronizer_tests {
         pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
     ) -> Vec<Status> {
         sandi_on(Oscillator::offset(offset_ppm), seconds, pps)
-            .into_iter()
             .map(|second| second.status)
             .collect()
     }
@@ -2733,12 +2734,12 @@ mod synchronizer_tests {
         frequency_error_ppb: f64,
     }
 
-    /// [`sandi_under`] on `oscillator`.
+    /// [`sandi_under`] on `oscillator`, one second at a time.
     fn sandi_on(
         mut oscillator: Oscillator,
         seconds: u64,
         mut pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
-    ) -> Vec<Second> {
+    ) -> impl Iterator<Item = Second> {
         let mut sync = Synchronizer::new(
             CounterDomain::new(SANDI_HZ),
             PulseConfig::DEFAULT,
@@ -2750,8 +2751,7 @@ mod synchronizer_tests {
         let actions = sync.wake(oscillator.counter(0), 0);
         oscillator.steer(0, actions);
         let trace = std::env::var_os("SYNC_TRACE").is_some();
-        (1..=seconds)
-            .map(|second| {
+        (1..=seconds).map(move |second| {
                 let true_ns = second * NANOS_PER_SECOND + 300_000_000;
                 let mut at_true = oscillator.clone();
                 let true_ticks = at_true.ticks_at(true_ns);
@@ -2789,7 +2789,6 @@ mod synchronizer_tests {
                     frequency_error_ppb: at_true.ppm() * 1e3,
                 }
             })
-            .collect()
     }
 
     /// A PPS on frequency but jittering 3 µs RMS is followed: it locks within
@@ -3025,11 +3024,12 @@ mod synchronizer_tests {
     /// and its RMS and largest time error against true seconds.
     fn drifting(drift: usize, jitter_ns: f64) -> (bool, f64, f64) {
         let own_ppm = drifts(0.5)[drift].1.clone();
-        let trace = sandi_on(
+        let trace: Vec<Second> = sandi_on(
             Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, 5_000_000),
             3600,
             |_, rng| Some(rng.gaussian() * jitter_ns),
-        );
+        )
+        .collect();
         let errors = || {
             trace[600..]
                 .iter()
@@ -3067,6 +3067,64 @@ mod synchronizer_tests {
         );
     }
 
+    /// Thirty days of a GPS PPS on a SiT5356 43 ppm fast under a daily ±0.5 ppm
+    /// thermal cycle: the steering integrates past 10¹¹ ns, and the last day's
+    /// time error and its estimate are no worse than the first's.
+    #[test]
+    #[ignore = "thirty simulated days, for a release build"]
+    fn thirty_days_forty_three_ppm_off_hold_their_precision() {
+        const DAY: u64 = 86_400;
+        let own_ppm = (0..30 * DAY)
+            .map(|second| {
+                43.0 + 0.5 * (core::f64::consts::TAU * (second % DAY) as f64 / DAY as f64).sin()
+            })
+            .collect();
+        let days: Vec<(bool, f64, f64, f64)> = sandi_on(
+            Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, 5_000_000),
+            30 * DAY,
+            |_, rng| Some(rng.gaussian() * 20.0),
+        )
+        .enumerate()
+        .skip(600)
+        .fold(
+            vec![(true, 0.0, 0.0f64, 0.0, 0.0); 30],
+            |mut days, (index, second)| {
+                let day = &mut days[index / DAY as usize];
+                let error = second.time_error_ns.unwrap_or(f64::INFINITY);
+                let estimate = second
+                    .status
+                    .time_error_ns
+                    .map_or(f64::INFINITY, |ns| ns as f64);
+                *day = (
+                    day.0 && second.status.pulse.is_locked(),
+                    day.1 + error * error,
+                    day.2.max(error.abs()),
+                    day.3 + estimate * estimate,
+                    day.4 + 1.0,
+                );
+                days
+            },
+        )
+        .into_iter()
+        .map(|(locked, error, max, estimate, seconds)| {
+            (
+                locked,
+                (error / seconds).sqrt(),
+                max,
+                (estimate / seconds).sqrt(),
+            )
+        })
+        .collect();
+        let (first, last) = (days[0], days[29]);
+        assert!(
+            days.iter().all(|day| day.0)
+                && last.1 <= 1.2 * first.1
+                && last.2 <= 1.5 * first.2
+                && last.3 <= 1.2 * first.3,
+            "locked, RMS and max time error, and RMS estimate, ns, by day: {days:?}"
+        );
+    }
+
     /// An hour of each drift under each jitter and latency, 0.5 ppm off to
     /// start, with time and frequency errors taken against true seconds past
     /// the first ten minutes.
@@ -3092,8 +3150,9 @@ mod synchronizer_tests {
                 for (name, own_ppm) in drifts(0.5) {
                     let oscillator =
                         Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, latency_ms * 1_000_000);
-                    let trace =
-                        sandi_on(oscillator, 3600, |_, rng| Some(rng.gaussian() * jitter_ns));
+                    let trace: Vec<Second> =
+                        sandi_on(oscillator, 3600, |_, rng| Some(rng.gaussian() * jitter_ns))
+                            .collect();
                     let after = &trace[SETTLE..];
                     println!(
                         "{name:<22} {jitter_ns:>6} {latency_ms:>4} {:>6} {:>6.1}% {:>9.1} {:>9.1} {:>9.3} {:>5} {:>9.1}",
