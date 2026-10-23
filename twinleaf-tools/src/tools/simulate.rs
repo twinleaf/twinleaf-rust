@@ -2496,6 +2496,7 @@ mod tests {
                 time: (at / NANOS_PER_SECOND) as u32 + PARENT_OFFSET,
                 session: SessionId::new(PARENT_SESSION),
                 serial: PARENT_SERIAL.as_bytes(),
+                clock: None,
             };
             let mut buf = [0u8; 64];
             let len = timeref

@@ -342,6 +342,7 @@ impl Reference {
             time: self.second,
             session: self.identity.session,
             serial: self.identity.serial.as_bytes(),
+            clock: None,
         }
     }
 }
@@ -520,6 +521,7 @@ mod reference_tests {
             time,
             session: SessionId::new(99),
             serial: b"parent",
+            clock: None,
         }
     }
 
@@ -1283,6 +1285,7 @@ mod synchronizer_tests {
             time,
             session: SessionId::new(99),
             serial: b"parent",
+            clock: None,
         }
     }
 
