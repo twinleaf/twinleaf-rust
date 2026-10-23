@@ -346,11 +346,8 @@ impl Device {
     fn received(&mut self, result: &ReceiveResult) {
         // Any received packet (text included) refreshes liveness, for every
         // device — the watchdog needs a timestamp regardless of rate state.
-        match result {
-            Ok(TransportEvent::Packet(_) | TransportEvent::Text(_)) => {
-                self.last_rx = Instant::now();
-            }
-            _ => {}
+        if let Ok(TransportEvent::Packet(_) | TransportEvent::Text(_)) = result {
+            self.last_rx = Instant::now();
         }
         if !self.has_static_rate() {
             if let Ok(TransportEvent::Packet(pkt)) = result {
