@@ -47,8 +47,6 @@ pub struct PulseConfig {
     /// Factor a rejected edge grows the edge-noise estimate by, so a train
     /// noisier than assumed is still acquired.
     pub rejected_noise_growth: f64,
-    /// Frequency uncertainty under which a train may lock, ppb (1σ).
-    pub lock_frequency_ppb: f64,
 }
 
 impl PulseConfig {
@@ -66,7 +64,6 @@ impl PulseConfig {
         bias_sigmas: 3.0,
         noise_memory_seconds: 32.0,
         rejected_noise_growth: 2.0,
-        lock_frequency_ppb: 1_000.0,
     };
 }
 
@@ -76,12 +73,14 @@ impl PulseConfig {
 pub enum PulseState {
     /// No external pulse train has been established.
     FreeRunning,
-    /// A plausible pulse train exists but its estimate has not converged.
+    /// A plausible pulse train whose frequency is not yet measured and
+    /// tested, or one just switched onto that has closed no period since.
     Acquiring {
         /// Pulses accepted since the train was established or resumed.
         good_pulses: u8,
     },
-    /// The train's phase and frequency are known well enough to follow.
+    /// The train's frequency is measured and it is steered to with no
+    /// re-anchor pending, as linuxptp's servo is locked.
     Locked,
     /// A previously established pulse train is currently absent.
     Holdover {
@@ -316,16 +315,10 @@ impl Train {
             .predicted(config, self.unclosed() as f64, steered)
     }
 
-    /// A run long enough to test its fit, a frequency known well enough to
-    /// steer by, and a prediction no worse than one more edge would be.
-    fn is_locked(&self, config: PulseConfig) -> bool {
-        let estimate = self.estimate(config, self.filter.steered);
-        matches!(
-            self.mode,
-            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. }
-        ) && self.run >= ACQUISITION_RUN
-            && estimate.p[1][1] <= config.lock_frequency_ppb * config.lock_frequency_ppb
-            && estimate.p[0][0] <= estimate.r
+    /// linuxptp's servo locked: a run long enough to have measured the
+    /// frequency and tested it, with a period closed since any switch onto it.
+    const fn is_locked(&self) -> bool {
+        matches!(self.mode, Mode::Tracking | Mode::Coasting { .. }) && self.run >= ACQUISITION_RUN
     }
 
     /// Returns the seconds this pulse accounts for beyond the one it closes,
@@ -471,8 +464,7 @@ impl PulseTracker {
                 && config.drift_prior_ppb_per_second >= 0.0
                 && config.bias_sigmas > 0.0
                 && config.noise_memory_seconds >= 1.0
-                && config.rejected_noise_growth >= 1.0
-                && config.lock_frequency_ppb > 0.0,
+                && config.rejected_noise_growth >= 1.0,
             "pulse filter parameters"
         );
         Self {
@@ -503,9 +495,7 @@ impl PulseTracker {
             Mode::Lapsed { missed } => PulseState::Holdover {
                 missed_pulses: missed.min(u8::MAX as u32) as u8,
             },
-            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. }
-                if self.main.is_locked(self.config) =>
-            {
+            Mode::Fresh | Mode::Tracking | Mode::Coasting { .. } if self.main.is_locked() => {
                 PulseState::Locked
             }
             Mode::Fresh | Mode::Tracking | Mode::Coasting { .. } => PulseState::Acquiring {
@@ -657,7 +647,7 @@ impl PulseTracker {
         if !missed {
             return None;
         }
-        if !self.tentative.is_locked(self.config) {
+        if !self.tentative.is_locked() {
             return Some(SecondEvent::Missed);
         }
         let seconds = (self
@@ -791,7 +781,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_coherent_alternate_train_takes_over_after_enough_misses() {
+    fn a_coherent_alternate_train_takes_over_after_enough_misses_and_locks_on_its_next_edge() {
         let mut tracker = new_tracker();
         for second in 0..3u64 {
             tracker.capture(100, second * 1_000_000_000).unwrap();
@@ -802,6 +792,9 @@ pub(super) mod tests {
             while let Some(event) = tracker.poll(now + 1_000_000_000) {
                 if let SecondEvent::Switched { .. } = event {
                     assert_eq!(tracker.target_edge(), Some(500_000));
+                    assert!(!tracker.state().is_locked());
+                    tracker.capture(500_000, now + 1_500_000_000).unwrap();
+                    assert_eq!(tracker.state(), PulseState::Locked);
                     return;
                 }
             }
