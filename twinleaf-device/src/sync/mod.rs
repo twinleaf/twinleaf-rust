@@ -1,0 +1,3179 @@
+//! Clock synchronization and acquisition scheduling, free of any hardware.
+//!
+//! [`Synchronizer`] is the whole interface and the only thing that advances
+//! the reference timeline. A runtime turns its hardware events into these
+//! calls and performs the [`Actions`] that come back; nothing here knows about
+//! a counter peripheral, an executor, or a clock of its own.
+//!
+//! The pieces it composes are below it: the wrapping-counter arithmetic, the
+//! timeref association, the oscillator servo, and the acquisition scheduler.
+
+mod acquisition;
+mod pulse;
+
+pub use acquisition::{
+    AcquisitionAction, AcquisitionError, AcquisitionMachine, AcquisitionState, ScheduledEdge,
+    StartPlan,
+};
+pub use pulse::{ticks, PhaseEstimate, PulseConfig, PulseState};
+
+use core::mem::{discriminant, Discriminant};
+
+use twinleaf_proto::sync::{Clock, ClockAccuracy, Epoch, TimeSource, Timeref, MAX_SERIAL_SIZE};
+use twinleaf_proto::SessionId;
+
+use pulse::{PulseTracker, SecondEvent};
+
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Coherent observations before a new source may replace the active one.
+const CONFIRMATIONS: u8 = 3;
+
+/// How long after the second it labels a SYNC packet may still be paired with
+/// it. A hub emits within 500 ms of its edge and never replays history.
+const REFERENCE_WINDOW_NS: u64 = 900_000_000;
+
+/// The pad byte counts seconds modulo 64.
+const SEQUENCE_MASK: u8 = 0x3f;
+
+/// Seconds a child that lost its qualified train refuses a free-running
+/// upstream, its packets and the pulses they come with, before following it.
+const HOLDOVER_TIMEOUT: u8 = 60;
+
+/// Steps from its root at which an upstream reference is refused. PTP discards
+/// 255; a hub chain is a few cables deep, and a stale source counting up one a
+/// second around a loop of them is dropped in half a minute rather than four.
+const MAX_STEPS_REMOVED: u8 = 32;
+
+/// Work for the runtime after one [`Synchronizer`] call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Actions {
+    /// At least one second event was processed. A catch-up poll still reports
+    /// one: historical SYNC packets must not follow their output edges.
+    pub second: bool,
+    /// What the acquisition asks of the sampler.
+    pub local: AcquisitionAction,
+    /// Frequency correction for the oscillator, present once per second event
+    /// on a board that has an actuator.
+    pub correction_ppm: Option<f32>,
+    /// The SYNC packet to send to every child, on a device that has children.
+    pub announce: Option<Announce>,
+    /// A counter value for the outgoing PPS compare, when the anchor moved.
+    pub set_edge: Option<u32>,
+    /// The status to log and report, when it is no longer what was reported.
+    pub status_changed: Option<Status>,
+}
+
+impl Actions {
+    /// Nothing to do.
+    pub const NONE: Self = Self {
+        second: false,
+        local: AcquisitionAction::None,
+        correction_ppm: None,
+        announce: None,
+        set_edge: None,
+        status_changed: None,
+    };
+
+    pub(crate) const fn local(local: AcquisitionAction) -> Self {
+        Self {
+            local,
+            ..Self::NONE
+        }
+    }
+}
+
+/// One second's SYNC packet, as the only emitter of them produces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Announce {
+    /// The second just closed, which a child labels its next edge from.
+    pub timeref: Reference,
+    /// Sequence in bits 0..=5, [`TimeStatus`] in bits 6..=7.
+    pub pad: u8,
+}
+
+/// What a device says its own time is worth, in the SYNC pad byte.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeStatus {
+    /// A hub that predates the pad byte, 0. It says nothing either way.
+    Legacy,
+    /// No pulse train has been established, 1.
+    FreeRun,
+    /// An established pulse train is absent, 2.
+    Holdover,
+    /// The pulse train is qualified, 3.
+    Locked,
+}
+
+impl TimeStatus {
+    /// The status a pad byte carries.
+    pub const fn from_pad(pad: u8) -> Self {
+        match pad >> 6 {
+            0 => Self::Legacy,
+            1 => Self::FreeRun,
+            2 => Self::Holdover,
+            3..=u8::MAX => Self::Locked,
+        }
+    }
+
+    /// The two-bit code, which is also what `sync.status` reports.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Legacy => 0,
+            Self::FreeRun => 1,
+            Self::Holdover => 2,
+            Self::Locked => 3,
+        }
+    }
+
+    /// That code shifted into its pad byte field.
+    pub const fn bits(self) -> u8 {
+        self.code() << 6
+    }
+
+    /// The poorer of two statuses, which is what a hub passes on.
+    pub const fn worse(self, other: Self) -> Self {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::FreeRun => 0,
+            Self::Holdover => 1,
+            Self::Legacy | Self::Locked => 2,
+        }
+    }
+}
+
+/// Snapshot for a diagnostic RPC or status stream. Deliberately kept out of
+/// the SYNC packet: a child only needs the PPS edge and timeref to follow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Status {
+    /// Qualification of the electrical pulse train.
+    pub pulse: PulseState,
+    /// Qualification of packet-provided time.
+    pub reference: ReferenceState,
+    /// Where the acquisition stands.
+    pub acquisition: AcquisitionState,
+    /// The second carried by the most recently processed edge.
+    pub active: Reference,
+    /// Counter value of the drift-compensated second edge.
+    pub counter_edge: Option<u32>,
+    /// Bumped when the edge anchor moves, which restarts an active
+    /// acquisition; a replaced timeref only relabels it.
+    pub generation: u32,
+    /// Measured phase, absent while no pulse is closing the second.
+    pub phase_error_ns: Option<f32>,
+    /// Estimated RMS time error against the pulse train, 1σ, where a root announces
+    /// [`PhaseEstimate::accuracy_ns`]; absent while no outside train is established.
+    pub time_error_ns: Option<u64>,
+    /// `None` on a board with no frequency actuator, so a held zero can never
+    /// be mistaken for active discipline.
+    pub correction_ppm: Option<f32>,
+    /// Whether the servo is against its pull limit.
+    pub correction_saturated: bool,
+    /// What this device's pad byte says its own time is worth, and what
+    /// `sync.status` reports.
+    pub announced: TimeStatus,
+    /// What the last accepted SYNC packet said its time was worth.
+    pub upstream: TimeStatus,
+    /// Edges the main pulse train rejected.
+    pub spurs: u32,
+    /// SYNC packets that arrived too late to label an edge.
+    pub late_references: u32,
+    /// SYNC packets refused for naming this device's own time, come back
+    /// around a loop, or a source 32 or more steps away.
+    pub refused_references: u32,
+    /// Seconds that did not reconcile; see [`Synchronizer::poll`].
+    pub divergences: u32,
+    /// Acknowledgements that named a superseded start plan.
+    pub stale_acks: u32,
+    /// Staged starts whose target second never arrived.
+    pub superseded_plans: u32,
+    /// Timestamps that preceded the previous one.
+    pub backward_time: u32,
+}
+
+/// One wrapping counter period. The math is unitless: the period may be timer
+/// clocks, prescaled ticks, or a simulated counter.
+#[derive(Debug, Clone, Copy)]
+pub struct CounterDomain {
+    period: u32,
+}
+
+impl CounterDomain {
+    /// # Panics
+    ///
+    /// On a zero period. Build the domain in a `const` item to get a build
+    /// failure instead of a runtime one.
+    pub const fn new(period: u32) -> Self {
+        assert!(period != 0, "counter period must be nonzero");
+        Self { period }
+    }
+
+    /// Counter values in one second.
+    pub const fn period(self) -> u32 {
+        self.period
+    }
+
+    /// Bring an arbitrary non-negative value into the counter period.
+    pub(crate) const fn normalize(self, value: u64) -> u32 {
+        (value % self.period as u64) as u32
+    }
+
+    /// Shortest signed displacement from `expected` to `observed`. An exactly
+    /// half-period ambiguity resolves negative.
+    pub(crate) const fn signed_delta(self, observed: u32, expected: u32) -> i64 {
+        let period = self.period as i64;
+        let mut delta = observed as i64 - expected as i64;
+        let half = period / 2;
+        if delta >= half {
+            delta -= period;
+        } else if delta < -half {
+            delta += period;
+        }
+        delta
+    }
+
+    /// Convert counter ticks to nanoseconds without assuming a prescaler.
+    pub(crate) fn ticks_to_ns(self, ticks: i64) -> f64 {
+        ticks as f64 * (1_000_000_000.0 / self.period as f64)
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "counter period must be nonzero")]
+    fn a_zero_period_is_a_build_error() {
+        CounterDomain::new(0);
+    }
+
+    #[test]
+    fn signed_delta_uses_the_short_path() {
+        let domain = CounterDomain::new(100);
+        assert_eq!(domain.signed_delta(3, 98), 5);
+        assert_eq!(domain.signed_delta(98, 3), -5);
+        assert_eq!(domain.signed_delta(50, 0), -50);
+    }
+
+    #[test]
+    fn conversions_stay_inside_the_period() {
+        let domain = CounterDomain::new(1_000_000);
+        assert_eq!(domain.normalize(2_500_000), 500_000);
+        assert!((domain.ticks_to_ns(20) - 20_000.0).abs() < 0.1);
+    }
+}
+
+/// Owned form of the source serial carried by a borrowed [`Timeref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSerial {
+    len: u8,
+    bytes: [u8; MAX_SERIAL_SIZE],
+}
+
+impl SourceSerial {
+    /// Truncates rather than rejects: the wire format allows a longer serial
+    /// than this field holds, and dropping the packet would lose the timeref.
+    pub const fn new(value: &[u8]) -> Self {
+        let len = if value.len() > MAX_SERIAL_SIZE {
+            MAX_SERIAL_SIZE
+        } else {
+            value.len()
+        };
+        let mut bytes = [0; MAX_SERIAL_SIZE];
+        let mut i = 0;
+        while i < len {
+            bytes[i] = value[i];
+            i += 1;
+        }
+        Self {
+            len: len as u8,
+            bytes,
+        }
+    }
+
+    /// The serial as it goes back on the wire.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+/// Identity of one timebase instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceIdentity {
+    /// Timescale its seconds are counted in.
+    pub epoch: Epoch,
+    /// Session of the source, so a reboot is a new timebase.
+    pub session: SessionId,
+    /// Serial of the source.
+    pub serial: SourceSerial,
+}
+
+impl ReferenceIdentity {
+    /// An identity, truncating an oversized serial.
+    pub const fn new(epoch: Epoch, session: SessionId, serial: &[u8]) -> Self {
+        Self {
+            epoch,
+            session,
+            serial: SourceSerial::new(serial),
+        }
+    }
+}
+
+/// A source identity and the second assigned to one particular edge.
+#[derive(Debug, Clone, Copy)]
+pub struct Reference {
+    /// Whose timebase this is.
+    pub identity: ReferenceIdentity,
+    /// The second of the edge it names.
+    pub second: u32,
+    /// Where this device stands relative to the source's root.
+    pub clock: Clock,
+}
+
+/// Equal when they name the same edge of the same source, by whatever path.
+impl PartialEq for Reference {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.second == other.second
+    }
+}
+
+impl Eq for Reference {}
+
+impl Reference {
+    /// The same source, `seconds` later.
+    pub const fn advance(self, seconds: u32) -> Self {
+        Self {
+            second: self.second.wrapping_add(seconds),
+            ..self
+        }
+    }
+
+    /// Borrow this owned reference in the SYNC packet shape.
+    pub fn timeref(&self) -> Timeref<'_> {
+        Timeref {
+            epoch: self.identity.epoch,
+            time: self.second,
+            session: self.identity.session,
+            serial: self.identity.serial.as_bytes(),
+            clock: Some(self.clock),
+        }
+    }
+}
+
+/// Qualification state of packet-provided time.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceState {
+    /// The device's own timeline.
+    Local,
+    /// A source that has been coherent for this many edges.
+    Candidate {
+        /// Coherent observations so far, of the three adoption needs.
+        confirmations: u8,
+    },
+    /// A source adopted from upstream.
+    Upstream,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    identity: ReferenceIdentity,
+    clock: Clock,
+    base_edge: u64,
+    base_second: u32,
+    confirmations: u8,
+    last_observed_edge: u64,
+}
+
+impl Candidate {
+    fn reference_at(self, edge: u64) -> Reference {
+        Reference {
+            identity: self.identity,
+            second: self
+                .base_second
+                .wrapping_add(edge.wrapping_sub(self.base_edge) as u32),
+            clock: self.clock,
+        }
+    }
+
+    fn is_consistent(self, edge: u64, reference: Reference) -> bool {
+        self.identity == reference.identity && self.reference_at(edge).second == reference.second
+    }
+}
+
+/// Qualifies packet time independently from electrical PPS qualification.
+///
+/// A type-0 SYNC packet labels the next edge with `time + 1`; a candidate is
+/// only adopted on a qualified electrical edge.
+pub(crate) struct ReferenceTracker {
+    local: ReferenceIdentity,
+    own: Clock,
+    active: Reference,
+    active_is_upstream: bool,
+    edge_sequence: u64,
+    candidate: Option<Candidate>,
+}
+
+impl ReferenceTracker {
+    pub(crate) const fn new(local: Reference) -> Self {
+        Self {
+            local: local.identity,
+            own: local.clock,
+            active: local,
+            active_is_upstream: false,
+            edge_sequence: 0,
+            candidate: None,
+        }
+    }
+
+    pub(crate) const fn active(&self) -> Reference {
+        self.active
+    }
+
+    pub(crate) const fn own(&self) -> Clock {
+        self.own
+    }
+
+    pub(crate) fn state(&self) -> ReferenceState {
+        match self.candidate {
+            Some(candidate) => ReferenceState::Candidate {
+                confirmations: candidate.confirmations,
+            },
+            None if self.active_is_upstream => ReferenceState::Upstream,
+            None => ReferenceState::Local,
+        }
+    }
+
+    /// Restart the local timeline at `second`, keeping the local identity.
+    pub(crate) fn reset_local(&mut self, second: u32) {
+        self.active.second = second;
+    }
+
+    /// Name what this device's own seconds come from and how close they are to
+    /// it, for whenever it is the root.
+    pub(crate) fn set_own(&mut self, own: Clock) {
+        self.own = own;
+        if self.is_own(
+            self.active.identity.session,
+            self.active.identity.serial.as_bytes(),
+        ) {
+            self.active.clock = self.own;
+        }
+    }
+
+    /// Whether a packet is refused: one naming this device's own time, come
+    /// back around a loop, or one [`MAX_STEPS_REMOVED`] steps from its root.
+    /// Either returns the device to its own time, unless the loop's source
+    /// orders before it, as PTP breaks a tie between clocks on their identity.
+    pub(crate) fn refuses(&mut self, timeref: &Timeref<'_>) -> bool {
+        let looped = self.is_own(timeref.session, timeref.serial);
+        let distant = timeref
+            .clock
+            .is_some_and(|clock| clock.steps_removed >= MAX_STEPS_REMOVED);
+        let active = self.active.identity;
+        let resume = match (looped, distant) {
+            (false, false) => return false,
+            (true, true | false) => {
+                (self.local.serial.as_bytes(), self.local.session)
+                    < (active.serial.as_bytes(), active.session)
+            }
+            (false, true) => !self.is_own(active.session, active.serial.as_bytes()),
+        };
+        if resume {
+            let edge = self.edge_sequence.wrapping_add(1);
+            self.candidate = Some(Candidate {
+                identity: ReferenceIdentity {
+                    epoch: active.epoch,
+                    ..self.local
+                },
+                clock: self.own,
+                base_edge: edge,
+                base_second: self.active.second.wrapping_add(1),
+                confirmations: CONFIRMATIONS,
+                last_observed_edge: edge,
+            });
+        }
+        true
+    }
+
+    /// Observe a packet received after the current edge. Its timeref applies to
+    /// the next edge, one step further from its root than the packet's sender;
+    /// a sender that names no clock is taken for a root of unknown source.
+    pub(crate) fn observe(&mut self, timeref: Timeref<'_>) {
+        self.qualify(Reference {
+            identity: ReferenceIdentity::new(timeref.epoch, timeref.session, timeref.serial),
+            second: timeref.time.wrapping_add(1),
+            clock: timeref
+                .clock
+                .unwrap_or(Clock::root(TimeSource::Other))
+                .forwarded(),
+        });
+    }
+
+    /// Observe a second the device was told by something other than a packet,
+    /// a GPS receiver above all, under its own identity in `epoch`.
+    pub(crate) fn observe_local(&mut self, second: u32, epoch: Epoch) {
+        self.qualify(Reference {
+            identity: ReferenceIdentity {
+                epoch,
+                ..self.local
+            },
+            second: second.wrapping_add(1),
+            clock: self.own,
+        });
+    }
+
+    /// Drop the source being qualified, which has proved incoherent.
+    pub(crate) fn discard_candidate(&mut self) {
+        self.candidate = None;
+    }
+
+    /// Advance by one second edge, reporting whether a candidate replaced the
+    /// active reference. Adoption needs `pulse_qualified`.
+    pub(crate) fn on_edge(&mut self, pulse_qualified: bool) -> bool {
+        self.edge_sequence = self.edge_sequence.wrapping_add(1);
+        self.active = self.active.advance(1);
+
+        let Some(candidate) = self.candidate else {
+            return false;
+        };
+        if !pulse_qualified || candidate.confirmations < CONFIRMATIONS {
+            return false;
+        }
+
+        let next = candidate.reference_at(self.edge_sequence);
+        self.candidate = None;
+        if next == self.active {
+            return false;
+        }
+        self.active = next;
+        self.active_is_upstream = true;
+        true
+    }
+
+    fn qualify(&mut self, reference: Reference) {
+        let target_edge = self.edge_sequence.wrapping_add(1);
+
+        if reference == self.active.advance(1) {
+            self.active.clock = reference.clock;
+            self.candidate = None;
+            return;
+        }
+
+        self.candidate = Some(match self.candidate {
+            Some(mut candidate) if candidate.is_consistent(target_edge, reference) => {
+                if candidate.last_observed_edge != target_edge {
+                    candidate.confirmations = candidate.confirmations.saturating_add(1);
+                    candidate.last_observed_edge = target_edge;
+                }
+                candidate.clock = reference.clock;
+                candidate
+            }
+            _ => Candidate {
+                identity: reference.identity,
+                clock: reference.clock,
+                base_edge: target_edge,
+                base_second: reference.second,
+                confirmations: 1,
+                last_observed_edge: target_edge,
+            },
+        });
+    }
+
+    fn is_own(&self, session: SessionId, serial: &[u8]) -> bool {
+        session == self.local.session && serial == self.local.serial.as_bytes()
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    fn local() -> Reference {
+        Reference {
+            identity: ReferenceIdentity::new(Epoch::SYSTIME, SessionId::new(1), b"local"),
+            second: 10,
+            clock: Clock::root(TimeSource::InternalOscillator),
+        }
+    }
+
+    fn packet(time: u32) -> Timeref<'static> {
+        Timeref {
+            epoch: Epoch::UNIX,
+            time,
+            session: SessionId::new(99),
+            serial: b"parent",
+            clock: None,
+        }
+    }
+
+    #[test]
+    fn three_coherent_packets_and_pulses_adopt_parent_time() {
+        let mut tracker = ReferenceTracker::new(local());
+
+        tracker.observe(packet(100));
+        assert_eq!(
+            tracker.state(),
+            ReferenceState::Candidate { confirmations: 1 }
+        );
+        assert!(!tracker.on_edge(true));
+
+        tracker.observe(packet(101));
+        assert!(!tracker.on_edge(true));
+
+        tracker.observe(packet(102));
+        assert!(tracker.on_edge(true));
+        assert_eq!(tracker.active().second, 103);
+        assert_eq!(tracker.active().identity.epoch, Epoch::UNIX);
+        assert_eq!(tracker.active().identity.serial.as_bytes(), b"parent");
+        assert_eq!(tracker.state(), ReferenceState::Upstream);
+    }
+
+    #[test]
+    fn packet_qualification_cannot_replace_pps_qualification() {
+        let mut tracker = ReferenceTracker::new(local());
+        for time in 100..103 {
+            tracker.observe(packet(time));
+            assert!(!tracker.on_edge(false));
+        }
+        assert!(matches!(
+            tracker.state(),
+            ReferenceState::Candidate { confirmations: 3 }
+        ));
+        assert!(tracker.on_edge(true));
+        assert_eq!(tracker.active().second, 104);
+    }
+
+    #[test]
+    fn duplicate_packets_for_one_edge_do_not_qualify() {
+        let mut tracker = ReferenceTracker::new(local());
+        tracker.observe(packet(100));
+        tracker.observe(packet(100));
+        tracker.observe(packet(100));
+        assert_eq!(
+            tracker.state(),
+            ReferenceState::Candidate { confirmations: 1 }
+        );
+    }
+
+    #[test]
+    fn an_inconsistent_second_restarts_qualification() {
+        let mut tracker = ReferenceTracker::new(local());
+        tracker.observe(packet(100));
+        tracker.on_edge(true);
+        tracker.observe(packet(500));
+        assert_eq!(
+            tracker.state(),
+            ReferenceState::Candidate { confirmations: 1 }
+        );
+    }
+
+    #[test]
+    fn an_upstream_reference_advances_through_holdover() {
+        let mut tracker = ReferenceTracker::new(local());
+        for time in 100..103 {
+            tracker.observe(packet(time));
+            tracker.on_edge(true);
+        }
+        assert_eq!(tracker.state(), ReferenceState::Upstream);
+        let adopted = tracker.active().second;
+        for _ in 0..5 {
+            assert!(!tracker.on_edge(false));
+        }
+        assert_eq!(tracker.active().second, adopted + 5);
+        assert_eq!(tracker.state(), ReferenceState::Upstream);
+    }
+
+    /// A GPS receiver's second qualifies exactly as a packet's does, under the
+    /// device's own serial and the epoch the receiver reports.
+    #[test]
+    fn a_local_label_qualifies_under_the_devices_own_identity() {
+        let mut tracker = ReferenceTracker::new(local());
+        for time in 100..103 {
+            tracker.observe_local(time, Epoch::UNIX);
+            tracker.on_edge(true);
+        }
+        assert_eq!(tracker.state(), ReferenceState::Upstream);
+        assert_eq!(tracker.active().second, 103);
+        assert_eq!(tracker.active().identity.epoch, Epoch::UNIX);
+        assert_eq!(tracker.active().identity.serial.as_bytes(), b"local");
+    }
+
+    #[test]
+    fn an_adopted_reference_is_one_step_further_from_its_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        let gps = Clock {
+            steps_removed: 2,
+            ..Clock::root(TimeSource::Gnss)
+        };
+        for time in 100..103 {
+            tracker.observe(Timeref {
+                clock: Some(gps),
+                ..packet(time)
+            });
+            tracker.on_edge(true);
+        }
+        assert_eq!(tracker.active().clock, gps.forwarded());
+        tracker.observe(Timeref {
+            clock: Some(Clock::root(TimeSource::Ptp)),
+            ..packet(103)
+        });
+        assert_eq!(
+            tracker.active().clock,
+            Clock::root(TimeSource::Ptp).forwarded()
+        );
+        assert_eq!(tracker.state(), ReferenceState::Upstream);
+    }
+
+    /// A deployed hub that sends no clock is a root, but of nothing it says,
+    /// and what follows it is never mistaken for one.
+    #[test]
+    fn a_source_with_no_clock_is_followed_one_step_from_an_unknown_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        for time in 100..103 {
+            tracker.observe(packet(time));
+            tracker.on_edge(true);
+        }
+        assert_eq!(tracker.active().clock.steps_removed, 1);
+        assert_eq!(tracker.active().clock.time_source, TimeSource::Other);
+        assert_eq!(
+            tracker.active().timeref().clock,
+            Some(tracker.active().clock)
+        );
+    }
+
+    #[test]
+    fn the_stated_time_source_is_announced_while_the_device_is_its_own_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        tracker.set_own(Clock::root(TimeSource::Gnss));
+        assert_eq!(tracker.active().clock, Clock::root(TimeSource::Gnss));
+        for time in 100..103 {
+            tracker.observe(packet(time));
+            tracker.on_edge(true);
+        }
+        tracker.set_own(Clock::root(TimeSource::Ptp));
+        assert_eq!(tracker.active().clock.time_source, TimeSource::Other);
+    }
+
+    #[test]
+    fn a_source_too_many_steps_from_its_root_is_refused() {
+        let mut tracker = ReferenceTracker::new(local());
+        let distant = |steps_removed| Timeref {
+            clock: Some(Clock {
+                steps_removed,
+                ..Clock::root(TimeSource::Gnss)
+            }),
+            ..packet(100)
+        };
+        assert!(tracker.refuses(&distant(MAX_STEPS_REMOVED)));
+        assert_eq!(tracker.state(), ReferenceState::Local);
+        assert!(!tracker.refuses(&distant(MAX_STEPS_REMOVED - 1)));
+    }
+
+    #[test]
+    fn a_device_hearing_its_own_time_refuses_it_and_stays_its_own_root() {
+        let mut tracker = ReferenceTracker::new(local());
+        let echoed = local().advance(5);
+        let echo = Timeref {
+            epoch: Epoch::UNIX,
+            ..echoed.timeref()
+        };
+        assert!(tracker.refuses(&echo));
+        assert_eq!(tracker.state(), ReferenceState::Local);
+        assert!(!tracker.on_edge(true));
+        assert_eq!(tracker.active().identity, local().identity);
+    }
+
+    #[test]
+    fn an_oversized_serial_is_truncated_like_the_c_timeref() {
+        let serial = SourceSerial::new(&[7; MAX_SERIAL_SIZE + 4]);
+        assert_eq!(serial.as_bytes(), [7; MAX_SERIAL_SIZE]);
+    }
+}
+
+/// Seconds the servo closes a train's estimated phase over: long enough that the
+/// sample clock's frequency holds steady at the cost of a few ns of time error.
+const STEERING_SECONDS: f32 = 10.0;
+
+/// The operator's hold on a servo: whether it steers or holds a pull.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Steering {
+    /// Whether the loop steers; a disabled servo holds `pull_ppm`.
+    pub enabled: bool,
+    /// The correction held while disabled, and until an enabled loop has an estimate.
+    pub pull_ppm: f32,
+}
+
+/// A 1 Hz servo from a pulse train's estimated state to an oscillator
+/// correction, in ppm: `-(y + θ / STEERING_SECONDS) / 1000`.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseServo {
+    max_pull_ppm: f32,
+    enabled: bool,
+    output_ppm: f32,
+    saturated: bool,
+}
+
+impl PhaseServo {
+    /// Holds 0 ppm, within ±`max_pull_ppm`, until [`Self::set_steering`] enables it.
+    ///
+    /// # Panics
+    ///
+    /// On a negative or NaN pull range, a board constant.
+    pub const fn new(max_pull_ppm: f32) -> Self {
+        assert!(max_pull_ppm >= 0.0, "servo pull range");
+        Self {
+            max_pull_ppm,
+            enabled: false,
+            output_ppm: 0.0,
+            saturated: false,
+        }
+    }
+
+    /// The correction it is asking for.
+    pub const fn output_ppm(&self) -> f32 {
+        self.output_ppm
+    }
+
+    /// Whether that correction is against a limit.
+    pub const fn saturated(&self) -> bool {
+        self.saturated
+    }
+
+    /// Starts from or holds the pull, unless the loop was already steering.
+    pub fn set_steering(&mut self, steering: Steering) {
+        match (self.enabled, steering.enabled) {
+            (true, true) => {}
+            (true, false) | (false, true | false) => self.clamp(steering.pull_ppm),
+        }
+        self.enabled = steering.enabled;
+    }
+
+    /// Steer by one second's estimate. With none, there is no train to follow
+    /// and the correction holds, as a disabled servo's does.
+    pub fn observe(&mut self, estimate: Option<PhaseEstimate>) -> f32 {
+        if let (true, Some(estimate)) = (self.enabled, estimate) {
+            self.clamp(-(estimate.frequency_ppb + estimate.phase_ns / STEERING_SECONDS) / 1_000.0);
+        }
+        self.output_ppm
+    }
+
+    fn clamp(&mut self, requested_ppm: f32) {
+        self.output_ppm = requested_ppm.max(-self.max_pull_ppm).min(self.max_pull_ppm);
+        self.saturated = self.output_ppm != requested_ppm;
+    }
+}
+
+#[cfg(test)]
+mod discipline_tests {
+    use super::*;
+
+    /// A servo steering from 0 ppm within ±`max_pull_ppm`.
+    pub(super) fn steering(max_pull_ppm: f32) -> PhaseServo {
+        let mut servo = PhaseServo::new(max_pull_ppm);
+        servo.set_steering(Steering {
+            enabled: true,
+            pull_ppm: 0.0,
+        });
+        servo
+    }
+
+    fn estimate(phase_ns: f32, frequency_ppb: f32) -> Option<PhaseEstimate> {
+        Some(PhaseEstimate {
+            phase_ns,
+            frequency_ppb,
+            time_error_ns: 0,
+            accuracy_ns: 0,
+        })
+    }
+
+    #[test]
+    fn the_correction_removes_the_frequency_and_a_tenth_of_the_phase_each_second() {
+        let mut servo = steering(50.0);
+        assert!((servo.observe(estimate(1_000.0, 2_000.0)) - -2.1).abs() < 1.0e-6);
+        assert!((servo.observe(estimate(-1_000.0, 2_000.0)) - -1.9).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_correction_past_the_pull_is_clamped_and_says_so() {
+        let mut servo = steering(1.0);
+        assert_eq!(servo.observe(estimate(0.0, -43_000.0)), 1.0);
+        assert!(servo.saturated());
+        assert!(servo.observe(estimate(0.0, 500.0)) == -0.5 && !servo.saturated());
+    }
+
+    #[test]
+    fn no_estimate_holds_the_correction() {
+        let mut servo = steering(50.0);
+        let acquired = servo.observe(estimate(-500.0, 3_000.0));
+        assert_eq!(servo.observe(None), acquired);
+        assert_eq!(servo.output_ppm(), acquired);
+    }
+
+    #[test]
+    fn an_untuned_or_disabled_servo_holds_its_pull_whatever_the_estimate() {
+        let mut servo = PhaseServo::new(50.0);
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 0.0);
+        let held = Steering {
+            enabled: false,
+            pull_ppm: 3.0,
+        };
+        servo.set_steering(held);
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 3.0);
+        servo.set_steering(Steering {
+            pull_ppm: 80.0,
+            ..held
+        });
+        assert_eq!(servo.observe(estimate(1000.0, 0.0)), 50.0);
+        assert!(servo.saturated());
+    }
+
+    #[test]
+    fn enabling_starts_from_the_pull_and_enabling_again_keeps_the_loop_running() {
+        let mut servo = PhaseServo::new(50.0);
+        let steering = Steering {
+            enabled: true,
+            pull_ppm: 3.0,
+        };
+        servo.set_steering(steering);
+        assert_eq!(servo.observe(None), 3.0);
+        assert!((servo.observe(estimate(1000.0, 0.0)) - -0.1).abs() < 1.0e-6);
+        servo.set_steering(Steering {
+            pull_ppm: -7.0,
+            ..steering
+        });
+        assert!((servo.output_ppm() - -0.1).abs() < 1.0e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "servo pull range")]
+    fn a_negative_pull_range_is_a_build_error() {
+        PhaseServo::new(-1.0);
+    }
+}
+
+/// The last sequence accepted from one source, and when.
+#[derive(Debug, Clone, Copy)]
+struct Sequence {
+    identity: ReferenceIdentity,
+    sequence: u8,
+    seconds: u32,
+}
+
+/// The coarse state a change of status is reported for. Holdover's missing
+/// pulses and a candidate's confirmations move every second and are not it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Summary {
+    pulse: Discriminant<PulseState>,
+    reference: Discriminant<ReferenceState>,
+    acquisition: AcquisitionState,
+    announced: TimeStatus,
+}
+
+/// Everything a device needs to follow a PPS input and schedule acquisitions.
+///
+/// A runtime translates its events into these calls and performs the
+/// [`Actions`] that come out; it never interprets a count of elapsed seconds.
+pub struct Synchronizer {
+    pulses: PulseTracker,
+    references: ReferenceTracker,
+    servo: Option<PhaseServo>,
+    acquisition: AcquisitionMachine,
+    anchor: Option<u32>,
+    generation: u32,
+    divergences: u32,
+    late_references: u32,
+    refused_references: u32,
+    upstream: TimeStatus,
+    /// Whether a pulse train ever qualified: without one there is nothing to
+    /// hold over, and a later absence is still free-run.
+    qualified_once: bool,
+    sequence: Option<Sequence>,
+    reported: Option<Summary>,
+    /// Second events processed since construction. Bootstrap happens on the
+    /// first wake, so this tracks uptime closely enough to time the autostart.
+    seconds: u32,
+    /// Monotonic stamp of the last second event, which the arrival window for
+    /// a SYNC packet is measured from.
+    last_second_ns: Option<u64>,
+}
+
+impl Synchronizer {
+    /// `servo` is `None` on a board with no frequency actuator.
+    pub const fn new(
+        domain: CounterDomain,
+        pulses: PulseConfig,
+        local: Reference,
+        servo: Option<PhaseServo>,
+        autostart_seconds: u8,
+    ) -> Self {
+        Self {
+            pulses: PulseTracker::new(domain, pulses),
+            references: ReferenceTracker::new(local),
+            servo,
+            acquisition: AcquisitionMachine::new(autostart_seconds),
+            anchor: None,
+            generation: 0,
+            divergences: 0,
+            late_references: 0,
+            refused_references: 0,
+            upstream: TimeStatus::Legacy,
+            qualified_once: false,
+            sequence: None,
+            reported: None,
+            seconds: 0,
+            last_second_ns: None,
+        }
+    }
+
+    /// What everything here stands at.
+    pub fn status(&self) -> Status {
+        Status {
+            pulse: self.pulses.state(),
+            reference: self.references.state(),
+            acquisition: self.acquisition.state(),
+            active: self.references.active(),
+            counter_edge: self.anchor,
+            generation: self.generation,
+            phase_error_ns: self.pulses.phase_error_ns(),
+            time_error_ns: self
+                .pulses
+                .estimate()
+                .map(|estimate| estimate.time_error_ns),
+            correction_ppm: self.servo.map(|servo| servo.output_ppm()),
+            correction_saturated: self.servo.is_some_and(|servo| servo.saturated()),
+            announced: self.announced(),
+            upstream: self.upstream,
+            spurs: self.pulses.spur_count(),
+            late_references: self.late_references,
+            refused_references: self.refused_references,
+            divergences: self.divergences,
+            stale_acks: self.acquisition.stale_acks(),
+            superseded_plans: self.acquisition.superseded_plans(),
+            backward_time: self.pulses.backward_time_count(),
+        }
+    }
+
+    /// The counter the pulses are measured against.
+    pub const fn domain(&self) -> CounterDomain {
+        self.pulses.domain()
+    }
+
+    /// Earliest monotonic nanosecond at which [`Self::poll`] can advance the
+    /// timeline because an expected PPS did not arrive.
+    fn next_poll_deadline_ns(&self) -> Option<u64> {
+        self.pulses.next_poll_deadline_ns()
+    }
+
+    /// Earliest useful wakeup for a runtime: now while unanchored, since the
+    /// bootstrap defines the first second boundary. It is the one source of
+    /// the wake that closes a period; nothing else advances seconds.
+    pub fn next_wake_deadline_ns(&self, monotonic_ns: u64) -> u64 {
+        if self.anchor.is_none() {
+            return monotonic_ns;
+        }
+        self.next_poll_deadline_ns()
+            .unwrap_or_else(|| monotonic_ns.saturating_add(NANOS_PER_SECOND))
+    }
+
+    /// Process the wakeup returned by [`Self::next_wake_deadline_ns`].
+    pub fn wake(&mut self, counter_now: u32, monotonic_ns: u64) -> Actions {
+        if self.anchor.is_none() {
+            self.bootstrap(counter_now, monotonic_ns)
+        } else {
+            self.poll(monotonic_ns)
+        }
+    }
+
+    /// Observe a SYNC timeref that arrived at `arrival_ns`, labelling the
+    /// second just closed. One that missed its second's window, or that names
+    /// this device's own time or too distant a root, is dropped and counted; a sequence that skipped is a divergence, and discards whatever
+    /// the source had qualified so far.
+    pub fn observe_packet(&mut self, timeref: Timeref<'_>, pad: u8, arrival_ns: u64) {
+        let status = TimeStatus::from_pad(pad);
+        let holding = match self.pulses.state() {
+            PulseState::Holdover { missed_pulses } => {
+                self.qualified_once && missed_pulses < HOLDOVER_TIMEOUT
+            }
+            PulseState::FreeRunning | PulseState::Acquiring { .. } | PulseState::Locked => false,
+        };
+        if holding && status == TimeStatus::FreeRun {
+            self.pulses.discard_tentative();
+            return;
+        }
+        let in_window = self
+            .last_second_ns
+            .is_some_and(|last| arrival_ns.saturating_sub(last) < REFERENCE_WINDOW_NS);
+        if !in_window {
+            self.late_references = self.late_references.saturating_add(1);
+            return;
+        }
+        if self.references.refuses(&timeref) {
+            self.refused_references = self.refused_references.saturating_add(1);
+            return;
+        }
+        let identity = ReferenceIdentity::new(timeref.epoch, timeref.session, timeref.serial);
+        if !self.sequenced(identity, status, pad & SEQUENCE_MASK) {
+            return;
+        }
+        self.upstream = status;
+        self.references.observe(timeref);
+    }
+
+    /// Name what the device's own seconds come from: GNSS while a GPS receiver
+    /// labels them, PTP while PTP does, its internal oscillator otherwise.
+    pub fn set_time_source(&mut self, time_source: TimeSource) {
+        self.references.set_own(Clock {
+            time_source,
+            ..self.references.own()
+        });
+    }
+
+    /// Observe a second from the device's own receiver rather than a packet,
+    /// labelling the locked pulse just closed; before a lock it discards what was qualified.
+    pub fn observe_local(&mut self, second: u32, epoch: Epoch) {
+        match self.pulses.state().is_locked() {
+            true => self.references.observe_local(second, epoch),
+            false => self.references.discard_candidate(),
+        }
+    }
+
+    /// Capture an electrical PPS rising edge.
+    ///
+    /// Spurs return [`Actions::NONE`]: they never reach the timeline.
+    pub fn capture(&mut self, pulse_edge: u32, monotonic_ns: u64) -> Actions {
+        match self.pulses.capture(pulse_edge, monotonic_ns) {
+            Some(event) => self.second(event, monotonic_ns),
+            None => Actions::NONE,
+        }
+    }
+
+    /// Account for PPS edges that have not arrived and advance a free-running
+    /// timebase. Calling this before the deadline is safe and does nothing.
+    pub fn poll(&mut self, monotonic_ns: u64) -> Actions {
+        let mut actions = Actions::NONE;
+        while let Some(event) = self.pulses.poll(monotonic_ns) {
+            let mut next = self.second(event, monotonic_ns);
+            if let (
+                AcquisitionAction::Arm(_) | AcquisitionAction::Rearm(_),
+                AcquisitionAction::Start(edge),
+            ) = (actions.local, next.local)
+            {
+                next.local = self.acquisition.rearm_from(edge, monotonic_ns);
+            }
+            if next.local != AcquisitionAction::None {
+                actions.local = next.local;
+            }
+            actions.second |= next.second;
+            actions.correction_ppm = next.correction_ppm.or(actions.correction_ppm);
+            actions.announce = next.announce.or(actions.announce);
+            actions.set_edge = next.set_edge.or(actions.set_edge);
+            actions.status_changed = next.status_changed.or(actions.status_changed);
+        }
+        actions
+    }
+
+    /// Establish a local timebase from the monotonic clock, so a board with no
+    /// PPS input can still acquire. The calling instant is the first boundary,
+    /// so `counter_now` is the edge. Does nothing once an anchor exists.
+    pub fn bootstrap(&mut self, counter_now: u32, monotonic_ns: u64) -> Actions {
+        if self.anchor.is_some() {
+            return Actions::NONE;
+        }
+
+        let edge = self.pulses.domain().normalize(counter_now as u64);
+        let label = ((monotonic_ns + NANOS_PER_SECOND / 2) / NANOS_PER_SECOND) as u32;
+        self.references.reset_local(label.wrapping_sub(1));
+        self.anchor = Some(edge);
+        self.generation = self.generation.wrapping_add(1);
+
+        let event = self.pulses.bootstrap(edge, monotonic_ns);
+        let mut actions = self.second(event, monotonic_ns);
+        actions.set_edge = Some(edge);
+        actions
+    }
+
+    /// `dev.autostart`.
+    pub fn autostart_seconds(&self) -> u8 {
+        self.acquisition.autostart_seconds()
+    }
+
+    /// Set `dev.autostart`.
+    pub fn set_autostart_seconds(&mut self, seconds: u8) {
+        self.acquisition.set_autostart_seconds(seconds);
+    }
+
+    /// Hand the operator's steering to the servo, on a board that has one.
+    pub fn set_steering(&mut self, steering: Steering) {
+        self.servo
+            .iter_mut()
+            .for_each(|servo| servo.set_steering(steering));
+    }
+
+    /// `dev.start`.
+    pub fn start(&mut self) -> Result<Actions, AcquisitionError> {
+        let actions = self.acquisition.request_start()?;
+        Ok(self.report(actions))
+    }
+
+    /// `dev.stop`.
+    pub fn stop(&mut self) -> Result<Actions, AcquisitionError> {
+        let actions = self.acquisition.request_stop()?;
+        Ok(self.report(actions))
+    }
+
+    /// `dev.restart`: rebase the phase anchor onto the pulses as observed now.
+    /// Keeps the learned frequency correction, and is deliberately not a
+    /// synchronization change: the new segment starts against the new anchor.
+    pub fn restart(&mut self) -> Result<Actions, AcquisitionError> {
+        let actions = self.acquisition.request_restart()?;
+        self.pulses.rebase();
+        if let Some(edge) = self.pulses.target_edge() {
+            self.anchor = Some(edge);
+        }
+        Ok(self.report(actions))
+    }
+
+    /// Confirm that the peripheral produced the first sample of `plan`.
+    pub fn mark_running(&mut self, plan: u16) -> Result<(), AcquisitionError> {
+        self.acquisition.mark_running(plan)
+    }
+
+    /// Report that `plan`'s staging window was already past when the board
+    /// went to program it.
+    pub fn missed(&mut self, plan: u16) -> Result<(), AcquisitionError> {
+        self.acquisition.missed(plan)
+    }
+
+    /// Confirm that the board-specific stop completed.
+    pub fn finish_stop(&mut self) -> Result<(), AcquisitionError> {
+        self.acquisition.finish_stop()
+    }
+
+    /// The one place the reference timeline moves: one second per second event,
+    /// never a measured elapsed gap, which would double-count what a
+    /// [`Self::poll`] already reported. A gap no poll accounted for is counted
+    /// as a divergence and drops the edge to holdover instead of anchoring it.
+    fn second(&mut self, event: SecondEvent, monotonic_ns: u64) -> Actions {
+        let anchored_at = self.anchor;
+        let (steps, qualified) = match event {
+            SecondEvent::Captured { unaccounted: 0 } => (1, self.pulses.state().is_locked()),
+            SecondEvent::Captured { unaccounted } => {
+                self.divergences = self.divergences.saturating_add(1);
+                ((1 + unaccounted).max(0) as u32, false)
+            }
+            SecondEvent::Missed => (1, false),
+            SecondEvent::Switched { seconds } => {
+                self.references.discard_candidate();
+                (seconds, false)
+            }
+        };
+        if steps == 0 {
+            return self.report(Actions::NONE);
+        }
+
+        self.qualified_once |= qualified;
+        self.seconds = self.seconds.saturating_add(steps);
+        self.last_second_ns = Some(monotonic_ns);
+        for _ in 1..steps {
+            self.references.on_edge(false);
+        }
+        let displaced = self.references.active().advance(1);
+        let adopted = self.references.on_edge(qualified);
+
+        let mut actions = if qualified && self.pulses.target_edge() != self.anchor {
+            self.anchor = self.pulses.target_edge();
+            self.generation = self.generation.wrapping_add(1);
+            self.acquisition.synchronization_changed()
+        } else if adopted {
+            self.acquisition
+                .reference_changed(displaced.second, self.references.active())
+        } else if let Some(counter_edge) = self.anchor {
+            self.acquisition.on_edge(
+                ScheduledEdge {
+                    reference: self.references.active(),
+                    counter_edge,
+                },
+                monotonic_ns,
+            )
+        } else {
+            Actions::NONE
+        };
+
+        self.acquisition.advance_autostart(self.seconds);
+
+        let estimate = self.pulses.estimate();
+        self.references.set_own(Clock {
+            accuracy: estimate.map_or(ClockAccuracy::UNKNOWN, |estimate| {
+                ClockAccuracy::within_ns(estimate.accuracy_ns)
+            }),
+            ..self.references.own()
+        });
+        actions.second = true;
+        actions.correction_ppm = self.servo.as_mut().map(|servo| servo.observe(estimate));
+        if let Some(correction_ppm) = actions.correction_ppm {
+            self.pulses.steer(correction_ppm, monotonic_ns);
+        }
+        actions.set_edge = self.anchor.filter(|edge| Some(*edge) != anchored_at);
+        actions.announce = self.anchor.map(|_| Announce {
+            timeref: self.references.active(),
+            pad: self.pad(),
+        });
+        self.report(actions)
+    }
+
+    /// What this device announces its time is worth: the poorer of what its
+    /// own seconds are worth and what upstream said.
+    fn announced(&self) -> TimeStatus {
+        let own = if self.pulses.state().is_locked() {
+            TimeStatus::Locked
+        } else if self.qualified_once {
+            TimeStatus::Holdover
+        } else {
+            TimeStatus::FreeRun
+        };
+        own.worse(self.upstream)
+    }
+
+    /// The pad byte this device announces: its own second count and status.
+    fn pad(&self) -> u8 {
+        (self.seconds as u8 & SEQUENCE_MASK) | self.announced().bits()
+    }
+
+    /// Whether a packet's sequence follows the last one this source sent. The
+    /// count is reset whenever the source changes, so a hub reboot is not a
+    /// divergence, and a legacy hub sends no sequence to check.
+    fn sequenced(&mut self, identity: ReferenceIdentity, status: TimeStatus, sequence: u8) -> bool {
+        let previous = self.sequence.filter(|prev| prev.identity == identity);
+        self.sequence = Some(Sequence {
+            identity,
+            sequence,
+            seconds: self.seconds,
+        });
+        let (Some(previous), TimeStatus::FreeRun | TimeStatus::Holdover | TimeStatus::Locked) =
+            (previous, status)
+        else {
+            return true;
+        };
+        let closed = self.seconds.wrapping_sub(previous.seconds) as u8 & SEQUENCE_MASK;
+        if sequence.wrapping_sub(previous.sequence) & SEQUENCE_MASK == closed {
+            return true;
+        }
+        self.divergences = self.divergences.saturating_add(1);
+        self.references.discard_candidate();
+        false
+    }
+
+    /// Report the status once per change of it, which is what a runtime logs
+    /// and what rolls its segments over.
+    fn report(&mut self, mut actions: Actions) -> Actions {
+        let summary = Summary {
+            pulse: discriminant(&self.pulses.state()),
+            reference: discriminant(&self.references.state()),
+            acquisition: self.acquisition.state(),
+            announced: self.announced(),
+        };
+        if self.reported != Some(summary) {
+            self.reported = Some(summary);
+            actions.status_changed = Some(self.status());
+        }
+        actions
+    }
+}
+
+#[cfg(test)]
+mod synchronizer_tests {
+    use super::*;
+
+    const PERIOD: u32 = 1_000_000;
+    const EDGE: u32 = 100;
+
+    fn local() -> Reference {
+        Reference {
+            identity: ReferenceIdentity::new(Epoch::SYSTIME, SessionId::new(1), b"local"),
+            second: 10,
+            clock: Clock::root(TimeSource::InternalOscillator),
+        }
+    }
+
+    fn synchronizer() -> Synchronizer {
+        Synchronizer::new(
+            CounterDomain::new(PERIOD),
+            PulseConfig::DEFAULT,
+            local(),
+            Some(discipline_tests::steering(50.0)),
+            0,
+        )
+    }
+
+    fn plain() -> Synchronizer {
+        Synchronizer::new(
+            CounterDomain::new(PERIOD),
+            PulseConfig::DEFAULT,
+            local(),
+            None,
+            0,
+        )
+    }
+
+    fn packet(time: u32) -> Timeref<'static> {
+        Timeref {
+            epoch: Epoch::UNIX,
+            time,
+            session: SessionId::new(99),
+            serial: b"parent",
+            clock: None,
+        }
+    }
+
+    /// A hub's pad byte: its second count and what its own time is worth.
+    fn pad(sequence: u8, status: TimeStatus) -> u8 {
+        (sequence & SEQUENCE_MASK) | status.bits()
+    }
+
+    /// One clean pulse per second, on the same counter edge.
+    fn run(sync: &mut Synchronizer, seconds: u64) {
+        for second in 0..seconds {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+        }
+    }
+
+    #[test]
+    fn one_pulse_per_second_advances_the_timeline_once_per_second() {
+        let mut sync = synchronizer();
+        for second in 0..10 {
+            let now = second * NANOS_PER_SECOND;
+            assert!(!sync.poll(now).second);
+            assert!(sync.capture(EDGE, now).second);
+        }
+        assert_eq!(sync.status().active.second, local().second + 10);
+        assert_eq!(sync.status().pulse, PulseState::Locked);
+        assert_eq!(sync.status().divergences, 0);
+        assert_eq!(sync.status().counter_edge, Some(EDGE));
+    }
+
+    #[test]
+    fn non_timeline_actions_do_not_manufacture_a_second_event() {
+        let mut sync = synchronizer();
+        let actions = sync.start().unwrap();
+        assert!(!actions.second);
+        assert_eq!(sync.status().acquisition, AcquisitionState::WaitingForEdge);
+    }
+
+    #[test]
+    fn a_three_second_outage_with_polls_advances_exactly_three_seconds() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+        let before = sync.status().active.second;
+
+        for tenths in 1..40 {
+            sync.poll(3 * NANOS_PER_SECOND + tenths * NANOS_PER_SECOND / 10);
+        }
+        assert_eq!(sync.status().active.second, before + 3);
+        assert!(matches!(sync.status().pulse, PulseState::Holdover { .. }));
+
+        sync.capture(EDGE, 7 * NANOS_PER_SECOND);
+        assert_eq!(sync.status().active.second, before + 4);
+        assert_eq!(sync.status().divergences, 0);
+    }
+
+    #[test]
+    fn a_resumed_capture_without_polls_diverges_loudly_but_lands_correctly() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+        let before = sync.status().active.second;
+
+        sync.capture(EDGE, 7 * NANOS_PER_SECOND);
+        assert_eq!(sync.status().active.second, before + 4);
+        assert_eq!(sync.status().divergences, 1);
+        assert_eq!(sync.status().counter_edge, Some(EDGE));
+
+        let mut polled = synchronizer();
+        run(&mut polled, 4);
+        for tenths in 1..40 {
+            polled.poll(3 * NANOS_PER_SECOND + tenths * NANOS_PER_SECOND / 10);
+        }
+        polled.capture(EDGE, 7 * NANOS_PER_SECOND);
+        assert_eq!(polled.status().active.second, sync.status().active.second);
+        assert_eq!(polled.status().divergences, 0);
+    }
+
+    /// A pulse arriving after the poll that counted it missing closes no second.
+    #[test]
+    fn a_late_capture_after_its_miss_announces_nothing() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        assert!(sync.poll(3_020_000_000).announce.is_some());
+        let second = sync.status().active.second;
+
+        let late = sync.capture(EDGE, 3_030_000_000);
+        assert_eq!((late.second, late.announce), (false, None));
+        assert_eq!(sync.status().active.second, second);
+        assert_eq!(sync.status().divergences, 1);
+
+        let next = sync.capture(EDGE, 4 * NANOS_PER_SECOND).announce;
+        assert_eq!(
+            next.map(|announce| announce.timeref.second),
+            Some(second + 1)
+        );
+    }
+
+    #[test]
+    fn a_spur_beside_the_second_boundary_does_not_skew_the_timeline() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        let before = sync.status().active.second;
+
+        for second in 3..13u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now - NANOS_PER_SECOND / 100);
+            sync.capture(PERIOD + EDGE - PERIOD / 100, now - NANOS_PER_SECOND / 100);
+            sync.poll(now);
+            sync.capture(EDGE, now);
+        }
+        assert_eq!(sync.status().active.second, before + 10);
+        assert_eq!(sync.status().counter_edge, Some(EDGE));
+        assert_eq!(sync.status().divergences, 0);
+        assert_eq!(sync.status().generation, 1);
+        assert_eq!(sync.status().spurs, 10);
+    }
+
+    #[test]
+    fn packets_observed_between_edges_are_adopted_on_a_qualified_edge() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        assert_eq!(sync.status().reference, ReferenceState::Local);
+
+        for second in 3..6u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_packet(packet(500 + second as u32), 0, now);
+        }
+        let now = 6 * NANOS_PER_SECOND;
+        sync.poll(now);
+        sync.capture(EDGE, now);
+
+        let status = sync.status();
+        assert_eq!(status.reference, ReferenceState::Upstream);
+        assert_eq!(status.active.second, 506);
+        assert_eq!(status.active.identity.epoch, Epoch::UNIX);
+        assert_eq!(status.generation, 1);
+    }
+
+    /// A root announces its own estimate as its clock accuracy, unknown before
+    /// it has a train; a follower announces its root's, as PTP forwards it.
+    #[test]
+    fn a_root_announces_its_estimate_and_a_follower_its_roots_accuracy() {
+        let mut sync = synchronizer();
+        let booted = sync.wake(EDGE, 0).announce.unwrap();
+        assert_eq!(booted.timeref.clock.accuracy, ClockAccuracy::UNKNOWN);
+
+        run(&mut sync, 10);
+        let now = 10 * NANOS_PER_SECOND;
+        sync.poll(now);
+        let root = sync.capture(EDGE, now).announce.unwrap().timeref.clock;
+        let estimate = sync.pulses.estimate().unwrap().accuracy_ns;
+        assert_eq!(root.accuracy, ClockAccuracy::within_ns(estimate));
+
+        let upstream = Clock {
+            accuracy: ClockAccuracy::new(0x29),
+            ..Clock::root(TimeSource::Gnss)
+        };
+        let followed = (11..16u64)
+            .filter_map(|second| {
+                let now = second * NANOS_PER_SECOND;
+                sync.poll(now);
+                let announce = sync.capture(EDGE, now).announce;
+                sync.observe_packet(
+                    Timeref {
+                        clock: Some(upstream),
+                        ..packet(500 + second as u32)
+                    },
+                    0,
+                    now,
+                );
+                announce
+            })
+            .last()
+            .unwrap();
+        assert_eq!(followed.timeref.clock, upstream.forwarded());
+    }
+
+    /// The new reference names the edges the running segment already sits on.
+    #[test]
+    fn a_reference_change_relabels_a_running_acquisition() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        sync.start().unwrap();
+
+        let mut second = 3u64;
+        let mut plan = 0;
+        loop {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            let actions = sync.capture(EDGE, now);
+            second += 1;
+            match actions.local {
+                AcquisitionAction::Arm(staged) | AcquisitionAction::Rearm(staged) => {
+                    plan = staged.id
+                }
+                AcquisitionAction::Start(_) => break,
+                AcquisitionAction::None
+                | AcquisitionAction::Disarm
+                | AcquisitionAction::Stop
+                | AcquisitionAction::Relabel { .. } => assert!(second < 8, "never started"),
+            }
+        }
+        sync.mark_running(plan).unwrap();
+        assert_eq!(sync.status().acquisition, AcquisitionState::Running);
+
+        for _ in 0..3 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_packet(packet(900 + second as u32), 0, now);
+            second += 1;
+        }
+        let now = second * NANOS_PER_SECOND;
+        sync.poll(now);
+        let from = sync.status().active.second + 1;
+        let actions = sync.capture(EDGE, now);
+        assert_eq!(
+            actions.local,
+            AcquisitionAction::Relabel {
+                from,
+                to: sync.status().active,
+            }
+        );
+        assert_eq!(sync.status().active.second, 900 + second as u32);
+        assert_eq!(sync.status().acquisition, AcquisitionState::Running);
+        assert_eq!(sync.status().generation, 1);
+    }
+
+    /// A healthy train never moves the drift-compensated anchor; a switchover
+    /// does, and that jump must restart an acquisition.
+    #[test]
+    fn a_switchover_moves_the_anchor_and_restarts_the_segment() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        sync.start().unwrap();
+        let generation = sync.status().generation;
+
+        let alternate = PERIOD * 2 / 5;
+        let mut switched = None;
+        for second in 3..16u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.capture(alternate, now + NANOS_PER_SECOND * 2 / 5);
+            sync.poll(now + NANOS_PER_SECOND);
+            if sync.status().counter_edge == Some(alternate) {
+                switched = Some(second);
+                break;
+            }
+        }
+        let second = switched.expect("no switchover");
+        assert_eq!(sync.status().generation, generation + 1);
+        assert_eq!(sync.status().acquisition, AcquisitionState::Stopping);
+        assert_eq!(
+            sync.status().active.second,
+            local().second + second as u32 + 1
+        );
+        assert_eq!(sync.status().divergences, 0);
+    }
+
+    /// A child bootstrapped either side of half a second after its hub's pulses
+    /// qualifies the hub's second on them once switched, never the replaced train's.
+    #[test]
+    fn a_switch_onto_a_hubs_pulses_qualifies_its_second_from_either_phase() {
+        const HUB: u32 = 1_000;
+        for (edge_ms, adopted_ms, divergences) in [(295, 6_295, 0), (524, 7_524, 1)] {
+            let mut sync = plain();
+            let timeline: Vec<(u64, ReferenceState, u32)> = (14..12_000u64)
+                .map(|ms| {
+                    let (now, second) = (ms * 1_000_000, (ms / 1_000) as u32);
+                    sync.wake((ms * 1_000 % PERIOD as u64) as u32, now);
+                    match (ms + 1_000 - edge_ms) % 1_000 {
+                        0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
+                        3 => sync.observe_packet(
+                            packet(HUB + second),
+                            pad(second as u8, TimeStatus::Locked),
+                            now,
+                        ),
+                        _ => {}
+                    }
+                    let status = sync.status();
+                    (ms, status.reference, status.active.second)
+                })
+                .collect();
+            let adopted = timeline
+                .iter()
+                .position(|&(_, reference, _)| reference == ReferenceState::Upstream)
+                .expect("never adopted");
+            assert_eq!(
+                (timeline[adopted].0, sync.status().divergences),
+                (adopted_ms, divergences),
+                "{edge_ms} ms"
+            );
+            let wrong: Vec<_> = timeline[adopted..]
+                .iter()
+                .filter(|&&(ms, reference, second)| {
+                    reference != ReferenceState::Upstream
+                        || second != HUB + ((ms - edge_ms) / 1_000) as u32
+                })
+                .collect();
+            assert!(wrong.is_empty(), "{edge_ms} ms: {wrong:?}");
+        }
+    }
+
+    /// An adopted hub whose pulses step under half a second either way keeps
+    /// the child on its second through the switch, without requalifying.
+    #[test]
+    fn a_switch_under_an_adopted_hub_keeps_its_second() {
+        const HUB: u32 = 1_000;
+        let label = |edge_ms: u64| HUB + ((edge_ms + 500) / 1_000) as u32;
+        for step_ms in [400, 600] {
+            let mut sync = plain();
+            let timeline: Vec<(u64, Status)> = (0..24_000u64)
+                .map(|ms| {
+                    let now = ms * 1_000_000;
+                    let edge_ms = match ms < 11_500 {
+                        true => 0,
+                        false => step_ms,
+                    };
+                    sync.poll(now);
+                    match (ms + 1_000 - edge_ms) % 1_000 {
+                        0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
+                        3 => sync.observe_packet(
+                            packet(label(ms - 3)),
+                            pad(label(ms - 3) as u8, TimeStatus::Locked),
+                            now,
+                        ),
+                        _ => {}
+                    }
+                    (ms, sync.status())
+                })
+                .collect();
+            let adopted = timeline
+                .iter()
+                .position(|(_, status)| status.reference == ReferenceState::Upstream)
+                .expect("never adopted");
+            let steps: Vec<(u64, u32)> = timeline[adopted..]
+                .windows(2)
+                .filter_map(|pair| {
+                    let ((_, before), (ms, after)) = (pair[0], pair[1]);
+                    (after.active.second != before.active.second)
+                        .then(|| (ms, after.active.second.wrapping_sub(before.active.second)))
+                })
+                .collect();
+            assert!(
+                steps.iter().all(|&(_, step)| step == 1)
+                    && steps
+                        .windows(2)
+                        .all(|pair| (500..1_500).contains(&(pair[1].0 - pair[0].0))),
+                "{step_ms} ms: {steps:?}"
+            );
+            let requalified: Vec<_> = timeline
+                .iter()
+                .filter(|(_, status)| {
+                    status.counter_edge == Some(step_ms as u32 * 1_000)
+                        && status.reference != ReferenceState::Upstream
+                })
+                .collect();
+            assert!(requalified.is_empty(), "{step_ms} ms: {requalified:?}");
+            assert_eq!(
+                (timeline[adopted].0, sync.status().active.second),
+                (3_000, label(23_000 + step_ms)),
+                "{step_ms} ms"
+            );
+        }
+    }
+
+    /// Pulses just before the bootstrapped boundaries take over the second
+    /// they are nearest to: one, closed by the switch itself.
+    #[test]
+    fn a_switch_onto_an_earlier_phase_closes_one_second() {
+        let mut sync = plain();
+        sync.wake(14_000, 14_000_000);
+        let steps: Vec<(u64, u32)> = (15..12_000u64)
+            .filter_map(|ms| {
+                let before = sync.status().active.second;
+                sync.wake((ms * 1_000 % PERIOD as u64) as u32, ms * 1_000_000);
+                if ms % 1_000 == 900 {
+                    sync.capture(900_000, ms * 1_000_000);
+                }
+                let second = sync.status().active.second;
+                (second != before).then(|| (ms, second.wrapping_sub(before)))
+            })
+            .collect();
+        assert!(
+            steps.iter().all(|&(_, step)| step == 1)
+                && steps
+                    .windows(2)
+                    .all(|pair| (500..1_500).contains(&(pair[1].0 - pair[0].0))),
+            "{steps:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(900_000));
+        assert_eq!(sync.status().pulse, PulseState::Locked);
+    }
+
+    /// A child labels its next edge from each announcement, so a switch that
+    /// closes no second announces none.
+    #[test]
+    fn a_hub_announces_each_second_once_across_a_switch() {
+        let mut sync = plain();
+        sync.wake(14_000, 14_000_000);
+        let announced: Vec<(u64, Announce)> = (15..12_000u64)
+            .flat_map(|ms| {
+                let now = ms * 1_000_000;
+                let polled = sync.wake((ms * 1_000 % PERIOD as u64) as u32, now);
+                let captured = match ms % 1_000 {
+                    295 => sync.capture(295_000, now),
+                    _ => Actions::NONE,
+                };
+                [polled, captured]
+                    .into_iter()
+                    .filter_map(move |actions| actions.announce.map(|announce| (ms, announce)))
+            })
+            .collect();
+        assert!(
+            announced.windows(2).all(|pair| {
+                let ((at, first), (next_at, next)) = (pair[0], pair[1]);
+                next.timeref.second == first.timeref.second + 1
+                    && next.pad.wrapping_sub(first.pad) & SEQUENCE_MASK == 1
+                    && (500..1_500).contains(&(next_at - at))
+            }),
+            "{announced:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(295_000));
+    }
+
+    #[test]
+    fn restart_rebases_the_anchor_without_a_generation_bump() {
+        let mut sync = plain();
+        for second in 0..5u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE + 10 * second as u32, now);
+        }
+        let status = sync.status();
+        assert_eq!(status.counter_edge, Some(EDGE));
+        assert!(status.phase_error_ns.unwrap() > 0.0);
+
+        sync.restart().unwrap();
+        let after = sync.status();
+        assert_eq!(after.counter_edge, Some(EDGE + 40));
+        assert_eq!(after.phase_error_ns, Some(0.0));
+        assert_eq!(after.generation, status.generation);
+        assert_eq!(after.correction_ppm, status.correction_ppm);
+    }
+
+    #[test]
+    fn a_board_with_no_actuator_never_reports_a_correction() {
+        let mut sync = plain();
+        run(&mut sync, 4);
+        assert_eq!(sync.status().correction_ppm, None);
+        assert!(sync.status().phase_error_ns.is_some());
+    }
+
+    #[test]
+    fn a_bootstrapped_root_advances_and_acquires_without_any_pps() {
+        let mut sync = plain();
+        assert_eq!(sync.status().pulse, PulseState::FreeRunning);
+
+        let bootstrapped = sync.bootstrap(100_000, 5_100_000_000);
+        assert!(bootstrapped.second);
+        assert_eq!(sync.status().divergences, 0);
+        assert_eq!(sync.status().counter_edge, Some(100_000));
+        assert_eq!(sync.status().active.second, 5);
+        assert_eq!(sync.status().generation, 1);
+        assert_eq!(bootstrapped.set_edge, Some(100_000));
+
+        sync.start().unwrap();
+        let mut started = false;
+        for second in 6..12u64 {
+            let actions = sync.poll(second * NANOS_PER_SECOND + 500_000_000);
+            assert!(actions.second);
+            assert_eq!(actions.set_edge, None);
+            assert_eq!(sync.status().pulse, PulseState::FreeRunning);
+            assert_eq!(sync.bootstrap(0, second * NANOS_PER_SECOND), Actions::NONE);
+            if let AcquisitionAction::Start(edge) = actions.local {
+                assert_eq!(edge.counter_edge, 100_000);
+                started = true;
+            }
+        }
+        assert!(started, "a free-running board never started");
+        assert_eq!(sync.status().active.second, 11);
+    }
+
+    /// Staging and target seconds can both fall inside one delayed poll. The
+    /// board must still be handed a plan before it is told to start it.
+    #[test]
+    fn a_catchup_that_spans_a_staged_start_re_arms_instead() {
+        let mut sync = plain();
+        sync.bootstrap(100_000, 5_100_000_000);
+        sync.start().unwrap();
+        assert_eq!(sync.status().acquisition, AcquisitionState::WaitingForEdge);
+
+        let actions = sync.poll(7_500_000_000);
+        assert!(actions.second);
+        let plan = match actions.local {
+            AcquisitionAction::Rearm(plan) => plan,
+            action => panic!("unexpected action: {action:?}"),
+        };
+        assert_eq!(sync.status().acquisition, AcquisitionState::Armed);
+
+        let started = sync.poll(8_500_000_000);
+        let AcquisitionAction::Start(target) = started.local else {
+            panic!("a start");
+        };
+        assert_eq!(target.reference, plan.target);
+        assert_eq!(target.counter_edge, plan.counter_edge);
+        assert_eq!(sync.status().acquisition, AcquisitionState::Starting);
+        sync.mark_running(plan.id).unwrap();
+        assert_eq!(sync.status().acquisition, AcquisitionState::Running);
+    }
+
+    #[test]
+    fn a_late_poll_reports_one_second_for_a_whole_catchup() {
+        let mut sync = plain();
+        sync.bootstrap(100_000, 5_100_000_000);
+
+        let actions = sync.poll(9_500_000_000);
+        assert!(actions.second);
+        assert_eq!(sync.status().pulse, PulseState::FreeRunning);
+        assert_eq!(sync.status().active.second, 9);
+    }
+
+    #[test]
+    fn a_board_can_sleep_until_the_explicit_deadline() {
+        let mut sync = plain();
+        assert_eq!(sync.next_poll_deadline_ns(), None);
+
+        sync.bootstrap(100_000, 5_100_000_000);
+        let deadline = 6_110_000_001;
+        assert_eq!(sync.next_poll_deadline_ns(), Some(deadline));
+        assert_eq!(sync.poll(deadline - 1), Actions::NONE);
+        assert!(sync.poll(deadline).second);
+        assert_eq!(
+            sync.next_poll_deadline_ns(),
+            Some(deadline + NANOS_PER_SECOND)
+        );
+    }
+
+    #[test]
+    fn an_unanchored_board_wakes_now_and_then_tracks_the_pulse_deadline() {
+        let mut sync = plain();
+
+        assert_eq!(sync.next_wake_deadline_ns(5_100_000_000), 5_100_000_000);
+        assert_eq!(sync.next_wake_deadline_ns(5_600_000_000), 5_600_000_000);
+
+        assert!(sync.wake(100_000, 5_600_000_000).second);
+        assert_eq!(sync.status().active.second, 6);
+        assert_eq!(sync.status().counter_edge, Some(100_000));
+        assert_eq!(
+            sync.next_wake_deadline_ns(5_600_000_000),
+            sync.next_poll_deadline_ns().unwrap()
+        );
+    }
+
+    /// Autostart is timed by counted second events, not by a second clock.
+    #[test]
+    fn autostart_zero_goes_idle_and_nonzero_starts_after_its_delay() {
+        let mut disabled = synchronizer();
+        run(&mut disabled, 1);
+        assert_eq!(disabled.status().acquisition, AcquisitionState::Idle);
+
+        let mut enabled = Synchronizer::new(
+            CounterDomain::new(PERIOD),
+            PulseConfig::DEFAULT,
+            local(),
+            None,
+            4,
+        );
+        run(&mut enabled, 4);
+        assert_eq!(enabled.status().acquisition, AcquisitionState::Autostart);
+
+        let now = 4 * NANOS_PER_SECOND;
+        enabled.poll(now);
+        enabled.capture(EDGE, now);
+        assert_eq!(
+            enabled.status().acquisition,
+            AcquisitionState::WaitingForEdge
+        );
+
+        let staged = (5..10u64).any(|second| {
+            let now = second * NANOS_PER_SECOND;
+            enabled.poll(now);
+            matches!(
+                enabled.capture(EDGE, now).local,
+                AcquisitionAction::Arm(_) | AcquisitionAction::Rearm(_)
+            )
+        });
+        assert!(staged, "autostart never staged an acquisition");
+    }
+
+    #[test]
+    fn local_bootstrap_replaces_an_unqualified_startup_edge() {
+        let mut sync = plain();
+
+        sync.capture(123, 5_500_000_000);
+        assert_eq!(sync.status().counter_edge, None);
+        assert_eq!(sync.next_wake_deadline_ns(5_500_000_000), 5_500_000_000);
+
+        let actions = sync.wake(500_000, 6_000_000_000);
+        assert!(actions.second);
+        assert_eq!(sync.status().divergences, 0);
+        assert_eq!(sync.status().counter_edge, Some(500_000));
+        assert_eq!(sync.status().active.second, 6);
+        assert_eq!(sync.next_poll_deadline_ns(), Some(7_010_000_001));
+    }
+
+    /// D4: a packet is paired with the second it labels by its arrival, and a
+    /// packet that missed that window labels nothing.
+    #[test]
+    fn a_packet_outside_its_seconds_window_is_dropped_and_counted() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+
+        sync.observe_packet(packet(500), 0, 3 * NANOS_PER_SECOND + 899_999_999);
+        assert_eq!(
+            sync.status().reference,
+            ReferenceState::Candidate { confirmations: 1 }
+        );
+        assert_eq!(sync.status().late_references, 0);
+
+        sync.observe_packet(packet(501), 0, 3 * NANOS_PER_SECOND + 900_000_000);
+        assert_eq!(sync.status().late_references, 1);
+        assert_eq!(
+            sync.status().reference,
+            ReferenceState::Candidate { confirmations: 1 }
+        );
+    }
+
+    /// A packet before the first second event has no window to fall in.
+    #[test]
+    fn a_packet_before_any_second_event_is_counted_late() {
+        let mut sync = synchronizer();
+        sync.observe_packet(packet(500), 0, 0);
+        assert_eq!(sync.status().late_references, 1);
+        assert_eq!(sync.status().reference, ReferenceState::Local);
+    }
+
+    /// D5: the sequence in the pad byte catches a slip that the arrival
+    /// window cannot, and wrapping at 64 is not one.
+    #[test]
+    fn a_sequence_that_skipped_discards_the_candidate() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+
+        for second in 3..5u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_packet(
+                packet(500 + second as u32),
+                pad(second as u8, TimeStatus::Locked),
+                now,
+            );
+        }
+        assert_eq!(
+            sync.status().reference,
+            ReferenceState::Candidate { confirmations: 2 }
+        );
+
+        let now = 5 * NANOS_PER_SECOND;
+        sync.poll(now);
+        sync.capture(EDGE, now);
+        sync.observe_packet(packet(505), pad(9, TimeStatus::Locked), now);
+        assert_eq!(sync.status().reference, ReferenceState::Local);
+        assert_eq!(sync.status().divergences, 1);
+        assert_eq!(sync.status().upstream, TimeStatus::Locked);
+    }
+
+    #[test]
+    fn a_sequence_wrapping_at_sixty_four_is_not_a_slip() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+
+        let mut sequence = 62u8;
+        for second in 3..7u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_packet(
+                packet(500 + second as u32),
+                pad(sequence, TimeStatus::Locked),
+                now,
+            );
+            sequence = sequence.wrapping_add(1);
+        }
+        assert_eq!(sync.status().reference, ReferenceState::Upstream);
+        assert_eq!(sync.status().divergences, 0);
+    }
+
+    /// A legacy hub sends no sequence, so there is nothing to check.
+    #[test]
+    fn a_legacy_hub_is_paired_by_its_arrival_alone() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+
+        for second in 3..7u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_packet(packet(500 + second as u32), pad(7, TimeStatus::Legacy), now);
+        }
+        assert_eq!(sync.status().reference, ReferenceState::Upstream);
+        assert_eq!(sync.status().divergences, 0);
+        assert_eq!(sync.status().upstream, TimeStatus::Legacy);
+    }
+
+    /// R7: a hub reboot restarts its sequence from zero, and that is not a
+    /// divergence because the source is a new one.
+    #[test]
+    fn a_new_source_starts_its_sequence_over() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        let now = 3 * NANOS_PER_SECOND;
+        sync.poll(now);
+        sync.capture(EDGE, now);
+        sync.observe_packet(packet(500), pad(40, TimeStatus::Locked), now);
+
+        let rebooted = Timeref {
+            session: SessionId::new(100),
+            ..packet(700)
+        };
+        let now = 4 * NANOS_PER_SECOND;
+        sync.poll(now);
+        sync.capture(EDGE, now);
+        sync.observe_packet(rebooted, pad(0, TimeStatus::Locked), now);
+        assert_eq!(sync.status().divergences, 0);
+        assert_eq!(
+            sync.status().reference,
+            ReferenceState::Candidate { confirmations: 1 }
+        );
+    }
+
+    /// D7: a child stays on its parent's timeline through any outage; only a
+    /// new session ever takes it off.
+    #[test]
+    fn a_child_keeps_its_parents_identity_through_a_thousand_missed_pulses() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        for second in 3..7u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_packet(packet(500 + second as u32), 0, now);
+        }
+        let adopted = sync.status();
+        assert_eq!(adopted.reference, ReferenceState::Upstream);
+
+        for second in 7..1007u64 {
+            sync.poll(second * NANOS_PER_SECOND + NANOS_PER_SECOND / 2);
+        }
+        let after = sync.status();
+        assert_eq!(after.reference, ReferenceState::Upstream);
+        assert_eq!(after.active.identity, adopted.active.identity);
+        assert_eq!(after.active.second, adopted.active.second + 1000);
+        assert_eq!(after.pulse, PulseState::Holdover { missed_pulses: 255 });
+        assert_eq!(after.announced, TimeStatus::Holdover);
+    }
+
+    /// D8: a synthetic bootstrap edge is not a train to hold over from, so a
+    /// device that never saw a pulse keeps announcing free-run.
+    #[test]
+    fn a_device_with_no_pulse_train_announces_free_run_forever() {
+        let mut sync = synchronizer();
+        assert_eq!(sync.status().announced, TimeStatus::FreeRun);
+
+        assert_eq!(sync.wake(EDGE, 0).set_edge, Some(EDGE));
+        let bootstrapped = sync.status().active.second;
+        for second in 1..200u64 {
+            sync.poll(second * NANOS_PER_SECOND + NANOS_PER_SECOND / 2);
+        }
+        assert_eq!(sync.status().pulse, PulseState::FreeRunning);
+        assert_eq!(sync.status().announced, TimeStatus::FreeRun);
+        assert_eq!(sync.status().active.second, bootstrapped + 199);
+    }
+
+    /// D8: an established train that goes away is what holdover means, and the
+    /// change is reported once so the runtime can roll its segments over.
+    #[test]
+    fn a_train_that_goes_silent_announces_holdover_and_says_so_once() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+        assert_eq!(sync.status().announced, TimeStatus::Locked);
+
+        let lost = (4..8u64)
+            .map(|second| sync.poll(second * NANOS_PER_SECOND + NANOS_PER_SECOND / 2))
+            .find_map(|actions| actions.status_changed)
+            .expect("holdover is a status change");
+        assert_eq!(lost.announced, TimeStatus::Holdover);
+        assert_eq!(lost.pulse, PulseState::Holdover { missed_pulses: 1 });
+        assert!((8..12u64).all(|second| sync
+            .poll(second * NANOS_PER_SECOND)
+            .status_changed
+            .is_none()));
+    }
+
+    /// D8: pulses that come back are not a reference until they qualify, so a
+    /// train that lapsed is held over until it locks again.
+    #[test]
+    fn a_re_acquiring_train_stays_in_holdover_until_it_locks() {
+        let mut sync = synchronizer();
+        run(&mut sync, 4);
+        sync.poll(4 * NANOS_PER_SECOND + NANOS_PER_SECOND / 2);
+        assert_eq!(sync.status().announced, TimeStatus::Holdover);
+
+        for second in 5..7u64 {
+            sync.capture(EDGE, second * NANOS_PER_SECOND);
+            assert_eq!(
+                sync.status().pulse,
+                PulseState::Acquiring {
+                    good_pulses: second as u8 - 4
+                }
+            );
+            assert_eq!(sync.status().announced, TimeStatus::Holdover);
+        }
+
+        sync.capture(EDGE, 7 * NANOS_PER_SECOND);
+        assert_eq!(sync.status().announced, TimeStatus::Locked);
+    }
+
+    /// D8: a first acquisition has no qualified train behind it, so it is
+    /// free-running until its own pulses lock.
+    #[test]
+    fn a_first_acquisition_announces_free_run_until_it_locks() {
+        let mut sync = synchronizer();
+        for second in 0..2u64 {
+            sync.capture(EDGE, second * NANOS_PER_SECOND);
+            assert_eq!(sync.status().announced, TimeStatus::FreeRun);
+        }
+        sync.capture(EDGE, 2 * NANOS_PER_SECOND);
+        assert_eq!(sync.status().announced, TimeStatus::Locked);
+    }
+
+    /// D8: a child following its parent's pulses is no better than the parent
+    /// says its own seconds are.
+    #[test]
+    fn a_child_announces_the_poorer_of_its_pulses_and_its_parent() {
+        let child_of = |upstream| {
+            let mut sync = synchronizer();
+            run(&mut sync, 3);
+            for second in 3..7u64 {
+                let now = second * NANOS_PER_SECOND;
+                sync.poll(now);
+                sync.capture(EDGE, now);
+                sync.observe_packet(
+                    packet(500 + second as u32),
+                    pad(second as u8, upstream),
+                    now,
+                );
+            }
+            assert_eq!(sync.status().pulse, PulseState::Locked);
+            sync.status().announced
+        };
+        assert_eq!(child_of(TimeStatus::FreeRun), TimeStatus::FreeRun);
+        assert_eq!(child_of(TimeStatus::Holdover), TimeStatus::Holdover);
+        assert_eq!(child_of(TimeStatus::Locked), TimeStatus::Locked);
+    }
+
+    /// Every poll a runtime makes up to `until`, each as its deadline comes due.
+    fn wake_until(sync: &mut Synchronizer, until: u64) -> Vec<Actions> {
+        core::iter::from_fn(|| {
+            sync.next_poll_deadline_ns()
+                .filter(|&deadline| deadline <= until)
+                .map(|deadline| sync.poll(deadline))
+        })
+        .collect()
+    }
+
+    /// A child acquiring from a locked parent that reboots at second 12: three
+    /// silent seconds, `free_run` at another phase whose last two already
+    /// announce its lock, then its pulses at `returned`. Returns the child and
+    /// each acquisition action it took from the reboot on, by second and the
+    /// status its parent sent then.
+    fn parent_reboot(
+        free_run: u32,
+        returned: u32,
+    ) -> (
+        Synchronizer,
+        Vec<(u32, Option<TimeStatus>, AcquisitionAction)>,
+    ) {
+        let booted = |time| Timeref {
+            epoch: Epoch::SYSTIME,
+            session: SessionId::new(100),
+            ..packet(time)
+        };
+        let relocked = |time| Timeref {
+            session: SessionId::new(100),
+            ..packet(time)
+        };
+        let booting = |time| match time + 2 < free_run {
+            true => TimeStatus::FreeRun,
+            false => TimeStatus::Locked,
+        };
+        let schedule = (0..12)
+            .map(|time| Some((EDGE, packet(500 + time), TimeStatus::Locked)))
+            .chain((0..3).map(|_| None))
+            .chain((0..free_run).map(|time| Some((PERIOD * 2 / 5, booted(time), booting(time)))))
+            .chain(
+                (0..20).map(|time| {
+                    Some((returned, relocked(1_700_000_000 + time), TimeStatus::Locked))
+                }),
+            );
+
+        let mut sync = plain();
+        sync.start().unwrap();
+        let mut plan = 0;
+        let mut taken = Vec::new();
+        for (second, sent) in (0u32..).zip(schedule) {
+            let now = second as u64 * NANOS_PER_SECOND;
+            let mut actions = Vec::new();
+            if let Some((edge, timeref, status)) = sent {
+                let at = now + edge as u64 * 1_000;
+                actions.extend(wake_until(&mut sync, at));
+                actions.push(sync.capture(edge, at));
+                actions.extend(wake_until(&mut sync, at + 1_000_000));
+                sync.observe_packet(timeref, pad(second as u8, status), at + 1_000_000);
+            }
+            actions.extend(wake_until(&mut sync, now + NANOS_PER_SECOND - 1));
+            for action in actions.into_iter().map(|actions| actions.local) {
+                match action {
+                    AcquisitionAction::None => continue,
+                    AcquisitionAction::Arm(staged) | AcquisitionAction::Rearm(staged) => {
+                        plan = staged.id
+                    }
+                    AcquisitionAction::Start(_) => sync.mark_running(plan).unwrap(),
+                    AcquisitionAction::Stop => sync.finish_stop().unwrap(),
+                    AcquisitionAction::Disarm | AcquisitionAction::Relabel { .. } => {}
+                }
+                if second >= 12 {
+                    taken.push((second, sent.map(|(_, _, status)| status), action));
+                }
+            }
+        }
+        assert_eq!(sync.status().acquisition, AcquisitionState::Running);
+        (sync, taken)
+    }
+
+    /// A free-running parent is held over, and its pulses returning inside
+    /// the prediction resume the old anchor, so the segment only takes the new label.
+    #[test]
+    fn a_child_holds_over_a_rebooting_parent_and_resumes_its_returning_pulses() {
+        let (sync, taken) = parent_reboot(6, EDGE + 2);
+        assert!(
+            matches!(
+                taken[..],
+                [] | [(
+                    _,
+                    Some(TimeStatus::Locked),
+                    AcquisitionAction::Relabel { .. }
+                )]
+            ),
+            "{taken:?}"
+        );
+        let status = sync.status();
+        assert_eq!(status.counter_edge, Some(EDGE));
+        assert_eq!(status.generation, 1);
+        assert_eq!(status.active.identity.session, SessionId::new(100));
+        assert_eq!(status.announced, TimeStatus::Locked);
+    }
+
+    /// Pulses returning outside tolerance are a real discontinuity, followed
+    /// once the parent is locked again.
+    #[test]
+    fn a_child_restarts_once_on_a_relocked_parents_moved_pulses() {
+        let (sync, taken) = parent_reboot(6, EDGE + 300);
+        let restarts: Vec<_> = taken
+            .iter()
+            .filter(|(_, _, action)| *action == AcquisitionAction::Stop)
+            .collect();
+        assert!(
+            matches!(restarts[..], [(second, Some(TimeStatus::Locked), _)] if *second >= 21),
+            "{taken:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(EDGE + 300));
+        assert_eq!(sync.status().generation, 2);
+    }
+
+    /// A parent that stays free-running is followed once the holdover times out.
+    #[test]
+    fn a_child_follows_a_parent_free_running_past_the_holdover_timeout() {
+        let (sync, taken) = parent_reboot(90, PERIOD * 2 / 5);
+        let restarts: Vec<_> = taken
+            .iter()
+            .filter(|(_, _, action)| *action == AcquisitionAction::Stop)
+            .collect();
+        assert!(
+            matches!(
+                restarts[..],
+                [(second, Some(TimeStatus::FreeRun), _)] if *second > 11 + HOLDOVER_TIMEOUT as u32
+            ),
+            "{taken:?}"
+        );
+        assert_eq!(sync.status().counter_edge, Some(PERIOD * 2 / 5));
+    }
+
+    /// A GPS label names the PPS edge after it, whatever phase the free-running timebase booted at.
+    #[test]
+    fn a_gps_second_is_adopted_on_the_edge_it_names_from_any_boot_phase() {
+        const UNIX: u32 = 1_700_000_000;
+        const LABEL_LATENCY_NS: u64 = 300_000_000;
+        const STEP_NS: u64 = 10_000_000;
+
+        fn first_wrong_adoption(boot_ns: u64) -> Option<(u64, i64)> {
+            let mut sync = synchronizer();
+            sync.wake(EDGE + (boot_ns / 1_000) as u32, boot_ns);
+            (boot_ns / STEP_NS + 1..40 * NANOS_PER_SECOND / STEP_NS)
+                .map(|step| step * STEP_NS)
+                .find_map(|now| {
+                    sync.poll(now);
+                    let (second, phase) = (now / NANOS_PER_SECOND, now % NANOS_PER_SECOND);
+                    match phase {
+                        0 => drop(sync.capture(EDGE, now)),
+                        LABEL_LATENCY_NS => sync.observe_local(UNIX + second as u32, Epoch::UNIX),
+                        _ => {}
+                    }
+                    let status = sync.status();
+                    (phase == 0 && status.reference == ReferenceState::Upstream)
+                        .then(|| status.active.second as i64 - (UNIX as u64 + second) as i64)
+                        .filter(|&error| error != 0)
+                        .map(|error| (second, error))
+                })
+        }
+
+        let wrong: Vec<(u64, (u64, i64))> = (1..10u64)
+            .map(|tenth| tenth * 100_000_000)
+            .filter_map(|boot_ns| first_wrong_adoption(boot_ns).map(|wrong| (boot_ns, wrong)))
+            .collect();
+        assert!(wrong.is_empty(), "boot ns -> (second, error s): {wrong:?}");
+    }
+
+    /// D6: a GPS second qualifies like a packet, and its pad byte then carries
+    /// the poorer of the two statuses down the chain.
+    #[test]
+    fn a_hub_announces_the_poorer_of_its_own_status_and_upstreams() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        for second in 3..7u64 {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            sync.capture(EDGE, now);
+            sync.observe_local(1_700_000_000 + second as u32, Epoch::UNIX);
+        }
+        let now = 7 * NANOS_PER_SECOND;
+        sync.poll(now);
+        let announced = sync
+            .capture(EDGE, now)
+            .announce
+            .expect("an anchored device announces every second");
+        assert_eq!(sync.status().reference, ReferenceState::Upstream);
+        assert_eq!(announced.timeref.second, 1_700_000_007);
+        assert_eq!(TimeStatus::from_pad(announced.pad), TimeStatus::Locked);
+        assert_eq!(announced.pad & SEQUENCE_MASK, 8);
+
+        sync.observe_packet(packet(1_700_000_007), pad(1, TimeStatus::Holdover), now);
+        let now = 8 * NANOS_PER_SECOND;
+        sync.poll(now);
+        let announced = sync.capture(EDGE, now).announce.expect("an announcement");
+        assert_eq!(TimeStatus::from_pad(announced.pad), TimeStatus::Holdover);
+    }
+
+    #[test]
+    fn a_status_worse_than_holdover_wins_and_legacy_defers() {
+        assert_eq!(
+            TimeStatus::Locked.worse(TimeStatus::Holdover),
+            TimeStatus::Holdover
+        );
+        assert_eq!(
+            TimeStatus::Holdover.worse(TimeStatus::FreeRun),
+            TimeStatus::FreeRun
+        );
+        assert_eq!(
+            TimeStatus::Locked.worse(TimeStatus::Legacy),
+            TimeStatus::Locked
+        );
+        assert_eq!(
+            TimeStatus::from_pad(TimeStatus::Holdover.bits() | 5),
+            TimeStatus::Holdover
+        );
+    }
+
+    /// A hub of a set: `index` names its session and serial, and all of them
+    /// boot on the same instant from the same oscillator.
+    fn hub(index: u8) -> Synchronizer {
+        Synchronizer::new(
+            CounterDomain::new(PERIOD),
+            PulseConfig::DEFAULT,
+            Reference {
+                identity: ReferenceIdentity::new(
+                    Epoch::SYSTIME,
+                    SessionId::new(index.into()),
+                    &[b'h', b'0' + index],
+                ),
+                second: 10,
+                clock: Clock::root(TimeSource::InternalOscillator),
+            },
+            None,
+            0,
+        )
+    }
+
+    /// One second on a shared pulse, after which each hub hears the SYNC packet
+    /// of its `upstream`, as it travels the wire.
+    fn tick(hubs: &mut [Synchronizer], upstream: impl Fn(usize) -> Option<usize>, second: u64) {
+        let now = second * NANOS_PER_SECOND;
+        let announced: Vec<Option<Announce>> = hubs
+            .iter_mut()
+            .map(|hub| {
+                hub.poll(now);
+                hub.capture(EDGE, now).announce
+            })
+            .collect();
+        for (index, hub) in hubs.iter_mut().enumerate() {
+            let Some(announce) = upstream(index).and_then(|up| announced[up]) else {
+                continue;
+            };
+            let mut buf = [0u8; 64];
+            let len = announce
+                .timeref
+                .timeref()
+                .write_with_pad(&mut buf, announce.pad)
+                .unwrap();
+            let payload = &buf[twinleaf_proto::packet::Header::SIZE..len];
+            hub.observe_packet(
+                Timeref::parse(payload).unwrap(),
+                Timeref::pad(payload),
+                now + 1_000_000,
+            );
+        }
+    }
+
+    /// Each hub's source serial and steps from it.
+    fn roots(hubs: &[Synchronizer]) -> Vec<(Vec<u8>, u8)> {
+        hubs.iter()
+            .map(|hub| hub.status().active)
+            .map(|active| {
+                (
+                    active.identity.serial.as_bytes().to_vec(),
+                    active.clock.steps_removed,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_chain_of_hubs_counts_the_steps_from_its_root() {
+        let mut hubs: Vec<Synchronizer> = (0..5).map(hub).collect();
+        hubs[0].set_time_source(TimeSource::Gnss);
+        (0..40).for_each(|second| tick(&mut hubs, |index| index.checked_sub(1), second));
+        assert_eq!(
+            roots(&hubs),
+            (0..5)
+                .map(|steps| (b"h0".to_vec(), steps))
+                .collect::<Vec<_>>()
+        );
+        assert!(hubs
+            .iter()
+            .all(|hub| hub.status().active.clock.time_source == TimeSource::Gnss));
+        assert!(hubs.iter().all(|hub| hub.status().refused_references == 0));
+    }
+
+    /// Three hubs, each following the next around a ring with nothing above
+    /// it, start out as three roots and settle on one.
+    #[test]
+    fn a_ring_of_hubs_with_no_root_settles_on_exactly_one() {
+        let mut hubs: Vec<Synchronizer> = (0..3).map(hub).collect();
+        let upstream = |index: usize| Some((index + 2) % 3);
+        (0..60).for_each(|second| tick(&mut hubs, upstream, second));
+        let settled = roots(&hubs);
+        let root = settled.iter().position(|&(_, steps)| steps == 0).unwrap();
+        assert_eq!(
+            settled,
+            (0..3)
+                .map(|steps| (settled[root].0.clone(), steps as u8))
+                .cycle()
+                .skip(3 - root)
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(settled[root].0, [b'h', b'0' + root as u8]);
+        (60..180).for_each(|second| {
+            tick(&mut hubs, upstream, second);
+            assert_eq!(roots(&hubs), settled);
+        });
+        assert!(hubs[root].status().refused_references >= 120);
+    }
+
+    /// Sandi's TIM5 rate, from its board crate.
+    const SANDI_HZ: u32 = 147_456_000;
+
+    /// A counter clocked by an oscillator whose own frequency through each true
+    /// second is `own_ppm`'s, its last holding after, fast of true seconds.
+    /// Each correction the servo returns is rounded to `step_ppm`, if any, and
+    /// takes effect `latency_ns` later.
+    #[derive(Clone)]
+    struct Oscillator {
+        own_ppm: std::rc::Rc<[f64]>,
+        step_ppm: f64,
+        latency_ns: u64,
+        pending: Vec<(u64, f64)>,
+        correction_ppm: f64,
+        at_ns: u64,
+        ticks: f64,
+    }
+
+    impl Oscillator {
+        /// One `offset_ppm` fast, taking each correction exactly and at once.
+        fn offset(offset_ppm: f64) -> Self {
+            Self::drifting(vec![offset_ppm], 0.0, 0)
+        }
+
+        fn drifting(own_ppm: Vec<f64>, step_ppm: f64, latency_ns: u64) -> Self {
+            Self {
+                own_ppm: own_ppm.into(),
+                step_ppm,
+                latency_ns,
+                pending: Vec::new(),
+                correction_ppm: 0.0,
+                at_ns: 0,
+                ticks: 0.0,
+            }
+        }
+
+        /// Its frequency from true seconds now, ppm.
+        fn ppm(&self) -> f64 {
+            let second = (self.at_ns / NANOS_PER_SECOND) as usize;
+            self.own_ppm[second.min(self.own_ppm.len() - 1)] + self.correction_ppm
+        }
+
+        /// Ticks counted by `ns`, which never goes backwards.
+        fn ticks_at(&mut self, ns: u64) -> f64 {
+            loop {
+                if let Some(&(_, ppm)) = self.pending.first().filter(|&&(at, _)| at <= self.at_ns) {
+                    self.correction_ppm = ppm;
+                    self.pending.remove(0);
+                    continue;
+                }
+                if self.at_ns >= ns {
+                    return self.ticks;
+                }
+                let until = self
+                    .pending
+                    .first()
+                    .map_or(ns, |&(at, _)| at.min(ns))
+                    .min((self.at_ns / NANOS_PER_SECOND + 1) * NANOS_PER_SECOND);
+                self.ticks = (self.ticks
+                    + SANDI_HZ as f64
+                        * (1.0 + self.ppm() * 1e-6)
+                        * (until - self.at_ns) as f64
+                        * 1e-9)
+                    % SANDI_HZ as f64;
+                self.at_ns = until;
+            }
+        }
+
+        fn counter(&mut self, ns: u64) -> u32 {
+            (self.ticks_at(ns) as u64 % SANDI_HZ as u64) as u32
+        }
+
+        fn steer(&mut self, ns: u64, actions: Actions) {
+            self.ticks_at(ns);
+            if let Some(ppm) = actions.correction_ppm.map(f64::from) {
+                let ppm = if self.step_ppm > 0.0 {
+                    (ppm / self.step_ppm).round() * self.step_ppm
+                } else {
+                    ppm
+                };
+                self.pending.push((ns + self.latency_ns, ppm));
+            }
+        }
+    }
+
+    /// Sandi's synchronizer, booted at 0 ns and fed a PPS at 300 ms past each
+    /// true second with `jitter_ns` RMS of Gaussian jitter, polled at every
+    /// deadline as `twinleaf_embassy::sync::run` does. One status per second;
+    /// `SYNC_TRACE=1` prints them.
+    fn sandi_following(offset_ppm: f64, jitter_ns: f64, seconds: u64) -> Vec<Status> {
+        sandi_under(offset_ppm, seconds, |_, rng| {
+            Some(rng.gaussian() * jitter_ns)
+        })
+    }
+
+    /// [`sandi_following`] a PPS whose edge in each second is `pps`'s offset
+    /// from 300 ms past it, or absent.
+    fn sandi_under(
+        offset_ppm: f64,
+        seconds: u64,
+        pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
+    ) -> Vec<Status> {
+        sandi_on(Oscillator::offset(offset_ppm), seconds, pps)
+            .map(|second| second.status)
+            .collect()
+    }
+
+    /// One true second of [`sandi_on`]: the status after it, how far the
+    /// counter was past its anchor at the true second, ns, and how far the
+    /// oscillator was off true frequency then, ppb.
+    struct Second {
+        status: Status,
+        time_error_ns: Option<f64>,
+        frequency_error_ppb: f64,
+    }
+
+    /// [`sandi_under`] on `oscillator`, one second at a time.
+    fn sandi_on(
+        mut oscillator: Oscillator,
+        seconds: u64,
+        mut pps: impl FnMut(u64, &mut pulse::tests::scenarios::Rng) -> Option<f64>,
+    ) -> impl Iterator<Item = Second> {
+        let mut sync = Synchronizer::new(
+            CounterDomain::new(SANDI_HZ),
+            PulseConfig::DEFAULT,
+            local(),
+            Some(discipline_tests::steering(50.0)),
+            0,
+        );
+        let mut rng = pulse::tests::scenarios::Rng::new(7);
+        let actions = sync.wake(oscillator.counter(0), 0);
+        oscillator.steer(0, actions);
+        let trace = std::env::var_os("SYNC_TRACE").is_some();
+        (1..=seconds).map(move |second| {
+                let true_ns = second * NANOS_PER_SECOND + 300_000_000;
+                let mut at_true = oscillator.clone();
+                let true_ticks = at_true.ticks_at(true_ns);
+                let offset_ns = pps(second, &mut rng);
+                let edge_ns = true_ns.saturating_add_signed(offset_ns.unwrap_or(0.0) as i64);
+                while let Some(deadline) = sync.next_poll_deadline_ns().filter(|&d| d <= edge_ns) {
+                    let actions = sync.poll(deadline);
+                    oscillator.steer(deadline, actions);
+                }
+                if offset_ns.is_some() {
+                    let actions = sync.capture(oscillator.counter(edge_ns), edge_ns);
+                    oscillator.steer(edge_ns, actions);
+                }
+                let status = sync.status();
+                if trace {
+                    println!(
+                        "{second:4} {:?} {:?} edge {:?} spurs {} phase {:?} ns pull {:?} ppm saturated {}",
+                        status.pulse,
+                        status.reference,
+                        status.counter_edge,
+                        status.spurs,
+                        status.phase_error_ns,
+                        status.correction_ppm,
+                        status.correction_saturated
+                    );
+                }
+                let period = SANDI_HZ as f64;
+                Second {
+                    status,
+                    time_error_ns: status.counter_edge.map(|edge| {
+                        ((true_ticks - edge as f64 + period / 2.0).rem_euclid(period) - period / 2.0)
+                            * 1e9
+                            / period
+                    }),
+                    frequency_error_ppb: at_true.ppm() * 1e3,
+                }
+            })
+    }
+
+    /// A PPS on frequency but jittering 3 µs RMS is followed: it locks within
+    /// a minute and stays locked, few of its edges are called spurs, and the
+    /// measured phase stays within a couple of jitters.
+    #[test]
+    fn a_pps_on_frequency_with_microseconds_of_jitter_locks_and_stays_locked() {
+        const JITTER_NS: f64 = 3_000.0;
+        let trace = sandi_following(0.0, JITTER_NS, 600);
+        let first_lock = trace.iter().position(|status| status.pulse.is_locked());
+        let followed = &trace[60..];
+        let locked = followed
+            .iter()
+            .filter(|status| status.pulse.is_locked())
+            .count();
+        let phases: Vec<f64> = followed
+            .iter()
+            .filter_map(|status| status.phase_error_ns.map(f64::from))
+            .collect();
+        let rms = (phases.iter().map(|ns| ns * ns).sum::<f64>() / phases.len() as f64).sqrt();
+        let spurs = trace[trace.len() - 1].spurs;
+        assert!(
+            first_lock.is_some_and(|second| second < 60)
+                && locked * 10 >= followed.len() * 9
+                && spurs * 10 <= trace.len() as u32
+                && rms <= 2.0 * JITTER_NS,
+            "first lock {first_lock:?} s, locked {locked}/{} s after a minute, \
+             {spurs} spurs in {} edges, phase {rms:.0} ns RMS over {} measured seconds",
+            followed.len(),
+            trace.len(),
+            phases.len()
+        );
+    }
+
+    /// A clean PPS 43 ppm slow of the oscillator, inside Sandi's ±50 ppm pull,
+    /// is locked and steered out within a minute, and stays locked.
+    #[test]
+    fn a_clean_pps_forty_three_ppm_off_the_oscillator_is_pulled_in_within_a_minute() {
+        let trace = sandi_following(43.0, 30.0, 120);
+        let pulled = trace[59..].iter().all(|status| {
+            status.pulse.is_locked()
+                && status
+                    .correction_ppm
+                    .is_some_and(|ppm| (ppm + 43.0).abs() < 1.0)
+        });
+        let last = trace[trace.len() - 1];
+        assert!(
+            pulled,
+            "at 60 s: {:?}, {} spurs, pull {:?} ppm; at 120 s: {:?}, {} spurs, pull {:?} ppm",
+            trace[59].pulse,
+            trace[59].spurs,
+            trace[59].correction_ppm,
+            last.pulse,
+            last.spurs,
+            last.correction_ppm
+        );
+    }
+
+    /// RMS of the phase measured over `trace`, and the seconds it was measured.
+    fn phase_rms(trace: &[Status]) -> (f64, usize) {
+        let phases: Vec<f64> = trace
+            .iter()
+            .filter_map(|status| status.phase_error_ns.map(f64::from))
+            .collect();
+        let rms = (phases.iter().map(|ns| ns * ns).sum::<f64>() / phases.len() as f64).sqrt();
+        (rms, phases.len())
+    }
+
+    /// A GPS-grade PPS, on frequency with 20 ns of jitter, locks by its fifth
+    /// second and is held to 20.6 ns RMS, as the fixed ±1 µs gate did.
+    #[test]
+    fn a_gps_pps_locks_as_fast_and_as_tightly_as_a_fixed_gate_did() {
+        let trace = sandi_following(0.0, 20.0, 300);
+        let first_lock = trace.iter().position(|status| status.pulse.is_locked());
+        let (rms, measured) = phase_rms(&trace[60..]);
+        assert!(
+            first_lock.is_some_and(|second| second <= 5)
+                && trace[60..].iter().all(|status| status.pulse.is_locked())
+                && measured == 240
+                && rms <= 20.6,
+            "first lock {first_lock:?} s, phase {rms:.1} ns RMS over {measured} measured seconds"
+        );
+    }
+
+    /// One edge in a hundred 50 µs off a GPS-grade PPS is a spur: each is
+    /// counted, and none unlocks the train or disturbs its phase.
+    #[test]
+    fn sparse_large_outliers_are_counted_spurs_that_never_unlock() {
+        let outlier = |second: u64| second % 100 == 50;
+        let trace = sandi_under(0.0, 600, |second, rng| {
+            Some(match (outlier(second), second % 200 < 100) {
+                (true, true) => 50_000.0,
+                (true, false) => -50_000.0,
+                (false, true | false) => rng.gaussian() * 20.0,
+            })
+        });
+        let outliers = (61..=600).filter(|&second| outlier(second)).count() as u32;
+        let spurs = trace[599].spurs - trace[59].spurs;
+        let (rms, _) = phase_rms(&trace[60..]);
+        assert!(
+            trace[60..].iter().all(|status| status.pulse.is_locked())
+                && spurs == outliers
+                && rms <= 25.0,
+            "{spurs} spurs for {outliers} outliers, phase {rms:.1} ns RMS"
+        );
+    }
+
+    /// A PPS that steps 100 µs, far outside its prediction, is a new train:
+    /// its edges are spurs until a consistent run of them takes over within
+    /// a few seconds, with the anchor moved onto it.
+    #[test]
+    fn a_phase_step_is_followed_after_a_consistent_run_of_the_new_train() {
+        let trace = sandi_under(0.0, 200, |second, rng| {
+            Some(rng.gaussian() * 20.0 + if second > 100 { 100_000.0 } else { 0.0 })
+        });
+        let (before, after) = (trace[99], trace[199]);
+        let moved = after
+            .counter_edge
+            .zip(before.counter_edge)
+            .map(|(after, before)| CounterDomain::new(SANDI_HZ).signed_delta(after, before));
+        let spurs = after.spurs - before.spurs;
+        assert!(
+            trace[110..].iter().all(|status| status.pulse.is_locked())
+                && moved.is_some_and(|ticks| (ticks - 14_746).abs() <= 20)
+                && after.generation > before.generation
+                && spurs <= 5,
+            "anchor moved {moved:?} ticks, {spurs} spurs, at 110 s {:?}",
+            trace[110].pulse
+        );
+    }
+
+    /// A PPS 20 ppm off the oscillator that goes away for 30 s is held over at
+    /// the frequency it was steered to, and its returning edges, inside the
+    /// widened prediction, resume the train on its old anchor.
+    #[test]
+    fn thirty_missed_pulses_hold_the_frequency_and_resume_the_train() {
+        let trace = sandi_under(20.0, 180, |second, rng| {
+            (!(91..=120).contains(&second)).then(|| rng.gaussian() * 20.0)
+        });
+        let before = trace[89];
+        let held = before
+            .correction_ppm
+            .is_some_and(|ppm| (ppm + 20.0).abs() < 0.01)
+            && trace[92..119].iter().all(|status| {
+                matches!(status.pulse, PulseState::Holdover { .. })
+                    && status
+                        .correction_ppm
+                        .is_some_and(|ppm| (ppm + 20.0).abs() < 0.01)
+            });
+        let resumed = trace[125..].iter().all(|status| {
+            status.pulse.is_locked()
+                && (status.counter_edge, status.generation)
+                    == (before.counter_edge, before.generation)
+        });
+        let (rms, _) = phase_rms(&trace[125..]);
+        assert!(
+            held && resumed && rms <= 30.0,
+            "at 90 s {:?} pull {:?}; at 110 s {:?} pull {:?}; at 130 s {:?}; phase {rms:.1} ns RMS",
+            before.pulse,
+            before.correction_ppm,
+            trace[109].pulse,
+            trace[109].correction_ppm,
+            trace[129].pulse
+        );
+    }
+
+    /// The estimated time error grows through a 30 s outage as the covariance
+    /// does, and shrinks back once the pulses return.
+    #[test]
+    fn the_estimated_time_error_grows_in_holdover_and_shrinks_on_reacquisition() {
+        let trace = sandi_under(20.0, 180, |second, rng| {
+            (!(91..=120).contains(&second)).then(|| rng.gaussian() * 20.0)
+        });
+        let error = |second: usize| trace[second].time_error_ns.unwrap();
+        let held: Vec<u64> = (90..120).map(error).collect();
+        assert!(
+            held.windows(2).all(|pair| pair[0] < pair[1])
+                && error(179) * 4 < error(119)
+                && error(179) <= 2 * error(89),
+            "locked {} ns, held {held:?} ns, reacquired {} ns",
+            error(89),
+            error(179)
+        );
+    }
+
+    /// The SiT5356's tuning step on its ±50 ppm range: one part in 2^25.
+    const SIT5356_STEP_PPM: f64 = 50.0 / (1u64 << 25) as f64;
+
+    /// An hour of own frequency, ppm, from `offset_ppm`: steady, ramping as a
+    /// warming board does, cycling as an HVAC does, or random-walking as a
+    /// TCXO does and as one ten times worse in Allan deviation.
+    fn drifts(offset_ppm: f64) -> [(&'static str, Vec<f64>); 7] {
+        let ramp = |ppm_per_minute: f64| {
+            (0..3600)
+                .map(|second| offset_ppm + ppm_per_minute * second as f64 / 60.0)
+                .collect()
+        };
+        let walk = |ppb_per_root_second: f64| {
+            let mut rng = pulse::tests::scenarios::Rng::new(11);
+            (0..3600)
+                .scan(offset_ppm, |ppm, _| {
+                    *ppm += rng.gaussian() * ppb_per_root_second * 1e-3;
+                    Some(*ppm)
+                })
+                .collect()
+        };
+        [
+            ("steady", vec![offset_ppm]),
+            ("ramp 0.01 ppm/min", ramp(0.01)),
+            ("ramp 0.05 ppm/min", ramp(0.05)),
+            ("ramp 0.2 ppm/min", ramp(0.2)),
+            (
+                "cycle ±0.5 ppm/20 min",
+                (0..3600)
+                    .map(|second| {
+                        offset_ppm + 0.5 * (core::f64::consts::TAU * second as f64 / 1200.0).sin()
+                    })
+                    .collect(),
+            ),
+            ("walk tcxo", walk(0.1)),
+            ("walk 10x tcxo", walk(1.0)),
+        ]
+    }
+
+    /// Root mean square of `values`.
+    fn rms(values: impl Iterator<Item = f64>) -> f64 {
+        let (sum, count) = values.fold((0.0, 0), |(sum, count), v| (sum + v * v, count + 1));
+        (sum / count as f64).sqrt()
+    }
+
+    /// The second hour of `drift` under a PPS jittering `jitter_ns`, on a
+    /// SiT5356 taking each correction 5 ms late: whether it stayed locked,
+    /// and its RMS and largest time error against true seconds.
+    fn drifting(drift: usize, jitter_ns: f64) -> (bool, f64, f64) {
+        let own_ppm = drifts(0.5)[drift].1.clone();
+        let trace: Vec<Second> = sandi_on(
+            Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, 5_000_000),
+            3600,
+            |_, rng| Some(rng.gaussian() * jitter_ns),
+        )
+        .collect();
+        let errors = || {
+            trace[600..]
+                .iter()
+                .filter_map(|second| second.time_error_ns)
+        };
+        (
+            trace[600..]
+                .iter()
+                .all(|second| second.status.pulse.is_locked()),
+            rms(errors()),
+            errors().fold(0.0, |max: f64, ns| max.max(ns.abs())),
+        )
+    }
+
+    /// A GPS PPS on an oscillator warming 0.2 ppm a minute is held as tightly
+    /// as on a steady one: the drift is a state of the tracker, not a lag.
+    #[test]
+    fn a_warming_oscillator_is_held_to_a_gps_pps_as_tightly_as_a_steady_one() {
+        let (steady, warming) = (drifting(0, 20.0), drifting(3, 20.0));
+        assert!(
+            steady.0 && warming.0 && warming.1 <= 1.1 * steady.1 && warming.1 <= 8.0,
+            "steady {steady:?}, warming {warming:?}: locked, RMS and max ns"
+        );
+    }
+
+    /// An HVAC cycle of ±0.5 ppm every 20 minutes under a 1 µs PPS stays
+    /// locked and within a couple of microseconds, where a tracker blind to
+    /// its own lag would grow its noise estimate and drift off by milliseconds.
+    #[test]
+    fn an_hvac_cycle_under_a_microsecond_pps_is_followed_within_microseconds() {
+        let (locked, rms, max) = drifting(4, 1_000.0);
+        assert!(
+            locked && rms <= 1_000.0 && max <= 3_000.0,
+            "locked {locked}, {rms:.0} ns RMS, {max:.0} ns max"
+        );
+    }
+
+    /// Thirty days of a GPS PPS on a SiT5356 43 ppm fast under a daily ±0.5 ppm
+    /// thermal cycle: the steering integrates past 10¹¹ ns, and the last day's
+    /// time error and its estimate are no worse than the first's.
+    #[test]
+    #[ignore = "thirty simulated days, for a release build"]
+    fn thirty_days_forty_three_ppm_off_hold_their_precision() {
+        const DAY: u64 = 86_400;
+        let own_ppm = (0..30 * DAY)
+            .map(|second| {
+                43.0 + 0.5 * (core::f64::consts::TAU * (second % DAY) as f64 / DAY as f64).sin()
+            })
+            .collect();
+        let days: Vec<(bool, f64, f64, f64)> = sandi_on(
+            Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, 5_000_000),
+            30 * DAY,
+            |_, rng| Some(rng.gaussian() * 20.0),
+        )
+        .enumerate()
+        .skip(600)
+        .fold(
+            vec![(true, 0.0, 0.0f64, 0.0, 0.0); 30],
+            |mut days, (index, second)| {
+                let day = &mut days[index / DAY as usize];
+                let error = second.time_error_ns.unwrap_or(f64::INFINITY);
+                let estimate = second
+                    .status
+                    .time_error_ns
+                    .map_or(f64::INFINITY, |ns| ns as f64);
+                *day = (
+                    day.0 && second.status.pulse.is_locked(),
+                    day.1 + error * error,
+                    day.2.max(error.abs()),
+                    day.3 + estimate * estimate,
+                    day.4 + 1.0,
+                );
+                days
+            },
+        )
+        .into_iter()
+        .map(|(locked, error, max, estimate, seconds)| {
+            (
+                locked,
+                (error / seconds).sqrt(),
+                max,
+                (estimate / seconds).sqrt(),
+            )
+        })
+        .collect();
+        let (first, last) = (days[0], days[29]);
+        assert!(
+            days.iter().all(|day| day.0)
+                && last.1 <= 1.2 * first.1
+                && last.2 <= 1.5 * first.2
+                && last.3 <= 1.2 * first.3,
+            "locked, RMS and max time error, and RMS estimate, ns, by day: {days:?}"
+        );
+    }
+
+    /// An hour of each drift under each jitter and latency, 0.5 ppm off to
+    /// start, with time and frequency errors taken against true seconds past
+    /// the first ten minutes.
+    #[test]
+    #[ignore = "a sweep that prints a table"]
+    fn drift_sweep() {
+        const SETTLE: usize = 600;
+        println!(
+            "{:<22} {:>6} {:>4} {:>6} {:>7} {:>9} {:>9} {:>9} {:>5} {:>9}",
+            "drift",
+            "jitter",
+            "ms",
+            "lock s",
+            "locked",
+            "rms ns",
+            "max ns",
+            "rms ppb",
+            "spurs",
+            "est ns"
+        );
+        for jitter_ns in [20.0, 1_000.0, 3_000.0] {
+            for latency_ms in [0, 5, 50] {
+                for (name, own_ppm) in drifts(0.5) {
+                    let oscillator =
+                        Oscillator::drifting(own_ppm, SIT5356_STEP_PPM, latency_ms * 1_000_000);
+                    let trace: Vec<Second> =
+                        sandi_on(oscillator, 3600, |_, rng| Some(rng.gaussian() * jitter_ns))
+                            .collect();
+                    let after = &trace[SETTLE..];
+                    println!(
+                        "{name:<22} {jitter_ns:>6} {latency_ms:>4} {:>6} {:>6.1}% {:>9.1} {:>9.1} {:>9.3} {:>5} {:>9.1}",
+                        trace
+                            .iter()
+                            .position(|second| second.status.pulse.is_locked())
+                            .map_or(-1, |second| second as i64 + 1),
+                        100.0
+                            * after.iter().filter(|second| second.status.pulse.is_locked()).count() as f64
+                            / after.len() as f64,
+                        rms(after.iter().filter_map(|second| second.time_error_ns)),
+                        after
+                            .iter()
+                            .filter_map(|second| second.time_error_ns)
+                            .fold(0.0, |max: f64, ns| max.max(ns.abs())),
+                        rms(after.iter().map(|second| second.frequency_error_ppb)),
+                        trace[trace.len() - 1].status.spurs - trace[SETTLE - 1].status.spurs,
+                        rms(after.iter().filter_map(|second| second.status.time_error_ns.map(|ns| ns as f64))),
+                    );
+                }
+            }
+        }
+    }
+}
