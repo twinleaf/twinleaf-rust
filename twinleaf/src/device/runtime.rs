@@ -5,7 +5,7 @@
 //! [`Connection`](crate::Connection) connects to the proxy and asks it to
 //! open a target. When nothing answers at the proxy's address, the
 //! connection starts `tio proxy --background` and connects again. That proxy
-//! exits ten seconds after its last client is gone. When `tio` cannot be
+//! exits five seconds after its last client is gone. When `tio` cannot be
 //! started, or exits at once as a `tio` older than 2.0 does, the connection
 //! hosts the proxy in this process. A sandboxed macOS app hosts the proxy in
 //! its own process at once, without starting `tio`.

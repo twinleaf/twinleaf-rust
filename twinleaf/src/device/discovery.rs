@@ -997,7 +997,7 @@ mod tests {
 
         drop(discovery);
 
-        // Well within the ten seconds a device a client opened stays open.
+        // Well within the time a device a client opened stays open.
         wait_until(Duration::from_secs(2), "the device closed", || {
             device.connections() == 0
         });

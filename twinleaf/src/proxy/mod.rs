@@ -7,7 +7,7 @@
 //! background. [`stop`] stops a background proxy.
 //!
 //! The proxy closes a device that a client opened once no client has used it
-//! for ten seconds. It closes a device that only probes have used as soon as
+//! for five seconds. It closes a device that only probes have used as soon as
 //! the last probe leaves. It reconnects a device that drops out, and the
 //! clients using it stay connected. Each hears the link status
 //! [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
@@ -141,7 +141,7 @@ pub(super) const LEAVE_TIMEOUT: Duration = CLOSE_TIMEOUT.saturating_add(Duration
 
 /// How long a proxy keeps a device that a client opened with no client
 /// using it, and a background proxy keeps running with no client at all.
-const IDLE: Duration = Duration::from_secs(10);
+const IDLE: Duration = Duration::from_secs(5);
 
 /// The longest a client's RPC waits for its device's reply. The proxy holds
 /// a request this long, and a session's call may ask for no longer.
@@ -284,7 +284,7 @@ pub struct HostOptions {
     /// The TCP port to listen on. Port 0 picks a free port and skips the
     /// check for a proxy already running.
     pub port: u16,
-    /// Whether to stop once no client has been connected for ten seconds.
+    /// Whether to stop once no client has been connected for five seconds.
     pub idle_exit: bool,
     /// Whether a client may stop the proxy with `proxy.stop`. Only a
     /// background proxy allows it.
@@ -1275,7 +1275,7 @@ mod tests {
         drop(prober);
         drop(opener);
 
-        // Well within the ten seconds an opened device stays open.
+        // Well within the time an opened device stays open.
         let deadline = Instant::now() + WAIT;
         while proxy.links.urls() != [opened.url.clone()] {
             let urls = proxy.links.urls();

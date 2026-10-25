@@ -32,7 +32,7 @@ default `auto`, and `-s {route}` for a sensor in the tree, default
 
 Tools share devices through a proxy on `localhost:7855`, so several tools can
 use one sensor at once. The first tool starts the proxy in the background, and
-the proxy exits ten seconds after the last tool closes. If a device resets or
+the proxy exits five seconds after the last tool closes. If a device resets or
 is unplugged, the proxy reconnects to it and the tools keep running.
 
 With no `-r`, a tool uses the device `tio proxy` serves, the device another
