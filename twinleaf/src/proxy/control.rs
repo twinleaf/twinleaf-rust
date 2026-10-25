@@ -400,6 +400,10 @@ pub(crate) async fn handshake(
         let request = request.map_err(invalid_input)?;
         port.send_async(request).await.map_err(io::Error::other)?;
     }
+    // The proxy hangs up on a client that is quiet too long, and an open may
+    // wait longer than that for its device. A peer that is no proxy hears a
+    // heartbeat or two, as it would from a client older than tio 2.0.
+    port.keep_alive(CLIENT_KEEPALIVE).await;
     let started = Instant::now();
     let deadline = started + timeout;
     let hello_deadline = deadline.min(started + HELLO_TIMEOUT);

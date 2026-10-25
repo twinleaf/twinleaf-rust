@@ -34,13 +34,14 @@
 //! device's own log packets under `device::<route>` at their own level, and
 //! the traffic [`DumpFlags`] asks for.
 
-use super::{DumpFlags, MAX_RPC_TIMEOUT};
+use super::{control, DumpFlags, MAX_RPC_TIMEOUT};
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogLevel;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::tio::packet::{self, Packet};
+use crate::tio::rpc::RpcReply;
 use crate::tio::transport;
 use crate::tio::transport::Port as HardwarePort;
 use crate::tio::transport::{ReceiveResult, TransportEvent};
@@ -174,6 +175,178 @@ impl Opener {
     }
 }
 
+/// The name a TCP link gives in its hello to a proxy at the other end.
+const LINK_NAME: &str = "a proxy's link";
+
+/// The ids of a TCP link's hello and of its open of a proxy's `auto`.
+const HELLO_ID: u16 = 1;
+const OPEN_ID: u16 = 2;
+
+/// What answers at the other end of a TCP link.
+enum Peer {
+    /// A Twinleaf 2.0 proxy, whose `auto` the link opened.
+    Proxy,
+    /// A device, or a proxy older than 2.0, with what it sent first if it
+    /// sent anything.
+    Device(Option<ReceiveResult>),
+}
+
+/// Connects to the TCP peer at `url`, and returns its port, which delivers
+/// to `results`. The link says hello first. A Twinleaf 2.0 proxy answers,
+/// and the link then opens its `auto` as a control client does, so that it
+/// hears the proxy's link statuses for each route and keeps the connection
+/// alive. Any other peer answers with something else, or with nothing
+/// within [`control::HELLO_TIMEOUT`], and its packets are a device's.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails, closes before the peer
+/// answers, or a proxy at the other end refuses the hello or the open.
+async fn open_tcp(
+    url: &str,
+    results: flume::Sender<ReceiveResult>,
+    tasks: &Supervisor,
+) -> io::Result<HardwarePort> {
+    let (deliver, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+    let port = HardwarePort::open(url, deliver, tasks).await?;
+    let peer = greet(&port, &received, url).await?;
+    let proxied = matches!(peer, Peer::Proxy);
+    let first = match peer {
+        Peer::Proxy => None,
+        Peer::Device(first) => first,
+    };
+    tasks.spawn(format_args!("link relay {url}"), async move {
+        if let Some(first) = first {
+            if results.send_async(first).await.is_err() {
+                return;
+            }
+        }
+        while let Ok(result) = received.recv_async().await {
+            if proxied && !relayed(&result) {
+                continue;
+            }
+            if results.send_async(result).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(port)
+}
+
+/// Says hello on `port` and tells from the answer, read from `received`,
+/// what is at `url`. Opens the `auto` of a proxy that answers.
+async fn greet(
+    port: &HardwarePort,
+    received: &flume::Receiver<ReceiveResult>,
+    url: &str,
+) -> io::Result<Peer> {
+    let (name, hello) =
+        control::Request::Hello(control::Introduction::of_this_process(LINK_NAME)).encode();
+    let request = Packet::proxy_request(name, &hello, HELLO_ID).map_err(io::Error::other)?;
+    port.send_async(request).await.map_err(io::Error::other)?;
+    let first = match tokio::time::timeout(control::HELLO_TIMEOUT, received.recv_async()).await {
+        Err(_) => return Ok(Peer::Device(None)),
+        Ok(Err(_)) => return Err(closed(url)),
+        Ok(Ok(first)) => first,
+    };
+    let host = match &first {
+        Ok(TransportEvent::Packet(pkt)) => match pkt.payload() {
+            packet::Payload::ProxyRx(packet::ProxyRx::Reply(reply))
+                if reply.req_id.value() == HELLO_ID =>
+            {
+                control::Introduction::decode_reply(reply.value).map_err(io::Error::other)?
+            }
+            packet::Payload::ProxyRx(packet::ProxyRx::Error(error))
+                if error.req_id.value() == HELLO_ID =>
+            {
+                return Err(refused(url, error.message));
+            }
+            _ => return Ok(Peer::Device(Some(first))),
+        },
+        _ => return Ok(Peer::Device(Some(first))),
+    };
+    if host.protocol < control::VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{url} is {host}, which speaks an older proxy protocol"),
+        ));
+    }
+    let (name, target) = control::Request::Open {
+        target: super::auto::AUTO.to_string(),
+    }
+    .encode();
+    let request = Packet::proxy_request(name, &target, OPEN_ID).map_err(io::Error::other)?;
+    port.send_async(request).await.map_err(io::Error::other)?;
+    // The other proxy hangs up on a client that is quiet too long, and an
+    // open may wait longer than that for its device.
+    port.keep_alive(control::CLIENT_KEEPALIVE).await;
+    let deadline = Instant::now() + super::link::READY_TIMEOUT;
+    loop {
+        let event = tokio::time::timeout_at(deadline, received.recv_async())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{url} did not open its auto in time"),
+                )
+            })?
+            .map_err(|_| closed(url))?;
+        let Ok(TransportEvent::Packet(pkt)) = event else {
+            continue;
+        };
+        match pkt.payload() {
+            packet::Payload::ProxyRx(packet::ProxyRx::Reply(reply))
+                if reply.req_id.value() == OPEN_ID =>
+            {
+                let opened = String::from_utf8_lossy(reply.value);
+                log::debug!("{url} is {host}, which opened {opened} for this link");
+                break;
+            }
+            packet::Payload::ProxyRx(packet::ProxyRx::Error(error))
+                if error.req_id.value() == OPEN_ID =>
+            {
+                return Err(refused(url, error.message));
+            }
+            packet::Payload::ProxyRx(packet::ProxyRx::Link(packet::LinkStatus::Stopped)) => {
+                return Err(closed(url));
+            }
+            _ => {}
+        }
+    }
+    Ok(Peer::Proxy)
+}
+
+/// Returns `true` if a link to a proxy passes `result` on to its worker. A
+/// status of a subtree is passed on, and so is a sign of life, which keeps
+/// the link alive. Replies are the link's own, and a stop of the proxy is
+/// heard as the connection closes.
+fn relayed(result: &ReceiveResult) -> bool {
+    let Ok(TransportEvent::Packet(pkt)) = result else {
+        return true;
+    };
+    match pkt.payload() {
+        packet::Payload::ProxyRx(packet::ProxyRx::Link(packet::LinkStatus::Stopped)) => false,
+        packet::Payload::ProxyRx(packet::ProxyRx::Link(_) | packet::ProxyRx::Alive) => true,
+        packet::Payload::ProxyRx(_) => false,
+        _ => true,
+    }
+}
+
+/// Returns the error for a TCP peer at `url` that closed before it answered.
+fn closed(url: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!("{url} closed the connection before it answered"),
+    )
+}
+
+/// Returns the error for a proxy at `url` that refused a request, saying
+/// `message`.
+fn refused(url: &str, message: &[u8]) -> io::Error {
+    let message = String::from_utf8_lossy(message);
+    io::Error::other(format!("the proxy at {url} refused this link: {message}"))
+}
+
 /// How many commands may wait for a worker.
 const COMMAND_LANE: usize = 64;
 
@@ -216,7 +389,12 @@ pub(super) fn opener(tasks: &Supervisor, url: &str) -> Opener {
     if HardwarePort::opens_as_future(&url) {
         return Opener::droppable(move |results| {
             let (url, tasks) = (url.clone(), tasks.clone());
-            Box::pin(async move { HardwarePort::open(&url, results, &tasks).await })
+            Box::pin(async move {
+                match url.starts_with("tcp") {
+                    true => open_tcp(&url, results, &tasks).await,
+                    false => HardwarePort::open(&url, results, &tasks).await,
+                }
+            })
         });
     }
     // The key of a serial device, taken on the first attempt while the
@@ -719,6 +897,13 @@ impl Worker {
         };
         device.received(&result);
         match result {
+            // A proxy's sign of life keeps the link alive, which `received`
+            // noted. It is no answer of the device, and no port hears it.
+            Ok(TransportEvent::Packet(pkt))
+                if matches!(
+                    pkt.payload(),
+                    packet::Payload::ProxyRx(packet::ProxyRx::Alive)
+                ) => {}
             Ok(TransportEvent::Packet(pkt)) => {
                 // First packet since (re)connect: the device is live, announce it.
                 let first_packet = !std::mem::replace(&mut device.seen_since_connect, true);
@@ -1465,12 +1650,19 @@ mod tests {
             from_port.try_send(pkt).unwrap();
         }
 
-        // The port's packets are forwarded in order, so a control packet
-        // that got through would arrive ahead of the USER packet.
-        let mut first = vec![0; user.as_bytes().len()];
+        // The link's own hello comes first, as it asks whether a proxy is at
+        // the other end. The port's packets are forwarded in order after it,
+        // so a control packet of the port that got through would arrive
+        // ahead of the USER packet.
         device
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        let mut header = [0; 4];
+        device.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 66, "the link did not say hello first");
+        let mut hello = vec![0; usize::from(u16::from_le_bytes([header[2], header[3]]))];
+        device.read_exact(&mut hello).unwrap();
+        let mut first = vec![0; user.as_bytes().len()];
         device.read_exact(&mut first).unwrap();
         assert_eq!(
             first,

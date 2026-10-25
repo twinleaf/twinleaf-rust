@@ -110,7 +110,9 @@ mod link;
 mod server;
 mod worker;
 
-pub(crate) use control::{call, executable_name, handshake, Purpose, CLIENT_KEEPALIVE, MOUNT};
+#[cfg(test)]
+pub(crate) use control::CLIENT_KEEPALIVE;
+pub(crate) use control::{call, executable_name, handshake, Purpose, MOUNT};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -1054,6 +1056,73 @@ mod tests {
         client.hello(4242, "late");
         assert_eq!(client.open("default").unwrap_err().0, RpcError::Invalid);
         assert_eq!(client.open("auto"), Ok(device.url.clone()));
+    }
+
+    /// Returns a proxy whose default is `device`, and a proxy whose default
+    /// mounts that proxy at `/2`.
+    fn proxy_behind_proxy(device: &FakeDevice) -> (Proxy, Proxy) {
+        let upstream = Proxy::host(HostOptions {
+            default: Some(Layout::single(&device.url)),
+            ..options()
+        })
+        .unwrap();
+        let mount = Mount {
+            url: upstream.endpoint(),
+            source: DeviceRoute::root(),
+            prefix: "/2".parse().unwrap(),
+        };
+        let downstream = Proxy::host(HostOptions {
+            default: Some(Layout {
+                mounts: vec![mount],
+            }),
+            ..options()
+        })
+        .unwrap();
+        (upstream, downstream)
+    }
+
+    /// A proxy that mounts another proxy says hello to it and opens its
+    /// `auto`, as a control client does, so the other proxy knows it by name.
+    /// A client of the first reaches the device behind the second.
+    #[test]
+    fn a_proxy_that_mounts_another_is_its_control_client() {
+        let device = FakeDevice::start();
+        let (upstream, downstream) = proxy_behind_proxy(&device);
+        let client = TestClient::connect(&downstream.endpoint());
+        client.hello(4242, "two proxies away");
+        client.open("default").unwrap();
+
+        assert_eq!(client.dev_name_at("/2".parse().unwrap(), 7), "FAKE");
+        let links: Vec<_> = upstream
+            .clients()
+            .into_iter()
+            .filter(|client| client.name.as_deref() == Some("a proxy's link"))
+            .collect();
+        assert_eq!(links.len(), 1, "{:?}", upstream.clients());
+        assert!(links[0].target.is_some());
+    }
+
+    /// A device lost behind a mounted proxy is heard at its mount as a link
+    /// status, not in the legacy form, and the link between the proxies stays
+    /// up.
+    #[test]
+    fn a_device_lost_behind_a_mounted_proxy_is_a_status_at_its_mount() {
+        let device = FakeDevice::start();
+        let (upstream, downstream) = proxy_behind_proxy(&device);
+        let client = TestClient::connect(&downstream.endpoint());
+        client.hello(4242, "two proxies away");
+        client.open("default").unwrap();
+        assert_eq!(client.dev_name_at("/2".parse().unwrap(), 7), "FAKE");
+        let linked = upstream.clients().len();
+
+        device.drop_connections();
+
+        let lost = client.expect(|pkt| match pkt.payload() {
+            Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorDisconnected)) => Some(pkt.route()),
+            _ => None,
+        });
+        assert_eq!(lost, "/2".parse().unwrap());
+        assert_eq!(upstream.clients().len(), linked, "the link was dropped");
     }
 
     /// A client mounts devices of its own choosing, each where it says, and

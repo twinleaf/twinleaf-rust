@@ -29,7 +29,7 @@ use super::runtime::ProxyAddress;
 use super::stream::{End, Lane, Queued};
 use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{handshake, Layout, Purpose, CLIENT_KEEPALIVE, MAX_RPC_TIMEOUT, MOUNT};
+use crate::proxy::{handshake, Layout, Purpose, MAX_RPC_TIMEOUT, MOUNT};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
@@ -170,7 +170,6 @@ impl Session {
         let (port, received) = connect(proxy, &tasks).await?;
         let url = &proxy.url;
         let (host, opened) = handshake(&port, &received, url, method, &args, goal, timeout).await?;
-        port.keep_alive(CLIENT_KEEPALIVE).await;
         log::debug!(
             "the proxy at {url} opened {}",
             String::from_utf8_lossy(&opened)
@@ -689,6 +688,7 @@ mod tests {
     use crate::device::rpc::RpcReply;
     use crate::proto::rpc::{Method, RpcError};
     use crate::proxy::fixtures::assert_took;
+    use crate::proxy::CLIENT_KEEPALIVE;
     use crate::proxy::{client_name, Introduction};
     use crate::rt::BoxFuture;
     use std::io::{Read, Write};
@@ -1298,6 +1298,33 @@ mod tests {
         proxy.accept().accept_open(TARGET);
         assert!(opening.join().unwrap().is_ok());
         assert_eq!(ENSURED.load(Ordering::SeqCst), 1);
+    }
+
+    /// A session beats while the proxy waits on its device to open, as the
+    /// proxy hangs up on a client quiet longer than the wait may take.
+    #[test]
+    fn a_session_beats_while_its_open_waits() {
+        let proxy = FakeProxy::start();
+        let address = ProxyAddress {
+            url: proxy.url(),
+            ensure: None,
+        };
+        let opening = thread::spawn(move || Session::open(&address, TARGET, Purpose::Use, WAIT));
+        let mut end = proxy.accept();
+        let (hello, open) = end.expect_handshake("proxy.open", TARGET);
+        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+
+        let beat = end.next_within(CLIENT_KEEPALIVE.every * 2);
+        assert!(
+            matches!(
+                beat.as_ref().map(Packet::payload),
+                Some(Payload::Heartbeat(_))
+            ),
+            "the session sent {beat:?} while its open waited"
+        );
+
+        end.send(&Packet::proxy_reply(open, &TARGET.encode_args()).unwrap());
+        assert!(opening.join().unwrap().is_ok());
     }
 
     /// Once the proxy has said hello, a session beats while idle, and gives
