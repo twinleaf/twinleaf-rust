@@ -45,7 +45,7 @@ hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib",
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true }
 ureq = { version = "3", features = ["json"], optional = true }
 serde_json = { version = "1", optional = true }
-mdns-sd = { version = "0.20", optional = true }
+mdns-sd = { version = "0.21", optional = true }
 directories = "6.0"
 thiserror = "2"
 tokio-serial = { version = "5.5", optional = true }

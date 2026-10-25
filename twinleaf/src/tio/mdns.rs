@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 /// How long [`resolve`] waits for mDNS to answer.
-// The daemon sends its first query after a jitter of 20 to 120 ms and
+// The daemon sends its first query after a jitter of 10 to 50 ms and
 // repeats it after one second, so this covers two queries.
 pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_millis(1500);
 

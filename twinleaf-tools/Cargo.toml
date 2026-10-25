@@ -45,7 +45,7 @@ env_logger = "0.11"
 indicatif-log-bridge = "0.2"
 dialoguer = "0.12"
 gethostname = { version = "1", optional = true }
-mdns-sd = { version = "0.20", optional = true }
+mdns-sd = { version = "0.21", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
