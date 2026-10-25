@@ -1,6 +1,8 @@
 //! tio simulate
 //!
 //! Simulates a small Twinleaf device that publishes a noisy sine wave on stream 1.
+//! With `--layout`, it simulates one such device at each route given, all
+//! behind the one UDP port, as a hub and the devices on its ports are.
 
 use crate::SimulateCli;
 use ratatui::crossterm::{
@@ -22,8 +24,8 @@ use twinleaf::proto::{
 use twinleaf::tio::packet;
 
 pub fn run_simulate(cli: SimulateCli) -> eyre::Result<()> {
-    let mut device = TestDevice::new(cli)?;
-    device.run()?;
+    let mut simulator = Simulator::new(&cli)?;
+    simulator.run()?;
     Ok(())
 }
 
@@ -427,9 +429,209 @@ impl GaussianRng {
     }
 }
 
-struct TestDevice {
+/// The devices of a layout, behind the one UDP port a host reaches them on.
+/// It serves one host at a time, and hands each packet to the device at the
+/// packet's route.
+struct Simulator {
     socket: UdpSocket,
     client: Option<Client>,
+    /// Each device, in route order.
+    devices: Vec<TestDevice>,
+}
+
+impl Simulator {
+    /// Binds the UDP port and creates a device at each route of the layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the port cannot be bound, a route is given twice,
+    /// or a device cannot be created.
+    fn new(cli: &SimulateCli) -> io::Result<Self> {
+        let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
+        socket.set_nonblocking(true)?;
+        let mut routes = cli.layout.clone();
+        routes.sort();
+        if let Some(twice) = routes.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the layout gives {} twice", twice[0]),
+            ));
+        }
+        let devices = routes
+            .into_iter()
+            .enumerate()
+            .map(|(index, route)| TestDevice::new(cli, socket.try_clone()?, route, index))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            socket,
+            client: None,
+            devices,
+        })
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        let raw_mode = match RawModeGuard::enable() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                terminal_eprintln!("keyboard shortcuts disabled: {err}");
+                None
+            }
+        };
+
+        let port = self.socket.local_addr()?.port();
+        terminal_println!("tio test listening on udp://0.0.0.0:{port}");
+        if let [device] = &self.devices[..] {
+            if !device.route.is_empty() {
+                terminal_println!("  device at {}", device.route);
+            }
+        } else {
+            let routes: Vec<String> = self.devices.iter().map(|d| d.route.to_string()).collect();
+            terminal_println!("  devices at {}", routes.join(", "));
+        }
+        let missing: std::collections::BTreeSet<DeviceRoute> = self
+            .devices
+            .iter()
+            .filter_map(|device| self.missing_parent(&device.route))
+            .collect();
+        for parent in missing {
+            terminal_println!("  no device at {parent}: it answers nothing and sends no heartbeat");
+        }
+        self.devices[0].print_streams();
+        if raw_mode.is_some() {
+            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
+        }
+        terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
+
+        loop {
+            if raw_mode.is_some() && !self.handle_keyboard()? {
+                terminal_println!("stopping tio test");
+                return Ok(());
+            }
+            self.receive_packets()?;
+            self.expire_client();
+            for device in &mut self.devices {
+                device.send_periodic_packets()?;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Returns the nearest route above `route` that the layout leaves without
+    /// a device, if any.
+    fn missing_parent(&self, route: &DeviceRoute) -> Option<DeviceRoute> {
+        let hops = route.as_slice();
+        (0..hops.len())
+            .rev()
+            .filter_map(|len| DeviceRoute::from_hops(&hops[..len]).ok())
+            .find(|parent| self.devices.iter().all(|device| device.route != *parent))
+    }
+
+    fn handle_keyboard(&mut self) -> io::Result<bool> {
+        while event::poll(Duration::from_millis(0))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('d') => {
+                        for device in &mut self.devices {
+                            device.drop_samples_now()?;
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        for device in &mut self.devices {
+                            device.reboot()?;
+                        }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn receive_packets(&mut self) -> io::Result<()> {
+        let mut buf = [0u8; 1024];
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((size, addr)) => {
+                    if !self.accept_packet_from(addr)? {
+                        continue;
+                    }
+                    match packet::Packet::from_slice_prefix(&buf[..size]) {
+                        Ok((packet, parsed_size)) if parsed_size == size => {
+                            // A packet for a route with no device goes nowhere.
+                            let route = packet.route();
+                            if let Some(device) =
+                                self.devices.iter_mut().find(|device| device.route == route)
+                            {
+                                device.handle_packet(packet, addr)?;
+                            }
+                        }
+                        Ok(_) => {
+                            terminal_eprintln!(
+                                "Ignoring UDP datagram with trailing bytes from {addr}"
+                            );
+                        }
+                        Err(err) => {
+                            terminal_eprintln!("Ignoring malformed packet from {addr}: {err:?}");
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                // Windows reports a port unreachable reply to an earlier send,
+                // as when the host closed its socket, on the next receive.
+                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn accept_packet_from(&mut self, addr: SocketAddr) -> io::Result<bool> {
+        let now = Instant::now();
+        match self.client {
+            Some(mut client) if client.addr == addr => {
+                client.last_rx = now;
+                self.client = Some(client);
+                Ok(true)
+            }
+            Some(client) if now.duration_since(client.last_rx) < CLIENT_TIMEOUT => Ok(false),
+            _ => {
+                self.client = Some(Client { addr, last_rx: now });
+                terminal_println!("client connected: {addr}");
+                for device in &mut self.devices {
+                    device.connect(addr)?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn expire_client(&mut self) {
+        if let Some(client) = self.client {
+            if Instant::now().duration_since(client.last_rx) > CLIENT_TIMEOUT {
+                terminal_println!("client disconnected: {}", client.addr);
+                self.client = None;
+                for device in &mut self.devices {
+                    device.client = None;
+                }
+            }
+        }
+    }
+}
+
+/// One simulated device, at its route behind the [`Simulator`]'s port.
+struct TestDevice {
+    /// The simulator's socket, which this device sends on.
+    socket: UdpSocket,
+    /// The host's address while one is connected.
+    client: Option<SocketAddr>,
+    /// Where the device sits in the tree. Everything it sends carries it.
+    route: DeviceRoute,
+    serial: &'static str,
     initial_params: SineParams,
     params: SineParams,
     initial_status: u8,
@@ -471,13 +673,25 @@ struct TestDevice {
 }
 
 impl TestDevice {
-    fn new(cli: SimulateCli) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
-        socket.set_nonblocking(true)?;
-
+    /// Creates the device at `route` that sends on `socket`. `index` is its
+    /// place in the layout, which gives it a serial, a session id and noise
+    /// apart from the other devices.
+    fn new(
+        cli: &SimulateCli,
+        socket: UdpSocket,
+        route: DeviceRoute,
+        index: usize,
+    ) -> io::Result<Self> {
         let now = unix_duration();
         let start_time = unix_time_secs(now);
-        let seed = now.as_nanos() as u64 ^ u64::from(cli.port).rotate_left(32);
+        let seed = now.as_nanos() as u64
+            ^ u64::from(cli.port).rotate_left(32)
+            ^ (index as u64).rotate_left(48);
+        // A layout is made once per run, so its serials can live as long.
+        let serial = match index {
+            0 => DEVICE_SERIAL,
+            _ => format!("SIM{:04}", index + 1).leak(),
+        };
         let session_id = (seed as u32)
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
@@ -606,6 +820,8 @@ impl TestDevice {
         Ok(Self {
             socket,
             client: None,
+            route,
+            serial,
             initial_params,
             params: initial_params,
             initial_status,
@@ -645,19 +861,9 @@ impl TestDevice {
         })
     }
 
-    fn run(&mut self) -> io::Result<()> {
-        let raw_mode = match RawModeGuard::enable() {
-            Ok(guard) => Some(guard),
-            Err(err) => {
-                terminal_eprintln!("keyboard shortcuts disabled: {err}");
-                None
-            }
-        };
-
-        terminal_println!(
-            "tio test listening on udp://0.0.0.0:{}",
-            self.socket.local_addr()?.port()
-        );
+    /// Prints what the device streams. Every device of a layout streams the
+    /// same.
+    fn print_streams(&self) {
         terminal_println!(
             "  stream 1: 2 waveform channels, amplitude={} V frequency={} Hz noise={} V/sqrt(Hz) samplerate={} Hz segment={} s",
             self.params.amplitude,
@@ -690,99 +896,14 @@ impl TestDevice {
             CAPTURE_SAMPLE_COUNT_MAX,
             CAPTURE_TRIGGER_DELAY.as_secs_f64()
         );
-        if raw_mode.is_some() {
-            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
-        }
-        terminal_println!(
-            "  connect with: tio proxy udp4://127.0.0.1:{}",
-            self.socket.local_addr()?.port()
-        );
-
-        loop {
-            if raw_mode.is_some() && !self.handle_keyboard()? {
-                terminal_println!("stopping tio test");
-                return Ok(());
-            }
-            self.receive_packets()?;
-            self.expire_client();
-            self.send_periodic_packets()?;
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 
-    fn handle_keyboard(&mut self) -> io::Result<bool> {
-        while event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('d') => self.drop_samples_now()?,
-                    KeyCode::Char('r') => self.reboot()?,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(false);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    fn receive_packets(&mut self) -> io::Result<()> {
-        let mut buf = [0u8; 1024];
-        loop {
-            match self.socket.recv_from(&mut buf) {
-                Ok((size, addr)) => {
-                    if !self.accept_packet_from(addr)? {
-                        continue;
-                    }
-                    match packet::Packet::from_slice_prefix(&buf[..size]) {
-                        Ok((packet, parsed_size)) if parsed_size == size => {
-                            self.handle_packet(packet, addr)?;
-                        }
-                        Ok(_) => {
-                            terminal_eprintln!(
-                                "Ignoring UDP datagram with trailing bytes from {addr}"
-                            );
-                        }
-                        Err(err) => {
-                            terminal_eprintln!("Ignoring malformed packet from {addr}: {err:?}");
-                        }
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    fn accept_packet_from(&mut self, addr: SocketAddr) -> io::Result<bool> {
-        let now = Instant::now();
-        match self.client {
-            Some(mut client) if client.addr == addr => {
-                client.last_rx = now;
-                self.client = Some(client);
-                Ok(true)
-            }
-            Some(client) if now.duration_since(client.last_rx) < CLIENT_TIMEOUT => Ok(false),
-            _ => {
-                self.client = Some(Client { addr, last_rx: now });
-                self.reset_run();
-                terminal_println!("client connected: {addr}");
-                self.send_initial_packets(addr)?;
-                Ok(true)
-            }
-        }
-    }
-
-    fn expire_client(&mut self) {
-        if let Some(client) = self.client {
-            if Instant::now().duration_since(client.last_rx) > CLIENT_TIMEOUT {
-                terminal_println!("client disconnected: {}", client.addr);
-                self.client = None;
-            }
-        }
+    /// Starts a run for the host at `addr`, and sends it what a device sends
+    /// as it boots.
+    fn connect(&mut self, addr: SocketAddr) -> io::Result<()> {
+        self.client = Some(addr);
+        self.reset_run();
+        self.send_initial_packets(addr)
     }
 
     fn reset_run(&mut self) {
@@ -818,8 +939,8 @@ impl TestDevice {
         self.reset_run();
         terminal_println!("rebooted test device; new session id {}", self.session_id);
 
-        if let Some(client) = self.client {
-            self.send_initial_packets(client.addr)?;
+        if let Some(addr) = self.client {
+            self.send_initial_packets(addr)?;
         }
         Ok(())
     }
@@ -1251,18 +1372,18 @@ impl TestDevice {
 
     fn send_periodic_packets(&mut self) -> io::Result<()> {
         self.update_capture();
-        let Some(client) = self.client else {
+        let Some(addr) = self.client else {
             return Ok(());
         };
 
         if self.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            self.send_heartbeat(client.addr)?;
+            self.send_heartbeat(addr)?;
             self.last_heartbeat = Instant::now();
         }
 
-        self.send_log_message_if_due(client.addr)?;
-        self.send_due_samples(client.addr)?;
-        self.send_due_aux_samples(client.addr)
+        self.send_log_message_if_due(addr)?;
+        self.send_due_samples(addr)?;
+        self.send_due_aux_samples(addr)
     }
 
     fn send_log_message_if_due(&mut self, addr: SocketAddr) -> io::Result<()> {
@@ -1280,7 +1401,7 @@ impl TestDevice {
         };
         self.send_written(
             addr,
-            DeviceRoute::root(),
+            self.route,
             || format!("log message level={level:?} data={lucky_number}"),
             |buf| entry.write(buf),
         )?;
@@ -1432,7 +1553,7 @@ impl TestDevice {
         };
         self.send_written(
             addr,
-            DeviceRoute::root(),
+            self.route,
             || {
                 format!(
                     "stream data stream_id={stream_id} segment_id={segment_id} \
@@ -1493,7 +1614,7 @@ impl TestDevice {
     }
 
     fn drop_samples_now(&mut self) -> io::Result<()> {
-        let addr = self.client.map(|client| client.addr);
+        let addr = self.client;
         if let Some(addr) = addr {
             self.send_sample_segment_updates_if_needed(addr)?;
         }
@@ -1600,7 +1721,7 @@ impl TestDevice {
         let beat = heartbeat::Heartbeat::Session(SessionId::new(self.session_id));
         self.send_written(
             addr,
-            DeviceRoute::root(),
+            self.route,
             || format!("heartbeat session={}", self.session_id),
             |buf| beat.write(buf),
         )
@@ -1617,7 +1738,7 @@ impl TestDevice {
         };
         self.send_written(
             addr,
-            DeviceRoute::root(),
+            self.route,
             || "rpc.hash setting".to_string(),
             |buf| setting.write(buf),
         )
@@ -1626,7 +1747,7 @@ impl TestDevice {
     fn send_metadata(&self, record: data::Metadata<'_>, addr: SocketAddr) -> io::Result<()> {
         self.send_written(
             addr,
-            DeviceRoute::root(),
+            self.route,
             move || format!("metadata {record:?}"),
             move |buf| record.write(data::MetadataFlags::UPDATE, buf),
         )
@@ -1750,7 +1871,7 @@ impl TestDevice {
             session: SessionId::new(self.session_id),
             n_streams: 3,
             name: DEVICE_NAME,
-            serial: DEVICE_SERIAL,
+            serial: self.serial,
             firmware: DEVICE_FIRMWARE,
         }
     }
@@ -1790,7 +1911,7 @@ impl TestDevice {
             segment_id: SegmentId::new(segment_id),
             flags: data::SegmentFlags::VALID | data::SegmentFlags::ACTIVE,
             epoch: sync::Epoch::UNIX,
-            timeref_serial: DEVICE_SERIAL,
+            timeref_serial: self.serial,
             timeref_session: SessionId::new(self.session_id),
             start_time,
             sampling_rate,
@@ -1943,6 +2064,143 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// The device at the root that `cli` simulates, on a socket of its own.
+    fn root_device(cli: &SimulateCli) -> TestDevice {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        TestDevice::new(cli, socket, DeviceRoute::root(), 0).unwrap()
+    }
+
+    /// Returns the simulator `args` start on a free port of loopback, and a
+    /// host socket connected to it.
+    fn start_simulator(args: &[&str]) -> (Simulator, UdpSocket) {
+        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
+        let simulator = Simulator::new(&cli).unwrap();
+        let port = simulator.socket.local_addr().unwrap().port();
+        let host = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        host.connect(("127.0.0.1", port)).unwrap();
+        host.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        (simulator, host)
+    }
+
+    /// Sends `packet` from `host`, lets `simulator` take it, and returns
+    /// everything the simulator sent back, with its route.
+    fn exchange(
+        simulator: &mut Simulator,
+        host: &UdpSocket,
+        packet: &packet::Packet,
+    ) -> Vec<packet::Packet> {
+        host.send(packet.as_bytes()).unwrap();
+        // The datagram may reach the socket after send returns.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while simulator.client.is_none() && Instant::now() < deadline {
+            simulator.receive_packets().unwrap();
+        }
+        simulator.receive_packets().unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(size) = host.recv(&mut buf) {
+            received.push(packet::Packet::from_slice_prefix(&buf[..size]).unwrap().0);
+        }
+        received
+    }
+
+    fn route(text: &str) -> DeviceRoute {
+        text.parse().unwrap()
+    }
+
+    /// Each device of a layout boots at its own route when a host connects,
+    /// and nothing speaks for a route the layout leaves out.
+    #[test]
+    fn a_layout_boots_a_device_at_each_route() {
+        let (mut simulator, host) = start_simulator(&["--layout", "/1,/1/0,/3"]);
+
+        let received = exchange(
+            &mut simulator,
+            &host,
+            &packet::Packet::heartbeat(route("/1")),
+        );
+
+        let routes: std::collections::BTreeSet<_> =
+            received.iter().map(packet::Packet::route).collect();
+        assert_eq!(
+            routes,
+            [route("/1"), route("/1/0"), route("/3")]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// An RPC is answered by the device at its route, at that route, and an
+    /// RPC to a route with no device goes unanswered.
+    #[test]
+    fn an_rpc_is_answered_only_by_the_device_at_its_route() {
+        let (mut simulator, host) = start_simulator(&["--layout", "/1,/1/0"]);
+        exchange(
+            &mut simulator,
+            &host,
+            &packet::Packet::heartbeat(route("/1")),
+        );
+
+        let request = packet::Packet::rpc_request("dev.name", &[], 7, route("/1/0")).unwrap();
+        let replies = exchange(&mut simulator, &host, &request);
+        let answered: Vec<_> = replies
+            .iter()
+            .filter(|reply| matches!(reply.payload(), packet::Payload::RpcReply(_)))
+            .collect();
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].route(), route("/1/0"));
+
+        let request = packet::Packet::rpc_request("dev.name", &[], 8, DeviceRoute::root()).unwrap();
+        let replies = exchange(&mut simulator, &host, &request);
+        assert!(!replies.iter().any(|reply| matches!(
+            reply.payload(),
+            packet::Payload::RpcReply(_) | packet::Payload::RpcError(_)
+        )));
+    }
+
+    /// The devices of a layout tell themselves apart by serial and session.
+    #[test]
+    fn the_devices_of_a_layout_have_their_own_serials_and_sessions() {
+        let (simulator, _host) = start_simulator(&["--layout", "/,/0,/1"]);
+
+        let serials: std::collections::BTreeSet<_> = simulator
+            .devices
+            .iter()
+            .map(|device| device.serial)
+            .collect();
+        let sessions: std::collections::BTreeSet<_> = simulator
+            .devices
+            .iter()
+            .map(|device| device.session_id)
+            .collect();
+        assert_eq!(serials.len(), 3);
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(simulator.devices[0].serial, DEVICE_SERIAL);
+    }
+
+    #[test]
+    fn a_route_given_twice_is_refused() {
+        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0", "--layout", "/0,/1,/0"]);
+        let refused = Simulator::new(&cli).map(drop).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A route whose parent the layout leaves out names that parent, the
+    /// nearest one missing.
+    #[test]
+    fn a_layout_names_the_parents_it_leaves_out() {
+        let (simulator, _host) = start_simulator(&["--layout", "/,/2/0,/2/1"]);
+        assert_eq!(simulator.missing_parent(&route("/2/0")), Some(route("/2")));
+        assert_eq!(simulator.missing_parent(&DeviceRoute::root()), None);
+
+        let (simulator, _host) = start_simulator(&["--layout", "/0"]);
+        assert_eq!(
+            simulator.missing_parent(&route("/0")),
+            Some(DeviceRoute::root())
+        );
+    }
+
     #[test]
     fn crc32_matches_standard_check_value() {
         // CRC-32/ISO-HDLC check value for "123456789", the same algorithm as
@@ -2072,7 +2330,7 @@ mod tests {
     #[test]
     fn metadata_bootstrap_replies_in_sweep_order_within_capacity() {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let device = TestDevice::new(cli).unwrap();
+        let device = root_device(&cli);
 
         let reply = device.bootstrap_metadata_reply().unwrap();
         assert!(reply.len() <= data::MAX_METADATA_REPLY_SIZE);
@@ -2095,7 +2353,7 @@ mod tests {
     #[test]
     fn a_metadata_reply_at_capacity_refuses_further_records() {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let device = TestDevice::new(cli).unwrap();
+        let device = root_device(&cli);
 
         let mut reply = vec![0u8; data::MAX_METADATA_REPLY_SIZE - 5];
         let before = reply.clone();
@@ -2108,7 +2366,7 @@ mod tests {
     #[test]
     fn metadata_selectors_resolve_the_current_segment_sentinel() {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let device = TestDevice::new(cli).unwrap();
+        let device = root_device(&cli);
 
         let record = device
             .requested_record(data::MetadataSelector::segment(
@@ -2140,7 +2398,7 @@ mod tests {
             "--noise",
             "0",
         ]);
-        let mut device = TestDevice::new(cli).unwrap();
+        let mut device = root_device(&cli);
 
         let (data, info) = device.generate_capture_data();
 
@@ -2162,7 +2420,7 @@ mod tests {
     #[test]
     fn capture_metadata_uses_tl_chibi_type_and_y_calibration() {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"]);
-        let mut device = TestDevice::new(cli).unwrap();
+        let mut device = root_device(&cli);
         let (data, info) = device.generate_capture_data();
         let data_len = data.len();
         device

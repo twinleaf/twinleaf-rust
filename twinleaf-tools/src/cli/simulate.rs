@@ -1,8 +1,9 @@
 //! The arguments of `tio simulate`.
 
 use clap::Parser;
+use twinleaf::DeviceRoute;
 
-use super::nonneg_f64;
+use super::{nonneg_f64, parse_device_route};
 
 #[derive(Parser, Debug)]
 pub struct SimulateCli {
@@ -42,4 +43,13 @@ pub struct SimulateCli {
     /// Disable random sample drops (the 'd' key still drops one manually)
     #[arg(long = "no-drop")]
     pub(crate) no_drop: bool,
+
+    /// Routes of the simulated devices, comma-separated (e.g. `/,/0,/1,/1/0`). A route left out has no device and answers nothing, like a hub port with nothing plugged in
+    #[arg(
+        long = "layout",
+        value_delimiter = ',',
+        default_value = "/",
+        value_parser = parse_device_route,
+    )]
+    pub(crate) layout: Vec<DeviceRoute>,
 }
