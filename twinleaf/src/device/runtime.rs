@@ -91,6 +91,14 @@ fn spawn_proxy(port: u16) -> io::Result<SpawnedProxy> {
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    // The proxy gets the null and log handles above as its own, and none of
+    // this process's, which it would keep open after this process exits.
+    // Any other handle this process marked inheritable still reaches the
+    // proxy, as std starts every child with inheritance on. Once
+    // CommandExt::inherit_handles is stable (rust-lang/rust#146407), the
+    // proxy can open proxy.log itself and be started inheriting nothing.
+    #[cfg(windows)]
+    let _kept = crate::tio::os::windows_helpers::StdioGuard::keep();
     let child = command.spawn().map_err(|e| {
         io::Error::new(
             e.kind(),
