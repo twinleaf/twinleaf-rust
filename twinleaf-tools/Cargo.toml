@@ -28,6 +28,7 @@ ctrlc = { version = "3.5", features = ["termination"] }
 serialport = { version = "4.5", optional = true }
 toml_edit = {version = "0.25", features = ["parse"]}
 twinleaf = { version = "2.0", path = "../twinleaf", default-features = false, features = ["firmware-update", "processing"] }
+twinleaf-device = { version = "0.1", path = "../twinleaf-device" }
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 tui-prompts = "0.6"
