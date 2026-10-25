@@ -23,7 +23,7 @@ mod udp;
 
 #[cfg(test)]
 pub(crate) use fake::FakeEnd;
-pub(crate) use tcp::CONNECT_TIMEOUT;
+pub(crate) use tcp::{connect_blocking, connect_socket, CONNECT_TIMEOUT};
 
 use super::packet::{self, Packet};
 use crate::proto;
@@ -813,7 +813,6 @@ mod tests {
 
     /// A loopback connect waits for a handshake as long as any other, but a
     /// port nothing listens on refuses it at once.
-    #[cfg(not(windows))]
     #[test]
     fn a_refused_loopback_connect_fails_at_once() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();

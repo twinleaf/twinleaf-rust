@@ -14,7 +14,7 @@ use crate::tio::transport::{self, KeepAlive, ReceiveResult, RecvError, Transport
 use futures_util::StreamExt;
 use std::fmt;
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
@@ -348,7 +348,7 @@ pub(crate) fn call(
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
     let connect = timeout.min(HELLO_TIMEOUT);
-    let connected = TcpStream::connect_timeout(&socket_addr(endpoint)?, connect);
+    let connected = transport::connect_blocking(&socket_addr(endpoint)?, connect);
     let stream = connected.map_err(|error| match error.kind() {
         // A firewall can drop a connection to a closed port rather than
         // refuse it.

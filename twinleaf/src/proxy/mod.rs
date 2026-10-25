@@ -126,7 +126,8 @@ use tokio::sync::{mpsc, watch};
 /// completes it at once.
 // A listening socket completes the handshake in the kernel before it
 // accepts. A closed port can hang instead of refusing, as on WSL2 with
-// mirrored networking, or take about 2 s to refuse, as on Windows.
+// mirrored networking. Windows would take about 2 s to refuse, but a
+// loopback connect is told not to resend its handshake there.
 const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long [`stop`] waits for the proxy to reply.
@@ -179,7 +180,8 @@ pub(crate) fn answers(port: u16) -> bool {
 /// more for longer, and a refusal is final. Must be awaited on a tokio
 /// runtime.
 pub(crate) async fn answers_async(port: u16) -> bool {
-    answers_on_retry(|| tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))).await
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    answers_on_retry(|| crate::tio::transport::connect_socket(address)).await
 }
 
 /// Returns `true` if `connect` completes within [`LOOPBACK_CONNECT_TIMEOUT`],
@@ -686,7 +688,6 @@ mod tests {
         assert!(answers(listener.local_addr().unwrap().port()));
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn a_refused_port_does_not_answer_at_once() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
