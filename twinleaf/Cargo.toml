@@ -29,7 +29,7 @@ hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 firmware-update = ["dep:ureq", "dep:serde_json"]
 # mDNS/DNS-SD discovery of networked devices advertising `_twinleaf._tcp`,
 # and mDNS resolution of `.local` host names.
-mdns = ["dep:mdns-sd"]
+mdns = ["dep:mdns-sd", "dep:if-addrs"]
 # Signal processing ops over a column: decimation and spectral estimates.
 processing = ["dep:rustfft"]
 
@@ -46,6 +46,7 @@ hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true }
 ureq = { version = "3", features = ["json"], optional = true }
 serde_json = { version = "1", optional = true }
 mdns-sd = { version = "0.21", optional = true }
+if-addrs = { version = "0.15", optional = true }
 directories = "6.0"
 thiserror = "2"
 tokio-serial = { version = "5.5", optional = true }

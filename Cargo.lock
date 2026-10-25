@@ -3074,6 +3074,7 @@ dependencies = [
  "glob",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "if-addrs",
  "libc",
  "log",
  "mdns-sd",

@@ -1,6 +1,8 @@
 //! The process's one mDNS daemon, which the transports resolve `.local`
 //! names with.
 
+mod one_shot;
+
 use crate::rt::Supervisor;
 use mdns_sd::{HostnameResolutionEvent, Receiver, ScopedIp, ServiceDaemon};
 use std::collections::BTreeMap;
@@ -45,6 +47,10 @@ pub(crate) fn daemon() -> Result<ServiceDaemon, mdns_sd::Error> {
 
 /// Resolves `host`, a `.local` name in lower case without a trailing dot,
 /// over mDNS. Returns the addresses of the first answer, each with `port`.
+/// Asks with a one-shot query and with the daemon at once, and takes the
+/// first answer of either. A device answers a one-shot query at once, even
+/// in the second after it multicast its address, when it would leave the
+/// daemon's query for the next one, a second later.
 ///
 /// Waits for at most [`RESOLVE_TIMEOUT`], and longer only while another
 /// resolution of the same name runs. Returns no address if mDNS answers
@@ -55,6 +61,27 @@ pub(crate) async fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
     let name = format!("{host}.");
     let turn = lock(&RESOLVING).entry(name.clone()).or_default().clone();
     let _turn = turn.lock().await;
+    // A one-shot query is answered at once, and the daemon from its cache, so
+    // whichever answers first is taken.
+    let quick = one_shot::resolve(&name, port);
+    let searched = search(host, &name, port);
+    tokio::pin!(quick, searched);
+    tokio::select! {
+        found = &mut quick => match found.is_empty() {
+            true => searched.await,
+            false => found,
+        },
+        found = &mut searched => match found.is_empty() {
+            true => quick.await,
+            false => found,
+        },
+    }
+}
+
+/// Resolves `name`, `host` with its trailing dot, with the daemon, as
+/// [`resolve`] describes.
+async fn search(host: &str, name: &str, port: u16) -> Vec<SocketAddr> {
+    let name = name.to_string();
     // Starting the daemon binds its sockets and starts its thread.
     let started = Supervisor::new().spawn_blocking(daemon).await;
     let daemon = match started {
