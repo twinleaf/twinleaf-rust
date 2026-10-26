@@ -1,6 +1,6 @@
 //! The arguments of `tio simulate`.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use twinleaf::DeviceRoute;
 
 use super::{nonneg_f64, parse_device_route};
@@ -52,4 +52,17 @@ pub struct SimulateCli {
         value_parser = parse_device_route,
     )]
     pub(crate) layout: Vec<DeviceRoute>,
+
+    /// The firmware images the devices take, as one kind of real device does
+    #[arg(long = "upload", value_enum, default_value_t = UploadKind::TlChibi)]
+    pub(crate) upload: UploadKind,
+}
+
+/// What kind of firmware image a simulated device takes.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadKind {
+    /// tl-chibi images, whose chunks carry their own envelope
+    TlChibi,
+    /// Signed packages for board `tio-test`, as a device built on twinleaf-device takes
+    Signed,
 }

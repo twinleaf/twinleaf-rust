@@ -24,7 +24,7 @@ pub use log::{
 pub use monitor::MonitorCli;
 pub use proxy::{MountArg, ProxyCli, ProxySubcommands};
 pub use rpc::{RPCSubcommands, RpcCli};
-pub use simulate::SimulateCli;
+pub use simulate::{SimulateCli, UploadKind};
 pub use upgrade::UpgradeCli;
 
 use clap::{Args, Parser, Subcommand};

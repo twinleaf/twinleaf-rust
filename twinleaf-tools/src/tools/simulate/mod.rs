@@ -259,6 +259,26 @@ impl Simulator {
             device::CAPTURE_SAMPLES_MAX,
             device::CAPTURE_DELAY_NS as f64 / 1e9
         );
+        match cli.upload {
+            crate::UploadKind::TlChibi => {
+                terminal_println!(
+                    "  firmware upload: tl-chibi images (--upload signed for packages)"
+                )
+            }
+            crate::UploadKind::Signed => {
+                let text = |bytes: &[u8]| {
+                    String::from_utf8_lossy(bytes)
+                        .trim_end_matches('\0')
+                        .to_string()
+                };
+                terminal_println!(
+                    "  firmware upload: signed development packages, magic {:?} board {:?} revision {}, signature unchecked",
+                    text(device::PACKAGE.magic.as_bytes()),
+                    text(device::PACKAGE.board_id.as_bytes()),
+                    device::PACKAGE.hw_rev.value()
+                )
+            }
+        }
     }
 
     fn handle_keyboard(&mut self) -> io::Result<bool> {
@@ -658,6 +678,63 @@ mod tests {
         assert!(String::from_utf8(desc)
             .unwrap()
             .ends_with("[2026-06-08/000002]"));
+        assert_eq!(
+            call(&mut simulator, &host, "dev.firmware.abort", &[], "/"),
+            Err(RpcError::NotFound.value()),
+            "tl-chibi has no abort"
+        );
+    }
+
+    /// The header of a signed package for the simulator, around an image of
+    /// `len` bytes.
+    fn package_header(len: u32) -> Vec<u8> {
+        let mut header = vec![0u8; 288];
+        header[..8].copy_from_slice(device::PACKAGE.magic.as_bytes());
+        header[8..10].copy_from_slice(&1u16.to_le_bytes());
+        header[10..12].copy_from_slice(&288u16.to_le_bytes());
+        header[12..20].copy_from_slice(device::PACKAGE.board_id.as_bytes());
+        header[20..22].copy_from_slice(&device::PACKAGE.hw_rev.to_le_bytes());
+        header[22..24].copy_from_slice(&1u16.to_le_bytes());
+        header[24..28].copy_from_slice(&len.to_le_bytes());
+        header
+    }
+
+    /// With `--upload signed`, the simulator takes a package as a device built
+    /// on `twinleaf-device` does, and refuses a chunk out of place.
+    #[test]
+    fn a_signed_upload_takes_a_package_and_reboots_into_it() {
+        let (mut simulator, host) = start_simulator(&["--upload", "signed"]);
+        let session = simulator.tree.devices()[0].session();
+        let upload = |simulator: &mut Simulator, args: &[u8]| {
+            call(simulator, &host, "dev.firmware.upload", args, "/")
+        };
+        let chunk = |offset: u32, len: usize| {
+            let mut chunk = offset.to_le_bytes().to_vec();
+            chunk.resize(4 + len, 0xa5);
+            chunk
+        };
+
+        assert_eq!(
+            upload(&mut simulator, &[0; 288]),
+            Err(RpcError::Invalid.value()),
+            "a tl-chibi chunk is no package header"
+        );
+        upload(&mut simulator, &package_header(300)).unwrap();
+        upload(&mut simulator, &chunk(0, 256)).unwrap();
+        assert_eq!(
+            upload(&mut simulator, &chunk(0, 44)),
+            Err(RpcError::Range.value()),
+            "a chunk already written"
+        );
+        upload(&mut simulator, &chunk(256, 44)).unwrap();
+        assert_eq!(
+            upload(&mut simulator, &[]),
+            Ok(300u32.to_le_bytes().to_vec())
+        );
+        call(&mut simulator, &host, "dev.firmware.upgrade", &[], "/").unwrap();
+
+        assert_ne!(simulator.tree.devices()[0].session(), session);
+        assert_eq!(upload(&mut simulator, &[]), Ok(0u32.to_le_bytes().to_vec()));
     }
 
     /// The devices of a layout tell themselves apart by serial and session.

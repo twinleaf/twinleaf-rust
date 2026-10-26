@@ -11,17 +11,18 @@ use twinleaf::proto::log::LogLevel;
 use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::sync::Epoch;
-use twinleaf::proto::{DeviceRoute, SessionId, StreamId};
+use twinleaf::proto::{BoardId, DeviceRoute, FirmwareMagic, HwRev, SessionId, StreamId};
 use twinleaf_device::data::{filter, ColumnDef, Params, Stream, StreamDef, Timeref};
 use twinleaf_device::device::{
     self, Action, Actions, Announcer, Deferred, Entries, Entry, FlashOp, Group, Identity, Input,
     OneLane, Pending, SyncRequest,
 };
 use twinleaf_device::rpc::{Access, Capture, Reply, RpcSpec, Selector, Setting, Status, STANDARD};
+use twinleaf_device::storage::update::{Package, Take, Upload};
 use twinleaf_device::{Device, Sink};
 
 use super::{unix_duration, GaussianRng};
-use crate::SimulateCli;
+use crate::{SimulateCli, UploadKind};
 
 const DEVICE_NAME: &str = "tio-test";
 const DEVICE_DESC: &str = "Twinleaf tio-test R1 ((null)) [2026-06-08/000001-DEV]";
@@ -47,6 +48,83 @@ pub(super) const CAPTURE_SAMPLES_MIN: usize = 800;
 pub(super) const CAPTURE_SAMPLES_MAX: usize = 1200;
 /// The bytes of a tl-chibi upload chunk that are envelope rather than image.
 const CHUNK_ENVELOPE: usize = 32;
+
+/// What a signed package for the simulator names.
+pub(super) const PACKAGE: Package = Package {
+    magic: FirmwareMagic::new(*b"TIOTEST\0"),
+    board_id: BoardId::from_ascii("tio-test"),
+    hw_rev: HwRev::new(1),
+    development: true,
+    image_max: 1 << 20,
+};
+
+/// The firmware slot, as the kind of device being simulated keeps it.
+enum Slot {
+    /// tl-chibi's, counting the image bytes of each chunk it takes.
+    TlChibi { uploaded: u32 },
+    /// A `twinleaf-device` firmware's, keeping the crate's own cursor.
+    Signed(Upload),
+}
+
+impl Slot {
+    fn new(kind: UploadKind) -> Self {
+        match kind {
+            UploadKind::TlChibi => Self::TlChibi { uploaded: 0 },
+            UploadKind::Signed => Self::Signed(Upload::new()),
+        }
+    }
+
+    fn kind(&self) -> UploadKind {
+        match self {
+            Self::TlChibi { .. } => UploadKind::TlChibi,
+            Self::Signed(_) => UploadKind::Signed,
+        }
+    }
+
+    /// Takes one chunk of `dev.firmware.upload`, or reads the cursor for an
+    /// empty one. The image goes nowhere, so every write lands.
+    fn upload(&mut self, chunk: &[u8], now_ns: u64) -> Result<Vec<u8>, RpcError> {
+        match self {
+            Self::TlChibi { uploaded } if chunk.is_empty() => Ok(uploaded.to_le_bytes().to_vec()),
+            Self::TlChibi { uploaded } => {
+                let image = chunk.len().saturating_sub(CHUNK_ENVELOPE) as u32;
+                *uploaded = uploaded.saturating_add(image);
+                Ok(Vec::new())
+            }
+            Self::Signed(upload) if chunk.is_empty() => {
+                Ok(upload.cursor(now_ns).to_le_bytes().to_vec())
+            }
+            Self::Signed(upload) => match upload.chunk(&PACKAGE, chunk, now_ns)? {
+                Take::Header { .. } => Ok(Vec::new()),
+                Take::Image(image) => {
+                    image.written();
+                    Ok(Vec::new())
+                }
+            },
+        }
+    }
+
+    /// `dev.firmware.upgrade`. The simulator holds no key, so a signed
+    /// package's signature goes unchecked.
+    fn upgrade(&mut self, now_ns: u64) -> Result<(), RpcError> {
+        match self {
+            Self::TlChibi { .. } => Ok(()),
+            Self::Signed(upload) => {
+                upload.upgrade(now_ns)?;
+                upload.armed();
+                Ok(())
+            }
+        }
+    }
+
+    /// `dev.firmware.abort`, which tl-chibi does not have.
+    fn abort(&mut self) -> Result<(), RpcError> {
+        match self {
+            Self::TlChibi { .. } => Err(RpcError::NotFound),
+            Self::Signed(upload) => upload.abort(),
+        }
+    }
+}
 
 static SINE: StreamDef = StreamDef {
     name: "sine",
@@ -275,8 +353,7 @@ pub(super) struct SimDevice {
     aux: Clock,
     rng: GaussianRng,
     capture: Captured,
-    /// Image bytes `dev.firmware.upload` has taken, as tl-chibi counts them.
-    uploaded: u32,
+    slot: Slot,
     /// The configuration `dev.conf.save` or an autosave stored, if any.
     stored: Option<Entries>,
     next_log_ns: u64,
@@ -334,7 +411,7 @@ impl SimDevice {
             aux: Clock::stopped(AUX_SAMPLE_RATE),
             rng,
             capture: Captured::idle(),
-            uploaded: 0,
+            slot: Slot::new(cli.upload),
             stored: None,
             next_log_ns,
             next_log_level: 0,
@@ -473,10 +550,8 @@ impl SimDevice {
         }
     }
 
-    /// What firmware does with its flash, in memory. An upload follows
-    /// tl-chibi, as the host's `tio upgrade` does. Each chunk's image bytes
-    /// are counted, and the cursor reads back that count. The simulator
-    /// decrypts nothing, so it takes any image.
+    /// What firmware does with its flash, in memory. An upload goes to the
+    /// slot of the kind of device being simulated.
     fn flash(&mut self, pending: Pending<'_>, op: FlashOp, now_ns: u64, out: &mut impl Sink) {
         let answered: Result<Vec<u8>, RpcError> = match op {
             FlashOp::ConfSave(image) => {
@@ -498,13 +573,11 @@ impl SimDevice {
                 );
                 return self.carry_out(actions, now_ns, out);
             }
-            FlashOp::Upload(chunk) if chunk.is_empty() => Ok(self.uploaded.to_le_bytes().to_vec()),
-            FlashOp::Upload(chunk) => {
-                let image = chunk.len().saturating_sub(CHUNK_ENVELOPE) as u32;
-                self.uploaded = self.uploaded.saturating_add(image);
-                Ok(Vec::new())
-            }
+            FlashOp::Upload(chunk) => self.slot.upload(&chunk, now_ns),
             FlashOp::Upgrade => {
+                if let Err(error) = self.slot.upgrade(now_ns) {
+                    return device::answer(pending, Err(error), out);
+                }
                 device::answer(pending, Ok::<_, RpcError>(&[][..]), out);
                 let serial = self.device.identity.serial.clone();
                 self.device.identity =
@@ -512,10 +585,7 @@ impl SimDevice {
                         .expect("the simulator's identity fits");
                 return self.reboot(now_ns, out);
             }
-            FlashOp::Abort => {
-                self.uploaded = 0;
-                Ok(Vec::new())
-            }
+            FlashOp::Abort => self.slot.abort().map(|()| Vec::new()),
         };
         device::answer(pending, answered.as_deref().map_err(|&error| error), out);
     }
@@ -579,7 +649,7 @@ impl SimDevice {
             );
             self.carry_out(actions, now_ns, out);
         }
-        self.uploaded = 0;
+        self.slot = Slot::new(self.slot.kind());
         self.capture = Captured::idle();
         self.stop();
         self.start(now_ns);
