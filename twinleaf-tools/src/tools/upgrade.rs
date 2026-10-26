@@ -478,9 +478,13 @@ fn flash_with_progress(device: &Device, firmware_data: &[u8]) -> eyre::Result<()
         spinner.finish_and_clear();
     }
 
-    result
-        .wrap_err("firmware upgrade failed")
-        .suggestion(power_cycle_hint)?;
+    // An image the device cannot take fails the same after a power cycle.
+    let refused = matches!(result, Err(firmware::FirmwareError::Refused(_)));
+    let result = result.wrap_err("firmware upgrade failed");
+    match refused {
+        true => result?,
+        false => result.suggestion(power_cycle_hint)?,
+    }
 
     println!(
         " {} {}",

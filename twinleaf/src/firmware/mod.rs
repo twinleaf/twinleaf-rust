@@ -24,6 +24,14 @@ const UPLOAD_CHUNK_SIZE: usize = 288;
 /// AES IV and the size, offset, CRC and id header the device checks before
 /// appending.
 const CHUNK_ENVELOPE: usize = 32;
+/// The header a signed package opens with, in the layout `twinleaf-device`
+/// reads in `storage::update`, and the version of that layout.
+const PACKAGE_HEADER_SIZE: usize = 288;
+const PACKAGE_FORMAT_VERSION: u16 = 1;
+/// The image bytes in each chunk of a signed package, behind the four bytes
+/// of offset the chunk opens with. A power of two, so a chunk is a whole
+/// number of flash writes.
+const PACKAGE_CHUNK_DATA: usize = 256;
 /// The most upload chunks awaiting acknowledgement at once.
 const MAX_CHUNKS_IN_FLIGHT: usize = 2;
 /// How many resumptions in a row may leave the device's upload cursor where
@@ -209,6 +217,9 @@ pub enum FirmwareError {
     /// The upload did not complete.
     #[error("firmware upload failed: {0}")]
     Upload(String),
+    /// The device cannot take this image, so retrying does not help.
+    #[error("the device cannot take this image: {0}")]
+    Refused(String),
 }
 
 /// A source of published firmware images (e.g. a GitHub repository).
@@ -450,6 +461,12 @@ pub fn download_cached(
 /// Uploads `firmware_data` to `device` and commits the upgrade. Reports
 /// progress through `on_event` and prints nothing.
 ///
+/// The image is either a tl-chibi image, whose chunks carry their own
+/// envelope, or a signed package for a device built on `twinleaf-device`. A
+/// device built on `twinleaf-device` answers `dev.firmware.abort` and tl-chibi
+/// does not, which tells them apart before anything is stopped or sent. An
+/// image the device cannot take is refused then.
+///
 /// A chunk lost in either direction fails the upload window it is in. The
 /// upload then reads the device's upload cursor and resumes from that chunk.
 /// It gives up after three resumptions in a row that leave the cursor where
@@ -459,14 +476,30 @@ pub fn download_cached(
 ///
 /// # Errors
 ///
-/// Returns [`FirmwareError::Rpc`] if `dev.stop` or the commit fails, and
-/// [`FirmwareError::Upload`] if the upload stalls or the device's cursor is
-/// not a chunk boundary of the image.
+/// Returns [`FirmwareError::Rpc`] if `dev.stop` or the commit fails,
+/// [`FirmwareError::Refused`] if the device takes the other kind of image or
+/// refuses a package's header, and [`FirmwareError::Upload`] if an upload
+/// stalls or the device's cursor is not a chunk boundary of the image.
 pub fn flash(
     device: &Device,
     firmware_data: &[u8],
     mut on_event: impl FnMut(FlashEvent),
 ) -> Result<(), FirmwareError> {
+    let package = is_package(firmware_data);
+    match (package, takes_packages(device)?) {
+        (true, false) => {
+            return Err(FirmwareError::Refused(
+                "this is a signed package, and the device takes tl-chibi images".into(),
+            ))
+        }
+        (false, true) => {
+            return Err(FirmwareError::Refused(
+                "the device takes signed packages, and this is a tl-chibi image".into(),
+            ))
+        }
+        (true, true) | (false, false) => {}
+    }
+
     // Stop streaming first. A device that lacks dev.stop, or is already
     // stopped, is fine to proceed with.
     on_event(FlashEvent::Stopping);
@@ -482,6 +515,61 @@ pub fn flash(
     };
     on_event(FlashEvent::Stopped(stop_outcome));
 
+    match package {
+        true => upload_package(device, firmware_data, &mut on_event)?,
+        false => upload_image(device, firmware_data, &mut on_event)?,
+    }
+
+    on_event(FlashEvent::Committing);
+    device.action("dev.firmware.upgrade")?;
+
+    on_event(FlashEvent::Finalizing);
+    std::thread::sleep(COMMIT_SETTLE_TIME);
+
+    on_event(FlashEvent::Complete);
+    Ok(())
+}
+
+/// Whether `data` is a signed package. Its header names the format version
+/// and size `twinleaf-device` reads, and exactly the image behind it, which a
+/// tl-chibi image matches only by chance in eight bytes.
+fn is_package(data: &[u8]) -> bool {
+    if data.len() <= PACKAGE_HEADER_SIZE {
+        return false;
+    }
+    let word = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]);
+    let image_len = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+    word(8) == PACKAGE_FORMAT_VERSION
+        && usize::from(word(10)) == PACKAGE_HEADER_SIZE
+        && image_len as usize == data.len() - PACKAGE_HEADER_SIZE
+}
+
+/// Whether `device` takes signed packages, which it says by answering
+/// `dev.firmware.abort`. Aborting first also throws away what an earlier
+/// host left half uploaded.
+fn takes_packages(device: &Device) -> Result<bool, FirmwareError> {
+    match device.action("dev.firmware.abort") {
+        Ok(()) => Ok(true),
+        Err(CallError::DeviceError(ref e)) if matches!(e.error, wire_rpc::RpcError::NotFound) => {
+            Ok(false)
+        }
+        Err(CallError::DeviceError(ref e)) if matches!(e.error, wire_rpc::RpcError::State) => {
+            Err(FirmwareError::Upload(
+                "the device already has an upgrade committed, which its next reboot installs"
+                    .into(),
+            ))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Uploads a tl-chibi image, whose chunks each carry the envelope the device
+/// checks before appending them.
+fn upload_image(
+    device: &Device,
+    firmware_data: &[u8],
+    on_event: &mut impl FnMut(FlashEvent),
+) -> Result<(), FirmwareError> {
     let total_chunks = firmware_data.len().div_ceil(UPLOAD_CHUNK_SIZE);
     let mut resume_at = 0;
     let mut stalls = 0;
@@ -500,7 +588,9 @@ pub fn flash(
                     })
                 })
             });
-        let Err(error) = outcome else { break };
+        let Err(error) = outcome else {
+            return Ok(());
+        };
         let next = match device.get::<u32>("dev.firmware.upload") {
             Ok(cursor) => chunk_at(cursor, firmware_data).ok_or_else(|| {
                 FirmwareError::Upload(format!(
@@ -518,7 +608,7 @@ pub fn flash(
             )));
         }
         if next == total_chunks {
-            break;
+            return Ok(());
         }
         on_event(FlashEvent::Resuming {
             chunk: next + 1,
@@ -527,15 +617,98 @@ pub fn flash(
         });
         resume_at = next;
     }
+}
 
-    on_event(FlashEvent::Committing);
-    device.action("dev.firmware.upgrade")?;
-
-    on_event(FlashEvent::Finalizing);
-    std::thread::sleep(COMMIT_SETTLE_TIME);
-
-    on_event(FlashEvent::Complete);
-    Ok(())
+/// Uploads a signed package. The header goes first in a chunk of its own,
+/// then the image in chunks that each open with the image offset they start
+/// at, so the device refuses one that would land anywhere but its cursor.
+///
+/// The cursor counts image bytes. At zero it cannot tell whether the header
+/// was taken, so the upload resends the header, which the device takes again
+/// until image bytes arrive. A header the device refuses names another board,
+/// revision or key, and fails the upload at once.
+fn upload_package(
+    device: &Device,
+    package: &[u8],
+    on_event: &mut impl FnMut(FlashEvent),
+) -> Result<(), FirmwareError> {
+    let (header, image) = package.split_at(PACKAGE_HEADER_SIZE);
+    let total_chunks = 1 + image.len().div_ceil(PACKAGE_CHUNK_DATA);
+    // The chunk number, counted from one, of what starts at image `offset`.
+    let chunk_of = |offset: usize| match offset {
+        0 => 1,
+        offset => 2 + offset / PACKAGE_CHUNK_DATA,
+    };
+    let mut resume_at = 0;
+    let mut stalls = 0;
+    loop {
+        let first = chunk_of(resume_at);
+        let header_chunk = (resume_at == 0).then(|| header.to_vec());
+        let image_chunks = image[resume_at..]
+            .chunks(PACKAGE_CHUNK_DATA)
+            .enumerate()
+            .map(|(index, data)| {
+                let offset = (resume_at + index * PACKAGE_CHUNK_DATA) as u32;
+                let mut chunk = offset.to_le_bytes().to_vec();
+                chunk.extend_from_slice(data);
+                chunk
+            });
+        let sends = header_chunk
+            .into_iter()
+            .chain(image_chunks)
+            .map(|chunk| device.submit("dev.firmware.upload", &chunk));
+        let mut acked = 0;
+        let outcome = pipelined(sends, MAX_CHUNKS_IN_FLIGHT).try_for_each(|ack| {
+            ack.map(|_| {
+                acked += 1;
+                on_event(FlashEvent::Uploading {
+                    chunk: first + acked - 1,
+                    total: total_chunks,
+                })
+            })
+        });
+        let Err(error) = outcome else {
+            return Ok(());
+        };
+        if let (0, 0, CallError::DeviceError(refused)) = (resume_at, acked, &error) {
+            if matches!(
+                refused.error,
+                wire_rpc::RpcError::Invalid | wire_rpc::RpcError::Range
+            ) {
+                return Err(FirmwareError::Refused(format!(
+                    "its header was refused ({}), so the package is for \
+                     another board or revision, signed with the other kind of key, or too large",
+                    refused.error
+                )));
+            }
+        }
+        let next = match device.get::<u32>("dev.firmware.upload") {
+            Ok(cursor) if cursor as usize <= image.len() => cursor as usize,
+            Ok(cursor) => {
+                return Err(FirmwareError::Upload(format!(
+                    "the device's upload cursor ({cursor} bytes) is past the end of this image"
+                )))
+            }
+            Err(_) => resume_at,
+        };
+        stalls = if next > resume_at { 0 } else { stalls + 1 };
+        if stalls == MAX_STALLS {
+            return Err(FirmwareError::Upload(format!(
+                "firmware chunk {}/{} failed {stalls} times without progress: {error}",
+                chunk_of(next),
+                total_chunks
+            )));
+        }
+        if next == image.len() {
+            return Ok(());
+        }
+        on_event(FlashEvent::Resuming {
+            chunk: chunk_of(next),
+            total: total_chunks,
+            error: error.to_string(),
+        });
+        resume_at = next;
+    }
 }
 
 /// Returns the chunk of `image` that starts at the device's upload `cursor`.
@@ -726,7 +899,7 @@ mod tests {
     /// RPCs are always acknowledged. Returns the outcome, the events, the
     /// chunk indices sent in order, and the device's final cursor.
     fn flash_against(
-        firmware_len: usize,
+        firmware: Vec<u8>,
         cursor: u32,
         fault: impl FnMut(usize) -> Fault + Send + 'static,
     ) -> (Result<(), FirmwareError>, Vec<FlashEvent>, Vec<usize>, u32) {
@@ -745,6 +918,11 @@ mod tests {
                 let wire_rpc::Method::ByName(name) = request.method else {
                     panic!("expected a call by name");
                 };
+                // tl-chibi has no way to abort an upload.
+                if name == b"dev.firmware.abort" {
+                    proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
+                    continue;
+                }
                 if name != b"dev.firmware.upload" {
                     proxy.reply(id, &[], route);
                     continue;
@@ -782,7 +960,7 @@ mod tests {
         };
 
         let mut events = Vec::new();
-        let result = flash(&device, &image(firmware_len), |e| events.push(e));
+        let result = flash(&device, &firmware, |e| events.push(e));
         drop(device);
         let (sent, cursor) = responder.join().unwrap();
         (result, events, sent, cursor)
@@ -814,7 +992,8 @@ mod tests {
 
     #[test]
     fn flash_acknowledges_every_chunk_in_order_and_commits() {
-        let (result, events, sent, cursor) = flash_against(THREE_CHUNKS, 0, |_| Fault::Deliver);
+        let (result, events, sent, cursor) =
+            flash_against(image(THREE_CHUNKS), 0, |_| Fault::Deliver);
 
         result.unwrap();
         assert_eq!(sent, [0, 1, 2]);
@@ -828,7 +1007,7 @@ mod tests {
     #[test]
     fn a_lost_chunk_is_resent_from_the_devices_cursor() {
         let mut lost = false;
-        let (result, events, sent, cursor) = flash_against(THREE_CHUNKS, 0, move |chunk| {
+        let (result, events, sent, cursor) = flash_against(image(THREE_CHUNKS), 0, move |chunk| {
             if chunk == 1 && !std::mem::replace(&mut lost, true) {
                 Fault::LoseRequest
             } else {
@@ -846,7 +1025,7 @@ mod tests {
     /// cursor is already past it.
     #[test]
     fn a_lost_ack_is_not_resent() {
-        let (result, events, sent, cursor) = flash_against(THREE_CHUNKS, 0, |chunk| {
+        let (result, events, sent, cursor) = flash_against(image(THREE_CHUNKS), 0, |chunk| {
             if chunk == 1 {
                 Fault::LoseAck
             } else {
@@ -866,7 +1045,7 @@ mod tests {
     fn a_partial_upload_resumes_where_the_device_left_off() {
         let first_chunk = (UPLOAD_CHUNK_SIZE - CHUNK_ENVELOPE) as u32;
         let (result, events, sent, cursor) =
-            flash_against(THREE_CHUNKS, first_chunk, |_| Fault::Deliver);
+            flash_against(image(THREE_CHUNKS), first_chunk, |_| Fault::Deliver);
 
         result.unwrap();
         assert_eq!(sent, [0, 1, 2]);
@@ -876,7 +1055,7 @@ mod tests {
 
     #[test]
     fn an_upload_the_device_keeps_rejecting_fails_without_progress() {
-        let (result, _, sent, _) = flash_against(100, 0, |_| Fault::Reject);
+        let (result, _, sent, _) = flash_against(image(100), 0, |_| Fault::Reject);
 
         let err = result.unwrap_err().to_string();
         assert_eq!(sent.len(), MAX_STALLS as usize);
@@ -888,7 +1067,7 @@ mod tests {
 
     #[test]
     fn an_upload_that_keeps_timing_out_fails_without_progress() {
-        let (result, _, sent, _) = flash_against(100, 0, |_| Fault::LoseRequest);
+        let (result, _, sent, _) = flash_against(image(100), 0, |_| Fault::LoseRequest);
 
         let err = result.unwrap_err().to_string();
         assert_eq!(sent.len(), MAX_STALLS as usize);
@@ -908,6 +1087,224 @@ mod tests {
         assert_eq!(chunk_at(THREE_CHUNKS_DATA, &image), Some(3));
         assert_eq!(chunk_at(data_per_chunk + 1, &image), None);
         assert_eq!(chunk_at(THREE_CHUNKS_DATA + 256, &image), None);
+    }
+
+    use twinleaf_device::storage::update::{self as device_update, Take};
+
+    /// The board the package fake takes packages for.
+    fn board() -> device_update::Package {
+        device_update::Package {
+            magic: crate::proto::FirmwareMagic::new(*b"TESTFW\0\0"),
+            board_id: crate::proto::BoardId::from_ascii("TEST"),
+            hw_rev: crate::proto::HwRev::new(1),
+            development: true,
+            image_max: 64 * 1024,
+        }
+    }
+
+    /// A signed package for `board`, the signature left blank, around an
+    /// image of `len` bytes.
+    fn package(board: &device_update::Package, len: usize) -> Vec<u8> {
+        let mut data = vec![0u8; PACKAGE_HEADER_SIZE];
+        data[..8].copy_from_slice(board.magic.as_bytes());
+        data[8..10].copy_from_slice(&PACKAGE_FORMAT_VERSION.to_le_bytes());
+        data[10..12].copy_from_slice(&(PACKAGE_HEADER_SIZE as u16).to_le_bytes());
+        data[12..20].copy_from_slice(board.board_id.as_bytes());
+        data[20..22].copy_from_slice(&board.hw_rev.to_le_bytes());
+        data[22..24].copy_from_slice(&1u16.to_le_bytes());
+        data[24..28].copy_from_slice(&(len as u32).to_le_bytes());
+        data.extend((0..len).map(|byte| byte as u8));
+        data
+    }
+
+    /// Run [`flash`] against a fake device that keeps the crate's own upload
+    /// cursor for `board`, with `fault` deciding what happens to each chunk.
+    /// Returns the outcome, the events, the chunks sent in order (zero for
+    /// the header, then one more than each image chunk's index), and the
+    /// device's final cursor.
+    fn flash_package_against(
+        board: device_update::Package,
+        firmware: Vec<u8>,
+        fault: impl FnMut(usize) -> Fault + Send + 'static,
+    ) -> (Result<(), FirmwareError>, Vec<FlashEvent>, Vec<usize>, u32) {
+        let (device, proxy) = crate::device::Device::test_pair();
+        let responder = std::thread::spawn(move || {
+            let booted = std::time::Instant::now();
+            let mut upload = device_update::Upload::new();
+            let mut fault = fault;
+            let mut sent = Vec::new();
+            while let Ok(request) = proxy.sent.recv_timeout(Duration::from_secs(5)) {
+                let now = booted.elapsed().as_nanos() as u64;
+                let route = request.route();
+                let crate::tio::packet::Payload::RpcRequest(request) = request.payload() else {
+                    panic!("flash only makes RPC calls");
+                };
+                let id = request.id.value();
+                let wire_rpc::Method::ByName(name) = request.method else {
+                    panic!("expected a call by name");
+                };
+                let answer = |result: Result<Vec<u8>, wire_rpc::RpcError>| match result {
+                    Ok(value) => proxy.reply(id, &value, route),
+                    Err(error) => proxy.refuse(id, error, route),
+                };
+                match name {
+                    b"dev.firmware.abort" => answer(upload.abort().map(|()| Vec::new())),
+                    b"dev.firmware.upgrade" => answer(upload.upgrade(now).map(|_| {
+                        upload.armed();
+                        Vec::new()
+                    })),
+                    b"dev.firmware.upload" if request.args.is_empty() => {
+                        answer(Ok(upload.cursor(now).to_le_bytes().to_vec()))
+                    }
+                    b"dev.firmware.upload" => {
+                        let chunk = match request.args.len() == PACKAGE_HEADER_SIZE
+                            && request.args[..8] == *board.magic.as_bytes()
+                        {
+                            true => 0,
+                            false => {
+                                let offset =
+                                    u32::from_le_bytes(request.args[..4].try_into().unwrap());
+                                1 + offset as usize / PACKAGE_CHUNK_DATA
+                            }
+                        };
+                        sent.push(chunk);
+                        let mut take = || match upload.chunk(&board, request.args, now)? {
+                            Take::Header { .. } => Ok(Vec::new()),
+                            Take::Image(image) => {
+                                image.written();
+                                Ok(Vec::new())
+                            }
+                        };
+                        // A lost request or ack goes unanswered, and times out.
+                        match fault(chunk) {
+                            Fault::Deliver => answer(take()),
+                            Fault::LoseRequest => {}
+                            Fault::LoseAck => drop(take()),
+                            Fault::Reject => answer(Err(wire_rpc::RpcError::Invalid)),
+                        }
+                    }
+                    _ => answer(Ok(Vec::new())),
+                }
+            }
+            let cursor = upload.cursor(0);
+            (sent, cursor)
+        });
+        let device = device.with_timeout(Duration::from_millis(500));
+        let mut events = Vec::new();
+        let result = flash(&device, &firmware, |e| events.push(e));
+        drop(device);
+        let (sent, cursor) = responder.join().unwrap();
+        (result, events, sent, cursor)
+    }
+
+    /// An image of two full chunks and a short tail.
+    const PACKAGE_IMAGE: usize = 2 * PACKAGE_CHUNK_DATA + 88;
+
+    #[test]
+    fn a_package_is_told_from_a_tl_chibi_image() {
+        let board = board();
+        assert!(is_package(&package(&board, PACKAGE_IMAGE)));
+        assert!(!is_package(&image(THREE_CHUNKS)));
+        let mut truncated = package(&board, PACKAGE_IMAGE);
+        truncated.pop();
+        assert!(
+            !is_package(&truncated),
+            "the header names the image behind it"
+        );
+    }
+
+    #[test]
+    fn a_package_goes_header_first_then_by_offset_and_commits() {
+        let board = board();
+        let firmware = package(&board, PACKAGE_IMAGE);
+        let (result, events, sent, cursor) =
+            flash_package_against(board, firmware, |_| Fault::Deliver);
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 2, 3]);
+        assert_eq!(acked(&events), [1, 2, 3, 4]);
+        assert_eq!(cursor, PACKAGE_IMAGE as u32);
+        assert!(events.contains(&FlashEvent::Complete));
+    }
+
+    /// Losing image chunk 1 gets chunk 2, already in flight, refused for its
+    /// offset rather than written in chunk 1's place. Both are resent.
+    #[test]
+    fn a_lost_package_chunk_never_lets_the_next_take_its_place() {
+        let board = board();
+        let firmware = package(&board, PACKAGE_IMAGE);
+        let mut lost = false;
+        let (result, events, sent, cursor) = flash_package_against(board, firmware, move |chunk| {
+            if chunk == 2 && !std::mem::replace(&mut lost, true) {
+                Fault::LoseRequest
+            } else {
+                Fault::Deliver
+            }
+        });
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 2, 3, 2, 3]);
+        assert_eq!(resumed(&events), [3]);
+        assert_eq!(cursor, PACKAGE_IMAGE as u32);
+    }
+
+    /// The device took the header but its ack was lost, and the first image
+    /// chunk was lost too. A cursor of zero cannot say whether the header was
+    /// taken, so it is sent again, and the device takes it again.
+    #[test]
+    fn a_header_whose_ack_was_lost_is_sent_again() {
+        let board = board();
+        let firmware = package(&board, PACKAGE_IMAGE);
+        let mut faults = vec![Fault::LoseAck, Fault::LoseRequest].into_iter();
+        let (result, _, sent, cursor) = flash_package_against(board, firmware, move |_| {
+            faults.next().unwrap_or(Fault::Deliver)
+        });
+
+        result.unwrap();
+        assert_eq!(sent, [0, 1, 0, 1, 2, 3]);
+        assert_eq!(cursor, PACKAGE_IMAGE as u32);
+    }
+
+    /// A header the device refuses fails at once, without resending.
+    #[test]
+    fn a_package_for_another_board_is_refused_at_its_header() {
+        let other = device_update::Package {
+            board_id: crate::proto::BoardId::from_ascii("OTHER"),
+            ..board()
+        };
+        let firmware = package(&board(), PACKAGE_IMAGE);
+        let (result, _, sent, _) = flash_package_against(other, firmware, |_| Fault::Deliver);
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot take this image: its header was refused"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(sent.first(), Some(&0));
+        assert_eq!(sent.iter().filter(|&&chunk| chunk == 0).count(), 1);
+    }
+
+    /// Each kind of device refuses the other kind of image before anything is
+    /// stopped or sent.
+    #[test]
+    fn a_device_refuses_the_other_kind_of_image() {
+        let (result, events, sent, _) =
+            flash_package_against(board(), image(THREE_CHUNKS), |_| Fault::Deliver);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("takes signed packages"),
+            "unexpected error: {err}"
+        );
+        assert!(events.is_empty() && sent.is_empty());
+
+        let (result, events, sent, _) =
+            flash_against(package(&board(), PACKAGE_IMAGE), 0, |_| Fault::Deliver);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("takes tl-chibi images"),
+            "unexpected error: {err}"
+        );
+        assert!(events.is_empty() && sent.is_empty());
     }
 
     #[test]

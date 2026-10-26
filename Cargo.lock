@@ -3117,6 +3117,7 @@ dependencies = [
  "tokio-serial",
  "tokio-stream",
  "tokio-util",
+ "twinleaf-device",
  "twinleaf-proto",
  "ureq",
  "windows-sys 0.61.2",

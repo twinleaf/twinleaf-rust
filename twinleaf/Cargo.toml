@@ -62,6 +62,7 @@ flume = { version = "0.12", default-features = false, features = ["async", "sele
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
+twinleaf-device = { path = "../twinleaf-device" }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
