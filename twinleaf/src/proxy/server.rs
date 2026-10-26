@@ -18,7 +18,7 @@ use std::future::{self, Future};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -54,13 +54,6 @@ pub(super) enum Update {
     Target(String),
 }
 
-/// The proxy's default layout, as the server sets it and as every task that
-/// reads it watches it.
-pub(super) type DefaultLayout = (
-    watch::Sender<Option<Layout>>,
-    watch::Receiver<Option<Layout>>,
-);
-
 /// What every client's task reads, none of which keeps the proxy running.
 pub(super) struct Shared {
     /// How the proxy is hosted. Its default layout is held in `default`.
@@ -71,7 +64,10 @@ pub(super) struct Shared {
     pub(super) tasks: Supervisor,
     /// The server's mailbox.
     pub(super) server: mpsc::WeakUnboundedSender<Notice>,
-    pub(super) default: watch::Receiver<Option<Layout>>,
+    /// The default layout, which the host sets and a client may hold.
+    pub(super) default: watch::Sender<Option<Layout>>,
+    /// The id and address of the client holding the default with `proxy.default`.
+    pub(super) holder: Mutex<Option<(u64, String)>>,
 }
 
 impl Shared {
@@ -125,8 +121,13 @@ pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
         options.dump,
         default.1.clone(),
     );
-    let (proxy, mut server) =
-        Server::new(options, endpoint_at(port), tasks.clone(), registry, default);
+    let (proxy, mut server) = Server::new(
+        options,
+        endpoint_at(port),
+        tasks.clone(),
+        registry,
+        default.0,
+    );
     server.listeners = listeners;
     log::info!(
         "Proxy hosted by {} at {}",
@@ -174,7 +175,7 @@ impl Server {
         endpoint: String,
         tasks: Supervisor,
         (links, registry): (Links, Owner),
-        (default, defaults): DefaultLayout,
+        default: watch::Sender<Option<Layout>>,
     ) -> (Proxy, Server) {
         let (notices, mailbox) = mpsc::unbounded_channel();
         let (table, clients) = watch::channel(Vec::new());
@@ -183,7 +184,7 @@ impl Server {
             server: notices.clone(),
             stopped: waited,
             clients,
-            default,
+            default: default.clone(),
             endpoint: endpoint.clone(),
             #[cfg(test)]
             links: links.clone(),
@@ -194,7 +195,8 @@ impl Server {
             links,
             tasks,
             server: notices.downgrade(),
-            default: defaults,
+            default,
+            holder: Mutex::new(None),
         });
         let server = Server {
             shared,
@@ -515,7 +517,7 @@ mod tests {
         let default = watch::channel(options.default.take());
         let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
         let endpoint = endpoint_at(address.port());
-        let (proxy, mut server) = Server::new(options, endpoint, tasks, registry, default);
+        let (proxy, mut server) = Server::new(options, endpoint, tasks, registry, default.0);
         let _runtime = rt::handle().enter();
         server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
         let _client = std::net::TcpStream::connect(address).unwrap();
@@ -541,7 +543,8 @@ mod tests {
         let tasks = Supervisor::current();
         let default = watch::channel(options.default.take());
         let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
-        let (proxy, mut server) = Server::new(options, endpoint, tasks.clone(), registry, default);
+        let (proxy, mut server) =
+            Server::new(options, endpoint, tasks.clone(), registry, default.0);
         server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
         tasks.spawn("a test proxy", server.run());
         proxy

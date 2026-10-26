@@ -48,6 +48,10 @@
 //!   mounts, then each mount's URL, source route and prefix route, each
 //!   after a `u8` length. Each mount's device becomes a choice for `auto`.
 //!   A layout that mounts nothing, or whose prefixes overlap, is refused.
+//! - `proxy.default` takes a [`Layout`] and replies nothing. The layout is
+//!   the default until the connection that sent it closes, when the default
+//!   it replaced returns. Only a proxy with [`HostOptions::stoppable`] set
+//!   accepts it, from one connection at a time.
 //! - `proxy.stop` takes nothing and replies nothing, then stops the proxy.
 //!   Only a proxy with [`HostOptions::stoppable`] set accepts it.
 //!
@@ -113,7 +117,7 @@ mod worker;
 
 #[cfg(test)]
 pub(crate) use control::CLIENT_KEEPALIVE;
-pub(crate) use control::{call, executable_name, handshake, Purpose, MOUNT};
+pub(crate) use control::{call, executable_name, handshake, Purpose, DEFAULT_LAYOUT, MOUNT};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -1058,6 +1062,75 @@ mod tests {
         client.hello(4242, "late");
         assert_eq!(client.open("default").unwrap_err().0, RpcError::Invalid);
         assert_eq!(client.open("auto"), Ok(device.url.clone()));
+    }
+
+    /// A client holds a background proxy's default for others to open with
+    /// `auto`, one holder at a time, until it leaves.
+    #[test]
+    fn a_held_default_serves_auto_until_its_holder_leaves() {
+        let device = FakeDevice::start();
+        let prefix: DeviceRoute = "/3".parse().unwrap();
+        let layout = Layout {
+            mounts: vec![Mount {
+                url: device.url.clone(),
+                source: DeviceRoute::root(),
+                prefix,
+            }],
+        };
+        let proxy = Proxy::host(HostOptions {
+            stoppable: true,
+            ..options()
+        })
+        .unwrap();
+        let holder = TestClient::connect(&proxy.endpoint());
+        holder.hello(4242, "tio list");
+        assert_eq!(
+            holder.control("proxy.default", &layout.encode_args(), 2),
+            Ok(Vec::new())
+        );
+
+        let client = TestClient::connect(&proxy.endpoint());
+        client.hello(4243, "tio monitor");
+        assert_eq!(client.open("auto"), Ok("default".to_string()));
+        assert_eq!(client.dev_name_at(prefix, 7), "FAKE");
+        let rival = TestClient::connect(&proxy.endpoint());
+        rival.hello(4244, "rival");
+        let refused = rival.control("proxy.default", &layout.encode_args(), 2);
+        assert_eq!(refused.unwrap_err().0, RpcError::State);
+
+        drop(holder);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let late = loop {
+            let late = TestClient::connect(&proxy.endpoint());
+            late.hello(4245, "late");
+            match late.open("default") {
+                Err((RpcError::Invalid, _)) => break late,
+                outcome if Instant::now() >= deadline => {
+                    panic!("the default outlived its holder: {outcome:?}")
+                }
+                Ok(_) | Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        assert_eq!(
+            late.control("proxy.default", &layout.encode_args(), 3),
+            Ok(Vec::new())
+        );
+    }
+
+    /// A proxy a terminal or an app hosts keeps its own default.
+    #[test]
+    fn a_hosted_proxy_refuses_to_lend_its_default() {
+        let proxy = Proxy::host(options()).unwrap();
+        let client = TestClient::connect(&proxy.endpoint());
+        client.hello(4242, "tio list");
+
+        let layout = Layout::single("tcp://192.0.2.1");
+        let (code, message) = client
+            .control("proxy.default", &layout.encode_args(), 2)
+            .unwrap_err();
+
+        assert_eq!(code, RpcError::State);
+        assert!(message.contains("a test"), "{message}");
     }
 
     /// Returns a proxy whose default is `device`, and a proxy whose default

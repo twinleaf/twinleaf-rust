@@ -187,18 +187,37 @@ impl Connection {
     /// layout, such as one whose prefixes overlap, and in every way
     /// [`open`](Self::open) does.
     pub fn open_layout(layout: &Layout) -> std::io::Result<Connection> {
-        let too_long = layout
-            .mounts
-            .iter()
-            .any(|mount| mount.url.len() > u8::MAX.into());
-        if too_long || layout.mounts.len() > u8::MAX.into() {
-            let message = format!("the layout {layout} does not fit one request");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                message,
-            ));
-        }
+        fits_one_request(layout)?;
         Self::mount_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+    }
+
+    /// Makes `layout` the default of the machine's background proxy, the
+    /// tree every client that names no device opens, until the returned
+    /// connection closes. The connection itself sees nothing. Starts the
+    /// proxy when none runs.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`open_layout`](Self::open_layout) does, and with the proxy's
+    /// message when a terminal or an app hosts it, or another client already
+    /// holds its default.
+    pub fn hold_default(layout: &Layout) -> std::io::Result<Connection> {
+        fits_one_request(layout)?;
+        Self::hold_default_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+    }
+
+    /// Holds `layout` as the default of `proxy`, waiting at most
+    /// `open_timeout` for its answer.
+    pub(crate) fn hold_default_at(
+        proxy: &ProxyAddress,
+        layout: &Layout,
+        open_timeout: Duration,
+    ) -> std::io::Result<Connection> {
+        let (proxy, layout) = (proxy.clone(), layout.clone());
+        let session = Supervisor::new().run("twinleaf connection default", async move {
+            Session::hold_default_async(&proxy, &layout, open_timeout).await
+        })?;
+        Ok(Self::over(session))
     }
 
     /// Opens a connection through `proxy` that sees `layout`, waiting at most
@@ -313,6 +332,22 @@ impl Connection {
     /// [`DeviceTree::packets`].
     pub fn packets(&self) -> Receiver<tio::Packet> {
         self.tree.packets()
+    }
+}
+
+/// Returns an [`InvalidInput`](std::io::ErrorKind::InvalidInput) error if a
+/// mount's URL is longer than 255 bytes or `layout` has more than 255 mounts.
+fn fits_one_request(layout: &Layout) -> std::io::Result<()> {
+    let too_long = layout
+        .mounts
+        .iter()
+        .any(|mount| mount.url.len() > u8::MAX.into());
+    match too_long || layout.mounts.len() > u8::MAX.into() {
+        true => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the layout {layout} does not fit one request"),
+        )),
+        false => Ok(()),
     }
 }
 
