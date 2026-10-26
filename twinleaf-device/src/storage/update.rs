@@ -7,6 +7,12 @@
 //! manifest the platform verifies against a key the crate never holds.
 //! Nothing but a reboot or a timeout moves the cursor back, so a host that
 //! lost an acknowledgement reads the cursor and resumes there.
+//!
+//! The header goes in a chunk of its own. Every chunk after it opens with
+//! the image offset its bytes start at, as a little-endian `u32`, and one
+//! that does not start at the cursor is refused. A host keeping several
+//! chunks in flight therefore never has one written where a lost one
+//! belonged: the next is refused, and the host resumes from the cursor.
 
 use twinleaf_proto::rpc::RpcError;
 use twinleaf_proto::{BoardId, FirmwareMagic, HwRev};
@@ -160,7 +166,14 @@ impl Upload {
         }
     }
 
-    /// What one chunk of `dev.firmware.upload` asks of the platform.
+    /// What one chunk of `dev.firmware.upload` asks of the platform: the
+    /// package header, or image bytes behind the offset they start at.
+    ///
+    /// A header sent again before any image bytes is taken again, so a host
+    /// that lost the header's acknowledgement, and reads a cursor of zero,
+    /// simply resends it. An image chunk starting anywhere but the cursor is
+    /// refused with [`RpcError::Range`], and one that carries no bytes or runs
+    /// past the image with [`RpcError::ArgsSize`].
     pub fn chunk<'u, 'a>(
         &'u mut self,
         package: &Package,
@@ -177,16 +190,29 @@ impl Upload {
                     discarded: core::mem::take(&mut self.discarded),
                 })
             }
+            // An image chunk at offset zero opens with four zero bytes, which
+            // no package magic does, so a header is never mistaken for one.
+            State::Payload(0) if Manifest::parse(package, data).is_ok() => {
+                self.manifest = Manifest::parse(package, data)?;
+                self.touched = Some(now_ns);
+                Ok(Take::Header { discarded: false })
+            }
             State::Payload(received) => {
+                let Some((offset, bytes)) = data.split_first_chunk::<4>() else {
+                    return Err(RpcError::ArgsSize);
+                };
+                if u32::from_le_bytes(*offset) != received {
+                    return Err(RpcError::Range);
+                }
                 let remaining = self.manifest.image_len - received;
-                if data.is_empty() || data.len() > remaining as usize {
+                if bytes.is_empty() || bytes.len() > remaining as usize {
                     return Err(RpcError::ArgsSize);
                 }
                 self.touched = Some(now_ns);
                 Ok(Take::Image(Image {
                     upload: self,
                     offset: received,
-                    bytes: data,
+                    bytes,
                 }))
             }
             State::Complete | State::Committed => Err(RpcError::State),
@@ -346,6 +372,13 @@ mod tests {
         }
     }
 
+    /// An image chunk: `bytes` behind the offset they start at.
+    fn at(offset: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut chunk = offset.to_le_bytes().to_vec();
+        chunk.extend_from_slice(bytes);
+        chunk
+    }
+
     #[test]
     fn the_cursor_follows_the_image_bytes_the_device_holds() {
         let package = package();
@@ -359,9 +392,15 @@ mod tests {
             "the header is not image data"
         );
         assert_eq!(upload.upgrade(BOOT), Err(RpcError::State));
-        assert_eq!(take(&mut upload, &package, &image[..32], BOOT), Ok(32));
+        assert_eq!(
+            take(&mut upload, &package, &at(0, &image[..32]), BOOT),
+            Ok(32)
+        );
         assert_eq!(upload.cursor(BOOT), 32);
-        assert_eq!(take(&mut upload, &package, &image[32..], BOOT), Ok(64));
+        assert_eq!(
+            take(&mut upload, &package, &at(32, &image[32..]), BOOT),
+            Ok(64)
+        );
         assert_eq!(upload.cursor(BOOT), 64, "a whole image reads back whole");
         assert_eq!(upload.upgrade(BOOT).unwrap().image_len, 64);
     }
@@ -375,8 +414,9 @@ mod tests {
         let mut upload = Upload::new();
         take(&mut upload, &package, &header, BOOT).unwrap();
 
+        let head = at(0, &image[..32]);
         {
-            let Ok(Take::Image(refused)) = upload.chunk(&package, &image[..32], BOOT) else {
+            let Ok(Take::Image(refused)) = upload.chunk(&package, &head, BOOT) else {
                 panic!("image bytes")
             };
             assert_eq!(
@@ -386,8 +426,9 @@ mod tests {
         }
         assert_eq!(upload.cursor(BOOT), 0);
 
-        take(&mut upload, &package, &image[..32], BOOT).unwrap();
-        let Ok(Take::Image(tail)) = upload.chunk(&package, &image[32..], BOOT) else {
+        take(&mut upload, &package, &head, BOOT).unwrap();
+        let rest = at(32, &image[32..]);
+        let Ok(Take::Image(tail)) = upload.chunk(&package, &rest, BOOT) else {
             panic!("image bytes")
         };
         assert!(tail.last(), "only the last bytes may be ragged");
@@ -401,11 +442,16 @@ mod tests {
         let (header, image) = small(&package, 64);
         let mut upload = Upload::new();
         take(&mut upload, &package, &header, BOOT).unwrap();
-        take(&mut upload, &package, &image[..32], BOOT).unwrap();
+        take(&mut upload, &package, &at(0, &image[..32]), BOOT).unwrap();
 
-        // Still inside the window: this really is the same host, so the header
-        // bytes are image data and are taken as such.
-        assert_eq!(upload.cursor(BOOT + IDLE_TIMEOUT_NS - 1), 32);
+        // Still inside the window: this really is the same host, and a header
+        // in the middle of its image starts nowhere near the cursor.
+        let live = BOOT + IDLE_TIMEOUT_NS - 1;
+        assert_eq!(
+            upload.chunk(&package, &header, live).err(),
+            Some(RpcError::Range)
+        );
+        assert_eq!(upload.cursor(live), 32);
 
         let gone = BOOT + IDLE_TIMEOUT_NS;
         assert_eq!(upload.cursor(gone), 0, "the stale cursor is forgotten");
@@ -423,13 +469,13 @@ mod tests {
         let (header, image) = small(&package, 64);
         let mut upload = Upload::new();
 
-        let mut at = BOOT;
-        take(&mut upload, &package, &header, at).unwrap();
-        for chunk in image.chunks(8) {
-            at += IDLE_TIMEOUT_NS - 1;
-            take(&mut upload, &package, chunk, at).unwrap();
+        let mut now = BOOT;
+        take(&mut upload, &package, &header, now).unwrap();
+        for (index, chunk) in image.chunks(8).enumerate() {
+            now += IDLE_TIMEOUT_NS - 1;
+            take(&mut upload, &package, &at(index as u32 * 8, chunk), now).unwrap();
         }
-        assert_eq!(upload.cursor(at), 64);
+        assert_eq!(upload.cursor(now), 64);
     }
 
     /// A finished-but-uncommitted upload also times out, or a host that walked
@@ -441,7 +487,7 @@ mod tests {
         let (header, image) = small(&package, 64);
         let mut upload = Upload::new();
         take(&mut upload, &package, &header, BOOT).unwrap();
-        take(&mut upload, &package, &image, BOOT).unwrap();
+        take(&mut upload, &package, &at(0, &image), BOOT).unwrap();
 
         let gone = BOOT + IDLE_TIMEOUT_NS;
         assert_eq!(upload.upgrade(gone), Err(RpcError::State));
@@ -457,7 +503,7 @@ mod tests {
 
         assert_eq!(upload.abort(), Ok(()), "there is simply nothing to lose");
         take(&mut upload, &package, &header, BOOT).unwrap();
-        take(&mut upload, &package, &image[..32], BOOT).unwrap();
+        take(&mut upload, &package, &at(0, &image[..32]), BOOT).unwrap();
         assert_eq!(upload.abort(), Ok(()));
         assert_eq!(upload.cursor(BOOT), 0);
 
@@ -465,7 +511,7 @@ mod tests {
             panic!("the next host starts from the header")
         };
         assert!(discarded, "over what the aborted upload left");
-        take(&mut upload, &package, &image, BOOT).unwrap();
+        take(&mut upload, &package, &at(0, &image), BOOT).unwrap();
         upload.upgrade(BOOT).unwrap();
         upload.armed();
         assert_eq!(upload.cursor(BOOT + IDLE_TIMEOUT_NS), 64, "and it stays");
@@ -484,13 +530,60 @@ mod tests {
         let mut upload = Upload::new();
         take(&mut upload, &package, &header, BOOT).unwrap();
 
-        for data in [&[][..], &[0u8; 65][..]] {
+        for data in [vec![], vec![0; 3], at(0, &[]), at(0, &[0; 65])] {
             assert_eq!(
-                upload.chunk(&package, data, BOOT).err(),
+                upload.chunk(&package, &data, BOOT).err(),
                 Some(RpcError::ArgsSize)
             );
         }
-        assert_eq!(take(&mut upload, &package, &image, BOOT), Ok(64));
+        assert_eq!(take(&mut upload, &package, &at(0, &image), BOOT), Ok(64));
+    }
+
+    /// With two chunks in flight, losing the first must not let the second be
+    /// written in its place, and a chunk resent after a lost acknowledgement
+    /// must not be written twice. Both are refused, and the cursor says where
+    /// to resume.
+    #[test]
+    fn a_chunk_that_starts_off_the_cursor_is_refused() {
+        let package = package();
+        let (header, image) = small(&package, 64);
+        let mut upload = Upload::new();
+        take(&mut upload, &package, &header, BOOT).unwrap();
+
+        let skipped = at(16, &image[16..32]);
+        assert_eq!(
+            upload.chunk(&package, &skipped, BOOT).err(),
+            Some(RpcError::Range)
+        );
+        assert_eq!(upload.cursor(BOOT), 0);
+
+        assert_eq!(
+            take(&mut upload, &package, &at(0, &image[..16]), BOOT),
+            Ok(16)
+        );
+        let resent = at(0, &image[..16]);
+        assert_eq!(
+            upload.chunk(&package, &resent, BOOT).err(),
+            Some(RpcError::Range)
+        );
+        assert_eq!(take(&mut upload, &package, &skipped, BOOT), Ok(32));
+    }
+
+    /// A host that lost the header's acknowledgement reads a cursor of zero
+    /// either way, so the header may come again until image bytes do.
+    #[test]
+    fn a_header_resent_before_any_image_is_taken_again() {
+        let package = package();
+        let (header, image) = small(&package, 64);
+        let mut upload = Upload::new();
+        take(&mut upload, &package, &header, BOOT).unwrap();
+
+        assert_eq!(take(&mut upload, &package, &header, BOOT), Ok(0));
+        assert_eq!(take(&mut upload, &package, &at(0, &image), BOOT), Ok(64));
+        assert_eq!(
+            upload.chunk(&package, &header, BOOT).err(),
+            Some(RpcError::State)
+        );
     }
 
     #[test]
