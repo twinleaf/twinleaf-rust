@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use twinleaf::device::discovery::{self, PortInterface};
 use twinleaf::proxy::{self, DumpFlags, HostOptions, Layout, Listen, Mount, Proxy};
-use twinleaf::DeviceRoute;
+use twinleaf::{Connection, DeviceRoute, RecvError};
 
 pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
     match proxy_cli.subcommands.take() {
@@ -41,25 +41,34 @@ fn list_cli() -> ProxyCli {
     ProxyCli::parse_from(["tio-proxy"])
 }
 
-/// Hosts the proxy that `tio list` serves a selection through, before its
-/// picker opens. It is hosted as a terminal `tio proxy` hosts it, with no
-/// default until devices are picked.
-pub(super) fn host_for_list() -> eyre::Result<Proxy> {
-    host(host_options(&list_cli(), "tio list"))
-}
-
-/// Makes the devices picked in `tio proxy list` the default of `proxy` for
-/// every tool until Ctrl-C. `proxy` is the one `host_for_list` hosted.
+/// Holds the devices picked in `tio proxy list` as the default of the
+/// machine's proxy for every tool until Ctrl-C, or until the proxy lets go.
 ///
 /// # Errors
 ///
-/// Returns an error if the signal handlers cannot be installed.
-pub fn run_proxy_for(proxy: Proxy, picked: Vec<PickedSubtree>) -> eyre::Result<()> {
+/// Returns an error if the proxy refuses the selection, the signal handler
+/// cannot be installed, or the proxy stops first.
+fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     let cli = list_cli();
     crate::logging::release();
     let front = FrontDoor::picked(picked);
-    proxy.set_default(Some(within_subtree(&front.layout, cli.subtree)?));
-    serve(proxy, &front, &cli)
+    let held = Connection::hold_default(&within_subtree(&front.layout, cli.subtree)?)?;
+    let events = held.events();
+    let closer = held.clone();
+    ctrlc::set_handler(move || closer.close())?;
+    front.print_startup(&cli);
+    println!(
+        "Using {} as the default while this runs. Ctrl-C to stop.",
+        front.describe(cli.subtree)
+    );
+    loop {
+        match events.recv() {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return Ok(()),
+            Err(RecvError::Stopped) => return Err(eyre::eyre!("the proxy stopped")),
+            Err(error) => return Err(eyre::eyre!("the proxy let the selection go: {error}")),
+        }
+    }
 }
 
 /// Serves the sensors the arguments name, or the one attached, from a terminal

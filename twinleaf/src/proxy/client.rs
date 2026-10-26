@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use tokio::time::{timeout_at, Instant};
@@ -139,6 +139,24 @@ impl Binding {
     }
 }
 
+/// The default a client holds with `proxy.default`. Dropping it gives the
+/// default back to the layout it replaced.
+struct Held {
+    shared: Arc<Shared>,
+    replaced: Option<Layout>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        *self
+            .shared
+            .holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.shared.default.send_replace(self.replaced.take());
+    }
+}
+
 /// An open in flight. It resolves to the id of the control request it
 /// answers, or `None` for a legacy client's open of `auto`, and the outcome
 /// of the binding.
@@ -163,6 +181,7 @@ pub(super) struct Session {
     slow: SlowTracker,
     binding: Option<Binding>,
     opening: Option<Opening>,
+    held: Option<Held>,
     /// Whether the client is a legacy client, whose first packet was not a
     /// control request. A legacy client reads link statuses in the legacy
     /// form. It is `true` until the client is classified.
@@ -193,6 +212,7 @@ impl Session {
             slow: SlowTracker::default(),
             binding: None,
             opening: None,
+            held: None,
             legacy: true,
         }
     }
@@ -483,6 +503,7 @@ impl Session {
                 let binding = attach(shared, addr, layout.to_string(), layout, None, Purpose::Use);
                 self.request(id, binding)
             }
+            Request::Default(layout) => self.hold_default(id, layout),
             Request::Stop if self.shared.options.stoppable => {
                 self.answer(id, Ok(Vec::new()))?;
                 log::info!("Stopped by proxy.stop from client {}", self.addr);
@@ -501,6 +522,46 @@ impl Session {
             #[cfg(test)]
             Request::Panic => panic!("client {} asked its task to panic", self.addr),
         }
+    }
+
+    /// Makes `layout` the default until this client leaves, answering control
+    /// request `id`. Only a background proxy lets a client hold its default,
+    /// and one client at a time.
+    fn hold_default(&mut self, id: u16, layout: Layout) -> Result<(), ClientError> {
+        if !self.shared.options.stoppable {
+            let message = format!(
+                "the proxy at {} is hosted by {} and keeps its own default",
+                self.shared.endpoint, self.shared.options.name
+            );
+            return self.answer(id, Err(Refusal::new(RpcError::State, message)));
+        }
+        let mut holder = self
+            .shared
+            .holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match holder.as_ref() {
+            None => {
+                *holder = Some((self.id, self.addr.clone()));
+                self.held = Some(Held {
+                    shared: self.shared.clone(),
+                    replaced: self.shared.default(),
+                });
+            }
+            Some((holding, _)) if *holding == self.id => {}
+            Some((_, addr)) => {
+                let message = format!(
+                    "client {addr} holds the default of the proxy at {}",
+                    self.shared.endpoint
+                );
+                drop(holder);
+                return self.answer(id, Err(Refusal::new(RpcError::State, message)));
+            }
+        }
+        drop(holder);
+        log::info!("Client {} holds {layout} as the default", self.addr);
+        self.shared.default.send_replace(Some(layout));
+        self.answer(id, Ok(Vec::new()))
     }
 
     /// Begins the open of `target` for `purpose` that control request `id`
@@ -755,7 +816,8 @@ mod tests {
             links: links.clone(),
             tasks: tasks.clone(),
             server: mpsc::unbounded_channel().0.downgrade(),
-            default: watch::channel(default).1,
+            default: watch::channel(default).0,
+            holder: std::sync::Mutex::new(None),
         });
         let (deliver, incoming) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
         let (port, end) = transport::Port::fake(TransportKind::Tcp, None, deliver);

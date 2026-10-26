@@ -29,6 +29,9 @@ pub(super) const PROBE: &str = "proxy.probe";
 /// The method that binds a connection to a layout of mounts the client
 /// names, each of which becomes a choice for `auto`.
 pub(crate) const MOUNT: &str = "proxy.mount";
+/// The method that makes a layout the default of a background proxy while
+/// the connection that names it stays open.
+pub(crate) const DEFAULT_LAYOUT: &str = "proxy.default";
 /// The method that stops a background proxy.
 pub(super) const STOP: &str = "proxy.stop";
 
@@ -176,6 +179,8 @@ pub(super) enum Request {
     },
     /// `proxy.mount`, naming the layout to open.
     Mount(Layout),
+    /// `proxy.default`, naming the layout every client that names none opens.
+    Default(Layout),
     /// `proxy.stop`.
     Stop,
     /// `proxy.test.panic`, which makes the task serving the client panic.
@@ -201,6 +206,7 @@ impl Request {
                 url: String::decode_reply(args).map_err(malformed)?,
             }),
             b"proxy.mount" => Ok(Request::Mount(decode_layout(args)?)),
+            b"proxy.default" => Ok(Request::Default(decode_layout(args)?)),
             b"proxy.stop" => Ok(Request::Stop),
             #[cfg(test)]
             b"proxy.test.panic" => Ok(Request::Panic),
@@ -218,6 +224,7 @@ impl Request {
             Request::Open { target } => (OPEN, target.encode_args()),
             Request::Probe { url } => (PROBE, url.encode_args()),
             Request::Mount(layout) => (MOUNT, layout.encode_args()),
+            Request::Default(layout) => (DEFAULT_LAYOUT, layout.encode_args()),
             Request::Stop => (STOP, Vec::new()),
             #[cfg(test)]
             Request::Panic => ("proxy.test.panic", Vec::new()),
@@ -656,6 +663,9 @@ mod tests {
                     mount("serial:///dev/ttyACM0", "/", "/1"),
                     mount("tcp://192.0.2.1", "/2", "/3/4"),
                 ],
+            }),
+            Request::Default(Layout {
+                mounts: vec![mount("tcp://192.0.2.1", "/", "/")],
             }),
             Request::Stop,
         ] {

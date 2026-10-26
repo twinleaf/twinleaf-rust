@@ -29,7 +29,7 @@ use super::runtime::ProxyAddress;
 use super::stream::{End, Lane, Queued};
 use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{handshake, Layout, Purpose, MAX_RPC_TIMEOUT, MOUNT};
+use crate::proxy::{handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
@@ -156,6 +156,18 @@ impl Session {
     ) -> io::Result<Session> {
         let request = (MOUNT, layout.encode_args());
         Session::request_async(proxy, request, &format!("mount {layout}"), timeout).await
+    }
+
+    /// Opens a session that holds `layout` as the proxy's default for as long
+    /// as it lasts, and opens nothing itself.
+    pub(crate) async fn hold_default_async(
+        proxy: &ProxyAddress,
+        layout: &Layout,
+        timeout: Duration,
+    ) -> io::Result<Session> {
+        let request = (DEFAULT_LAYOUT, layout.encode_args());
+        let goal = format!("hold {layout} as the default");
+        Session::request_async(proxy, request, &goal, timeout).await
     }
 
     /// Connects to `proxy` and makes the control request `(method, args)`
