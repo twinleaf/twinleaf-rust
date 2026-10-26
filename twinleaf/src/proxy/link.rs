@@ -24,7 +24,7 @@
 use super::auto::Candidate;
 use super::control::Refusal;
 use super::worker::{self, Command, Opener, Readiness, Subscriber};
-use super::{DumpFlags, IDLE, LEAVE_TIMEOUT};
+use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
@@ -284,15 +284,17 @@ impl Owner {
 impl Links {
     /// Starts a registry with no links, whose tasks run on `tasks`. Their
     /// workers retry a lost device for `reconnect_timeout`, or forever with
-    /// `None`, and log the traffic `dump` asks for.
+    /// `None`, log the traffic `dump` asks for, and name routes as the
+    /// proxy's `default` layout shows them.
     pub(super) fn new(
         tasks: &Supervisor,
         reconnect_timeout: Option<Duration>,
         dump: DumpFlags,
+        default: watch::Receiver<Option<Layout>>,
     ) -> (Links, Owner) {
         let opening = tasks.clone();
         let opens = Box::new(move |url: &str| worker::opener(&opening, url));
-        Links::on(tasks, reconnect_timeout, dump, opens)
+        Links::on(tasks, reconnect_timeout, dump, default, opens)
     }
 
     /// Starts a registry as [`new`](Self::new) does, with each new link's
@@ -301,6 +303,7 @@ impl Links {
         tasks: &Supervisor,
         reconnect_timeout: Option<Duration>,
         dump: DumpFlags,
+        default: watch::Receiver<Option<Layout>>,
         opens: Opens,
     ) -> (Links, Owner) {
         let (requests, mailbox) = mpsc::unbounded_channel();
@@ -317,6 +320,7 @@ impl Links {
             tasks: tasks.clone(),
             reconnect_timeout,
             dump,
+            default,
             opens,
         };
         let task = tasks.spawn("proxy links", registry.run()).fuse();
@@ -406,9 +410,16 @@ impl Entry {
     }
 
     /// Returns when a chosen open link with no users is due to close, which
-    /// is [`IDLE`] after its last lease dropped.
-    fn due(&self) -> Option<Instant> {
-        let idle = self.commands.is_some() && self.chosen && self.users == 0;
+    /// is [`IDLE`] after its last lease dropped. A link to a device the
+    /// proxy's `default` layout mounts stays open while the proxy runs.
+    fn due(&self, default: Option<&Layout>) -> Option<Instant> {
+        let served = default.is_some_and(|layout| {
+            layout
+                .mounts
+                .iter()
+                .any(|mount| *mount.url == *self.link.url)
+        });
+        let idle = self.commands.is_some() && self.chosen && self.users == 0 && !served;
         idle.then(|| self.idle_since + IDLE)
     }
 }
@@ -439,13 +450,22 @@ struct Registry {
     reconnect_timeout: Option<Duration>,
     dump: DumpFlags,
     opens: Opens,
+    /// The proxy's default layout, which each link names its routes by.
+    default: watch::Receiver<Option<Layout>>,
 }
 
 impl Registry {
     /// Serves requests until its owner drops, then closes every link.
     async fn run(mut self) {
         loop {
-            let due = self.links.values().filter_map(Entry::due).min();
+            let due = {
+                let default = self.default.borrow();
+                let due = self
+                    .links
+                    .values()
+                    .filter_map(|entry| entry.due(default.as_ref()));
+                due.min()
+            };
             tokio::select! {
                 request = self.requests.recv() => match request {
                     Some(request) => self.handle(request),
@@ -453,6 +473,8 @@ impl Registry {
                 },
                 Some((id, _outcome)) = self.workers.join_next() => self.ended(id),
                 () = sleep_until_some(due) => self.expire(),
+                // A device the new default leaves out may be due already.
+                Ok(()) = self.default.changed() => {}
             }
         }
         self.close_all().await;
@@ -565,13 +587,15 @@ impl Registry {
         entry.commands = None;
     }
 
-    /// Closes each chosen link that has had no users for [`IDLE`].
+    /// Closes each chosen link that has had no users for [`IDLE`], unless the
+    /// default layout mounts its device.
     fn expire(&mut self) {
         let now = Instant::now();
+        let default = self.default.borrow();
         let due = self
             .links
             .values_mut()
-            .filter(|entry| entry.due().is_some_and(|due| due <= now));
+            .filter(|entry| entry.due(default.as_ref()).is_some_and(|due| due <= now));
         for entry in due {
             log::info!("Closing {}, unused for {:?}", entry.link.url, IDLE);
             entry.commands = None;
@@ -584,7 +608,9 @@ impl Registry {
         let id = LinkId(self.next_id);
         self.next_id += 1;
         let open = (self.opens)(url);
-        let (commands, readiness, run) = worker::new(url, self.reconnect_timeout, self.dump, open);
+        let default = self.default.clone();
+        let (commands, readiness, run) =
+            worker::new(url, self.reconnect_timeout, self.dump, default, open);
         self.tasks
             .spawn_in_map(&mut self.workers, id, format_args!("proxy link {url}"), run);
         let link = Link {
@@ -657,6 +683,12 @@ impl Registry {
             );
         }
     }
+}
+
+/// The default layout of a proxy that has none, for a test.
+#[cfg(test)]
+pub(super) fn no_default() -> watch::Receiver<Option<Layout>> {
+    watch::channel(None).1
 }
 
 #[cfg(test)]
@@ -852,7 +884,13 @@ mod tests {
     /// owner and the receiver of each device port it opens.
     fn registry(first: Vec<(&str, First)>) -> (Links, Owner, mpsc::UnboundedReceiver<Opened>) {
         let (opens, opened) = fakes(first);
-        let (links, owner) = Links::on(&Supervisor::current(), None, DumpFlags::default(), opens);
+        let (links, owner) = Links::on(
+            &Supervisor::current(),
+            None,
+            DumpFlags::default(),
+            no_default(),
+            opens,
+        );
         (links, owner, opened)
     }
 
@@ -915,6 +953,38 @@ mod tests {
         tokio::time::sleep(IDLE / 2).await;
         assert_eq!(urls(&links).await, [DEVICE]);
         assert_took(released(&mut device).await - left, IDLE, "closing");
+        assert!(urls(&links).await.is_empty());
+    }
+
+    /// A device the proxy's default layout mounts stays open with no user
+    /// for as long as the default mounts it, and closes once a new default
+    /// leaves it out.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_the_default_mounts_stays_open_while_it_does() {
+        let (opens, mut devices) = fakes(Vec::new());
+        let (default, watched) = watch::channel(Some(Layout::single(DEVICE)));
+        let (links, _owner) = Links::on(
+            &Supervisor::current(),
+            None,
+            DumpFlags::default(),
+            watched,
+            opens,
+        );
+        let open = acquire(&links, DEVICE).await;
+        links.choose(vec![open.link().id()]);
+        let mut device = opened(&mut devices).await;
+        drop(open);
+
+        tokio::time::sleep(IDLE * 4).await;
+        assert_eq!(urls(&links).await, [DEVICE]);
+
+        default.send_replace(Some(Layout::single(OTHER)));
+        let replaced = Instant::now();
+        assert_took(
+            released(&mut device).await - replaced,
+            Duration::ZERO,
+            "closing",
+        );
         assert!(urls(&links).await.is_empty());
     }
 
@@ -1027,7 +1097,8 @@ mod tests {
     fn a_device_reopened_as_its_link_closes_waits_for_the_old_worker() {
         let device = FakeDevice::start();
         device.exclusive();
-        let (links, owner) = Links::new(&Supervisor::new(), None, DumpFlags::default());
+        let (links, owner) =
+            Links::new(&Supervisor::new(), None, DumpFlags::default(), no_default());
         let probe = links.acquire_blocking(&device.url).unwrap();
         assert_eq!(settled(probe.link()), Readiness::Ready);
         drop(probe);
@@ -1043,7 +1114,8 @@ mod tests {
 
     #[test]
     fn nothing_opens_once_the_registry_has_ended() {
-        let (links, owner) = Links::new(&Supervisor::new(), None, DumpFlags::default());
+        let (links, owner) =
+            Links::new(&Supervisor::new(), None, DumpFlags::default(), no_default());
 
         crate::rt::handle().block_on(owner.close());
 

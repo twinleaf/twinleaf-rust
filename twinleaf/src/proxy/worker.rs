@@ -34,7 +34,7 @@
 //! device's own log packets under `device::<route>` at their own level, and
 //! the traffic [`DumpFlags`] asks for.
 
-use super::{control, DumpFlags, MAX_RPC_TIMEOUT};
+use super::{control, DumpFlags, Layout, MAX_RPC_TIMEOUT};
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogLevel;
 use crate::proto::rpc::RpcError;
@@ -352,13 +352,15 @@ const COMMAND_LANE: usize = 64;
 
 /// Creates the worker of the device at `url`, which `open` opens. A lost
 /// device is retried for `reconnect_timeout`, or forever with `None`. The
-/// worker logs the traffic `dump` asks for. It stops once every command
+/// worker logs the traffic `dump` asks for, and names the device's routes as
+/// the proxy's `default` layout shows them. It stops once every command
 /// sender has dropped. Returns the command sender, the receiver of the
 /// worker's readiness, and the future that runs the worker as its link's task.
 pub(super) fn new(
     url: &str,
     reconnect_timeout: Option<Duration>,
     dump: DumpFlags,
+    default: watch::Receiver<Option<Layout>>,
     open: Opener,
 ) -> (
     mpsc::Sender<Command>,
@@ -367,14 +369,17 @@ pub(super) fn new(
 ) {
     let (commands, command_queue) = mpsc::channel(COMMAND_LANE);
     let (readiness, watched) = watch::channel(Readiness::Pending);
-    let worker = Worker::new(
-        url.to_string(),
-        reconnect_timeout,
-        command_queue,
-        dump,
-        readiness,
-        open,
-    );
+    let worker = Worker {
+        default: Some(default),
+        ..Worker::new(
+            url.to_string(),
+            reconnect_timeout,
+            command_queue,
+            dump,
+            readiness,
+            open,
+        )
+    };
     (commands, watched, worker.run())
 }
 
@@ -598,6 +603,9 @@ struct Worker {
     readiness: watch::Sender<Readiness>,
     /// What opens the device's port.
     open: Opener,
+    /// The proxy's default layout, which says where its clients see this
+    /// device, for the log. `None` for a worker on its own.
+    default: Option<watch::Receiver<Option<Layout>>>,
 
     device: Option<Device>,
     /// The attempt in flight to reopen the device.
@@ -676,6 +684,32 @@ impl Worker {
             next_rpc_id: 0,
             rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
+            default: None,
+        }
+    }
+
+    /// The route at which a client of the proxy's default layout sees `route`
+    /// of this device. A device the layout does not mount there is named by
+    /// its URL and the route on it.
+    fn shown(&self, route: DeviceRoute) -> String {
+        let default = self.default.as_ref().map(|default| default.borrow());
+        let mounted = default
+            .as_deref()
+            .and_then(Option::as_ref)
+            .into_iter()
+            .flat_map(|layout| &layout.mounts)
+            .filter(|mount| mount.url == self.url)
+            .filter_map(|mount| {
+                let relative = mount.source.relative_route(&route).ok()?;
+                Some((
+                    mount.source.len(),
+                    mount.prefix.absolute_route(&relative).ok()?,
+                ))
+            })
+            .max_by_key(|(depth, _)| *depth);
+        match mounted {
+            Some((_, shown)) => shown.to_string(),
+            None => format!("{} {route}", self.url),
         }
     }
 
@@ -919,7 +953,7 @@ impl Worker {
                         self.readiness.send_replace(Readiness::Ready);
                     }
                 }
-                log_device_packet(&pkt, self.dump);
+                log_device_packet(&pkt, self.dump, || self.shown(pkt.route()));
                 self.dispatch_device_packet(pkt).await;
             }
             Ok(TransportEvent::Text(text)) => {
@@ -1406,9 +1440,9 @@ impl Worker {
 }
 
 /// Logs a packet from the device if `dump` asks for its kind. Logs a device's
-/// log packet under `device::<route>` at the device's level.
-fn log_device_packet(pkt: &Packet, dump: DumpFlags) {
-    let routing = pkt.route();
+/// log packet under `device::<route>` at the device's level. Either names the
+/// device's route as `shown` does.
+fn log_device_packet(pkt: &Packet, dump: DumpFlags, shown: impl Fn() -> String) {
     let payload = pkt.payload();
     let dump = match payload {
         packet::Payload::Heartbeat(_) => dump.heartbeats,
@@ -1417,7 +1451,7 @@ fn log_device_packet(pkt: &Packet, dump: DumpFlags) {
         _ => dump.traffic,
     };
     if dump {
-        log::info!("Packet from {} -- {:?}", routing, payload);
+        log::info!("Packet from {} -- {:?}", shown(), payload);
     }
     if let packet::Payload::Log(message) = payload {
         // Map the device-reported level onto the log crate's level
@@ -1429,7 +1463,7 @@ fn log_device_packet(pkt: &Packet, dump: DumpFlags) {
             _ => log::Level::Info,
         };
         let text = String::from_utf8_lossy(message.message);
-        log::log!(target: &format!("device::{routing}"), level, "{text}");
+        log::log!(target: &format!("device::{}", shown()), level, "{text}");
     }
 }
 
@@ -1547,6 +1581,45 @@ mod tests {
         Worker::new(String::new(), None, command_queue, dump, readiness, never())
     }
 
+    /// A device's routes are logged where the proxy's default layout mounts
+    /// them, and by the device's URL where it does not.
+    #[test]
+    fn a_device_is_logged_where_the_default_layout_mounts_it() {
+        let route = |path: &str| path.parse::<DeviceRoute>().unwrap();
+        let mount = |url: &str, source: &str, prefix: &str| crate::proxy::Mount {
+            url: url.into(),
+            source: route(source),
+            prefix: route(prefix),
+        };
+        let layout = Layout {
+            mounts: vec![
+                mount("udp://a", "/", "/2"),
+                mount("udp://a", "/1", "/5"),
+                mount("udp://b", "/", "/"),
+            ],
+        };
+        let (_default, watched) = watch::channel(Some(layout));
+        let worker = Worker {
+            url: "udp://a".into(),
+            default: Some(watched),
+            ..idle_worker()
+        };
+
+        assert_eq!(worker.shown(route("/")), "/2");
+        assert_eq!(worker.shown(route("/0/3")), "/2/0/3");
+        assert_eq!(
+            worker.shown(route("/1/0")),
+            "/5/0",
+            "the deepest mount names it"
+        );
+
+        let alone = Worker {
+            url: "udp://c".into(),
+            ..idle_worker()
+        };
+        assert_eq!(alone.shown(route("/1")), "udp://c /1");
+    }
+
     /// The depth of the queue a test port is delivered to.
     const DELIVERED: usize = 64;
 
@@ -1627,7 +1700,8 @@ mod tests {
         let dump = DumpFlags::default();
         let tasks = Supervisor::new();
         let open = opener(&tasks, &url);
-        let (commands, _readiness, run) = new(&url, None, dump, open);
+        let (commands, _readiness, run) =
+            new(&url, None, dump, crate::proxy::link::no_default(), open);
         let worker = tasks.spawn("a test worker", run);
         let (mut device, _) = listener.accept().unwrap();
 

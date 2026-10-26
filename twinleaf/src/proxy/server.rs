@@ -54,6 +54,13 @@ pub(super) enum Update {
     Target(String),
 }
 
+/// The proxy's default layout, as the server sets it and as every task that
+/// reads it watches it.
+pub(super) type DefaultLayout = (
+    watch::Sender<Option<Layout>>,
+    watch::Receiver<Option<Layout>>,
+);
+
 /// What every client's task reads, none of which keeps the proxy running.
 pub(super) struct Shared {
     /// How the proxy is hosted. Its default layout is held in `default`.
@@ -85,7 +92,7 @@ impl Shared {
 /// # Panics
 ///
 /// Panics if the crate's runtime cannot start.
-pub(super) fn host(options: HostOptions) -> io::Result<Proxy> {
+pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
     if options.port != 0 && answers(options.port) {
         let endpoint = endpoint_at(options.port);
         let hello = Introduction::of_this_process(&options.name).encode_args();
@@ -111,8 +118,15 @@ pub(super) fn host(options: HostOptions) -> io::Result<Proxy> {
         listening.collect::<io::Result<Vec<_>>>()?
     };
     let tasks = Supervisor::new();
-    let registry = Links::new(&tasks, options.reconnect_timeout, options.dump);
-    let (proxy, mut server) = Server::new(options, endpoint_at(port), tasks.clone(), registry);
+    let default = watch::channel(options.default.take());
+    let registry = Links::new(
+        &tasks,
+        options.reconnect_timeout,
+        options.dump,
+        default.1.clone(),
+    );
+    let (proxy, mut server) =
+        Server::new(options, endpoint_at(port), tasks.clone(), registry, default);
     server.listeners = listeners;
     log::info!(
         "Proxy hosted by {} at {}",
@@ -153,15 +167,17 @@ pub(super) struct Server {
 impl Server {
     /// Returns the handle of a proxy at `endpoint` hosted with `options`, whose
     /// clients run on `tasks` and links in `registry`, with its server to run.
+    /// Its default layout is the one `default` holds, which the links watch
+    /// too.
     pub(super) fn new(
-        mut options: HostOptions,
+        options: HostOptions,
         endpoint: String,
         tasks: Supervisor,
         (links, registry): (Links, Owner),
+        (default, defaults): DefaultLayout,
     ) -> (Proxy, Server) {
         let (notices, mailbox) = mpsc::unbounded_channel();
         let (table, clients) = watch::channel(Vec::new());
-        let (default, defaults) = watch::channel(options.default.take());
         let (stopped, waited) = flume::bounded(0);
         let proxy = Proxy {
             server: notices.clone(),
@@ -491,14 +507,15 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        let options = HostOptions {
+        let mut options = HostOptions {
             idle_exit: true,
             ..options()
         };
         let tasks = Supervisor::new();
-        let registry = Links::new(&tasks, None, DumpFlags::default());
+        let default = watch::channel(options.default.take());
+        let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
         let endpoint = endpoint_at(address.port());
-        let (proxy, mut server) = Server::new(options, endpoint, tasks, registry);
+        let (proxy, mut server) = Server::new(options, endpoint, tasks, registry, default);
         let _runtime = rt::handle().enter();
         server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
         let _client = std::net::TcpStream::connect(address).unwrap();
@@ -516,14 +533,15 @@ mod tests {
 
     /// Starts a proxy hosted with `options` on the test's runtime, and
     /// returns its handle.
-    fn started(options: HostOptions) -> Proxy {
+    fn started(mut options: HostOptions) -> Proxy {
         // Nothing connects to it, so the paused clock never waits on it.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoint = endpoint_at(listener.local_addr().unwrap().port());
         listener.set_nonblocking(true).unwrap();
         let tasks = Supervisor::current();
-        let registry = Links::new(&tasks, None, DumpFlags::default());
-        let (proxy, mut server) = Server::new(options, endpoint, tasks.clone(), registry);
+        let default = watch::channel(options.default.take());
+        let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
+        let (proxy, mut server) = Server::new(options, endpoint, tasks.clone(), registry, default);
         server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
         tasks.spawn("a test proxy", server.run());
         proxy

@@ -6,8 +6,9 @@
 //! a terminal, an app may embed one, and a tool may start one in the
 //! background. [`stop`] stops a background proxy.
 //!
-//! The proxy closes a device that a client opened once no client has used it
-//! for five seconds. It closes a device that only probes have used as soon as
+//! The proxy keeps open each device its default layout mounts for as long as
+//! it runs. It closes any other device that a client opened once no client has
+//! used it for five seconds. It closes a device that only probes have used as soon as
 //! the last probe leaves. It reconnects a device that drops out, and the
 //! clients using it stay connected. Each hears the link status
 //! [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
@@ -139,8 +140,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// closes its transport within [`CLOSE_TIMEOUT`].
 pub(super) const LEAVE_TIMEOUT: Duration = CLOSE_TIMEOUT.saturating_add(Duration::from_millis(500));
 
-/// How long a proxy keeps a device that a client opened with no client
-/// using it, and a background proxy keeps running with no client at all.
+/// How long a proxy keeps a device that a client opened with no client using
+/// it, unless its default layout mounts the device, and how long a background
+/// proxy keeps running with no client at all.
 const IDLE: Duration = Duration::from_secs(5);
 
 /// The longest a client's RPC waits for its device's reply. The proxy holds

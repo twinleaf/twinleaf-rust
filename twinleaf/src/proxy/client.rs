@@ -742,7 +742,13 @@ mod tests {
     fn connect(default: Option<Layout>, reconnect_timeout: Option<Duration>) -> Client {
         let tasks = Supervisor::current();
         let (opens, devices) = fakes(Vec::new());
-        let (links, registry) = Links::on(&tasks, reconnect_timeout, DumpFlags::default(), opens);
+        let (links, registry) = Links::on(
+            &tasks,
+            reconnect_timeout,
+            DumpFlags::default(),
+            super::link::no_default(),
+            opens,
+        );
         let shared = Arc::new(Shared {
             options: options(),
             endpoint: "tcp://127.0.0.1:7855".to_string(),
