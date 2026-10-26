@@ -401,6 +401,7 @@ mod tests {
     fn start_simulator(args: &[&str]) -> (Simulator, UdpSocket) {
         let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
         let simulator = Simulator::new(&cli).unwrap();
+        simulator.socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let port = simulator.socket.local_addr().unwrap().port();
         let host = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         host.connect(("127.0.0.1", port)).unwrap();
@@ -418,10 +419,9 @@ mod tests {
     ) -> Vec<packet::Packet> {
         host.send(packet.as_bytes()).unwrap();
         // The datagram may reach the socket after send returns.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while simulator.client.is_none() && Instant::now() < deadline {
-            simulator.receive_packets().unwrap();
-        }
+        simulator.socket.set_nonblocking(false).unwrap();
+        simulator.socket.peek_from(&mut [0; Packet::MAX_SIZE]).unwrap();
+        simulator.socket.set_nonblocking(true).unwrap();
         simulator.receive_packets().unwrap();
         received(host)
     }
