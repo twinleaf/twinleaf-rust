@@ -2274,6 +2274,7 @@ mod tests {
         let mut sent = Sent::default();
         assert_eq!(call(&mut sim, b"dev.systime", &[], &mut sent), [0; 8]);
         assert_eq!(call(&mut sim, b"dev.uptime", &[], &mut sent), [0; 4]);
+        assert_eq!(call(&mut sim, b"dev.lifetime", &[], &mut sent), [0; 4]);
         assert_eq!(
             call(&mut sim, b"rpc.match", b"test.ampl", &mut sent),
             b"test.amplitude"

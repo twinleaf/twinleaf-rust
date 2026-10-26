@@ -51,8 +51,10 @@ pub const PASSWORD_MAX: usize = 16;
 /// The bytes a stored configuration is built in and read back into.
 pub type Entries = Image<IMAGE_MAX>;
 
-/// Nanoseconds in the hour `dev.uptime` counts.
-const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
+/// Nanoseconds in the second `dev.uptime` counts.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Nanoseconds in the hour `dev.lifetime` counts.
+const NANOS_PER_HOUR: u64 = 3_600 * NANOS_PER_SECOND;
 
 /// What a device says it is: every `dev.*` identity RPC, and the device record.
 ///
@@ -272,8 +274,8 @@ pub struct Device<S: Group> {
     autostart: Setting<u8>,
     settings: S,
     next_beat: u64,
-    /// The nanosecond the device came up, which `dev.systime` and `dev.uptime`
-    /// count from.
+    /// The nanosecond the device came up, which `dev.systime`, `dev.uptime`
+    /// and `dev.lifetime` count from.
     booted_ns: u64,
     /// Whole powered-on hours restored once at boot.
     lifetime_hours: u32,
@@ -318,7 +320,7 @@ impl<S: Group> Device<S> {
     }
 
     /// Restores lifetime powered-on hours without changing the current boot clock.
-    pub fn restore_uptime(&mut self, hours: u32) {
+    pub fn restore_lifetime(&mut self, hours: u32) {
         self.lifetime_hours = hours;
     }
 
@@ -542,7 +544,14 @@ impl<S: Group> Device<S> {
                 Std::ConfReset => {
                     return actions.defer(pending, Deferred::Flash(FlashOp::ConfReset))
                 }
-                Std::Uptime => {
+                Std::Uptime => read(
+                    &mut reply,
+                    args,
+                    &u32::try_from(since_boot_ns / NANOS_PER_SECOND)
+                        .unwrap_or(u32::MAX)
+                        .to_le_bytes(),
+                ),
+                Std::Lifetime => {
                     let hours = self.lifetime_hours.saturating_add(
                         u32::try_from(since_boot_ns / NANOS_PER_HOUR).unwrap_or(u32::MAX),
                     );
@@ -1532,25 +1541,25 @@ mod tests {
     #[test]
     fn restored_lifetime_hours_keep_the_boot_clock_separate_and_saturate() {
         let mut device = harness();
-        device.device.restore_uptime(123);
+        device.device.restore_lifetime(123);
         let later = BOOT + 2 * NANOS_PER_HOUR + 1;
         assert_eq!(
-            device.ask_at("dev.uptime", &[], later).value(),
+            device.ask_at("dev.lifetime", &[], later).value(),
             &125u32.to_le_bytes()
         );
         assert_eq!(
             device.ask_at("dev.systime", &[], later).value(),
             &(later - BOOT).to_le_bytes()
         );
-        device.device.restore_uptime(u32::MAX);
+        device.device.restore_lifetime(u32::MAX);
         assert_eq!(
-            device.ask_at("dev.uptime", &[], later).value(),
+            device.ask_at("dev.lifetime", &[], later).value(),
             &u32::MAX.to_le_bytes()
         );
         let mut rebooted = harness();
-        rebooted.device.restore_uptime(125);
+        rebooted.device.restore_lifetime(125);
         assert_eq!(
-            rebooted.ask("dev.uptime", &[]).value(),
+            rebooted.ask("dev.lifetime", &[]).value(),
             &125u32.to_le_bytes()
         );
     }
@@ -1569,10 +1578,15 @@ mod tests {
         );
         assert_eq!(
             device.ask_at("dev.uptime", &[], later).value(),
+            &7_201u32.to_le_bytes()
+        );
+        assert_eq!(
+            device.ask_at("dev.lifetime", &[], later).value(),
             &2u32.to_le_bytes()
         );
         assert_eq!(device.ask("dev.systime", b"0").error(), RpcError::ReadOnly);
         assert_eq!(device.ask("dev.uptime", b"0").error(), RpcError::ReadOnly);
+        assert_eq!(device.ask("dev.lifetime", b"0").error(), RpcError::ReadOnly);
     }
 
     #[test]
