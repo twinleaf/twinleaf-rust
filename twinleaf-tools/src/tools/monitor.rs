@@ -22,8 +22,8 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Chart, Dataset, GraphType, LegendPosition, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState,
+        Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, LegendPosition, Paragraph,
+        Scrollbar, ScrollbarOrientation, ScrollbarState,
     },
     DefaultTerminal, Frame,
 };
@@ -361,9 +361,7 @@ fn row_style(color: Color, selected: bool, stale: bool, in_plot_mode: bool) -> S
     }
     if selected {
         s = s.add_modifier(Modifier::BOLD);
-        if !in_plot_mode {
-            s = s.add_modifier(Modifier::RAPID_BLINK);
-        }
+        s = s.reversed();
     }
     s
 }
@@ -1006,8 +1004,8 @@ fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => Some(Action::Quit),
             KeyCode::Esc => Some(Action::ClosePlot),
-            KeyCode::Up => Some(Action::Nav(NavMove::Up)),
-            KeyCode::Down => Some(Action::Nav(NavMove::Down)),
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::Nav(NavMove::Up)),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::Nav(NavMove::Down)),
             KeyCode::Left => Some(Action::Nav(NavMove::Left)),
             KeyCode::Right => Some(Action::Nav(NavMove::Right)),
             KeyCode::BackTab => Some(Action::Nav(NavMove::DevicePrev)),
@@ -1870,7 +1868,10 @@ fn render_plot_series(f: &mut Frame, app: &MonitorState, area: Rect) {
     } else {
         format!("{} channels ({:.1}s)", series.len(), secs)
     };
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
 
     let datasets: Vec<Dataset> = series
         .iter()
