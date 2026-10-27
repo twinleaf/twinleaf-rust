@@ -42,6 +42,7 @@ number! {
     u8 => Uint,
     u16 => Uint,
     u32 => Uint,
+    i16 => Int,
     i32 => Int,
     f32 => Float,
     f64 => Float,
