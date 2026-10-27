@@ -337,7 +337,7 @@ struct Theme {
 impl Theme {
     fn get_value_color(&self, stream: &str, col: &str, val: f64) -> Option<Color> {
         if val.is_nan() {
-            return Some(Color::Yellow);
+            return Some(Color::LightYellow);
         }
         let key = format!("{}.{}", stream, col);
         if let Some((range, is_temp)) = self.value_bounds.get(&key) {
@@ -1431,14 +1431,14 @@ fn build_left_lines(
                                 .expect("wire schemas contain at most 256 columns"),
                         ),
                     });
-                    let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
+                    let label_style = row_style(Color::Reset, is_sel, is_stale);
                     let (val_str, val_f64) = fmt_value(&value);
                     let val_col = app
                         .view
                         .theme
                         .get_value_color(row.stream().name, metadata.name, val_f64)
                         .unwrap_or(Color::Reset);
-                    let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
+                    let val_style = row_style(val_col, is_sel, is_stale);
 
                     let mut desc = metadata.description.to_string();
                     if desc.len() < app.view.desc_width {
