@@ -354,7 +354,7 @@ impl Theme {
     }
 }
 
-fn row_style(color: Color, selected: bool, stale: bool, in_plot_mode: bool) -> Style {
+fn row_style(color: Color, selected: bool, stale: bool) -> Style {
     let mut s = Style::default().fg(color);
     if stale {
         s = s.add_modifier(Modifier::DIM);
