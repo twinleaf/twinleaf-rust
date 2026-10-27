@@ -451,6 +451,7 @@ impl<S: Group> Device<S> {
                 }
             }
             Input::Packet(packet) if packet.header.ptype == PacketType::RPC_REQ => {
+                self.refresh(&mut events(&mut *lanes));
                 self.request(streams, packet, now_ns, lanes, &mut actions)
             }
             Input::Packet(_) => {}
@@ -840,6 +841,7 @@ impl<S: Group> Device<S> {
     /// change left unsaved for a period, owed until [`Device::saved`].
     pub fn tick(&mut self, now_ns: u64, out: &mut impl Sink) -> Option<Entries> {
         if now_ns >= self.next_beat {
+            self.refresh(out);
             self.beat(now_ns, out);
         }
         if now_ns < self.dirty_since? + AUTOSAVE_INTERVAL {
@@ -867,6 +869,15 @@ impl<S: Group> Device<S> {
             .dirty_since
             .map_or(u64::MAX, |at| at + AUTOSAVE_INTERVAL);
         self.next_beat.min(save)
+    }
+
+    /// Bring the read-only settings up to date, announcing into `out` what moved.
+    fn refresh(&mut self, out: &mut dyn Sink) {
+        self.settings.refresh(&mut Announcer {
+            version: &mut self.settings_version,
+            dirty: &mut false,
+            events: out,
+        });
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
@@ -965,6 +976,12 @@ pub trait Group {
 
     /// Hand every task that reads one of these what they now say.
     fn publish(&self) {}
+
+    /// Move the read-only settings to what the tasks behind them now say,
+    /// announcing each that moved.
+    fn refresh(&mut self, to: &mut Announcer<'_>) {
+        let _ = to;
+    }
 
     /// Refuse a combination of these settings no hardware can run, naming what limits it.
     fn check(&self) -> Result<(), Refusal> {
@@ -1068,6 +1085,43 @@ impl<T: Scalar> Cell for Setting<T> {
     }
 }
 
+/// A read-only value computed when read, such as a counter a task keeps,
+/// typed so its table entry and its reply agree.
+pub struct Computed<T: Scalar> {
+    name: &'static str,
+    access: Access,
+    read: fn() -> T,
+}
+
+impl<T: Scalar> Computed<T> {
+    /// `name`, answered with what `read` returns.
+    pub const fn new(name: &'static str, read: fn() -> T) -> Self {
+        Self {
+            name,
+            access: Access::READ,
+            read,
+        }
+    }
+
+    /// The same reading, reached only by a session `dev.priv` has unlocked.
+    pub const fn privileged(self) -> Self {
+        Self {
+            access: self.access.privileged(),
+            ..self
+        }
+    }
+}
+
+impl<T: Scalar> Reading for Computed<T> {
+    fn spec(&self) -> RpcSpec {
+        RpcSpec::prop(self.name, T::KIND, self.access)
+    }
+
+    fn read(&self, out: &mut Reply) -> Result<(), RpcError> {
+        (self.read)().encode(out)
+    }
+}
+
 /// A read-only number, such as a hub diagnostic.
 pub trait Reading {
     /// Its table entry.
@@ -1096,12 +1150,11 @@ pub struct Announcer<'a> {
 }
 
 impl Announcer<'_> {
-    /// Move a setting, announcing it and counting it in `settings.version`.
+    /// Move a setting, read-only or not, announcing it and counting it in `settings.version`.
     pub fn set<T: Scalar>(&mut self, setting: &mut Setting<T>, value: T) -> Result<(), RpcError> {
-        let mut args = Reply::new();
-        value.encode(&mut args)?;
-        let mut announced = Reply::new();
-        if setting.rpc(&args, &mut announced)? == Changed::Changed {
+        if setting.put(value)? == Changed::Changed {
+            let mut announced = Reply::new();
+            setting.get().encode(&mut announced)?;
             *self.dirty |= Setting::spec(setting).access.contains(Access::PERSISTENT);
             announce(self.version, &mut self.events, setting.name(), &announced);
         }
@@ -1204,7 +1257,14 @@ mod tests {
         counter: Counter,
         quiet: Setting<u32>,
         secret: Setting<u32>,
+        /// What the board's own task last measured, which hosts only read.
+        live: Setting<u32>,
         published: core::cell::Cell<u32>,
+    }
+
+    std::thread_local! {
+        /// The board's task's measurement, behind `board.live`, one per test thread.
+        static LIVE: core::cell::Cell<u32> = const { core::cell::Cell::new(3) };
     }
 
     impl Board {
@@ -1217,6 +1277,7 @@ mod tests {
                 },
                 quiet: Setting::new("board.quiet", 9).hidden(),
                 secret: Setting::new("board.secret", 11).privileged(),
+                live: Setting::new("board.live", 3).read_only(),
                 published: core::cell::Cell::new(0),
             }
         }
@@ -1229,10 +1290,15 @@ mod tests {
             Group::entries(&mut self.counter, visit);
             Group::entries(&mut self.quiet, visit);
             Group::entries(&mut self.secret, visit);
+            Group::entries(&mut self.live, visit);
         }
 
         fn publish(&self) {
             self.published.set(self.published.get() + 1);
+        }
+
+        fn refresh(&mut self, to: &mut Announcer<'_>) {
+            let _ = to.set(&mut self.live, LIVE.get());
         }
 
         fn check(&self) -> Result<(), Refusal> {
@@ -1266,6 +1332,7 @@ mod tests {
         "board.rewind",
         "board.quiet",
         "board.secret",
+        "board.live",
     ];
 
     /// Every packet one lane took.
@@ -1734,6 +1801,26 @@ mod tests {
         assert_eq!(device.device.autostart(), DEFAULT_AUTOSTART);
         device.drive(Input::Loaded(None, Ok(&image)), BOOT);
         assert_eq!(device.device.autostart(), 0);
+    }
+
+    /// A read-only setting refuses a host's write, and what its task measures
+    /// reaches a read at once and every port once per change.
+    #[test]
+    fn a_read_only_setting_follows_its_task_and_announces_each_change() {
+        let mut device = harness();
+        assert_eq!(device.ask("board.live", &[]).value(), 3u32.to_le_bytes());
+        assert_eq!(
+            device.ask("board.live", &9u32.to_le_bytes()).error(),
+            RpcError::ReadOnly
+        );
+        LIVE.set(4);
+        assert_eq!(device.ask("board.live", &[]).value(), 4u32.to_le_bytes());
+        device.ask("board.live", &[]);
+        assert_eq!(
+            device.lanes.events.announced(),
+            [("board.live".to_owned(), 4u32.to_le_bytes().to_vec())],
+            "every port hears it, once per change"
+        );
     }
 
     /// `sync.delay` boots at zero, and a written value is announced and

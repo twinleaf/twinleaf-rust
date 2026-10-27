@@ -188,6 +188,15 @@ impl<T: Scalar> Setting<T> {
         }
     }
 
+    /// The same setting, which a host only reads and the device moves through
+    /// [`crate::device::Announcer::set`], announcing each change as a write is.
+    pub const fn read_only(self) -> Self {
+        Self {
+            access: Access::READ,
+            ..self
+        }
+    }
+
     /// The same setting, reached only by a session `dev.priv` has unlocked.
     pub const fn privileged(self) -> Self {
         Self {
@@ -211,22 +220,25 @@ impl<T: Scalar> Setting<T> {
         self.value = self.initial;
     }
 
-    /// Answer its RPC: no argument reads, a value of its size writes.
+    /// Answer its RPC: no argument reads, a value of its size writes, unless it is read-only.
     pub fn rpc(&mut self, args: &[u8], out: &mut Reply) -> Result<Changed, RpcError> {
         let changed = match args {
             [] => Changed::Unchanged,
-            value => {
-                let value = (self.check)(T::decode(value)?)?;
-                let changed = if value == self.value {
-                    Changed::Unchanged
-                } else {
-                    Changed::Changed
-                };
-                self.value = value;
-                changed
-            }
+            _ if !self.access.contains(Access::WRITE) => return Err(RpcError::ReadOnly),
+            value => self.put(T::decode(value)?)?,
         };
         self.value.encode(out)?;
+        Ok(changed)
+    }
+
+    /// Take `value` through the check, saying whether it moved.
+    pub(crate) fn put(&mut self, value: T) -> Result<Changed, RpcError> {
+        let value = (self.check)(value)?;
+        let changed = match value == self.value {
+            true => Changed::Unchanged,
+            false => Changed::Changed,
+        };
+        self.value = value;
         Ok(changed)
     }
 
