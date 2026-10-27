@@ -11,7 +11,7 @@ mod settings;
 mod table;
 
 pub use capture::{Capture, Selector, Status};
-pub use settings::{finite, Changed, Persisted, Scalar, Setting, Text};
+pub use settings::{finite, Atomic, Changed, Persisted, Publish, Scalar, Setting, Text};
 pub use table::{
     hash, id, info, list, match_name, name, put, read, Access, Kind, Method, Reply, RpcSpec, Std,
     REPLY_MAX, STANDARD,

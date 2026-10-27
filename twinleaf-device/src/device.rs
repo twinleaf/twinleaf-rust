@@ -25,7 +25,7 @@ use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::data::metadata::{self, Streams};
 use crate::rpc::{self as table, put, read, Access, Kind, Reply, RpcSpec, Std, STANDARD};
-use crate::rpc::{finite, Changed, Persisted, Scalar, Setting, Text};
+use crate::rpc::{finite, Atomic, Changed, Persisted, Scalar, Setting, Text};
 use crate::storage::conf::{self, Image};
 use crate::Sink;
 
@@ -1030,6 +1030,10 @@ impl<T: Scalar> Group for Setting<T> {
     fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
         visit(Entry::Setting(self));
     }
+
+    fn publish(&self) {
+        Setting::publish(self);
+    }
 }
 
 /// One entry a board adds to the RPC table, and what answers it.
@@ -1093,13 +1097,30 @@ impl<T: Scalar> Cell for Setting<T> {
 /// see [the five channels](crate#channels) for when a value is one.
 pub struct Probe<T: Scalar> {
     name: &'static str,
-    read: fn() -> T,
+    read: Read<T>,
+}
+
+/// Where a probe's value comes from.
+enum Read<T: Scalar> {
+    Computed(fn() -> T),
+    Atomic(&'static dyn Atomic<T>),
 }
 
 impl<T: Scalar> Probe<T> {
     /// `name`, answered with what `read` returns.
     pub const fn new(name: &'static str, read: fn() -> T) -> Self {
-        Self { name, read }
+        Self {
+            name,
+            read: Read::Computed(read),
+        }
+    }
+
+    /// `name`, answered with what `atomic` holds.
+    pub const fn atomic(name: &'static str, atomic: &'static dyn Atomic<T>) -> Self {
+        Self {
+            name,
+            read: Read::Atomic(atomic),
+        }
     }
 }
 
@@ -1113,7 +1134,11 @@ impl<T: Scalar> Diagnostic for Probe<T> {
     }
 
     fn read(&self, out: &mut Reply) -> Result<(), RpcError> {
-        (self.read)().encode(out)
+        match self.read {
+            Read::Computed(read) => read(),
+            Read::Atomic(atomic) => atomic.load(),
+        }
+        .encode(out)
     }
 }
 
@@ -1185,6 +1210,7 @@ mod tests {
     use crate::data::{ColumnDef, Stream, StreamDef};
     use crate::rpc::put;
     use core::num::NonZeroU32;
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
     use std::string::String;
     use twinleaf_proto::data::{MetadataReply, MetadataType};
     use twinleaf_proto::packet::{Header, PacketType};
@@ -1269,6 +1295,8 @@ mod tests {
         /// What the board's own task last measured, which hosts only read.
         live: Setting<u32>,
         published: core::cell::Cell<u32>,
+        /// Where `board.second` publishes, as a task's static would be.
+        taken: &'static AtomicU32,
     }
 
     std::thread_local! {
@@ -1278,9 +1306,12 @@ mod tests {
 
     impl Board {
         fn new() -> Self {
+            let taken = Box::leak(Box::new(AtomicU32::new(0)));
             Self {
                 first: Setting::new("board.first", 7).persistent(),
-                second: Setting::new("board.second", 0).persistent(),
+                second: Setting::new("board.second", 0)
+                    .persistent()
+                    .publishes(taken),
                 counter: Counter {
                     value: Setting::new("board.count", 5).persistent(),
                 },
@@ -1288,6 +1319,7 @@ mod tests {
                 secret: Setting::new("board.secret", 11).privileged(),
                 live: Setting::new("board.live", 3).read_only(),
                 published: core::cell::Cell::new(0),
+                taken,
             }
         }
     }
@@ -1304,6 +1336,7 @@ mod tests {
 
         fn publish(&self) {
             self.published.set(self.published.get() + 1);
+            Group::publish(&self.second);
         }
 
         fn refresh(&mut self, to: &mut Announcer<'_>) {
@@ -2332,6 +2365,22 @@ mod tests {
         assert_eq!(published(&device), 1);
         device.ask("board.rewind", &[]);
         assert_eq!(published(&device), 2);
+        device.ask("board.second", &9u32.to_le_bytes());
+        assert_eq!(device.device.settings().taken.load(Relaxed), 9);
+    }
+
+    /// A probe over an atomic answers what the atomic holds when asked.
+    #[test]
+    fn a_probe_reads_its_atomic_when_asked() {
+        static COUNT: AtomicU32 = AtomicU32::new(3);
+        let probe = Probe::atomic("board.count", &COUNT);
+        let read = |probe: &Probe<u32>| {
+            let mut out = Reply::new();
+            probe.read(&mut out).map(|()| out.to_vec())
+        };
+        assert_eq!(read(&probe), Ok(3u32.to_le_bytes().to_vec()));
+        COUNT.store(4, Relaxed);
+        assert_eq!(read(&probe), Ok(4u32.to_le_bytes().to_vec()));
     }
 
     /// A name the table declares and no entry answers comes back for the
@@ -2493,6 +2542,7 @@ mod tests {
             [(LogLevel::INFO, "restored the saved configuration")]
         );
         assert_eq!(device.device.settings().published.get(), 1);
+        assert_eq!(device.device.settings().taken.load(Relaxed), 42);
         assert_eq!(
             device.ask("board.second", &[]).value(),
             &42u32.to_le_bytes()

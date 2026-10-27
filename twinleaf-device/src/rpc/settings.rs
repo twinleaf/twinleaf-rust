@@ -5,12 +5,16 @@
 //! [`crate::device::Device::apply`], which broadcasts a SETTING packet on
 //! each value change and counts it in `settings.version`.
 
+use core::sync::atomic::{
+    AtomicBool, AtomicI16, AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering,
+};
+
 use twinleaf_proto::rpc::RpcError;
 
 use crate::rpc::{self, put, Access, Reply, RpcSpec};
 
 /// A value a setting holds, encoded as its RPC reads and writes it.
-pub trait Scalar: Copy + PartialEq {
+pub trait Scalar: Copy + PartialEq + Send + Sync + 'static {
     /// The kind of value the table declares for it.
     const KIND: rpc::Kind;
 
@@ -125,6 +129,43 @@ pub fn finite(value: f32) -> Result<f32, RpcError> {
     Ok(value)
 }
 
+/// Where a setting hands each value it takes, for the tasks that read it.
+pub trait Publish<T>: Sync {
+    /// Take `value` as what the setting now holds.
+    fn publish(&self, value: T);
+}
+
+/// An atomic a task moves and a probe reads; a setting may publish into one.
+pub trait Atomic<T>: Sync {
+    /// The value it holds.
+    fn load(&self) -> T;
+}
+
+macro_rules! atomic {
+    ($($atomic:ty => $type:ty,)*) => {$(
+        impl Atomic<$type> for $atomic {
+            fn load(&self) -> $type {
+                <$atomic>::load(self, Ordering::Relaxed)
+            }
+        }
+
+        impl Publish<$type> for $atomic {
+            fn publish(&self, value: $type) {
+                self.store(value, Ordering::Relaxed)
+            }
+        }
+    )*};
+}
+
+atomic! {
+    AtomicBool => bool,
+    AtomicU8 => u8,
+    AtomicU16 => u16,
+    AtomicU32 => u32,
+    AtomicI16 => i16,
+    AtomicI32 => i32,
+}
+
 /// Whether a call left the setting holding a value to announce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Changed {
@@ -154,6 +195,7 @@ pub struct Setting<T: Scalar> {
     initial: T,
     access: Access,
     check: fn(T) -> Result<T, RpcError>,
+    target: Option<&'static dyn Publish<T>>,
 }
 
 impl<T: Scalar> Setting<T> {
@@ -165,6 +207,7 @@ impl<T: Scalar> Setting<T> {
             initial,
             access: Access::RW,
             check: Ok,
+            target: None,
         }
     }
 
@@ -206,9 +249,24 @@ impl<T: Scalar> Setting<T> {
         }
     }
 
+    /// The same setting, handing every value it takes to `target`.
+    pub const fn publishes(self, target: &'static dyn Publish<T>) -> Self {
+        Self {
+            target: Some(target),
+            ..self
+        }
+    }
+
     /// The name its RPC and its announcements carry.
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Hand the value it holds to its target, if it has one.
+    pub(crate) fn publish(&self) {
+        if let Some(target) = self.target {
+            target.publish(self.value);
+        }
     }
 
     /// The value it holds.
