@@ -255,6 +255,8 @@ struct Edge {
     at_ns: u64,
     /// Phase the corrections have moved the counter by `at_ns`.
     steered: f64,
+    /// Nanoseconds the input wire delayed the edge.
+    delay_ns: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -339,11 +341,14 @@ impl Train {
             counter: pulse_edge,
             at_ns: pulse_time_ns,
             steered,
+            delay_ns,
         } = edge;
         let floor = domain.ticks_to_ns(1) * domain.ticks_to_ns(1);
         if !self.is_valid() {
+            let mut filter = Filter::fresh(config, floor, steered);
+            filter.x[0] = -delay_ns;
             *self = Self {
-                filter: Filter::fresh(config, floor, steered),
+                filter,
                 ..Self::new()
             };
         } else {
@@ -360,7 +365,8 @@ impl Train {
             }
             (self.pending_seconds, self.pending_delta) = (pending_seconds, pending_delta);
 
-            let phase = domain.ticks_to_ns(self.phase_error.saturating_add(pending_delta));
+            let phase =
+                domain.ticks_to_ns(self.phase_error.saturating_add(pending_delta)) - delay_ns;
             if pending_seconds == 0 {
                 self.rejected = true;
                 return None;
@@ -447,6 +453,8 @@ pub(crate) struct PulseTracker {
     /// Phase the corrections have moved the counter by `steered_at_ns`.
     steered_ns: f64,
     steered_at_ns: u64,
+    /// Nanoseconds the input wire delays every edge, taken off each measured phase.
+    delay_ns: f64,
 }
 
 impl PulseTracker {
@@ -483,6 +491,7 @@ impl PulseTracker {
             steering_ppb: 0.0,
             steered_ns: 0.0,
             steered_at_ns: 0,
+            delay_ns: 0.0,
         }
     }
 
@@ -506,6 +515,11 @@ impl PulseTracker {
                 good_pulses: self.main.run.min(u8::MAX as u32) as u8,
             },
         }
+    }
+
+    /// Nanoseconds taken off every edge.
+    pub(crate) const fn delay_ns(&self) -> f64 {
+        self.delay_ns
     }
 
     /// The drift-compensated phase anchor.
@@ -538,6 +552,16 @@ impl PulseTracker {
                 accuracy_ns: x[0].abs() as u64 + 2 * (p[0][0] as u64).isqrt(),
             }
         })
+    }
+
+    /// Take `delay_ns` off every edge from now on, moving both trains' phase
+    /// with it so the change is not mistaken for a jump.
+    pub(crate) fn set_delay_ns(&mut self, delay_ns: f64) {
+        let shift = delay_ns - self.delay_ns;
+        self.delay_ns = delay_ns;
+        for train in [&mut self.main, &mut self.tentative] {
+            train.filter.x[0] -= shift;
+        }
     }
 
     /// Put `correction_ppm` in force from `monotonic_ns`: the filters predict
@@ -616,6 +640,7 @@ impl PulseTracker {
             counter: pulse_edge,
             at_ns: monotonic_ns,
             steered: self.steered(monotonic_ns),
+            delay_ns: self.delay_ns,
         };
 
         match self.main.process_pulse(self.domain, self.config, edge) {
@@ -727,6 +752,29 @@ pub(super) mod tests {
         assert_eq!(tracker.main.phase_error, 20);
         assert_eq!(tracker.target_edge(), Some(100));
         assert!((tracker.phase_error_ns().unwrap() - 20_000.0).abs() < 0.1);
+    }
+
+    /// An input delay comes off every edge, and moving it moves the estimate
+    /// without the next edge looking like a jump.
+    #[test]
+    fn an_input_delay_comes_off_every_edge_without_a_jump() {
+        let mut tracker = new_tracker();
+        let phase = |tracker: &PulseTracker| tracker.estimate().unwrap().phase_ns;
+        tracker.set_delay_ns(250.0);
+        for second in 0..10u64 {
+            tracker.capture(100, second * NANOS_PER_SECOND);
+        }
+        assert!((phase(&tracker) + 250.0).abs() < 1.0, "{}", phase(&tracker));
+        tracker.set_delay_ns(4_000.0);
+        for second in 10..20u64 {
+            tracker.capture(100, second * NANOS_PER_SECOND);
+        }
+        assert!(
+            (phase(&tracker) + 4_000.0).abs() < 1.0,
+            "{}",
+            phase(&tracker)
+        );
+        assert_eq!(tracker.spur_count(), 0);
     }
 
     #[test]

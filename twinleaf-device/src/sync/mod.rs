@@ -1216,6 +1216,32 @@ impl Synchronizer {
         self.acquisition.set_autostart_seconds(seconds);
     }
 
+    /// Take `delay_ns`, the delay of the wire the counter captures, off every edge.
+    pub fn set_input_delay_ns(&mut self, delay_ns: f32) {
+        if f64::from(delay_ns) != self.pulses.delay_ns() {
+            self.pulses.set_delay_ns(f64::from(delay_ns));
+        }
+    }
+
+    /// The edge acquisitions anchor to: the pulse train's, taken back by the input
+    /// delay in whole ticks on a board with no servo to take it back in phase.
+    fn anchor_edge(&self) -> Option<u32> {
+        let edge = self.pulses.target_edge()?;
+        match self.servo {
+            Some(_) => Some(edge),
+            None => {
+                let period = i64::from(self.pulses.domain().period());
+                let ticks = self.pulses.delay_ns() * period as f64 / NANOS_PER_SECOND as f64;
+                let ticks = if ticks < 0.0 {
+                    ticks - 0.5
+                } else {
+                    ticks + 0.5
+                } as i64;
+                Some((i64::from(edge) - ticks).rem_euclid(period) as u32)
+            }
+        }
+    }
+
     /// Hand the operator's steering to the servo, on a board that has one.
     pub fn set_steering(&mut self, steering: Steering) {
         self.servo
@@ -1241,7 +1267,7 @@ impl Synchronizer {
     pub fn restart(&mut self) -> Result<Actions, AcquisitionError> {
         let actions = self.acquisition.request_restart()?;
         self.pulses.rebase();
-        if let Some(edge) = self.pulses.target_edge() {
+        if let Some(edge) = self.anchor_edge() {
             self.anchor = Some(edge);
         }
         Ok(self.report(actions))
@@ -1302,8 +1328,8 @@ impl Synchronizer {
         let displaced = self.references.active().advance(1);
         let adopted = self.references.on_edge(qualified);
 
-        let mut actions = if qualified && self.pulses.target_edge() != self.anchor {
-            self.anchor = self.pulses.target_edge();
+        let mut actions = if qualified && self.anchor_edge() != self.anchor {
+            self.anchor = self.anchor_edge();
             self.generation = self.generation.wrapping_add(1);
             self.acquisition.synchronization_changed()
         } else if adopted {
@@ -1460,6 +1486,19 @@ mod synchronizer_tests {
             sync.poll(now);
             sync.capture(EDGE, now);
         }
+    }
+
+    /// With no servo to take it back in phase, the input delay moves the
+    /// anchor by whole ticks; with one, the anchor stays and the servo moves.
+    #[test]
+    fn an_input_delay_moves_a_plain_devices_anchor_in_whole_ticks() {
+        let (mut plain, mut steered) = (plain(), synchronizer());
+        for sync in [&mut plain, &mut steered] {
+            sync.set_input_delay_ns(2_500.0);
+            run(sync, 5);
+        }
+        assert_eq!(plain.status().counter_edge, Some(EDGE - 3));
+        assert_eq!(steered.status().counter_edge, Some(EDGE));
     }
 
     #[test]

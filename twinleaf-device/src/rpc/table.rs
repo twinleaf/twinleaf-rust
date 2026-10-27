@@ -292,6 +292,7 @@ standard! {
     SettingsVersion "settings.version" prop(Kind::Uint(4), Access::READ),
     SyncStatus "sync.status" prop(Kind::Uint(1), Access::READ),
     Lifetime "dev.lifetime" prop(Kind::Uint(4), Access::READ),
+    SyncDelay "sync.delay" prop(Kind::Float(4), Access::RW.union(Access::PERSISTENT)),
     Priv "dev.priv" std(Access::RW).hidden(),
     PrivLock "dev.priv.lock" action().privileged(),
     PrivPassword "dev.priv.password"
@@ -481,7 +482,7 @@ mod tests {
     use super::*;
 
     /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x8a1f_b17e;
+    const HASH: u32 = 0x2c69_6152;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -551,13 +552,13 @@ mod tests {
 
     #[test]
     fn the_standard_table_order_is_pinned() {
-        assert_eq!(STANDARD.len(), 37);
+        assert_eq!(STANDARD.len(), 38);
         assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
         assert_eq!(STANDARD.last().unwrap().name, "dev.priv.password");
         assert_eq!(hash(STANDARD, true), HASH);
         assert_eq!(
             hash(STANDARD, false),
-            0xd24d_fff1,
+            0xdd20_1bb0,
             "the four developer entries are invisible to a customer"
         );
     }

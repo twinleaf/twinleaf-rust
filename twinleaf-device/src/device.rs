@@ -25,7 +25,7 @@ use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::data::metadata::{self, Streams};
 use crate::rpc::{self as table, put, read, Access, Reply, RpcSpec, Std, STANDARD};
-use crate::rpc::{Changed, Persisted, Scalar, Setting, Text};
+use crate::rpc::{finite, Changed, Persisted, Scalar, Setting, Text};
 use crate::storage::conf::{self, Image};
 use crate::Sink;
 
@@ -272,6 +272,8 @@ pub struct Device<S: Group> {
     password: Setting<Text<PASSWORD_MAX>>,
     /// Seconds after boot the acquisition starts on its own, or never at zero.
     autostart: Setting<u8>,
+    /// Nanoseconds the wire carrying a parent's PPS delays it.
+    sync_delay: Setting<f32>,
     settings: S,
     next_beat: u64,
     /// The nanosecond the device came up, which `dev.systime`, `dev.uptime`
@@ -308,6 +310,7 @@ impl<S: Group> Device<S> {
             privileged: false,
             password: Setting::new("dev.priv.password", Text::from(password)).persistent(),
             autostart: Setting::new("dev.autostart", DEFAULT_AUTOSTART).persistent(),
+            sync_delay: Setting::new("sync.delay", 0.0).checked(finite).persistent(),
             settings,
             next_beat: 0,
             booted_ns: now_ns,
@@ -355,6 +358,11 @@ impl<S: Group> Device<S> {
     /// `dev.autostart`, for the platform's acquisition to wait out.
     pub fn autostart(&self) -> u8 {
         self.autostart.get()
+    }
+
+    /// `sync.delay`, for the platform's synchronizer to take off a parent's edges.
+    pub fn sync_delay_ns(&self) -> f32 {
+        self.sync_delay.get()
     }
 
     /// Publish what this device's own time is now worth, for `sync.status`.
@@ -583,6 +591,18 @@ impl<S: Group> Device<S> {
                         self.dirty_since = Some(now_ns);
                     }
                 }),
+                Std::SyncDelay => write(
+                    &mut self.settings_version,
+                    &mut self.sync_delay,
+                    args,
+                    &mut reply,
+                    &mut to(lanes),
+                )
+                .map(|changed| {
+                    if changed == Changed::Changed {
+                        self.dirty_since = Some(now_ns);
+                    }
+                }),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
                 Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
                 Std::Restart => {
@@ -719,6 +739,7 @@ impl<S: Group> Device<S> {
                 &mut self.password as &mut dyn Persisted,
                 &mut self.autostart,
                 &mut self.loglevel,
+                &mut self.sync_delay,
             ],
             image,
         );
@@ -745,11 +766,12 @@ impl<S: Group> Device<S> {
             password,
             autostart,
             loglevel,
+            sync_delay,
             ..
         } = self;
         let mut outcome =
             conf::load([password as &mut dyn Persisted], image, |_, _| {}).and(conf::load(
-                [autostart as &mut dyn Persisted, loglevel],
+                [autostart as &mut dyn Persisted, loglevel, sync_delay],
                 image,
                 |name, reply| announce(settings_version, &mut events(&mut *lanes), name, reply),
             ));
@@ -808,6 +830,7 @@ impl<S: Group> Device<S> {
         self.loglevel.reset();
         self.password.reset();
         self.autostart.reset();
+        self.sync_delay.reset();
         self.privileged = false;
         self.settings_version = 0;
         self.dirty_since = None;
@@ -1713,6 +1736,31 @@ mod tests {
         assert_eq!(device.device.autostart(), 0);
     }
 
+    /// `sync.delay` boots at zero, and a written value is announced and
+    /// restored at the next boot.
+    #[test]
+    fn a_written_sync_delay_is_announced_and_restored_at_the_next_boot() {
+        let mut device = harness();
+        let delay = 12.5f32.to_le_bytes();
+        assert_eq!(
+            device.ask("sync.delay", &delay).announced(),
+            [("sync.delay".to_owned(), delay.to_vec())]
+        );
+        device.ask("dev.conf.save", &[]);
+        let Some((_, Deferred::Flash(FlashOp::ConfSave(image)))) = device.deferred.take() else {
+            panic!("a save carries the image");
+        };
+
+        device.device.reboot(SessionId::new(2), BOOT);
+        assert_eq!(device.device.sync_delay_ns(), 0.0);
+        device.drive(Input::Loaded(None, Ok(&image)), BOOT);
+        assert_eq!(device.device.sync_delay_ns(), 12.5);
+        assert_eq!(
+            device.ask("sync.delay", &f32::NAN.to_le_bytes()).error(),
+            RpcError::Invalid
+        );
+    }
+
     /// The board's password is a compiled default the developer overrides,
     /// stored like any other persistent setting.
     #[test]
@@ -2308,13 +2356,14 @@ mod tests {
                 &b"dev.priv.password"[..],
                 b"dev.autostart",
                 b"dev.loglevel",
+                b"sync.delay",
                 b"board.first",
                 b"board.second",
                 b"board.count"
             ],
             "every persistent cell, in table order"
         );
-        assert_eq!(stored[4].1, 42u32.to_le_bytes());
+        assert_eq!(stored[5].1, 42u32.to_le_bytes());
     }
 
     /// The boot restore: every stored value is taken, announced where every
@@ -2462,7 +2511,7 @@ mod tests {
             .map(|entry| entry.unwrap())
             .map(|entry| (entry.name, entry.value))
             .collect();
-        assert_eq!(stored[4], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
+        assert_eq!(stored[5], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
         assert!(
             device.tick(BOOT + 3 * AUTOSAVE_INTERVAL).is_none(),
             "one save, not a save every period"
