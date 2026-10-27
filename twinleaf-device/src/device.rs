@@ -24,7 +24,7 @@ use twinleaf_proto::settings::Setting as Announcement;
 use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::data::metadata::{self, Streams};
-use crate::rpc::{self as table, put, read, Access, Reply, RpcSpec, Std, STANDARD};
+use crate::rpc::{self as table, put, read, Access, Kind, Reply, RpcSpec, Std, STANDARD};
 use crate::rpc::{finite, Changed, Persisted, Scalar, Setting, Text};
 use crate::storage::conf::{self, Image};
 use crate::Sink;
@@ -694,9 +694,9 @@ impl<S: Group> Device<S> {
                         }),
                 );
             }
-            Entry::Reading(reading) => {
+            Entry::Diagnostic(diagnostic) => {
                 found = Some(match args {
-                    [] => reading.read(out),
+                    [] => diagnostic.read(out),
                     _ => Err(RpcError::ReadOnly),
                 });
             }
@@ -1036,18 +1036,22 @@ impl<T: Scalar> Group for Setting<T> {
 pub enum Entry<'a> {
     /// A value a host reads and writes; a write is announced.
     Setting(&'a mut dyn Cell),
-    /// A number the device computes when asked.
-    Reading(&'a dyn Reading),
+    /// A developer's number, read when asked and never announced.
+    Diagnostic(&'a dyn Diagnostic),
     /// Something the device does, which may move several settings.
     Action(&'a mut dyn Action),
 }
 
 impl Entry<'_> {
-    /// The table entry it declares.
+    /// The table entry it declares, a diagnostic's always privileged and hidden.
     pub fn spec(&self) -> RpcSpec {
         match self {
             Self::Setting(cell) => cell.spec(),
-            Self::Reading(reading) => reading.spec(),
+            Self::Diagnostic(diagnostic) => {
+                RpcSpec::prop(diagnostic.name(), diagnostic.kind(), Access::READ)
+                    .hidden()
+                    .privileged()
+            }
             Self::Action(action) => action.spec(),
         }
     }
@@ -1085,36 +1089,27 @@ impl<T: Scalar> Cell for Setting<T> {
     }
 }
 
-/// A read-only value computed when read, such as a counter a task keeps,
-/// typed so its table entry and its reply agree.
-pub struct Computed<T: Scalar> {
+/// A diagnostic `read` computes when asked, typed so its entry and reply agree;
+/// see [the five channels](crate#channels) for when a value is one.
+pub struct Probe<T: Scalar> {
     name: &'static str,
-    access: Access,
     read: fn() -> T,
 }
 
-impl<T: Scalar> Computed<T> {
+impl<T: Scalar> Probe<T> {
     /// `name`, answered with what `read` returns.
     pub const fn new(name: &'static str, read: fn() -> T) -> Self {
-        Self {
-            name,
-            access: Access::READ,
-            read,
-        }
-    }
-
-    /// The same reading, reached only by a session `dev.priv` has unlocked.
-    pub const fn privileged(self) -> Self {
-        Self {
-            access: self.access.privileged(),
-            ..self
-        }
+        Self { name, read }
     }
 }
 
-impl<T: Scalar> Reading for Computed<T> {
-    fn spec(&self) -> RpcSpec {
-        RpcSpec::prop(self.name, T::KIND, self.access)
+impl<T: Scalar> Diagnostic for Probe<T> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn kind(&self) -> Kind {
+        T::KIND
     }
 
     fn read(&self, out: &mut Reply) -> Result<(), RpcError> {
@@ -1122,10 +1117,20 @@ impl<T: Scalar> Reading for Computed<T> {
     }
 }
 
-/// A read-only number, such as a hub diagnostic.
-pub trait Reading {
-    /// Its table entry.
-    fn spec(&self) -> RpcSpec;
+impl<T: Scalar> Group for Probe<T> {
+    fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
+        visit(Entry::Diagnostic(self));
+    }
+}
+
+/// A read-only number for developers, such as a hub counter, whose entry the
+/// device makes privileged and hidden so no board can make one public.
+pub trait Diagnostic {
+    /// Its RPC name.
+    fn name(&self) -> &'static str;
+
+    /// What it replies with.
+    fn kind(&self) -> Kind;
 
     /// Compute it into `out`.
     fn read(&self, out: &mut Reply) -> Result<(), RpcError>;
@@ -1178,7 +1183,7 @@ mod tests {
     use crate::data::filter::Butterworth4;
     use crate::data::Params;
     use crate::data::{ColumnDef, Stream, StreamDef};
-    use crate::rpc::{put, Kind};
+    use crate::rpc::put;
     use core::num::NonZeroU32;
     use std::string::String;
     use twinleaf_proto::data::{MetadataReply, MetadataType};
@@ -1210,7 +1215,7 @@ mod tests {
     impl Group for Counter {
         fn entries(&mut self, visit: &mut dyn FnMut(Entry<'_>)) {
             visit(Entry::Setting(&mut self.value));
-            visit(Entry::Reading(&Doubled(self.value.get())));
+            visit(Entry::Diagnostic(&Doubled(self.value.get())));
             visit(Entry::Action(&mut Rewind(self)));
         }
 
@@ -1227,9 +1232,13 @@ mod tests {
 
     struct Doubled(u32);
 
-    impl Reading for Doubled {
-        fn spec(&self) -> RpcSpec {
-            RpcSpec::prop("board.doubled", Kind::Uint(4), Access::READ)
+    impl Diagnostic for Doubled {
+        fn name(&self) -> &'static str {
+            "board.doubled"
+        }
+
+        fn kind(&self) -> Kind {
+            Kind::Uint(4)
         }
 
         fn read(&self, out: &mut Reply) -> Result<(), RpcError> {
@@ -1684,8 +1693,8 @@ mod tests {
         let mut device = harness();
         assert_eq!(
             device.listed(),
-            device.table().len() - 6,
-            "`dev.mcu.model`, the three `dev.priv` entries, and the board's own two"
+            device.table().len() - 7,
+            "`dev.mcu.model`, the three `dev.priv` entries, and the board's own three"
         );
         device.ask("dev.priv", PASSWORD.as_bytes());
         assert_eq!(device.listed(), device.table().len());
@@ -1704,7 +1713,14 @@ mod tests {
             RpcError::NotFound
         );
 
-        for name in ["board.quiet", "board.secret", "dev.priv", "dev.priv.lock"] {
+        assert_eq!(device.ask("board.doubled", &[]).error(), RpcError::NotFound);
+        for name in [
+            "board.quiet",
+            "board.secret",
+            "board.doubled",
+            "dev.priv",
+            "dev.priv.lock",
+        ] {
             assert_eq!(
                 device.ask("rpc.id", name.as_bytes()).error(),
                 RpcError::Invalid,
@@ -2249,8 +2265,9 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_is_computed_when_asked_and_refuses_a_write() {
+    fn a_diagnostic_is_computed_when_asked_and_refuses_a_write() {
         let mut device = harness();
+        device.ask("dev.priv", PASSWORD.as_bytes());
         assert_eq!(
             device.ask("board.doubled", &[]).value(),
             &10u32.to_le_bytes()
