@@ -44,6 +44,8 @@ const HOLDOVER_TIMEOUT: u8 = 60;
 /// 255; a hub chain is a few cables deep, and a stale source counting up one a
 /// second around a loop of them is dropped in half a minute rather than four.
 const MAX_STEPS_REMOVED: u8 = 32;
+/// How long a time source's clock outlives its last label.
+const LABEL_TIMEOUT_NS: u64 = 3_000_000_000;
 
 /// Work for the runtime after one [`Synchronizer`] call.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -521,7 +523,7 @@ impl ReferenceTracker {
 
     /// Observe a second the device was told by something other than a packet,
     /// a GPS receiver above all, under its own identity in `epoch`.
-    pub(crate) fn observe_local(&mut self, second: u32, epoch: Epoch) {
+    pub(crate) fn observe_time_source(&mut self, second: u32, epoch: Epoch) {
         self.qualify(Reference {
             identity: ReferenceIdentity {
                 epoch,
@@ -699,7 +701,7 @@ mod reference_tests {
     fn a_local_label_qualifies_under_the_devices_own_identity() {
         let mut tracker = ReferenceTracker::new(local());
         for time in 100..103 {
-            tracker.observe_local(time, Epoch::UNIX);
+            tracker.observe_time_source(time, Epoch::UNIX);
             tracker.on_edge(true);
         }
         assert_eq!(tracker.state(), ReferenceState::Upstream);
@@ -1005,6 +1007,8 @@ pub struct Synchronizer {
     /// Monotonic stamp of the last second event, which the arrival window for
     /// a SYNC packet is measured from.
     last_second_ns: Option<u64>,
+    /// When the time source last labelled a second; its clock lapses [`LABEL_TIMEOUT_NS`] later.
+    labelled_ns: Option<u64>,
 }
 
 impl Synchronizer {
@@ -1032,6 +1036,7 @@ impl Synchronizer {
             reported: None,
             seconds: 0,
             last_second_ns: None,
+            labelled_ns: None,
         }
     }
 
@@ -1094,11 +1099,11 @@ impl Synchronizer {
         }
     }
 
-    /// Observe a SYNC timeref that arrived at `arrival_ns`, labelling the
+    /// Observe a parent's SYNC timeref that arrived at `arrival_ns`, labelling the
     /// second just closed. One that missed its second's window, or that names
     /// this device's own time or too distant a root, is dropped and counted; a sequence that skipped is a divergence, and discards whatever
     /// the source had qualified so far.
-    pub fn observe_packet(&mut self, timeref: Timeref<'_>, pad: u8, arrival_ns: u64) {
+    pub fn observe_parent(&mut self, timeref: Timeref<'_>, pad: u8, arrival_ns: u64) {
         let status = TimeStatus::from_pad(pad);
         let holding = match self.pulses.state() {
             PulseState::Holdover { missed_pulses } => {
@@ -1129,20 +1134,19 @@ impl Synchronizer {
         self.references.observe(timeref);
     }
 
-    /// Name what the device's own seconds come from: GNSS while a GPS receiver
-    /// labels them, PTP while PTP does, its internal oscillator otherwise.
-    pub fn set_time_source(&mut self, time_source: TimeSource) {
-        self.references.set_own(Clock {
-            time_source,
-            ..self.references.own()
-        });
-    }
-
-    /// Observe a second from the device's own receiver rather than a packet,
+    /// Observe a second from the device's own time source, which `clock` describes,
     /// labelling the locked pulse just closed; before a lock it discards what was qualified.
-    pub fn observe_local(&mut self, second: u32, epoch: Epoch) {
+    pub fn observe_time_source(
+        &mut self,
+        second: u32,
+        epoch: Epoch,
+        clock: Clock,
+        monotonic_ns: u64,
+    ) {
+        self.labelled_ns = Some(monotonic_ns);
+        self.references.set_own(clock);
         match self.pulses.state().is_locked() {
-            true => self.references.observe_local(second, epoch),
+            true => self.references.observe_time_source(second, epoch),
             false => self.references.discard_candidate(),
         }
     }
@@ -1284,6 +1288,14 @@ impl Synchronizer {
         self.qualified_once |= qualified;
         self.seconds = self.seconds.saturating_add(steps);
         self.last_second_ns = Some(monotonic_ns);
+        if self
+            .labelled_ns
+            .is_some_and(|at| monotonic_ns.saturating_sub(at) > LABEL_TIMEOUT_NS)
+        {
+            self.labelled_ns = None;
+            self.references
+                .set_own(Clock::root(TimeSource::InternalOscillator));
+        }
         for _ in 1..steps {
             self.references.on_edge(false);
         }
@@ -1396,6 +1408,7 @@ mod synchronizer_tests {
 
     const PERIOD: u32 = 1_000_000;
     const EDGE: u32 = 100;
+    const GNSS: Clock = Clock::root(TimeSource::Gnss);
 
     fn local() -> Reference {
         Reference {
@@ -1559,7 +1572,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_packet(packet(500 + second as u32), 0, now);
+            sync.observe_parent(packet(500 + second as u32), 0, now);
         }
         let now = 6 * NANOS_PER_SECOND;
         sync.poll(now);
@@ -1596,7 +1609,7 @@ mod synchronizer_tests {
                 let now = second * NANOS_PER_SECOND;
                 sync.poll(now);
                 let announce = sync.capture(EDGE, now).announce;
-                sync.observe_packet(
+                sync.observe_parent(
                     Timeref {
                         clock: Some(upstream),
                         ..packet(500 + second as u32)
@@ -1643,7 +1656,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_packet(packet(900 + second as u32), 0, now);
+            sync.observe_parent(packet(900 + second as u32), 0, now);
             second += 1;
         }
         let now = second * NANOS_PER_SECOND;
@@ -1705,7 +1718,7 @@ mod synchronizer_tests {
                     sync.wake((ms * 1_000 % PERIOD as u64) as u32, now);
                     match (ms + 1_000 - edge_ms) % 1_000 {
                         0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
-                        3 => sync.observe_packet(
+                        3 => sync.observe_parent(
                             packet(HUB + second),
                             pad(second as u8, TimeStatus::Locked),
                             now,
@@ -1754,7 +1767,7 @@ mod synchronizer_tests {
                     sync.poll(now);
                     match (ms + 1_000 - edge_ms) % 1_000 {
                         0 => drop(sync.capture(edge_ms as u32 * 1_000, now)),
-                        3 => sync.observe_packet(
+                        3 => sync.observe_parent(
                             packet(label(ms - 3)),
                             pad(label(ms - 3) as u8, TimeStatus::Locked),
                             now,
@@ -2046,14 +2059,14 @@ mod synchronizer_tests {
         let mut sync = synchronizer();
         run(&mut sync, 4);
 
-        sync.observe_packet(packet(500), 0, 3 * NANOS_PER_SECOND + 899_999_999);
+        sync.observe_parent(packet(500), 0, 3 * NANOS_PER_SECOND + 899_999_999);
         assert_eq!(
             sync.status().reference,
             ReferenceState::Candidate { confirmations: 1 }
         );
         assert_eq!(sync.status().late_references, 0);
 
-        sync.observe_packet(packet(501), 0, 3 * NANOS_PER_SECOND + 900_000_000);
+        sync.observe_parent(packet(501), 0, 3 * NANOS_PER_SECOND + 900_000_000);
         assert_eq!(sync.status().late_references, 1);
         assert_eq!(
             sync.status().reference,
@@ -2065,7 +2078,7 @@ mod synchronizer_tests {
     #[test]
     fn a_packet_before_any_second_event_is_counted_late() {
         let mut sync = synchronizer();
-        sync.observe_packet(packet(500), 0, 0);
+        sync.observe_parent(packet(500), 0, 0);
         assert_eq!(sync.status().late_references, 1);
         assert_eq!(sync.status().reference, ReferenceState::Local);
     }
@@ -2081,7 +2094,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_packet(
+            sync.observe_parent(
                 packet(500 + second as u32),
                 pad(second as u8, TimeStatus::Locked),
                 now,
@@ -2095,7 +2108,7 @@ mod synchronizer_tests {
         let now = 5 * NANOS_PER_SECOND;
         sync.poll(now);
         sync.capture(EDGE, now);
-        sync.observe_packet(packet(505), pad(9, TimeStatus::Locked), now);
+        sync.observe_parent(packet(505), pad(9, TimeStatus::Locked), now);
         assert_eq!(sync.status().reference, ReferenceState::Local);
         assert_eq!(sync.status().divergences, 1);
         assert_eq!(sync.status().upstream, TimeStatus::Locked);
@@ -2111,7 +2124,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_packet(
+            sync.observe_parent(
                 packet(500 + second as u32),
                 pad(sequence, TimeStatus::Locked),
                 now,
@@ -2132,7 +2145,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_packet(packet(500 + second as u32), pad(7, TimeStatus::Legacy), now);
+            sync.observe_parent(packet(500 + second as u32), pad(7, TimeStatus::Legacy), now);
         }
         assert_eq!(sync.status().reference, ReferenceState::Upstream);
         assert_eq!(sync.status().divergences, 0);
@@ -2148,7 +2161,7 @@ mod synchronizer_tests {
         let now = 3 * NANOS_PER_SECOND;
         sync.poll(now);
         sync.capture(EDGE, now);
-        sync.observe_packet(packet(500), pad(40, TimeStatus::Locked), now);
+        sync.observe_parent(packet(500), pad(40, TimeStatus::Locked), now);
 
         let rebooted = Timeref {
             session: SessionId::new(100),
@@ -2157,7 +2170,7 @@ mod synchronizer_tests {
         let now = 4 * NANOS_PER_SECOND;
         sync.poll(now);
         sync.capture(EDGE, now);
-        sync.observe_packet(rebooted, pad(0, TimeStatus::Locked), now);
+        sync.observe_parent(rebooted, pad(0, TimeStatus::Locked), now);
         assert_eq!(sync.status().divergences, 0);
         assert_eq!(
             sync.status().reference,
@@ -2175,7 +2188,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_packet(packet(500 + second as u32), 0, now);
+            sync.observe_parent(packet(500 + second as u32), 0, now);
         }
         let adopted = sync.status();
         assert_eq!(adopted.reference, ReferenceState::Upstream);
@@ -2276,7 +2289,7 @@ mod synchronizer_tests {
                 let now = second * NANOS_PER_SECOND;
                 sync.poll(now);
                 sync.capture(EDGE, now);
-                sync.observe_packet(
+                sync.observe_parent(
                     packet(500 + second as u32),
                     pad(second as u8, upstream),
                     now,
@@ -2347,7 +2360,7 @@ mod synchronizer_tests {
                 actions.extend(wake_until(&mut sync, at));
                 actions.push(sync.capture(edge, at));
                 actions.extend(wake_until(&mut sync, at + 1_000_000));
-                sync.observe_packet(timeref, pad(second as u8, status), at + 1_000_000);
+                sync.observe_parent(timeref, pad(second as u8, status), at + 1_000_000);
             }
             actions.extend(wake_until(&mut sync, now + NANOS_PER_SECOND - 1));
             for action in actions.into_iter().map(|actions| actions.local) {
@@ -2444,7 +2457,9 @@ mod synchronizer_tests {
                     let (second, phase) = (now / NANOS_PER_SECOND, now % NANOS_PER_SECOND);
                     match phase {
                         0 => drop(sync.capture(EDGE, now)),
-                        LABEL_LATENCY_NS => sync.observe_local(UNIX + second as u32, Epoch::UNIX),
+                        LABEL_LATENCY_NS => {
+                            sync.observe_time_source(UNIX + second as u32, Epoch::UNIX, GNSS, now)
+                        }
                         _ => {}
                     }
                     let status = sync.status();
@@ -2472,7 +2487,7 @@ mod synchronizer_tests {
             let now = second * NANOS_PER_SECOND;
             sync.poll(now);
             sync.capture(EDGE, now);
-            sync.observe_local(1_700_000_000 + second as u32, Epoch::UNIX);
+            sync.observe_time_source(1_700_000_000 + second as u32, Epoch::UNIX, GNSS, now);
         }
         let now = 7 * NANOS_PER_SECOND;
         sync.poll(now);
@@ -2485,11 +2500,37 @@ mod synchronizer_tests {
         assert_eq!(TimeStatus::from_pad(announced.pad), TimeStatus::Locked);
         assert_eq!(announced.pad & SEQUENCE_MASK, 8);
 
-        sync.observe_packet(packet(1_700_000_007), pad(1, TimeStatus::Holdover), now);
+        sync.observe_parent(packet(1_700_000_007), pad(1, TimeStatus::Holdover), now);
         let now = 8 * NANOS_PER_SECOND;
         sync.poll(now);
         let announced = sync.capture(EDGE, now).announce.expect("an announcement");
         assert_eq!(TimeStatus::from_pad(announced.pad), TimeStatus::Holdover);
+    }
+
+    /// A time source's clock is what the device announces while it labels
+    /// seconds, and its own oscillator's once the labels stop.
+    #[test]
+    fn a_time_source_clock_is_announced_until_its_labels_lapse() {
+        let mut sync = synchronizer();
+        run(&mut sync, 3);
+        let announced = |sync: &mut Synchronizer, second: u64| {
+            let now = second * NANOS_PER_SECOND;
+            sync.poll(now);
+            let announce = sync.capture(EDGE, now).announce.expect("an announcement");
+            announce.timeref.clock.time_source
+        };
+        for second in 3..8u64 {
+            announced(&mut sync, second);
+            let now = second * NANOS_PER_SECOND;
+            sync.observe_time_source(1_700_000_000 + second as u32, Epoch::UNIX, GNSS, now);
+        }
+        assert_eq!(announced(&mut sync, 8), TimeSource::Gnss);
+        assert_eq!(
+            announced(&mut sync, 10),
+            TimeSource::Gnss,
+            "within the timeout"
+        );
+        assert_eq!(announced(&mut sync, 11), TimeSource::InternalOscillator);
     }
 
     #[test]
@@ -2554,7 +2595,7 @@ mod synchronizer_tests {
                 .write_with_pad(&mut buf, announce.pad)
                 .unwrap();
             let payload = &buf[twinleaf_proto::packet::Header::SIZE..len];
-            hub.observe_packet(
+            hub.observe_parent(
                 Timeref::parse(payload).unwrap(),
                 Timeref::pad(payload),
                 now + 1_000_000,
@@ -2578,8 +2619,11 @@ mod synchronizer_tests {
     #[test]
     fn a_chain_of_hubs_counts_the_steps_from_its_root() {
         let mut hubs: Vec<Synchronizer> = (0..5).map(hub).collect();
-        hubs[0].set_time_source(TimeSource::Gnss);
-        (0..40).for_each(|second| tick(&mut hubs, |index| index.checked_sub(1), second));
+        (0..40).for_each(|second| {
+            tick(&mut hubs, |index| index.checked_sub(1), second);
+            let labelled = second * NANOS_PER_SECOND + 300_000_000;
+            hubs[0].observe_time_source(1_700_000_000 + second as u32, Epoch::UNIX, GNSS, labelled);
+        });
         assert_eq!(
             roots(&hubs),
             (0..5)
