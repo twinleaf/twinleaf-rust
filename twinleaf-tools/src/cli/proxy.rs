@@ -1,19 +1,20 @@
-use clap::{Parser, Subcommand, ValueHint};
-use twinleaf::device::DeviceRoute;
+//! The arguments of `tio proxy` and its subcommands.
 
-use crate::{parse_device_route, TioOpts};
+use super::{parse_device_route, ListCli, TioOpts};
+use clap::{Parser, Subcommand, ValueHint};
+use twinleaf::DeviceRoute;
 
 #[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "Multiplexes access to a sensor, exposing the functionality of tio::proxy via TCP",
-    args_conflicts_with_subcommands = true
-)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ProxyCli {
+    /// Internal. Host the proxy on `127.0.0.1:7855` until it idles out or `tio proxy stop` stops it
+    #[arg(long, hide = true)]
+    pub(crate) background: bool,
+
     #[command(subcommand)]
     pub subcommands: Option<ProxySubcommands>,
 
-    /// Sensor URL (e.g., tcp://localhost, serial:///dev/ttyUSB0); defaults to auto-detecting a single connected device
+    /// Sensor URL (e.g., `serial:///dev/ttyUSB0`, `tcp://192.168.1.20`). Defaults to auto-detecting a single serial device (use `tio proxy list` for network discovery)
     #[arg(value_hint = ValueHint::Url, conflicts_with = "mounts")]
     pub(crate) sensor_url: Option<String>,
 
@@ -25,7 +26,11 @@ pub struct ProxyCli {
     #[arg(short = 'p', long = "port", default_value = "7855")]
     pub(crate) port: u16,
 
-    /// Kick off slow clients instead of dropping traffic
+    /// Advertise this proxy over mDNS (off by default)
+    #[arg(long = "mdns")]
+    pub(crate) mdns: bool,
+
+    /// Kick off slow clients (by default their packets are dropped)
     #[arg(short = 'k', long)]
     pub(crate) kick_slow: bool,
 
@@ -47,18 +52,9 @@ pub struct ProxyCli {
     #[arg(short = 'd', long)]
     pub(crate) debug: bool,
 
-    /// Deprecated; timestamps are now emitted by the logger (set RUST_LOG to control verbosity)
-    #[arg(
-        short = 't',
-        long = "timestamp",
-        default_value = "%T%.3f ",
-        hide = true
-    )]
-    pub(crate) timestamp_format: String,
-
-    /// Time limit for sensor reconnection attempts (seconds)
-    #[arg(short = 'T', long = "timeout", default_value = "30")]
-    pub(crate) reconnect_timeout: u64,
+    /// Give up reconnecting to the sensor after this many seconds (retries forever by default)
+    #[arg(short = 'T', long = "timeout")]
+    pub(crate) reconnect_timeout: Option<u64>,
 
     /// Dump packet traffic except sample data/metadata or heartbeats
     #[arg(long)]
@@ -75,17 +71,10 @@ pub struct ProxyCli {
     /// Dump heartbeat traffic
     #[arg(long)]
     pub(crate) dump_hb: bool,
-
-    /// Deprecated; running without -s <url> now auto-detects by default.
-    #[arg(short = 'a', long = "auto", hide = true)]
-    pub(crate) auto: bool,
-
-    /// Deprecated; use `tio list` instead.
-    #[arg(short = 'e', long = "enumerate", name = "enum", hide = true)]
-    pub(crate) enumerate: bool,
 }
 
-/// A `--mount LOCATOR=/N` argument: a sensor URL bound to a route prefix.
+/// A sensor URL bound to a route prefix, as a `--mount LOCATOR=/N` argument
+/// gives it.
 #[derive(Debug, Clone)]
 pub struct MountArg {
     pub locator: String,
@@ -101,7 +90,8 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
     if locator.is_empty() {
         return Err(format!("missing sensor locator before '=' in {s:?}"));
     }
-    let prefix = DeviceRoute::from_str(prefix_str)
+    let prefix = prefix_str
+        .parse::<DeviceRoute>()
         .map_err(|_| format!("invalid route prefix: {prefix_str:?}"))?;
     if prefix.len() != 1 {
         return Err(format!(
@@ -116,6 +106,11 @@ fn parse_mount(s: &str) -> Result<MountArg, String> {
 
 #[derive(Subcommand, Debug)]
 pub enum ProxySubcommands {
+    /// Stop the background proxy that a tool started, on `127.0.0.1:7855` unless `TWINLEAF_PROXY` names another
+    Stop,
+    /// Discover devices and host a selection as the default until Ctrl-C
+    List(ListCli),
+
     /// Bridge Twinleaf sensor data to NMEA TCP stream
     Nmea {
         #[command(flatten)]

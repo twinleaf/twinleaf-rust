@@ -1,379 +1,392 @@
-//! tio proxy
+//! The `tio proxy` subcommand and its `stop`, `list` and `nmea` subcommands.
 //!
-//! Multiplexes access to one or more sensors, exposing the functionality of
-//! tio::proxy via TCP. With `--mount`, each sensor hangs off a route prefix
-//! and the proxy presents the set as a single virtual hub.
+//! [`run_proxy`] hosts the proxy of [`twinleaf::proxy`], which shares one or
+//! more sensors over TCP. In a terminal it serves the sensors named on the
+//! command line, or the one attached, as the default for every tool until
+//! Ctrl-C. With `--mount`, each sensor hangs off a route prefix and clients
+//! see the set as a single virtual hub.
 
+mod list;
+mod nmea;
+
+pub use list::run_list;
+
+use crate::tui::selector::PickedSubtree;
 use crate::{MountArg, ProxyCli, ProxySubcommands};
+#[cfg(feature = "mdns")]
+use std::collections::BTreeMap;
 use std::io;
-use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::Duration;
 use twinleaf::device::discovery::{self, PortInterface};
-use twinleaf::tio::{self, proto, proxy};
-
-fn init_proxy_logging(verbose: bool, debug: bool) {
-    use std::io::Write;
-    let level_filter = if debug {
-        "trace"
-    } else if verbose {
-        "debug"
-    } else {
-        "info,device=debug"
-    };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level_filter))
-        .format(|buf, record| {
-            let level = record.level();
-            let level_style = buf.default_level_style(level);
-            let target = record.target();
-            let source = target
-                .strip_prefix("device::")
-                .unwrap_or_else(|| target.rsplit("::").next().unwrap_or(target));
-            let bold = env_logger::fmt::style::Style::new().bold();
-            let ts = chrono::Local::now().format("%T%.3f");
-            writeln!(
-                buf,
-                "{ts} {level_style}{level:5}{level_style:#} {bold}{source}:{bold:#} {}",
-                record.args()
-            )
-        })
-        .init();
-}
+use twinleaf::proxy::{self, DumpFlags, HostOptions, Layout, Listen, Mount, Proxy};
+use twinleaf::{Connection, DeviceRoute, RecvError};
 
 pub fn run_proxy(mut proxy_cli: ProxyCli) -> eyre::Result<()> {
     match proxy_cli.subcommands.take() {
-        Some(ProxySubcommands::Nmea { tio, tcp_port }) => {
-            init_proxy_logging(false, false);
-            crate::tools::proxy_nmea::run_nmea_proxy(tio, tcp_port)
+        Some(ProxySubcommands::Stop) => stop(),
+        Some(ProxySubcommands::List(cli)) => list::run_list(cli),
+        Some(ProxySubcommands::Nmea { tio, tcp_port }) => nmea::run_nmea_proxy(tio, tcp_port),
+        None => match proxy_cli.background {
+            true => run_background(&proxy_cli),
+            false => run_foreground(&proxy_cli),
+        },
+    }
+}
+
+/// Returns the options a terminal `tio list` starts from, which are those of
+/// `tio proxy` with no arguments.
+fn list_cli() -> ProxyCli {
+    use clap::Parser;
+    ProxyCli::parse_from(["tio-proxy"])
+}
+
+/// Holds the devices picked in `tio proxy list` as the default of the
+/// machine's proxy for every tool until Ctrl-C, or until the proxy lets go.
+///
+/// # Errors
+///
+/// Returns an error if the proxy refuses the selection, the signal handler
+/// cannot be installed, or the proxy stops first.
+fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
+    let cli = list_cli();
+    crate::logging::release();
+    let front = FrontDoor::picked(picked);
+    let held = Connection::hold_default(&within_subtree(&front.layout, cli.subtree)?)?;
+    let events = held.events();
+    let closer = held.clone();
+    ctrlc::set_handler(move || closer.close())?;
+    front.print_startup(&cli);
+    println!(
+        "Using {} as the default while this runs. Ctrl-C to stop.",
+        front.describe(cli.subtree)
+    );
+    loop {
+        match events.recv() {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return Ok(()),
+            Err(RecvError::Stopped) => return Err(eyre::eyre!("the proxy stopped")),
+            Err(error) => return Err(eyre::eyre!("the proxy let the selection go: {error}")),
         }
+    }
+}
+
+/// Serves the sensors the arguments name, or the one attached, from a terminal
+/// until Ctrl-C.
+fn run_foreground(cli: &ProxyCli) -> eyre::Result<()> {
+    let requested = requested_layout(cli.sensor_url.as_deref(), &cli.mounts)?;
+    let default = requested
+        .as_ref()
+        .map(|layout| within_subtree(layout, cli.subtree))
+        .transpose()?;
+    // Hosting comes first, so that a proxy already running is reported
+    // rather than whatever detecting the device finds.
+    let proxy = host(HostOptions {
+        default,
+        ..host_options(cli, "tio proxy")
+    })?;
+    let front = match requested {
+        Some(layout) => FrontDoor::named(layout),
         None => {
-            init_proxy_logging(proxy_cli.verbose, proxy_cli.debug);
-            if proxy_cli.timestamp_format != "%T%.3f " {
-                log::warn!(
-                    "--timestamp is deprecated and no longer applied; \
-                     timestamps are emitted by the logger"
-                );
-            }
-            if proxy_cli.enumerate {
-                return crate::tools::list::list_devices_deprecated(true);
-            }
-            if proxy_cli.auto {
-                log::warn!(
-                    "'--auto' is deprecated; running without a URL now auto-detects by default"
-                );
-            }
-            let mounts = std::mem::take(&mut proxy_cli.mounts);
-            let layout = Layout::from_cli(mounts, proxy_cli.sensor_url.take())?;
-            let server = ProxyServer {
-                config: ProxyConfig::from(&proxy_cli),
-                layout,
+            let url = match auto_detect_serial(&proxy) {
+                Ok(url) => url,
+                Err(error) => {
+                    proxy.shutdown();
+                    return Err(error);
+                }
             };
-            server.run()
+            let front = FrontDoor {
+                auto_detected: true,
+                ..FrontDoor::named(whole_device(&url))
+            };
+            proxy.set_default(Some(within_subtree(&front.layout, cli.subtree)?));
+            front
         }
+    };
+    serve(proxy, &front, cli)
+}
+
+/// Hosts the proxy in the background, as a tool starts it, until it idles
+/// out or `tio proxy stop` stops it. Returns `Ok(())` without hosting if
+/// another proxy already holds the port.
+fn run_background(cli: &ProxyCli) -> eyre::Result<()> {
+    let default = default_layout(cli)?;
+    let hosted = Proxy::host(HostOptions {
+        listen: Listen::Loopback,
+        idle_exit: true,
+        stoppable: true,
+        default,
+        ..host_options(cli, "a background tio proxy")
+    });
+    let proxy = match hosted {
+        Ok(proxy) => proxy,
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            log::info!("{error}, so this one exits");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    proxy.wait();
+    Ok(())
+}
+
+/// Stops the background proxy that tools go through.
+fn stop() -> eyre::Result<()> {
+    proxy::stop(None)?;
+    println!("Stopped the background proxy");
+    Ok(())
+}
+
+/// Returns the options a terminal hosts the proxy with, from `-p`, `-T`, `-k`
+/// and the `--dump` flags. `name` says who hosts it.
+fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
+    HostOptions {
+        listen: Listen::AllInterfaces,
+        port: cli.port,
+        name: format!("{name} (pid {})", std::process::id()),
+        reconnect_timeout: cli.reconnect_timeout.map(Duration::from_secs),
+        kick_slow: cli.kick_slow,
+        dump: DumpFlags {
+            traffic: cli.dump,
+            data: cli.dump_data,
+            meta: cli.dump_meta,
+            heartbeats: cli.dump_hb,
+        },
+        ..HostOptions::default()
     }
 }
 
-/// Server settings, fixed at startup.
-#[derive(Debug, Clone)]
-struct ProxyConfig {
-    tcp_port: u16,
-    reconnect_timeout: Duration,
-    disconnect_slow: bool,
-    verbose: bool,
-    debugging: bool,
-    subtree: proto::DeviceRoute,
-    dump_traffic: bool,
-    dump_data: bool,
-    dump_meta: bool,
-    dump_hb: bool,
-}
-
-impl From<&ProxyCli> for ProxyConfig {
-    fn from(cli: &ProxyCli) -> Self {
-        Self {
-            tcp_port: cli.port,
-            reconnect_timeout: Duration::from_secs(cli.reconnect_timeout),
-            disconnect_slow: cli.kick_slow,
-            verbose: cli.verbose,
-            debugging: cli.debug,
-            subtree: cli.subtree.clone(),
-            dump_traffic: cli.dump,
-            dump_data: cli.dump_data,
-            dump_meta: cli.dump_meta,
-            dump_hb: cli.dump_hb,
-        }
-    }
-}
-
-/// One upstream sensor bound to a route prefix. A single device without
-/// `--mount` sits at the root prefix.
-#[derive(Debug, Clone)]
-struct Mount {
-    locator: String,
-    prefix: proto::DeviceRoute,
-    auto_detected: bool,
-}
-
-#[derive(Debug, Clone)]
-struct Layout {
-    mounts: Vec<Mount>,
-}
-
-impl Layout {
-    fn from_cli(mount_args: Vec<MountArg>, sensor_url: Option<String>) -> eyre::Result<Layout> {
-        if mount_args.is_empty() {
-            return Ok(Layout {
-                mounts: vec![resolve_root_mount(sensor_url)?],
-            });
-        }
-        let mut prefixes = std::collections::HashSet::new();
-        for arg in &mount_args {
-            if !prefixes.insert(arg.prefix.clone()) {
-                return Err(eyre::eyre!("duplicate mount prefix {}", arg.prefix));
-            }
-        }
-        Ok(Layout {
-            mounts: mount_args
-                .into_iter()
-                .map(|arg| Mount {
-                    locator: arg.locator,
-                    prefix: arg.prefix,
-                    auto_detected: false,
-                })
-                .collect(),
-        })
-    }
-}
-
-/// Resolve the sensor URL into a root-prefix `Mount`, auto-detecting if no
-/// URL was given.
-fn resolve_root_mount(sensor_url: Option<String>) -> eyre::Result<Mount> {
+/// Hosts a proxy with `options`. When the port is taken, the error says
+/// whether a proxy or something else, such as a 1.x `tio proxy`, holds it,
+/// and suggests what to do.
+fn host(options: HostOptions) -> eyre::Result<Proxy> {
     use color_eyre::Help;
 
-    let auto_detected = sensor_url.is_none();
-    let locator = if let Some(url) = sensor_url {
-        url
-    } else {
-        let devices = discovery::enumerate_serial(false);
-        let mut valid_urls = Vec::new();
-        for dev in devices {
-            match dev.interface {
-                PortInterface::STM32 | PortInterface::FTDI => {
-                    valid_urls.push(dev.url.clone());
-                }
-                _ => {}
-            }
-        }
-        if valid_urls.is_empty() {
-            return Err(eyre::eyre!("no sensors detected")
-                .suggestion("specify a URL with -s <url>, or run 'tio list'"));
-        }
-        if valid_urls.len() > 1 {
-            eprintln!("multiple sensors detected:");
-            let query_timeout = Duration::from_millis(500);
-            for url in &valid_urls {
-                match discovery::query_name(url, query_timeout) {
-                    Some(name) => eprintln!("  {}  {}", url, name),
-                    None => eprintln!("  {}  (no response)", url),
-                }
-            }
-            return Err(eyre::eyre!("multiple sensors detected, cannot auto-select")
-                .suggestion("specify one with -s <url>")
-                .suggestion("or mount each at a route prefix with --mount <url>=/N"));
-        }
-        valid_urls.swap_remove(0)
-    };
-
-    Ok(Mount {
-        locator,
-        prefix: proto::DeviceRoute::root(),
-        auto_detected,
+    Proxy::host(options).map_err(|error| match error.kind() {
+        io::ErrorKind::AddrInUse => eyre::Report::new(error)
+            .suggestion("a proxy there already shares devices, so pass -r <url> to reach one")
+            .suggestion(
+                "'tio proxy stop' ends a proxy a tio command started, \
+                 and names the terminal or app hosting any other",
+            )
+            .suggestion("or serve on another port with --port <N>"),
+        _ => error.into(),
     })
 }
 
-/// A mounted device's live connection: the proxy interface, its status
-/// events, and the server's own monitoring port on it.
-struct DeviceLink {
-    prefix: proto::DeviceRoute,
-    interface: proxy::Interface,
-    status_rx: crossbeam::channel::Receiver<proxy::Event>,
-    monitor_port: proxy::Port,
-}
-
-/// What a ready `Select` slot in the server loop corresponds to, recorded
-/// at registration so readiness never has to be decoded from index math.
-#[derive(Clone, Copy)]
-enum Source<'a> {
-    NewClient,
-    Status(&'a DeviceLink),
-    DevicePacket(&'a DeviceLink),
-}
-
-/// Why a client's forwarding loop ended.
-enum Disconnect {
-    ClientClosed,
-    TooSlow,
-    PortReceiveFailed,
-    PortForwardFailed,
-}
-
-fn is_rpc(payload: &proto::Payload) -> bool {
-    matches!(
-        payload,
-        proto::Payload::RpcRequest(_) | proto::Payload::RpcReply(_) | proto::Payload::RpcError(_)
-    )
-}
-
-/// Tracks a client that isn't keeping up, so the drop and the recovery are
-/// each reported once rather than per packet.
-#[derive(Default)]
-struct SlowTracker {
-    is_slow: bool,
-    dropped: usize,
-}
-
-impl SlowTracker {
-    fn packet_dropped(&mut self, addr: &str) {
-        if !log::log_enabled!(log::Level::Debug) {
-            return;
-        }
-        if !self.is_slow {
-            self.is_slow = true;
-            log::debug!("Client {} is not keeping up and is dropping packets", addr);
-        }
-        self.dropped += 1;
-    }
-
-    fn packet_delivered(&mut self, addr: &str) {
-        if self.is_slow {
-            log::debug!(
-                "Client {} resuming after having dropped {} packets",
-                addr,
-                self.dropped
-            );
-            self.is_slow = false;
-            self.dropped = 0;
-        }
+/// Returns a layout of the whole device at `url`, seen at the root.
+fn whole_device(url: &str) -> Layout {
+    Layout {
+        mounts: vec![Mount {
+            url: url.to_string(),
+            source: DeviceRoute::root(),
+            prefix: DeviceRoute::root(),
+        }],
     }
 }
 
-/// The server fronting the TCP port: fans the mounted devices' traffic out
-/// to TCP clients.
-struct ProxyServer {
-    config: ProxyConfig,
-    layout: Layout,
+/// Returns the layout the arguments name, with each source as given before
+/// `-s` applies, or `None` when they name no device.
+fn requested_layout(
+    sensor_url: Option<&str>,
+    mount_args: &[MountArg],
+) -> eyre::Result<Option<Layout>> {
+    if let Some(url) = sensor_url {
+        return Ok(Some(whole_device(url)));
+    }
+    if mount_args.is_empty() {
+        return Ok(None);
+    }
+    let mut prefixes = std::collections::HashSet::new();
+    for arg in mount_args {
+        if !prefixes.insert(arg.prefix) {
+            return Err(eyre::eyre!("duplicate mount prefix {}", arg.prefix));
+        }
+    }
+    Ok(Some(Layout {
+        mounts: mount_args
+            .iter()
+            .map(|arg| Mount {
+                url: arg.locator.clone(),
+                source: DeviceRoute::root(),
+                prefix: arg.prefix,
+            })
+            .collect(),
+    }))
 }
 
-impl ProxyServer {
-    fn run(self) -> eyre::Result<()> {
-        use color_eyre::{Help, SectionExt};
-        use eyre::bail;
+/// Returns the layout the arguments name, as the proxy mounts it, or `None`
+/// when they name no device.
+fn default_layout(cli: &ProxyCli) -> eyre::Result<Option<Layout>> {
+    requested_layout(cli.sensor_url.as_deref(), &cli.mounts)?
+        .map(|layout| within_subtree(&layout, cli.subtree))
+        .transpose()
+}
 
-        self.print_startup();
+/// Returns `layout` with each source taken within `subtree`, as the proxy
+/// mounts it.
+fn within_subtree(layout: &Layout, subtree: DeviceRoute) -> eyre::Result<Layout> {
+    let mounts = layout
+        .mounts
+        .iter()
+        .map(|mount| {
+            Ok(Mount {
+                source: mount.source.absolute_route(&subtree)?,
+                ..mount.clone()
+            })
+        })
+        .collect::<eyre::Result<_>>()?;
+    Ok(Layout { mounts })
+}
 
-        let new_client = self.start_listeners()?;
+/// Returns the URL of the one Twinleaf serial device attached, for
+/// `tio proxy` with no URL. With several attached, it prints each one with
+/// the name read through `proxy`, and returns an error.
+fn auto_detect_serial(proxy: &Proxy) -> eyre::Result<String> {
+    use color_eyre::Help;
 
-        let mut links = Vec::with_capacity(self.layout.mounts.len());
-        for mount in &self.layout.mounts {
-            let (status_send, status_rx) = crossbeam::channel::bounded::<proxy::Event>(100);
-            let interface = proxy::Interface::new_proxy(
-                &mount.locator,
-                Some(self.config.reconnect_timeout),
-                Some(status_send),
-            );
-            // This is used by the proxy itself to communicate with the device
-            // tree, for now only to receive log messages and dump traffic.
-            let monitor_port = match interface.subtree_full(self.config.subtree.clone()) {
-                Ok(port) => port,
-                Err(e) => {
-                    let last_status = status_rx.iter().last();
-                    let err = eyre::Report::new(e)
-                        .wrap_err(format!("could not open port on {}", mount.locator));
-                    return Err(if let Some(status) = last_status {
-                        err.with_section(move || {
-                            format!("{:?}", status).header("Last proxy event:")
-                        })
-                    } else {
-                        err
-                    });
-                }
-            };
-            links.push(DeviceLink {
-                prefix: mount.prefix.clone(),
-                interface,
-                status_rx,
-                monitor_port,
-            });
+    let mut valid_urls = Vec::new();
+    for dev in discovery::enumerate_serial(false) {
+        if matches!(dev.interface, PortInterface::STM32 | PortInterface::FTDI) {
+            valid_urls.push(dev.url);
         }
-
-        let mut sel = crossbeam::channel::Select::new();
-        let mut sources = Vec::with_capacity(1 + 2 * links.len());
-        sel.recv(&new_client);
-        sources.push(Source::NewClient);
-        for link in &links {
-            sel.recv(&link.status_rx);
-            sources.push(Source::Status(link));
-            sel.recv(link.monitor_port.receiver());
-            sources.push(Source::DevicePacket(link));
-        }
-
-        loop {
-            let oper = sel.select();
-            match sources[oper.index()] {
-                Source::NewClient => {
-                    let Ok(stream) = oper.recv(&new_client) else {
-                        bail!("listener thread died unexpectedly");
-                    };
-                    self.accept_client(stream, &links);
-                }
-                Source::Status(link) => {
-                    let Ok(evt) = oper.recv(&link.status_rx) else {
-                        // The proxy thread died, most likely due to the sensor
-                        // getting disconnected past the autoreconnection
-                        break;
-                    };
-                    log_proxy_event(evt, &link.prefix);
-                }
-                Source::DevicePacket(link) => {
-                    let Ok(pkt) = oper.recv(link.monitor_port.receiver()) else {
-                        break;
-                    };
-                    self.log_device_packet(pkt, &link.prefix);
-                }
+    }
+    if valid_urls.is_empty() {
+        return Err(eyre::eyre!("no sensors detected").suggestion(
+            "specify a URL, or run 'tio proxy list' to discover devices on the network",
+        ));
+    }
+    if valid_urls.len() > 1 {
+        eprintln!("multiple sensors detected:");
+        let query_timeout = Duration::from_millis(500);
+        for url in &valid_urls {
+            match discovery::query_name_via(&proxy.endpoint(), url, query_timeout) {
+                Some(name) => eprintln!("  {}  {}", url, name),
+                None => eprintln!("  {}  (no response)", url),
             }
         }
-        Ok(())
+        return Err(eyre::eyre!("multiple sensors detected, cannot auto-select")
+            .suggestion("pick one interactively with 'tio proxy list', or specify a URL")
+            .suggestion("or mount each at a route prefix with --mount <url>=/N"));
+    }
+    Ok(valid_urls.swap_remove(0))
+}
+
+/// What a terminal serves as the default while it runs.
+struct FrontDoor {
+    /// The mounts as chosen, each source before `-s` applies.
+    layout: Layout,
+    /// The name of each mount's device, when the picker knew it.
+    names: Vec<Option<String>>,
+    /// Whether the one device was auto-detected.
+    auto_detected: bool,
+}
+
+impl FrontDoor {
+    /// Creates a `FrontDoor` of the mounts of `layout`, named on the command
+    /// line.
+    fn named(layout: Layout) -> FrontDoor {
+        FrontDoor {
+            names: vec![None; layout.mounts.len()],
+            layout,
+            auto_detected: false,
+        }
     }
 
-    fn print_startup(&self) {
-        println!("tio proxy starting:");
+    /// Creates a `FrontDoor` of the subtrees picked in `tio proxy list`.
+    fn picked(picked: Vec<PickedSubtree>) -> FrontDoor {
+        let (mounts, names) = picked
+            .into_iter()
+            .map(
+                |PickedSubtree {
+                     device,
+                     source,
+                     prefix,
+                 }| {
+                    let mount = Mount {
+                        url: device.url,
+                        source,
+                        prefix,
+                    };
+                    (mount, device.name)
+                },
+            )
+            .unzip();
+        FrontDoor {
+            layout: Layout { mounts },
+            names,
+            auto_detected: false,
+        }
+    }
+
+    /// Describes the sensors served, and the subtree when it is not the root.
+    fn describe(&self, subtree: DeviceRoute) -> String {
+        let sensors = self
+            .layout
+            .mounts
+            .iter()
+            .zip(&self.names)
+            .map(|(mount, name)| {
+                format!(
+                    "{} ({} → {})",
+                    name.as_deref().unwrap_or(&mount.url),
+                    mount.source,
+                    mount.prefix
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        match subtree.is_empty() {
+            true => sensors,
+            false => format!("{sensors} at {subtree}"),
+        }
+    }
+
+    fn print_startup(&self, cli: &ProxyCli) {
         let mounts = &self.layout.mounts;
-        if mounts.len() == 1 && mounts[0].prefix.len() == 0 {
+        match self.names.as_slice() {
+            [Some(name)] => println!("tio proxy starting (selected {name}):"),
+            _ => println!("tio proxy starting:"),
+        }
+        if mounts.len() == 1 && mounts[0].prefix.is_empty() {
             println!(
                 "  Sensor: {}{}",
-                mounts[0].locator,
-                if mounts[0].auto_detected {
+                mounts[0].url,
+                if self.auto_detected {
                     " (auto-detected)"
                 } else {
                     ""
                 }
             );
+            if !mounts[0].source.is_empty() {
+                println!(
+                    "  Mapping: {} → / (including descendants)",
+                    mounts[0].source
+                );
+            }
         } else {
             println!("  Mounts:");
-            for mount in mounts {
-                println!("    {}  {}", mount.prefix, mount.locator);
+            for (mount, name) in mounts.iter().zip(&self.names) {
+                println!(
+                    "    {}  {} → {}  ({})",
+                    mount.url,
+                    mount.source,
+                    mount.prefix,
+                    name.as_deref().unwrap_or("device")
+                );
             }
         }
-        println!("  TCP port: {}", self.config.tcp_port);
-        println!("  Subtree: {}", self.config.subtree);
+        println!("  TCP port: {}", cli.port);
+        println!("  Subtree: {}", cli.subtree);
 
         let flags = [
-            ("verbose", self.config.verbose),
-            ("debug", self.config.debugging),
-            ("kick-slow", self.config.disconnect_slow),
-            ("dump", self.config.dump_traffic),
-            ("dump-data", self.config.dump_data),
-            ("dump-meta", self.config.dump_meta),
-            ("dump-hb", self.config.dump_hb),
+            ("verbose", cli.verbose),
+            ("debug", cli.debug),
+            ("kick-slow", cli.kick_slow),
+            ("dump", cli.dump),
+            ("dump-data", cli.dump_data),
+            ("dump-meta", cli.dump_meta),
+            ("dump-hb", cli.dump_hb),
         ];
         let enabled: Vec<&str> = flags
             .iter()
@@ -384,254 +397,354 @@ impl ProxyServer {
         }
         println!();
     }
-
-    fn start_listeners(&self) -> eyre::Result<crossbeam::channel::Receiver<std::net::TcpStream>> {
-        use color_eyre::Help;
-
-        let (client_send, new_client) = crossbeam::channel::bounded::<std::net::TcpStream>(10);
-        let started_v6 = create_listener_thread(
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                self.config.tcp_port,
-            ),
-            client_send.clone(),
-        );
-        let started_v4 = if let (Ok(()), false) = (&started_v6, cfg!(windows)) {
-            // If v6 started correctly and we are not in windows, pretend
-            // v4 also started correctly. The OS will pass the new clients
-            // through the v6 socket.
-            Ok(())
-        } else {
-            create_listener_thread(
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    self.config.tcp_port,
-                ),
-                client_send.clone(),
-            )
-        };
-        if let (Err(e1), Err(e2)) = (started_v6, started_v4) {
-            let addr_in_use = matches!(e1.kind(), io::ErrorKind::AddrInUse)
-                || matches!(e2.kind(), io::ErrorKind::AddrInUse);
-            let err = eyre::eyre!(
-                "could not bind TCP port {}: v6={}, v4={}",
-                self.config.tcp_port,
-                e1,
-                e2
-            );
-            return Err(if addr_in_use {
-                err.suggestion(format!(
-                    "another 'tio proxy' is likely running on port {}; try --port <N>",
-                    self.config.tcp_port
-                ))
-            } else {
-                err
-            });
-        }
-        Ok(new_client)
-    }
-
-    fn accept_client(&self, stream: std::net::TcpStream, links: &[DeviceLink]) {
-        let addr = match stream.peer_addr() {
-            Ok(addr) => addr.to_string(),
-            Err(err) => {
-                log::warn!("Failed to determine client address: {:?}", err);
-                return;
-            }
-        };
-        // A client from the proxy perspective is a port in reverse, i.e. what it receives
-        // is what a client transmits, and vice-versa. Therefore, the channel size settings
-        // for rx and tx are inverted. Also, we use the proxy port channel size setting
-        // instead of the physical ports setting.
-        let (rx_send, client_rx) =
-            tio::port::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
-        let client = match tio::port::Port::from_tcp_stream_custom(
-            stream,
-            tio::port::Port::rx_to_channel(rx_send),
-            proxy::Interface::get_client_rx_channel_size(),
-        ) {
-            Ok(client_port) => client_port,
-            _ => return,
-        };
-
-        log::debug!("Accepted client from {}", addr);
-        let mut ports = Vec::with_capacity(links.len());
-        for link in links {
-            let port = link
-                .interface
-                .new_port(
-                    Some(Duration::from_millis(2000)),
-                    self.config.subtree.clone(),
-                    usize::MAX,
-                    true,
-                    true,
-                )
-                .expect("Failed to create new proxy port");
-            ports.push((link.prefix.clone(), port));
-        }
-
-        let dump_traffic = self.config.dump_traffic;
-        let disconnect_slow = self.config.disconnect_slow;
-        std::thread::spawn(move || {
-            let mut slow = SlowTracker::default();
-
-            // Slot 0 is the client's own traffic; slot 1 + i is ports[i].
-            let mut sel = crossbeam::channel::Select::new();
-            sel.recv(&client_rx);
-            for (_, port) in &ports {
-                sel.recv(port.receiver());
-            }
-
-            let reason = loop {
-                let oper = sel.select();
-                match oper.index() {
-                    0 => {
-                        let Ok(Ok(mut pkt)) = oper.recv(&client_rx) else {
-                            break Disconnect::ClientClosed;
-                        };
-                        if dump_traffic {
-                            log::info!("{}->{} -- {:?}", addr, pkt.routing, pkt.payload);
-                        }
-                        let mut dest = None;
-                        for (prefix, port) in &ports {
-                            if let Ok(relative) = prefix.relative_route(&pkt.routing) {
-                                dest = Some((relative, port));
-                                break;
-                            }
-                        }
-                        let Some((relative, port)) = dest else {
-                            log::debug!(
-                                "Client {} addressed unmounted route {}",
-                                addr,
-                                pkt.routing
-                            );
-                            continue;
-                        };
-                        pkt.routing = relative;
-                        if port.try_send(pkt).is_err() {
-                            break Disconnect::PortForwardFailed;
-                        }
-                    }
-                    i => {
-                        let (prefix, port) = &ports[i - 1];
-                        let Ok(mut pkt) = oper.recv(port.receiver()) else {
-                            break Disconnect::PortReceiveFailed;
-                        };
-                        pkt.routing = prefix.absolute_route(&pkt.routing);
-                        if pkt.routing.len() > proto::TIO_PACKET_MAX_ROUTING_SIZE {
-                            log::warn!(
-                                "Dropping packet for client {}: route {} exceeds max depth",
-                                addr,
-                                pkt.routing
-                            );
-                            continue;
-                        }
-                        if dump_traffic && is_rpc(&pkt.payload) {
-                            log::info!("{}->{} -- {:?}", pkt.routing, addr, pkt.payload);
-                        }
-                        match client.try_send(pkt) {
-                            Ok(()) => slow.packet_delivered(&addr),
-                            Err(tio::SendError::Full) if !disconnect_slow => {
-                                slow.packet_dropped(&addr)
-                            }
-                            Err(tio::SendError::Full) => break Disconnect::TooSlow,
-                            Err(_) => break Disconnect::ClientClosed,
-                        }
-                    }
-                }
-            };
-
-            match reason {
-                Disconnect::ClientClosed => log::debug!("Client {} exiting", addr),
-                Disconnect::TooSlow => {
-                    log::warn!("Disconnecting client {} due to slowness", addr)
-                }
-                Disconnect::PortReceiveFailed => log::warn!(
-                    "Disconnecting client {} due to internal error receiving tio data in thread",
-                    addr
-                ),
-                Disconnect::PortForwardFailed => log::warn!(
-                    "Disconnecting client {} due to internal error forwarding tio data in thread",
-                    addr
-                ),
-            }
-        });
-    }
-
-    fn log_device_packet(&self, mut pkt: proto::Packet, prefix: &proto::DeviceRoute) {
-        pkt.routing = prefix.absolute_route(&pkt.routing);
-        let dump = match pkt.payload {
-            proto::Payload::Heartbeat(_) => self.config.dump_hb,
-            proto::Payload::Metadata(_) => self.config.dump_meta,
-            proto::Payload::StreamData(_) => self.config.dump_data,
-            _ => self.config.dump_traffic,
-        };
-        if dump {
-            log::info!("Packet from {} -- {:?}", pkt.routing, pkt.payload);
-        }
-        if let proto::Payload::LogMessage(log_msg) = pkt.payload {
-            // Map the device-reported level onto the log crate's level
-            // so the logger filter and prefix reflect it.
-            let level = match &log_msg.level {
-                proto::LogLevel::Critical | proto::LogLevel::Error => log::Level::Error,
-                proto::LogLevel::Warning => log::Level::Warn,
-                proto::LogLevel::Info => log::Level::Info,
-                proto::LogLevel::Debug => log::Level::Debug,
-                proto::LogLevel::Unknown(_) => log::Level::Info,
-            };
-            log::log!(target: &format!("device::{}", pkt.routing), level, "{}", log_msg.message);
-        }
-    }
 }
 
-fn create_listener_thread(
-    addr: std::net::SocketAddr,
-    client_send: crossbeam::channel::Sender<std::net::TcpStream>,
-) -> io::Result<()> {
-    let listener = TcpListener::bind(addr)?;
-    std::thread::Builder::new()
-        .name("listener".to_string())
-        .spawn(move || {
-            for res in listener.incoming() {
-                match res {
-                    Ok(stream) => client_send.send(stream).expect("New client queue full"),
-                    Err(err) => eprintln!("error accepting client: {}", err),
-                };
-            }
-        })?;
+/// Serves `front` through `proxy` as the default for every tool until
+/// Ctrl-C, SIGTERM or SIGHUP. Each client then hears that the proxy stopped.
+/// A second signal quits at once. A SIGHUP that was already ignored, as under
+/// `nohup`, does not stop it.
+fn serve(proxy: Proxy, front: &FrontDoor, cli: &ProxyCli) -> eyre::Result<()> {
+    let proxy = Arc::new(proxy);
+    stop_on_signals(proxy.clone())?;
+
+    front.print_startup(cli);
+    // The advertisement lasts until this returns, then says goodbye.
+    #[cfg(feature = "mdns")]
+    let _mdns = advertise_mdns(&proxy, cli);
+    println!(
+        "Using {} as the default while this runs. Ctrl-C to stop.",
+        front.describe(cli.subtree)
+    );
+
+    proxy.wait();
+    log::info!("tio proxy stopped");
     Ok(())
 }
 
-fn log_proxy_event(evt: proxy::Event, prefix: &proto::DeviceRoute) {
-    let target = format!("proxy::{}", prefix);
-    let target = target.as_str();
-    match evt {
-        proxy::Event::SensorDisconnected => {
-            log::warn!(target: target, "Sensor disconnected");
+/// Stops `proxy` on the first SIGINT, SIGTERM or SIGHUP, and exits the
+/// process at once with status 130 on the next. A SIGHUP that was already
+/// ignored, as under `nohup`, stays ignored.
+fn stop_on_signals(proxy: Arc<Proxy>) -> eyre::Result<()> {
+    #[cfg(unix)]
+    let hangup = hangup_disposition();
+    let mut stopping = false;
+    ctrlc::set_handler(move || {
+        if std::mem::replace(&mut stopping, true) {
+            eprintln!("Quitting at once.");
+            std::process::exit(130);
         }
-        proxy::Event::SensorReconnected => {
-            log::info!(target: target, "Sensor reconnected");
+        eprintln!("Stopping. Press Ctrl-C again to quit at once.");
+        // The handler must return to hear the next signal, and the stop
+        // blocks until it is done.
+        let stopper = proxy.clone();
+        let stop = std::thread::Builder::new().name("tio proxy stop".to_string());
+        if let Err(error) = stop.spawn(move || stopper.shutdown()) {
+            log::warn!("Stopping the proxy in the signal handler, as {error}");
+            proxy.shutdown();
         }
-        proxy::Event::FailedToReconnect => {
-            log::error!(target: target, "Stopping reconnection attempts due to timeout");
+    })?;
+    #[cfg(unix)]
+    if let Some(ignored) = hangup.filter(|action| action.sa_sigaction == libc::SIG_IGN) {
+        // SAFETY: the action restored is the one the kernel reported, which
+        // ignores the signal and runs no code of this process.
+        if unsafe { libc::sigaction(libc::SIGHUP, &ignored, std::ptr::null_mut()) } != 0 {
+            log::warn!(
+                "SIGHUP will stop tio proxy, though it was ignored: {}",
+                io::Error::last_os_error()
+            );
         }
-        proxy::Event::FailedToConnect => {
-            log::error!(target: target, "Fatal proxy error: failed to connect to sensor");
+    }
+    Ok(())
+}
+
+/// Returns the current action for SIGHUP, or `None` if it cannot be read.
+#[cfg(unix)]
+fn hangup_disposition() -> Option<libc::sigaction> {
+    // SAFETY: an all zero sigaction is a valid value to be overwritten, and a
+    // null new action only reads the current one, changing nothing.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        (libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current) == 0).then_some(current)
+    }
+}
+
+/// Advertises the proxy over mDNS when `--mdns` asks. The returned guard
+/// keeps the advertisement live until dropped.
+#[cfg(feature = "mdns")]
+fn advertise_mdns(proxy: &Proxy, cli: &ProxyCli) -> Option<MdnsService> {
+    if !cli.mdns {
+        return None;
+    }
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let instance = mdns_instance_name(proxy, &host);
+    match advertise_tcp(&instance, &host, cli.port) {
+        Some(service) => {
+            log::info!("advertising over mDNS as \"{instance}\"");
+            Some(service)
         }
-        proxy::Event::FatalError(err) => {
-            log::error!(target: target, "Fatal proxy error: {:?}", err);
-            // the proxy thread will exit and we'll detect it at the next iteration.
+        None => {
+            log::warn!("could not advertise over mDNS");
+            None
         }
-        proxy::Event::ProtocolError(perr) => match perr {
-            proto::Error::Text(txt) => {
-                log::info!(target: target, "Text: {}", txt);
-            }
-            other => {
-                log::debug!(target: target, "Protocol error: {:?}", other);
-            }
-        },
-        evt => {
-            log::trace!(target: target, "{:?}", evt);
+    }
+}
+
+/// Returns the name other hosts see in `tio proxy list`, which counts the
+/// sensor models the proxy serves by default, as in `VMR (x2)`. COMM and HUB
+/// routing devices are not counted. Returns `tio-proxy (host)` when no
+/// sensors are found.
+#[cfg(feature = "mdns")]
+fn mdns_instance_name(proxy: &Proxy, host: &str) -> String {
+    if let Some(summary) = summarize_sensors(&discover_sensor_models(proxy)) {
+        return summary;
+    }
+    let short = host.trim_end_matches('.').trim_end_matches(".local");
+    format!("tio-proxy ({short})")
+}
+
+/// How long to listen for heartbeats to discover the connected sensors.
+#[cfg(feature = "mdns")]
+const MDNS_ROUTE_WINDOW: Duration = Duration::from_millis(500);
+
+/// A live mDNS advertisement. Dropping it stops the responder and sends
+/// goodbye packets, which tell other hosts the proxy is gone.
+#[cfg(feature = "mdns")]
+pub struct MdnsService {
+    responder: mdns_sd::ServiceDaemon,
+    fullname: String,
+}
+
+#[cfg(feature = "mdns")]
+impl Drop for MdnsService {
+    fn drop(&mut self) {
+        let _ = self.responder.unregister(&self.fullname);
+        let _ = self.responder.shutdown();
+    }
+}
+
+/// Advertises a `_twinleaf._tcp` service on the local network, where
+/// `tio proxy list` on other hosts finds it.
+///
+/// `instance` is the human-readable name shown to browsers, `host_name` is the
+/// machine's name (a `.local.` suffix is added if missing), and `port` is the
+/// TCP port being served. The host's addresses are filled in automatically.
+/// Keep the returned guard alive for as long as the service should be
+/// advertised. Returns `None` if the responder can't be set up.
+#[cfg(feature = "mdns")]
+fn advertise_tcp(instance: &str, host_name: &str, port: u16) -> Option<MdnsService> {
+    use mdns_sd::{ServiceDaemon, ServiceInfo};
+    use std::collections::HashMap;
+
+    let host = {
+        let base = host_name.trim_end_matches('.').trim_end_matches(".local");
+        format!("{base}.local.")
+    };
+
+    let responder = ServiceDaemon::new().ok()?;
+    let info = ServiceInfo::new(
+        "_twinleaf._tcp.local.",
+        instance,
+        &host,
+        (),
+        port,
+        None::<HashMap<String, String>>,
+    )
+    .ok()?
+    // Publish the host's current addresses (and track interface changes).
+    .enable_addr_auto();
+
+    let fullname = info.get_fullname().to_string();
+    responder.register(info).ok()?;
+    Some(MdnsService {
+        responder,
+        fullname,
+    })
+}
+
+/// Returns the `dev.name` of each device the proxy serves by default, read
+/// over a connection to the proxy itself.
+#[cfg(feature = "mdns")]
+fn discover_sensor_models(proxy: &Proxy) -> Vec<String> {
+    match twinleaf::Connection::open(&proxy.endpoint()) {
+        Ok(connection) => connection
+            .tree(DeviceRoute::root())
+            .named_routes(MDNS_ROUTE_WINDOW)
+            .into_iter()
+            .filter_map(|nr| nr.name)
+            .collect(),
+        Err(error) => {
+            log::warn!("could not connect to the proxy to name it over mDNS: {error}");
+            Vec::new()
         }
+    }
+}
+
+/// Summarizes device names as a sensor count for the mDNS instance name,
+/// ignoring COMM and HUB routing devices. For example,
+/// `["HUB-USB-TDS", "COMM-RS422", "VMR", "VMR"]` becomes `"VMR (x2)"`.
+/// Several models are joined with `", "`. Returns `None` if no sensors
+/// remain.
+#[cfg(feature = "mdns")]
+fn summarize_sensors(models: &[String]) -> Option<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for model in models {
+        if !is_infrastructure(model) {
+            *counts.entry(model.as_str()).or_default() += 1;
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    Some(
+        counts
+            .iter()
+            .map(|(model, &n)| {
+                if n > 1 {
+                    format!("{model} (x{n})")
+                } else {
+                    (*model).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// Returns `true` if `name` is a COMM or HUB routing device, not a sensor.
+#[cfg(feature = "mdns")]
+fn is_infrastructure(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.starts_with("COMM") || upper.starts_with("HUB")
+}
+
+#[cfg(all(test, feature = "mdns"))]
+mod mdns_tests {
+    use super::{is_infrastructure, summarize_sensors};
+
+    fn models(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn excludes_comm_and_hub_routes() {
+        assert!(is_infrastructure("COMM-RS422"));
+        assert!(is_infrastructure("COMM-USB-RS422"));
+        assert!(is_infrastructure("HUB-USB-TDS"));
+        assert!(!is_infrastructure("VMR"));
+        assert!(!is_infrastructure("AXIS"));
+    }
+
+    #[test]
+    fn counts_duplicate_sensors() {
+        // A hub with two VMRs -> "VMR (x2)", COMM/HUB left out.
+        let got = summarize_sensors(&models(&["HUB-USB-TDS", "COMM-RS422", "VMR", "VMR"]));
+        assert_eq!(got.as_deref(), Some("VMR (x2)"));
+    }
+
+    #[test]
+    fn single_sensor_has_no_count_suffix() {
+        let got = summarize_sensors(&models(&["HUB-USB-TDS", "COMM-RS422", "VMR"]));
+        assert_eq!(got.as_deref(), Some("VMR"));
+    }
+
+    #[test]
+    fn multiple_models_are_joined_sorted() {
+        let got = summarize_sensors(&models(&["VMR", "VMR", "AXIS", "COMM-RS422"]));
+        assert_eq!(got.as_deref(), Some("AXIS, VMR (x2)"));
+    }
+
+    #[test]
+    fn no_sensors_yields_none() {
+        assert_eq!(
+            summarize_sensors(&models(&["HUB-USB-TDS", "COMM-RS422"])),
+            None
+        );
+        assert_eq!(summarize_sensors(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(path: &str) -> DeviceRoute {
+        path.parse().unwrap()
+    }
+
+    fn mount(url: &str, source: &str, prefix: &str) -> Mount {
+        Mount {
+            url: url.to_string(),
+            source: route(source),
+            prefix: route(prefix),
+        }
+    }
+
+    fn mount_arg(locator: &str, prefix: &str) -> MountArg {
+        MountArg {
+            locator: locator.to_string(),
+            prefix: route(prefix),
+        }
+    }
+
+    #[test]
+    fn no_url_and_no_mounts_name_no_layout() {
+        assert_eq!(requested_layout(None, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_url_is_the_whole_device_at_the_root() {
+        let layout = requested_layout(Some("tcp://192.0.2.1"), &[]).unwrap();
+
+        let mounts = vec![mount("tcp://192.0.2.1", "/", "/")];
+        assert_eq!(layout, Some(Layout { mounts }));
+    }
+
+    #[test]
+    fn mounts_keep_their_order_and_prefixes() {
+        let args = [
+            mount_arg("serial:///dev/ttyACM0", "/2"),
+            mount_arg("tcp://192.0.2.1", "/1"),
+        ];
+
+        let layout = requested_layout(None, &args).unwrap();
+
+        let mounts = vec![
+            mount("serial:///dev/ttyACM0", "/", "/2"),
+            mount("tcp://192.0.2.1", "/", "/1"),
+        ];
+        assert_eq!(layout, Some(Layout { mounts }));
+    }
+
+    #[test]
+    fn a_prefix_mounted_twice_is_refused() {
+        let args = [
+            mount_arg("serial:///dev/ttyACM0", "/1"),
+            mount_arg("tcp://192.0.2.1", "/1"),
+        ];
+
+        let error = requested_layout(None, &args).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate mount prefix /1"));
+    }
+
+    #[test]
+    fn the_subtree_becomes_each_source() {
+        let layout = whole_device("tcp://192.0.2.1");
+
+        let hosted = within_subtree(&layout, route("/3")).unwrap();
+
+        let mounts = vec![mount("tcp://192.0.2.1", "/3", "/")];
+        assert_eq!(hosted, Layout { mounts });
+    }
+
+    #[test]
+    fn a_picked_source_stays_as_picked_under_the_root() {
+        let layout = Layout {
+            mounts: vec![mount("tcp://192.0.2.1", "/2", "/1")],
+        };
+
+        let hosted = within_subtree(&layout, DeviceRoute::root()).unwrap();
+
+        assert_eq!(hosted, layout);
     }
 }

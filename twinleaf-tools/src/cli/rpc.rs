@@ -1,10 +1,12 @@
+//! The arguments of `tio rpc` and its subcommands.
+
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser, ValueHint},
     Args, Subcommand,
 };
-use twinleaf::device::{util, RpcValueType};
+use twinleaf::device::rpc::{RpcValueType, RpcValueTypeExt};
 
-use crate::TioOpts;
+use super::TioOpts;
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
@@ -32,8 +34,8 @@ pub struct RpcCli {
     #[arg(
         short = 't',
         long = "req-type",
-        value_parser = PossibleValuesParser::new(util::RPC_TYPE_NAMES)
-            .map(|s: String| util::parse_rpc_type(&s).expect("validated by possible-values")),
+        value_parser = PossibleValuesParser::new(RpcValueType::NAMES)
+            .map(|s: String| RpcValueType::from_name(&s).expect("validated by possible-values")),
         help_heading = "Type Options",
     )]
     pub req_type: Option<RpcValueType>,
@@ -42,8 +44,8 @@ pub struct RpcCli {
     #[arg(
         short = 'T',
         long = "rep-type",
-        value_parser = PossibleValuesParser::new(util::RPC_TYPE_NAMES)
-            .map(|s: String| util::parse_rpc_type(&s).expect("validated by possible-values")),
+        value_parser = PossibleValuesParser::new(RpcValueType::NAMES)
+            .map(|s: String| RpcValueType::from_name(&s).expect("validated by possible-values")),
         help_heading = "Type Options",
     )]
     pub rep_type: Option<RpcValueType>,
@@ -68,9 +70,5 @@ pub enum RPCSubcommands {
         /// RPC name to dump
         #[arg(value_hint = ValueHint::Other)]
         rpc_name: String,
-
-        /// Trigger a capture before dumping
-        #[arg(long)]
-        capture: bool,
     },
 }

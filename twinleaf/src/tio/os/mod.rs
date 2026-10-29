@@ -32,6 +32,13 @@ pub mod windows_helpers {
     use std::io;
     use windows_sys::w;
 
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Power::{
         SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
     };
@@ -74,8 +81,6 @@ pub mod windows_helpers {
     pub struct ActivityGuard {
         mmcss_handle: AvrtHandle,
         _prev_priority: i32,
-        #[allow(dead_code)]
-        _sleep: Option<SleepGuard>,
     }
 
     impl ActivityGuard {
@@ -111,13 +116,9 @@ pub mod windows_helpers {
                     0
                 };
 
-                // Also keep the system awake while this thread runs
-                let sleep = SleepGuard::prevent_sleep(false).ok();
-
                 Ok(ActivityGuard {
                     mmcss_handle: handle,
                     _prev_priority: prev_raw,
-                    _sleep: sleep,
                 })
             }
         }
@@ -130,6 +131,87 @@ pub mod windows_helpers {
                     AvRevertMmThreadCharacteristics(self.mmcss_handle);
                 }
             }
+        }
+    }
+
+    /// Keeps this process's standard handles from a child started while it
+    /// lives. Windows hands a child every handle marked inheritable, and a
+    /// child that outlives this process, as a background proxy does, would
+    /// hold its output open. A caller reading that output to its end would
+    /// then wait for the child to exit. Dropping the guard marks each handle
+    /// inheritable again if it was.
+    pub struct StdioGuard {
+        inheritable: Vec<HANDLE>,
+    }
+
+    impl StdioGuard {
+        pub fn keep() -> Self {
+            let mut inheritable = Vec::new();
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // SAFETY: the calls only read and set the flags of a handle
+                // this process holds, and fail on one it does not.
+                unsafe {
+                    let handle = GetStdHandle(which);
+                    let mut flags = 0;
+                    if handle.is_null()
+                        || handle == INVALID_HANDLE_VALUE
+                        || GetHandleInformation(handle, &mut flags) == 0
+                        || flags & HANDLE_FLAG_INHERIT == 0
+                    {
+                        continue;
+                    }
+                    if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0 {
+                        inheritable.push(handle);
+                    }
+                }
+            }
+            StdioGuard { inheritable }
+        }
+    }
+
+    impl Drop for StdioGuard {
+        fn drop(&mut self) {
+            for &handle in &self.inheritable {
+                // SAFETY: as in `keep`.
+                unsafe {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Returns whether each standard handle is inheritable, or `None`
+        /// for one this process does not have.
+        fn inheritable() -> Vec<Option<bool>> {
+            [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+                .into_iter()
+                .map(|which| unsafe {
+                    let handle = GetStdHandle(which);
+                    let mut flags = 0;
+                    let known = !handle.is_null()
+                        && handle != INVALID_HANDLE_VALUE
+                        && GetHandleInformation(handle, &mut flags) != 0;
+                    known.then_some(flags & HANDLE_FLAG_INHERIT != 0)
+                })
+                .collect()
+        }
+
+        /// No standard handle is inheritable while the guard lives, and each
+        /// is as it was once the guard drops.
+        #[test]
+        fn the_guard_keeps_each_standard_handle_and_gives_it_back() {
+            let before = inheritable();
+
+            let guard = StdioGuard::keep();
+            let kept = inheritable();
+            drop(guard);
+
+            assert!(kept.iter().all(|flag| *flag != Some(true)), "{kept:?}");
+            assert_eq!(inheritable(), before);
         }
     }
 }
