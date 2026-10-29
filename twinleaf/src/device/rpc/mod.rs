@@ -40,6 +40,8 @@ mod error;
 mod registry;
 mod reply;
 mod settings;
+#[cfg(test)]
+mod settings_sim;
 mod value;
 
 #[doc(no_inline)]
