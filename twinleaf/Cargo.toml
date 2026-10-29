@@ -61,6 +61,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 flume = { version = "0.12", default-features = false, features = ["async", "select", "eventual-fairness"] }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
 

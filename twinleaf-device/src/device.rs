@@ -1842,6 +1842,19 @@ mod tests {
         assert_eq!(device.ask("board.secret", &[]).error(), RpcError::State);
     }
 
+    /// An unlocked session writes a privileged setting as it writes any other.
+    #[test]
+    fn an_unlocked_session_writes_a_privileged_setting() {
+        let mut device = harness();
+        device.ask("dev.priv", PASSWORD.as_bytes());
+        let written = device.ask("board.secret", &12u32.to_le_bytes());
+        assert_eq!(written.value(), &12u32.to_le_bytes());
+        assert_eq!(
+            written.announced(),
+            [("board.secret".to_string(), 12u32.to_le_bytes().to_vec())]
+        );
+    }
+
     /// The password is written, never read back, and a write answers nothing.
     #[test]
     fn the_password_is_write_only() {

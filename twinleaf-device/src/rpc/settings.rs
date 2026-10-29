@@ -275,7 +275,7 @@ impl<T: Scalar> Setting<T> {
     pub fn rpc(&mut self, args: &[u8], out: &mut Reply) -> Result<Changed, RpcError> {
         let changed = match args {
             [] => Changed::Unchanged,
-            _ if !self.access.contains(Access::WRITE) => return Err(RpcError::ReadOnly),
+            _ if !self.access.granted().contains(Access::WRITE) => return Err(RpcError::ReadOnly),
             value => self.put(T::decode(value)?)?,
         };
         self.value.encode(out)?;
@@ -285,12 +285,11 @@ impl<T: Scalar> Setting<T> {
     /// Take `value` through the check, saying whether it moved.
     pub(crate) fn put(&mut self, value: T) -> Result<Changed, RpcError> {
         let value = (self.check)(value)?;
-        let changed = match value == self.value {
-            true => Changed::Unchanged,
-            false => Changed::Changed,
-        };
+        if value == self.value {
+            return Ok(Changed::Unchanged);
+        }
         self.value = value;
-        Ok(changed)
+        Ok(Changed::Changed)
     }
 
     /// The table entry it answers, announced as every setting and report is.
@@ -309,12 +308,7 @@ impl<T: Scalar> Persisted for Setting<T> {
     }
 
     fn load(&mut self, value: &[u8], out: &mut Reply) -> Result<Changed, RpcError> {
-        let value = (self.check)(T::decode(value)?)?;
-        let changed = match value == self.value {
-            true => Changed::Unchanged,
-            false => Changed::Changed,
-        };
-        self.value = value;
+        let changed = self.put(T::decode(value)?)?;
         self.value.encode(out)?;
         Ok(changed)
     }
@@ -400,6 +394,25 @@ mod tests {
             Err(RpcError::Invalid)
         );
         assert_eq!(rate.get(), 1.0);
+    }
+
+    /// A write equal to the value held leaves it, so what the setting replies
+    /// never moves without an announcement.
+    #[test]
+    fn an_equal_write_keeps_the_value_held() {
+        let mut offset = Setting::new("app.offset", 0.0f32);
+        assert_eq!(
+            answer(&mut offset, &(-0.0f32).to_le_bytes()),
+            Ok((Changed::Unchanged, 0.0f32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            offset.load(&(-0.0f32).to_le_bytes(), &mut Reply::new()),
+            Ok(Changed::Unchanged)
+        );
+        assert_eq!(
+            answer(&mut offset, &[]),
+            Ok((Changed::Unchanged, vec![0; 4]))
+        );
     }
 
     #[test]
