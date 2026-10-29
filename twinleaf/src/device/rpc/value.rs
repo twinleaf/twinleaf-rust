@@ -19,6 +19,8 @@ pub enum RpcValue {
     I64(i64),
     /// Any float type, widened.
     F64(f64),
+    /// A bool.
+    Bool(bool),
     /// A string.
     Str(String),
     /// Raw bytes, for a type with no better reading.
@@ -32,6 +34,7 @@ impl std::fmt::Display for RpcValue {
             RpcValue::U64(n) => write!(f, "{}", n),
             RpcValue::I64(n) => write!(f, "{}", n),
             RpcValue::F64(x) => write!(f, "{}", x),
+            RpcValue::Bool(b) => write!(f, "{}", b),
             RpcValue::Str(s) => write!(f, "{}", s),
             RpcValue::Bytes(b) => {
                 for byte in b {
@@ -114,7 +117,7 @@ pub trait RpcValueTypeExt {
 
 impl RpcValueTypeExt for RpcValueType {
     const NAMES: &'static [&'static str] = &[
-        "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "string",
+        "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bool", "string",
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -130,6 +133,7 @@ impl RpcValueTypeExt for RpcValueType {
             "i64" => int(true, 8),
             "f32" => RpcValueType::Float { size: 4 },
             "f64" => RpcValueType::Float { size: 8 },
+            "bool" => RpcValueType::Bool,
             "string" => RpcValueType::String { max_len: None },
             _ => return None,
         })
@@ -144,6 +148,7 @@ impl RpcValueTypeExt for RpcValueType {
             RpcValueType::Int { signed: true, .. } => RpcValue::I64(text.parse()?),
             RpcValueType::Float { size: 4 } => RpcValue::F64(text.parse::<f32>()?.into()),
             RpcValueType::Float { .. } => RpcValue::F64(text.parse()?),
+            RpcValueType::Bool => RpcValue::Bool(text.parse()?),
             RpcValueType::Raw { .. } => RpcValue::Bytes(text.as_bytes().to_vec()),
         })
     }
@@ -181,6 +186,7 @@ impl RpcValueTypeExt for RpcValueType {
                 }
                 Ok(value.as_bytes().to_vec())
             }
+            (RpcValueType::Bool, RpcValue::Bool(value)) => Ok(vec![u8::from(*value)]),
             (RpcValueType::Raw { .. }, RpcValue::Bytes(value)) => Ok(value.clone()),
             (expected, actual) => Err(RpcValueEncodeError::TypeMismatch {
                 expected,
@@ -212,6 +218,7 @@ impl RpcValueTypeExt for RpcValueType {
             RpcValueType::Float { size: 4 } => Ok(RpcValue::F64(scalar::<f32>(bytes)?.into())),
             RpcValueType::Float { size: 8 } => Ok(RpcValue::F64(scalar::<f64>(bytes)?)),
             RpcValueType::Float { size } => Err(RpcValueDecodeError::UnsupportedFloatSize(size)),
+            RpcValueType::Bool => Ok(RpcValue::Bool(scalar::<u8>(bytes)? != 0)),
             RpcValueType::String { .. } => match std::str::from_utf8(bytes) {
                 Ok(value) => Ok(RpcValue::Str(value.to_owned())),
                 Err(_) => Ok(RpcValue::Bytes(bytes.to_vec())),
@@ -228,6 +235,7 @@ impl RpcValue {
             RpcValue::U64(_) => "unsigned integer",
             RpcValue::I64(_) => "signed integer",
             RpcValue::F64(_) => "float",
+            RpcValue::Bool(_) => "bool",
             RpcValue::Str(_) => "string",
             RpcValue::Bytes(_) => "bytes",
         }
@@ -305,6 +313,9 @@ pub enum RpcValueEncodeError {
     /// The text is not a float.
     #[error(transparent)]
     FloatText(#[from] std::num::ParseFloatError),
+    /// The text is not `true` or `false`.
+    #[error(transparent)]
+    BoolText(#[from] std::str::ParseBoolError),
     /// A unit is written as empty text, and this text is not empty.
     #[error("unit RPC arguments must be empty")]
     UnitText,
@@ -330,8 +341,7 @@ pub trait RpcMetaExt {
     /// Returns the access as three letters for read, write, and persistent,
     /// with `-` for each the RPC lacks. An unknown RPC gives `???`.
     fn perm_str(&self) -> String;
-    /// Returns the value type's name, or `capture` or `bool` when a flag
-    /// refines it.
+    /// Returns the value type's name, or `capture` when the flag marks one.
     fn type_str(&self) -> String;
     /// Returns the type a person types this RPC's values in and reads its
     /// replies as. It is the value type, with raw bytes taken as a string.
@@ -354,12 +364,8 @@ impl RpcMetaExt for RpcMeta {
     }
 
     fn type_str(&self) -> String {
-        let flags = self.flags();
-        if flags.contains(RpcMetaFlags::CAPTURE) {
+        if self.flags().contains(RpcMetaFlags::CAPTURE) {
             return "capture".to_string();
-        }
-        if flags.contains(RpcMetaFlags::BOOL) {
-            return "bool".to_string();
         }
         match self.kind() {
             RpcValueType::Unit => String::new(),
@@ -372,6 +378,7 @@ impl RpcMetaExt for RpcMeta {
                 }
             }
             RpcValueType::Float { size } => format!("f{}", (size as usize) * 8),
+            RpcValueType::Bool => "bool".to_string(),
             RpcValueType::String { max_len } => match max_len {
                 Some(n) => format!("string<{n}>"),
                 None => "string".to_string(),
@@ -437,7 +444,6 @@ mod tests {
             assert_eq!(meta.kind(), kind, "{name}");
             assert_eq!(meta.type_str(), *name);
         }
-        assert_eq!(RpcValueType::from_name("bool"), None);
         assert_eq!(RpcValueType::from_name("string<8>"), None);
     }
 
@@ -453,12 +459,17 @@ mod tests {
         assert_eq!(string.encode_text("a b").unwrap(), b"a b");
         assert_eq!(RpcValueType::Unit.encode_text("").unwrap(), b"");
         assert_eq!(f32.parse("0.1").unwrap(), RpcValue::F64(0.1f32.into()));
+        assert_eq!(RpcValueType::Bool.encode_text("true").unwrap(), [1]);
 
         let error =
             |kind: RpcValueType, text: &str| kind.encode_text(text).unwrap_err().to_string();
         assert_eq!(error(U16, "-1"), "invalid digit found in string");
         assert_eq!(error(I8, "x"), "invalid digit found in string");
         assert_eq!(error(f32, "x"), "invalid float literal");
+        assert_eq!(
+            error(RpcValueType::Bool, "1"),
+            "provided string was not `true` or `false`"
+        );
         assert_eq!(
             error(U16, "65536"),
             "value 65536 is out of range for Int { signed: false, size: 2 }"
@@ -496,6 +507,10 @@ mod tests {
     fn a_scalar_decodes_through_the_typed_codec() {
         assert_eq!(I8.decode(&[0xff]).unwrap(), RpcValue::I64(-1));
         assert_eq!(U16.decode(&[1, 2]).unwrap(), RpcValue::U64(0x0201));
+        assert_eq!(
+            RpcValueType::Bool.decode(&[2]).unwrap(),
+            RpcValue::Bool(true)
+        );
         assert!(matches!(
             U16.decode(&[1]),
             Err(RpcValueDecodeError::Reply(RpcDecodeError::TooShort {

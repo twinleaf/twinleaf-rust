@@ -424,8 +424,9 @@ impl core::fmt::Debug for RpcMetaFlags {
             (Self::READABLE, "READABLE"),
             (Self::WRITABLE, "WRITABLE"),
             (Self::PERSISTENT, "PERSISTENT"),
-            (Self::BOOL, "BOOL"),
             (Self::CAPTURE, "CAPTURE"),
+            (Self::ANNOUNCED, "ANNOUNCED"),
+            (Self::PRIVILEGED, "PRIVILEGED"),
         ] {
             if self.contains(flag) {
                 write!(f, "{}{name}", if first { "" } else { " | " })?;
@@ -446,10 +447,12 @@ impl RpcMetaFlags {
     pub const WRITABLE: Self = Self(0x0200);
     /// Saved across reboots, 0x0400.
     pub const PERSISTENT: Self = Self(0x0400);
-    /// Boolean value, 0x0800.
-    pub const BOOL: Self = Self(0x0800);
-    /// Capture, read in blocks, 0x1000.
+    /// Capture, an array of the element type read in blocks, 0x1000.
     pub const CAPTURE: Self = Self(0x1000);
+    /// Every change is announced, so a host may cache the value, 0x2000.
+    pub const ANNOUNCED: Self = Self(0x2000);
+    /// Callable only by a session `dev.priv` has unlocked, 0x4000.
+    pub const PRIVILEGED: Self = Self(0x4000);
 
     // Preserve unknown flag bits when decoding.
     const MASK: u16 = 0xff00;
@@ -564,6 +567,8 @@ pub enum RpcValueType {
         /// Longest value in bytes, or `None` if unbounded.
         max_len: Option<RpcStringLen>,
     },
+    /// Boolean, one byte, nonzero for true.
+    Bool,
     /// Any other encoding.
     Raw {
         /// The raw `rpc.info` word.
@@ -576,6 +581,7 @@ impl RpcValueType {
     const TYPE_INT: u8 = 1;
     const TYPE_FLOAT: u8 = 2;
     const TYPE_STRING: u8 = 3;
+    const TYPE_BOOL: u8 = 4;
 
     /// Decodes the value type in the low byte of an `rpc.info` word. Returns
     /// `None` for an undefined encoding.
@@ -607,6 +613,11 @@ impl RpcValueType {
             Self::TYPE_STRING => Some(Self::String {
                 max_len: RpcStringLen::new(data_size),
             }),
+            Self::TYPE_BOOL => match data_size {
+                0 => Some(Self::Unit),
+                1 => Some(Self::Bool),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -625,6 +636,7 @@ impl RpcValueType {
                 Some(size) => (size.get() << 4) | Self::TYPE_STRING,
                 None => Self::TYPE_STRING,
             },
+            Self::Bool => (1 << 4) | Self::TYPE_BOOL,
             Self::Raw { meta } => (meta & 0x00ff) as u8,
         }
     }
@@ -648,6 +660,8 @@ impl core::fmt::Debug for RpcMeta {
 
 impl RpcMeta {
     const TYPED: u16 = 0x8000;
+    /// The retired bool flag older firmware sets on a `u8`, read but never written.
+    const LEGACY_BOOL: u16 = 0x0800;
 
     /// Untyped metadata, for a variable-size or unspecified value.
     pub const ANY: Self = Self(0);
@@ -723,12 +737,17 @@ impl RpcMeta {
     }
 
     /// Returns the value type. An untyped word, a capture, or an undefined
-    /// encoding is [`RpcValueType::Raw`].
+    /// encoding is [`RpcValueType::Raw`], and a `u8` with the retired bool
+    /// flag is [`RpcValueType::Bool`].
     pub const fn kind(self) -> RpcValueType {
         if self.is_unknown() || self.flags().contains(RpcMetaFlags::CAPTURE) {
             return RpcValueType::Raw { meta: self.0 };
         }
         match RpcValueType::from_low_byte(self.0 as u8) {
+            Some(RpcValueType::Int {
+                signed: false,
+                size: 1,
+            }) if self.0 & Self::LEGACY_BOOL != 0 => RpcValueType::Bool,
             Some(kind) => kind,
             None => RpcValueType::Raw { meta: self.0 },
         }
@@ -740,6 +759,7 @@ impl RpcMeta {
         match self.kind() {
             RpcValueType::Unit => Some(0),
             RpcValueType::Int { size, .. } | RpcValueType::Float { size } => Some(size as usize),
+            RpcValueType::Bool => Some(1),
             RpcValueType::String { .. } | RpcValueType::Raw { .. } => None,
         }
     }
@@ -1036,5 +1056,30 @@ mod tests {
         );
         assert_eq!(RpcMeta::from_bits(0x8120).access(), RpcAccess::ReadOnly);
         assert_eq!(RpcMeta::from_bits(0x8120).size_bytes(), Some(2));
+    }
+
+    /// A bool is its own type code; the retired `0x0800` flag on a `u8` still
+    /// reads as one, and on anything else is ignored.
+    #[test]
+    fn a_bool_is_a_type_and_the_retired_flag_still_decodes() {
+        let flag = RpcMeta::typed(RpcValueType::Bool, RpcMetaFlags::READABLE);
+        assert_eq!(flag.bits(), 0x8114);
+        assert_eq!(flag.kind(), RpcValueType::Bool);
+        assert_eq!(flag.size_bytes(), Some(1));
+        assert_eq!(RpcMeta::from_bits(0x8b10).kind(), RpcValueType::Bool);
+        assert_eq!(
+            RpcMeta::from_bits(0x8b20).kind(),
+            RpcValueType::Int {
+                signed: false,
+                size: 2
+            }
+        );
+        assert_eq!(
+            RpcMeta::from_bits(0x8114 | 0x2000 | 0x4000).flags(),
+            RpcMetaFlags::READABLE
+                | RpcMetaFlags::ANNOUNCED
+                | RpcMetaFlags::PRIVILEGED
+                | RpcMetaFlags::from_meta(0x8000)
+        );
     }
 }

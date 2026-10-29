@@ -47,7 +47,7 @@ pub enum Kind {
     Float(u16),
     /// String.
     String,
-    /// A flag: one byte on the wire, and marked as a bool to hosts.
+    /// A flag: one byte on the wire, and typed as a bool to hosts.
     Bool,
 }
 
@@ -203,14 +203,14 @@ impl RpcSpec {
 
     /// The metadata `rpc.info` and `rpc.listinfo` report for a public caller.
     pub fn legacy_metadata(&self) -> u16 {
-        let (kind, size, marks) = match self.kind {
+        let (kind, size) = match self.kind {
             Kind::Any => return self.extra_meta,
             Kind::Void => return 0x8000 | self.extra_meta,
-            Kind::Uint(size) => (0, size, 0),
-            Kind::Int(size) => (1, size, 0),
-            Kind::Float(size) => (2, size, 0),
-            Kind::String => (3, 0, 0),
-            Kind::Bool => (0, 1, RpcMetaFlags::BOOL.bits()),
+            Kind::Uint(size) => (0, size),
+            Kind::Int(size) => (1, size),
+            Kind::Float(size) => (2, size),
+            Kind::String => (3, 0),
+            Kind::Bool => (4, 1),
         };
         if size > 0xF {
             return self.extra_meta;
@@ -224,7 +224,7 @@ impl RpcSpec {
         .into_iter()
         .filter(|(bit, _)| granted.contains(*bit))
         .fold(0, |meta, (_, flag)| meta | flag.bits());
-        0x8000 | size << 4 | kind | access | marks | self.extra_meta
+        0x8000 | size << 4 | kind | access | self.extra_meta
     }
 }
 
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(stop.legacy_metadata(), 0x8000);
         assert_eq!(
             enable.legacy_metadata(),
-            0x8000 | (1 << 4) | 0x0100 | 0x0200 | RpcMetaFlags::BOOL.bits()
+            0x8000 | (1 << 4) | 4 | 0x0100 | 0x0200
         );
 
         let spec = RpcSpec::std("rpc.list", Access::RW);
