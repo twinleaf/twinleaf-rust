@@ -217,6 +217,7 @@ impl StreamState {
                         route,
                         DeviceEvent::Setting {
                             name: name.to_string(),
+                            seq: setting.seq,
                             reply: setting.reply.to_vec(),
                         },
                     );
@@ -624,11 +625,11 @@ mod tests {
     }
 
     /// One SETTING announcement, as a device sends it.
-    fn announcement(name: &str, reply: &[u8], route: DeviceRoute) -> Packet {
+    fn announcement(name: &str, seq: Option<u32>, reply: &[u8], route: DeviceRoute) -> Packet {
         let mut raw = [0u8; 64];
         let len = crate::proto::settings::Setting {
             name: name.as_bytes(),
-            flags: 0,
+            seq,
             reply,
         }
         .write(&mut raw)
@@ -763,7 +764,7 @@ mod tests {
         for first in sample_number.by_ref().take(4096) {
             proxy.send(samples(first, root));
         }
-        proxy.send(announcement("flood.end", b"", root));
+        proxy.send(announcement("flood.end", Some(1), b"", root));
 
         // An RPC issued while the pump is buried in samples still completes.
         let pending = handle.submit(root, "dev.name", b"");
@@ -1627,14 +1628,19 @@ mod tests {
         let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());
         let (_subscriptions, proxy, _root) = pump(PumpSink::Events(sink));
         let route: DeviceRoute = "/1".parse().expect("a valid route");
-        proxy.send(announcement("test.amplitude", &[1, 2, 3, 4], route));
+        proxy.send(announcement(
+            "test.amplitude",
+            Some(9),
+            &[1, 2, 3, 4],
+            route,
+        ));
 
         wait_for(&events, |event| {
             matches!(
                 event,
                 Event::Device {
                     route: from,
-                    event: DeviceEvent::Setting { name, reply },
+                    event: DeviceEvent::Setting { name, seq: Some(9), reply },
                 } if *from == route && name == "test.amplitude" && reply == &[1, 2, 3, 4]
             )
         });
@@ -1647,7 +1653,7 @@ mod tests {
         let (sink, events) = Sink::new(EVENT_QUEUE_LEN, everything());
         let (_subscriptions, proxy, _root) = pump(PumpSink::Events(sink));
         let root = DeviceRoute::root();
-        proxy.send(announcement("rpc.hash", &7u32.to_le_bytes(), root));
+        proxy.send(announcement("rpc.hash", None, &7u32.to_le_bytes(), root));
 
         wait_for(&events, |event| {
             matches!(

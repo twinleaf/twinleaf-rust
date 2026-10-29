@@ -670,7 +670,7 @@ impl SimDevice {
     /// Sends the heartbeat, log message and samples due at `now_ns`. A configuration left unsaved long
     /// enough is stored, as firmware's autosave does.
     pub(super) fn tick(&mut self, now_ns: u64, out: &mut impl Sink) {
-        if let Some(image) = self.device.tick(now_ns, out) {
+        if let Some(image) = self.device.tick(now_ns, &mut OneLane(&mut *out)) {
             self.stored = Some(image);
             self.device.saved();
         }

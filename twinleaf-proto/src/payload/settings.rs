@@ -1,16 +1,22 @@
 //! The `SETTING` packet, a setting change broadcast.
 //!
-//! The payload is `{ name_len: u8, flags: u8 }`, then the name, then the value.
-//! The value runs to the end of the payload. Neither is NUL-terminated. The
-//! value is the bytes the RPC of that name would return. `flags` is reserved
-//! and sent as zero. [`Setting`] parses and writes the packet.
+//! The payload is `{ name_len: u8, flags: u8 }`, then a `u32le` sequence
+//! number if `flags` has [`VERSION`], then the name, then the value. The value
+//! runs to the end of the payload. Neither is NUL-terminated. The value is the
+//! bytes the RPC of that name would return. The other `flags` bits are
+//! reserved and sent as zero. [`Setting`] parses and writes the packet.
 
 use crate::packet::{Header, Packet, PacketType};
 
 /// Size of the `{ name_len, flags }` head before the name and value.
 pub const SETTING_HEADER_SIZE: usize = 2;
-/// Most bytes of name and value together (`TL_SETTING_MAX_PAYLOAD_SIZE`).
+/// Most bytes of name and value together in an unnumbered announcement
+/// (`TL_SETTING_MAX_PAYLOAD_SIZE`).
 pub const MAX_SETTING_SIZE: usize = Packet::MAX_PAYLOAD - SETTING_HEADER_SIZE;
+/// The `flags` bit saying a sequence number follows the head, 0x01.
+pub const VERSION: u8 = 0x01;
+/// Size of the sequence number [`VERSION`] puts after the head.
+pub const SEQUENCE_SIZE: usize = 4;
 
 /// One setting announcement, as it travels in a `SETTING` packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,8 +24,9 @@ pub struct Setting<'a> {
     /// RPC name, not NUL-terminated. At most 255 bytes, the limit of its
     /// one-byte length field.
     pub name: &'a [u8],
-    /// Reserved. Devices send zero.
-    pub flags: u8,
+    /// The device's `settings.version` once this change is counted, or `None`
+    /// from firmware that does not number its announcements.
+    pub seq: Option<u32>,
     /// The new value, as the RPC of that name would have replied it.
     pub reply: &'a [u8],
 }
@@ -30,8 +37,14 @@ impl<'a> Setting<'a> {
     pub fn parse(payload: &'a [u8]) -> Option<Self> {
         let (&name_len, rest) = payload.split_first()?;
         let (&flags, rest) = rest.split_first()?;
+        let (seq, rest) = match flags & VERSION {
+            0 => (None, rest),
+            _ => rest
+                .split_first_chunk()
+                .map(|(seq, rest)| (Some(u32::from_le_bytes(*seq)), rest))?,
+        };
         let (name, reply) = rest.split_at_checked(name_len as usize)?;
-        Some(Self { name, flags, reply })
+        Some(Self { name, seq, reply })
     }
 
     /// Returns the name as text, or `None` if it is not UTF-8.
@@ -45,7 +58,7 @@ impl<'a> Setting<'a> {
         if self.name.len() > u8::MAX as usize {
             return None;
         }
-        let len = SETTING_HEADER_SIZE + self.name.len() + self.reply.len();
+        let len = self.head_len() + self.name.len() + self.reply.len();
         (len <= Packet::MAX_PAYLOAD).then_some(len)
     }
 
@@ -71,11 +84,25 @@ impl<'a> Setting<'a> {
             return None;
         }
         out[0] = self.name.len() as u8;
-        out[1] = self.flags;
-        let value_start = SETTING_HEADER_SIZE + self.name.len();
-        out[SETTING_HEADER_SIZE..value_start].copy_from_slice(self.name);
+        out[1] = match self.seq {
+            Some(seq) => {
+                out[SETTING_HEADER_SIZE..][..SEQUENCE_SIZE].copy_from_slice(&seq.to_le_bytes());
+                VERSION
+            }
+            None => 0,
+        };
+        let name_start = self.head_len();
+        let value_start = name_start + self.name.len();
+        out[name_start..value_start].copy_from_slice(self.name);
         out[value_start..len].copy_from_slice(self.reply);
         Some(len)
+    }
+
+    fn head_len(&self) -> usize {
+        match self.seq {
+            Some(_) => SETTING_HEADER_SIZE + SEQUENCE_SIZE,
+            None => SETTING_HEADER_SIZE,
+        }
     }
 }
 
@@ -87,7 +114,7 @@ mod tests {
     fn round_trip() {
         let setting = Setting {
             name: b"aux.data.decimation",
-            flags: 0,
+            seq: None,
             reply: &100u32.to_le_bytes(),
         };
         let mut buf = [0u8; 64];
@@ -104,7 +131,7 @@ mod tests {
     fn matches_the_packed_wire_layout() {
         let setting = Setting {
             name: b"rpc.hash",
-            flags: 0,
+            seq: None,
             reply: &0x0102_0304u32.to_le_bytes(),
         };
         let mut buf = [0u8; 32];
@@ -157,13 +184,41 @@ mod tests {
     fn an_empty_value_is_a_valid_announcement() {
         let setting = Setting {
             name: b"dev.stop",
-            flags: 0,
+            seq: None,
             reply: b"",
         };
         let mut buf = [0u8; 32];
         let len = setting.write(&mut buf).unwrap();
         assert_eq!(len, Header::SIZE + SETTING_HEADER_SIZE + 8);
         assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
+    }
+
+    /// Byte-exact: the head with [`VERSION`] set, the sequence number, then
+    /// the name and value as before.
+    #[test]
+    fn a_numbered_announcement_puts_its_sequence_before_the_name() {
+        let setting = Setting {
+            name: b"dev.name",
+            seq: Some(0x0102_0304),
+            reply: b"X",
+        };
+        let mut buf = [0u8; 32];
+        let len = setting.write(&mut buf).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(&buf[..len], &[
+            12, 0, 15, 0,           // header: SETTING, no routing, payload 15
+            8,                      // name_len
+            VERSION,                // flags
+            0x04, 0x03, 0x02, 0x01, // sequence, little-endian
+            b'd', b'e', b'v', b'.', b'n', b'a', b'm', b'e',
+            b'X',
+        ]);
+        assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
+        assert_eq!(
+            Setting::parse(&[0, VERSION, 1, 0, 0]),
+            None,
+            "a short sequence"
+        );
     }
 
     #[test]
@@ -181,7 +236,7 @@ mod tests {
     fn rejects_an_overlong_name_and_an_oversize_payload() {
         let long_name = Setting {
             name: &[b'x'; 256],
-            flags: 0,
+            seq: None,
             reply: b"",
         };
         assert_eq!(long_name.payload_len(), None);
@@ -189,7 +244,7 @@ mod tests {
 
         let oversize = Setting {
             name: b"n",
-            flags: 0,
+            seq: None,
             reply: &[0u8; MAX_SETTING_SIZE],
         };
         assert_eq!(oversize.write(&mut [0u8; Packet::MAX_SIZE]), None);

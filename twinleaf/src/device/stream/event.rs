@@ -43,15 +43,19 @@ pub enum DeviceEvent {
     /// The device answered `dev.metadata` with `NotFound`. Its firmware
     /// cannot describe its streams, and no samples from this route decode.
     MetadataUnavailable,
-    /// A new RPC table hash. `Some(hash)` comes from a settings packet.
+    /// A new RPC table hash. `Some(hash)` comes from the `rpc.hash`
+    /// announcement firmware whose table changes with `dev.priv` sends.
     /// `None` follows a reconnection and asks for a refresh.
     NewHash(Option<u32>),
-    /// A setting changed, as the device announced it. The `rpc.hash`
+    /// A setting changed, as the device announced it. A legacy `rpc.hash`
     /// announcement arrives here as well as in [`NewHash`](Self::NewHash).
     /// An announcement whose name is not UTF-8 is dropped.
     Setting {
         /// The setting's RPC name.
         name: String,
+        /// The device's `settings.version` once this change is counted, or
+        /// `None` from firmware that does not number its announcements.
+        seq: Option<u32>,
         /// Its new value, the bytes that RPC would reply.
         reply: Vec<u8>,
     },

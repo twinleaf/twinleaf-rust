@@ -201,16 +201,20 @@ impl<'p> Actions<'p> {
 
 /// Where a device's packets go.
 ///
-/// Two lanes rather than one sink: a reply belongs to the port that asked and
-/// outranks everything queued for it, while a setting the device itself moved
-/// belongs to every port. A platform with one port is [`OneLane`].
+/// A reply belongs to the port that asked and outranks everything queued for
+/// it. An announcement belongs to every port, in one order everywhere, and on
+/// the port that asked ahead of the reply that follows it. A log or heartbeat
+/// belongs to every port with no order against either. A platform with one
+/// port is [`OneLane`].
 pub trait Lanes {
-    /// The ordered lane of the port that asked: its replies, and the
-    /// announcement a write puts in front of its reply.
+    /// The ordered lane of the port that asked: its replies.
     fn reply(&mut self, packet: &[u8]);
 
-    /// The lane every port drains: what the device announced or logged on its
-    /// own account.
+    /// Every port's ordered lane: a setting announcement, behind every one
+    /// before it and ahead of any reply after it.
+    fn announce(&mut self, packet: &[u8]);
+
+    /// The lane every port drains: what the device logged or beat on its own account.
     fn event(&mut self, packet: &[u8]);
 }
 
@@ -222,22 +226,35 @@ impl<S: Sink> Lanes for OneLane<S> {
         self.0.send(packet);
     }
 
+    fn announce(&mut self, packet: &[u8]) {
+        self.0.send(packet);
+    }
+
     fn event(&mut self, packet: &[u8]) {
         self.0.send(packet);
     }
 }
 
+/// Which of [`Lanes`] a [`Lane`] writes into.
+#[derive(Clone, Copy)]
+enum Route {
+    Reply,
+    Announce,
+    Event,
+}
+
 /// One lane, as the device writes packets into it.
 struct Lane<'a, L: Lanes + ?Sized> {
     lanes: &'a mut L,
-    event: bool,
+    route: Route,
 }
 
 impl<L: Lanes + ?Sized> Sink for Lane<'_, L> {
     fn send(&mut self, packet: &[u8]) {
-        match self.event {
-            true => self.lanes.event(packet),
-            false => self.lanes.reply(packet),
+        match self.route {
+            Route::Reply => self.lanes.reply(packet),
+            Route::Announce => self.lanes.announce(packet),
+            Route::Event => self.lanes.event(packet),
         }
     }
 }
@@ -246,13 +263,24 @@ impl<L: Lanes + ?Sized> Sink for Lane<'_, L> {
 fn to<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
     Lane {
         lanes,
-        event: false,
+        route: Route::Reply,
+    }
+}
+
+/// Every port's ordered lane of announcements.
+fn announcements<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
+    Lane {
+        lanes,
+        route: Route::Announce,
     }
 }
 
 /// The lane every port drains.
 fn events<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
-    Lane { lanes, event: true }
+    Lane {
+        lanes,
+        route: Route::Event,
+    }
 }
 
 /// The one owner of a device and its settings.
@@ -381,15 +409,14 @@ impl<S: Group> Device<S> {
         }
     }
 
-    /// Tell a host that has just connected everything it needs: the table
-    /// hash, a heartbeat, and every metadata record.
+    /// Tell a host that has just connected everything it needs: a heartbeat,
+    /// and every metadata record.
     pub fn connected(
         &mut self,
         streams: &(impl Streams + ?Sized),
         now_ns: u64,
         out: &mut impl Sink,
     ) {
-        announcement(out, "rpc.hash", &self.hash().to_le_bytes());
         self.beat(now_ns, out);
         let record = self.record(streams);
         let mut sweep = metadata::Sweep::new();
@@ -427,7 +454,7 @@ impl<S: Group> Device<S> {
                 let repaired = self.settings.repair(&mut Announcer {
                     version: &mut self.settings_version,
                     dirty: &mut false,
-                    events: &mut events(&mut *lanes),
+                    events: &mut announcements(&mut *lanes),
                 });
                 self.settings.publish();
                 actions.log = Some(match (outcome, repaired) {
@@ -451,7 +478,7 @@ impl<S: Group> Device<S> {
                 }
             }
             Input::Packet(packet) if packet.header.ptype == PacketType::RPC_REQ => {
-                self.refresh(&mut events(&mut *lanes));
+                self.refresh(&mut announcements(&mut *lanes));
                 self.request(streams, packet, now_ns, lanes, &mut actions)
             }
             Input::Packet(_) => {}
@@ -524,7 +551,7 @@ impl<S: Group> Device<S> {
                     &mut self.loglevel,
                     args,
                     &mut reply,
-                    &mut to(lanes),
+                    &mut announcements(lanes),
                 )
                 .map(drop),
                 Std::Name => read(&mut reply, args, self.identity.name.as_bytes()),
@@ -585,7 +612,7 @@ impl<S: Group> Device<S> {
                     &mut self.autostart,
                     args,
                     &mut reply,
-                    &mut to(lanes),
+                    &mut announcements(lanes),
                 )
                 .map(|changed| {
                     if changed == Changed::Changed {
@@ -597,7 +624,7 @@ impl<S: Group> Device<S> {
                     &mut self.sync_delay,
                     args,
                     &mut reply,
-                    &mut to(lanes),
+                    &mut announcements(lanes),
                 )
                 .map(|changed| {
                     if changed == Changed::Changed {
@@ -614,10 +641,9 @@ impl<S: Group> Device<S> {
                     read(&mut reply, args, &self.settings_version.to_le_bytes())
                 }
                 Std::SyncStatus => read(&mut reply, args, &[self.time_status]),
-                Std::Priv => self.unlock(args, &mut reply, &mut events(lanes)),
+                Std::Priv => self.unlock(args, &mut reply),
                 Std::PrivLock => {
                     self.privileged = false;
-                    announcement(&mut events(lanes), "rpc.hash", &self.hash().to_le_bytes());
                     Ok(())
                 }
                 Std::PrivPassword => match self.password.rpc(args, &mut reply) {
@@ -637,12 +663,7 @@ impl<S: Group> Device<S> {
     /// `dev.priv`: a read says whether the session is unlocked, a write takes
     /// the password, and a wrong one conceals the method from a locked session
     /// as tl-chibi does. A board that names no password opens no session.
-    fn unlock(
-        &mut self,
-        args: &[u8],
-        out: &mut Reply,
-        events: &mut impl Sink,
-    ) -> Result<(), RpcError> {
+    fn unlock(&mut self, args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
         let password = self.password.get();
         if args.is_empty() {
             return put(out, &[u8::from(self.privileged)]);
@@ -657,7 +678,6 @@ impl<S: Group> Device<S> {
             });
         }
         self.privileged = true;
-        announcement(events, "rpc.hash", &self.hash().to_le_bytes());
         Ok(())
     }
 
@@ -702,7 +722,7 @@ impl<S: Group> Device<S> {
             }
             Entry::Action(action) => {
                 moved = true;
-                let mut lane = events(&mut *lanes);
+                let mut lane = announcements(&mut *lanes);
                 found = Some(action.run(&mut Announcer {
                     version: settings_version,
                     dirty: &mut dirty,
@@ -722,7 +742,7 @@ impl<S: Group> Device<S> {
             }
             moved = true;
             dirty |= access.contains(Access::PERSISTENT);
-            announce(settings_version, &mut to(&mut *lanes), name, out);
+            announce(settings_version, &mut announcements(&mut *lanes), name, out);
         }
         if moved {
             settings.publish();
@@ -774,13 +794,20 @@ impl<S: Group> Device<S> {
             conf::load([password as &mut dyn Persisted], image, |_, _| {}).and(conf::load(
                 [autostart as &mut dyn Persisted, loglevel, sync_delay],
                 image,
-                |name, reply| announce(settings_version, &mut events(&mut *lanes), name, reply),
+                |name, reply| {
+                    announce(
+                        settings_version,
+                        &mut announcements(&mut *lanes),
+                        name,
+                        reply,
+                    )
+                },
             ));
         settings.entries(&mut |entry| {
             let Entry::Setting(cell) = entry else {
                 return;
             };
-            let mut lane = events(&mut *lanes);
+            let mut lane = announcements(&mut *lanes);
             let loaded = conf::load([cell as &mut dyn Persisted], image, |name, reply| {
                 announce(settings_version, &mut lane, name, reply)
             });
@@ -837,12 +864,13 @@ impl<S: Group> Device<S> {
         self.dirty_since = None;
     }
 
-    /// Send whatever is due at `now_ns`, and hand back the configuration a
+    /// Send whatever is due at `now_ns`, the reports that moved as
+    /// announcements and then a heartbeat, and hand back the configuration a
     /// change left unsaved for a period, owed until [`Device::saved`].
-    pub fn tick(&mut self, now_ns: u64, out: &mut impl Sink) -> Option<Entries> {
+    pub fn tick(&mut self, now_ns: u64, lanes: &mut (impl Lanes + ?Sized)) -> Option<Entries> {
         if now_ns >= self.next_beat {
-            self.refresh(out);
-            self.beat(now_ns, out);
+            self.refresh(&mut announcements(&mut *lanes));
+            self.beat(now_ns, &mut events(lanes));
         }
         if now_ns < self.dirty_since? + AUTOSAVE_INTERVAL {
             return None;
@@ -935,17 +963,13 @@ fn write<T: Scalar>(
     Ok(changed)
 }
 
-/// Count a change and announce it.
+/// Count a change and send it as a SETTING packet numbered with the count,
+/// carrying the value as the RPC of `name` replies it.
 fn announce(version: &mut u32, out: &mut impl Sink, name: &str, reply: &[u8]) {
     *version = version.wrapping_add(1);
-    announcement(out, name, reply);
-}
-
-/// Send a SETTING packet carrying a value as the RPC of `name` replies it.
-fn announcement(out: &mut impl Sink, name: &str, reply: &[u8]) {
     let setting = Announcement {
         name: name.as_bytes(),
-        flags: 0,
+        seq: Some(*version),
         reply,
     };
     send(out, &[], |buf| setting.write(buf));
@@ -1454,6 +1478,11 @@ mod tests {
             self.to.send(packet);
         }
 
+        fn announce(&mut self, packet: &[u8]) {
+            self.to.send(packet);
+            self.events.send(packet);
+        }
+
         fn event(&mut self, packet: &[u8]) {
             self.events.send(packet);
         }
@@ -1605,7 +1634,7 @@ mod tests {
         /// Drive the clock to `now_ns` and store what the device decided to
         /// save on its own account, as a platform whose flash took it does.
         fn tick(&mut self, now_ns: u64) -> Option<Entries> {
-            let image = self.device.tick(now_ns, &mut Sent::default())?;
+            let image = self.device.tick(now_ns, &mut OneLane(Sent::default()))?;
             self.device.saved();
             Some(image)
         }
@@ -1816,9 +1845,9 @@ mod tests {
         let full = table::hash(device.table(), true);
         assert_eq!(device.ask("rpc.hash", &[]).value(), full.to_le_bytes());
         assert_eq!(
-            device.lanes.events.announced().last().unwrap(),
-            &("rpc.hash".to_string(), full.to_le_bytes().to_vec()),
-            "an unlocked session is told the table it may now cache"
+            device.lanes.events.announced(),
+            [],
+            "unlocking announces nothing"
         );
         assert_eq!(
             device.ask("dev.priv", b"wrong").error(),
@@ -2002,15 +2031,13 @@ mod tests {
     /// What a host learns the moment it connects, ending on the record that
     /// closes the sweep.
     #[test]
-    fn connecting_sends_the_hash_a_heartbeat_and_the_sweep() {
+    fn connecting_sends_a_heartbeat_and_the_sweep() {
         let mut device = harness();
-        let hash = device.device.hash().to_le_bytes();
         let views = device.connect(BOOT).views();
         let types: Vec<_> = views.iter().map(|view| view.header.ptype).collect();
         assert_eq!(
             types,
             [
-                PacketType::SETTING,
                 PacketType::HEARTBEAT,
                 PacketType::METADATA,
                 PacketType::METADATA,
@@ -2018,17 +2045,14 @@ mod tests {
                 PacketType::METADATA,
             ]
         );
-        let setting = Announcement::parse(views[0].payload).unwrap();
-        assert_eq!(setting.name, b"rpc.hash");
-        assert_eq!(setting.reply, hash);
         assert_eq!(
-            Heartbeat::parse(views[1].payload),
+            Heartbeat::parse(views[0].payload),
             Some(Heartbeat::Session {
                 session: SESSION,
                 settings: Some(0)
             })
         );
-        let kinds: Vec<_> = views[2..]
+        let kinds: Vec<_> = views[1..]
             .iter()
             .map(|view| data::split_metadata(view.payload).unwrap())
             .map(|(kind, flags, _)| {
@@ -2059,12 +2083,12 @@ mod tests {
 
         assert!(device
             .device
-            .tick(BOOT + HEARTBEAT_INTERVAL / 2, &mut sent)
+            .tick(BOOT + HEARTBEAT_INTERVAL / 2, &mut OneLane(&mut sent))
             .is_none());
         assert!(sent.0.is_empty());
         assert!(device
             .device
-            .tick(BOOT + HEARTBEAT_INTERVAL, &mut sent)
+            .tick(BOOT + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent))
             .is_none());
         assert_eq!(sent.views()[0].header.ptype, PacketType::HEARTBEAT);
         assert_eq!(device.device.deadline(), BOOT + 2 * HEARTBEAT_INTERVAL);
@@ -2077,7 +2101,7 @@ mod tests {
         let mut device = harness();
         device.ask("board.first", &8u32.to_le_bytes());
         let mut sent = Sent::default();
-        device.device.tick(BOOT, &mut sent);
+        device.device.tick(BOOT, &mut OneLane(&mut sent));
         assert_eq!(
             Heartbeat::parse(sent.views()[0].payload),
             Some(Heartbeat::Session {
@@ -2305,13 +2329,22 @@ mod tests {
             [PacketType::SETTING, PacketType::RPC_REP],
             "an announcement, then the reply"
         );
+        let answered_announced = answered.announced();
         assert_eq!(
-            answered.announced(),
+            answered_announced,
             [("board.second".to_owned(), 42u32.to_le_bytes().to_vec())]
         );
-        assert!(
-            device.lanes.events.0.is_empty(),
-            "a write one port asked for is not an event"
+        assert_eq!(
+            Announcement::parse(answered.views()[0].payload)
+                .unwrap()
+                .seq,
+            Some(1),
+            "numbered with the count it makes"
+        );
+        assert_eq!(
+            device.lanes.events.announced(),
+            answered_announced,
+            "every port hears a write"
         );
         assert_eq!(version(&mut device), 1, "the write is counted");
 
@@ -2322,6 +2355,73 @@ mod tests {
         // Reading it back neither announces nor counts.
         assert_eq!(device.ask("board.second", &[]).0.len(), 1);
         assert_eq!(version(&mut device), 1);
+    }
+
+    /// Two control ports, as a board with a host USB port and a parent UART
+    /// has: an announcement reaches both in one order, and the port that
+    /// asked hears it before its reply.
+    struct Ports {
+        ports: [Sent; 2],
+        asking: usize,
+    }
+
+    impl Lanes for Ports {
+        fn reply(&mut self, packet: &[u8]) {
+            self.ports[self.asking].send(packet);
+        }
+
+        fn announce(&mut self, packet: &[u8]) {
+            self.ports.iter_mut().for_each(|port| port.send(packet));
+        }
+
+        fn event(&mut self, packet: &[u8]) {
+            self.ports.iter_mut().for_each(|port| port.send(packet));
+        }
+    }
+
+    #[test]
+    fn every_port_hears_each_announcement_in_one_sequence() {
+        let mut device = harness();
+        let mut lanes = Ports {
+            ports: Default::default(),
+            asking: 0,
+        };
+        for (port, name, value) in [(0, "board.first", 8u32), (1, "board.second", 9)] {
+            lanes.asking = port;
+            let packet = asking(Method::ByName(name.as_bytes()), &value.to_le_bytes(), &[]);
+            let (view, _) = PacketView::parse_prefix(&packet).unwrap();
+            device
+                .device
+                .handle(&device.streams[..], Input::Packet(view), BOOT, &mut lanes);
+        }
+        let heard = |port: &Sent| -> Vec<(PacketType, Option<u32>)> {
+            port.views()
+                .iter()
+                .map(|view| {
+                    let seq = (view.header.ptype == PacketType::SETTING)
+                        .then(|| Announcement::parse(view.payload).unwrap().seq)
+                        .flatten();
+                    (view.header.ptype, seq)
+                })
+                .collect()
+        };
+        let [first, second] = &lanes.ports;
+        assert_eq!(
+            heard(first),
+            [
+                (PacketType::SETTING, Some(1)),
+                (PacketType::RPC_REP, None),
+                (PacketType::SETTING, Some(2)),
+            ]
+        );
+        assert_eq!(
+            heard(second),
+            [
+                (PacketType::SETTING, Some(1)),
+                (PacketType::SETTING, Some(2)),
+                (PacketType::RPC_REP, None),
+            ]
+        );
     }
 
     #[test]
@@ -2352,7 +2452,12 @@ mod tests {
         device.lanes.events = Sent::default();
 
         let answered = device.ask("board.rewind", &[]);
-        assert_eq!(answered.0.len(), 1, "only the reply went to the port");
+        let types: Vec<_> = answered
+            .views()
+            .iter()
+            .map(|view| view.header.ptype)
+            .collect();
+        assert_eq!(types, [PacketType::SETTING, PacketType::RPC_REP]);
         assert!(answered.value().is_empty());
         assert_eq!(
             device.lanes.events.announced(),
@@ -2560,9 +2665,10 @@ mod tests {
             device.lanes.events.announced(),
             [("board.second".to_owned(), 42u32.to_le_bytes().to_vec())]
         );
-        assert!(
-            device.lanes.to.0.is_empty(),
-            "nothing asked for the restore"
+        assert_eq!(
+            device.lanes.to.announced().len(),
+            device.lanes.to.0.len(),
+            "nothing asked for the restore, so nothing is answered"
         );
         assert_eq!(
             device.logged,
@@ -2789,13 +2895,22 @@ mod tests {
         device.ask_at("board.second", &42u32.to_le_bytes(), BOOT);
         let mut sent = Sent::default();
         let due = BOOT + AUTOSAVE_INTERVAL;
-        assert!(device.device.tick(due, &mut sent).is_some(), "the save");
         assert!(
-            device.device.tick(due + 1, &mut sent).is_some(),
+            device.device.tick(due, &mut OneLane(&mut sent)).is_some(),
+            "the save"
+        );
+        assert!(
+            device
+                .device
+                .tick(due + 1, &mut OneLane(&mut sent))
+                .is_some(),
             "still owed"
         );
         device.device.saved();
-        assert!(device.device.tick(due + 2, &mut sent).is_none());
+        assert!(device
+            .device
+            .tick(due + 2, &mut OneLane(&mut sent))
+            .is_none());
     }
 
     /// A save that does not fit its image is owed for another period, as
@@ -2827,11 +2942,13 @@ mod tests {
 
         let mut sent = Sent::default();
         assert!(
-            device.tick(BOOT + AUTOSAVE_INTERVAL, &mut sent).is_none(),
+            device
+                .tick(BOOT + AUTOSAVE_INTERVAL, &mut OneLane(&mut sent))
+                .is_none(),
             "the image has no room for them"
         );
         assert!(device
-            .tick(BOOT + 2 * AUTOSAVE_INTERVAL - 1, &mut sent)
+            .tick(BOOT + 2 * AUTOSAVE_INTERVAL - 1, &mut OneLane(&mut sent))
             .is_none());
         assert_eq!(
             device.deadline(),
