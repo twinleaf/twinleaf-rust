@@ -17,10 +17,13 @@
 //!       type.
 //!     - Interactive tools and GUIs use this way.
 //!
-//! A device announces every setting change, which
+//! A device announces every change to a setting or report, numbered by
+//! `settings.version`, which
 //! [`DeviceEvent::Setting`](crate::DeviceEvent::Setting) carries.
-//! [`SettingsCache`] holds the announced values and re-reads them when
-//! `settings.version` shows announcements were missed.
+//! [`SettingsCache`] holds the announced values, kept by those numbers and
+//! the heartbeat's, and asks for a snapshot when one was missed.
+//! [`STANDARD`] and [`Channel`] say what each standard entry is for, from
+//! the same table the device crate answers.
 //!
 //! Either way, [`submit`](crate::device::Device::submit) issues a call and
 //! returns a [`PendingReply`] to block on or await. [`pipelined`] keeps a
@@ -46,5 +49,7 @@ pub use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
 pub use error::{CallError, RpcErrorPayload};
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
 pub use reply::{pipelined, PendingReply, ReplyFuture};
-pub use settings::SettingsCache;
+pub use settings::{CacheAction, SettingsCache};
+#[doc(no_inline)]
+pub use twinleaf_device::rpc::{Channel, Std, STANDARD};
 pub use value::{RpcMetaExt, RpcValue, RpcValueDecodeError, RpcValueEncodeError, RpcValueTypeExt};

@@ -36,6 +36,7 @@ processing = ["dep:rustfft"]
 [dependencies]
 bytes = "1"
 twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }
+twinleaf-device = { version = "0.1", path = "../twinleaf-device" }
 crc = "3.2"
 num_enum = "0.7"
 glob = "0.3"
@@ -62,7 +63,6 @@ flume = { version = "0.12", default-features = false, features = ["async", "sele
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
-twinleaf-device = { path = "../twinleaf-device" }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

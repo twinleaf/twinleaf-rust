@@ -785,20 +785,21 @@ impl Device {
         self.tree.rpc_meta(self.route(), name)
     }
 
-    /// Re-reads the settings in `cache` if this device's `settings.version`
-    /// differs from the count of announcements `cache` has applied.
+    /// Fills `cache` with one consistent snapshot of this device's announced
+    /// values, read between two reads of `settings.version` that agree.
     ///
-    /// Returns `true` if it re-read them. A device without the counter is
-    /// not read, and gives `false`. Apply every announcement already received
-    /// before calling. An announcement received before the call but applied
-    /// after it is counted twice.
+    /// Call it once the cache is built and whenever
+    /// [`SettingsCache::observe`] asks for it. Announcements received during
+    /// the call are observed after it, and those the snapshot already holds
+    /// are skipped by their sequence numbers. A device the cache does not
+    /// hold is not read.
     ///
     /// # Errors
     ///
-    /// Returns a [`CallError`] if reading `settings.version` or any setting
-    /// fails. The cache then keeps its old values and count.
-    pub fn resync_settings(&self, cache: &mut SettingsCache) -> Result<bool, CallError> {
-        cache.resync_with(|name, arg| self.submit(name, arg))
+    /// Returns a [`CallError`] if reading `settings.version` or any value
+    /// fails. The cache then keeps what it held.
+    pub fn snapshot_settings(&self, cache: &mut SettingsCache) -> Result<(), CallError> {
+        cache.snapshot_with(|name, arg| self.submit(name, arg))
     }
 
     /// Returns a test device at the root, over a session whose socket is a
