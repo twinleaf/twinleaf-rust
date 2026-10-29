@@ -146,7 +146,8 @@ impl SettingsCache {
     /// Reads `settings.version`, every cached value, and `settings.version`
     /// again through `submit`, until both reads agree. If they never do, the
     /// last read is kept at the first version, and the announcements between
-    /// the two, still to be observed, bring it up to date.
+    /// the two, still to be observed, bring it up to date. A value the device
+    /// refuses to read is not held.
     pub(crate) fn snapshot_with(
         &mut self,
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
@@ -166,7 +167,11 @@ impl SettingsCache {
                 .iter()
                 .cloned()
                 .zip(pipelined(calls, SNAPSHOT_WINDOW))
-                .map(|(name, reply)| Ok((name, reply?)))
+                .filter_map(|(name, reply)| match reply {
+                    Ok(value) => Some(Ok((name, value))),
+                    Err(CallError::DeviceError(_)) => None,
+                    Err(error) => Some(Err(error)),
+                })
                 .collect::<Result<BTreeMap<String, Vec<u8>>, CallError>>()?;
             let after = version(submit(SETTINGS_VERSION, &[]))?;
             if after == before || attempt == SNAPSHOT_ATTEMPTS {
@@ -200,9 +205,11 @@ fn ahead(seq: u32, applied: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::RpcErrorPayload;
     use super::super::registry::RpcDescriptor;
     use super::super::reply::resolved;
     use super::*;
+    use crate::proto::rpc::RpcError;
 
     /// The metadata words of an announced read-write byte, an announced
     /// read-only one, a clock, a privileged announced byte, an announced
@@ -290,6 +297,34 @@ mod tests {
         );
         assert_eq!(cache.get("test.amplitude"), Some(&[7][..]));
         assert_eq!(cache.get("test.status"), Some(&[2][..]));
+        assert_eq!(cache.version(), Some(4));
+    }
+
+    /// A value the device refuses, as a platform without that hardware fact
+    /// refuses `dev.model`, is not held, and the rest of the snapshot stands.
+    #[test]
+    fn a_refused_read_is_not_held() {
+        let mut cache = SettingsCache::new(&registry(true));
+        let refused = CallError::DeviceError(RpcErrorPayload {
+            error: RpcError::State,
+            extra: Vec::new(),
+        });
+        let mut replies = [
+            Ok(vec![4, 0, 0, 0]),
+            Ok(vec![7]),
+            Err(refused),
+            Ok(vec![4, 0, 0, 0]),
+        ]
+        .into_iter();
+        let taken = cache.snapshot_with(|_, _| {
+            let (resolve, reply) = flume::bounded(1);
+            resolve.send(replies.next().expect("four reads")).unwrap();
+            PendingReply { reply }
+        });
+
+        assert!(taken.is_ok());
+        assert_eq!(cache.get("test.amplitude"), Some(&[7][..]));
+        assert_eq!(cache.get("test.status"), None);
         assert_eq!(cache.version(), Some(4));
     }
 
