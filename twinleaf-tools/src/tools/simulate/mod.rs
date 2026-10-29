@@ -214,13 +214,19 @@ impl Simulator {
                 terminal_println!("stopping tio test");
                 return Ok(());
             }
-            self.receive_packets()?;
-            self.expire_client();
-            let mut sent = Queue::default();
-            self.tree.tick(self.now_ns(), &mut sent);
-            self.send(sent)?;
+            self.step()?;
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Takes what the host sent, runs the devices up to now, and sends the
+    /// host what they sent.
+    fn step(&mut self) -> io::Result<()> {
+        self.receive_packets()?;
+        self.expire_client();
+        let mut sent = Queue::default();
+        self.tree.tick(self.now_ns(), &mut sent);
+        self.send(sent)
     }
 
     /// Prints what the devices stream. Every device of a layout streams the
@@ -387,6 +393,26 @@ impl Simulator {
             }
         }
     }
+}
+
+/// Serves the simulator `args` start on a free port from a thread until
+/// `stop` is set, and returns the URL a proxy opens it at.
+#[cfg(test)]
+pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+    use clap::Parser;
+    let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
+    let (bound, port) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut simulator = Simulator::new(&cli).unwrap();
+        bound
+            .send(simulator.socket.local_addr().unwrap().port())
+            .unwrap();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            simulator.step().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    format!("udp://127.0.0.1:{}", port.recv().unwrap())
 }
 
 #[cfg(test)]
