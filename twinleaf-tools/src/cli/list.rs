@@ -17,7 +17,11 @@ pub struct ListCli {
     #[arg(long = "udp")]
     pub udp: bool,
 
-    /// How long to browse before printing when output isn't a terminal (e.g. 2s, 500ms)
+    /// Print a JSON array of the devices and their routes after browsing, with no picker
+    #[arg(long = "json")]
+    pub json: bool,
+
+    /// How long to browse before printing with --json or when output isn't a terminal (e.g. 2s, 500ms)
     #[arg(long = "duration", default_value = "2s", value_parser = humantime::parse_duration)]
     pub duration: Duration,
 }
