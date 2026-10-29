@@ -514,7 +514,8 @@ pub enum RpcAccess {
     Action,
 }
 
-/// Bounded string length, as encoded in the metadata size nibble.
+/// A length of 1 to 15 bytes, as the metadata size nibble encodes it, which
+/// bounds a string and sizes a byte array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RpcStringLen(u8);
@@ -569,6 +570,11 @@ pub enum RpcValueType {
     },
     /// Boolean, one byte, nonzero for true.
     Bool,
+    /// Raw bytes.
+    Bytes {
+        /// The exact length in bytes, or `None` if it varies.
+        len: Option<RpcStringLen>,
+    },
     /// Any other encoding.
     Raw {
         /// The raw `rpc.info` word.
@@ -582,6 +588,7 @@ impl RpcValueType {
     const TYPE_FLOAT: u8 = 2;
     const TYPE_STRING: u8 = 3;
     const TYPE_BOOL: u8 = 4;
+    const TYPE_BYTES: u8 = 5;
 
     /// Decodes the value type in the low byte of an `rpc.info` word. Returns
     /// `None` for an undefined encoding.
@@ -618,6 +625,9 @@ impl RpcValueType {
                 1 => Some(Self::Bool),
                 _ => None,
             },
+            Self::TYPE_BYTES => Some(Self::Bytes {
+                len: RpcStringLen::new(data_size),
+            }),
             _ => None,
         }
     }
@@ -637,6 +647,10 @@ impl RpcValueType {
                 None => Self::TYPE_STRING,
             },
             Self::Bool => (1 << 4) | Self::TYPE_BOOL,
+            Self::Bytes { len } => match len {
+                Some(size) => (size.get() << 4) | Self::TYPE_BYTES,
+                None => Self::TYPE_BYTES,
+            },
             Self::Raw { meta } => (meta & 0x00ff) as u8,
         }
     }
@@ -760,7 +774,10 @@ impl RpcMeta {
             RpcValueType::Unit => Some(0),
             RpcValueType::Int { size, .. } | RpcValueType::Float { size } => Some(size as usize),
             RpcValueType::Bool => Some(1),
-            RpcValueType::String { .. } | RpcValueType::Raw { .. } => None,
+            RpcValueType::Bytes { len: Some(len) } => Some(len.get() as usize),
+            RpcValueType::Bytes { len: None }
+            | RpcValueType::String { .. }
+            | RpcValueType::Raw { .. } => None,
         }
     }
 }
@@ -1056,6 +1073,22 @@ mod tests {
         );
         assert_eq!(RpcMeta::from_bits(0x8120).access(), RpcAccess::ReadOnly);
         assert_eq!(RpcMeta::from_bits(0x8120).size_bytes(), Some(2));
+    }
+
+    /// A byte array is type 5 with its exact length in the size nibble, or
+    /// zero for a length that varies.
+    #[test]
+    fn bytes_carry_their_length_or_none() {
+        let uid = RpcValueType::Bytes {
+            len: RpcStringLen::new(12),
+        };
+        let meta = RpcMeta::typed(uid, RpcMetaFlags::READABLE);
+        assert_eq!(meta.bits(), 0x81c5);
+        assert_eq!(meta.kind(), uid);
+        assert_eq!(meta.size_bytes(), Some(12));
+        let any = RpcMeta::from_bits(0x8105);
+        assert_eq!(any.kind(), RpcValueType::Bytes { len: None });
+        assert_eq!(any.size_bytes(), None);
     }
 
     /// A bool is its own type code; the retired `0x0800` flag on a `u8` still

@@ -25,7 +25,7 @@ use twinleaf_proto::{RpcRequestId, SessionId};
 
 use crate::data::metadata::{self, Streams};
 use crate::rpc::{self as table, put, read, Access, Kind, Reply, RpcSpec, Std, STANDARD};
-use crate::rpc::{finite, Atomic, Changed, Persisted, Scalar, Setting, Text};
+use crate::rpc::{finite, Atomic, Changed, Persisted, Scalar, Setting, Text, UID_SIZE};
 use crate::storage::conf::{self, Image};
 use crate::Sink;
 
@@ -78,7 +78,7 @@ pub struct Identity {
     /// `dev.mcu.model`.
     pub mcu: Option<&'static str>,
     /// `dev.uid`.
-    pub uid: Option<&'static [u8]>,
+    pub uid: Option<&'static [u8; UID_SIZE]>,
     /// `dev.revision`.
     pub hw_rev: Option<u16>,
 }
@@ -103,7 +103,7 @@ impl Identity {
         self,
         model: &'static str,
         mcu: &'static str,
-        uid: &'static [u8],
+        uid: &'static [u8; UID_SIZE],
         hw_rev: u16,
     ) -> Self {
         Self {
@@ -566,7 +566,7 @@ impl<S: Group> Device<S> {
                 .map(drop),
                 Std::Name => read(&mut reply, args, self.identity.name.as_bytes()),
                 Std::Model => declared(&mut reply, args, self.identity.model.map(str::as_bytes)),
-                Std::Uid => declared(&mut reply, args, self.identity.uid),
+                Std::Uid => declared(&mut reply, args, self.identity.uid.map(|uid| &uid[..])),
                 Std::Serial => read(&mut reply, args, self.identity.serial.as_bytes()),
                 Std::Revision => {
                     declared(&mut reply, args, hw_rev.as_ref().map(|bytes| &bytes[..]))

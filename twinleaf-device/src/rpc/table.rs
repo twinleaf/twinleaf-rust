@@ -11,6 +11,9 @@ use twinleaf_proto::packet::Packet;
 use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf_proto::serial::CRC32;
 
+/// Bytes in `dev.uid`, an MCU's 96-bit unique id.
+pub const UID_SIZE: usize = 12;
+
 /// Largest RPC reply: the payload less the two-byte request id.
 pub const REPLY_MAX: usize = Packet::MAX_PAYLOAD - 2;
 
@@ -45,6 +48,8 @@ pub enum Kind {
     String,
     /// A flag: one byte on the wire, and typed as a bool to hosts.
     Bool,
+    /// Raw bytes of this exact length, or of any length at zero.
+    Bytes(u16),
 }
 
 impl Kind {
@@ -57,6 +62,7 @@ impl Kind {
             Kind::Float(size) => (4, size),
             Kind::String => (5, 0),
             Kind::Bool => (2, 1),
+            Kind::Bytes(size) => (6, size),
         };
         kind << 4 | (size as u32) << 8
     }
@@ -201,6 +207,7 @@ impl RpcSpec {
             Kind::Float(size) => (2, size),
             Kind::String => (3, 0),
             Kind::Bool => (4, 1),
+            Kind::Bytes(size) => (5, size),
         };
         if size > 0xF {
             return self.extra_meta;
@@ -291,7 +298,7 @@ standard! {
     Loglevel "dev.loglevel" Setting prop(Kind::Uint(1), Access::RW).announced(),
     Name "dev.name" Report prop(Kind::String, Access::READ).announced(),
     Model "dev.model" Report prop(Kind::String, Access::READ).announced(),
-    Uid "dev.uid" Report std(Access::READ).announced(),
+    Uid "dev.uid" Report prop(Kind::Bytes(UID_SIZE as u16), Access::READ).announced(),
     Serial "dev.serial" Report prop(Kind::String, Access::READ).announced(),
     Revision "dev.revision" Report prop(Kind::Uint(2), Access::READ).announced(),
     Desc "dev.desc" Report prop(Kind::String, Access::READ).announced(),
@@ -473,7 +480,7 @@ mod tests {
     use super::*;
 
     /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x909e_9b78;
+    const HASH: u32 = 0x1b98_ccb2;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -581,6 +588,11 @@ mod tests {
         }
         assert_eq!(Std::Uptime.channel(), Channel::Protocol);
         assert_eq!(Std::Systime.channel(), Channel::Protocol);
+        assert_eq!(
+            STANDARD[Std::Uid as usize].metadata(),
+            0x8000 | (12 << 4) | 5 | 0x0100 | 0x2000,
+            "twelve raw bytes, a typed report"
+        );
         let mcu = &STANDARD[Std::Mcu as usize];
         assert_eq!(
             mcu.metadata(),

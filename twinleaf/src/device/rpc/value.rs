@@ -49,12 +49,11 @@ impl std::fmt::Display for RpcValue {
 impl RpcValue {
     /// Formats the value as text for a person to read.
     ///
-    /// A string is quoted and followed by its bytes, raw bytes are a list,
-    /// and any other value is as [`Display`](std::fmt::Display) writes it.
+    /// A string is quoted and followed by its bytes, and any other value,
+    /// raw bytes in hex, is as [`Display`](std::fmt::Display) writes it.
     pub fn to_text(&self) -> String {
         match self {
             RpcValue::Str(value) => format!("\"{}\" {:?}", value, value.as_bytes()),
-            RpcValue::Bytes(value) => format!("{:?}", value),
             other => other.to_string(),
         }
     }
@@ -118,6 +117,7 @@ pub trait RpcValueTypeExt {
 impl RpcValueTypeExt for RpcValueType {
     const NAMES: &'static [&'static str] = &[
         "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bool", "string",
+        "bytes",
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -135,6 +135,7 @@ impl RpcValueTypeExt for RpcValueType {
             "f64" => RpcValueType::Float { size: 8 },
             "bool" => RpcValueType::Bool,
             "string" => RpcValueType::String { max_len: None },
+            "bytes" => RpcValueType::Bytes { len: None },
             _ => return None,
         })
     }
@@ -149,6 +150,17 @@ impl RpcValueTypeExt for RpcValueType {
             RpcValueType::Float { size: 4 } => RpcValue::F64(text.parse::<f32>()?.into()),
             RpcValueType::Float { .. } => RpcValue::F64(text.parse()?),
             RpcValueType::Bool => RpcValue::Bool(text.parse()?),
+            RpcValueType::Bytes { .. } => RpcValue::Bytes(
+                (0..text.len())
+                    .step_by(2)
+                    .map(|at| {
+                        text.get(at..at + 2)
+                            .filter(|pair| pair.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    })
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| RpcValueEncodeError::HexText(text.to_owned()))?,
+            ),
             RpcValueType::Raw { .. } => RpcValue::Bytes(text.as_bytes().to_vec()),
         })
     }
@@ -187,7 +199,17 @@ impl RpcValueTypeExt for RpcValueType {
                 Ok(value.as_bytes().to_vec())
             }
             (RpcValueType::Bool, RpcValue::Bool(value)) => Ok(vec![u8::from(*value)]),
-            (RpcValueType::Raw { .. }, RpcValue::Bytes(value)) => Ok(value.clone()),
+            (RpcValueType::Bytes { len: Some(len) }, RpcValue::Bytes(value))
+                if value.len() != usize::from(len.get()) =>
+            {
+                Err(RpcValueEncodeError::BytesLength {
+                    expected: len.get(),
+                    actual: value.len(),
+                })
+            }
+            (RpcValueType::Bytes { .. } | RpcValueType::Raw { .. }, RpcValue::Bytes(value)) => {
+                Ok(value.clone())
+            }
             (expected, actual) => Err(RpcValueEncodeError::TypeMismatch {
                 expected,
                 actual: actual.kind_name(),
@@ -223,7 +245,19 @@ impl RpcValueTypeExt for RpcValueType {
                 Ok(value) => Ok(RpcValue::Str(value.to_owned())),
                 Err(_) => Ok(RpcValue::Bytes(bytes.to_vec())),
             },
-            RpcValueType::Raw { .. } => Ok(RpcValue::Bytes(bytes.to_vec())),
+            RpcValueType::Bytes { len: Some(len) } => {
+                let expected = usize::from(len.get());
+                bytes
+                    .get(..expected)
+                    .map(|value| RpcValue::Bytes(value.to_vec()))
+                    .ok_or(RpcValueDecodeError::Reply(RpcDecodeError::TooShort {
+                        expected,
+                        actual: bytes.len(),
+                    }))
+            }
+            RpcValueType::Bytes { len: None } | RpcValueType::Raw { .. } => {
+                Ok(RpcValue::Bytes(bytes.to_vec()))
+            }
         }
     }
 }
@@ -316,6 +350,17 @@ pub enum RpcValueEncodeError {
     /// The text is not `true` or `false`.
     #[error(transparent)]
     BoolText(#[from] std::str::ParseBoolError),
+    /// The text is not an even run of hex digits.
+    #[error("not hex bytes: {0}")]
+    HexText(String),
+    /// The bytes are not the type's exact length.
+    #[error("{actual} bytes where the type takes {expected}")]
+    BytesLength {
+        /// Bytes the type takes.
+        expected: u8,
+        /// Bytes offered.
+        actual: usize,
+    },
     /// A unit is written as empty text, and this text is not empty.
     #[error("unit RPC arguments must be empty")]
     UnitText,
@@ -379,6 +424,10 @@ impl RpcMetaExt for RpcMeta {
             }
             RpcValueType::Float { size } => format!("f{}", (size as usize) * 8),
             RpcValueType::Bool => "bool".to_string(),
+            RpcValueType::Bytes { len } => match len {
+                Some(n) => format!("bytes<{n}>"),
+                None => "bytes".to_string(),
+            },
             RpcValueType::String { max_len } => match max_len {
                 Some(n) => format!("string<{n}>"),
                 None => "string".to_string(),
@@ -484,7 +533,7 @@ mod tests {
     #[test]
     fn a_value_as_text_shows_a_string_with_its_bytes() {
         assert_eq!(RpcValue::Str("ok".into()).to_text(), "\"ok\" [111, 107]");
-        assert_eq!(RpcValue::Bytes(vec![1, 2]).to_text(), "[1, 2]");
+        assert_eq!(RpcValue::Bytes(vec![1, 0xab]).to_text(), "01ab");
         assert_eq!(RpcValue::I64(-3).to_text(), "-3");
         assert_eq!(RpcValue::F64(0.5).to_text(), "0.5");
         assert_eq!(RpcValue::Unit.to_text(), "");
@@ -499,6 +548,44 @@ mod tests {
         assert_eq!(raw.text_type(), RpcValueType::String { max_len: None });
         let f64 = RpcMeta::new(RpcValueType::Float { size: 8 }, RpcMetaFlags::READABLE);
         assert_eq!(f64.text_type(), RpcValueType::Float { size: 8 });
+    }
+
+    /// Bytes read and write as hex, a fixed length is held to, and a reply
+    /// shorter than it is the codec's own error.
+    #[test]
+    fn bytes_are_hex_and_keep_their_length() {
+        let uid = RpcValueType::Bytes {
+            len: crate::proto::rpc::RpcStringLen::new(2),
+        };
+        let any = RpcValueType::Bytes { len: None };
+        assert_eq!(uid.encode_text("01aB").unwrap(), [0x01, 0xab]);
+        assert_eq!(any.encode_text("").unwrap(), b"");
+        for bad in ["1", "0g", "+1", "é1"] {
+            assert!(
+                matches!(any.parse(bad), Err(RpcValueEncodeError::HexText(_))),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            uid.encode_text("010203"),
+            Err(RpcValueEncodeError::BytesLength {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(uid.decode(&[1, 2, 3]).unwrap(), RpcValue::Bytes(vec![1, 2]));
+        assert!(matches!(
+            uid.decode(&[1]),
+            Err(RpcValueDecodeError::Reply(RpcDecodeError::TooShort {
+                expected: 2,
+                actual: 1
+            }))
+        ));
+        assert_eq!(
+            RpcMeta::new(uid, RpcMetaFlags::READABLE).type_str(),
+            "bytes<2>"
+        );
+        assert_eq!(RpcMeta::new(uid, RpcMetaFlags::READABLE).text_type(), uid);
     }
 
     /// A scalar decodes as the typed codec reads it, and too few bytes are
