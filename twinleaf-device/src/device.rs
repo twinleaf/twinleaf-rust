@@ -27,6 +27,7 @@ use crate::data::metadata::{self, Streams};
 use crate::rpc::{self as table, put, read, Access, Kind, Reply, RpcSpec, Std, STANDARD};
 use crate::rpc::{finite, Atomic, Changed, Persisted, Scalar, Setting, Text, UID_SIZE};
 use crate::storage::conf::{self, Image};
+use crate::sync::AcquisitionState;
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
@@ -321,6 +322,10 @@ pub struct Device<S: Group> {
     time_status: u8,
     /// `sync.status`, moved to what the platform published at each refresh.
     sync_status: Setting<u8>,
+    /// What the platform last published of its acquisition.
+    acquisition: AcquisitionState,
+    /// `dev.running`, moved to whether that acquisition runs at each refresh.
+    running: Setting<bool>,
 }
 
 impl<S: Group> Device<S> {
@@ -354,6 +359,8 @@ impl<S: Group> Device<S> {
             dirty_since: None,
             time_status: 0,
             sync_status: Setting::new("sync.status", 0).read_only(),
+            acquisition: AcquisitionState::Idle,
+            running: Setting::new("dev.running", false).read_only(),
         }
     }
 
@@ -401,6 +408,12 @@ impl<S: Group> Device<S> {
     /// to announce at the next refresh.
     pub fn set_time_status(&mut self, code: u8) {
         self.time_status = code;
+    }
+
+    /// Publish the state of the platform's acquisition, for `dev.running` to
+    /// announce at the next refresh.
+    pub fn set_acquisition(&mut self, state: AcquisitionState) {
+        self.acquisition = state;
     }
 
     /// The device record: identity, session, and how many streams.
@@ -646,6 +659,7 @@ impl<S: Group> Device<S> {
                     read(&mut reply, args, &self.settings_version.to_le_bytes())
                 }
                 Std::SyncStatus => self.sync_status.rpc(args, &mut reply).map(drop),
+                Std::Running => self.running.rpc(args, &mut reply).map(drop),
                 Std::Priv => self.unlock(args, &mut reply),
                 Std::PrivLock => {
                     self.privileged = false;
@@ -916,6 +930,10 @@ impl<S: Group> Device<S> {
         self.settings.refresh(&mut to);
         let _ = to.set(&mut self.lifetime, hours);
         let _ = to.set(&mut self.sync_status, self.time_status);
+        let _ = to.set(
+            &mut self.running,
+            self.acquisition == AcquisitionState::Running,
+        );
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
@@ -2252,7 +2270,7 @@ mod tests {
         let device = harness();
         let names: Vec<&str> = device.table().iter().map(|spec| spec.name).collect();
         assert_eq!(names[0], "dev.metadata", "the standard table comes first");
-        assert_eq!(names[STANDARD.len() - 1], "dev.priv.password");
+        assert_eq!(names[STANDARD.len() - 1], "dev.running");
         assert_eq!(&names[STANDARD.len()..], BOARD_NAMES);
     }
 
@@ -2590,6 +2608,21 @@ mod tests {
         device.device.set_time_status(3);
         assert_eq!(device.ask("sync.status", &[]).value(), [3]);
         assert_eq!(device.ask("sync.status", &[1]).error(), RpcError::ReadOnly);
+    }
+
+    /// `dev.running` follows what the platform publishes of its acquisition,
+    /// true only once samples flow.
+    #[test]
+    fn dev_running_follows_the_acquisition_the_platform_publishes() {
+        let mut device = harness();
+        assert_eq!(device.ask("dev.running", &[]).value(), [0]);
+        device.device.set_acquisition(AcquisitionState::Starting);
+        assert_eq!(device.ask("dev.running", &[]).value(), [0]);
+        device.device.set_acquisition(AcquisitionState::Running);
+        let answered = device.ask("dev.running", &[]);
+        assert_eq!(answered.announced(), [("dev.running".to_owned(), vec![1])]);
+        assert_eq!(answered.value(), [1]);
+        assert_eq!(device.ask("dev.running", &[1]).error(), RpcError::ReadOnly);
     }
 
     /// The standard reports that move are announced as they move, at the

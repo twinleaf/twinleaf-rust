@@ -19,6 +19,7 @@ use twinleaf_device::device::{
 };
 use twinleaf_device::rpc::{Access, Capture, Reply, RpcSpec, Selector, Setting, Status, STANDARD};
 use twinleaf_device::storage::update::{Package, Take, Upload};
+use twinleaf_device::sync::AcquisitionState;
 use twinleaf_device::{Device, Sink};
 
 use super::{unix_duration, GaussianRng};
@@ -610,6 +611,7 @@ impl SimDevice {
         self.main = self.started(self.main.rate);
         self.aux = self.started(self.aux.rate);
         self.started_ns = Some(now_ns);
+        self.device.set_acquisition(AcquisitionState::Running);
     }
 
     /// A clock at sample zero, with its first drop and rollover.
@@ -627,6 +629,7 @@ impl SimDevice {
             stream.stop();
         }
         self.started_ns = None;
+        self.device.set_acquisition(AcquisitionState::Idle);
     }
 
     /// Power-cycles into a new session. The board's entries go back to their
