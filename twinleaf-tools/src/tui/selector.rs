@@ -582,12 +582,34 @@ fn print_devices(entries: &[Entry]) {
     }
 }
 
+/// Prints the devices as a JSON array, each with the routes found behind it.
+fn print_devices_json(entries: &[Entry]) -> eyre::Result<()> {
+    let devices: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let routes: Vec<serde_json::Value> = e
+                .routes
+                .iter()
+                .map(|r| serde_json::json!({"route": r.route.to_string(), "name": r.name}))
+                .collect();
+            serde_json::json!({
+                "url": e.device.url,
+                "interface": interface_tag(&e.device.interface),
+                "name": e.device.name,
+                "routes": routes,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&devices)?);
+    Ok(())
+}
+
 /// Lists devices for `tio list`. On a terminal, it opens the live picker at
 /// once. Enter returns the devices to proxy with their mount prefixes, which
 /// is a single root mount unless some were marked with Space. Quitting
 /// prints the device tree gathered so far and returns `None`. Without a
 /// terminal, it collects devices for `browse`, prints them and returns
-/// `None`.
+/// `None`, and with `json` it prints them as [`print_devices_json`] does.
 ///
 /// # Errors
 ///
@@ -596,7 +618,12 @@ fn print_devices(entries: &[Entry]) {
 pub fn list_devices(
     config: DiscoveryConfig,
     browse: Duration,
+    json: bool,
 ) -> eyre::Result<Option<Vec<PickedSubtree>>> {
+    if json {
+        print_devices_json(&collect(config, browse))?;
+        return Ok(None);
+    }
     if !std::io::stdout().is_terminal() {
         print_devices(&collect(config, browse));
         return Ok(None);
