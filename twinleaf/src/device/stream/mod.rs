@@ -203,6 +203,7 @@ impl StreamState {
                         route,
                         DeviceEvent::Heartbeat {
                             session_id: beat.session(),
+                            settings: beat.settings(),
                         },
                     );
                 }

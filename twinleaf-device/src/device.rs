@@ -881,7 +881,10 @@ impl<S: Group> Device<S> {
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
-        let beat = Heartbeat::Session(self.session);
+        let beat = Heartbeat::Session {
+            session: self.session,
+            settings: Some(self.settings_version),
+        };
         send(out, &[], |buf| beat.write(buf));
         self.next_beat = now_ns + HEARTBEAT_INTERVAL;
     }
@@ -2020,7 +2023,10 @@ mod tests {
         assert_eq!(setting.reply, hash);
         assert_eq!(
             Heartbeat::parse(views[1].payload),
-            Some(Heartbeat::Session(SESSION))
+            Some(Heartbeat::Session {
+                session: SESSION,
+                settings: Some(0)
+            })
         );
         let kinds: Vec<_> = views[2..]
             .iter()
@@ -2062,6 +2068,23 @@ mod tests {
             .is_none());
         assert_eq!(sent.views()[0].header.ptype, PacketType::HEARTBEAT);
         assert_eq!(device.device.deadline(), BOOT + 2 * HEARTBEAT_INTERVAL);
+    }
+
+    /// A heartbeat carries the sequence number of the last announcement, so a
+    /// host that missed one learns it within an interval.
+    #[test]
+    fn a_heartbeat_carries_the_settings_sequence() {
+        let mut device = harness();
+        device.ask("board.first", &8u32.to_le_bytes());
+        let mut sent = Sent::default();
+        device.device.tick(BOOT, &mut sent);
+        assert_eq!(
+            Heartbeat::parse(sent.views()[0].payload),
+            Some(Heartbeat::Session {
+                session: SESSION,
+                settings: Some(1)
+            })
+        );
     }
 
     /// tl-chibi's `dev.loglevel` (`lib/tlfirmware.c:766-773`): a write reaches
@@ -2217,7 +2240,11 @@ mod tests {
     fn traffic_that_is_not_a_request_is_ignored() {
         let mut device = harness();
         let mut buf = [0u8; Packet::MAX_SIZE];
-        let len = Heartbeat::Session(SESSION).write(&mut buf).unwrap();
+        let beat = Heartbeat::Session {
+            session: SESSION,
+            settings: Some(0),
+        };
+        let len = beat.write(&mut buf).unwrap();
         let (view, _) = PacketView::parse_prefix(&buf[..len]).unwrap();
         device.drive(Input::Packet(view), BOOT);
         assert!(device.lanes.to.0.is_empty());

@@ -728,7 +728,7 @@ impl DeviceState {
                     global_generation,
                 );
             }
-            packet::Payload::Heartbeat(Heartbeat::Session(session)) => {
+            packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
                 if let Some(device) = &self.metadata {
                     if device.get().session != session && !self.ignore_session {
                         for stream in self.streams.iter_mut().flatten() {

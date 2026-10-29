@@ -143,7 +143,7 @@ impl RpcConsole {
             }
             Event::Device {
                 route,
-                event: DeviceEvent::Heartbeat { session_id },
+                event: DeviceEvent::Heartbeat { session_id, .. },
             } => self.update(*route, |rpc| rpc.on_heartbeat(*session_id)),
             Event::Device {
                 route,

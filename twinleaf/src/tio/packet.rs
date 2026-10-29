@@ -351,9 +351,14 @@ impl Packet {
         Self::write_heartbeat(Heartbeat::Any(&[]), routing)
     }
 
-    /// Creates a heartbeat announcing `session`, as a device sends it.
+    /// Creates a heartbeat announcing `session` alone, as a device with no
+    /// settings sequence sends it.
     pub fn heartbeat_session(session: u32, routing: DeviceRoute) -> Packet {
-        Self::write_heartbeat(Heartbeat::Session(WireSessionId::new(session)), routing)
+        let beat = Heartbeat::Session {
+            session: WireSessionId::new(session),
+            settings: None,
+        };
+        Self::write_heartbeat(beat, routing)
     }
 
     fn write_heartbeat(beat: Heartbeat<'_>, routing: DeviceRoute) -> Packet {

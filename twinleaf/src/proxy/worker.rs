@@ -534,7 +534,9 @@ impl Device {
         }
         if !self.has_static_rate() {
             if let Ok(TransportEvent::Packet(pkt)) = result {
-                if let packet::Payload::Heartbeat(Heartbeat::Session(session)) = pkt.payload() {
+                if let packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) =
+                    pkt.payload()
+                {
                     let session = session.value();
                     if pkt.route().is_empty() {
                         // This is a heartbeat for the root sensor

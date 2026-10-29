@@ -528,9 +528,12 @@ mod tests {
 
     fn heartbeat(session: u32) -> Vec<u8> {
         let mut buf = [0u8; 32];
-        let len = Heartbeat::Session(SessionId::new(session))
-            .write(&mut buf)
-            .unwrap();
+        let len = Heartbeat::Session {
+            session: SessionId::new(session),
+            settings: Some(0),
+        }
+        .write(&mut buf)
+        .unwrap();
         buf[..len + 1].to_vec()
     }
 

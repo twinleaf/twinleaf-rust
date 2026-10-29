@@ -36,6 +36,9 @@ pub enum DeviceEvent {
     Heartbeat {
         /// The session the device reports, when its heartbeat carries one.
         session_id: Option<SessionId>,
+        /// The sequence number of the device's last setting announcement, when
+        /// its heartbeat carries one.
+        settings: Option<u32>,
     },
     /// The device answered `dev.metadata` with `NotFound`. Its firmware
     /// cannot describe its streams, and no samples from this route decode.
