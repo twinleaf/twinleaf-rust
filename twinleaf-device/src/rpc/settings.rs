@@ -275,7 +275,7 @@ impl<T: Scalar> Setting<T> {
     pub fn rpc(&mut self, args: &[u8], out: &mut Reply) -> Result<Changed, RpcError> {
         let changed = match args {
             [] => Changed::Unchanged,
-            _ if !self.access.contains(Access::WRITE) => return Err(RpcError::ReadOnly),
+            _ if !self.access.granted().contains(Access::WRITE) => return Err(RpcError::ReadOnly),
             value => self.put(T::decode(value)?)?,
         };
         self.value.encode(out)?;
