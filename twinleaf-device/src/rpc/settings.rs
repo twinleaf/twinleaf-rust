@@ -224,14 +224,6 @@ impl<T: Scalar> Setting<T> {
         }
     }
 
-    /// The same setting, callable but left out of what a locked session lists.
-    pub const fn hidden(self) -> Self {
-        Self {
-            access: self.access.union(Access::HIDDEN),
-            ..self
-        }
-    }
-
     /// The same setting, which a host only reads and the device moves through
     /// [`crate::device::Announcer::set`], announcing each change as a write is.
     pub const fn read_only(self) -> Self {
@@ -301,9 +293,9 @@ impl<T: Scalar> Setting<T> {
         Ok(changed)
     }
 
-    /// The table entry it answers.
+    /// The table entry it answers, announced as every setting and report is.
     pub fn spec(&self) -> RpcSpec {
-        RpcSpec::prop(self.name, T::KIND, self.access)
+        RpcSpec::prop(self.name, T::KIND, self.access).announced()
     }
 }
 
@@ -466,21 +458,11 @@ mod tests {
     }
 
     #[test]
-    fn a_developer_setting_declares_the_bits_that_hide_it() {
+    fn a_developer_setting_declares_the_bits_that_lock_it() {
         let cal = Setting::new("imu.cal.x", 0.0f64).persistent().privileged();
         assert!(cal.spec().access.is_privileged());
         assert!(cal.spec().access.contains(Access::PERSISTENT));
-        assert!(!cal.spec().access.visible(false));
-        assert!(Setting::new("dev.secret", 0u8)
-            .hidden()
-            .spec()
-            .access
-            .visible(true));
-        assert!(!Setting::new("dev.secret", 0u8)
-            .hidden()
-            .spec()
-            .access
-            .visible(false));
+        assert!(cal.spec().access.contains(Access::ANNOUNCED));
     }
 
     #[test]
@@ -517,11 +499,11 @@ mod tests {
         let spec = Setting::new("app.rate", 1.0f64).spec();
         assert_eq!(spec.method, Method::Prop);
         assert_eq!(spec.kind, Kind::Float(8));
-        assert_eq!(spec.access, Access::RW);
+        assert_eq!(spec.access, Access::RW | Access::ANNOUNCED);
         assert_eq!(Setting::new("app.enable", true).spec().kind, Kind::Bool);
         assert_eq!(
             Setting::new("app.rate", 1.0f64).persistent().spec().access,
-            Access::RW | Access::PERSISTENT
+            Access::RW | Access::PERSISTENT | Access::ANNOUNCED
         );
 
         let kinds = [

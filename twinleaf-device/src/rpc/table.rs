@@ -3,13 +3,9 @@
 //! An entry carries the flags word libtio firmware uses, since `rpc.hash` is a
 //! CRC over that encoding, and the wire metadata is derived from it.
 //!
-//! An entry a board marks hidden or privileged is a developer entry: it stays
-//! out of what a locked session lists and out of the hash that session reads,
-//! until `dev.priv` takes the board's password. tl-chibi sorts its table so
-//! each tier is a run of ids and one bound decides everything; here ids stay
-//! declaration positions and every entry is checked on its own. That is the
-//! one divergence: `rpc.list` enumerates the entries a session sees, while
-//! `rpc.name` and `rpc.id` go on speaking in ids.
+//! The table is fixed per firmware image: every entry is listed to every
+//! session, so `rpc.hash` never changes while the image runs. A privileged
+//! entry says so in its metadata, and a locked session calling it is refused.
 
 use twinleaf_proto::packet::Packet;
 use twinleaf_proto::rpc::{RpcError, RpcMetaFlags};
@@ -79,10 +75,10 @@ impl Access {
     pub const WRITE: Self = Self(0x2);
     /// Readable and writable.
     pub const RW: Self = Self(0x3);
-    /// Callable by name or id, but left out of what a locked session lists.
-    pub const HIDDEN: Self = Self(0x10);
     /// Persisted across reboots.
     pub const PERSISTENT: Self = Self(0x20);
+    /// Every change is announced, so a host may cache the value.
+    pub const ANNOUNCED: Self = Self(0x40);
 
     /// Whether every bit of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
@@ -101,7 +97,7 @@ impl Access {
     }
 
     /// The read and write it grants, privileged or not, as `rpc.info` reports
-    /// them to a session that sees the entry at all.
+    /// them.
     pub const fn granted(self) -> Self {
         Self(self.0 | (self.0 & 0xC) >> 2)
     }
@@ -109,12 +105,6 @@ impl Access {
     /// Whether only a privileged session may call it.
     pub const fn is_privileged(self) -> bool {
         self.0 & Self::RW.0 == 0
-    }
-
-    /// Whether a session lists it: everything once unlocked, and otherwise
-    /// what is neither hidden nor privileged.
-    pub const fn visible(self, privileged: bool) -> bool {
-        privileged || !(self.contains(Self::HIDDEN) || self.is_privileged())
     }
 }
 
@@ -179,10 +169,10 @@ impl RpcSpec {
         Self { extra_meta, ..self }
     }
 
-    /// The same entry, callable but left out of what a locked session lists.
-    pub const fn hidden(self) -> Self {
+    /// The same entry, its every change announced so a host may cache it.
+    pub const fn announced(self) -> Self {
         Self {
-            access: self.access.union(Access::HIDDEN),
+            access: self.access.union(Access::ANNOUNCED),
             ..self
         }
     }
@@ -201,8 +191,8 @@ impl RpcSpec {
         self.method as u32 | self.kind.bits() | (self.access.0 as u32) << 24
     }
 
-    /// The metadata `rpc.info` and `rpc.listinfo` report for a public caller.
-    pub fn legacy_metadata(&self) -> u16 {
+    /// The metadata `rpc.info` and `rpc.listinfo` report.
+    pub fn metadata(&self) -> u16 {
         let (kind, size) = match self.kind {
             Kind::Any => return self.extra_meta,
             Kind::Void => return 0x8000 | self.extra_meta,
@@ -216,22 +206,52 @@ impl RpcSpec {
             return self.extra_meta;
         }
         let granted = self.access.granted();
-        let access = [
-            (Access::READ, RpcMetaFlags::READABLE),
-            (Access::WRITE, RpcMetaFlags::WRITABLE),
-            (Access::PERSISTENT, RpcMetaFlags::PERSISTENT),
+        let flags = [
+            (granted.contains(Access::READ), RpcMetaFlags::READABLE),
+            (granted.contains(Access::WRITE), RpcMetaFlags::WRITABLE),
+            (
+                granted.contains(Access::PERSISTENT),
+                RpcMetaFlags::PERSISTENT,
+            ),
+            (granted.contains(Access::ANNOUNCED), RpcMetaFlags::ANNOUNCED),
+            (self.access.is_privileged(), RpcMetaFlags::PRIVILEGED),
         ]
         .into_iter()
-        .filter(|(bit, _)| granted.contains(*bit))
+        .filter(|(set, _)| *set)
         .fold(0, |meta, (_, flag)| meta | flag.bits());
-        0x8000 | size << 4 | kind | access | self.extra_meta
+        0x8000 | size << 4 | kind | flags | self.extra_meta
     }
 }
 
+/// What a table entry is for, which decides how a host treats it.
+///
+/// | Channel | Metadata | A host |
+/// |---|---|---|
+/// | `Setting` | `READABLE \| WRITABLE \| ANNOUNCED`, may persist | caches it, writes it |
+/// | `Report` | `READABLE \| ANNOUNCED` | caches it |
+/// | `Protocol` | as the method needs, unannounced | uses it to speak to the device, or reads it for the time |
+/// | `Action` | neither readable nor writable | calls it |
+/// | `Diagnostic` | `READABLE \| PRIVILEGED`, unannounced | reads it when asked, unlocked |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    /// Host-configured, announced on every change.
+    Setting,
+    /// State the device moves, announced on every change.
+    Report,
+    /// How a host talks to the device, introspection, upload, privilege, and
+    /// the clocks that move every read.
+    Protocol,
+    /// Something the device does.
+    Action,
+    /// A developer's number, privileged and never announced.
+    Diagnostic,
+}
+
 /// Declare the standard table once: the variant [`Std`] answers by, the name
-/// the entry carries, and the [`RpcSpec`] constructor that describes it.
+/// the entry carries, its [`Channel`], and the [`RpcSpec`] constructor that
+/// describes it.
 macro_rules! standard {
-    ($($variant:ident $name:literal $method:ident($($arg:expr),*) $(.$build:ident())*,)*) => {
+    ($($variant:ident $name:literal $channel:ident $method:ident($($arg:expr),*) $(.$build:ident())*,)*) => {
         /// One entry of [`STANDARD`], in the id order that is on the wire.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Std {
@@ -244,6 +264,13 @@ macro_rules! standard {
             pub fn at(index: usize) -> Option<Self> {
                 const ALL: &[Std] = &[$(Std::$variant,)*];
                 ALL.get(index).copied()
+            }
+
+            /// What the entry is for.
+            pub const fn channel(self) -> Channel {
+                match self {
+                    $(Std::$variant => Channel::$channel,)*
+                }
             }
         }
 
@@ -258,52 +285,54 @@ macro_rules! standard {
 }
 
 standard! {
-    Metadata "dev.metadata" std(Access::RW),
-    Systime "dev.systime" prop(Kind::Uint(8), Access::READ),
-    Reboot "dev.reboot" action(),
-    Loglevel "dev.loglevel" prop(Kind::Uint(1), Access::RW),
-    Name "dev.name" prop(Kind::String, Access::READ),
-    Model "dev.model" prop(Kind::String, Access::READ),
-    Uid "dev.uid" std(Access::READ),
-    Serial "dev.serial" prop(Kind::String, Access::READ),
-    Revision "dev.revision" prop(Kind::Uint(2), Access::READ),
-    Desc "dev.desc" prop(Kind::String, Access::READ),
-    Session "dev.session" prop(Kind::Uint(4), Access::READ),
-    Mcu "dev.mcu.model" prop(Kind::String, Access::READ).privileged(),
-    FirmwareSerial "dev.firmware.serial" prop(Kind::String, Access::READ),
-    ConfLoad "dev.conf.load" action(),
-    ConfSave "dev.conf.save" action(),
-    ConfReset "dev.conf.reset" action(),
-    Uptime "dev.uptime" prop(Kind::Uint(4), Access::READ),
-    Upload "dev.firmware.upload" std(Access::RW),
-    Upgrade "dev.firmware.upgrade" action(),
-    RpcName "rpc.name" std(Access::RW),
-    RpcId "rpc.id" std(Access::RW),
-    RpcInfo "rpc.info" std(Access::RW),
-    RpcList "rpc.list" std(Access::RW),
-    RpcListInfo "rpc.listinfo" std(Access::RW),
-    RpcMatch "rpc.match" std(Access::RW),
-    RpcHash "rpc.hash" prop(Kind::Uint(4), Access::READ),
-    Autostart "dev.autostart" prop(Kind::Uint(1), Access::RW.union(Access::PERSISTENT)),
-    Start "dev.start" action(),
-    Stop "dev.stop" action(),
-    Restart "dev.restart" action(),
-    Abort "dev.firmware.abort" action(),
-    SettingsVersion "settings.version" prop(Kind::Uint(4), Access::READ),
-    SyncStatus "sync.status" prop(Kind::Uint(1), Access::READ),
-    Lifetime "dev.lifetime" prop(Kind::Uint(4), Access::READ),
-    SyncDelay "sync.delay" prop(Kind::Float(4), Access::RW.union(Access::PERSISTENT)),
-    Priv "dev.priv" std(Access::RW).hidden(),
-    PrivLock "dev.priv.lock" action().privileged(),
-    PrivPassword "dev.priv.password"
-        prop(Kind::String, Access::RW.union(Access::PERSISTENT)).privileged(),
+    Metadata "dev.metadata" Protocol std(Access::RW),
+    Systime "dev.systime" Protocol prop(Kind::Uint(8), Access::READ),
+    Reboot "dev.reboot" Action action(),
+    Loglevel "dev.loglevel" Setting prop(Kind::Uint(1), Access::RW).announced(),
+    Name "dev.name" Report prop(Kind::String, Access::READ).announced(),
+    Model "dev.model" Report prop(Kind::String, Access::READ).announced(),
+    Uid "dev.uid" Report std(Access::READ).announced(),
+    Serial "dev.serial" Report prop(Kind::String, Access::READ).announced(),
+    Revision "dev.revision" Report prop(Kind::Uint(2), Access::READ).announced(),
+    Desc "dev.desc" Report prop(Kind::String, Access::READ).announced(),
+    Session "dev.session" Report prop(Kind::Uint(4), Access::READ).announced(),
+    Mcu "dev.mcu.model" Report prop(Kind::String, Access::READ).announced(),
+    FirmwareSerial "dev.firmware.serial" Report prop(Kind::String, Access::READ).announced(),
+    ConfLoad "dev.conf.load" Action action(),
+    ConfSave "dev.conf.save" Action action(),
+    ConfReset "dev.conf.reset" Action action(),
+    Uptime "dev.uptime" Protocol prop(Kind::Uint(4), Access::READ),
+    Upload "dev.firmware.upload" Protocol std(Access::RW),
+    Upgrade "dev.firmware.upgrade" Protocol action(),
+    RpcName "rpc.name" Protocol std(Access::RW),
+    RpcId "rpc.id" Protocol std(Access::RW),
+    RpcInfo "rpc.info" Protocol std(Access::RW),
+    RpcList "rpc.list" Protocol std(Access::RW),
+    RpcListInfo "rpc.listinfo" Protocol std(Access::RW),
+    RpcMatch "rpc.match" Protocol std(Access::RW),
+    RpcHash "rpc.hash" Protocol prop(Kind::Uint(4), Access::READ),
+    Autostart "dev.autostart" Setting
+        prop(Kind::Uint(1), Access::RW.union(Access::PERSISTENT)).announced(),
+    Start "dev.start" Action action(),
+    Stop "dev.stop" Action action(),
+    Restart "dev.restart" Action action(),
+    Abort "dev.firmware.abort" Protocol action(),
+    SettingsVersion "settings.version" Protocol prop(Kind::Uint(4), Access::READ),
+    SyncStatus "sync.status" Report prop(Kind::Uint(1), Access::READ).announced(),
+    Lifetime "dev.lifetime" Report prop(Kind::Uint(4), Access::READ).announced(),
+    SyncDelay "sync.delay" Setting
+        prop(Kind::Float(4), Access::RW.union(Access::PERSISTENT)).announced(),
+    Priv "dev.priv" Protocol std(Access::RW),
+    PrivLock "dev.priv.lock" Protocol action().privileged(),
+    PrivPassword "dev.priv.password" Protocol
+        prop(Kind::String, Access::WRITE.union(Access::PERSISTENT)).privileged(),
 }
 
 /// `rpc.hash`: a CRC32 over the name, flags, description, and signature of
-/// every entry the session sees, so a host caches the table it was shown.
-pub fn hash(table: &[RpcSpec], privileged: bool) -> u32 {
+/// every entry, so a host caches the table once per firmware image.
+pub fn hash(table: &[RpcSpec]) -> u32 {
     let mut digest = CRC32.digest();
-    for spec in seen(table, privileged) {
+    for spec in table {
         digest.update(spec.name.as_bytes());
         digest.update(&spec.flags().to_le_bytes());
         digest.update(spec.desc.as_bytes());
@@ -312,69 +341,39 @@ pub fn hash(table: &[RpcSpec], privileged: bool) -> u32 {
     digest.finalize()
 }
 
-/// The entries a session sees.
-fn seen(table: &[RpcSpec], privileged: bool) -> impl Iterator<Item = &RpcSpec> {
-    table
-        .iter()
-        .filter(move |spec| spec.access.visible(privileged))
-}
-
-/// `rpc.name`: the name of the method at an id, which a session that cannot
-/// see the entry is answered as if it did not exist.
-pub fn name(
-    table: &[RpcSpec],
-    privileged: bool,
-    arg: &[u8],
-    out: &mut Reply,
-) -> Result<(), RpcError> {
-    let spec = table
-        .get(index(arg)?)
-        .filter(|spec| spec.access.visible(privileged))
-        .ok_or(RpcError::Invalid)?;
+/// `rpc.name`: the name of the method at an id.
+pub fn name(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+    let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
     put(out, spec.name.as_bytes())
 }
 
 /// `rpc.id`: the id of the method with a name.
-pub fn id(
-    table: &[RpcSpec],
-    privileged: bool,
-    arg: &[u8],
-    out: &mut Reply,
-) -> Result<(), RpcError> {
-    let (index, _) = find(table, privileged, arg)?;
+pub fn id(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+    let (index, _) = find(table, arg)?;
     put(out, &(index as u16).to_le_bytes())
 }
 
 /// `rpc.info`: the metadata of the method with a name.
-pub fn info(
-    table: &[RpcSpec],
-    privileged: bool,
-    arg: &[u8],
-    out: &mut Reply,
-) -> Result<(), RpcError> {
-    let (_, spec) = find(table, privileged, arg)?;
-    put(out, &spec.legacy_metadata().to_le_bytes())
+pub fn info(table: &[RpcSpec], arg: &[u8], out: &mut Reply) -> Result<(), RpcError> {
+    let (_, spec) = find(table, arg)?;
+    put(out, &spec.metadata().to_le_bytes())
 }
 
-/// `rpc.list` and `rpc.listinfo`: how many entries the session sees with no
-/// argument, or the name of the one at a position in that enumeration,
-/// preceded by its metadata for `rpc.listinfo`.
+/// `rpc.list` and `rpc.listinfo`: how many entries the table has with no
+/// argument, or the name of the one at an id, preceded by its metadata for
+/// `rpc.listinfo`.
 pub fn list(
     table: &[RpcSpec],
-    privileged: bool,
     arg: &[u8],
     with_info: bool,
     out: &mut Reply,
 ) -> Result<(), RpcError> {
     if arg.is_empty() {
-        let count = seen(table, privileged).count() as u16;
-        return put(out, &count.to_le_bytes());
+        return put(out, &(table.len() as u16).to_le_bytes());
     }
-    let spec = seen(table, privileged)
-        .nth(index(arg)?)
-        .ok_or(RpcError::Invalid)?;
+    let spec = table.get(index(arg)?).ok_or(RpcError::Invalid)?;
     if with_info {
-        put(out, &spec.legacy_metadata().to_le_bytes())?;
+        put(out, &spec.metadata().to_le_bytes())?;
     }
     put(out, spec.name.as_bytes())
 }
@@ -395,12 +394,7 @@ pub fn list(
 /// An empty argument is [`RpcError::Invalid`]. Byte-compatible with tl-chibi's
 /// `rpc_match`, down to its parser: only the first `|` separates, and a
 /// non-numeric tail after it still cuts the prefix but selects nothing.
-pub fn match_name(
-    table: &[RpcSpec],
-    privileged: bool,
-    args: &[u8],
-    out: &mut Reply,
-) -> Result<(), RpcError> {
+pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     if args.is_empty() {
         return Err(RpcError::Invalid);
     }
@@ -408,7 +402,8 @@ pub fn match_name(
         Some(bar) => (&args[..bar], match_index(&args[bar + 1..])),
         None => (args, None),
     };
-    let mut matches = seen(table, privileged)
+    let mut matches = table
+        .iter()
         .map(|spec| spec.name)
         .filter(|name| name.as_bytes().starts_with(prefix));
 
@@ -449,18 +444,14 @@ fn index(arg: &[u8]) -> Result<usize, RpcError> {
     Ok(usize::from(u16::from_le_bytes(bytes)))
 }
 
-fn find<'t>(
-    table: &'t [RpcSpec],
-    privileged: bool,
-    name: &[u8],
-) -> Result<(usize, &'t RpcSpec), RpcError> {
+fn find<'t>(table: &'t [RpcSpec], name: &[u8]) -> Result<(usize, &'t RpcSpec), RpcError> {
     if name.is_empty() {
         return Err(RpcError::Invalid);
     }
     table
         .iter()
         .enumerate()
-        .find(|(_, spec)| spec.access.visible(privileged) && spec.name.as_bytes() == name)
+        .find(|(_, spec)| spec.name.as_bytes() == name)
         .ok_or(RpcError::Invalid)
 }
 
@@ -482,7 +473,7 @@ mod tests {
     use super::*;
 
     /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x2c69_6152;
+    const HASH: u32 = 0x909e_9b78;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -506,48 +497,42 @@ mod tests {
     }
 
     #[test]
-    fn legacy_metadata_matches_firmware_encoding() {
+    fn metadata_matches_firmware_encoding() {
         let spec = RpcSpec::prop("test.amplitude", Kind::Float(8), Access::RW);
-        assert_eq!(
-            spec.legacy_metadata(),
-            0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200
-        );
+        assert_eq!(spec.metadata(), 0x8000 | (8 << 4) | 2 | 0x0100 | 0x0200);
 
         let [hash, stop, enable] = table();
-        assert_eq!(hash.legacy_metadata(), 0x8000 | (4 << 4) | 0x0100);
-        assert_eq!(stop.legacy_metadata(), 0x8000);
-        assert_eq!(
-            enable.legacy_metadata(),
-            0x8000 | (1 << 4) | 4 | 0x0100 | 0x0200
-        );
+        assert_eq!(hash.metadata(), 0x8000 | (4 << 4) | 0x0100);
+        assert_eq!(stop.metadata(), 0x8000);
+        assert_eq!(enable.metadata(), 0x8000 | (1 << 4) | 4 | 0x0100 | 0x0200);
 
         let spec = RpcSpec::std("rpc.list", Access::RW);
-        assert_eq!(spec.legacy_metadata(), 0);
+        assert_eq!(spec.metadata(), 0);
         let spec = RpcSpec::prop("wide", Kind::Uint(16), Access::RW);
-        assert_eq!(spec.legacy_metadata(), 0);
+        assert_eq!(spec.metadata(), 0);
     }
 
     #[test]
     fn hash_covers_name_flags_desc_signature() {
         let table = table();
-        let base = hash(&table, true);
-        assert_eq!(base, hash(&table.clone(), true));
+        let base = hash(&table);
+        assert_eq!(base, hash(&table.clone()));
 
         let mut renamed = table.clone();
         renamed[0].name = "a.x";
-        assert_ne!(base, hash(&renamed, true));
+        assert_ne!(base, hash(&renamed));
 
         let mut reflagged = table.clone();
         reflagged[1].access = reflagged[1].access | Access::PERSISTENT;
-        assert_ne!(base, hash(&reflagged, true));
+        assert_ne!(base, hash(&reflagged));
 
         let mut redesc = table.clone();
         redesc[0].desc = "described";
-        assert_ne!(base, hash(&redesc, true));
+        assert_ne!(base, hash(&redesc));
 
         let mut resig = table;
         resig[0].signature = "u32";
-        assert_ne!(base, hash(&resig, true));
+        assert_ne!(base, hash(&resig));
     }
 
     #[test]
@@ -555,12 +540,7 @@ mod tests {
         assert_eq!(STANDARD.len(), 38);
         assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
         assert_eq!(STANDARD.last().unwrap().name, "dev.priv.password");
-        assert_eq!(hash(STANDARD, true), HASH);
-        assert_eq!(
-            hash(STANDARD, false),
-            0xdd20_1bb0,
-            "the four developer entries are invisible to a customer"
-        );
+        assert_eq!(hash(STANDARD), HASH);
     }
 
     #[test]
@@ -571,32 +551,41 @@ mod tests {
             &STANDARD[STANDARD.len() - 1],
         ];
         assert_eq!(unlock.name, "dev.priv");
-        assert!(unlock.access.contains(Access::HIDDEN) && !unlock.access.is_privileged());
+        assert!(
+            !unlock.access.is_privileged(),
+            "a locked session unlocks it"
+        );
         assert_eq!(lock.name, "dev.priv.lock");
         assert!(lock.access.is_privileged());
         assert_eq!(password.name, "dev.priv.password");
-        assert!(password.access.is_privileged() && password.access.contains(Access::PERSISTENT));
+        assert_eq!(
+            password.metadata(),
+            0x8000 | 3 | 0x0200 | 0x0400 | 0x4000,
+            "written only, unlocked, and never read or announced"
+        );
     }
 
+    /// A setting or report is announced and nothing else is, so a host caches
+    /// exactly those, and every privileged standard entry is protocol.
     #[test]
-    fn privileged_access_moves_the_read_and_write_bits_as_tl_chibi_does() {
-        assert_eq!(Access::RW.privileged(), Access(0xC));
-        assert_eq!(Access::WRITE.privileged(), Access(0x8));
+    fn the_channel_decides_what_is_announced_and_privileged() {
+        for (index, spec) in STANDARD.iter().enumerate() {
+            let channel = Std::at(index).unwrap().channel();
+            assert_eq!(
+                spec.access.contains(Access::ANNOUNCED),
+                matches!(channel, Channel::Setting | Channel::Report),
+                "{}",
+                spec.name
+            );
+            assert!(!spec.access.is_privileged() || channel == Channel::Protocol);
+        }
+        assert_eq!(Std::Uptime.channel(), Channel::Protocol);
+        assert_eq!(Std::Systime.channel(), Channel::Protocol);
+        let mcu = &STANDARD[Std::Mcu as usize];
         assert_eq!(
-            Access::RW.union(Access::PERSISTENT).privileged(),
-            Access(0x2C)
-        );
-        assert_eq!(Access::RW.privileged().granted(), Access(0xF));
-        assert!(Access::NONE.is_privileged());
-        assert!(!Access::READ.is_privileged());
-        assert!(!Access::RW.union(Access::HIDDEN).visible(false));
-        assert!(Access::RW.union(Access::HIDDEN).visible(true));
-        assert_eq!(
-            RpcSpec::prop("p", Kind::Uint(4), Access::RW)
-                .privileged()
-                .legacy_metadata(),
-            RpcSpec::prop("p", Kind::Uint(4), Access::RW).legacy_metadata(),
-            "a session that sees a privileged entry reads it as readable and writable"
+            mcu.metadata(),
+            0x8000 | 3 | 0x0100 | 0x2000,
+            "a public report"
         );
     }
 
@@ -610,7 +599,7 @@ mod tests {
     #[test]
     fn hash_is_the_iso_hdlc_crc_of_the_entries() {
         let table = [RpcSpec::std("a", Access::NONE)];
-        assert_eq!(hash(&table, true), CRC32.checksum(b"a\x01\0\0\0"));
+        assert_eq!(hash(&table), CRC32.checksum(b"a\x01\0\0\0"));
     }
 
     fn answer(call: impl FnOnce(&mut Reply) -> Result<(), RpcError>) -> Result<Vec<u8>, RpcError> {
@@ -623,43 +612,40 @@ mod tests {
         let table = table();
 
         assert_eq!(
-            answer(|out| list(&table, true, &[], false, out)),
+            answer(|out| list(&table, &[], false, out)),
             Ok(3u16.to_le_bytes().to_vec())
         );
 
         assert_eq!(
-            answer(|out| name(&table, true, &1u16.to_le_bytes(), out)),
+            answer(|out| name(&table, &1u16.to_le_bytes(), out)),
             Ok(b"dev.stop".to_vec())
         );
         assert_eq!(
-            answer(|out| name(&table, true, &3u16.to_le_bytes(), out)),
+            answer(|out| name(&table, &3u16.to_le_bytes(), out)),
             Err(RpcError::Invalid)
         );
         assert_eq!(
-            answer(|out| name(&table, true, &[1], out)),
+            answer(|out| name(&table, &[1], out)),
             Err(RpcError::ArgsSize)
         );
 
         assert_eq!(
-            answer(|out| id(&table, true, b"test.enable", out)),
+            answer(|out| id(&table, b"test.enable", out)),
             Ok(2u16.to_le_bytes().to_vec())
         );
+        assert_eq!(answer(|out| id(&table, b"", out)), Err(RpcError::Invalid));
         assert_eq!(
-            answer(|out| id(&table, true, b"", out)),
-            Err(RpcError::Invalid)
-        );
-        assert_eq!(
-            answer(|out| id(&table, true, b"nope", out)),
+            answer(|out| id(&table, b"nope", out)),
             Err(RpcError::Invalid)
         );
 
         assert_eq!(
-            answer(|out| info(&table, true, b"dev.stop", out)),
+            answer(|out| info(&table, b"dev.stop", out)),
             Ok(0x8000u16.to_le_bytes().to_vec())
         );
 
-        let listed = answer(|out| list(&table, true, &2u16.to_le_bytes(), true, out)).unwrap();
-        assert_eq!(&listed[..2], &table[2].legacy_metadata().to_le_bytes());
+        let listed = answer(|out| list(&table, &2u16.to_le_bytes(), true, out)).unwrap();
+        assert_eq!(&listed[..2], &table[2].metadata().to_le_bytes());
         assert_eq!(&listed[2..], b"test.enable");
     }
 
@@ -685,7 +671,7 @@ mod tests {
 
     fn matched(args: &[u8]) -> Result<Reply, RpcError> {
         let mut out = Reply::new();
-        match_name(&named(), true, args, &mut out).map(|()| out)
+        match_name(&named(), args, &mut out).map(|()| out)
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::tio::rpc::RpcDecodeError;
 
 /// A device's refusal of an RPC, with its error code and message.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{error}")]
+#[error("{error}{}", said(.extra))]
 pub struct RpcErrorPayload {
     /// The code.
     pub error: wire::RpcError,
@@ -19,6 +19,14 @@ impl RpcErrorPayload {
             error: error.error(),
             extra: error.message.to_vec(),
         }
+    }
+}
+
+/// The message a device sent after its code, behind a colon, or nothing.
+fn said(extra: &[u8]) -> String {
+    match extra {
+        [] => String::new(),
+        message => format!(": {}", String::from_utf8_lossy(message)),
     }
 }
 
@@ -45,4 +53,23 @@ pub enum CallError {
     /// The reply did not decode as the expected type.
     #[error("RPC reply did not match expected type: {0}")]
     InvalidReply(#[source] RpcDecodeError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refusal shows the message a device sent after its code.
+    #[test]
+    fn a_refusal_shows_its_message() {
+        let refused = |extra: &[u8]| RpcErrorPayload {
+            error: wire::RpcError::State,
+            extra: extra.to_vec(),
+        };
+        assert_eq!(
+            refused(b"privileged: unlock with dev.priv").to_string(),
+            "wrong device state: privileged: unlock with dev.priv"
+        );
+        assert_eq!(refused(b"").to_string(), "wrong device state");
+    }
 }

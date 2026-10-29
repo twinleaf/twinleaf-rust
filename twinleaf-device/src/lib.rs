@@ -29,11 +29,12 @@
 //! | Report, a [read-only](rpc::Setting::read_only) setting | users, apps | state with a latest value, announced on change as [`refresh`](device::Group::refresh) moves it, never periodic |
 //! | [Stream](data) | users, apps | anything sampled on the device clock |
 //! | Log | users, developers | one packet per occurrence, rate-limited |
-//! | [`Diagnostic`](device::Diagnostic) | developers | read when asked, always privileged and hidden, never announced, not a stable interface |
+//! | [`Diagnostic`](device::Diagnostic) | developers | read when asked, always privileged, never announced, not a stable interface |
 //!
 //! Would an app user want to see it? If not, it is a diagnostic. If so, what
 //! is configured is a setting, state a report, what is sampled over time a
-//! stream, and an occurrence a log.
+//! stream, and an occurrence a log. The standard table also holds protocol
+//! and actions; [`rpc::Channel`] classifies every entry of it.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
