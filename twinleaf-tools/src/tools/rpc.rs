@@ -4,6 +4,8 @@
 use std::io::Write;
 
 use crate::{ProxyHelp, RPCSubcommands, RpcCli, TioOpts};
+use clap::Subcommand;
+use color_eyre::Help;
 use eyre::WrapErr;
 use serde_json::{json, Value};
 use twinleaf::device::rpc::{
@@ -358,10 +360,16 @@ fn call_and_print(device: &Device, cli: &RpcCli) -> eyre::Result<()> {
         (Some(_), None) => unreachable!("req_type is set whenever rpc_arg is present"),
     };
 
-    let reply = device
+    let called = device
         .raw_rpc(rpc_name, &arg_bytes)
-        .wrap_err_with(|| format!("RPC {} failed", rpc_name))
-        .with_proxy_help()?;
+        .wrap_err_with(|| format!("RPC {} failed", rpc_name));
+    // Clap reads a subcommand's name as an RPC name once an option comes first.
+    let reply = match RPCSubcommands::has_subcommand(rpc_name) {
+        true => called.suggestion(format!(
+            "put options after it: `tio rpc {rpc_name} -r <url>`"
+        )),
+        false => called.with_proxy_help(),
+    }?;
 
     if !reply.is_empty() {
         let rep_type = cli
