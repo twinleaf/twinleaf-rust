@@ -138,7 +138,7 @@ pub struct LogHdfCli {
     #[arg(short = 'g', long = "glob")]
     pub filter: Option<String>,
 
-    /// Enable deflate compression (saves space, slows down write significantly)
+    /// Compress tables with shuffle and deflate (saves space, slows down writes)
     #[arg(short = 'c', long = "compress")]
     pub compress: bool,
 
