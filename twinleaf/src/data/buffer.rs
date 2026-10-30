@@ -7,8 +7,9 @@
 //! still-accumulating rows they ask for.
 
 use super::coalesce::BatchCoalescer;
+use super::continuity::Generations;
 use super::metadata::{effective_rate, ColumnKey, StreamKey, StreamMetadataSnapshot};
-use super::sample::{Generations, SampleBatch};
+use super::sample::SampleBatch;
 use crate::proto::data as wire;
 use crate::proto::{ColumnId, SampleNumber};
 use std::collections::{HashMap, VecDeque};

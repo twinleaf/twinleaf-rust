@@ -3,9 +3,10 @@
 //! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
+use super::continuity::{BoundaryClass, BoundaryReason};
 use super::metadata::{effective_rate, DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{sample_time, BoundaryClass, BoundaryReason, RowSource, SampleBatch};
+use super::sample::{sample_time, RowSource, SampleBatch};
 use super::state::{DataError, ScannedRows};
 use crate::proto::data as wire;
 use crate::tio::{self, Packet};
@@ -573,8 +574,8 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::Generations;
     use crate::data::fixtures::{column, device, segment, stream};
-    use crate::data::sample::Generations;
     use crate::data::state::StreamDataError;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;

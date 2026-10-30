@@ -4,14 +4,13 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
+use super::continuity::{BoundaryReason, Generations};
+use super::decode::{decode_samples, decodes};
 use super::metadata::{
     effective_rate, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery,
     SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord, StreamSchema,
 };
-use super::sample::{
-    decodes, native_types, sample_time, BatchContext, BoundaryReason, ColumnBuilder, Generations,
-    RowSource, SampleBatchBuilder,
-};
+use super::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::heartbeat::Heartbeat;
@@ -1059,30 +1058,6 @@ impl ScannedRows<'_> {
     }
 }
 
-/// Appends the value `offset` bytes into each sample of `samples`, which
-/// packs samples `stride` bytes apart, to `values`. The column's type decides
-/// the loop once, so each value is a plain load.
-fn decode_column(values: &mut ColumnBuilder, samples: &[u8], stride: usize, offset: usize) {
-    macro_rules! decode {
-        ($($variant:ident $native:ty),* $(,)?) => {
-            match values {
-                $(
-                    ColumnBuilder::$variant(values) => {
-                        values.extend(samples.chunks_exact(stride).map(|sample| {
-                            <$native>::from_le_bytes(
-                                sample[offset..offset + size_of::<$native>()]
-                                    .try_into()
-                                    .expect("a value of its own size"),
-                            )
-                        }))
-                    }
-                )*
-            }
-        };
-    }
-    native_types!(decode)
-}
-
 impl RowSource for ScannedRows<'_> {
     fn len(&self) -> usize {
         self.row_count
@@ -1116,13 +1091,7 @@ impl RowSource for ScannedRows<'_> {
     }
 
     fn append_to(&self, tail: &mut SampleBatchBuilder) {
-        let sample_size = usize::from(self.schema.stream().sample_size());
-        let samples = &self.encoded[..self.row_count * sample_size];
         let columns = tail.push_samples(self.first_sample_n, self.row_count);
-        let mut offset = 0;
-        for (column, values) in self.schema.columns().zip(columns) {
-            decode_column(values, samples, sample_size, offset);
-            offset += column.data_type().size();
-        }
+        decode_samples(self.schema, self.encoded, self.row_count, columns);
     }
 }

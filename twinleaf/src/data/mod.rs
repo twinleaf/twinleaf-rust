@@ -141,6 +141,8 @@ println!("{} samples", writer.finish()?.total_samples);
 
 mod buffer;
 mod coalesce;
+mod continuity;
+mod decode;
 mod filter;
 mod metadata;
 mod parser;
@@ -163,6 +165,7 @@ mod fixtures;
 #[doc(no_inline)]
 pub use crate::proto::data::DataType;
 pub use buffer::{Buffer, Run};
+pub use continuity::{BoundaryClass, BoundaryReason, Generations};
 pub use filter::ColumnFilter;
 pub use metadata::{
     ColumnKey, DeviceMetadataSnapshot, MetadataQuery, StreamKey, StreamMetadataSnapshot,
@@ -172,8 +175,5 @@ pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub(crate) use sample::RowSource;
-pub use sample::{
-    BoundaryClass, BoundaryReason, ColumnArray, ColumnData, Generations, SampleBatch, SampleRow,
-    ScalarBuffer,
-};
+pub use sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
 pub use state::{DataError, StreamDataError};

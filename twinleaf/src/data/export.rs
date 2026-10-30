@@ -31,9 +31,10 @@
 //! decides which breaks start a new run at all. [`RunSplitLevel`] decides
 //! which streams roll to a new table when one does.
 
+use super::continuity::{BoundaryReason, Generations};
 use super::filter::ColumnFilter;
 use super::metadata::{StreamKey, StreamMetadataSnapshot};
-use super::sample::{native_types, BoundaryReason, ColumnArray, Generations, SampleBatch};
+use super::sample::{native_types, ColumnArray, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
@@ -687,7 +688,7 @@ fn hdf_name_component(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnData, SampleBatchBuilder};
+    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::proto::data::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -6,7 +6,8 @@
 //! merge only while they carry the same metadata and generations, and rows
 //! that start at a boundary form a batch of their own.
 
-use super::sample::{Generations, RowSource, SampleBatch, SampleBatchBuilder};
+use super::continuity::Generations;
+use super::sample::{RowSource, SampleBatch, SampleBatchBuilder};
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -104,9 +105,10 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::BoundaryReason;
     use crate::data::fixtures;
     use crate::data::metadata::StreamMetadataSnapshot;
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData};
+    use crate::data::sample::{BatchContext, ColumnArray, ColumnData};
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;

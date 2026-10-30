@@ -345,9 +345,10 @@ impl Batcher {
 mod tests {
     use super::*;
     use crate::data::buffer::Buffer;
+    use crate::data::continuity::{BoundaryClass, BoundaryReason, Generations};
     use crate::data::fixtures;
     use crate::data::metadata::ColumnKey;
-    use crate::data::sample::{BoundaryClass, BoundaryReason, ColumnData, Generations};
+    use crate::data::sample::ColumnData;
     use crate::data::state::StreamDataError;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};

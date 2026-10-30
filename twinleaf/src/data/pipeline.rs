@@ -1,8 +1,9 @@
 //! Incremental per-column computation driven by a [`Buffer`].
 
 use super::buffer::{Buffer, Run};
+use super::continuity::Generations;
 use super::metadata::ColumnKey;
-use super::sample::{ColumnArray, Generations};
+use super::sample::ColumnArray;
 use std::ops::Range;
 
 /// An incremental computation over one column's sample stream, such as
