@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// Why a well-formed packet cannot be applied to the data state.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum PacketError {
+pub enum DataError {
     /// A stream-data payload contradicts the metadata retained for its stream.
     ///
     /// The rows are dropped, but the retained metadata survives for later
@@ -111,17 +111,9 @@ pub enum StreamDataError {
     },
 }
 
-/// Result of validating stream data against the metadata learned so far.
-enum RowState<'a> {
-    WaitingForMetadata,
-    /// The stream has a column of a type this build cannot decode.
-    Unsupported,
-    Validated(ScannedRows<'a>),
-}
-
 /// Metadata and continuity state for one stream on one device.
 #[derive(Debug, Clone)]
-struct StreamState {
+struct StreamTracker {
     metadata: Option<StreamRecord>,
     segments: Vec<Option<SegmentRecord>>,
     columns: Vec<ColumnRecord>,
@@ -144,7 +136,7 @@ struct StreamState {
     effective_rate: f64,
 }
 
-impl StreamState {
+impl StreamTracker {
     fn new(key: StreamKey) -> Self {
         Self {
             metadata: None,
@@ -308,7 +300,7 @@ impl StreamState {
 
     /// Validates one encoded payload and updates continuity state.
     ///
-    /// Missing metadata yields `RowState::WaitingForMetadata`. A payload that
+    /// Missing metadata yields `PacketEvent::WaitingForMetadata`. A payload that
     /// contradicts complete metadata is an error.
     fn validate_rows<'a>(
         &'a mut self,
@@ -317,9 +309,9 @@ impl StreamState {
         device_generation: &mut u32,
         global_generation: &mut u32,
         metadata_revision: &mut u32,
-    ) -> Result<RowState<'a>, StreamDataError> {
+    ) -> Result<PacketEvent<'a>, StreamDataError> {
         let Some(stream_metadata) = self.metadata.clone() else {
-            return Ok(RowState::WaitingForMetadata);
+            return Ok(PacketEvent::WaitingForMetadata);
         };
         let stream = stream_metadata.get();
         let n_segments = stream.n_segments();
@@ -342,7 +334,7 @@ impl StreamState {
 
         let n_columns = usize::from(stream.n_columns());
         match self.columns.len().cmp(&n_columns) {
-            Ordering::Less => return Ok(RowState::WaitingForMetadata),
+            Ordering::Less => return Ok(PacketEvent::WaitingForMetadata),
             Ordering::Greater => {
                 return Err(StreamDataError::ColumnCount {
                     expected: n_columns,
@@ -358,7 +350,7 @@ impl StreamState {
             .iter()
             .all(|column| decodes(column.get().data_type()))
         {
-            return Ok(RowState::Unsupported);
+            return Ok(PacketEvent::Unsupported);
         }
 
         let sample_size = usize::from(stream.sample_size());
@@ -459,7 +451,7 @@ impl StreamState {
                     && seconds_at(next_sample) > seconds_at(next_sample - 1)
                     && data.segment_id == next_segment;
                 if !forced_rollover {
-                    return Ok(RowState::WaitingForMetadata);
+                    return Ok(PacketEvent::WaitingForMetadata);
                 }
                 rolled.start_time += seconds_at(next_sample) as u32;
                 rolled.segment_id = data.segment_id;
@@ -467,7 +459,7 @@ impl StreamState {
                     .expect("a re-timed copy of a retained record is the same length");
                 (rolled, true)
             }
-            (None, None) => return Ok(RowState::WaitingForMetadata),
+            (None, None) => return Ok(PacketEvent::WaitingForMetadata),
         };
         let segment = segment_record.get();
 
@@ -510,7 +502,7 @@ impl StreamState {
             .as_ref()
             .expect("a stream with every column has a schema");
         debug_assert!(schema.describes(&stream_metadata, &self.columns));
-        Ok(RowState::Validated(ScannedRows {
+        Ok(PacketEvent::Rows(ScannedRows {
             schema,
             device: device_metadata,
             segment: segment_record,
@@ -563,7 +555,7 @@ enum MetadataSource {
 struct DeviceState {
     route: DeviceRoute,
     metadata: Option<DeviceRecord>,
-    streams: Vec<Option<StreamState>>,
+    streams: Vec<Option<StreamTracker>>,
     ignore_session: bool,
     query_in_flight: bool,
     metadata_generation: u32,
@@ -591,13 +583,13 @@ impl DeviceState {
         self.metadata_revision = self.metadata_revision.wrapping_add(1);
     }
 
-    fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamState {
+    fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamTracker {
         let index = usize::from(stream_id.value());
         if self.streams.len() <= index {
             self.streams.resize_with(index + 1, || None);
         }
         let key = StreamKey::new(self.route, stream_id);
-        self.streams[index].get_or_insert_with(|| StreamState::new(key))
+        self.streams[index].get_or_insert_with(|| StreamTracker::new(key))
     }
 
     /// Bootstraps this route again after metadata contradicted the state used
@@ -608,7 +600,7 @@ impl DeviceState {
         *global_generation += 1;
     }
 
-    /// Resets every stream as [`StreamState::reset`] does, and opens a new
+    /// Resets every stream as [`StreamTracker::reset`] does, and opens a new
     /// device generation.
     fn reset(&mut self) {
         self.metadata = None;
@@ -792,12 +784,12 @@ impl DeviceState {
         &'a mut self,
         data: wire::Samples<'a>,
         global_generation: &mut u32,
-    ) -> Result<RowState<'a>, StreamDataError> {
+    ) -> Result<PacketEvent<'a>, StreamDataError> {
         let Some(device_metadata) = self.metadata.clone() else {
-            return Ok(RowState::WaitingForMetadata);
+            return Ok(PacketEvent::WaitingForMetadata);
         };
         if !self.accepts_stream(data.stream_id, global_generation) {
-            return Ok(RowState::WaitingForMetadata);
+            return Ok(PacketEvent::WaitingForMetadata);
         }
 
         let index = usize::from(data.stream_id.value());
@@ -806,7 +798,7 @@ impl DeviceState {
         }
         let key = StreamKey::new(self.route, data.stream_id);
         self.streams[index]
-            .get_or_insert_with(|| StreamState::new(key))
+            .get_or_insert_with(|| StreamTracker::new(key))
             .validate_rows(
                 data,
                 device_metadata,
@@ -912,6 +904,7 @@ impl DeviceState {
 pub(super) enum PacketEvent<'a> {
     Applied,
     WaitingForMetadata,
+    /// The stream has a column of a type this build cannot decode.
     Unsupported,
     Reset,
     Rows(ScannedRows<'a>),
@@ -952,7 +945,7 @@ impl ParseState {
     pub(super) fn apply_packet<'a>(
         &'a mut self,
         packet: &'a tio::Packet,
-    ) -> Result<PacketEvent<'a>, PacketError> {
+    ) -> Result<PacketEvent<'a>, DataError> {
         let route = packet.route();
 
         if let Some(status) = packet.link_status() {
@@ -969,18 +962,13 @@ impl ParseState {
         match packet.payload() {
             packet::Payload::Samples(data) => {
                 let index = self.device_index(route);
-                let state = self.devices[index]
+                self.devices[index]
                     .validate_stream_data(data, &mut self.global_generation)
-                    .map_err(|source| PacketError::Stream {
+                    .map_err(|source| DataError::Stream {
                         route,
                         stream_id: data.stream_id,
                         source,
-                    })?;
-                Ok(match state {
-                    RowState::WaitingForMetadata => PacketEvent::WaitingForMetadata,
-                    RowState::Unsupported => PacketEvent::Unsupported,
-                    RowState::Validated(rows) => PacketEvent::Rows(rows),
-                })
+                    })
             }
             _ => {
                 let index = self.device_index(route);
@@ -1053,22 +1041,6 @@ impl ScannedRows<'_> {
         self.schema.stream_key()
     }
 
-    pub(crate) fn boundary(&self) -> Option<&BoundaryReason> {
-        self.boundary.as_ref()
-    }
-
-    pub(crate) fn generations(&self) -> Generations {
-        self.generations
-    }
-
-    pub(crate) fn schema(&self) -> &Arc<StreamSchema> {
-        self.schema
-    }
-
-    pub(crate) fn segment(&self) -> &SegmentRecord {
-        &self.segment
-    }
-
     pub(crate) fn device(&self) -> &DeviceRecord {
         &self.device
     }
@@ -1080,10 +1052,6 @@ impl ScannedRows<'_> {
             self.device.clone(),
             self.segment.clone(),
         )
-    }
-
-    pub(crate) fn row_count(&self) -> usize {
-        self.row_count
     }
 
     pub(crate) fn sample_number_bounds(&self) -> (SampleNumber, SampleNumber) {
@@ -1121,11 +1089,11 @@ impl RowSource for ScannedRows<'_> {
     }
 
     fn boundary(&self) -> Option<&BoundaryReason> {
-        self.boundary()
+        self.boundary.as_ref()
     }
 
     fn generations(&self) -> Generations {
-        self.generations()
+        self.generations
     }
 
     fn schema(&self) -> &Arc<StreamSchema> {

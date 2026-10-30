@@ -5,8 +5,8 @@
 
 use super::metadata::{effective_rate, DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch};
-use super::state::{PacketError, ScannedRows};
+use super::sample::{sample_time, BoundaryClass, BoundaryReason, RowSource, SampleBatch};
+use super::state::{DataError, ScannedRows};
 use crate::proto::data as wire;
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
@@ -122,7 +122,7 @@ pub enum LogError {
         offset: usize,
         /// Why the packet could not be applied to the data state.
         #[source]
-        source: PacketError,
+        source: DataError,
     },
 }
 
@@ -313,11 +313,11 @@ impl LogSummary {
             });
         }
         let stream = runs.last_mut().expect("a run was just opened if empty");
-        stream.sample_count += rows.row_count() as u64;
+        stream.sample_count += rows.len() as u64;
 
         let (first_n, last_n) = rows.sample_number_bounds();
-        let first_timestamp = sample_time(rows.segment().get(), first_n.value() + 1);
-        let last_timestamp = sample_time(rows.segment().get(), last_n.value() + 1);
+        let first_timestamp = sample_time(rows.segment_record().get(), first_n.value() + 1);
+        let last_timestamp = sample_time(rows.segment_record().get(), last_n.value() + 1);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp
@@ -656,7 +656,7 @@ mod tests {
             index.summary().error(),
             Some(LogError::Data {
                 offset,
-                source: PacketError::Stream {
+                source: DataError::Stream {
                     source: StreamDataError::SegmentOutOfRange { .. },
                     ..
                 },

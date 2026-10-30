@@ -171,8 +171,9 @@ pub use metadata::{
 pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
+pub(crate) use sample::RowSource;
 pub use sample::{
     BoundaryClass, BoundaryReason, ColumnArray, ColumnData, Generations, SampleBatch, SampleRow,
     ScalarBuffer,
 };
-pub use state::{PacketError, StreamDataError};
+pub use state::{DataError, StreamDataError};

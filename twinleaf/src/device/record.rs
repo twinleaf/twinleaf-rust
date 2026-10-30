@@ -8,7 +8,7 @@
 use super::connection::DeviceTree;
 use super::session::RawCallResult;
 use super::stream::{Completed, MetadataSchedule, Receiver, RecvError};
-use crate::data::{BoundaryReason, MetadataQuery, PacketParser};
+use crate::data::{BoundaryReason, MetadataQuery, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use crate::tio::packet;

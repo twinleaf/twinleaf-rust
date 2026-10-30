@@ -6,8 +6,8 @@
 
 use super::coalesce::BatchCoalescer;
 use super::metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
-use super::sample::SampleBatch;
-use super::state::{PacketError, PacketEvent, ParseState, ScannedRows};
+use super::sample::{RowSource, SampleBatch};
+use super::state::{DataError, PacketEvent, ParseState, ScannedRows};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use std::collections::{HashMap, VecDeque};
@@ -150,10 +150,10 @@ impl PacketParser {
     ///
     /// # Errors
     ///
-    /// Returns a [`PacketError`] if stream data contradicts the metadata
+    /// Returns a [`DataError`] if stream data contradicts the metadata
     /// retained for its stream. The packet's rows are dropped, and the
     /// metadata stays for later packets.
-    pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, PacketError> {
+    pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, DataError> {
         Ok(match self.state.apply_packet(packet)? {
             PacketEvent::Applied => PacketOutcome::Applied,
             PacketEvent::WaitingForMetadata => PacketOutcome::WaitingForMetadata,
@@ -174,7 +174,7 @@ impl PacketParser {
     pub(crate) fn scan_packet<'a>(
         &'a mut self,
         packet: &'a tio::Packet,
-    ) -> Result<Option<ScannedRows<'a>>, PacketError> {
+    ) -> Result<Option<ScannedRows<'a>>, DataError> {
         Ok(match self.state.apply_packet(packet)? {
             PacketEvent::Rows(rows) => Some(rows),
             PacketEvent::Applied
@@ -294,7 +294,7 @@ impl Batcher {
     /// Decodes validated rows into their stream's coalescer and collects the
     /// batches it completes. Returns the number of rows.
     fn queue(&mut self, input: ScannedRows<'_>) -> usize {
-        let rows = input.row_count();
+        let rows = input.len();
         let key = input.stream_key();
         let global_generation = input.generations().global;
         // A stream's own continuity is the coalescer's business; the parser only
@@ -747,7 +747,7 @@ mod tests {
         // must not become the state the next packet is validated against.
         assert!(matches!(
             parser.push_packet(&stream_data_packet_in_segment(255, 0, vec![0; 4])),
-            Err(PacketError::Stream {
+            Err(DataError::Stream {
                 source: StreamDataError::SegmentOutOfRange { .. },
                 ..
             })
@@ -767,7 +767,7 @@ mod tests {
 
         assert!(matches!(
             parser.push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 8])),
-            Err(PacketError::Stream {
+            Err(DataError::Stream {
                 source: StreamDataError::SampleNumberOverflow { .. },
                 ..
             })

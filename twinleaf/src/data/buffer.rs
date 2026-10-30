@@ -167,7 +167,7 @@ impl Run {
             batch.schema() == self.metadata.schema(),
             "the parser guarantees a constant schema within a run"
         );
-        self.coalescer.push_batch(batch);
+        self.coalescer.push(batch);
         self.take_completed_chunks();
 
         self.metadata = batch.metadata().clone();

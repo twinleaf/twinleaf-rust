@@ -1068,7 +1068,7 @@ impl MetadataSelector {
 /// Why a `dev.metadata` request argument does not parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum MetadataQueryError {
+pub enum MetadataRequestError {
     /// Argument length is not a multiple of three.
     #[error("argument length is not a whole number of selectors")]
     Misaligned,
@@ -1080,24 +1080,24 @@ pub enum MetadataQueryError {
 /// The selectors of a `dev.metadata` request argument. An empty argument
 /// selects a device-chosen prefix of all records.
 #[derive(Debug, Clone, Copy)]
-pub struct MetadataQuery<'a> {
+pub struct MetadataRequest<'a> {
     arg: &'a [u8],
 }
 
-impl<'a> MetadataQuery<'a> {
+impl<'a> MetadataRequest<'a> {
     /// Parses the selectors of a request argument.
     ///
     /// # Errors
     ///
-    /// Returns [`MetadataQueryError::Misaligned`] if the length of `arg` is not
-    /// a multiple of three, and [`MetadataQueryError::TooManySelectors`] if it
-    /// holds more than [`MAX_METADATA_SELECTORS`].
-    pub fn parse(arg: &'a [u8]) -> Result<Self, MetadataQueryError> {
+    /// Returns [`MetadataRequestError::Misaligned`] if the length of `arg` is
+    /// not a multiple of three, and [`MetadataRequestError::TooManySelectors`]
+    /// if it holds more than [`MAX_METADATA_SELECTORS`].
+    pub fn parse(arg: &'a [u8]) -> Result<Self, MetadataRequestError> {
         if !arg.len().is_multiple_of(MetadataSelector::SIZE) {
-            return Err(MetadataQueryError::Misaligned);
+            return Err(MetadataRequestError::Misaligned);
         }
         if arg.len() / MetadataSelector::SIZE > MAX_METADATA_SELECTORS {
-            return Err(MetadataQueryError::TooManySelectors);
+            return Err(MetadataRequestError::TooManySelectors);
         }
         Ok(Self { arg })
     }
@@ -1736,31 +1736,31 @@ mod tests {
             MetadataSelector::column(1, 2),
         ];
         let arg: Vec<u8> = selectors.iter().flat_map(|s| s.encode()).collect();
-        let query = MetadataQuery::parse(&arg).unwrap();
-        assert!(!query.is_bootstrap());
-        assert_eq!(query.selectors().collect::<Vec<_>>(), selectors);
+        let request = MetadataRequest::parse(&arg).unwrap();
+        assert!(!request.is_bootstrap());
+        assert_eq!(request.selectors().collect::<Vec<_>>(), selectors);
     }
 
     #[test]
-    fn the_empty_query_is_the_bootstrap_and_selects_nothing_explicitly() {
-        let query = MetadataQuery::parse(&[]).unwrap();
-        assert!(query.is_bootstrap());
-        assert_eq!(query.selectors().count(), 0);
+    fn the_empty_request_is_the_bootstrap_and_selects_nothing_explicitly() {
+        let request = MetadataRequest::parse(&[]).unwrap();
+        assert!(request.is_bootstrap());
+        assert_eq!(request.selectors().count(), 0);
     }
 
     #[test]
     fn a_query_rejects_misaligned_or_oversized_arguments() {
         assert_eq!(
-            MetadataQuery::parse(&[1, 0]).unwrap_err(),
-            MetadataQueryError::Misaligned
+            MetadataRequest::parse(&[1, 0]).unwrap_err(),
+            MetadataRequestError::Misaligned
         );
         let oversized = [0u8; (MAX_METADATA_SELECTORS + 1) * MetadataSelector::SIZE];
         assert_eq!(
-            MetadataQuery::parse(&oversized).unwrap_err(),
-            MetadataQueryError::TooManySelectors
+            MetadataRequest::parse(&oversized).unwrap_err(),
+            MetadataRequestError::TooManySelectors
         );
         let full = [0u8; MAX_METADATA_SELECTORS * MetadataSelector::SIZE];
-        assert!(MetadataQuery::parse(&full).is_ok());
+        assert!(MetadataRequest::parse(&full).is_ok());
     }
 
     #[test]

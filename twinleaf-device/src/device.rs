@@ -1260,7 +1260,7 @@ mod tests {
     use super::*;
     use crate::data::filter::Butterworth4;
     use crate::data::Params;
-    use crate::data::{ColumnDef, Stream, StreamDef};
+    use crate::data::{ColumnDef, DataStream, StreamDef};
     use crate::rpc::put;
     use core::num::NonZeroU32;
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -1513,7 +1513,7 @@ mod tests {
     /// One device, the streams it describes, and the two lanes.
     struct Harness {
         device: Device<Board>,
-        streams: [Stream<4>; 1],
+        streams: [DataStream<4>; 1],
         lanes: Both,
         reboot: bool,
         deferred: Option<(RpcRequestId, Deferred)>,
@@ -1553,7 +1553,7 @@ mod tests {
         };
         Harness {
             device: device(table()),
-            streams: [Stream::new(
+            streams: [DataStream::new(
                 StreamId::new(1),
                 &AUX,
                 Box::leak(Box::new(Butterworth4::<1>::new())),
@@ -2976,7 +2976,7 @@ mod tests {
 
         let asked = asking(Method::ByName(b"board.filler000"), &1u32.to_le_bytes(), &[]);
         let (view, _) = PacketView::parse_prefix(&asked).unwrap();
-        let none: [Stream<4>; 0] = [];
+        let none: [DataStream<4>; 0] = [];
         let mut lanes = Both::default();
         device.handle(&none[..], Input::Packet(view), BOOT, &mut lanes);
         assert_eq!(lanes.to.value(), &1u32.to_le_bytes(), "the write it owes");

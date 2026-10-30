@@ -66,7 +66,7 @@ pub const fn float_columns(columns: &[ColumnDef]) -> usize {
 }
 
 /// One data stream with `N` segments.
-pub struct Stream<const N: usize> {
+pub struct DataStream<const N: usize> {
     id: StreamId,
     def: &'static StreamDef,
     segments: Segments<N>,
@@ -75,7 +75,7 @@ pub struct Stream<const N: usize> {
     tuned: Option<SegmentId>,
 }
 
-impl<const N: usize> Stream<N> {
+impl<const N: usize> DataStream<N> {
     /// A stopped stream decimating through `filter`, `None` if its sample does
     /// not fit a packet or it has more than [`MAX_COLUMNS`] float columns.
     pub fn new(
@@ -237,7 +237,7 @@ impl<const N: usize> Stream<N> {
 }
 
 /// A device's streams, in the order it describes them.
-impl<const N: usize> Streams for [Stream<N>] {
+impl<const N: usize> Streams for [DataStream<N>] {
     fn ids(&self) -> impl Iterator<Item = u8> {
         self.iter().map(|stream| stream.id.value())
     }
@@ -288,7 +288,7 @@ fn filtered<'a>(
     &buf[..sample.len()]
 }
 
-fn find<const N: usize>(streams: &[Stream<N>], stream_id: u8) -> Option<&Stream<N>> {
+fn find<const N: usize>(streams: &[DataStream<N>], stream_id: u8) -> Option<&DataStream<N>> {
     streams.iter().find(|stream| stream.id.value() == stream_id)
 }
 
@@ -426,19 +426,19 @@ mod tests {
         }
     }
 
-    fn streams() -> [Stream<4>; 2] {
+    fn streams() -> [DataStream<4>; 2] {
         [
-            Stream::new(StreamId::new(1), &SINE, butterworth::<0>(), params(10)).unwrap(),
-            Stream::new(StreamId::new(2), &STATUS, butterworth::<0>(), params(10)).unwrap(),
+            DataStream::new(StreamId::new(1), &SINE, butterworth::<0>(), params(10)).unwrap(),
+            DataStream::new(StreamId::new(2), &STATUS, butterworth::<0>(), params(10)).unwrap(),
         ]
     }
 
-    fn decimated(filter: &'static mut dyn Filter, decimation: u32) -> Stream<4> {
+    fn decimated(filter: &'static mut dyn Filter, decimation: u32) -> DataStream<4> {
         let params = Params {
             decimation: NonZeroU32::new(decimation).unwrap(),
             ..params(10)
         };
-        let mut stream = Stream::new(StreamId::new(1), &STEP, filter, params).unwrap();
+        let mut stream = DataStream::new(StreamId::new(1), &STEP, filter, params).unwrap();
         stream.start(timeref()).unwrap();
         stream
     }
@@ -447,7 +447,7 @@ mod tests {
         Timeref::new(Epoch::UNIX, 1000, SessionId::new(3), "S1").unwrap()
     }
 
-    fn started() -> [Stream<4>; 2] {
+    fn started() -> [DataStream<4>; 2] {
         let timeref = timeref();
         let mut streams = streams();
         streams
@@ -474,8 +474,12 @@ mod tests {
         };
         assert_eq!(SINE.sample_size(), 16);
         let params = params(10);
-        assert!(Stream::<4>::new(StreamId::new(1), &WIDE, butterworth::<0>(), params).is_none());
-        assert!(Stream::<4>::new(StreamId::new(1), &EMPTY, butterworth::<0>(), params).is_none());
+        assert!(
+            DataStream::<4>::new(StreamId::new(1), &WIDE, butterworth::<0>(), params).is_none()
+        );
+        assert!(
+            DataStream::<4>::new(StreamId::new(1), &EMPTY, butterworth::<0>(), params).is_none()
+        );
     }
 
     #[test]
@@ -494,9 +498,10 @@ mod tests {
 
     #[test]
     fn a_batched_stream_sends_short_packets() {
-        let mut stream = Stream::<4>::new(StreamId::new(1), &SINE, butterworth::<0>(), params(10))
-            .unwrap()
-            .batched(32);
+        let mut stream =
+            DataStream::<4>::new(StreamId::new(1), &SINE, butterworth::<0>(), params(10))
+                .unwrap()
+                .batched(32);
         stream.start(timeref()).unwrap();
         let mut sent = Sent::default();
         (0..3).for_each(|_| stream.push(&[0; 16], &mut sent));
@@ -569,7 +574,7 @@ mod tests {
         let mut sent = Sent::default();
         (0..5).for_each(|_| streams[0].push(&[0; 16], &mut sent));
         streams[0].retune(params(20));
-        let current = |streams: &[Stream<4>]| {
+        let current = |streams: &[DataStream<4>]| {
             let record = streams.segment(1, CURRENT_SEGMENT).unwrap();
             (
                 record.segment_id.value(),
@@ -696,7 +701,7 @@ mod tests {
     /// it carries now, not the one it carried the first time.
     #[test]
     fn a_reused_segment_retunes_the_filter() {
-        let mut stream = Stream::<3>::new(
+        let mut stream = DataStream::<3>::new(
             StreamId::new(1),
             &STEP,
             butterworth::<1>(),
@@ -734,7 +739,7 @@ mod tests {
             ..params(10)
         };
         let mut stream =
-            Stream::<4>::new(StreamId::new(1), &MIXED, butterworth::<1>(), params).unwrap();
+            DataStream::<4>::new(StreamId::new(1), &MIXED, butterworth::<1>(), params).unwrap();
         stream.start(timeref()).unwrap();
         let mut sent = Sent::default();
         let mut sample = [0u8; 16];
@@ -764,7 +769,7 @@ mod tests {
         assert_eq!(WIDE.float_columns(), MAX_COLUMNS + 1);
         assert!(WIDE.sample_size() <= MAX_SAMPLE_BYTES);
         assert!(
-            Stream::<4>::new(StreamId::new(1), &WIDE, butterworth::<9>(), params(10)).is_none()
+            DataStream::<4>::new(StreamId::new(1), &WIDE, butterworth::<9>(), params(10)).is_none()
         );
     }
 

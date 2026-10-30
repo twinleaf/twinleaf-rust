@@ -12,7 +12,7 @@ use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
 use twinleaf::proto::sync::Epoch;
 use twinleaf::proto::{BoardId, DeviceRoute, FirmwareMagic, HwRev, SessionId, StreamId};
-use twinleaf_device::data::{filter, ColumnDef, Params, Stream, StreamDef, Timeref};
+use twinleaf_device::data::{filter, ColumnDef, DataStream, Params, StreamDef, Timeref};
 use twinleaf_device::device::{
     self, Action, Actions, Announcer, Deferred, Entries, Entry, FlashOp, Group, Identity, Input,
     OneLane, Pending, SyncRequest,
@@ -345,7 +345,7 @@ pub(super) struct SimDevice {
     device: Device<Board>,
     /// The sine, status and aux streams, in id order. The first two take the
     /// main clock's samples, the last the aux clock's.
-    streams: [Stream<SEGMENTS>; 3],
+    streams: [DataStream<SEGMENTS>; 3],
     segment_seconds: u32,
     no_drop: bool,
     /// When the acquisition started, while it runs.
@@ -393,7 +393,7 @@ impl SimDevice {
             };
             // Each stream makes its filter once and keeps it for the whole run.
             let filter = Box::leak(Box::new(filter::None));
-            Stream::new(StreamId::new(id), def, filter, params).expect("a sample fits a packet")
+            DataStream::new(StreamId::new(id), def, filter, params).expect("a sample fits a packet")
         };
         let streams = [
             stream(1, &SINE, cli.samplerate),

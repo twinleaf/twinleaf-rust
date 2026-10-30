@@ -328,7 +328,7 @@ pub struct SampleBatch {
 
 /// Rows that can enter a batch coalescer. They describe the batch they would
 /// form and append themselves onto an accumulating builder.
-pub(super) trait RowSource {
+pub(crate) trait RowSource {
     fn len(&self) -> usize;
     fn boundary(&self) -> Option<&BoundaryReason>;
     fn generations(&self) -> Generations;
@@ -345,7 +345,7 @@ pub(super) trait RowSource {
 
 /// Accumulates decoded rows into a [`SampleBatch`], one row or one batch at a
 /// time.
-pub(super) struct SampleBatchBuilder {
+pub(crate) struct SampleBatchBuilder {
     context: BatchContext,
     sample_numbers: Vec<SampleNumber>,
     /// Each row's end-of-sample time, carried alongside its sample number.
