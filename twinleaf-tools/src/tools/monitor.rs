@@ -749,17 +749,14 @@ impl MonitorState {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
                     let key = StreamKey::new(*route, *sid);
                     if let Some(row) = buffer.latest_row(&key) {
-                        for (column_idx, _) in row.schema().iter().enumerate() {
+                        for column in row.schema() {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
                                 spec: ColumnKey {
                                     route: *route,
                                     stream_id: *sid,
-                                    column_id: twinleaf::ColumnId::new(
-                                        u8::try_from(column_idx)
-                                            .expect("wire schemas contain at most 256 columns"),
-                                    ),
+                                    column_id: column.index(),
                                 },
                             });
                         }
@@ -1413,9 +1410,7 @@ fn build_left_lines(
                         > stale_threshold(run.effective_rate())
                 });
                 let sample = row.row(0).expect("latest_row is one row");
-                for (col_idx, (column, value)) in
-                    row.schema().iter().zip(sample.values()).enumerate()
-                {
+                for (column, value) in row.schema().iter().zip(sample.values()) {
                     let metadata = column.metadata();
                     let nav_idx = global_idx;
                     global_idx += 1;
@@ -1431,10 +1426,7 @@ fn build_left_lines(
                     let plot_slot = app.plot_slots.get(&ColumnKey {
                         route: *route,
                         stream_id: sid,
-                        column_id: twinleaf::ColumnId::new(
-                            u8::try_from(col_idx)
-                                .expect("wire schemas contain at most 256 columns"),
-                        ),
+                        column_id: column.index(),
                     });
                     let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
                     let (val_str, val_f64) = fmt_value(&value);
