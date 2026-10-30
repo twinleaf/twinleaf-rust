@@ -5,11 +5,12 @@
 //! validated bytes immediately or retain only their metadata and boundaries.
 
 use super::metadata::{
-    decoded_buffer_type, effective_rate, BufferType, ColumnRecord, DeviceMetadataSnapshot,
-    DeviceRecord, MetadataQuery, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
+    effective_rate, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery,
+    SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
 };
 use super::sample::{
-    sample_time, BatchContext, BoundaryReason, Generations, RowSource, SampleBatchBuilder,
+    decodes, native_types, sample_time, BatchContext, BoundaryReason, ColumnBuilder, Generations,
+    RowSource, SampleBatchBuilder,
 };
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
@@ -112,6 +113,8 @@ pub enum StreamDataError {
 /// Result of validating stream data against the metadata learned so far.
 enum RowState<'a> {
     WaitingForMetadata,
+    /// The stream has a column of a type this build cannot decode.
+    Unsupported,
     Validated(ScannedRows<'a>),
 }
 
@@ -318,6 +321,15 @@ impl StreamState {
                 });
             }
             Ordering::Equal => {}
+        }
+        // A stream with a column this build cannot decode is refused whole,
+        // so every batch has one array per column of its stream.
+        if !self
+            .columns
+            .iter()
+            .all(|column| decodes(column.get().data_type()))
+        {
+            return Ok(RowState::Unsupported);
         }
 
         let sample_size = usize::from(stream.sample_size());
@@ -700,6 +712,12 @@ impl DeviceState {
                     None => {
                         let appended = index == stream.columns.len();
                         if appended {
+                            if !decodes(column.data_type()) {
+                                log::warn!(
+                                    "stream {stream_id} column {index} has data type {}, which this build cannot decode, so the stream is refused",
+                                    column.data_type()
+                                );
+                            }
                             stream.columns.push(incoming);
                         }
                         (false, appended)
@@ -871,6 +889,7 @@ impl DeviceState {
 pub(super) enum PacketEvent<'a> {
     Applied,
     WaitingForMetadata,
+    Unsupported,
     Reset,
     Rows(ScannedRows<'a>),
 }
@@ -938,6 +957,7 @@ impl ParseState {
                     })?;
                 Ok(match state {
                     RowState::WaitingForMetadata => PacketEvent::WaitingForMetadata,
+                    RowState::Unsupported => PacketEvent::Unsupported,
                     RowState::Validated(rows) => PacketEvent::Rows(rows),
                 })
             }
@@ -1020,15 +1040,6 @@ pub(crate) struct ScannedRows<'a> {
     columns: &'a [ColumnRecord],
 }
 
-/// One column of a decoded batch, with its byte offset within a sample, its
-/// wire type, the buffer its values land in, and its metadata.
-struct DecodableColumn<'a> {
-    offset: usize,
-    data_type: wire::DataType,
-    buffer_type: BufferType,
-    metadata: &'a ColumnRecord,
-}
-
 impl ScannedRows<'_> {
     pub(crate) fn stream_key(&self) -> StreamKey {
         self.key
@@ -1065,27 +1076,30 @@ impl ScannedRows<'_> {
     pub(crate) fn sample_number_bounds(&self) -> (SampleNumber, SampleNumber) {
         (self.first_sample_n, self.last_sample_n)
     }
+}
 
-    /// Returns the columns a batch can hold, in schema order. Columns whose
-    /// wire type this build cannot decode are left out.
-    fn decodable_columns(&self) -> impl Iterator<Item = DecodableColumn<'_>> {
-        self.columns
-            .iter()
-            .scan(0usize, |offset, metadata| {
-                let data_type = metadata.get().data_type();
-                let at = *offset;
-                *offset += data_type.size();
-                Some((at, data_type, metadata))
-            })
-            .filter_map(|(offset, data_type, metadata)| {
-                Some(DecodableColumn {
-                    offset,
-                    data_type,
-                    buffer_type: decoded_buffer_type(data_type)?,
-                    metadata,
-                })
-            })
+/// Appends the value `offset` bytes into each sample of `samples`, which
+/// packs samples `stride` bytes apart, to `values`. The column's type decides
+/// the loop once, so each value is a plain load.
+fn decode_column(values: &mut ColumnBuilder, samples: &[u8], stride: usize, offset: usize) {
+    macro_rules! decode {
+        ($($variant:ident $native:ty),* $(,)?) => {
+            match values {
+                $(
+                    ColumnBuilder::$variant(values) => {
+                        values.extend(samples.chunks_exact(stride).map(|sample| {
+                            <$native>::from_le_bytes(
+                                sample[offset..offset + size_of::<$native>()]
+                                    .try_into()
+                                    .expect("a value of its own size"),
+                            )
+                        }))
+                    }
+                )*
+            }
+        };
     }
+    native_types!(decode)
 }
 
 impl RowSource for ScannedRows<'_> {
@@ -1115,19 +1129,22 @@ impl RowSource for ScannedRows<'_> {
                 self.stream.clone(),
                 self.device.clone(),
             ),
-            self.decodable_columns()
-                .map(|column| (column.metadata.clone(), column.buffer_type)),
+            self.columns.iter().map(|record| {
+                let values = ColumnBuilder::for_type(record.get().data_type(), capacity)
+                    .expect("a stream with a column this build cannot decode is refused");
+                (record.clone(), values)
+            }),
             capacity,
         )
     }
 
     fn append_to(&self, tail: &mut SampleBatchBuilder) {
-        tail.push_packed(
-            self.first_sample_n,
-            &self.encoded[..self.row_count * self.sample_size],
-            self.sample_size,
-            self.decodable_columns()
-                .map(|column| (column.offset, column.data_type)),
-        );
+        let samples = &self.encoded[..self.row_count * self.sample_size];
+        let columns = tail.push_samples(self.first_sample_n, self.row_count);
+        let mut offset = 0;
+        for (record, values) in self.columns.iter().zip(columns) {
+            decode_column(values, samples, self.sample_size, offset);
+            offset += record.get().data_type().size();
+        }
     }
 }

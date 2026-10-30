@@ -14,11 +14,11 @@
 //!
 //! Every table starts with the same fields.
 //!
-//! | Field         | Type             | Source                      |
-//! |---------------|------------------|-----------------------------|
-//! | `sample`      | u32              | sample number               |
-//! | `time`        | f64              | end-of-sample timestamp     |
-//! | *column name* | f64, i64, or u64 | one field per stream column |
+//! | Field         | Type                     | Source                      |
+//! |---------------|--------------------------|-----------------------------|
+//! | `sample`      | u32                      | sample number               |
+//! | `time`        | f64                      | end-of-sample timestamp     |
+//! | *column name* | the column's wire type   | one field per stream column |
 //!
 //! Fields are little-endian at C-aligned offsets. Compression is byte shuffle
 //! then deflate, which every HDF5 reader decodes without a plugin.
@@ -33,7 +33,7 @@
 
 use super::filter::ColumnFilter;
 use super::metadata::{ColumnRecord, DeviceRecord, StreamKey, StreamRecord};
-use super::sample::{BoundaryReason, ColumnArray, Generations, SampleBatch, Series};
+use super::sample::{native_types, BoundaryReason, ColumnArray, Generations, SampleBatch, Series};
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
 use hdf5_pure::{
@@ -462,20 +462,35 @@ impl Hdf5Appender {
 
         // Create the compound table on first sight of this stream/run.
         if !self.tables.contains_key(&table_path) {
-            // `sample` is a u32 padded to 8 bytes, so every field after it is an
-            // aligned 8-byte value, the layout a C struct of these fields has.
-            let row_size = 16 + 8 * valid.len();
+            // Fields sit where a C struct of them would put them: each at a
+            // multiple of its own size, and the row padded to 8 bytes.
+            let mut offsets = Vec::with_capacity(valid.len());
+            let mut end: usize = 16;
+            for col in &valid {
+                let size = col.values().data_type().size();
+                let offset = end.next_multiple_of(size);
+                offsets.push(offset);
+                end = offset + size;
+            }
+            let row_size = end.next_multiple_of(8);
             let mut layout = CompoundTypeBuilder::with_size(row_size as u32)
                 .u32_field("sample", 0)
                 .f64_field("time", 8);
             let mut fields = vec![(0, FieldSource::Sample), (8, FieldSource::Time)];
-            for (i, col) in valid.iter().enumerate() {
-                let offset = 16 + 8 * i;
+            for (col, &offset) in valid.iter().zip(&offsets) {
                 let name = col.metadata().name();
+                let at = offset as u64;
                 layout = match col.values() {
-                    ColumnArray::F64(_) => layout.f64_field(name, offset as u64),
-                    ColumnArray::I64(_) => layout.i64_field(name, offset as u64),
-                    ColumnArray::U64(_) => layout.u64_field(name, offset as u64),
+                    ColumnArray::I8(_) => layout.i8_field(name, at),
+                    ColumnArray::U8(_) => layout.u8_field(name, at),
+                    ColumnArray::I16(_) => layout.i16_field(name, at),
+                    ColumnArray::U16(_) => layout.u16_field(name, at),
+                    ColumnArray::I32(_) => layout.i32_field(name, at),
+                    ColumnArray::U32(_) => layout.u32_field(name, at),
+                    ColumnArray::I64(_) => layout.i64_field(name, at),
+                    ColumnArray::U64(_) => layout.u64_field(name, at),
+                    ColumnArray::F32(_) => layout.f32_field(name, at),
+                    ColumnArray::F64(_) => layout.f64_field(name, at),
                 };
                 fields.push((offset, FieldSource::Column(col.index())));
             }
@@ -542,15 +557,7 @@ impl Hdf5Appender {
                     }
                     FieldSource::Column(col_id) => {
                         if let Some(col) = batch.schema().iter().find(|c| c.index() == *col_id) {
-                            for i in 0..n {
-                                let bytes = match col.values() {
-                                    ColumnArray::F64(v) => v[i].to_le_bytes(),
-                                    ColumnArray::I64(v) => v[i].to_le_bytes(),
-                                    ColumnArray::U64(v) => v[i].to_le_bytes(),
-                                };
-                                let base = i * row_size + offset;
-                                buf[base..base + 8].copy_from_slice(&bytes);
-                            }
+                            write_column(&mut buf, col.values(), row_size, offset);
                         }
                     }
                 }
@@ -620,6 +627,26 @@ impl Hdf5Appender {
     }
 }
 
+/// Writes each of `values` little-endian into the field `offset` bytes into
+/// its row of `rows`, which packs rows `row_size` bytes apart.
+fn write_column(rows: &mut [u8], values: &ColumnArray, row_size: usize, offset: usize) {
+    macro_rules! write {
+        ($($variant:ident $native:ty),* $(,)?) => {
+            match values {
+                $(
+                    ColumnArray::$variant(values) => {
+                        for (row, value) in rows.chunks_exact_mut(row_size).zip(values.iter()) {
+                            row[offset..offset + size_of::<$native>()]
+                                .copy_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                )*
+            }
+        };
+    }
+    native_types!(write)
+}
+
 /// Returns the `units` and `descriptions` attributes, string arrays aligned
 /// with the compound fields (`sample`, `time`, then each column).
 fn field_metadata_attributes(valid: &[&Series]) -> [(&'static str, AttrValue); 2] {
@@ -686,8 +713,10 @@ fn hdf_name_component(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{buffer_type, DeviceRecord, SegmentRecord, StreamRecord};
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnData, SampleBatchBuilder};
+    use crate::data::metadata::{DeviceRecord, SegmentRecord, StreamRecord};
+    use crate::data::sample::{
+        BatchContext, BoundaryReason, ColumnBuilder, ColumnData, SampleBatchBuilder,
+    };
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use std::path::PathBuf;
@@ -760,10 +789,10 @@ mod tests {
                 })
                 .unwrap(),
             ),
-            [(column.clone(), buffer_type(column.get().data_type()))],
+            [(column.clone(), ColumnBuilder::F64(Vec::new()))],
             1,
         );
-        builder.push_row(SampleNumber::new(0), [ColumnData::Float(1.0)]);
+        builder.push_row(SampleNumber::new(0), [ColumnData::F64(1.0)]);
         builder.finish()
     }
 

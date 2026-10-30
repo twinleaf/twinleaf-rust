@@ -87,6 +87,9 @@ pub enum PacketOutcome {
     Applied,
     /// Stream data is valid so far but cannot be decoded until metadata arrives.
     WaitingForMetadata,
+    /// The stream has a column of a type this build cannot decode, so its
+    /// rows are refused.
+    Unsupported,
     /// A disconnect reset metadata and continuity state.
     Reset,
     /// The packet contained this many validated sample rows.
@@ -154,6 +157,7 @@ impl PacketParser {
         Ok(match self.state.apply_packet(packet)? {
             PacketEvent::Applied => PacketOutcome::Applied,
             PacketEvent::WaitingForMetadata => PacketOutcome::WaitingForMetadata,
+            PacketEvent::Unsupported => PacketOutcome::Unsupported,
             PacketEvent::Reset => {
                 self.flush();
                 PacketOutcome::Reset
@@ -173,7 +177,10 @@ impl PacketParser {
     ) -> Result<Option<ScannedRows<'a>>, PacketError> {
         Ok(match self.state.apply_packet(packet)? {
             PacketEvent::Rows(rows) => Some(rows),
-            PacketEvent::Applied | PacketEvent::WaitingForMetadata | PacketEvent::Reset => None,
+            PacketEvent::Applied
+            | PacketEvent::WaitingForMetadata
+            | PacketEvent::Unsupported
+            | PacketEvent::Reset => None,
         })
     }
 
@@ -340,9 +347,7 @@ mod tests {
     use crate::data::buffer::Buffer;
     use crate::data::fixtures;
     use crate::data::metadata::ColumnKey;
-    use crate::data::sample::{
-        BoundaryClass, BoundaryReason, ColumnArray, ColumnData, Generations,
-    };
+    use crate::data::sample::{BoundaryClass, BoundaryReason, ColumnData, Generations};
     use crate::data::state::StreamDataError;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
@@ -719,38 +724,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_column_type_is_absent_from_the_batch() {
-        // A newer firmware reports a type this build predates, between two
-        // columns it understands.
-        let unknown = DataType::new(0x35);
-        assert_eq!(unknown.size(), 3);
-        let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
-
-        let mut data = Vec::new();
-        for (value, raw) in [(1.0f32, -3i16), (2.0f32, -4i16)] {
-            data.extend_from_slice(&value.to_le_bytes());
-            data.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
-            data.extend_from_slice(&raw.to_le_bytes());
-        }
-        assert_eq!(
-            parser.push_packet(&stream_data_packet(0, data)).unwrap(),
-            PacketOutcome::Rows(2)
-        );
-        let batch = parser.pop_batch().expect("known columns still decode");
-
-        assert_eq!(batch.len(), 2);
-        let names: Vec<&str> = batch
-            .schema()
-            .iter()
-            .map(|series| series.metadata().name())
-            .collect();
-        assert_eq!(names, ["col_0", "col_2"]);
-        match (batch.schema()[0].values(), batch.schema()[1].values()) {
-            (ColumnArray::F64(floats), ColumnArray::I64(ints)) => {
-                assert_eq!(&floats[..], [1.0, 2.0]);
-                assert_eq!(&ints[..], [-3, -4]);
-            }
-            other => panic!("unexpected column buffers: {other:?}"),
+    fn a_stream_with_a_column_type_this_build_cannot_decode_is_refused() {
+        // A 24-bit column, or a type from newer firmware, between two columns
+        // this build decodes.
+        for unknown in [DataType::I24, DataType::new(0x35)] {
+            assert_eq!(unknown.size(), 3);
+            let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
+            assert_eq!(
+                parser
+                    .push_packet(&stream_data_packet(0, vec![0; 18]))
+                    .unwrap(),
+                PacketOutcome::Unsupported
+            );
+            assert!(parser.pop_batch().is_none());
         }
     }
 
@@ -792,17 +778,6 @@ mod tests {
             .expect("the largest representable sample itself is valid");
         let batch = parser.pop_batch().expect("a batch is ready");
         assert_eq!(batch.sample_numbers(), [MAX_SAMPLE_NUMBER]);
-    }
-
-    #[test]
-    fn all_columns_unknown_yields_rows_without_columns() {
-        let mut parser = parser_with_schema(&[DataType::new(0x35)], 3);
-        parser
-            .push_packet(&stream_data_packet(7, vec![0; 6]))
-            .expect("rows are still counted");
-        let batch = parser.pop_batch().expect("a batch is ready");
-        assert!(batch.schema().is_empty());
-        assert_eq!(batch.sample_numbers(), vec![7, 8]);
     }
 
     /// Drive a forced rollover: `output_rows` samples of segment 0, then the
@@ -1441,12 +1416,10 @@ mod tests {
             .schema()
             .iter()
             .map(|series| {
-                let values = match series.values() {
-                    ColumnArray::F64(values) => values.to_vec(),
-                    ColumnArray::I64(values) => values.iter().map(|&value| value as f64).collect(),
-                    ColumnArray::U64(values) => values.iter().map(|&value| value as f64).collect(),
-                };
-                (series.metadata().name().to_string(), values)
+                (
+                    series.metadata().name().to_string(),
+                    series.values().to_f64().into_owned(),
+                )
             })
             .collect()
     }
@@ -1754,9 +1727,9 @@ mod tests {
         assert_eq!(by_column(wide, 1), column([-100_000.0, -100_001.0]));
     }
 
-    /// Whatever its column types, including ones this build does not decode,
-    /// and whatever padding ends its samples, a stream decodes each column at
-    /// the offset the types before it add up to.
+    /// Whatever its column types and whatever padding ends its samples, a
+    /// stream decodes each column at the offset the types before it add up
+    /// to, in the column's own type.
     #[test]
     fn every_layout_decodes_each_column_at_its_offset() {
         use proptest::prelude::*;
@@ -1767,15 +1740,12 @@ mod tests {
             DataType::U8,
             DataType::I16,
             DataType::U16,
-            DataType::I24,
-            DataType::U24,
             DataType::I32,
             DataType::U32,
             DataType::I64,
             DataType::U64,
             DataType::F32,
             DataType::F64,
-            DataType::new(0x35),
         ]);
         let case = (
             prop::collection::vec(types, 1..7),
@@ -1808,27 +1778,24 @@ mod tests {
                             )
                         })
                         .collect();
-                    if !matches!(cells[0], ColumnData::Unknown) {
-                        expected.push((format!("col_{index}"), cells));
-                    }
+                    expected.push((format!("col_{index}"), cells));
                     offset += data_type.size();
                 }
 
                 prop_assert_eq!(batch.schema().len(), expected.len());
                 for (series, (name, cells)) in batch.schema().iter().zip(&expected) {
                     prop_assert_eq!(series.metadata().name(), name.as_str());
+                    prop_assert_eq!(series.values().data_type(), series.metadata().data_type());
                     for (row, cell) in cells.iter().enumerate() {
-                        let same = match (series.values(), cell) {
-                            (ColumnArray::F64(values), ColumnData::Float(value)) => {
-                                values[row].to_bits() == value.to_bits()
+                        // Floats compare by bits, so a NaN matches itself.
+                        let same = match (series.values().get(row), cell) {
+                            (ColumnData::F32(value), ColumnData::F32(cell)) => {
+                                value.to_bits() == cell.to_bits()
                             }
-                            (ColumnArray::I64(values), ColumnData::Int(value)) => {
-                                values[row] == *value
+                            (ColumnData::F64(value), ColumnData::F64(cell)) => {
+                                value.to_bits() == cell.to_bits()
                             }
-                            (ColumnArray::U64(values), ColumnData::UInt(value)) => {
-                                values[row] == *value
-                            }
-                            _ => false,
+                            (value, cell) => value == *cell,
                         };
                         prop_assert!(same, "{name} row {row}: {cell:?}");
                     }

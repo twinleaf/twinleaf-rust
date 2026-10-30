@@ -119,10 +119,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{
-        buffer_type, ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord,
-    };
-    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
+    use crate::data::sample::{BatchContext, ColumnBuilder, ColumnData, SampleBatchBuilder};
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
@@ -222,16 +220,13 @@ mod tests {
                     self.stream.clone(),
                     self.device.clone(),
                 ),
-                [(
-                    self.column_metadata.clone(),
-                    buffer_type(self.column_metadata.get().data_type()),
-                )],
+                [(self.column_metadata.clone(), ColumnBuilder::F64(Vec::new()))],
                 rows.len(),
             );
             for &(sample_number, value) in rows {
                 builder.push_row(
                     crate::proto::SampleNumber::new(sample_number),
-                    [ColumnData::Float(value)],
+                    [ColumnData::F64(value)],
                 );
             }
             let batch = builder.finish();

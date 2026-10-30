@@ -1955,11 +1955,10 @@ fn generate_log_labels(
 }
 
 fn fmt_value(v: &ColumnData) -> (String, f64) {
-    match v {
-        ColumnData::Float(x) => (format!("{:15.4}", x), *x),
-        ColumnData::Int(x) => (format!("{:15}", x), *x as f64),
-        ColumnData::UInt(x) => (format!("{:15}", x), *x as f64),
-        _ => ("           type?".to_string(), f64::NAN),
+    match (v, v.try_as_f64()) {
+        (ColumnData::F32(_) | ColumnData::F64(_), Some(x)) => (format!("{:15.4}", x), x),
+        (_, Some(x)) => (format!("{:>15}", v.to_string()), x),
+        (_, None) => ("           type?".to_string(), f64::NAN),
     }
 }
 

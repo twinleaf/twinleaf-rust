@@ -6,8 +6,7 @@
 //! reports.
 
 use super::metadata::{
-    BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamMetadataSnapshot,
-    StreamRecord,
+    ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
 };
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
@@ -38,81 +37,6 @@ impl SampleClock {
 
 pub(crate) fn sample_time(segment: wire::SegmentView<'_>, n: u32) -> f64 {
     SampleClock::of(segment).time_at(n)
-}
-
-/// One decoded scalar, in the storage class its column decodes to.
-#[derive(Debug, Clone)]
-pub enum ColumnData {
-    /// Signed integer, sign-extended from its narrower wire width.
-    Int(i64),
-    /// Unsigned integer, zero-extended from its narrower wire width.
-    UInt(u64),
-    /// Floating point, widened from `f32` where the column is 32-bit.
-    Float(f64),
-    /// Cell whose wire data type this build cannot decode.
-    Unknown,
-}
-
-impl ColumnData {
-    /// Returns the value as an `f64`, or `None` for `Unknown`. Integers larger
-    /// than 2^53 in magnitude lose precision.
-    pub fn try_as_f64(&self) -> Option<f64> {
-        match *self {
-            ColumnData::Int(i) => Some(i as f64),
-            ColumnData::UInt(u) => Some(u as f64),
-            ColumnData::Float(f) => Some(f),
-            ColumnData::Unknown => None,
-        }
-    }
-
-    /// Decodes the value of `data_type` at the front of `data`, or returns
-    /// [`ColumnData::Unknown`] for a type this build cannot decode.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `data` is shorter than the type's size.
-    pub(crate) fn from_le_bytes(
-        data: &[u8],
-        data_type: crate::proto::data::DataType,
-    ) -> ColumnData {
-        use crate::proto::data::DataType;
-        match data_type {
-            DataType::I8 => ColumnData::Int(i8::from_le_bytes([data[0]]).into()),
-            DataType::U8 => ColumnData::UInt(data[0].into()),
-            DataType::I16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
-            DataType::U16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
-            DataType::I32 => {
-                ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
-            }
-            DataType::U32 => {
-                ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
-            }
-            DataType::I64 => ColumnData::Int(i64::from_le_bytes([
-                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ])),
-            DataType::U64 => ColumnData::UInt(u64::from_le_bytes([
-                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ])),
-            DataType::F32 => {
-                ColumnData::Float(f32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
-            }
-            DataType::F64 => ColumnData::Float(f64::from_le_bytes([
-                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ])),
-            _ => ColumnData::Unknown,
-        }
-    }
-}
-
-impl std::fmt::Display for ColumnData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            ColumnData::Int(x) => write!(f, "{}", x),
-            ColumnData::UInt(x) => write!(f, "{}", x),
-            ColumnData::Float(x) => write!(f, "{}", x),
-            ColumnData::Unknown => write!(f, "?"),
-        }
-    }
 }
 
 /// A frozen `Vec<T>`, shared by [`Arc`] and narrowed to a row range. Cloning
@@ -170,206 +94,220 @@ impl<T> Deref for ScalarBuffer<T> {
     }
 }
 
-/// One column's decoded values while they are still being accumulated.
-#[derive(Debug, Clone)]
-enum ColumnBuilder {
-    F64(Vec<f64>),
-    I64(Vec<i64>),
-    U64(Vec<u64>),
+/// Calls `$then!` with every native column type, each as its variant name
+/// and Rust type. The arrays, builders, cells and their decoders are all
+/// generated from this one list.
+macro_rules! native_types {
+    ($then:ident) => {
+        $then! {
+            I8 i8, U8 u8, I16 i16, U16 u16, I32 i32,
+            U32 u32, I64 i64, U64 u64, F32 f32, F64 f64,
+        }
+    };
+}
+pub(crate) use native_types;
+
+macro_rules! define_columns {
+    ($($variant:ident $native:ty),* $(,)?) => {
+        /// One decoded value, in its column's native type.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub enum ColumnData {
+            $(
+                #[doc = concat!("A `", stringify!($native), "` value.")]
+                $variant($native),
+            )*
+            /// A value whose wire type this build cannot decode.
+            Unknown,
+        }
+
+        impl ColumnData {
+            /// Returns the value as an `f64`, or `None` for `Unknown`. 64-bit
+            /// integers larger than 2^53 in magnitude lose precision.
+            pub fn try_as_f64(&self) -> Option<f64> {
+                match *self {
+                    $(Self::$variant(value) => Some(value as f64),)*
+                    Self::Unknown => None,
+                }
+            }
+
+            /// Decodes the value of `data_type` at the front of `data`, or
+            /// returns [`ColumnData::Unknown`] for a type this build cannot
+            /// decode.
+            ///
+            /// # Panics
+            ///
+            /// Panics if `data` is shorter than the type's size.
+            pub(crate) fn from_le_bytes(data: &[u8], data_type: wire::DataType) -> ColumnData {
+                match data_type {
+                    $(
+                        wire::DataType::$variant => Self::$variant(<$native>::from_le_bytes(
+                            data[..size_of::<$native>()]
+                                .try_into()
+                                .expect("a value of its own size"),
+                        )),
+                    )*
+                    _ => Self::Unknown,
+                }
+            }
+        }
+
+        impl std::fmt::Display for ColumnData {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match *self {
+                    $(Self::$variant(value) => write!(f, "{value}"),)*
+                    Self::Unknown => write!(f, "?"),
+                }
+            }
+        }
+
+        /// Returns `true` if this build decodes columns of `data_type`.
+        pub(crate) fn decodes(data_type: wire::DataType) -> bool {
+            matches!(data_type, $(wire::DataType::$variant)|*)
+        }
+
+        /// One column's values while they are still being accumulated, in the
+        /// column's native type.
+        #[derive(Debug, Clone)]
+        pub(crate) enum ColumnBuilder {
+            $($variant(Vec<$native>),)*
+        }
+
+        impl ColumnBuilder {
+            /// Returns an empty column for values of `data_type`, with room
+            /// for `capacity` of them, or `None` for a type this build cannot
+            /// decode.
+            pub(crate) fn for_type(data_type: wire::DataType, capacity: usize) -> Option<Self> {
+                Some(match data_type {
+                    $(wire::DataType::$variant => Self::$variant(Vec::with_capacity(capacity)),)*
+                    _ => return None,
+                })
+            }
+
+            /// Returns an empty column of `array`'s type, with room for
+            /// `capacity` values.
+            fn like(array: &ColumnArray, capacity: usize) -> Self {
+                match array {
+                    $(ColumnArray::$variant(_) => Self::$variant(Vec::with_capacity(capacity)),)*
+                }
+            }
+
+            /// Appends one cell, converted to the column's type. Tests build
+            /// rows from cells of any type.
+            ///
+            /// # Panics
+            ///
+            /// Panics if the cell is `Unknown`.
+            #[cfg(test)]
+            fn push_data(&mut self, cell: &ColumnData) {
+                let value = cell.try_as_f64().expect("a known cell");
+                match self {
+                    $(Self::$variant(values) => values.push(value as $native),)*
+                }
+            }
+
+            /// Appends a frozen column's values to this one.
+            ///
+            /// # Panics
+            ///
+            /// Panics if the two columns hold different types.
+            fn extend_from(&mut self, values: &ColumnArray) {
+                match (self, values) {
+                    $((Self::$variant(own), ColumnArray::$variant(more)) => own.extend_from_slice(more),)*
+                    (own, more) => panic!(
+                        "cannot extend a {} column from a {} one",
+                        ColumnArray::from(own.clone()).data_type(),
+                        more.data_type()
+                    ),
+                }
+            }
+
+            /// Returns a frozen copy of `rows`, leaving this column
+            /// accumulating.
+            ///
+            /// # Panics
+            ///
+            /// Panics if `rows` is out of bounds.
+            fn freeze_rows(&self, rows: Range<usize>) -> ColumnArray {
+                match self {
+                    $(Self::$variant(values) => ColumnArray::$variant(values[rows].to_vec().into()),)*
+                }
+            }
+        }
+
+        /// One frozen column's values in its native type, shared and
+        /// sliceable. Each variant's buffer derefs to a plain slice.
+        #[derive(Debug, Clone)]
+        pub enum ColumnArray {
+            $(
+                #[doc = concat!("A column of `", stringify!($native), "` values.")]
+                $variant(ScalarBuffer<$native>),
+            )*
+        }
+
+        impl ColumnArray {
+            /// Returns the wire type a column of this type decodes from.
+            pub fn data_type(&self) -> wire::DataType {
+                match self {
+                    $(Self::$variant(_) => wire::DataType::$variant,)*
+                }
+            }
+
+            /// Returns the number of values, one per row of its batch.
+            pub fn len(&self) -> usize {
+                match self {
+                    $(Self::$variant(values) => values.len(),)*
+                }
+            }
+
+            /// Returns `true` if the column holds no values.
+            pub fn is_empty(&self) -> bool {
+                self.len() == 0
+            }
+
+            /// Returns the cell at row `i`, or `Unknown` if `i` is out of
+            /// bounds.
+            pub fn get(&self, i: usize) -> ColumnData {
+                match self {
+                    $(Self::$variant(values) => values.get(i).map_or(ColumnData::Unknown, |&value| ColumnData::$variant(value)),)*
+                }
+            }
+
+            /// Returns the values in `rows` without copying them.
+            ///
+            /// # Panics
+            ///
+            /// Panics if `rows` starts after it ends or ends past the
+            /// column's length.
+            pub fn slice(&self, rows: Range<usize>) -> ColumnArray {
+                match self {
+                    $(Self::$variant(values) => Self::$variant(values.slice(rows)),)*
+                }
+            }
+
+            /// Returns the values as `f64`, borrowed from an `f64` column and
+            /// converted from any other. 64-bit integers larger than 2^53 in
+            /// magnitude lose precision.
+            pub fn to_f64(&self) -> std::borrow::Cow<'_, [f64]> {
+                if let Self::F64(values) = self {
+                    return std::borrow::Cow::Borrowed(values);
+                }
+                match self {
+                    $(Self::$variant(values) => values.iter().map(|&value| value as f64).collect(),)*
+                }
+            }
+        }
+
+        impl From<ColumnBuilder> for ColumnArray {
+            fn from(values: ColumnBuilder) -> ColumnArray {
+                match values {
+                    $(ColumnBuilder::$variant(values) => ColumnArray::$variant(values.into()),)*
+                }
+            }
+        }
+    };
 }
 
-impl ColumnBuilder {
-    /// Creates an empty column of the variant for `bt`, with room for
-    /// `capacity` values.
-    fn with_capacity_for(bt: BufferType, capacity: usize) -> Self {
-        match bt {
-            BufferType::Float => Self::F64(Vec::with_capacity(capacity)),
-            BufferType::Int => Self::I64(Vec::with_capacity(capacity)),
-            BufferType::UInt => Self::U64(Vec::with_capacity(capacity)),
-        }
-    }
-
-    /// Returns the buffer type whose columns land in this variant.
-    fn buffer_type(&self) -> BufferType {
-        match self {
-            Self::F64(_) => BufferType::Float,
-            Self::I64(_) => BufferType::Int,
-            Self::U64(_) => BufferType::UInt,
-        }
-    }
-
-    /// Appends one decoded cell, widening `Int` into a `Float` column.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the cell's variant does not match the column in any other
-    /// way.
-    #[cfg(test)]
-    fn push_data(&mut self, v: &ColumnData) {
-        match (self, v) {
-            (Self::F64(d), ColumnData::Float(x)) => d.push(*x),
-            (Self::F64(d), ColumnData::Int(x)) => d.push(*x as f64),
-            (Self::I64(d), ColumnData::Int(x)) => d.push(*x),
-            (Self::U64(d), ColumnData::UInt(x)) => d.push(*x),
-            // Dropping a cell decoded for another column type would desync this
-            // column from its batch's rows.
-            (this, v) => panic!("cannot push {v:?} into a {:?} column", this.buffer_type()),
-        }
-    }
-
-    /// Appends this column's value from every sample in `samples`, which packs
-    /// samples `stride` bytes apart. The value sits `offset` bytes into each
-    /// sample, encoded as `data_type`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `data_type` does not decode to this column's variant, or if
-    /// the value runs past the end of a sample.
-    fn extend_packed(
-        &mut self,
-        data_type: wire::DataType,
-        samples: &[u8],
-        stride: usize,
-        offset: usize,
-    ) {
-        use wire::DataType;
-        // One loop per wire type, so each value is a plain load, with no
-        // per-value dispatch on its type.
-        macro_rules! decode {
-            ($values:expr, $wire:ty => $stored:ty) => {
-                $values.extend(samples.chunks_exact(stride).map(|sample| {
-                    let bytes = &sample[offset..offset + size_of::<$wire>()];
-                    <$stored>::from(<$wire>::from_le_bytes(
-                        bytes.try_into().expect("a value of its own size"),
-                    ))
-                }))
-            };
-        }
-        match (self, data_type) {
-            (Self::F64(values), DataType::F32) => decode!(values, f32 => f64),
-            (Self::F64(values), DataType::F64) => decode!(values, f64 => f64),
-            (Self::I64(values), DataType::I8) => decode!(values, i8 => i64),
-            (Self::I64(values), DataType::I16) => decode!(values, i16 => i64),
-            (Self::I64(values), DataType::I32) => decode!(values, i32 => i64),
-            (Self::I64(values), DataType::I64) => decode!(values, i64 => i64),
-            (Self::U64(values), DataType::U8) => decode!(values, u8 => u64),
-            (Self::U64(values), DataType::U16) => decode!(values, u16 => u64),
-            (Self::U64(values), DataType::U32) => decode!(values, u32 => u64),
-            (Self::U64(values), DataType::U64) => decode!(values, u64 => u64),
-            (this, data_type) => panic!(
-                "cannot decode {data_type} into a {:?} column",
-                this.buffer_type()
-            ),
-        }
-    }
-
-    /// Appends a frozen column's values to this one.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the two columns hold different variants.
-    fn extend_from(&mut self, values: &ColumnArray) {
-        match (self, values) {
-            (Self::F64(d), ColumnArray::F64(v)) => d.extend_from_slice(v),
-            (Self::I64(d), ColumnArray::I64(v)) => d.extend_from_slice(v),
-            (Self::U64(d), ColumnArray::U64(v)) => d.extend_from_slice(v),
-            (this, v) => panic!(
-                "cannot extend a {:?} column from a {:?} one",
-                this.buffer_type(),
-                v.buffer_type()
-            ),
-        }
-    }
-
-    /// Returns a frozen copy of `rows`, leaving this column accumulating.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `rows` is out of bounds.
-    fn freeze_rows(&self, rows: Range<usize>) -> ColumnArray {
-        match self {
-            Self::F64(v) => ColumnArray::F64(v[rows].to_vec().into()),
-            Self::I64(v) => ColumnArray::I64(v[rows].to_vec().into()),
-            Self::U64(v) => ColumnArray::U64(v[rows].to_vec().into()),
-        }
-    }
-}
-
-/// One frozen column's decoded values, shared and sliceable. Each variant's
-/// buffer derefs to a plain slice.
-#[derive(Debug, Clone)]
-pub enum ColumnArray {
-    /// Float column. Signed integer cells are widened into one.
-    F64(ScalarBuffer<f64>),
-    /// Signed integer column, whatever its narrower wire width.
-    I64(ScalarBuffer<i64>),
-    /// Unsigned integer column, whatever its narrower wire width.
-    U64(ScalarBuffer<u64>),
-}
-
-impl ColumnArray {
-    /// Returns the buffer type whose columns land in this variant.
-    pub(crate) fn buffer_type(&self) -> BufferType {
-        match self {
-            Self::F64(_) => BufferType::Float,
-            Self::I64(_) => BufferType::Int,
-            Self::U64(_) => BufferType::UInt,
-        }
-    }
-
-    /// Returns the number of values, one per row of its batch.
-    pub fn len(&self) -> usize {
-        match self {
-            Self::F64(v) => v.len(),
-            Self::I64(v) => v.len(),
-            Self::U64(v) => v.len(),
-        }
-    }
-
-    /// Returns `true` if the column holds no values.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Returns the cell at row `i` as a [`ColumnData`], or `Unknown` if `i` is
-    /// out of bounds.
-    pub fn get(&self, i: usize) -> ColumnData {
-        match self {
-            Self::F64(v) => v
-                .get(i)
-                .map_or(ColumnData::Unknown, |&x| ColumnData::Float(x)),
-            Self::I64(v) => v
-                .get(i)
-                .map_or(ColumnData::Unknown, |&x| ColumnData::Int(x)),
-            Self::U64(v) => v
-                .get(i)
-                .map_or(ColumnData::Unknown, |&x| ColumnData::UInt(x)),
-        }
-    }
-
-    /// Returns the values in `rows` without copying them.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `rows` starts after it ends or ends past the column's length.
-    pub fn slice(&self, rows: Range<usize>) -> ColumnArray {
-        match self {
-            Self::F64(v) => Self::F64(v.slice(rows)),
-            Self::I64(v) => Self::I64(v.slice(rows)),
-            Self::U64(v) => Self::U64(v.slice(rows)),
-        }
-    }
-}
-
-impl From<ColumnBuilder> for ColumnArray {
-    fn from(values: ColumnBuilder) -> ColumnArray {
-        match values {
-            ColumnBuilder::F64(v) => ColumnArray::F64(v.into()),
-            ColumnBuilder::I64(v) => ColumnArray::I64(v.into()),
-            ColumnBuilder::U64(v) => ColumnArray::U64(v.into()),
-        }
-    }
-}
+native_types!(define_columns);
 
 /// The identity, boundary, generations, and metadata records that every row
 /// of a batch shares.
@@ -518,9 +456,12 @@ impl RowSource for SampleBatch {
     fn start_builder(&self, capacity: usize) -> SampleBatchBuilder {
         SampleBatchBuilder::new(
             self.context.clone(),
-            self.columns
-                .iter()
-                .map(|column| (column.metadata.clone(), column.values.buffer_type())),
+            self.columns.iter().map(|column| {
+                (
+                    column.metadata.clone(),
+                    ColumnBuilder::like(&column.values, capacity),
+                )
+            }),
             capacity,
         )
     }
@@ -541,29 +482,26 @@ impl RowSource for SampleBatch {
 
 impl SampleBatchBuilder {
     /// Creates a builder for rows that share `context` and have `columns`,
-    /// with room for `capacity` rows.
+    /// each a record and an empty column of its type, with room for
+    /// `capacity` rows.
     ///
     /// # Panics
     ///
     /// Panics if a column describes a stream other than the context's.
     pub(super) fn new(
         context: BatchContext,
-        columns: impl IntoIterator<Item = (ColumnRecord, BufferType)>,
+        columns: impl IntoIterator<Item = (ColumnRecord, ColumnBuilder)>,
         capacity: usize,
     ) -> Self {
         let key = context.key;
         let columns = columns
             .into_iter()
-            .map(|(metadata, buffer_type)| {
+            .inspect(|(metadata, _)| {
                 assert_eq!(
                     key.stream_id,
                     metadata.get().stream_id(),
                     "column must match stream"
                 );
-                (
-                    metadata,
-                    ColumnBuilder::with_capacity_for(buffer_type, capacity),
-                )
             })
             .collect();
         Self {
@@ -610,33 +548,20 @@ impl SampleBatchBuilder {
         debug_assert!(cells.next().is_none(), "one cell per column");
     }
 
-    /// Appends every sample in `samples`, packed `stride` bytes apart and
-    /// numbered from `first`. `layout` gives each column's offset within a
-    /// sample and wire type, in schema order. Each column is decoded in one
-    /// pass over the samples.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `layout` gives fewer entries than there are columns, or an
-    /// entry its column cannot hold.
-    pub(super) fn push_packed(
+    /// Appends `rows` samples numbered from `first`, with their timestamps,
+    /// and returns every column, in schema order, for the caller to append
+    /// exactly `rows` values to each.
+    pub(super) fn push_samples(
         &mut self,
         first: SampleNumber,
-        samples: &[u8],
-        stride: usize,
-        layout: impl IntoIterator<Item = (usize, wire::DataType)>,
-    ) {
-        let rows = samples.len() / stride;
+        rows: usize,
+    ) -> impl Iterator<Item = &mut ColumnBuilder> {
         for row in 0..rows {
             let n = SampleNumber::new(first.value() + row as u32);
             self.sample_numbers.push(n);
             self.timestamps.push(self.clock.time_at(n.value() + 1));
         }
-        let mut layout = layout.into_iter();
-        for (_, values) in &mut self.columns {
-            let (offset, data_type) = layout.next().expect("one layout entry per column");
-            values.extend_packed(data_type, samples, stride, offset);
-        }
+        self.columns.iter_mut().map(|(_, values)| values)
     }
 
     /// Returns a frozen copy of `rows`, leaving the builder accumulating. The
@@ -1177,15 +1102,12 @@ mod tests {
             ),
             [(
                 ColumnRecord::encode(column(1, 0, DataType::F64)).unwrap(),
-                BufferType::Float,
+                ColumnBuilder::F64(Vec::new()),
             )],
             4,
         );
         for n in 0..4 {
-            builder.push_row(
-                SampleNumber::new(n),
-                [ColumnData::Float(f64::from(n) * 10.0)],
-            );
+            builder.push_row(SampleNumber::new(n), [ColumnData::F64(f64::from(n) * 10.0)]);
         }
         builder.finish()
     }

@@ -3,7 +3,6 @@
 //! data type decodes to.
 
 use crate::proto::data as wire;
-use crate::proto::data::DataType;
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, StreamId};
@@ -359,29 +358,6 @@ impl DeviceMetadataSnapshot {
             )
             .collect()
     }
-}
-
-#[cfg(test)]
-pub(crate) fn buffer_type(data_type: DataType) -> BufferType {
-    decoded_buffer_type(data_type).unwrap_or(BufferType::Float)
-}
-
-/// Returns the storage class a column of `data_type` decodes to, or `None` for
-/// an unknown wire type.
-pub(crate) fn decoded_buffer_type(data_type: DataType) -> Option<BufferType> {
-    Some(match data_type {
-        DataType::F32 | DataType::F64 => BufferType::Float,
-        DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => BufferType::Int,
-        DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => BufferType::UInt,
-        _ => return None,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BufferType {
-    Float,
-    Int,
-    UInt,
 }
 
 #[cfg(test)]

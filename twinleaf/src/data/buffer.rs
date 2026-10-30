@@ -323,9 +323,11 @@ impl Run {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{buffer_type, DeviceRecord};
+    use crate::data::metadata::DeviceRecord;
     use crate::data::pipeline::{ColumnOp, ColumnProcessor};
-    use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
+    use crate::data::sample::{
+        BatchContext, ColumnArray, ColumnBuilder, ColumnData, SampleBatchBuilder,
+    };
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 
@@ -406,9 +408,10 @@ mod tests {
                     self.stream.clone(),
                     self.device.clone(),
                 ),
-                self.columns
-                    .iter()
-                    .map(|metadata| (metadata.clone(), buffer_type(metadata.get().data_type()))),
+                self.columns.iter().map(|metadata| {
+                    let values = ColumnBuilder::for_type(metadata.get().data_type(), rows.len());
+                    (metadata.clone(), values.expect("a native type"))
+                }),
                 rows.len(),
             );
             for &(sample_number, ref row) in rows {
@@ -423,7 +426,7 @@ mod tests {
         /// the sample numbers.
         fn push_floats(&self, buffer: &mut Buffer, stream_generation: u32, samples: Range<u32>) {
             let rows: Vec<_> = samples
-                .map(|n| (n, vec![ColumnData::Float(f64::from(n))]))
+                .map(|n| (n, vec![ColumnData::F64(f64::from(n))]))
                 .collect();
             self.push_rows(buffer, stream_generation, &rows);
         }
@@ -572,7 +575,7 @@ mod tests {
         })
         .unwrap();
         let rows: Vec<_> = (0..3)
-            .map(|n| (n, vec![ColumnData::Float(f64::from(n) + 100.0)]))
+            .map(|n| (n, vec![ColumnData::F64(f64::from(n) + 100.0)]))
             .collect();
         fx.push_in_segment(&mut buffer, 1, &rolled, &rows);
 
@@ -631,17 +634,17 @@ mod tests {
                 (
                     0,
                     vec![
-                        ColumnData::Float(0.5),
-                        ColumnData::Int(-1),
-                        ColumnData::UInt(10),
+                        ColumnData::F64(0.5),
+                        ColumnData::I64(-1),
+                        ColumnData::U64(10),
                     ],
                 ),
                 (
                     1,
                     vec![
-                        ColumnData::Float(1.5),
-                        ColumnData::Int(-2),
-                        ColumnData::UInt(11),
+                        ColumnData::F64(1.5),
+                        ColumnData::I64(-2),
+                        ColumnData::U64(11),
                     ],
                 ),
             ],
@@ -653,9 +656,9 @@ mod tests {
             &[(
                 2,
                 vec![
-                    ColumnData::Float(2.5),
-                    ColumnData::Int(-3),
-                    ColumnData::UInt(12),
+                    ColumnData::F64(2.5),
+                    ColumnData::I64(-3),
+                    ColumnData::U64(12),
                 ],
             )],
         );
@@ -670,9 +673,9 @@ mod tests {
         // Values come back in schema order, each in its column's own variant.
         let values: Vec<ColumnData> = row.row(0).expect("the only row").values().collect();
         assert_eq!(values.len(), 3);
-        assert!(matches!(values[0], ColumnData::Float(v) if v == 2.5));
-        assert!(matches!(values[1], ColumnData::Int(-3)));
-        assert!(matches!(values[2], ColumnData::UInt(12)));
+        assert!(matches!(values[0], ColumnData::F64(v) if v == 2.5));
+        assert!(matches!(values[1], ColumnData::I64(-3)));
+        assert!(matches!(values[2], ColumnData::U64(12)));
 
         // No run for a stream that never received data.
         let other = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(99));
@@ -718,7 +721,7 @@ mod tests {
         changed.push_rows(
             &mut buffer,
             2,
-            &[(0, vec![ColumnData::Float(1.0), ColumnData::UInt(2)])],
+            &[(0, vec![ColumnData::F64(1.0), ColumnData::U64(2)])],
         );
         assert_eq!(
             buffer

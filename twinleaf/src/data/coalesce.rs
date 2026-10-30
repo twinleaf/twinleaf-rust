@@ -111,9 +111,11 @@ mod tests {
     use super::*;
     use crate::data::fixtures;
     use crate::data::metadata::{
-        BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord,
+        ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord,
     };
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData};
+    use crate::data::sample::{
+        BatchContext, BoundaryReason, ColumnArray, ColumnBuilder, ColumnData,
+    };
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
@@ -152,14 +154,14 @@ mod tests {
             ),
             [(
                 ColumnRecord::encode(fixtures::column(1, 0, DataType::F64)).unwrap(),
-                BufferType::Float,
+                ColumnBuilder::F64(Vec::new()),
             )],
             rows as usize,
         );
         for n in first..first + rows {
             builder.push_row(
                 crate::proto::SampleNumber::new(n),
-                [ColumnData::Float(f64::from(n))],
+                [ColumnData::F64(f64::from(n))],
             );
         }
         builder.finish()
