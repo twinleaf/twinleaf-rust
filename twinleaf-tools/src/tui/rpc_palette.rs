@@ -27,6 +27,7 @@ use tui_prompts::{State, TextState};
 use twinleaf::device::rpc::{
     RpcDescriptor, RpcMetaExt, RpcRegistry, RpcValueType, RpcValueTypeExt,
 };
+use twinleaf::device::Settings;
 use twinleaf::DeviceRoute;
 const RPCLIST_MAX_LEN: usize = 12;
 /// The close hint in the title of the input block. Clicking it closes the
@@ -732,6 +733,7 @@ impl RpcPalette {
         blink: bool,
     ) {
         let registry = rpc.registry();
+        let settings = rpc.settings();
         let (loading_message, status) = rpc.status();
         let footer_height = area.height;
         self.zones = HitZones {
@@ -748,134 +750,135 @@ impl RpcPalette {
             .split(area);
 
         if footer_height > 3 {
-            let (rows, title_left, title_right): (Vec<Line>, Line, Line) =
-                if let Some(picker) = &self.picker {
-                    let visible_rows = self.visible_rows(footer_height);
-                    let end = visible_rows.min(picker.filtered.len());
-                    let items = picker.filtered[..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &hist_idx)| {
-                            let text = self.history.get(hist_idx).map(|s| s.as_str()).unwrap_or("");
-                            let line = Line::from(Span::raw(text.to_string()));
-                            if i == picker.selected {
-                                line.bold()
-                            } else {
-                                line.dim()
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let rows = if items.is_empty() {
-                        let msg = if self.history.is_empty() {
-                            "(no history yet)"
+            let (rows, title_left, title_right): (Vec<Line>, Line, Line) = if let Some(picker) =
+                &self.picker
+            {
+                let visible_rows = self.visible_rows(footer_height);
+                let end = visible_rows.min(picker.filtered.len());
+                let items = picker.filtered[..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &hist_idx)| {
+                        let text = self.history.get(hist_idx).map(|s| s.as_str()).unwrap_or("");
+                        let line = Line::from(Span::raw(text.to_string()));
+                        if i == picker.selected {
+                            line.bold()
                         } else {
-                            "(no matches)"
-                        };
-                        vec![Line::from(Span::styled(
-                            msg,
-                            Style::default().fg(Color::DarkGray),
-                        ))]
+                            line.dim()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let rows = if items.is_empty() {
+                    let msg = if self.history.is_empty() {
+                        "(no history yet)"
                     } else {
-                        items
+                        "(no matches)"
                     };
-                    let title = format!(" History: {}▏", picker.query);
-                    (
-                        rows,
-                        Line::from(title).left_aligned(),
-                        Line::from(" ↑ | ↓ | Esc ").right_aligned(),
-                    )
-                } else if let Some(rp) = &self.route_picker {
-                    let visible_rows = self.visible_rows(footer_height);
-                    let start = rp.scroll.min(rp.routes.len().saturating_sub(visible_rows));
-                    let end = (start + visible_rows).min(rp.routes.len());
-                    let items = rp.routes[start..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| {
-                            let idx = start + i;
-                            let text = format!("{}", r);
-                            let mut line = Line::from(Span::raw(text));
-                            if idx == rp.selected {
-                                line = line.bold();
-                            } else if self.hovered != Some(idx) {
-                                line = line.dim();
-                            }
-                            if self.hovered == Some(idx) {
-                                line = line.bg(Color::DarkGray);
-                            }
-                            line
-                        })
-                        .collect::<Vec<_>>();
-                    let rows = if items.is_empty() {
-                        vec![Line::from(Span::raw("(no routes)"))]
-                    } else {
-                        items
-                    };
-                    (
-                        rows,
-                        Line::from(" Routes ").left_aligned(),
-                        Line::from(" ↑ | ↓ | Enter ").right_aligned(),
-                    )
-                } else if self.current_zone() == Zone::Arg {
-                    let rpc_name = self.rpc_name_part().to_string();
-                    let sig = registry
-                        .and_then(|r| r.find(&rpc_name))
-                        .map(rpc_signature)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_default();
-                    let mut spans = vec![Span::styled(
-                        rpc_name,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )];
-                    if !sig.is_empty() {
-                        spans.push(Span::raw("  "));
-                        spans.push(Span::styled(
-                            sig,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                        ));
-                    }
-                    (
-                        vec![Line::from(spans)],
-                        Line::from(" Argument ").left_aligned(),
-                        Line::from(" Enter | ← clear ").right_aligned(),
-                    )
+                    vec![Line::from(Span::styled(
+                        msg,
+                        Style::default().fg(Color::DarkGray),
+                    ))]
                 } else {
-                    let items: Vec<Line> = if registry.is_some() {
-                        let visible_rows = self.visible_rows(footer_height);
-                        let start = self.effective_scroll(visible_rows);
-                        let end = if visible_rows == 0 {
-                            start
-                        } else {
-                            (start + visible_rows).min(self.suggestions.len())
-                        };
-                        self.suggestions[start..end]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, sugg)| {
-                                let is_sel = Some(start + i) == self.selected;
-                                let is_hover = Some(start + i) == self.hovered;
-                                self.render_suggestion_line(sugg, registry, is_sel, is_hover)
-                            })
-                            .collect()
-                    } else {
-                        vec![Line::from(vec![
-                            Span::styled(spinner_frame(blink), Style::default().fg(Color::Cyan)),
-                            Span::raw(format!(" {}", loading_message)),
-                        ])]
-                    };
-                    let rows = if items.is_empty() {
-                        vec![Line::from(Span::raw(""))]
-                    } else {
-                        items
-                    };
-                    (
-                        rows,
-                        Line::from(" RPCs ").left_aligned(),
-                        Line::from(suggestions_title(status)).right_aligned(),
-                    )
+                    items
                 };
+                let title = format!(" History: {}▏", picker.query);
+                (
+                    rows,
+                    Line::from(title).left_aligned(),
+                    Line::from(" ↑ | ↓ | Esc ").right_aligned(),
+                )
+            } else if let Some(rp) = &self.route_picker {
+                let visible_rows = self.visible_rows(footer_height);
+                let start = rp.scroll.min(rp.routes.len().saturating_sub(visible_rows));
+                let end = (start + visible_rows).min(rp.routes.len());
+                let items = rp.routes[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let idx = start + i;
+                        let text = format!("{}", r);
+                        let mut line = Line::from(Span::raw(text));
+                        if idx == rp.selected {
+                            line = line.bold();
+                        } else if self.hovered != Some(idx) {
+                            line = line.dim();
+                        }
+                        if self.hovered == Some(idx) {
+                            line = line.bg(Color::DarkGray);
+                        }
+                        line
+                    })
+                    .collect::<Vec<_>>();
+                let rows = if items.is_empty() {
+                    vec![Line::from(Span::raw("(no routes)"))]
+                } else {
+                    items
+                };
+                (
+                    rows,
+                    Line::from(" Routes ").left_aligned(),
+                    Line::from(" ↑ | ↓ | Enter ").right_aligned(),
+                )
+            } else if self.current_zone() == Zone::Arg {
+                let rpc_name = self.rpc_name_part().to_string();
+                let sig = registry
+                    .and_then(|r| r.find(&rpc_name))
+                    .map(rpc_signature)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let mut spans = vec![Span::styled(
+                    rpc_name,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                if !sig.is_empty() {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        sig,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                (
+                    vec![Line::from(spans)],
+                    Line::from(" Argument ").left_aligned(),
+                    Line::from(" Enter | ← clear ").right_aligned(),
+                )
+            } else {
+                let items: Vec<Line> = if registry.is_some() {
+                    let visible_rows = self.visible_rows(footer_height);
+                    let start = self.effective_scroll(visible_rows);
+                    let end = if visible_rows == 0 {
+                        start
+                    } else {
+                        (start + visible_rows).min(self.suggestions.len())
+                    };
+                    self.suggestions[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sugg)| {
+                            let is_sel = Some(start + i) == self.selected;
+                            let is_hover = Some(start + i) == self.hovered;
+                            self.render_suggestion_line(sugg, registry, settings, is_sel, is_hover)
+                        })
+                        .collect()
+                } else {
+                    vec![Line::from(vec![
+                        Span::styled(spinner_frame(blink), Style::default().fg(Color::Cyan)),
+                        Span::raw(format!(" {}", loading_message)),
+                    ])]
+                };
+                let rows = if items.is_empty() {
+                    vec![Line::from(Span::raw(""))]
+                } else {
+                    items
+                };
+                (
+                    rows,
+                    Line::from(" RPCs ").left_aligned(),
+                    Line::from(suggestions_title(status)).right_aligned(),
+                )
+            };
 
             let rpc_block = Block::default()
                 .borders(Borders::ALL)
@@ -1078,11 +1081,13 @@ impl RpcPalette {
     }
 
     /// Renders one suggestion row with fuzzy-match highlights and, when
-    /// known, the registry's permission and type signature trailing in dim.
+    /// known, the registry's permission and type signature and the setting's
+    /// value trailing in dim.
     fn render_suggestion_line<'a>(
         &self,
         sugg: &'a Suggestion,
         registry: Option<&RpcRegistry>,
+        settings: Option<&Settings>,
         is_selected: bool,
         is_hovered: bool,
     ) -> Line<'a> {
@@ -1105,18 +1110,24 @@ impl RpcPalette {
         }
 
         if let Some(desc) = registry.and_then(|r| r.find(&sugg.name)) {
+            // DarkGray fg would vanish on the DarkGray hover tint.
+            let sig_style = if is_hovered {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            };
             let sig = rpc_signature(desc);
             if !sig.is_empty() {
-                // DarkGray fg would vanish on the DarkGray hover tint.
-                let sig_style = if is_hovered {
-                    Style::default().add_modifier(Modifier::DIM)
-                } else {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM)
-                };
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(sig, sig_style));
+            }
+            let value = settings
+                .and_then(|settings| settings.get(&sugg.name))
+                .and_then(|value| desc.meta.text_type().decode(value).ok());
+            if let Some(value) = value {
+                spans.push(Span::styled(format!("  = {}", value.to_text()), sig_style));
             }
         }
 

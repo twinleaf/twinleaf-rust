@@ -2,11 +2,11 @@
 
 use super::rpc::{
     CallError, PendingReply, RpcArgs, RpcMeta, RpcRegistry, RpcRegistryError, RpcReply,
-    SettingsCache,
 };
 use super::runtime::ProxyAddress;
 use super::session::{Handle, Session};
-use super::stream::{DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, Stream};
+use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use super::stream::{Event, NamedRoute, Receiver, RecvError, Scope, Stream};
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
@@ -17,15 +17,15 @@ use crate::tio::transport::is_local_tcp;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How long [`DeviceTree::metadata`] waits for discovery to finish, across
-/// all its `dev.metadata` round trips.
+/// How long [`Device::metadata`] waits for discovery to finish, across all
+/// its `dev.metadata` round trips.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long [`Connection::open`] waits for the proxy to open a device. The
 /// proxy itself gives a device 10 s to answer.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Why [`DeviceTree::metadata`] returned no metadata.
+/// Why [`Device::metadata`] returned no metadata.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[non_exhaustive]
 pub enum MetadataError {
@@ -467,66 +467,53 @@ impl DeviceTree {
         self.stream.packets(Scope::of(&self.handle))
     }
 
+    /// Returns the routes heard in the subtree so far, sorted. Sends nothing
+    /// to the devices.
+    pub fn routes(&self) -> Vec<DeviceRoute> {
+        self.routes_updates().recv().unwrap_or_default()
+    }
+
+    /// Subscribes to the routes heard in the subtree. The receiver yields the
+    /// sorted list of them now, then the whole list again each time a new
+    /// route is heard. A reader that falls behind skips to the newest list.
+    pub fn routes_updates(&self) -> Receiver<Vec<DeviceRoute>> {
+        self.stream.routes(Scope::of(&self.handle))
+    }
+
     /// Returns the session handle behind this view.
     pub(super) fn handle(&self) -> &Handle {
         &self.handle
     }
 
-    /// Collects complete metadata for `route`, waiting up to 10 s.
+    /// Collects complete metadata for `route`, waiting up to 10 s. See
+    /// [`Device::metadata`].
     ///
     /// # Errors
     ///
     /// Returns [`MetadataError::Route`] at once if `route` lies outside this
-    /// view. Returns [`MetadataError::Unsupported`] if the device has no
-    /// `dev.metadata`, [`MetadataError::Timeout`] if discovery does not
-    /// finish in time, and [`MetadataError::Disconnected`] if the connection
-    /// ends.
+    /// view. Otherwise fails as [`Device::metadata`] does.
     pub fn metadata(&self, route: DeviceRoute) -> Result<DeviceMetadataSnapshot, MetadataError> {
-        self.handle.scoped(route)?;
-        let events = self.events();
-        let deadline = Instant::now() + METADATA_TIMEOUT;
-        loop {
-            let event = match events.recv_deadline(deadline) {
-                Ok(event) => event,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Timeout) => return Err(MetadataError::Timeout),
-                Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
-                    return Err(MetadataError::Disconnected)
-                }
-            };
-            match event {
-                Event::Device { route: from, event } if from == route => match event {
-                    DeviceEvent::Metadata(snapshot) => return Ok(snapshot),
-                    DeviceEvent::MetadataUnavailable => return Err(MetadataError::Unsupported),
-                    DeviceEvent::Heartbeat { .. }
-                    | DeviceEvent::NewHash(_)
-                    | DeviceEvent::Setting { .. } => {}
-                },
-                Event::Device { .. } | Event::RouteDiscovered { .. } | Event::Link { .. } => {}
-            }
-        }
+        self.device(route)?.metadata()
     }
 
-    /// Listens to the subtree for `window` and returns the routes heard,
-    /// sorted. Sends nothing to the devices.
+    /// Listens to the subtree for `window` and returns the routes heard by
+    /// then, sorted. Sends nothing to the devices.
     pub fn discover_routes(&self, window: Duration) -> Vec<DeviceRoute> {
-        let events = self.events();
+        let updates = self.routes_updates();
         let deadline = Instant::now() + window;
         let mut routes = Vec::new();
         loop {
-            match events.recv_deadline(deadline) {
-                Ok(Event::RouteDiscovered { route }) => routes.push(route),
-                Ok(Event::Device { .. }) | Ok(Event::Link { .. }) | Err(RecvError::Lagged(_)) => {}
+            match updates.recv_deadline(deadline) {
+                Ok(heard) => routes = heard,
+                Err(RecvError::Lagged(_)) => {}
                 Err(
                     RecvError::Timeout
                     | RecvError::Disconnected
                     | RecvError::Stopped
                     | RecvError::Closed,
-                ) => break,
+                ) => return routes,
             }
         }
-        routes.sort();
-        routes
     }
 
     /// Discovers the subtree's routes as [`discover_routes`](Self::discover_routes)
@@ -609,18 +596,17 @@ impl DeviceTree {
         self.rpc(route, name, ())
     }
 
-    /// Returns the RPCs the device at `route` offers.
-    ///
-    /// The table comes from the on-disk cache when the device's `rpc.hash`
-    /// matches it. On a miss it is read with `rpc.listinfo` and cached. A
-    /// cache that cannot be read or written is logged and skipped.
+    /// Returns the RPCs the device at `route` offers. See
+    /// [`Device::rpc_registry`].
     ///
     /// # Errors
     ///
-    /// Returns [`RpcRegistryError::DeviceRpcError`] if a call fails, and
-    /// [`RpcRegistryError::TableChanged`] if the table changed during every walk.
-    pub fn rpc_registry(&self, route: DeviceRoute) -> Result<RpcRegistry, RpcRegistryError> {
-        RpcRegistry::load_with(|name, arg| self.submit(route, name, arg))
+    /// Returns [`RpcRegistryError::DeviceRpcError`] with
+    /// [`CallError::InvalidRoute`] if `route` lies outside this view.
+    /// Otherwise fails as [`Device::rpc_registry`] does.
+    pub fn rpc_registry(&self, route: DeviceRoute) -> Result<Arc<RpcRegistry>, RpcRegistryError> {
+        let device = self.device(route).map_err(CallError::InvalidRoute)?;
+        device.rpc_registry()
     }
 
     /// Returns the type, access, and flags of the RPC `name` at `route`, as
@@ -679,13 +665,57 @@ impl Device {
         self.tree.packets()
     }
 
+    /// Returns whether this device is there now.
+    ///
+    /// The connection follows each device from its packets and the statuses
+    /// of the link that serves it. A device it has not heard from is
+    /// [`Presence::Connecting`]. Once the connection has ended, every device
+    /// is [`Presence::Lost`].
+    pub fn presence(&self) -> Presence {
+        self.presence_updates().recv().unwrap_or(Presence::Lost {
+            since: Instant::now(),
+        })
+    }
+
+    /// Subscribes to whether this device is there. The receiver yields the
+    /// presence now, then each change, including each heartbeat. A reader
+    /// that falls behind skips to the newest.
+    pub fn presence_updates(&self) -> Receiver<Presence> {
+        self.tree.stream.presence(self.route())
+    }
+
     /// Collects this device's complete metadata, waiting up to 10 s.
+    ///
+    /// The connection asks the device once, and every caller shares what it
+    /// collected.
     ///
     /// # Errors
     ///
-    /// Fails as [`DeviceTree::metadata`] does.
+    /// Returns [`MetadataError::Unsupported`] if the device has no
+    /// `dev.metadata`, [`MetadataError::Timeout`] if discovery does not
+    /// finish in time, and [`MetadataError::Disconnected`] if the connection
+    /// ends.
     pub fn metadata(&self) -> Result<DeviceMetadataSnapshot, MetadataError> {
-        self.tree.metadata(self.route())
+        let updates = self.metadata_updates();
+        let deadline = Instant::now() + METADATA_TIMEOUT;
+        loop {
+            match updates.recv_deadline(deadline) {
+                Ok(MetadataState::Ready(snapshot)) => return Ok(snapshot),
+                Ok(MetadataState::Unsupported) => return Err(MetadataError::Unsupported),
+                Ok(MetadataState::Pending) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Timeout) => return Err(MetadataError::Timeout),
+                Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
+                    return Err(MetadataError::Disconnected)
+                }
+            }
+        }
+    }
+
+    /// Subscribes to this device's metadata. The receiver yields how far it
+    /// is collected now, then each change. Subscribing starts discovery. A
+    /// reader that falls behind skips to the newest.
+    pub fn metadata_updates(&self) -> Receiver<MetadataState> {
+        self.tree.stream.metadata(self.route())
     }
 
     /// Returns the same device, with each RPC giving up after `rpc_timeout`.
@@ -766,13 +796,83 @@ impl Device {
         self.tree.get(self.route(), name)
     }
 
-    /// Returns the RPCs this device offers. See [`DeviceTree::rpc_registry`].
+    /// Returns the RPCs this device offers, waiting until the table is
+    /// loaded.
+    ///
+    /// The connection loads the table once, and every caller shares it. It
+    /// comes from the on-disk cache when the device's `rpc.hash` matches it.
+    /// On a miss it is read with `rpc.listinfo` and cached. A cache that
+    /// cannot be read or written is logged and skipped. The table is loaded
+    /// again when the device announces a new `rpc.hash`, starts a new
+    /// session, or its link reconnects.
     ///
     /// # Errors
     ///
-    /// Fails as [`DeviceTree::rpc_registry`] does.
-    pub fn rpc_registry(&self) -> Result<RpcRegistry, RpcRegistryError> {
-        self.tree.rpc_registry(self.route())
+    /// Returns [`RpcRegistryError::DeviceRpcError`] if a call fails, and
+    /// [`RpcRegistryError::TableChanged`] if the table changed during every walk.
+    /// The connection loads it again later.
+    pub fn rpc_registry(&self) -> Result<Arc<RpcRegistry>, RpcRegistryError> {
+        self.rpc_registry_updates()
+            .recv()
+            .unwrap_or(Err(RpcRegistryError::DeviceRpcError(
+                CallError::ResponseLost,
+            )))
+    }
+
+    /// Subscribes to this device's RPC table. The receiver yields the table,
+    /// or why it could not be loaded, once it is known, then each new one.
+    /// Subscribing starts loading it. A reader that falls behind skips to the
+    /// newest.
+    pub fn rpc_registry_updates(&self) -> Receiver<RegistryState> {
+        self.tree.stream.rpc_registry(self.route())
+    }
+
+    /// Returns the values of this device's announced settings, waiting until
+    /// the RPC table is loaded and the values are read.
+    ///
+    /// The connection reads them once and keeps them by the device's
+    /// announcements, and every caller shares them. See [`Settings`].
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`rpc_registry`](Self::rpc_registry) does, as the values
+    /// cannot be read without the table.
+    pub fn settings(&self) -> Result<Arc<Settings>, RpcRegistryError> {
+        let settings = self.settings_updates();
+        let registry = self.rpc_registry_updates();
+        let lost = || Err(RpcRegistryError::DeviceRpcError(CallError::ResponseLost));
+        loop {
+            let woken = flume::Selector::new()
+                .recv(settings.as_flume(), |received| {
+                    settings.resolve(received).map(Ok)
+                })
+                .recv(registry.as_flume(), |received| {
+                    registry.resolve(received).map(Err)
+                })
+                .wait();
+            match woken {
+                Ok(Ok(settings)) => return Ok(settings),
+                Ok(Err(Err(error))) => return Err(error),
+                Ok(Err(Ok(_))) | Err(RecvError::Lagged(_)) => {}
+                Err(_) => return lost(),
+            }
+        }
+    }
+
+    /// Subscribes to the values of this device's announced settings. The
+    /// receiver yields them once they are read, then again after each
+    /// change. Subscribing starts loading the RPC table and reading them. A
+    /// reader that falls behind skips to the newest values.
+    pub fn settings_updates(&self) -> Receiver<Arc<Settings>> {
+        self.tree.stream.settings(self.route())
+    }
+
+    /// Subscribes to every setting this device announces from now on, in
+    /// the order it announces them. The receiver queues up to 4096 of them,
+    /// and one that falls behind gets [`RecvError::Lagged`]. Read
+    /// [`settings`](Self::settings) then to catch up.
+    pub fn setting_changes(&self) -> Receiver<SettingChange> {
+        self.tree.stream.setting_changes(self.route())
     }
 
     /// Returns the type, access, and flags of this device's RPC `name`. See
@@ -783,23 +883,6 @@ impl Device {
     /// Fails as [`DeviceTree::rpc_meta`] does.
     pub fn rpc_meta(&self, name: &str) -> Result<RpcMeta, CallError> {
         self.tree.rpc_meta(self.route(), name)
-    }
-
-    /// Fills `cache` with one consistent snapshot of this device's announced
-    /// values, read between two reads of `settings.version` that agree.
-    ///
-    /// Call it once the cache is built and whenever
-    /// [`SettingsCache::observe`] asks for it. Announcements received during
-    /// the call are observed after it, and those the snapshot already holds
-    /// are skipped by their sequence numbers. A device the cache does not
-    /// hold is not read.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CallError`] if reading `settings.version` or any value
-    /// fails. The cache then keeps what it held.
-    pub fn snapshot_settings(&self, cache: &mut SettingsCache) -> Result<(), CallError> {
-        cache.snapshot_with(|name, arg| self.submit(name, arg))
     }
 
     /// Returns a test device at the root, over a session whose socket is a

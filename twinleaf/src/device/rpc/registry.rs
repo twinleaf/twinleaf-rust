@@ -18,7 +18,7 @@ const WALK_ATTEMPTS: usize = 3;
 const SESSION: &str = "dev.session";
 
 /// Why a device's RPC table could not be loaded.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcRegistryError {
     /// A call during the walk failed.

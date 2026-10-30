@@ -1,8 +1,8 @@
 //! The stream pump, one task per connection.
 //!
 //! The pump drains the session's inlet and keeps metadata discovery going. It
-//! sends packets, batches, and events to owned [`Receiver`]s, each filtered
-//! to the subtree its view covers.
+//! sends packets, batches, events and device state to owned [`Receiver`]s,
+//! each filtered to the subtree its view covers.
 
 mod event;
 mod metadata;
@@ -14,6 +14,9 @@ pub(crate) use subscription::{End, Lane, Queued, Scope};
 pub use subscription::{Receiver, RecvError};
 
 use super::session::{Handle, Inlet, RawCallResult};
+use super::state::{
+    self, Learned, MetadataState, Presence, RegistryState, SettingChange, Settings,
+};
 use crate::data::{DeviceMetadataSnapshot, MetadataQuery, PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
@@ -24,7 +27,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{self, Future};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use subscription::Sink;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -54,17 +57,56 @@ fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
 }
 
 /// The pump's state. It holds the parser, the known routes and their
-/// metadata revisions, the latest link status per subtree, and the batches
-/// and events waiting to go out.
+/// metadata revisions and presence, the latest link status per subtree, the
+/// devices' workers, and the batches, events and state changes waiting to go
+/// out.
 struct StreamState {
     parser: PacketParser,
     known_routes: HashSet<DeviceRoute>,
     metadata_seen: HashMap<DeviceRoute, u32>,
-    /// Latest status per subtree, replayed root-first to late subscribers. A new
-    /// status supersedes every entry under it.
-    link_state: HashMap<DeviceRoute, packet::LinkStatus>,
+    /// Routes whose firmware has no `dev.metadata`.
+    unsupported: HashSet<DeviceRoute>,
+    /// Latest status per subtree, and when it arrived, replayed root-first to
+    /// late subscribers. A new status supersedes every entry under it.
+    link_state: HashMap<DeviceRoute, (packet::LinkStatus, std::time::Instant)>,
+    /// The presence of each route heard. Any other route is as its link
+    /// left it.
+    presence: HashMap<DeviceRoute, Presence>,
+    /// The worker of each device whose RPC table or settings were asked for.
+    workers: HashMap<DeviceRoute, Worker>,
     batches: VecDeque<SampleBatch>,
     events: VecDeque<Event>,
+    changes: VecDeque<Change>,
+}
+
+/// A device's worker, and the latest it learned.
+struct Worker {
+    events: flume::Sender<DeviceEvent>,
+    registry: Option<RegistryState>,
+    settings: Option<Arc<Settings>>,
+}
+
+/// Device state that changed, waiting to go out.
+enum Change {
+    Route(DeviceRoute),
+    Presence(DeviceRoute),
+    Metadata(DeviceRoute),
+    Setting(DeviceRoute, SettingChange),
+    Registry(DeviceRoute),
+    Settings(DeviceRoute),
+}
+
+/// Returns the presence a link's `status` gives the devices it serves, or
+/// `None` for a status that says nothing about them.
+fn link_presence(status: packet::LinkStatus, since: std::time::Instant) -> Option<Presence> {
+    match status {
+        packet::LinkStatus::SensorDisconnected
+        | packet::LinkStatus::Stopped
+        | packet::LinkStatus::FailedToConnect
+        | packet::LinkStatus::FailedToReconnect => Some(Presence::Lost { since }),
+        packet::LinkStatus::SensorReconnected => Some(Presence::Connecting),
+        packet::LinkStatus::Unknown(_) => None,
+    }
 }
 
 impl StreamState {
@@ -73,9 +115,13 @@ impl StreamState {
             parser: PacketParser::new(false),
             known_routes: HashSet::new(),
             metadata_seen: HashMap::new(),
+            unsupported: HashSet::new(),
             link_state: HashMap::new(),
+            presence: HashMap::new(),
+            workers: HashMap::new(),
             batches: VecDeque::new(),
             events: VecDeque::new(),
+            changes: VecDeque::new(),
         }
     }
 
@@ -87,8 +133,70 @@ impl StreamState {
         self.events.pop_front()
     }
 
+    /// Queues a fact about the device at `route`, and hands its worker the
+    /// facts the worker follows.
     fn device_event(&mut self, route: DeviceRoute, event: DeviceEvent) {
+        if let Some(worker) = self.workers.get(&route) {
+            if let DeviceEvent::Heartbeat { .. }
+            | DeviceEvent::Setting { .. }
+            | DeviceEvent::NewHash(_) = event
+            {
+                let _ = worker.events.send(event.clone());
+            }
+        }
         self.events.push_back(Event::Device { route, event });
+    }
+
+    /// Returns the routes heard within `scope`, sorted.
+    fn routes_in(&self, scope: Scope) -> Vec<DeviceRoute> {
+        let mut routes: Vec<_> = self
+            .known_routes
+            .iter()
+            .copied()
+            .filter(|route| scope.covers(*route))
+            .collect();
+        routes.sort();
+        routes
+    }
+
+    /// Returns the presence of the device at `route`. One not heard from is
+    /// as the deepest link status over it left it.
+    fn presence_of(&self, route: DeviceRoute) -> Presence {
+        if let Some(presence) = self.presence.get(&route) {
+            return *presence;
+        }
+        self.link_state
+            .iter()
+            .filter(|(subtree, _)| route.starts_with(subtree))
+            .max_by_key(|(subtree, _)| subtree.len())
+            .and_then(|(_, (status, since))| link_presence(*status, *since))
+            .unwrap_or(Presence::Connecting)
+    }
+
+    fn set_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        if self.presence.insert(route, presence) != Some(presence) {
+            self.changes.push_back(Change::Presence(route));
+        }
+    }
+
+    /// Returns how far the metadata of the device at `route` is collected.
+    fn metadata_of(&self, route: DeviceRoute) -> MetadataState {
+        match self.metadata_seen.contains_key(&route) {
+            true => self
+                .parser
+                .metadata(route)
+                .map_or(MetadataState::Pending, MetadataState::Ready),
+            false if self.unsupported.contains(&route) => MetadataState::Unsupported,
+            false => MetadataState::Pending,
+        }
+    }
+
+    /// Notes that the firmware at `route` has no `dev.metadata`.
+    fn metadata_unavailable(&mut self, route: DeviceRoute) {
+        if self.unsupported.insert(route) {
+            self.changes.push_back(Change::Metadata(route));
+        }
+        self.device_event(route, DeviceEvent::MetadataUnavailable);
     }
 
     /// Queues [`DeviceEvent::Metadata`] when a route's complete metadata is a
@@ -99,6 +207,7 @@ impl StreamState {
             return;
         };
         self.metadata_seen.insert(route, revision);
+        self.changes.push_back(Change::Metadata(route));
         self.device_event(route, DeviceEvent::Metadata(snapshot));
     }
 
@@ -120,7 +229,7 @@ impl StreamState {
         }) && {
             let mut link: Vec<_> = self.link_state.iter().collect();
             link.sort_by_key(|(subtree, _)| subtree.len());
-            link.into_iter().all(|(subtree, status)| {
+            link.into_iter().all(|(subtree, (status, _))| {
                 sink.offer(Scope::subtree(*subtree), || Event::Link {
                     subtree: *subtree,
                     event: LinkEvent::Status(*status),
@@ -137,9 +246,20 @@ impl StreamState {
     /// Clears the metadata of every route in `subtree`. The next session
     /// there discovers it again.
     fn forget_metadata(&mut self, subtree: DeviceRoute) {
+        let forgotten: Vec<_> = self
+            .metadata_seen
+            .keys()
+            .chain(&self.unsupported)
+            .filter(|route| route.starts_with(&subtree))
+            .copied()
+            .collect();
         self.metadata_seen
             .retain(|route, _| !route.starts_with(&subtree));
+        self.unsupported
+            .retain(|route| !route.starts_with(&subtree));
         self.parser.reset_subtree(subtree);
+        self.changes
+            .extend(forgotten.into_iter().map(Change::Metadata));
     }
 
     /// Reports an inlet overflow without resetting the parser. The parser
@@ -155,9 +275,21 @@ impl StreamState {
     /// Applies a link's status to the subtree it concerns, the root or one
     /// mount of what the proxy serves.
     fn apply_status(&mut self, subtree: DeviceRoute, status: packet::LinkStatus) {
+        let now = std::time::Instant::now();
         self.link_state
             .retain(|root, _| !root.starts_with(&subtree));
-        self.link_state.insert(subtree, status);
+        self.link_state.insert(subtree, (status, now));
+        if let Some(presence) = link_presence(status, now) {
+            let served: Vec<_> = self
+                .presence
+                .keys()
+                .filter(|route| route.starts_with(&subtree))
+                .copied()
+                .collect();
+            for route in served {
+                self.set_presence(route, presence);
+            }
+        }
         self.events.push_back(Event::Link {
             subtree,
             event: LinkEvent::Status(status),
@@ -171,12 +303,11 @@ impl StreamState {
                     .known_routes
                     .iter()
                     .filter(|route| route.starts_with(&subtree))
-                    .map(|route| Event::Device {
-                        route: *route,
-                        event: DeviceEvent::NewHash(None),
-                    })
+                    .copied()
                     .collect();
-                self.events.extend(refresh);
+                for route in refresh {
+                    self.device_event(route, DeviceEvent::NewHash(None));
+                }
             }
             packet::LinkStatus::FailedToConnect
             | packet::LinkStatus::FailedToReconnect
@@ -194,7 +325,24 @@ impl StreamState {
         let route = pkt.route();
         if self.known_routes.insert(route) {
             self.events.push_back(Event::RouteDiscovered { route });
+            self.changes.push_back(Change::Route(route));
         }
+        let session = match self.presence.get(&route) {
+            Some(Presence::Alive { session, .. }) => *session,
+            _ => None,
+        };
+        let heartbeat = match self.presence.get(&route) {
+            Some(Presence::Alive { heartbeat, .. }) => *heartbeat,
+            _ => None,
+        };
+        let alive = match pkt.payload() {
+            packet::Payload::Heartbeat(beat) => Presence::Alive {
+                session: beat.session().or(session),
+                heartbeat: Some(std::time::Instant::now()),
+            },
+            _ => Presence::Alive { session, heartbeat },
+        };
+        self.set_presence(route, alive);
 
         match pkt.payload() {
             packet::Payload::Heartbeat(beat) => {
@@ -213,12 +361,19 @@ impl StreamState {
                     self.device_event(route, DeviceEvent::NewHash(Some(hash)));
                 }
                 if let Some(name) = setting.name_str() {
+                    let change = SettingChange {
+                        name: name.to_string(),
+                        seq: setting.seq,
+                        reply: setting.reply.to_vec(),
+                    };
+                    self.changes
+                        .push_back(Change::Setting(route, change.clone()));
                     self.device_event(
                         route,
                         DeviceEvent::Setting {
-                            name: name.to_string(),
-                            seq: setting.seq,
-                            reply: setting.reply.to_vec(),
+                            name: change.name,
+                            seq: change.seq,
+                            reply: change.reply,
                         },
                     );
                 }
@@ -242,6 +397,12 @@ enum PumpSink {
     Batches(Sink<SampleBatch>),
     Events(Sink<Event>),
     Packets(Sink<tio::Packet>),
+    Routes(Sink<Vec<DeviceRoute>>),
+    Presence(Sink<Presence>),
+    Metadata(Sink<MetadataState>),
+    Registry(Sink<RegistryState>),
+    Settings(Sink<Arc<Settings>>),
+    SettingChanges(Sink<SettingChange>),
 }
 
 impl PumpSink {
@@ -251,8 +412,110 @@ impl PumpSink {
             PumpSink::Batches(sink) => sink.lane.end(end),
             PumpSink::Events(sink) => sink.lane.end(end),
             PumpSink::Packets(sink) => sink.lane.end(end),
+            PumpSink::Routes(sink) => sink.lane.end(end),
+            PumpSink::Presence(sink) => sink.lane.end(end),
+            PumpSink::Metadata(sink) => sink.lane.end(end),
+            PumpSink::Registry(sink) => sink.lane.end(end),
+            PumpSink::Settings(sink) => sink.lane.end(end),
+            PumpSink::SettingChanges(sink) => sink.lane.end(end),
         }
     }
+}
+
+/// The pump's fan-out lists, one per kind of subscription.
+#[derive(Default)]
+struct Sinks {
+    batches: Vec<Sink<SampleBatch>>,
+    events: Vec<Sink<Event>>,
+    packets: Vec<Sink<tio::Packet>>,
+    routes: Vec<Sink<Vec<DeviceRoute>>>,
+    presence: Vec<Sink<Presence>>,
+    metadata: Vec<Sink<MetadataState>>,
+    registry: Vec<Sink<RegistryState>>,
+    settings: Vec<Sink<Arc<Settings>>>,
+    setting_changes: Vec<Sink<SettingChange>>,
+}
+
+/// Calls the generic `$apply` with each list of `$sinks` and then `$args`.
+macro_rules! each_list {
+    ($sinks:expr, $apply:ident $(, $args:expr)*) => {{
+        let sinks = $sinks;
+        $apply(&mut sinks.batches $(, $args)*);
+        $apply(&mut sinks.events $(, $args)*);
+        $apply(&mut sinks.packets $(, $args)*);
+        $apply(&mut sinks.routes $(, $args)*);
+        $apply(&mut sinks.presence $(, $args)*);
+        $apply(&mut sinks.metadata $(, $args)*);
+        $apply(&mut sinks.registry $(, $args)*);
+        $apply(&mut sinks.settings $(, $args)*);
+        $apply(&mut sinks.setting_changes $(, $args)*);
+    }};
+}
+
+impl Sinks {
+    /// Returns `true` if a subscription that needs the route decoded covers
+    /// `route`. Raw taps and route lists do not.
+    fn cover(&self, route: DeviceRoute) -> bool {
+        let scopes = self
+            .batches
+            .iter()
+            .map(|sink| sink.scope)
+            .chain(self.events.iter().map(|sink| sink.scope))
+            .chain(self.presence.iter().map(|sink| sink.scope))
+            .chain(self.metadata.iter().map(|sink| sink.scope))
+            .chain(self.registry.iter().map(|sink| sink.scope))
+            .chain(self.settings.iter().map(|sink| sink.scope))
+            .chain(self.setting_changes.iter().map(|sink| sink.scope));
+        let mut scopes = scopes;
+        scopes.any(|scope| scope.covers(route))
+    }
+
+    /// Returns how many subscriptions there are.
+    fn len(&mut self) -> usize {
+        let mut count = 0;
+        each_list!(self, count_into, &mut count);
+        count
+    }
+
+    /// Ends every subscription saying why.
+    fn end(&mut self, end: End) {
+        each_list!(self, end_all, end);
+    }
+
+    /// Sends each subscriber's count of missed items, and drops the
+    /// subscriptions whose receivers are gone.
+    fn report_lag(&mut self) {
+        each_list!(self, report_all);
+    }
+
+    /// Drops the subscriptions whose receivers are gone, as their
+    /// lifelines report in `cx`.
+    fn prune(&mut self, cx: &mut Context<'_>) {
+        each_list!(self, prune_all, &mut *cx);
+    }
+}
+
+fn count_into<T>(list: &[Sink<T>], count: &mut usize) {
+    *count += list.len();
+}
+
+fn end_all<T>(list: &mut Vec<Sink<T>>, end: End) {
+    list.drain(..).for_each(|sink| sink.lane.end(end));
+}
+
+fn report_all<T>(list: &mut Vec<Sink<T>>) {
+    list.retain_mut(|sink| sink.lane.report_lag());
+}
+
+fn prune_all<T>(list: &mut Vec<Sink<T>>, cx: &mut Context<'_>) {
+    // A lifeline resolves only once its receiver is gone, and its sink is
+    // dropped before it is polled again.
+    list.retain_mut(|sink| Pin::new(&mut sink.alive).poll(cx).is_pending());
+}
+
+/// Sends `item` to each subscriber in `list` whose scope covers `route`.
+fn send_at<T>(list: &mut Vec<Sink<T>>, route: DeviceRoute, item: impl Fn() -> T) {
+    list.retain_mut(|sink| sink.offer(Scope::point(route), &item));
 }
 
 /// What the pump does after a turn.
@@ -296,6 +559,43 @@ impl Stream {
         self.mint(scope, PACKET_QUEUE_LEN, PumpSink::Packets)
     }
 
+    /// Subscribes to the sorted list of the routes heard in `scope`.
+    pub(super) fn routes(self: &Arc<Stream>, scope: Scope) -> Receiver<Vec<DeviceRoute>> {
+        self.mint_latest(scope, PumpSink::Routes)
+    }
+
+    /// Subscribes to the presence of the device at `route`.
+    pub(super) fn presence(self: &Arc<Stream>, route: DeviceRoute) -> Receiver<Presence> {
+        self.mint_latest(Scope::point(route), PumpSink::Presence)
+    }
+
+    /// Subscribes to the metadata of the device at `route`.
+    pub(super) fn metadata(self: &Arc<Stream>, route: DeviceRoute) -> Receiver<MetadataState> {
+        self.mint_latest(Scope::point(route), PumpSink::Metadata)
+    }
+
+    /// Subscribes to the RPC table of the device at `route`.
+    pub(super) fn rpc_registry(self: &Arc<Stream>, route: DeviceRoute) -> Receiver<RegistryState> {
+        self.mint_latest(Scope::point(route), PumpSink::Registry)
+    }
+
+    /// Subscribes to the settings of the device at `route`.
+    pub(super) fn settings(self: &Arc<Stream>, route: DeviceRoute) -> Receiver<Arc<Settings>> {
+        self.mint_latest(Scope::point(route), PumpSink::Settings)
+    }
+
+    /// Subscribes to every setting the device at `route` announces.
+    pub(super) fn setting_changes(
+        self: &Arc<Stream>,
+        route: DeviceRoute,
+    ) -> Receiver<SettingChange> {
+        self.mint(
+            Scope::point(route),
+            EVENT_QUEUE_LEN,
+            PumpSink::SettingChanges,
+        )
+    }
+
     /// Hands the pump one more sink, starting the pump if this is the first.
     /// A sink the pump does not take is dropped, and its receiver reports
     /// that the stream ended.
@@ -305,7 +605,24 @@ impl Stream {
         capacity: usize,
         wrap: fn(Sink<T>) -> PumpSink,
     ) -> Receiver<T> {
-        let (sink, receiver) = Sink::new(capacity, scope);
+        self.hand(Sink::new(capacity, scope), wrap)
+    }
+
+    /// Hands the pump one more sink on a latest-value lane, as
+    /// [`mint`](Self::mint) does.
+    fn mint_latest<T>(
+        self: &Arc<Stream>,
+        scope: Scope,
+        wrap: fn(Sink<T>) -> PumpSink,
+    ) -> Receiver<T> {
+        self.hand(Sink::latest(scope), wrap)
+    }
+
+    fn hand<T>(
+        self: &Arc<Stream>,
+        (sink, receiver): (Sink<T>, Receiver<T>),
+        wrap: fn(Sink<T>) -> PumpSink,
+    ) -> Receiver<T> {
         let _ = self.pump().send(wrap(sink));
         receiver.tied_to(self)
     }
@@ -317,17 +634,20 @@ impl Stream {
     }
 }
 
-/// The pump itself. It owns the session's inlet, the parser, and the
-/// metadata queries in flight, and runs whether or not anything receives
-/// from it.
+/// The pump itself. It owns the session's inlet, the parser, the metadata
+/// queries in flight and the devices' workers, and runs whether or not
+/// anything receives from it.
 struct Pump {
+    root: Handle,
     inlet: Inlet,
     commands: mpsc::UnboundedReceiver<PumpSink>,
     state: StreamState,
     schedule: MetadataSchedule,
-    batches: Vec<Sink<SampleBatch>>,
-    events: Vec<Sink<Event>>,
-    packets: Vec<Sink<tio::Packet>>,
+    sinks: Sinks,
+    /// What the devices' workers learned.
+    learned: mpsc::UnboundedReceiver<(DeviceRoute, Learned)>,
+    /// The sender of what they learned, which each worker gets.
+    teach: mpsc::UnboundedSender<(DeviceRoute, Learned)>,
 }
 
 impl Pump {
@@ -340,14 +660,16 @@ impl Pump {
     }
 
     fn new(root: &Handle, inlet: Inlet, commands: mpsc::UnboundedReceiver<PumpSink>) -> Pump {
+        let (teach, learned) = mpsc::unbounded_channel();
         Pump {
+            root: root.clone(),
             state: StreamState::new(),
             schedule: MetadataSchedule::new(root.clone()),
             inlet,
             commands,
-            batches: Vec::new(),
-            events: Vec::new(),
-            packets: Vec::new(),
+            sinks: Sinks::default(),
+            learned,
+            teach,
         }
     }
 
@@ -372,7 +694,11 @@ impl Pump {
                     self.take_metadata_replies(reply);
                     Turn::Running
                 }
-                () = pruned(&mut self.batches, &mut self.events, &mut self.packets) => Turn::Running,
+                Some((route, learned)) = self.learned.recv() => {
+                    self.take_learned(route, learned);
+                    Turn::Running
+                }
+                () = pruned(&mut self.sinks) => Turn::Running,
                 received = self.inlet.recv_async() => self.take_input(received),
                 () = sleep_until_some(retry) => Turn::Running,
             };
@@ -383,34 +709,98 @@ impl Pump {
                 Turn::Ended(end) => break end,
             }
         };
-        self.batches.drain(..).for_each(|sink| sink.lane.end(end));
-        self.events.drain(..).for_each(|sink| sink.lane.end(end));
-        self.packets.drain(..).for_each(|sink| sink.lane.end(end));
+        self.sinks.end(end);
+        self.state.workers.clear();
         while let Some(sink) = self.commands.recv().await {
             sink.end(end);
         }
     }
 
+    /// Takes a new subscription. A subscription to state receives the
+    /// current value first, and one to events the facts already known.
     fn add_sink(&mut self, sink: PumpSink) {
+        let state = &self.state;
         match sink {
-            PumpSink::Batches(sink) => self.batches.push(sink),
+            PumpSink::Batches(sink) => self.sinks.batches.push(sink),
             PumpSink::Events(mut sink) => {
-                if self.state.replay(&mut sink) {
-                    self.events.push(sink);
+                if state.replay(&mut sink) {
+                    self.sinks.events.push(sink);
                 }
             }
-            PumpSink::Packets(sink) => self.packets.push(sink),
+            PumpSink::Packets(sink) => self.sinks.packets.push(sink),
+            PumpSink::Routes(mut sink) => {
+                if sink.lane.send(state.routes_in(sink.scope)) {
+                    self.sinks.routes.push(sink);
+                }
+            }
+            PumpSink::Presence(mut sink) => {
+                if sink.lane.send(state.presence_of(sink.scope.route)) {
+                    self.sinks.presence.push(sink);
+                }
+            }
+            PumpSink::Metadata(mut sink) => {
+                if sink.lane.send(state.metadata_of(sink.scope.route)) {
+                    self.sinks.metadata.push(sink);
+                }
+            }
+            PumpSink::Registry(mut sink) => {
+                let worker = self.worker(sink.scope.route);
+                if worker
+                    .registry
+                    .clone()
+                    .is_none_or(|registry| sink.lane.send(registry))
+                {
+                    self.sinks.registry.push(sink);
+                }
+            }
+            PumpSink::Settings(mut sink) => {
+                let worker = self.worker(sink.scope.route);
+                if worker
+                    .settings
+                    .clone()
+                    .is_none_or(|settings| sink.lane.send(settings))
+                {
+                    self.sinks.settings.push(sink);
+                }
+            }
+            PumpSink::SettingChanges(sink) => self.sinks.setting_changes.push(sink),
         }
     }
 
-    /// Returns `true` if any batch or event subscriber covers `route`. Raw
-    /// taps do not count.
+    /// Returns the worker of the device at `route`, starting it if it is
+    /// not running.
+    fn worker(&mut self, route: DeviceRoute) -> &mut Worker {
+        let (root, teach) = (&self.root, &self.teach);
+        self.state.workers.entry(route).or_insert_with(|| Worker {
+            events: state::start_worker(root.clone(), route, teach.clone()),
+            registry: None,
+            settings: None,
+        })
+    }
+
+    /// Keeps what a device's worker learned and queues it to go out.
+    fn take_learned(&mut self, route: DeviceRoute, learned: Learned) {
+        let Some(worker) = self.state.workers.get_mut(&route) else {
+            return;
+        };
+        let change = match learned {
+            Learned::Registry(registry) => {
+                worker.registry = Some(registry);
+                Change::Registry(route)
+            }
+            Learned::Settings(settings) => {
+                worker.settings = Some(settings);
+                Change::Settings(route)
+            }
+        };
+        self.state.changes.push_back(change);
+    }
+
+    /// Returns `true` if a subscription that needs the route decoded covers
+    /// `route`, or the route has a worker. Raw taps and route lists do not
+    /// count.
     fn covers(&self, route: DeviceRoute) -> bool {
-        self.batches
-            .iter()
-            .map(|sink| sink.scope)
-            .chain(self.events.iter().map(|sink| sink.scope))
-            .any(|scope| scope.covers(route))
+        self.sinks.cover(route) || self.state.workers.contains_key(&route)
     }
 
     /// Takes `received` from the inlet, and what else the inlet held then,
@@ -452,14 +842,15 @@ impl Pump {
     /// Offers a packet to the raw taps, unparsed and with its absolute route.
     /// A status reaches every tap its subtree overlaps.
     fn tap(&mut self, packet: &tio::Packet) {
-        if self.packets.is_empty() {
+        if self.sinks.packets.is_empty() {
             return;
         }
         let scope = match packet.link_status() {
             Some(_) => Scope::subtree(packet.route()),
             None => Scope::point(packet.route()),
         };
-        self.packets
+        self.sinks
+            .packets
             .retain_mut(|sink| sink.offer(scope, || packet.clone()));
     }
 
@@ -478,9 +869,7 @@ impl Pump {
                 .complete(&mut self.state.parser, query, result)
             {
                 Completed::Applied => self.state.publish_metadata(route),
-                Completed::Unsupported => self
-                    .state
-                    .device_event(route, DeviceEvent::MetadataUnavailable),
+                Completed::Unsupported => self.state.metadata_unavailable(route),
                 Completed::BackedOff => {}
             }
         }
@@ -502,35 +891,59 @@ impl Pump {
     fn publish(&mut self) {
         while let Some(batch) = self.state.pop_batch() {
             let scope = Scope::point(batch.route());
-            self.batches
+            self.sinks
+                .batches
                 .retain_mut(|sink| sink.offer(scope, || batch.clone()));
         }
         while let Some(event) = self.state.pop_event() {
             let scope = event.scope();
-            self.events
+            self.sinks
+                .events
                 .retain_mut(|sink| sink.offer(scope, || event.clone()));
         }
-        self.batches.retain_mut(|sink| sink.lane.report_lag());
-        self.events.retain_mut(|sink| sink.lane.report_lag());
-        self.packets.retain_mut(|sink| sink.lane.report_lag());
+        while let Some(change) = self.state.changes.pop_front() {
+            self.publish_change(change);
+        }
+        self.sinks.report_lag();
+    }
+
+    /// Sends the current value of what `change` names to its subscribers.
+    fn publish_change(&mut self, change: Change) {
+        let (state, sinks) = (&self.state, &mut self.sinks);
+        match change {
+            Change::Route(route) => sinks.routes.retain_mut(|sink| {
+                !sink.scope.covers(route) || sink.lane.send(state.routes_in(sink.scope))
+            }),
+            Change::Presence(route) => {
+                send_at(&mut sinks.presence, route, || state.presence_of(route))
+            }
+            Change::Metadata(route) => {
+                send_at(&mut sinks.metadata, route, || state.metadata_of(route))
+            }
+            Change::Setting(route, change) => {
+                send_at(&mut sinks.setting_changes, route, || change.clone())
+            }
+            Change::Registry(route) => {
+                if let Some(registry) = state.workers.get(&route).and_then(|w| w.registry.clone()) {
+                    send_at(&mut sinks.registry, route, || registry.clone());
+                }
+            }
+            Change::Settings(route) => {
+                if let Some(settings) = state.workers.get(&route).and_then(|w| w.settings.clone()) {
+                    send_at(&mut sinks.settings, route, || settings.clone());
+                }
+            }
+        }
     }
 }
 
 /// Waits until a subscriber drops its receiver, then drops the sink of each
 /// subscriber that has.
-async fn pruned(
-    batches: &mut Vec<Sink<SampleBatch>>,
-    events: &mut Vec<Sink<Event>>,
-    packets: &mut Vec<Sink<tio::Packet>>,
-) {
+async fn pruned(sinks: &mut Sinks) {
     future::poll_fn(|cx| {
-        let held = batches.len() + events.len() + packets.len();
-        // A lifeline resolves only once its receiver is gone, and its sink
-        // is dropped before it is polled again.
-        batches.retain_mut(|sink| Pin::new(&mut sink.alive).poll(cx).is_pending());
-        events.retain_mut(|sink| Pin::new(&mut sink.alive).poll(cx).is_pending());
-        packets.retain_mut(|sink| Pin::new(&mut sink.alive).poll(cx).is_pending());
-        match batches.len() + events.len() + packets.len() < held {
+        let held = sinks.len();
+        sinks.prune(cx);
+        match sinks.len() < held {
             true => Poll::Ready(()),
             false => Poll::Pending,
         }
@@ -1707,6 +2120,220 @@ mod tests {
 
         assert_eq!(awaited.recv_async().await.err(), Some(RecvError::Stopped));
         assert_eq!(blocked.recv().err(), Some(RecvError::Stopped));
+    }
+
+    /// A device is connecting until it is heard, alive with the session its
+    /// heartbeat reports, lost when its link is, and connecting again when the
+    /// link reconnects. A late subscriber starts from the presence now.
+    #[test]
+    fn presence_follows_packets_heartbeats_and_link_statuses() {
+        let (stream, proxy) = stream();
+        let route = DeviceRoute::root();
+        let presence = stream.presence(route);
+        assert_eq!(presence.recv(), Ok(Presence::Connecting));
+
+        proxy.send(Packet::heartbeat_session(7, route));
+        let Ok(Presence::Alive { session, heartbeat }) = presence.recv() else {
+            panic!("a heartbeat makes the device alive");
+        };
+        assert_eq!(session, Some(WireSessionId::new(7)));
+        assert!(heartbeat.is_some());
+
+        proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
+        assert!(matches!(presence.recv(), Ok(Presence::Lost { .. })));
+
+        proxy.send(Packet::link(packet::LinkStatus::SensorReconnected));
+        assert_eq!(presence.recv(), Ok(Presence::Connecting));
+        assert_eq!(stream.presence(route).recv(), Ok(Presence::Connecting));
+    }
+
+    /// A device's metadata is pending until it is complete, and pending again
+    /// once its link drops it.
+    #[test]
+    fn metadata_state_is_ready_once_complete_and_pending_after_a_disconnect() {
+        let (stream, proxy) = stream();
+        let route = DeviceRoute::root();
+        let metadata = stream.metadata(route);
+        assert!(matches!(metadata.recv(), Ok(MetadataState::Pending)));
+
+        describe(&proxy, route, 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let ready = std::iter::from_fn(|| metadata.recv_deadline(deadline).ok())
+            .find_map(|state| match state {
+                MetadataState::Ready(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .expect("the described device is ready");
+        assert_eq!(ready.device().name(), "d");
+
+        proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
+        assert!(matches!(
+            metadata.recv_timeout(Duration::from_secs(5)),
+            Ok(MetadataState::Pending)
+        ));
+    }
+
+    /// A device whose firmware has no `dev.metadata` is reported as such.
+    #[test]
+    fn metadata_state_reports_firmware_without_dev_metadata() {
+        let (stream, proxy) = stream();
+        let route = DeviceRoute::root();
+        let metadata = stream.metadata(route);
+        assert!(matches!(metadata.recv(), Ok(MetadataState::Pending)));
+
+        proxy.send(samples(0, route));
+        let (route, _, id) = metadata_call(&proxy);
+        proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
+        assert!(matches!(
+            metadata.recv_timeout(Duration::from_secs(5)),
+            Ok(MetadataState::Unsupported)
+        ));
+    }
+
+    /// A route list holds every route heard within its scope, sorted, and
+    /// only those.
+    #[test]
+    fn a_route_list_holds_the_routes_heard_within_its_scope() {
+        let (stream, proxy) = stream();
+        let below: DeviceRoute = "/1".parse().expect("a valid route");
+        let routes = stream.routes(Scope::subtree(below));
+        assert_eq!(routes.recv(), Ok(Vec::new()));
+
+        let (second, first, outside) = ("/1/2", "/1/0", "/2");
+        for route in [second, outside, first] {
+            proxy.send(Packet::heartbeat(route.parse().expect("a valid route")));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let heard = std::iter::from_fn(|| routes.recv_deadline(deadline).ok())
+            .find(|heard| heard.len() == 2)
+            .expect("both routes below are heard");
+        let expected: Vec<DeviceRoute> = [first, second]
+            .iter()
+            .map(|route| route.parse().expect("a valid route"))
+            .collect();
+        assert_eq!(heard, expected);
+        assert_eq!(
+            stream.routes(everything()).recv().map(|all| all.len()),
+            Ok(3)
+        );
+    }
+
+    /// Setting changes arrive one by one, in the order announced.
+    #[test]
+    fn setting_changes_arrive_in_order() {
+        let (stream, proxy) = stream();
+        let route = DeviceRoute::root();
+        let changes = stream.setting_changes(route);
+        // The subscription reaches the pump before the announcements do.
+        let _ = stream.presence(route).recv();
+
+        proxy.send(announcement("test.amplitude", Some(9), &[1], route));
+        proxy.send(announcement("test.amplitude", Some(10), &[2], route));
+        let seqs: Vec<_> = (0..2)
+            .map(|_| {
+                changes
+                    .recv_timeout(Duration::from_secs(5))
+                    .map(|change| change.seq)
+            })
+            .collect();
+        assert_eq!(seqs, [Ok(Some(9)), Ok(Some(10))]);
+    }
+
+    /// The name, hash and session of the table [`answer_table`] serves.
+    const TABLE_DEVICE: &str = "state-test-device";
+    const TABLE_HASH: u32 = 0x5747_e001;
+
+    /// Answers the calls the session writes as a device with an announced
+    /// setting and `settings.version` would, until no call comes for a
+    /// while. Returns how many times the table was loaded.
+    fn answer_table(proxy: &TestProxy) -> std::thread::JoinHandle<usize> {
+        let (sent, deliver) = (proxy.sent.clone(), proxy.deliver.clone());
+        std::thread::spawn(move || {
+            let proxy = TestProxy { sent, deliver };
+            let table = [("test.amplitude", 0xA310u16), ("settings.version", 0x8140)];
+            let mut loads = 0;
+            while let Ok(packet) = proxy.sent.recv_timeout(Duration::from_secs(2)) {
+                let packet::Payload::RpcRequest(request) = packet.payload() else {
+                    continue;
+                };
+                let wire_rpc::Method::ByName(name) = request.method else {
+                    continue;
+                };
+                let (id, route) = (request.id.value(), packet.route());
+                let reply = match std::str::from_utf8(name).expect("a UTF-8 name") {
+                    "dev.name" => {
+                        loads += 1;
+                        TABLE_DEVICE.as_bytes().to_vec()
+                    }
+                    "rpc.hash" => TABLE_HASH.to_le_bytes().to_vec(),
+                    "dev.session" => 7u32.to_le_bytes().to_vec(),
+                    "rpc.listinfo" if request.args.is_empty() => {
+                        (table.len() as u16).to_le_bytes().to_vec()
+                    }
+                    "rpc.listinfo" => {
+                        let index = u16::from_le_bytes([request.args[0], request.args[1]]);
+                        let (name, meta) = table[usize::from(index)];
+                        let mut reply = meta.to_le_bytes().to_vec();
+                        reply.extend_from_slice(name.as_bytes());
+                        reply
+                    }
+                    "settings.version" => 5u32.to_le_bytes().to_vec(),
+                    "test.amplitude" => vec![1],
+                    _ => {
+                        proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
+                        continue;
+                    }
+                };
+                proxy.reply(id, &reply, route);
+            }
+            loads
+        })
+    }
+
+    /// The table is loaded once for every subscriber, the settings are read
+    /// and then kept by each announcement, and a new table hash loads the
+    /// table again.
+    #[test]
+    fn the_table_and_settings_load_once_and_follow_announcements() {
+        let (stream, proxy) = stream();
+        let route = DeviceRoute::root();
+        let answering = answer_table(&proxy);
+        let settings = stream.settings(route);
+        let wait = Duration::from_secs(5);
+
+        let first = settings.recv_timeout(wait).expect("the settings are read");
+        assert_eq!(first.version(), Some(5));
+        assert_eq!(first.get("test.amplitude"), Some(&[1u8][..]));
+        assert_eq!(first.get("settings.version"), None);
+        let registry = stream
+            .rpc_registry(route)
+            .recv_timeout(wait)
+            .expect("the table is shared")
+            .expect("the table loaded");
+        assert_eq!(registry.hash, Some(TABLE_HASH));
+
+        proxy.send(announcement("test.amplitude", Some(6), &[2], route));
+        let next = settings
+            .recv_timeout(wait)
+            .expect("the announcement is kept");
+        assert_eq!(
+            (next.version(), next.get("test.amplitude")),
+            (Some(6), Some(&[2u8][..]))
+        );
+
+        proxy.send(announcement(
+            "rpc.hash",
+            Some(7),
+            &(TABLE_HASH + 1).to_le_bytes(),
+            route,
+        ));
+        let reread = settings.recv_timeout(wait).expect("the table loads again");
+        assert_eq!(reread.version(), Some(5));
+        drop((settings, stream));
+        assert_eq!(answering.join().expect("the device answers"), 2);
+        if let Some(cached) = crate::device::rpc::cache::path(TABLE_DEVICE, TABLE_HASH) {
+            let _ = std::fs::remove_file(cached);
+        }
     }
 
     /// Every announcement reaches the views covering the device that sent it.

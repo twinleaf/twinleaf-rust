@@ -34,7 +34,7 @@ use twinleaf::{
         Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
         StreamKey,
     },
-    device::{DeviceEvent, Event as StreamEvent, RecvError},
+    device::{MetadataState, Presence, RecvError},
     Connection, DeviceRoute,
 };
 
@@ -374,10 +374,6 @@ struct DeviceStatus {
 }
 
 impl DeviceStatus {
-    fn on_heartbeat(&mut self) {
-        self.last_heartbeat = Some(Instant::now());
-    }
-
     fn is_alive(&self, timeout: Duration) -> bool {
         self.last_heartbeat
             .map(|t| t.elapsed() < timeout)
@@ -810,23 +806,26 @@ impl MonitorState {
         self.visible_routes().len()
     }
 
-    fn handle_event(&mut self, event: StreamEvent) {
-        match event {
-            StreamEvent::RouteDiscovered { route } => {
-                self.discovered_routes.insert(route);
-                self.device_status.entry(route).or_default();
-            }
-            StreamEvent::Device {
-                route,
-                event: DeviceEvent::Heartbeat { .. },
-            } => self.device_status.entry(route).or_default().on_heartbeat(),
-            StreamEvent::Device {
-                route,
-                event: DeviceEvent::Metadata(snapshot),
-            } => {
-                self.device_metadata.insert(route, snapshot);
-            }
-            _ => {}
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        for &route in routes {
+            self.discovered_routes.insert(route);
+            self.device_status.entry(route).or_default();
+        }
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        if let Presence::Alive {
+            heartbeat: Some(heartbeat),
+            ..
+        } = presence
+        {
+            self.device_status.entry(route).or_default().last_heartbeat = Some(heartbeat);
+        }
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        if let MetadataState::Ready(snapshot) = metadata {
+            self.device_metadata.insert(route, snapshot);
         }
     }
 
@@ -2011,8 +2010,16 @@ impl Screen for Monitor {
         self.buffer.process_batch(&batch);
     }
 
-    fn on_event(&mut self, event: StreamEvent) {
-        self.app.handle_event(event);
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        self.app.on_routes(routes);
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.app.on_presence(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        self.app.on_metadata(route, metadata);
     }
 
     // Monitor keeps no log to report a lag in.

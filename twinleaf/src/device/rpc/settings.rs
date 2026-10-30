@@ -20,12 +20,11 @@ const SNAPSHOT_ATTEMPTS: usize = 3;
 
 /// What a host does next to keep a [`SettingsCache`] exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheAction {
+pub(crate) enum CacheAction {
     /// Nothing, as the cache is as exact as the events so far show.
     Keep,
-    /// Take a snapshot with
-    /// [`Device::snapshot_settings`](crate::Device::snapshot_settings), since
-    /// an announcement was missed.
+    /// Take a snapshot with [`SettingsCache::snapshot_with`], since an
+    /// announcement was missed.
     Snapshot,
     /// The device started a new session, which may run another table. Read
     /// the registry again and build a new cache from it.
@@ -43,7 +42,7 @@ pub enum CacheAction {
 /// one heartbeat old. A device without `settings.version`, or one that does
 /// not number its announcements, is never cached.
 #[derive(Debug)]
-pub struct SettingsCache {
+pub(crate) struct SettingsCache {
     cached: BTreeSet<String>,
     values: BTreeMap<String, Vec<u8>>,
     session: Option<SessionId>,
@@ -53,7 +52,7 @@ pub struct SettingsCache {
 impl SettingsCache {
     /// Creates an empty cache for the device `registry` describes, to be
     /// filled by a snapshot.
-    pub fn new(registry: &RpcRegistry) -> SettingsCache {
+    pub(crate) fn new(registry: &RpcRegistry) -> SettingsCache {
         let cached = match registry.find(SETTINGS_VERSION) {
             None => BTreeSet::new(),
             Some(_) => registry
@@ -78,7 +77,7 @@ impl SettingsCache {
     /// Takes one event from the device, applying an announcement in sequence
     /// and checking a heartbeat against the last one applied, and says what
     /// the host does next.
-    pub fn observe(&mut self, event: &DeviceEvent) -> CacheAction {
+    pub(crate) fn observe(&mut self, event: &DeviceEvent) -> CacheAction {
         if self.cached.is_empty() {
             return CacheAction::Keep;
         }
@@ -133,14 +132,25 @@ impl SettingsCache {
 
     /// Returns the value the device last announced for `name`, or `None` for
     /// an entry the cache does not hold or while it waits for a snapshot.
-    pub fn get(&self, name: &str) -> Option<&[u8]> {
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &str) -> Option<&[u8]> {
         self.values.get(name).map(Vec::as_slice)
     }
 
     /// Returns the sequence number of the last announcement applied, or
     /// `None` while the cache waits for a snapshot.
-    pub fn version(&self) -> Option<u32> {
+    pub(crate) fn version(&self) -> Option<u32> {
         self.applied
+    }
+
+    /// Returns the session the values were read in.
+    pub(crate) fn session(&self) -> Option<SessionId> {
+        self.session
+    }
+
+    /// Returns every value held, by name.
+    pub(crate) fn values(&self) -> &BTreeMap<String, Vec<u8>> {
+        &self.values
     }
 
     /// Reads `settings.version`, every cached value, and `settings.version`

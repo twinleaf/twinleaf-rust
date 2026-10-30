@@ -30,6 +30,16 @@
 //! Each returns a [`Receiver`]. Its [`RecvError`] tells lag, a timeout, the
 //! proxy stopping, and any other end apart.
 //!
+//! The connection also keeps each device's state current, and every view
+//! shares it. [`presence`](Device::presence) says whether the device is
+//! there, [`metadata`](Device::metadata) describes its streams,
+//! [`rpc_registry`](Device::rpc_registry) lists its RPCs, and
+//! [`settings`](Device::settings) holds the values it announces. Each returns
+//! the value now, and its `_updates` method a [`Receiver`] that yields the
+//! value now and then each new one. Such a receiver never lags, as a reader
+//! that falls behind skips to the newest value.
+//! [`routes`](DeviceTree::routes) lists the devices a tree has heard.
+//!
 //! The RPCs [`get`](Device::get), [`rpc`](Device::rpc), and
 //! [`action`](Device::action) block until the reply arrives. They encode
 //! through the [`rpc`] module's [`RpcArgs`](rpc::RpcArgs) and
@@ -51,12 +61,12 @@
 //!
 //! # Examples
 //!
-//! Name every device behind a hub, then follow the link's status until the
-//! proxy stops.
+//! Name every device behind a hub, then follow whether the root device is
+//! there until the proxy stops.
 //!
 //! ```no_run
 //! use std::time::Duration;
-//! use twinleaf::{Connection, DeviceRoute, Event, LinkEvent};
+//! use twinleaf::{Connection, DeviceRoute};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let connection = Connection::open("serial:///dev/ttyACM0")?;
@@ -65,11 +75,9 @@
 //!     println!("{}: {}", named.route, named.name.as_deref().unwrap_or("(no answer)"));
 //! }
 //!
-//! let events = connection.events();
-//! while let Ok(event) = events.recv() {
-//!     if let Event::Link { subtree, event: LinkEvent::Status(status) } = event {
-//!         println!("{subtree}: {status:?}");
-//!     }
+//! let presence = connection.device(DeviceRoute::root()).presence_updates();
+//! while let Ok(presence) = presence.recv() {
+//!     println!("{presence:?}");
 //! }
 //! # Ok(())
 //! # }
@@ -100,6 +108,7 @@ pub mod record;
 pub mod rpc;
 pub(crate) mod runtime;
 mod session;
+mod state;
 mod stream;
 
 #[cfg(test)]
@@ -108,4 +117,5 @@ mod fixtures;
 #[doc(no_inline)]
 pub use crate::proto::RouteError;
 pub use connection::{Connection, Device, DeviceTree, MetadataError};
+pub use state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 pub use stream::{DeviceEvent, Event, LinkEvent, NamedRoute, Receiver, RecvError};

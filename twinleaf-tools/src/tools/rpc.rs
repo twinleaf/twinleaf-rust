@@ -11,7 +11,7 @@ use twinleaf::device::rpc::{
     RpcValue, RpcValueType, RpcValueTypeExt, Std, STANDARD,
 };
 use twinleaf::device::Device;
-use twinleaf::{Connection, Event};
+use twinleaf::Connection;
 
 /// The most reads `tio rpc get` keeps in flight at once.
 const READ_WINDOW: usize = 16;
@@ -166,7 +166,7 @@ fn compile(texts: &[String]) -> eyre::Result<Vec<NamePattern>> {
     }
 }
 
-fn load_registry(device: &Device) -> eyre::Result<RpcRegistry> {
+fn load_registry(device: &Device) -> eyre::Result<std::sync::Arc<RpcRegistry>> {
     device
         .rpc_registry()
         .wrap_err("failed to query RPC registry")
@@ -329,17 +329,14 @@ fn infer_rpc_type(name: &str, device: &Device, kind: &str) -> RpcValueType {
 
 fn rpc(cli: RpcCli) -> eyre::Result<()> {
     let connection = Connection::open(&cli.tio.root)?;
-    // The link's statuses arrive among the connection's events.
-    let events = cli.debug.then(|| connection.events());
     let device = connection.device(cli.tio.route);
+    let presence = cli.debug.then(|| device.presence_updates());
 
     let outcome = call_and_print(&device, &cli);
 
-    if let Some(events) = events {
-        while let Ok(Some(event)) = events.try_recv() {
-            if let Event::Link { subtree, event } = event {
-                println!("{subtree}: {event:?}");
-            }
+    if let Some(presence) = presence {
+        while let Ok(Some(presence)) = presence.try_recv() {
+            println!("{}: {presence:?}", cli.tio.route);
         }
     }
     outcome

@@ -265,10 +265,6 @@ impl<T> Lane<T> {
     /// end. Its reader never lags. One that falls behind receives the newest
     /// item next. It suits state, where each item is a whole value and the
     /// latest one is what matters.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the device state subscriptions will use it")
-    )]
     pub(crate) fn latest() -> (Lane<T>, flume::Receiver<Queued<T>>) {
         let (mut lane, received) = Lane::new(1);
         lane.unread = Some(received.clone());
@@ -350,10 +346,6 @@ impl<T> Sink<T> {
 
     /// Returns a sink whose [latest-value](Lane::latest) lane holds only the
     /// newest item, and its receiver.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the device state subscriptions will use it")
-    )]
     pub(super) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
         Self::with_lane(Lane::latest(), scope)
     }
