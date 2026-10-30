@@ -143,12 +143,14 @@ fn local_name(addr: &str) -> Option<(String, u16)> {
     valid.then_some((host, port))
 }
 
-/// Returns the address to connect to of those mDNS `found` for a name. Takes
-/// only an address of a version `family` allows. Prefers a routable address,
-/// IPv4 first, then a link-local one, then loopback. Takes the lowest address
-/// of the best kind. Returns `None` if no address fits.
-#[cfg_attr(not(feature = "mdns"), allow(dead_code))]
-fn preferred(found: Vec<SocketAddr>, family: &AddrFamilyRestrict) -> Option<SocketAddr> {
+/// Returns the one address to use of those `found` for a name, where only one
+/// can be tried. That is any address mDNS finds, and the address of a UDP
+/// link, which has no handshake to tell an address that answers from one
+/// that does not. Takes only an address of a version `family` allows. Prefers
+/// a routable address, IPv4 first, then a link-local one, then loopback.
+/// Takes the lowest address of the best kind. Returns `None` if no address
+/// fits.
+fn preferred(found: &[SocketAddr], family: &AddrFamilyRestrict) -> Option<SocketAddr> {
     let rank = |addr: &SocketAddr| match addr.ip() {
         IpAddr::V4(ip) if ip.is_loopback() => 4,
         IpAddr::V6(ip) if ip.is_loopback() => 4,
@@ -158,7 +160,8 @@ fn preferred(found: Vec<SocketAddr>, family: &AddrFamilyRestrict) -> Option<Sock
         IpAddr::V6(_) => 1,
     };
     found
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|addr| family.allows(addr) && !addr.ip().is_unspecified())
         .min_by_key(|addr| (rank(addr), addr.ip()))
 }
@@ -265,7 +268,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 async fn resolve(addr: &str, family: AddrFamilyRestrict) -> io::Result<Vec<SocketAddr>> {
     #[cfg(feature = "mdns")]
     if let Some((host, port)) = local_name(addr) {
-        match preferred(super::mdns::resolve(&host, port).await, &family) {
+        match preferred(&super::mdns::resolve(&host, port).await, &family) {
             Some(found) => return Ok(vec![found]),
             None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
         }
@@ -459,7 +462,9 @@ impl Port {
                 ))
             }
             IpLink::Udp => {
-                let peer = found[0];
+                // An unspecified address, which `preferred` skips, is still
+                // sent to when it is all the name resolves to.
+                let peer = preferred(&found, &family).unwrap_or(found[0]);
                 let socket = udp::bind(&peer).await?;
                 let (port, task) = Port::with_task(
                     TransportKind::Udp,
@@ -781,7 +786,7 @@ mod tests {
             "10.0.0.9:7855",
             "0.0.0.0:7855",
         ]);
-        let chosen = |found: &[SocketAddr], family| preferred(found.to_vec(), &family);
+        let chosen = |found: &[SocketAddr], family| preferred(found, &family);
 
         assert_eq!(
             chosen(&all, AddrFamilyRestrict::Either),
@@ -1094,6 +1099,25 @@ mod tests {
         };
         assert_eq!(received.as_bytes(), packet.as_bytes());
         assert!(matches!(gone.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    /// A UDP link to `localhost` reaches a device listening on IPv4 only,
+    /// although the name may resolve to `::1` first, as it does on Windows.
+    #[tokio::test]
+    async fn a_udp_link_to_localhost_reaches_an_ipv4_device() {
+        let device = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("udp://localhost:{}", device.local_addr().unwrap().port());
+        let (send, _received) = flume::unbounded();
+        let _port = Port::open(&url, send, &Supervisor::current())
+            .await
+            .unwrap();
+
+        let mut datagram = [0; 512];
+        let heartbeat = device.recv_from(&mut datagram);
+        tokio::time::timeout(Duration::from_secs(2), heartbeat)
+            .await
+            .expect("the link's heartbeat reaches the device")
+            .unwrap();
     }
 
     /// Datagram framing rejects malformed and empty datagrams independently,

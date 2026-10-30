@@ -7,7 +7,7 @@
 //! for the rest.
 
 use twinleaf_proto::data::{
-    self, Metadata, MetadataQuery, MetadataQueryError, MetadataSelector, MetadataType,
+    self, Metadata, MetadataRequest, MetadataRequestError, MetadataSelector, MetadataType,
     CURRENT_SEGMENT, METADATA_REPLY_FRAME_HEADER,
 };
 use twinleaf_proto::rpc::RpcError;
@@ -52,14 +52,14 @@ pub fn reply(
     arg: &[u8],
     out: &mut Reply,
 ) -> Result<(), RpcError> {
-    let query = MetadataQuery::parse(arg).map_err(|error| match error {
-        MetadataQueryError::Misaligned => RpcError::ArgsSize,
-        MetadataQueryError::TooManySelectors => RpcError::Invalid,
+    let request = MetadataRequest::parse(arg).map_err(|error| match error {
+        MetadataRequestError::Misaligned => RpcError::ArgsSize,
+        MetadataRequestError::TooManySelectors => RpcError::Invalid,
     })?;
-    if query.is_bootstrap() {
+    if request.is_bootstrap() {
         return bootstrap(device, streams, out);
     }
-    for selector in query.selectors() {
+    for selector in request.selectors() {
         let MetadataSelector {
             mtype,
             stream_id,

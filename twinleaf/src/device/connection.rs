@@ -447,7 +447,7 @@ impl DeviceTree {
     ///     };
     ///     for row in batch.iter() {
     ///         let values: Vec<String> = row.values().map(|v| v.to_string()).collect();
-    ///         println!("{} {}: {}", batch.route(), batch.stream().name, values.join(" "));
+    ///         println!("{} {}: {}", batch.route(), batch.schema().stream().name(), values.join(" "));
     ///     }
     /// }
     /// # }

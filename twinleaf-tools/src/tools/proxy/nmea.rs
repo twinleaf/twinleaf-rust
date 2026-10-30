@@ -64,7 +64,7 @@ fn broadcast_to_client(mut stream: TcpStream, device: Device) {
         };
 
         // Only process samples from stream ID 1
-        if batch.stream().stream_id.value() != 1 {
+        if batch.stream_key().stream_id.value() != 1 {
             continue;
         }
 
@@ -80,10 +80,9 @@ fn broadcast_to_client(mut stream: TcpStream, device: Device) {
             let mut fields = vec![time_str];
             for value in row.values() {
                 let value = match value {
-                    twinleaf::data::ColumnData::Int(x) => format!("{}", x),
-                    twinleaf::data::ColumnData::UInt(x) => format!("{}", x),
-                    twinleaf::data::ColumnData::Float(x) => format!("{:.2}", x),
-                    twinleaf::data::ColumnData::Unknown => "?".to_string(),
+                    twinleaf::data::ColumnData::F32(x) => format!("{:.2}", x),
+                    twinleaf::data::ColumnData::F64(x) => format!("{:.2}", x),
+                    other => other.to_string(),
                 };
                 fields.push(value);
             }

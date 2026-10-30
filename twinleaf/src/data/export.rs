@@ -14,11 +14,14 @@
 //!
 //! Every table starts with the same fields.
 //!
-//! | Field         | Type             | Source                      |
-//! |---------------|------------------|-----------------------------|
-//! | `sample`      | u32              | sample number               |
-//! | `time`        | f64              | end-of-sample timestamp     |
-//! | *column name* | f64, i64, or u64 | one field per stream column |
+//! | Field         | Type                     | Source                      |
+//! |---------------|--------------------------|-----------------------------|
+//! | `sample`      | u32                      | sample number               |
+//! | `time`        | f64                      | end-of-sample timestamp     |
+//! | *column name* | the column's wire type   | one field per stream column |
+//!
+//! Fields are little-endian at C-aligned offsets. Compression is byte shuffle
+//! then deflate, which every HDF5 reader decodes without a plugin.
 //!
 //! Tables are jagged. Streams sample independently, so two tables in one file
 //! do not start or end at the same `time`, even at the same run number. Align
@@ -28,20 +31,50 @@
 //! decides which breaks start a new run at all. [`RunSplitLevel`] decides
 //! which streams roll to a new table when one does.
 
+use super::continuity::{BoundaryReason, Generations};
 use super::filter::ColumnFilter;
-use super::metadata::{ColumnRecord, DeviceRecord, StreamKey, StreamRecord};
-use super::sample::{BoundaryReason, ColumnArray, Generations, SampleBatch, Series};
+use super::metadata::{StreamKey, StreamMetadataSnapshot};
+use super::sample::{native_types, ColumnArray, SampleBatch};
+use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
-use hdf5::filters::{Blosc, BloscShuffle};
-use hdf5::types::{CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
-use hdf5::{Dataset, Dataspace, File, H5Type, Location, Result, SimpleExtents};
-use hdf5_sys::h5d::H5Dwrite;
-use hdf5_sys::h5p::H5P_DEFAULT;
+use hdf5_pure::{
+    AttrValue, CompoundTypeBuilder, Dataset, File, FileAccessProperties, FileCreateProperties,
+    Group, MaxExtent, SyncPolicy,
+};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 type TableIndex = u64;
+
+/// The deflate level of a compressed table, zlib's balance of speed and size.
+const DEFLATE_LEVEL: u32 = 4;
+
+/// An error from writing an HDF5 export.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ExportError {
+    /// The output file could not be created, or already exists.
+    #[error("cannot create {}: {source}", path.display())]
+    Create {
+        /// The path asked for.
+        path: PathBuf,
+        /// Why it could not be created.
+        source: std::io::Error,
+    },
+    /// A batch's device or column schema differs from that of its table.
+    #[error("metadata or schema changed while writing HDF5 table {table}; split the export into distinct runs")]
+    SchemaChanged {
+        /// The table's path in the file.
+        table: String,
+    },
+    /// The HDF5 writer failed.
+    #[error(transparent)]
+    Hdf5(#[from] hdf5_pure::Error),
+}
+
+/// The result of an export operation.
+pub type Result<T> = std::result::Result<T, ExportError>;
 
 /// Which discontinuities start a new run.
 ///
@@ -208,44 +241,16 @@ struct TableInfo {
     row_size: usize,
     /// `(byte offset, source)` for each compound field, in field order.
     fields: Vec<(usize, FieldSource)>,
-    schema: TableSchema,
+    /// The metadata of the table's first batch. Later batches must share its
+    /// schema and device serial. Segment and session may change, so a table
+    /// spans segment rollovers.
+    metadata: StreamMetadataSnapshot,
 }
 
-/// The structure one HDF5 compound table represents. Segment and session
-/// metadata are not part of it, and a table spans segment rollovers. A batch
-/// with a different device or column schema does not match it.
-struct TableSchema {
-    key: StreamKey,
-    device: DeviceRecord,
-    stream: StreamRecord,
-    columns: Vec<ColumnRecord>,
-}
-
-impl TableSchema {
-    fn from_batch(batch: &SampleBatch, columns: &[&Series]) -> Self {
-        let (device, stream, _) = batch.records();
-        Self {
-            key: batch.stream_key(),
-            device: device.clone(),
-            stream: stream.clone(),
-            columns: columns
-                .iter()
-                .map(|column| column.record().clone())
-                .collect(),
-        }
-    }
-
-    fn matches(&self, batch: &SampleBatch, columns: &[&Series]) -> bool {
-        self.key == batch.stream_key()
-            && self.device.get().serial == batch.device().serial
-            && self.stream.get().name == batch.stream().name
-            && self.stream.get().sample_size == batch.stream().sample_size
-            && self.columns.len() == columns.len()
-            && self
-                .columns
-                .iter()
-                .zip(columns)
-                .all(|(expected, actual)| *expected == *actual.record())
+impl TableInfo {
+    fn accepts(&self, batch: &SampleBatch) -> bool {
+        self.metadata.schema() == batch.schema()
+            && self.metadata.device().serial() == batch.metadata().device().serial()
     }
 }
 
@@ -255,6 +260,8 @@ impl TableSchema {
 /// [`Hdf5Appender::write_batch`], and close it with [`Hdf5Appender::finish`].
 pub struct Hdf5Appender {
     file: File,
+    /// Every group created so far, by path. `/` is the root.
+    groups: HashMap<String, Group>,
     tables: HashMap<String, TableInfo>,
     filter: Option<ColumnFilter>,
     compress: bool,
@@ -277,14 +284,14 @@ impl std::fmt::Debug for Hdf5Appender {
 impl Hdf5Appender {
     /// Creates an appender that writes a new HDF5 file at `path`.
     ///
-    /// `compress` turns on Blosc compression. `filter` keeps only the columns
-    /// it selects. `split_policy` and `split_level` decide how runs map to
-    /// tables.
+    /// `compress` turns on shuffle and deflate compression. `filter` keeps only
+    /// the columns it selects. `split_policy` and `split_level` decide how
+    /// runs map to tables.
     ///
     /// # Errors
     ///
-    /// Returns an HDF5 error if `path` already exists or the file cannot be
-    /// created.
+    /// Returns [`ExportError::Create`] if `path` already exists or cannot be
+    /// created, and an HDF5 error if the file cannot be initialized.
     pub fn with_options(
         path: &Path,
         compress: bool,
@@ -292,8 +299,29 @@ impl Hdf5Appender {
         split_policy: SplitPolicy,
         split_level: RunSplitLevel,
     ) -> Result<Self> {
+        // Claims the path first, since the HDF5 writer would replace a file
+        // already there.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|source| ExportError::Create {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        // One sync when the file closes, as libhdf5 does, rather than one per
+        // append.
+        let file = File::create_with_options(
+            path,
+            FileCreateProperties::new(),
+            FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+        )
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(path);
+        })?;
         Ok(Self {
-            file: File::create_excl(path)?,
+            groups: HashMap::from([("/".to_string(), file.root())]),
+            file,
             tables: HashMap::new(),
             filter,
             compress,
@@ -320,8 +348,12 @@ impl Hdf5Appender {
         if let Some(boundary) = batch.boundary() {
             log::debug!(
                 "[{}] sample_n={} boundary={:?}",
-                batch.stream().name,
-                batch.first_sample().unwrap_or(SampleNumber::new(0)),
+                batch.schema().stream().name(),
+                batch
+                    .sample_numbers()
+                    .first()
+                    .copied()
+                    .unwrap_or(SampleNumber::new(0)),
                 boundary
             );
         }
@@ -333,9 +365,21 @@ impl Hdf5Appender {
     ///
     /// # Errors
     ///
-    /// This currently always succeeds.
+    /// Returns an HDF5 error if the file cannot be committed or synced.
     pub fn finish(self) -> Result<ExportStats> {
-        Ok(self.stats)
+        let Self {
+            file,
+            groups,
+            tables,
+            stats,
+            ..
+        } = self;
+        // Every table and group handle holds the file's lock, so they go
+        // before the file closes.
+        drop(tables);
+        drop(groups);
+        file.close()?;
+        Ok(stats)
     }
 
     fn append_batch(&mut self, batch: &SampleBatch) -> Result<()> {
@@ -345,7 +389,7 @@ impl Hdf5Appender {
 
         let key = batch.stream_key();
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
-        let stream_name = batch.stream().name.to_string();
+        let stream_name = batch.schema().stream().name().to_string();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
@@ -355,21 +399,20 @@ impl Hdf5Appender {
         };
         self.stats.streams_seen.insert(stream_id_path.clone());
 
-        // Apply the column filter; the parser already emits columns index-ordered.
-        let mut valid: Vec<&Series> = Vec::new();
-        for col in batch.schema() {
-            if let Some(f) = &self.filter {
-                if !f.matches(&key.route, &stream_name, col.metadata().name) {
-                    continue;
-                }
-            }
-            valid.push(col);
-        }
+        // Columns arrive in index order, so the kept ones stay in it.
+        let valid: Vec<wire::ColumnView<'_>> = batch
+            .schema()
+            .columns()
+            .filter(|column| {
+                self.filter
+                    .as_ref()
+                    .is_none_or(|f| f.matches(&key.route, &stream_name, column.name()))
+            })
+            .collect();
 
         if valid.is_empty() {
             return Ok(());
         }
-        valid.sort_by_key(|c| c.index());
 
         let group_path = if route_str.is_empty() {
             "/".to_string()
@@ -389,91 +432,88 @@ impl Hdf5Appender {
         };
 
         if let Some(info) = self.tables.get(&table_path) {
-            if !info.schema.matches(batch, &valid) {
-                return Err(format!(
-                    "metadata or schema changed while writing HDF5 table {table_path}; split the export into distinct runs"
-                )
-                .into());
+            if !info.accepts(batch) {
+                return Err(ExportError::SchemaChanged { table: table_path });
             }
         }
 
         // Create the compound table on first sight of this stream/run.
         if !self.tables.contains_key(&table_path) {
-            self.ensure_group(&group_path)?;
-
-            let mut fields = Vec::with_capacity(valid.len() + 2);
-            fields.push(CompoundField::new(
-                "sample",
-                TypeDescriptor::Unsigned(IntSize::U4),
-                0,
-                0,
-            ));
-            fields.push(CompoundField::new(
-                "time",
-                TypeDescriptor::Float(FloatSize::U8),
-                0,
-                1,
-            ));
-            for (i, col) in valid.iter().enumerate() {
-                let ty = match col.values() {
-                    ColumnArray::F64(_) => TypeDescriptor::Float(FloatSize::U8),
-                    ColumnArray::I64(_) => TypeDescriptor::Integer(IntSize::U8),
-                    ColumnArray::U64(_) => TypeDescriptor::Unsigned(IntSize::U8),
-                };
-                fields.push(CompoundField::new(col.metadata().name, ty, 0, i + 2));
+            // Fields sit where a C struct of them would put them: each at a
+            // multiple of its own size, and the row padded to 8 bytes.
+            let mut offsets = Vec::with_capacity(valid.len());
+            let mut end: usize = 16;
+            for col in &valid {
+                let size = col.data_type().size();
+                let offset = end.next_multiple_of(size);
+                offsets.push(offset);
+                end = offset + size;
             }
+            let row_size = end.next_multiple_of(8);
+            let mut layout = CompoundTypeBuilder::with_size(row_size as u32)
+                .u32_field("sample", 0)
+                .f64_field("time", 8);
+            let mut fields = vec![(0, FieldSource::Sample), (8, FieldSource::Time)];
+            for (col, &offset) in valid.iter().zip(&offsets) {
+                let values = batch
+                    .column(col.index())
+                    .expect("one array per schema column");
+                let (name, at) = (col.name(), offset as u64);
+                layout = match values {
+                    ColumnArray::I8(_) => layout.i8_field(name, at),
+                    ColumnArray::U8(_) => layout.u8_field(name, at),
+                    ColumnArray::I16(_) => layout.i16_field(name, at),
+                    ColumnArray::U16(_) => layout.u16_field(name, at),
+                    ColumnArray::I32(_) => layout.i32_field(name, at),
+                    ColumnArray::U32(_) => layout.u32_field(name, at),
+                    ColumnArray::I64(_) => layout.i64_field(name, at),
+                    ColumnArray::U64(_) => layout.u64_field(name, at),
+                    ColumnArray::F32(_) => layout.f32_field(name, at),
+                    ColumnArray::F64(_) => layout.f64_field(name, at),
+                };
+                fields.push((offset, FieldSource::Column(col.index())));
+            }
+            let datatype = layout.build().map_err(hdf5_pure::Error::from)?;
 
-            // `to_c_repr` assigns aligned byte offsets and the total row size.
-            let layout = CompoundType { fields, size: 0 }.to_c_repr();
-            let desc = TypeDescriptor::Compound(layout.clone());
+            let mut attributes = self.metadata_attributes(batch, &key);
+            attributes.extend(field_metadata_attributes(&valid));
 
-            let group = self.file.group(&group_path)?;
             // Aim for ~64 KiB chunks: large enough to compress and stream well,
             // small enough that short captures don't over-allocate a chunk tail.
-            let chunk_rows = (65_536 / layout.size.max(1)).clamp(256, 65_536);
-            let builder = group
-                .new_dataset_builder()
-                .empty_as(&desc)
-                .chunk((chunk_rows,))
-                .shape(SimpleExtents::resizable([0usize]));
-            let builder = if self.compress {
-                builder.blosc(Blosc::BloscLZ, 5, BloscShuffle::Byte)
-            } else {
-                builder
-            };
-            let ds = builder.create(table_name.as_str())?;
-
-            self.write_metadata_attributes(&ds, batch, &key)?;
-            self.write_field_metadata(&ds, &valid)?;
-
-            // Map each (already index-ordered) compound field to its data source.
-            let field_sources = layout
-                .fields
-                .iter()
-                .map(|f| {
-                    let source = match f.index {
-                        0 => FieldSource::Sample,
-                        1 => FieldSource::Time,
-                        k => FieldSource::Column(valid[k - 2].index()),
-                    };
-                    (f.offset, source)
-                })
-                .collect();
+            let chunk_rows = (65_536 / row_size).clamp(256, 65_536) as u64;
+            let compress = self.compress;
+            let ds = self
+                .ensure_group(&group_path)?
+                .create_dataset(&table_name, |builder| {
+                    builder
+                        .with_compound_data(datatype, Vec::new(), 0)
+                        .with_shape(&[0])
+                        .with_maxshape(&[MaxExtent::Unlimited])
+                        .with_chunks(&[chunk_rows]);
+                    if compress {
+                        builder.with_shuffle().with_deflate(DEFLATE_LEVEL);
+                    }
+                    for (name, value) in attributes {
+                        builder.set_attr(name, value);
+                    }
+                })?;
+            // Appends need the table in the file, not only staged.
+            self.file.commit()?;
 
             self.tables.insert(
                 table_path.clone(),
                 TableInfo {
                     dataset: ds,
-                    row_size: layout.size,
-                    fields: field_sources,
-                    schema: TableSchema::from_batch(batch, &valid),
+                    row_size,
+                    fields,
+                    metadata: batch.metadata().clone(),
                 },
             );
         }
 
         let n = batch.len();
         {
-            let info = self.tables.get(&table_path).unwrap();
+            let info = self.tables.get_mut(&table_path).unwrap();
             let row_size = info.row_size;
             let mut buf = vec![0u8; n * row_size];
 
@@ -482,35 +522,28 @@ impl Hdf5Appender {
                 match source {
                     FieldSource::Sample => {
                         for i in 0..n {
-                            let bytes = batch.sample_numbers()[i].value().to_ne_bytes();
+                            let bytes = batch.sample_numbers()[i].value().to_le_bytes();
                             let base = i * row_size + offset;
                             buf[base..base + bytes.len()].copy_from_slice(&bytes);
                         }
                     }
                     FieldSource::Time => {
                         for i in 0..n {
-                            let bytes = batch.timestamps()[i].to_ne_bytes();
+                            let bytes = batch.timestamps()[i].to_le_bytes();
                             let base = i * row_size + offset;
                             buf[base..base + 8].copy_from_slice(&bytes);
                         }
                     }
                     FieldSource::Column(col_id) => {
-                        if let Some(col) = batch.schema().iter().find(|c| c.index() == *col_id) {
-                            for i in 0..n {
-                                let bytes = match col.values() {
-                                    ColumnArray::F64(v) => v[i].to_ne_bytes(),
-                                    ColumnArray::I64(v) => v[i].to_ne_bytes(),
-                                    ColumnArray::U64(v) => v[i].to_ne_bytes(),
-                                };
-                                let base = i * row_size + offset;
-                                buf[base..base + 8].copy_from_slice(&bytes);
-                            }
+                        if let Some(values) = batch.column(*col_id) {
+                            write_column(&mut buf, values, row_size, offset);
                         }
                     }
                 }
             }
 
-            Self::append_rows(&info.dataset, &buf, n)?;
+            // Extends the table by `n` rows and writes the packed buffer there.
+            info.dataset.append_raw(&buf)?;
         }
 
         self.stats.total_samples += n as u64;
@@ -525,119 +558,129 @@ impl Hdf5Appender {
         Ok(())
     }
 
-    /// Appends `n` packed compound rows to the end of an extendible table.
-    fn append_rows(ds: &Dataset, buf: &[u8], n: usize) -> Result<()> {
-        let old = ds.shape()[0];
-        ds.resize((old + n,))?;
-
-        let fspace = ds.space()?.select(old..old + n)?;
-        let mspace = Dataspace::try_new(SimpleExtents::from([n]))?;
-        let memtype = ds.dtype()?;
-
-        // The dataset's own datatype is reused for memory, so the packed,
-        // native-endian buffer is written without any conversion.
-        let status = unsafe {
-            H5Dwrite(
-                ds.id(),
-                memtype.id(),
-                mspace.id(),
-                fspace.id(),
-                H5P_DEFAULT,
-                buf.as_ptr() as *const std::ffi::c_void,
-            )
-        };
-        if status < 0 {
-            return Err("H5Dwrite failed while appending compound table rows".into());
-        }
-        Ok(())
-    }
-
-    fn write_metadata_attributes(
+    /// Returns the attributes describing a table's stream, segment, and run.
+    fn metadata_attributes(
         &self,
-        loc: &Location,
         batch: &SampleBatch,
         key: &StreamKey,
-    ) -> Result<()> {
-        let meta = batch.segment();
-        self.write_attr_scalar(loc, "sampling_rate", &meta.sampling_rate)?;
-        self.write_attr_scalar(loc, "decimation", &meta.decimation)?;
-        self.write_attr_scalar(loc, "start_time", &meta.start_time)?;
-        self.write_attr_scalar(loc, "filter_cutoff", &meta.filter_cutoff)?;
-        self.write_attr_scalar(loc, "session_id", &batch.device().session.value())?;
-        self.write_attr_scalar(loc, "stream_id", &batch.stream().stream_id.value())?;
-        self.write_attr_string(loc, "stream_name", batch.stream().name)?;
-        self.write_attr_string(loc, "device_serial", batch.device().serial)?;
-        self.write_attr_string(loc, "firmware_hash", batch.device().firmware)?;
-
+    ) -> Vec<(&'static str, AttrValue)> {
+        let meta = batch.metadata().segment();
+        let mut attributes = vec![
+            ("sampling_rate", AttrValue::U32(meta.sampling_rate())),
+            ("decimation", AttrValue::U32(meta.decimation())),
+            ("start_time", AttrValue::U32(meta.start_time())),
+            ("filter_cutoff", AttrValue::F32(meta.filter_cutoff())),
+            (
+                "session_id",
+                batch.metadata().device().session().value().attr(),
+            ),
+            (
+                "stream_id",
+                batch.schema().stream().stream_id().value().attr(),
+            ),
+            ("stream_name", string_attr(batch.schema().stream().name())),
+            (
+                "device_serial",
+                string_attr(batch.metadata().device().serial()),
+            ),
+            (
+                "firmware_hash",
+                string_attr(batch.metadata().device().firmware()),
+            ),
+        ];
         if let Some(id) = self.runs.index(*key) {
-            self.write_attr_scalar(loc, "run_id", &id)?;
+            attributes.push(("run_id", AttrValue::U64(id)));
         }
-
-        self.write_attr_scalar(loc, "time_ref_epoch", &meta.epoch.value())?;
-        self.write_attr_scalar(loc, "filter_type", &meta.filter_type.value())?;
-
-        if !meta.timeref_serial.is_empty() {
-            self.write_attr_string(loc, "time_ref_serial", meta.timeref_serial)?;
+        attributes.push(("time_ref_epoch", meta.epoch().value().attr()));
+        attributes.push(("filter_type", meta.filter_type().value().attr()));
+        if !meta.timeref_serial().is_empty() {
+            attributes.push(("time_ref_serial", string_attr(meta.timeref_serial())));
         }
-        Ok(())
+        attributes
     }
 
-    /// Stores per-field `units` and `descriptions` as string arrays aligned with
-    /// the compound fields (`sample`, `time`, then each column).
-    fn write_field_metadata(&self, loc: &Location, valid: &[&Series]) -> Result<()> {
-        let mut units: Vec<VarLenUnicode> = Vec::with_capacity(valid.len() + 2);
-        let mut descriptions: Vec<VarLenUnicode> = Vec::with_capacity(valid.len() + 2);
-
-        units.push(to_vlu(""));
-        descriptions.push(to_vlu("Sample number from device"));
-        units.push(to_vlu("s"));
-        descriptions.push(to_vlu("Time in seconds"));
-        for col in valid {
-            units.push(to_vlu(col.metadata().units));
-            descriptions.push(to_vlu(col.metadata().description));
-        }
-
-        self.write_attr_string_array(loc, "units", &units)?;
-        self.write_attr_string_array(loc, "descriptions", &descriptions)?;
-        Ok(())
-    }
-
-    fn ensure_group(&self, path: &str) -> Result<()> {
-        if self.file.group(path).is_ok() {
-            return Ok(());
-        }
-        let mut current = String::new();
-        for part in path.split('/').filter(|s| !s.is_empty()) {
-            current.push('/');
-            current.push_str(part);
-            if self.file.group(&current).is_err() {
-                self.file.create_group(&current)?;
+    /// Returns the group at `path`, creating it and any missing parents.
+    fn ensure_group(&mut self, path: &str) -> Result<&Group> {
+        if !self.groups.contains_key(path) {
+            let mut current = String::new();
+            for part in path.split('/').filter(|s| !s.is_empty()) {
+                let parent = if current.is_empty() { "/" } else { &current };
+                let parent = self.groups[parent].clone();
+                current.push('/');
+                current.push_str(part);
+                if !self.groups.contains_key(&current) {
+                    self.groups
+                        .insert(current.clone(), parent.create_group(part)?);
+                }
             }
         }
-        Ok(())
+        Ok(&self.groups[path])
     }
+}
 
-    fn write_attr_scalar<T: H5Type>(&self, loc: &Location, name: &str, val: &T) -> Result<()> {
-        loc.new_attr::<T>().create(name)?.write_scalar(val)
+/// Writes each of `values` little-endian into the field `offset` bytes into
+/// its row of `rows`, which packs rows `row_size` bytes apart.
+fn write_column(rows: &mut [u8], values: &ColumnArray, row_size: usize, offset: usize) {
+    macro_rules! write {
+        ($($variant:ident $native:ty),* $(,)?) => {
+            match values {
+                $(
+                    ColumnArray::$variant(values) => {
+                        for (row, value) in rows.chunks_exact_mut(row_size).zip(values.iter()) {
+                            row[offset..offset + size_of::<$native>()]
+                                .copy_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                )*
+            }
+        };
     }
+    native_types!(write)
+}
 
-    fn write_attr_string(&self, loc: &Location, name: &str, val: &str) -> Result<()> {
-        let attr = loc.new_attr::<VarLenUnicode>().create(name)?;
-        attr.write_scalar(&to_vlu(val))
+/// Returns the `units` and `descriptions` attributes, string arrays aligned
+/// with the compound fields (`sample`, `time`, then each column).
+fn field_metadata_attributes(valid: &[wire::ColumnView<'_>]) -> [(&'static str, AttrValue); 2] {
+    let mut units = vec![String::new(), "s".to_string()];
+    let mut descriptions = vec![
+        "Sample number from device".to_string(),
+        "Time in seconds".to_string(),
+    ];
+    for col in valid {
+        units.push(col.units().to_string());
+        descriptions.push(col.description().to_string());
     }
+    [
+        ("units", AttrValue::VarLenStringArray(units)),
+        ("descriptions", AttrValue::VarLenStringArray(descriptions)),
+    ]
+}
 
-    fn write_attr_string_array(
-        &self,
-        loc: &Location,
-        name: &str,
-        vals: &[VarLenUnicode],
-    ) -> Result<()> {
-        let attr = loc
-            .new_attr::<VarLenUnicode>()
-            .shape(SimpleExtents::from([vals.len()]))
-            .create(name)?;
-        attr.write_raw(vals)
+/// A protocol identifier's value, stored as an attribute of its own width.
+trait ScalarAttr {
+    fn attr(self) -> AttrValue;
+}
+
+impl ScalarAttr for u8 {
+    fn attr(self) -> AttrValue {
+        AttrValue::U8(self)
     }
+}
+
+impl ScalarAttr for u16 {
+    fn attr(self) -> AttrValue {
+        AttrValue::U16(self)
+    }
+}
+
+impl ScalarAttr for u32 {
+    fn attr(self) -> AttrValue {
+        AttrValue::U32(self)
+    }
+}
+
+fn string_attr(value: &str) -> AttrValue {
+    AttrValue::VarLenString(value.to_string())
 }
 
 /// Returns `name` as one HDF5 path component, with each `/` and NUL replaced
@@ -657,18 +700,11 @@ fn hdf_name_component(name: &str) -> String {
     }
 }
 
-fn to_vlu(s: &str) -> VarLenUnicode {
-    s.parse::<VarLenUnicode>()
-        .unwrap_or_else(|_| "".parse().unwrap())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{buffer_type, DeviceRecord, SegmentRecord, StreamRecord};
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnData, SampleBatchBuilder};
-    use crate::proto::data as wire;
+    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::proto::data::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -696,53 +732,51 @@ mod tests {
     }
 
     fn batch(stream_id: u8, stream_name: &str, column_name: &str) -> SampleBatch {
-        batch_in_segment(stream_id, stream_name, column_name, 0)
+        batch_in_segment(DeviceRoute::root(), stream_id, stream_name, column_name, 0)
     }
 
     fn batch_in_segment(
+        route: DeviceRoute,
         stream_id: u8,
         stream_name: &str,
         column_name: &str,
         start_time: u32,
     ) -> SampleBatch {
-        let column = ColumnRecord::encode(wire::Column {
-            name: column_name,
-            units: "V",
-            description: "test column",
-            ..fixtures::column(stream_id, 0, DataType::F32)
-        })
-        .unwrap();
         let mut builder = SampleBatchBuilder::new(
-            BatchContext::new(
-                key(stream_id),
-                None,
-                Generations {
+            BatchContext {
+                metadata: fixtures::metadata(
+                    route,
+                    wire::Device {
+                        n_streams: 2,
+                        ..fixtures::device()
+                    },
+                    wire::Stream {
+                        name: stream_name,
+                        buf_samples: 1,
+                        ..fixtures::stream(stream_id)
+                    },
+                    wire::Segment {
+                        segment_id: crate::proto::SegmentId::new(1),
+                        start_time,
+                        ..fixtures::segment(stream_id)
+                    },
+                    &[wire::Column {
+                        name: column_name,
+                        units: "V",
+                        description: "test column",
+                        ..fixtures::column(stream_id, 0, DataType::F64)
+                    }],
+                ),
+                boundary: None,
+                generations: Generations {
                     stream: 1,
                     device: 0,
                     global: 0,
                 },
-                SegmentRecord::encode(wire::Segment {
-                    segment_id: crate::proto::SegmentId::new(1),
-                    start_time,
-                    ..fixtures::segment(stream_id)
-                })
-                .unwrap(),
-                StreamRecord::encode(wire::Stream {
-                    name: stream_name,
-                    buf_samples: 1,
-                    ..fixtures::stream(stream_id)
-                })
-                .unwrap(),
-                DeviceRecord::encode(wire::Device {
-                    n_streams: 2,
-                    ..fixtures::device()
-                })
-                .unwrap(),
-            ),
-            [(column.clone(), buffer_type(column.get().data_type))],
+            },
             1,
         );
-        builder.push_row(SampleNumber::new(0), [ColumnData::Float(1.0)]);
+        builder.push_row(SampleNumber::new(0), [ColumnData::F64(1.0)]);
         builder.finish()
     }
 
@@ -881,18 +915,50 @@ mod tests {
         let path = temp_hdf("segment_rollover");
         let mut writer = appender(&path);
         writer
-            .write_batch(batch_in_segment(1, "field", "x", 0))
+            .write_batch(batch_in_segment(DeviceRoute::root(), 1, "field", "x", 0))
             .expect("write first segment");
         writer
-            .write_batch(batch_in_segment(1, "field", "x", 100))
+            .write_batch(batch_in_segment(DeviceRoute::root(), 1, "field", "x", 100))
             .expect("write next segment");
         writer.finish().expect("finish output");
 
         let file = File::open(&path).expect("open output");
         assert_eq!(
-            file.dataset("field").expect("open stream table").shape(),
+            file.dataset("field")
+                .expect("open stream table")
+                .shape()
+                .expect("read table shape"),
             vec![2]
         );
+        drop(file);
+        std::fs::remove_file(path).expect("remove output");
+    }
+
+    #[test]
+    fn each_route_gets_a_group_with_its_parents() {
+        let _guard = hdf_test_lock();
+        let path = temp_hdf("nested_routes");
+        let mut writer = appender(&path);
+        // The deeper route comes first, so its parent group is created for it.
+        for route in ["/0/2", "/0", "/1"] {
+            let route = route.parse().expect("parse route");
+            writer
+                .write_batch(batch_in_segment(route, 1, "field", "x", 0))
+                .expect("write routed stream");
+        }
+        writer.finish().expect("finish output");
+
+        let file = File::open(&path).expect("open output");
+        for table in ["0/2/field", "0/field", "1/field"] {
+            assert_eq!(
+                file.dataset(table)
+                    .expect("open routed table")
+                    .shape()
+                    .expect("read table shape"),
+                vec![1],
+                "{table}"
+            );
+        }
         drop(file);
         std::fs::remove_file(path).expect("remove output");
     }

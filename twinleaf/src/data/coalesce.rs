@@ -1,15 +1,17 @@
 //! Merging of small sample batches into larger ones.
 //!
-//! [`BatchCoalescer`] accumulates the batches of one stream into batches of
-//! roughly `target_rows` rows. It decides which rows may share a batch. Rows
+//! [`BatchCoalescer`] accumulates the batches of one stream until a batch
+//! holds `target_rows` rows, and never splits a pushed batch. A batch ends
+//! sooner when the next rows cannot share it. Rows
 //! merge only while they carry the same metadata and generations, and rows
 //! that start at a boundary form a batch of their own.
 
-use super::sample::{Generations, RowSource, SampleBatch, SampleBatchBuilder};
+use super::continuity::Generations;
+use super::sample::{RowSource, SampleBatch, SampleBatchBuilder};
 use std::collections::VecDeque;
 use std::ops::Range;
 
-/// Accumulates one stream's batches into batches of about `target_rows` rows.
+/// Accumulates one stream's batches until a batch holds `target_rows` rows.
 ///
 /// Pushed rows land in a buffered tail, which completes once it reaches the
 /// target or once rows that cannot share a batch with it arrive. Completed
@@ -60,12 +62,6 @@ impl BatchCoalescer {
         }
     }
 
-    /// Merges `batch` into the buffered tail, completing batches as needed.
-    /// Empty batches are ignored.
-    pub fn push_batch(&mut self, batch: &SampleBatch) {
-        self.push(batch)
-    }
-
     /// Removes and returns the oldest completed batch.
     pub fn next_completed_batch(&mut self) -> Option<SampleBatch> {
         self.completed.pop_front()
@@ -109,57 +105,54 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::BoundaryReason;
     use crate::data::fixtures;
-    use crate::data::metadata::{
-        BufferType, ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord,
-    };
-    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData};
+    use crate::data::metadata::StreamMetadataSnapshot;
+    use crate::data::sample::{BatchContext, ColumnArray, ColumnData};
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 
-    fn segment(segment_id: u8) -> SegmentRecord {
-        SegmentRecord::encode(wire::Segment {
-            segment_id: crate::proto::SegmentId::new(segment_id),
-            sampling_rate: 4,
-            ..fixtures::segment(1)
-        })
-        .unwrap()
+    /// The metadata of a 4 Hz float stream in segment `segment_id`.
+    fn segment(segment_id: u8) -> StreamMetadataSnapshot {
+        fixtures::metadata(
+            DeviceRoute::root(),
+            fixtures::device(),
+            wire::Stream {
+                n_segments: 2,
+                sample_size: 8,
+                ..fixtures::stream(1)
+            },
+            wire::Segment {
+                segment_id: crate::proto::SegmentId::new(segment_id),
+                sampling_rate: 4,
+                ..fixtures::segment(1)
+            },
+            &[fixtures::column(1, 0, DataType::F64)],
+        )
     }
 
     /// A float batch of `rows` rows numbered from `first`, whose values are the
     /// sample numbers.
     fn batch(
-        segment: &SegmentRecord,
+        metadata: &StreamMetadataSnapshot,
         first: u32,
         rows: u32,
         boundary: Option<BoundaryReason>,
         generations: Generations,
     ) -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
-            BatchContext::new(
-                StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1)),
+            BatchContext {
+                metadata: metadata.clone(),
                 boundary,
                 generations,
-                segment.clone(),
-                StreamRecord::encode(wire::Stream {
-                    n_segments: 2,
-                    sample_size: 8,
-                    ..fixtures::stream(1)
-                })
-                .unwrap(),
-                DeviceRecord::encode(fixtures::device()).unwrap(),
-            ),
-            [(
-                ColumnRecord::encode(fixtures::column(1, 0, DataType::F64)).unwrap(),
-                BufferType::Float,
-            )],
+            },
             rows as usize,
         );
         for n in first..first + rows {
             builder.push_row(
                 crate::proto::SampleNumber::new(n),
-                [ColumnData::Float(f64::from(n))],
+                [ColumnData::F64(f64::from(n))],
             );
         }
         builder.finish()
@@ -174,7 +167,7 @@ mod tests {
     }
 
     fn values(batch: &SampleBatch) -> Vec<f64> {
-        match batch.schema()[0].values() {
+        match &batch.columns()[0] {
             ColumnArray::F64(v) => v.to_vec(),
             other => panic!("expected an f64 column, got {other:?}"),
         }
@@ -185,7 +178,7 @@ mod tests {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(8));
         for first in [0, 2, 4] {
-            coalescer.push_batch(&batch(&segment, first, 2, None, generations(1)));
+            coalescer.push(&batch(&segment, first, 2, None, generations(1)));
         }
         assert!(coalescer.next_completed_batch().is_none());
         assert_eq!(coalescer.buffered_len(), 6);
@@ -202,10 +195,10 @@ mod tests {
     fn reaching_the_target_completes_a_batch() {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(4));
-        coalescer.push_batch(&batch(&segment, 0, 3, None, generations(1)));
+        coalescer.push(&batch(&segment, 0, 3, None, generations(1)));
         assert!(coalescer.next_completed_batch().is_none());
         // The target is approximate: rows arriving as a batch stay together.
-        coalescer.push_batch(&batch(&segment, 3, 3, None, generations(1)));
+        coalescer.push(&batch(&segment, 3, 3, None, generations(1)));
         let completed = coalescer.next_completed_batch().expect("the full batch");
         assert_eq!(completed.len(), 6);
         assert_eq!(coalescer.buffered_len(), 0);
@@ -215,8 +208,8 @@ mod tests {
     fn without_a_target_every_batch_completes_on_its_own() {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(None);
-        coalescer.push_batch(&batch(&segment, 0, 2, None, generations(1)));
-        coalescer.push_batch(&batch(&segment, 2, 2, None, generations(1)));
+        coalescer.push(&batch(&segment, 0, 2, None, generations(1)));
+        coalescer.push(&batch(&segment, 2, 2, None, generations(1)));
         assert_eq!(coalescer.buffered_len(), 0);
         let lengths: Vec<usize> = std::iter::from_fn(|| coalescer.next_completed_batch())
             .map(|b| b.len())
@@ -228,8 +221,8 @@ mod tests {
     fn a_boundary_batch_stands_alone() {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(8));
-        coalescer.push_batch(&batch(&segment, 0, 2, None, generations(1)));
-        coalescer.push_batch(&batch(
+        coalescer.push(&batch(&segment, 0, 2, None, generations(1)));
+        coalescer.push(&batch(
             &segment,
             2,
             2,
@@ -239,7 +232,7 @@ mod tests {
             }),
             generations(1),
         ));
-        coalescer.push_batch(&batch(&segment, 4, 2, None, generations(1)));
+        coalescer.push(&batch(&segment, 4, 2, None, generations(1)));
 
         // The rows before the boundary complete first, then the boundary batch
         // itself; only the rows after it stay buffered.
@@ -261,8 +254,8 @@ mod tests {
     fn differing_generations_complete_the_buffered_rows() {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(8));
-        coalescer.push_batch(&batch(&segment, 0, 2, None, generations(1)));
-        coalescer.push_batch(&batch(&segment, 0, 2, None, generations(2)));
+        coalescer.push(&batch(&segment, 0, 2, None, generations(1)));
+        coalescer.push(&batch(&segment, 0, 2, None, generations(2)));
         let completed = coalescer.next_completed_batch().expect("the older rows");
         assert_eq!(completed.generations(), generations(1));
         assert_eq!(coalescer.buffered_generations(), Some(generations(2)));
@@ -271,8 +264,8 @@ mod tests {
     #[test]
     fn a_different_segment_completes_the_buffered_rows() {
         let mut coalescer = BatchCoalescer::new(Some(8));
-        coalescer.push_batch(&batch(&segment(0), 0, 2, None, generations(1)));
-        coalescer.push_batch(&batch(&segment(1), 2, 2, None, generations(1)));
+        coalescer.push(&batch(&segment(0), 0, 2, None, generations(1)));
+        coalescer.push(&batch(&segment(1), 2, 2, None, generations(1)));
         assert_eq!(
             coalescer
                 .next_completed_batch()
@@ -287,7 +280,7 @@ mod tests {
     fn empty_batches_are_ignored() {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(4));
-        coalescer.push_batch(&batch(&segment, 0, 0, None, generations(1)));
+        coalescer.push(&batch(&segment, 0, 0, None, generations(1)));
         assert_eq!(coalescer.buffered_len(), 0);
         assert!(coalescer.next_completed_batch().is_none());
     }
@@ -297,14 +290,14 @@ mod tests {
         let segment = segment(0);
         let mut coalescer = BatchCoalescer::new(Some(8));
         assert!(coalescer.buffered_rows(0..0).is_none());
-        coalescer.push_batch(&batch(&segment, 0, 3, None, generations(1)));
+        coalescer.push(&batch(&segment, 0, 3, None, generations(1)));
 
         let frozen = coalescer.buffered_rows(1..3).expect("the buffered rows");
         assert_eq!(frozen.sample_numbers(), [1, 2]);
         assert_eq!(values(&frozen), [1.0, 2.0]);
         assert_eq!(coalescer.buffered_len(), 3);
 
-        coalescer.push_batch(&batch(&segment, 3, 2, None, generations(1)));
+        coalescer.push(&batch(&segment, 3, 2, None, generations(1)));
         coalescer.finish_buffered_batch();
         let completed = coalescer.next_completed_batch().expect("every row");
         assert_eq!(completed.sample_numbers(), [0, 1, 2, 3, 4]);

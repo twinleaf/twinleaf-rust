@@ -3,10 +3,11 @@
 //! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
-use super::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord};
+use super::continuity::{BoundaryClass, BoundaryReason};
+use super::metadata::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch};
-use super::state::{PacketError, ScannedRows};
+use super::sample::{sample_time, RowSource, SampleBatch};
+use super::state::{DataError, ScannedRows};
 use crate::proto::data as wire;
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
@@ -58,7 +59,7 @@ const PROGRESS_BYTES: usize = 1024 * 1024;
 /// }
 /// for (stream, runs) in index.summary().streams() {
 ///     for run in runs {
-///         let (n, rate) = (run.sample_count(), run.rate_hz());
+///         let (n, rate) = (run.sample_count(), run.metadata().rate_hz());
 ///         println!("{stream} run {}: {n} samples at {rate} Hz", run.run());
 ///     }
 /// }
@@ -122,7 +123,7 @@ pub enum LogError {
         offset: usize,
         /// Why the packet could not be applied to the data state.
         #[source]
-        source: PacketError,
+        source: DataError,
     },
 }
 
@@ -180,9 +181,8 @@ impl Iterator for PacketIter {
 pub struct StreamSummary {
     run: u32,
     opened_by: Option<BoundaryClass>,
-    metadata: StreamRecord,
-    segment: SegmentRecord,
-    columns: Vec<ColumnRecord>,
+    /// The metadata of the run's first rows.
+    metadata: StreamMetadataSnapshot,
     sample_count: u64,
     first_timestamp: Option<f64>,
     last_timestamp: Option<f64>,
@@ -200,19 +200,10 @@ impl StreamSummary {
         self.opened_by
     }
 
-    /// Returns the stream record in effect for the whole run.
-    pub fn metadata(&self) -> wire::Stream<'_> {
-        self.metadata.get()
-    }
-
-    /// Returns the segment record the run began in.
-    pub fn segment(&self) -> wire::Segment<'_> {
-        self.segment.get()
-    }
-
-    /// Returns every column of a sample, in schema order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
-        self.columns.iter().map(ColumnRecord::get)
+    /// Returns the metadata of the run's first rows. Its schema holds for the
+    /// whole run, and its segment and rate are those the run began in.
+    pub fn metadata(&self) -> &StreamMetadataSnapshot {
+        &self.metadata
     }
 
     /// Returns the number of rows in this run alone.
@@ -230,13 +221,6 @@ impl StreamSummary {
     /// epoch, or `None` if the run counted no rows.
     pub fn last_timestamp(&self) -> Option<f64> {
         self.last_timestamp
-    }
-
-    /// Returns the output rate in hertz after decimation, or zero for a
-    /// segment whose rate or decimation is zero. The parser emits no rows from
-    /// such a segment.
-    pub fn rate_hz(&self) -> f64 {
-        self.segment.effective_rate().unwrap_or(0.0)
     }
 }
 
@@ -268,7 +252,7 @@ impl LogSummary {
     /// Returns the devices that produced rows, in route order.
     pub fn devices(
         &self,
-    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::Device<'_>)> + '_ {
+    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::DeviceView<'_>)> + '_ {
         self.devices
             .iter()
             .map(|(&route, device)| (route, device.get()))
@@ -307,20 +291,18 @@ impl LogSummary {
             runs.push(StreamSummary {
                 run: rows.generations().stream,
                 opened_by: rows.boundary().map(BoundaryReason::class),
-                metadata: rows.stream().clone(),
-                segment: rows.segment().clone(),
-                columns: rows.columns().to_vec(),
+                metadata: rows.metadata(),
                 sample_count: 0,
                 first_timestamp: None,
                 last_timestamp: None,
             });
         }
         let stream = runs.last_mut().expect("a run was just opened if empty");
-        stream.sample_count += rows.row_count() as u64;
+        stream.sample_count += rows.len() as u64;
 
         let (first_n, last_n) = rows.sample_number_bounds();
-        let first_timestamp = sample_time(rows.segment().get(), first_n.value() + 1);
-        let last_timestamp = sample_time(rows.segment().get(), last_n.value() + 1);
+        let first_timestamp = sample_time(rows.segment_record().get(), first_n.value() + 1);
+        let last_timestamp = sample_time(rows.segment_record().get(), last_n.value() + 1);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp
@@ -576,8 +558,8 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::Generations;
     use crate::data::fixtures::{column, device, segment, stream};
-    use crate::data::sample::Generations;
     use crate::data::state::StreamDataError;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
@@ -659,7 +641,7 @@ mod tests {
             index.summary().error(),
             Some(LogError::Data {
                 offset,
-                source: PacketError::Stream {
+                source: DataError::Stream {
                     source: StreamDataError::SegmentOutOfRange { .. },
                     ..
                 },
@@ -688,13 +670,13 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run(), 1);
         assert_eq!(runs[0].opened_by(), Some(BoundaryClass::Startup));
-        assert_eq!(runs[0].rate_hz(), 1.0);
+        assert_eq!(runs[0].metadata().rate_hz(), 1.0);
         assert_eq!(runs[0].sample_count(), 2);
         assert_eq!(runs[0].first_timestamp(), Some(1.0));
         assert_eq!(runs[0].last_timestamp(), Some(2.0));
         assert_eq!(runs[1].run(), 2);
         assert_eq!(runs[1].opened_by(), Some(BoundaryClass::Reconfig));
-        assert_eq!(runs[1].rate_hz(), 10.0);
+        assert_eq!(runs[1].metadata().rate_hz(), 10.0);
         assert_eq!(runs[1].sample_count(), 2);
         assert!((runs[1].first_timestamp().unwrap() - 0.3).abs() < 1e-9);
         assert!((runs[1].last_timestamp().unwrap() - 0.4).abs() < 1e-9);

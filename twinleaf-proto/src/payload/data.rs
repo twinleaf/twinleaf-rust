@@ -286,9 +286,10 @@ impl<'a> Device<'a> {
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
-    /// if the record or its head is too short or a string is not UTF-8.
+    /// if the record is truncated or a string is not UTF-8. Fields past a shorter
+    /// head than this build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split::<DeviceHead>(buf)?;
+        let (head, mut strings) = RecordReader::split_defaulting::<DeviceHead>(buf)?;
         Some(Self {
             session: SessionId::new(head.session.get()),
             n_streams: head.n_streams,
@@ -350,10 +351,11 @@ impl<'a> Stream<'a> {
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
-    /// if the record or its head is too short, the stream id is outside 1 to
-    /// 127, or a string is not UTF-8.
+    /// if the record is truncated, the stream id is outside 1 to
+    /// 127, or a string is not UTF-8. Fields past a shorter head than this
+    /// build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split::<StreamHead>(buf)?;
+        let (head, mut strings) = RecordReader::split_defaulting::<StreamHead>(buf)?;
         Some(Self {
             stream_id: StreamId::try_new(head.stream_id)?,
             n_columns: head.n_columns,
@@ -437,10 +439,11 @@ impl<'a> Segment<'a> {
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
-    /// if the record or its head is too short, the stream id is outside 1 to
-    /// 127, or a string is not UTF-8.
+    /// if the record is truncated, the stream id is outside 1 to
+    /// 127, or a string is not UTF-8. Fields past a shorter head than this
+    /// build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split::<SegmentHead>(buf)?;
+        let (head, mut strings) = RecordReader::split_defaulting::<SegmentHead>(buf)?;
         Some(Self {
             stream_id: StreamId::try_new(head.stream_id)?,
             segment_id: SegmentId::new(head.segment_id),
@@ -510,10 +513,11 @@ impl<'a> Column<'a> {
     }
 
     /// Parses a bare record, without a `[type][flags]` header. Returns `None`
-    /// if the record or its head is too short, the stream id is outside 1 to
-    /// 127, or a string is not UTF-8.
+    /// if the record is truncated, the stream id is outside 1 to
+    /// 127, or a string is not UTF-8. Fields past a shorter head than this
+    /// build's read as zero.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
-        let (head, mut strings) = RecordReader::split::<ColumnHead>(buf)?;
+        let (head, mut strings) = RecordReader::split_defaulting::<ColumnHead>(buf)?;
         Some(Self {
             stream_id: StreamId::try_new(head.stream_id)?,
             index: ColumnId::new(head.index),
@@ -522,6 +526,291 @@ impl<'a> Column<'a> {
             units: strings.take(head.units_len)?,
             description: strings.take(head.description_len)?,
         })
+    }
+}
+
+/// Defines a view that reads one kind of bare record in place.
+macro_rules! record_view {
+    ($view:ident, $fields:ident, $head:ident) => {
+        #[doc = concat!("A bare [`", stringify!($fields), "`] record, read in place.")]
+        ///
+        /// [`new_checked`](Self::new_checked) checks the record once. Each
+        /// accessor then reads its field from the record's bytes, without
+        /// copying the record or checking its strings again in full. A field
+        /// past a shorter head than this build's reads as zero. Equality is
+        /// byte equality, so a head field this build does not know still
+        /// counts.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub struct $view<'a> {
+            record: &'a [u8],
+        }
+
+        impl<'a> $view<'a> {
+            /// Returns a view of `record`, or `None` if it does not parse as
+            /// this record.
+            pub fn new_checked(record: &'a [u8]) -> Option<Self> {
+                $fields::parse(record)?;
+                Some(Self { record })
+            }
+
+            /// Returns a view of `record` without checking it.
+            ///
+            /// # Panics
+            ///
+            /// Accessors panic if `record` would not pass
+            /// [`new_checked`](Self::new_checked).
+            pub fn new_unchecked(record: &'a [u8]) -> Self {
+                Self { record }
+            }
+
+            /// Returns the bare record the view reads.
+            pub fn bytes(&self) -> &'a [u8] {
+                self.record
+            }
+
+            /// Returns every field this build knows, for writing the record
+            /// again.
+            pub fn fields(&self) -> $fields<'a> {
+                $fields::parse(self.record).expect("a view's record was checked")
+            }
+
+            /// Reads the head field of type `T` at `offset`, or zero when the
+            /// record's head ends before it.
+            fn field<T: FromBytes>(&self, offset: usize) -> T {
+                head_field(self.record, offset)
+            }
+
+            fn split(&self) -> ($head, RecordReader<'a>) {
+                RecordReader::split_defaulting::<$head>(self.record)
+                    .expect("a view's record was checked")
+            }
+        }
+
+        impl core::fmt::Debug for $view<'_> {
+            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                self.fields().fmt(formatter)
+            }
+        }
+    };
+}
+
+/// Reads the `n`th string of a checked record, after skipping the lengths
+/// before it.
+fn nth_string<'a>(mut strings: RecordReader<'a>, before: &[u8], len: u8) -> &'a str {
+    for &skipped in before {
+        strings.skip(skipped).expect("a view's record was checked");
+    }
+    strings.take(len).expect("a view's record was checked")
+}
+
+/// Reads the head field of type `T` at `offset` of a checked record, or zero
+/// when the head the record declares ends before the field, the default the
+/// protocol gives a field an older device does not send.
+fn head_field<T: FromBytes>(record: &[u8], offset: usize) -> T {
+    let end = offset + size_of::<T>();
+    record
+        .get(offset..end)
+        .filter(|_| end <= usize::from(record[0]))
+        .and_then(|bytes| T::read_from_bytes(bytes).ok())
+        .unwrap_or_else(T::new_zeroed)
+}
+
+record_view!(DeviceView, Device, DeviceHead);
+record_view!(StreamView, Stream, StreamHead);
+record_view!(SegmentView, Segment, SegmentHead);
+record_view!(ColumnView, Column, ColumnHead);
+
+impl<'a> DeviceView<'a> {
+    /// Session id of the device.
+    pub fn session(&self) -> SessionId {
+        SessionId::new(
+            self.field::<U32>(core::mem::offset_of!(DeviceHead, session))
+                .get(),
+        )
+    }
+
+    /// Streams the host should expect to be described in this sweep.
+    pub fn n_streams(&self) -> u8 {
+        self.field::<u8>(core::mem::offset_of!(DeviceHead, n_streams))
+    }
+
+    /// Device name.
+    pub fn name(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(strings, &[], head.name_len)
+    }
+
+    /// Device serial.
+    pub fn serial(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(strings, &[head.name_len], head.serial_len)
+    }
+
+    /// Firmware build serial.
+    pub fn firmware(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(
+            strings,
+            &[head.name_len, head.serial_len],
+            head.firmware_len,
+        )
+    }
+}
+
+impl<'a> StreamView<'a> {
+    /// Stream id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the view reads a record that
+    /// [`new_checked`](Self::new_checked) would refuse.
+    pub fn stream_id(&self) -> StreamId {
+        StreamId::try_new(self.field::<u8>(core::mem::offset_of!(StreamHead, stream_id)))
+            .expect("a view's record was checked")
+    }
+
+    /// Number of columns in a sample.
+    pub fn n_columns(&self) -> u8 {
+        self.field::<u8>(core::mem::offset_of!(StreamHead, n_columns))
+    }
+
+    /// Number of segments in the ring.
+    pub fn n_segments(&self) -> u8 {
+        self.field::<u8>(core::mem::offset_of!(StreamHead, n_segments))
+    }
+
+    /// Bytes per sample, the packed size of all columns.
+    pub fn sample_size(&self) -> u16 {
+        self.field::<U16>(core::mem::offset_of!(StreamHead, sample_size))
+            .get()
+    }
+
+    /// Samples the device retains for retransmission.
+    pub fn buf_samples(&self) -> u16 {
+        self.field::<U16>(core::mem::offset_of!(StreamHead, buf_samples))
+            .get()
+    }
+
+    /// Stream name.
+    pub fn name(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(strings, &[], head.name_len)
+    }
+}
+
+impl<'a> SegmentView<'a> {
+    /// Stream id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the view reads a record that
+    /// [`new_checked`](Self::new_checked) would refuse.
+    pub fn stream_id(&self) -> StreamId {
+        StreamId::try_new(self.field::<u8>(core::mem::offset_of!(SegmentHead, stream_id)))
+            .expect("a view's record was checked")
+    }
+
+    /// Segment id.
+    pub fn segment_id(&self) -> SegmentId {
+        SegmentId::new(self.field::<u8>(core::mem::offset_of!(SegmentHead, segment_id)))
+    }
+
+    /// Segment state.
+    pub fn flags(&self) -> SegmentFlags {
+        SegmentFlags::from_bits(self.field::<u8>(core::mem::offset_of!(SegmentHead, flags)))
+    }
+
+    /// Timescale of `start_time`.
+    pub fn epoch(&self) -> Epoch {
+        Epoch::new(self.field::<u8>(core::mem::offset_of!(SegmentHead, epoch)))
+    }
+
+    /// Serial of the device that owns the timebase.
+    pub fn timeref_serial(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(strings, &[], head.timeref_serial_len)
+    }
+
+    /// Session id of the timebase source.
+    pub fn timeref_session(&self) -> SessionId {
+        SessionId::new(
+            self.field::<U32>(core::mem::offset_of!(SegmentHead, timeref_session))
+                .get(),
+        )
+    }
+
+    /// Time of sample zero, in seconds after `epoch`.
+    pub fn start_time(&self) -> u32 {
+        self.field::<U32>(core::mem::offset_of!(SegmentHead, start_time))
+            .get()
+    }
+
+    /// Samples per second before decimation.
+    pub fn sampling_rate(&self) -> u32 {
+        self.field::<U32>(core::mem::offset_of!(SegmentHead, sampling_rate))
+            .get()
+    }
+
+    /// Samples averaged into each output sample.
+    pub fn decimation(&self) -> u32 {
+        self.field::<U32>(core::mem::offset_of!(SegmentHead, decimation))
+            .get()
+    }
+
+    /// Filter cutoff in hertz.
+    pub fn filter_cutoff(&self) -> f32 {
+        self.field::<F32>(core::mem::offset_of!(SegmentHead, filter_cutoff))
+            .get()
+    }
+
+    /// Filter applied before decimation.
+    pub fn filter_type(&self) -> FilterType {
+        FilterType::new(self.field::<u8>(core::mem::offset_of!(SegmentHead, filter_type)))
+    }
+}
+
+impl<'a> ColumnView<'a> {
+    /// Stream id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the view reads a record that
+    /// [`new_checked`](Self::new_checked) would refuse.
+    pub fn stream_id(&self) -> StreamId {
+        StreamId::try_new(self.field::<u8>(core::mem::offset_of!(ColumnHead, stream_id)))
+            .expect("a view's record was checked")
+    }
+
+    /// Position of this column within the packed sample.
+    pub fn index(&self) -> ColumnId {
+        ColumnId::new(self.field::<u8>(core::mem::offset_of!(ColumnHead, index)))
+    }
+
+    /// Sample encoding.
+    pub fn data_type(&self) -> DataType {
+        DataType::new(self.field::<u8>(core::mem::offset_of!(ColumnHead, data_type)))
+    }
+
+    /// Column name.
+    pub fn name(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(strings, &[], head.name_len)
+    }
+
+    /// Units of the value.
+    pub fn units(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(strings, &[head.name_len], head.units_len)
+    }
+
+    /// Description of the column.
+    pub fn description(&self) -> &'a str {
+        let (head, strings) = self.split();
+        nth_string(
+            strings,
+            &[head.name_len, head.units_len],
+            head.description_len,
+        )
     }
 }
 
@@ -779,7 +1068,7 @@ impl MetadataSelector {
 /// Why a `dev.metadata` request argument does not parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum MetadataQueryError {
+pub enum MetadataRequestError {
     /// Argument length is not a multiple of three.
     #[error("argument length is not a whole number of selectors")]
     Misaligned,
@@ -791,24 +1080,24 @@ pub enum MetadataQueryError {
 /// The selectors of a `dev.metadata` request argument. An empty argument
 /// selects a device-chosen prefix of all records.
 #[derive(Debug, Clone, Copy)]
-pub struct MetadataQuery<'a> {
+pub struct MetadataRequest<'a> {
     arg: &'a [u8],
 }
 
-impl<'a> MetadataQuery<'a> {
+impl<'a> MetadataRequest<'a> {
     /// Parses the selectors of a request argument.
     ///
     /// # Errors
     ///
-    /// Returns [`MetadataQueryError::Misaligned`] if the length of `arg` is not
-    /// a multiple of three, and [`MetadataQueryError::TooManySelectors`] if it
-    /// holds more than [`MAX_METADATA_SELECTORS`].
-    pub fn parse(arg: &'a [u8]) -> Result<Self, MetadataQueryError> {
+    /// Returns [`MetadataRequestError::Misaligned`] if the length of `arg` is
+    /// not a multiple of three, and [`MetadataRequestError::TooManySelectors`]
+    /// if it holds more than [`MAX_METADATA_SELECTORS`].
+    pub fn parse(arg: &'a [u8]) -> Result<Self, MetadataRequestError> {
         if !arg.len().is_multiple_of(MetadataSelector::SIZE) {
-            return Err(MetadataQueryError::Misaligned);
+            return Err(MetadataRequestError::Misaligned);
         }
         if arg.len() / MetadataSelector::SIZE > MAX_METADATA_SELECTORS {
-            return Err(MetadataQueryError::TooManySelectors);
+            return Err(MetadataRequestError::TooManySelectors);
         }
         Ok(Self { arg })
     }
@@ -986,6 +1275,27 @@ impl<'a> RecordReader<'a> {
         let (declared, strings) = split_record(record)?;
         let (head, _) = H::ref_from_prefix(declared).ok()?;
         Some((head, Self { strings }))
+    }
+
+    /// Returns the head this build reads and a reader of the strings after the
+    /// head on the wire. A head shorter than this build's leaves the fields it
+    /// does not reach zero, the default the protocol gives a field an older
+    /// device does not send. A longer one is read as far as this build knows.
+    pub(crate) fn split_defaulting<H: FromBytes + IntoBytes>(
+        record: &'a [u8],
+    ) -> Option<(H, Self)> {
+        let (declared, strings) = split_record(record)?;
+        let mut head = H::new_zeroed();
+        let known = declared.len().min(size_of::<H>());
+        head.as_mut_bytes()[..known].copy_from_slice(&declared[..known]);
+        Some((head, Self { strings }))
+    }
+
+    /// Skips the next string of `len` bytes. Returns `None` if the record ends
+    /// first.
+    fn skip(&mut self, len: u8) -> Option<()> {
+        self.strings = self.strings.get(len as usize..)?;
+        Some(())
     }
 
     pub(crate) fn take(&mut self, len: u8) -> Option<&'a str> {
@@ -1197,10 +1507,160 @@ mod tests {
         assert_eq!(Metadata::parse(&[1]), None);
         // Record type 5 is not defined; its layout is unknown.
         assert_eq!(Metadata::parse(&[5, 0, 7, 0, 0, 0, 0, 0, 0]), None);
-        // Head shorter than this build's known fields.
+        // A head under two bytes holds no field.
+        assert_eq!(Column::parse(&[1, 0]), None);
+        // A head that reaches the stream id must name a valid one.
         assert_eq!(Column::parse(&[6, 0, 0, 0, 0, 0]), None);
         // name_varlen runs past the end of the record.
         assert_eq!(Column::parse(&[7, 0, 0, 0, 9, 0, 0, b'x']), None);
+    }
+
+    fn written(metadata: Metadata<'_>) -> Vec<u8> {
+        let mut buf = vec![0; metadata.record_len()];
+        let (_, len) = metadata.write_record(&mut buf).unwrap();
+        buf.truncate(len);
+        buf
+    }
+
+    fn column() -> Column<'static> {
+        Column {
+            stream_id: StreamId::new(1),
+            index: ColumnId::new(2),
+            data_type: DataType::F32,
+            name: "field",
+            units: "nT",
+            description: "Total field",
+        }
+    }
+
+    /// Every view accessor reads what `parse` reads.
+    #[test]
+    fn views_read_what_parse_reads() {
+        let record = written(Metadata::Device(device()));
+        let view = DeviceView::new_checked(&record).unwrap();
+        assert_eq!(view.fields(), device());
+        assert_eq!(
+            (
+                view.session(),
+                view.n_streams(),
+                view.name(),
+                view.serial(),
+                view.firmware()
+            ),
+            (
+                SESSION,
+                2,
+                "COMM-USB",
+                "twinleaf-37383731",
+                "2026-07-24/a1b2c3-DEV"
+            )
+        );
+
+        let stream = Stream {
+            stream_id: StreamId::new(1),
+            n_columns: 6,
+            n_segments: 2,
+            sample_size: 24,
+            buf_samples: 128,
+            name: "imu",
+        };
+        let record = written(Metadata::Stream(stream));
+        let view = StreamView::new_checked(&record).unwrap();
+        assert_eq!(view.fields(), stream);
+        assert_eq!(
+            (
+                view.stream_id(),
+                view.n_columns(),
+                view.n_segments(),
+                view.sample_size(),
+                view.buf_samples(),
+                view.name()
+            ),
+            (StreamId::new(1), 6, 2, 24, 128, "imu")
+        );
+
+        let record = written(Metadata::Segment(segment()));
+        let view = SegmentView::new_checked(&record).unwrap();
+        assert_eq!(view.fields(), segment());
+        assert_eq!(view.segment_id(), SegmentId::new(3));
+        assert_eq!(view.flags(), SegmentFlags::VALID | SegmentFlags::ACTIVE);
+        assert_eq!(view.epoch(), Epoch::UNIX);
+        assert_eq!(view.timeref_serial(), "twinleaf-37383731");
+        assert_eq!(view.timeref_session(), SESSION);
+        assert_eq!(
+            (view.start_time(), view.sampling_rate(), view.decimation()),
+            (1_774_137_600, 1000, 100)
+        );
+        assert_eq!(view.filter_cutoff(), 0.0);
+        assert_eq!(view.filter_type(), FilterType::NONE);
+
+        let record = written(Metadata::Column(column()));
+        let view = ColumnView::new_checked(&record).unwrap();
+        assert_eq!(view.fields(), column());
+        assert_eq!(
+            (
+                view.stream_id(),
+                view.index(),
+                view.data_type(),
+                view.name(),
+                view.units(),
+                view.description()
+            ),
+            (
+                StreamId::new(1),
+                ColumnId::new(2),
+                DataType::F32,
+                "field",
+                "nT",
+                "Total field"
+            )
+        );
+    }
+
+    /// An older device's shorter head leaves out its last fields, which read
+    /// as zero, and the strings start where its head ends.
+    #[test]
+    fn fields_past_a_shorter_head_read_as_zero() {
+        // A column head that stops before `units_len` and `description_len`.
+        let record = [5, 1, 2, DataType::F32.value(), 1, b'x'];
+        let view = ColumnView::new_checked(&record).unwrap();
+        assert_eq!(view.data_type(), DataType::F32);
+        assert_eq!(
+            (view.name(), view.units(), view.description()),
+            ("x", "", "")
+        );
+        assert_eq!(
+            Column::parse(&record),
+            Some(Column {
+                stream_id: StreamId::new(1),
+                index: ColumnId::new(2),
+                data_type: DataType::F32,
+                name: "x",
+                units: "",
+                description: "",
+            })
+        );
+    }
+
+    /// A newer device's longer head is read as far as this build knows. Its
+    /// strings start after the whole head, and the extra bytes stay in the
+    /// record, so two records that differ only there are unequal.
+    #[test]
+    fn a_longer_head_is_skipped_and_kept() {
+        let record = written(Metadata::Column(column()));
+        let (head, strings) = split_record(&record).unwrap();
+        let mut longer = vec![head[0] + 2];
+        longer.extend_from_slice(&head[1..]);
+        longer.extend_from_slice(&[0xAB, 0xCD]);
+        longer.extend_from_slice(strings);
+
+        let view = ColumnView::new_checked(&longer).unwrap();
+        assert_eq!(view.fields(), column());
+        assert_eq!(view.description(), "Total field");
+
+        let mut changed = longer.clone();
+        changed[Column::HEAD_SIZE] = 0xEE;
+        assert_ne!(view, ColumnView::new_checked(&changed).unwrap());
     }
 
     #[test]
@@ -1276,31 +1736,31 @@ mod tests {
             MetadataSelector::column(1, 2),
         ];
         let arg: Vec<u8> = selectors.iter().flat_map(|s| s.encode()).collect();
-        let query = MetadataQuery::parse(&arg).unwrap();
-        assert!(!query.is_bootstrap());
-        assert_eq!(query.selectors().collect::<Vec<_>>(), selectors);
+        let request = MetadataRequest::parse(&arg).unwrap();
+        assert!(!request.is_bootstrap());
+        assert_eq!(request.selectors().collect::<Vec<_>>(), selectors);
     }
 
     #[test]
-    fn the_empty_query_is_the_bootstrap_and_selects_nothing_explicitly() {
-        let query = MetadataQuery::parse(&[]).unwrap();
-        assert!(query.is_bootstrap());
-        assert_eq!(query.selectors().count(), 0);
+    fn the_empty_request_is_the_bootstrap_and_selects_nothing_explicitly() {
+        let request = MetadataRequest::parse(&[]).unwrap();
+        assert!(request.is_bootstrap());
+        assert_eq!(request.selectors().count(), 0);
     }
 
     #[test]
     fn a_query_rejects_misaligned_or_oversized_arguments() {
         assert_eq!(
-            MetadataQuery::parse(&[1, 0]).unwrap_err(),
-            MetadataQueryError::Misaligned
+            MetadataRequest::parse(&[1, 0]).unwrap_err(),
+            MetadataRequestError::Misaligned
         );
         let oversized = [0u8; (MAX_METADATA_SELECTORS + 1) * MetadataSelector::SIZE];
         assert_eq!(
-            MetadataQuery::parse(&oversized).unwrap_err(),
-            MetadataQueryError::TooManySelectors
+            MetadataRequest::parse(&oversized).unwrap_err(),
+            MetadataRequestError::TooManySelectors
         );
         let full = [0u8; MAX_METADATA_SELECTORS * MetadataSelector::SIZE];
-        assert!(MetadataQuery::parse(&full).is_ok());
+        assert!(MetadataRequest::parse(&full).is_ok());
     }
 
     #[test]

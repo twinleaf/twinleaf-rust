@@ -1,9 +1,38 @@
 //! Shared field values for the unit tests of this module.
 
+use super::metadata::{
+    ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
+    StreamSchema,
+};
 use crate::proto::data as wire;
 use crate::proto::data::DataType;
 use crate::proto::sync::Epoch;
-use crate::proto::{ColumnId, SegmentId, SessionId, StreamId};
+use crate::proto::{ColumnId, DeviceRoute, SegmentId, SessionId, StreamId};
+use std::sync::Arc;
+
+/// Retains the records of one routed stream as the parser would, with the
+/// stream's schema built from `stream` and `columns`.
+pub(crate) fn metadata(
+    route: DeviceRoute,
+    device: wire::Device<'_>,
+    stream: wire::Stream<'_>,
+    segment: wire::Segment<'_>,
+    columns: &[wire::Column<'_>],
+) -> StreamMetadataSnapshot {
+    let schema = StreamSchema::new(
+        StreamKey::new(route, stream.stream_id),
+        StreamRecord::encode(stream).unwrap(),
+        columns
+            .iter()
+            .map(|column| ColumnRecord::encode(*column).unwrap())
+            .collect(),
+    );
+    StreamMetadataSnapshot::new(
+        Arc::new(schema),
+        DeviceRecord::encode(device).unwrap(),
+        SegmentRecord::encode(segment).unwrap(),
+    )
+}
 
 pub(crate) fn device() -> wire::Device<'static> {
     wire::Device {

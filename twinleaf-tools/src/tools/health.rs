@@ -491,7 +491,7 @@ impl HealthState {
 
     fn handle_batch(&mut self, batch: SampleBatch, now: Instant) {
         let route = batch.route();
-        let sid = batch.stream().stream_id;
+        let sid = batch.stream_key().stream_id;
 
         if let Some(filter) = &self.cli.streams {
             if !filter.contains(&sid.value()) {
@@ -501,25 +501,30 @@ impl HealthState {
 
         let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
-            name: batch.stream().name.to_string(),
+            name: batch.schema().stream().name().to_string(),
             ..Default::default()
         });
 
-        st.name = batch.stream().name.to_string();
+        st.name = batch.schema().stream().name().to_string();
         if st.metadata.is_none() || batch.boundary().is_some() {
-            st.metadata = Some(batch.metadata());
+            st.metadata = Some(batch.metadata().clone());
         }
 
         if let Some(boundary) = batch.boundary() {
-            self.handle_boundary(boundary, &route, batch.stream().name, sid);
+            self.handle_boundary(boundary, &route, batch.schema().stream().name(), sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();
         for row in batch.iter() {
-            if st.last_n.map(|n| row.n() != n).unwrap_or(true) {
+            if st.last_n.map(|n| row.sample_number() != n).unwrap_or(true) {
                 st.last_seen = Some(now);
             }
-            st.on_sample(row.n(), row.timestamp_end(), now, self.cli.jitter_window);
+            st.on_sample(
+                row.sample_number(),
+                row.timestamp_end(),
+                now,
+                self.cli.jitter_window,
+            );
         }
     }
 
@@ -677,7 +682,7 @@ impl HealthState {
                 }
                 DeviceEvent::Metadata(snapshot) => {
                     self.log_event(
-                        format!("[{}] METADATA: {}", route, snapshot.device().name),
+                        format!("[{}] METADATA: {}", route, snapshot.device().name()),
                         Severity::Info,
                     );
                 }
@@ -982,20 +987,20 @@ fn draw_detail_pane(
     }
 
     fn column_cells<'a>(
-        schema: impl ExactSizeIterator<Item = twinleaf::proto::data::Column<'a>>,
+        schema: impl ExactSizeIterator<Item = twinleaf::proto::data::ColumnView<'a>>,
     ) -> Vec<(Vec<Span<'static>>, usize, usize)> {
         let len = schema.len();
         schema
             .enumerate()
             .map(|(i, column)| {
-                let mut spans = vec![Span::raw(column.name.to_string())];
-                let mut nat = column.name.len();
-                if !column.units.is_empty() {
+                let mut spans = vec![Span::raw(column.name().to_string())];
+                let mut nat = column.name().len();
+                if !column.units().is_empty() {
                     spans.push(Span::styled(
-                        format!(" ({})", column.units),
+                        format!(" ({})", column.units()),
                         Style::default().fg(Color::DarkGray),
                     ));
-                    nat += column.units.len() + 3;
+                    nat += column.units().len() + 3;
                 }
                 if i + 1 < len {
                     spans.push(Span::raw(", "));
@@ -1009,36 +1014,36 @@ fn draw_detail_pane(
     let device_row = st.metadata.as_ref().map(|metadata| {
         let device = metadata.device();
         (
-            device.name.to_string(),
+            device.name().to_string(),
             vec![
-                ("serial", device.serial.to_string()),
-                ("session", format!("{:#010x}", device.session.value())),
-                ("firmware", device.firmware.to_string()),
+                ("serial", device.serial().to_string()),
+                ("session", format!("{:#010x}", device.session().value())),
+                ("firmware", device.firmware().to_string()),
             ],
         )
     });
     let stream_row = st.metadata.as_ref().map(|metadata| {
-        let stream = metadata.stream();
+        let stream = metadata.schema().stream();
         (
-            stream.name.to_string(),
+            stream.name().to_string(),
             vec![
-                ("columns", stream.n_columns.to_string()),
-                ("segments", stream.n_segments.to_string()),
+                ("columns", stream.n_columns().to_string()),
+                ("segments", stream.n_segments().to_string()),
             ],
         )
     });
     let segment_row = st.metadata.as_ref().map(|metadata| {
         let segment = metadata.segment();
         let mut pairs = vec![
-            ("id", segment.segment_id.to_string()),
-            ("rate", format!("{} Hz", segment.sampling_rate)),
-            ("decimation", segment.decimation.to_string()),
-            ("epoch", segment.epoch.to_string()),
+            ("id", segment.segment_id().to_string()),
+            ("rate", format!("{} Hz", segment.sampling_rate())),
+            ("decimation", segment.decimation().to_string()),
+            ("epoch", segment.epoch().to_string()),
         ];
-        if segment.filter_type != twinleaf::proto::data::FilterType::NONE {
+        if segment.filter_type() != twinleaf::proto::data::FilterType::NONE {
             pairs.push((
                 "filter",
-                format!("{} @ {} Hz", segment.filter_type, segment.filter_cutoff),
+                format!("{} @ {} Hz", segment.filter_type(), segment.filter_cutoff()),
             ));
         }
         pairs
@@ -1099,9 +1104,9 @@ fn draw_detail_pane(
     meta_lines.extend(flow(
         "columns",
         (None, 0),
-        st.metadata
-            .as_ref()
-            .map_or_else(Vec::new, |metadata| column_cells(metadata.columns())),
+        st.metadata.as_ref().map_or_else(Vec::new, |metadata| {
+            column_cells(metadata.schema().columns())
+        }),
         inner_w,
     ));
     meta_lines.push(Line::default());

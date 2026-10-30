@@ -8,7 +8,7 @@
 use super::connection::DeviceTree;
 use super::session::RawCallResult;
 use super::stream::{Completed, MetadataSchedule, Receiver, RecvError};
-use crate::data::{BoundaryReason, MetadataQuery, PacketParser};
+use crate::data::{BoundaryReason, MetadataQuery, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use crate::tio::packet;
@@ -94,7 +94,7 @@ impl<W: Write> Transcript<W> {
                     log::warn!(
                         "{}/{} dropped {lost} samples",
                         rows.stream_key().route,
-                        rows.stream().get().name
+                        rows.schema().stream().name()
                     );
                     (true, u64::from(lost))
                 }
@@ -570,7 +570,7 @@ mod tests {
             .iter()
             .map(|batch| {
                 (
-                    batch.segment().segment_id.value(),
+                    batch.metadata().segment().segment_id().value(),
                     batch.sample_numbers()[0].value(),
                 )
             })
@@ -649,7 +649,7 @@ mod tests {
             .iter()
             .map(|batch| {
                 (
-                    batch.device().session.value(),
+                    batch.metadata().device().session().value(),
                     batch.sample_numbers()[0].value(),
                 )
             })
@@ -704,7 +704,7 @@ mod tests {
 
         let sessions: Vec<u32> = recorded(&file, "stale-reply")
             .iter()
-            .map(|batch| batch.device().session.value())
+            .map(|batch| batch.metadata().device().session().value())
             .collect();
         assert_eq!(sessions, [2], "only the session that answered is described");
     }

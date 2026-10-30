@@ -6,8 +6,8 @@
 
 use super::coalesce::BatchCoalescer;
 use super::metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
-use super::sample::SampleBatch;
-use super::state::{PacketError, PacketEvent, ParseState, ScannedRows};
+use super::sample::{RowSource, SampleBatch};
+use super::state::{DataError, PacketEvent, ParseState, ScannedRows};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use std::collections::{HashMap, VecDeque};
@@ -87,6 +87,9 @@ pub enum PacketOutcome {
     Applied,
     /// Stream data is valid so far but cannot be decoded until metadata arrives.
     WaitingForMetadata,
+    /// The stream has a column of a type this build cannot decode, so its
+    /// rows are refused.
+    Unsupported,
     /// A disconnect reset metadata and continuity state.
     Reset,
     /// The packet contained this many validated sample rows.
@@ -147,13 +150,14 @@ impl PacketParser {
     ///
     /// # Errors
     ///
-    /// Returns a [`PacketError`] if stream data contradicts the metadata
+    /// Returns a [`DataError`] if stream data contradicts the metadata
     /// retained for its stream. The packet's rows are dropped, and the
     /// metadata stays for later packets.
-    pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, PacketError> {
+    pub fn push_packet(&mut self, packet: &tio::Packet) -> Result<PacketOutcome, DataError> {
         Ok(match self.state.apply_packet(packet)? {
             PacketEvent::Applied => PacketOutcome::Applied,
             PacketEvent::WaitingForMetadata => PacketOutcome::WaitingForMetadata,
+            PacketEvent::Unsupported => PacketOutcome::Unsupported,
             PacketEvent::Reset => {
                 self.flush();
                 PacketOutcome::Reset
@@ -170,10 +174,13 @@ impl PacketParser {
     pub(crate) fn scan_packet<'a>(
         &'a mut self,
         packet: &'a tio::Packet,
-    ) -> Result<Option<ScannedRows<'a>>, PacketError> {
+    ) -> Result<Option<ScannedRows<'a>>, DataError> {
         Ok(match self.state.apply_packet(packet)? {
             PacketEvent::Rows(rows) => Some(rows),
-            PacketEvent::Applied | PacketEvent::WaitingForMetadata | PacketEvent::Reset => None,
+            PacketEvent::Applied
+            | PacketEvent::WaitingForMetadata
+            | PacketEvent::Unsupported
+            | PacketEvent::Reset => None,
         })
     }
 
@@ -287,7 +294,7 @@ impl Batcher {
     /// Decodes validated rows into their stream's coalescer and collects the
     /// batches it completes. Returns the number of rows.
     fn queue(&mut self, input: ScannedRows<'_>) -> usize {
-        let rows = input.row_count();
+        let rows = input.len();
         let key = input.stream_key();
         let global_generation = input.generations().global;
         // A stream's own continuity is the coalescer's business; the parser only
@@ -338,9 +345,9 @@ impl Batcher {
 mod tests {
     use super::*;
     use crate::data::buffer::Buffer;
+    use crate::data::continuity::{BoundaryClass, BoundaryReason, Generations};
     use crate::data::fixtures;
-    use crate::data::metadata::ColumnKey;
-    use crate::data::sample::{BoundaryClass, BoundaryReason, ColumnArray, Generations};
+    use crate::data::sample::ColumnData;
     use crate::data::state::StreamDataError;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
@@ -534,7 +541,7 @@ mod tests {
         let stream = snapshot
             .stream(crate::proto::StreamId::new(STREAM_ID))
             .expect("the described stream");
-        assert_eq!(stream.segment().segment_id.value(), 1);
+        assert_eq!(stream.segment().segment_id().value(), 1);
     }
 
     /// One `dev.metadata` reply carrying `records`, in wire framing.
@@ -717,38 +724,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_column_type_is_absent_from_the_batch() {
-        // A newer firmware reports a type this build predates, between two
-        // columns it understands.
-        let unknown = DataType::new(0x35);
-        assert_eq!(unknown.size(), 3);
-        let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
-
-        let mut data = Vec::new();
-        for (value, raw) in [(1.0f32, -3i16), (2.0f32, -4i16)] {
-            data.extend_from_slice(&value.to_le_bytes());
-            data.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
-            data.extend_from_slice(&raw.to_le_bytes());
-        }
-        assert_eq!(
-            parser.push_packet(&stream_data_packet(0, data)).unwrap(),
-            PacketOutcome::Rows(2)
-        );
-        let batch = parser.pop_batch().expect("known columns still decode");
-
-        assert_eq!(batch.len(), 2);
-        let names: Vec<&str> = batch
-            .schema()
-            .iter()
-            .map(|series| series.metadata().name)
-            .collect();
-        assert_eq!(names, ["col_0", "col_2"]);
-        match (batch.schema()[0].values(), batch.schema()[1].values()) {
-            (ColumnArray::F64(floats), ColumnArray::I64(ints)) => {
-                assert_eq!(&floats[..], [1.0, 2.0]);
-                assert_eq!(&ints[..], [-3, -4]);
-            }
-            other => panic!("unexpected column buffers: {other:?}"),
+    fn a_stream_with_a_column_type_this_build_cannot_decode_is_refused() {
+        // A 24-bit column, or a type from newer firmware, between two columns
+        // this build decodes.
+        for unknown in [DataType::I24, DataType::new(0x35)] {
+            assert_eq!(unknown.size(), 3);
+            let mut parser = parser_with_schema(&[DataType::F32, unknown, DataType::I16], 9);
+            assert_eq!(
+                parser
+                    .push_packet(&stream_data_packet(0, vec![0; 18]))
+                    .unwrap(),
+                PacketOutcome::Unsupported
+            );
+            assert!(parser.pop_batch().is_none());
         }
     }
 
@@ -759,7 +747,7 @@ mod tests {
         // must not become the state the next packet is validated against.
         assert!(matches!(
             parser.push_packet(&stream_data_packet_in_segment(255, 0, vec![0; 4])),
-            Err(PacketError::Stream {
+            Err(DataError::Stream {
                 source: StreamDataError::SegmentOutOfRange { .. },
                 ..
             })
@@ -779,7 +767,7 @@ mod tests {
 
         assert!(matches!(
             parser.push_packet(&stream_data_packet(MAX_SAMPLE_NUMBER, vec![0; 8])),
-            Err(PacketError::Stream {
+            Err(DataError::Stream {
                 source: StreamDataError::SampleNumberOverflow { .. },
                 ..
             })
@@ -790,17 +778,6 @@ mod tests {
             .expect("the largest representable sample itself is valid");
         let batch = parser.pop_batch().expect("a batch is ready");
         assert_eq!(batch.sample_numbers(), [MAX_SAMPLE_NUMBER]);
-    }
-
-    #[test]
-    fn all_columns_unknown_yields_rows_without_columns() {
-        let mut parser = parser_with_schema(&[DataType::new(0x35)], 3);
-        parser
-            .push_packet(&stream_data_packet(7, vec![0; 6]))
-            .expect("rows are still counted");
-        let batch = parser.pop_batch().expect("a batch is ready");
-        assert!(batch.schema().is_empty());
-        assert_eq!(batch.sample_numbers(), vec![7, 8]);
     }
 
     /// Drive a forced rollover: `output_rows` samples of segment 0, then the
@@ -822,7 +799,7 @@ mod tests {
         // 10 Hz sampled, decimated by 3: the device switches at undecimated
         // sample 20 (t = 2 s), which follows the 7th output sample.
         let batch = rollover_batch(10, 3, 7);
-        assert_eq!(batch.segment().start_time, 2);
+        assert_eq!(batch.metadata().segment().start_time(), 2);
         assert!(matches!(
             batch.boundary().map(BoundaryReason::class),
             Some(BoundaryClass::Seamless)
@@ -834,7 +811,7 @@ mod tests {
         // 10 Hz sampled, decimated by 2: the switch at undecimated sample 10
         // (t = 1 s) is also the 5th output sample.
         let batch = rollover_batch(10, 2, 5);
-        assert_eq!(batch.segment().start_time, 1);
+        assert_eq!(batch.metadata().segment().start_time(), 1);
         assert!(matches!(
             batch.boundary().map(BoundaryReason::class),
             Some(BoundaryClass::Seamless)
@@ -928,7 +905,10 @@ mod tests {
             .push_packet(&stream_data_packet_for(1, 0, 2))
             .expect("valid rows");
         let initial = parser.pop_batch().expect("the initial batch");
-        assert_eq!(initial.stream().stream_id, crate::proto::StreamId::new(1));
+        assert_eq!(
+            initial.schema().stream().stream_id(),
+            crate::proto::StreamId::new(1)
+        );
         assert!(parser.pop_batch().is_none(), "stream 2 still accumulates");
 
         // A gap on stream 1 bumps the shared generations: stream 2's held rows
@@ -937,7 +917,10 @@ mod tests {
             .push_packet(&stream_data_packet_for(1, 10, 2))
             .expect("valid rows");
         let held = parser.pop_batch().expect("the flushed pre-bump batch");
-        assert_eq!(held.stream().stream_id, crate::proto::StreamId::new(2));
+        assert_eq!(
+            held.schema().stream().stream_id(),
+            crate::proto::StreamId::new(2)
+        );
         assert_eq!(
             held.generations(),
             Generations {
@@ -948,7 +931,7 @@ mod tests {
         );
         let boundary_batch = parser.pop_batch().expect("the boundary batch");
         assert_eq!(
-            boundary_batch.stream().stream_id,
+            boundary_batch.schema().stream().stream_id(),
             crate::proto::StreamId::new(1)
         );
         assert_eq!(
@@ -1125,8 +1108,9 @@ mod tests {
             buffer
                 .latest_row(&key)
                 .expect("the replacement row")
+                .metadata()
                 .device()
-                .serial,
+                .serial(),
             "SN456"
         );
     }
@@ -1295,7 +1279,7 @@ mod tests {
                 .stream(crate::proto::StreamId::new(STREAM_ID))
                 .unwrap()
                 .segment()
-                .segment_id
+                .segment_id()
                 .value(),
             1
         );
@@ -1363,7 +1347,7 @@ mod tests {
                 .stream(crate::proto::StreamId::new(STREAM_ID))
                 .unwrap()
                 .segment()
-                .segment_id
+                .segment_id()
                 .value(),
             1
         );
@@ -1401,16 +1385,13 @@ mod tests {
         let key = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(STREAM_ID));
         let run = buffer.run(&key).expect("the new schema's run");
         assert_eq!(run.retained_rows(), 0..1);
-        assert_eq!(run.stream().sample_size, 8);
+        let schema = run.metadata().schema();
+        assert_eq!(schema.stream().sample_size(), 8);
         assert_eq!(
-            buffer
-                .column_metadata(&ColumnKey::new(
-                    DeviceRoute::root(),
-                    crate::proto::StreamId::new(STREAM_ID),
-                    crate::proto::ColumnId::new(0),
-                ))
+            schema
+                .column(crate::proto::ColumnId::new(0))
                 .expect("the new column")
-                .data_type,
+                .data_type(),
             DataType::F64
         );
     }
@@ -1429,5 +1410,401 @@ mod tests {
             parser.take_metadata_queries_for(DeviceRoute::root()).len(),
             1
         );
+    }
+
+    /// Each column of a batch as its decoded values, by column name.
+    type Decoded = Vec<(String, Vec<f64>)>;
+
+    fn decoded(batch: &SampleBatch) -> Decoded {
+        batch
+            .schema()
+            .columns()
+            .zip(batch.columns())
+            .map(|(column, values)| (column.name().to_string(), values.to_f64().into_owned()))
+            .collect()
+    }
+
+    fn named(columns: &[(&str, &[f64])]) -> Decoded {
+        columns
+            .iter()
+            .map(|(name, values)| (name.to_string(), values.to_vec()))
+            .collect()
+    }
+
+    /// Once a stream's metadata is known, decoding a packet into a batch and
+    /// reading the batch's metadata parse no retained record. A record is
+    /// checked when it arrives and read in place after that. Every batch
+    /// shares the one schema of its run, so no batch allocates metadata.
+    #[test]
+    fn a_steady_packet_parses_no_metadata_record() {
+        let types = [DataType::F32, DataType::I16, DataType::U8];
+        let mut parser = parser_with_schema(&types, 7);
+        let rows = 4;
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 7 * rows]))
+            .expect("valid rows");
+        let first = parser.pop_batch().expect("the first batch");
+
+        let before = crate::data::metadata::record_parses();
+        for packet in 1..=10 {
+            let first_sample = packet * rows as u32;
+            parser
+                .push_packet(&stream_data_packet(first_sample, vec![0; 7 * rows]))
+                .expect("valid rows");
+            let batch = parser.pop_batch().expect("a batch per packet");
+            assert_eq!(batch.schema().columns().len(), types.len());
+            assert!(std::sync::Arc::ptr_eq(batch.schema(), first.schema()));
+        }
+        assert_eq!(crate::data::metadata::record_parses() - before, 0);
+    }
+
+    /// One `f32` and one `i16` column, six bytes a sample.
+    fn first_layout_sample(value: f32, count: i16) -> Vec<u8> {
+        let mut sample = value.to_le_bytes().to_vec();
+        sample.extend_from_slice(&count.to_le_bytes());
+        sample
+    }
+
+    /// A reboot can bring firmware whose stream has another layout. The rows
+    /// after it decode at the new offsets and types, not the old ones.
+    #[test]
+    fn rows_after_a_reboot_decode_with_the_new_layout() {
+        let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
+        parser
+            .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
+            .expect("valid rows");
+        let before = parser.pop_batch().expect("the first session's batch");
+        assert_eq!(
+            decoded(&before),
+            named(&[("col_0", &[1.5]), ("col_1", &[-7.0])])
+        );
+
+        announce_schema_for(
+            &mut parser,
+            wire::Device {
+                session: crate::proto::SessionId::new(43),
+                ..fixtures::device()
+            },
+            &[DataType::I16, DataType::F64, DataType::U8],
+            11,
+            1,
+            1,
+            1,
+        );
+        let mut sample = (-2i16).to_le_bytes().to_vec();
+        sample.extend_from_slice(&2.25f64.to_le_bytes());
+        sample.push(200);
+        parser
+            .push_packet(&stream_data_packet(0, sample))
+            .expect("valid rows in the new session");
+        let after = parser.pop_batch().expect("the new session's batch");
+
+        assert!(matches!(
+            after.boundary(),
+            Some(BoundaryReason::SessionChanged { .. })
+        ));
+        assert_eq!(
+            decoded(&after),
+            named(&[("col_0", &[-2.0]), ("col_1", &[2.25]), ("col_2", &[200.0])])
+        );
+    }
+
+    /// A device lost and found again may be another build of it. Its layout
+    /// is learned anew, even with the same session.
+    #[test]
+    fn rows_after_a_disconnect_decode_with_the_reannounced_layout() {
+        let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
+        parser
+            .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+
+        parser
+            .push_packet(
+                &tio::Packet::link(LinkStatus::SensorDisconnected).with_route(DeviceRoute::root()),
+            )
+            .expect("the disconnect resets the route");
+        announce_schema(&mut parser, &[DataType::U16, DataType::F32], 6, 1, 1, 1);
+        let mut sample = 513u16.to_le_bytes().to_vec();
+        sample.extend_from_slice(&(-0.5f32).to_le_bytes());
+        parser
+            .push_packet(&stream_data_packet(0, sample))
+            .expect("valid rows under the new layout");
+        let after = parser.pop_batch().expect("the batch after the reconnect");
+
+        assert!(after.is_initial());
+        assert_eq!(
+            decoded(&after),
+            named(&[("col_0", &[513.0]), ("col_1", &[-0.5])])
+        );
+    }
+
+    /// A column record that contradicts a learned one resets the route, and
+    /// the replacement is laid out from scratch.
+    #[test]
+    fn a_contradicted_column_is_laid_out_again() {
+        let mut parser = parser_with_schema(&[DataType::F32, DataType::F32], 8);
+        let mut sample = 1.0f32.to_le_bytes().to_vec();
+        sample.extend_from_slice(&2.0f32.to_le_bytes());
+        parser
+            .push_packet(&stream_data_packet(0, sample))
+            .expect("valid rows");
+        parser.pop_batch().expect("the old layout's batch");
+
+        parser
+            .push_packet(&metadata_packet(wire::Metadata::Column(wire::Column {
+                name: "col_0",
+                ..fixtures::column(STREAM_ID, 0, DataType::F64)
+            })))
+            .expect("the changed column triggers rediscovery");
+        announce_schema(&mut parser, &[DataType::F64, DataType::F32], 12, 1, 1, 1);
+        let mut sample = 3.5f64.to_le_bytes().to_vec();
+        sample.extend_from_slice(&4.0f32.to_le_bytes());
+        parser
+            .push_packet(&stream_data_packet(0, sample))
+            .expect("valid rows under the new layout");
+        let after = parser.pop_batch().expect("the new layout's batch");
+
+        assert_eq!(
+            decoded(&after),
+            named(&[("col_0", &[3.5]), ("col_1", &[4.0])])
+        );
+    }
+
+    /// Decimation lives in the segment, not the columns. A new segment with
+    /// another rate retimes the rows but leaves their layout alone.
+    #[test]
+    fn a_decimation_change_retimes_rows_without_relaying_them() {
+        let mut parser = parser_with_clock(&[DataType::I32], 4, 2, 1000, 1);
+        let samples = |values: &[i32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        parser
+            .push_packet(&stream_data_packet(0, samples(&[10, 11])))
+            .expect("valid rows at the full rate");
+        let before = parser.pop_batch().expect("the full rate batch");
+        assert_eq!(decoded(&before), named(&[("col_0", &[10.0, 11.0])]));
+
+        parser
+            .push_packet(&metadata_packet(wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                sampling_rate: 1000,
+                decimation: 10,
+                ..fixtures::segment(STREAM_ID)
+            })))
+            .expect("the decimated segment");
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 0, samples(&[-20, -21])))
+            .expect("valid rows at the decimated rate");
+        let after = parser.pop_batch().expect("the decimated batch");
+
+        assert!(matches!(
+            after.boundary(),
+            Some(BoundaryReason::RateChanged { .. })
+        ));
+        assert_eq!(decoded(&after), named(&[("col_0", &[-20.0, -21.0])]));
+        let step = after.timestamps()[1] - after.timestamps()[0];
+        assert!(
+            (step - 0.01).abs() < 1e-9,
+            "rows are 10 ms apart, got {step}"
+        );
+    }
+
+    /// Setting announcements, such as the `rpc.hash` that `dev.priv` sends,
+    /// and heartbeats of the same session change no stream metadata.
+    #[test]
+    fn announcements_and_heartbeats_keep_the_layout() {
+        let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
+        parser
+            .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+
+        let mut raw = [0u8; 64];
+        let len = crate::proto::settings::Setting {
+            name: b"rpc.hash",
+            seq: Some(1),
+            reply: &0x1234_5678u32.to_le_bytes(),
+        }
+        .write(&mut raw)
+        .expect("the announcement fits");
+        let announcement = tio::Packet::from_slice_prefix(&raw[..len])
+            .expect("a valid packet")
+            .0
+            .with_route(DeviceRoute::root());
+        parser
+            .push_packet(&announcement)
+            .expect("an announcement applies");
+        parser
+            .push_packet(&tio::Packet::heartbeat_session(
+                fixtures::device().session.value(),
+                DeviceRoute::root(),
+            ))
+            .expect("a heartbeat applies");
+        parser
+            .push_packet(&stream_data_packet(1, first_layout_sample(2.5, 8)))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the next batch");
+
+        assert!(after.boundary().is_none(), "{:?}", after.boundary());
+        assert_eq!(
+            decoded(&after),
+            named(&[("col_0", &[2.5]), ("col_1", &[8.0])])
+        );
+    }
+
+    /// A log can interleave devices whose streams share an id but not a
+    /// layout. Each route decodes with its own.
+    #[test]
+    fn interleaved_devices_decode_with_their_own_layouts() {
+        let mut parser = PacketParser::new(true);
+        let narrow: DeviceRoute = "/0".parse().unwrap();
+        let wide: DeviceRoute = "/1".parse().unwrap();
+        for (route, serial, types, sample_size) in [
+            (narrow, "NARROW", [DataType::I8, DataType::U16], 3u16),
+            (wide, "WIDE", [DataType::F64, DataType::I32], 12),
+        ] {
+            let mut records = vec![
+                wire::Metadata::Device(wire::Device {
+                    serial,
+                    ..fixtures::device()
+                }),
+                wire::Metadata::Stream(wire::Stream {
+                    n_columns: 2,
+                    sample_size,
+                    ..fixtures::stream(STREAM_ID)
+                }),
+                wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+            ];
+            records.extend(types.iter().enumerate().map(|(index, data_type)| {
+                wire::Metadata::Column(fixtures::column(STREAM_ID, index as u8, *data_type))
+            }));
+            for record in records {
+                parser
+                    .push_packet(&metadata_packet(record).with_route(route))
+                    .expect("valid metadata");
+            }
+        }
+
+        let narrow_sample = |count: i8, level: u16| -> Vec<u8> {
+            let mut sample = count.to_le_bytes().to_vec();
+            sample.extend_from_slice(&level.to_le_bytes());
+            sample
+        };
+        let wide_sample = |value: f64, count: i32| -> Vec<u8> {
+            let mut sample = value.to_le_bytes().to_vec();
+            sample.extend_from_slice(&count.to_le_bytes());
+            sample
+        };
+        let packets = [
+            (narrow, 0, narrow_sample(-1, 300)),
+            (wide, 0, wide_sample(0.25, -100_000)),
+            (narrow, 1, narrow_sample(-2, 301)),
+            (wide, 1, wide_sample(0.5, -100_001)),
+        ];
+        let mut values: HashMap<DeviceRoute, Vec<Decoded>> = HashMap::new();
+        for (route, first, data) in packets {
+            let packet =
+                tio::Packet::samples(STREAM_ID, 0, first, &data, route).expect("valid samples");
+            parser.push_packet(&packet).expect("valid rows");
+            let batch = parser.pop_batch().expect("a batch per packet");
+            assert_eq!(batch.stream_key().route, route);
+            values.entry(route).or_default().push(decoded(&batch));
+        }
+
+        let column =
+            |values: [f64; 2]| -> Vec<Vec<f64>> { values.map(|value| vec![value]).to_vec() };
+        let by_column = |route: DeviceRoute, index: usize| -> Vec<Vec<f64>> {
+            values[&route]
+                .iter()
+                .map(|batch| batch[index].1.clone())
+                .collect()
+        };
+        assert_eq!(by_column(narrow, 0), column([-1.0, -2.0]));
+        assert_eq!(by_column(narrow, 1), column([300.0, 301.0]));
+        assert_eq!(by_column(wide, 0), column([0.25, 0.5]));
+        assert_eq!(by_column(wide, 1), column([-100_000.0, -100_001.0]));
+    }
+
+    /// Whatever its column types and whatever padding ends its samples, a
+    /// stream decodes each column at the offset the types before it add up
+    /// to, in the column's own type.
+    #[test]
+    fn every_layout_decodes_each_column_at_its_offset() {
+        use proptest::prelude::*;
+        use proptest::test_runner::TestRunner;
+
+        let types = prop::sample::select(vec![
+            DataType::I8,
+            DataType::U8,
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::I64,
+            DataType::U64,
+            DataType::F32,
+            DataType::F64,
+        ]);
+        let case = (
+            prop::collection::vec(types, 1..7),
+            0usize..4,
+            1usize..5,
+            prop::collection::vec(any::<u8>(), 256),
+        );
+        TestRunner::default()
+            .run(&case, |(types, padding, rows, bytes)| {
+                let sample_size = types
+                    .iter()
+                    .map(|data_type| data_type.size())
+                    .sum::<usize>()
+                    + padding;
+                let mut parser = parser_with_schema(&types, sample_size as u16);
+                let data = bytes[..rows * sample_size].to_vec();
+                parser
+                    .push_packet(&stream_data_packet(0, data.clone()))
+                    .expect("valid rows");
+                let batch = parser.pop_batch().expect("a batch");
+
+                let mut expected = Vec::new();
+                let mut offset = 0;
+                for (index, data_type) in types.iter().enumerate() {
+                    let cells: Vec<ColumnData> = (0..rows)
+                        .map(|row| {
+                            ColumnData::from_le_bytes(
+                                &data[row * sample_size + offset..],
+                                *data_type,
+                            )
+                        })
+                        .collect();
+                    expected.push((format!("col_{index}"), cells));
+                    offset += data_type.size();
+                }
+
+                prop_assert_eq!(batch.columns().len(), expected.len());
+                let columns = batch.schema().columns().zip(batch.columns());
+                for ((column, values), (name, cells)) in columns.zip(&expected) {
+                    prop_assert_eq!(column.name(), name.as_str());
+                    prop_assert_eq!(values.data_type(), column.data_type());
+                    for (row, cell) in cells.iter().enumerate() {
+                        // Floats compare by bits, so a NaN matches itself.
+                        let same = match (values.get(row), cell) {
+                            (ColumnData::F32(value), ColumnData::F32(cell)) => {
+                                value.to_bits() == cell.to_bits()
+                            }
+                            (ColumnData::F64(value), ColumnData::F64(cell)) => {
+                                value.to_bits() == cell.to_bits()
+                            }
+                            (value, cell) => value == *cell,
+                        };
+                        prop_assert!(same, "{name} row {row}: {cell:?}");
+                    }
+                }
+                Ok(())
+            })
+            .expect("every layout decodes at its offsets");
     }
 }

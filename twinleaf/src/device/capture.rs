@@ -372,11 +372,22 @@ mod tests {
     /// the calibration, and the data past `length` is ignored.
     #[test]
     fn capture_values_decode_as_sample_columns_do() {
-        let raw = [0xff, 0xff, 0xff, 0x01, 0x00, 0x80, 0x99];
-        let values = decode_capture_values(&raw, &metadata(DataType::I24, 2, 0.5)).unwrap();
-        assert_eq!(values, [-0.5, -4194303.5]);
+        let raw = [0xff, 0xff, 0x01, 0x80, 0x99];
+        let values = decode_capture_values(&raw, &metadata(DataType::I16, 2, 0.5)).unwrap();
+        assert_eq!(values, [-0.5, -16383.5]);
 
         let values = decode_capture_values(&raw, &metadata(DataType::U8, 3, 2.0)).unwrap();
-        assert_eq!(values, [510.0, 510.0, 510.0]);
+        assert_eq!(values, [510.0, 510.0, 2.0]);
+    }
+
+    /// A capture of a type samples do not decode, such as 24-bit integers,
+    /// is refused rather than misread.
+    #[test]
+    fn capture_values_of_undecoded_types_are_refused() {
+        let raw = [0xff; 6];
+        assert!(matches!(
+            decode_capture_values(&raw, &metadata(DataType::I24, 2, 1.0)),
+            Err(CaptureError::UnsupportedDataType(code)) if code == DataType::I24.value()
+        ));
     }
 }

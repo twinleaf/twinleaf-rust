@@ -207,12 +207,7 @@ impl ColumnOp for Fpcs {
     }
 
     fn update_batch(&mut self, timestamps: &[f64], values: &ColumnArray) {
-        let times = timestamps.iter().copied();
-        match values {
-            ColumnArray::F64(v) => self.push_values(times, v.iter().copied()),
-            ColumnArray::I64(v) => self.push_values(times, v.iter().map(|&x| x as f64)),
-            ColumnArray::U64(v) => self.push_values(times, v.iter().map(|&x| x as f64)),
-        }
+        self.push_values(timestamps.iter().copied(), values.to_f64().iter().copied());
         self.prune_retention();
     }
 

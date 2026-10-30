@@ -160,11 +160,7 @@ impl ColumnOp for Welch {
     }
 
     fn update_batch(&mut self, _timestamps: &[f64], values: &ColumnArray) {
-        match values {
-            ColumnArray::F64(v) => self.ring.extend(v.iter().copied()),
-            ColumnArray::I64(v) => self.ring.extend(v.iter().map(|&x| x as f64)),
-            ColumnArray::U64(v) => self.ring.extend(v.iter().map(|&x| x as f64)),
-        }
+        self.ring.extend(values.to_f64().iter().copied());
         while self.ring.len() > self.window_samples {
             self.ring.pop_front();
         }
