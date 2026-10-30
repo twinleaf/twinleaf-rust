@@ -24,8 +24,6 @@ pub use twinleaf_proto as proto;
 pub use flume;
 
 pub use data::{SampleBatch, SampleRow};
-pub use device::{
-    Connection, Device, DeviceEvent, DeviceTree, Event, LinkEvent, Receiver, RecvError,
-};
+pub use device::{Connection, Device, DeviceTree, Receiver, RecvError};
 #[doc(no_inline)]
 pub use proto::{ColumnId, DeviceRoute, SampleNumber, SegmentId, SessionId, StreamId};

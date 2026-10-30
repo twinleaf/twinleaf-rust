@@ -3,10 +3,10 @@
 use super::error::CallError;
 use super::registry::RpcRegistry;
 use super::reply::{pipelined, PendingReply};
+use crate::device::stream::DeviceEvent;
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
-use crate::DeviceEvent;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The counter a device raises on every setting announcement, numbering each.
@@ -124,8 +124,6 @@ impl SettingsCache {
             DeviceEvent::Heartbeat {
                 session_id: None, ..
             }
-            | DeviceEvent::Metadata(_)
-            | DeviceEvent::MetadataUnavailable
             | DeviceEvent::NewHash(_) => CacheAction::Keep,
         }
     }

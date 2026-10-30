@@ -11,6 +11,7 @@ use super::error::{CallError, RpcErrorPayload};
 use super::registry::{RpcDescriptor, RpcRegistry};
 use super::reply::PendingReply;
 use super::settings::{CacheAction, SettingsCache};
+use crate::device::stream::DeviceEvent;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::packet::{PacketType, PacketView};
 use crate::proto::rpc::{self as wire, Method, Request, RpcError, RpcMetaFlags};
@@ -19,7 +20,6 @@ use crate::proto::{DeviceRoute, RpcRequestId, SessionId};
 use crate::tio::packet::Payload;
 use crate::tio::rpc::RpcReply;
 use crate::tio::Packet;
-use crate::DeviceEvent;
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
 use std::cell::RefCell;
@@ -1070,8 +1070,6 @@ impl<'c> World<'c> {
                 session_id: None, ..
             }
             | DeviceEvent::Setting { seq: Some(_), .. }
-            | DeviceEvent::Metadata(_)
-            | DeviceEvent::MetadataUnavailable
             | DeviceEvent::NewHash(_) => false,
         };
         let action = client
@@ -1095,9 +1093,7 @@ impl<'c> World<'c> {
                 )
             }
             DeviceEvent::Setting { name, seq, .. } => format!("{name} {seq:?}"),
-            DeviceEvent::Metadata(_)
-            | DeviceEvent::MetadataUnavailable
-            | DeviceEvent::NewHash(_) => "another event".to_string(),
+            DeviceEvent::NewHash(_) => "another event".to_string(),
         };
         let client = &mut self.clients[c];
         let asked = action != CacheAction::Keep || (heartbeat && client.owed != Owed::Nothing);

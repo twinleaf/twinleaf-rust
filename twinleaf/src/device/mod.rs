@@ -18,13 +18,11 @@
 //! view, and [`DeviceTree::to_depth`] only narrows. No view reaches beyond
 //! its own scope.
 //!
-//! Each view offers three subscriptions, filtered to its scope.
+//! Each view offers two subscriptions, filtered to its scope.
 //!
 //! - [`samples`](DeviceTree::samples) gives decoded
 //!   [`SampleBatch`](crate::data::SampleBatch)es, the output of
 //!   [`data::PacketParser`](crate::data::PacketParser).
-//! - [`events`](DeviceTree::events) gives [`Event`]s for link status, route
-//!   discovery, and per-device facts such as metadata and heartbeats.
 //! - [`packets`](DeviceTree::packets) gives the routed packets themselves.
 //!
 //! Each returns a [`Receiver`]. Its [`RecvError`] tells lag, a timeout, the
@@ -118,4 +116,4 @@ mod fixtures;
 pub use crate::proto::RouteError;
 pub use connection::{Connection, Device, DeviceTree, MetadataError};
 pub use state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-pub use stream::{DeviceEvent, Event, LinkEvent, NamedRoute, Receiver, RecvError};
+pub use stream::{NamedRoute, Receiver, RecvError};

@@ -6,7 +6,7 @@ use super::rpc::{
 use super::runtime::ProxyAddress;
 use super::session::{Handle, Session};
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-use super::stream::{Event, NamedRoute, Receiver, RecvError, Scope, Stream};
+use super::stream::{NamedRoute, Receiver, RecvError, Scope, Stream};
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
@@ -133,13 +133,13 @@ impl Connection {
     /// # Lifetime
     ///
     /// The connection does not reconnect. A device that drops out does not
-    /// end it. The proxy reconnects the device, and the views see each change
-    /// as a [`LinkEvent::Status`](crate::LinkEvent::Status) on
-    /// [`events`](Self::events).
+    /// end it. The proxy reconnects the device, and each change shows in the
+    /// device's [`presence`](Device::presence).
     ///
     /// The connection ends when its socket to the proxy closes, or when the
     /// proxy stops, as `tio proxy` does at Ctrl-C. Then every subscription
-    /// ends and every RPC fails. At a stop the views first see a
+    /// ends and every RPC fails. At a stop the raw
+    /// [`packets`](DeviceTree::packets) first carry a
     /// [`Stopped`](crate::tio::packet::LinkStatus::Stopped) status, and
     /// subscriptions end with [`RecvError::Stopped`]. After
     /// [`close`](Self::close) they end with [`RecvError::Closed`]. Any other
@@ -323,11 +323,6 @@ impl Connection {
         self.tree.samples()
     }
 
-    /// Subscribes to the events of every route. See [`DeviceTree::events`].
-    pub fn events(&self) -> Receiver<Event> {
-        self.tree.events()
-    }
-
     /// Subscribes to every packet on the connection. See
     /// [`DeviceTree::packets`].
     pub fn packets(&self) -> Receiver<tio::Packet> {
@@ -454,12 +449,6 @@ impl DeviceTree {
     /// ```
     pub fn samples(&self) -> Receiver<SampleBatch> {
         self.stream.batches(Scope::of(&self.handle))
-    }
-
-    /// Subscribes to the subtree's events. A new subscriber first receives
-    /// the routes, link statuses, and metadata already known.
-    pub fn events(&self) -> Receiver<Event> {
-        self.stream.events(Scope::of(&self.handle))
     }
 
     /// Subscribes to the subtree's packets before they are parsed.
@@ -652,12 +641,6 @@ impl Device {
     /// [`DeviceTree::samples`].
     pub fn samples(&self) -> Receiver<SampleBatch> {
         self.tree.samples()
-    }
-
-    /// Subscribes to this device's events and the events of the links that
-    /// serve it. See [`DeviceTree::events`].
-    pub fn events(&self) -> Receiver<Event> {
-        self.tree.events()
     }
 
     /// Subscribes to this device's packets. See [`DeviceTree::packets`].
@@ -901,10 +884,8 @@ mod tests {
     use crate::device::fixtures::{self, open_through, FakeDevice, WAIT};
     use crate::device::rpc::RpcArgs;
     use crate::device::session::TestProxy;
-    use crate::device::LinkEvent;
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::{call, Proxy};
-    use crate::tio::packet::LinkStatus;
     use std::thread;
 
     fn test_tree() -> (DeviceTree, TestProxy) {
@@ -1092,7 +1073,8 @@ mod tests {
         let device = FakeDevice::start();
         let proxy = fixtures::proxy();
         let connection = open_through(&proxy, &device.url).unwrap();
-        let (events, view) = (connection.events(), connection.device(DeviceRoute::root()));
+        let view = connection.device(DeviceRoute::root());
+        let presence = view.presence_updates();
         assert_eq!(root_name(&connection), "FAKE");
 
         connection.clone().close();
@@ -1100,7 +1082,7 @@ mod tests {
 
         let deadline = Instant::now() + WAIT;
         let ended = loop {
-            match events.recv_deadline(deadline) {
+            match presence.recv_deadline(deadline) {
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(ended) => break ended,
             }
@@ -1189,35 +1171,35 @@ mod tests {
         }
     }
 
-    /// A connection whose proxy stops hears the stop, then ends with every
+    /// A connection whose proxy stops loses its devices, then ends with every
     /// subscription saying so, and never starts a proxy in its place.
     #[test]
     fn a_connection_ends_when_its_proxy_stops() {
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
         let connection = open_through(&proxy, "auto").unwrap();
-        let events = connection.events();
+        let presence = connection.device(DeviceRoute::root()).presence_updates();
         assert_eq!(root_name(&connection), "FAKE");
+        let deadline = Instant::now() + WAIT;
+        while !matches!(presence.recv_deadline(deadline), Ok(Presence::Alive { .. })) {
+            assert!(Instant::now() < deadline, "the device was never heard");
+        }
 
         proxy.shutdown();
 
-        let deadline = Instant::now() + WAIT;
-        let mut stopped = false;
+        let mut lost = false;
         loop {
-            match events.recv_deadline(deadline) {
-                Ok(Event::Link {
-                    event: LinkEvent::Status(LinkStatus::Stopped),
-                    ..
-                }) => stopped = true,
+            match presence.recv_deadline(deadline) {
+                Ok(Presence::Lost { .. }) => lost = true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Stopped) => break,
                 Err(RecvError::Disconnected | RecvError::Closed) => {
-                    panic!("the events ended with no stop")
+                    panic!("the presence ended with no stop")
                 }
                 Err(RecvError::Timeout) => panic!("the connection outlived its proxy"),
             }
         }
-        assert!(stopped, "the stop never reached the events");
+        assert!(lost, "the stop never reached the presence");
         assert!(matches!(
             connection
                 .device(DeviceRoute::root())
