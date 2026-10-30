@@ -3,7 +3,7 @@
 //! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
-use super::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord};
+use super::metadata::{effective_rate, DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
 use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch};
 use super::state::{PacketError, ScannedRows};
@@ -180,9 +180,8 @@ impl Iterator for PacketIter {
 pub struct StreamSummary {
     run: u32,
     opened_by: Option<BoundaryClass>,
-    metadata: StreamRecord,
-    segment: SegmentRecord,
-    columns: Vec<ColumnRecord>,
+    /// The metadata of the run's first rows.
+    metadata: StreamMetadataSnapshot,
     sample_count: u64,
     first_timestamp: Option<f64>,
     last_timestamp: Option<f64>,
@@ -202,17 +201,17 @@ impl StreamSummary {
 
     /// Returns the stream record in effect for the whole run.
     pub fn metadata(&self) -> wire::StreamView<'_> {
-        self.metadata.get()
+        self.metadata.stream()
     }
 
     /// Returns the segment record the run began in.
     pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.segment.get()
+        self.metadata.segment()
     }
 
     /// Returns every column of a sample, in schema order.
     pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
-        self.columns.iter().map(ColumnRecord::get)
+        self.metadata.columns()
     }
 
     /// Returns the number of rows in this run alone.
@@ -236,7 +235,7 @@ impl StreamSummary {
     /// segment whose rate or decimation is zero. The parser emits no rows from
     /// such a segment.
     pub fn rate_hz(&self) -> f64 {
-        self.segment.effective_rate().unwrap_or(0.0)
+        effective_rate(&self.metadata.segment()).unwrap_or(0.0)
     }
 }
 
@@ -307,9 +306,7 @@ impl LogSummary {
             runs.push(StreamSummary {
                 run: rows.generations().stream,
                 opened_by: rows.boundary().map(BoundaryReason::class),
-                metadata: rows.stream().clone(),
-                segment: rows.segment().clone(),
-                columns: rows.columns().to_vec(),
+                metadata: rows.metadata(),
                 sample_count: 0,
                 first_timestamp: None,
                 last_timestamp: None,

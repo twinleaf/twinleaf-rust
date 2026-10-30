@@ -110,52 +110,46 @@ impl BatchCoalescer {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{
-        ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord,
-    };
-    use crate::data::sample::{
-        BatchContext, BoundaryReason, ColumnArray, ColumnBuilder, ColumnData,
-    };
+    use crate::data::metadata::StreamMetadataSnapshot;
+    use crate::data::sample::{BatchContext, BoundaryReason, ColumnArray, ColumnData};
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 
-    fn segment(segment_id: u8) -> SegmentRecord {
-        SegmentRecord::encode(wire::Segment {
-            segment_id: crate::proto::SegmentId::new(segment_id),
-            sampling_rate: 4,
-            ..fixtures::segment(1)
-        })
-        .unwrap()
+    /// The metadata of a 4 Hz float stream in segment `segment_id`.
+    fn segment(segment_id: u8) -> StreamMetadataSnapshot {
+        fixtures::metadata(
+            DeviceRoute::root(),
+            fixtures::device(),
+            wire::Stream {
+                n_segments: 2,
+                sample_size: 8,
+                ..fixtures::stream(1)
+            },
+            wire::Segment {
+                segment_id: crate::proto::SegmentId::new(segment_id),
+                sampling_rate: 4,
+                ..fixtures::segment(1)
+            },
+            &[fixtures::column(1, 0, DataType::F64)],
+        )
     }
 
     /// A float batch of `rows` rows numbered from `first`, whose values are the
     /// sample numbers.
     fn batch(
-        segment: &SegmentRecord,
+        metadata: &StreamMetadataSnapshot,
         first: u32,
         rows: u32,
         boundary: Option<BoundaryReason>,
         generations: Generations,
     ) -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
-            BatchContext::new(
-                StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1)),
+            BatchContext {
+                metadata: metadata.clone(),
                 boundary,
                 generations,
-                segment.clone(),
-                StreamRecord::encode(wire::Stream {
-                    n_segments: 2,
-                    sample_size: 8,
-                    ..fixtures::stream(1)
-                })
-                .unwrap(),
-                DeviceRecord::encode(fixtures::device()).unwrap(),
-            ),
-            [(
-                ColumnRecord::encode(fixtures::column(1, 0, DataType::F64)).unwrap(),
-                ColumnBuilder::F64(Vec::new()),
-            )],
+            },
             rows as usize,
         );
         for n in first..first + rows {
@@ -176,7 +170,7 @@ mod tests {
     }
 
     fn values(batch: &SampleBatch) -> Vec<f64> {
-        match batch.schema()[0].values() {
+        match &batch.columns()[0] {
             ColumnArray::F64(v) => v.to_vec(),
             other => panic!("expected an f64 column, got {other:?}"),
         }

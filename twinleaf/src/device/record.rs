@@ -94,7 +94,7 @@ impl<W: Write> Transcript<W> {
                     log::warn!(
                         "{}/{} dropped {lost} samples",
                         rows.stream_key().route,
-                        rows.stream().get().name()
+                        rows.schema().stream().name()
                     );
                     (true, u64::from(lost))
                 }

@@ -32,8 +32,9 @@
 //! which streams roll to a new table when one does.
 
 use super::filter::ColumnFilter;
-use super::metadata::{ColumnRecord, DeviceRecord, StreamKey, StreamRecord};
-use super::sample::{native_types, BoundaryReason, ColumnArray, Generations, SampleBatch, Series};
+use super::metadata::{StreamKey, StreamMetadataSnapshot};
+use super::sample::{native_types, BoundaryReason, ColumnArray, Generations, SampleBatch};
+use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
 use hdf5_pure::{
@@ -239,44 +240,16 @@ struct TableInfo {
     row_size: usize,
     /// `(byte offset, source)` for each compound field, in field order.
     fields: Vec<(usize, FieldSource)>,
-    schema: TableSchema,
+    /// The metadata of the table's first batch. Later batches must share its
+    /// schema and device serial. Segment and session may change, so a table
+    /// spans segment rollovers.
+    metadata: StreamMetadataSnapshot,
 }
 
-/// The structure one HDF5 compound table represents. Segment and session
-/// metadata are not part of it, and a table spans segment rollovers. A batch
-/// with a different device or column schema does not match it.
-struct TableSchema {
-    key: StreamKey,
-    device: DeviceRecord,
-    stream: StreamRecord,
-    columns: Vec<ColumnRecord>,
-}
-
-impl TableSchema {
-    fn from_batch(batch: &SampleBatch, columns: &[&Series]) -> Self {
-        let (device, stream, _) = batch.records();
-        Self {
-            key: batch.stream_key(),
-            device: device.clone(),
-            stream: stream.clone(),
-            columns: columns
-                .iter()
-                .map(|column| column.record().clone())
-                .collect(),
-        }
-    }
-
-    fn matches(&self, batch: &SampleBatch, columns: &[&Series]) -> bool {
-        self.key == batch.stream_key()
-            && self.device.get().serial() == batch.device().serial()
-            && self.stream.get().name() == batch.stream().name()
-            && self.stream.get().sample_size() == batch.stream().sample_size()
-            && self.columns.len() == columns.len()
-            && self
-                .columns
-                .iter()
-                .zip(columns)
-                .all(|(expected, actual)| *expected == *actual.record())
+impl TableInfo {
+    fn accepts(&self, batch: &SampleBatch) -> bool {
+        self.metadata.schema() == batch.schema()
+            && self.metadata.device().serial() == batch.device().serial()
     }
 }
 
@@ -421,21 +394,20 @@ impl Hdf5Appender {
         };
         self.stats.streams_seen.insert(stream_id_path.clone());
 
-        // Apply the column filter; the parser already emits columns index-ordered.
-        let mut valid: Vec<&Series> = Vec::new();
-        for col in batch.schema() {
-            if let Some(f) = &self.filter {
-                if !f.matches(&key.route, &stream_name, col.metadata().name()) {
-                    continue;
-                }
-            }
-            valid.push(col);
-        }
+        // Columns arrive in index order, so the kept ones stay in it.
+        let valid: Vec<wire::ColumnView<'_>> = batch
+            .schema()
+            .columns()
+            .filter(|column| {
+                self.filter
+                    .as_ref()
+                    .is_none_or(|f| f.matches(&key.route, &stream_name, column.name()))
+            })
+            .collect();
 
         if valid.is_empty() {
             return Ok(());
         }
-        valid.sort_by_key(|c| c.index());
 
         let group_path = if route_str.is_empty() {
             "/".to_string()
@@ -455,7 +427,7 @@ impl Hdf5Appender {
         };
 
         if let Some(info) = self.tables.get(&table_path) {
-            if !info.schema.matches(batch, &valid) {
+            if !info.accepts(batch) {
                 return Err(ExportError::SchemaChanged { table: table_path });
             }
         }
@@ -467,7 +439,7 @@ impl Hdf5Appender {
             let mut offsets = Vec::with_capacity(valid.len());
             let mut end: usize = 16;
             for col in &valid {
-                let size = col.values().data_type().size();
+                let size = col.data_type().size();
                 let offset = end.next_multiple_of(size);
                 offsets.push(offset);
                 end = offset + size;
@@ -478,9 +450,11 @@ impl Hdf5Appender {
                 .f64_field("time", 8);
             let mut fields = vec![(0, FieldSource::Sample), (8, FieldSource::Time)];
             for (col, &offset) in valid.iter().zip(&offsets) {
-                let name = col.metadata().name();
-                let at = offset as u64;
-                layout = match col.values() {
+                let values = batch
+                    .column(col.index())
+                    .expect("one array per schema column");
+                let (name, at) = (col.name(), offset as u64);
+                layout = match values {
                     ColumnArray::I8(_) => layout.i8_field(name, at),
                     ColumnArray::U8(_) => layout.u8_field(name, at),
                     ColumnArray::I16(_) => layout.i16_field(name, at),
@@ -527,7 +501,7 @@ impl Hdf5Appender {
                     dataset: ds,
                     row_size,
                     fields,
-                    schema: TableSchema::from_batch(batch, &valid),
+                    metadata: batch.metadata().clone(),
                 },
             );
         }
@@ -556,8 +530,8 @@ impl Hdf5Appender {
                         }
                     }
                     FieldSource::Column(col_id) => {
-                        if let Some(col) = batch.schema().iter().find(|c| c.index() == *col_id) {
-                            write_column(&mut buf, col.values(), row_size, offset);
+                        if let Some(values) = batch.column(*col_id) {
+                            write_column(&mut buf, values, row_size, offset);
                         }
                     }
                 }
@@ -649,15 +623,15 @@ fn write_column(rows: &mut [u8], values: &ColumnArray, row_size: usize, offset: 
 
 /// Returns the `units` and `descriptions` attributes, string arrays aligned
 /// with the compound fields (`sample`, `time`, then each column).
-fn field_metadata_attributes(valid: &[&Series]) -> [(&'static str, AttrValue); 2] {
+fn field_metadata_attributes(valid: &[wire::ColumnView<'_>]) -> [(&'static str, AttrValue); 2] {
     let mut units = vec![String::new(), "s".to_string()];
     let mut descriptions = vec![
         "Sample number from device".to_string(),
         "Time in seconds".to_string(),
     ];
     for col in valid {
-        units.push(col.metadata().units().to_string());
-        descriptions.push(col.metadata().description().to_string());
+        units.push(col.units().to_string());
+        descriptions.push(col.description().to_string());
     }
     [
         ("units", AttrValue::VarLenStringArray(units)),
@@ -713,11 +687,7 @@ fn hdf_name_component(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{DeviceRecord, SegmentRecord, StreamRecord};
-    use crate::data::sample::{
-        BatchContext, BoundaryReason, ColumnBuilder, ColumnData, SampleBatchBuilder,
-    };
-    use crate::proto::data as wire;
+    use crate::data::sample::{BatchContext, BoundaryReason, ColumnData, SampleBatchBuilder};
     use crate::proto::data::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -755,41 +725,38 @@ mod tests {
         column_name: &str,
         start_time: u32,
     ) -> SampleBatch {
-        let column = ColumnRecord::encode(wire::Column {
-            name: column_name,
-            units: "V",
-            description: "test column",
-            ..fixtures::column(stream_id, 0, DataType::F32)
-        })
-        .unwrap();
         let mut builder = SampleBatchBuilder::new(
-            BatchContext::new(
-                StreamKey::new(route, crate::proto::StreamId::new(stream_id)),
-                None,
-                Generations {
+            BatchContext {
+                metadata: fixtures::metadata(
+                    route,
+                    wire::Device {
+                        n_streams: 2,
+                        ..fixtures::device()
+                    },
+                    wire::Stream {
+                        name: stream_name,
+                        buf_samples: 1,
+                        ..fixtures::stream(stream_id)
+                    },
+                    wire::Segment {
+                        segment_id: crate::proto::SegmentId::new(1),
+                        start_time,
+                        ..fixtures::segment(stream_id)
+                    },
+                    &[wire::Column {
+                        name: column_name,
+                        units: "V",
+                        description: "test column",
+                        ..fixtures::column(stream_id, 0, DataType::F64)
+                    }],
+                ),
+                boundary: None,
+                generations: Generations {
                     stream: 1,
                     device: 0,
                     global: 0,
                 },
-                SegmentRecord::encode(wire::Segment {
-                    segment_id: crate::proto::SegmentId::new(1),
-                    start_time,
-                    ..fixtures::segment(stream_id)
-                })
-                .unwrap(),
-                StreamRecord::encode(wire::Stream {
-                    name: stream_name,
-                    buf_samples: 1,
-                    ..fixtures::stream(stream_id)
-                })
-                .unwrap(),
-                DeviceRecord::encode(wire::Device {
-                    n_streams: 2,
-                    ..fixtures::device()
-                })
-                .unwrap(),
-            ),
-            [(column.clone(), ColumnBuilder::F64(Vec::new()))],
+            },
             1,
         );
         builder.push_row(SampleNumber::new(0), [ColumnData::F64(1.0)]);

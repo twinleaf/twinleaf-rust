@@ -84,8 +84,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
     /// Feeds `rows` to the op, one contiguous span at a time.
     fn feed(&mut self, run: &Run, rows: Range<u64>) {
         for span in run.row_spans(rows) {
-            if let Some(column) = span.column(self.key.column_id) {
-                self.op.update_batch(span.timestamps(), column.values());
+            if let Some(values) = span.column(self.key.column_id) {
+                self.op.update_batch(span.timestamps(), values);
             }
         }
     }
@@ -119,8 +119,8 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamRecord};
-    use crate::data::sample::{BatchContext, ColumnBuilder, ColumnData, SampleBatchBuilder};
+    use crate::data::metadata::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
+    use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
@@ -157,10 +157,7 @@ mod tests {
 
     struct Fixture {
         column_key: ColumnKey,
-        column_metadata: ColumnRecord,
-        device: DeviceRecord,
-        stream: StreamRecord,
-        segment: SegmentRecord,
+        metadata: StreamMetadataSnapshot,
     }
 
     fn fixture() -> Fixture {
@@ -168,28 +165,26 @@ mod tests {
         let stream_id = 1;
         let column_id = crate::proto::ColumnId::new(0);
 
-        let device = DeviceRecord::encode(fixtures::device()).unwrap();
-        let stream = StreamRecord::encode(wire::Stream {
-            sample_size: 0,
-            buf_samples: 1024,
-            ..fixtures::stream(stream_id)
-        })
-        .unwrap();
-        let segment = SegmentRecord::encode(fixtures::segment(stream_id)).unwrap();
-        let column_metadata = ColumnRecord::encode(fixtures::column(
-            stream_id,
-            column_id.value(),
-            DataType::F64,
-        ))
-        .unwrap();
+        let metadata = fixtures::metadata(
+            route,
+            fixtures::device(),
+            wire::Stream {
+                sample_size: 0,
+                buf_samples: 1024,
+                ..fixtures::stream(stream_id)
+            },
+            fixtures::segment(stream_id),
+            &[fixtures::column(
+                stream_id,
+                column_id.value(),
+                DataType::F64,
+            )],
+        );
         let column_key = ColumnKey::new(route, crate::proto::StreamId::new(stream_id), column_id);
 
         Fixture {
             column_key,
-            column_metadata,
-            device,
-            stream,
-            segment,
+            metadata,
         }
     }
 
@@ -197,7 +192,8 @@ mod tests {
         /// Push one batch of `f64` rows, with an explicit stream generation and
         /// explicit sample numbers so runs can be restarted deliberately.
         fn push(&self, buffer: &mut Buffer, stream_generation: u32, rows: &[(u32, f64)]) {
-            self.push_in_segment(buffer, stream_generation, self.segment.clone(), rows);
+            let segment = self.metadata.segment_record().clone();
+            self.push_in_segment(buffer, stream_generation, segment, rows);
         }
 
         fn push_in_segment(
@@ -208,19 +204,19 @@ mod tests {
             rows: &[(u32, f64)],
         ) {
             let mut builder = SampleBatchBuilder::new(
-                BatchContext::new(
-                    self.column_key.stream_key(),
-                    None,
-                    Generations {
+                BatchContext {
+                    metadata: StreamMetadataSnapshot::new(
+                        self.metadata.schema().clone(),
+                        DeviceRecord::encode(fixtures::device()).unwrap(),
+                        segment,
+                    ),
+                    boundary: None,
+                    generations: Generations {
                         stream: stream_generation,
                         device: 0,
                         global: 0,
                     },
-                    segment,
-                    self.stream.clone(),
-                    self.device.clone(),
-                ),
-                [(self.column_metadata.clone(), ColumnBuilder::F64(Vec::new()))],
+                },
                 rows.len(),
             );
             for &(sample_number, value) in rows {
@@ -293,7 +289,7 @@ mod tests {
             SegmentRecord::encode(wire::Segment {
                 segment_id,
                 start_time,
-                ..fx.segment.get().fields()
+                ..fx.metadata.segment().fields()
             })
             .unwrap()
         };

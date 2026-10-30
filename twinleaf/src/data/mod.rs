@@ -166,12 +166,13 @@ pub use buffer::{Buffer, Run};
 pub use filter::ColumnFilter;
 pub use metadata::{
     ColumnKey, DeviceMetadataSnapshot, MetadataQuery, StreamKey, StreamMetadataSnapshot,
+    StreamSchema,
 };
 pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub use sample::{
     BoundaryClass, BoundaryReason, ColumnArray, ColumnData, Generations, SampleBatch, SampleRow,
-    ScalarBuffer, Series,
+    ScalarBuffer,
 };
 pub use state::{PacketError, StreamDataError};

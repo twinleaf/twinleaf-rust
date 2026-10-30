@@ -107,8 +107,8 @@ impl Printer {
         let matched = filter.as_ref().is_none_or(|f| {
             batch
                 .schema()
-                .iter()
-                .any(|series| f.matches(&route, batch.stream().name(), series.metadata().name()))
+                .columns()
+                .any(|column| f.matches(&route, batch.stream().name(), column.name()))
         });
         if !matched {
             return false;
@@ -156,8 +156,8 @@ fn print_batch_meta(batch: &SampleBatch) {
         if !boundary.is_continuous() {
             println!("# {} DEVICE {:?}", route, batch.device());
             println!("# {} STREAM {:?}", route, batch.stream());
-            for series in batch.schema() {
-                println!("# {} COLUMN {:?}", route, series.metadata());
+            for column in batch.schema().columns() {
+                println!("# {} COLUMN {:?}", route, column);
             }
         }
         println!("# {} SEGMENT {:?}", route, batch.segment());

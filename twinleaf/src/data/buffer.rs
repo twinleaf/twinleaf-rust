@@ -7,7 +7,7 @@
 //! still-accumulating rows they ask for.
 
 use super::coalesce::BatchCoalescer;
-use super::metadata::{ColumnKey, ColumnRecord, SegmentRecord, StreamKey, StreamRecord};
+use super::metadata::{effective_rate, ColumnKey, StreamKey, StreamMetadataSnapshot};
 use super::sample::{Generations, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::{ColumnId, SampleNumber};
@@ -121,10 +121,8 @@ impl Buffer {
 pub struct Run {
     /// The continuity generations stamped on every batch of this run.
     generations: Generations,
-    stream: StreamRecord,
-    segment: SegmentRecord,
-    /// Column metadata in schema order, constant within a run.
-    columns: Vec<ColumnRecord>,
+    /// The newest batch's metadata. Its schema is constant within a run.
+    metadata: StreamMetadataSnapshot,
     /// Completed chunks in row order. The coalescer holds the rows after them.
     chunks: VecDeque<SampleBatch>,
     coalescer: BatchCoalescer,
@@ -150,16 +148,9 @@ impl std::fmt::Debug for Run {
 
 impl Run {
     fn new(batch: &SampleBatch, capacity: usize) -> Run {
-        let (_, stream, segment) = batch.records();
         let mut run = Run {
             generations: batch.generations(),
-            stream: stream.clone(),
-            segment: segment.clone(),
-            columns: batch
-                .schema()
-                .iter()
-                .map(|column| column.record().clone())
-                .collect(),
+            metadata: batch.metadata().clone(),
             chunks: VecDeque::new(),
             coalescer: BatchCoalescer::new(Some((capacity / 16).clamp(256, 65_536))),
             next_row: 0,
@@ -172,17 +163,14 @@ impl Run {
     }
 
     fn append(&mut self, batch: &SampleBatch) {
-        debug_assert_eq!(
-            batch.schema().len(),
-            self.columns.len(),
+        debug_assert!(
+            batch.schema() == self.metadata.schema(),
             "the parser guarantees a constant schema within a run"
         );
         self.coalescer.push_batch(batch);
         self.take_completed_chunks();
 
-        let (_, stream, segment) = batch.records();
-        self.stream = stream.clone();
-        self.segment = segment.clone();
+        self.metadata = batch.metadata().clone();
         self.next_row += batch.len() as u64;
         self.rows += batch.len();
         self.last_seen = Instant::now();
@@ -265,10 +253,7 @@ impl Run {
     }
 
     fn column_metadata(&self, column_id: ColumnId) -> Option<wire::ColumnView<'_>> {
-        self.columns
-            .iter()
-            .find(|column| column.get().index() == column_id)
-            .map(ColumnRecord::get)
+        self.metadata.column(column_id)
     }
 
     /// Returns the continuity generations stamped on every batch of this run.
@@ -284,20 +269,20 @@ impl Run {
 
     /// Returns the run's stream descriptor as of its newest batch.
     pub fn stream(&self) -> wire::StreamView<'_> {
-        self.stream.get()
+        self.metadata.stream()
     }
 
     /// Returns the run's segment descriptor as of its newest batch. It holds
     /// the raw sampling rate and decimation behind [`Self::effective_rate`].
     pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.segment.get()
+        self.metadata.segment()
     }
 
     /// Returns the sample rate in hertz after decimation, or zero for a
     /// segment whose rate or decimation is zero. The parser emits no rows from
     /// such a segment.
     pub fn effective_rate(&self) -> f64 {
-        self.segment.effective_rate().unwrap_or(0.0)
+        effective_rate(&self.metadata.segment()).unwrap_or(0.0)
     }
 
     /// Returns the end-of-sample time of the newest retained row, in seconds
@@ -323,11 +308,9 @@ impl Run {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::DeviceRecord;
+    use crate::data::metadata::{DeviceRecord, SegmentRecord};
     use crate::data::pipeline::{ColumnOp, ColumnProcessor};
-    use crate::data::sample::{
-        BatchContext, ColumnArray, ColumnBuilder, ColumnData, SampleBatchBuilder,
-    };
+    use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 
@@ -369,11 +352,8 @@ mod tests {
 
     struct Fixture {
         stream_key: StreamKey,
-        columns: Vec<ColumnRecord>,
         column_keys: Vec<ColumnKey>,
-        device: DeviceRecord,
-        stream: StreamRecord,
-        segment: SegmentRecord,
+        metadata: StreamMetadataSnapshot,
     }
 
     impl Fixture {
@@ -385,7 +365,12 @@ mod tests {
             stream_generation: u32,
             rows: &[(u32, Vec<ColumnData>)],
         ) {
-            self.push_in_segment(buffer, stream_generation, &self.segment, rows);
+            self.push_in_segment(
+                buffer,
+                stream_generation,
+                self.metadata.segment_record(),
+                rows,
+            );
         }
 
         fn push_in_segment(
@@ -396,26 +381,23 @@ mod tests {
             rows: &[(u32, Vec<ColumnData>)],
         ) {
             let mut builder = SampleBatchBuilder::new(
-                BatchContext::new(
-                    self.stream_key,
-                    None,
-                    Generations {
+                BatchContext {
+                    metadata: StreamMetadataSnapshot::new(
+                        self.metadata.schema().clone(),
+                        DeviceRecord::encode(fixtures::device()).unwrap(),
+                        segment.clone(),
+                    ),
+                    boundary: None,
+                    generations: Generations {
                         stream: stream_generation,
                         device: 0,
                         global: 0,
                     },
-                    segment.clone(),
-                    self.stream.clone(),
-                    self.device.clone(),
-                ),
-                self.columns.iter().map(|metadata| {
-                    let values = ColumnBuilder::for_type(metadata.get().data_type(), rows.len());
-                    (metadata.clone(), values.expect("a native type"))
-                }),
+                },
                 rows.len(),
             );
             for &(sample_number, ref row) in rows {
-                assert_eq!(row.len(), self.columns.len());
+                assert_eq!(row.len(), self.column_keys.len());
                 builder.push_row(SampleNumber::new(sample_number), row.iter().cloned());
             }
             let batch = builder.finish();
@@ -438,19 +420,27 @@ mod tests {
         let route = DeviceRoute::root();
         let stream_id = 1;
 
-        let columns: Vec<ColumnRecord> = column_types
-            .iter()
-            .enumerate()
-            .map(|(index, data_type)| {
-                let index = index as u8;
-                ColumnRecord::encode(wire::Column {
-                    name: &format!("col_{index}"),
-                    units: &format!("u{index}"),
-                    description: &format!("column {index}"),
-                    ..fixtures::column(stream_id, index, *data_type)
-                })
-                .unwrap()
+        let names: Vec<_> = (0..column_types.len())
+            .map(|index| {
+                (
+                    format!("col_{index}"),
+                    format!("u{index}"),
+                    format!("column {index}"),
+                )
             })
+            .collect();
+        let columns: Vec<_> = column_types
+            .iter()
+            .zip(&names)
+            .enumerate()
+            .map(
+                |(index, (data_type, (name, units, description)))| wire::Column {
+                    name,
+                    units,
+                    description,
+                    ..fixtures::column(stream_id, index as u8, *data_type)
+                },
+            )
             .collect();
 
         Fixture {
@@ -464,16 +454,18 @@ mod tests {
                     )
                 })
                 .collect(),
-            device: DeviceRecord::encode(fixtures::device()).unwrap(),
-            stream: StreamRecord::encode(wire::Stream {
-                n_columns: columns.len() as u8,
-                sample_size: 0,
-                buf_samples: 1024,
-                ..fixtures::stream(stream_id)
-            })
-            .unwrap(),
-            segment: SegmentRecord::encode(fixtures::segment(stream_id)).unwrap(),
-            columns,
+            metadata: fixtures::metadata(
+                route,
+                fixtures::device(),
+                wire::Stream {
+                    n_columns: columns.len() as u8,
+                    sample_size: 0,
+                    buf_samples: 1024,
+                    ..fixtures::stream(stream_id)
+                },
+                fixtures::segment(stream_id),
+                &columns,
+            ),
         }
     }
 
@@ -571,7 +563,7 @@ mod tests {
         let rolled = SegmentRecord::encode(wire::Segment {
             segment_id: crate::proto::SegmentId::new(1),
             start_time: 4,
-            ..fx.segment.get().fields()
+            ..fx.metadata.segment().fields()
         })
         .unwrap();
         let rows: Vec<_> = (0..3)
@@ -667,8 +659,8 @@ mod tests {
         assert_eq!(row.len(), 1);
         assert_eq!(row.sample_numbers(), [2]);
         assert_eq!(row.timestamps(), [3.0]);
-        assert_eq!(row.stream(), fx.stream.get());
-        assert_eq!(row.segment(), fx.segment.get());
+        assert_eq!(row.stream(), fx.metadata.stream());
+        assert_eq!(row.segment(), fx.metadata.segment());
 
         // Values come back in schema order, each in its column's own variant.
         let values: Vec<ColumnData> = row.row(0).expect("the only row").values().collect();

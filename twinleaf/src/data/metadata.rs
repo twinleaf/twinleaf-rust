@@ -146,16 +146,8 @@ metadata_record!(StreamRecord, Stream, StreamView);
 metadata_record!(SegmentRecord, Segment, SegmentView);
 metadata_record!(ColumnRecord, Column, ColumnView);
 
-impl SegmentRecord {
-    /// Returns the sample rate in hertz after decimation,
-    /// `sampling_rate / decimation`, or `None` if either is zero.
-    pub(crate) fn effective_rate(&self) -> Option<f64> {
-        effective_rate(&self.get())
-    }
-}
-
-/// Returns the sample rate in hertz after decimation of a segment already
-/// parsed, as [`SegmentRecord::effective_rate`] does.
+/// Returns the sample rate in hertz after decimation,
+/// `sampling_rate / decimation`, or `None` if either is zero.
 pub(crate) fn effective_rate(segment: &wire::SegmentView<'_>) -> Option<f64> {
     let (sampling_rate, decimation) = (segment.sampling_rate(), segment.decimation());
     (sampling_rate != 0 && decimation != 0)
@@ -187,83 +179,173 @@ impl MetadataQuery {
     }
 }
 
+/// The layout of one routed stream for one run, its stream record and its
+/// column records in index order.
+///
+/// The parser builds it once the stream's columns are complete, and every
+/// batch, run and snapshot of the run shares it by [`Arc`]. Two schemas are
+/// equal when they are the same allocation or their records are equal byte
+/// for byte.
+#[derive(Debug)]
+pub struct StreamSchema {
+    key: StreamKey,
+    stream: StreamRecord,
+    columns: Vec<ColumnRecord>,
+}
+
+impl StreamSchema {
+    /// Creates the schema of `key` from its stream record and its columns in
+    /// index order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a record describes a stream other than `key`'s, or if a
+    /// column is out of index order.
+    pub(super) fn new(
+        key: StreamKey,
+        stream: StreamRecord,
+        columns: Vec<ColumnRecord>,
+    ) -> StreamSchema {
+        assert_eq!(
+            key.stream_id,
+            stream.get().stream_id(),
+            "stream key must match metadata"
+        );
+        for (position, column) in columns.iter().enumerate() {
+            let column = column.get();
+            assert_eq!(
+                key.stream_id,
+                column.stream_id(),
+                "column must match stream"
+            );
+            assert_eq!(column.index().index(), position, "columns in index order");
+        }
+        StreamSchema {
+            key,
+            stream,
+            columns,
+        }
+    }
+
+    /// Returns the routed stream this schema describes.
+    pub fn stream_key(&self) -> StreamKey {
+        self.key
+    }
+
+    /// Returns the stream descriptor, borrowed from the retained wire record.
+    pub fn stream(&self) -> wire::StreamView<'_> {
+        self.stream.get()
+    }
+
+    /// Returns the stream's columns in index order.
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
+        self.columns.iter().map(ColumnRecord::get)
+    }
+
+    /// Returns the column whose index is `id`, or `None` if the stream has no
+    /// such column.
+    pub fn column(&self, id: ColumnId) -> Option<wire::ColumnView<'_>> {
+        self.columns.get(id.index()).map(ColumnRecord::get)
+    }
+
+    /// Returns `true` if `stream` and `columns` are the records this schema
+    /// was built from.
+    pub(super) fn describes(&self, stream: &StreamRecord, columns: &[ColumnRecord]) -> bool {
+        self.stream == *stream && self.columns == columns
+    }
+}
+
+impl PartialEq for StreamSchema {
+    fn eq(&self, other: &StreamSchema) -> bool {
+        std::ptr::eq(self, other)
+            || (self.key == other.key && self.describes(&other.stream, &other.columns))
+    }
+}
+
+impl Eq for StreamSchema {}
+
 /// Point-in-time metadata for one routed stream. It holds the stream's
-/// identity, its device and stream records, its current segment, and its
-/// columns.
+/// schema, the record of the device that sent it, and its current segment.
 ///
 /// It is the owned counterpart of the borrowed protocol views a
 /// [`SampleBatch`](super::SampleBatch) returns. It holds no sample arrays,
 /// clones by pointer, and outlives the batch it came from.
 #[derive(Debug, Clone)]
-pub struct StreamMetadataSnapshot(Arc<StreamMetadataInner>);
-
-#[derive(Debug)]
-struct StreamMetadataInner {
-    key: StreamKey,
+pub struct StreamMetadataSnapshot {
+    schema: Arc<StreamSchema>,
     device: DeviceRecord,
-    stream: StreamRecord,
     segment: SegmentRecord,
-    columns: Vec<ColumnRecord>,
 }
 
 impl StreamMetadataSnapshot {
+    /// Creates a snapshot of `schema`'s stream as `device` sent it in
+    /// `segment`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `segment` describes a stream other than the schema's.
     pub(super) fn new(
-        key: StreamKey,
+        schema: Arc<StreamSchema>,
         device: DeviceRecord,
-        stream: StreamRecord,
         segment: SegmentRecord,
-        columns: Vec<ColumnRecord>,
     ) -> StreamMetadataSnapshot {
-        StreamMetadataSnapshot(Arc::new(StreamMetadataInner {
-            key,
+        assert_eq!(
+            schema.key.stream_id,
+            segment.get().stream_id(),
+            "segment must match stream"
+        );
+        StreamMetadataSnapshot {
+            schema,
             device,
-            stream,
             segment,
-            columns,
-        }))
+        }
     }
 
     /// Returns the route half of [`Self::stream_key`].
     pub fn route(&self) -> DeviceRoute {
-        self.0.key.route
+        self.schema.key.route
     }
 
     /// Returns the route and stream id together, the identity a
     /// [`SampleBatch`](super::SampleBatch) carries.
     pub fn stream_key(&self) -> StreamKey {
-        self.0.key
+        self.schema.key
+    }
+
+    /// Returns the stream's schema, shared with every batch of its run.
+    pub fn schema(&self) -> &Arc<StreamSchema> {
+        &self.schema
     }
 
     /// Returns the device descriptor, borrowed from the retained wire record.
     pub fn device(&self) -> wire::DeviceView<'_> {
-        self.0.device.get()
+        self.device.get()
     }
 
     /// Returns the stream descriptor, borrowed from the retained wire record.
     pub fn stream(&self) -> wire::StreamView<'_> {
-        self.0.stream.get()
+        self.schema.stream()
     }
 
     /// Returns the current segment's descriptor, borrowed from its retained
     /// record.
     pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.0.segment.get()
+        self.segment.get()
     }
 
     /// Returns the stream's columns in index order.
     pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
-        self.0.columns.iter().map(ColumnRecord::get)
+        self.schema.columns()
     }
 
     /// Returns the column whose index is `id`, or `None` if the schema has no
     /// such column.
     pub fn column(&self, id: ColumnId) -> Option<wire::ColumnView<'_>> {
-        self.columns().find(|column| column.index() == id)
+        self.schema.column(id)
     }
 
-    /// Returns the column records in index order, as retained.
-    pub(super) fn column_records(&self) -> &[ColumnRecord] {
-        &self.0.columns
+    pub(super) fn segment_record(&self) -> &SegmentRecord {
+        &self.segment
     }
 
     /// Encodes the retained descriptors as byte-faithful UPDATE packets, in the
@@ -273,7 +355,7 @@ impl StreamMetadataSnapshot {
     ///
     /// Returns an [`EncodeError`] if a record is too large for a packet.
     pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, EncodeError> {
-        std::iter::once(self.0.device.update(self.route()))
+        std::iter::once(self.device.update(self.route()))
             .chain(self.stream_packets())
             .collect()
     }
@@ -283,12 +365,12 @@ impl StreamMetadataSnapshot {
     fn stream_packets(&self) -> impl Iterator<Item = Result<tio::Packet, EncodeError>> + '_ {
         let routing = self.route();
         [
-            self.0.stream.update(routing),
-            self.0.segment.update(routing),
+            self.schema.stream.update(routing),
+            self.segment.update(routing),
         ]
         .into_iter()
         .chain(
-            self.0
+            self.schema
                 .columns
                 .iter()
                 .map(move |column| column.update(routing)),
@@ -371,13 +453,13 @@ mod tests {
     #[test]
     fn a_segment_rate_is_its_sampling_rate_over_its_decimation() {
         let rate = |sampling_rate, decimation| {
-            SegmentRecord::encode(wire::Segment {
+            let segment = SegmentRecord::encode(wire::Segment {
                 sampling_rate,
                 decimation,
                 ..fixtures::segment(1)
             })
-            .unwrap()
-            .effective_rate()
+            .unwrap();
+            effective_rate(&segment.get())
         };
         assert_eq!(rate(1000, 4), Some(250.0));
         assert_eq!(rate(1000, 0), None);

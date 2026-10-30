@@ -1414,13 +1414,9 @@ mod tests {
     fn decoded(batch: &SampleBatch) -> Decoded {
         batch
             .schema()
-            .iter()
-            .map(|series| {
-                (
-                    series.metadata().name().to_string(),
-                    series.values().to_f64().into_owned(),
-                )
-            })
+            .columns()
+            .zip(batch.columns())
+            .map(|(column, values)| (column.name().to_string(), values.to_f64().into_owned()))
             .collect()
     }
 
@@ -1433,7 +1429,8 @@ mod tests {
 
     /// Once a stream's metadata is known, decoding a packet into a batch and
     /// reading the batch's metadata parse no retained record. A record is
-    /// checked when it arrives and read in place after that.
+    /// checked when it arrives and read in place after that. Every batch
+    /// shares the one schema of its run, so no batch allocates metadata.
     #[test]
     fn a_steady_packet_parses_no_metadata_record() {
         let types = [DataType::F32, DataType::I16, DataType::U8];
@@ -1442,16 +1439,17 @@ mod tests {
         parser
             .push_packet(&stream_data_packet(0, vec![0; 7 * rows]))
             .expect("valid rows");
-        parser.pop_batch().expect("the first batch");
+        let first = parser.pop_batch().expect("the first batch");
 
         let before = crate::data::metadata::record_parses();
         for packet in 1..=10 {
-            let first = packet * rows as u32;
+            let first_sample = packet * rows as u32;
             parser
-                .push_packet(&stream_data_packet(first, vec![0; 7 * rows]))
+                .push_packet(&stream_data_packet(first_sample, vec![0; 7 * rows]))
                 .expect("valid rows");
             let batch = parser.pop_batch().expect("a batch per packet");
-            assert_eq!(batch.schema().len(), types.len());
+            assert_eq!(batch.schema().columns().len(), types.len());
+            assert!(std::sync::Arc::ptr_eq(batch.schema(), first.schema()));
         }
         assert_eq!(crate::data::metadata::record_parses() - before, 0);
     }
@@ -1782,13 +1780,14 @@ mod tests {
                     offset += data_type.size();
                 }
 
-                prop_assert_eq!(batch.schema().len(), expected.len());
-                for (series, (name, cells)) in batch.schema().iter().zip(&expected) {
-                    prop_assert_eq!(series.metadata().name(), name.as_str());
-                    prop_assert_eq!(series.values().data_type(), series.metadata().data_type());
+                prop_assert_eq!(batch.columns().len(), expected.len());
+                let columns = batch.schema().columns().zip(batch.columns());
+                for ((column, values), (name, cells)) in columns.zip(&expected) {
+                    prop_assert_eq!(column.name(), name.as_str());
+                    prop_assert_eq!(values.data_type(), column.data_type());
                     for (row, cell) in cells.iter().enumerate() {
                         // Floats compare by bits, so a NaN matches itself.
-                        let same = match (series.values().get(row), cell) {
+                        let same = match (values.get(row), cell) {
                             (ColumnData::F32(value), ColumnData::F32(cell)) => {
                                 value.to_bits() == cell.to_bits()
                             }

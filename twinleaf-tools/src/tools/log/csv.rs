@@ -6,7 +6,8 @@ use crate::{parse_csv_target, LogCsvCli, StreamSel};
 use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use twinleaf::data::{PacketParser, SampleBatch, StreamMetadataSnapshot};
+use std::sync::Arc;
+use twinleaf::data::{PacketParser, SampleBatch, StreamSchema};
 use twinleaf::DeviceRoute;
 
 struct CsvOutput {
@@ -17,7 +18,7 @@ struct CsvOutput {
     path: Option<String>,
     stream_name: Option<String>,
     writer: Option<BufWriter<File>>,
-    schema: Option<StreamMetadataSnapshot>,
+    schema: Option<Arc<StreamSchema>>,
     header: Vec<String>,
     row: String,
     rows_written: u64,
@@ -56,14 +57,14 @@ impl CsvOutput {
         }
 
         if let Some(existing) = &self.schema {
-            if !existing.matches_schema(&batch) {
+            if existing != batch.schema() {
                 return Err(eyre::eyre!(
                     "stream identity or schema changed while writing {}; refusing to emit rows under a stale CSV header",
                     self.path.as_deref().unwrap_or("CSV output")
                 ));
             }
         } else {
-            self.schema = Some(batch.metadata());
+            self.schema = Some(batch.schema().clone());
         }
 
         if self.writer.is_none() {
@@ -71,8 +72,8 @@ impl CsvOutput {
             self.header.extend(
                 batch
                     .schema()
-                    .iter()
-                    .map(|series| series.metadata().name().to_string()),
+                    .columns()
+                    .map(|column| column.name().to_string()),
             );
 
             let route_label = route_filename_label(&self.route);

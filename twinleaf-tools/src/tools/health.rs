@@ -507,7 +507,7 @@ impl HealthState {
 
         st.name = batch.stream().name().to_string();
         if st.metadata.is_none() || batch.boundary().is_some() {
-            st.metadata = Some(batch.metadata());
+            st.metadata = Some(batch.metadata().clone());
         }
 
         if let Some(boundary) = batch.boundary() {

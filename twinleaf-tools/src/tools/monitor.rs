@@ -749,7 +749,7 @@ impl MonitorState {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
                     let key = StreamKey::new(*route, *sid);
                     if let Some(row) = buffer.latest_row(&key) {
-                        for column in row.schema() {
+                        for column in row.schema().columns() {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
@@ -1319,14 +1319,14 @@ fn build_left_lines(
     let mut global_idx = 0;
     app.view.desc_width = latest
         .values()
-        .flat_map(|row| row.schema().iter())
-        .map(|column| column.metadata().description().len())
+        .flat_map(|row| row.schema().columns())
+        .map(|column| column.description().len())
         .max()
         .unwrap_or(0);
     app.view.units_width = latest
         .values()
-        .flat_map(|row| row.schema().iter())
-        .map(|column| column.metadata().units().len())
+        .flat_map(|row| row.schema().columns())
+        .map(|column| column.units().len())
         .max()
         .unwrap_or(0);
 
@@ -1410,8 +1410,7 @@ fn build_left_lines(
                         > stale_threshold(run.effective_rate())
                 });
                 let sample = row.row(0).expect("latest_row is one row");
-                for (column, value) in row.schema().iter().zip(sample.values()) {
-                    let metadata = column.metadata();
+                for (column, value) in row.schema().columns().zip(sample.values()) {
                     let nav_idx = global_idx;
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
@@ -1433,16 +1432,16 @@ fn build_left_lines(
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(row.stream().name(), metadata.name(), val_f64)
+                        .get_value_color(row.stream().name(), column.name(), val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
-                    let mut desc = metadata.description().to_string();
+                    let mut desc = column.description().to_string();
                     if desc.len() < app.view.desc_width {
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
-                    let units = metadata.units().to_string();
+                    let units = column.units().to_string();
                     let padded_units = if app.view.units_width > 0 && !units.is_empty() {
                         format!("{:>width$}", units, width = app.view.units_width)
                     } else if app.view.units_width > 0 {

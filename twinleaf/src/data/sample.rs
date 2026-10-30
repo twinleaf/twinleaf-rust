@@ -1,13 +1,11 @@
 //! The decoded sample model.
 //!
-//! [`SampleBatch`] holds immutable columnar rows, [`Series`] and
-//! [`ColumnArray`] hold its columns, and [`SampleRow`] views one row.
+//! [`SampleBatch`] holds immutable columnar rows, one [`ColumnArray`] per
+//! column of its [`StreamSchema`], and [`SampleRow`] views one row.
 //! [`BoundaryReason`] and [`Generations`] describe the continuity the parser
 //! reports.
 
-use super::metadata::{
-    ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
-};
+use super::metadata::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSchema};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber, SegmentId, SessionId};
@@ -183,14 +181,6 @@ macro_rules! define_columns {
                 })
             }
 
-            /// Returns an empty column of `array`'s type, with room for
-            /// `capacity` values.
-            fn like(array: &ColumnArray, capacity: usize) -> Self {
-                match array {
-                    $(ColumnArray::$variant(_) => Self::$variant(Vec::with_capacity(capacity)),)*
-                }
-            }
-
             /// Appends one cell, converted to the column's type. Tests build
             /// rows from cells of any type.
             ///
@@ -309,102 +299,31 @@ macro_rules! define_columns {
 
 native_types!(define_columns);
 
-/// The identity, boundary, generations, and metadata records that every row
-/// of a batch shares.
+/// The metadata, boundary and generations that every row of a batch shares.
 #[derive(Debug, Clone)]
 pub(super) struct BatchContext {
-    key: StreamKey,
+    pub(super) metadata: StreamMetadataSnapshot,
     /// At most one boundary per batch, anchored at its first row.
-    boundary: Option<BoundaryReason>,
-    generations: Generations,
-    segment: SegmentRecord,
-    stream: StreamRecord,
-    device: DeviceRecord,
-}
-
-impl BatchContext {
-    /// Creates the context for a batch of `key`'s rows.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `stream` or `segment` describes a stream other than `key`'s.
-    pub(super) fn new(
-        key: StreamKey,
-        boundary: Option<BoundaryReason>,
-        generations: Generations,
-        segment: SegmentRecord,
-        stream: StreamRecord,
-        device: DeviceRecord,
-    ) -> Self {
-        assert_eq!(
-            key.stream_id,
-            stream.get().stream_id(),
-            "stream key must match metadata"
-        );
-        assert_eq!(
-            key.stream_id,
-            segment.get().stream_id(),
-            "segment must match stream"
-        );
-        Self {
-            key,
-            boundary,
-            generations,
-            segment,
-            stream,
-            device,
-        }
-    }
+    pub(super) boundary: Option<BoundaryReason>,
+    pub(super) generations: Generations,
 }
 
 /// Rows of one stream from one device, held column-major.
 ///
-/// A batch is immutable and clones by pointer. Metadata accessors return
-/// borrowed protocol views of the records the parser retained. They copy
-/// nothing and match the bytes the instrument sent.
+/// A batch is its stream's [`StreamSchema`] plus one [`ColumnArray`] per
+/// schema column. Column `i` of the schema
+/// describes the values of column `i` of the batch. A batch is immutable and
+/// clones by pointer. Metadata accessors return borrowed protocol views of
+/// the records the parser retained. They copy nothing and match the bytes the
+/// instrument sent.
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
     context: BatchContext,
     sample_numbers: ScalarBuffer<SampleNumber>,
     /// Each row's end-of-sample time, materialized at construction.
     timestamps: ScalarBuffer<f64>,
-    /// Columns in index order.
-    columns: Vec<Series>,
-}
-
-/// One column of a batch, with its metadata and its decoded values.
-#[derive(Debug, Clone)]
-pub struct Series {
-    metadata: ColumnRecord,
-    values: ColumnArray,
-}
-
-impl Series {
-    /// Returns the column's position within the stream's packed sample.
-    pub fn index(&self) -> ColumnId {
-        self.metadata.get().index()
-    }
-
-    /// Returns a borrowed view of the column record the parser retained.
-    pub fn metadata(&self) -> wire::ColumnView<'_> {
-        self.metadata.get()
-    }
-
-    pub(crate) fn record(&self) -> &ColumnRecord {
-        &self.metadata
-    }
-
-    /// Returns the column's decoded values in row order.
-    pub fn values(&self) -> &ColumnArray {
-        &self.values
-    }
-
-    fn slice(&self, rows: Range<usize>) -> Series {
-        Series {
-            metadata: self.metadata.clone(),
-            values: self.values.slice(rows),
-        }
-    }
+    /// One array per schema column, in index order.
+    columns: Vec<ColumnArray>,
 }
 
 /// Rows that can enter a batch coalescer. They describe the batch they would
@@ -413,6 +332,7 @@ pub(super) trait RowSource {
     fn len(&self) -> usize;
     fn boundary(&self) -> Option<&BoundaryReason>;
     fn generations(&self) -> Generations;
+    fn schema(&self) -> &Arc<StreamSchema>;
     fn segment_record(&self) -> &SegmentRecord;
     /// Returns an empty builder with these rows' metadata, boundary and
     /// generations, and room for `capacity` rows.
@@ -432,8 +352,8 @@ pub(super) struct SampleBatchBuilder {
     timestamps: Vec<f64>,
     /// The segment's clock, read when the builder is created.
     clock: SampleClock,
-    /// One accumulating buffer per decodable column, in schema order.
-    columns: Vec<(ColumnRecord, ColumnBuilder)>,
+    /// One accumulating buffer per schema column, in index order.
+    columns: Vec<ColumnBuilder>,
 }
 
 impl RowSource for SampleBatch {
@@ -449,63 +369,46 @@ impl RowSource for SampleBatch {
         self.context.generations
     }
 
+    fn schema(&self) -> &Arc<StreamSchema> {
+        self.context.metadata.schema()
+    }
+
     fn segment_record(&self) -> &SegmentRecord {
-        &self.context.segment
+        self.context.metadata.segment_record()
     }
 
     fn start_builder(&self, capacity: usize) -> SampleBatchBuilder {
-        SampleBatchBuilder::new(
-            self.context.clone(),
-            self.columns.iter().map(|column| {
-                (
-                    column.metadata.clone(),
-                    ColumnBuilder::like(&column.values, capacity),
-                )
-            }),
-            capacity,
-        )
+        SampleBatchBuilder::new(self.context.clone(), capacity)
     }
 
     fn append_to(&self, tail: &mut SampleBatchBuilder) {
-        assert_eq!(
-            tail.columns.len(),
-            self.columns.len(),
-            "appended rows must have one value per column"
-        );
         tail.sample_numbers.extend_from_slice(&self.sample_numbers);
         tail.timestamps.extend_from_slice(&self.timestamps);
-        for ((_, values), column) in tail.columns.iter_mut().zip(&self.columns) {
-            values.extend_from(&column.values);
+        for (values, more) in tail.columns.iter_mut().zip(&self.columns) {
+            values.extend_from(more);
         }
     }
 }
 
 impl SampleBatchBuilder {
-    /// Creates a builder for rows that share `context` and have `columns`,
-    /// each a record and an empty column of its type, with room for
-    /// `capacity` rows.
+    /// Creates a builder for rows that share `context`, with an empty column
+    /// of each schema column's type and room for `capacity` rows.
     ///
     /// # Panics
     ///
-    /// Panics if a column describes a stream other than the context's.
-    pub(super) fn new(
-        context: BatchContext,
-        columns: impl IntoIterator<Item = (ColumnRecord, ColumnBuilder)>,
-        capacity: usize,
-    ) -> Self {
-        let key = context.key;
-        let columns = columns
-            .into_iter()
-            .inspect(|(metadata, _)| {
-                assert_eq!(
-                    key.stream_id,
-                    metadata.get().stream_id(),
-                    "column must match stream"
-                );
+    /// Panics if the schema has a column of a type this build cannot decode.
+    pub(super) fn new(context: BatchContext, capacity: usize) -> Self {
+        let columns = context
+            .metadata
+            .schema()
+            .columns()
+            .map(|column| {
+                ColumnBuilder::for_type(column.data_type(), capacity)
+                    .expect("a stream with a column this build cannot decode is refused")
             })
             .collect();
         Self {
-            clock: SampleClock::of(context.segment.get()),
+            clock: SampleClock::of(context.metadata.segment()),
             context,
             sample_numbers: Vec::with_capacity(capacity),
             timestamps: Vec::with_capacity(capacity),
@@ -523,7 +426,8 @@ impl SampleBatchBuilder {
 
     pub(super) fn accepts(&self, rows: &impl RowSource) -> bool {
         self.context.generations == rows.generations()
-            && self.context.segment == *rows.segment_record()
+            && self.context.metadata.segment_record() == rows.segment_record()
+            && self.context.metadata.schema() == rows.schema()
     }
 
     /// Appends one decoded row. `cells` yields one value per column, in schema
@@ -542,7 +446,7 @@ impl SampleBatchBuilder {
         self.sample_numbers.push(n);
         self.timestamps.push(self.clock.time_at(n.value() + 1));
         let mut cells = cells.into_iter();
-        for (_, values) in &mut self.columns {
+        for values in &mut self.columns {
             values.push_data(&cells.next().expect("one cell per column"));
         }
         debug_assert!(cells.next().is_none(), "one cell per column");
@@ -561,7 +465,7 @@ impl SampleBatchBuilder {
             self.sample_numbers.push(n);
             self.timestamps.push(self.clock.time_at(n.value() + 1));
         }
-        self.columns.iter_mut().map(|(_, values)| values)
+        self.columns.iter_mut()
     }
 
     /// Returns a frozen copy of `rows`, leaving the builder accumulating. The
@@ -575,40 +479,68 @@ impl SampleBatchBuilder {
         if rows.start != 0 {
             context.boundary = None;
         }
-        SampleBatch {
+        SampleBatch::new(
             context,
-            sample_numbers: self.sample_numbers[rows.clone()].to_vec().into(),
-            timestamps: self.timestamps[rows.clone()].to_vec().into(),
-            columns: self
-                .columns
+            self.sample_numbers[rows.clone()].to_vec().into(),
+            self.timestamps[rows.clone()].to_vec().into(),
+            self.columns
                 .iter()
-                .map(|(metadata, values)| Series {
-                    metadata: metadata.clone(),
-                    values: values.freeze_rows(rows.clone()),
-                })
+                .map(|values| values.freeze_rows(rows.clone()))
                 .collect(),
-        }
+        )
     }
 
     /// Freezes the accumulated rows into a shareable batch.
     pub(super) fn finish(self) -> SampleBatch {
-        SampleBatch {
-            context: self.context,
-            timestamps: self.timestamps.into(),
-            sample_numbers: self.sample_numbers.into(),
-            columns: self
-                .columns
-                .into_iter()
-                .map(|(metadata, values)| Series {
-                    metadata,
-                    values: values.into(),
-                })
-                .collect(),
-        }
+        SampleBatch::new(
+            self.context,
+            self.sample_numbers.into(),
+            self.timestamps.into(),
+            self.columns.into_iter().map(ColumnArray::from).collect(),
+        )
     }
 }
 
 impl SampleBatch {
+    /// Creates a batch of `columns`, one per column of the context's schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless there is one array per schema column, each of its
+    /// column's type and with one value per row.
+    fn new(
+        context: BatchContext,
+        sample_numbers: ScalarBuffer<SampleNumber>,
+        timestamps: ScalarBuffer<f64>,
+        columns: Vec<ColumnArray>,
+    ) -> SampleBatch {
+        let schema = context.metadata.schema();
+        assert_eq!(
+            columns.len(),
+            schema.columns().len(),
+            "one array per schema column"
+        );
+        for (column, values) in schema.columns().zip(&columns) {
+            assert_eq!(
+                column.data_type(),
+                values.data_type(),
+                "an array of its column's type"
+            );
+            assert_eq!(values.len(), sample_numbers.len(), "one value per row");
+        }
+        assert_eq!(
+            timestamps.len(),
+            sample_numbers.len(),
+            "one timestamp per row"
+        );
+        SampleBatch {
+            context,
+            sample_numbers,
+            timestamps,
+            columns,
+        }
+    }
+
     /// Returns a view of `rows` that shares this batch's buffers. The boundary
     /// is anchored at the first row and survives only in a slice that starts
     /// there.
@@ -632,12 +564,12 @@ impl SampleBatch {
     /// Returns the route of the device that produced these rows,
     /// root-to-leaf.
     pub fn route(&self) -> DeviceRoute {
-        self.context.key.route
+        self.stream_key().route
     }
 
     /// Returns the routed stream these rows came from.
     pub fn stream_key(&self) -> StreamKey {
-        self.context.key
+        self.context.metadata.stream_key()
     }
 
     /// Returns the batch's boundary, anchored at its first row, or `None` if
@@ -664,41 +596,24 @@ impl SampleBatch {
 
     /// Returns a borrowed view of the segment these rows were sampled in.
     pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.context.segment.get()
+        self.context.metadata.segment()
     }
 
     /// Returns a borrowed view of the stream record these rows belong to.
     pub fn stream(&self) -> wire::StreamView<'_> {
-        self.context.stream.get()
+        self.context.metadata.stream()
     }
 
     /// Returns a borrowed view of the record of the device that sent these
     /// rows.
     pub fn device(&self) -> wire::DeviceView<'_> {
-        self.context.device.get()
+        self.context.metadata.device()
     }
 
     /// Returns this batch's metadata as a snapshot that holds no sample
-    /// arrays.
-    pub fn metadata(&self) -> StreamMetadataSnapshot {
-        StreamMetadataSnapshot::new(
-            self.context.key,
-            self.context.device.clone(),
-            self.context.stream.clone(),
-            self.context.segment.clone(),
-            self.columns
-                .iter()
-                .map(|series| series.metadata.clone())
-                .collect(),
-        )
-    }
-
-    pub(crate) fn records(&self) -> (&DeviceRecord, &StreamRecord, &SegmentRecord) {
-        (
-            &self.context.device,
-            &self.context.stream,
-            &self.context.segment,
-        )
+    /// arrays. Cloning it copies no records.
+    pub fn metadata(&self) -> &StreamMetadataSnapshot {
+        &self.context.metadata
     }
 
     /// Encodes this batch's metadata as byte-faithful UPDATE packets, as
@@ -732,16 +647,21 @@ impl SampleBatch {
         self.sample_numbers.last().copied()
     }
 
-    /// Returns the batch's columns in index order. Their metadata gives each
-    /// column's name, type and units.
-    pub fn schema(&self) -> &[Series] {
+    /// Returns the schema shared by every batch of this batch's run. Its
+    /// columns give each column's name, type and units.
+    pub fn schema(&self) -> &Arc<StreamSchema> {
+        self.context.metadata.schema()
+    }
+
+    /// Returns one array per schema column, in index order.
+    pub fn columns(&self) -> &[ColumnArray] {
         &self.columns
     }
 
-    /// Returns the column whose index is `id`, or `None` if the schema has no
-    /// such column.
-    pub fn column(&self, id: ColumnId) -> Option<&Series> {
-        self.columns.iter().find(|c| c.index() == id)
+    /// Returns the values of the column whose index is `id`, or `None` if
+    /// the schema has no such column.
+    pub fn column(&self, id: ColumnId) -> Option<&ColumnArray> {
+        self.columns.get(id.index())
     }
 
     /// Returns a borrowing view of row `row`, or `None` past the last row.
@@ -793,16 +713,16 @@ impl<'a> SampleRow<'a> {
     }
     /// Returns a borrowed view of the stream record this row belongs to.
     pub fn stream(&self) -> wire::StreamView<'a> {
-        self.batch.context.stream.get()
+        self.batch.stream()
     }
     /// Returns a borrowed view of the segment this row was sampled in.
     pub fn segment(&self) -> wire::SegmentView<'a> {
-        self.batch.context.segment.get()
+        self.batch.segment()
     }
     /// Returns a borrowed view of the record of the device that sent this
     /// row.
     pub fn device(&self) -> wire::DeviceView<'a> {
-        self.batch.context.device.get()
+        self.batch.device()
     }
     /// Returns the start of the sample's interval, in seconds after the
     /// segment's epoch.
@@ -818,13 +738,13 @@ impl<'a> SampleRow<'a> {
     /// Returns the row's column values in schema order.
     pub fn values(&self) -> impl Iterator<Item = ColumnData> + '_ {
         let row = self.row;
-        self.batch.columns.iter().map(move |c| c.values.get(row))
+        self.batch.columns.iter().map(move |values| values.get(row))
     }
 
     /// Returns the row's value in the column whose index is `id`, or `None`
     /// if the schema has no such column.
     pub fn value(&self, id: ColumnId) -> Option<ColumnData> {
-        self.batch.column(id).map(|c| c.values.get(self.row))
+        self.batch.column(id).map(|values| values.get(self.row))
     }
 }
 
@@ -849,8 +769,8 @@ impl std::fmt::Display for SampleRow<'_> {
             self.segment().segment_id(),
             self.timestamp_end()
         )?;
-        for (series, value) in self.batch.schema().iter().zip(self.values()) {
-            write!(f, " {}: {}", series.metadata().name(), value)?;
+        for (column, value) in self.batch.schema().columns().zip(self.values()) {
+            write!(f, " {}: {}", column.name(), value)?;
         }
         write!(f, " [#{}]", self.n())
     }
@@ -1042,27 +962,11 @@ impl BoundaryReason {
     }
 }
 
-impl StreamMetadataSnapshot {
-    /// Returns `true` if `batch` has this snapshot's routed stream identity and
-    /// exact column schema. Device and segment changes do not change a stream
-    /// schema.
-    pub fn matches_schema(&self, batch: &SampleBatch) -> bool {
-        let columns = self.column_records();
-        self.stream_key() == batch.stream_key()
-            && columns.len() == batch.schema().len()
-            && columns
-                .iter()
-                .zip(batch.schema())
-                .all(|(expected, actual)| expected == actual.record())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fixtures::{column, device, segment, stream};
+    use crate::data::fixtures::{self, column, device, segment, stream};
     use crate::proto::data::DataType;
-    use crate::proto::StreamId;
 
     /// No device sends 24-bit columns, so they are not decoded. Their type
     /// codes still parse, and the parser steps over their bytes.
@@ -1076,34 +980,38 @@ mod tests {
         }
     }
 
+    fn metadata(stream_id: u8, column_name: &str) -> StreamMetadataSnapshot {
+        fixtures::metadata(
+            DeviceRoute::root(),
+            device(),
+            wire::Stream {
+                sample_size: 8,
+                ..stream(stream_id)
+            },
+            wire::Segment {
+                sampling_rate: 4,
+                ..segment(stream_id)
+            },
+            &[wire::Column {
+                name: column_name,
+                ..column(stream_id, 0, DataType::F64)
+            }],
+        )
+    }
+
     /// A four-row float batch numbered 0..4, sampled at 4 Hz, with an initial
     /// boundary anchored at its first row.
     fn batch() -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
-            BatchContext::new(
-                StreamKey::new(DeviceRoute::root(), StreamId::new(1)),
-                Some(BoundaryReason::Initial),
-                Generations {
+            BatchContext {
+                metadata: metadata(1, "col_0"),
+                boundary: Some(BoundaryReason::Initial),
+                generations: Generations {
                     stream: 1,
                     device: 0,
                     global: 0,
                 },
-                SegmentRecord::encode(wire::Segment {
-                    sampling_rate: 4,
-                    ..segment(1)
-                })
-                .unwrap(),
-                StreamRecord::encode(wire::Stream {
-                    sample_size: 8,
-                    ..stream(1)
-                })
-                .unwrap(),
-                DeviceRecord::encode(device()).unwrap(),
-            ),
-            [(
-                ColumnRecord::encode(column(1, 0, DataType::F64)).unwrap(),
-                ColumnBuilder::F64(Vec::new()),
-            )],
+            },
             4,
         );
         for n in 0..4 {
@@ -1113,37 +1021,36 @@ mod tests {
     }
 
     #[test]
-    fn owned_metadata_matches_only_the_same_routed_schema() {
+    fn a_schema_equals_only_the_same_routed_records() {
         let original = batch();
-        let metadata = original.metadata();
-        assert!(metadata.matches_schema(&original));
-        assert_eq!(metadata.device(), original.device());
-        assert_eq!(metadata.stream(), original.stream());
-        assert_eq!(metadata.segment(), original.segment());
+        let schema = original.schema();
+        assert!(Arc::ptr_eq(schema, original.clone().schema()));
+        assert_eq!(schema, metadata(1, "col_0").schema(), "equal bytes");
+        assert_ne!(schema, metadata(2, "col_0").schema(), "another stream");
+        assert_ne!(schema, metadata(1, "renamed").schema(), "a changed column");
         assert_eq!(
-            metadata.columns().collect::<Vec<_>>(),
-            vec![original.schema()[0].metadata()]
+            schema.columns().collect::<Vec<_>>(),
+            [schema.column(ColumnId::new(0)).unwrap()]
         );
+    }
 
-        let mut another_stream = original.clone();
-        another_stream.context.key.stream_id = StreamId::new(2);
-        assert!(!metadata.matches_schema(&another_stream));
-
-        let mut changed_schema = original.clone();
-        let column = changed_schema.columns[0].metadata.get().fields();
-        changed_schema.columns[0].metadata = ColumnRecord::encode(wire::Column {
-            name: "renamed",
-            ..column
-        })
-        .unwrap();
-        assert!(!metadata.matches_schema(&changed_schema));
+    #[test]
+    #[should_panic(expected = "an array of its column's type")]
+    fn a_batch_refuses_an_array_of_another_type() {
+        let batch = batch();
+        SampleBatch::new(
+            batch.context.clone(),
+            batch.sample_numbers.clone(),
+            batch.timestamps.clone(),
+            vec![ColumnArray::F32(vec![0.0; 4].into())],
+        );
     }
 
     #[test]
     fn finishing_preserves_values_and_materializes_end_of_sample_times() {
         let batch = batch();
         assert_eq!(batch.sample_numbers(), [0, 1, 2, 3]);
-        match batch.schema()[0].values() {
+        match &batch.columns()[0] {
             ColumnArray::F64(v) => assert_eq!(&v[..], [0.0, 10.0, 20.0, 30.0]),
             other => panic!("expected an f64 column, got {other:?}"),
         }
@@ -1164,14 +1071,14 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail.sample_numbers(), [1, 2]);
         assert_eq!(tail.timestamps(), [0.5, 0.75]);
-        match tail.schema()[0].values() {
+        match &tail.columns()[0] {
             ColumnArray::F64(v) => assert_eq!(&v[..], [10.0, 20.0]),
             other => panic!("expected an f64 column, got {other:?}"),
         }
         // Nothing was copied: the slice's rows are the originals in place.
         assert!(std::ptr::eq(&batch.timestamps()[1], &tail.timestamps()[0]));
         let (ColumnArray::F64(whole), ColumnArray::F64(part)) =
-            (batch.schema()[0].values(), tail.schema()[0].values())
+            (&batch.columns()[0], &tail.columns()[0])
         else {
             panic!("expected f64 columns");
         };
