@@ -110,7 +110,7 @@ impl Buffer {
 
     /// Returns a column's metadata as of its stream's newest batch, or `None`
     /// if the stream has no run or no such column.
-    pub fn column_metadata(&self, col: &ColumnKey) -> Option<wire::Column<'_>> {
+    pub fn column_metadata(&self, col: &ColumnKey) -> Option<wire::ColumnView<'_>> {
         self.runs
             .get(&col.stream_key())?
             .column_metadata(col.column_id)
@@ -264,10 +264,10 @@ impl Run {
         Some(chunk.slice(chunk.len() - 1..chunk.len()))
     }
 
-    fn column_metadata(&self, column_id: ColumnId) -> Option<wire::Column<'_>> {
+    fn column_metadata(&self, column_id: ColumnId) -> Option<wire::ColumnView<'_>> {
         self.columns
             .iter()
-            .find(|column| column.get().index == column_id)
+            .find(|column| column.get().index() == column_id)
             .map(ColumnRecord::get)
     }
 
@@ -283,13 +283,13 @@ impl Run {
     }
 
     /// Returns the run's stream descriptor as of its newest batch.
-    pub fn stream(&self) -> wire::Stream<'_> {
+    pub fn stream(&self) -> wire::StreamView<'_> {
         self.stream.get()
     }
 
     /// Returns the run's segment descriptor as of its newest batch. It holds
     /// the raw sampling rate and decimation behind [`Self::effective_rate`].
-    pub fn segment(&self) -> wire::Segment<'_> {
+    pub fn segment(&self) -> wire::SegmentView<'_> {
         self.segment.get()
     }
 
@@ -408,7 +408,7 @@ mod tests {
                 ),
                 self.columns
                     .iter()
-                    .map(|metadata| (metadata.clone(), buffer_type(metadata.get().data_type))),
+                    .map(|metadata| (metadata.clone(), buffer_type(metadata.get().data_type()))),
                 rows.len(),
             );
             for &(sample_number, ref row) in rows {
@@ -568,7 +568,7 @@ mod tests {
         let rolled = SegmentRecord::encode(wire::Segment {
             segment_id: crate::proto::SegmentId::new(1),
             start_time: 4,
-            ..fx.segment.get()
+            ..fx.segment.get().fields()
         })
         .unwrap();
         let rows: Vec<_> = (0..3)
@@ -709,8 +709,8 @@ mod tests {
         let metadata = buffer
             .column_metadata(&fx.column_keys[0])
             .expect("the column");
-        assert_eq!(metadata.description, "column 0");
-        assert_eq!(metadata.units, "u0");
+        assert_eq!(metadata.description(), "column 0");
+        assert_eq!(metadata.units(), "u0");
 
         // A schema change rides a new stream generation, and the new run's columns
         // replace the old ones.
@@ -724,7 +724,7 @@ mod tests {
             buffer
                 .column_metadata(&changed.column_keys[1])
                 .expect("the added column")
-                .data_type,
+                .data_type(),
             DataType::U64
         );
         assert!(buffer

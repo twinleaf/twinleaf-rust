@@ -115,9 +115,9 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
             println!(
                 "   • {}  {}  {}  {}",
                 route,
-                device.name,
-                style(format!("fw {}", device.firmware)).dim(),
-                style(format!("serial {}", device.serial)).dim(),
+                device.name(),
+                style(format!("fw {}", device.firmware())).dim(),
+                style(format!("serial {}", device.serial())).dim(),
             );
         }
     }
@@ -139,7 +139,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                 "   • {} {} {:<12} {:>6.0} {}  {:>4} {}  {:>10} {}{}",
                 key.route,
                 key.stream_id,
-                s.metadata().name,
+                s.metadata().name(),
                 s.rate_hz(),
                 unit("Hz"),
                 s.columns().len(),
@@ -170,15 +170,15 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                 let cols: Vec<String> = s
                     .columns()
                     .map(|column| {
-                        let data_type = column.data_type.to_string();
-                        if column.units.is_empty() {
-                            format!("{} {}", column.name, style(data_type).dim())
+                        let data_type = column.data_type().to_string();
+                        if column.units().is_empty() {
+                            format!("{} {}", column.name(), style(data_type).dim())
                         } else {
                             format!(
                                 "{} {} {}",
-                                column.name,
+                                column.name(),
                                 style(data_type).dim(),
-                                style(&column.units).dim()
+                                style(&column.units()).dim()
                             )
                         }
                     })

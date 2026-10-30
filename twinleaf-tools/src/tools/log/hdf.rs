@@ -19,9 +19,9 @@ impl FilterDebug {
             return;
         }
         let route = batch.stream_key().route;
-        let stream = batch.stream().name.to_string();
+        let stream = batch.stream().name().to_string();
         for column in batch.schema() {
-            let name = column.metadata().name;
+            let name = column.metadata().name();
             let path = self.filter.path_string(&route, &stream, name);
             if self.seen.insert(path.clone()) {
                 let kept = self.filter.matches(&route, &stream, name);

@@ -201,17 +201,17 @@ impl StreamSummary {
     }
 
     /// Returns the stream record in effect for the whole run.
-    pub fn metadata(&self) -> wire::Stream<'_> {
+    pub fn metadata(&self) -> wire::StreamView<'_> {
         self.metadata.get()
     }
 
     /// Returns the segment record the run began in.
-    pub fn segment(&self) -> wire::Segment<'_> {
+    pub fn segment(&self) -> wire::SegmentView<'_> {
         self.segment.get()
     }
 
     /// Returns every column of a sample, in schema order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
         self.columns.iter().map(ColumnRecord::get)
     }
 
@@ -268,7 +268,7 @@ impl LogSummary {
     /// Returns the devices that produced rows, in route order.
     pub fn devices(
         &self,
-    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::Device<'_>)> + '_ {
+    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::DeviceView<'_>)> + '_ {
         self.devices
             .iter()
             .map(|(&route, device)| (route, device.get()))

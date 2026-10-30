@@ -24,10 +24,10 @@ pub(crate) struct SampleClock {
 }
 
 impl SampleClock {
-    pub(crate) fn of(segment: wire::Segment<'_>) -> Self {
+    pub(crate) fn of(segment: wire::SegmentView<'_>) -> Self {
         Self {
-            start_time: f64::from(segment.start_time),
-            period: f64::from(segment.decimation) / f64::from(segment.sampling_rate),
+            start_time: f64::from(segment.start_time()),
+            period: f64::from(segment.decimation()) / f64::from(segment.sampling_rate()),
         }
     }
 
@@ -36,7 +36,7 @@ impl SampleClock {
     }
 }
 
-pub(crate) fn sample_time(segment: wire::Segment<'_>, n: u32) -> f64 {
+pub(crate) fn sample_time(segment: wire::SegmentView<'_>, n: u32) -> f64 {
     SampleClock::of(segment).time_at(n)
 }
 
@@ -353,12 +353,12 @@ impl BatchContext {
     ) -> Self {
         assert_eq!(
             key.stream_id,
-            stream.get().stream_id,
+            stream.get().stream_id(),
             "stream key must match metadata"
         );
         assert_eq!(
             key.stream_id,
-            segment.get().stream_id,
+            segment.get().stream_id(),
             "segment must match stream"
         );
         Self {
@@ -397,11 +397,11 @@ pub struct Series {
 impl Series {
     /// Returns the column's position within the stream's packed sample.
     pub fn index(&self) -> ColumnId {
-        self.metadata.get().index
+        self.metadata.get().index()
     }
 
     /// Returns a borrowed view of the column record the parser retained.
-    pub fn metadata(&self) -> wire::Column<'_> {
+    pub fn metadata(&self) -> wire::ColumnView<'_> {
         self.metadata.get()
     }
 
@@ -510,7 +510,7 @@ impl SampleBatchBuilder {
             .map(|(metadata, buffer_type)| {
                 assert_eq!(
                     key.stream_id,
-                    metadata.get().stream_id,
+                    metadata.get().stream_id(),
                     "column must match stream"
                 );
                 (
@@ -661,18 +661,18 @@ impl SampleBatch {
     }
 
     /// Returns a borrowed view of the segment these rows were sampled in.
-    pub fn segment(&self) -> wire::Segment<'_> {
+    pub fn segment(&self) -> wire::SegmentView<'_> {
         self.context.segment.get()
     }
 
     /// Returns a borrowed view of the stream record these rows belong to.
-    pub fn stream(&self) -> wire::Stream<'_> {
+    pub fn stream(&self) -> wire::StreamView<'_> {
         self.context.stream.get()
     }
 
     /// Returns a borrowed view of the record of the device that sent these
     /// rows.
-    pub fn device(&self) -> wire::Device<'_> {
+    pub fn device(&self) -> wire::DeviceView<'_> {
         self.context.device.get()
     }
 
@@ -790,16 +790,16 @@ impl<'a> SampleRow<'a> {
         self.batch.sample_numbers[self.row]
     }
     /// Returns a borrowed view of the stream record this row belongs to.
-    pub fn stream(&self) -> wire::Stream<'a> {
+    pub fn stream(&self) -> wire::StreamView<'a> {
         self.batch.context.stream.get()
     }
     /// Returns a borrowed view of the segment this row was sampled in.
-    pub fn segment(&self) -> wire::Segment<'a> {
+    pub fn segment(&self) -> wire::SegmentView<'a> {
         self.batch.context.segment.get()
     }
     /// Returns a borrowed view of the record of the device that sent this
     /// row.
-    pub fn device(&self) -> wire::Device<'a> {
+    pub fn device(&self) -> wire::DeviceView<'a> {
         self.batch.context.device.get()
     }
     /// Returns the start of the sample's interval, in seconds after the
@@ -842,13 +842,13 @@ impl std::fmt::Display for SampleRow<'_> {
         write!(
             f,
             "SAMPLE({}:{}:{}) {:.6}",
-            self.device().session.value(),
-            self.stream().stream_id,
-            self.segment().segment_id,
+            self.device().session().value(),
+            self.stream().stream_id(),
+            self.segment().segment_id(),
             self.timestamp_end()
         )?;
         for (series, value) in self.batch.schema().iter().zip(self.values()) {
-            write!(f, " {}: {}", series.metadata().name, value)?;
+            write!(f, " {}: {}", series.metadata().name(), value)?;
         }
         write!(f, " [#{}]", self.n())
     }
@@ -1131,7 +1131,7 @@ mod tests {
         assert!(!metadata.matches_schema(&another_stream));
 
         let mut changed_schema = original.clone();
-        let column = changed_schema.columns[0].metadata.get();
+        let column = changed_schema.columns[0].metadata.get().fields();
         changed_schema.columns[0].metadata = ColumnRecord::encode(wire::Column {
             name: "renamed",
             ..column

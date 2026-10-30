@@ -5,8 +5,8 @@
 //! validated bytes immediately or retain only their metadata and boundaries.
 
 use super::metadata::{
-    decoded_buffer_type, BufferType, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord,
-    MetadataQuery, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
+    decoded_buffer_type, effective_rate, BufferType, ColumnRecord, DeviceMetadataSnapshot,
+    DeviceRecord, MetadataQuery, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
 };
 use super::sample::{
     sample_time, BatchContext, BoundaryReason, ColumnData, Generations, RowSource,
@@ -175,7 +175,7 @@ impl StreamState {
         let mut missing = Vec::new();
         match self.metadata.as_ref() {
             Some(metadata) => {
-                for index in self.columns.len()..usize::from(metadata.get().n_columns) {
+                for index in self.columns.len()..usize::from(metadata.get().n_columns()) {
                     missing.push(wire::MetadataSelector::column(
                         self.stream_id.value(),
                         index as u8,
@@ -199,8 +199,8 @@ impl StreamState {
         &self,
         first_sample_n: SampleNumber,
         first_timestamp: f64,
-        device: wire::Device<'_>,
-        segment: wire::Segment<'_>,
+        device: wire::DeviceView<'_>,
+        segment: wire::SegmentView<'_>,
         new_rate: f64,
         is_segment_rollover: bool,
     ) -> Option<BoundaryReason> {
@@ -208,17 +208,17 @@ impl StreamState {
             return Some(BoundaryReason::Initial);
         }
 
-        if device.session != self.last_session_id {
+        if device.session() != self.last_session_id {
             return Some(BoundaryReason::SessionChanged {
                 old: self.last_session_id,
-                new: device.session,
+                new: device.session(),
             });
         }
 
-        if segment.timeref_session != self.last_time_ref_session_id {
+        if segment.timeref_session() != self.last_time_ref_session_id {
             return Some(BoundaryReason::TimeRefSessionChanged {
                 old: self.last_time_ref_session_id,
-                new: segment.timeref_session,
+                new: segment.timeref_session(),
             });
         }
 
@@ -238,19 +238,19 @@ impl StreamState {
             });
         }
 
-        if segment.segment_id != self.last_segment_id {
+        if segment.segment_id() != self.last_segment_id {
             // A benign rollover is time-continuous; a stream restart leaves a
             // forward gap. Backward jumps already returned above.
             let time_continuous = time_gap < half_period;
             return Some(if is_segment_rollover && time_continuous {
                 BoundaryReason::SegmentRollover {
                     old_id: self.last_segment_id,
-                    new_id: segment.segment_id,
+                    new_id: segment.segment_id(),
                 }
             } else {
                 BoundaryReason::SegmentChanged {
                     old_id: self.last_segment_id,
-                    new_id: segment.segment_id,
+                    new_id: segment.segment_id(),
                 }
             });
         }
@@ -291,15 +291,17 @@ impl StreamState {
             return Ok(RowState::WaitingForMetadata);
         };
         let stream = stream_metadata.get();
+        let n_segments = stream.n_segments();
+        let device = device_metadata.get();
 
         // Segment ids index a fixed ring, so a wire value outside it is corrupt.
-        if stream.n_segments == 0 {
+        if n_segments == 0 {
             return Err(StreamDataError::ZeroSegmentCount);
         }
-        if data.segment_id.value() >= stream.n_segments {
+        if data.segment_id.value() >= n_segments {
             return Err(StreamDataError::SegmentOutOfRange {
                 segment_id: data.segment_id,
-                segment_count: stream.n_segments,
+                segment_count: n_segments,
             });
         }
         if self.current_segment_id != data.segment_id {
@@ -307,7 +309,7 @@ impl StreamState {
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
 
-        let n_columns = usize::from(stream.n_columns);
+        let n_columns = usize::from(stream.n_columns());
         match self.columns.len().cmp(&n_columns) {
             Ordering::Less => return Ok(RowState::WaitingForMetadata),
             Ordering::Greater => {
@@ -319,11 +321,11 @@ impl StreamState {
             Ordering::Equal => {}
         }
 
-        let sample_size = usize::from(stream.sample_size);
+        let sample_size = usize::from(stream.sample_size());
         let expected_sample_size: usize = self
             .columns
             .iter()
-            .map(|column| column.get().data_type.size())
+            .map(|column| column.get().data_type().size())
             .sum();
         if expected_sample_size > sample_size {
             return Err(StreamDataError::ColumnsExceedSample {
@@ -365,23 +367,23 @@ impl StreamState {
 
         let next_sample = self.last_sample_number.value() + 1;
         let next_segment =
-            SegmentId::new(self.last_segment_id.value().wrapping_add(1) % stream.n_segments);
+            SegmentId::new(self.last_segment_id.value().wrapping_add(1) % n_segments);
 
         // Infer stale ring entries from backward timestamps within the same
         // device and clock sessions. Comparing across sessions would repeatedly
         // evict valid metadata after a reboot.
         if data.segment_id != self.last_segment_id
             && self.established
-            && device_metadata.get().session == self.last_session_id
+            && device.session() == self.last_session_id
         {
             let stale = self.segment(data.segment_id).is_some_and(|record| {
                 let seg = record.get();
-                seg.timeref_session == self.last_time_ref_session_id
-                    && seg.decimation != 0
-                    && seg.sampling_rate != 0
+                seg.timeref_session() == self.last_time_ref_session_id
+                    && seg.decimation() != 0
+                    && seg.sampling_rate() != 0
                     && {
                         let half_period =
-                            0.5 * f64::from(seg.decimation) / f64::from(seg.sampling_rate);
+                            0.5 * f64::from(seg.decimation()) / f64::from(seg.sampling_rate());
                         sample_time(seg, data.first.value()) < self.last_timestamp - half_period
                     }
             });
@@ -403,7 +405,7 @@ impl StreamState {
             // changes can also match this pattern. The batch uses the inferred
             // descriptor while discovery requests the real one.
             (None, Some(previous)) => {
-                let mut rolled = previous.get();
+                let mut rolled = previous.get().fields();
                 // Segments roll on whole seconds of the undecimated clock, on
                 // which output sample n sits at sample n * decimation.
                 let seconds_at = |sample: u64| {
@@ -429,17 +431,17 @@ impl StreamState {
         };
         let segment = segment_record.get();
 
-        let Some(new_rate) = segment_record.effective_rate() else {
+        let Some(new_rate) = effective_rate(&segment) else {
             return Err(StreamDataError::InvalidRate {
-                sampling_rate: segment.sampling_rate,
-                decimation: segment.decimation,
+                sampling_rate: segment.sampling_rate(),
+                decimation: segment.decimation(),
             });
         };
 
         let boundary = self.detect_boundary(
             data.first,
             sample_time(segment, data.first.value()),
-            device_metadata.get(),
+            device,
             segment,
             new_rate,
             is_segment_rollover,
@@ -457,13 +459,13 @@ impl StreamState {
 
         self.last_sample_number = last_sample_n;
         self.last_timestamp = sample_time(segment, last_sample_n.value() + 1);
-        self.last_session_id = device_metadata.get().session;
-        self.last_time_ref_session_id = segment.timeref_session;
-        self.last_segment_id = segment.segment_id;
+        self.last_session_id = device.session();
+        self.last_time_ref_session_id = segment.timeref_session();
+        self.last_segment_id = segment.segment_id();
         self.effective_rate = new_rate;
         self.established = true;
 
-        let key = StreamKey::new(route, stream.stream_id);
+        let key = StreamKey::new(route, self.stream_id);
         Ok(RowState::Validated(ScannedRows {
             key,
             boundary,
@@ -592,7 +594,7 @@ impl DeviceState {
         if self
             .metadata
             .as_ref()
-            .is_some_and(|device| stream_id.value() > device.get().n_streams)
+            .is_some_and(|device| stream_id.value() > device.get().n_streams())
         {
             // An impossible stream id means our device description is stale or
             // corrupt. Bootstrap the route again instead of retaining it.
@@ -622,16 +624,16 @@ impl DeviceState {
                 }
                 if let Some(previous) = self.metadata.take() {
                     let (old, new) = (previous.get(), incoming.get());
-                    if old.serial != new.serial {
+                    if old.serial() != new.serial() {
                         self.forget_all_metadata(global_generation);
-                    } else if old.session != new.session {
+                    } else if old.session() != new.session() {
                         // Keeping continuity state lets the first rows under the
                         // new metadata report a specific SessionChanged boundary.
                         for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
                         self.rediscover_metadata();
-                    } else if old.firmware != new.firmware {
+                    } else if old.firmware() != new.firmware() {
                         // A firmware change can alter a schema without changing
                         // the session or timeline, so it must explicitly end all
                         // current runs rather than relying on boundary detection.
@@ -644,7 +646,7 @@ impl DeviceState {
                 let Some(incoming) = StreamRecord::new(record) else {
                     return;
                 };
-                let stream_id = incoming.get().stream_id;
+                let stream_id = incoming.get().stream_id();
                 if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
@@ -668,7 +670,7 @@ impl DeviceState {
                     return;
                 };
                 let segment = incoming.get();
-                let (stream_id, segment_id) = (segment.stream_id, segment.segment_id);
+                let (stream_id, segment_id) = (segment.stream_id(), segment.segment_id());
                 if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
@@ -689,7 +691,7 @@ impl DeviceState {
                     return;
                 };
                 let column = incoming.get();
-                let (stream_id, index) = (column.stream_id, column.index.index());
+                let (stream_id, index) = (column.stream_id(), column.index().index());
                 if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
@@ -730,7 +732,7 @@ impl DeviceState {
             }
             packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
                 if let Some(device) = &self.metadata {
-                    if device.get().session != session && !self.ignore_session {
+                    if device.get().session() != session && !self.ignore_session {
                         for stream in self.streams.iter_mut().flatten() {
                             stream.invalidate_metadata();
                         }
@@ -830,7 +832,7 @@ impl DeviceState {
     /// Returns selectors for every piece of metadata this route still lacks.
     fn missing_metadata(&self) -> Vec<wire::MetadataSelector> {
         match self.metadata.as_ref() {
-            Some(device) => (1..=device.get().n_streams)
+            Some(device) => (1..=device.get().n_streams())
                 .flat_map(|stream_id| {
                     match self
                         .streams
@@ -851,7 +853,7 @@ impl DeviceState {
             return None;
         }
         let device = self.metadata.as_ref()?.clone();
-        let streams = (1..=device.get().n_streams)
+        let streams = (1..=device.get().n_streams())
             .map(|stream_id| {
                 let id = StreamId::new(stream_id);
                 let stream = self
@@ -1019,10 +1021,11 @@ pub(crate) struct ScannedRows<'a> {
     columns: &'a [ColumnRecord],
 }
 
-/// One column of a decoded batch, with its byte offset within a sample, the
-/// buffer its values land in, and its metadata.
+/// One column of a decoded batch, with its byte offset within a sample, its
+/// wire type, the buffer its values land in, and its metadata.
 struct DecodableColumn<'a> {
     offset: usize,
+    data_type: wire::DataType,
     buffer_type: BufferType,
     metadata: &'a ColumnRecord,
 }
@@ -1070,14 +1073,16 @@ impl ScannedRows<'_> {
         self.columns
             .iter()
             .scan(0usize, |offset, metadata| {
+                let data_type = metadata.get().data_type();
                 let at = *offset;
-                *offset += metadata.get().data_type.size();
-                Some((at, metadata))
+                *offset += data_type.size();
+                Some((at, data_type, metadata))
             })
-            .filter_map(|(offset, metadata)| {
+            .filter_map(|(offset, data_type, metadata)| {
                 Some(DecodableColumn {
                     offset,
-                    buffer_type: decoded_buffer_type(metadata.get().data_type)?,
+                    data_type,
+                    buffer_type: decoded_buffer_type(data_type)?,
                     metadata,
                 })
             })
@@ -1124,10 +1129,7 @@ impl RowSource for ScannedRows<'_> {
             tail.push_row(
                 SampleNumber::new(self.first_sample_n.value() + row as u32),
                 self.decodable_columns().map(|column| {
-                    ColumnData::from_le_bytes(
-                        &raw[column.offset..],
-                        column.metadata.get().data_type,
-                    )
+                    ColumnData::from_le_bytes(&raw[column.offset..], column.data_type)
                 }),
             );
         }

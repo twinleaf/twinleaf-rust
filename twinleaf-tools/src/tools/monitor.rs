@@ -986,9 +986,12 @@ impl MonitorState {
 }
 
 fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
-    buffer
-        .column_metadata(key)
-        .map(|metadata| (metadata.description.to_string(), metadata.units.to_string()))
+    buffer.column_metadata(key).map(|metadata| {
+        (
+            metadata.description().to_string(),
+            metadata.units().to_string(),
+        )
+    })
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -1320,13 +1323,13 @@ fn build_left_lines(
     app.view.desc_width = latest
         .values()
         .flat_map(|row| row.schema().iter())
-        .map(|column| column.metadata().description.len())
+        .map(|column| column.metadata().description().len())
         .max()
         .unwrap_or(0);
     app.view.units_width = latest
         .values()
         .flat_map(|row| row.schema().iter())
-        .map(|column| column.metadata().units.len())
+        .map(|column| column.metadata().units().len())
         .max()
         .unwrap_or(0);
 
@@ -1352,10 +1355,10 @@ fn build_left_lines(
         };
 
         let header_text = if let Some(d) = dev {
-            if d.serial.is_empty() {
-                d.name.to_string()
+            if d.serial().is_empty() {
+                d.name().to_string()
             } else {
-                format!("{}  Serial: {}", d.name, d.serial)
+                format!("{}  Serial: {}", d.name(), d.serial())
             }
         } else {
             format!("<{}>", route)
@@ -1438,16 +1441,16 @@ fn build_left_lines(
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(row.stream().name, metadata.name, val_f64)
+                        .get_value_color(row.stream().name(), metadata.name(), val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
-                    let mut desc = metadata.description.to_string();
+                    let mut desc = metadata.description().to_string();
                     if desc.len() < app.view.desc_width {
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
-                    let units = metadata.units.to_string();
+                    let units = metadata.units().to_string();
                     let padded_units = if app.view.units_width > 0 && !units.is_empty() {
                         format!("{:>width$}", units, width = app.view.units_width)
                     } else if app.view.units_width > 0 {
@@ -1457,7 +1460,7 @@ fn build_left_lines(
                     };
 
                     let (pipe_glyph, pipe_style) = if is_current_stream {
-                        ("┃ ", Style::default().fg(stream_color(row.stream().name)))
+                        ("┃ ", Style::default().fg(stream_color(row.stream().name())))
                     } else {
                         ("│ ", Style::default().fg(Color::DarkGray))
                     };

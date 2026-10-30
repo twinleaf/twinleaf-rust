@@ -75,12 +75,25 @@ impl std::fmt::Display for ColumnKey {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECORD_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns how many records this thread has checked to retain, so tests can
+/// bound the checks a packet costs.
+#[cfg(test)]
+pub(crate) fn record_parses() -> u64 {
+    RECORD_PARSES.with(std::cell::Cell::get)
+}
+
 macro_rules! metadata_record {
-    ($record:ident, $kind:ident) => {
+    ($record:ident, $kind:ident, $view:ident) => {
         /// One retained metadata descriptor, holding the bare wire record
-        /// without the `[type][flags]` header of a METADATA packet. Equality
-        /// is byte equality, so a field a newer device adds still counts as a
-        /// change.
+        /// without the `[type][flags]` header of a METADATA packet. It is
+        /// checked once, when retained, and read in place after that.
+        /// Equality is byte equality, so a field a newer device adds still
+        /// counts as a change.
         #[derive(Clone, PartialEq, Eq)]
         pub(crate) struct $record(Arc<[u8]>);
 
@@ -88,7 +101,9 @@ macro_rules! metadata_record {
             /// Copies `record` if it parses as this descriptor, or returns
             /// `None`.
             pub(crate) fn new(record: &[u8]) -> Option<Self> {
-                wire::$kind::parse(record)?;
+                #[cfg(test)]
+                RECORD_PARSES.with(|parses| parses.set(parses.get() + 1));
+                wire::$view::new_checked(record)?;
                 Some(Self(Arc::from(record)))
             }
 
@@ -102,8 +117,9 @@ macro_rules! metadata_record {
                 Self::new(&buf[..len])
             }
 
-            pub(crate) fn get(&self) -> wire::$kind<'_> {
-                wire::$kind::parse(&self.0).expect("record parsed when retained")
+            /// Returns a view that reads the record's fields in place.
+            pub(crate) fn get(&self) -> wire::$view<'_> {
+                wire::$view::new_unchecked(&self.0)
             }
 
             /// Encodes the descriptor as an UPDATE broadcast to `routing`,
@@ -126,19 +142,25 @@ macro_rules! metadata_record {
     };
 }
 
-metadata_record!(DeviceRecord, Device);
-metadata_record!(StreamRecord, Stream);
-metadata_record!(SegmentRecord, Segment);
-metadata_record!(ColumnRecord, Column);
+metadata_record!(DeviceRecord, Device, DeviceView);
+metadata_record!(StreamRecord, Stream, StreamView);
+metadata_record!(SegmentRecord, Segment, SegmentView);
+metadata_record!(ColumnRecord, Column, ColumnView);
 
 impl SegmentRecord {
     /// Returns the sample rate in hertz after decimation,
     /// `sampling_rate / decimation`, or `None` if either is zero.
     pub(crate) fn effective_rate(&self) -> Option<f64> {
-        let segment = self.get();
-        (segment.sampling_rate != 0 && segment.decimation != 0)
-            .then(|| f64::from(segment.sampling_rate) / f64::from(segment.decimation))
+        effective_rate(&self.get())
     }
+}
+
+/// Returns the sample rate in hertz after decimation of a segment already
+/// parsed, as [`SegmentRecord::effective_rate`] does.
+pub(crate) fn effective_rate(segment: &wire::SegmentView<'_>) -> Option<f64> {
+    let (sampling_rate, decimation) = (segment.sampling_rate(), segment.decimation());
+    (sampling_rate != 0 && decimation != 0)
+        .then(|| f64::from(sampling_rate) / f64::from(decimation))
 }
 
 /// A request for metadata one route still lacks, as selectors for a
@@ -214,30 +236,30 @@ impl StreamMetadataSnapshot {
     }
 
     /// Returns the device descriptor, borrowed from the retained wire record.
-    pub fn device(&self) -> wire::Device<'_> {
+    pub fn device(&self) -> wire::DeviceView<'_> {
         self.0.device.get()
     }
 
     /// Returns the stream descriptor, borrowed from the retained wire record.
-    pub fn stream(&self) -> wire::Stream<'_> {
+    pub fn stream(&self) -> wire::StreamView<'_> {
         self.0.stream.get()
     }
 
     /// Returns the current segment's descriptor, borrowed from its retained
     /// record.
-    pub fn segment(&self) -> wire::Segment<'_> {
+    pub fn segment(&self) -> wire::SegmentView<'_> {
         self.0.segment.get()
     }
 
     /// Returns the stream's columns in index order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
         self.0.columns.iter().map(ColumnRecord::get)
     }
 
     /// Returns the column whose index is `id`, or `None` if the schema has no
     /// such column.
-    pub fn column(&self, id: ColumnId) -> Option<wire::Column<'_>> {
-        self.columns().find(|column| column.index == id)
+    pub fn column(&self, id: ColumnId) -> Option<wire::ColumnView<'_>> {
+        self.columns().find(|column| column.index() == id)
     }
 
     /// Returns the column records in index order, as retained.
@@ -303,7 +325,7 @@ impl DeviceMetadataSnapshot {
     }
 
     /// Returns the device descriptor, borrowed from the retained wire record.
-    pub fn device(&self) -> wire::Device<'_> {
+    pub fn device(&self) -> wire::DeviceView<'_> {
         self.0.device.get()
     }
 
@@ -401,7 +423,7 @@ mod tests {
         };
         let record = DeviceRecord::encode(fields).expect("a short record fits");
 
-        assert_eq!(record.get(), fields);
+        assert_eq!(record.get().fields(), fields);
         assert_eq!(
             record.update(route("/1")).unwrap().as_bytes(),
             Packet::metadata(

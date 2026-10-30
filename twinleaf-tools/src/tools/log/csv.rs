@@ -48,8 +48,8 @@ impl CsvOutput {
             return Ok(());
         }
         let is_match = match &self.stream {
-            StreamSel::Id(id) => batch.stream().stream_id.value() == *id,
-            StreamSel::Name(name) => batch.stream().name == name,
+            StreamSel::Id(id) => batch.stream().stream_id().value() == *id,
+            StreamSel::Name(name) => batch.stream().name() == name,
         };
         if !is_match {
             return Ok(());
@@ -72,7 +72,7 @@ impl CsvOutput {
                 batch
                     .schema()
                     .iter()
-                    .map(|series| series.metadata().name.to_string()),
+                    .map(|series| series.metadata().name().to_string()),
             );
 
             let route_label = route_filename_label(&self.route);
@@ -80,7 +80,7 @@ impl CsvOutput {
                 "{}.{}.{}.csv",
                 self.prefix,
                 route_label,
-                filename_component(batch.stream().name)
+                filename_component(batch.stream().name())
             );
             if !self.force && std::path::Path::new(&path).exists() {
                 return Err(eyre::eyre!("output {} already exists", path)
@@ -93,7 +93,7 @@ impl CsvOutput {
                 .open(&path)
                 .wrap_err_with(|| format!("could not open {}", path))?;
             self.writer = Some(BufWriter::new(file));
-            self.stream_name = Some(batch.stream().name.to_string());
+            self.stream_name = Some(batch.stream().name().to_string());
             self.path = Some(path);
 
             let output_path = self.path.as_deref().unwrap_or_default();

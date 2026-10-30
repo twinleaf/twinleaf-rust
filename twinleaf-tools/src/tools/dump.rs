@@ -108,7 +108,7 @@ impl Printer {
             batch
                 .schema()
                 .iter()
-                .any(|series| f.matches(&route, batch.stream().name, series.metadata().name))
+                .any(|series| f.matches(&route, batch.stream().name(), series.metadata().name()))
         });
         if !matched {
             return false;

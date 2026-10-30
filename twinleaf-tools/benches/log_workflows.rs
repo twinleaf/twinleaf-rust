@@ -116,7 +116,7 @@ fn discover_csv_target(input: &Path) -> eyre::Result<String> {
         let packet = packet?;
         parser.push_packet(&packet)?;
         if let Some(batch) = parser.pop_batch() {
-            let stream_id = batch.stream().stream_id;
+            let stream_id = batch.stream().stream_id();
             return Ok(if batch.route().is_empty() {
                 format!("/{stream_id}")
             } else {

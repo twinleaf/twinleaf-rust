@@ -224,7 +224,7 @@ mod tests {
                 ),
                 [(
                     self.column_metadata.clone(),
-                    buffer_type(self.column_metadata.get().data_type),
+                    buffer_type(self.column_metadata.get().data_type()),
                 )],
                 rows.len(),
             );
@@ -298,7 +298,7 @@ mod tests {
             SegmentRecord::encode(wire::Segment {
                 segment_id,
                 start_time,
-                ..fx.segment.get()
+                ..fx.segment.get().fields()
             })
             .unwrap()
         };

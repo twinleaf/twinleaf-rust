@@ -706,7 +706,7 @@ mod tests {
             .stream(crate::proto::StreamId::new(1))
             .expect("the described stream")
             .segment()
-            .segment_id
+            .segment_id()
             .value()
     }
 
@@ -870,13 +870,13 @@ mod tests {
         let root = DeviceRoute::root();
         describe(&proxy, root, 1);
         wait_for(&events, |event| {
-            snapshot(event).is_some_and(|snapshot| snapshot.device().session.value() == 1)
+            snapshot(event).is_some_and(|snapshot| snapshot.device().session().value() == 1)
         });
 
         proxy.send(Packet::heartbeat_session(2, root));
         describe(&proxy, root, 2);
         wait_for(&events, |event| {
-            snapshot(event).is_some_and(|snapshot| snapshot.device().session.value() == 2)
+            snapshot(event).is_some_and(|snapshot| snapshot.device().session().value() == 2)
         });
     }
 

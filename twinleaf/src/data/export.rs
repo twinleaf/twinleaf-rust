@@ -268,9 +268,9 @@ impl TableSchema {
 
     fn matches(&self, batch: &SampleBatch, columns: &[&Series]) -> bool {
         self.key == batch.stream_key()
-            && self.device.get().serial == batch.device().serial
-            && self.stream.get().name == batch.stream().name
-            && self.stream.get().sample_size == batch.stream().sample_size
+            && self.device.get().serial() == batch.device().serial()
+            && self.stream.get().name() == batch.stream().name()
+            && self.stream.get().sample_size() == batch.stream().sample_size()
             && self.columns.len() == columns.len()
             && self
                 .columns
@@ -374,7 +374,7 @@ impl Hdf5Appender {
         if let Some(boundary) = batch.boundary() {
             log::debug!(
                 "[{}] sample_n={} boundary={:?}",
-                batch.stream().name,
+                batch.stream().name(),
                 batch.first_sample().unwrap_or(SampleNumber::new(0)),
                 boundary
             );
@@ -411,7 +411,7 @@ impl Hdf5Appender {
 
         let key = batch.stream_key();
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
-        let stream_name = batch.stream().name.to_string();
+        let stream_name = batch.stream().name().to_string();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
@@ -425,7 +425,7 @@ impl Hdf5Appender {
         let mut valid: Vec<&Series> = Vec::new();
         for col in batch.schema() {
             if let Some(f) = &self.filter {
-                if !f.matches(&key.route, &stream_name, col.metadata().name) {
+                if !f.matches(&key.route, &stream_name, col.metadata().name()) {
                     continue;
                 }
             }
@@ -471,7 +471,7 @@ impl Hdf5Appender {
             let mut fields = vec![(0, FieldSource::Sample), (8, FieldSource::Time)];
             for (i, col) in valid.iter().enumerate() {
                 let offset = 16 + 8 * i;
-                let name = col.metadata().name;
+                let name = col.metadata().name();
                 layout = match col.values() {
                     ColumnArray::F64(_) => layout.f64_field(name, offset as u64),
                     ColumnArray::I64(_) => layout.i64_field(name, offset as u64),
@@ -580,23 +580,23 @@ impl Hdf5Appender {
     ) -> Vec<(&'static str, AttrValue)> {
         let meta = batch.segment();
         let mut attributes = vec![
-            ("sampling_rate", AttrValue::U32(meta.sampling_rate)),
-            ("decimation", AttrValue::U32(meta.decimation)),
-            ("start_time", AttrValue::U32(meta.start_time)),
-            ("filter_cutoff", AttrValue::F32(meta.filter_cutoff)),
-            ("session_id", batch.device().session.value().attr()),
-            ("stream_id", batch.stream().stream_id.value().attr()),
-            ("stream_name", string_attr(batch.stream().name)),
-            ("device_serial", string_attr(batch.device().serial)),
-            ("firmware_hash", string_attr(batch.device().firmware)),
+            ("sampling_rate", AttrValue::U32(meta.sampling_rate())),
+            ("decimation", AttrValue::U32(meta.decimation())),
+            ("start_time", AttrValue::U32(meta.start_time())),
+            ("filter_cutoff", AttrValue::F32(meta.filter_cutoff())),
+            ("session_id", batch.device().session().value().attr()),
+            ("stream_id", batch.stream().stream_id().value().attr()),
+            ("stream_name", string_attr(batch.stream().name())),
+            ("device_serial", string_attr(batch.device().serial())),
+            ("firmware_hash", string_attr(batch.device().firmware())),
         ];
         if let Some(id) = self.runs.index(*key) {
             attributes.push(("run_id", AttrValue::U64(id)));
         }
-        attributes.push(("time_ref_epoch", meta.epoch.value().attr()));
-        attributes.push(("filter_type", meta.filter_type.value().attr()));
-        if !meta.timeref_serial.is_empty() {
-            attributes.push(("time_ref_serial", string_attr(meta.timeref_serial)));
+        attributes.push(("time_ref_epoch", meta.epoch().value().attr()));
+        attributes.push(("filter_type", meta.filter_type().value().attr()));
+        if !meta.timeref_serial().is_empty() {
+            attributes.push(("time_ref_serial", string_attr(meta.timeref_serial())));
         }
         attributes
     }
@@ -629,8 +629,8 @@ fn field_metadata_attributes(valid: &[&Series]) -> [(&'static str, AttrValue); 2
         "Time in seconds".to_string(),
     ];
     for col in valid {
-        units.push(col.metadata().units.to_string());
-        descriptions.push(col.metadata().description.to_string());
+        units.push(col.metadata().units().to_string());
+        descriptions.push(col.metadata().description().to_string());
     }
     [
         ("units", AttrValue::VarLenStringArray(units)),
@@ -760,7 +760,7 @@ mod tests {
                 })
                 .unwrap(),
             ),
-            [(column.clone(), buffer_type(column.get().data_type))],
+            [(column.clone(), buffer_type(column.get().data_type()))],
             1,
         );
         builder.push_row(SampleNumber::new(0), [ColumnData::Float(1.0)]);

@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = device.samples();
     let batch = samples.recv_timeout(Duration::from_secs(5))?;
 
-    println!("{name}: {} rows from {}", batch.len(), batch.stream().name);
+    println!("{name}: {} rows from {}", batch.len(), batch.stream().name());
     Ok(())
 }
 ```
