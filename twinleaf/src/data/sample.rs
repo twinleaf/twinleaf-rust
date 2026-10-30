@@ -204,6 +204,7 @@ impl ColumnBuilder {
     ///
     /// Panics if the cell's variant does not match the column in any other
     /// way.
+    #[cfg(test)]
     fn push_data(&mut self, v: &ColumnData) {
         match (self, v) {
             (Self::F64(d), ColumnData::Float(x)) => d.push(*x),
@@ -213,6 +214,52 @@ impl ColumnBuilder {
             // Dropping a cell decoded for another column type would desync this
             // column from its batch's rows.
             (this, v) => panic!("cannot push {v:?} into a {:?} column", this.buffer_type()),
+        }
+    }
+
+    /// Appends this column's value from every sample in `samples`, which packs
+    /// samples `stride` bytes apart. The value sits `offset` bytes into each
+    /// sample, encoded as `data_type`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data_type` does not decode to this column's variant, or if
+    /// the value runs past the end of a sample.
+    fn extend_packed(
+        &mut self,
+        data_type: wire::DataType,
+        samples: &[u8],
+        stride: usize,
+        offset: usize,
+    ) {
+        use wire::DataType;
+        // One loop per wire type, so each value is a plain load, with no
+        // per-value dispatch on its type.
+        macro_rules! decode {
+            ($values:expr, $wire:ty => $stored:ty) => {
+                $values.extend(samples.chunks_exact(stride).map(|sample| {
+                    let bytes = &sample[offset..offset + size_of::<$wire>()];
+                    <$stored>::from(<$wire>::from_le_bytes(
+                        bytes.try_into().expect("a value of its own size"),
+                    ))
+                }))
+            };
+        }
+        match (self, data_type) {
+            (Self::F64(values), DataType::F32) => decode!(values, f32 => f64),
+            (Self::F64(values), DataType::F64) => decode!(values, f64 => f64),
+            (Self::I64(values), DataType::I8) => decode!(values, i8 => i64),
+            (Self::I64(values), DataType::I16) => decode!(values, i16 => i64),
+            (Self::I64(values), DataType::I32) => decode!(values, i32 => i64),
+            (Self::I64(values), DataType::I64) => decode!(values, i64 => i64),
+            (Self::U64(values), DataType::U8) => decode!(values, u8 => u64),
+            (Self::U64(values), DataType::U16) => decode!(values, u16 => u64),
+            (Self::U64(values), DataType::U32) => decode!(values, u32 => u64),
+            (Self::U64(values), DataType::U64) => decode!(values, u64 => u64),
+            (this, data_type) => panic!(
+                "cannot decode {data_type} into a {:?} column",
+                this.buffer_type()
+            ),
         }
     }
 
@@ -548,6 +595,7 @@ impl SampleBatchBuilder {
     ///
     /// Panics if `cells` yields too few values or a value its column cannot
     /// hold. Debug builds also panic if it yields too many.
+    #[cfg(test)]
     pub(super) fn push_row(
         &mut self,
         n: SampleNumber,
@@ -560,6 +608,35 @@ impl SampleBatchBuilder {
             values.push_data(&cells.next().expect("one cell per column"));
         }
         debug_assert!(cells.next().is_none(), "one cell per column");
+    }
+
+    /// Appends every sample in `samples`, packed `stride` bytes apart and
+    /// numbered from `first`. `layout` gives each column's offset within a
+    /// sample and wire type, in schema order. Each column is decoded in one
+    /// pass over the samples.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layout` gives fewer entries than there are columns, or an
+    /// entry its column cannot hold.
+    pub(super) fn push_packed(
+        &mut self,
+        first: SampleNumber,
+        samples: &[u8],
+        stride: usize,
+        layout: impl IntoIterator<Item = (usize, wire::DataType)>,
+    ) {
+        let rows = samples.len() / stride;
+        for row in 0..rows {
+            let n = SampleNumber::new(first.value() + row as u32);
+            self.sample_numbers.push(n);
+            self.timestamps.push(self.clock.time_at(n.value() + 1));
+        }
+        let mut layout = layout.into_iter();
+        for (_, values) in &mut self.columns {
+            let (offset, data_type) = layout.next().expect("one layout entry per column");
+            values.extend_packed(data_type, samples, stride, offset);
+        }
     }
 
     /// Returns a frozen copy of `rows`, leaving the builder accumulating. The

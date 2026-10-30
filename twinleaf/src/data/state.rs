@@ -9,8 +9,7 @@ use super::metadata::{
     DeviceRecord, MetadataQuery, SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord,
 };
 use super::sample::{
-    sample_time, BatchContext, BoundaryReason, ColumnData, Generations, RowSource,
-    SampleBatchBuilder,
+    sample_time, BatchContext, BoundaryReason, Generations, RowSource, SampleBatchBuilder,
 };
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
@@ -1123,15 +1122,12 @@ impl RowSource for ScannedRows<'_> {
     }
 
     fn append_to(&self, tail: &mut SampleBatchBuilder) {
-        for row in 0..self.row_count {
-            let start = row * self.sample_size;
-            let raw = &self.encoded[start..start + self.sample_size];
-            tail.push_row(
-                SampleNumber::new(self.first_sample_n.value() + row as u32),
-                self.decodable_columns().map(|column| {
-                    ColumnData::from_le_bytes(&raw[column.offset..], column.data_type)
-                }),
-            );
-        }
+        tail.push_packed(
+            self.first_sample_n,
+            &self.encoded[..self.row_count * self.sample_size],
+            self.sample_size,
+            self.decodable_columns()
+                .map(|column| (column.offset, column.data_type)),
+        );
     }
 }
