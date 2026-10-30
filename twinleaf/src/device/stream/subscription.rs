@@ -235,10 +235,17 @@ impl Scope {
 
 /// The sending end of a queue that counts the items it had no room for, and
 /// keeps one place for the end.
+///
+/// A [latest-value](Self::latest) lane holds one item, and a new item takes
+/// the place of one still unread instead of being counted as missed.
 pub(crate) struct Lane<T> {
     items: flume::Sender<Queued<T>>,
     room: usize,
     skipped: u64,
+    /// A latest-value lane's own hold on its queue, through which it takes
+    /// back an unread item to make room for a newer one. `None` for a FIFO
+    /// lane.
+    unread: Option<flume::Receiver<Queued<T>>>,
 }
 
 impl<T> Lane<T> {
@@ -249,13 +256,41 @@ impl<T> Lane<T> {
             items,
             room: capacity,
             skipped: 0,
+            unread: None,
         };
+        (lane, received)
+    }
+
+    /// Returns a lane that holds only the newest item, and its receiving
+    /// end. Its reader never lags. One that falls behind receives the newest
+    /// item next. It suits state, where each item is a whole value and the
+    /// latest one is what matters.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the device state subscriptions will use it")
+    )]
+    pub(crate) fn latest() -> (Lane<T>, flume::Receiver<Queued<T>>) {
+        let (mut lane, received) = Lane::new(1);
+        lane.unread = Some(received.clone());
         (lane, received)
     }
 
     /// Sends one item, or counts it as missed if the queue is full. Returns
     /// `false` once the receiver is gone.
     pub(crate) fn send(&mut self, item: T) -> bool {
+        if let Some(unread) = &self.unread {
+            // The lane's own hold keeps the queue connected, so the reader
+            // is gone once that hold is the only receiver left.
+            if self.items.receiver_count() <= 1 {
+                return false;
+            }
+            // The pump is the only sender, so once the unread item is taken
+            // back, or the reader takes it first, there is room.
+            if self.items.len() >= self.room {
+                let _ = unread.try_recv();
+            }
+            return self.push(Queued::Item(item)).is_ok();
+        }
         if !self.report_lag() {
             return false;
         }
@@ -310,7 +345,23 @@ pub(super) struct Sink<T> {
 
 impl<T> Sink<T> {
     pub(super) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
-        let (lane, items) = Lane::new(capacity);
+        Self::with_lane(Lane::new(capacity), scope)
+    }
+
+    /// Returns a sink whose [latest-value](Lane::latest) lane holds only the
+    /// newest item, and its receiver.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the device state subscriptions will use it")
+    )]
+    pub(super) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
+        Self::with_lane(Lane::latest(), scope)
+    }
+
+    fn with_lane(
+        (lane, items): (Lane<T>, flume::Receiver<Queued<T>>),
+        scope: Scope,
+    ) -> (Sink<T>, Receiver<T>) {
         let (lifeline, alive) = oneshot::channel();
         let receiver = Receiver {
             items,
