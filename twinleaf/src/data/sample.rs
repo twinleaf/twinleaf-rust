@@ -81,13 +81,6 @@ impl ColumnData {
             DataType::U8 => ColumnData::UInt(data[0].into()),
             DataType::I16 => ColumnData::Int(i16::from_le_bytes([data[0], data[1]]).into()),
             DataType::U16 => ColumnData::UInt(u16::from_le_bytes([data[0], data[1]]).into()),
-            DataType::I24 => {
-                let sign = if data[2] & 0x80 == 0 { 0 } else { 0xff };
-                ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], sign]).into())
-            }
-            DataType::U24 => {
-                ColumnData::UInt(u32::from_le_bytes([data[0], data[1], data[2], 0]).into())
-            }
             DataType::I32 => {
                 ColumnData::Int(i32::from_le_bytes([data[0], data[1], data[2], data[3]]).into())
             }
@@ -1069,18 +1062,15 @@ mod tests {
     use crate::proto::data::DataType;
     use crate::proto::StreamId;
 
+    /// No device sends 24-bit columns, so they are not decoded. Their type
+    /// codes still parse, and the parser steps over their bytes.
     #[test]
-    fn signed_int24_values_are_sign_extended() {
-        for (bytes, expected) in [
-            ([0x00, 0x00, 0x00], 0),
-            ([0xff, 0xff, 0x7f], 8_388_607),
-            ([0xff, 0xff, 0xff], -1),
-            ([0x00, 0x00, 0x80], -8_388_608),
-        ] {
-            let ColumnData::Int(value) = ColumnData::from_le_bytes(&bytes, DataType::I24) else {
-                panic!("expected an integer value");
-            };
-            assert_eq!(value, expected);
+    fn int24_values_are_not_decoded() {
+        for data_type in [DataType::I24, DataType::U24] {
+            assert!(matches!(
+                ColumnData::from_le_bytes(&[0xff, 0xff, 0xff], data_type),
+                ColumnData::Unknown
+            ));
         }
     }
 

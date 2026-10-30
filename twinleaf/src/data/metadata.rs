@@ -349,12 +349,8 @@ pub(crate) fn buffer_type(data_type: DataType) -> BufferType {
 pub(crate) fn decoded_buffer_type(data_type: DataType) -> Option<BufferType> {
     Some(match data_type {
         DataType::F32 | DataType::F64 => BufferType::Float,
-        DataType::I8 | DataType::I16 | DataType::I24 | DataType::I32 | DataType::I64 => {
-            BufferType::Int
-        }
-        DataType::U8 | DataType::U16 | DataType::U24 | DataType::U32 | DataType::U64 => {
-            BufferType::UInt
-        }
+        DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => BufferType::Int,
+        DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => BufferType::UInt,
         _ => return None,
     })
 }
