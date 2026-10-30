@@ -108,7 +108,7 @@ impl Printer {
             batch
                 .schema()
                 .columns()
-                .any(|column| f.matches(&route, batch.stream().name(), column.name()))
+                .any(|column| f.matches(&route, batch.schema().stream().name(), column.name()))
         });
         if !matched {
             return false;
@@ -154,13 +154,13 @@ fn print_batch_meta(batch: &SampleBatch) {
     if let Some(boundary) = batch.boundary() {
         println!("# {} BOUNDARY {:?}", route, boundary);
         if !boundary.is_continuous() {
-            println!("# {} DEVICE {:?}", route, batch.device());
-            println!("# {} STREAM {:?}", route, batch.stream());
+            println!("# {} DEVICE {:?}", route, batch.metadata().device());
+            println!("# {} STREAM {:?}", route, batch.schema().stream());
             for column in batch.schema().columns() {
                 println!("# {} COLUMN {:?}", route, column);
             }
         }
-        println!("# {} SEGMENT {:?}", route, batch.segment());
+        println!("# {} SEGMENT {:?}", route, batch.metadata().segment());
     }
 }
 

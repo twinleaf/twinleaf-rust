@@ -491,7 +491,7 @@ impl HealthState {
 
     fn handle_batch(&mut self, batch: SampleBatch, now: Instant) {
         let route = batch.route();
-        let sid = batch.stream().stream_id();
+        let sid = batch.stream_key().stream_id;
 
         if let Some(filter) = &self.cli.streams {
             if !filter.contains(&sid.value()) {
@@ -501,25 +501,30 @@ impl HealthState {
 
         let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
-            name: batch.stream().name().to_string(),
+            name: batch.schema().stream().name().to_string(),
             ..Default::default()
         });
 
-        st.name = batch.stream().name().to_string();
+        st.name = batch.schema().stream().name().to_string();
         if st.metadata.is_none() || batch.boundary().is_some() {
             st.metadata = Some(batch.metadata().clone());
         }
 
         if let Some(boundary) = batch.boundary() {
-            self.handle_boundary(boundary, &route, batch.stream().name(), sid);
+            self.handle_boundary(boundary, &route, batch.schema().stream().name(), sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();
         for row in batch.iter() {
-            if st.last_n.map(|n| row.n() != n).unwrap_or(true) {
+            if st.last_n.map(|n| row.sample_number() != n).unwrap_or(true) {
                 st.last_seen = Some(now);
             }
-            st.on_sample(row.n(), row.timestamp_end(), now, self.cli.jitter_window);
+            st.on_sample(
+                row.sample_number(),
+                row.timestamp_end(),
+                now,
+                self.cli.jitter_window,
+            );
         }
     }
 
@@ -1018,7 +1023,7 @@ fn draw_detail_pane(
         )
     });
     let stream_row = st.metadata.as_ref().map(|metadata| {
-        let stream = metadata.stream();
+        let stream = metadata.schema().stream();
         (
             stream.name().to_string(),
             vec![
@@ -1099,9 +1104,9 @@ fn draw_detail_pane(
     meta_lines.extend(flow(
         "columns",
         (None, 0),
-        st.metadata
-            .as_ref()
-            .map_or_else(Vec::new, |metadata| column_cells(metadata.columns())),
+        st.metadata.as_ref().map_or_else(Vec::new, |metadata| {
+            column_cells(metadata.schema().columns())
+        }),
         inner_w,
     ));
     meta_lines.push(Line::default());

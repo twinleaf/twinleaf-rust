@@ -347,7 +347,6 @@ mod tests {
     use crate::data::buffer::Buffer;
     use crate::data::continuity::{BoundaryClass, BoundaryReason, Generations};
     use crate::data::fixtures;
-    use crate::data::metadata::ColumnKey;
     use crate::data::sample::ColumnData;
     use crate::data::state::StreamDataError;
     use crate::proto::data as wire;
@@ -800,7 +799,7 @@ mod tests {
         // 10 Hz sampled, decimated by 3: the device switches at undecimated
         // sample 20 (t = 2 s), which follows the 7th output sample.
         let batch = rollover_batch(10, 3, 7);
-        assert_eq!(batch.segment().start_time(), 2);
+        assert_eq!(batch.metadata().segment().start_time(), 2);
         assert!(matches!(
             batch.boundary().map(BoundaryReason::class),
             Some(BoundaryClass::Seamless)
@@ -812,7 +811,7 @@ mod tests {
         // 10 Hz sampled, decimated by 2: the switch at undecimated sample 10
         // (t = 1 s) is also the 5th output sample.
         let batch = rollover_batch(10, 2, 5);
-        assert_eq!(batch.segment().start_time(), 1);
+        assert_eq!(batch.metadata().segment().start_time(), 1);
         assert!(matches!(
             batch.boundary().map(BoundaryReason::class),
             Some(BoundaryClass::Seamless)
@@ -906,7 +905,10 @@ mod tests {
             .push_packet(&stream_data_packet_for(1, 0, 2))
             .expect("valid rows");
         let initial = parser.pop_batch().expect("the initial batch");
-        assert_eq!(initial.stream().stream_id(), crate::proto::StreamId::new(1));
+        assert_eq!(
+            initial.schema().stream().stream_id(),
+            crate::proto::StreamId::new(1)
+        );
         assert!(parser.pop_batch().is_none(), "stream 2 still accumulates");
 
         // A gap on stream 1 bumps the shared generations: stream 2's held rows
@@ -915,7 +917,10 @@ mod tests {
             .push_packet(&stream_data_packet_for(1, 10, 2))
             .expect("valid rows");
         let held = parser.pop_batch().expect("the flushed pre-bump batch");
-        assert_eq!(held.stream().stream_id(), crate::proto::StreamId::new(2));
+        assert_eq!(
+            held.schema().stream().stream_id(),
+            crate::proto::StreamId::new(2)
+        );
         assert_eq!(
             held.generations(),
             Generations {
@@ -926,7 +931,7 @@ mod tests {
         );
         let boundary_batch = parser.pop_batch().expect("the boundary batch");
         assert_eq!(
-            boundary_batch.stream().stream_id(),
+            boundary_batch.schema().stream().stream_id(),
             crate::proto::StreamId::new(1)
         );
         assert_eq!(
@@ -1103,6 +1108,7 @@ mod tests {
             buffer
                 .latest_row(&key)
                 .expect("the replacement row")
+                .metadata()
                 .device()
                 .serial(),
             "SN456"
@@ -1379,14 +1385,11 @@ mod tests {
         let key = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(STREAM_ID));
         let run = buffer.run(&key).expect("the new schema's run");
         assert_eq!(run.retained_rows(), 0..1);
-        assert_eq!(run.stream().sample_size(), 8);
+        let schema = run.metadata().schema();
+        assert_eq!(schema.stream().sample_size(), 8);
         assert_eq!(
-            buffer
-                .column_metadata(&ColumnKey::new(
-                    DeviceRoute::root(),
-                    crate::proto::StreamId::new(STREAM_ID),
-                    crate::proto::ColumnId::new(0),
-                ))
+            schema
+                .column(crate::proto::ColumnId::new(0))
                 .expect("the new column")
                 .data_type(),
             DataType::F64

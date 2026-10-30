@@ -8,7 +8,6 @@ use super::metadata::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSc
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
-use crate::tio;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 
@@ -568,37 +567,11 @@ impl SampleBatch {
         &self.timestamps
     }
 
-    /// Returns a borrowed view of the segment these rows were sampled in.
-    pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.context.metadata.segment()
-    }
-
-    /// Returns a borrowed view of the stream record these rows belong to.
-    pub fn stream(&self) -> wire::StreamView<'_> {
-        self.context.metadata.stream()
-    }
-
-    /// Returns a borrowed view of the record of the device that sent these
-    /// rows.
-    pub fn device(&self) -> wire::DeviceView<'_> {
-        self.context.metadata.device()
-    }
-
-    /// Returns this batch's metadata as a snapshot that holds no sample
-    /// arrays. Cloning it copies no records.
+    /// Returns this batch's metadata, the device and segment of its rows with
+    /// the schema of its run. Its accessors return borrowed views of the
+    /// records the parser retained, and cloning it copies no records.
     pub fn metadata(&self) -> &StreamMetadataSnapshot {
         &self.context.metadata
-    }
-
-    /// Encodes this batch's metadata as byte-faithful UPDATE packets, as
-    /// [`StreamMetadataSnapshot::metadata_packets`] does.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`EncodeError`](tio::packet::EncodeError) if a record is too
-    /// large for a packet.
-    pub fn metadata_packets(&self) -> Result<Vec<tio::Packet>, tio::packet::EncodeError> {
-        self.metadata().metadata_packets()
     }
 
     /// Returns the number of rows, which every column's length matches.
@@ -609,16 +582,6 @@ impl SampleBatch {
     /// Returns `true` if the batch carries no rows.
     pub fn is_empty(&self) -> bool {
         self.sample_numbers.is_empty()
-    }
-
-    /// Returns the first row's sample number, or `None` if the batch is empty.
-    pub fn first_sample(&self) -> Option<SampleNumber> {
-        self.sample_numbers.first().copied()
-    }
-
-    /// Returns the last row's sample number, or `None` if the batch is empty.
-    pub fn last_sample(&self) -> Option<SampleNumber> {
-        self.sample_numbers.last().copied()
     }
 
     /// Returns the schema shared by every batch of this batch's run. Its
@@ -682,26 +645,14 @@ pub struct SampleRow<'a> {
 
 impl<'a> SampleRow<'a> {
     /// Returns the row's sample number within its segment.
-    pub fn n(&self) -> SampleNumber {
+    pub fn sample_number(&self) -> SampleNumber {
         self.batch.sample_numbers[self.row]
-    }
-    /// Returns a borrowed view of the stream record this row belongs to.
-    pub fn stream(&self) -> wire::StreamView<'a> {
-        self.batch.stream()
-    }
-    /// Returns a borrowed view of the segment this row was sampled in.
-    pub fn segment(&self) -> wire::SegmentView<'a> {
-        self.batch.segment()
-    }
-    /// Returns a borrowed view of the record of the device that sent this
-    /// row.
-    pub fn device(&self) -> wire::DeviceView<'a> {
-        self.batch.device()
     }
     /// Returns the start of the sample's interval, in seconds after the
     /// segment's epoch.
     pub fn timestamp_begin(&self) -> f64 {
-        sample_time(self.segment(), self.n().value())
+        let segment = self.batch.metadata().segment();
+        sample_time(segment, self.sample_number().value())
     }
     /// Returns the end of the sample's interval, in seconds after the
     /// segment's epoch. It is the row's entry in [`SampleBatch::timestamps`].
@@ -726,7 +677,7 @@ impl std::fmt::Debug for SampleRow<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SampleRow")
             .field("row", &self.row)
-            .field("n", &self.n())
+            .field("sample_number", &self.sample_number())
             .field("timestamp_end", &self.timestamp_end())
             .field("values", &self.values().collect::<Vec<_>>())
             .finish_non_exhaustive()
@@ -735,18 +686,19 @@ impl std::fmt::Debug for SampleRow<'_> {
 
 impl std::fmt::Display for SampleRow<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let metadata = self.batch.metadata();
         write!(
             f,
             "SAMPLE({}:{}:{}) {:.6}",
-            self.device().session().value(),
-            self.stream().stream_id(),
-            self.segment().segment_id(),
+            metadata.device().session().value(),
+            metadata.stream_key().stream_id,
+            metadata.segment().segment_id(),
             self.timestamp_end()
         )?;
         for (column, value) in self.batch.schema().columns().zip(self.values()) {
             write!(f, " {}: {}", column.name(), value)?;
         }
-        write!(f, " [#{}]", self.n())
+        write!(f, " [#{}]", self.sample_number())
     }
 }
 
@@ -833,7 +785,7 @@ mod tests {
         let expected: Vec<f64> = batch
             .sample_numbers()
             .iter()
-            .map(|&n| sample_time(batch.segment(), n.value() + 1))
+            .map(|&n| sample_time(batch.metadata().segment(), n.value() + 1))
             .collect();
         assert_eq!(batch.timestamps(), expected);
         assert_eq!(batch.timestamps(), [0.25, 0.5, 0.75, 1.0]);

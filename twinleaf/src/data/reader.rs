@@ -4,7 +4,7 @@
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
 use super::continuity::{BoundaryClass, BoundaryReason};
-use super::metadata::{effective_rate, DeviceRecord, StreamKey, StreamMetadataSnapshot};
+use super::metadata::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
 use super::sample::{sample_time, RowSource, SampleBatch};
 use super::state::{DataError, ScannedRows};
@@ -59,7 +59,7 @@ const PROGRESS_BYTES: usize = 1024 * 1024;
 /// }
 /// for (stream, runs) in index.summary().streams() {
 ///     for run in runs {
-///         let (n, rate) = (run.sample_count(), run.rate_hz());
+///         let (n, rate) = (run.sample_count(), run.metadata().rate_hz());
 ///         println!("{stream} run {}: {n} samples at {rate} Hz", run.run());
 ///     }
 /// }
@@ -200,19 +200,10 @@ impl StreamSummary {
         self.opened_by
     }
 
-    /// Returns the stream record in effect for the whole run.
-    pub fn metadata(&self) -> wire::StreamView<'_> {
-        self.metadata.stream()
-    }
-
-    /// Returns the segment record the run began in.
-    pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.metadata.segment()
-    }
-
-    /// Returns every column of a sample, in schema order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
-        self.metadata.columns()
+    /// Returns the metadata of the run's first rows. Its schema holds for the
+    /// whole run, and its segment and rate are those the run began in.
+    pub fn metadata(&self) -> &StreamMetadataSnapshot {
+        &self.metadata
     }
 
     /// Returns the number of rows in this run alone.
@@ -230,13 +221,6 @@ impl StreamSummary {
     /// epoch, or `None` if the run counted no rows.
     pub fn last_timestamp(&self) -> Option<f64> {
         self.last_timestamp
-    }
-
-    /// Returns the output rate in hertz after decimation, or zero for a
-    /// segment whose rate or decimation is zero. The parser emits no rows from
-    /// such a segment.
-    pub fn rate_hz(&self) -> f64 {
-        effective_rate(&self.metadata.segment()).unwrap_or(0.0)
     }
 }
 
@@ -686,13 +670,13 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run(), 1);
         assert_eq!(runs[0].opened_by(), Some(BoundaryClass::Startup));
-        assert_eq!(runs[0].rate_hz(), 1.0);
+        assert_eq!(runs[0].metadata().rate_hz(), 1.0);
         assert_eq!(runs[0].sample_count(), 2);
         assert_eq!(runs[0].first_timestamp(), Some(1.0));
         assert_eq!(runs[0].last_timestamp(), Some(2.0));
         assert_eq!(runs[1].run(), 2);
         assert_eq!(runs[1].opened_by(), Some(BoundaryClass::Reconfig));
-        assert_eq!(runs[1].rate_hz(), 10.0);
+        assert_eq!(runs[1].metadata().rate_hz(), 10.0);
         assert_eq!(runs[1].sample_count(), 2);
         assert!((runs[1].first_timestamp().unwrap() - 0.3).abs() < 1e-9);
         assert!((runs[1].last_timestamp().unwrap() - 0.4).abs() < 1e-9);

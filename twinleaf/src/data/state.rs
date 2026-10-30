@@ -7,8 +7,8 @@
 use super::continuity::{BoundaryReason, Generations};
 use super::decode::{decode_samples, decodes};
 use super::metadata::{
-    effective_rate, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery,
-    SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamRecord, StreamSchema,
+    rate_hz, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord,
+    StreamKey, StreamMetadataSnapshot, StreamRecord, StreamSchema,
 };
 use super::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::proto::data as wire;
@@ -132,7 +132,7 @@ struct StreamTracker {
     last_timestamp: f64,
     last_session_id: SessionId,
     last_time_ref_session_id: SessionId,
-    effective_rate: f64,
+    rate_hz: f64,
 }
 
 impl StreamTracker {
@@ -151,7 +151,7 @@ impl StreamTracker {
             last_timestamp: 0.0,
             last_session_id: SessionId::new(0),
             last_time_ref_session_id: SessionId::new(0),
-            effective_rate: 0.0,
+            rate_hz: 0.0,
         }
     }
 
@@ -245,9 +245,9 @@ impl StreamTracker {
             });
         }
 
-        if (new_rate - self.effective_rate).abs() > 1e-9 {
+        if (new_rate - self.rate_hz).abs() > 1e-9 {
             return Some(BoundaryReason::RateChanged {
-                old_rate: self.effective_rate,
+                old_rate: self.rate_hz,
                 new_rate,
             });
         }
@@ -462,7 +462,7 @@ impl StreamTracker {
         };
         let segment = segment_record.get();
 
-        let Some(new_rate) = effective_rate(&segment) else {
+        let Some(new_rate) = rate_hz(&segment) else {
             return Err(StreamDataError::InvalidRate {
                 sampling_rate: segment.sampling_rate(),
                 decimation: segment.decimation(),
@@ -493,7 +493,7 @@ impl StreamTracker {
         self.last_session_id = device.session();
         self.last_time_ref_session_id = segment.timeref_session();
         self.last_segment_id = segment.segment_id();
-        self.effective_rate = new_rate;
+        self.rate_hz = new_rate;
         self.established = true;
 
         let schema = self

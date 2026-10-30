@@ -148,7 +148,7 @@ metadata_record!(ColumnRecord, Column, ColumnView);
 
 /// Returns the sample rate in hertz after decimation,
 /// `sampling_rate / decimation`, or `None` if either is zero.
-pub(crate) fn effective_rate(segment: &wire::SegmentView<'_>) -> Option<f64> {
+pub(crate) fn rate_hz(segment: &wire::SegmentView<'_>) -> Option<f64> {
     let (sampling_rate, decimation) = (segment.sampling_rate(), segment.decimation());
     (sampling_rate != 0 && decimation != 0)
         .then(|| f64::from(sampling_rate) / f64::from(decimation))
@@ -267,8 +267,9 @@ impl Eq for StreamSchema {}
 /// Point-in-time metadata for one routed stream. It holds the stream's
 /// schema, the record of the device that sent it, and its current segment.
 ///
-/// It is the owned counterpart of the borrowed protocol views a
-/// [`SampleBatch`](super::SampleBatch) returns. It holds no sample arrays,
+/// A [`SampleBatch`](super::SampleBatch), a [`Run`](super::Run) and a
+/// [`StreamSummary`](super::StreamSummary) each carry one, and reach the
+/// protocol views of their records through it. It holds no sample arrays,
 /// clones by pointer, and outlives the batch it came from.
 #[derive(Debug, Clone)]
 pub struct StreamMetadataSnapshot {
@@ -322,26 +323,17 @@ impl StreamMetadataSnapshot {
         self.device.get()
     }
 
-    /// Returns the stream descriptor, borrowed from the retained wire record.
-    pub fn stream(&self) -> wire::StreamView<'_> {
-        self.schema.stream()
-    }
-
     /// Returns the current segment's descriptor, borrowed from its retained
     /// record.
     pub fn segment(&self) -> wire::SegmentView<'_> {
         self.segment.get()
     }
 
-    /// Returns the stream's columns in index order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::ColumnView<'_>> + '_ {
-        self.schema.columns()
-    }
-
-    /// Returns the column whose index is `id`, or `None` if the schema has no
-    /// such column.
-    pub fn column(&self, id: ColumnId) -> Option<wire::ColumnView<'_>> {
-        self.schema.column(id)
+    /// Returns the segment's sample rate in hertz after decimation, or zero
+    /// for a segment whose rate or decimation is zero. The parser emits no
+    /// rows from such a segment.
+    pub fn rate_hz(&self) -> f64 {
+        rate_hz(&self.segment.get()).unwrap_or(0.0)
     }
 
     pub(super) fn segment_record(&self) -> &SegmentRecord {
@@ -459,7 +451,7 @@ mod tests {
                 ..fixtures::segment(1)
             })
             .unwrap();
-            effective_rate(&segment.get())
+            rate_hz(&segment.get())
         };
         assert_eq!(rate(1000, 4), Some(250.0));
         assert_eq!(rate(1000, 0), None);

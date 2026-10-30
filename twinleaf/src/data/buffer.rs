@@ -8,10 +8,9 @@
 
 use super::coalesce::BatchCoalescer;
 use super::continuity::Generations;
-use super::metadata::{effective_rate, ColumnKey, StreamKey, StreamMetadataSnapshot};
+use super::metadata::{StreamKey, StreamMetadataSnapshot};
 use super::sample::SampleBatch;
-use crate::proto::data as wire;
-use crate::proto::{ColumnId, SampleNumber};
+use crate::proto::SampleNumber;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::time::Instant;
@@ -54,7 +53,7 @@ use std::time::Instant;
 /// let key = *buffer.stream_keys().next().expect("one stream");
 /// let run = buffer.run(&key).expect("a run");
 /// assert_eq!(run.retained_rows(), 1..3);
-/// assert_eq!(run.effective_rate(), 10.0);
+/// assert_eq!(run.metadata().rate_hz(), 10.0);
 ///
 /// let latest = buffer.latest_row(&key).expect("a retained row");
 /// println!("{}", latest.row(0).expect("one row"));
@@ -107,14 +106,6 @@ impl Buffer {
     /// retains no rows.
     pub fn latest_row(&self, stream_key: &StreamKey) -> Option<SampleBatch> {
         self.runs.get(stream_key)?.last_row()
-    }
-
-    /// Returns a column's metadata as of its stream's newest batch, or `None`
-    /// if the stream has no run or no such column.
-    pub fn column_metadata(&self, col: &ColumnKey) -> Option<wire::ColumnView<'_>> {
-        self.runs
-            .get(&col.stream_key())?
-            .column_metadata(col.column_id)
     }
 }
 
@@ -253,10 +244,6 @@ impl Run {
         Some(chunk.slice(chunk.len() - 1..chunk.len()))
     }
 
-    fn column_metadata(&self, column_id: ColumnId) -> Option<wire::ColumnView<'_>> {
-        self.metadata.column(column_id)
-    }
-
     /// Returns the continuity generations stamped on every batch of this run.
     pub fn generations(&self) -> Generations {
         self.generations
@@ -268,22 +255,10 @@ impl Run {
         self.last_seen
     }
 
-    /// Returns the run's stream descriptor as of its newest batch.
-    pub fn stream(&self) -> wire::StreamView<'_> {
-        self.metadata.stream()
-    }
-
-    /// Returns the run's segment descriptor as of its newest batch. It holds
-    /// the raw sampling rate and decimation behind [`Self::effective_rate`].
-    pub fn segment(&self) -> wire::SegmentView<'_> {
-        self.metadata.segment()
-    }
-
-    /// Returns the sample rate in hertz after decimation, or zero for a
-    /// segment whose rate or decimation is zero. The parser emits no rows from
-    /// such a segment.
-    pub fn effective_rate(&self) -> f64 {
-        effective_rate(&self.metadata.segment()).unwrap_or(0.0)
+    /// Returns the metadata of the run's newest batch. Its schema is the
+    /// run's, and its segment and rate are the newest.
+    pub fn metadata(&self) -> &StreamMetadataSnapshot {
+        &self.metadata
     }
 
     /// Returns the end-of-sample time of the newest retained row, in seconds
@@ -309,10 +284,12 @@ impl Run {
 mod tests {
     use super::*;
     use crate::data::fixtures;
-    use crate::data::metadata::{DeviceRecord, SegmentRecord};
+    use crate::data::metadata::{ColumnKey, DeviceRecord, SegmentRecord};
     use crate::data::pipeline::{ColumnOp, ColumnProcessor};
     use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
+    use crate::proto::data as wire;
     use crate::proto::data::DataType;
+    use crate::proto::ColumnId;
     use crate::proto::DeviceRoute;
 
     /// Records every sample it is fed, plus the length of each span it was fed as,
@@ -490,7 +467,7 @@ mod tests {
         assert_eq!(run.retained_rows(), 0..300);
         assert_eq!(run.last_timestamp(), Some(300.0));
         assert_eq!(run.last_sample_number(), Some(SampleNumber::new(299)));
-        assert_eq!(run.effective_rate(), 1.0);
+        assert_eq!(run.metadata().rate_hz(), 1.0);
 
         let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
         assert_eq!(processor.catch_up(&buffer), &expected(0..300));
@@ -574,7 +551,7 @@ mod tests {
 
         let run = buffer.run(&fx.stream_key).expect("the run");
         assert_eq!(run.retained_rows(), 0..7);
-        assert_eq!(run.segment(), rolled.get(), "the newest segment");
+        assert_eq!(run.metadata().segment(), rolled.get(), "the newest segment");
 
         let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
         let out = processor.catch_up(&buffer).clone();
@@ -660,8 +637,8 @@ mod tests {
         assert_eq!(row.len(), 1);
         assert_eq!(row.sample_numbers(), [2]);
         assert_eq!(row.timestamps(), [3.0]);
-        assert_eq!(row.stream(), fx.metadata.stream());
-        assert_eq!(row.segment(), fx.metadata.segment());
+        assert_eq!(row.schema(), fx.metadata.schema());
+        assert_eq!(row.metadata().segment(), fx.metadata.segment());
 
         // Values come back in schema order, each in its column's own variant.
         let values: Vec<ColumnData> = row.row(0).expect("the only row").values().collect();
@@ -696,17 +673,27 @@ mod tests {
     }
 
     #[test]
-    fn column_metadata_comes_from_the_newest_schema() {
+    fn run_metadata_comes_from_the_newest_schema() {
+        /// The description, units and type of the column at `key`.
+        fn column(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String, DataType)> {
+            let run = buffer.run(&key.stream_key())?;
+            let column = run.metadata().schema().column(key.column_id)?;
+            Some((
+                column.description().to_string(),
+                column.units().to_string(),
+                column.data_type(),
+            ))
+        }
+
         let mut buffer = Buffer::new(16);
         let fx = test_fixture(&[DataType::F64]);
-        assert!(buffer.column_metadata(&fx.column_keys[0]).is_none());
+        assert!(column(&buffer, &fx.column_keys[0]).is_none());
 
         fx.push_floats(&mut buffer, 1, 0..2);
-        let metadata = buffer
-            .column_metadata(&fx.column_keys[0])
-            .expect("the column");
-        assert_eq!(metadata.description(), "column 0");
-        assert_eq!(metadata.units(), "u0");
+        assert_eq!(
+            column(&buffer, &fx.column_keys[0]),
+            Some(("column 0".to_string(), "u0".to_string(), DataType::F64))
+        );
 
         // A schema change rides a new stream generation, and the new run's columns
         // replace the old ones.
@@ -717,19 +704,15 @@ mod tests {
             &[(0, vec![ColumnData::F64(1.0), ColumnData::U64(2)])],
         );
         assert_eq!(
-            buffer
-                .column_metadata(&changed.column_keys[1])
-                .expect("the added column")
-                .data_type(),
-            DataType::U64
+            column(&buffer, &changed.column_keys[1]).map(|(_, _, data_type)| data_type),
+            Some(DataType::U64)
         );
-        assert!(buffer
-            .column_metadata(&ColumnKey::new(
-                DeviceRoute::root(),
-                crate::proto::StreamId::new(1),
-                ColumnId::new(7),
-            ))
-            .is_none());
+        let missing = ColumnKey::new(
+            DeviceRoute::root(),
+            crate::proto::StreamId::new(1),
+            ColumnId::new(7),
+        );
+        assert!(column(&buffer, &missing).is_none());
     }
 
     #[test]

@@ -64,7 +64,7 @@ fn broadcast_to_client(mut stream: TcpStream, device: Device) {
         };
 
         // Only process samples from stream ID 1
-        if batch.stream().stream_id().value() != 1 {
+        if batch.stream_key().stream_id.value() != 1 {
             continue;
         }
 

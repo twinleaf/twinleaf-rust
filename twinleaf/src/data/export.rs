@@ -250,7 +250,7 @@ struct TableInfo {
 impl TableInfo {
     fn accepts(&self, batch: &SampleBatch) -> bool {
         self.metadata.schema() == batch.schema()
-            && self.metadata.device().serial() == batch.device().serial()
+            && self.metadata.device().serial() == batch.metadata().device().serial()
     }
 }
 
@@ -348,8 +348,12 @@ impl Hdf5Appender {
         if let Some(boundary) = batch.boundary() {
             log::debug!(
                 "[{}] sample_n={} boundary={:?}",
-                batch.stream().name(),
-                batch.first_sample().unwrap_or(SampleNumber::new(0)),
+                batch.schema().stream().name(),
+                batch
+                    .sample_numbers()
+                    .first()
+                    .copied()
+                    .unwrap_or(SampleNumber::new(0)),
                 boundary
             );
         }
@@ -385,7 +389,7 @@ impl Hdf5Appender {
 
         let key = batch.stream_key();
         let route_str = key.route.to_string().trim_start_matches('/').to_string();
-        let stream_name = batch.stream().name().to_string();
+        let stream_name = batch.schema().stream().name().to_string();
 
         // Stream identity for stats counts a stream once, regardless of runs.
         let stream_id_path = if route_str.is_empty() {
@@ -560,17 +564,29 @@ impl Hdf5Appender {
         batch: &SampleBatch,
         key: &StreamKey,
     ) -> Vec<(&'static str, AttrValue)> {
-        let meta = batch.segment();
+        let meta = batch.metadata().segment();
         let mut attributes = vec![
             ("sampling_rate", AttrValue::U32(meta.sampling_rate())),
             ("decimation", AttrValue::U32(meta.decimation())),
             ("start_time", AttrValue::U32(meta.start_time())),
             ("filter_cutoff", AttrValue::F32(meta.filter_cutoff())),
-            ("session_id", batch.device().session().value().attr()),
-            ("stream_id", batch.stream().stream_id().value().attr()),
-            ("stream_name", string_attr(batch.stream().name())),
-            ("device_serial", string_attr(batch.device().serial())),
-            ("firmware_hash", string_attr(batch.device().firmware())),
+            (
+                "session_id",
+                batch.metadata().device().session().value().attr(),
+            ),
+            (
+                "stream_id",
+                batch.schema().stream().stream_id().value().attr(),
+            ),
+            ("stream_name", string_attr(batch.schema().stream().name())),
+            (
+                "device_serial",
+                string_attr(batch.metadata().device().serial()),
+            ),
+            (
+                "firmware_hash",
+                string_attr(batch.metadata().device().firmware()),
+            ),
         ];
         if let Some(id) = self.runs.index(*key) {
             attributes.push(("run_id", AttrValue::U64(id)));
