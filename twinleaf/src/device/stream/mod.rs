@@ -536,7 +536,7 @@ fn prune_all<T>(list: &mut Vec<Sink<T>>, cx: &mut Context<'_>) {
 }
 
 /// Sends `item` to each subscriber in `list` whose scope covers `route`.
-fn send_at<T>(list: &mut Vec<Sink<T>>, route: DeviceRoute, item: impl Fn() -> T) {
+fn send_at<T: Clone>(list: &mut Vec<Sink<T>>, route: DeviceRoute, item: impl Fn() -> T) {
     list.retain_mut(|sink| sink.offer(Scope::point(route), &item));
 }
 
@@ -2181,6 +2181,40 @@ mod tests {
 
         assert!(sink.lane.send(6));
         assert_eq!(receiver.recv(), Ok(6));
+    }
+
+    /// A lane being replaced as fast as another thread can never looks empty
+    /// to a reader who has not taken its item, and a reader who takes items
+    /// meanwhile ends on the last one sent.
+    #[test]
+    fn a_latest_value_lane_never_looks_empty_while_it_is_replaced() {
+        const SENT: u32 = 100_000;
+        let (mut sink, receiver) = Sink::latest(everything());
+        assert!(sink.lane.send(0));
+        let sender = std::thread::spawn(move || {
+            for value in 1..=SENT {
+                sink.lane.send(value);
+            }
+            sink
+        });
+        while !sender.is_finished() {
+            assert!(!receiver.as_flume().is_empty(), "the lane looked empty");
+        }
+        let mut sink = sender.join().unwrap();
+        assert_eq!(receiver.try_recv(), Ok(Some(SENT)));
+
+        let sender = std::thread::spawn(move || {
+            for value in 1..=SENT {
+                sink.lane.send(value);
+            }
+        });
+        let mut last = 0;
+        while last < SENT {
+            let value = receiver.recv().unwrap();
+            assert!(value >= last, "{value} came after {last}");
+            last = value;
+        }
+        sender.join().unwrap();
     }
 
     /// A blocking receive with a deadline times out on an empty lane, and
