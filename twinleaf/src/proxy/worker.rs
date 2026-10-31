@@ -173,6 +173,11 @@ enum Peer {
 /// alive. Any other peer answers with something else, or with nothing
 /// within [`control::HELLO_TIMEOUT`], and its packets are a device's.
 ///
+/// The task `link relay <url>` on `tasks` hands what the port receives to
+/// `results`. No one holds it. It ends once the port's task has ended and
+/// so closed what the relay reads, which the drop of the port brings about,
+/// or once nothing receives from `results`.
+///
 /// # Errors
 ///
 /// Returns an error if the connection fails, closes before the peer

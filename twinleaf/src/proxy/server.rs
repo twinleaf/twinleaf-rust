@@ -6,9 +6,9 @@ use super::client::{Session, SOCKET_QUEUE};
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
 use super::link::{self, Links, Owner};
 use super::{
-    answers, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
+    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
 };
-use crate::rt::{self, sleep_until_some, Supervisor};
+use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{BTreeMap, HashMap};
@@ -77,21 +77,22 @@ impl Shared {
 }
 
 /// Binds the listeners for `options`, and starts the server, which serves
-/// clients until the proxy stops. Returns the proxy's handle.
+/// clients until the proxy stops. Returns the proxy's handle. Must be
+/// awaited on a tokio runtime, which runs every task of the proxy.
 ///
 /// Returns an [`io::ErrorKind::AddrInUse`] error if anything already answers
 /// on a nonzero port. The message calls it a Twinleaf proxy if it answers
 /// `proxy.hello`. Also returns any error from binding the listeners or
-/// registering them with the crate's runtime.
-///
-/// # Panics
-///
-/// Panics if the crate's runtime cannot start.
-pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
-    if options.port != 0 && answers(options.port) {
+/// registering them with the runtime.
+pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
+    let tasks = Supervisor::current();
+    if options.port != 0 && answers_async(options.port).await {
         let endpoint = endpoint_at(options.port);
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, options.port));
         let hello = control::encode(&Introduction::of_this_process(&options.name));
-        let message = match control::call(&endpoint, HELLO, &hello, HELLO_TIMEOUT) {
+        let called =
+            control::call_at(address, &endpoint, HELLO, &hello, HELLO_TIMEOUT, &tasks).await;
+        let message = match called {
             Ok(reply) => match control::decode::<Introduction>(&reply) {
                 Ok(host) => {
                     format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
@@ -104,15 +105,11 @@ pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
     }
     let listeners = bind(options.listen, options.port)?;
     let port = listeners[0].local_addr()?.port();
-    let listeners = {
-        let _runtime = rt::handle().enter();
-        let listening = listeners.into_iter().map(|listener| {
-            listener.set_nonblocking(true)?;
-            TcpListener::from_std(listener)
-        });
-        listening.collect::<io::Result<Vec<_>>>()?
-    };
-    let tasks = Supervisor::new();
+    let listening = listeners.into_iter().map(|listener| {
+        listener.set_nonblocking(true)?;
+        TcpListener::from_std(listener)
+    });
+    let listeners = listening.collect::<io::Result<Vec<_>>>()?;
     let default = watch::channel(options.default.take());
     let registry = Links::new(
         &tasks,
@@ -182,6 +179,7 @@ impl Server {
         let proxy = Proxy {
             server: notices.clone(),
             stopped: waited,
+            drop_waits: false,
             clients,
             default: default.clone(),
             endpoint: endpoint.clone(),
@@ -448,6 +446,7 @@ mod tests {
     use super::*;
     use crate::proxy::fixtures::{assert_took, options, PAUSED_WAIT};
     use crate::proxy::DumpFlags;
+    use crate::rt;
     use std::net::TcpListener;
     use std::thread;
     use tokio::time::timeout;

@@ -97,6 +97,10 @@ pub enum DiscoveryEvent {
 /// connection to the device through the proxy. Dropping the session stops
 /// browsing and probing. It blocks until every task of the session has
 /// ended, each probe with its connection dropped, for at most five seconds.
+///
+/// A session has only a synchronous entry point, so all of its tasks run on
+/// the crate's runtime, whatever runtime [`start`](Discovery::start) is
+/// called from.
 #[derive(Debug)]
 pub struct Discovery {
     events: flume::Receiver<DiscoveryEvent>,

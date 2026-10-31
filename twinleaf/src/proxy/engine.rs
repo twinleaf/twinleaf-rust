@@ -11,10 +11,11 @@
 //! connecting that stays silent as long. It collects the metadata of each
 //! device a watch follows, and publishes it once it is complete. It loads
 //! the RPC table and keeps the settings of each device it has heard whose
-//! table a watch follows, on a worker thread per device that stops once no
-//! watch has followed the table for [`LINGER`]. It keeps all of this in the
-//! link's [`Store`], which the clients' watches follow, for as long as the
-//! link runs.
+//! table a watch follows, on a worker task per device. The engine holds each
+//! worker's task, which ends once no watch has followed the table for
+//! [`LINGER`], and with the engine. It keeps all of this in the link's
+//! [`Store`], which the clients' watches follow, for as long as the link
+//! runs.
 //!
 //! The engine also feeds the link's [`Mounts`]. For each packet, in the
 //! order the link delivered it, it takes the packet into the store, and
@@ -49,13 +50,14 @@ use crate::device::store::{pruned, Store, CHANGES, METADATA, PRESENCE};
 use crate::device::stream::Queued;
 use crate::device::{MetadataState, Presence, SettingChange, Settings};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::rt::{lock, sleep_until_some};
+use crate::rt::{lock, sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::time::{timeout_at, Instant};
+use tokio_util::task::AbortOnDropHandle;
 
 /// How long a device may be silent before the engine loses it. The link
 /// loses the device at its root sooner, as it goes quiet.
@@ -76,11 +78,13 @@ const LINGER: Duration = Duration::from_millis(500);
 /// Keeps `store` from what arrives over `session`, and feeds `mounts`, until
 /// the session ends. Then ends every receiver of the store and lets every
 /// client of `mounts` go. It attaches to the session at once, so it takes
-/// every packet that arrives from then on.
+/// every packet that arrives from then on. The workers of its devices run
+/// on `tasks`.
 pub(super) fn serve(
     store: Arc<Mutex<Store>>,
     mounts: Arc<Mounts>,
     session: Session,
+    tasks: &Supervisor,
 ) -> impl std::future::Future<Output = ()> {
     // An inlet with room for every packet a `usize` can count has no limit.
     let inlet = session.attach(usize::MAX);
@@ -95,6 +99,7 @@ pub(super) fn serve(
         metadata_seen: HashMap::new(),
         heard: HashMap::new(),
         demand: BTreeSet::new(),
+        tasks: tasks.clone(),
         workers: HashMap::new(),
     };
     async move {
@@ -324,9 +329,21 @@ struct Engine {
     heard: HashMap<DeviceRoute, Instant>,
     /// What the store's receivers follow, as it last said.
     demand: BTreeSet<Watch>,
-    /// The events of each device whose RPC table a receiver follows, which
-    /// its worker takes, and since when no receiver has followed it.
-    workers: HashMap<DeviceRoute, (flume::Sender<DeviceEvent>, Option<Instant>)>,
+    /// The spawner of the workers.
+    tasks: Supervisor,
+    /// The worker of each device whose RPC table a receiver follows.
+    workers: HashMap<DeviceRoute, WorkerHold>,
+}
+
+/// The engine's hold on the worker of one device. The worker ends once the
+/// hold drops.
+struct WorkerHold {
+    /// The device's events, which the worker takes.
+    events: flume::Sender<DeviceEvent>,
+    /// Since when no receiver has followed the device's table.
+    unwatched: Option<Instant>,
+    /// The worker's task, aborted once the hold drops.
+    _task: AbortOnDropHandle<Option<()>>,
 }
 
 impl Engine {
@@ -336,7 +353,7 @@ impl Engine {
         let followed = Arc::clone(&lock(&self.store).followed);
         loop {
             let quiet = self.heard.values().map(|at| *at + QUIET).min();
-            let unwatched = self.workers.values().filter_map(|(_, since)| *since);
+            let unwatched = self.workers.values().filter_map(|hold| hold.unwatched);
             let linger = unwatched.min().map(|since| since + LINGER);
             let wake = [self.schedule.next_retry(), quiet, linger];
             let wake = wake.into_iter().flatten().min();
@@ -388,13 +405,13 @@ impl Engine {
         let mut store = lock(&self.store);
         self.demand = store.demand();
         let now = Instant::now();
-        for (route, (_, since)) in &mut self.workers {
+        for (route, hold) in &mut self.workers {
             match self.demand.contains(&Watch {
                 route: *route,
                 table: true,
             }) {
-                true => *since = None,
-                false => *since = since.or(Some(now)),
+                true => hold.unwatched = None,
+                false => hold.unwatched = hold.unwatched.or(Some(now)),
             }
         }
         let wanted: Vec<_> = self
@@ -406,8 +423,8 @@ impl Engine {
             .collect();
         drop(store);
         for route in wanted {
-            let events = start_worker(self.handle.clone(), route, Arc::clone(&self.store));
-            self.workers.insert(route, (events, None));
+            let hold = start_worker(&self.tasks, self.handle.clone(), route, &self.store);
+            self.workers.insert(route, hold);
         }
     }
 
@@ -419,8 +436,8 @@ impl Engine {
         // The store stays locked until each stopped worker is let go, and a
         // worker sets nothing in it once it is.
         let mut store = lock(&self.store);
-        self.workers.retain(|route, (_, since)| {
-            let lingers = since.is_none_or(|since| since + LINGER > now);
+        self.workers.retain(|route, hold| {
+            let lingers = hold.unwatched.is_none_or(|since| since + LINGER > now);
             if !lingers {
                 store.clear(Watch {
                     route: *route,
@@ -433,8 +450,8 @@ impl Engine {
 
     /// Hands a fact about the device at `route` to its worker, if it has one.
     fn tell(&self, route: DeviceRoute, event: DeviceEvent) {
-        if let Some((events, _)) = self.workers.get(&route) {
-            let _ = events.send(event);
+        if let Some(hold) = self.workers.get(&route) {
+            let _ = hold.events.send(event);
         }
     }
 
@@ -629,32 +646,32 @@ fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
 }
 
 /// Starts the worker that loads the RPC table of the device at `route`
-/// through `handle` and keeps its settings in `store`, and returns the
-/// sender of the device's events it follows. It stops once the sender is
-/// dropped.
+/// through `handle` and keeps its settings in `store`, as a task on `tasks`.
+/// Returns the hold on it, which hands it the device's events.
 fn start_worker(
+    tasks: &Supervisor,
     handle: Handle,
     route: DeviceRoute,
-    store: Arc<Mutex<Store>>,
-) -> flume::Sender<DeviceEvent> {
+    store: &Arc<Mutex<Store>>,
+) -> WorkerHold {
     let (events, received) = flume::unbounded();
     let worker = Worker {
         handle,
         route,
         events: received,
-        store,
+        store: Arc::clone(store),
     };
-    let started = std::thread::Builder::new()
-        .name(format!("twinleaf settings {route}"))
-        .spawn(move || worker.run());
-    if let Err(error) = started {
-        log::warn!("could not start the settings worker of {route}: {error}");
+    let task = tasks.spawn(format_args!("proxy settings {route}"), worker.run());
+    WorkerHold {
+        events,
+        unwatched: None,
+        _task: AbortOnDropHandle::new(task),
     }
-    events
 }
 
-/// The worker of one device. Its calls block, so it runs on a thread of its
-/// own.
+/// The worker of one device. Once the engine lets it go it sets nothing in
+/// the store, which it checks under the store's lock, since a step of its
+/// task can still be running on another thread then.
 struct Worker {
     handle: Handle,
     route: DeviceRoute,
@@ -665,9 +682,9 @@ struct Worker {
 impl Worker {
     /// Loads the table and tracks the device until a new table or a new
     /// session calls for loading it again, until the engine lets go.
-    fn run(self) {
+    async fn run(self) {
         while !self.events.is_disconnected() {
-            let loaded = RpcRegistry::load_with(|name, arg| self.submit(name, arg));
+            let loaded = RpcRegistry::load_with(|name, arg| self.submit(name, arg)).await;
             let registry = loaded.map(Arc::new);
             {
                 let mut store = lock(&self.store);
@@ -677,10 +694,10 @@ impl Worker {
                 store.set_registry(self.route, registry.clone());
             }
             let tracked = match registry {
-                Ok(registry) => self.track(&registry),
+                Ok(registry) => self.track(&registry).await,
                 Err(error) => {
                     log::warn!("could not load the RPC table of {}: {error}", self.route);
-                    self.await_new_table()
+                    self.await_new_table().await
                 }
             };
             if !tracked {
@@ -691,11 +708,11 @@ impl Worker {
 
     /// Keeps the settings of `registry` until it is out of date. Returns
     /// `false` once the engine lets go.
-    fn track(&self, registry: &Arc<RpcRegistry>) -> bool {
+    async fn track(&self, registry: &Arc<RpcRegistry>) -> bool {
         let mut cache = SettingsCache::new(registry);
-        self.snapshot(registry, &mut cache);
+        self.snapshot(registry, &mut cache).await;
         loop {
-            let Ok(event) = self.events.recv() else {
+            let Ok(event) = self.events.recv_async().await else {
                 return false;
             };
             match &event {
@@ -711,7 +728,7 @@ impl Worker {
             match cache.observe(&event) {
                 CacheAction::Keep if cache.version() == before => {}
                 CacheAction::Keep => self.publish(registry, &cache),
-                CacheAction::Snapshot => self.snapshot(registry, &mut cache),
+                CacheAction::Snapshot => self.snapshot(registry, &mut cache).await,
                 CacheAction::Reload => return true,
             }
         }
@@ -720,11 +737,14 @@ impl Worker {
     /// Fills `cache` with a snapshot and publishes the settings it holds
     /// then. A failed snapshot is logged, and the cache asks for another at
     /// the next heartbeat.
-    fn snapshot(&self, registry: &Arc<RpcRegistry>, cache: &mut SettingsCache) {
+    async fn snapshot(&self, registry: &Arc<RpcRegistry>, cache: &mut SettingsCache) {
         if self.events.is_disconnected() {
             return;
         }
-        if let Err(error) = cache.snapshot_with(|name, arg| self.submit(name, arg)) {
+        let taken = cache
+            .snapshot_with(|name, arg| self.submit(name, arg))
+            .await;
+        if let Err(error) = taken {
             log::warn!("could not read the settings of {}: {error}", self.route);
         }
         self.publish(registry, cache);
@@ -748,14 +768,14 @@ impl Worker {
     /// before loading again and then for the device to be heard, so a
     /// device that is not there is not asked again. Returns `false` once the
     /// engine lets go.
-    fn await_new_table(&self) -> bool {
-        let deadline = std::time::Instant::now() + RELOAD_DELAY;
+    async fn await_new_table(&self) -> bool {
+        let deadline = Instant::now() + RELOAD_DELAY;
         loop {
-            match self.events.recv_deadline(deadline) {
-                Ok(DeviceEvent::NewHash(_)) => return true,
-                Ok(_) => {}
-                Err(flume::RecvTimeoutError::Timeout) => return self.events.recv().is_ok(),
-                Err(flume::RecvTimeoutError::Disconnected) => return false,
+            match timeout_at(deadline, self.events.recv_async()).await {
+                Ok(Ok(DeviceEvent::NewHash(_))) => return true,
+                Ok(Ok(_)) => {}
+                Ok(Err(flume::RecvError::Disconnected)) => return false,
+                Err(_elapsed) => return self.events.recv_async().await.is_ok(),
             }
         }
     }
@@ -999,7 +1019,7 @@ mod tests {
         let (session, proxy) = Session::test_pair_on(tasks);
         let store = Arc::new(Mutex::new(Store::new(true)));
         let mounts = Mounts::new("tcp://device");
-        let serving = serve(Arc::clone(&store), Arc::clone(&mounts), session);
+        let serving = serve(Arc::clone(&store), Arc::clone(&mounts), session, tasks);
         tasks.spawn("proxy state", serving);
         (store, mounts, proxy)
     }
@@ -1745,8 +1765,69 @@ mod tests {
         assert_eq!(asked, device);
     }
 
+    /// A worker's task ends once the engine lets go of its device, sooner
+    /// than the call it waits on, never answered, times out. Every worker's
+    /// task ends with the engine. Devices followed and let go again and
+    /// again leave no task behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_workers_task_ends_when_the_engine_lets_go_and_with_the_engine() {
+        let (engine_tasks, workers) = (Supervisor::current(), Supervisor::current());
+        let (session, proxy) = Session::test_pair_on(&engine_tasks);
+        let store = Arc::new(Mutex::new(Store::new(true)));
+        let mounts = Mounts::new("tcp://device");
+        engine_tasks.spawn(
+            "proxy state",
+            serve(Arc::clone(&store), mounts, session, &workers),
+        );
+        let devices = [route("/1"), route("/2"), route("/3")];
+        let follow_all = || -> Vec<_> {
+            let followed = devices.iter();
+            followed
+                .map(|device| follow(&store, *device, REGISTRY))
+                .collect()
+        };
+
+        for _ in 0..3 {
+            let followed = follow_all();
+            for device in devices {
+                proxy.send(Packet::heartbeat(device));
+            }
+            running(&workers, devices.len()).await;
+            drop(followed);
+            let released = Instant::now();
+            running(&workers, 0).await;
+            let took = released.elapsed();
+            assert!(
+                took < LINGER * 2,
+                "the workers ended {took:?} after release"
+            );
+        }
+
+        let _followed = follow_all();
+        running(&workers, devices.len()).await;
+        drop(proxy);
+        let ended = Instant::now();
+        running(&workers, 0).await;
+        let took = ended.elapsed();
+        assert!(took < LINGER, "the workers ended {took:?} after the engine");
+    }
+
+    /// Waits until `count` of the tasks `tasks` spawned run.
+    async fn running(tasks: &Supervisor, count: usize) {
+        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+            while tasks.running() != count {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        assert!(
+            waited.await.is_ok(),
+            "{} tasks run, not {count}",
+            tasks.running()
+        );
+    }
+
     /// A table followed of a device not heard starts no worker, so a watch
-    /// of a route where nothing is starts no thread and asks nothing, until
+    /// of a route where nothing is starts no task and asks nothing, until
     /// the device is heard.
     #[test]
     fn a_table_of_a_device_not_heard_is_not_loaded_until_it_is() {

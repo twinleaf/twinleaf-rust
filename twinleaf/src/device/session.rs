@@ -9,7 +9,7 @@
 //! has answered. It fails with the proxy's refusal, or when the peer does not
 //! answer as a 2.0 proxy does.
 //!
-//! One task on the crate's runtime then owns the socket. It sends
+//! One task then owns the socket, on the runtime the open ran on. It sends
 //! each call, and a reply completes the call it answers. Every other packet
 //! goes to the pump, in the order it arrived. The session ends when the proxy
 //! stops, and every call still waiting fails.
@@ -155,6 +155,9 @@ pub(crate) enum Received {
 #[derive(Clone)]
 pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
+    /// The spawner of the session's task, which the tasks of its views run
+    /// on too.
+    tasks: Supervisor,
 }
 
 impl Session {
@@ -179,7 +182,7 @@ impl Session {
     }
 
     /// Opens a session as [`open`](Self::open) does, without blocking. Must
-    /// be awaited on a tokio runtime.
+    /// be awaited on a tokio runtime, which runs the session's tasks.
     pub(crate) async fn open_async(
         proxy: &ProxyAddress,
         target: &str,
@@ -225,7 +228,7 @@ impl Session {
         goal: &str,
         timeout: Duration,
     ) -> io::Result<Session> {
-        let tasks = Supervisor::new();
+        let tasks = Supervisor::current();
         let (opened, answer) = bind(proxy, (method, &args), goal, timeout, &tasks).await?;
         // An open again opens the target the proxy resolved.
         let resolved = (method == Purpose::Use.method()).then_some(answer);
@@ -275,9 +278,18 @@ impl Session {
             sending: None,
             reopen,
             reopening: None,
+            tasks: tasks.clone(),
         };
         tasks.spawn("twinleaf session", worker.run(mailbox));
-        Session { commands }
+        Session {
+            commands,
+            tasks: tasks.clone(),
+        }
+    }
+
+    /// Returns the spawner of the session's task.
+    pub(crate) fn tasks(&self) -> &Supervisor {
+        &self.tasks
     }
 
     /// Sends `packet`, such as a control request whose replies the pump
@@ -397,11 +409,12 @@ async fn bind(
 /// doubles from 250 ms up to 1 s, so a proxy that is back is tried within
 /// 1.25 s, and each is made up
 /// to a quarter longer or shorter at random, so the clients of one proxy
-/// do not all try at once. Returns `None` if no try succeeded.
+/// do not all try at once. The new socket's task runs on `tasks`. Returns
+/// `None` if no try succeeded.
 async fn open_again(
     (proxy, method, args): (ProxyAddress, &'static str, Vec<u8>),
+    tasks: Supervisor,
 ) -> Option<Opened> {
-    let tasks = Supervisor::new();
     let tries = async {
         let mut wait = Duration::from_millis(250);
         loop {
@@ -461,6 +474,9 @@ struct Worker {
     reopen: Option<(ProxyAddress, &'static str, Vec<u8>)>,
     /// The open in progress after a socket closed.
     reopening: Option<BoxFuture<'static, Option<Opened>>>,
+    /// The spawner of the session's task, which a socket opened again runs
+    /// its task on too.
+    tasks: Supervisor,
 }
 
 impl Worker {
@@ -550,7 +566,7 @@ impl Worker {
         if let Some(inlet) = &mut self.inlet {
             inlet.send_always(Received::SocketLost);
         }
-        self.reopening = Some(Box::pin(open_again(reopen)));
+        self.reopening = Some(Box::pin(open_again(reopen, self.tasks.clone())));
         true
     }
 

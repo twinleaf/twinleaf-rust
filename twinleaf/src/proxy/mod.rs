@@ -221,6 +221,7 @@ pub(crate) use control::{
 };
 #[cfg(test)]
 pub(crate) use control::{decode, parts, CLIENT_KEEPALIVE};
+pub(crate) use server::host;
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -281,6 +282,7 @@ pub(crate) fn endpoint_at(port: u16) -> String {
 /// Returns `true` if anything answers a connection to `port` of
 /// `127.0.0.1`. A connect that times out is tried once more for longer, and
 /// a refusal is final. Blocks the calling thread.
+#[cfg(test)]
 pub(crate) fn answers(port: u16) -> bool {
     let probing = async move { Ok(answers_async(port).await) };
     matches!(Supervisor::new().run("proxy probe", probing), Ok(true))
@@ -454,12 +456,17 @@ pub struct ClientInfo {
     pub own_process: bool,
 }
 
-/// A running proxy. It is shut down when dropped.
+/// A running proxy. Dropping it stops it, and the drop blocks until the
+/// proxy has stopped, as [`shutdown`](Proxy::shutdown) does, for at most
+/// 1.5 s and the moment its aborts take.
 pub struct Proxy {
     /// The server's mailbox, which keeps the proxy running.
     server: mpsc::UnboundedSender<server::Notice>,
     /// The receiver that disconnects once the proxy has stopped.
     stopped: flume::Receiver<()>,
+    /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
+    /// started on the crate's runtime.
+    drop_waits: bool,
     /// The client table, as the server publishes it.
     clients: watch::Receiver<Vec<ClientInfo>>,
     default: watch::Sender<Option<Layout>>,
@@ -504,6 +511,10 @@ pub fn stop(proxy: Option<&str>) -> io::Result<()> {
 impl Proxy {
     /// Starts a proxy with `options`. Returns once it accepts clients.
     ///
+    /// The proxy runs on the crate's own runtime. This may be called from
+    /// inside an application's tokio runtime, and blocks that thread until
+    /// the proxy accepts clients or fails to start.
+    ///
     /// # Errors
     ///
     /// Returns an [`io::ErrorKind::AddrInUse`] error if `options.port` is
@@ -535,7 +546,9 @@ impl Proxy {
     /// # }
     /// ```
     pub fn host(options: HostOptions) -> io::Result<Proxy> {
-        server::host(options)
+        let mut proxy = Supervisor::new().run("proxy host", host(options))?;
+        proxy.drop_waits = true;
+        Ok(proxy)
     }
 
     /// Returns the URL a client on this machine connects to, such as
@@ -568,12 +581,32 @@ impl Proxy {
     /// Stops the proxy and blocks until it has stopped. Each client hears the
     /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
     /// connection closes. The proxy stops accepting clients and closes every
-    /// device. A stop waits at most 1.5 s for the clients and devices to
-    /// close, and then ends what still runs.
-    /// Calling it again does nothing.
+    /// link.
+    ///
+    /// The stop waits at most 1.5 s for the clients to close, and in the
+    /// same 1.5 s for each link to let go of its device. Then it aborts the
+    /// tasks of the clients and links that still run, and returns. So it
+    /// blocks for at most 1.5 s and the moment the aborts take. An open of a
+    /// serial device in flight on a blocking thread runs to its end after
+    /// that. The engine that keeps a link's state, and the tasks that read
+    /// its devices' settings, end once their link has ended, and the stop
+    /// does not wait for them.
+    ///
+    /// Calling it again does nothing. It may be called from inside an
+    /// application's tokio runtime, and blocks that thread as it would any
+    /// other.
     pub fn shutdown(&self) {
         let _ = self.server.send(server::Notice::Stop);
         self.wait();
+    }
+
+    /// Stops the proxy as [`shutdown`](Self::shutdown) does, and waits for
+    /// it without blocking. A proxy hosted on its caller's runtime, as the
+    /// crate's async [`host`] starts it, is stopped this way, since its drop
+    /// only asks it to stop.
+    pub(crate) async fn shutdown_async(&self) {
+        let _ = self.server.send(server::Notice::Stop);
+        let _ = self.stopped.recv_async().await;
     }
 }
 
@@ -597,8 +630,15 @@ impl Proxy {
 }
 
 impl Drop for Proxy {
+    /// Stops the proxy. A proxy [`Proxy::host`] started is waited for as
+    /// [`shutdown`](Proxy::shutdown) waits. Any other proxy runs on its
+    /// caller's runtime and is only asked to stop, since on a runtime of one
+    /// thread a wait would block the proxy itself.
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.server.send(server::Notice::Stop);
+        if self.drop_waits {
+            self.wait();
+        }
     }
 }
 
@@ -614,6 +654,7 @@ mod tests {
     use super::*;
     use crate::proto::rpc::RpcError;
     use crate::proto::PacketType;
+    use crate::rt;
     use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
     use crate::tio::transport;
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
@@ -1987,5 +2028,85 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(proxy.clients()[0].name.as_deref(), Some("mine"));
+    }
+
+    /// The layout that mounts each of `devices` at a prefix of its own, and
+    /// the prefixes.
+    fn each_at_its_own_prefix(devices: &[FakeDevice]) -> (Layout, Vec<DeviceRoute>) {
+        let prefixes: Vec<DeviceRoute> = (1..=devices.len())
+            .map(|place| format!("/{place}").parse().unwrap())
+            .collect();
+        let mounts = devices.iter().zip(&prefixes).map(|(device, prefix)| Mount {
+            url: device.url.clone(),
+            source: DeviceRoute::root(),
+            prefix: *prefix,
+        });
+        let layout = Layout {
+            mounts: mounts.collect(),
+        };
+        (layout, prefixes)
+    }
+
+    /// A proxy hosted and a connection opened through the async entry points
+    /// run every task on the runtime they are awaited on, here one of a
+    /// single thread, and never reach the crate's runtime. The proxy keeps
+    /// the tables and settings of several devices there.
+    #[test]
+    fn a_proxy_and_a_connection_run_on_the_runtime_they_are_awaited_on() {
+        let devices: Vec<FakeDevice> = (0..3).map(|_| FakeDevice::start()).collect();
+        let (layout, prefixes) = each_at_its_own_prefix(&devices);
+        let caller = std::thread::spawn(move || {
+            rt::forbid_crate_runtime();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .on_thread_start(rt::forbid_crate_runtime)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let proxy = host(options()).await.unwrap();
+                let address = crate::device::runtime::ProxyAddress {
+                    url: proxy.endpoint(),
+                    ensure: None,
+                };
+                let session = crate::device::session::Session::mount_async(&address, &layout, WAIT);
+                let connection = crate::Connection::over(session.await.unwrap());
+                for prefix in &prefixes {
+                    let device = connection.device(*prefix);
+                    assert_eq!(device.submit("dev.name", &[]).await.unwrap(), b"FAKE");
+                    let followed = device.settings_updates();
+                    let settings = tokio::time::timeout(WAIT, followed.recv_async()).await;
+                    let settings = settings.expect("the settings in time").unwrap();
+                    assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
+                }
+                connection.close();
+                proxy.shutdown_async().await;
+            });
+        });
+        if let Err(panic) = caller.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The synchronous API works from inside an application's tokio runtime
+    /// of one thread, where `block_on` panics. It runs on the crate's runtime
+    /// and blocks the application's thread until each call is done.
+    #[tokio::test]
+    async fn the_sync_api_works_inside_an_applications_runtime() {
+        let device = FakeDevice::start();
+        let proxy = Proxy::host(HostOptions {
+            default: Some(Layout::single(&device.url)),
+            ..options()
+        })
+        .unwrap();
+        let connection = crate::Connection::open(&proxy.endpoint()).unwrap();
+
+        let name: String = connection
+            .device(DeviceRoute::root())
+            .get("dev.name")
+            .unwrap();
+
+        assert_eq!(name, "FAKE");
+        drop(connection);
+        drop(proxy);
     }
 }

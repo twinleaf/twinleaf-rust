@@ -3,12 +3,15 @@
 //! [`SettingsCache`] against what the device announced.
 //!
 //! Time is simulated and every choice comes from one seed, so a case replays
-//! exactly. Each host waits on its calls as a state machine, and the cache's
-//! own [`SettingsCache::snapshot_with`] runs on a thread that runs only while
-//! the world waits on its next call.
+//! exactly. Each host waits on its calls as a state machine. The cache's own
+//! [`SettingsCache::snapshot_with`] is a future the world polls once a call
+//! it waits on is answered, and the world puts each call it submits on the
+//! wire one at a time, in the order submitted.
 
 use super::settings::{CacheAction, DeviceEvent, SettingsCache};
-use crate::device::rpc::{CallError, PendingReply, RpcDescriptor, RpcErrorPayload, RpcRegistry};
+use crate::device::rpc::{
+    poll_once, CallError, PendingReply, RpcDescriptor, RpcErrorPayload, RpcRegistry,
+};
 use crate::device::SettingChange;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::packet::{PacketType, PacketView};
@@ -22,7 +25,11 @@ use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::OnceLock;
+use std::task::Poll;
 use std::time::Instant;
 use twinleaf_device::device::{
     self, Action, Actions, Announcer, Deferred, Entries, Entry, FlashOp, Group, Identity, Input,
@@ -413,19 +420,24 @@ enum Then {
     Snapshot(Snapshotting),
 }
 
-/// A snapshot running [`SettingsCache::snapshot_with`] on its own thread,
-/// which runs only while the world waits on its next step.
+/// A snapshot [`SettingsCache::snapshot_with`] takes, which the world polls.
 struct Snapshotting {
-    reply: flume::Sender<Result<Vec<u8>, CallError>>,
-    next: flume::Receiver<Step>,
+    /// The snapshot, which hands the cache back with its outcome.
+    snapshot: Pin<Box<dyn Future<Output = Taken>>>,
+    /// The outcome, once the snapshot has finished.
+    taken: Option<Taken>,
+    /// The calls the snapshot submitted that are not answered yet, in order,
+    /// each with what resolves its reply. The world answers each of them
+    /// before it takes the outcome, so a snapshot that ends at an error has
+    /// sent every call it submitted.
+    submitted: Rc<RefCell<VecDeque<Submitted>>>,
     reading: String,
     settled: Option<u32>,
 }
 
-enum Step {
-    Call(String, Vec<u8>),
-    Done(SettingsCache, Result<(), CallError>),
-}
+type Taken = (SettingsCache, Result<(), CallError>);
+
+type Submitted = (String, Vec<u8>, flume::Sender<Result<Vec<u8>, CallError>>);
 
 enum Wake {
     Timeout(usize, u64),
@@ -1170,20 +1182,24 @@ impl<'c> World<'c> {
         let Some(mut cache) = self.clients[c].cache.take() else {
             return;
         };
-        let (reply, replies) = flume::bounded(1);
-        let (steps, next) = flume::bounded(1);
-        std::thread::spawn(move || {
-            let taken = cache.snapshot_with(|name, arg| {
-                let _ = steps.send(Step::Call(name.to_string(), arg.to_vec()));
+        let submitted = Rc::new(RefCell::new(VecDeque::new()));
+        let submit = {
+            let submitted = Rc::clone(&submitted);
+            move |name: &str, arg: &[u8]| {
                 let (resolve, reply) = flume::bounded(1);
-                let _ = resolve.send(replies.recv().unwrap_or(Err(CallError::ResponseLost)));
+                let call = (name.to_string(), arg.to_vec(), resolve);
+                submitted.borrow_mut().push_back(call);
                 PendingReply { reply }
-            });
-            let _ = steps.send(Step::Done(cache, taken));
+            }
+        };
+        let snapshot = Box::pin(async move {
+            let taken = cache.snapshot_with(submit).await;
+            (cache, taken)
         });
         let snapshotting = Snapshotting {
-            reply,
-            next,
+            snapshot,
+            taken: None,
+            submitted,
             reading: String::new(),
             settled: None,
         };
@@ -1202,18 +1218,33 @@ impl<'c> World<'c> {
                 .ok()
                 .and_then(|v| u32::decode_reply(v).ok());
         }
-        let _ = snapshotting.reply.send(reply);
+        let answered = snapshotting.submitted.borrow_mut().pop_front();
+        if let Some((_, _, resolve)) = answered {
+            let _ = resolve.send(reply);
+        }
         self.await_snapshot(c, snapshotting);
     }
 
-    /// Lets the snapshot thread run to its next call or its end.
+    /// Polls the snapshot until it waits, and then sends the next call it
+    /// submitted, or takes its outcome once every call it submitted is
+    /// answered.
     fn await_snapshot(&mut self, c: usize, mut snapshotting: Snapshotting) {
-        match snapshotting.next.recv() {
-            Ok(Step::Call(name, arg)) => {
-                snapshotting.reading.clone_from(&name);
-                self.start_call(c, &[(&name, arg)], Then::Snapshot(snapshotting));
+        if snapshotting.taken.is_none() {
+            if let Poll::Ready(taken) = poll_once(snapshotting.snapshot.as_mut()) {
+                snapshotting.taken = Some(taken);
             }
-            Ok(Step::Done(cache, taken)) => {
+        }
+        let submitted = snapshotting.submitted.borrow();
+        let next = submitted
+            .front()
+            .map(|(name, arg, _)| (name.clone(), arg.clone()));
+        drop(submitted);
+        if let Some((name, arg)) = next {
+            snapshotting.reading.clone_from(&name);
+            return self.start_call(c, &[(&name, arg)], Then::Snapshot(snapshotting));
+        }
+        match snapshotting.taken.take() {
+            Some((cache, taken)) => {
                 let client = &mut self.clients[c];
                 client.cache = Some(cache);
                 client.rebuilt += 1;
@@ -1231,7 +1262,7 @@ impl<'c> World<'c> {
                 ));
                 self.check(c);
             }
-            Err(_) => self.fail("a snapshot thread ended without a result".into()),
+            None => self.fail("a snapshot waits on no call".into()),
         }
     }
 

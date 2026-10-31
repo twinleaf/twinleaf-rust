@@ -22,7 +22,6 @@ use crate::data::{PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proxy::{encode, Joined, Update, Watch, UNWATCH, WATCH};
 use crate::rt::lock;
-use crate::rt::Supervisor;
 use crate::tio;
 use crate::tio::packet::{self, LinkStatus, Packet, ProxyRx};
 use crate::tio::transport;
@@ -95,13 +94,15 @@ impl Stream {
     }
 
     /// Returns the sender of the pump's new taps, starting the pump on the
-    /// first call. Only one pump takes the session's inlet.
+    /// first call, on the runtime of the session's task. Only one pump takes
+    /// the session's inlet.
     fn pump(&self) -> &mpsc::UnboundedSender<Tap> {
         self.pump.get_or_init(|| {
             let (taps, received) = mpsc::unbounded_channel();
-            let attached = self.root.session().attach(INLET_LEN);
+            let session = self.root.session();
+            let attached = session.attach(INLET_LEN);
             let pump = Pump::new(&self.root, attached, Arc::clone(&self.store), received);
-            Supervisor::new().spawn("twinleaf stream", pump.run());
+            session.tasks().spawn("twinleaf stream", pump.run());
             taps
         })
     }
@@ -359,6 +360,7 @@ mod tests {
     use crate::device::{MetadataState, Presence};
     use crate::proto::SessionId as WireSessionId;
     use crate::proxy::{decode, Update};
+    use crate::rt::Supervisor;
     use crate::tio::packet::Packet;
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};

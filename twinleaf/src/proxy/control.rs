@@ -629,8 +629,31 @@ pub(crate) fn call(
     args: &[u8],
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
+    let address = socket_addr(endpoint)?;
+    let (endpoint, method, args) = (endpoint.to_string(), method.to_string(), args.to_vec());
+    let tasks = Supervisor::new();
+    let on = tasks.clone();
+    tasks.run("proxy control call", async move {
+        call_at(address, &endpoint, &method, &args, timeout, &on).await
+    })
+}
+
+/// Makes one control request of the proxy at `endpoint`, whose address is
+/// `address`, as [`call`] does, without blocking. The connection's task runs
+/// on `tasks`.
+pub(crate) async fn call_at(
+    address: SocketAddr,
+    endpoint: &str,
+    method: &str,
+    args: &[u8],
+    timeout: Duration,
+    tasks: &Supervisor,
+) -> io::Result<Vec<u8>> {
     let connect = timeout.min(HELLO_TIMEOUT);
-    let connected = transport::connect_blocking(&socket_addr(endpoint)?, connect);
+    let connected = match tokio::time::timeout(connect, transport::connect_socket(address)).await {
+        Ok(connected) => connected,
+        Err(_elapsed) => Err(io::ErrorKind::TimedOut.into()),
+    };
     let stream = connected.map_err(|error| match error.kind() {
         // A firewall can drop a connection to a closed port rather than
         // refuse it.
@@ -639,17 +662,12 @@ pub(crate) fn call(
         }
         _ => error,
     })?;
-    stream.set_nodelay(true)?;
     let (sender, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
     let port =
-        transport::Port::from_tcp_stream(stream, sender, transport::DEFAULT_TX_CHANNEL_SIZE)?;
-    let (endpoint, method, args) = (endpoint.to_string(), method.to_string(), args.to_vec());
-    Supervisor::new().run("proxy control call", async move {
-        let goal = format!("answer {method}");
-        let (_, reply) =
-            handshake(&port, &received, &endpoint, &method, &args, &goal, timeout).await?;
-        Ok(reply)
-    })
+        transport::Port::over_tcp(stream, sender, transport::DEFAULT_TX_CHANNEL_SIZE, tasks)?;
+    let goal = format!("answer {method}");
+    let (_, reply) = handshake(&port, &received, endpoint, method, args, &goal, timeout).await?;
+    Ok(reply)
 }
 
 /// Introduces this process to the proxy at `endpoint` with `proxy.hello`,

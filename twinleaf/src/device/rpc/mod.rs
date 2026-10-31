@@ -46,9 +46,10 @@ pub use crate::proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcStringLen, RpcV
 pub use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
 pub use error::{CallError, RpcErrorPayload};
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
-#[cfg(test)]
-pub(crate) use reply::resolved;
+pub(crate) use reply::Pipeline;
 pub use reply::{pipelined, PendingReply, ReplyFuture};
+#[cfg(test)]
+pub(crate) use reply::{poll_once, resolved};
 #[doc(no_inline)]
 pub use twinleaf_device::rpc::{Channel, Std, STANDARD};
 pub use value::{RpcMetaExt, RpcValue, RpcValueDecodeError, RpcValueEncodeError, RpcValueTypeExt};

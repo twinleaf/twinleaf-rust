@@ -588,7 +588,11 @@ impl Registry {
         }
     }
 
-    /// Opens a new link to `url` under `key`, and spawns its worker.
+    /// Opens a new link to `url` under `key`, and spawns its worker and its
+    /// engine. The registry holds the worker's task. No one holds the
+    /// engine's task. It ends once the worker's task has ended, as the
+    /// worker's end closes the port the engine reads, and the engine's
+    /// settings tasks end with it.
     fn start(&mut self, url: &str, key: String) -> LinkId {
         log::info!("Opening {url}");
         let id = LinkId(self.next_id);
@@ -614,7 +618,12 @@ impl Registry {
             store: Arc::new(Mutex::new(Store::new(true))),
             mounts: Mounts::new(url),
         };
-        let engine = engine::serve(link.store(), Arc::clone(&link.mounts), started.engine);
+        let engine = engine::serve(
+            link.store(),
+            Arc::clone(&link.mounts),
+            started.engine,
+            &self.tasks,
+        );
         self.tasks.spawn(format_args!("proxy state {url}"), engine);
         let entry = Entry {
             link,

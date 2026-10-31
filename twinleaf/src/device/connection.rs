@@ -135,6 +135,10 @@ impl Connection {
     /// `$XDG_RUNTIME_DIR/twinleaf`, or in `twinleaf/runtime` under the local
     /// data directory. `TWINLEAF_RUNTIME_DIR` names another directory.
     ///
+    /// The connection's tasks run on the crate's own runtime. This may be
+    /// called from inside an application's tokio runtime, and blocks that
+    /// thread until the proxy has opened the device or the open fails.
+    ///
     /// # Lifetime
     ///
     /// A device that drops out does not end the connection. The proxy

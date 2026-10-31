@@ -67,13 +67,56 @@ pub fn pipelined(
     calls: impl IntoIterator<Item = PendingReply>,
     window: usize,
 ) -> impl Iterator<Item = Result<Vec<u8>, CallError>> {
-    debug_assert!(window > 0, "a zero window would never submit anything");
-    let mut calls = calls.into_iter();
-    let mut in_flight = VecDeque::with_capacity(window);
-    std::iter::from_fn(move || {
-        in_flight.extend(calls.by_ref().take(window - in_flight.len()));
-        in_flight.pop_front().map(PendingReply::wait)
-    })
+    let mut calls = Pipeline::new(calls, window);
+    std::iter::from_fn(move || calls.next_call().map(PendingReply::wait))
+}
+
+/// A run of calls whose replies are taken in order, with up to a window of
+/// calls in flight. [`pipelined`] blocks on each reply, and
+/// [`next`](Self::next) awaits it.
+pub(crate) struct Pipeline<I> {
+    calls: I,
+    window: usize,
+    in_flight: VecDeque<PendingReply>,
+}
+
+impl<I: Iterator<Item = PendingReply>> Pipeline<I> {
+    /// Returns the run of `calls`, keeping up to `window` calls in flight.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `window` is zero.
+    pub(crate) fn new(calls: impl IntoIterator<IntoIter = I>, window: usize) -> Pipeline<I> {
+        debug_assert!(window > 0, "a zero window would never submit anything");
+        Pipeline {
+            calls: calls.into_iter(),
+            window,
+            in_flight: VecDeque::with_capacity(window),
+        }
+    }
+
+    /// Draws calls from the run until the window is full, and returns the
+    /// earliest call in flight. Returns `None` once every call has been
+    /// taken.
+    fn next_call(&mut self) -> Option<PendingReply> {
+        let room = self.window - self.in_flight.len();
+        self.in_flight.extend(self.calls.by_ref().take(room));
+        self.in_flight.pop_front()
+    }
+
+    /// Waits for the reply to the earliest call in flight, as
+    /// [`next_call`](Self::next_call) draws it. Returns `None` once every
+    /// call has been answered.
+    pub(crate) async fn next(&mut self) -> Option<Result<Vec<u8>, CallError>> {
+        Some(self.next_call()?.await)
+    }
+}
+
+/// Polls `future` once with a waker that does nothing.
+/// A future over replies already resolved is ready at once.
+#[cfg(test)]
+pub(crate) fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
+    future.poll(&mut Context::from_waker(std::task::Waker::noop()))
 }
 
 #[cfg(test)]
@@ -89,18 +132,6 @@ pub(crate) fn resolved(reply: Option<Vec<u8>>) -> PendingReply {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::task::Waker;
-
-    fn block_on<F: IntoFuture>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future.into_future());
-        let mut cx = Context::from_waker(Waker::noop());
-        loop {
-            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-                return output;
-            }
-            std::thread::yield_now();
-        }
-    }
 
     #[test]
     fn replies_come_back_in_submission_order_a_window_ahead() {
@@ -135,7 +166,14 @@ mod tests {
             resolve.send(Ok(b"later".to_vec())).unwrap();
         });
 
-        assert_eq!(block_on(pending).unwrap(), b"later");
+        let mut awaited = std::pin::pin!(pending.into_future());
+        let reply = loop {
+            if let Poll::Ready(reply) = poll_once(awaited.as_mut()) {
+                break reply;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(reply.unwrap(), b"later");
         resolver.join().unwrap();
     }
 }

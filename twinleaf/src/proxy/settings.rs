@@ -1,6 +1,6 @@
 //! The [`SettingsCache`] of setting values a device announces.
 
-use crate::device::rpc::{pipelined, CallError, PendingReply, RpcRegistry};
+use crate::device::rpc::{CallError, PendingReply, Pipeline, RpcRegistry};
 use crate::device::SettingChange;
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
@@ -171,32 +171,34 @@ impl SettingsCache {
     /// last read is kept at the first version, and the announcements between
     /// the two, still to be observed, bring it up to date. A value the device
     /// refuses to read is not held.
-    pub(crate) fn snapshot_with(
+    pub(crate) async fn snapshot_with(
         &mut self,
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<(), CallError> {
         if self.cached.is_empty() {
             return Ok(());
         }
-        let version = |reply: PendingReply| {
-            u32::decode_reply(&reply.wait()?).map_err(CallError::InvalidReply)
-        };
         let mut attempt = 1;
         loop {
-            let before = version(submit(SETTINGS_VERSION, &[]))?;
-            let calls = self.cached.iter().map(|name| submit(name, &[]));
-            let values = self
-                .cached
-                .iter()
-                .cloned()
-                .zip(pipelined(calls, SNAPSHOT_WINDOW))
-                .filter_map(|(name, reply)| match reply {
-                    Ok(value) => Some(Ok((name, value))),
-                    Err(CallError::DeviceError(_)) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<Result<BTreeMap<String, Vec<u8>>, CallError>>()?;
-            let after = version(submit(SETTINGS_VERSION, &[]))?;
+            let before = version(submit(SETTINGS_VERSION, &[]).await)?;
+            let mut values = BTreeMap::new();
+            {
+                let calls = self.cached.iter().map(|name| submit(name, &[]));
+                let mut replies = Pipeline::new(calls, SNAPSHOT_WINDOW);
+                for name in &self.cached {
+                    let Some(reply) = replies.next().await else {
+                        break;
+                    };
+                    match reply {
+                        Ok(value) => {
+                            values.insert(name.clone(), value);
+                        }
+                        Err(CallError::DeviceError(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            let after = version(submit(SETTINGS_VERSION, &[]).await)?;
             if after == before || attempt == SNAPSHOT_ATTEMPTS {
                 self.values = values;
                 self.applied = Some(before);
@@ -221,6 +223,11 @@ impl SettingsCache {
     }
 }
 
+/// Decodes the reply to a read of `settings.version`.
+fn version(reply: Result<Vec<u8>, CallError>) -> Result<u32, CallError> {
+    u32::decode_reply(&reply?).map_err(CallError::InvalidReply)
+}
+
 /// Whether sequence number `seq` comes after `applied`, across a wrap.
 fn ahead(seq: u32, applied: u32) -> bool {
     (seq.wrapping_sub(applied) as i32) > 0
@@ -229,8 +236,9 @@ fn ahead(seq: u32, applied: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::rpc::{resolved, RpcDescriptor, RpcErrorPayload};
+    use crate::device::rpc::{poll_once, resolved, RpcDescriptor, RpcErrorPayload};
     use crate::proto::rpc::RpcError;
+    use std::task::Poll;
 
     /// The metadata words of an announced read-write byte, an announced
     /// read-only one, a clock, a privileged announced byte, an announced
@@ -269,10 +277,13 @@ mod tests {
     ) -> (Vec<String>, Result<(), CallError>) {
         let mut asked = Vec::new();
         let mut replies = replies.iter().map(|reply| reply.to_vec());
-        let taken = cache.snapshot_with(|name, _| {
+        let taken = poll_once(std::pin::pin!(cache.snapshot_with(|name, _| {
             asked.push(name.to_string());
             resolved(replies.next())
-        });
+        })));
+        let Poll::Ready(taken) = taken else {
+            panic!("the snapshot waits on replies already resolved");
+        };
         (asked, taken)
     }
 
@@ -337,13 +348,13 @@ mod tests {
             Ok(vec![4, 0, 0, 0]),
         ]
         .into_iter();
-        let taken = cache.snapshot_with(|_, _| {
+        let taken = poll_once(std::pin::pin!(cache.snapshot_with(|_, _| {
             let (resolve, reply) = flume::bounded(1);
             resolve.send(replies.next().expect("four reads")).unwrap();
             PendingReply { reply }
-        });
+        })));
 
-        assert!(taken.is_ok());
+        assert!(matches!(taken, Poll::Ready(Ok(()))));
         assert_eq!(cache.get("test.amplitude"), Some(&[7][..]));
         assert_eq!(cache.get("test.status"), None);
         assert_eq!(cache.version(), Some(4));

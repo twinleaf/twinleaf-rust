@@ -5,7 +5,6 @@
 //! each header gives, as its [codec](super::codec::tcp::Codec) does.
 
 use super::task::{ByteStream, Rules};
-use crate::rt;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -32,7 +31,7 @@ pub(super) const CLIENT_RULES: Rules = Rules {
 
 /// Connects to the first of `addresses` that answers, trying each in turn
 /// for at most [`CONNECT_TIMEOUT`], and returns the stream. Must be awaited
-/// on the crate's runtime, which the stream belongs to.
+/// on a tokio runtime, which the stream belongs to.
 ///
 /// # Errors
 ///
@@ -59,25 +58,6 @@ pub(crate) async fn connect_socket(address: SocketAddr) -> io::Result<TcpStream>
         refuse_at_once(&socket);
     }
     socket.connect(address).await
-}
-
-/// Connects to `address` as [`std::net::TcpStream::connect_timeout`] does,
-/// refusing at once like [`connect_socket`].
-pub(crate) fn connect_blocking(
-    address: &SocketAddr,
-    timeout: Duration,
-) -> io::Result<std::net::TcpStream> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(
-        Domain::for_address(*address),
-        Type::STREAM,
-        Some(Protocol::TCP),
-    )?;
-    if address.ip().is_loopback() {
-        refuse_at_once(&socket);
-    }
-    socket.connect_timeout(&(*address).into(), timeout)?;
-    Ok(socket.into())
 }
 
 /// Makes a connect on `socket` give up after the first refusal. Windows
@@ -135,22 +115,6 @@ async fn connect_stream(address: SocketAddr) -> io::Result<TcpStream> {
         })??;
     stream.set_nodelay(true)?;
     Ok(stream)
-}
-
-/// Returns the connected `stream` as a stream a port's task can drive, with
-/// Nagle's algorithm off.
-///
-/// # Errors
-///
-/// Returns an error if the stream cannot be set up or registered with the
-/// runtime.
-pub(super) fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
-    // TIO packets are small and latency-sensitive (RPCs, heartbeats);
-    // Nagle + delayed ACK would serialize a burst of requests.
-    stream.set_nodelay(true)?;
-    stream.set_nonblocking(true)?;
-    let _runtime = rt::handle().enter();
-    TcpStream::from_std(stream)
 }
 
 impl ByteStream for TcpStream {}

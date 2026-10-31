@@ -1,8 +1,10 @@
 //! Serial, TCP and UDP links that carry packets, each driven by a task.
 //!
-//! A [`Port`] is the host's end of one link. Its task runs on the crate's
-//! internal tokio runtime. It frames bytes into [`Packet`]s, writes queued
-//! packets, sets serial rates, and sends heartbeats. The
+//! A [`Port`] is the host's end of one link. Its task runs on the runtime
+//! of the supervisor it was opened with, the crate's own for the
+//! synchronous API and the caller's for an async entry point. It frames
+//! bytes into [`Packet`]s, writes queued packets, sets serial rates, and
+//! sends heartbeats. The
 //! [proxy](crate::proxy) opens one for its link to each device and one for
 //! each client socket it accepts. A [`Connection`](crate::Connection) opens
 //! one for its socket to the proxy. Applications do not open ports directly.
@@ -23,7 +25,7 @@ mod udp;
 
 #[cfg(test)]
 pub(crate) use fake::FakeEnd;
-pub(crate) use tcp::{connect_blocking, connect_socket, CONNECT_TIMEOUT};
+pub(crate) use tcp::{connect_socket, CONNECT_TIMEOUT};
 
 use super::packet::{self, Packet};
 use crate::proto;
@@ -262,13 +264,20 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// With the `mdns` feature, a `.local` name in any case, with or without a
 /// trailing dot, is resolved over mDNS first. That takes at most 1.5 s. The
 /// system's resolver resolves the name when mDNS finds no address that
-/// fits, and any other name, within [`LOOKUP_TIMEOUT`].
+/// fits, and any other name, within [`LOOKUP_TIMEOUT`]. The mDNS daemon
+/// starts on a blocking thread of `tasks`.
 ///
 /// Returns an error if nothing resolves in time.
-async fn resolve(addr: &str, family: AddrFamilyRestrict) -> io::Result<Vec<SocketAddr>> {
+async fn resolve(
+    addr: &str,
+    family: AddrFamilyRestrict,
+    tasks: &Supervisor,
+) -> io::Result<Vec<SocketAddr>> {
+    #[cfg(not(feature = "mdns"))]
+    let _ = tasks;
     #[cfg(feature = "mdns")]
     if let Some((host, port)) = local_name(addr) {
-        match preferred(&super::mdns::resolve(&host, port).await, &family) {
+        match preferred(&super::mdns::resolve(&host, port, tasks).await, &family) {
             Some(found) => return Ok(vec![found]),
             None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
         }
@@ -426,7 +435,7 @@ impl Port {
 
     #[cfg(feature = "serial")]
     fn open_serial(serial_config: &str, rx: Delivery, tasks: &Supervisor) -> io::Result<Port> {
-        let (stream, rates) = serial::open(serial_config)?;
+        let (stream, rates) = serial::open(serial_config, tasks)?;
         let (port, task) = Port::with_task(
             TransportKind::Serial,
             Some(rates),
@@ -449,7 +458,7 @@ impl Port {
         rx: Delivery,
         tasks: &Supervisor,
     ) -> io::Result<Port> {
-        let found = resolve(address, family).await?;
+        let found = resolve(address, family, tasks).await?;
         match link {
             IpLink::Tcp => {
                 let stream = tcp::connect(&found).await?;
@@ -531,7 +540,7 @@ impl Port {
 
         if Port::opens_as_future(url) {
             let (url, on) = (url.to_string(), tasks.clone());
-            return Supervisor::new().run("twinleaf port open", async move {
+            return tasks.run("twinleaf port open", async move {
                 Port::open(&url, rx, &on).await
             });
         }
@@ -550,11 +559,11 @@ impl Port {
         }
     }
 
-    /// Opens a [`Port`] for `url` as [`new`](Self::new) does, without
+    /// Opens a [`Port`] for `url` as [`new_on`](Self::new_on) does, without
     /// blocking a worker of the runtime. A TCP or UDP link resolves its
     /// address and opens as a future, and dropping it at any await leaves
-    /// nothing open. Its task runs on `tasks`. Any other link opens on a blocking
-    /// thread of `tasks`.
+    /// nothing open. Its task runs on `tasks`. Any other link opens on a
+    /// blocking thread of `tasks`.
     ///
     /// # Errors
     ///
@@ -591,28 +600,50 @@ impl Port {
     }
 
     /// Creates a [`Port`] over the connected TCP `stream`, such as the one a
-    /// control call opens to the proxy. It delivers what it receives to `rx`
-    /// as [`new`](Self::new) does, and queues up to `tx_size` packets to
-    /// send. Returns an error if the stream cannot be set up.
+    /// control call opens to the proxy, with Nagle's algorithm off. Its task
+    /// runs on `tasks`. It delivers what it receives to `rx` as
+    /// [`new_on`](Self::new_on) does, and queues up to `tx_size` packets to
+    /// send.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Nagle's algorithm cannot be turned off.
+    pub(crate) fn over_tcp(
+        stream: tokio::net::TcpStream,
+        rx: Delivery,
+        tx_size: usize,
+        tasks: &Supervisor,
+    ) -> io::Result<Port> {
+        // TIO packets are small and latency sensitive, and Nagle's algorithm
+        // with delayed acknowledgement would serialize a burst of requests.
+        stream.set_nodelay(true)?;
+        Ok(Port::start_tcp(stream, tcp::RULES, rx, tx_size, tasks))
+    }
+
+    /// Creates a [`Port`] over the connected TCP `stream`, a socket of no
+    /// runtime yet, as [`over_tcp`](Self::over_tcp) does on the crate's
+    /// runtime.
+    #[cfg(test)]
     pub(crate) fn from_tcp_stream(
         stream: std::net::TcpStream,
         rx: Delivery,
         tx_size: usize,
     ) -> io::Result<Port> {
-        Ok(Port::start_tcp(
-            tcp::from_std(stream)?,
-            tcp::RULES,
-            rx,
-            tx_size,
-            &Supervisor::new(),
-        ))
+        let tasks = Supervisor::new();
+        stream.set_nonblocking(true)?;
+        let stream = {
+            let _runtime = tasks.enter();
+            tokio::net::TcpStream::from_std(stream)?
+        };
+        Port::over_tcp(stream, rx, tx_size, &tasks)
     }
 
     /// Creates a [`Port`] over `stream`, a connected TCP stream of the
-    /// crate's runtime, such as a client the proxy accepted. Its task runs on
-    /// `tasks`. It delivers what it receives to `rx` as [`new`](Self::new)
-    /// does, and queues up to `tx_size` packets to send. Once the port is
-    /// dropped and its queue is written, the link closes in stages. The task
+    /// runtime of `tasks`, such as a client the proxy accepted. Its task runs
+    /// on `tasks`. It delivers what it receives to `rx` as
+    /// [`new_on`](Self::new_on) does, and queues up to `tx_size` packets to
+    /// send. Once the port is dropped and its queue is written, the link
+    /// closes in stages. The task
     /// shuts down its sending side, and waits up to 500 ms for the client to
     /// close first.
     ///
@@ -1390,12 +1421,20 @@ mod tests {
     /// and a connect goes on to the next address when one refuses.
     #[test]
     fn a_connect_tries_each_address_the_name_resolves_to() {
-        let resolved = rt::handle().block_on(resolve("localhost:99", AddrFamilyRestrict::V4));
+        let resolved = rt::handle().block_on(resolve(
+            "localhost:99",
+            AddrFamilyRestrict::V4,
+            &Supervisor::new(),
+        ));
         assert!(resolved
             .unwrap()
             .iter()
             .all(|found| found.is_ipv4() && found.port() == 99));
-        let ip_v6 = rt::handle().block_on(resolve("127.0.0.1", AddrFamilyRestrict::V6));
+        let ip_v6 = rt::handle().block_on(resolve(
+            "127.0.0.1",
+            AddrFamilyRestrict::V6,
+            &Supervisor::new(),
+        ));
         assert_eq!(
             ip_v6.map_err(|error| error.kind()),
             Err(io::ErrorKind::NotFound)
