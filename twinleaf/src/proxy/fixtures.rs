@@ -5,8 +5,10 @@
 use super::link::Opens;
 use super::worker::Opener;
 use super::HostOptions;
+use crate::proto::data as wire;
 use crate::proto::rpc::Method;
-use crate::proto::{DeviceRoute, PacketType};
+use crate::proto::sync::Epoch;
+use crate::proto::{ColumnId, DeviceRoute, PacketType, SegmentId, SessionId, StreamId};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{FakeEnd, Port, TransportKind};
 use std::collections::HashMap;
@@ -56,12 +58,16 @@ struct DeviceState {
     resets: AtomicUsize,
     /// Set once the device is gone.
     dead: AtomicBool,
+    /// Set once the device sends no more heartbeats.
+    quiet: AtomicBool,
     /// Packets for a connection to send.
     outbox: Mutex<Vec<Packet>>,
     /// Every packet the device received.
     received: Mutex<Vec<Packet>>,
     /// How long it takes to answer `dev.name`.
     reply_delay: Mutex<Duration>,
+    /// The hash of the device's RPC table, one no other fake device shares.
+    table_hash: u32,
     stop: AtomicBool,
 }
 
@@ -74,7 +80,8 @@ struct Generations {
 }
 
 /// A device behind a TCP port on this machine. Each connection gets a
-/// heartbeat about every 300 ms, and an answer to `dev.name`.
+/// heartbeat about every 300 ms, and answers to `dev.name`, `dev.metadata`
+/// and the calls that load its RPC table and read its one setting.
 pub(crate) struct FakeDevice {
     /// The URL it listens at.
     pub(crate) url: String,
@@ -85,9 +92,13 @@ impl FakeDevice {
     /// Starts a fake device on a free port of `127.0.0.1`.
     pub(crate) fn start() -> FakeDevice {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let address = listener.local_addr().unwrap();
+        let url = format!("tcp://{address}");
         listener.set_nonblocking(true).unwrap();
-        let state = Arc::new(DeviceState::default());
+        let state = Arc::new(DeviceState {
+            table_hash: (std::process::id() << 16) | u32::from(address.port()),
+            ..DeviceState::default()
+        });
         let accepting = state.clone();
         std::thread::spawn(move || {
             while !accepting.stop.load(Ordering::SeqCst) {
@@ -165,6 +176,27 @@ impl FakeDevice {
     /// behind an endpoint that still answers does. Its port stays taken.
     pub(crate) fn die(&self) {
         self.state.dead.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops sending heartbeats, and keeps every connection open, as a
+    /// device that hangs does.
+    pub(crate) fn go_quiet(&self) {
+        self.state.quiet.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns the hash of the device's RPC table.
+    pub(crate) fn table_hash(&self) -> u32 {
+        self.state.table_hash
+    }
+
+    /// Returns how many calls of the RPC `name` the device has received.
+    pub(crate) fn calls(&self, name: &str) -> usize {
+        let received = self.state.received.lock().unwrap();
+        let called = |pkt: &&Packet| match pkt.payload() {
+            Payload::RpcRequest(request) => request.method == Method::ByName(name.as_bytes()),
+            _ => false,
+        };
+        received.iter().filter(called).count()
     }
 
     /// Delays each answer to `dev.name` by `delay`. Heartbeats continue
@@ -258,7 +290,9 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
         if state.reset_generation.load(Ordering::SeqCst) != born.reset {
             return reset(stream, state);
         }
-        if Instant::now() >= next_beat {
+        if state.quiet.load(Ordering::SeqCst) {
+            next_beat = Instant::now();
+        } else if Instant::now() >= next_beat {
             if stream.write_all(heartbeat.as_bytes()).is_err() {
                 return;
             }
@@ -293,13 +327,94 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
             let Payload::RpcRequest(request) = pkt.payload() else {
                 continue;
             };
-            if request.method == Method::ByName(b"dev.name") {
-                let reply = Packet::rpc_reply(request.id.value(), b"FAKE", pkt.route());
-                let due = Instant::now() + *state.reply_delay.lock().unwrap();
+            let Method::ByName(name) = request.method else {
+                continue;
+            };
+            let due = match name {
+                b"dev.name" => Instant::now() + *state.reply_delay.lock().unwrap(),
+                _ => Instant::now(),
+            };
+            if let Some(value) = answer(name, request.args, state.table_hash) {
+                let reply = Packet::rpc_reply(request.id.value(), &value, pkt.route());
                 replies.push((due, reply.unwrap()));
             }
         }
     }
+}
+
+/// The fake device's RPC table besides `dev.name`, each entry's name and
+/// metadata word. It has one readable, announced setting and
+/// `settings.version`.
+const TABLE: [(&str, u16); 2] = [("test.amplitude", 0xA310), ("settings.version", 0x8140)];
+
+/// Returns the fake device's answer to the RPC `name` with `args`, or `None`
+/// for an RPC it leaves unanswered. It describes itself as one stream of one
+/// column, in session 7, and its table has the hash `table_hash`.
+fn answer(name: &[u8], args: &[u8], table_hash: u32) -> Option<Vec<u8>> {
+    Some(match name {
+        b"dev.name" => b"FAKE".to_vec(),
+        b"rpc.hash" => table_hash.to_le_bytes().to_vec(),
+        b"dev.session" | b"settings.version" => 7u32.to_le_bytes().to_vec(),
+        b"rpc.listinfo" if args.is_empty() => (TABLE.len() as u16).to_le_bytes().to_vec(),
+        b"rpc.listinfo" => {
+            let index = u16::from_le_bytes(args.try_into().ok()?);
+            let (name, meta) = TABLE.get(usize::from(index))?;
+            [&meta.to_le_bytes()[..], name.as_bytes()].concat()
+        }
+        b"test.amplitude" => vec![1],
+        b"dev.metadata" => {
+            let mut reply = vec![0u8; wire::MAX_METADATA_REPLY_SIZE];
+            let written = description().iter().fold(0, |written, record| {
+                written + record.write_reply_frame(&mut reply[written..]).unwrap()
+            });
+            reply.truncate(written);
+            reply
+        }
+        _ => return None,
+    })
+}
+
+/// The records the fake device describes itself with, in session 7.
+pub(crate) fn description() -> [wire::Metadata<'static>; 4] {
+    let stream_id = StreamId::new(1);
+    [
+        wire::Metadata::Device(wire::Device {
+            session: SessionId::new(7),
+            n_streams: 1,
+            name: "FAKE",
+            serial: "F1",
+            firmware: "1",
+        }),
+        wire::Metadata::Stream(wire::Stream {
+            stream_id,
+            n_columns: 1,
+            n_segments: 1,
+            sample_size: 4,
+            buf_samples: 128,
+            name: "field",
+        }),
+        wire::Metadata::Segment(wire::Segment {
+            stream_id,
+            segment_id: SegmentId::new(0),
+            flags: wire::SegmentFlags::default(),
+            epoch: Epoch::UNIX,
+            timeref_serial: "",
+            timeref_session: SessionId::new(7),
+            start_time: 0,
+            sampling_rate: 10,
+            decimation: 1,
+            filter_cutoff: 0.0,
+            filter_type: wire::FilterType::NONE,
+        }),
+        wire::Metadata::Column(wire::Column {
+            stream_id,
+            index: ColumnId::new(0),
+            data_type: wire::DataType::F32,
+            name: "x",
+            units: "nT",
+            description: "",
+        }),
+    ]
 }
 
 /// Closes `stream` once bytes it has not read arrive, which makes the kernel

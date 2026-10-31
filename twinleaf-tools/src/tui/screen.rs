@@ -1,6 +1,6 @@
 //! The screen loop that `tio monitor` and `tio health` share.
 
-use super::rpc_console::{LoadedRegistry, Reply};
+use super::rpc_console::Reply;
 use super::RpcConsole;
 use ratatui::{
     crossterm::{
@@ -11,10 +11,11 @@ use ratatui::{
 };
 use std::{
     io,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use twinleaf::{
-    device::{DeviceTree, Event, RecvError},
+    device::{DeviceTree, MetadataState, Presence, RecvError, RegistryState, Settings},
     flume::{self, select::SelectError, Receiver, Selector},
     DeviceRoute, SampleBatch,
 };
@@ -30,8 +31,15 @@ pub trait Screen {
     /// Takes a batch of samples.
     fn on_batch(&mut self, batch: SampleBatch);
 
-    /// Takes an event, which the console has taken already.
-    fn on_event(&mut self, event: Event);
+    /// Takes every route heard in the tree so far, each time a new one is.
+    fn on_routes(&mut self, routes: &[DeviceRoute]);
+
+    /// Takes the new presence of the device at `route`, which the console has
+    /// taken already.
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence);
+
+    /// Takes how far the metadata of the device at `route` is collected now.
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState);
 
     /// Takes note that the tool fell behind and lost what `error` says.
     fn on_lagged(&mut self, error: RecvError);
@@ -57,8 +65,8 @@ pub trait Screen {
 /// Panics if `fps` is zero.
 pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Result<()> {
     let batches = tree.samples();
-    let events = tree.events();
-    let loaded = screen.console().loaded().clone();
+    let routes = tree.routes_updates();
+    let mut devices: Vec<Watched> = Vec::new();
     let replies = screen.console().replies().clone();
     let input = read_input();
     let frame = Duration::from_millis(1000 / fps);
@@ -73,37 +81,73 @@ pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Resul
                 return Ok(());
             }
         }
-        let woken = Selector::new()
+        let mut selector = Selector::new()
             .recv(batches.as_flume(), |batch| {
                 batches
                     .resolve(batch)
                     .map_or_else(Woken::Failed, Woken::Batch)
             })
-            .recv(events.as_flume(), |event| {
-                events
-                    .resolve(event)
-                    .map_or_else(Woken::Failed, Woken::Event)
+            .recv(routes.as_flume(), |heard| {
+                routes
+                    .resolve(heard)
+                    .map_or_else(Woken::Failed, Woken::Routes)
             })
             .recv(&input, |event| event.map_or(Woken::Closed, Woken::Input))
-            .recv(&loaded, |registry| {
-                registry.map_or(Woken::Closed, Woken::Loaded)
-            })
-            .recv(&replies, |reply| reply.map_or(Woken::Closed, Woken::Reply))
-            .wait_deadline(next_frame);
-        match woken {
+            .recv(&replies, |reply| reply.map_or(Woken::Closed, Woken::Reply));
+        for device in &devices {
+            let route = device.route;
+            selector = selector
+                .recv(device.presence.as_flume(), move |presence| {
+                    device
+                        .presence
+                        .resolve(presence)
+                        .map_or_else(Woken::Failed, |presence| Woken::Presence(route, presence))
+                })
+                .recv(device.metadata.as_flume(), move |metadata| {
+                    device
+                        .metadata
+                        .resolve(metadata)
+                        .map_or_else(Woken::Failed, |metadata| Woken::Metadata(route, metadata))
+                });
+        }
+        for (route, registry, settings) in screen.console().watched() {
+            selector = selector
+                .recv(registry.as_flume(), move |loaded| {
+                    registry
+                        .resolve(loaded)
+                        .map_or_else(Woken::Failed, |loaded| Woken::Registry(route, loaded))
+                })
+                .recv(settings.as_flume(), move |read| {
+                    settings
+                        .resolve(read)
+                        .map_or_else(Woken::Failed, |read| Woken::Settings(route, read))
+                });
+        }
+        match selector.wait_deadline(next_frame) {
             Ok(Woken::Batch(batch)) => screen.on_batch(batch),
-            Ok(Woken::Event(event)) => {
-                screen.console().handle_event(&event);
-                screen.on_event(event);
+            Ok(Woken::Routes(heard)) => {
+                for &route in &heard {
+                    if devices.iter().all(|device| device.route != route) {
+                        devices.push(Watched::new(tree, route)?);
+                    }
+                }
+                screen.console().on_routes(&heard);
+                screen.on_routes(&heard);
             }
+            Ok(Woken::Presence(route, presence)) => {
+                screen.console().on_presence(route, presence);
+                screen.on_presence(route, presence);
+            }
+            Ok(Woken::Metadata(route, metadata)) => screen.on_metadata(route, metadata),
+            Ok(Woken::Registry(route, registry)) => {
+                let default = screen.rpc_default();
+                screen.console().on_registry(route, registry, default);
+            }
+            Ok(Woken::Settings(route, settings)) => screen.console().on_settings(route, settings),
             Ok(Woken::Input(event)) => {
                 if screen.on_input(event) {
                     return Ok(());
                 }
-            }
-            Ok(Woken::Loaded(registry)) => {
-                let default = screen.rpc_default();
-                screen.console().on_loaded(registry, default);
             }
             Ok(Woken::Reply(reply)) => screen.console().on_reply(reply),
             Ok(Woken::Failed(error @ RecvError::Lagged(_))) => screen.on_lagged(error),
@@ -114,12 +158,38 @@ pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Resul
     }
 }
 
+/// The state of one device the screen loop follows.
+struct Watched {
+    route: DeviceRoute,
+    presence: twinleaf::Receiver<Presence>,
+    metadata: twinleaf::Receiver<MetadataState>,
+}
+
+impl Watched {
+    /// Follows the device at `route` in `tree`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `route` lies outside `tree`.
+    fn new(tree: &DeviceTree, route: DeviceRoute) -> eyre::Result<Watched> {
+        let device = tree.device(route)?;
+        Ok(Watched {
+            route,
+            presence: device.presence_updates(),
+            metadata: device.metadata_updates(),
+        })
+    }
+}
+
 /// What woke the screen loop, with what it received.
 enum Woken {
     Batch(SampleBatch),
-    Event(Event),
+    Routes(Vec<DeviceRoute>),
+    Presence(DeviceRoute, Presence),
+    Metadata(DeviceRoute, MetadataState),
+    Registry(DeviceRoute, RegistryState),
+    Settings(DeviceRoute, Arc<Settings>),
     Input(term::Event),
-    Loaded(LoadedRegistry),
     Reply(Reply),
     /// The stream lagged or ended.
     Failed(RecvError),

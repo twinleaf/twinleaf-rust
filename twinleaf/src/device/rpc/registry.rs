@@ -18,7 +18,7 @@ const WALK_ATTEMPTS: usize = 3;
 const SESSION: &str = "dev.session";
 
 /// Why a device's RPC table could not be loaded.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcRegistryError {
     /// A call during the walk failed.
@@ -95,7 +95,7 @@ impl RpcRegistry {
         for _ in 0..WALK_ATTEMPTS {
             let path = cache::path(&dev_name, hash);
             if let Some(entries) = path.as_deref().and_then(cache::load) {
-                return Ok(Self::from_entries(entries, hash, session));
+                return Ok(Self::from_entries(entries, Some(hash), session));
             }
             let total: u16 = decode(submit("rpc.listinfo", &[]).wait()?)?;
             let descriptors = (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
@@ -107,20 +107,26 @@ impl RpcRegistry {
                 if let Some(path) = &path {
                     cache::store(path, &entries);
                 }
-                return Ok(Self::from_entries(entries, hash, session));
+                return Ok(Self::from_entries(entries, Some(hash), session));
             }
             hash = after;
         }
         Err(RpcRegistryError::TableChanged)
     }
 
-    fn from_entries(entries: cache::Entries, hash: u32, session: Option<SessionId>) -> Self {
+    /// Creates a registry of `entries`, each a name and its metadata word,
+    /// with `hash` and `session`.
+    pub(crate) fn from_entries(
+        entries: Vec<(String, u16)>,
+        hash: Option<u32>,
+        session: Option<SessionId>,
+    ) -> Self {
         let specs = entries
             .into_iter()
             .map(|(name, meta)| RpcDescriptor::from_meta(meta, name))
             .collect();
         let mut registry = Self::new(specs);
-        registry.hash = Some(hash);
+        registry.hash = hash;
         registry.session = session;
         registry
     }

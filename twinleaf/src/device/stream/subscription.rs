@@ -265,10 +265,6 @@ impl<T> Lane<T> {
     /// end. Its reader never lags. One that falls behind receives the newest
     /// item next. It suits state, where each item is a whole value and the
     /// latest one is what matters.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the device state subscriptions will use it")
-    )]
     pub(crate) fn latest() -> (Lane<T>, flume::Receiver<Queued<T>>) {
         let (mut lane, received) = Lane::new(1);
         lane.unread = Some(received.clone());
@@ -277,19 +273,26 @@ impl<T> Lane<T> {
 
     /// Sends one item, or counts it as missed if the queue is full. Returns
     /// `false` once the receiver is gone.
-    pub(crate) fn send(&mut self, item: T) -> bool {
+    pub(crate) fn send(&mut self, item: T) -> bool
+    where
+        T: Clone,
+    {
         if let Some(unread) = &self.unread {
             // The lane's own hold keeps the queue connected, so the reader
             // is gone once that hold is the only receiver left.
             if self.items.receiver_count() <= 1 {
                 return false;
             }
-            // The pump is the only sender, so once the unread item is taken
-            // back, or the reader takes it first, there is room.
-            if self.items.len() >= self.room {
-                let _ = unread.try_recv();
+            // The new item goes in before the unread one comes out, in the
+            // place kept for the end, so the lane never looks empty while it
+            // holds an item. The pump is the only sender.
+            let _ = self.items.try_send(Queued::Item(item.clone()));
+            // A reader that took an item meanwhile may leave the lane empty
+            // once the older one is out, and then gets the new one again.
+            if self.items.len() > self.room && unread.try_recv().is_ok() && self.items.is_empty() {
+                let _ = self.items.try_send(Queued::Item(item));
             }
-            return self.push(Queued::Item(item)).is_ok();
+            return true;
         }
         if !self.report_lag() {
             return false;
@@ -350,10 +353,6 @@ impl<T> Sink<T> {
 
     /// Returns a sink whose [latest-value](Lane::latest) lane holds only the
     /// newest item, and its receiver.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the device state subscriptions will use it")
-    )]
     pub(super) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
         Self::with_lane(Lane::latest(), scope)
     }
@@ -373,7 +372,10 @@ impl<T> Sink<T> {
 
     /// Offers an item concerning `scope`, sent only if `scope` overlaps this
     /// subscriber's scope. Returns `false` once the subscriber is gone.
-    pub(super) fn offer(&mut self, scope: Scope, item: impl FnOnce() -> T) -> bool {
+    pub(super) fn offer(&mut self, scope: Scope, item: impl FnOnce() -> T) -> bool
+    where
+        T: Clone,
+    {
         if self.scope.intersects(&scope) {
             self.lane.send(item())
         } else {

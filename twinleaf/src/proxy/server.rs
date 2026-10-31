@@ -9,7 +9,6 @@ use super::{
     answers, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
 };
 use crate::rt::{self, sleep_until_some, Supervisor};
-use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{BTreeMap, HashMap};
@@ -91,9 +90,9 @@ impl Shared {
 pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
     if options.port != 0 && answers(options.port) {
         let endpoint = endpoint_at(options.port);
-        let hello = Introduction::of_this_process(&options.name).encode_args();
+        let hello = control::encode(&Introduction::of_this_process(&options.name));
         let message = match control::call(&endpoint, HELLO, &hello, HELLO_TIMEOUT) {
-            Ok(reply) => match Introduction::decode_reply(&reply) {
+            Ok(reply) => match control::decode::<Introduction>(&reply) {
                 Ok(host) => {
                     format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
                 }

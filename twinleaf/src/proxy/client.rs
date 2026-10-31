@@ -3,17 +3,20 @@
 //! [`Session::run`] runs it.
 
 use super::auto::{self, Choice};
-use super::control::{self, Purpose, Refusal, Request};
+use super::control::encode;
+use super::control::{self, Purpose, Refusal, Request, Watch};
 use super::link::{self, Lease, Link};
 use super::server::{Notice, Shared, Update};
 use super::worker;
 use super::Layout;
+use crate::device::rpc::RpcRegistry;
+use crate::device::{Device, MetadataState, RecvError};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
-use crate::tio::rpc::RpcArgs;
 use crate::tio::transport::{self, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
+use futures_util::stream::{self, BoxStream};
 use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -112,6 +115,8 @@ impl SlowTracker {
 /// where the client sees it.
 struct Mounted {
     prefix: DeviceRoute,
+    /// The subtree of the device the mount shows at its prefix.
+    source: DeviceRoute,
     port: link::PortSender,
     /// Whether the last link status the mount heard is `FailedToReconnect`.
     gave_up: bool,
@@ -182,6 +187,9 @@ pub(super) struct Session {
     binding: Option<Binding>,
     opening: Option<Opening>,
     held: Option<Held>,
+    /// The updates of each device the client watches, by the id of its
+    /// `proxy.watch`.
+    watches: StreamMap<u16, BoxStream<'static, control::Update>>,
     /// Whether the client is a legacy client, whose first packet was not a
     /// control request. A legacy client reads link statuses in the legacy
     /// form. It is `true` until the client is classified.
@@ -213,6 +221,7 @@ impl Session {
             binding: None,
             opening: None,
             held: None,
+            watches: StreamMap::new(),
             legacy: true,
         }
     }
@@ -285,6 +294,9 @@ impl Session {
                         return Err(binding.expect("a mount is bound").closed(index));
                     };
                     self.mount_packet(pkt, index)?;
+                }
+                Some((id, update)) = self.watches.next(), if !self.watches.is_empty() => {
+                    self.send_update(id, &update)?;
                 }
                 (request, outcome) = finish(&mut self.opening) => {
                     self.opened(request, outcome).await?;
@@ -494,7 +506,7 @@ impl Session {
                 log::debug!("Client {} is {client}", self.addr);
                 self.update(Update::Hello(client)).await;
                 let host = control::Introduction::of_this_process(&self.shared.options.name);
-                self.answer(id, Ok(host.encode_args()))
+                self.answer(id, Ok(encode(&host)))
             }
             Request::Open { target } => self.request_open(id, target, Purpose::Use),
             Request::Probe { url } => self.request_open(id, url, Purpose::Probe),
@@ -504,6 +516,7 @@ impl Session {
                 self.request(id, binding)
             }
             Request::Default(layout) => self.hold_default(id, layout),
+            Request::Watch(watch) => self.watch(id, watch),
             Request::Stop if self.shared.options.stoppable => {
                 self.answer(id, Ok(Vec::new()))?;
                 log::info!("Stopped by proxy.stop from client {}", self.addr);
@@ -522,6 +535,63 @@ impl Session {
             #[cfg(test)]
             Request::Panic => panic!("client {} asked its task to panic", self.addr),
         }
+    }
+
+    /// Follows the device that control request `id` names, answering with
+    /// its state now and then each change. The client inside the proxy that
+    /// keeps the state of the device's link starts with the first watch.
+    fn watch(&mut self, id: u16, watch: Watch) -> Result<(), ClientError> {
+        match self.watched(watch.route) {
+            Ok(device) => {
+                self.watches.insert(id, updates(&device, watch.table));
+                Ok(())
+            }
+            Err(refusal) => self.answer(id, Err(refusal)),
+        }
+    }
+
+    /// Returns the device at `route`, as the client sees it, from the client
+    /// inside the proxy that keeps the state of its mount's link.
+    ///
+    /// Returns a [`Refusal`] if the client opened nothing, no mount shows
+    /// `route`, or the link takes no more ports.
+    fn watched(&self, route: DeviceRoute) -> Result<Device, Refusal> {
+        let Some(binding) = &self.binding else {
+            return Err(Refusal::new(
+                RpcError::State,
+                "this connection opened nothing",
+            ));
+        };
+        let mounted = binding.mounts.iter().zip(&binding.leases);
+        let found = mounted.into_iter().find_map(|(mount, lease)| {
+            let below = mount.prefix.relative_route(&route).ok()?;
+            Some((mount.source.absolute_route(&below).ok()?, lease.link()))
+        });
+        let Some((source, link)) = found else {
+            let message = format!("no mount shows {route}");
+            return Err(Refusal::new(RpcError::Invalid, message));
+        };
+        let state = link.state(&self.shared.tasks);
+        let state = state.map_err(|reason| Refusal::new(RpcError::Load, reason))?;
+        Ok(state.device(source))
+    }
+
+    /// Sends `update` to the client in the parts of replies to watch `id`.
+    ///
+    /// Returns an error if the client is gone, or if it falls behind a proxy
+    /// that kicks slow clients.
+    fn send_update(&mut self, id: u16, update: &control::Update) -> Result<(), ClientError> {
+        for part in control::parts(id, update) {
+            match self.client.try_send(part) {
+                Ok(()) => self.slow.packet_delivered(&self.addr),
+                Err(transport::SendError::Full) if !self.shared.options.kick_slow => {
+                    self.slow.packet_dropped(&self.addr)
+                }
+                Err(transport::SendError::Full) => return Err(ClientError::TooSlow),
+                Err(_) => return Err(ClientError::HungUp),
+            }
+        }
+        Ok(())
     }
 
     /// Makes `layout` the default until this client leaves, answering control
@@ -618,7 +688,7 @@ impl Session {
                 let target = binding.target.clone();
                 self.update(Update::Target(target.clone())).await;
                 self.binding = Some(binding);
-                Ok(target.encode_args())
+                Ok(encode(&target))
             }
             Err(_) if self.stopping() => return Err(self.stopped()),
             Err(refusal) => Err(refusal),
@@ -703,6 +773,7 @@ async fn attach(
         );
         mounts.push(Mounted {
             prefix: mount.prefix,
+            source: mount.source,
             port,
             gave_up: false,
         });
@@ -762,6 +833,74 @@ async fn resolve(
         },
         url => Ok((url.to_string(), Layout::single(url), None)),
     }
+}
+
+/// Returns the updates a watch of `device` sends, of its presence, metadata
+/// and announced settings, or with `table` of its RPC table and settings. A table goes out ahead of the first
+/// settings read with it. The stream ends with the client that keeps them.
+fn updates(device: &Device, table: bool) -> BoxStream<'static, control::Update> {
+    if !table {
+        let followed = (
+            device.presence_updates(),
+            device.metadata_updates(),
+            device.setting_changes(),
+        );
+        return stream::unfold(followed, |(presence, metadata, changes)| async move {
+            let update = tokio::select! {
+                now = presence.recv_async() => Some(control::Update::presence(now.ok()?)),
+                state = metadata.recv_async() => match state.ok()? {
+                    MetadataState::Ready(snapshot) => control::Update::metadata(&snapshot),
+                    MetadataState::Unsupported => Some(control::Update::Unsupported),
+                    MetadataState::Pending => None,
+                },
+                change = changes.recv_async() => match change {
+                    Ok(change) => Some(control::Update::setting(change)),
+                    Err(RecvError::Lagged(_)) => None,
+                    Err(_) => return None,
+                },
+            };
+            Some((stream::iter(update), (presence, metadata, changes)))
+        })
+        .flatten()
+        .boxed();
+    }
+    let followed = (
+        device.rpc_registry_updates(),
+        device.settings_updates(),
+        None,
+    );
+    stream::unfold(followed, |(registry, settings, mut sent)| async move {
+        let updates = tokio::select! {
+            loaded = registry.recv_async() => match loaded.ok()? {
+                Ok(table) => new_table(&mut sent, &table).into_iter().collect(),
+                Err(error) => {
+                    sent = None;
+                    vec![control::Update::unloaded(&error)]
+                }
+            },
+            read = settings.recv_async() => {
+                let read = read.ok()?;
+                let table = new_table(&mut sent, read.rpc_registry());
+                table.into_iter().chain([control::Update::settings(&read)]).collect()
+            }
+        };
+        Some((stream::iter(updates), (registry, settings, sent)))
+    })
+    .flatten()
+    .boxed()
+}
+
+/// Returns the update of `table` unless it is the table `sent` holds, and
+/// then holds it there.
+fn new_table(
+    sent: &mut Option<Arc<RpcRegistry>>,
+    table: &Arc<RpcRegistry>,
+) -> Option<control::Update> {
+    if sent.as_ref().is_some_and(|sent| Arc::ptr_eq(sent, table)) {
+        return None;
+    }
+    *sent = Some(Arc::clone(table));
+    Some(control::Update::table(table))
 }
 
 /// Returns the refusal of an open whose blocking step failed with `error`.
@@ -850,7 +989,7 @@ mod tests {
             .await;
         assert_eq!(
             answer(&next(&mut client.end).await),
-            (2, Ok(DEVICE.encode_args()))
+            (2, Ok(encode(&DEVICE)))
         );
         device
     }
@@ -917,7 +1056,7 @@ mod tests {
 
     /// Returns the request to open `target`, with `id`.
     fn open(target: &str, id: u16) -> Packet {
-        Packet::proxy_request("proxy.open", &target.encode_args(), id).unwrap()
+        Packet::proxy_request("proxy.open", &encode(&target), id).unwrap()
     }
 
     /// Waits for the next packet the client is sent, skipping the proxy's
@@ -1030,7 +1169,7 @@ mod tests {
         device.end.send(&beat("/")).await;
 
         let opened = answer(&next(&mut client.end).await);
-        assert_eq!(opened, (2, Ok(DEVICE.encode_args())));
+        assert_eq!(opened, (2, Ok(encode(&DEVICE))));
         let message = format!("this connection already opened {DEVICE}");
         let refused = answer(&next(&mut client.end).await);
         assert_eq!(refused, (3, Err((RpcError::State, message))));

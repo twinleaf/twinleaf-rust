@@ -53,7 +53,8 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
     crate::logging::release();
     let front = FrontDoor::picked(picked);
     let held = Connection::hold_default(&within_subtree(&front.layout, cli.subtree)?)?;
-    let events = held.events();
+    // Its routes are followed only to learn when the connection ends.
+    let routes = held.tree(DeviceRoute::root()).routes_updates();
     let closer = held.clone();
     ctrlc::set_handler(move || closer.close())?;
     front.print_startup(&cli);
@@ -62,7 +63,7 @@ fn hold_selection(picked: Vec<PickedSubtree>) -> eyre::Result<()> {
         front.describe(cli.subtree)
     );
     loop {
-        match events.recv() {
+        match routes.recv() {
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => return Ok(()),
             Err(RecvError::Stopped) => return Err(eyre::eyre!("the proxy stopped")),

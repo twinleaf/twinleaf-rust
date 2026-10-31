@@ -58,6 +58,7 @@ tokio-util = { version = "0.7", features = ["rt", "codec", "net", "join-map"] }
 tokio-stream = { version = "0.1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select", "eventual-fairness"] }
+minicbor = { version = "2.3", features = ["derive", "std"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -41,7 +41,6 @@ use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::tio::packet::{self, Packet};
-use crate::tio::rpc::RpcReply;
 use crate::tio::transport;
 use crate::tio::transport::Port as HardwarePort;
 use crate::tio::transport::{ReceiveResult, TransportEvent};
@@ -254,7 +253,7 @@ async fn greet(
             packet::Payload::ProxyRx(packet::ProxyRx::Reply(reply))
                 if reply.req_id.value() == HELLO_ID =>
             {
-                control::Introduction::decode_reply(reply.value).map_err(io::Error::other)?
+                control::decode::<control::Introduction>(reply.value).map_err(io::Error::other)?
             }
             packet::Payload::ProxyRx(packet::ProxyRx::Error(error))
                 if error.req_id.value() == HELLO_ID =>

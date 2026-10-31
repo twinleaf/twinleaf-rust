@@ -27,12 +27,13 @@
 
 use super::runtime::ProxyAddress;
 use super::stream::{End, Lane, Queued};
-use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
+use crate::device::rpc::{CallError, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
+use crate::proxy::{encode, handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
@@ -57,9 +58,11 @@ pub(crate) type RawCallResult = Result<Vec<u8>, CallError>;
 /// session's task, and must not block.
 pub(crate) type Completion = Box<dyn FnOnce(RawCallResult) + Send>;
 
-/// Where a session writes, its socket or a channel a test reads.
+/// Where a session writes, its socket, a port on a link of the proxy that
+/// hosts it, or a channel a test reads.
 enum Socket {
     Transport(transport::Port),
+    Port(mpsc::Sender<Packet>),
     #[cfg(test)]
     Channel(flume::Sender<Packet>),
 }
@@ -70,6 +73,10 @@ impl Socket {
             Socket::Transport(port) => port.try_send(packet).map_err(|error| match error {
                 transport::SendError::Full => CallError::RequestNotSubmitted,
                 _ => CallError::ResponseLost,
+            }),
+            Socket::Port(port) => port.try_send(packet).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => CallError::RequestNotSubmitted,
+                mpsc::error::TrySendError::Closed(_) => CallError::ResponseLost,
             }),
             #[cfg(test)]
             Socket::Channel(sent) => sent.send(packet).map_err(|_| CallError::ResponseLost),
@@ -95,6 +102,8 @@ enum Command {
     Call(Call),
     /// Feeds the pump through this inlet. A second inlet is dropped.
     Attach(Lane<Packet>),
+    /// Sends a packet that expects no reply the session would complete.
+    Send(Packet),
     /// Ends the session, as its owner closed it.
     Close,
 }
@@ -108,6 +117,9 @@ pub(crate) type Inlet = flume::Receiver<Queued<Packet>>;
 #[derive(Clone)]
 pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
+    /// Whether the proxy keeps the device state and the pump watches it,
+    /// which is so for a session the proxy opened with a handshake.
+    watches: bool,
 }
 
 impl Session {
@@ -143,7 +155,7 @@ impl Session {
             "" => AUTO,
             target => target,
         };
-        let request = (purpose.method(), target.encode_args());
+        let request = (purpose.method(), encode(&target));
         Session::request_async(proxy, request, &format!("open {target}"), timeout).await
     }
 
@@ -154,7 +166,7 @@ impl Session {
         layout: &Layout,
         timeout: Duration,
     ) -> io::Result<Session> {
-        let request = (MOUNT, layout.encode_args());
+        let request = (MOUNT, encode(&layout));
         Session::request_async(proxy, request, &format!("mount {layout}"), timeout).await
     }
 
@@ -165,7 +177,7 @@ impl Session {
         layout: &Layout,
         timeout: Duration,
     ) -> io::Result<Session> {
-        let request = (DEFAULT_LAYOUT, layout.encode_args());
+        let request = (DEFAULT_LAYOUT, encode(&layout));
         let goal = format!("hold {layout} as the default");
         Session::request_async(proxy, request, &goal, timeout).await
     }
@@ -191,7 +203,11 @@ impl Session {
             None => format!("the proxy at {url}"),
         };
         let socket = Socket::Transport(port);
-        Ok(Session::start(socket, received, peer, &tasks))
+        let received = received.into_stream().boxed();
+        Ok(Session {
+            watches: true,
+            ..Session::start(socket, received, peer, &tasks)
+        })
     }
 
     /// Connects to the proxy at the loopback `url` with no handshake, as a
@@ -203,7 +219,23 @@ impl Session {
         })?;
         let socket = Socket::Transport(port);
         let peer = format!("the proxy at {url}");
+        let received = received.into_stream().boxed();
         Ok(Session::start(socket, received, peer, &Supervisor::new()))
+    }
+
+    /// Starts a session inside the proxy over a port on one of its links,
+    /// which sends on `sent` and delivers on `received`. Its pump asks the
+    /// device for its state itself. `peer` names the link in the log.
+    pub(crate) fn over_port(
+        sent: mpsc::Sender<Packet>,
+        received: mpsc::Receiver<Packet>,
+        peer: String,
+        tasks: &Supervisor,
+    ) -> Session {
+        let received = tokio_stream::wrappers::ReceiverStream::new(received)
+            .map(|packet| Ok(TransportEvent::Packet(packet)))
+            .boxed();
+        Session::start(Socket::Port(sent), received, peer, tasks)
     }
 
     /// Starts the session's task on `tasks`, which reads `received` and
@@ -211,14 +243,14 @@ impl Session {
     /// proxy at tcp://127.0.0.1:7855`.
     fn start(
         socket: Socket,
-        received: flume::Receiver<ReceiveResult>,
+        received: BoxStream<'static, ReceiveResult>,
         peer: String,
         tasks: &Supervisor,
     ) -> Session {
         let (commands, mailbox) = mpsc::unbounded_channel();
         let worker = Worker {
             socket,
-            received: received.into_stream(),
+            received,
             peer,
             pending: HashMap::new(),
             next_id: 0,
@@ -226,7 +258,27 @@ impl Session {
             inlet: None,
         };
         tasks.spawn("twinleaf session", worker.run(mailbox));
-        Session { commands }
+        Session {
+            commands,
+            watches: false,
+        }
+    }
+
+    /// Returns `true` if the proxy keeps the device state of this session,
+    /// which its pump then watches rather than asks the devices for.
+    pub(crate) fn watches(&self) -> bool {
+        self.watches
+    }
+
+    /// Returns `true` once the session has ended.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
+    /// Sends `packet`, such as a control request whose replies the pump
+    /// reads. A packet the socket cannot take is dropped.
+    pub(crate) fn send(&self, packet: Packet) {
+        let _ = self.commands.send(Command::Send(packet));
     }
 
     /// Calls `name` at `route` with encoded `args`, giving up after
@@ -337,7 +389,7 @@ impl fmt::Display for Ending {
 /// feeds the pump, and fails the calls that run out of time.
 struct Worker {
     socket: Socket,
-    received: flume::r#async::RecvStream<'static, ReceiveResult>,
+    received: BoxStream<'static, ReceiveResult>,
     /// The proxy, as the log names it.
     peer: String,
     /// The calls waiting for a reply, by the id each went out with.
@@ -362,6 +414,11 @@ impl Worker {
                     Some(Command::Attach(inlet)) => {
                         self.inlet.get_or_insert(inlet);
                     }
+                    Some(Command::Send(packet)) => {
+                        if let Err(error) = self.socket.send(packet) {
+                            log::debug!("could not send to {}: {error}", self.peer);
+                        }
+                    }
                     Some(Command::Close) => break Ending::Closed,
                     None => break Ending::HandlesGone,
                 },
@@ -375,6 +432,10 @@ impl Worker {
             }
         };
         match ending {
+            // A port inside the proxy closes with its link.
+            Ending::SocketClosed if matches!(self.socket, Socket::Port(_)) => {
+                log::debug!("{} closed", self.peer)
+            }
             Ending::SocketClosed => log::warn!("{} closed the connection", self.peer),
             ending => log::debug!("the session with {} ended: {ending}", self.peer),
         }
@@ -392,7 +453,7 @@ impl Worker {
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Call(call) => (call.complete)(Err(CallError::ResponseLost)),
-                Command::Attach(_) | Command::Close => {}
+                Command::Attach(_) | Command::Send(_) | Command::Close => {}
             }
         }
         for (_, pending) in self.pending.drain() {
@@ -683,11 +744,21 @@ impl Session {
         Session::test_pair_on(&Supervisor::new())
     }
 
+    /// The same session, its pump watching the proxy's state as a session
+    /// the proxy opened does.
+    pub(crate) fn watching(self) -> Session {
+        Session {
+            watches: true,
+            ..self
+        }
+    }
+
     /// [`test_pair`](Self::test_pair) with the session's task on `tasks`.
     pub(crate) fn test_pair_on(tasks: &Supervisor) -> (Session, TestProxy) {
         let (sender, sent) = flume::unbounded();
         let (deliver, received) = flume::unbounded();
         let peer = "the test's proxy".to_string();
+        let received = received.into_stream().boxed();
         let session = Session::start(Socket::Channel(sender), received, peer, tasks);
         (session, TestProxy { sent, deliver })
     }
@@ -697,11 +768,10 @@ impl Session {
 mod tests {
     use super::*;
     use crate::device::fixtures::{self, FakeDevice};
-    use crate::device::rpc::RpcReply;
     use crate::proto::rpc::{Method, RpcError};
     use crate::proxy::fixtures::assert_took;
     use crate::proxy::CLIENT_KEEPALIVE;
-    use crate::proxy::{client_name, Introduction};
+    use crate::proxy::{client_name, decode, Introduction};
     use crate::rt::BoxFuture;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -850,20 +920,20 @@ mod tests {
             let (name, args, hello) = self.expect_control();
             assert_eq!(name, "proxy.hello");
             assert_eq!(
-                Introduction::decode_reply(&args).unwrap(),
+                decode::<Introduction>(&args).unwrap(),
                 Introduction::of_this_process(client_name())
             );
             let (name, args, open) = self.expect_control();
             assert_eq!(name, method);
-            assert_eq!(String::decode_reply(&args).unwrap(), target);
+            assert_eq!(decode::<String>(&args).unwrap(), target);
             (hello, open)
         }
 
         /// Expect the handshake opening `target`, and accept it.
         fn accept_open(&mut self, target: &str) {
             let (hello, open) = self.expect_handshake("proxy.open", target);
-            self.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
-            self.send(&Packet::proxy_reply(open, &target.encode_args()).unwrap());
+            self.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
+            self.send(&Packet::proxy_reply(open, &encode(&target)).unwrap());
         }
 
         /// The next call the session sends, as its method name and its id.
@@ -916,7 +986,7 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, open) = end.expect_handshake("proxy.open", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
         assert!(
             end.next_within(Duration::from_millis(200)).is_none(),
             "the session sent more before the open was answered"
@@ -925,7 +995,7 @@ mod tests {
             !opening.is_finished(),
             "the open returned before its answer"
         );
-        end.send(&Packet::proxy_reply(open, &TARGET.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(open, &encode(&TARGET)).unwrap());
 
         let root = Handle::root(opening.join().unwrap().unwrap());
         let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
@@ -944,7 +1014,7 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, open) = end.expect_handshake("proxy.open", "auto");
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
         let refusal = Packet::proxy_error(open, RpcError::Invalid, "auto finds two devices");
         end.send(&refusal.unwrap());
 
@@ -965,7 +1035,7 @@ mod tests {
             protocol: 0,
             ..fake_host()
         };
-        end.send(&Packet::proxy_reply(hello, &older.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&older)).unwrap());
 
         let error = opening.join().unwrap().err().expect("the open failed");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
@@ -981,8 +1051,8 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, probe) = end.expect_handshake("proxy.probe", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
-        end.send(&Packet::proxy_reply(probe, &TARGET.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
+        end.send(&Packet::proxy_reply(probe, &encode(&TARGET)).unwrap());
 
         assert!(opening.join().unwrap().is_ok());
     }
@@ -995,7 +1065,7 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, _) = end.expect_handshake("proxy.open", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
         end.send(&Packet::link(LinkStatus::Stopped));
 
         let error = opening.join().unwrap().err().expect("the open failed");
@@ -1324,7 +1394,7 @@ mod tests {
         let opening = thread::spawn(move || Session::open(&address, TARGET, Purpose::Use, WAIT));
         let mut end = proxy.accept();
         let (hello, open) = end.expect_handshake("proxy.open", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
 
         let beat = end.next_within(CLIENT_KEEPALIVE.every * 2);
         assert!(
@@ -1335,7 +1405,7 @@ mod tests {
             "the session sent {beat:?} while its open waited"
         );
 
-        end.send(&Packet::proxy_reply(open, &TARGET.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(open, &encode(&TARGET)).unwrap());
         assert!(opening.join().unwrap().is_ok());
     }
 

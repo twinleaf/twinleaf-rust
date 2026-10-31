@@ -1,20 +1,27 @@
 //! The control protocol, which carries a client's requests to the proxy
 //! itself. A request travels in a `PROXY_TX` packet and its answer in a
-//! `PROXY_RX` packet. [`Request`] decodes a request, [`answer`] builds the
-//! reply, and [`call`] and [`handshake`] make requests as a client.
+//! `PROXY_RX` packet, its arguments and reply each in CBOR. [`Request`]
+//! decodes a request, [`answer`] builds the reply, and [`call`] and
+//! [`handshake`] make requests as a client.
 
-use super::{Layout, Mount};
+use super::Layout;
+use crate::data::DeviceMetadataSnapshot;
+use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
+use crate::device::{Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
-use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
+use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
-use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply};
 use crate::tio::transport::{self, KeepAlive, ReceiveResult, RecvError, TransportEvent};
 use futures_util::StreamExt;
+use minicbor::bytes::ByteVec;
+use minicbor::{Decode, Encode};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
@@ -34,9 +41,12 @@ pub(crate) const MOUNT: &str = "proxy.mount";
 pub(crate) const DEFAULT_LAYOUT: &str = "proxy.default";
 /// The method that stops a background proxy.
 pub(super) const STOP: &str = "proxy.stop";
+/// The method that follows the state of one device a connection opened.
+pub(crate) const WATCH: &str = "proxy.watch";
 
-/// The version of the control protocol this build speaks.
-pub(super) const VERSION: u8 = 1;
+/// The version of the control protocol this build speaks. Version 2 encodes
+/// every argument and reply in CBOR.
+pub(super) const VERSION: u8 = 2;
 
 /// How a client keeps its link to the proxy alive once the hello is done.
 pub(crate) const CLIENT_KEEPALIVE: KeepAlive = KeepAlive {
@@ -54,18 +64,20 @@ pub(super) const PROXY_KEEPALIVE: KeepAlive = KeepAlive {
 
 /// What one side of `proxy.hello` says about itself. A client sends its own,
 /// and the proxy replies with its own.
-///
-/// On the wire it is the `u32` pid, the `u8` protocol, the `twinleaf`
-/// version as three `u16`s for major, minor and patch, and then the name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Introduction {
     /// The process id.
+    #[n(0)]
     pub(crate) pid: u32,
     /// The version of the control protocol it speaks.
+    #[n(1)]
     pub(crate) protocol: u8,
-    /// The version of the `twinleaf` crate it was built with.
+    /// The version of the `twinleaf` crate it was built with, as major,
+    /// minor and patch.
+    #[n(2)]
     pub(crate) version: [u16; 3],
     /// Its name, such as `tio monitor` or `tio proxy`.
+    #[n(3)]
     pub(crate) name: String,
 }
 
@@ -105,28 +117,257 @@ impl fmt::Display for Introduction {
     }
 }
 
-impl RpcArgs for Introduction {
-    fn encode_into(&self, output: &mut Vec<u8>) {
-        let [major, minor, patch] = self.version;
-        (
-            self.pid,
-            (self.protocol, (major, (minor, (patch, self.name.as_str())))),
-        )
-            .encode_into(output);
+/// Encodes a control request's arguments or reply.
+pub(crate) fn encode<T: Encode<()> + ?Sized>(value: &T) -> Vec<u8> {
+    minicbor::to_vec(value).expect("encoding into a Vec cannot fail")
+}
+
+/// Decodes a control request's arguments or reply.
+pub(crate) fn decode<'b, T: Decode<'b, ()>>(bytes: &'b [u8]) -> Result<T, minicbor::decode::Error> {
+    minicbor::decode(bytes)
+}
+
+/// Encodes a [`DeviceRoute`] as the byte string of its hops, for
+/// `#[cbor(with = "...")]`.
+pub(super) mod hops {
+    use crate::proto::DeviceRoute;
+    use minicbor::{Decoder, Encoder};
+
+    pub(crate) fn encode<C, W: minicbor::encode::Write>(
+        route: &DeviceRoute,
+        encoder: &mut Encoder<W>,
+        _: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        encoder.bytes(route.as_slice())?;
+        Ok(())
+    }
+
+    pub(crate) fn decode<C>(
+        decoder: &mut Decoder<'_>,
+        _: &mut C,
+    ) -> Result<DeviceRoute, minicbor::decode::Error> {
+        DeviceRoute::from_hops(decoder.bytes()?)
+            .map_err(|error| minicbor::decode::Error::message(error.to_string()))
     }
 }
 
-impl RpcReply for Introduction {
-    fn decode_from(input: &mut &[u8]) -> Result<Self, RpcDecodeError> {
-        let (pid, (protocol, (major, (minor, (patch, name))))) =
-            <(u32, (u8, (u16, (u16, (u16, String)))))>::decode_from(input)?;
-        Ok(Introduction {
-            pid,
-            protocol,
-            version: [major, minor, patch],
-            name,
-        })
+/// What `proxy.watch` follows, the device at `route` as the client sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Watch {
+    #[n(0)]
+    #[cbor(with = "hops")]
+    pub(crate) route: DeviceRoute,
+    /// Whether the watch follows the RPC table and the settings, rather
+    /// than the presence, the metadata and the announced settings.
+    #[n(1)]
+    pub(crate) table: bool,
+}
+
+/// One value of a watched device's state, as a reply to `proxy.watch`
+/// carries it in [`Part`]s.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum Update {
+    /// The device's complete metadata, as its own metadata packets, each
+    /// addressed to the root.
+    #[n(0)]
+    Metadata(#[n(0)] Vec<ByteVec>),
+    /// The device has no `dev.metadata`.
+    #[n(1)]
+    Unsupported,
+    /// The RPC table, as its hash, the session it was read in, and the
+    /// name and metadata word of each entry.
+    #[n(2)]
+    Table {
+        #[n(0)]
+        hash: Option<u32>,
+        #[n(1)]
+        session: Option<u32>,
+        #[n(2)]
+        entries: Vec<(String, u16)>,
+    },
+    /// The RPC table did not load, as the device refused a call with this
+    /// code and message.
+    #[n(3)]
+    Refused(#[n(0)] u16, #[n(1)] ByteVec),
+    /// The RPC table did not load, as it changed during every walk.
+    #[n(4)]
+    Changed,
+    /// The RPC table did not load, as a call timed out.
+    #[n(5)]
+    TimedOut,
+    /// The RPC table did not load, as a call got no reply.
+    #[n(6)]
+    Unanswered,
+    /// The values of the announced settings, as the hash of the table they
+    /// were read with, their session and version, and each value by name.
+    #[n(7)]
+    Settings {
+        #[n(0)]
+        hash: Option<u32>,
+        #[n(1)]
+        session: Option<u32>,
+        #[n(2)]
+        version: Option<u32>,
+        #[n(3)]
+        values: BTreeMap<String, ByteVec>,
+    },
+    /// The device has not been heard yet, or its link reconnected and it has
+    /// not spoken since.
+    #[n(8)]
+    Connecting,
+    /// The device is sending, in the session its heartbeats report.
+    #[n(9)]
+    Alive(#[n(0)] Option<u32>),
+    /// The device's link lost it this many milliseconds before the update
+    /// went out.
+    #[n(10)]
+    Lost(#[n(0)] u64),
+    /// One setting the device announced, its name, its `settings.version`
+    /// once counted and its value.
+    #[n(11)]
+    Setting {
+        #[n(0)]
+        name: String,
+        #[n(1)]
+        seq: Option<u32>,
+        #[n(2)]
+        reply: ByteVec,
+    },
+}
+
+impl Update {
+    /// Returns the update of a device's complete metadata, or `None` if a
+    /// record does not fit a packet.
+    pub(crate) fn metadata(snapshot: &DeviceMetadataSnapshot) -> Option<Update> {
+        let packets = snapshot.metadata_packets().ok()?;
+        let records = packets.iter().map(|packet| {
+            packet
+                .with_route(DeviceRoute::root())
+                .as_bytes()
+                .to_vec()
+                .into()
+        });
+        Some(Update::Metadata(records.collect()))
     }
+
+    /// Returns the update of an RPC table as loaded.
+    pub(crate) fn table(registry: &RpcRegistry) -> Update {
+        Update::Table {
+            hash: registry.hash,
+            session: registry.session.map(SessionId::value),
+            entries: registry
+                .iter()
+                .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()))
+                .collect(),
+        }
+    }
+
+    /// Returns the update of why an RPC table did not load.
+    pub(crate) fn unloaded(error: &RpcRegistryError) -> Update {
+        match error {
+            RpcRegistryError::DeviceRpcError(CallError::DeviceError(refusal)) => {
+                Update::Refused(refusal.error.value(), refusal.extra.clone().into())
+            }
+            RpcRegistryError::DeviceRpcError(CallError::Timeout) => Update::TimedOut,
+            RpcRegistryError::TableChanged => Update::Changed,
+            RpcRegistryError::DeviceRpcError(_) => Update::Unanswered,
+        }
+    }
+
+    /// Returns the update of the values of a device's announced settings.
+    pub(crate) fn settings(settings: &Settings) -> Update {
+        Update::Settings {
+            hash: settings.rpc_registry().hash,
+            session: settings.session().map(SessionId::value),
+            version: settings.version(),
+            values: settings
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_vec().into()))
+                .collect(),
+        }
+    }
+
+    /// Returns the update of a device's presence. How long ago it was lost
+    /// travels as a duration, as the two ends share no clock.
+    pub(crate) fn presence(presence: Presence) -> Update {
+        match presence {
+            Presence::Connecting => Update::Connecting,
+            Presence::Alive { session } => Update::Alive(session.map(SessionId::value)),
+            Presence::Lost { since } => {
+                let ago = since.elapsed().as_millis();
+                Update::Lost(u64::try_from(ago).unwrap_or(u64::MAX))
+            }
+        }
+    }
+
+    /// Returns the update of one announced setting.
+    pub(crate) fn setting(change: SettingChange) -> Update {
+        Update::Setting {
+            name: change.name,
+            seq: change.seq,
+            reply: change.reply.into(),
+        }
+    }
+
+    /// Returns the RPC table, or why it did not load, that the update
+    /// carries, or `None` for an update of something else.
+    pub(crate) fn registry(self) -> Option<RegistryState> {
+        let failed = |error: CallError| Some(Err(RpcRegistryError::DeviceRpcError(error)));
+        match self {
+            Update::Table {
+                hash,
+                session,
+                entries,
+            } => {
+                let session = session.map(SessionId::new);
+                Some(Ok(Arc::new(RpcRegistry::from_entries(
+                    entries, hash, session,
+                ))))
+            }
+            Update::Refused(code, message) => failed(CallError::DeviceError(RpcErrorPayload {
+                error: RpcError::from(code),
+                extra: message.into(),
+            })),
+            Update::TimedOut => failed(CallError::Timeout),
+            Update::Unanswered => failed(CallError::ResponseLost),
+            Update::Changed => Some(Err(RpcRegistryError::TableChanged)),
+            _ => None,
+        }
+    }
+}
+
+/// One part of an encoded [`Update`], as a reply to `proxy.watch` carries
+/// it. The parts of one update go out in order, numbered from zero.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Part {
+    #[n(0)]
+    pub(crate) index: u16,
+    #[n(1)]
+    pub(crate) count: u16,
+    #[n(2)]
+    pub(crate) bytes: ByteVec,
+}
+
+/// The most bytes of an update one part carries. The rest of the reply
+/// fits in what a packet leaves.
+const PART_BYTES: usize = WirePacket::MAX_PAYLOAD - 32;
+
+/// Returns the replies to watch `id` that carry `update`, one per part.
+pub(crate) fn parts(id: u16, update: &Update) -> Vec<Packet> {
+    let encoded = encode(update);
+    let chunks = encoded.chunks(PART_BYTES);
+    let count = u16::try_from(chunks.len()).unwrap_or(u16::MAX);
+    chunks
+        .zip(0..count)
+        .map(|(bytes, index)| {
+            let part = Part {
+                index,
+                count,
+                bytes: bytes.to_vec().into(),
+            };
+            Packet::proxy_reply(id, &encode(&part)).expect("a part fits a reply")
+        })
+        .collect()
 }
 
 /// Why a client binds a connection to a device. It names the control method
@@ -183,6 +424,8 @@ pub(super) enum Request {
     Default(Layout),
     /// `proxy.stop`.
     Stop,
+    /// `proxy.watch`, naming the device to follow.
+    Watch(Watch),
     /// `proxy.test.panic`, which makes the task serving the client panic.
     #[cfg(test)]
     Panic,
@@ -194,20 +437,20 @@ impl Request {
     /// Returns a [`Refusal`] if the proxy has no method `name` or `args` do
     /// not decode.
     pub(super) fn decode(name: &[u8], args: &[u8]) -> Result<Request, Refusal> {
-        let malformed = |error: RpcDecodeError| Refusal::new(RpcError::ArgsSize, error.to_string());
+        let malformed =
+            |error: minicbor::decode::Error| Refusal::new(RpcError::ArgsSize, error.to_string());
         match name {
-            b"proxy.hello" => Ok(Request::Hello(
-                Introduction::decode_reply(args).map_err(malformed)?,
-            )),
+            b"proxy.hello" => Ok(Request::Hello(decode(args).map_err(malformed)?)),
             b"proxy.open" => Ok(Request::Open {
-                target: String::decode_reply(args).map_err(malformed)?,
+                target: decode(args).map_err(malformed)?,
             }),
             b"proxy.probe" => Ok(Request::Probe {
-                url: String::decode_reply(args).map_err(malformed)?,
+                url: decode(args).map_err(malformed)?,
             }),
-            b"proxy.mount" => Ok(Request::Mount(decode_layout(args)?)),
-            b"proxy.default" => Ok(Request::Default(decode_layout(args)?)),
+            b"proxy.mount" => Ok(Request::Mount(checked(decode(args).map_err(malformed)?)?)),
+            b"proxy.default" => Ok(Request::Default(checked(decode(args).map_err(malformed)?)?)),
             b"proxy.stop" => Ok(Request::Stop),
+            b"proxy.watch" => Ok(Request::Watch(decode(args).map_err(malformed)?)),
             #[cfg(test)]
             b"proxy.test.panic" => Ok(Request::Panic),
             other => Err(Refusal::new(
@@ -220,73 +463,24 @@ impl Request {
     /// Returns the method name and encoded arguments, as a client sends them.
     pub(super) fn encode(&self) -> (&'static str, Vec<u8>) {
         match self {
-            Request::Hello(introduction) => (HELLO, introduction.encode_args()),
-            Request::Open { target } => (OPEN, target.encode_args()),
-            Request::Probe { url } => (PROBE, url.encode_args()),
-            Request::Mount(layout) => (MOUNT, layout.encode_args()),
-            Request::Default(layout) => (DEFAULT_LAYOUT, layout.encode_args()),
+            Request::Hello(introduction) => (HELLO, encode(introduction)),
+            Request::Open { target } => (OPEN, encode(target)),
+            Request::Probe { url } => (PROBE, encode(url)),
+            Request::Mount(layout) => (MOUNT, encode(layout)),
+            Request::Default(layout) => (DEFAULT_LAYOUT, encode(layout)),
             Request::Stop => (STOP, Vec::new()),
+            Request::Watch(watch) => (WATCH, encode(watch)),
             #[cfg(test)]
             Request::Panic => ("proxy.test.panic", Vec::new()),
         }
     }
 }
 
-/// Encodes a layout as `proxy.mount` sends it, a count of mounts and then
-/// each mount's URL, source and prefix, each after its length in a byte.
-impl RpcArgs for Layout {
-    fn encode_into(&self, output: &mut Vec<u8>) {
-        output.push(self.mounts.len() as u8);
-        for mount in &self.mounts {
-            for part in [
-                mount.url.as_bytes(),
-                mount.source.as_slice(),
-                mount.prefix.as_slice(),
-            ] {
-                output.push(part.len() as u8);
-                output.extend_from_slice(part);
-            }
-        }
-    }
-}
-
-/// Decodes the layout that `proxy.mount` sends.
-///
-/// Returns a [`Refusal`] if `args` do not decode, a route is not valid, the
-/// layout mounts nothing, or one prefix lies within another, as a packet's
-/// route would then fall under two mounts.
-fn decode_layout(mut args: &[u8]) -> Result<Layout, Refusal> {
-    let truncated = || Refusal::new(RpcError::ArgsSize, "the layout is cut short");
-    let part = |args: &mut &[u8]| -> Result<Vec<u8>, Refusal> {
-        let (&len, rest) = args.split_first().ok_or_else(truncated)?;
-        let (part, rest) = rest.split_at_checked(len.into()).ok_or_else(truncated)?;
-        *args = rest;
-        Ok(part.to_vec())
-    };
-    let route = |hops: Vec<u8>| {
-        DeviceRoute::from_hops(&hops)
-            .map_err(|error| Refusal::new(RpcError::Invalid, format!("a mount's route: {error}")))
-    };
-    let (&count, rest) = args.split_first().ok_or_else(truncated)?;
-    args = rest;
-    let mounts = (0..count)
-        .map(|_| {
-            let url = String::from_utf8_lossy(&part(&mut args)?).into_owned();
-            let source = route(part(&mut args)?)?;
-            let prefix = route(part(&mut args)?)?;
-            Ok(Mount {
-                url,
-                source,
-                prefix,
-            })
-        })
-        .collect::<Result<Vec<_>, Refusal>>()?;
-    if !args.is_empty() {
-        return Err(Refusal::new(
-            RpcError::ArgsSize,
-            "the layout has bytes left over",
-        ));
-    }
+/// Returns `layout` if it mounts something and no prefix lies within
+/// another, as a packet's route would then fall under two mounts, or else a
+/// [`Refusal`] saying why.
+fn checked(layout: Layout) -> Result<Layout, Refusal> {
+    let mounts = &layout.mounts;
     if mounts.is_empty() {
         return Err(Refusal::new(RpcError::Invalid, "the layout mounts nothing"));
     }
@@ -299,7 +493,7 @@ fn decode_layout(mut args: &[u8]) -> Result<Layout, Refusal> {
         let message = format!("the mounts at {} and {} overlap", a.prefix, b.prefix);
         return Err(Refusal::new(RpcError::Invalid, message));
     }
-    Ok(Layout { mounts })
+    Ok(layout)
 }
 
 /// A control request refused, with a code and a message saying why.
@@ -457,13 +651,11 @@ pub(crate) async fn handshake(
         };
         answered = true;
         match rx {
+            // A proxy from before protocol 2 can neither read this hello nor
+            // write one this build reads.
             ProxyRx::Reply(reply) if reply.req_id.value() == HELLO_ID => {
-                let introduction = Introduction::decode_reply(reply.value).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("the proxy at {endpoint} answered proxy.hello with {error}"),
-                    )
-                })?;
+                let introduction: Introduction =
+                    decode(reply.value).map_err(|_| older_build(endpoint))?;
                 if introduction.protocol < VERSION {
                     return Err(older_protocol(endpoint, &introduction));
                 }
@@ -472,6 +664,12 @@ pub(crate) async fn handshake(
             }
             ProxyRx::Reply(reply) if reply.req_id.value() == REQUEST_ID => {
                 return Ok((host, reply.value.to_vec()))
+            }
+            ProxyRx::Error(error)
+                if error.req_id.value() == HELLO_ID
+                    && RpcError::from(error.code) == RpcError::ArgsSize =>
+            {
+                return Err(older_build(endpoint))
             }
             ProxyRx::Error(error) if matches!(error.req_id.value(), HELLO_ID | REQUEST_ID) => {
                 return Err(io::Error::other(
@@ -498,6 +696,18 @@ fn older_protocol(endpoint: &str, host: &Introduction) -> io::Error {
             "the proxy at {endpoint} is {host}, which speaks proxy protocol {}, older than {VERSION}; \
              update it, or stop it and let this program start its own",
             host.protocol
+        ),
+    )
+}
+
+/// Returns the error for the proxy at `endpoint` from a build of twinleaf
+/// before protocol 2, which cannot read this build's hello.
+fn older_build(endpoint: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "the proxy at {endpoint} is from an older build of twinleaf and speaks another \
+             proxy protocol; update tio, or stop it and let this program start its own"
         ),
     )
 }
@@ -563,6 +773,7 @@ pub(crate) fn client_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::Mount;
 
     /// Events skipped during the handshake do not restart its absolute deadline.
     #[tokio::test(start_paused = true)]
@@ -673,8 +884,8 @@ mod tests {
         }
     }
 
-    /// An introduction is the pid, the protocol and the version, each little
-    /// endian, then the name raw.
+    /// An introduction is a CBOR array of the pid, the protocol, the version
+    /// as an array of three, and the name.
     #[test]
     fn a_hello_matches_the_wire_layout() {
         let (name, args) = Request::Hello(Introduction {
@@ -686,7 +897,35 @@ mod tests {
         .encode();
 
         assert_eq!(name, "proxy.hello");
-        assert_eq!(args, [4, 3, 2, 1, 1, 2, 0, 4, 3, 5, 0, b'a', b'b']);
+        let pid = [0x1a, 1, 2, 3, 4];
+        let version = [0x83, 2, 0x19, 3, 4, 5];
+        let expected = [&[0x84][..], &pid, &[1], &version, &[0x62, b'a', b'b']].concat();
+        assert_eq!(args, expected);
+    }
+
+    /// A proxy from before protocol 2 refuses this build's hello as cut
+    /// short, which the client reports as a proxy to update.
+    #[tokio::test]
+    async fn a_hello_refused_as_cut_short_is_a_proxy_from_an_older_build() {
+        let (send, received) = flume::unbounded();
+        let (port, _peer) =
+            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let refusal = Packet::proxy_error(HELLO_ID, RpcError::ArgsSize, "short").unwrap();
+        send.send(Ok(TransportEvent::Packet(refusal))).unwrap();
+
+        let error = handshake(
+            &port,
+            &received,
+            "tcp://127.0.0.1:7855",
+            OPEN,
+            &[],
+            "open the device",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("older build"), "{error}");
     }
 
     /// Returns the mount of `source` of the device at `url`, seen at `prefix`.
@@ -698,23 +937,24 @@ mod tests {
         }
     }
 
-    /// A layout is its count of mounts, then each URL, source and prefix after
-    /// its length.
+    /// A layout is a CBOR array holding the array of its mounts, and a mount
+    /// the array of its URL and the hops of its source and prefix as bytes.
     #[test]
     fn a_layout_matches_the_wire_layout() {
         let layout = Layout {
             mounts: vec![mount("ab", "/", "/7")],
         };
 
-        assert_eq!(layout.encode_args(), [1, 2, b'a', b'b', 0, 1, 7]);
+        let expected = [0x81, 0x81, 0x83, 0x62, b'a', b'b', 0x40, 0x41, 7];
+        assert_eq!(encode(&layout), expected);
     }
 
     /// A layout that mounts nothing, or two prefixes of which one lies within
     /// the other, is refused, as is one cut short.
     #[test]
     fn a_layout_whose_mounts_are_missing_or_overlap_is_refused() {
-        let refused =
-            |mounts: Vec<Mount>| decode_layout(&Layout { mounts }.encode_args()).unwrap_err();
+        let decode_layout = |args: &[u8]| Request::decode(b"proxy.mount", args);
+        let refused = |mounts: Vec<Mount>| decode_layout(&encode(&Layout { mounts })).unwrap_err();
 
         assert_eq!(refused(Vec::new()).code, RpcError::Invalid);
         let overlapping = vec![mount("a", "/", "/1"), mount("b", "/", "/1/2")];
@@ -727,16 +967,16 @@ mod tests {
         let whole = Layout {
             mounts: vec![mount("a", "/", "/1")],
         };
-        let cut = &whole.encode_args()[..3];
+        let cut = &encode(&whole)[..3];
         assert_eq!(decode_layout(cut).unwrap_err().code, RpcError::ArgsSize);
     }
 
     #[test]
     fn replies_decode_as_they_were_encoded() {
         let host = Introduction::of_this_process("tio proxy");
-        assert_eq!(Introduction::decode_reply(&host.encode_args()), Ok(host));
+        assert_eq!(decode::<Introduction>(&encode(&host)).unwrap(), host);
         let target = "tcp://127.0.0.1:7856".to_string();
-        assert_eq!(String::decode_reply(&target.encode_args()), Ok(target));
+        assert_eq!(decode::<String>(&encode(&target)).unwrap(), target);
     }
 
     /// This build introduces itself with its own protocol and crate version.

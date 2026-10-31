@@ -16,41 +16,30 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque},
     io,
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
     data::{BoundaryClass, BoundaryReason, SampleBatch, StreamKey, StreamMetadataSnapshot},
-    device::{DeviceEvent, Event as StreamEvent, LinkEvent, RecvError},
-    tio, Connection, DeviceRoute, SampleNumber, StreamId,
+    device::{MetadataState, Presence, RecvError},
+    Connection, DeviceRoute, SampleNumber, StreamId,
 };
 
 #[derive(Default)]
 struct DeviceState {
-    last_heartbeat: Option<Instant>,
-    heartbeat_toggle: bool,
+    /// The device is sending.
+    alive: bool,
+    /// The device's link lost it, and it has not been heard since.
+    lost: bool,
 }
 
 impl DeviceState {
-    fn heartbeat_char(&self, now: Instant) -> char {
-        let fresh = self
-            .last_heartbeat
-            .map(|t| now.duration_since(t) < Duration::from_millis(500))
-            .unwrap_or(false);
-
-        if !fresh {
-            '♡' // No recent heartbeat
-        } else if self.heartbeat_toggle {
-            '♥' // Filled
-        } else {
-            '♡' // Empty
+    fn heartbeat_char(&self) -> char {
+        match self.alive {
+            true => '♥',
+            false => '♡',
         }
-    }
-
-    fn on_heartbeat(&mut self, now: Instant) {
-        self.last_heartbeat = Some(now);
-        self.heartbeat_toggle = !self.heartbeat_toggle;
     }
 }
 
@@ -641,60 +630,48 @@ impl HealthState {
         }
     }
 
-    fn handle_event(&mut self, event: StreamEvent, now: Instant) {
-        match event {
-            StreamEvent::Link {
-                subtree,
-                event: LinkEvent::Status(status),
-            } => {
-                self.log_event(
-                    format!("[{}] STATUS: {:?}", subtree, status),
-                    Severity::Warning,
-                );
-                if matches!(
-                    status,
-                    tio::packet::LinkStatus::SensorDisconnected | tio::packet::LinkStatus::Stopped
-                ) {
-                    for (key, st) in &mut self.stats {
-                        if key.route.starts_with(&subtree) {
-                            st.reset_timing();
-                            st.reset_rate();
-                        }
+    fn handle_routes(&mut self, routes: &[DeviceRoute]) {
+        for &route in routes {
+            if let Entry::Vacant(state) = self.device_states.entry(route) {
+                state.insert(DeviceState::default());
+                self.log_event(format!("[{}] ROUTE DISCOVERED", route), Severity::Info);
+            }
+        }
+    }
+
+    fn handle_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        let state = self.device_states.entry(route).or_default();
+        state.alive = matches!(presence, Presence::Alive { .. });
+        match presence {
+            Presence::Lost { .. } if !state.lost => {
+                state.lost = true;
+                self.log_event(format!("[{}] LOST", route), Severity::Warning);
+                for (key, st) in &mut self.stats {
+                    if key.route == route {
+                        st.reset_timing();
+                        st.reset_rate();
                     }
                 }
             }
-            StreamEvent::Link {
-                event: LinkEvent::InputOverrun,
-                ..
-            } => {
-                self.log_event("INPUT OVERRUN: samples were lost".into(), Severity::Error);
+            Presence::Alive { .. } => {
+                let back = std::mem::take(&mut state.lost);
+                if back {
+                    self.log_event(format!("[{}] BACK", route), Severity::Info);
+                }
             }
-            StreamEvent::RouteDiscovered { route } => {
-                self.device_states.entry(route).or_default();
-                self.log_event(format!("[{}] ROUTE DISCOVERED", route), Severity::Info);
+            _ => {}
+        }
+    }
+
+    fn handle_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        match metadata {
+            MetadataState::Ready(snapshot) => self.log_event(
+                format!("[{}] METADATA: {}", route, snapshot.device().name()),
+                Severity::Info,
+            ),
+            MetadataState::Unsupported => {
+                self.log_event(format!("[{}] NO METADATA SUPPORT", route), Severity::Error)
             }
-            StreamEvent::Device { route, event } => match event {
-                DeviceEvent::Heartbeat { .. } => {
-                    self.device_states
-                        .entry(route)
-                        .or_default()
-                        .on_heartbeat(now);
-                }
-                DeviceEvent::Metadata(snapshot) => {
-                    self.log_event(
-                        format!("[{}] METADATA: {}", route, snapshot.device().name()),
-                        Severity::Info,
-                    );
-                }
-                DeviceEvent::MetadataUnavailable => {
-                    self.log_event(format!("[{}] NO METADATA SUPPORT", route), Severity::Error);
-                }
-                DeviceEvent::NewHash(hash) => {
-                    self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Severity::Info);
-                }
-                DeviceEvent::Setting { .. } => {}
-                _ => {}
-            },
             _ => {}
         }
     }
@@ -1222,7 +1199,7 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut HealthState) -> io::Result<
     let mut heartbeat_entries: Vec<_> = app
         .device_states
         .iter()
-        .map(|(route, state)| (route.to_string(), state.heartbeat_char(now)))
+        .map(|(route, state)| (route.to_string(), state.heartbeat_char()))
         .collect();
     heartbeat_entries.sort_by(|a, b| a.0.cmp(&b.0));
     let heartbeat_display: String = heartbeat_entries
@@ -1631,8 +1608,16 @@ impl Screen for HealthState {
         self.handle_batch(batch, Instant::now());
     }
 
-    fn on_event(&mut self, event: StreamEvent) {
-        self.handle_event(event, Instant::now());
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        self.handle_routes(routes);
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.handle_presence(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        self.handle_metadata(route, metadata);
     }
 
     fn on_lagged(&mut self, error: RecvError) {

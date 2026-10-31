@@ -34,7 +34,7 @@ use twinleaf::{
         Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
         StreamKey,
     },
-    device::{DeviceEvent, Event as StreamEvent, RecvError},
+    device::{MetadataState, Presence, RecvError},
     Connection, DeviceRoute,
 };
 
@@ -368,23 +368,6 @@ fn row_style(color: Color, selected: bool, stale: bool, in_plot_mode: bool) -> S
     s
 }
 
-#[derive(Debug, Clone, Default)]
-struct DeviceStatus {
-    last_heartbeat: Option<Instant>,
-}
-
-impl DeviceStatus {
-    fn on_heartbeat(&mut self) {
-        self.last_heartbeat = Some(Instant::now());
-    }
-
-    fn is_alive(&self, timeout: Duration) -> bool {
-        self.last_heartbeat
-            .map(|t| t.elapsed() < timeout)
-            .unwrap_or(false)
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Action {
     Quit,
@@ -472,7 +455,7 @@ struct MonitorState {
     nav_items: Vec<NavPos>,
 
     discovered_routes: HashSet<DeviceRoute>,
-    device_status: HashMap<DeviceRoute, DeviceStatus>,
+    device_presence: HashMap<DeviceRoute, Presence>,
     device_metadata: HashMap<DeviceRoute, DeviceMetadataSnapshot>,
     fft_series: Vec<FftSeries>,
     fft_status: FftStatus,
@@ -508,7 +491,7 @@ impl MonitorState {
             nav: Nav::default(),
             nav_items: Vec::new(),
             discovered_routes: HashSet::new(),
-            device_status: HashMap::new(),
+            device_presence: HashMap::new(),
             device_metadata: HashMap::new(),
             fft_series: Vec::new(),
             fft_status: FftStatus::WaitingForSelection,
@@ -810,23 +793,19 @@ impl MonitorState {
         self.visible_routes().len()
     }
 
-    fn handle_event(&mut self, event: StreamEvent) {
-        match event {
-            StreamEvent::RouteDiscovered { route } => {
-                self.discovered_routes.insert(route);
-                self.device_status.entry(route).or_default();
-            }
-            StreamEvent::Device {
-                route,
-                event: DeviceEvent::Heartbeat { .. },
-            } => self.device_status.entry(route).or_default().on_heartbeat(),
-            StreamEvent::Device {
-                route,
-                event: DeviceEvent::Metadata(snapshot),
-            } => {
-                self.device_metadata.insert(route, snapshot);
-            }
-            _ => {}
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        for &route in routes {
+            self.discovered_routes.insert(route);
+        }
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.device_presence.insert(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        if let MetadataState::Ready(snapshot) = metadata {
+            self.device_metadata.insert(route, snapshot);
         }
     }
 
@@ -1332,10 +1311,7 @@ fn build_left_lines(
     for (dev_idx, route) in routes.iter().enumerate() {
         let dev = app.device_metadata.get(route).map(|m| m.device());
 
-        let status = app.device_status.get(route);
-        let is_alive = status
-            .map(|s| s.is_alive(Duration::from_millis(300)))
-            .unwrap_or(false);
+        let is_alive = matches!(app.device_presence.get(route), Some(Presence::Alive { .. }));
 
         let is_selected_header = if app.console.is_open() {
             *route == app.console.target(app.current_route())
@@ -2011,8 +1987,16 @@ impl Screen for Monitor {
         self.buffer.process_batch(&batch);
     }
 
-    fn on_event(&mut self, event: StreamEvent) {
-        self.app.handle_event(event);
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        self.app.on_routes(routes);
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.app.on_presence(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        self.app.on_metadata(route, metadata);
     }
 
     // Monitor keeps no log to report a lag in.
