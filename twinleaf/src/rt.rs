@@ -1,27 +1,47 @@
-//! The crate's internal tokio runtime, which runs its I/O tasks.
+//! The crate's internal tokio runtime, which runs the I/O tasks of its
+//! synchronous API.
 //!
-//! One multi-thread runtime runs the task of every [port](crate::tio), the
-//! tasks of the [proxy](crate::proxy) that hold its links, serve its
-//! clients, accept them and stop it, the session and stream pump of each
-//! [connection](crate::Connection), and the scans and probes of each
-//! [discovery](crate::device::discovery) session. It starts on first use
-//! and runs until the process exits. Its worker threads are named
+//! The synchronous API, such as [`Connection::open`](crate::Connection::open),
+//! [`Proxy::host`](crate::proxy::Proxy::host) and
+//! [`Discovery::start`](crate::device::discovery::Discovery::start), runs
+//! its tasks on one multi-thread runtime of the crate's own. Those are the
+//! task of every [port](crate::tio), the tasks of the
+//! [proxy](crate::proxy) that hold its links, keep their devices' state,
+//! serve its clients, accept them and stop it, the session and stream pump
+//! of each [connection](crate::Connection), and the scans and probes of each
+//! [discovery](crate::device::discovery) session. The runtime starts on
+//! first use and runs until the process exits. Its worker threads are named
 //! `twinleaf-io`. On Windows each runs at the platform's latency critical
 //! priority for as long as it lives.
+//!
+//! The synchronous API may be called from inside an application's own tokio
+//! runtime, where `block_on`, `blocking_recv` and `blocking_send` panic. Its
+//! entry points wait on flume channels, which block without that check, and
+//! block the calling thread until they are done.
+//!
+//! The async entry points are internal to the crate.
+//! `Session::open_async`, `Session::mount_async`,
+//! `Session::hold_default_async`, `Connection::open_at_async` and
+//! `proxy::host` run every task they start on the runtime they are awaited
+//! on. `Port::open` and `control::call_at` run their task on the supervisor
+//! they are given, which each caller takes from the runtime it runs on. The
+//! synchronous API runs each of them on the crate's runtime. Only the machine's own proxy, which an open
+//! finds or starts when nothing answers at the machine's address, runs on the
+//! crate's runtime whatever runtime the open is awaited on, as it outlives
+//! the open. Discovery has only a synchronous entry point, and runs on the
+//! crate's runtime.
 //!
 //! Each open port holds an [`Activity`], which keeps the system from idle
 //! sleep on macOS and Windows.
 //!
-//! A [`Supervisor`] spawns tasks, logs a task that panics, and waits for its
-//! tasks to end. A caller outside the runtime waits for a task on a
-//! flume channel that the task answers on or drops.
+//! A [`Supervisor`] spawns tasks on one runtime, logs a task that panics, and
+//! waits for its tasks to end. A task spawns the tasks it starts with the
+//! supervisor it was started by, so they share its runtime. A caller outside
+//! the runtime waits for a task on a flume channel that the task answers on
+//! or drops.
 //!
-//! A child process forked after the runtime started has none of its
+//! A child process forked after the crate's runtime started has none of its
 //! threads. The child panics on its first use of the runtime.
-
-// The public API is synchronous and may be called from inside an
-// application's own tokio runtime, where `block_on`, `blocking_recv` and
-// `blocking_send` panic. The channels above block without that check.
 
 use std::fmt::Display;
 use std::future::Future;
@@ -30,7 +50,7 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::process;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
@@ -42,9 +62,15 @@ use tokio_util::task::{JoinMap, TaskTracker};
 /// # Panics
 ///
 /// Panics if the runtime cannot start, as when the OS refuses a thread. Panics
-/// in a child process forked after the runtime started.
+/// in a child process forked after the runtime started. In a test, panics on
+/// a thread that forbade itself the runtime with `forbid_crate_runtime`.
 pub(crate) fn handle() -> &'static Handle {
     static RUNTIME: OnceLock<(Runtime, u32)> = OnceLock::new();
+    #[cfg(test)]
+    assert!(
+        !FORBIDDEN.get(),
+        "the crate's runtime was reached from a thread that forbade it"
+    );
     let (runtime, started_in) = RUNTIME.get_or_init(|| (start(), process::id()));
     // A forked child has a copy of the runtime but none of its threads, so
     // a task it spawned would never run, and a wait for one never return.
@@ -83,7 +109,8 @@ pub(crate) struct Supervisor {
 }
 
 impl Supervisor {
-    /// Returns a supervisor of tasks on the crate's runtime.
+    /// Returns a supervisor of tasks on the crate's runtime, which an entry
+    /// point of the synchronous API runs its tasks on.
     ///
     /// # Panics
     ///
@@ -92,12 +119,29 @@ impl Supervisor {
         Supervisor::on(handle().clone())
     }
 
+    /// Returns a supervisor of tasks on the runtime it is called from, which
+    /// an async entry point runs its tasks on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if it is called outside a runtime.
+    pub(crate) fn current() -> Supervisor {
+        Supervisor::on(Handle::current())
+    }
+
     /// Returns a supervisor of tasks on the runtime of `handle`.
     fn on(handle: Handle) -> Supervisor {
         Supervisor {
             handle,
             tracker: TaskTracker::new(),
         }
+    }
+
+    /// Enters the supervisor's runtime until the guard drops, so a socket
+    /// made outside the runtime can register with it.
+    #[cfg(any(feature = "serial", test))]
+    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
+        self.handle.enter()
     }
 
     /// Spawns `future` as the task named `task`. Returns the task's handle,
@@ -166,6 +210,12 @@ impl Supervisor {
         self.tracker.close();
         self.tracker.wait().await;
     }
+}
+
+/// Locks `mutex`, past a panic of another holder. It suits a lock that
+/// guards no change a panic could leave half made.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Waits until `deadline`, or forever if there is none.
@@ -349,21 +399,31 @@ mod priority {
 }
 
 #[cfg(test)]
+impl Supervisor {
+    /// Returns how many of the tasks it spawned have not ended.
+    pub(crate) fn running(&self) -> usize {
+        self.tracker.len()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread has forbidden itself the crate's runtime.
+    static FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Forbids the calling thread the crate's runtime for as long as the thread
+/// lives, so that reaching the runtime from it panics. A test of code that
+/// runs on its caller's runtime calls it on every thread of that runtime.
+#[cfg(test)]
+pub(crate) fn forbid_crate_runtime() {
+    FORBIDDEN.set(true);
+}
+
+#[cfg(test)]
 mod tests {
     use super::{Activity, Supervisor};
     use std::sync::{Arc, Mutex, Weak};
-    use tokio::runtime::Handle;
-
-    impl Supervisor {
-        /// Returns a supervisor of tasks on the runtime it is called from.
-        ///
-        /// # Panics
-        ///
-        /// Panics if it is called outside a runtime.
-        pub(crate) fn current() -> Supervisor {
-            Supervisor::on(Handle::current())
-        }
-    }
 
     /// A task resolves to what its future returns, and to `None` if it
     /// panics.

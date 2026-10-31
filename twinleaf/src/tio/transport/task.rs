@@ -1,8 +1,8 @@
 //! The task that drives a port's link.
 //!
-//! Each [`Port`](super::Port) has one task on the crate's runtime, which owns
-//! the link and its buffers. The task hands what arrives to the port's
-//! receiver. It writes what the port queues one packet at a time, sends
+//! Each [`Port`](super::Port) has one task on the runtime it opened on,
+//! which owns the link and its buffers. The task hands what arrives to the
+//! port's receiver. It writes what the port queues one packet at a time, sends
 //! heartbeats, and keeps the startup holdoff. It ends when the link closes,
 //! when nothing receives what it reads, or once the port is dropped and the
 //! packets it queued are written. The link closes as the task ends. A link

@@ -2,7 +2,7 @@
 
 use super::cache;
 use super::error::CallError;
-use super::reply::{pipelined, PendingReply};
+use super::reply::{PendingReply, Pipeline};
 use crate::proto::rpc::{RpcError, RpcMeta};
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
@@ -83,26 +83,32 @@ impl RpcRegistry {
     /// walk counts only when `rpc.hash` reads the same after it, and only
     /// then is it cached. Otherwise the table is walked again under the new
     /// hash, up to [`WALK_ATTEMPTS`] times.
-    pub(crate) fn load_with(
+    pub(crate) async fn load_with(
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<Self, RpcRegistryError> {
         let name_reply = submit("dev.name", &[]);
         let hash_reply = submit("rpc.hash", &[]);
         let session_reply = submit(SESSION, &[]);
-        let dev_name: String = decode(name_reply.wait()?)?;
-        let mut hash: u32 = decode(hash_reply.wait()?)?;
-        let session = optional(session_reply.wait())?.map(SessionId::new);
+        let dev_name: String = decode(name_reply.await?)?;
+        let mut hash: u32 = decode(hash_reply.await?)?;
+        let session = optional(session_reply.await)?.map(SessionId::new);
         for _ in 0..WALK_ATTEMPTS {
             let path = cache::path(&dev_name, hash);
             if let Some(entries) = path.as_deref().and_then(cache::load) {
                 return Ok(Self::from_entries(entries, Some(hash), session));
             }
-            let total: u16 = decode(submit("rpc.listinfo", &[]).wait()?)?;
-            let descriptors = (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
-            let entries = pipelined(descriptors, WALK_WINDOW)
-                .map(|reply| decode::<(u16, String)>(reply?).map(|(meta, name)| (name, meta)))
-                .collect::<Result<cache::Entries, _>>()?;
-            let after: u32 = decode(submit("rpc.hash", &[]).wait()?)?;
+            let total: u16 = decode(submit("rpc.listinfo", &[]).await?)?;
+            let mut entries = cache::Entries::with_capacity(total.into());
+            {
+                let descriptors =
+                    (0..total).map(|index| submit("rpc.listinfo", &index.to_le_bytes()));
+                let mut replies = Pipeline::new(descriptors, WALK_WINDOW);
+                while let Some(reply) = replies.next().await {
+                    let (meta, name) = decode::<(u16, String)>(reply?)?;
+                    entries.push((name, meta));
+                }
+            }
+            let after: u32 = decode(submit("rpc.hash", &[]).await?)?;
             if after == hash {
                 if let Some(path) = &path {
                     cache::store(path, &entries);
@@ -165,8 +171,9 @@ fn decode<T: RpcReply>(reply: Vec<u8>) -> Result<T, RpcRegistryError> {
 #[cfg(test)]
 mod tests {
     use super::super::error::RpcErrorPayload;
-    use super::super::reply::resolved;
+    use super::super::reply::{poll_once, resolved};
     use super::*;
+    use std::task::Poll;
 
     fn descriptor(name: &str) -> Vec<u8> {
         let mut reply = 0x0300u16.to_le_bytes().to_vec();
@@ -179,10 +186,11 @@ mod tests {
     fn walk_recording(replies: Vec<Vec<u8>>) -> (Vec<(String, Vec<u8>)>, RpcRegistryError) {
         let mut asked = Vec::new();
         let mut replies = replies.into_iter();
-        let Err(error) = RpcRegistry::load_with(|name, arg| {
+        let loaded = poll_once(std::pin::pin!(RpcRegistry::load_with(|name, arg| {
             asked.push((name.to_string(), arg.to_vec()));
             resolved(replies.next())
-        }) else {
+        })));
+        let Poll::Ready(Err(error)) = loaded else {
             panic!("the walk runs out of replies");
         };
         (asked, error)

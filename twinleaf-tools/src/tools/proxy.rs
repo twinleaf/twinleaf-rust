@@ -138,15 +138,14 @@ fn stop() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Returns the options a terminal hosts the proxy with, from `-p`, `-T`, `-k`
-/// and the `--dump` flags. `name` says who hosts it.
+/// Returns the options a terminal hosts the proxy with, from `-p`, `-T` and
+/// the `--dump` flags. `name` says who hosts it.
 fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
     HostOptions {
         listen: Listen::AllInterfaces,
         port: cli.port,
         name: format!("{name} (pid {})", std::process::id()),
         reconnect_timeout: cli.reconnect_timeout.map(Duration::from_secs),
-        kick_slow: cli.kick_slow,
         dump: DumpFlags {
             traffic: cli.dump,
             data: cli.dump_data,
@@ -383,7 +382,6 @@ impl FrontDoor {
         let flags = [
             ("verbose", cli.verbose),
             ("debug", cli.debug),
-            ("kick-slow", cli.kick_slow),
             ("dump", cli.dump),
             ("dump-data", cli.dump_data),
             ("dump-meta", cli.dump_meta),
@@ -563,7 +561,9 @@ fn advertise_tcp(instance: &str, host_name: &str, port: u16) -> Option<MdnsServi
 }
 
 /// Returns the `dev.name` of each device the proxy serves by default, read
-/// over a connection to the proxy itself.
+/// over a connection to the proxy itself. The proxy's endpoint is a TCP URL
+/// on this machine, so the connection opens the proxy's `auto`, which is the
+/// default it holds.
 #[cfg(feature = "mdns")]
 fn discover_sensor_models(proxy: &Proxy) -> Vec<String> {
     match twinleaf::Connection::open(&proxy.endpoint()) {

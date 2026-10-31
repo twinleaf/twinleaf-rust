@@ -254,8 +254,8 @@ impl Action for Go {
 }
 
 /// The table every simulated device answers. The standard table comes first,
-/// then the board's entries, then `test.capture`, which no entry answers and
-/// so comes back to the board as a call.
+/// then the board's entries, then `test.capture` and `test.drop`, which no
+/// entry answers and so come back to the board as calls.
 fn table(cli: &SimulateCli) -> &'static [RpcSpec] {
     let mut specs = STANDARD.to_vec();
     Board::new(cli).entries(&mut |entry| specs.push(entry.spec()));
@@ -263,6 +263,7 @@ fn table(cli: &SimulateCli) -> &'static [RpcSpec] {
         RpcSpec::std("test.capture", Access::READ)
             .with_extra_meta((RpcMetaFlags::READABLE | RpcMetaFlags::CAPTURE).bits()),
     );
+    specs.push(RpcSpec::std("test.drop", Access::WRITE));
     // Each device makes its table once and keeps it for the whole run.
     Box::leak(specs.into_boxed_slice())
 }
@@ -471,6 +472,7 @@ impl SimDevice {
         if let Some((pending, name, args)) = call {
             let answered = match name {
                 "test.capture" => self.capture_rpc(args, now_ns),
+                "test.drop" => self.drop_rpc(args),
                 _ => Err(RpcError::NotFound),
             };
             device::answer(pending, answered.as_deref().map_err(|&error| error), out);
@@ -668,6 +670,21 @@ impl SimDevice {
     pub(super) fn drop_samples_now(&mut self) {
         self.main.drop_at = self.main.taken;
         self.aux.drop_at = self.aux.taken;
+    }
+
+    /// Answers `test.drop`. With no argument it drops the next sample of each
+    /// clock, as the `d` key does. With `rollover` it drops the first sample
+    /// of each clock's next segment.
+    fn drop_rpc(&mut self, args: &[u8]) -> Result<Vec<u8>, RpcError> {
+        match args {
+            b"" => self.drop_samples_now(),
+            b"rollover" => {
+                self.main.drop_at = self.main.rollover_at;
+                self.aux.drop_at = self.aux.rollover_at;
+            }
+            _ => return Err(RpcError::Invalid),
+        }
+        Ok(Vec::new())
     }
 
     /// Sends the heartbeat, log message and samples due at `now_ns`. A configuration left unsaved long

@@ -1,13 +1,33 @@
 //! The [`SettingsCache`] of setting values a device announces.
 
-use super::error::CallError;
-use super::registry::RpcRegistry;
-use super::reply::{pipelined, PendingReply};
-use crate::device::stream::DeviceEvent;
+use crate::device::rpc::{CallError, PendingReply, Pipeline, RpcRegistry};
+use crate::device::SettingChange;
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// A fact about one device, which the engine takes to keep the device's RPC
+/// table and settings current.
+#[derive(Debug, Clone)]
+pub(crate) enum DeviceEvent {
+    /// A heartbeat from the device.
+    Heartbeat {
+        /// The session the device reports, when its heartbeat carries one.
+        session_id: Option<SessionId>,
+        /// The sequence number of the device's last setting announcement, when
+        /// its heartbeat carries one.
+        settings: Option<u32>,
+    },
+    /// A new RPC table hash. `Some(hash)` comes from the `rpc.hash`
+    /// announcement firmware whose table changes with `dev.priv` sends.
+    /// `None` follows a reconnection and asks for a refresh.
+    NewHash(Option<u32>),
+    /// A setting the device announced. An `rpc.hash` announcement arrives
+    /// here as well as in [`NewHash`](Self::NewHash), and one whose name is
+    /// not UTF-8 never arrives.
+    Setting(SettingChange),
+}
 
 /// The counter a device raises on every setting announcement, numbering each.
 const SETTINGS_VERSION: &str = "settings.version";
@@ -101,15 +121,15 @@ impl SettingsCache {
                     None => CacheAction::Snapshot,
                 }
             }
-            DeviceEvent::Setting { seq: None, .. } => {
+            DeviceEvent::Setting(SettingChange { seq: None, .. }) => {
                 self.forget();
                 CacheAction::Keep
             }
-            DeviceEvent::Setting {
+            DeviceEvent::Setting(SettingChange {
                 name,
                 seq: Some(seq),
                 reply,
-            } => match self.applied {
+            }) => match self.applied {
                 None => CacheAction::Snapshot,
                 Some(applied) if *seq == applied.wrapping_add(1) => {
                     if self.cached.contains(name) {
@@ -141,11 +161,6 @@ impl SettingsCache {
         self.applied
     }
 
-    /// Returns the session the values were read in.
-    pub(crate) fn session(&self) -> Option<SessionId> {
-        self.session
-    }
-
     /// Returns every value held, by name.
     pub(crate) fn values(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.values
@@ -156,32 +171,34 @@ impl SettingsCache {
     /// last read is kept at the first version, and the announcements between
     /// the two, still to be observed, bring it up to date. A value the device
     /// refuses to read is not held.
-    pub(crate) fn snapshot_with(
+    pub(crate) async fn snapshot_with(
         &mut self,
         mut submit: impl FnMut(&str, &[u8]) -> PendingReply,
     ) -> Result<(), CallError> {
         if self.cached.is_empty() {
             return Ok(());
         }
-        let version = |reply: PendingReply| {
-            u32::decode_reply(&reply.wait()?).map_err(CallError::InvalidReply)
-        };
         let mut attempt = 1;
         loop {
-            let before = version(submit(SETTINGS_VERSION, &[]))?;
-            let calls = self.cached.iter().map(|name| submit(name, &[]));
-            let values = self
-                .cached
-                .iter()
-                .cloned()
-                .zip(pipelined(calls, SNAPSHOT_WINDOW))
-                .filter_map(|(name, reply)| match reply {
-                    Ok(value) => Some(Ok((name, value))),
-                    Err(CallError::DeviceError(_)) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<Result<BTreeMap<String, Vec<u8>>, CallError>>()?;
-            let after = version(submit(SETTINGS_VERSION, &[]))?;
+            let before = version(submit(SETTINGS_VERSION, &[]).await)?;
+            let mut values = BTreeMap::new();
+            {
+                let calls = self.cached.iter().map(|name| submit(name, &[]));
+                let mut replies = Pipeline::new(calls, SNAPSHOT_WINDOW);
+                for name in &self.cached {
+                    let Some(reply) = replies.next().await else {
+                        break;
+                    };
+                    match reply {
+                        Ok(value) => {
+                            values.insert(name.clone(), value);
+                        }
+                        Err(CallError::DeviceError(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            let after = version(submit(SETTINGS_VERSION, &[]).await)?;
             if after == before || attempt == SNAPSHOT_ATTEMPTS {
                 self.values = values;
                 self.applied = Some(before);
@@ -206,6 +223,11 @@ impl SettingsCache {
     }
 }
 
+/// Decodes the reply to a read of `settings.version`.
+fn version(reply: Result<Vec<u8>, CallError>) -> Result<u32, CallError> {
+    u32::decode_reply(&reply?).map_err(CallError::InvalidReply)
+}
+
 /// Whether sequence number `seq` comes after `applied`, across a wrap.
 fn ahead(seq: u32, applied: u32) -> bool {
     (seq.wrapping_sub(applied) as i32) > 0
@@ -213,11 +235,10 @@ fn ahead(seq: u32, applied: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::error::RpcErrorPayload;
-    use super::super::registry::RpcDescriptor;
-    use super::super::reply::resolved;
     use super::*;
+    use crate::device::rpc::{poll_once, resolved, RpcDescriptor, RpcErrorPayload};
     use crate::proto::rpc::RpcError;
+    use std::task::Poll;
 
     /// The metadata words of an announced read-write byte, an announced
     /// read-only one, a clock, a privileged announced byte, an announced
@@ -256,10 +277,13 @@ mod tests {
     ) -> (Vec<String>, Result<(), CallError>) {
         let mut asked = Vec::new();
         let mut replies = replies.iter().map(|reply| reply.to_vec());
-        let taken = cache.snapshot_with(|name, _| {
+        let taken = poll_once(std::pin::pin!(cache.snapshot_with(|name, _| {
             asked.push(name.to_string());
             resolved(replies.next())
-        });
+        })));
+        let Poll::Ready(taken) = taken else {
+            panic!("the snapshot waits on replies already resolved");
+        };
         (asked, taken)
     }
 
@@ -272,11 +296,11 @@ mod tests {
     }
 
     fn setting(name: &str, seq: Option<u32>, reply: u8) -> DeviceEvent {
-        DeviceEvent::Setting {
+        DeviceEvent::Setting(SettingChange {
             name: name.to_string(),
             seq,
             reply: vec![reply],
-        }
+        })
     }
 
     fn heartbeat(session: SessionId, settings: Option<u32>) -> DeviceEvent {
@@ -324,13 +348,13 @@ mod tests {
             Ok(vec![4, 0, 0, 0]),
         ]
         .into_iter();
-        let taken = cache.snapshot_with(|_, _| {
+        let taken = poll_once(std::pin::pin!(cache.snapshot_with(|_, _| {
             let (resolve, reply) = flume::bounded(1);
             resolve.send(replies.next().expect("four reads")).unwrap();
             PendingReply { reply }
-        });
+        })));
 
-        assert!(taken.is_ok());
+        assert!(matches!(taken, Poll::Ready(Ok(()))));
         assert_eq!(cache.get("test.amplitude"), Some(&[7][..]));
         assert_eq!(cache.get("test.status"), None);
         assert_eq!(cache.version(), Some(4));

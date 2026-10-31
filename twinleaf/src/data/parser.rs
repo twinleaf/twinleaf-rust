@@ -217,7 +217,14 @@ impl PacketParser {
     /// metadata again.
     pub fn reset_subtree(&mut self, subtree: DeviceRoute) {
         self.flush();
-        self.state.reset_subtree(subtree);
+        self.state.reset(|route| route.starts_with(&subtree));
+    }
+
+    /// Forgets the device metadata of the absolute route `route` alone, as
+    /// [`reset_subtree`](Self::reset_subtree) does for a subtree.
+    pub(crate) fn reset_route(&mut self, route: DeviceRoute) {
+        self.flush();
+        self.state.reset(|device| *device == route);
     }
 
     /// Takes the pending metadata query for `route`, creating the route's

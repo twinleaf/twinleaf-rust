@@ -952,7 +952,7 @@ impl ParseState {
                 status,
                 packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped
             ) {
-                self.reset_subtree(route);
+                self.reset(|device| device.starts_with(&route));
                 return Ok(PacketEvent::Reset);
             }
             return Ok(PacketEvent::Applied);
@@ -980,10 +980,10 @@ impl ParseState {
     /// Forgets the metadata of every route at and below `subtree` and ends its
     /// runs. The generation counters keep counting, and no stamp from before
     /// the reset recurs after it.
-    pub(super) fn reset_subtree(&mut self, subtree: DeviceRoute) {
+    pub(super) fn reset(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
         self.global_generation += 1;
         for device in &mut self.devices {
-            if device.route.starts_with(&subtree) {
+            if routes(&device.route) {
                 device.reset();
             }
         }

@@ -19,8 +19,80 @@
 //! first, each client hears
 //! [`FailedToReconnect`](crate::tio::packet::LinkStatus::FailedToReconnect)
 //! and is disconnected. A proxy that stops sends every client
-//! [`Stopped`](crate::tio::packet::LinkStatus::Stopped) at the root and
-//! closes each connection. A client must not reconnect after that status.
+//! [`Stopped`](crate::tio::packet::LinkStatus::Stopped) at the root, behind
+//! everything already queued for the client, and closes each connection once
+//! that is written or one second has passed, the `CLOSE_TIMEOUT` of its
+//! transport. A client must not reconnect after that status. The status can
+//! fail to arrive, when that second runs out or the proxy crashes. A
+//! client's session then takes the closed socket as a lost one, and opens
+//! its target again through the same address. It never starts a proxy to do
+//! so.
+//!
+//! A client that falls behind loses samples, the oldest first, and nothing
+//! else.
+//!
+//! # When the proxy lets a client go
+//!
+//! The proxy closes a client's connection, and logs why, in these cases, and
+//! when it cannot set up a new connection's transport at all.
+//!
+//! - The client hung up, or a write to it stalled for longer than the
+//!   transport's drain timeout of 3 s, `DRAIN_TIMEOUT`, as when the client
+//!   stops reading. It is logged as `HungUp`.
+//! - The client sent nothing for longer than the 5 s quiet time of the
+//!   proxy's keepalive, `PROXY_KEEPALIVE`. It is logged as `HungUp`.
+//! - The packets other than samples queued for the client passed 8 MiB,
+//!   `HARD_LIMIT`, as a flood of them outran a client that still reads. It
+//!   is logged as `TooSlow`.
+//! - The link to a device the client opened ended, as `LinkEnded`, or gave
+//!   the device up after `FailedToReconnect`, as `GaveUp`.
+//! - A packet the client sent found its mount's port full, or would reach
+//!   deeper on the device than a route can. It is logged as `ForwardFailed`.
+//! - The proxy stopped. It is logged as `Stopped`.
+//!
+//! # How a packet reaches a client
+//!
+//! Each link to a device has one worker, which owns the device's port. The
+//! worker hands every packet the device sends, in order, to the link's
+//! engine, through a queue with no limit, and the engine reads it through a
+//! session whose inlet has no limit either. The engine keeps the link's state
+//! from each packet, and then puts the packet on the stream of the outbox of
+//! each client whose mount covers its route. As it sets a device's metadata,
+//! it puts the metadata update on the stream of each client that follows the
+//! device, so the update reaches the client ahead of every sample sent after
+//! the change.
+//!
+//! A client's outbox holds that stream and an urgent queue, for the answers
+//! to the client's requests and the other updates of its watches. It drops
+//! only samples, the oldest first, past 1 MiB of them, `SAMPLE_BUDGET`, and
+//! lets the client go past 8 MiB of anything else. The client's task takes
+//! the whole urgent queue and then the oldest 64 KiB of the stream,
+//! `TAKE_LIMIT`, at a time, and writes them into the socket's queue of 64
+//! packets, `SOCKET_QUEUE`, from which the transport writes them to the
+//! connection. So an answer waits behind at most 64 KiB of the stream and
+//! the rest of one update, then the 64 packets the socket holds.
+//!
+//! What a client sends goes from its connection into a queue of 32768
+//! packets, or as many as `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` asks for
+//! above that. The client's task forwards each packet to the port of the
+//! mount its route falls in, a queue as deep, and a packet that finds that
+//! port full lets the client go. The worker writes each packet to the
+//! device, and hands the answer to a client's request back to that client's
+//! mount, which queues it on the urgent queue.
+//!
+//! On the client, the session reads the socket into its stream pump's
+//! inlet, which holds 32768 packets. A pump that falls that far behind loses
+//! what does not fit, and the parser marks the gap in the samples. The pump
+//! hands each sample batch to each receiver's queue of 1024 batches, and
+//! each packet to each packet receiver's queue of 8192 packets. A receiver
+//! that falls behind loses what does not fit in its queue, and hears
+//! [`RecvError::Lagged`](crate::RecvError::Lagged) with the count. The
+//! state the proxy sends goes into the connection's store, whose presence,
+//! metadata, RPC table and settings hold only their latest value, so a slow
+//! reader sees the newest and misses none it needs. Announced settings
+//! queue in order, and a reader that falls behind them hears how many it
+//! missed. So a sample can be lost in the proxy's outbox, in the pump's
+//! inlet, and in a receiver's queue, and each place counts what it lost.
 //!
 //! # Control requests
 //!
@@ -55,13 +127,19 @@
 //!   accepts it, from one connection at a time.
 //! - `proxy.stop` takes nothing and replies nothing, then stops the proxy.
 //!   Only a proxy with [`HostOptions::stoppable`] set accepts it.
+//! - `proxy.unwatch` takes the id of a `proxy.watch` request and replies
+//!   nothing. The proxy stops sending that watch's updates. Parts already
+//!   queued for the client still go out.
 //! - `proxy.watch` takes the route of a device the connection opened, as
 //!   the client sees it, and whether to follow the device's RPC table and
 //!   settings rather than its presence, metadata and announcements. It
 //!   replies with the state now, and again at each change, all under the
 //!   request's id. Each reply is one part of an update, the array of the
 //!   part's index, the count of parts and its bytes, and the bytes of every
-//!   part in order are one CBOR item.
+//!   part in order are one CBOR item. A metadata update reaches the client
+//!   ahead of every sample the device sent after the metadata changed. Any
+//!   other update may overtake the device's packets, and keeps its order
+//!   among the watch's updates of its kind.
 //!   An update is the device's presence, which is connecting, alive in a
 //!   session, or lost some milliseconds before the update went out, one
 //!   setting it announced, its complete metadata as its own metadata
@@ -82,10 +160,9 @@
 //!   serial device attached. If none of these is single, the refusal lists
 //!   the candidates.
 //!
-//! A client whose first packet within 250 ms of connecting is not a control
-//! request is a legacy client. It is opened to `auto` at once and hears link
-//! statuses in the legacy form, type 64. It is disconnected if `auto` opens
-//! nothing.
+//! A client reaches no device until a control request opens a target, and
+//! it hears each link status as a `PROXY_RX` link packet. A client that
+//! sends no control request opens nothing.
 //!
 //! # Choosing a proxy
 //!
@@ -128,16 +205,23 @@
 mod auto;
 mod client;
 mod control;
+mod engine;
 mod link;
+mod metadata;
+mod outbox;
 mod server;
+mod settings;
+#[cfg(test)]
+mod settings_sim;
 mod worker;
 
-#[cfg(test)]
-pub(crate) use control::{parts, CLIENT_KEEPALIVE};
 pub(crate) use control::{
-    call, decode, encode, executable_name, handshake, Part, Purpose, Update, Watch, DEFAULT_LAYOUT,
-    MOUNT, WATCH,
+    call, encode, executable_name, handshake, Joined, Purpose, Update, Watch, DEFAULT_LAYOUT,
+    MOUNT, UNWATCH, WATCH,
 };
+#[cfg(test)]
+pub(crate) use control::{decode, parts, CLIENT_KEEPALIVE};
+pub(crate) use server::host;
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -153,8 +237,8 @@ use tokio::sync::{mpsc, watch};
 /// completes it at once.
 // A listening socket completes the handshake in the kernel before it
 // accepts. A closed port can hang instead of refusing, as on WSL2 with
-// mirrored networking. Windows would take about 2 s to refuse, but a
-// loopback connect is told not to resend its handshake there.
+// mirrored networking. Windows resends an unanswered handshake before it
+// refuses, and a loopback connect is told not to resend it there.
 const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long [`stop`] waits for the proxy to reply.
@@ -198,6 +282,7 @@ pub(crate) fn endpoint_at(port: u16) -> String {
 /// Returns `true` if anything answers a connection to `port` of
 /// `127.0.0.1`. A connect that times out is tried once more for longer, and
 /// a refusal is final. Blocks the calling thread.
+#[cfg(test)]
 pub(crate) fn answers(port: u16) -> bool {
     let probing = async move { Ok(answers_async(port).await) };
     matches!(Supervisor::new().run("proxy probe", probing), Ok(true))
@@ -328,9 +413,6 @@ pub struct HostOptions {
     /// How long a link keeps trying to reconnect to a device it lost, or
     /// `None` to try forever. A link that gives up disconnects its clients.
     pub reconnect_timeout: Option<Duration>,
-    /// Whether to disconnect a client that falls behind. When `false`, the
-    /// proxy drops the packets the client cannot take.
-    pub kick_slow: bool,
     /// The traffic to log.
     pub dump: DumpFlags,
 }
@@ -338,8 +420,7 @@ pub struct HostOptions {
 /// The options a tool hosts the machine's proxy with. The proxy listens on
 /// loopback at the default port and runs until it is shut down. No client
 /// may stop it, it has no default layout, and its name is this executable's.
-/// It reconnects forever, drops what a slow client cannot take, and logs no
-/// traffic.
+/// It reconnects forever and logs no traffic.
 impl Default for HostOptions {
     fn default() -> Self {
         HostOptions {
@@ -350,7 +431,6 @@ impl Default for HostOptions {
             default: None,
             name: executable_name(),
             reconnect_timeout: None,
-            kick_slow: false,
             dump: DumpFlags::default(),
         }
     }
@@ -376,12 +456,17 @@ pub struct ClientInfo {
     pub own_process: bool,
 }
 
-/// A running proxy. It is shut down when dropped.
+/// A running proxy. Dropping it stops it, and the drop blocks until the
+/// proxy has stopped, as [`shutdown`](Proxy::shutdown) does, for at most
+/// 1.5 s and the moment its aborts take.
 pub struct Proxy {
     /// The server's mailbox, which keeps the proxy running.
     server: mpsc::UnboundedSender<server::Notice>,
     /// The receiver that disconnects once the proxy has stopped.
     stopped: flume::Receiver<()>,
+    /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
+    /// started on the crate's runtime.
+    drop_waits: bool,
     /// The client table, as the server publishes it.
     clients: watch::Receiver<Vec<ClientInfo>>,
     default: watch::Sender<Option<Layout>>,
@@ -426,6 +511,10 @@ pub fn stop(proxy: Option<&str>) -> io::Result<()> {
 impl Proxy {
     /// Starts a proxy with `options`. Returns once it accepts clients.
     ///
+    /// The proxy runs on the crate's own runtime. This may be called from
+    /// inside an application's tokio runtime, and blocks that thread until
+    /// the proxy accepts clients or fails to start.
+    ///
     /// # Errors
     ///
     /// Returns an [`io::ErrorKind::AddrInUse`] error if `options.port` is
@@ -457,7 +546,9 @@ impl Proxy {
     /// # }
     /// ```
     pub fn host(options: HostOptions) -> io::Result<Proxy> {
-        server::host(options)
+        let mut proxy = Supervisor::new().run("proxy host", host(options))?;
+        proxy.drop_waits = true;
+        Ok(proxy)
     }
 
     /// Returns the URL a client on this machine connects to, such as
@@ -490,11 +581,32 @@ impl Proxy {
     /// Stops the proxy and blocks until it has stopped. Each client hears the
     /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
     /// connection closes. The proxy stops accepting clients and closes every
-    /// device. A stop takes about 1.5 s at most, and then ends what still runs.
-    /// Calling it again does nothing.
+    /// link.
+    ///
+    /// The stop waits at most 1.5 s for the clients to close, and in the
+    /// same 1.5 s for each link to let go of its device. Then it aborts the
+    /// tasks of the clients and links that still run, and returns. So it
+    /// blocks for at most 1.5 s and the moment the aborts take. An open of a
+    /// serial device in flight on a blocking thread runs to its end after
+    /// that. The engine that keeps a link's state, and the tasks that read
+    /// its devices' settings, end once their link has ended, and the stop
+    /// does not wait for them.
+    ///
+    /// Calling it again does nothing. It may be called from inside an
+    /// application's tokio runtime, and blocks that thread as it would any
+    /// other.
     pub fn shutdown(&self) {
         let _ = self.server.send(server::Notice::Stop);
         self.wait();
+    }
+
+    /// Stops the proxy as [`shutdown`](Self::shutdown) does, and waits for
+    /// it without blocking. A proxy hosted on its caller's runtime, as the
+    /// crate's async [`host`] starts it, is stopped this way, since its drop
+    /// only asks it to stop.
+    pub(crate) async fn shutdown_async(&self) {
+        let _ = self.server.send(server::Notice::Stop);
+        let _ = self.stopped.recv_async().await;
     }
 }
 
@@ -507,9 +619,26 @@ impl fmt::Debug for Proxy {
     }
 }
 
+#[cfg(test)]
+impl Proxy {
+    /// Ends the proxy as a crash does, and waits until it has ended. No
+    /// client hears a stop, and each one's connection closes.
+    pub(crate) fn crash(&self) {
+        let _ = self.server.send(server::Notice::Panic);
+        self.wait();
+    }
+}
+
 impl Drop for Proxy {
+    /// Stops the proxy. A proxy [`Proxy::host`] started is waited for as
+    /// [`shutdown`](Proxy::shutdown) waits. Any other proxy runs on its
+    /// caller's runtime and is only asked to stop, since on a runtime of one
+    /// thread a wait would block the proxy itself.
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.server.send(server::Notice::Stop);
+        if self.drop_waits {
+            self.wait();
+        }
     }
 }
 
@@ -525,6 +654,7 @@ mod tests {
     use super::*;
     use crate::proto::rpc::RpcError;
     use crate::proto::PacketType;
+    use crate::rt;
     use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
     use crate::tio::transport;
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
@@ -560,7 +690,7 @@ mod tests {
     impl TestClient {
         fn connect(endpoint: &str) -> TestClient {
             let (sender, rx) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
-            let port = transport::Port::new(endpoint, sender);
+            let port = transport::Port::new_on(endpoint, sender, &Supervisor::new());
             TestClient {
                 port: port.unwrap(),
                 rx,
@@ -609,17 +739,10 @@ mod tests {
 
         /// Wait for the client to hear that the proxy stopped, then for its
         /// connection to close.
-        fn expect_stopped(&self, legacy: bool) {
+        fn expect_stopped(&self) {
             self.expect(|pkt| {
-                let status = match pkt.payload() {
-                    Payload::ProxyRx(ProxyRx::Link(status)) if !legacy => status,
-                    // A legacy client knows no stop, so it hears that
-                    // reconnecting failed.
-                    Payload::LegacyStatus(status) if legacy => match status {
-                        LinkStatus::FailedToReconnect => LinkStatus::Stopped,
-                        status => status,
-                    },
-                    _ => return None,
+                let Payload::ProxyRx(ProxyRx::Link(status)) = pkt.payload() else {
+                    return None;
                 };
                 assert_eq!(status, LinkStatus::Stopped);
                 assert_eq!(pkt.route(), DeviceRoute::root());
@@ -895,8 +1018,8 @@ mod tests {
     }
 
     /// A device that never comes back is given up once the reconnect timeout
-    /// passes. Each client using it hears so in its own form and is then
-    /// disconnected, and its link is closed and forgotten.
+    /// passes. Each client using it hears so and is then disconnected, and
+    /// its link is closed and forgotten.
     #[test]
     fn the_clients_of_a_device_given_up_hear_so_and_are_disconnected() {
         let device = FakeDevice::start();
@@ -908,33 +1031,25 @@ mod tests {
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open(&device.url).unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
+        let auto = TestClient::connect(&proxy.endpoint());
+        auto.hello(4243, "auto");
+        assert_eq!(auto.open("auto"), Ok(device.url.clone()));
 
         device.die();
 
-        control.expect(|pkt| match pkt.payload() {
-            Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorDisconnected)) => None,
-            Payload::ProxyRx(ProxyRx::Link(status)) => {
-                assert_eq!(status, LinkStatus::FailedToReconnect);
-                assert_eq!(pkt.route(), DeviceRoute::root());
-                Some(())
-            }
-            Payload::LegacyStatus(status) => panic!("a control client was sent {status:?}"),
-            _ => None,
-        });
-        legacy.expect(|pkt| match pkt.payload() {
-            Payload::LegacyStatus(LinkStatus::SensorDisconnected) => None,
-            Payload::LegacyStatus(status) => {
-                assert_eq!(pkt.ptype(), PacketType::PROXY_STATUS);
-                assert_eq!(status, LinkStatus::FailedToReconnect);
-                Some(())
-            }
-            Payload::ProxyRx(rx) => panic!("a legacy client was sent {rx:?}"),
-            _ => None,
-        });
-        control.expect_closed();
-        legacy.expect_closed();
+        for client in [&control, &auto] {
+            client.expect(|pkt| match pkt.payload() {
+                Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorDisconnected)) => None,
+                Payload::ProxyRx(ProxyRx::Link(status)) => {
+                    assert_eq!(status, LinkStatus::FailedToReconnect);
+                    assert_eq!(pkt.route(), DeviceRoute::root());
+                    Some(())
+                }
+                Payload::LegacyStatus(status) => panic!("a client was sent {status:?}"),
+                _ => None,
+            });
+            client.expect_closed();
+        }
         let deadline = Instant::now() + WAIT;
         while !proxy.links.urls().is_empty() || !proxy.clients().is_empty() {
             assert!(Instant::now() < deadline, "the link given up stayed open");
@@ -972,10 +1087,7 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
         assert_eq!(
             refused.to_string(),
-            format!(
-                "tcp://127.0.0.1:{port} is not a Twinleaf 2.0 proxy; \
-                 reach it with -r tcp://localhost:{port}"
-            )
+            format!("tcp://127.0.0.1:{port} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it")
         );
     }
 
@@ -1029,12 +1141,11 @@ mod tests {
             Duration::from_millis(800),
         );
         let legacy = legacy.unwrap_err();
-        let port = device.url.rsplit(':').next().unwrap();
         assert_eq!(legacy.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             legacy.to_string(),
             format!(
-                "{} is not a Twinleaf 2.0 proxy; reach it with -r tcp://localhost:{port}",
+                "{} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it",
                 device.url
             )
         );
@@ -1296,11 +1407,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
         let auto = TestClient::connect(&proxy.endpoint());
         auto.hello(4244, "auto");
         assert_eq!(auto.open("auto"), Ok(device.url.clone()));
+        assert_eq!(auto.dev_name(7), "FAKE");
     }
 
     /// `auto` shares the link it chose as it is. A replug that moved the
@@ -1461,10 +1571,10 @@ mod tests {
         assert_eq!(proxy.clients().len(), 2);
     }
 
-    /// A client whose first packet is not a control request, or that sends
-    /// nothing at first, is served `auto` at once.
+    /// A client whose first packet is not a control request opens nothing,
+    /// so what it sends reaches no device, though `auto` would resolve.
     #[test]
-    fn a_legacy_client_is_bound_to_auto() {
+    fn a_client_that_opens_nothing_reaches_no_device() {
         let device = FakeDevice::start();
         let proxy = Proxy::host(options()).unwrap();
         let opener = TestClient::connect(&proxy.endpoint());
@@ -1472,35 +1582,51 @@ mod tests {
         opener.open(&device.url).unwrap();
 
         let talker = TestClient::connect(&proxy.endpoint());
-        assert_eq!(talker.dev_name(7), "FAKE");
+        let request = Packet::rpc_request("dev.name", &[], 7, DeviceRoute::root());
+        talker.send(request.unwrap());
 
-        let silent = TestClient::connect(&proxy.endpoint());
-        silent.expect(|pkt| matches!(pkt.payload(), Payload::Heartbeat(_)).then_some(()));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Ok(heard) = talker.rx.recv_deadline(deadline) {
+            if let Ok(transport::TransportEvent::Packet(pkt)) = heard {
+                assert!(
+                    !matches!(pkt.payload(), Payload::RpcReply(_)),
+                    "a device answered"
+                );
+            }
+        }
         assert_eq!(device.accepted(), 1);
     }
 
+    /// A proxy refuses to open its own port at a loopback address or at
+    /// `localhost`, as its link would be a client of the proxy itself.
     #[test]
-    fn each_client_hears_link_statuses_in_its_own_form() {
+    fn a_proxy_refuses_to_mount_itself() {
+        let proxy = Proxy::host(options()).unwrap();
+        let client = TestClient::connect(&proxy.endpoint());
+        client.hello(4242, "itself");
+        let port = proxy.endpoint().rsplit(':').next().unwrap().to_string();
+
+        for url in [proxy.endpoint(), format!("tcp://localhost:{port}")] {
+            let (code, message) = client.open(&url).unwrap_err();
+            assert_eq!(code, RpcError::Invalid);
+            assert_eq!(
+                message,
+                format!("{url} is this proxy, which cannot mount itself")
+            );
+        }
+        assert!(proxy.links.urls().is_empty(), "a link to the proxy opened");
+    }
+
+    #[test]
+    fn a_client_hears_link_statuses_as_link_packets() {
         let device = FakeDevice::start();
         let proxy = Proxy::host(options()).unwrap();
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open(&device.url).unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
 
         device.drop_connections();
 
-        legacy.expect(|pkt| match pkt.payload() {
-            Payload::LegacyStatus(status) => {
-                assert_eq!(pkt.ptype(), PacketType::PROXY_STATUS);
-                assert_eq!(pkt.route(), DeviceRoute::root());
-                assert_eq!(status, LinkStatus::SensorDisconnected);
-                Some(())
-            }
-            Payload::ProxyRx(rx) => panic!("a legacy client was sent {rx:?}"),
-            _ => None,
-        });
         control.expect(|pkt| match pkt.payload() {
             Payload::ProxyRx(ProxyRx::Link(status)) => {
                 assert_eq!(pkt.route(), DeviceRoute::root());
@@ -1534,13 +1660,15 @@ mod tests {
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open("default").unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name_at(prefix, 7), "FAKE");
+        let auto = TestClient::connect(&proxy.endpoint());
+        auto.hello(4243, "auto");
+        auto.open("auto").unwrap();
+        assert_eq!(auto.dev_name_at(prefix, 7), "FAKE");
         let (user, _) = Packet::from_slice_prefix(&[64, 0, 3, 0, 4, 0xAA, 0xBB]).unwrap();
 
         device.send(user.clone());
 
-        for client in [&control, &legacy] {
+        for client in [&control, &auto] {
             client.expect(|pkt| match pkt.payload() {
                 Payload::ProxyRx(rx) => panic!("the USER packet arrived as {rx:?}"),
                 _ if pkt.ptype() == PacketType::PROXY_STATUS => {
@@ -1551,31 +1679,13 @@ mod tests {
             });
         }
 
-        for client in [&control, &legacy] {
+        for client in [&control, &auto] {
             client.send(user.with_route(prefix));
         }
 
         for pkt in device.expect_received(PacketType::PROXY_STATUS, 2) {
             assert_eq!(pkt.as_bytes(), user.as_bytes());
         }
-    }
-
-    /// A legacy client cannot be told why, so it is disconnected.
-    #[test]
-    fn a_legacy_client_whose_auto_cannot_open_is_closed() {
-        let url = UNREACHABLE.to_string();
-        let proxy = Proxy::host(HostOptions {
-            default: Some(Layout::single(&url)),
-            ..options()
-        })
-        .unwrap();
-
-        let legacy = TestClient::connect(&proxy.endpoint());
-
-        assert!(matches!(
-            legacy.rx.recv_timeout(WAIT),
-            Err(flume::RecvTimeoutError::Disconnected)
-        ));
     }
 
     /// Whether `proxy` stops within the time a test waits, waited for on
@@ -1639,8 +1749,8 @@ mod tests {
         assert_eq!(proxy.links.users(), 1);
 
         assert!(shuts_down_in_time(proxy));
-        first.expect_stopped(false);
-        second.expect_stopped(false);
+        first.expect_stopped();
+        second.expect_stopped();
     }
 
     /// Hosts a proxy, and connects a client that opened `device` and one
@@ -1677,7 +1787,7 @@ mod tests {
 
         proxy.links.panic();
 
-        watcher.expect_stopped(false);
+        watcher.expect_stopped();
         // Its link ended with the registry, before or after the stop.
         user.expect_closed();
         assert!(stops_in_time(proxy.clone()));
@@ -1691,7 +1801,7 @@ mod tests {
         let device = FakeDevice::start();
         let (proxy, user, watcher) = hosted_with_clients(&device);
 
-        let _ = proxy.server.send(server::Notice::Panic);
+        proxy.crash();
 
         watcher.expect_closed();
         user.expect_closed();
@@ -1707,13 +1817,13 @@ mod tests {
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open(&device.url).unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
+        let idle = TestClient::connect(&proxy.endpoint());
+        idle.hello(4243, "idle");
 
         proxy.shutdown();
 
-        control.expect_stopped(false);
-        legacy.expect_stopped(true);
+        control.expect_stopped();
+        idle.expect_stopped();
         let deadline = Instant::now() + WAIT;
         while !proxy.clients().is_empty() {
             assert!(Instant::now() < deadline, "a client stayed listed");
@@ -1741,7 +1851,7 @@ mod tests {
 
         proxy.shutdown();
 
-        client.expect_stopped(false);
+        client.expect_stopped();
         sending.join().unwrap();
     }
 
@@ -1761,7 +1871,7 @@ mod tests {
             .collect();
         stopped.shutdown();
         for client in &clients {
-            client.expect_stopped(false);
+            client.expect_stopped();
         }
         drop(clients);
 
@@ -1836,7 +1946,7 @@ mod tests {
 
         stop(Some(&stoppable.endpoint())).unwrap();
 
-        watcher.expect_stopped(false);
+        watcher.expect_stopped();
         let endpoint = stoppable.endpoint();
         assert!(stops_in_time(Arc::new(stoppable)));
         assert_eq!(
@@ -1918,5 +2028,85 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(proxy.clients()[0].name.as_deref(), Some("mine"));
+    }
+
+    /// The layout that mounts each of `devices` at a prefix of its own, and
+    /// the prefixes.
+    fn each_at_its_own_prefix(devices: &[FakeDevice]) -> (Layout, Vec<DeviceRoute>) {
+        let prefixes: Vec<DeviceRoute> = (1..=devices.len())
+            .map(|place| format!("/{place}").parse().unwrap())
+            .collect();
+        let mounts = devices.iter().zip(&prefixes).map(|(device, prefix)| Mount {
+            url: device.url.clone(),
+            source: DeviceRoute::root(),
+            prefix: *prefix,
+        });
+        let layout = Layout {
+            mounts: mounts.collect(),
+        };
+        (layout, prefixes)
+    }
+
+    /// A proxy hosted and a connection opened through the async entry points
+    /// run every task on the runtime they are awaited on, here one of a
+    /// single thread, and never reach the crate's runtime. The proxy keeps
+    /// the tables and settings of several devices there.
+    #[test]
+    fn a_proxy_and_a_connection_run_on_the_runtime_they_are_awaited_on() {
+        let devices: Vec<FakeDevice> = (0..3).map(|_| FakeDevice::start()).collect();
+        let (layout, prefixes) = each_at_its_own_prefix(&devices);
+        let caller = std::thread::spawn(move || {
+            rt::forbid_crate_runtime();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .on_thread_start(rt::forbid_crate_runtime)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let proxy = host(options()).await.unwrap();
+                let address = crate::device::runtime::ProxyAddress {
+                    url: proxy.endpoint(),
+                    ensure: None,
+                };
+                let session = crate::device::session::Session::mount_async(&address, &layout, WAIT);
+                let connection = crate::Connection::over(session.await.unwrap());
+                for prefix in &prefixes {
+                    let device = connection.device(*prefix);
+                    assert_eq!(device.submit("dev.name", &[]).await.unwrap(), b"FAKE");
+                    let followed = device.settings_updates();
+                    let settings = tokio::time::timeout(WAIT, followed.recv_async()).await;
+                    let settings = settings.expect("the settings in time").unwrap();
+                    assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
+                }
+                connection.close();
+                proxy.shutdown_async().await;
+            });
+        });
+        if let Err(panic) = caller.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The synchronous API works from inside an application's tokio runtime
+    /// of one thread, where `block_on` panics. It runs on the crate's runtime
+    /// and blocks the application's thread until each call is done.
+    #[tokio::test]
+    async fn the_sync_api_works_inside_an_applications_runtime() {
+        let device = FakeDevice::start();
+        let proxy = Proxy::host(HostOptions {
+            default: Some(Layout::single(&device.url)),
+            ..options()
+        })
+        .unwrap();
+        let connection = crate::Connection::open(&proxy.endpoint()).unwrap();
+
+        let name: String = connection
+            .device(DeviceRoute::root())
+            .get("dev.name")
+            .unwrap();
+
+        assert_eq!(name, "FAKE");
+        drop(connection);
+        drop(proxy);
     }
 }

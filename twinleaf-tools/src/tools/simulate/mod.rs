@@ -205,7 +205,9 @@ impl Simulator {
         }
         self.print_streams(cli);
         if raw_mode.is_some() {
-            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
+            terminal_println!(
+                "  press d to drop one sample now (test.drop), r to reboot (dev.reboot), Ctrl-C to quit"
+            );
         }
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
 
@@ -683,6 +685,48 @@ mod tests {
             .tree
             .tick(simulator.now_ns() + 50_000_000, &mut sent);
         assert!(samples(&sent) > 0);
+    }
+
+    /// `test.drop rollover` drops the first sample of the next segment, so
+    /// the outgoing segment ends whole and the new one begins at sample 1.
+    /// Any other argument is invalid.
+    #[test]
+    fn a_drop_at_rollover_takes_the_first_sample_of_the_next_segment() {
+        let (mut simulator, host) = start_simulator(&["--no-drop", "--segment-seconds", "1"]);
+        assert_eq!(
+            call(&mut simulator, &host, "test.drop", b"later", "/"),
+            Err(RpcError::Invalid.value())
+        );
+        call(&mut simulator, &host, "test.drop", b"rollover", "/").unwrap();
+        let mut sent = Queue::default();
+        simulator
+            .tree
+            .tick(simulator.now_ns() + 1_100_000_000, &mut sent);
+
+        // The main clock's sine stream and the aux stream, each sample 16
+        // bytes, at 1000 and 25 samples a segment.
+        for (stream, per_segment) in [(1, 1000), (3, 25)] {
+            let mut numbers: [Vec<u32>; 2] = Default::default();
+            for bytes in &sent.0 {
+                let (packet, _) = packet::Packet::from_slice_prefix(bytes).unwrap();
+                if let packet::Payload::Samples(samples) = packet.payload() {
+                    if samples.stream_id.value() == stream {
+                        let first = samples.first.value();
+                        let count = (samples.data.len() / 16) as u32;
+                        let segment = usize::from(samples.segment_id.value());
+                        numbers[segment].extend(first..first + count);
+                    }
+                }
+            }
+            let [outgoing, next] = numbers;
+            assert_eq!(
+                outgoing,
+                (0..per_segment).collect::<Vec<_>>(),
+                "stream {stream}"
+            );
+            assert_eq!(next.first(), Some(&1), "stream {stream}: {next:?}");
+            assert!(next.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        }
     }
 
     /// An upload counts the image bytes of each chunk as tl-chibi does, and an

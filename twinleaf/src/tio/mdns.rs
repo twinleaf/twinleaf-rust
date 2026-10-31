@@ -3,11 +3,11 @@
 
 mod one_shot;
 
-use crate::rt::Supervisor;
+use crate::rt::{lock, Supervisor};
 use mdns_sd::{HostnameResolutionEvent, Receiver, ScopedIp, ServiceDaemon};
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, SocketAddrV6};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -24,11 +24,6 @@ static DAEMON: Mutex<Option<ServiceDaemon>> = Mutex::new(None);
 // would take the first one's answers, and stopping either would stop both.
 static RESOLVING: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>> =
     Mutex::new(BTreeMap::new());
-
-/// Locks `mutex`, even if a thread panicked while holding it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Returns the process's mDNS daemon, starting it on first use.
 ///
@@ -56,15 +51,15 @@ pub(crate) fn daemon() -> Result<ServiceDaemon, mdns_sd::Error> {
 /// resolution of the same name runs. Returns no address if mDNS answers
 /// nothing in time or the daemon cannot start. Skips an IPv6 link-local
 /// address that comes without its interface. Dropping the future stops the
-/// search. Must be called on the crate's runtime.
-pub(crate) async fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
+/// search. The daemon starts on a blocking thread of `tasks`.
+pub(crate) async fn resolve(host: &str, port: u16, tasks: &Supervisor) -> Vec<SocketAddr> {
     let name = format!("{host}.");
     let turn = lock(&RESOLVING).entry(name.clone()).or_default().clone();
     let _turn = turn.lock().await;
     // A one-shot query is answered at once, and the daemon from its cache, so
     // whichever answers first is taken.
     let quick = one_shot::resolve(&name, port);
-    let searched = search(host, &name, port);
+    let searched = search(host, &name, port, tasks);
     tokio::pin!(quick, searched);
     tokio::select! {
         found = &mut quick => match found.is_empty() {
@@ -79,11 +74,12 @@ pub(crate) async fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
 }
 
 /// Resolves `name`, `host` with its trailing dot, with the daemon, as
-/// [`resolve`] describes.
-async fn search(host: &str, name: &str, port: u16) -> Vec<SocketAddr> {
+/// [`resolve`] describes, starting the daemon on a blocking thread of
+/// `tasks`.
+async fn search(host: &str, name: &str, port: u16, tasks: &Supervisor) -> Vec<SocketAddr> {
     let name = name.to_string();
     // Starting the daemon binds its sockets and starts its thread.
-    let started = Supervisor::new().spawn_blocking(daemon).await;
+    let started = tasks.spawn_blocking(daemon).await;
     let daemon = match started {
         Ok(Ok(daemon)) => daemon,
         Ok(Err(error)) => return unresolved(host, error),
@@ -191,10 +187,14 @@ mod tests {
     async fn a_resolution_dropped_while_it_waits_gives_up_its_turn() {
         let host = "twinleaf-test-nobody-answers.local";
         let short = Duration::from_millis(100);
-        let _ = tokio::time::timeout(short, resolve(host, 7855)).await;
+        let _ = tokio::time::timeout(short, resolve(host, 7855, &Supervisor::current())).await;
 
         let began = std::time::Instant::now();
-        let next = tokio::time::timeout(RESOLVE_TIMEOUT * 2, resolve(host, 7855)).await;
+        let next = tokio::time::timeout(
+            RESOLVE_TIMEOUT * 2,
+            resolve(host, 7855, &Supervisor::current()),
+        )
+        .await;
 
         assert_eq!(next, Ok(Vec::new()), "the dropped resolution kept its turn");
         assert!(began.elapsed() < RESOLVE_TIMEOUT + short);

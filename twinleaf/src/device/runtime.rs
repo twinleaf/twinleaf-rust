@@ -164,7 +164,7 @@ async fn wait_for_proxy(
                     if !status.success() {
                         let log = log.clone();
                         let failed = move || failure(&log, status);
-                        let reading = Supervisor::new().spawn_blocking(failed);
+                        let reading = Supervisor::current().spawn_blocking(failed);
                         return Err(reading.await.unwrap_or_else(io::Error::other));
                     }
                 }
@@ -232,7 +232,7 @@ async fn ensure_proxy_at(
         log::debug!("hosting the proxy in this process, as it runs in the App Sandbox");
         return embed(port, embedded).await;
     }
-    let spawning = Supervisor::new().spawn_blocking(move || spawn_proxy(port));
+    let spawning = Supervisor::current().spawn_blocking(move || spawn_proxy(port));
     let waited = match spawning.await.map_err(io::Error::other)? {
         Ok(spawned) => wait_for_proxy(port, Some(spawned), STARTUP).await,
         Err(error)
@@ -265,16 +265,19 @@ async fn embed(port: u16, embedded: &Mutex<Option<Proxy>>) -> io::Result<()> {
         name: format!("{} (embedded)", proxy::executable_name()),
         ..HostOptions::default()
     };
-    // Hosting checks the port with a blocking connect, and may call the
-    // proxy that answers there.
-    let hosting = Supervisor::new().spawn_blocking(move || Proxy::host(options));
-    match hosting.await.map_err(io::Error::other)? {
+    // The embedded proxy is the machine's and outlives the open that starts
+    // it, so it runs on the crate's runtime.
+    let hosting = Supervisor::new().spawn("proxy host", proxy::host(options));
+    let hosted = hosting.await.map_err(io::Error::other)?;
+    match hosted.unwrap_or_else(|| Err(io::Error::other("hosting the proxy panicked"))) {
         Ok(proxy) => {
             let stopped = embedded
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .replace(proxy);
-            Supervisor::new().spawn_blocking(move || drop(stopped));
+            if let Some(stopped) = stopped {
+                stopped.shutdown_async().await;
+            }
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {

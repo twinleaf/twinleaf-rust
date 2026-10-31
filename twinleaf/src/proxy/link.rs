@@ -23,20 +23,21 @@
 
 use super::auto::Candidate;
 use super::control::Refusal;
-use super::worker::{self, Command, Opener, Readiness, Subscriber};
+use super::engine::{self, Mount, Mounts};
+use super::outbox::Outbox;
+use super::worker::{self, OpenPort, Opener, Readiness};
 use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
-use crate::device::session::Session;
+use crate::device::store::Store;
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::Packet;
 use crate::tio::transport;
-use crate::Connection;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::env;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -53,69 +54,6 @@ pub(super) type Opens = Box<dyn FnMut(&str) -> Opener + Send>;
 /// The number of a link, unique among the links of one registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct LinkId(u64);
-
-/// A client's port on a link. It carries the packets of one subtree of the
-/// device, with routes relative to that subtree.
-pub(super) struct Port {
-    sender: PortSender,
-    rx: mpsc::Receiver<Packet>,
-}
-
-/// The sending half of a client's port, with routes relative to its scope.
-pub(super) struct PortSender {
-    tx: mpsc::Sender<Packet>,
-    scope: DeviceRoute,
-}
-
-/// Why a port could not take a packet. Each carries the packet back.
-#[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum SendError {
-    /// The port's queue is full.
-    #[error("channel full")]
-    WouldBlock(Packet),
-    /// The link's worker is gone.
-    #[error("proxy disconnected")]
-    ProxyDisconnected(Packet),
-    /// The route lies outside the port's scope.
-    #[error("route exceeds port scope")]
-    InvalidRoute(Packet),
-}
-
-impl PortSender {
-    /// Sends `packet` to the port without blocking.
-    ///
-    /// Returns the packet back in a [`SendError`] if the queue is full, the
-    /// worker is gone, or the route is outside the port's subtree.
-    #[allow(clippy::result_large_err)] // Preserve ownership when submission fails.
-    pub(super) fn try_send(&self, packet: Packet) -> Result<(), SendError> {
-        if self.scope.absolute_route(&packet.route()).is_err() {
-            return Err(SendError::InvalidRoute(packet));
-        }
-        match self.tx.try_send(packet) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(pkt)) => Err(SendError::WouldBlock(pkt)),
-            Err(mpsc::error::TrySendError::Closed(pkt)) => Err(SendError::ProxyDisconnected(pkt)),
-        }
-    }
-}
-
-impl Port {
-    /// Separates outgoing routing from the channel of packets the link delivers.
-    pub(super) fn into_split(self) -> (PortSender, mpsc::Receiver<Packet>) {
-        (self.sender, self.rx)
-    }
-}
-
-/// Returns the depth of the queue the proxy fills for each of its ports.
-/// `TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE` may raise it above the default.
-pub(super) fn client_rx_channel_size() -> usize {
-    let min_size = transport::DEFAULT_RX_CHANNEL_SIZE;
-    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
-        std::cmp::max(req.parse().unwrap_or(0), min_size)
-    } else {
-        min_size
-    }
-}
 
 /// Returns the depth of the queue each port fills for the proxy.
 /// `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` may raise it above the default.
@@ -134,12 +72,13 @@ pub(super) struct Link {
     id: LinkId,
     url: Arc<str>,
     /// The worker's commands, which the registry alone keeps open.
-    commands: mpsc::WeakSender<Command>,
+    commands: mpsc::WeakSender<OpenPort>,
     /// The link's readiness, as its worker reports it.
     readiness: watch::Receiver<Readiness>,
-    /// The client inside the proxy that keeps the state of the link's
-    /// device for every watch, from the first watch on.
-    state: Arc<Mutex<Option<Connection>>>,
+    /// The state of the link's devices, which its engine keeps.
+    store: Arc<Mutex<Store>>,
+    /// The clients' mounts of the link, which its engine feeds.
+    mounts: Arc<Mounts>,
 }
 
 impl Link {
@@ -175,28 +114,18 @@ impl Link {
         }
     }
 
-    /// Queues a client's port on the subtree at `source` for the worker to
-    /// adopt, without blocking.
-    ///
-    /// Returns an error message if the link is closed, the worker's queue is
-    /// full, or the worker is gone.
-    pub(super) fn open_port(&self, source: DeviceRoute) -> Result<Port, String> {
+    /// Hands the port of `mount` to the worker to adopt, without blocking.
+    /// The worker reads what the client sends from `from_port`.
+    fn adopt(&self, mount: Arc<Mount>, from_port: mpsc::Receiver<Packet>) -> Result<(), String> {
         let Some(commands) = self.commands.upgrade() else {
             return Err(format!("the link to {} closed", self.url));
         };
-        let (to_worker, from_port) = mpsc::channel(client_tx_channel_size());
-        let (to_port, from_worker) = mpsc::channel(client_rx_channel_size());
-        let subscriber = Subscriber::new(to_port, from_port, source);
-        let reason = match commands.try_send(Command::OpenPort(subscriber)) {
-            Ok(()) => {
-                return Ok(Port {
-                    sender: PortSender {
-                        tx: to_worker,
-                        scope: source,
-                    },
-                    rx: from_worker,
-                })
-            }
+        let open = OpenPort {
+            mount,
+            from_client: from_port,
+        };
+        let reason = match commands.try_send(open) {
+            Ok(()) => return Ok(()),
             // Transient, as the worker still runs.
             Err(mpsc::error::TrySendError::Full(_)) => "the proxy is busy",
             Err(mpsc::error::TrySendError::Closed(_)) => "failed to set up new proxy client",
@@ -204,24 +133,9 @@ impl Link {
         Err(format!("could not open a port on {}: {reason}", self.url))
     }
 
-    /// Returns the client inside the proxy that keeps the state of the
-    /// link's device, the one place its metadata, RPC table and settings are
-    /// asked for. The first call starts it over a port of its own, with its
-    /// tasks on `tasks`, and so does a call once it has ended.
-    ///
-    /// # Errors
-    ///
-    /// Returns why a port could not be opened, as [`open_port`](Self::open_port) does.
-    pub(super) fn state(&self, tasks: &Supervisor) -> Result<Connection, String> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(connection) = state.as_ref().filter(|state| !state.is_closed()) {
-            return Ok(connection.clone());
-        }
-        let (sender, received) = self.open_port(DeviceRoute::root())?.into_split();
-        let peer = format!("the state of {}", self.url);
-        let connection = Connection::over(Session::over_port(sender.tx, received, peer, tasks));
-        *state = Some(connection.clone());
-        Ok(connection)
+    /// Returns the state of the link's devices.
+    pub(super) fn store(&self) -> Arc<Mutex<Store>> {
+        Arc::clone(&self.store)
     }
 }
 
@@ -237,6 +151,53 @@ impl Lease {
     /// Returns the link the lease uses.
     pub(super) fn link(&self) -> &Link {
         &self.link
+    }
+
+    /// Mounts the subtree at `source` of the link for the client of
+    /// `outbox`, which sees it at `prefix`. Queues a port for the worker to
+    /// adopt, without blocking, that takes what the client sends and queues
+    /// the answers to its requests in `outbox`. The link's engine feeds the
+    /// client every packet of the subtree until the mount drops.
+    ///
+    /// Returns an error message if the link is closed, the worker's queue is
+    /// full, or the worker is gone.
+    pub(super) fn mount(
+        self,
+        source: DeviceRoute,
+        prefix: DeviceRoute,
+        outbox: &Arc<Outbox>,
+    ) -> Result<Mounted, String> {
+        let (port, from_port) = mpsc::channel(client_tx_channel_size());
+        // The engine feeds the mount before the worker adopts its port. An
+        // engine that ends lets the client go, and a port asked for after
+        // that is refused, as the worker ended first.
+        let mount = Mount::new(source, prefix, outbox);
+        self.link.mounts.add(Arc::clone(&mount));
+        // From here the guard removes the mount, if the worker refuses its
+        // port too.
+        let mounted = Mounted {
+            mount,
+            port,
+            lease: self,
+        };
+        let link = mounted.lease.link();
+        link.adopt(Arc::clone(&mounted.mount), from_port)?;
+        Ok(mounted)
+    }
+}
+
+/// A client's mount of a link, with its lease on the link. Dropping it ends
+/// the mount.
+pub(super) struct Mounted {
+    pub(super) mount: Arc<Mount>,
+    /// Takes what the client sends to the device, at the device's routes.
+    pub(super) port: mpsc::Sender<Packet>,
+    pub(super) lease: Lease,
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        self.lease.link.mounts.remove(&self.mount);
     }
 }
 
@@ -413,7 +374,7 @@ impl Links {
 struct Entry {
     link: Link,
     /// The only sender of the worker's commands, dropped to close the link.
-    commands: Option<mpsc::Sender<Command>>,
+    commands: Option<mpsc::Sender<OpenPort>>,
     /// The key the link is filed under.
     key: String,
     /// The number of leases on the link.
@@ -627,27 +588,46 @@ impl Registry {
         }
     }
 
-    /// Opens a new link to `url` under `key`, and spawns its worker.
+    /// Opens a new link to `url` under `key`, and spawns its worker and its
+    /// engine. The registry holds the worker's task. No one holds the
+    /// engine's task. It ends once the worker's task has ended, as the
+    /// worker's end closes the port the engine reads, and the engine's
+    /// settings tasks end with it.
     fn start(&mut self, url: &str, key: String) -> LinkId {
         log::info!("Opening {url}");
         let id = LinkId(self.next_id);
         self.next_id += 1;
         let open = (self.opens)(url);
         let default = self.default.clone();
-        let (commands, readiness, run) =
-            worker::new(url, self.reconnect_timeout, self.dump, default, open);
+        let started = worker::new(
+            url,
+            self.reconnect_timeout,
+            self.dump,
+            default,
+            open,
+            &self.tasks,
+        );
+        let name = format_args!("proxy link {url}");
         self.tasks
-            .spawn_in_map(&mut self.workers, id, format_args!("proxy link {url}"), run);
+            .spawn_in_map(&mut self.workers, id, name, started.run);
         let link = Link {
             id,
             url: url.into(),
-            commands: commands.downgrade(),
-            readiness,
-            state: Arc::default(),
+            commands: started.commands.downgrade(),
+            readiness: started.readiness,
+            store: Arc::new(Mutex::new(Store::new(true))),
+            mounts: Mounts::new(url),
         };
+        let engine = engine::serve(
+            link.store(),
+            Arc::clone(&link.mounts),
+            started.engine,
+            &self.tasks,
+        );
+        self.tasks.spawn(format_args!("proxy state {url}"), engine);
         let entry = Entry {
             link,
-            commands: Some(commands),
+            commands: Some(started.commands),
             key,
             users: 0,
             idle_since: Instant::now(),
@@ -730,7 +710,7 @@ mod tests {
     impl Link {
         /// Creates a link to `url` with no worker. Returns it with the
         /// sender that keeps its commands open, and their receiver.
-        pub(crate) fn idle(url: &str) -> (Link, mpsc::Sender<Command>, mpsc::Receiver<Command>) {
+        pub(crate) fn idle(url: &str) -> (Link, mpsc::Sender<OpenPort>, mpsc::Receiver<OpenPort>) {
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let (commands, receiver) = mpsc::channel(16);
             let link = Link {
@@ -738,9 +718,17 @@ mod tests {
                 url: url.into(),
                 commands: commands.downgrade(),
                 readiness: watch::channel(Readiness::Pending).1,
-                state: Arc::default(),
+                store: Arc::new(Mutex::new(Store::new(true))),
+                mounts: Mounts::new(url),
             };
             (link, commands, receiver)
+        }
+
+        /// Queues the port of a mount of the whole device for the worker to
+        /// adopt, as a client's mount does.
+        fn open_port(&self) -> Result<(), String> {
+            let mount = Mount::new(DeviceRoute::root(), DeviceRoute::root(), &Arc::default());
+            self.adopt(mount, mpsc::channel(1).1)
         }
     }
 
@@ -850,7 +838,7 @@ mod tests {
 
     /// A link to nothing whose worker never runs, with the sender that
     /// keeps its commands open and their far end.
-    fn idle_link() -> (Link, mpsc::Sender<Command>, mpsc::Receiver<Command>) {
+    fn idle_link() -> (Link, mpsc::Sender<OpenPort>, mpsc::Receiver<OpenPort>) {
         Link::idle(UNREACHABLE)
     }
 
@@ -860,11 +848,9 @@ mod tests {
     fn opening_a_port_does_not_wait_for_a_worker_that_never_answers() {
         let (link, _open, mut commands) = idle_link();
 
-        let _port = link
-            .open_port(DeviceRoute::root())
-            .expect("the port is queued");
+        link.open_port().expect("the port is queued");
 
-        assert!(matches!(commands.try_recv(), Ok(Command::OpenPort(_))));
+        assert!(commands.try_recv().is_ok());
     }
 
     /// A congested command lane says nothing about whether the worker lives,
@@ -872,33 +858,16 @@ mod tests {
     #[test]
     fn a_full_command_lane_is_distinct_from_a_stopped_worker() {
         let (link, _open, commands) = idle_link();
-        while link.open_port(DeviceRoute::root()).is_ok() {}
+        while link.open_port().is_ok() {}
 
-        let busy = link.open_port(DeviceRoute::root()).err().unwrap();
+        let busy = link.open_port().err().unwrap();
         assert!(busy.ends_with("the proxy is busy"), "{busy}");
         drop(commands);
-        let gone = link.open_port(DeviceRoute::root()).err().unwrap();
+        let gone = link.open_port().err().unwrap();
         assert!(
             gone.ends_with("failed to set up new proxy client"),
             "{gone}"
         );
-    }
-
-    /// A port's routes are relative to its scope, and together they reach no
-    /// deeper than a route can.
-    #[test]
-    fn a_port_rejects_routes_that_reach_too_deep() {
-        let (link, _open, _commands) = idle_link();
-        let (port, _received) = link.open_port("/1".parse().unwrap()).unwrap().into_split();
-
-        let too_deep = Packet::heartbeat("/2/3/4/5/6/7/8/9".parse().unwrap());
-        assert!(matches!(
-            port.try_send(too_deep),
-            Err(SendError::InvalidRoute(_))
-        ));
-        assert!(port
-            .try_send(Packet::heartbeat("/2".parse().unwrap()))
-            .is_ok());
     }
 
     /// The device a test opens.
@@ -1062,18 +1031,14 @@ mod tests {
             .send(&Packet::heartbeat(DeviceRoute::root()))
             .await;
         assert_eq!(lease.link().ready().await, Ok(()));
-        let (port, _received) = lease
-            .link()
-            .open_port(DeviceRoute::root())
-            .unwrap()
-            .into_split();
+        let root = DeviceRoute::root();
+        let mounted = lease.mount(root, root, &Arc::default()).unwrap();
         let queued = 2000;
         for _ in 0..queued {
-            port.try_send(Packet::heartbeat(DeviceRoute::root()))
-                .unwrap();
+            mounted.port.try_send(Packet::heartbeat(root)).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
-        drop((port, lease));
+        drop(mounted);
         let ending = Instant::now();
 
         let ended = tokio::spawn(owner.close());

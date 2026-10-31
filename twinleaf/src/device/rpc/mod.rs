@@ -34,13 +34,10 @@
 //! [`proto::rpc`](crate::proto::rpc). The wire layout of requests, replies,
 //! and errors is documented there.
 
-pub(in crate::device) mod cache;
+pub(crate) mod cache;
 mod error;
 mod registry;
 mod reply;
-mod settings;
-#[cfg(test)]
-mod settings_sim;
 mod value;
 
 #[doc(no_inline)]
@@ -49,8 +46,10 @@ pub use crate::proto::rpc::{RpcAccess, RpcMeta, RpcMetaFlags, RpcStringLen, RpcV
 pub use crate::tio::rpc::{RpcArgs, RpcDecodeError, RpcReply, RpcReplyFixedSize};
 pub use error::{CallError, RpcErrorPayload};
 pub use registry::{RpcDescriptor, RpcRegistry, RpcRegistryError};
+pub(crate) use reply::Pipeline;
 pub use reply::{pipelined, PendingReply, ReplyFuture};
-pub(crate) use settings::{CacheAction, SettingsCache};
+#[cfg(test)]
+pub(crate) use reply::{poll_once, resolved};
 #[doc(no_inline)]
 pub use twinleaf_device::rpc::{Channel, Std, STANDARD};
 pub use value::{RpcMetaExt, RpcValue, RpcValueDecodeError, RpcValueEncodeError, RpcValueTypeExt};

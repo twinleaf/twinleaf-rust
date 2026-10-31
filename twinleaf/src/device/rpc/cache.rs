@@ -15,7 +15,7 @@ static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 /// Returns the cache file of a device's registry, or `None` when no usable
 /// cache directory exists.
 // TODO: evict stale cache files from old firmware versions (<dev_name>.*.rpcs)
-pub(in crate::device) fn path(dev_name: &str, hash: u32) -> Option<PathBuf> {
+pub(crate) fn path(dev_name: &str, hash: u32) -> Option<PathBuf> {
     let Some(dirs) = BaseDirs::new() else {
         log::debug!("no cache directory, so RPC tables are not cached");
         return None;

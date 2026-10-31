@@ -193,8 +193,8 @@ impl<T> Receiver<T> {
 /// The subtree one view covers, `depth` levels below `route`.
 #[derive(Clone, Copy)]
 pub(crate) struct Scope {
-    pub(super) route: DeviceRoute,
-    pub(super) depth: usize,
+    pub(crate) route: DeviceRoute,
+    pub(crate) depth: usize,
 }
 
 impl Scope {
@@ -220,7 +220,7 @@ impl Scope {
     }
 
     /// Returns `true` if `route` lies within this scope.
-    pub(super) fn covers(&self, route: DeviceRoute) -> bool {
+    pub(crate) fn covers(&self, route: DeviceRoute) -> bool {
         self.route
             .relative_route(&route)
             .is_ok_and(|below| below.len() <= self.depth)
@@ -233,8 +233,9 @@ impl Scope {
     }
 }
 
-/// The sending end of a queue that counts the items it had no room for, and
-/// keeps one place for the end.
+/// The sending end of a queue that counts the items it had no room for. The
+/// end, and an item sent with [`send_always`](Self::send_always), go in
+/// however full the queue is.
 ///
 /// A [latest-value](Self::latest) lane holds one item, and a new item takes
 /// the place of one still unread instead of being counted as missed.
@@ -251,7 +252,7 @@ pub(crate) struct Lane<T> {
 impl<T> Lane<T> {
     /// Returns a lane with room for `capacity` items, and its receiving end.
     pub(crate) fn new(capacity: usize) -> (Lane<T>, flume::Receiver<Queued<T>>) {
-        let (items, received) = flume::bounded(capacity + 1);
+        let (items, received) = flume::unbounded();
         let lane = Lane {
             items,
             room: capacity,
@@ -307,6 +308,19 @@ impl<T> Lane<T> {
         }
     }
 
+    /// Sends one item that is never missed, however full the queue is.
+    pub(crate) fn send_always(&mut self, item: T) {
+        let _ = self.items.send(Queued::Item(item));
+    }
+
+    /// Counts `missed` items that never reached the lane, and reports them
+    /// as [`report_lag`](Self::report_lag) does. Returns `false` once the
+    /// receiver is gone.
+    pub(crate) fn lag(&mut self, missed: u64) -> bool {
+        self.skipped += missed;
+        self.report_lag()
+    }
+
     /// Sends the count of missed items once the queue has room. Returns
     /// `false` once the receiver is gone.
     pub(crate) fn report_lag(&mut self) -> bool {
@@ -323,12 +337,12 @@ impl<T> Lane<T> {
         }
     }
 
-    /// Ends the queue saying why, for which it always has room.
+    /// Ends the queue saying why.
     pub(crate) fn end(self, end: End) {
-        let _ = self.items.try_send(Queued::Ended(end));
+        let _ = self.items.send(Queued::Ended(end));
     }
 
-    /// Sends `queued` if it leaves the place kept for the stop.
+    /// Sends `queued` if the queue has room for it.
     fn push(&self, queued: Queued<T>) -> Result<(), flume::TrySendError<Queued<T>>> {
         if self.items.len() < self.room {
             self.items.try_send(queued)
@@ -339,21 +353,21 @@ impl<T> Lane<T> {
 }
 
 /// One subscriber's queue, with its scope.
-pub(super) struct Sink<T> {
-    pub(super) lane: Lane<T>,
+pub(crate) struct Sink<T> {
+    pub(crate) lane: Lane<T>,
     /// Closes when the subscriber drops its receiver, waking the pump.
-    pub(super) alive: oneshot::Receiver<Infallible>,
-    pub(super) scope: Scope,
+    pub(crate) alive: oneshot::Receiver<Infallible>,
+    pub(crate) scope: Scope,
 }
 
 impl<T> Sink<T> {
-    pub(super) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
+    pub(crate) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
         Self::with_lane(Lane::new(capacity), scope)
     }
 
     /// Returns a sink whose [latest-value](Lane::latest) lane holds only the
     /// newest item, and its receiver.
-    pub(super) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
+    pub(crate) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
         Self::with_lane(Lane::latest(), scope)
     }
 

@@ -30,10 +30,6 @@ pub struct ProxyCli {
     #[arg(long = "mdns")]
     pub(crate) mdns: bool,
 
-    /// Kick off slow clients (by default their packets are dropped)
-    #[arg(short = 'k', long)]
-    pub(crate) kick_slow: bool,
-
     /// Sensor subtree to look at
     #[arg(
         short = 's',

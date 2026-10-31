@@ -50,7 +50,8 @@ it removes the last routing byte and forwards the packet to that port.
 | 128 + n | `STREAM` n   | Samples of stream n, [`data`]            |
 
 Values 0, 9, 10, and 13 are invalid. Value 65 was `RPC_UPDATE` and is unused.
-Proxies still send their link status to 1.x clients as a `USER` packet.
+Proxies older than 2.0 send their link status as a `USER` packet, which
+parsers still read.
 
 ## RPC Formats
 

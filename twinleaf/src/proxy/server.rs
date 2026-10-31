@@ -2,13 +2,13 @@
 //! clients, runs the task of each, keeps the client table, and owns the
 //! registry of links. [`Shared`] holds what every client's task reads.
 
-use super::client::Session;
+use super::client::{Session, SOCKET_QUEUE};
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
 use super::link::{self, Links, Owner};
 use super::{
-    answers, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
+    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
 };
-use crate::rt::{self, sleep_until_some, Supervisor};
+use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{BTreeMap, HashMap};
@@ -77,21 +77,22 @@ impl Shared {
 }
 
 /// Binds the listeners for `options`, and starts the server, which serves
-/// clients until the proxy stops. Returns the proxy's handle.
+/// clients until the proxy stops. Returns the proxy's handle. Must be
+/// awaited on a tokio runtime, which runs every task of the proxy.
 ///
 /// Returns an [`io::ErrorKind::AddrInUse`] error if anything already answers
 /// on a nonzero port. The message calls it a Twinleaf proxy if it answers
 /// `proxy.hello`. Also returns any error from binding the listeners or
-/// registering them with the crate's runtime.
-///
-/// # Panics
-///
-/// Panics if the crate's runtime cannot start.
-pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
-    if options.port != 0 && answers(options.port) {
+/// registering them with the runtime.
+pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
+    let tasks = Supervisor::current();
+    if options.port != 0 && answers_async(options.port).await {
         let endpoint = endpoint_at(options.port);
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, options.port));
         let hello = control::encode(&Introduction::of_this_process(&options.name));
-        let message = match control::call(&endpoint, HELLO, &hello, HELLO_TIMEOUT) {
+        let called =
+            control::call_at(address, &endpoint, HELLO, &hello, HELLO_TIMEOUT, &tasks).await;
+        let message = match called {
             Ok(reply) => match control::decode::<Introduction>(&reply) {
                 Ok(host) => {
                     format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
@@ -104,15 +105,11 @@ pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
     }
     let listeners = bind(options.listen, options.port)?;
     let port = listeners[0].local_addr()?.port();
-    let listeners = {
-        let _runtime = rt::handle().enter();
-        let listening = listeners.into_iter().map(|listener| {
-            listener.set_nonblocking(true)?;
-            TcpListener::from_std(listener)
-        });
-        listening.collect::<io::Result<Vec<_>>>()?
-    };
-    let tasks = Supervisor::new();
+    let listening = listeners.into_iter().map(|listener| {
+        listener.set_nonblocking(true)?;
+        TcpListener::from_std(listener)
+    });
+    let listeners = listening.collect::<io::Result<Vec<_>>>()?;
     let default = watch::channel(options.default.take());
     let registry = Links::new(
         &tasks,
@@ -182,6 +179,7 @@ impl Server {
         let proxy = Proxy {
             server: notices.clone(),
             stopped: waited,
+            drop_waits: false,
             clients,
             default: default.clone(),
             endpoint: endpoint.clone(),
@@ -226,8 +224,13 @@ impl Server {
                 notice = self.notices.recv() => match notice {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
                     Some(Notice::Stop) | None => break,
+                    // The clients' tasks end before they could hear a stop,
+                    // as a proxy that crashes tells no client.
                     #[cfg(test)]
-                    Some(Notice::Panic) => panic!("a test asked the server to panic"),
+                    Some(Notice::Panic) => {
+                        self.sessions.abort_all();
+                        panic!("a test asked the server to panic")
+                    }
                 },
                 accepted = accept(&self.listeners), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),
@@ -309,13 +312,11 @@ impl Server {
     /// Adds the client at `peer` connected on `stream` to the table, and
     /// spawns its task.
     fn serve(&mut self, stream: TcpStream, peer: SocketAddr) {
-        // A client from the proxy perspective is a port in reverse, i.e. what it receives
-        // is what a client transmits, and vice-versa. Therefore, the channel size settings
-        // for rx and tx are inverted. Also, we use the proxy port channel size setting
-        // instead of the physical ports setting.
+        // What a client sends goes to its ports, so it is queued as deep as
+        // they are. What it is sent waits in its outbox.
         let (deliver, incoming) = flume::bounded(link::client_tx_channel_size());
-        let size = link::client_rx_channel_size();
-        let port = match transport::Port::from_tcp(stream, deliver, size, &self.shared.tasks) {
+        let tasks = &self.shared.tasks;
+        let port = match transport::Port::from_tcp(stream, deliver, SOCKET_QUEUE, tasks) {
             Ok(port) => port,
             Err(error) => {
                 log::warn!("Failed to set up client {peer}: {error}");
@@ -445,6 +446,7 @@ mod tests {
     use super::*;
     use crate::proxy::fixtures::{assert_took, options, PAUSED_WAIT};
     use crate::proxy::DumpFlags;
+    use crate::rt;
     use std::net::TcpListener;
     use std::thread;
     use tokio::time::timeout;

@@ -6,19 +6,12 @@
 //! one first and then each new one. A reader that falls behind skips to the
 //! newest, so it never lags.
 
-use super::rpc::{CacheAction, PendingReply, RpcRegistry, RpcRegistryError, SettingsCache};
-use super::session::Handle;
-use super::stream::DeviceEvent;
+use super::rpc::{RpcRegistry, RpcRegistryError};
 use crate::data::DeviceMetadataSnapshot;
-use crate::proto::{DeviceRoute, SessionId};
+use crate::proto::SessionId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-
-/// How long a worker waits after its RPC table failed to load before it
-/// loads it again, unless the device announces a new table first.
-const RELOAD_DELAY: Duration = Duration::from_secs(5);
+use std::time::Instant;
 
 /// Whether a device is there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,41 +65,35 @@ pub struct SettingChange {
 /// The values of a device's announced settings, read with one RPC table.
 ///
 /// It holds every readable, announced entry of the table that is neither a
-/// capture nor privileged. The values are exact while
-/// [`version`](Self::version) is `Some`. A device without `settings.version`,
-/// or one that does not number its announcements, has no values here.
+/// capture nor privileged. Three numbers place the values. The table's
+/// `rpc.hash` identifies the table's contents. The table's session is the
+/// one boot of the device the values were read in. The `settings.version`
+/// orders the device's announcements within that session, and the values
+/// are exact at it.
+///
+/// The values are exact while [`version`](Self::version) is `Some`. A device
+/// without `settings.version`, or one that does not number its
+/// announcements, has no values here.
 #[derive(Debug, Clone)]
 pub struct Settings {
     registry: Arc<RpcRegistry>,
-    session: Option<SessionId>,
     version: Option<u32>,
     values: BTreeMap<String, Vec<u8>>,
 }
 
 impl Settings {
-    /// Creates the settings read with `registry` in `session`, exact at
-    /// `version`, holding `values` by name.
+    /// Creates the settings read with `registry`, exact at `version`,
+    /// holding `values` by name.
     pub(crate) fn new(
         registry: Arc<RpcRegistry>,
-        session: Option<SessionId>,
         version: Option<u32>,
         values: BTreeMap<String, Vec<u8>>,
     ) -> Settings {
         Settings {
             registry,
-            session,
             version,
             values,
         }
-    }
-
-    fn of(registry: &Arc<RpcRegistry>, cache: &SettingsCache) -> Settings {
-        Settings::new(
-            Arc::clone(registry),
-            cache.session(),
-            cache.version(),
-            cache.values().clone(),
-        )
     }
 
     /// Returns the value of `name` as the bytes its RPC replies, or `None`
@@ -128,147 +115,9 @@ impl Settings {
         self.version
     }
 
-    /// Returns the session the values were read in.
-    pub fn session(&self) -> Option<SessionId> {
-        self.session
-    }
-
     /// Returns the RPC table the values were read with, which gives each
-    /// value its type.
+    /// value its type, and its hash and the session the values were read in.
     pub fn rpc_registry(&self) -> &Arc<RpcRegistry> {
         &self.registry
-    }
-}
-
-/// What a device's worker learned.
-pub(crate) enum Learned {
-    Registry(RegistryState),
-    Settings(Arc<Settings>),
-}
-
-/// Starts the worker that loads the RPC table of the device at `route`
-/// through `handle` and keeps its settings, and returns the sender of the
-/// device's events it follows. It sends what it learns on `learned`, and
-/// stops once the sender is dropped.
-pub(crate) fn start_worker(
-    handle: Handle,
-    route: DeviceRoute,
-    learned: mpsc::UnboundedSender<(DeviceRoute, Learned)>,
-) -> flume::Sender<DeviceEvent> {
-    let (events, received) = flume::unbounded();
-    let worker = Worker {
-        handle,
-        route,
-        events: received,
-        learned,
-    };
-    let started = std::thread::Builder::new()
-        .name(format!("twinleaf settings {route}"))
-        .spawn(move || worker.run());
-    if let Err(error) = started {
-        log::warn!("could not start the settings worker of {route}: {error}");
-    }
-    events
-}
-
-/// The worker of one device. Its calls block, so it runs on a thread of its
-/// own.
-struct Worker {
-    handle: Handle,
-    route: DeviceRoute,
-    events: flume::Receiver<DeviceEvent>,
-    learned: mpsc::UnboundedSender<(DeviceRoute, Learned)>,
-}
-
-impl Worker {
-    /// Loads the table and follows the device until a new table or a new
-    /// session calls for loading it again, until the pump lets go.
-    fn run(self) {
-        loop {
-            let loaded = RpcRegistry::load_with(|name, arg| self.submit(name, arg));
-            let registry = match loaded {
-                Ok(registry) => Arc::new(registry),
-                Err(error) => {
-                    log::warn!("could not load the RPC table of {}: {error}", self.route);
-                    if !self.tell(Learned::Registry(Err(error))) || !self.await_new_table() {
-                        return;
-                    }
-                    continue;
-                }
-            };
-            if !self.tell(Learned::Registry(Ok(Arc::clone(&registry)))) || !self.follow(&registry) {
-                return;
-            }
-        }
-    }
-
-    /// Keeps the settings of `registry` until it is out of date. Returns
-    /// `false` once the pump lets go.
-    fn follow(&self, registry: &Arc<RpcRegistry>) -> bool {
-        let mut cache = SettingsCache::new(registry);
-        if !self.snapshot(registry, &mut cache) {
-            return false;
-        }
-        loop {
-            let Ok(event) = self.events.recv() else {
-                return false;
-            };
-            match &event {
-                DeviceEvent::NewHash(None) => return true,
-                DeviceEvent::NewHash(Some(hash)) if Some(*hash) != registry.hash => return true,
-                DeviceEvent::Heartbeat {
-                    session_id: Some(session),
-                    ..
-                } if registry.session.is_some_and(|read_in| read_in != *session) => return true,
-                _ => {}
-            }
-            let before = cache.version();
-            let kept = match cache.observe(&event) {
-                CacheAction::Keep if cache.version() == before => true,
-                CacheAction::Keep => {
-                    self.tell(Learned::Settings(Arc::new(Settings::of(registry, &cache))))
-                }
-                CacheAction::Snapshot => self.snapshot(registry, &mut cache),
-                CacheAction::Reload => return true,
-            };
-            if !kept {
-                return false;
-            }
-        }
-    }
-
-    /// Fills `cache` with a snapshot and sends the settings it holds then.
-    /// A failed snapshot is logged, and the cache asks for another at the
-    /// next heartbeat. Returns `false` once the pump lets go.
-    fn snapshot(&self, registry: &Arc<RpcRegistry>, cache: &mut SettingsCache) -> bool {
-        if let Err(error) = cache.snapshot_with(|name, arg| self.submit(name, arg)) {
-            log::warn!("could not read the settings of {}: {error}", self.route);
-        }
-        self.tell(Learned::Settings(Arc::new(Settings::of(registry, cache))))
-    }
-
-    /// Waits for the device to announce a new table, or for the delay
-    /// before loading again. Returns `false` once the pump lets go.
-    fn await_new_table(&self) -> bool {
-        let deadline = Instant::now() + RELOAD_DELAY;
-        loop {
-            match self.events.recv_deadline(deadline) {
-                Ok(DeviceEvent::NewHash(_)) | Err(flume::RecvTimeoutError::Timeout) => return true,
-                Ok(_) => {}
-                Err(flume::RecvTimeoutError::Disconnected) => return false,
-            }
-        }
-    }
-
-    fn submit(&self, name: &str, arg: &[u8]) -> PendingReply {
-        PendingReply {
-            reply: self.handle.submit(self.route, name, arg),
-        }
-    }
-
-    /// Sends what the worker learned to the pump. Returns `false` once the
-    /// pump is gone.
-    fn tell(&self, learned: Learned) -> bool {
-        self.learned.send((self.route, learned)).is_ok()
     }
 }

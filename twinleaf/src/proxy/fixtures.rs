@@ -388,7 +388,7 @@ pub(crate) fn description() -> [wire::Metadata<'static>; 4] {
         wire::Metadata::Stream(wire::Stream {
             stream_id,
             n_columns: 1,
-            n_segments: 1,
+            n_segments: 2,
             sample_size: 4,
             buf_samples: 128,
             name: "field",
@@ -472,8 +472,6 @@ pub(crate) enum First {
 pub(crate) struct Opened {
     /// The URL of the link it opened.
     pub(crate) url: String,
-    /// When it opened.
-    pub(crate) at: tokio::time::Instant,
     /// The device's end of the port.
     pub(crate) end: FakeEnd,
 }
@@ -495,8 +493,7 @@ pub(super) fn fakes(first: Vec<(&str, First)>) -> (Opens, mpsc::UnboundedReceive
                 let (url, sender) = (url.clone(), sender.clone());
                 move || {
                     let (port, end) = Port::fake(TransportKind::Tcp, None, results);
-                    let at = tokio::time::Instant::now();
-                    let _ = sender.send(Opened { url, at, end });
+                    let _ = sender.send(Opened { url, end });
                     Ok(port)
                 }
             };
