@@ -68,37 +68,50 @@ impl NamePattern {
     }
 }
 
-/// Returns the entries of `registry` that `patterns` select, in name order.
-/// A hidden entry is selected under `all`, or by a pattern that selects
-/// nothing else.
+/// Returns the entries of `registry` that `patterns` select, in name order,
+/// for a device that is `unlocked` or not. A hidden entry is selected under
+/// `all`, or by a pattern that selects nothing else.
 fn select<'a>(
     registry: &'a RpcRegistry,
     patterns: &[NamePattern],
     all: bool,
+    unlocked: bool,
 ) -> Vec<&'a RpcDescriptor> {
+    let hidden = |desc: &RpcDescriptor| is_hidden(desc, unlocked);
     let explicit: Vec<bool> = patterns
         .iter()
         .map(|pattern| {
             registry
                 .iter()
                 .filter(|desc| pattern.matches(&desc.full_name))
-                .all(is_hidden)
+                .all(hidden)
         })
         .collect();
     registry
         .iter()
         .filter(|desc| {
             patterns.iter().zip(&explicit).any(|(pattern, &explicit)| {
-                pattern.matches(&desc.full_name) && (all || explicit || !is_hidden(desc))
+                pattern.matches(&desc.full_name) && (all || explicit || !hidden(desc))
             })
         })
         .collect()
 }
 
-/// Whether listing and reading leave `desc` out unless asked, as a protocol
-/// entry or a privileged one is.
-fn is_hidden(desc: &RpcDescriptor) -> bool {
-    desc.meta.flags().contains(RpcMetaFlags::PRIVILEGED) || channel(desc) == Some(Channel::Protocol)
+/// Whether listing and reading leave `desc` out unless asked, as they do a
+/// protocol entry, and a privileged one while the device is not `unlocked`
+/// and so refuses that call.
+fn is_hidden(desc: &RpcDescriptor, unlocked: bool) -> bool {
+    let privileged = desc.meta.flags().contains(RpcMetaFlags::PRIVILEGED);
+    channel(desc) == Some(Channel::Protocol) || (privileged && !unlocked)
+}
+
+/// Returns whether `device` has unlocked privileged access, as a read of
+/// `dev.priv` says. A device that cannot say is taken to list only what it
+/// grants, as older firmware does.
+fn unlocked(device: &Device) -> bool {
+    device
+        .get::<u8>("dev.priv")
+        .map_or(true, |unlocked| unlocked != 0)
 }
 
 /// What `desc` is for, from the standard table when it is a standard entry
@@ -178,8 +191,9 @@ fn load_registry(device: &Device) -> eyre::Result<std::sync::Arc<RpcRegistry>> {
 fn list_rpcs(tio: &TioOpts, patterns: &[String], all: bool, json: bool) -> eyre::Result<()> {
     let patterns = compile(patterns)?;
     let connection = Connection::open(&tio.root)?;
-    let registry = load_registry(&connection.device(tio.route))?;
-    let selected = select(&registry, &patterns, all);
+    let device = connection.device(tio.route);
+    let registry = load_registry(&device)?;
+    let selected = select(&registry, &patterns, all, unlocked(&device));
 
     if json {
         let rows: Vec<Value> = selected.into_iter().map(describe).collect();
@@ -235,7 +249,7 @@ fn read_selected(
     patterns: &[NamePattern],
     all: bool,
 ) -> Vec<Reading> {
-    let readable: Vec<&RpcDescriptor> = select(registry, patterns, all)
+    let readable: Vec<&RpcDescriptor> = select(registry, patterns, all, unlocked(device))
         .into_iter()
         .filter(|desc| is_readable(desc))
         .collect();
@@ -459,7 +473,7 @@ mod tests {
 
     fn selected(patterns: &[&str], all: bool) -> Vec<String> {
         let texts: Vec<String> = patterns.iter().map(|text| text.to_string()).collect();
-        select(&registry(), &compile(&texts).unwrap(), all)
+        select(&registry(), &compile(&texts).unwrap(), all, false)
             .into_iter()
             .map(|desc| desc.full_name.clone())
             .collect()
@@ -486,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_and_privileged_entries_are_hidden_unless_asked_for() {
+    fn protocol_entries_and_locked_privileged_ones_are_hidden_unless_asked_for() {
         let everything = selected(&[], false);
         assert!(everything.contains(&"dev.name".to_string()));
         for hidden in [
@@ -497,10 +511,14 @@ mod tests {
         ] {
             assert!(!everything.contains(&hidden.to_string()), "{hidden} shown");
         }
-        assert!(selected(&[], true).contains(&"diag.adc.raw".to_string()));
+        let table = registry();
+        let unlocked = select(&table, &compile(&[]).unwrap(), false, true);
+        assert!(unlocked.iter().any(|desc| desc.full_name == "diag.adc.raw"));
+        assert!(!unlocked.iter().any(|desc| desc.full_name == "rpc.listinfo"));
+        assert!(selected(&[], true).contains(&"rpc.listinfo".to_string()));
+        assert_eq!(selected(&["diag"], false), ["diag.adc.raw"]);
         assert!(!selected(&["dev"], false).contains(&"dev.systime".to_string()));
         assert_eq!(selected(&["rpc.*"], false).len(), 7);
-        assert_eq!(selected(&["diag"], false), ["diag.adc.raw"]);
         assert_eq!(selected(&["dev.systime"], false), ["dev.systime"]);
     }
 
@@ -578,10 +596,11 @@ mod tests {
             .unwrap()
         };
 
-        let listed: Vec<Value> = select(&registry, &patterns(&["test.enable", "sync"]), false)
-            .into_iter()
-            .map(describe)
-            .collect();
+        let listed: Vec<Value> =
+            select(&registry, &patterns(&["test.enable", "sync"]), false, false)
+                .into_iter()
+                .map(describe)
+                .collect();
         let read: Vec<Value> = read_selected(
             &device,
             &registry,

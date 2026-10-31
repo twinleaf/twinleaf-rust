@@ -60,9 +60,10 @@ A PATTERN is a dotted prefix or a glob over the dotted name, as in sysctl.
 `therm` selects `therm` and everything under it, `*.enable` an `enable` one
 level down, `**.enable` one at any depth, and `cell.*.setpoint` each cell's.
 
-Protocol RPCs (the standard table's `rpc.*`, clocks, upload, privilege) and
-privileged diagnostics are hidden unless --all is given or a pattern selects
-nothing else, as `rpc.*` or a diagnostics prefix does.";
+What is shown is what the device grants now. Protocol RPCs (the standard
+table's `rpc.*`, clocks, upload, privilege) are hidden, and so are privileged
+RPCs while `dev.priv` says the device is locked. --all, or a pattern that
+selects nothing else, as `rpc.*` does, shows them.";
 
 const LIST_ABOUT: &str = "\
 List available RPCs on the device.
@@ -95,7 +96,7 @@ pub enum RPCSubcommands {
         #[arg(value_name = "PATTERN", value_hint = ValueHint::Other)]
         patterns: Vec<String>,
 
-        /// Include protocol and privileged RPCs
+        /// Include protocol RPCs, and privileged ones while locked
         #[arg(short = 'a', long)]
         all: bool,
 
@@ -113,7 +114,7 @@ pub enum RPCSubcommands {
         #[arg(value_name = "PATTERN", required = true, value_hint = ValueHint::Other)]
         patterns: Vec<String>,
 
-        /// Include protocol and privileged RPCs
+        /// Include protocol RPCs, and privileged ones while locked
         #[arg(short = 'a', long)]
         all: bool,
 
