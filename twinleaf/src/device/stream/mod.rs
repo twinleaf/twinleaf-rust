@@ -5,20 +5,23 @@
 //! to the subtree its view covers. The state of each device comes from the
 //! proxy alone. The pump watches each device a receiver follows with
 //! `proxy.watch`, and keeps what the proxy sends in the connection's
-//! [`Store`]. The proxy sends an update ahead of every packet its device
-//! sent after the change. The metadata of an update reaches the parser too,
-//! which decodes the samples after it with it.
+//! [`Store`]. The proxy sends a metadata update ahead of every packet its
+//! device sent after the metadata changed. The update reaches the parser
+//! too, which decodes the samples after it with it. The proxy's other
+//! updates may overtake the device's packets, as each is the latest value of
+//! one field of the store.
 
 mod subscription;
 
 pub(crate) use subscription::{End, Lane, Queued, Scope, Sink};
 pub use subscription::{Receiver, RecvError};
 
-use super::session::{Handle, Inlet};
-use super::store::{end_sinks, lock, prune, pruned, Field, Store};
+use super::session::{Handle, Inlet, Received};
+use super::store::{end_sinks, prune, pruned, Field, Store};
 use crate::data::{PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proxy::{encode, Joined, Update, Watch, UNWATCH, WATCH};
+use crate::rt::lock;
 use crate::rt::Supervisor;
 use crate::tio;
 use crate::tio::packet::{self, LinkStatus, Packet, ProxyRx};
@@ -282,7 +285,7 @@ impl Pump {
 
     /// Takes `first` from the inlet, and what else the inlet held then, up
     /// to the end.
-    fn take_input(&mut self, first: Queued<Option<tio::Packet>>) -> Option<End> {
+    fn take_input(&mut self, first: Queued<Received>) -> Option<End> {
         let inlet = self.inlet.clone();
         let held = inlet.try_iter().take(inlet.len());
         std::iter::once(first)
@@ -293,12 +296,14 @@ impl Pump {
     /// Takes one entry of the inlet, a packet, a reply to a watch or the
     /// loss of the socket, or reports the gap the session left. Returns why
     /// the session ended, at its end. The packets of a route a tap covers
-    /// reach the parser, but for metadata, which it takes from the proxy's
-    /// updates alone.
-    fn take(&mut self, queued: Queued<Option<tio::Packet>>) -> Option<End> {
+    /// reach the parser, but for the device's own metadata records, as the
+    /// parser takes metadata from the proxy's metadata updates alone. Until
+    /// the first metadata update of a device, the parser waits for metadata
+    /// and drops the device's samples.
+    fn take(&mut self, queued: Queued<Received>) -> Option<End> {
         let packet = &match queued {
-            Queued::Item(Some(packet)) => packet,
-            Queued::Item(None) => {
+            Queued::Item(Received::Packet(packet)) => packet,
+            Queued::Item(Received::SocketLost) => {
                 self.lose();
                 return None;
             }
@@ -591,10 +596,10 @@ mod tests {
         let (sink, packets) = Sink::new(PACKET_QUEUE_LEN, everything());
         let _ = taps.send(Tap::Packets(sink));
         let presence = lock(&store).follow(route, PRESENCE);
-        let deliver = |packet| inlet.borrow_mut().send(Some(packet));
+        let deliver = |packet| inlet.borrow_mut().send(Received::Packet(packet));
         let reply = |id: u16, update: &Update| {
             for part in crate::proxy::parts(id, update) {
-                inlet.borrow_mut().send_always(Some(part));
+                inlet.borrow_mut().send_always(Received::Packet(part));
             }
         };
         let id = watch_of(&proxy, device(route));
@@ -608,7 +613,7 @@ mod tests {
         deliver(samples(0, route));
         assert!(batches.recv_timeout(wait).unwrap().is_initial());
 
-        inlet.borrow_mut().send_always(None);
+        inlet.borrow_mut().send_always(Received::SocketLost);
         wait_for(&presence, lost);
         let marked = wait_for(&packets, |packet| packet.link_status().is_some());
         assert_eq!(
@@ -749,7 +754,7 @@ mod tests {
         Supervisor::new().spawn("twinleaf stream", pump.run());
         let (sink, tapped) = Sink::new(PACKET_QUEUE_LEN, everything());
         taps.send(Tap::Packets(sink)).unwrap();
-        let deliver = |packet| inlet.send(Queued::Item(Some(packet))).unwrap();
+        let deliver = |packet| inlet.send(Queued::Item(Received::Packet(packet))).unwrap();
 
         deliver(samples(0, DeviceRoute::root()));
         inlet.send(Queued::Gap(1)).unwrap();

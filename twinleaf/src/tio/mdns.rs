@@ -3,11 +3,11 @@
 
 mod one_shot;
 
-use crate::rt::Supervisor;
+use crate::rt::{lock, Supervisor};
 use mdns_sd::{HostnameResolutionEvent, Receiver, ScopedIp, ServiceDaemon};
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, SocketAddrV6};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -24,11 +24,6 @@ static DAEMON: Mutex<Option<ServiceDaemon>> = Mutex::new(None);
 // would take the first one's answers, and stopping either would stop both.
 static RESOLVING: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>> =
     Mutex::new(BTreeMap::new());
-
-/// Locks `mutex`, even if a thread panicked while holding it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Returns the process's mDNS daemon, starting it on first use.
 ///

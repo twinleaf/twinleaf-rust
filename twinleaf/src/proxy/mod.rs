@@ -19,11 +19,80 @@
 //! first, each client hears
 //! [`FailedToReconnect`](crate::tio::packet::LinkStatus::FailedToReconnect)
 //! and is disconnected. A proxy that stops sends every client
-//! [`Stopped`](crate::tio::packet::LinkStatus::Stopped) at the root and
-//! closes each connection. A client must not reconnect after that status.
+//! [`Stopped`](crate::tio::packet::LinkStatus::Stopped) at the root, behind
+//! everything already queued for the client, and closes each connection once
+//! that is written or one second has passed, the `CLOSE_TIMEOUT` of its
+//! transport. A client must not reconnect after that status. The status can
+//! fail to arrive, when that second runs out or the proxy crashes. A
+//! client's session then takes the closed socket as a lost one, and opens
+//! its target again through the same address. It never starts a proxy to do
+//! so.
 //!
 //! A client that falls behind loses samples, the oldest first, and nothing
-//! else. A client that stops reading is disconnected.
+//! else.
+//!
+//! # When the proxy lets a client go
+//!
+//! The proxy closes a client's connection, and logs why, in these cases, and
+//! when it cannot set up a new connection's transport at all.
+//!
+//! - The client hung up, or a write to it stalled for longer than the
+//!   transport's drain timeout of 3 s, `DRAIN_TIMEOUT`, as when the client
+//!   stops reading. It is logged as `HungUp`.
+//! - The client sent nothing for longer than the 5 s quiet time of the
+//!   proxy's keepalive, `PROXY_KEEPALIVE`. It is logged as `HungUp`.
+//! - The packets other than samples queued for the client passed 8 MiB,
+//!   `HARD_LIMIT`, as a flood of them outran a client that still reads. It
+//!   is logged as `TooSlow`.
+//! - The link to a device the client opened ended, as `LinkEnded`, or gave
+//!   the device up after `FailedToReconnect`, as `GaveUp`.
+//! - A packet the client sent found its mount's port full, or would reach
+//!   deeper on the device than a route can. It is logged as `ForwardFailed`.
+//! - The proxy stopped. It is logged as `Stopped`.
+//!
+//! # How a packet reaches a client
+//!
+//! Each link to a device has one worker, which owns the device's port. The
+//! worker hands every packet the device sends, in order, to the link's
+//! engine, through a queue with no limit, and the engine reads it through a
+//! session whose inlet has no limit either. The engine keeps the link's state
+//! from each packet, and then puts the packet on the stream of the outbox of
+//! each client whose mount covers its route. As it sets a device's metadata,
+//! it puts the metadata update on the stream of each client that follows the
+//! device, so the update reaches the client ahead of every sample sent after
+//! the change.
+//!
+//! A client's outbox holds that stream and an urgent queue, for the answers
+//! to the client's requests and the other updates of its watches. It drops
+//! only samples, the oldest first, past 1 MiB of them, `SAMPLE_BUDGET`, and
+//! lets the client go past 8 MiB of anything else. The client's task takes
+//! the whole urgent queue and then the oldest 64 KiB of the stream,
+//! `TAKE_LIMIT`, at a time, and writes them into the socket's queue of 64
+//! packets, `SOCKET_QUEUE`, from which the transport writes them to the
+//! connection. So an answer waits behind at most 64 KiB of the stream and
+//! the rest of one update, then the 64 packets the socket holds.
+//!
+//! What a client sends goes from its connection into a queue of 32768
+//! packets, or as many as `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` asks for
+//! above that. The client's task forwards each packet to the port of the
+//! mount its route falls in, a queue as deep, and a packet that finds that
+//! port full lets the client go. The worker writes each packet to the
+//! device, and hands the answer to a client's request back to that client's
+//! mount, which queues it on the urgent queue.
+//!
+//! On the client, the session reads the socket into its stream pump's
+//! inlet, which holds 32768 packets. A pump that falls that far behind loses
+//! what does not fit, and the parser marks the gap in the samples. The pump
+//! hands each sample batch to each receiver's queue of 1024 batches, and
+//! each packet to each packet receiver's queue of 8192 packets. A receiver
+//! that falls behind loses what does not fit in its queue, and hears
+//! [`RecvError::Lagged`](crate::RecvError::Lagged) with the count. The
+//! state the proxy sends goes into the connection's store, whose presence,
+//! metadata, RPC table and settings hold only their latest value, so a slow
+//! reader sees the newest and misses none it needs. Announced settings
+//! queue in order, and a reader that falls behind them hears how many it
+//! missed. So a sample can be lost in the proxy's outbox, in the pump's
+//! inlet, and in a receiver's queue, and each place counts what it lost.
 //!
 //! # Control requests
 //!
@@ -58,13 +127,19 @@
 //!   accepts it, from one connection at a time.
 //! - `proxy.stop` takes nothing and replies nothing, then stops the proxy.
 //!   Only a proxy with [`HostOptions::stoppable`] set accepts it.
+//! - `proxy.unwatch` takes the id of a `proxy.watch` request and replies
+//!   nothing. The proxy stops sending that watch's updates. Parts already
+//!   queued for the client still go out.
 //! - `proxy.watch` takes the route of a device the connection opened, as
 //!   the client sees it, and whether to follow the device's RPC table and
 //!   settings rather than its presence, metadata and announcements. It
 //!   replies with the state now, and again at each change, all under the
 //!   request's id. Each reply is one part of an update, the array of the
 //!   part's index, the count of parts and its bytes, and the bytes of every
-//!   part in order are one CBOR item.
+//!   part in order are one CBOR item. A metadata update reaches the client
+//!   ahead of every sample the device sent after the metadata changed. Any
+//!   other update may overtake the device's packets, and keeps its order
+//!   among the watch's updates of its kind.
 //!   An update is the device's presence, which is connecting, alive in a
 //!   session, or lost some milliseconds before the update went out, one
 //!   setting it announced, its complete metadata as its own metadata

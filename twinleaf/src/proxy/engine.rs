@@ -1,42 +1,60 @@
 //! The engine of one link, the one place its devices' state is computed, and
-//! the one reader of its packets.
+//! the one reader of its device's packets.
 //!
-//! The engine reads every packet of its link through a session over a port
-//! of its own, which never fills, so it loses nothing. It follows each
-//! device's presence from the packets it hears and the link's statuses, and
-//! loses a device silent for [`QUIET`], or one a reconnect left connecting
-//! that stays silent as long. It collects the metadata of each device a
-//! watch follows. It loads the RPC table and keeps the settings of each
-//! device it has heard whose table a watch follows, on a worker thread per
-//! device that stops once no watch has followed the table for [`LINGER`].
-//! It keeps all of this in the link's [`Store`], which every client's
-//! watches follow, for as long as the link runs.
+//! The engine reads every packet of its link through a [`Session`] over a
+//! port of its own, whose queues have no limit, so it loses nothing. It
+//! reads through a session, as an app does, so its [`Handle`] can call
+//! `dev.metadata`, load the RPC table and read the settings of each device.
+//! It follows each device's presence from the packets it hears and the
+//! link's statuses,
+//! and loses a device silent for [`QUIET`], or one a reconnect left
+//! connecting that stays silent as long. It collects the metadata of each
+//! device a watch follows, and publishes it once it is complete. It loads
+//! the RPC table and keeps the settings of each device it has heard whose
+//! table a watch follows, on a worker thread per device that stops once no
+//! watch has followed the table for [`LINGER`]. It keeps all of this in the
+//! link's [`Store`], which the clients' watches follow, for as long as the
+//! link runs.
 //!
-//! The engine then hands each packet, in the order the link delivered it, to
-//! each client that mounts its route, through the client's [`Outlet`]. A
-//! state update the packet caused reaches the outlet first, so a client
-//! hears a record ahead of every sample the device sent after it.
+//! The engine also feeds the link's [`Mounts`]. For each packet, in the
+//! order the link delivered it, it takes the packet into the store, and
+//! then puts the packet on the stream of each client's [`Outbox`] whose
+//! mount covers its route. Each time it sets a device's metadata it puts the
+//! metadata update on the stream of each client whose watch follows that
+//! device, in the same step. So a client hears a metadata update ahead of
+//! every sample the device sent after the metadata changed.
+//!
+//! The engine takes each finished `dev.metadata` call ahead of the packets
+//! waiting in its inlet. A reply fills in only metadata the parser still
+//! lacks for a device, so it replaces no record that a waiting sample was
+//! sent under, and the client's parser decodes each sample with the record
+//! of the sample's own segment.
+//! Until a device's metadata is complete the client has none for it, and
+//! its parser drops the device's samples.
+//!
+//! Locks nest in one order. The list of mounts comes first, then a mount's
+//! metadata watches, and then the store or an outbox. The engine holds no
+//! other lock while it holds the store.
 
 use super::client::ClientError;
-use super::link::Link;
+use super::control::Update;
 use super::metadata::{Completed, MetadataSchedule};
-use super::outbox::Outlet;
+use super::outbox::Outbox;
 use super::settings::{CacheAction, DeviceEvent, SettingsCache};
-use super::worker::within;
 use super::Watch;
 use crate::data::{MetadataQuery, PacketParser};
 use crate::device::rpc::{PendingReply, RpcRegistry};
-use crate::device::session::{Handle, Inlet, RawCallResult, Session};
-use crate::device::store::{lock, pruned, Store, CHANGES, METADATA, PRESENCE};
+use crate::device::session::{Handle, Inlet, RawCallResult, Received, Session};
+use crate::device::store::{pruned, Store, CHANGES, METADATA, PRESENCE};
 use crate::device::stream::Queued;
 use crate::device::{MetadataState, Presence, SettingChange, Settings};
-use crate::proto::DeviceRoute;
-use crate::rt::{sleep_until_some, Supervisor};
+use crate::proto::{DeviceRoute, RouteError};
+use crate::rt::{lock, sleep_until_some};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 /// How long a device may be silent before the engine loses it. The link
@@ -55,33 +73,21 @@ const LINGER: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const LINGER: Duration = Duration::from_millis(500);
 
-/// Runs the engine of `link` until the link ends, with the tasks of its
-/// session on `tasks`. Every receiver of the link's store then ends, and
-/// every client that mounts the link is let go.
-pub(super) async fn run(link: Link, tasks: Supervisor) {
-    match link.open_session(&tasks) {
-        Ok(session) => serve(link.store(), link.taps(), session).await,
-        Err(_) => {
-            lock(&link.store()).end_all(None);
-            link.taps().end();
-        }
-    }
-}
-
-/// Keeps `store` from what arrives over `session`, and feeds `taps`, until
+/// Keeps `store` from what arrives over `session`, and feeds `mounts`, until
 /// the session ends. Then ends every receiver of the store and lets every
-/// client of `taps` go. It attaches to the session at once, so it takes every
-/// packet that arrives from then on.
-fn serve(
+/// client of `mounts` go. It attaches to the session at once, so it takes
+/// every packet that arrives from then on.
+pub(super) fn serve(
     store: Arc<Mutex<Store>>,
-    taps: Arc<Taps>,
+    mounts: Arc<Mounts>,
     session: Session,
 ) -> impl std::future::Future<Output = ()> {
-    let inlet = session.attach(usize::MAX / 2);
+    // An inlet with room for every packet a `usize` can count has no limit.
+    let inlet = session.attach(usize::MAX);
     lock(&store).list(DeviceRoute::root(), []);
     let engine = Engine {
         store: Arc::clone(&store),
-        taps: Arc::clone(&taps),
+        mounts: Arc::clone(&mounts),
         schedule: MetadataSchedule::new(Handle::root(session.clone())),
         handle: Handle::root(session),
         inlet,
@@ -94,91 +100,210 @@ fn serve(
     async move {
         engine.run().await;
         lock(&store).end_all(None);
-        taps.end();
+        mounts.end();
     }
 }
 
 /// The clients' mounts of one link, which the link's engine feeds.
-pub(super) struct Taps {
+pub(super) struct Mounts {
     /// The link's URL, which names it when a client is let go.
     url: String,
-    mounts: Mutex<Vec<Feed>>,
+    list: Mutex<MountList>,
 }
 
-/// One client's mount of a subtree of the link.
-struct Feed {
+/// What [`Mounts`] holds behind its lock.
+#[derive(Default)]
+struct MountList {
+    mounts: Vec<Arc<Mount>>,
+    /// The last link status the engine took at the root, which says whether
+    /// the link has lost its device or given it up.
+    status: Option<LinkStatus>,
+}
+
+/// One client's mount of a subtree of a link, which the client sees at a
+/// prefix of its own. It maps routes between the two, and holds the
+/// client's [`Outbox`] and the devices whose metadata the client's watches
+/// follow through it.
+pub(super) struct Mount {
+    /// The subtree of the link's device the mount shows.
     source: DeviceRoute,
     /// Where the client sees the subtree.
     prefix: DeviceRoute,
-    outlet: Arc<Outlet>,
-    /// The client's port on the link, which the mount lasts as long as.
-    port: mpsc::WeakSender<Packet>,
-    /// Whether the last link status the mount heard is `FailedToReconnect`.
-    gave_up: bool,
+    outbox: Arc<Outbox>,
+    /// The device each watch follows the metadata of here, by the id of its
+    /// `proxy.watch`, as its route on the link.
+    metadata: Mutex<HashMap<u16, DeviceRoute>>,
 }
 
-impl Taps {
-    /// Creates the mounts of the link to `url`, none yet.
-    pub(super) fn new(url: &str) -> Arc<Taps> {
-        let mounts = Mutex::default();
-        let url = url.to_string();
-        Arc::new(Taps { url, mounts })
-    }
-
-    /// Locks the mounts, and forgets each whose client let go of its port.
-    fn lock(&self) -> MutexGuard<'_, Vec<Feed>> {
-        let mut mounts = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
-        mounts.retain(|feed| feed.port.strong_count() > 0);
-        mounts
-    }
-
-    /// Feeds the client of `outlet` the packets of the subtree at `source`,
-    /// at the routes it sees under `prefix`, for as long as it holds `port`.
-    pub(super) fn add(
-        &self,
+impl Mount {
+    /// Returns the mount of the subtree at `source` that the client of
+    /// `outbox` sees at `prefix`.
+    pub(super) fn new(
         source: DeviceRoute,
         prefix: DeviceRoute,
-        outlet: &Arc<Outlet>,
-        port: &mpsc::Sender<Packet>,
-    ) {
-        self.lock().push(Feed {
+        outbox: &Arc<Outbox>,
+    ) -> Arc<Mount> {
+        Arc::new(Mount {
             source,
             prefix,
-            outlet: Arc::clone(outlet),
-            port: port.downgrade(),
-            gave_up: false,
-        });
+            outbox: Arc::clone(outbox),
+            metadata: Mutex::default(),
+        })
     }
 
-    /// Hands `packet` to each client whose mount it falls in, at the route
-    /// the client sees.
-    fn feed(&self, packet: &Packet) {
-        let status = packet.link_status();
-        for feed in self.lock().iter_mut() {
-            let Some(below) = within(feed.source, packet) else {
-                continue;
-            };
-            let Ok(route) = feed.prefix.absolute_route(&below) else {
-                log::warn!("Dropping a packet whose route {below} exceeds the max depth");
-                continue;
-            };
-            if let Some(status) = status {
-                feed.gave_up = status == LinkStatus::FailedToReconnect;
+    /// Returns `packet` at the route the client sees, or `None` for a packet
+    /// outside the mount or one whose route there would be deeper than a
+    /// route can be. A link status whose route is above the subtree concerns
+    /// the subtree's root.
+    fn shown(&self, packet: &Packet) -> Option<Packet> {
+        let route = packet.route();
+        let below = match self.source.relative_route(&route) {
+            Ok(below) => below,
+            Err(_) if packet.link_status().is_some() && self.source.starts_with(&route) => {
+                DeviceRoute::root()
             }
-            feed.outlet.push(packet.with_route(route));
+            Err(_) => return None,
+        };
+        let Ok(shown) = self.prefix.absolute_route(&below) else {
+            log::warn!("Dropping a packet whose route {below} exceeds the max depth");
+            return None;
+        };
+        Some(packet.with_route(shown))
+    }
+
+    /// Returns the route on the link of `route`, a route the client sees, or
+    /// `None` if the mount does not show it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the route on the link would be deeper than a
+    /// route can be.
+    pub(super) fn to_device(&self, route: DeviceRoute) -> Option<Result<DeviceRoute, RouteError>> {
+        let below = self.prefix.relative_route(&route).ok()?;
+        Some(self.source.absolute_route(&below))
+    }
+
+    /// Returns the route the client sees of `route`, a route on the link, or
+    /// `None` if the mount does not show it.
+    pub(super) fn to_client(&self, route: DeviceRoute) -> Option<DeviceRoute> {
+        let below = self.source.relative_route(&route).ok()?;
+        self.prefix.absolute_route(&below).ok()
+    }
+
+    /// Returns the subtree on the link that the client sees at or below
+    /// `route`, or `None` if the mount shows nothing there. That is the
+    /// route's own subtree for a route the mount shows, and the whole mount
+    /// for a route above the mount's prefix.
+    pub(super) fn subtree_at(&self, route: DeviceRoute) -> Option<DeviceRoute> {
+        match self.to_device(route) {
+            Some(device) => device.ok(),
+            None if self.prefix.starts_with(&route) => Some(self.source),
+            None => None,
         }
     }
 
-    /// Lets each client go, as the link ended. A mount that last heard
-    /// `FailedToReconnect` hears that the proxy gave up on the link.
-    pub(super) fn end(&self) {
-        for feed in self.lock().drain(..) {
-            let url = self.url.clone();
-            let error = match feed.gave_up {
-                true => ClientError::GaveUp(url),
-                false => ClientError::LinkEnded(url),
-            };
-            feed.outlet.end(error);
+    /// Queues `packet` ahead of the client's stream, at the route the client
+    /// sees, such as the answer to one of its requests.
+    pub(super) fn urgent(&self, packet: &Packet) {
+        if let Some(shown) = self.shown(packet) {
+            self.outbox.urgent(shown);
+        }
+    }
+
+    /// Has the link's engine queue the metadata of the device at `route` on
+    /// the link for watch `id`, starting with what `store` holds now, in
+    /// place of what the watch followed here before. The metadata of a
+    /// device the engine has not described is pending. The engine sets the
+    /// store before it takes this mount's lock to queue a change, so a
+    /// change made while the watch starts comes once or twice, and never not
+    /// at all. The client takes a repeat as the same latest value. Samples
+    /// queued for the client before the watch starts reach it ahead of this
+    /// first update, and its parser drops them for want of metadata, unless
+    /// an earlier watch gave it the metadata they were sent under.
+    pub(super) fn watch_metadata(&self, id: u16, route: DeviceRoute, store: &Mutex<Store>) {
+        let mut metadata = lock(&self.metadata);
+        let state = lock(store).value(route, METADATA);
+        if let Some(update) = Update::metadata(&state.unwrap_or(MetadataState::Pending)) {
+            self.outbox.update(id, &update);
+        }
+        metadata.insert(id, route);
+    }
+
+    /// Stops queuing metadata for watch `id`.
+    pub(super) fn unwatch(&self, id: u16) {
+        lock(&self.metadata).remove(&id);
+    }
+}
+
+impl Mounts {
+    /// Creates the mounts of the link to `url`, none yet.
+    pub(super) fn new(url: &str) -> Arc<Mounts> {
+        Arc::new(Mounts {
+            url: url.to_string(),
+            list: Mutex::default(),
+        })
+    }
+
+    /// Feeds `mount` the packets of its subtree from now on. A mount added
+    /// while the link has lost its device hears so first. The status goes
+    /// on the urgent queue, which here keeps device order, as nothing of
+    /// this mount is queued on its client's stream yet.
+    pub(super) fn add(&self, mount: Arc<Mount>) {
+        let mut list = lock(&self.list);
+        if list.status == Some(LinkStatus::SensorDisconnected) {
+            mount.urgent(&Packet::link(LinkStatus::SensorDisconnected));
+        }
+        list.mounts.push(mount);
+    }
+
+    /// Stops feeding `mount`.
+    pub(super) fn remove(&self, mount: &Arc<Mount>) {
+        let mut list = lock(&self.list);
+        list.mounts.retain(|held| !Arc::ptr_eq(held, mount));
+    }
+
+    /// Puts `packet` on the stream of each client whose mount it falls in,
+    /// at the route the client sees.
+    fn feed(&self, packet: &Packet) {
+        let mut list = lock(&self.list);
+        let status = packet.link_status();
+        if status.is_some() && packet.route().is_empty() {
+            list.status = status;
+        }
+        for mount in &list.mounts {
+            if let Some(shown) = mount.shown(packet) {
+                mount.outbox.stream(shown);
+            }
+        }
+    }
+
+    /// Puts the update of `state`, the metadata of the device at `route`, on
+    /// the stream of each client whose watch follows it.
+    fn metadata(&self, route: DeviceRoute, state: &MetadataState) {
+        let Some(update) = Update::metadata(state) else {
+            return;
+        };
+        let list = lock(&self.list);
+        for mount in &list.mounts {
+            let watches = lock(&mount.metadata);
+            let following = watches.iter().filter(|(_, followed)| **followed == route);
+            for (id, _) in following {
+                mount.outbox.update(*id, &update);
+            }
+        }
+    }
+
+    /// Lets each client go, as the link ended. The clients hear that the
+    /// proxy gave up on the link if the last status was `FailedToReconnect`.
+    fn end(&self) {
+        let mut list = lock(&self.list);
+        let url = self.url.clone();
+        let error = match list.status {
+            Some(LinkStatus::FailedToReconnect) => ClientError::GaveUp(url),
+            _ => ClientError::LinkEnded(url),
+        };
+        for mount in list.mounts.drain(..) {
+            mount.outbox.end(error.clone());
         }
     }
 }
@@ -187,7 +312,7 @@ impl Taps {
 struct Engine {
     store: Arc<Mutex<Store>>,
     /// The clients the engine feeds.
-    taps: Arc<Taps>,
+    mounts: Arc<Mounts>,
     handle: Handle,
     inlet: Inlet,
     parser: PacketParser,
@@ -207,10 +332,8 @@ struct Engine {
 impl Engine {
     /// Runs until the session over the link's port ends.
     async fn run(mut self) {
-        let (store, followed) = (
-            Arc::clone(&self.store),
-            Arc::clone(&lock(&self.store).followed),
-        );
+        let store = Arc::clone(&self.store);
+        let followed = Arc::clone(&lock(&self.store).followed);
         loop {
             let quiet = self.heard.values().map(|at| *at + QUIET).min();
             let unwatched = self.workers.values().filter_map(|(_, since)| *since);
@@ -224,18 +347,8 @@ impl Engine {
                 Ok(reply) = self.schedule.replies().recv_async() => self.take_metadata_replies(reply),
                 received = self.inlet.recv_async() => {
                     let Ok(first) = received else { return };
-                    let inlet = self.inlet.clone();
-                    let held = inlet.try_iter().take(inlet.len());
-                    for queued in std::iter::once(first).chain(held) {
-                        match queued {
-                            Queued::Item(Some(packet)) => {
-                                self.take(&packet);
-                                self.taps.feed(&packet);
-                            }
-                            Queued::Item(None) => {}
-                            Queued::Gap(lost) => log::error!("the engine lost {lost} packets"),
-                            Queued::Ended(_) => return,
-                        }
+                    if self.take_inlet(first).is_break() {
+                        return;
                     }
                 }
                 () = sleep_until_some(wake) => {
@@ -245,6 +358,27 @@ impl Engine {
             }
             self.discover();
         }
+    }
+
+    /// Takes `first` and what else the inlet holds now, in order. Takes each
+    /// packet into the store, and then feeds it to the mounts. Breaks once
+    /// the session has ended.
+    fn take_inlet(&mut self, first: Queued<Received>) -> ControlFlow<()> {
+        let inlet = self.inlet.clone();
+        let held = inlet.try_iter().take(inlet.len());
+        for queued in std::iter::once(first).chain(held) {
+            match queued {
+                Queued::Item(Received::Packet(packet)) => {
+                    self.take(&packet);
+                    self.mounts.feed(&packet);
+                }
+                // The session over the engine's port has no socket to lose.
+                Queued::Item(Received::SocketLost) => {}
+                Queued::Gap(_) => unreachable!("the engine's inlet has no limit"),
+                Queued::Ended(_) => return ControlFlow::Break(()),
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     /// Starts a worker for each table a receiver now follows of a device
@@ -386,6 +520,7 @@ impl Engine {
         }
         // A device a receiver follows that was not heard yet goes with its
         // link too.
+        let mut forgotten = Vec::new();
         let mut store = lock(&self.store);
         let followed = self.demand.iter().map(|watch| &watch.route);
         let served: BTreeSet<_> = store
@@ -402,12 +537,16 @@ impl Engine {
                 store.set(route, PRESENCE, presence);
             }
             if forget {
-                store.set(route, METADATA, MetadataState::Pending);
+                forgotten.push(route);
             }
             if presence == Presence::Connecting {
                 self.heard.insert(route, Instant::now());
                 self.tell(route, DeviceEvent::NewHash(None));
             }
+        }
+        drop(store);
+        for route in forgotten {
+            self.set_metadata(route, MetadataState::Pending);
         }
     }
 
@@ -426,14 +565,23 @@ impl Engine {
     }
 
     /// Publishes the metadata of `route` if it is complete and a revision
-    /// not yet published.
+    /// not yet published. Metadata that is not complete is not published, so
+    /// a client has none of the device's metadata until then.
     fn publish_metadata(&mut self, route: DeviceRoute) {
         let seen = self.metadata_seen.get(&route).copied();
         let Some((revision, snapshot)) = self.parser.revised_metadata(route, seen) else {
             return;
         };
         self.metadata_seen.insert(route, revision);
-        lock(&self.store).set(route, METADATA, MetadataState::Ready(snapshot));
+        self.set_metadata(route, MetadataState::Ready(snapshot));
+    }
+
+    /// Sets the metadata of the device at `route` in the store, and puts its
+    /// update on the stream of each client that follows it, ahead of every
+    /// packet the engine takes after.
+    fn set_metadata(&mut self, route: DeviceRoute, state: MetadataState) {
+        lock(&self.store).set(route, METADATA, state.clone());
+        self.mounts.metadata(route, &state);
     }
 
     /// Takes `first` and every other finished `dev.metadata` call.
@@ -446,9 +594,7 @@ impl Engine {
             let route = query.route;
             match self.schedule.complete(&mut self.parser, query, result) {
                 Completed::Applied => self.publish_metadata(route),
-                Completed::Unsupported => {
-                    lock(&self.store).set(route, METADATA, MetadataState::Unsupported)
-                }
+                Completed::Unsupported => self.set_metadata(route, MetadataState::Unsupported),
                 Completed::BackedOff => {}
             }
         }
@@ -634,26 +780,25 @@ mod tests {
     use crate::proto::data as wire;
     use crate::proto::rpc as wire_rpc;
     use crate::proto::SessionId;
-    use crate::proxy::client::device_updates;
-    use crate::proxy::control::{Joined, Update};
+    use crate::proxy::control::Joined;
+    use crate::rt::Supervisor;
     use crate::tio::packet::{Payload, ProxyRx};
     use std::time::Instant as StdInstant;
 
-    /// Feeds a client the whole link, with a watch of the device at the
-    /// root, from the engine whose store is `store`, for as long as the
-    /// client holds the port returned.
-    fn client_of(store: &Mutex<Store>, taps: &Taps) -> (Arc<Outlet>, mpsc::Sender<Packet>) {
-        let (outlet, root) = (Arc::<Outlet>::default(), DeviceRoute::root());
-        outlet.watch(1, root, device_updates(store, root));
-        let port = mpsc::channel(1).0;
-        taps.add(root, root, &outlet, &port);
-        (outlet, port)
+    /// Feeds a client the whole link, with watch 1 following the metadata
+    /// of the device at the root, from the engine whose store is `store`.
+    fn client_of(store: &Mutex<Store>, mounts: &Mounts) -> Arc<Outbox> {
+        let (outbox, root) = (Arc::<Outbox>::default(), DeviceRoute::root());
+        let mount = Mount::new(root, root, &outbox);
+        mount.watch_metadata(1, root, store);
+        mounts.add(mount);
+        outbox
     }
 
-    /// Takes what `outlet` holds, as a client's task does, pausing between
+    /// Takes what `outbox` holds, as a client's task does, pausing between
     /// takes for a while that `seed` picks, until a packet `done` picks has
     /// gone. Returns everything taken, in order.
-    fn take_until(outlet: &Arc<Outlet>, seed: u64, done: impl Fn(&Packet) -> bool) -> Vec<Packet> {
+    fn take_until(outbox: &Outbox, seed: u64, done: impl Fn(&Packet) -> bool) -> Vec<Packet> {
         let deadline = StdInstant::now() + Duration::from_secs(20);
         let (mut taken, mut pause) = (Vec::new(), seed);
         loop {
@@ -661,7 +806,8 @@ mod tests {
                 StdInstant::now() < deadline,
                 "the last packet never went out"
             );
-            let (queued, _) = outlet.take().expect("the client is kept");
+            let queued = outbox.take().packets;
+            outbox.check();
             let finished = queued.iter().any(&done);
             taken.extend(queued);
             if finished {
@@ -706,7 +852,7 @@ mod tests {
     }
 
     /// Whatever the interleaving of segment records and samples, and however
-    /// the client's task takes from its outlet meanwhile, the client hears
+    /// the client's task takes from its outbox meanwhile, the client hears
     /// each record ahead of every sample the device sent after it. A sample
     /// that goes out goes out under the record it was sent under.
     #[test]
@@ -714,9 +860,9 @@ mod tests {
         let root = DeviceRoute::root();
         let done = route("/9");
         for seed in 1..=4u64 {
-            let (store, taps, proxy) = engine_with_taps(&Supervisor::new());
-            let (outlet, _tap) = client_of(&store, &taps);
-            let taking = Arc::clone(&outlet);
+            let (store, mounts, proxy) = engine_with_mounts(&Supervisor::new());
+            let outbox = client_of(&store, &mounts);
+            let taking = Arc::clone(&outbox);
             let taker = std::thread::spawn(move || {
                 take_until(&taking, seed, |packet| packet.route() == done)
             });
@@ -771,6 +917,36 @@ mod tests {
         }
     }
 
+    /// A mount added while its link has lost the device hears so first, at
+    /// the root of its subtree, and then hears the device come back along
+    /// with the mount that was there.
+    #[test]
+    fn a_mount_added_while_its_device_is_lost_hears_so_first() {
+        let root = DeviceRoute::root();
+        let mounts = Mounts::new("tcp://device");
+        let (early, late) = (Arc::<Outbox>::default(), Arc::<Outbox>::default());
+        mounts.add(Mount::new(root, root, &early));
+        mounts.feed(&Packet::heartbeat(root));
+        mounts.feed(&Packet::link(LinkStatus::SensorDisconnected));
+
+        mounts.add(Mount::new(route("/1"), route("/2"), &late));
+        mounts.feed(&Packet::link(LinkStatus::SensorReconnected));
+
+        let heard = |outbox: &Outbox| -> Vec<_> {
+            let taken = outbox.take().packets;
+            taken
+                .iter()
+                .map(|pkt| (pkt.route(), pkt.link_status()))
+                .collect()
+        };
+        let (lost, back) = (
+            Some(LinkStatus::SensorDisconnected),
+            Some(LinkStatus::SensorReconnected),
+        );
+        assert_eq!(heard(&early), [(root, None), (root, lost), (root, back)]);
+        assert_eq!(heard(&late), [(route("/2"), lost), (route("/2"), back)]);
+    }
+
     /// The segment record of `segment` that starts at `start`.
     fn record(segment: u8, start: u32) -> wire::Metadata<'static> {
         wire::Metadata::Segment(wire::Segment {
@@ -785,8 +961,8 @@ mod tests {
     #[test]
     fn an_old_sessions_heartbeat_goes_out_ahead_of_the_new_sessions_metadata() {
         let root = DeviceRoute::root();
-        let (store, taps, proxy) = engine_with_taps(&Supervisor::new());
-        let (outlet, _tap) = client_of(&store, &taps);
+        let (store, mounts, proxy) = engine_with_mounts(&Supervisor::new());
+        let outbox = client_of(&store, &mounts);
         describe(&proxy, root, 1);
         proxy.send(Packet::heartbeat_session(1, root));
         proxy.send(Packet::heartbeat_session(2, root));
@@ -794,7 +970,7 @@ mod tests {
         proxy.send(samples(5, root));
 
         let is_sample = |packet: &Packet| matches!(packet.payload(), Payload::Samples(_));
-        let taken = take_until(&outlet, 0, is_sample);
+        let taken = take_until(&outbox, 0, is_sample);
         let beat = taken.iter().position(|packet| match packet.payload() {
             Payload::Heartbeat(beat) => beat.session().map(SessionId::value) == Some(1),
             _ => false,
@@ -814,18 +990,18 @@ mod tests {
     /// its tasks on `tasks`. Returns its store and the session's far end,
     /// which plays the link.
     fn engine_on(tasks: &Supervisor) -> (Arc<Mutex<Store>>, TestProxy) {
-        let (store, _, proxy) = engine_with_taps(tasks);
+        let (store, _, proxy) = engine_with_mounts(tasks);
         (store, proxy)
     }
 
     /// An engine as [`engine_on`] starts it, with the mounts it feeds.
-    fn engine_with_taps(tasks: &Supervisor) -> (Arc<Mutex<Store>>, Arc<Taps>, TestProxy) {
+    fn engine_with_mounts(tasks: &Supervisor) -> (Arc<Mutex<Store>>, Arc<Mounts>, TestProxy) {
         let (session, proxy) = Session::test_pair_on(tasks);
         let store = Arc::new(Mutex::new(Store::new(true)));
-        let taps = Taps::new("tcp://device");
-        let serving = serve(Arc::clone(&store), Arc::clone(&taps), session);
+        let mounts = Mounts::new("tcp://device");
+        let serving = serve(Arc::clone(&store), Arc::clone(&mounts), session);
         tasks.spawn("proxy state", serving);
-        (store, taps, proxy)
+        (store, mounts, proxy)
     }
 
     fn engine() -> (Arc<Mutex<Store>>, TestProxy) {

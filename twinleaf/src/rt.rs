@@ -30,7 +30,7 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::process;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
@@ -166,6 +166,12 @@ impl Supervisor {
         self.tracker.close();
         self.tracker.wait().await;
     }
+}
+
+/// Locks `mutex`, past a panic of another holder. It suits a lock that
+/// guards no change a panic could leave half made.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Waits until `deadline`, or forever if there is none.

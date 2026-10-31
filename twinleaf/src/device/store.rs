@@ -20,7 +20,7 @@ use crate::proxy::Watch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::Notify;
 
@@ -110,11 +110,6 @@ pub(crate) const METADATA: Field<MetadataState> = |entry| &mut entry.metadata;
 pub(crate) const REGISTRY: Field<RegistryState> = |entry| &mut entry.registry;
 pub(crate) const SETTINGS: Field<Arc<Settings>> = |entry| &mut entry.settings;
 pub(crate) const CHANGES: Field<SettingChange> = |entry| &mut entry.changes;
-
-/// Locks `store`, past a panic of another holder.
-pub(crate) fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
-    store.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// The state of every device in one tree, and its receivers.
 #[derive(Default)]

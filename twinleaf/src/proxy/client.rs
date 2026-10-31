@@ -1,52 +1,65 @@
 //! The task that serves each client connection. It answers the client's
-//! control requests, forwards what the client sends to its mounts, and writes
-//! what the engines of the links it mounts queue for it on its [`Outlet`].
+//! control requests, forwards what the client sends to its mounts, follows
+//! the client's watches, and writes the client's [`Outbox`] to its socket.
 //! [`Session::run`] runs it.
+//!
+//! A device watch follows the device's presence, announced settings and
+//! routes here, and these updates go on the outbox's urgent queue. The
+//! device's metadata update says how to decode its samples, so the engine of
+//! the device's link queues it on the stream instead, as it sets it. A table
+//! watch follows the RPC table and settings here.
 
 use super::auto::{self, Choice};
 use super::control::encode;
 use super::control::{self, Purpose, Refusal, Request, Update, Watch};
-use super::link::{self, Lease, Link, PortSender};
-use super::outbox::Outlet;
+use super::engine::Mount;
+use super::link::{self, Link, Mounted};
+use super::outbox::Outbox;
+use super::outbox::Taken;
 use super::server::{self, Notice, Shared};
 use super::worker;
 use super::Layout;
-use crate::device::store::{lock, Store, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
+use crate::device::store::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
 use crate::device::stream::Scope;
 use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, TCP_DEFAULT_PORT};
-use crate::rt::{finish, BoxFuture};
+use crate::rt::{finish, lock, BoxFuture};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::future;
 use futures_util::stream::{self, BoxStream};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{timeout_at, Instant};
+use tokio_stream::{StreamMap, StreamNotifyClose};
 
-/// How many packets a client's socket queues. The outlet holds what waits
+/// How many packets a client's socket queues. The outbox holds what waits
 /// for the client, and this queue only keeps the socket's task busy while
 /// the next batch is taken.
 pub(super) const SOCKET_QUEUE: usize = 64;
 
 /// Why a client's connection ended. The task serving the client logs it
 /// once.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(super) enum ClientError {
-    /// The client closed its connection, or the connection failed.
+    /// The client closed its connection, or the connection failed. A write
+    /// to a client that stops reading fails so once the transport has
+    /// waited its drain timeout, `DRAIN_TIMEOUT`, for one packet to go out,
+    /// and the connection of a client quiet for longer than the keepalive
+    /// allows fails so too.
     #[error("it hung up")]
     HungUp,
     /// The proxy stopped and told the client.
     #[error("the proxy stopped")]
     Stopped,
-    /// The client did not read what it was sent within the time a quiet
-    /// client is given, or let more pile up than its outbox holds.
+    /// The client let more pile up than its outbox holds, its
+    /// [`HARD_LIMIT`](super::outbox::HARD_LIMIT).
     #[error("it fell behind")]
     TooSlow,
     /// The link to the device at this URL, which the client had opened,
@@ -70,22 +83,10 @@ fn is_rpc(pkt: &Packet) -> bool {
     )
 }
 
-/// One mount a client opened. It holds the port on the device, which the
-/// link's engine feeds the client for, and the prefix where the client sees
-/// it.
-struct Mounted {
-    prefix: DeviceRoute,
-    /// The subtree of the device the mount shows at its prefix.
-    source: DeviceRoute,
-    port: PortSender,
-}
-
-/// What a client opened. It holds a lease on each mount's link until dropped.
+/// What a client opened. Each mount holds a lease on its link until dropped.
 struct Binding {
     target: String,
     mounts: Vec<Mounted>,
-    /// The lease on the link of each mount, in the order of `mounts`.
-    leases: Vec<Lease>,
 }
 
 /// The default a client holds with `proxy.default`. Dropping it gives the
@@ -97,11 +98,7 @@ struct Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        *self
-            .shared
-            .holder
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        *lock(&self.shared.holder) = None;
         self.shared.default.send_replace(self.replaced.take());
     }
 }
@@ -122,9 +119,12 @@ pub(super) struct Session {
     alive: oneshot::Receiver<Infallible>,
     /// Packets the client sent that wait their turn while an open waits.
     backlog: VecDeque<Packet>,
-    /// What goes to the client, with the client's watches.
-    outlet: Arc<Outlet>,
-    /// The write of what was last taken from the outlet, while it lasts.
+    /// What goes to the client.
+    outbox: Arc<Outbox>,
+    /// The updates of the client's watches but metadata, by the id of each
+    /// `proxy.watch`. Each ends with `None`.
+    watches: StreamMap<u16, StreamNotifyClose<BoxStream<'static, Update>>>,
+    /// The write of what was last taken from the outbox, while it lasts.
     writing: Option<BoxFuture<'static, Result<(), ClientError>>>,
     binding: Option<Binding>,
     opening: Option<Opening>,
@@ -151,7 +151,8 @@ impl Session {
             incoming: incoming.into_stream(),
             alive,
             backlog: VecDeque::new(),
-            outlet: Arc::default(),
+            outbox: Arc::default(),
+            watches: StreamMap::new(),
             writing: None,
             binding: None,
             opening: None,
@@ -176,48 +177,40 @@ impl Session {
     }
 
     /// Closes the connection once what was queued for the client is written,
-    /// such as the status that says why it ends. Waits at most
-    /// [`CLOSE_TIMEOUT`].
-    async fn close(self) {
-        let Session {
-            client,
-            incoming,
-            outlet,
-            writing,
-            binding,
-            ..
-        } = self;
-        // The links stop feeding the client first.
-        drop(binding);
+    /// such as the status that says why it ends. The write under way goes
+    /// first, then everything the outbox still holds, the status that the
+    /// proxy stopped last. Waits at most [`CLOSE_TIMEOUT`].
+    async fn close(mut self) {
+        // The links and watches stop feeding the client first.
+        self.binding = None;
+        self.watches.clear();
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         let flushed = async {
-            if let Some(writing) = writing {
-                let _ = writing.await;
-            }
             loop {
-                let queued = outlet.drain();
-                if queued.is_empty() {
+                if self.writing.is_none() {
+                    // The client is let go already, whatever the outbox says.
+                    let _end = self.write();
+                }
+                // Nothing was left to write.
+                if self.writing.is_none() {
                     return;
                 }
-                for pkt in queued {
-                    if client.send_async(pkt).await.is_err() {
-                        return;
-                    }
+                if finish(&mut self.writing).await.is_err() {
+                    return;
                 }
             }
         };
         let _ = timeout_at(deadline, flushed).await;
         // The transport writes its queue before it ends. It would end at
-        // once if what the client sends found no receiver.
-        client
-            .close(deadline.saturating_duration_since(Instant::now()))
-            .await;
-        drop(incoming);
+        // once if what the client sends found no receiver, so `incoming`
+        // stays until then.
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.client.close(left).await;
     }
 
-    /// Forwards what the client sends to its mounts, and writes its outlet,
-    /// until the connection ends, keeping the client's link alive. Returns
-    /// why it ended.
+    /// Forwards what the client sends to its mounts, follows its watches,
+    /// and writes its outbox, until the connection ends, keeping the client's
+    /// link alive. Returns why it ended.
     async fn serve(&mut self) -> Result<(), ClientError> {
         self.client.keep_alive(control::PROXY_KEEPALIVE).await;
         loop {
@@ -233,9 +226,11 @@ impl Session {
                 self.client_packet(pkt).await?;
             }
             if self.writing.is_none() {
-                self.write()?;
+                if let Some(end) = self.write() {
+                    return Err(end);
+                }
             }
-            let outlet = Arc::clone(&self.outlet);
+            let outbox = Arc::clone(&self.outbox);
             tokio::select! {
                 _ = &mut self.alive => return Err(self.stopped()),
                 received = self.incoming.next() => {
@@ -244,7 +239,10 @@ impl Session {
                         self.backlog.push_back(pkt);
                     }
                 }
-                () = outlet.ready.notified(), if self.writing.is_none() => {}
+                Some((id, update)) = self.watches.next(), if !self.watches.is_empty() => {
+                    self.watched(id, update);
+                }
+                () = outbox.ready.notified(), if self.writing.is_none() => {}
                 written = finish(&mut self.writing) => written?,
                 (request, outcome) = finish(&mut self.opening) => {
                     self.opened(request, outcome).await?;
@@ -253,13 +251,19 @@ impl Session {
         }
     }
 
-    /// Starts writing what the outlet holds for the client, if it holds
-    /// anything. The write fails as [`ClientError::TooSlow`] if it takes
-    /// longer than a quiet client is given.
+    /// Starts writing what the outbox holds for the client, if it holds
+    /// anything. Each packet waits for room in the socket's queue of
+    /// [`SOCKET_QUEUE`] packets, and a write fails as
+    /// [`ClientError::HungUp`] once the connection has.
     ///
-    /// Returns why the client must be let go, if the outlet says so.
-    fn write(&mut self) -> Result<(), ClientError> {
-        let (queued, dropped) = self.outlet.take()?;
+    /// Returns why the client must be let go once that is written, if the
+    /// outbox says so.
+    fn write(&mut self) -> Option<ClientError> {
+        let Taken {
+            packets: queued,
+            dropped,
+            end,
+        } = self.outbox.take();
         if dropped > 0 {
             log::debug!(
                 "Client {} is not keeping up and lost {dropped} samples",
@@ -267,7 +271,7 @@ impl Session {
             );
         }
         if queued.is_empty() {
-            return Ok(());
+            return end;
         }
         if self.shared.options.dump.traffic {
             for pkt in queued.iter().filter(|pkt| is_rpc(pkt)) {
@@ -278,17 +282,13 @@ impl Session {
             .into_iter()
             .map(|pkt| self.client.send_async(pkt))
             .collect();
-        let written = async {
+        self.writing = Some(Box::pin(async {
             for send in sends {
                 send.await.map_err(|_| ClientError::HungUp)?;
             }
             Ok(())
-        };
-        let quiet = control::PROXY_KEEPALIVE.quiet;
-        let written =
-            timeout(quiet, written).map(|written| written.unwrap_or(Err(ClientError::TooSlow)));
-        self.writing = Some(Box::pin(written));
-        Ok(())
+        }));
+        end
     }
 
     /// Returns the packet in what the client's transport delivered, or `None`
@@ -316,8 +316,22 @@ impl Session {
     /// The close writes it as it writes the rest.
     fn stopped(&mut self) -> ClientError {
         self.binding = None;
-        self.outlet.stop();
+        self.watches.clear();
+        self.outbox.stop();
         ClientError::Stopped
+    }
+
+    /// Queues `update` of watch `id` for the client, whole, or ends a watch
+    /// whose updates have ended and queues its refusal.
+    fn watched(&mut self, id: u16, update: Option<Update>) {
+        match update {
+            Some(update) => self.outbox.update(id, &update),
+            None => {
+                self.unwatch(id);
+                let ended = "the proxy no longer follows this device";
+                self.answer(id, Err(Refusal::new(RpcError::State, ended)));
+            }
+        }
     }
 
     /// Handles a packet from the client. Answers a control request, and
@@ -325,7 +339,7 @@ impl Session {
     /// packet that falls under no mount.
     ///
     /// Returns [`ClientError::ForwardFailed`] if the mount's port cannot take
-    /// the packet.
+    /// the packet, or its route reaches too deep on the device.
     async fn client_packet(&mut self, pkt: Packet) -> Result<(), ClientError> {
         if self.shared.options.dump.traffic {
             log::info!("{}->{} -- {:?}", self.addr, pkt.route(), pkt.payload());
@@ -349,14 +363,11 @@ impl Session {
             );
             return Ok(());
         };
-        let mut dest = None;
-        for Mounted { prefix, port, .. } in &binding.mounts {
-            if let Ok(relative) = prefix.relative_route(&pkt.route()) {
-                dest = Some((relative, port));
-                break;
-            }
-        }
-        let Some((relative, port)) = dest else {
+        let dest = binding.mounts.iter().find_map(|mounted| {
+            let route = mounted.mount.to_device(pkt.route())?;
+            Some((mounted, route))
+        });
+        let Some((mounted, route)) = dest else {
             log::debug!(
                 "Client {} addressed unmounted route {}",
                 self.addr,
@@ -364,13 +375,14 @@ impl Session {
             );
             return Ok(());
         };
-        let sent = port.try_send(pkt.with_route(relative));
+        let route = route.map_err(|_| ClientError::ForwardFailed)?;
+        let sent = mounted.port.try_send(pkt.with_route(route));
         sent.map_err(|_| ClientError::ForwardFailed)
     }
 
     /// Queues the answer to control request `id` for the client.
     fn answer(&self, id: u16, outcome: Result<Vec<u8>, Refusal>) {
-        self.outlet.push(control::answer(id, outcome));
+        self.outbox.urgent(control::answer(id, outcome));
     }
 
     /// Changes the client's entry in the table, and waits until the table
@@ -418,14 +430,14 @@ impl Session {
             Request::Probe { url } => self.request_open(id, url, Purpose::Probe),
             Request::Mount(layout) => {
                 let (shared, addr) = (self.shared.clone(), self.addr.clone());
-                let outlet = Arc::clone(&self.outlet);
+                let outbox = Arc::clone(&self.outbox);
                 let target = layout.to_string();
-                let binding = attach(shared, addr, target, layout, None, Purpose::Use, outlet);
+                let binding = attach(shared, addr, target, layout, None, Purpose::Use, outbox);
                 self.request(id, binding)
             }
             Request::Default(layout) => self.hold_default(id, layout),
             Request::Watch(watch) => self.watch(id, watch),
-            Request::Unwatch(watched) => self.outlet.unwatch(watched),
+            Request::Unwatch(watched) => self.unwatch(watched),
             Request::Stop if self.shared.options.stoppable => {
                 self.answer(id, Ok(Vec::new()));
                 log::info!("Stopped by proxy.stop from client {}", self.addr);
@@ -449,12 +461,23 @@ impl Session {
     /// its state now and then each change. A watch under an id the client
     /// already watches with replaces it.
     fn watch(&mut self, id: u16, watch: Watch) {
-        let opened = self.binding.as_ref();
-        let opened =
-            opened.ok_or_else(|| Refusal::new(RpcError::State, "this connection opened nothing"));
-        match opened.and_then(|binding| updates(binding, watch)) {
-            Ok(updates) => self.outlet.watch(id, watch.route, updates),
+        let Some(binding) = &self.binding else {
+            let refusal = Refusal::new(RpcError::State, "this connection opened nothing");
+            return self.answer(id, Err(refusal));
+        };
+        match binding.watch(id, watch) {
+            Ok(updates) => {
+                self.watches.insert(id, StreamNotifyClose::new(updates));
+            }
             Err(refusal) => self.answer(id, Err(refusal)),
+        }
+    }
+
+    /// Stops watch `id`.
+    fn unwatch(&mut self, id: u16) {
+        self.watches.remove(&id);
+        if let Some(binding) = &self.binding {
+            binding.unwatch_metadata(id);
         }
     }
 
@@ -469,11 +492,7 @@ impl Session {
             );
             return self.answer(id, Err(Refusal::new(RpcError::State, message)));
         }
-        let mut holder = self
-            .shared
-            .holder
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut holder = lock(&self.shared.holder);
         match holder.as_ref() {
             None => {
                 *holder = Some((self.id, self.addr.clone()));
@@ -502,7 +521,7 @@ impl Session {
     /// asks for.
     fn request_open(&mut self, id: u16, target: String, purpose: Purpose) {
         let (shared, addr) = (self.shared.clone(), self.addr.clone());
-        let binding = bind(shared, addr, target, purpose, Arc::clone(&self.outlet));
+        let binding = bind(shared, addr, target, purpose, Arc::clone(&self.outbox));
         self.request(id, binding)
     }
 
@@ -547,7 +566,7 @@ impl Session {
 
 /// Binds a connection of the client at `addr` to `target` for `purpose`.
 /// Resolves the target, takes a lease on each mount's link, waits for each
-/// link's device to answer, and mounts each for the client of `outlet`. A
+/// link's device to answer, and mounts each for the client of `outbox`. A
 /// binding for [`Purpose::Use`] marks each link as chosen. A probe's target
 /// is a device URL.
 ///
@@ -558,13 +577,13 @@ async fn bind(
     addr: String,
     target: String,
     purpose: Purpose,
-    outlet: Arc<Outlet>,
+    outbox: Arc<Outbox>,
 ) -> Result<Binding, Refusal> {
     let (target, layout, chosen) = match purpose {
         Purpose::Use => resolve(&shared, target).await?,
         Purpose::Probe => (target.clone(), Layout::single(&target), None),
     };
-    attach(shared, addr, target, layout, chosen, purpose, outlet).await
+    attach(shared, addr, target, layout, chosen, purpose, outbox).await
 }
 
 /// Binds the connection to `layout`, named `target`, as [`bind`] does once
@@ -580,7 +599,7 @@ async fn attach(
     layout: Layout,
     chosen: Option<Link>,
     purpose: Purpose,
-    outlet: Arc<Outlet>,
+    outbox: Arc<Outbox>,
 ) -> Result<Binding, Refusal> {
     let deadline = Instant::now() + link::READY_TIMEOUT;
     let mut leases = Vec::with_capacity(layout.mounts.len());
@@ -614,31 +633,19 @@ async fn attach(
         return Err(Refusal::new(RpcError::Load, message));
     }
     let mut mounts = Vec::with_capacity(layout.mounts.len());
-    for (mount, lease) in layout.mounts.iter().zip(&leases) {
-        let port = lease
-            .link()
-            .mount(mount.source, mount.prefix, &outlet)
-            .map_err(|reason| Refusal::new(RpcError::Load, reason))?;
-        mounts.push(Mounted {
-            prefix: mount.prefix,
-            source: mount.source,
-            port,
-        });
+    for (mount, lease) in layout.mounts.iter().zip(leases) {
+        let mounted = lease.mount(mount.source, mount.prefix, &outbox);
+        mounts.push(mounted.map_err(|reason| Refusal::new(RpcError::Load, reason))?);
     }
     match purpose {
         Purpose::Use => {
-            shared
-                .links
-                .choose(leases.iter().map(|lease| lease.link().id()).collect());
+            let chosen = mounts.iter().map(|mounted| mounted.lease.link().id());
+            shared.links.choose(chosen.collect());
             log::info!("Client {addr} opened {target}");
         }
         Purpose::Probe => log::debug!("Client {addr} probed {target}"),
     }
-    Ok(Binding {
-        target,
-        mounts,
-        leases,
-    })
+    Ok(Binding { target, mounts })
 }
 
 /// Resolves `target`. Returns the target it resolved to, the layout it
@@ -681,41 +688,50 @@ async fn resolve(
     }
 }
 
-/// Returns the updates `watch` sends through the mounts of `binding`.
-///
-/// With `table`, they are the RPC table and settings of the device the
-/// watch names, and a table goes out ahead of the first settings read with
-/// it. Without, they are the routes heard at or below it, from every mount
-/// there, and the presence, metadata and announced settings of the device
-/// it names, if a mount shows it. The updates end when the link's engine
-/// does.
-///
-/// Returns a [`Refusal`] if no mount shows what the watch follows.
-fn updates(binding: &Binding, watch: Watch) -> Result<BoxStream<'static, Update>, Refusal> {
-    let refused = || Refusal::new(RpcError::Invalid, format!("no mount shows {}", watch.route));
-    let device = binding.device(watch.route);
-    if watch.table {
-        let (store, route) = device.ok_or_else(refused)?;
-        return Ok(table_updates(&store, route));
-    }
-    let routes = binding.routes(watch.route).ok_or_else(refused)?;
-    Ok(match device {
-        Some((store, route)) => stream::select(routes, device_updates(&store, route)).boxed(),
-        None => routes,
-    })
-}
-
 impl Binding {
-    /// Returns the store of the link whose mount shows `route`, and the
-    /// route there.
-    fn device(&self, route: DeviceRoute) -> Option<(Arc<Mutex<Store>>, DeviceRoute)> {
-        let mounted = self.mounts.iter().zip(&self.leases);
-        mounted.into_iter().find_map(|(mount, lease)| {
-            let below = mount.prefix.relative_route(&route).ok()?;
-            Some((
-                lease.link().store(),
-                mount.source.absolute_route(&below).ok()?,
-            ))
+    /// Starts watch `id`, in place of any watch the client had under that
+    /// id, and returns the updates the client's task follows for it.
+    ///
+    /// With `table`, the updates are the RPC table and settings of the device
+    /// the watch names, and a table goes out ahead of the first settings read
+    /// with it. Without, they are the routes heard at or below it, from every
+    /// mount there, and the presence and announced settings of the device it
+    /// names, if a mount shows it. The engine of that mount's link then queues
+    /// the device's metadata updates for the watch itself. The updates end
+    /// when the link's engine does.
+    ///
+    /// Returns a [`Refusal`] if no mount shows what the watch follows, and
+    /// leaves the watch the client had under that id as it was.
+    fn watch(&self, id: u16, watch: Watch) -> Result<BoxStream<'static, Update>, Refusal> {
+        let refused = || Refusal::new(RpcError::Invalid, format!("no mount shows {}", watch.route));
+        let device = self.device(watch.route);
+        if watch.table {
+            let (mounted, route) = device.ok_or_else(refused)?;
+            self.unwatch_metadata(id);
+            return Ok(table_updates(&mounted.lease.link().store(), route));
+        }
+        let routes = self.routes(watch.route).ok_or_else(refused)?;
+        self.unwatch_metadata(id);
+        let Some((mounted, route)) = device else {
+            return Ok(routes);
+        };
+        let store = mounted.lease.link().store();
+        mounted.mount.watch_metadata(id, route, &store);
+        Ok(stream::select(routes, device_updates(&store, route)).boxed())
+    }
+
+    /// Stops the metadata updates of watch `id` on every mount.
+    fn unwatch_metadata(&self, id: u16) {
+        for mounted in &self.mounts {
+            mounted.mount.unwatch(id);
+        }
+    }
+
+    /// Returns the mount that shows `route`, and the route on its link.
+    fn device(&self, route: DeviceRoute) -> Option<(&Mounted, DeviceRoute)> {
+        self.mounts.iter().find_map(|mounted| {
+            let on_link = mounted.mount.to_device(route)?.ok()?;
+            Some((mounted, on_link))
         })
     }
 
@@ -724,19 +740,13 @@ impl Binding {
     /// list sends the whole list, read from every mount's store then.
     /// Returns `None` if no mount is there.
     fn routes(&self, route: DeviceRoute) -> Option<BoxStream<'static, Update>> {
-        let mounted = self.mounts.iter().zip(&self.leases);
-        let shown: Vec<_> = mounted
-            .filter_map(|(mount, lease)| {
-                let below = match mount.prefix.relative_route(&route) {
-                    Ok(below) => mount.source.absolute_route(&below).ok()?,
-                    Err(_) if mount.prefix.starts_with(&route) => mount.source,
-                    Err(_) => return None,
-                };
-                Some((
-                    lease.link().store(),
-                    Scope::subtree(below),
-                    (mount.prefix, mount.source),
-                ))
+        let shown: Vec<(Arc<Mount>, Arc<Mutex<Store>>, Scope)> = self
+            .mounts
+            .iter()
+            .filter_map(|mounted| {
+                let subtree = mounted.mount.subtree_at(route)?;
+                let store = mounted.lease.link().store();
+                Some((Arc::clone(&mounted.mount), store, Scope::subtree(subtree)))
             })
             .collect();
         if shown.is_empty() {
@@ -744,36 +754,30 @@ impl Binding {
         }
         let changes = shown
             .iter()
-            .map(|(store, scope, _)| values(lock(store).follow_routes(*scope)));
+            .map(|(_, store, scope)| values(lock(store).follow_routes(*scope)));
         let changes = stream::select_all(changes.collect::<Vec<_>>());
-        Some(
-            changes
-                .map(move |_| {
-                    let all = shown.iter().flat_map(|(store, scope, (prefix, source))| {
-                        let heard = lock(store).routes().clone().into_iter();
-                        let heard = heard.filter(|heard| scope.covers(*heard));
-                        let below = heard.filter_map(|heard| source.relative_route(&heard).ok());
-                        below.filter_map(|below| prefix.absolute_route(&below).ok())
-                    });
-                    Update::Routes(all.map(|route| route.as_slice().to_vec().into()).collect())
-                })
-                .boxed(),
-        )
+        let lists = changes.map(move |_| {
+            let all = shown.iter().flat_map(|(mount, store, scope)| {
+                let heard = lock(store).routes().clone().into_iter();
+                let heard = heard.filter(|heard| scope.covers(*heard));
+                heard.filter_map(|heard| mount.to_client(heard))
+            });
+            Update::Routes(all.map(|route| route.as_slice().to_vec().into()).collect())
+        });
+        Some(lists.boxed())
     }
 }
 
-/// Returns the updates of the presence, metadata and announced settings of
-/// the device at `route` that `store` holds.
+/// Returns the updates of the presence and announced settings of the device
+/// at `route` that `store` holds.
 pub(super) fn device_updates(
     store: &Mutex<Store>,
     route: DeviceRoute,
 ) -> BoxStream<'static, Update> {
     let mut store = lock(store);
     let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
-    let metadata = values(store.follow(route, METADATA));
-    let metadata = metadata.filter_map(|state| future::ready(Update::metadata(&state)));
     let changes = announced(store.follow(route, CHANGES));
-    stream::select_all([presence.boxed(), metadata.boxed(), changes]).boxed()
+    stream::select_all([presence.boxed(), changes]).boxed()
 }
 
 /// Returns the updates of the RPC table and settings of the device at
@@ -856,6 +860,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
+    use futures_util::FutureExt;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -950,9 +955,38 @@ mod tests {
 
         drop(device);
 
+        let gave_up = |pkt: &Packet| pkt.link_status() == Some(LinkStatus::FailedToReconnect);
+        read_until(&mut client.end, gave_up).await;
         let error = ended(client).await;
         assert!(matches!(error, ClientError::GaveUp(_)), "{error}");
         assert_eq!(error.to_string(), format!("the proxy gave up on {DEVICE}"));
+    }
+
+    /// A packet whose route on its device would be deeper than a route can
+    /// be cannot reach the device, and its client is let go.
+    #[tokio::test(start_paused = true)]
+    async fn a_packet_too_deep_for_its_device_lets_its_client_go() {
+        let mut client = connect(None, None);
+        let source: DeviceRoute = "/1/2/3/4/5/6".parse().unwrap();
+        let layout = Layout {
+            mounts: vec![crate::proxy::Mount {
+                url: DEVICE.to_string(),
+                source,
+                prefix: DeviceRoute::root(),
+            }],
+        };
+        let mount = Packet::proxy_request(control::MOUNT, &encode(&layout), 2).unwrap();
+        client.end.send(&mount).await;
+        let mut device = opened(&mut client.devices).await;
+        let root = DeviceRoute::root();
+        device.end.send(&Packet::heartbeat(root)).await;
+        assert_eq!(answer(&next(&mut client.end).await).0, 2);
+
+        let too_deep = Packet::heartbeat("/1/2/3".parse().unwrap());
+        client.end.send(&too_deep).await;
+
+        let error = ended(client).await;
+        assert!(matches!(error, ClientError::ForwardFailed), "{error}");
     }
 
     /// A session whose link ends without giving up its device, as one the
@@ -1075,10 +1109,7 @@ mod tests {
             device.end.send(&hundred(first * 100)).await;
         }
         let error = ended(client).await;
-        assert!(
-            matches!(error, ClientError::HungUp | ClientError::TooSlow),
-            "{error}"
-        );
+        assert!(matches!(error, ClientError::HungUp), "{error}");
         assert!(stalled.elapsed() < control::PROXY_KEEPALIVE.quiet);
     }
 
@@ -1326,14 +1357,7 @@ mod tests {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
         let mut updates = device_updates(&store, route);
-        let first = ready(&mut updates);
-        assert_eq!(
-            first,
-            [
-                Update::Presence(Err(None)),
-                Update::Metadata(Some(Vec::new()))
-            ]
-        );
+        assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
 
         for session in 0..1000 {
             let alive = crate::device::Presence::Alive {

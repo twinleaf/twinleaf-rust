@@ -315,7 +315,7 @@ impl Server {
     /// spawns its task.
     fn serve(&mut self, stream: TcpStream, peer: SocketAddr) {
         // What a client sends goes to its ports, so it is queued as deep as
-        // they are. What it is sent waits in its outlet.
+        // they are. What it is sent waits in its outbox.
         let (deliver, incoming) = flume::bounded(link::client_tx_channel_size());
         let tasks = &self.shared.tasks;
         let port = match transport::Port::from_tcp(stream, deliver, SOCKET_QUEUE, tasks) {

@@ -26,10 +26,12 @@
 //! device, and the pump sees the link status
 //! [`SensorDisconnected`](LinkStatus::SensorDisconnected) and then
 //! [`SensorReconnected`](LinkStatus::SensorReconnected). Calls made in
-//! between fail. The proxy closes the socket only when it gives the device
-//! up, after [`FailedToReconnect`](LinkStatus::FailedToReconnect). A proxy
-//! that crashes also closes the socket, which ends the session as a stop
-//! does.
+//! between fail. The proxy closes the socket when it gives the device up,
+//! after [`FailedToReconnect`](LinkStatus::FailedToReconnect), which ends
+//! the session. It also closes the socket when the link to the device ends
+//! otherwise, when the session stops reading what it is sent, and when the
+//! session is quiet for longer than the keepalive allows. The session takes
+//! such a close as a socket that closes without a stop.
 
 use super::runtime::ProxyAddress;
 use super::stream::{End, Lane, Queued};
@@ -125,7 +127,7 @@ struct Pending {
 enum Command {
     Call(Call),
     /// Feeds the pump through this inlet. A second attach is dropped.
-    Attach(Lane<Option<Packet>>),
+    Attach(Lane<Received>),
     /// Sends a packet that expects no reply the session would complete.
     Send(Packet),
     /// Ends the session, as its owner closed it.
@@ -133,11 +135,20 @@ enum Command {
 }
 
 /// The pump's end of a session. It carries every packet from the proxy but
-/// the replies to calls, in the order they arrived, and `None` each time the
-/// socket is lost. The replies to the pump's control requests and the losses
-/// always go in. A gap stands where the session had no room for other
-/// packets, and the stop comes last.
-pub(crate) type Inlet = flume::Receiver<Queued<Option<Packet>>>;
+/// the replies to calls, in the order they arrived, and the loss of each
+/// socket. The replies to the pump's control requests and the losses always
+/// go in. A gap stands where the session had no room for other packets, and
+/// the stop comes last.
+pub(crate) type Inlet = flume::Receiver<Queued<Received>>;
+
+/// What the session hands its pump.
+#[derive(Debug, Clone)]
+pub(crate) enum Received {
+    /// A packet from the proxy.
+    Packet(Packet),
+    /// The socket was lost, and the session opens its target again.
+    SocketLost,
+}
 
 /// One session with a proxy. Every clone is the same session, and dropping
 /// the last ends the session's task, which closes the socket.
@@ -227,15 +238,15 @@ impl Session {
     }
 
     /// Starts a session inside the proxy over a port on one of its links,
-    /// which sends on `sent` and delivers on `received`. `peer` names the
-    /// link in the log.
+    /// which sends on `sent` and delivers what `received` yields. `peer`
+    /// names the link in the log.
     pub(crate) fn over_port(
         sent: mpsc::Sender<Packet>,
-        received: mpsc::Receiver<Packet>,
+        received: impl futures_util::Stream<Item = Packet> + Send + 'static,
         peer: String,
         tasks: &Supervisor,
     ) -> Session {
-        let received = tokio_stream::wrappers::ReceiverStream::new(received)
+        let received = received
             .map(|packet| Ok(TransportEvent::Packet(packet)))
             .boxed();
         Session::start((Socket::Port(sent), received, peer), None, tasks)
@@ -438,7 +449,7 @@ struct Worker {
     next_deadline: Option<Instant>,
     /// The pump's inlet, once it attached. Until then the session drops what
     /// it would queue.
-    inlet: Option<Lane<Option<Packet>>>,
+    inlet: Option<Lane<Received>>,
     /// The packets the pump sent, in order, which wait for room in the
     /// socket and for the socket to be open, and the send of the first of
     /// them under way.
@@ -537,7 +548,7 @@ impl Worker {
             (pending.complete)(Err(CallError::ResponseLost));
         }
         if let Some(inlet) = &mut self.inlet {
-            inlet.send_always(None);
+            inlet.send_always(Received::SocketLost);
         }
         self.reopening = Some(Box::pin(open_again(reopen)));
         true
@@ -613,7 +624,7 @@ impl Worker {
             Payload::ProxyRx(ProxyRx::Alive) => return true,
             Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_)) => {
                 if let Some(inlet) = &mut self.inlet {
-                    inlet.send_always(Some(packet));
+                    inlet.send_always(Received::Packet(packet));
                 }
                 return true;
             }
@@ -634,7 +645,7 @@ impl Worker {
     /// for those the inlet had no room for.
     fn forward(&mut self, packet: Packet) {
         if let Some(inlet) = &mut self.inlet {
-            inlet.send(Some(packet));
+            inlet.send(Received::Packet(packet));
         }
     }
 
@@ -1064,8 +1075,8 @@ mod tests {
     /// The next packet on `inlet`, within [`WAIT`].
     fn next(inlet: &Inlet) -> Result<Packet, flume::RecvTimeoutError> {
         match inlet.recv_timeout(WAIT)? {
-            Queued::Item(Some(packet)) => Ok(packet),
-            Queued::Item(None) => panic!("the session lost its socket"),
+            Queued::Item(Received::Packet(packet)) => Ok(packet),
+            Queued::Item(Received::SocketLost) => panic!("the session lost its socket"),
             Queued::Gap(dropped) => panic!("the session dropped {dropped} packets"),
             Queued::Ended(end) => panic!("the session ended its inlet: {end:?}"),
         }
@@ -1281,7 +1292,12 @@ mod tests {
         let tasks = Supervisor::current();
         let (sent, mut written) = mpsc::channel(1);
         let (_deliver, received) = mpsc::channel(1);
-        let session = Session::over_port(sent.clone(), received, "a full port".to_string(), &tasks);
+        let session = Session::over_port(
+            sent.clone(),
+            tokio_stream::wrappers::ReceiverStream::new(received),
+            "a full port".to_string(),
+            &tasks,
+        );
         sent.send(Packet::heartbeat(DeviceRoute::root()))
             .await
             .unwrap();
@@ -1308,7 +1324,12 @@ mod tests {
         let tasks = Supervisor::current();
         let (sent, _written) = mpsc::channel(1);
         let (_deliver, received) = mpsc::channel(1);
-        let session = Session::over_port(sent.clone(), received, "a full port".to_string(), &tasks);
+        let session = Session::over_port(
+            sent.clone(),
+            tokio_stream::wrappers::ReceiverStream::new(received),
+            "a full port".to_string(),
+            &tasks,
+        );
         sent.send(Packet::heartbeat(DeviceRoute::root()))
             .await
             .unwrap();
@@ -1348,7 +1369,10 @@ mod tests {
             Ok(Err(CallError::ResponseLost))
         ));
         assert!(
-            matches!(inlet.recv_timeout(WAIT), Ok(Queued::Item(None))),
+            matches!(
+                inlet.recv_timeout(WAIT),
+                Ok(Queued::Item(Received::SocketLost))
+            ),
             "the loss"
         );
         let mut end = proxy.accept();
@@ -1700,7 +1724,7 @@ mod tests {
         let kinds: Vec<_> = inlet
             .drain()
             .map(|queued| match queued {
-                Queued::Item(Some(packet)) => packet.ptype(),
+                Queued::Item(Received::Packet(packet)) => packet.ptype(),
                 other => panic!("expected a packet, got {other:?}"),
             })
             .collect();
