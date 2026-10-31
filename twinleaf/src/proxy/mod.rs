@@ -512,6 +512,16 @@ impl fmt::Debug for Proxy {
     }
 }
 
+#[cfg(test)]
+impl Proxy {
+    /// Ends the proxy as a crash does, and waits until it has ended. No
+    /// client hears a stop, and each one's connection closes.
+    pub(crate) fn crash(&self) {
+        let _ = self.server.send(server::Notice::Panic);
+        self.wait();
+    }
+}
+
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.shutdown();
@@ -1676,7 +1686,7 @@ mod tests {
         let device = FakeDevice::start();
         let (proxy, user, watcher) = hosted_with_clients(&device);
 
-        let _ = proxy.server.send(server::Notice::Panic);
+        proxy.crash();
 
         watcher.expect_closed();
         user.expect_closed();

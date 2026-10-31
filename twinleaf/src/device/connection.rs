@@ -137,13 +137,24 @@ impl Connection {
     ///
     /// # Lifetime
     ///
-    /// The connection does not reconnect. A device that drops out does not
-    /// end it. The proxy reconnects the device, and each change shows in the
-    /// device's [`presence`](Device::presence).
+    /// A device that drops out does not end the connection. The proxy
+    /// reconnects the device, and each change shows in the device's
+    /// [`presence`](Device::presence).
     ///
-    /// The connection ends when its socket to the proxy closes, or when the
-    /// proxy stops, as `tio proxy` does at Ctrl-C. Then every subscription
-    /// ends and every RPC fails. At a stop the raw
+    /// A socket to the proxy that closes without a stop, as when the proxy
+    /// crashes, does not end it either. Every device is
+    /// [`Lost`](Presence::Lost) and every RPC fails with
+    /// [`CallError::ResponseLost`] until the connection is open again, and
+    /// the raw [`packets`](DeviceTree::packets) carry a
+    /// [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
+    /// status at the root. It opens the target that proxy resolved the first
+    /// time again at the same address, never starting a proxy, and watches
+    /// each device again, and the samples after begin a new run. A
+    /// connection that cannot open again within 30 s ends.
+    ///
+    /// The connection ends when the proxy stops, as `tio proxy` does at
+    /// Ctrl-C, and when the proxy gives a device up and closes the socket.
+    /// Then every subscription ends and every RPC fails. At a stop the raw
     /// [`packets`](DeviceTree::packets) first carry a
     /// [`Stopped`](crate::tio::packet::LinkStatus::Stopped) status, and
     /// subscriptions end with [`RecvError::Stopped`]. After
@@ -1347,6 +1358,58 @@ mod tests {
             asked,
             [1, 1 + 2, 1],
             "one discovery, one walk of the two entries, and one snapshot for every client"
+        );
+    }
+
+    /// A proxy lost without a stop does not end the connection. Every device
+    /// is lost and every call fails meanwhile. Once a proxy answers on the
+    /// same port again, the connection opens the device it had opened and
+    /// watches it again, and its state and samples are back within 2 s.
+    #[test]
+    fn a_connection_opens_its_device_again_once_a_lost_proxy_is_back() {
+        let device = FakeDevice::start();
+        let first = fixtures::proxy();
+        let port: u16 = first
+            .endpoint()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let connection = open_through(&first, &device.url).unwrap();
+        let view = connection.device(DeviceRoute::root());
+        let presence = view.presence_updates();
+        let batches = connection.samples();
+        let alive = |presence: &Presence| matches!(presence, Presence::Alive { .. });
+        super::super::fixtures::wait_for(&presence, alive);
+        assert_eq!(view.metadata().unwrap().device().name(), "FAKE");
+
+        first.crash();
+        super::super::fixtures::wait_for(&presence, |presence| {
+            matches!(presence, Presence::Lost { .. })
+        });
+        let failed = view.get::<String>("dev.name");
+        assert!(matches!(failed, Err(CallError::ResponseLost)), "{failed:?}");
+
+        let _second = Proxy::host(crate::proxy::HostOptions {
+            port,
+            ..crate::proxy::fixtures::options()
+        })
+        .unwrap();
+        let back = Instant::now();
+        super::super::fixtures::wait_for(&presence, alive);
+        assert_eq!(view.get::<String>("dev.name").unwrap(), "FAKE");
+        assert_eq!(view.metadata().unwrap().device().name(), "FAKE");
+        let sample = (0..).find_map(|first| {
+            assert!(back.elapsed() < Duration::from_secs(2), "no samples");
+            device.send(super::super::fixtures::samples(first, DeviceRoute::root()));
+            batches.recv_timeout(Duration::from_millis(100)).ok()
+        });
+        assert!(sample.is_some());
+        assert!(
+            back.elapsed() < Duration::from_secs(2),
+            "back after {:?}",
+            back.elapsed()
         );
     }
 

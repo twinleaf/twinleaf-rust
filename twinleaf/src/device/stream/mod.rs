@@ -13,14 +13,14 @@ mod subscription;
 pub(crate) use subscription::{End, Lane, Queued, Scope, Sink};
 pub use subscription::{Receiver, RecvError};
 
-use super::session::{Handle, Inlet, Replies};
+use super::session::{Handle, Inlet};
 use super::store::{end_sinks, lock, prune, pruned, Field, Store};
 use crate::data::{PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proxy::{encode, Joined, Update, Watch, UNWATCH, WATCH};
 use crate::rt::Supervisor;
 use crate::tio;
-use crate::tio::packet::{self, Packet, ProxyRx};
+use crate::tio::packet::{self, LinkStatus, Packet, ProxyRx};
 use crate::tio::transport;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -108,7 +108,10 @@ impl Stream {
 struct Pump {
     root: Handle,
     inlet: Inlet,
-    replies: Replies,
+    /// The replies to the pump's control requests, each a `PROXY_RX`
+    /// packet, and `None` each time the session's socket is lost, which
+    /// ends every watch. No reply is ever dropped.
+    replies: flume::Receiver<Option<Packet>>,
     parser: PacketParser,
     store: Arc<Mutex<Store>>,
     taps: mpsc::UnboundedReceiver<Tap>,
@@ -123,7 +126,7 @@ struct Pump {
 impl Pump {
     fn new(
         root: &Handle,
-        (inlet, replies): (Inlet, Replies),
+        (inlet, replies): (Inlet, flume::Receiver<Option<Packet>>),
         store: Arc<Mutex<Store>>,
         taps: mpsc::UnboundedReceiver<Tap>,
     ) -> Pump {
@@ -145,7 +148,7 @@ impl Pump {
     /// device is lost, and every receiver ends, saying why the session
     /// ended, as does each new one until the stream drops.
     async fn run(mut self) {
-        let followed = lock(&self.store).followed();
+        let followed = Arc::clone(&lock(&self.store).followed);
         let end = loop {
             // A tap takes the packets that arrive after it was made, so new
             // taps, replies and pruning go ahead of the inlet.
@@ -156,7 +159,10 @@ impl Pump {
                     Some(Tap::Packets(sink)) => self.packets.push(sink),
                     None => return,
                 },
-                Ok(reply) = self.replies.recv_async() => self.take_reply(&reply),
+                Ok(reply) = self.replies.recv_async() => match reply {
+                    Some(reply) => self.take_reply(&reply),
+                    None => self.lose(),
+                },
                 () = followed.notified() => {}
                 () = pruned(|cx| {
                     let store = lock(&self.store).prune_gone(cx);
@@ -228,6 +234,18 @@ impl Pump {
             }
             self.watches.insert(id, (watch, Joined::default()));
         }
+    }
+
+    /// Drops every watch, as the session's socket is lost, and makes every
+    /// device lost. The raw taps get a disconnect status at the root. The watches go out again at once, and the session sends
+    /// them once it is open again. The parser starts again, so the samples
+    /// after begin a new run.
+    fn lose(&mut self) {
+        // A recording marks the outage as it marks a link's loss.
+        self.tap(&Packet::link(LinkStatus::SensorDisconnected));
+        lock(&self.store).mark_lost();
+        self.watches.clear();
+        self.parser = PacketParser::new(false);
     }
 
     /// Takes a reply to one of the pump's watches, a part of an update or a
@@ -546,6 +564,66 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the settings kept");
         assert_eq!(held.version(), Some(9));
+    }
+
+    /// When the session's socket is lost, every device the pump follows is
+    /// lost and every watch goes out again under a new id, which the session
+    /// sends once it is open again. The samples after begin a new run.
+    #[test]
+    fn a_lost_socket_loses_every_device_and_watches_again() {
+        let (session, proxy) = Session::test_pair();
+        let root = Handle::root(session);
+        let (mut inlet, inlet_received) = Lane::new(INLET_LEN);
+        let (replies, replies_received) = flume::unbounded();
+        let store = Arc::new(Mutex::new(Store::new(false)));
+        let (taps, taps_received) = mpsc::unbounded_channel();
+        let pump = Pump::new(
+            &root,
+            (inlet_received, replies_received),
+            Arc::clone(&store),
+            taps_received,
+        );
+        Supervisor::new().spawn("twinleaf stream", pump.run());
+        let route = DeviceRoute::root();
+        let (sink, batches) = Sink::new(BATCH_QUEUE_LEN, everything());
+        let _ = taps.send(Tap::Batches(sink));
+        let (sink, packets) = Sink::new(PACKET_QUEUE_LEN, everything());
+        let _ = taps.send(Tap::Packets(sink));
+        let presence = lock(&store).follow(route, PRESENCE);
+        let reply = |id: u16, update: &Update| {
+            for part in crate::proxy::parts(id, update) {
+                replies.send(Some(part)).unwrap();
+            }
+        };
+        let id = watch_of(&proxy, device(route));
+        reply(id, &Update::Presence(Ok(Some(7))));
+        reply(id, &routes_update(&[route]));
+        reply(id, &metadata_update(1));
+        let wait = Duration::from_secs(5);
+        wait_for(&presence, |presence| {
+            matches!(presence, Presence::Alive { .. })
+        });
+        inlet.send(samples(0, route));
+        assert!(batches.recv_timeout(wait).unwrap().is_initial());
+
+        replies.send(None).unwrap();
+        wait_for(&presence, lost);
+        let marked = wait_for(&packets, |packet| packet.link_status().is_some());
+        assert_eq!(
+            marked.link_status(),
+            Some(packet::LinkStatus::SensorDisconnected)
+        );
+        let again = watch_of(&proxy, device(route));
+        assert_ne!(again, id, "the watch is new");
+        reply(again, &routes_update(&[route]));
+        reply(again, &metadata_update(1));
+        inlet.send(samples(1, route));
+        let resumed = batches.recv_timeout(wait).unwrap();
+        assert_eq!(resumed.sample_numbers(), [1]);
+        assert!(
+            resumed.is_initial(),
+            "the samples after the outage continue a run"
+        );
     }
 
     /// A disconnect status that reaches the pump after the proxy's newer

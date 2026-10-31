@@ -11,9 +11,16 @@
 //!
 //! One task on the crate's runtime then owns the socket. It sends
 //! each call, and a reply completes the call it answers. Every other packet
-//! goes to the pump. The session ends when its socket closes or the proxy
-//! stops, and every call still waiting fails. The session does not
-//! reconnect.
+//! goes to the pump. The session ends when the proxy stops, and every call
+//! still waiting fails.
+//!
+//! A socket that closes without a stop, as when the proxy crashes, does not
+//! end a session a handshake opened, unless the proxy gave a device up
+//! before it closed. The session fails every call in flight, tells the pump
+//! the socket is lost, and opens the target the proxy resolved the first
+//! time again through the same address. It never starts a proxy for that,
+//! so a stopped proxy stays stopped. It ends once [`REOPEN_FOR`] has passed
+//! without an open.
 //!
 //! A device that drops out does not end the session. The proxy retries the
 //! device, and the pump sees the link status
@@ -35,7 +42,7 @@ use crate::tio::transport::{self, ReceiveResult, TransportEvent};
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
-use std::fmt;
+use std::hash::BuildHasher;
 use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -43,6 +50,10 @@ use tokio::time::Instant;
 
 /// The target an empty target means.
 const AUTO: &str = "auto";
+
+/// How long a session whose socket closed without a stop tries to open
+/// again before it ends.
+const REOPEN_FOR: Duration = Duration::from_secs(30);
 
 /// The RPC timeout a view starts with.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_millis(3000);
@@ -115,7 +126,7 @@ enum Command {
     Call(Call),
     /// Feeds the pump through this inlet, and the replies to its control
     /// requests through this lane. A second attach is dropped.
-    Attach(Lane<Packet>, flume::Sender<Packet>),
+    Attach(Lane<Packet>, flume::Sender<Option<Packet>>),
     /// Sends a packet that expects no reply the session would complete.
     Send(Packet),
     /// Ends the session, as its owner closed it.
@@ -125,10 +136,6 @@ enum Command {
 /// The pump's end of a session. It carries every packet from the proxy but
 /// replies, in order, a gap where the session had no room, and the stop.
 pub(crate) type Inlet = flume::Receiver<Queued<Packet>>;
-
-/// The replies to the pump's control requests, each a `PROXY_RX` packet. No
-/// reply is ever dropped.
-pub(crate) type Replies = flume::Receiver<Packet>;
 
 /// One session with a proxy. Every clone is the same session, and dropping
 /// the last ends the session's task, which closes the socket.
@@ -201,25 +208,20 @@ impl Session {
     /// that binds the connection, which fails as unable to `goal`.
     async fn request_async(
         proxy: &ProxyAddress,
-        (method, args): (&str, Vec<u8>),
+        (method, args): (&'static str, Vec<u8>),
         goal: &str,
         timeout: Duration,
     ) -> io::Result<Session> {
         let tasks = Supervisor::new();
-        let (port, received) = connect(proxy, &tasks).await?;
-        let url = &proxy.url;
-        let (host, opened) = handshake(&port, &received, url, method, &args, goal, timeout).await?;
-        log::debug!(
-            "the proxy at {url} opened {}",
-            String::from_utf8_lossy(&opened)
-        );
-        let peer = match host {
-            Some(host) => format!("the proxy at {url}, hosted by {host},"),
-            None => format!("the proxy at {url}"),
+        let (opened, answer) = bind(proxy, (method, &args), goal, timeout, &tasks).await?;
+        // An open again opens the target the proxy resolved.
+        let resolved = (method == Purpose::Use.method()).then_some(answer);
+        let again = ProxyAddress {
+            ensure: None,
+            ..proxy.clone()
         };
-        let socket = Socket::Transport(port);
-        let received = received.into_stream().boxed();
-        Ok(Session::start(socket, received, peer, &tasks))
+        let reopen = Some((again, method, resolved.unwrap_or(args)));
+        Ok(Session::start(opened, reopen, &tasks))
     }
 
     /// Starts a session inside the proxy over a port on one of its links,
@@ -234,16 +236,17 @@ impl Session {
         let received = tokio_stream::wrappers::ReceiverStream::new(received)
             .map(|packet| Ok(TransportEvent::Packet(packet)))
             .boxed();
-        Session::start(Socket::Port(sent), received, peer, tasks)
+        Session::start((Socket::Port(sent), received, peer), None, tasks)
     }
 
     /// Starts the session's task on `tasks`, which reads `received` and
     /// writes to `socket`. `peer` names the proxy in the log, such as `the
-    /// proxy at tcp://127.0.0.1:7855`.
+    /// proxy at tcp://127.0.0.1:7855`. With `reopen`, the proxy and the
+    /// control request that open it again, the session outlives a socket
+    /// that closes without a stop.
     fn start(
-        socket: Socket,
-        received: BoxStream<'static, ReceiveResult>,
-        peer: String,
+        (socket, received, peer): Opened,
+        reopen: Option<(ProxyAddress, &'static str, Vec<u8>)>,
         tasks: &Supervisor,
     ) -> Session {
         let (commands, mailbox) = mpsc::unbounded_channel();
@@ -258,6 +261,8 @@ impl Session {
             replies: None,
             queued: VecDeque::new(),
             sending: None,
+            reopen,
+            reopening: None,
         };
         tasks.spawn("twinleaf session", worker.run(mailbox));
         Session { commands }
@@ -304,7 +309,7 @@ impl Session {
     /// Attaches the pump, with room for `capacity` packets in its inlet, and
     /// returns the inlet and the replies to its control requests. The first
     /// attach is live, and any later one has already ended.
-    pub(crate) fn attach(&self, capacity: usize) -> (Inlet, Replies) {
+    pub(crate) fn attach(&self, capacity: usize) -> (Inlet, flume::Receiver<Option<Packet>>) {
         let (inlet, packets) = Lane::new(capacity);
         let (replies, received) = flume::unbounded();
         let _ = self.commands.send(Command::Attach(inlet, replies));
@@ -351,6 +356,61 @@ async fn connect(
     connected.map_err(|error| proxy.unreachable(error))
 }
 
+/// A session's socket, what it receives, and the proxy as the log names it.
+type Opened = (Socket, BoxStream<'static, ReceiveResult>, String);
+
+/// Connects to `proxy` and makes the control request `(method, args)`, which
+/// fails as unable to `goal` if the proxy does not answer within `timeout`.
+/// Returns the session's socket and the proxy's answer.
+async fn bind(
+    proxy: &ProxyAddress,
+    (method, args): (&str, &[u8]),
+    goal: &str,
+    timeout: Duration,
+    tasks: &Supervisor,
+) -> io::Result<(Opened, Vec<u8>)> {
+    let (port, received) = connect(proxy, tasks).await?;
+    let url = &proxy.url;
+    let (host, opened) = handshake(&port, &received, url, method, args, goal, timeout).await?;
+    let peer = match host {
+        Some(host) => format!("the proxy at {url}, hosted by {host},"),
+        None => format!("the proxy at {url}"),
+    };
+    log::debug!("{peer} opened {}", String::from_utf8_lossy(&opened));
+    let received = received.into_stream().boxed();
+    Ok(((Socket::Transport(port), received, peer), opened))
+}
+
+/// Opens a session through `proxy` again with the control request
+/// `(method, args)`, for at most [`REOPEN_FOR`]. The wait between two tries
+/// doubles from 250 ms up to 1 s, so a proxy that is back is tried within
+/// 1.25 s, and each is made up
+/// to a quarter longer or shorter at random, so the clients of one proxy
+/// do not all try at once. Returns `None` if no try succeeded.
+async fn open_again(
+    (proxy, method, args): (ProxyAddress, &'static str, Vec<u8>),
+) -> Option<Opened> {
+    let tasks = Supervisor::new();
+    let tries = async {
+        let mut wait = Duration::from_millis(250);
+        loop {
+            match bind(&proxy, (method, &args), "open it again", REOPEN_FOR, &tasks).await {
+                Ok((opened, _)) => return opened,
+                Err(error) => log::debug!("could not open the session again: {error}"),
+            }
+            tokio::time::sleep(jittered(wait)).await;
+            wait = (wait * 2).min(Duration::from_secs(1));
+        }
+    };
+    tokio::time::timeout(REOPEN_FOR, tries).await.ok()
+}
+
+/// Returns `wait` made up to a quarter longer or shorter at random.
+fn jittered(wait: Duration) -> Duration {
+    let random = std::collections::hash_map::RandomState::new().hash_one(());
+    wait.mul_f64(0.75 + random as f64 / u64::MAX as f64 / 2.0)
+}
+
 /// Why a session's task ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ending {
@@ -362,17 +422,6 @@ enum Ending {
     HandlesGone,
     /// Its owner closed it.
     Closed,
-}
-
-impl fmt::Display for Ending {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Ending::Stopped => "the proxy stopped",
-            Ending::SocketClosed => "its socket closed",
-            Ending::HandlesGone => "every handle on it is gone",
-            Ending::Closed => "its owner closed it",
-        })
-    }
 }
 
 /// The session's task. It owns the socket, sends calls and completes them,
@@ -392,11 +441,18 @@ struct Worker {
     inlet: Option<Lane<Packet>>,
     /// Where the replies to the pump's control requests go, once it
     /// attached.
-    replies: Option<flume::Sender<Packet>>,
+    replies: Option<flume::Sender<Option<Packet>>>,
     /// The packets the pump sent, in order, which wait for room in the
-    /// socket, and the send of the first of them under way.
+    /// socket and for the socket to be open, and the send of the first of
+    /// them under way.
     queued: VecDeque<Packet>,
     sending: Option<BoxFuture<'static, bool>>,
+    /// The proxy and the control request that open the session again once
+    /// its socket closes without a stop, or `None` for a session that ends
+    /// then.
+    reopen: Option<(ProxyAddress, &'static str, Vec<u8>)>,
+    /// The open in progress after a socket closed.
+    reopening: Option<BoxFuture<'static, Option<Opened>>>,
 }
 
 impl Worker {
@@ -404,7 +460,7 @@ impl Worker {
     /// socket closes, the proxy stops or every handle is gone.
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let ending = loop {
-            if self.sending.is_none() {
+            if self.sending.is_none() && self.reopening.is_none() {
                 self.sending = self
                     .queued
                     .pop_front()
@@ -423,11 +479,20 @@ impl Worker {
                     Some(Command::Close) => break Ending::Closed,
                     None => break Ending::HandlesGone,
                 },
-                received = self.received.next() => {
-                    let Some(received) = received else { break Ending::SocketClosed; };
-                    if let Some(ending) = self.delivered(received) {
-                        break ending;
+                received = self.received.next(), if self.reopening.is_none() => {
+                    let ending = received.map_or(Some(Ending::SocketClosed), |received| {
+                        self.delivered(received)
+                    });
+                    match ending {
+                        Some(Ending::SocketClosed) if self.lose() => {}
+                        Some(ending) => break ending,
+                        None => {}
                     }
+                }
+                opened = finish(&mut self.reopening) => {
+                    let Some(opened) = opened else { break Ending::SocketClosed };
+                    (self.socket, self.received, self.peer) = opened;
+                    log::info!("the session with {} is open again", self.peer);
                 }
                 sent = finish(&mut self.sending) => if !sent {
                     log::debug!("could not send to {}, which closed", self.peer);
@@ -441,7 +506,7 @@ impl Worker {
                 log::debug!("{} closed", self.peer)
             }
             Ending::SocketClosed => log::warn!("{} closed the connection", self.peer),
-            ending => log::debug!("the session with {} ended: {ending}", self.peer),
+            ending => log::debug!("the session with {} ended: {ending:?}", self.peer),
         }
         let end = match ending {
             Ending::Stopped => Some(End::Stopped),
@@ -463,6 +528,24 @@ impl Worker {
         for (_, pending) in self.pending.drain() {
             (pending.complete)(Err(CallError::ResponseLost));
         }
+    }
+
+    /// Fails every call in flight, tells the pump the socket is lost, and
+    /// opens the session again, unless it is one that ends then. Returns
+    /// whether it opens again.
+    fn lose(&mut self) -> bool {
+        let Some(reopen) = self.reopen.clone() else {
+            return false;
+        };
+        log::warn!("{} closed the connection, so it is opened again", self.peer);
+        for (_, pending) in self.pending.drain() {
+            (pending.complete)(Err(CallError::ResponseLost));
+        }
+        if let Some(replies) = &self.replies {
+            let _ = replies.send(None);
+        }
+        self.reopening = Some(Box::pin(open_again(reopen)));
+        true
     }
 
     /// Sends `call` with an id no pending call has, and keeps it until its
@@ -535,7 +618,7 @@ impl Worker {
             Payload::ProxyRx(ProxyRx::Alive) => return true,
             Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_)) => {
                 if let Some(replies) = &self.replies {
-                    let _ = replies.send(packet);
+                    let _ = replies.send(Some(packet));
                 }
                 return true;
             }
@@ -543,6 +626,11 @@ impl Worker {
         }
         let stopped =
             packet.route().is_empty() && packet.link_status() == Some(LinkStatus::Stopped);
+        // The proxy closes the socket once it gives a device up, and the
+        // session is not opened again then.
+        if packet.link_status() == Some(LinkStatus::FailedToReconnect) {
+            self.reopen = None;
+        }
         self.forward(packet);
         !stopped
     }
@@ -761,7 +849,7 @@ impl Session {
         let (deliver, received) = flume::unbounded();
         let peer = "the test's proxy".to_string();
         let received = received.into_stream().boxed();
-        let session = Session::start(Socket::Channel(sender), received, peer, tasks);
+        let session = Session::start((Socket::Channel(sender), received, peer), None, tasks);
         (session, TestProxy { sent, deliver })
     }
 }
@@ -940,7 +1028,12 @@ mod tests {
 
         /// The next call the session sends, as its method name and its id.
         fn expect_call(&mut self) -> (String, u16) {
-            let packet = self.expect();
+            let packet = loop {
+                let packet = self.expect();
+                if !matches!(packet.payload(), Payload::Heartbeat(_)) {
+                    break packet;
+                }
+            };
             let Payload::RpcRequest(request) = packet.payload() else {
                 panic!("expected an RPC request, got {:?}", packet.payload());
             };
@@ -1184,33 +1277,6 @@ mod tests {
         );
     }
 
-    /// A socket that drops ends the session as a stop does, and nothing
-    /// reconnects in its place.
-    #[test]
-    fn a_dropped_socket_fails_pending_calls_and_ends_the_stream_for_good() {
-        let proxy = FakeProxy::start();
-        let (session, mut end) = opened(&proxy);
-        let inlet = session.attach(64).0;
-        let root = Handle::root(session);
-        let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
-        end.expect_call();
-
-        drop(end);
-
-        assert!(matches!(
-            waiting.recv_timeout(WAIT),
-            Ok(Err(CallError::ResponseLost))
-        ));
-        assert_eq!(
-            next(&inlet).err(),
-            Some(flume::RecvTimeoutError::Disconnected)
-        );
-        assert!(
-            !proxy.arrives(Duration::from_secs(2)),
-            "the session reconnected after its socket dropped"
-        );
-    }
-
     /// A packet the pump sends, such as a watch, waits for room in a full
     /// socket rather than being dropped.
     #[tokio::test]
@@ -1258,6 +1324,115 @@ mod tests {
         assert!(
             matches!(ended, Ok(Ok(Queued::Ended(End::Closed)))),
             "{ended:?}"
+        );
+    }
+
+    /// A socket that drops without a stop fails the call in flight, and the
+    /// session opens the target the proxy resolved the first time again on
+    /// a new socket, not `auto`. The pump hears that the socket was lost.
+    #[test]
+    fn a_dropped_socket_fails_pending_calls_and_opens_the_resolved_target_again() {
+        let proxy = FakeProxy::start();
+        let opening = proxy.open("auto", Purpose::Use);
+        let mut end = proxy.accept();
+        let (hello, open) = end.expect_handshake("proxy.open", "auto");
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
+        end.send(&Packet::proxy_reply(open, &encode(&TARGET)).unwrap());
+        let session = opening.join().unwrap().unwrap();
+        let replies = session.attach(64).1;
+        let root = Handle::root(session);
+        let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
+        end.expect_call();
+
+        drop(end);
+
+        assert!(matches!(
+            waiting.recv_timeout(WAIT),
+            Ok(Err(CallError::ResponseLost))
+        ));
+        assert!(matches!(replies.recv_timeout(WAIT), Ok(None)), "the loss");
+        let mut end = proxy.accept();
+        end.accept_open(TARGET);
+        // A call made before the session is open again fails at once.
+        let reply = loop {
+            let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
+            match reply.recv_timeout(Duration::from_millis(100)) {
+                Ok(Err(CallError::ResponseLost)) => {}
+                Err(_) => break reply,
+                other => panic!("the call ended as {other:?}"),
+            }
+        };
+        let (name, id) = end.expect_call();
+        assert_eq!(name, "dev.name");
+        end.send(&Packet::rpc_reply(id, b"FAKE", DeviceRoute::root()).unwrap());
+        assert_eq!(reply.recv_timeout(WAIT).unwrap().unwrap(), b"FAKE");
+    }
+
+    /// Whether [`record_start`] ran.
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
+    /// Notes that it was asked to start a proxy, and fails.
+    fn record_start() -> BoxFuture<'static, io::Result<()>> {
+        STARTED.store(true, Ordering::SeqCst);
+        Box::pin(async { Err(io::Error::other("no proxy is started here")) })
+    }
+
+    /// A session opened again after its socket closed never starts a
+    /// proxy, though the open that made it would, so a stopped proxy whose
+    /// stop a client missed stays stopped.
+    #[test]
+    fn a_session_opened_again_never_starts_a_proxy() {
+        let proxy = FakeProxy::start();
+        let address = ProxyAddress {
+            url: proxy.url(),
+            ensure: Some(record_start),
+        };
+        let opening = thread::spawn(move || Session::open(&address, TARGET, Purpose::Use, WAIT));
+        let mut end = proxy.accept();
+        end.accept_open(TARGET);
+        let _session = opening.join().unwrap().unwrap();
+
+        drop((end, proxy));
+        thread::sleep(Duration::from_secs(1));
+
+        assert!(!STARTED.load(Ordering::SeqCst), "a proxy was started");
+    }
+
+    /// The proxy closes the socket once it gives the device up, so a socket
+    /// that drops after that ends the session, and nothing opens it again.
+    #[test]
+    fn a_socket_dropped_after_its_device_was_given_up_ends_the_session() {
+        let proxy = FakeProxy::start();
+        let (session, mut end) = opened(&proxy);
+        let inlet = session.attach(64).0;
+
+        end.send(&Packet::link(LinkStatus::FailedToReconnect));
+        drop(end);
+
+        let status = next(&inlet).map(|packet| packet.link_status());
+        assert_eq!(status, Ok(Some(LinkStatus::FailedToReconnect)));
+        assert_eq!(
+            next(&inlet).err(),
+            Some(flume::RecvTimeoutError::Disconnected)
+        );
+        assert!(
+            !proxy.arrives(Duration::from_secs(1)),
+            "the session opened again after its device was given up"
+        );
+    }
+
+    /// The wait between two tries to open again is never more than a
+    /// quarter longer or shorter than the backoff, and not always the same.
+    #[test]
+    fn the_wait_to_open_again_is_jittered_by_a_quarter() {
+        let wait = Duration::from_secs(4);
+        let waits: Vec<_> = (0..100).map(|_| jittered(wait)).collect();
+        assert!(waits
+            .iter()
+            .all(|jittered| *jittered >= wait * 3 / 4 && *jittered <= wait * 5 / 4));
+        assert!(
+            waits.iter().any(|jittered| *jittered != waits[0]),
+            "no jitter"
         );
     }
 

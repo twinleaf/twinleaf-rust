@@ -226,8 +226,13 @@ impl Server {
                 notice = self.notices.recv() => match notice {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
                     Some(Notice::Stop) | None => break,
+                    // The clients' tasks end before they could hear a stop,
+                    // as a proxy that crashes tells no client.
                     #[cfg(test)]
-                    Some(Notice::Panic) => panic!("a test asked the server to panic"),
+                    Some(Notice::Panic) => {
+                        self.sessions.abort_all();
+                        panic!("a test asked the server to panic")
+                    }
                 },
                 accepted = accept(&self.listeners), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),

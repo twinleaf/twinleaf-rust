@@ -99,7 +99,10 @@ struct Engine {
 impl Engine {
     /// Runs until the session over the link's port ends.
     async fn run(mut self) {
-        let (store, followed) = (Arc::clone(&self.store), lock(&self.store).followed());
+        let (store, followed) = (
+            Arc::clone(&self.store),
+            Arc::clone(&lock(&self.store).followed),
+        );
         loop {
             let quiet = self.heard.values().map(|at| *at + QUIET).min();
             let unwatched = self.workers.values().filter_map(|(_, since)| *since);

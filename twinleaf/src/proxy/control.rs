@@ -233,12 +233,11 @@ impl Update {
     /// Returns the update of a device's metadata, or `None` if a record
     /// does not fit a packet.
     pub(crate) fn metadata(state: &MetadataState) -> Option<Update> {
-        let snapshot = match state {
-            MetadataState::Ready(snapshot) => snapshot,
-            MetadataState::Pending => return Some(Update::Metadata(Some(Vec::new()))),
+        let packets = match state {
+            MetadataState::Ready(snapshot) => snapshot.metadata_packets().ok()?,
+            MetadataState::Pending => Vec::new(),
             MetadataState::Unsupported => return Some(Update::Metadata(None)),
         };
-        let packets = snapshot.metadata_packets().ok()?;
         let root = DeviceRoute::root();
         let records = packets
             .iter()

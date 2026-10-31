@@ -71,21 +71,21 @@ impl MetadataSchedule {
         routes: impl IntoIterator<Item = DeviceRoute>,
         now: Instant,
     ) -> Vec<DeviceRoute> {
-        let due: Vec<_> = routes
-            .into_iter()
-            .filter(|route| match self.schedule.get(route) {
-                None | Some(Schedule::Due { .. }) => true,
-                Some(Schedule::Backoff { until, .. }) => *until <= now,
-                Some(Schedule::Unsupported) => false,
-            })
-            .collect();
-        for route in &due {
-            if let Some(Schedule::Backoff { delay, .. }) = self.schedule.get(route) {
-                self.schedule
-                    .insert(*route, Schedule::Due { delay: *delay });
-            }
-        }
-        due
+        let due = |state: Option<&mut Schedule>| match state {
+            None | Some(Schedule::Due { .. }) => true,
+            Some(state @ Schedule::Backoff { .. }) => match *state {
+                Schedule::Backoff { until, delay } if until <= now => {
+                    *state = Schedule::Due { delay };
+                    true
+                }
+                _ => false,
+            },
+            Some(Schedule::Unsupported) => false,
+        };
+        let routes = routes.into_iter();
+        routes
+            .filter(|route| due(self.schedule.get_mut(route)))
+            .collect()
     }
 
     /// Asks `route` for whatever metadata `parser` still wants.

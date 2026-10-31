@@ -238,7 +238,7 @@ impl Session {
         self.client.keep_alive(control::PROXY_KEEPALIVE).await;
         loop {
             if self.stopping() {
-                return Err(self.stopped());
+                return Err(self.stopped().await);
             }
             // What the client sent while an open waited goes first, in
             // order.
@@ -255,7 +255,7 @@ impl Session {
             // State goes out ahead of the devices' packets.
             tokio::select! {
                 biased;
-                _ = &mut self.alive => return Err(self.stopped()),
+                _ = &mut self.alive => return Err(self.stopped().await),
                 Some((id, update)) = self.watches.next(), if !self.watches.is_empty() => {
                     let replies = match update {
                         Some(update) => control::parts(id, &update),
@@ -308,11 +308,15 @@ impl Session {
         matches!(self.alive.try_recv(), Err(TryRecvError::Closed))
     }
 
-    /// Tells the client at the root that the proxy stopped, and returns
+    /// Tells the client at the root that the proxy stopped, waiting at most
+    /// [`CLOSE_TIMEOUT`] for room in its queue, and returns
     /// [`ClientError::Stopped`].
-    fn stopped(&self) -> ClientError {
-        let _ = self.client.try_send(Packet::link(LinkStatus::Stopped));
-        ClientError::Stopped
+    fn stopped(&self) -> impl Future<Output = ClientError> {
+        let stop = self.client.send_async(Packet::link(LinkStatus::Stopped));
+        async move {
+            let _ = timeout(CLOSE_TIMEOUT, stop).await;
+            ClientError::Stopped
+        }
     }
 
     /// Handles a packet from the client. Answers a control request, and
@@ -517,7 +521,7 @@ impl Session {
             let quiet = control::PROXY_KEEPALIVE.quiet;
             let sent = tokio::select! {
                 biased;
-                _ = &mut self.alive => return Err(self.stopped()),
+                _ = &mut self.alive => return Err(self.stopped().await),
                 sent = timeout(quiet, self.client.send_async(part)) => sent,
             };
             match sent {
@@ -613,7 +617,7 @@ impl Session {
                 self.binding = Some(binding);
                 Ok(encode(&target))
             }
-            Err(_) if self.stopping() => return Err(self.stopped()),
+            Err(_) if self.stopping() => return Err(self.stopped().await),
             Err(refusal) => Err(refusal),
         };
         self.answer(request, outcome)
@@ -1192,7 +1196,8 @@ mod tests {
     }
 
     /// A stop reaches a client whose queue is too full for its state at
-    /// once, rather than once the wait for room runs out.
+    /// once, rather than once the wait for room runs out, and its status
+    /// arrives however full the queue is.
     #[tokio::test(start_paused = true)]
     async fn a_stop_reaches_a_client_waiting_to_send_state() {
         let Client {
@@ -1223,12 +1228,24 @@ mod tests {
 
         let stopping = Instant::now();
         drop(_lifeline);
-        let served = timeout(PAUSED_WAIT, served).await.unwrap().unwrap();
+        let heard = async {
+            let mut stopped = false;
+            while let Some(pkt) = end.recv().await {
+                stopped |= matches!(
+                    pkt.payload(),
+                    Payload::ProxyRx(ProxyRx::Link(LinkStatus::Stopped))
+                );
+            }
+            stopped
+        };
+        let (served, stopped) = tokio::join!(timeout(PAUSED_WAIT, served), heard);
+        let served = served.unwrap().unwrap();
         assert!(
             matches!(served, Some(Err(ClientError::Stopped))),
             "{served:?}"
         );
         assert!(stopping.elapsed() < control::PROXY_KEEPALIVE.quiet);
+        assert!(stopped, "the stop never arrived");
     }
 
     /// A table watch that falls behind a new table sends the new table, and

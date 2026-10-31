@@ -128,7 +128,7 @@ pub(crate) struct Store {
     /// Whether the store has ended, and why when it was told.
     ended: Option<Option<End>>,
     /// Wakes whoever fills the store when a receiver starts to follow it.
-    followed: Arc<Notify>,
+    pub(crate) followed: Arc<Notify>,
     /// Whether a device not heard yet is connecting with its metadata
     /// pending, as the proxy says, rather than not known yet.
     proxy: bool,
@@ -141,11 +141,6 @@ impl Store {
             proxy,
             ..Store::default()
         }
-    }
-
-    /// Returns what wakes once a receiver starts to follow the store.
-    pub(crate) fn followed(&self) -> Arc<Notify> {
-        Arc::clone(&self.followed)
     }
 
     fn entry(&mut self, route: DeviceRoute) -> &mut Entry {
@@ -163,12 +158,12 @@ impl Store {
     /// the value held now, if any, then each new one, and ends at once if
     /// the store has ended.
     pub(crate) fn follow<T: Clone>(&mut self, route: DeviceRoute, field: Field<T>) -> Receiver<T> {
-        let (ended, followed) = (self.ended, Arc::clone(&self.followed));
+        self.followed.notify_one();
+        let ended = self.ended;
         let slot = field(self.entry(route));
         let receiver = slot.follow(route);
-        match ended {
-            None => followed.notify_one(),
-            Some(end) => end_sinks(&mut slot.sinks, end),
+        if let Some(end) = ended {
+            end_sinks(&mut slot.sinks, end);
         }
         receiver
     }
@@ -177,14 +172,12 @@ impl Store {
     /// yields it once the list of a subtree that holds `scope` is known.
     pub(crate) fn follow_routes(&mut self, scope: Scope) -> Receiver<Vec<DeviceRoute>> {
         let (mut sink, receiver) = Sink::latest(scope);
-        match self.ended {
-            Some(end) => end_sinks(&mut vec![sink], end),
-            None => {
-                self.followed.notify_one();
-                if !self.knows(scope) || sink.lane.send(in_scope(&self.routes, scope)) {
-                    self.route_sinks.push(sink);
-                }
-            }
+        self.followed.notify_one();
+        if !self.knows(scope) || sink.lane.send(in_scope(&self.routes, scope)) {
+            self.route_sinks.push(sink);
+        }
+        if let Some(end) = self.ended {
+            end_sinks(&mut self.route_sinks, end);
         }
         receiver
     }
