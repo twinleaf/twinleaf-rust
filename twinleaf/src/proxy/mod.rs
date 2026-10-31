@@ -26,28 +26,29 @@
 //!
 //! A client connects over TCP and speaks the packet protocol, plus control
 //! requests to the proxy itself. A control request is an RPC request in a
-//! `PROXY_TX` packet, and the proxy answers it in a `PROXY_RX` packet.
-//! Arguments and replies are encoded as
-//! [`RpcArgs`](crate::tio::rpc::RpcArgs) encodes them. The methods are
-//! these.
+//! `PROXY_TX` packet, and the proxy answers it in a `PROXY_RX` packet. Its
+//! arguments and its reply are each one CBOR item. A struct is the array of
+//! its fields in order, and a route is the byte string of its hops. The
+//! methods are these.
 //!
 //! - `proxy.hello` takes the client's introduction and replies with the
-//!   proxy's own. An introduction is the `u32` pid, the `u8` protocol
-//!   version, the `twinleaf` version as three `u16`s for major, minor and
-//!   patch, and then the name. The protocol version is 1. A client refuses a
-//!   proxy whose protocol is older than its own.
-//! - `proxy.open` takes a target and replies what it resolved to, a device
-//!   URL or `default`. A connection opens once.
-//! - `proxy.probe` takes `(String url)` and opens that device for a client
+//!   proxy's own. An introduction is the pid, the protocol version, the
+//!   `twinleaf` version as an array of major, minor and patch, and the name.
+//!   The protocol version is 2. A client refuses a proxy whose protocol is
+//!   older than its own. A proxy of protocol 1 cannot read the hello, and
+//!   the client then says to update it.
+//! - `proxy.open` takes a target as a text string and replies what it
+//!   resolved to, a device URL or `default`. A connection opens once.
+//! - `proxy.probe` takes a device URL and opens that device for a client
 //!   that only looks it over, as discovery does to read its name. A device
 //!   that only probes have opened is not a choice for `auto`, and closes as
 //!   soon as the last probe leaves. A probe of a device a client opened
 //!   shares it.
 //! - `proxy.mount` takes a [`Layout`] and opens it as one tree, each mount
-//!   at its prefix, in place of `proxy.open`. A layout is a `u8` count of
-//!   mounts, then each mount's URL, source route and prefix route, each
-//!   after a `u8` length. Each mount's device becomes a choice for `auto`.
-//!   A layout that mounts nothing, or whose prefixes overlap, is refused.
+//!   at its prefix, in place of `proxy.open`. A layout is the array of its
+//!   mounts, and a mount is its URL, source route and prefix route. Each
+//!   mount's device becomes a choice for `auto`. A layout that mounts
+//!   nothing, or whose prefixes overlap, is refused.
 //! - `proxy.default` takes a [`Layout`] and replies nothing. The layout is
 //!   the default until the connection that sent it closes, when the default
 //!   it replaced returns. Only a proxy with [`HostOptions::stoppable`] set
@@ -116,8 +117,12 @@ mod server;
 mod worker;
 
 #[cfg(test)]
+pub(crate) use control::decode;
+#[cfg(test)]
 pub(crate) use control::CLIENT_KEEPALIVE;
-pub(crate) use control::{call, executable_name, handshake, Purpose, DEFAULT_LAYOUT, MOUNT};
+pub(crate) use control::{
+    call, encode, executable_name, handshake, Purpose, DEFAULT_LAYOUT, MOUNT,
+};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -219,20 +224,26 @@ pub enum Listen {
 }
 
 /// One device subtree and where a client sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 pub struct Mount {
     /// The device's URL.
+    #[n(0)]
     pub url: String,
     /// The subtree of the device that is mounted.
+    #[n(1)]
+    #[cbor(with = "control::hops")]
     pub source: DeviceRoute,
     /// The route at which a client sees that subtree.
+    #[n(2)]
+    #[cbor(with = "control::hops")]
     pub prefix: DeviceRoute,
 }
 
 /// Mounts a client sees together, as one tree.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 pub struct Layout {
     /// Each mounted subtree.
+    #[n(0)]
     pub mounts: Vec<Mount>,
 }
 
@@ -500,7 +511,6 @@ mod tests {
     use crate::proto::rpc::RpcError;
     use crate::proto::PacketType;
     use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
-    use crate::tio::rpc::{RpcArgs, RpcReply};
     use crate::tio::transport;
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -509,11 +519,10 @@ mod tests {
 
     /// The `proxy.hello` of a client named `caller` with pid 4242.
     fn caller_hello() -> Vec<u8> {
-        Introduction {
+        encode(&Introduction {
             pid: 4242,
             ..Introduction::of_this_process("caller")
-        }
-        .encode_args()
+        })
     }
 
     /// The introduction a proxy hosted by this process under `name` replies
@@ -524,7 +533,7 @@ mod tests {
 
     /// Decodes the reply to `proxy.hello`.
     fn host_of(reply: io::Result<Vec<u8>>) -> Introduction {
-        Introduction::decode_reply(&reply.unwrap()).unwrap()
+        decode::<Introduction>(&reply.unwrap()).unwrap()
     }
 
     /// A client speaking raw packets to a proxy.
@@ -646,19 +655,19 @@ mod tests {
                 pid,
                 ..Introduction::of_this_process(name)
             };
-            let reply = self.control("proxy.hello", &client.encode_args(), 1);
-            let host = Introduction::decode_reply(&reply.unwrap()).unwrap();
-            assert_eq!(host.protocol, 1);
+            let reply = self.control("proxy.hello", &encode(&client), 1);
+            let host = decode::<Introduction>(&reply.unwrap()).unwrap();
+            assert_eq!(host.protocol, control::VERSION);
         }
 
         fn open(&self, target: &str) -> Result<String, (RpcError, String)> {
-            self.control("proxy.open", &target.encode_args(), 2)
-                .map(|reply| String::decode_reply(&reply).unwrap())
+            self.control("proxy.open", &encode(&target), 2)
+                .map(|reply| decode::<String>(&reply).unwrap())
         }
 
         fn probe(&self, url: &str) -> Result<String, (RpcError, String)> {
-            self.control("proxy.probe", &url.encode_args(), 2)
-                .map(|reply| String::decode_reply(&reply).unwrap())
+            self.control("proxy.probe", &encode(&url), 2)
+                .map(|reply| decode::<String>(&reply).unwrap())
         }
 
         /// Ask the root device its name.
@@ -1085,7 +1094,7 @@ mod tests {
         let holder = TestClient::connect(&proxy.endpoint());
         holder.hello(4242, "tio list");
         assert_eq!(
-            holder.control("proxy.default", &layout.encode_args(), 2),
+            holder.control("proxy.default", &encode(&layout), 2),
             Ok(Vec::new())
         );
 
@@ -1095,7 +1104,7 @@ mod tests {
         assert_eq!(client.dev_name_at(prefix, 7), "FAKE");
         let rival = TestClient::connect(&proxy.endpoint());
         rival.hello(4244, "rival");
-        let refused = rival.control("proxy.default", &layout.encode_args(), 2);
+        let refused = rival.control("proxy.default", &encode(&layout), 2);
         assert_eq!(refused.unwrap_err().0, RpcError::State);
 
         drop(holder);
@@ -1112,7 +1121,7 @@ mod tests {
             }
         };
         assert_eq!(
-            late.control("proxy.default", &layout.encode_args(), 3),
+            late.control("proxy.default", &encode(&layout), 3),
             Ok(Vec::new())
         );
     }
@@ -1126,7 +1135,7 @@ mod tests {
 
         let layout = Layout::single("tcp://192.0.2.1");
         let (code, message) = client
-            .control("proxy.default", &layout.encode_args(), 2)
+            .control("proxy.default", &encode(&layout), 2)
             .unwrap_err();
 
         assert_eq!(code, RpcError::State);
@@ -1220,10 +1229,10 @@ mod tests {
         let client = TestClient::connect(&proxy.endpoint());
         client.hello(4242, "mounting");
 
-        let reply = client.control("proxy.mount", &layout.encode_args(), 2);
+        let reply = client.control("proxy.mount", &encode(&layout), 2);
 
         assert_eq!(
-            reply.map(|reply| String::decode_reply(&reply).unwrap()),
+            reply.map(|reply| decode::<String>(&reply).unwrap()),
             Ok(layout.to_string())
         );
         assert_eq!(client.dev_name_at(at("/1"), 7), "FAKE");
@@ -1246,7 +1255,7 @@ mod tests {
         };
         let other = TestClient::connect(&proxy.endpoint());
         other.hello(4242, "overlapping");
-        let refused = other.control("proxy.mount", &overlapping.encode_args(), 2);
+        let refused = other.control("proxy.mount", &encode(&overlapping), 2);
         assert_eq!(refused.unwrap_err().0, RpcError::Invalid);
     }
 
@@ -1264,7 +1273,7 @@ mod tests {
         answered.open(&device.url).unwrap();
         let waiting = TestClient::connect(&proxy.endpoint());
         waiting.hello(4243, "waiting");
-        let open = Packet::proxy_request("proxy.open", &silent_url.encode_args(), 2);
+        let open = Packet::proxy_request("proxy.open", &encode(&silent_url), 2);
         waiting.send(open.unwrap());
         let deadline = Instant::now() + WAIT;
         while proxy.links.urls().len() < 2 {
@@ -1374,7 +1383,7 @@ mod tests {
         for method in ["proxy.open", "proxy.probe"] {
             let leaving = TestClient::connect(&proxy.endpoint());
             leaving.hello(4242, "leaving");
-            let open = Packet::proxy_request(method, &silent_url.encode_args(), 2);
+            let open = Packet::proxy_request(method, &encode(&silent_url), 2);
             leaving.send(open.unwrap());
             let deadline = Instant::now() + WAIT;
             while proxy.links.users() == 0 {
@@ -1758,7 +1767,7 @@ mod tests {
         let proxy = Arc::new(Proxy::host(options()).unwrap());
         let waiting = TestClient::connect(&proxy.endpoint());
         waiting.hello(4242, "waiting");
-        let open = Packet::proxy_request("proxy.open", &silent_url.encode_args(), 2);
+        let open = Packet::proxy_request("proxy.open", &encode(&silent_url), 2);
         waiting.send(open.unwrap());
         let deadline = Instant::now() + WAIT;
         while proxy.links.urls().is_empty() {

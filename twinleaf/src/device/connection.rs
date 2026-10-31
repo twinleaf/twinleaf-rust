@@ -882,7 +882,6 @@ impl Device {
 mod tests {
     use super::*;
     use crate::device::fixtures::{self, open_through, FakeDevice, WAIT};
-    use crate::device::rpc::RpcArgs;
     use crate::device::session::TestProxy;
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::{call, Proxy};
@@ -1158,7 +1157,12 @@ mod tests {
             eprintln!("skipped: the one device attached makes auto unambiguous");
             return;
         }
-        let resolved = call(&proxy.endpoint(), "proxy.open", &"auto".encode_args(), WAIT);
+        let resolved = call(
+            &proxy.endpoint(),
+            "proxy.open",
+            &crate::proxy::encode("auto"),
+            WAIT,
+        );
         let message = resolved.expect_err("the proxy resolved auto").to_string();
 
         for target in ["auto", ""] {

@@ -27,9 +27,9 @@
 
 use super::runtime::ProxyAddress;
 use super::stream::{End, Lane, Queued};
-use crate::device::rpc::{CallError, RpcArgs, RpcErrorPayload};
+use crate::device::rpc::{CallError, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
+use crate::proxy::{encode, handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
@@ -143,7 +143,7 @@ impl Session {
             "" => AUTO,
             target => target,
         };
-        let request = (purpose.method(), target.encode_args());
+        let request = (purpose.method(), encode(&target));
         Session::request_async(proxy, request, &format!("open {target}"), timeout).await
     }
 
@@ -154,7 +154,7 @@ impl Session {
         layout: &Layout,
         timeout: Duration,
     ) -> io::Result<Session> {
-        let request = (MOUNT, layout.encode_args());
+        let request = (MOUNT, encode(&layout));
         Session::request_async(proxy, request, &format!("mount {layout}"), timeout).await
     }
 
@@ -165,7 +165,7 @@ impl Session {
         layout: &Layout,
         timeout: Duration,
     ) -> io::Result<Session> {
-        let request = (DEFAULT_LAYOUT, layout.encode_args());
+        let request = (DEFAULT_LAYOUT, encode(&layout));
         let goal = format!("hold {layout} as the default");
         Session::request_async(proxy, request, &goal, timeout).await
     }
@@ -697,11 +697,10 @@ impl Session {
 mod tests {
     use super::*;
     use crate::device::fixtures::{self, FakeDevice};
-    use crate::device::rpc::RpcReply;
     use crate::proto::rpc::{Method, RpcError};
     use crate::proxy::fixtures::assert_took;
     use crate::proxy::CLIENT_KEEPALIVE;
-    use crate::proxy::{client_name, Introduction};
+    use crate::proxy::{client_name, decode, Introduction};
     use crate::rt::BoxFuture;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -850,20 +849,20 @@ mod tests {
             let (name, args, hello) = self.expect_control();
             assert_eq!(name, "proxy.hello");
             assert_eq!(
-                Introduction::decode_reply(&args).unwrap(),
+                decode::<Introduction>(&args).unwrap(),
                 Introduction::of_this_process(client_name())
             );
             let (name, args, open) = self.expect_control();
             assert_eq!(name, method);
-            assert_eq!(String::decode_reply(&args).unwrap(), target);
+            assert_eq!(decode::<String>(&args).unwrap(), target);
             (hello, open)
         }
 
         /// Expect the handshake opening `target`, and accept it.
         fn accept_open(&mut self, target: &str) {
             let (hello, open) = self.expect_handshake("proxy.open", target);
-            self.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
-            self.send(&Packet::proxy_reply(open, &target.encode_args()).unwrap());
+            self.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
+            self.send(&Packet::proxy_reply(open, &encode(&target)).unwrap());
         }
 
         /// The next call the session sends, as its method name and its id.
@@ -916,7 +915,7 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, open) = end.expect_handshake("proxy.open", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
         assert!(
             end.next_within(Duration::from_millis(200)).is_none(),
             "the session sent more before the open was answered"
@@ -925,7 +924,7 @@ mod tests {
             !opening.is_finished(),
             "the open returned before its answer"
         );
-        end.send(&Packet::proxy_reply(open, &TARGET.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(open, &encode(&TARGET)).unwrap());
 
         let root = Handle::root(opening.join().unwrap().unwrap());
         let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
@@ -944,7 +943,7 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, open) = end.expect_handshake("proxy.open", "auto");
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
         let refusal = Packet::proxy_error(open, RpcError::Invalid, "auto finds two devices");
         end.send(&refusal.unwrap());
 
@@ -965,7 +964,7 @@ mod tests {
             protocol: 0,
             ..fake_host()
         };
-        end.send(&Packet::proxy_reply(hello, &older.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&older)).unwrap());
 
         let error = opening.join().unwrap().err().expect("the open failed");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
@@ -981,8 +980,8 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, probe) = end.expect_handshake("proxy.probe", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
-        end.send(&Packet::proxy_reply(probe, &TARGET.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
+        end.send(&Packet::proxy_reply(probe, &encode(&TARGET)).unwrap());
 
         assert!(opening.join().unwrap().is_ok());
     }
@@ -995,7 +994,7 @@ mod tests {
         let mut end = proxy.accept();
 
         let (hello, _) = end.expect_handshake("proxy.open", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
         end.send(&Packet::link(LinkStatus::Stopped));
 
         let error = opening.join().unwrap().err().expect("the open failed");
@@ -1324,7 +1323,7 @@ mod tests {
         let opening = thread::spawn(move || Session::open(&address, TARGET, Purpose::Use, WAIT));
         let mut end = proxy.accept();
         let (hello, open) = end.expect_handshake("proxy.open", TARGET);
-        end.send(&Packet::proxy_reply(hello, &fake_host().encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&fake_host())).unwrap());
 
         let beat = end.next_within(CLIENT_KEEPALIVE.every * 2);
         assert!(
@@ -1335,7 +1334,7 @@ mod tests {
             "the session sent {beat:?} while its open waited"
         );
 
-        end.send(&Packet::proxy_reply(open, &TARGET.encode_args()).unwrap());
+        end.send(&Packet::proxy_reply(open, &encode(&TARGET)).unwrap());
         assert!(opening.join().unwrap().is_ok());
     }
 

@@ -443,7 +443,6 @@ impl ProxyAddress {
 mod tests {
     use super::*;
     use crate::device::fixtures::{self, ENVIRONMENT, WAIT};
-    use crate::device::rpc::{RpcArgs, RpcReply};
 
     /// Runs [`ensure_proxy_at`] for `port` with `embedded` as its slot.
     /// Returns its outcome and the slot.
@@ -511,9 +510,9 @@ mod tests {
         let (port, ensured, hosted) = attempt.expect("no proxy was embedded");
         ensured.unwrap();
         assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
-        let hello = proxy::Introduction::of_this_process("test").encode_args();
+        let hello = proxy::encode(&proxy::Introduction::of_this_process("test"));
         let reply = proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
-        let host = proxy::Introduction::decode_reply(&reply).unwrap();
+        let host = proxy::decode::<proxy::Introduction>(&reply).unwrap();
         assert!(host.name.ends_with("(embedded)"), "{host}");
         let (ensured, again) = ensure_at(port, false, Mutex::default());
         ensured.unwrap();
@@ -608,7 +607,7 @@ mod tests {
             .into_inner()
             .unwrap()
             .expect("no proxy was hosted again");
-        let hello = proxy::Introduction::of_this_process("test").encode_args();
+        let hello = proxy::encode(&proxy::Introduction::of_this_process("test"));
         proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
     }
 

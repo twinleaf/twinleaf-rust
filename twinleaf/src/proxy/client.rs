@@ -3,6 +3,7 @@
 //! [`Session::run`] runs it.
 
 use super::auto::{self, Choice};
+use super::control::encode;
 use super::control::{self, Purpose, Refusal, Request};
 use super::link::{self, Lease, Link};
 use super::server::{Notice, Shared, Update};
@@ -12,7 +13,6 @@ use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
-use crate::tio::rpc::RpcArgs;
 use crate::tio::transport::{self, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::StreamExt;
 use std::collections::VecDeque;
@@ -494,7 +494,7 @@ impl Session {
                 log::debug!("Client {} is {client}", self.addr);
                 self.update(Update::Hello(client)).await;
                 let host = control::Introduction::of_this_process(&self.shared.options.name);
-                self.answer(id, Ok(host.encode_args()))
+                self.answer(id, Ok(encode(&host)))
             }
             Request::Open { target } => self.request_open(id, target, Purpose::Use),
             Request::Probe { url } => self.request_open(id, url, Purpose::Probe),
@@ -618,7 +618,7 @@ impl Session {
                 let target = binding.target.clone();
                 self.update(Update::Target(target.clone())).await;
                 self.binding = Some(binding);
-                Ok(target.encode_args())
+                Ok(encode(&target))
             }
             Err(_) if self.stopping() => return Err(self.stopped()),
             Err(refusal) => Err(refusal),
@@ -850,7 +850,7 @@ mod tests {
             .await;
         assert_eq!(
             answer(&next(&mut client.end).await),
-            (2, Ok(DEVICE.encode_args()))
+            (2, Ok(encode(&DEVICE)))
         );
         device
     }
@@ -917,7 +917,7 @@ mod tests {
 
     /// Returns the request to open `target`, with `id`.
     fn open(target: &str, id: u16) -> Packet {
-        Packet::proxy_request("proxy.open", &target.encode_args(), id).unwrap()
+        Packet::proxy_request("proxy.open", &encode(&target), id).unwrap()
     }
 
     /// Waits for the next packet the client is sent, skipping the proxy's
@@ -1030,7 +1030,7 @@ mod tests {
         device.end.send(&beat("/")).await;
 
         let opened = answer(&next(&mut client.end).await);
-        assert_eq!(opened, (2, Ok(DEVICE.encode_args())));
+        assert_eq!(opened, (2, Ok(encode(&DEVICE))));
         let message = format!("this connection already opened {DEVICE}");
         let refused = answer(&next(&mut client.end).await);
         assert_eq!(refused, (3, Err((RpcError::State, message))));
