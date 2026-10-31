@@ -333,10 +333,13 @@ fn get_rpcs(tio: &TioOpts, patterns: &[String], all: bool, json: bool) -> eyre::
     }
 }
 
+/// Returns the type the RPC `name` takes or replies with, from the table the
+/// proxy keeps, so the call itself is the only request sent to the device.
 fn infer_rpc_type(name: &str, device: &Device, kind: &str) -> RpcValueType {
-    match device.rpc_meta(name) {
-        Ok(meta) => meta.text_type(),
-        Err(_) => {
+    let registry = device.rpc_registry().ok();
+    match registry.as_ref().and_then(|registry| registry.find(name)) {
+        Some(desc) => desc.meta.text_type(),
+        None => {
             println!("Unknown RPC {kind} type, assuming 'string'. Use -t/-T to override.");
             RpcValueType::String { max_len: None }
         }
