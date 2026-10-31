@@ -62,6 +62,7 @@ minicbor = { version = "2.3", features = ["derive", "std"] }
 
 [dev-dependencies]
 proptest = "1"
+proptest-state-machine = "0.9"
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
 

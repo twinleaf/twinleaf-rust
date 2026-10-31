@@ -814,18 +814,6 @@ mod tests {
     }
 
     #[test]
-    fn forced_rollover_is_unchanged_when_decimation_divides_the_rate() {
-        // 10 Hz sampled, decimated by 2: the switch at undecimated sample 10
-        // (t = 1 s) is also the 5th output sample.
-        let batch = rollover_batch(10, 2, 5);
-        assert_eq!(batch.metadata().segment().start_time(), 1);
-        assert!(matches!(
-            batch.boundary().map(BoundaryReason::class),
-            Some(BoundaryClass::Seamless)
-        ));
-    }
-
-    #[test]
     fn a_rollover_continues_the_current_run() {
         let batch = rollover_batch(10, 2, 5);
         assert_eq!(

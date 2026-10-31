@@ -160,6 +160,8 @@ pub mod export;
 pub mod ops;
 
 #[cfg(test)]
+mod boundaries;
+#[cfg(test)]
 mod fixtures;
 
 #[doc(no_inline)]
