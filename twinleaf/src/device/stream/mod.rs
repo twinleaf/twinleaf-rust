@@ -5,9 +5,10 @@
 //! filtered to the subtree its view covers.
 //!
 //! A pump whose session the proxy opened follows the state the proxy keeps,
-//! with a `proxy.watch` of each device it needs. Any other pump asks the
-//! devices for their metadata, RPC table and settings itself, as the client
-//! inside the proxy does over a port on a link.
+//! presence and announcements included, with a `proxy.watch` of each device
+//! it needs. Any other pump asks the devices for their metadata, RPC table
+//! and settings itself, and follows their presence and announcements from
+//! the packets, as the client inside the proxy does over a port on a link.
 
 mod event;
 mod metadata;
@@ -35,6 +36,7 @@ use std::future::{self, Future};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use subscription::Sink;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -80,6 +82,9 @@ struct StreamState {
     presence: HashMap<DeviceRoute, Presence>,
     /// The worker of each device whose RPC table or settings were asked for.
     workers: HashMap<DeviceRoute, Worker>,
+    /// Whether presence and setting changes come from the packets, rather
+    /// than from the proxy's watches.
+    derives: bool,
     batches: VecDeque<SampleBatch>,
     changes: VecDeque<Change>,
 }
@@ -133,8 +138,12 @@ impl Watched {
     }
 }
 
-/// Asks the proxy over `root` for `watch`, as the next of `watches`.
+/// Asks the proxy over `root` for `watch`, as the next of `watches`, unless
+/// it is one of them already.
 fn start_watch(root: &Handle, watches: &mut HashMap<u16, Watched>, watch: Watch) {
+    if watches.values().any(|watched| watched.watch == watch) {
+        return;
+    }
     let id = u16::try_from(watches.len() + 1).unwrap_or(u16::MAX);
     match Packet::proxy_request(WATCH, &encode(&watch), id) {
         Ok(request) => root.session().send(request),
@@ -188,7 +197,7 @@ fn link_presence(status: packet::LinkStatus, since: std::time::Instant) -> Optio
 }
 
 impl StreamState {
-    fn new() -> StreamState {
+    fn new(derives: bool) -> StreamState {
         StreamState {
             parser: PacketParser::new(false),
             known_routes: HashSet::new(),
@@ -197,6 +206,7 @@ impl StreamState {
             link_state: HashMap::new(),
             presence: HashMap::new(),
             workers: HashMap::new(),
+            derives,
             batches: VecDeque::new(),
             changes: VecDeque::new(),
         }
@@ -298,10 +308,13 @@ impl StreamState {
     /// mount of what the proxy serves.
     fn apply_status(&mut self, subtree: DeviceRoute, status: packet::LinkStatus) {
         let now = std::time::Instant::now();
-        self.link_state
-            .retain(|root, _| !root.starts_with(&subtree));
-        self.link_state.insert(subtree, (status, now));
-        if let Some(presence) = link_presence(status, now) {
+        let presence = link_presence(status, now).filter(|_| self.derives);
+        if self.derives {
+            self.link_state
+                .retain(|root, _| !root.starts_with(&subtree));
+            self.link_state.insert(subtree, (status, now));
+        }
+        if let Some(presence) = presence {
             let served: Vec<_> = self
                 .presence
                 .keys()
@@ -345,21 +358,16 @@ impl StreamState {
             self.changes.push_back(Change::Route(route));
         }
         let session = match self.presence.get(&route) {
-            Some(Presence::Alive { session, .. }) => *session,
+            Some(Presence::Alive { session }) => *session,
             _ => None,
         };
-        let heartbeat = match self.presence.get(&route) {
-            Some(Presence::Alive { heartbeat, .. }) => *heartbeat,
-            _ => None,
+        let session = match pkt.payload() {
+            packet::Payload::Heartbeat(beat) => beat.session().or(session),
+            _ => session,
         };
-        let alive = match pkt.payload() {
-            packet::Payload::Heartbeat(beat) => Presence::Alive {
-                session: beat.session().or(session),
-                heartbeat: Some(std::time::Instant::now()),
-            },
-            _ => Presence::Alive { session, heartbeat },
-        };
-        self.set_presence(route, alive);
+        if self.derives {
+            self.set_presence(route, Presence::Alive { session });
+        }
 
         match pkt.payload() {
             packet::Payload::Heartbeat(beat) => {
@@ -383,8 +391,10 @@ impl StreamState {
                         seq: setting.seq,
                         reply: setting.reply.to_vec(),
                     };
-                    self.changes
-                        .push_back(Change::Setting(route, change.clone()));
+                    if self.derives {
+                        self.changes
+                            .push_back(Change::Setting(route, change.clone()));
+                    }
                     self.device_event(
                         route,
                         DeviceEvent::Setting {
@@ -668,10 +678,11 @@ impl Pump {
 
     fn new(root: &Handle, inlet: Inlet, commands: mpsc::UnboundedReceiver<PumpSink>) -> Pump {
         let (teach, learned) = mpsc::unbounded_channel();
+        let watches = root.session().watches();
         Pump {
             root: root.clone(),
-            state: StreamState::new(),
-            source: match root.session().watches() {
+            state: StreamState::new(!watches),
+            source: match watches {
                 true => Source::Watches(HashMap::new()),
                 false => Source::Asks(MetadataSchedule::new(root.clone())),
             },
@@ -722,6 +733,16 @@ impl Pump {
                 Turn::Ended(end) => break end,
             }
         };
+        // Every device is lost with the session, which no watch can say once
+        // the proxy is gone.
+        let since = std::time::Instant::now();
+        let routes: Vec<_> = self.sinks.presence.iter().map(|s| s.scope.route).collect();
+        for route in routes {
+            if !matches!(self.state.presence_of(route), Presence::Lost { .. }) {
+                self.state.set_presence(route, Presence::Lost { since });
+            }
+        }
+        self.publish();
         self.sinks.end(end);
         self.state.workers.clear();
         while let Some(sink) = self.commands.recv().await {
@@ -732,6 +753,23 @@ impl Pump {
     /// Takes a new subscription. A subscription to state receives the
     /// current value first.
     fn add_sink(&mut self, sink: PumpSink) {
+        if let (
+            PumpSink::Presence(Sink { scope, .. })
+            | PumpSink::Metadata(Sink { scope, .. })
+            | PumpSink::SettingChanges(Sink { scope, .. }),
+            Source::Watches(watches),
+        ) = (&sink, &mut self.source)
+        {
+            let route = scope.route;
+            start_watch(
+                &self.root,
+                watches,
+                Watch {
+                    route,
+                    table: false,
+                },
+            );
+        }
         let state = &self.state;
         match sink {
             PumpSink::Batches(sink) => self.sinks.batches.push(sink),
@@ -853,6 +891,21 @@ impl Pump {
                 self.state.publish_metadata(route);
             }
             Update::Unsupported => self.state.metadata_unavailable(route),
+            Update::Connecting => self.state.set_presence(route, Presence::Connecting),
+            Update::Alive(session) => {
+                let session = session.map(SessionId::new);
+                self.state.set_presence(route, Presence::Alive { session });
+            }
+            Update::Lost(ago) => {
+                let now = std::time::Instant::now();
+                let since = now.checked_sub(Duration::from_millis(ago)).unwrap_or(now);
+                self.state.set_presence(route, Presence::Lost { since });
+            }
+            Update::Setting { name, seq, reply } => {
+                let reply = reply.into();
+                let change = SettingChange { name, seq, reply };
+                self.state.changes.push_back(Change::Setting(route, change));
+            }
             Update::Settings {
                 hash,
                 session,
@@ -960,6 +1013,9 @@ impl Pump {
     /// device there that the pump has not heard, whose presence comes from
     /// the status alone.
     fn status_reached_unheard(&mut self, subtree: DeviceRoute) {
+        if !self.state.derives {
+            return;
+        }
         let unheard: Vec<_> = self
             .sinks
             .presence
@@ -1030,7 +1086,6 @@ impl Pump {
                         table: false,
                     })
                     .filter(|watch| covers(watch.route))
-                    .filter(|watch| !watches.values().any(|watched| watched.watch == *watch))
                     .collect();
                 for watch in unwatched {
                     start_watch(&self.root, watches, watch);
@@ -2240,11 +2295,12 @@ mod tests {
         assert_eq!(presence.recv(), Ok(Presence::Connecting));
 
         proxy.send(Packet::heartbeat_session(7, route));
-        let Ok(Presence::Alive { session, heartbeat }) = presence.recv() else {
-            panic!("a heartbeat makes the device alive");
-        };
-        assert_eq!(session, Some(WireSessionId::new(7)));
-        assert!(heartbeat.is_some());
+        assert_eq!(
+            presence.recv(),
+            Ok(Presence::Alive {
+                session: Some(WireSessionId::new(7))
+            })
+        );
 
         proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
         assert!(matches!(presence.recv(), Ok(Presence::Lost { .. })));
@@ -2535,6 +2591,120 @@ mod tests {
         let joined: Vec<_> = parts.iter().filter_map(|part| watched.join(part)).collect();
         assert_eq!(joined.len(), 1, "only the last part completes the update");
         assert_eq!(decode::<Update>(&joined[0]).unwrap(), update);
+    }
+
+    /// The watch request the pump wrote next, as its id and what it follows.
+    fn watch_request(proxy: &TestProxy) -> (u16, Watch) {
+        let request = proxy
+            .sent
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the pump watches the device");
+        let packet::Payload::ProxyTx(request) = request.payload() else {
+            panic!("expected a watch, got {:?}", request.payload());
+        };
+        (request.id.value(), decode(request.args).unwrap())
+    }
+
+    /// Hands the pump `update` as the proxy's replies to watch `id`.
+    fn reply_update(proxy: &TestProxy, id: u16, update: &Update) {
+        for part in crate::proxy::parts(id, update) {
+            proxy.send(part);
+        }
+    }
+
+    /// A table receiver taken with a change receiver holds the table by the
+    /// time a change arrives, even as the settings that change replaces are
+    /// on their way. A reader decodes each change with that table.
+    #[test]
+    fn a_table_subscribed_with_the_changes_is_held_when_a_change_arrives() {
+        let (session, proxy) = Session::test_pair();
+        let stream = Arc::new(Stream::new(Handle::root(session.watching())));
+        let route = DeviceRoute::root();
+        let loaded = stream.rpc_registry(route);
+        let (table_watch, _) = watch_request(&proxy);
+        let table = Update::Table {
+            hash: Some(1),
+            session: None,
+            entries: vec![("test.gain".to_string(), 0xA742)],
+        };
+        reply_update(&proxy, table_watch, &table);
+        loaded.recv().unwrap().expect("the table loads");
+
+        let changes = stream.setting_changes(route);
+        let tables = stream.rpc_registry(route);
+        let (device_watch, _) = watch_request(&proxy);
+        let announced = Update::Setting {
+            name: "test.gain".to_string(),
+            seq: Some(2),
+            reply: 1.5f32.to_le_bytes().to_vec().into(),
+        };
+        reply_update(&proxy, device_watch, &announced);
+        let values =
+            std::collections::BTreeMap::from([("test.gain".to_string(), vec![2u8].into())]);
+        let settings = Update::Settings {
+            hash: Some(1),
+            session: None,
+            version: Some(2),
+            values,
+        };
+        reply_update(&proxy, table_watch, &settings);
+
+        assert_eq!(changes.recv().unwrap().seq, Some(2));
+        let held = tables.try_recv().unwrap().expect("the table is held");
+        assert!(held.unwrap().find("test.gain").is_some());
+    }
+
+    /// A pump that watches the proxy takes presence and setting changes from
+    /// the watch alone. It watches a device once a presence subscriber asks,
+    /// before the device is heard, and a heartbeat or an announcement it
+    /// receives changes neither.
+    #[test]
+    fn a_watching_pump_takes_presence_and_setting_changes_from_the_proxy_alone() {
+        let (session, proxy) = Session::test_pair();
+        let stream = Arc::new(Stream::new(Handle::root(session.watching())));
+        let route = DeviceRoute::root();
+        let presence = stream.presence(route);
+        let changes = stream.setting_changes(route);
+        assert_eq!(presence.recv(), Ok(Presence::Connecting));
+        let (id, watch) = watch_request(&proxy);
+        assert_eq!(
+            watch,
+            Watch {
+                route,
+                table: false
+            }
+        );
+
+        proxy.send(Packet::heartbeat_session(7, route));
+        proxy.send(announcement("test.amplitude", Some(1), &[1], route));
+        let quiet = Duration::from_millis(200);
+        assert_eq!(presence.recv_timeout(quiet), Err(RecvError::Timeout));
+        assert_eq!(changes.recv_timeout(quiet), Err(RecvError::Timeout));
+
+        let announced = Update::Setting {
+            name: "test.amplitude".to_string(),
+            seq: Some(1),
+            reply: vec![1].into(),
+        };
+        reply_update(&proxy, id, &Update::Alive(Some(7)));
+        reply_update(&proxy, id, &announced);
+        assert_eq!(
+            presence.recv(),
+            Ok(Presence::Alive {
+                session: Some(WireSessionId::new(7))
+            })
+        );
+        let change = changes.recv().expect("the proxy's announcement");
+        assert_eq!(
+            (change.name.as_str(), change.reply),
+            ("test.amplitude", vec![1])
+        );
+
+        reply_update(&proxy, id, &Update::Lost(1000));
+        let Ok(Presence::Lost { since }) = presence.recv() else {
+            panic!("the proxy's loss of the device");
+        };
+        assert!(since.elapsed() >= Duration::from_secs(1));
     }
 
     /// A receiver dropped while the device is silent is pruned at once. A

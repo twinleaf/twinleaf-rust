@@ -28,31 +28,18 @@ use twinleaf::{
 
 #[derive(Default)]
 struct DeviceState {
-    last_heartbeat: Option<Instant>,
-    heartbeat_toggle: bool,
+    /// The device is sending.
+    alive: bool,
     /// The device's link lost it, and it has not been heard since.
     lost: bool,
 }
 
 impl DeviceState {
-    fn heartbeat_char(&self, now: Instant) -> char {
-        let fresh = self
-            .last_heartbeat
-            .map(|t| now.duration_since(t) < Duration::from_millis(500))
-            .unwrap_or(false);
-
-        if !fresh {
-            '♡' // No recent heartbeat
-        } else if self.heartbeat_toggle {
-            '♥' // Filled
-        } else {
-            '♡' // Empty
+    fn heartbeat_char(&self) -> char {
+        match self.alive {
+            true => '♥',
+            false => '♡',
         }
-    }
-
-    fn on_heartbeat(&mut self, now: Instant) {
-        self.last_heartbeat = Some(now);
-        self.heartbeat_toggle = !self.heartbeat_toggle;
     }
 }
 
@@ -654,6 +641,7 @@ impl HealthState {
 
     fn handle_presence(&mut self, route: DeviceRoute, presence: Presence) {
         let state = self.device_states.entry(route).or_default();
+        state.alive = matches!(presence, Presence::Alive { .. });
         match presence {
             Presence::Lost { .. } if !state.lost => {
                 state.lost = true;
@@ -665,13 +653,8 @@ impl HealthState {
                     }
                 }
             }
-            Presence::Alive { heartbeat, .. } => {
+            Presence::Alive { .. } => {
                 let back = std::mem::take(&mut state.lost);
-                if let Some(heartbeat) =
-                    heartbeat.filter(|beat| state.last_heartbeat != Some(*beat))
-                {
-                    state.on_heartbeat(heartbeat);
-                }
                 if back {
                     self.log_event(format!("[{}] BACK", route), Severity::Info);
                 }
@@ -1216,7 +1199,7 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut HealthState) -> io::Result<
     let mut heartbeat_entries: Vec<_> = app
         .device_states
         .iter()
-        .map(|(route, state)| (route.to_string(), state.heartbeat_char(now)))
+        .map(|(route, state)| (route.to_string(), state.heartbeat_char()))
         .collect();
     heartbeat_entries.sort_by(|a, b| a.0.cmp(&b.0));
     let heartbeat_display: String = heartbeat_entries

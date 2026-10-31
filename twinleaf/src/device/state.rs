@@ -27,12 +27,11 @@ pub enum Presence {
     /// Nothing has been heard from the device yet, or its link reconnected
     /// and it has not spoken since.
     Connecting,
-    /// The device is sending.
+    /// The device is sending. It stays alive until its link loses it, which
+    /// the proxy does once the link goes quiet for 1 s, or 3 s over TCP.
     Alive {
         /// The session its last heartbeat reported, when one did.
         session: Option<SessionId>,
-        /// When its last heartbeat arrived, if one has.
-        heartbeat: Option<Instant>,
     },
     /// The link that serves the device lost it or stopped.
     Lost {

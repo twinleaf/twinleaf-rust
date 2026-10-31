@@ -57,17 +57,20 @@
 //!   Only a proxy with [`HostOptions::stoppable`] set accepts it.
 //! - `proxy.watch` takes the route of a device the connection opened, as
 //!   the client sees it, and whether to follow the device's RPC table and
-//!   settings rather than its metadata. It replies with the state now, and
-//!   again at each change, all under the request's id. Each reply is one
-//!   part of an update, the array of the part's index, the count of parts
-//!   and its bytes, and the bytes of every part in order are one CBOR item.
-//!   An update is the device's complete metadata as its own metadata
+//!   settings rather than its presence, metadata and announcements. It
+//!   replies with the state now, and again at each change, all under the
+//!   request's id. Each reply is one part of an update, the array of the
+//!   part's index, the count of parts and its bytes, and the bytes of every
+//!   part in order are one CBOR item.
+//!   An update is the device's presence, which is connecting, alive in a
+//!   session, or lost some milliseconds before the update went out, one
+//!   setting it announced, its complete metadata as its own metadata
 //!   packets, that it has no `dev.metadata`, its RPC table as the hash, the
 //!   session and each entry's name and metadata word, why the table did not
 //!   load, or the values of its announced settings with the table's hash,
 //!   their session and their version. The proxy asks each device for this
-//!   state once, for every client that watches it, and a client asks the
-//!   device nothing of it.
+//!   state once, for every client that watches it. A client asks the device
+//!   nothing of it, and takes none of it from the packets it receives.
 //!
 //! A target is one of these.
 //!

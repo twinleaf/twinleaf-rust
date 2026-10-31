@@ -10,7 +10,7 @@ use super::server::{Notice, Shared, Update};
 use super::worker;
 use super::Layout;
 use crate::device::rpc::RpcRegistry;
-use crate::device::{Device, MetadataState};
+use crate::device::{Device, MetadataState, RecvError};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture};
@@ -835,23 +835,33 @@ async fn resolve(
     }
 }
 
-/// Returns the updates a watch of `device` sends, of its metadata, or with
-/// `table` of its RPC table and settings. A table goes out ahead of the first
+/// Returns the updates a watch of `device` sends, of its presence, metadata
+/// and announced settings, or with `table` of its RPC table and settings. A table goes out ahead of the first
 /// settings read with it. The stream ends with the client that keeps them.
 fn updates(device: &Device, table: bool) -> BoxStream<'static, control::Update> {
     if !table {
-        return stream::unfold(device.metadata_updates(), |metadata| async move {
-            loop {
-                let update = match metadata.recv_async().await.ok()? {
+        let followed = (
+            device.presence_updates(),
+            device.metadata_updates(),
+            device.setting_changes(),
+        );
+        return stream::unfold(followed, |(presence, metadata, changes)| async move {
+            let update = tokio::select! {
+                now = presence.recv_async() => Some(control::Update::presence(now.ok()?)),
+                state = metadata.recv_async() => match state.ok()? {
                     MetadataState::Ready(snapshot) => control::Update::metadata(&snapshot),
                     MetadataState::Unsupported => Some(control::Update::Unsupported),
                     MetadataState::Pending => None,
-                };
-                if let Some(update) = update {
-                    return Some((update, metadata));
-                }
-            }
+                },
+                change = changes.recv_async() => match change {
+                    Ok(change) => Some(control::Update::setting(change)),
+                    Err(RecvError::Lagged(_)) => None,
+                    Err(_) => return None,
+                },
+            };
+            Some((stream::iter(update), (presence, metadata, changes)))
         })
+        .flatten()
         .boxed();
     }
     let followed = (

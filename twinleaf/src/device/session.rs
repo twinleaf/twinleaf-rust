@@ -744,6 +744,15 @@ impl Session {
         Session::test_pair_on(&Supervisor::new())
     }
 
+    /// The same session, its pump watching the proxy's state as a session
+    /// the proxy opened does.
+    pub(crate) fn watching(self) -> Session {
+        Session {
+            watches: true,
+            ..self
+        }
+    }
+
     /// [`test_pair`](Self::test_pair) with the session's task on `tasks`.
     pub(crate) fn test_pair_on(tasks: &Supervisor) -> (Session, TestProxy) {
         let (sender, sent) = flume::unbounded();

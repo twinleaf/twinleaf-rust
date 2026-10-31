@@ -7,7 +7,7 @@
 use super::Layout;
 use crate::data::DeviceMetadataSnapshot;
 use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use crate::device::{RegistryState, Settings};
+use crate::device::{Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
@@ -158,7 +158,7 @@ pub(crate) struct Watch {
     #[cbor(with = "hops")]
     pub(crate) route: DeviceRoute,
     /// Whether the watch follows the RPC table and the settings, rather
-    /// than the metadata.
+    /// than the presence, the metadata and the announced settings.
     #[n(1)]
     pub(crate) table: bool,
 }
@@ -197,7 +197,7 @@ pub(crate) enum Update {
     TimedOut,
     /// The RPC table did not load, as a call got no reply.
     #[n(6)]
-    Lost,
+    Unanswered,
     /// The values of the announced settings, as the hash of the table they
     /// were read with, their session and version, and each value by name.
     #[n(7)]
@@ -210,6 +210,28 @@ pub(crate) enum Update {
         version: Option<u32>,
         #[n(3)]
         values: BTreeMap<String, ByteVec>,
+    },
+    /// The device has not been heard yet, or its link reconnected and it has
+    /// not spoken since.
+    #[n(8)]
+    Connecting,
+    /// The device is sending, in the session its heartbeats report.
+    #[n(9)]
+    Alive(#[n(0)] Option<u32>),
+    /// The device's link lost it this many milliseconds before the update
+    /// went out.
+    #[n(10)]
+    Lost(#[n(0)] u64),
+    /// One setting the device announced, its name, its `settings.version`
+    /// once counted and its value.
+    #[n(11)]
+    Setting {
+        #[n(0)]
+        name: String,
+        #[n(1)]
+        seq: Option<u32>,
+        #[n(2)]
+        reply: ByteVec,
     },
 }
 
@@ -248,7 +270,7 @@ impl Update {
             }
             RpcRegistryError::DeviceRpcError(CallError::Timeout) => Update::TimedOut,
             RpcRegistryError::TableChanged => Update::Changed,
-            RpcRegistryError::DeviceRpcError(_) => Update::Lost,
+            RpcRegistryError::DeviceRpcError(_) => Update::Unanswered,
         }
     }
 
@@ -262,6 +284,28 @@ impl Update {
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_vec().into()))
                 .collect(),
+        }
+    }
+
+    /// Returns the update of a device's presence. How long ago it was lost
+    /// travels as a duration, as the two ends share no clock.
+    pub(crate) fn presence(presence: Presence) -> Update {
+        match presence {
+            Presence::Connecting => Update::Connecting,
+            Presence::Alive { session } => Update::Alive(session.map(SessionId::value)),
+            Presence::Lost { since } => {
+                let ago = since.elapsed().as_millis();
+                Update::Lost(u64::try_from(ago).unwrap_or(u64::MAX))
+            }
+        }
+    }
+
+    /// Returns the update of one announced setting.
+    pub(crate) fn setting(change: SettingChange) -> Update {
+        Update::Setting {
+            name: change.name,
+            seq: change.seq,
+            reply: change.reply.into(),
         }
     }
 
@@ -285,9 +329,9 @@ impl Update {
                 extra: message.into(),
             })),
             Update::TimedOut => failed(CallError::Timeout),
-            Update::Lost => failed(CallError::ResponseLost),
+            Update::Unanswered => failed(CallError::ResponseLost),
             Update::Changed => Some(Err(RpcRegistryError::TableChanged)),
-            Update::Metadata(_) | Update::Unsupported | Update::Settings { .. } => None,
+            _ => None,
         }
     }
 }

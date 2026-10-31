@@ -368,19 +368,6 @@ fn row_style(color: Color, selected: bool, stale: bool, in_plot_mode: bool) -> S
     s
 }
 
-#[derive(Debug, Clone, Default)]
-struct DeviceStatus {
-    last_heartbeat: Option<Instant>,
-}
-
-impl DeviceStatus {
-    fn is_alive(&self, timeout: Duration) -> bool {
-        self.last_heartbeat
-            .map(|t| t.elapsed() < timeout)
-            .unwrap_or(false)
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Action {
     Quit,
@@ -468,7 +455,7 @@ struct MonitorState {
     nav_items: Vec<NavPos>,
 
     discovered_routes: HashSet<DeviceRoute>,
-    device_status: HashMap<DeviceRoute, DeviceStatus>,
+    device_presence: HashMap<DeviceRoute, Presence>,
     device_metadata: HashMap<DeviceRoute, DeviceMetadataSnapshot>,
     fft_series: Vec<FftSeries>,
     fft_status: FftStatus,
@@ -504,7 +491,7 @@ impl MonitorState {
             nav: Nav::default(),
             nav_items: Vec::new(),
             discovered_routes: HashSet::new(),
-            device_status: HashMap::new(),
+            device_presence: HashMap::new(),
             device_metadata: HashMap::new(),
             fft_series: Vec::new(),
             fft_status: FftStatus::WaitingForSelection,
@@ -809,18 +796,11 @@ impl MonitorState {
     fn on_routes(&mut self, routes: &[DeviceRoute]) {
         for &route in routes {
             self.discovered_routes.insert(route);
-            self.device_status.entry(route).or_default();
         }
     }
 
     fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
-        if let Presence::Alive {
-            heartbeat: Some(heartbeat),
-            ..
-        } = presence
-        {
-            self.device_status.entry(route).or_default().last_heartbeat = Some(heartbeat);
-        }
+        self.device_presence.insert(route, presence);
     }
 
     fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
@@ -1331,10 +1311,7 @@ fn build_left_lines(
     for (dev_idx, route) in routes.iter().enumerate() {
         let dev = app.device_metadata.get(route).map(|m| m.device());
 
-        let status = app.device_status.get(route);
-        let is_alive = status
-            .map(|s| s.is_alive(Duration::from_millis(300)))
-            .unwrap_or(false);
+        let is_alive = matches!(app.device_presence.get(route), Some(Presence::Alive { .. }));
 
         let is_selected_header = if app.console.is_open() {
             *route == app.console.target(app.current_route())

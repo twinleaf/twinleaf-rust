@@ -650,9 +650,9 @@ impl Device {
 
     /// Returns whether this device is there now.
     ///
-    /// The connection follows each device from its packets and the statuses
-    /// of the link that serves it. A device it has not heard from is
-    /// [`Presence::Connecting`]. Once the connection has ended, every device
+    /// The proxy follows each device from its packets and the statuses of
+    /// the link that serves it, and every client watches what it found. A
+    /// device not heard from yet is [`Presence::Connecting`]. Once the connection has ended, every device
     /// is [`Presence::Lost`].
     pub fn presence(&self) -> Presence {
         self.presence_updates().recv().unwrap_or(Presence::Lost {
@@ -661,8 +661,8 @@ impl Device {
     }
 
     /// Subscribes to whether this device is there. The receiver yields the
-    /// presence now, then each change, including each heartbeat. A reader
-    /// that falls behind skips to the newest.
+    /// presence now, then each change. A heartbeat changes it only when it
+    /// reports a new session. A reader that falls behind skips to the newest.
     pub fn presence_updates(&self) -> Receiver<Presence> {
         self.tree.stream.presence(self.route())
     }
@@ -1239,7 +1239,8 @@ mod tests {
     /// The proxy keeps each device's state for all its clients. However many
     /// follow a device, and wherever they mount it, the device is asked once
     /// for its metadata, walked once for its RPC table and read once for its
-    /// settings, and each announcement reaches every client's settings.
+    /// settings. Each announcement and the device's presence reach every
+    /// client from the proxy, up to the loss of a device gone quiet.
     #[test]
     fn clients_of_one_proxy_share_one_discovery_table_walk_and_snapshot() {
         let device = FakeDevice::start();
@@ -1279,6 +1280,7 @@ mod tests {
                 (Some(7), Some(&[1u8][..]))
             );
         }
+        let changes: Vec<_> = views.iter().map(Device::setting_changes).collect();
         let mut raw = [0u8; 64];
         let announced = crate::proto::settings::Setting {
             name: b"test.amplitude",
@@ -1288,7 +1290,7 @@ mod tests {
         let len = announced.write(&mut raw).unwrap();
         device.send(tio::Packet::from_slice_prefix(&raw[..len]).unwrap().0);
         let deadline = Instant::now() + WAIT;
-        for view in &views {
+        for (view, changes) in views.iter().zip(&changes) {
             let updates = view.settings_updates();
             let kept = loop {
                 let settings = updates.recv_deadline(deadline).expect("the announcement");
@@ -1297,6 +1299,18 @@ mod tests {
                 }
             };
             assert_eq!(kept.get("test.amplitude"), Some(&[2u8][..]));
+            let change = changes.recv_deadline(deadline).expect("the announcement");
+            assert_eq!((change.seq, change.reply), (Some(8), vec![2]));
+            assert_eq!(view.presence(), Presence::Alive { session: None });
+        }
+
+        // The link loses a device quiet for 3 s over TCP, and so does every
+        // client, from the proxy.
+        let presence: Vec<_> = views.iter().map(Device::presence_updates).collect();
+        device.go_quiet();
+        let deadline = Instant::now() + WAIT * 2;
+        for presence in &presence {
+            while !matches!(presence.recv_deadline(deadline), Ok(Presence::Lost { .. })) {}
         }
 
         forget_table();

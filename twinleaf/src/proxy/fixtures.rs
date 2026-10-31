@@ -58,6 +58,8 @@ struct DeviceState {
     resets: AtomicUsize,
     /// Set once the device is gone.
     dead: AtomicBool,
+    /// Set once the device sends no more heartbeats.
+    quiet: AtomicBool,
     /// Packets for a connection to send.
     outbox: Mutex<Vec<Packet>>,
     /// Every packet the device received.
@@ -176,6 +178,12 @@ impl FakeDevice {
         self.state.dead.store(true, Ordering::SeqCst);
     }
 
+    /// Stops sending heartbeats, and keeps every connection open, as a
+    /// device that hangs does.
+    pub(crate) fn go_quiet(&self) {
+        self.state.quiet.store(true, Ordering::SeqCst);
+    }
+
     /// Returns the hash of the device's RPC table.
     pub(crate) fn table_hash(&self) -> u32 {
         self.state.table_hash
@@ -282,7 +290,9 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
         if state.reset_generation.load(Ordering::SeqCst) != born.reset {
             return reset(stream, state);
         }
-        if Instant::now() >= next_beat {
+        if state.quiet.load(Ordering::SeqCst) {
+            next_beat = Instant::now();
+        } else if Instant::now() >= next_beat {
             if stream.write_all(heartbeat.as_bytes()).is_err() {
                 return;
             }
