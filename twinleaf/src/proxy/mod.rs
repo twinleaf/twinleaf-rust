@@ -55,6 +55,19 @@
 //!   accepts it, from one connection at a time.
 //! - `proxy.stop` takes nothing and replies nothing, then stops the proxy.
 //!   Only a proxy with [`HostOptions::stoppable`] set accepts it.
+//! - `proxy.watch` takes the route of a device the connection opened, as
+//!   the client sees it, and whether to follow the device's RPC table and
+//!   settings rather than its metadata. It replies with the state now, and
+//!   again at each change, all under the request's id. Each reply is one
+//!   part of an update, the array of the part's index, the count of parts
+//!   and its bytes, and the bytes of every part in order are one CBOR item.
+//!   An update is the device's complete metadata as its own metadata
+//!   packets, that it has no `dev.metadata`, its RPC table as the hash, the
+//!   session and each entry's name and metadata word, why the table did not
+//!   load, or the values of its announced settings with the table's hash,
+//!   their session and their version. The proxy asks each device for this
+//!   state once, for every client that watches it, and a client asks the
+//!   device nothing of it.
 //!
 //! A target is one of these.
 //!
@@ -117,11 +130,10 @@ mod server;
 mod worker;
 
 #[cfg(test)]
-pub(crate) use control::decode;
-#[cfg(test)]
-pub(crate) use control::CLIENT_KEEPALIVE;
+pub(crate) use control::{parts, CLIENT_KEEPALIVE};
 pub(crate) use control::{
-    call, encode, executable_name, handshake, Purpose, DEFAULT_LAYOUT, MOUNT,
+    call, decode, encode, executable_name, handshake, Part, Purpose, Update, Watch, DEFAULT_LAYOUT,
+    MOUNT, WATCH,
 };
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};

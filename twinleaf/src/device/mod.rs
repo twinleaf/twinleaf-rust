@@ -105,7 +105,7 @@ pub mod discovery;
 pub mod record;
 pub mod rpc;
 pub(crate) mod runtime;
-mod session;
+pub(crate) mod session;
 mod state;
 mod stream;
 

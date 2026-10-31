@@ -85,13 +85,29 @@ pub struct Settings {
 }
 
 impl Settings {
-    fn of(registry: &Arc<RpcRegistry>, cache: &SettingsCache) -> Settings {
+    /// Creates the settings read with `registry` in `session`, exact at
+    /// `version`, holding `values` by name.
+    pub(crate) fn new(
+        registry: Arc<RpcRegistry>,
+        session: Option<SessionId>,
+        version: Option<u32>,
+        values: BTreeMap<String, Vec<u8>>,
+    ) -> Settings {
         Settings {
-            registry: Arc::clone(registry),
-            session: cache.session(),
-            version: cache.version(),
-            values: cache.values().clone(),
+            registry,
+            session,
+            version,
+            values,
         }
+    }
+
+    fn of(registry: &Arc<RpcRegistry>, cache: &SettingsCache) -> Settings {
+        Settings::new(
+            Arc::clone(registry),
+            cache.session(),
+            cache.version(),
+            cache.values().clone(),
+        )
     }
 
     /// Returns the value of `name` as the bytes its RPC replies, or `None`

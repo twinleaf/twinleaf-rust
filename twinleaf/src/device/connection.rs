@@ -245,6 +245,11 @@ impl Connection {
         self.tree.handle.session().close();
     }
 
+    /// Returns `true` once the connection has ended.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tree.handle.session().is_closed()
+    }
+
     /// Opens `url` through `proxy` for `purpose`, waiting at most
     /// `open_timeout` for the proxy to open it. A TCP URL on this machine is
     /// reached directly.
@@ -469,11 +474,6 @@ impl DeviceTree {
         self.stream.routes(Scope::of(&self.handle))
     }
 
-    /// Returns the session handle behind this view.
-    pub(super) fn handle(&self) -> &Handle {
-        &self.handle
-    }
-
     /// Collects complete metadata for `route`, waiting up to 10 s. See
     /// [`Device::metadata`].
     ///
@@ -669,8 +669,8 @@ impl Device {
 
     /// Collects this device's complete metadata, waiting up to 10 s.
     ///
-    /// The connection asks the device once, and every caller shares what it
-    /// collected.
+    /// The proxy asks the device once, and every caller of every client of
+    /// the proxy shares what it collected.
     ///
     /// # Errors
     ///
@@ -782,8 +782,8 @@ impl Device {
     /// Returns the RPCs this device offers, waiting until the table is
     /// loaded.
     ///
-    /// The connection loads the table once, and every caller shares it. It
-    /// comes from the on-disk cache when the device's `rpc.hash` matches it.
+    /// The proxy loads the table once, and every caller of every client of
+    /// the proxy shares it. It comes from the on-disk cache when the device's `rpc.hash` matches it.
     /// On a miss it is read with `rpc.listinfo` and cached. A cache that
     /// cannot be read or written is logged and skipped. The table is loaded
     /// again when the device announces a new `rpc.hash`, starts a new
@@ -813,8 +813,9 @@ impl Device {
     /// Returns the values of this device's announced settings, waiting until
     /// the RPC table is loaded and the values are read.
     ///
-    /// The connection reads them once and keeps them by the device's
-    /// announcements, and every caller shares them. See [`Settings`].
+    /// The proxy reads them once and keeps them by the device's
+    /// announcements, and every caller of every client of the proxy shares
+    /// them. See [`Settings`].
     ///
     /// # Errors
     ///
@@ -1233,6 +1234,108 @@ mod tests {
         };
         assert_eq!(ended, RecvError::Stopped);
         assert_eq!(ended.to_string(), "the proxy stopped");
+    }
+
+    /// The proxy keeps each device's state for all its clients. However many
+    /// follow a device, and wherever they mount it, the device is asked once
+    /// for its metadata, walked once for its RPC table and read once for its
+    /// settings, and each announcement reaches every client's settings.
+    #[test]
+    fn clients_of_one_proxy_share_one_discovery_table_walk_and_snapshot() {
+        let device = FakeDevice::start();
+        let forget_table = || {
+            if let Some(cached) = super::super::rpc::cache::path("FAKE", device.table_hash()) {
+                let _ = std::fs::remove_file(cached);
+            }
+        };
+        forget_table();
+        let proxy = fixtures::proxy();
+        let prefix: DeviceRoute = "/3".parse().unwrap();
+        let mounted = Layout {
+            mounts: vec![crate::proxy::Mount {
+                url: device.url.clone(),
+                source: DeviceRoute::root(),
+                prefix,
+            }],
+        };
+        let address = ProxyAddress {
+            url: proxy.endpoint(),
+            ensure: None,
+        };
+        let mut views: Vec<Device> = (0..2)
+            .map(|_| open_through(&proxy, &device.url).unwrap())
+            .map(|connection| connection.device(DeviceRoute::root()))
+            .collect();
+        let connection = Connection::mount_at(&address, &mounted, WAIT).unwrap();
+        views.push(connection.device(prefix));
+
+        for view in &views {
+            let metadata = view.metadata().expect("the proxy collects the metadata");
+            assert_eq!(metadata.device().name(), "FAKE");
+            let settings = view.settings().expect("the proxy reads the settings");
+            assert_eq!(settings.rpc_registry().hash, Some(device.table_hash()));
+            assert_eq!(
+                (settings.version(), settings.get("test.amplitude")),
+                (Some(7), Some(&[1u8][..]))
+            );
+        }
+        let mut raw = [0u8; 64];
+        let announced = crate::proto::settings::Setting {
+            name: b"test.amplitude",
+            seq: Some(8),
+            reply: &[2],
+        };
+        let len = announced.write(&mut raw).unwrap();
+        device.send(tio::Packet::from_slice_prefix(&raw[..len]).unwrap().0);
+        let deadline = Instant::now() + WAIT;
+        for view in &views {
+            let updates = view.settings_updates();
+            let kept = loop {
+                let settings = updates.recv_deadline(deadline).expect("the announcement");
+                if settings.version() == Some(8) {
+                    break settings;
+                }
+            };
+            assert_eq!(kept.get("test.amplitude"), Some(&[2u8][..]));
+        }
+
+        forget_table();
+        let asked =
+            ["dev.metadata", "rpc.listinfo", "test.amplitude"].map(|name| device.calls(name));
+        assert_eq!(
+            asked,
+            [1, 1 + 2, 1],
+            "one discovery, one walk of the two entries, and one snapshot for every client"
+        );
+    }
+
+    /// A proxy whose link is another proxy keeps the state of the device
+    /// behind it as of any device. Its clients share one discovery, one walk
+    /// and one snapshot, which reach the device through the other proxy.
+    #[test]
+    fn clients_of_a_proxy_behind_a_proxy_share_its_state() {
+        let device = FakeDevice::start();
+        let forget_table = || {
+            if let Some(cached) = super::super::rpc::cache::path("FAKE", device.table_hash()) {
+                let _ = std::fs::remove_file(cached);
+            }
+        };
+        forget_table();
+        let upstream = fixtures::proxy_serving(&device.url);
+        let downstream = fixtures::proxy();
+        for _ in 0..2 {
+            let connection = open_through(&downstream, &upstream.endpoint()).unwrap();
+            let view = connection.device(DeviceRoute::root());
+            let metadata = view.metadata().expect("the proxy collects the metadata");
+            assert_eq!(metadata.device().name(), "FAKE");
+            let settings = view.settings().expect("the proxy reads the settings");
+            assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
+        }
+
+        forget_table();
+        let asked =
+            ["dev.metadata", "rpc.listinfo", "test.amplitude"].map(|name| device.calls(name));
+        assert_eq!(asked, [1, 1 + 2, 1]);
     }
 
     /// Point the variables a proxy is found or started by at `dir`, where

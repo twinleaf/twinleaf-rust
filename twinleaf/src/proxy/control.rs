@@ -5,17 +5,23 @@
 //! [`handshake`] make requests as a client.
 
 use super::Layout;
+use crate::data::DeviceMetadataSnapshot;
+use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
+use crate::device::{RegistryState, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
-use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
+use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, KeepAlive, ReceiveResult, RecvError, TransportEvent};
 use futures_util::StreamExt;
+use minicbor::bytes::ByteVec;
 use minicbor::{Decode, Encode};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
@@ -35,6 +41,8 @@ pub(crate) const MOUNT: &str = "proxy.mount";
 pub(crate) const DEFAULT_LAYOUT: &str = "proxy.default";
 /// The method that stops a background proxy.
 pub(super) const STOP: &str = "proxy.stop";
+/// The method that follows the state of one device a connection opened.
+pub(crate) const WATCH: &str = "proxy.watch";
 
 /// The version of the control protocol this build speaks. Version 2 encodes
 /// every argument and reply in CBOR.
@@ -143,6 +151,181 @@ pub(super) mod hops {
     }
 }
 
+/// What `proxy.watch` follows, the device at `route` as the client sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Watch {
+    #[n(0)]
+    #[cbor(with = "hops")]
+    pub(crate) route: DeviceRoute,
+    /// Whether the watch follows the RPC table and the settings, rather
+    /// than the metadata.
+    #[n(1)]
+    pub(crate) table: bool,
+}
+
+/// One value of a watched device's state, as a reply to `proxy.watch`
+/// carries it in [`Part`]s.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum Update {
+    /// The device's complete metadata, as its own metadata packets, each
+    /// addressed to the root.
+    #[n(0)]
+    Metadata(#[n(0)] Vec<ByteVec>),
+    /// The device has no `dev.metadata`.
+    #[n(1)]
+    Unsupported,
+    /// The RPC table, as its hash, the session it was read in, and the
+    /// name and metadata word of each entry.
+    #[n(2)]
+    Table {
+        #[n(0)]
+        hash: Option<u32>,
+        #[n(1)]
+        session: Option<u32>,
+        #[n(2)]
+        entries: Vec<(String, u16)>,
+    },
+    /// The RPC table did not load, as the device refused a call with this
+    /// code and message.
+    #[n(3)]
+    Refused(#[n(0)] u16, #[n(1)] ByteVec),
+    /// The RPC table did not load, as it changed during every walk.
+    #[n(4)]
+    Changed,
+    /// The RPC table did not load, as a call timed out.
+    #[n(5)]
+    TimedOut,
+    /// The RPC table did not load, as a call got no reply.
+    #[n(6)]
+    Lost,
+    /// The values of the announced settings, as the hash of the table they
+    /// were read with, their session and version, and each value by name.
+    #[n(7)]
+    Settings {
+        #[n(0)]
+        hash: Option<u32>,
+        #[n(1)]
+        session: Option<u32>,
+        #[n(2)]
+        version: Option<u32>,
+        #[n(3)]
+        values: BTreeMap<String, ByteVec>,
+    },
+}
+
+impl Update {
+    /// Returns the update of a device's complete metadata, or `None` if a
+    /// record does not fit a packet.
+    pub(crate) fn metadata(snapshot: &DeviceMetadataSnapshot) -> Option<Update> {
+        let packets = snapshot.metadata_packets().ok()?;
+        let records = packets.iter().map(|packet| {
+            packet
+                .with_route(DeviceRoute::root())
+                .as_bytes()
+                .to_vec()
+                .into()
+        });
+        Some(Update::Metadata(records.collect()))
+    }
+
+    /// Returns the update of an RPC table as loaded.
+    pub(crate) fn table(registry: &RpcRegistry) -> Update {
+        Update::Table {
+            hash: registry.hash,
+            session: registry.session.map(SessionId::value),
+            entries: registry
+                .iter()
+                .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()))
+                .collect(),
+        }
+    }
+
+    /// Returns the update of why an RPC table did not load.
+    pub(crate) fn unloaded(error: &RpcRegistryError) -> Update {
+        match error {
+            RpcRegistryError::DeviceRpcError(CallError::DeviceError(refusal)) => {
+                Update::Refused(refusal.error.value(), refusal.extra.clone().into())
+            }
+            RpcRegistryError::DeviceRpcError(CallError::Timeout) => Update::TimedOut,
+            RpcRegistryError::TableChanged => Update::Changed,
+            RpcRegistryError::DeviceRpcError(_) => Update::Lost,
+        }
+    }
+
+    /// Returns the update of the values of a device's announced settings.
+    pub(crate) fn settings(settings: &Settings) -> Update {
+        Update::Settings {
+            hash: settings.rpc_registry().hash,
+            session: settings.session().map(SessionId::value),
+            version: settings.version(),
+            values: settings
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_vec().into()))
+                .collect(),
+        }
+    }
+
+    /// Returns the RPC table, or why it did not load, that the update
+    /// carries, or `None` for an update of something else.
+    pub(crate) fn registry(self) -> Option<RegistryState> {
+        let failed = |error: CallError| Some(Err(RpcRegistryError::DeviceRpcError(error)));
+        match self {
+            Update::Table {
+                hash,
+                session,
+                entries,
+            } => {
+                let session = session.map(SessionId::new);
+                Some(Ok(Arc::new(RpcRegistry::from_entries(
+                    entries, hash, session,
+                ))))
+            }
+            Update::Refused(code, message) => failed(CallError::DeviceError(RpcErrorPayload {
+                error: RpcError::from(code),
+                extra: message.into(),
+            })),
+            Update::TimedOut => failed(CallError::Timeout),
+            Update::Lost => failed(CallError::ResponseLost),
+            Update::Changed => Some(Err(RpcRegistryError::TableChanged)),
+            Update::Metadata(_) | Update::Unsupported | Update::Settings { .. } => None,
+        }
+    }
+}
+
+/// One part of an encoded [`Update`], as a reply to `proxy.watch` carries
+/// it. The parts of one update go out in order, numbered from zero.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Part {
+    #[n(0)]
+    pub(crate) index: u16,
+    #[n(1)]
+    pub(crate) count: u16,
+    #[n(2)]
+    pub(crate) bytes: ByteVec,
+}
+
+/// The most bytes of an update one part carries. The rest of the reply
+/// fits in what a packet leaves.
+const PART_BYTES: usize = WirePacket::MAX_PAYLOAD - 32;
+
+/// Returns the replies to watch `id` that carry `update`, one per part.
+pub(crate) fn parts(id: u16, update: &Update) -> Vec<Packet> {
+    let encoded = encode(update);
+    let chunks = encoded.chunks(PART_BYTES);
+    let count = u16::try_from(chunks.len()).unwrap_or(u16::MAX);
+    chunks
+        .zip(0..count)
+        .map(|(bytes, index)| {
+            let part = Part {
+                index,
+                count,
+                bytes: bytes.to_vec().into(),
+            };
+            Packet::proxy_reply(id, &encode(&part)).expect("a part fits a reply")
+        })
+        .collect()
+}
+
 /// Why a client binds a connection to a device. It names the control method
 /// the client calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +380,8 @@ pub(super) enum Request {
     Default(Layout),
     /// `proxy.stop`.
     Stop,
+    /// `proxy.watch`, naming the device to follow.
+    Watch(Watch),
     /// `proxy.test.panic`, which makes the task serving the client panic.
     #[cfg(test)]
     Panic,
@@ -221,6 +406,7 @@ impl Request {
             b"proxy.mount" => Ok(Request::Mount(checked(decode(args).map_err(malformed)?)?)),
             b"proxy.default" => Ok(Request::Default(checked(decode(args).map_err(malformed)?)?)),
             b"proxy.stop" => Ok(Request::Stop),
+            b"proxy.watch" => Ok(Request::Watch(decode(args).map_err(malformed)?)),
             #[cfg(test)]
             b"proxy.test.panic" => Ok(Request::Panic),
             other => Err(Refusal::new(
@@ -239,6 +425,7 @@ impl Request {
             Request::Mount(layout) => (MOUNT, encode(layout)),
             Request::Default(layout) => (DEFAULT_LAYOUT, encode(layout)),
             Request::Stop => (STOP, Vec::new()),
+            Request::Watch(watch) => (WATCH, encode(watch)),
             #[cfg(test)]
             Request::Panic => ("proxy.test.panic", Vec::new()),
         }

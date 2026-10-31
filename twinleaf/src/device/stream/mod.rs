@@ -1,8 +1,13 @@
 //! The stream pump, one task per connection.
 //!
-//! The pump drains the session's inlet and keeps metadata discovery going. It
+//! The pump drains the session's inlet and keeps each device's state. It
 //! sends packets, batches and device state to owned [`Receiver`]s, each
 //! filtered to the subtree its view covers.
+//!
+//! A pump whose session the proxy opened follows the state the proxy keeps,
+//! with a `proxy.watch` of each device it needs. Any other pump asks the
+//! devices for their metadata, RPC table and settings itself, as the client
+//! inside the proxy does over a port on a link.
 
 mod event;
 mod metadata;
@@ -19,10 +24,11 @@ use super::state::{
     self, Learned, MetadataState, Presence, RegistryState, SettingChange, Settings,
 };
 use crate::data::{MetadataQuery, PacketParser, SampleBatch};
-use crate::proto::DeviceRoute;
+use crate::proto::{DeviceRoute, SessionId};
+use crate::proxy::{decode, encode, Part, Update, Watch, WATCH};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio;
-use crate::tio::packet;
+use crate::tio::packet::{self, Packet, ProxyRx};
 use crate::tio::transport;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{self, Future};
@@ -78,11 +84,68 @@ struct StreamState {
     changes: VecDeque<Change>,
 }
 
-/// A device's worker, and the latest it learned.
+/// A device's worker, and the latest it learned. A pump that watches the
+/// proxy's state has no thread to send events to, and the watch of the
+/// device's table and settings stands in for it.
 struct Worker {
-    events: flume::Sender<DeviceEvent>,
+    events: Option<flume::Sender<DeviceEvent>>,
     registry: Option<RegistryState>,
     settings: Option<Arc<Settings>>,
+}
+
+/// Where the pump's device state comes from.
+enum Source {
+    /// The pump asks each device for its metadata on this schedule, and its
+    /// workers load the table and read the settings. So does the client
+    /// inside the proxy, over a port on a link.
+    Asks(MetadataSchedule),
+    /// The proxy keeps the state, and the pump follows a `proxy.watch` of
+    /// each device it needs, by request id.
+    Watches(HashMap<u16, Watched>),
+}
+
+/// A `proxy.watch` the pump follows, and what has arrived of its next
+/// update.
+struct Watched {
+    watch: Watch,
+    joined: Vec<u8>,
+    /// The index of the part due next, or `None` once a part went missing,
+    /// until the next update begins.
+    next: Option<u16>,
+}
+
+impl Watched {
+    /// Takes the reply `value`, a part of an update. Returns the encoded
+    /// update once its last part is in.
+    fn join(&mut self, value: &[u8]) -> Option<Vec<u8>> {
+        let part: Part = decode(value).ok()?;
+        if part.index == 0 {
+            self.joined.clear();
+            self.next = Some(0);
+        }
+        if self.next != Some(part.index) {
+            self.next = None;
+            return None;
+        }
+        self.joined.extend_from_slice(&part.bytes);
+        self.next = part.index.checked_add(1);
+        (self.next == Some(part.count)).then(|| std::mem::take(&mut self.joined))
+    }
+}
+
+/// Asks the proxy over `root` for `watch`, as the next of `watches`.
+fn start_watch(root: &Handle, watches: &mut HashMap<u16, Watched>, watch: Watch) {
+    let id = u16::try_from(watches.len() + 1).unwrap_or(u16::MAX);
+    match Packet::proxy_request(WATCH, &encode(&watch), id) {
+        Ok(request) => root.session().send(request),
+        Err(error) => log::warn!("could not watch {}: {error}", watch.route),
+    }
+    let watched = Watched {
+        watch,
+        joined: Vec::new(),
+        next: None,
+    };
+    watches.insert(id, watched);
 }
 
 /// Device state that changed, waiting to go out.
@@ -145,8 +208,8 @@ impl StreamState {
 
     /// Hands a fact about the device at `route` to its worker, if it has one.
     fn device_event(&self, route: DeviceRoute, event: DeviceEvent) {
-        if let Some(worker) = self.workers.get(&route) {
-            let _ = worker.events.send(event);
+        if let Some(events) = self.workers.get(&route).and_then(|w| w.events.as_ref()) {
+            let _ = events.send(event);
         }
     }
 
@@ -579,14 +642,14 @@ impl Stream {
 }
 
 /// The pump itself. It owns the session's inlet, the parser, the metadata
-/// queries in flight and the devices' workers, and runs whether or not
-/// anything receives from it.
+/// queries in flight or the watches, and the devices' workers, and runs
+/// whether or not anything receives from it.
 struct Pump {
     root: Handle,
     inlet: Inlet,
     commands: mpsc::UnboundedReceiver<PumpSink>,
     state: StreamState,
-    schedule: MetadataSchedule,
+    source: Source,
     sinks: Sinks,
     /// What the devices' workers learned.
     learned: mpsc::UnboundedReceiver<(DeviceRoute, Learned)>,
@@ -608,7 +671,10 @@ impl Pump {
         Pump {
             root: root.clone(),
             state: StreamState::new(),
-            schedule: MetadataSchedule::new(root.clone()),
+            source: match root.session().watches() {
+                true => Source::Watches(HashMap::new()),
+                false => Source::Asks(MetadataSchedule::new(root.clone())),
+            },
             inlet,
             commands,
             sinks: Sinks::default(),
@@ -622,7 +688,10 @@ impl Pump {
     /// why, ends every sink so, and each new one until the stream drops.
     async fn run(mut self) {
         let end = loop {
-            let retry = self.schedule.next_retry();
+            let retry = match &self.source {
+                Source::Asks(schedule) => schedule.next_retry(),
+                Source::Watches(_) => None,
+            };
             // A sink takes the packets that arrive after it was made, so new
             // sinks, replies and pruning go ahead of the inlet.
             let turn = tokio::select! {
@@ -634,7 +703,7 @@ impl Pump {
                     }
                     None => Turn::Gone,
                 },
-                Ok(reply) = self.schedule.replies().recv_async() => {
+                Ok(reply) = metadata_reply(&self.source) => {
                     self.take_metadata_replies(reply);
                     Turn::Running
                 }
@@ -648,7 +717,7 @@ impl Pump {
             };
             self.publish();
             match turn {
-                Turn::Running => self.submit_metadata_queries(),
+                Turn::Running => self.discover(),
                 Turn::Gone => return,
                 Turn::Ended(end) => break end,
             }
@@ -707,14 +776,110 @@ impl Pump {
     }
 
     /// Returns the worker of the device at `route`, starting it if it is
-    /// not running.
+    /// not running, or watching the proxy's table and settings of the device.
     fn worker(&mut self, route: DeviceRoute) -> &mut Worker {
-        let (root, teach) = (&self.root, &self.teach);
-        self.state.workers.entry(route).or_insert_with(|| Worker {
-            events: state::start_worker(root.clone(), route, teach.clone()),
-            registry: None,
-            settings: None,
+        let (root, teach, source) = (&self.root, &self.teach, &mut self.source);
+        self.state.workers.entry(route).or_insert_with(|| {
+            let events = match source {
+                Source::Asks(_) => Some(state::start_worker(root.clone(), route, teach.clone())),
+                Source::Watches(watches) => {
+                    start_watch(root, watches, Watch { route, table: true });
+                    None
+                }
+            };
+            Worker {
+                events,
+                registry: None,
+                settings: None,
+            }
         })
+    }
+
+    /// Takes a reply to one of the pump's watches, a part of an update or a
+    /// refusal.
+    fn take_reply(&mut self, reply: ProxyRx<'_>) {
+        let Source::Watches(watches) = &mut self.source else {
+            return;
+        };
+        let (id, value) = match reply {
+            ProxyRx::Reply(reply) => (reply.req_id.value(), reply.value),
+            ProxyRx::Error(error) => {
+                if let Some(watched) = watches.get(&error.req_id.value()) {
+                    let message = String::from_utf8_lossy(error.message);
+                    log::warn!(
+                        "the proxy follows no state of {}: {message}",
+                        watched.watch.route
+                    );
+                }
+                return;
+            }
+            ProxyRx::Link(_) | ProxyRx::Alive | ProxyRx::Unknown(..) => return,
+        };
+        let Some(watched) = watches.get_mut(&id) else {
+            return;
+        };
+        let Some(joined) = watched.join(value) else {
+            return;
+        };
+        let route = watched.watch.route;
+        match decode::<Update>(&joined) {
+            Ok(update) => self.take_update(route, update),
+            Err(error) => {
+                log::warn!("dropping a state update of {route} that does not decode: {error}")
+            }
+        }
+    }
+
+    /// Keeps a value of the state of the device at `route` that the proxy
+    /// sent, and queues it to go out. Its metadata reaches the parser as the
+    /// device's own records.
+    fn take_update(&mut self, route: DeviceRoute, update: Update) {
+        match update {
+            Update::Metadata(records) => {
+                for record in records {
+                    let applied = Packet::from_slice_prefix(&record)
+                        .map_err(|error| error.to_string())
+                        .and_then(|(packet, _)| {
+                            let packet = packet.with_route(route);
+                            self.state
+                                .parser
+                                .push_packet(&packet)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = applied {
+                        log::warn!("dropping a metadata record of {route}: {error}");
+                    }
+                }
+                self.state.publish_metadata(route);
+            }
+            Update::Unsupported => self.state.metadata_unavailable(route),
+            Update::Settings {
+                hash,
+                session,
+                version,
+                values,
+            } => {
+                let worker = self.state.workers.get(&route);
+                let registry = worker.and_then(|worker| worker.registry.clone()?.ok());
+                let Some(registry) = registry.filter(|registry| registry.hash == hash) else {
+                    log::debug!("dropping settings of {route} read with a table not held here");
+                    return;
+                };
+                let values = values.into_iter().map(|(name, value)| (name, value.into()));
+                let settings = Settings::new(
+                    registry,
+                    session.map(SessionId::new),
+                    version,
+                    values.collect(),
+                );
+                self.take_learned(route, Learned::Settings(Arc::new(settings)));
+            }
+            update => {
+                if let Some(registry) = update.registry() {
+                    self.take_learned(route, Learned::Registry(registry));
+                }
+            }
+        }
     }
 
     /// Keeps what a device's worker learned and queues it to go out.
@@ -769,11 +934,19 @@ impl Pump {
             }
             Queued::Ended(end) => return Some(end),
         };
-        self.tap(packet);
-        if let Some(packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped) =
-            packet.link_status()
+        if let packet::Payload::ProxyRx(reply @ (ProxyRx::Reply(_) | ProxyRx::Error(_))) =
+            packet.payload()
         {
-            self.schedule.forget(packet.route());
+            self.take_reply(reply);
+            return None;
+        }
+        self.tap(packet);
+        if let (
+            Some(packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped),
+            Source::Asks(schedule),
+        ) = (packet.link_status(), &mut self.source)
+        {
+            schedule.forget(packet.route());
         }
         let covered = self.covers(packet.route());
         self.state.process_packet(packet, covered);
@@ -818,16 +991,15 @@ impl Pump {
     /// the metadata each completed, and reports the routes whose firmware
     /// has no `dev.metadata`.
     fn take_metadata_replies(&mut self, first: (MetadataQuery, RawCallResult)) {
+        let Source::Asks(schedule) = &mut self.source else {
+            return;
+        };
         let mut reply = Some(first);
-        while let Some((query, result)) = reply
-            .take()
-            .or_else(|| self.schedule.replies().try_recv().ok())
+        while let Some((query, result)) =
+            reply.take().or_else(|| schedule.replies().try_recv().ok())
         {
             let route = query.route;
-            match self
-                .schedule
-                .complete(&mut self.state.parser, query, result)
-            {
+            match schedule.complete(&mut self.state.parser, query, result) {
                 Completed::Applied => self.state.publish_metadata(route),
                 Completed::Unsupported => self.state.metadata_unavailable(route),
                 Completed::BackedOff => {}
@@ -836,14 +1008,33 @@ impl Pump {
     }
 
     /// Asks each covered route that is due for whatever metadata the parser
-    /// still wants.
-    fn submit_metadata_queries(&mut self) {
-        let due = self
-            .schedule
-            .due(self.state.known_routes.iter().copied(), Instant::now());
-        for route in due {
-            if self.covers(route) {
-                self.schedule.submit(&mut self.state.parser, route);
+    /// still wants, or watches the metadata of each covered route not yet
+    /// watched.
+    fn discover(&mut self) {
+        let (state, sinks) = (&mut self.state, &self.sinks);
+        let covers = |route| sinks.cover(route) || state.workers.contains_key(&route);
+        match &mut self.source {
+            Source::Asks(schedule) => {
+                let due = schedule.due(state.known_routes.iter().copied(), Instant::now());
+                let due: Vec<_> = due.into_iter().filter(|route| covers(*route)).collect();
+                for route in due {
+                    schedule.submit(&mut state.parser, route);
+                }
+            }
+            Source::Watches(watches) => {
+                let unwatched: Vec<_> = state
+                    .known_routes
+                    .iter()
+                    .map(|&route| Watch {
+                        route,
+                        table: false,
+                    })
+                    .filter(|watch| covers(watch.route))
+                    .filter(|watch| !watches.values().any(|watched| watched.watch == *watch))
+                    .collect();
+                for watch in unwatched {
+                    start_watch(&self.root, watches, watch);
+                }
             }
         }
     }
@@ -903,6 +1094,17 @@ impl Pump {
                 }
             }
         }
+    }
+}
+
+/// Waits for a finished `dev.metadata` call, or forever when the pump asks
+/// for no metadata itself.
+async fn metadata_reply(
+    source: &Source,
+) -> Result<(MetadataQuery, RawCallResult), flume::RecvError> {
+    match source {
+        Source::Asks(schedule) => schedule.replies().recv_async().await,
+        Source::Watches(_) => future::pending().await,
     }
 }
 
@@ -2295,6 +2497,44 @@ mod tests {
             (change.name.as_str(), change.seq, change.reply),
             ("rpc.hash", None, 7u32.to_le_bytes().to_vec())
         );
+    }
+
+    /// An update too large for one reply arrives in parts, and is whole once
+    /// its last part is in. An update that lost a part is dropped, and the
+    /// next one joins whole.
+    #[test]
+    fn a_watched_update_joins_from_its_parts_and_one_missing_a_part_is_dropped() {
+        let entries = (0..100).map(|index| (format!("test.entry{index}"), 0x8140));
+        let update = Update::Table {
+            hash: Some(1),
+            session: None,
+            entries: entries.collect(),
+        };
+        let parts: Vec<Vec<u8>> = crate::proxy::parts(1, &update)
+            .iter()
+            .map(|packet| match packet.payload() {
+                packet::Payload::ProxyRx(ProxyRx::Reply(reply)) => reply.value.to_vec(),
+                other => panic!("a part is a reply, not {other:?}"),
+            })
+            .collect();
+        assert!(parts.len() > 2, "the table takes several replies");
+        let mut watched = Watched {
+            watch: Watch {
+                route: DeviceRoute::root(),
+                table: true,
+            },
+            joined: Vec::new(),
+            next: None,
+        };
+
+        let lost_one = parts.iter().enumerate().filter(|(index, _)| *index != 1);
+        let joined: Vec<_> = lost_one
+            .filter_map(|(_, part)| watched.join(part))
+            .collect();
+        assert!(joined.is_empty(), "an update that lost a part is dropped");
+        let joined: Vec<_> = parts.iter().filter_map(|part| watched.join(part)).collect();
+        assert_eq!(joined.len(), 1, "only the last part completes the update");
+        assert_eq!(decode::<Update>(&joined[0]).unwrap(), update);
     }
 
     /// A receiver dropped while the device is silent is pruned at once. A

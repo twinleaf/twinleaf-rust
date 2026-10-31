@@ -33,6 +33,7 @@ use crate::proxy::{encode, handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_T
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
@@ -57,9 +58,11 @@ pub(crate) type RawCallResult = Result<Vec<u8>, CallError>;
 /// session's task, and must not block.
 pub(crate) type Completion = Box<dyn FnOnce(RawCallResult) + Send>;
 
-/// Where a session writes, its socket or a channel a test reads.
+/// Where a session writes, its socket, a port on a link of the proxy that
+/// hosts it, or a channel a test reads.
 enum Socket {
     Transport(transport::Port),
+    Port(mpsc::Sender<Packet>),
     #[cfg(test)]
     Channel(flume::Sender<Packet>),
 }
@@ -70,6 +73,10 @@ impl Socket {
             Socket::Transport(port) => port.try_send(packet).map_err(|error| match error {
                 transport::SendError::Full => CallError::RequestNotSubmitted,
                 _ => CallError::ResponseLost,
+            }),
+            Socket::Port(port) => port.try_send(packet).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => CallError::RequestNotSubmitted,
+                mpsc::error::TrySendError::Closed(_) => CallError::ResponseLost,
             }),
             #[cfg(test)]
             Socket::Channel(sent) => sent.send(packet).map_err(|_| CallError::ResponseLost),
@@ -95,6 +102,8 @@ enum Command {
     Call(Call),
     /// Feeds the pump through this inlet. A second inlet is dropped.
     Attach(Lane<Packet>),
+    /// Sends a packet that expects no reply the session would complete.
+    Send(Packet),
     /// Ends the session, as its owner closed it.
     Close,
 }
@@ -108,6 +117,9 @@ pub(crate) type Inlet = flume::Receiver<Queued<Packet>>;
 #[derive(Clone)]
 pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
+    /// Whether the proxy keeps the device state and the pump watches it,
+    /// which is so for a session the proxy opened with a handshake.
+    watches: bool,
 }
 
 impl Session {
@@ -191,7 +203,11 @@ impl Session {
             None => format!("the proxy at {url}"),
         };
         let socket = Socket::Transport(port);
-        Ok(Session::start(socket, received, peer, &tasks))
+        let received = received.into_stream().boxed();
+        Ok(Session {
+            watches: true,
+            ..Session::start(socket, received, peer, &tasks)
+        })
     }
 
     /// Connects to the proxy at the loopback `url` with no handshake, as a
@@ -203,7 +219,23 @@ impl Session {
         })?;
         let socket = Socket::Transport(port);
         let peer = format!("the proxy at {url}");
+        let received = received.into_stream().boxed();
         Ok(Session::start(socket, received, peer, &Supervisor::new()))
+    }
+
+    /// Starts a session inside the proxy over a port on one of its links,
+    /// which sends on `sent` and delivers on `received`. Its pump asks the
+    /// device for its state itself. `peer` names the link in the log.
+    pub(crate) fn over_port(
+        sent: mpsc::Sender<Packet>,
+        received: mpsc::Receiver<Packet>,
+        peer: String,
+        tasks: &Supervisor,
+    ) -> Session {
+        let received = tokio_stream::wrappers::ReceiverStream::new(received)
+            .map(|packet| Ok(TransportEvent::Packet(packet)))
+            .boxed();
+        Session::start(Socket::Port(sent), received, peer, tasks)
     }
 
     /// Starts the session's task on `tasks`, which reads `received` and
@@ -211,14 +243,14 @@ impl Session {
     /// proxy at tcp://127.0.0.1:7855`.
     fn start(
         socket: Socket,
-        received: flume::Receiver<ReceiveResult>,
+        received: BoxStream<'static, ReceiveResult>,
         peer: String,
         tasks: &Supervisor,
     ) -> Session {
         let (commands, mailbox) = mpsc::unbounded_channel();
         let worker = Worker {
             socket,
-            received: received.into_stream(),
+            received,
             peer,
             pending: HashMap::new(),
             next_id: 0,
@@ -226,7 +258,27 @@ impl Session {
             inlet: None,
         };
         tasks.spawn("twinleaf session", worker.run(mailbox));
-        Session { commands }
+        Session {
+            commands,
+            watches: false,
+        }
+    }
+
+    /// Returns `true` if the proxy keeps the device state of this session,
+    /// which its pump then watches rather than asks the devices for.
+    pub(crate) fn watches(&self) -> bool {
+        self.watches
+    }
+
+    /// Returns `true` once the session has ended.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
+    /// Sends `packet`, such as a control request whose replies the pump
+    /// reads. A packet the socket cannot take is dropped.
+    pub(crate) fn send(&self, packet: Packet) {
+        let _ = self.commands.send(Command::Send(packet));
     }
 
     /// Calls `name` at `route` with encoded `args`, giving up after
@@ -337,7 +389,7 @@ impl fmt::Display for Ending {
 /// feeds the pump, and fails the calls that run out of time.
 struct Worker {
     socket: Socket,
-    received: flume::r#async::RecvStream<'static, ReceiveResult>,
+    received: BoxStream<'static, ReceiveResult>,
     /// The proxy, as the log names it.
     peer: String,
     /// The calls waiting for a reply, by the id each went out with.
@@ -362,6 +414,11 @@ impl Worker {
                     Some(Command::Attach(inlet)) => {
                         self.inlet.get_or_insert(inlet);
                     }
+                    Some(Command::Send(packet)) => {
+                        if let Err(error) = self.socket.send(packet) {
+                            log::debug!("could not send to {}: {error}", self.peer);
+                        }
+                    }
                     Some(Command::Close) => break Ending::Closed,
                     None => break Ending::HandlesGone,
                 },
@@ -375,6 +432,10 @@ impl Worker {
             }
         };
         match ending {
+            // A port inside the proxy closes with its link.
+            Ending::SocketClosed if matches!(self.socket, Socket::Port(_)) => {
+                log::debug!("{} closed", self.peer)
+            }
             Ending::SocketClosed => log::warn!("{} closed the connection", self.peer),
             ending => log::debug!("the session with {} ended: {ending}", self.peer),
         }
@@ -392,7 +453,7 @@ impl Worker {
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Call(call) => (call.complete)(Err(CallError::ResponseLost)),
-                Command::Attach(_) | Command::Close => {}
+                Command::Attach(_) | Command::Send(_) | Command::Close => {}
             }
         }
         for (_, pending) in self.pending.drain() {
@@ -688,6 +749,7 @@ impl Session {
         let (sender, sent) = flume::unbounded();
         let (deliver, received) = flume::unbounded();
         let peer = "the test's proxy".to_string();
+        let received = received.into_stream().boxed();
         let session = Session::start(Socket::Channel(sender), received, peer, tasks);
         (session, TestProxy { sent, deliver })
     }

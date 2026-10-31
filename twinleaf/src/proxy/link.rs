@@ -25,16 +25,18 @@ use super::auto::Candidate;
 use super::control::Refusal;
 use super::worker::{self, Command, Opener, Readiness, Subscriber};
 use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
+use crate::device::session::Session;
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::Packet;
 use crate::tio::transport;
+use crate::Connection;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -135,6 +137,9 @@ pub(super) struct Link {
     commands: mpsc::WeakSender<Command>,
     /// The link's readiness, as its worker reports it.
     readiness: watch::Receiver<Readiness>,
+    /// The client inside the proxy that keeps the state of the link's
+    /// device for every watch, from the first watch on.
+    state: Arc<Mutex<Option<Connection>>>,
 }
 
 impl Link {
@@ -197,6 +202,26 @@ impl Link {
             Err(mpsc::error::TrySendError::Closed(_)) => "failed to set up new proxy client",
         };
         Err(format!("could not open a port on {}: {reason}", self.url))
+    }
+
+    /// Returns the client inside the proxy that keeps the state of the
+    /// link's device, the one place its metadata, RPC table and settings are
+    /// asked for. The first call starts it over a port of its own, with its
+    /// tasks on `tasks`, and so does a call once it has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a port could not be opened, as [`open_port`](Self::open_port) does.
+    pub(super) fn state(&self, tasks: &Supervisor) -> Result<Connection, String> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(connection) = state.as_ref().filter(|state| !state.is_closed()) {
+            return Ok(connection.clone());
+        }
+        let (sender, received) = self.open_port(DeviceRoute::root())?.into_split();
+        let peer = format!("the state of {}", self.url);
+        let connection = Connection::over(Session::over_port(sender.tx, received, peer, tasks));
+        *state = Some(connection.clone());
+        Ok(connection)
     }
 }
 
@@ -618,6 +643,7 @@ impl Registry {
             url: url.into(),
             commands: commands.downgrade(),
             readiness,
+            state: Arc::default(),
         };
         let entry = Entry {
             link,
@@ -712,6 +738,7 @@ mod tests {
                 url: url.into(),
                 commands: commands.downgrade(),
                 readiness: watch::channel(Readiness::Pending).1,
+                state: Arc::default(),
             };
             (link, commands, receiver)
         }

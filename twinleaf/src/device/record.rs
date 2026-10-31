@@ -6,9 +6,9 @@
 //! [`RecordMode`] picks this or a raw copy of every packet.
 
 use super::connection::DeviceTree;
-use super::session::RawCallResult;
-use super::stream::{Completed, MetadataSchedule, Receiver, RecvError};
-use crate::data::{BoundaryReason, MetadataQuery, PacketParser, RowSource};
+use super::state::MetadataState;
+use super::stream::{Receiver, RecvError};
+use crate::data::{BoundaryReason, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use crate::tio::packet;
@@ -163,8 +163,9 @@ impl<W: Write> Transcript<W> {
 
 /// Records one device tree into a writer.
 ///
-/// A recorder has its own parser and makes its own `dev.metadata` queries.
-/// Each [`step`](Self::step) writes what has arrived.
+/// A recorder has its own parser, and describes each device with the
+/// metadata its connection holds, which the connection collects once for
+/// every view. Each [`step`](Self::step) writes what has arrived.
 ///
 /// # Examples
 ///
@@ -193,8 +194,10 @@ impl<W: Write> Transcript<W> {
 /// # }
 /// ```
 pub struct Recorder<W> {
+    tree: DeviceTree,
     tap: Receiver<tio::Packet>,
-    schedule: MetadataSchedule,
+    /// The metadata of each device the tap has carried.
+    metadata: HashMap<DeviceRoute, Receiver<MetadataState>>,
     transcript: Transcript<W>,
 }
 
@@ -212,8 +215,9 @@ impl<W: Write> Recorder<W> {
     /// Creates a recorder of everything `tree` covers into `writer`.
     pub fn new(tree: &DeviceTree, writer: W, mode: RecordMode) -> Recorder<W> {
         Recorder {
+            tree: tree.clone(),
             tap: tree.packets(),
-            schedule: MetadataSchedule::new(tree.handle().clone()),
+            metadata: HashMap::new(),
             transcript: Transcript::new(writer, mode),
         }
     }
@@ -238,8 +242,8 @@ impl<W: Write> Recorder<W> {
         Ok(self.transcript.writer.flush()?)
     }
 
-    /// Records whatever has arrived. Blocks until a packet arrives, a
-    /// metadata query is due, or `deadline` passes.
+    /// Records whatever has arrived. Blocks until a packet or a device's
+    /// metadata arrives, or `deadline` passes.
     ///
     /// Returns [`Step::Deadline`] once `deadline` has passed, and
     /// [`Step::Running`] before then or with no deadline.
@@ -251,20 +255,15 @@ impl<W: Write> Recorder<W> {
     /// [`RecordError::Closed`] or [`RecordError::Disconnected`] once the
     /// connection has ended.
     pub fn step(&mut self, deadline: Option<Instant>) -> Result<Step, RecordError> {
-        // The schedule keeps tokio's clock, which is the system clock unless
-        // a test pauses it.
-        for route in self
-            .schedule
-            .due(self.transcript.parser.routes(), tokio::time::Instant::now())
-        {
-            self.schedule.submit(&mut self.transcript.parser, route);
-        }
-        let (tapped, reply) = match self.wait(deadline) {
-            Some(Woken::Tap(tapped)) => (tapped.map(Some), None),
-            Some(Woken::Reply(reply)) => (self.tap.try_recv(), reply.ok()),
-            None => (self.tap.try_recv(), None),
+        let tapped = match self.wait(deadline) {
+            Some(Woken::Tap(tapped)) => tapped.map(Some),
+            Some(Woken::Metadata(state)) => {
+                self.describe(state)?;
+                self.tap.try_recv()
+            }
+            None => self.tap.try_recv(),
         };
-        self.drain_metadata_replies(reply)?;
+        self.drain_metadata()?;
         self.drain_tap(tapped)?;
         match deadline {
             Some(deadline) if Instant::now() >= deadline => Ok(Step::Deadline),
@@ -272,44 +271,62 @@ impl<W: Write> Recorder<W> {
         }
     }
 
-    /// Waits for a packet or a reply, until the caller's deadline or the next
-    /// metadata retry. Returns what woke it, or `None` once the time is up.
+    /// Waits for a packet or a device's metadata, until the caller's
+    /// deadline. Returns what woke it, or `None` once the time is up.
     fn wait(&self, deadline: Option<Instant>) -> Option<Woken> {
-        let selector = flume::Selector::new()
-            .recv(self.tap.as_flume(), |item| {
-                Woken::Tap(self.tap.resolve(item))
+        let tap = flume::Selector::new().recv(self.tap.as_flume(), |item| {
+            Woken::Tap(self.tap.resolve(item))
+        });
+        let selector = self.metadata.values().fold(tap, |selector, metadata| {
+            selector.recv(metadata.as_flume(), |item| {
+                Woken::Metadata(metadata.resolve(item))
             })
-            .recv(self.schedule.replies(), Woken::Reply);
-        match [deadline, self.schedule.next_retry().map(Into::into)]
-            .into_iter()
-            .flatten()
-            .min()
-        {
-            Some(wake) => selector.wait_deadline(wake).ok(),
+        });
+        match deadline {
+            Some(deadline) => selector.wait_deadline(deadline).ok(),
             None => Some(selector.wait()),
         }
     }
 
-    /// Takes `first` and every other finished metadata call.
-    fn drain_metadata_replies(
-        &mut self,
-        first: Option<(MetadataQuery, RawCallResult)>,
-    ) -> Result<(), RecordError> {
-        let mut reply = first;
-        while let Some((query, result)) = reply
-            .take()
-            .or_else(|| self.schedule.replies().try_recv().ok())
-        {
-            let route = query.route;
-            match self
-                .schedule
-                .complete(&mut self.transcript.parser, query, result)
-            {
-                Completed::Applied => self.transcript.describe(route)?,
-                Completed::Unsupported | Completed::BackedOff => {}
-            }
+    /// Describes each device whose metadata changed since it last looked.
+    fn drain_metadata(&mut self) -> Result<(), RecordError> {
+        let changed: Vec<_> = self
+            .metadata
+            .values()
+            .filter_map(|metadata| metadata.try_recv().ok().flatten())
+            .collect();
+        for state in changed {
+            self.describe(Ok(state))?;
         }
         Ok(())
+    }
+
+    /// Hands the parser a device's metadata once it is complete, as the
+    /// device's own records. The file then describes the device before the
+    /// samples that follow.
+    fn describe(&mut self, state: Result<MetadataState, RecvError>) -> Result<(), RecordError> {
+        let Ok(MetadataState::Ready(snapshot)) = state else {
+            return Ok(());
+        };
+        for packet in snapshot.metadata_packets()? {
+            self.transcript.packet(&packet)?;
+        }
+        Ok(())
+    }
+
+    /// Follows the metadata of the device that sent `packet`, unless the
+    /// tap carried it before or the recording is raw.
+    fn follow(&mut self, packet: &tio::Packet) {
+        let route = packet.route();
+        if self.transcript.mode == RecordMode::Raw
+            || packet.link_status().is_some()
+            || self.metadata.contains_key(&route)
+        {
+            return;
+        }
+        if let Ok(device) = self.tree.device(route) {
+            self.metadata.insert(route, device.metadata_updates());
+        }
     }
 
     /// Records `tapped`, and every other packet already tapped. A gap loses
@@ -322,12 +339,7 @@ impl<W: Write> Recorder<W> {
         loop {
             match tapped {
                 Ok(Some(packet)) => {
-                    if let Some(
-                        packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped,
-                    ) = packet.link_status()
-                    {
-                        self.schedule.forget(packet.route());
-                    }
+                    self.follow(&packet);
                     self.transcript.packet(&packet)?;
                 }
                 Ok(None) | Err(RecvError::Timeout) => return Ok(()),
@@ -347,8 +359,8 @@ impl<W: Write> Recorder<W> {
 enum Woken {
     /// A packet from the tap, or why there is none.
     Tap(Result<tio::Packet, RecvError>),
-    /// A finished metadata call.
-    Reply(Result<(MetadataQuery, RawCallResult), flume::RecvError>),
+    /// A device's metadata, or why there is none.
+    Metadata(Result<MetadataState, RecvError>),
 }
 
 #[cfg(test)]
@@ -736,6 +748,49 @@ mod tests {
         };
         assert!(matches!(ended, RecordError::Stopped), "{ended}");
         assert_eq!(ended.to_string(), "the proxy stopped");
+    }
+
+    /// A recording through a proxy describes the device with the metadata
+    /// the proxy collected, ahead of the first sample, and asks the device
+    /// nothing itself.
+    #[test]
+    fn a_recording_describes_a_device_with_the_metadata_the_proxy_holds() {
+        use crate::device::fixtures::{self, FakeDevice, WAIT};
+
+        let device = FakeDevice::start();
+        let proxy = fixtures::proxy_serving(&device.url);
+        let connection = fixtures::open_through(&proxy, "auto").unwrap();
+        let route = DeviceRoute::root();
+        let tree = connection.tree(route);
+        let mut recorder = Recorder::new(&tree, Vec::new(), RecordMode::Described);
+        let deadline = Instant::now() + WAIT;
+        let mut sent = 0;
+        while !written(&recorder.transcript)
+            .iter()
+            .any(|packet| packet.is_data())
+        {
+            assert!(Instant::now() < deadline, "no sample was recorded");
+            device.send(samples(sent, route));
+            sent += 1;
+            let wake = Instant::now() + std::time::Duration::from_millis(50);
+            recorder.step(Some(wake)).unwrap();
+        }
+
+        let described: Vec<Vec<u8>> = crate::proxy::fixtures::description()
+            .into_iter()
+            .map(|record| broadcast(record, route).as_bytes().to_vec())
+            .collect();
+        let head: Vec<Vec<u8>> = written(&recorder.transcript)
+            .iter()
+            .take_while(|packet| !packet.is_data())
+            .filter(|packet| packet.ptype() == PacketType::METADATA)
+            .map(|packet| packet.as_bytes().to_vec())
+            .collect();
+        assert_eq!(
+            head, described,
+            "the device's own records, ahead of its samples"
+        );
+        assert_eq!(device.calls(wire::METADATA_RPC_METHOD), 1);
     }
 
     /// A raw recording is the tap itself, whatever the parser makes of it.
