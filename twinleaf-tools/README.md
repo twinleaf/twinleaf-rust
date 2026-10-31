@@ -57,8 +57,8 @@ tio proxy --port 17855 serial:///dev/ttyACM0
 tio monitor -r tcp://localhost:17855
 ```
 
-A loopback URL like this connects to that proxy and uses its default device.
-This is also how tio 1.x tools connect, and how to reach a 1.x `tio proxy`.
+A loopback URL like this connects to that proxy and opens its `auto`, which
+is its default device. It reaches only a 2.0 proxy.
 
 A background proxy logs to `proxy.log` in `$XDG_RUNTIME_DIR/twinleaf`, or in
 `twinleaf/runtime` under the local data directory.

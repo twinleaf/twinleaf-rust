@@ -82,10 +82,9 @@
 //!   serial device attached. If none of these is single, the refusal lists
 //!   the candidates.
 //!
-//! A client whose first packet within 250 ms of connecting is not a control
-//! request is a legacy client. It is opened to `auto` at once and hears link
-//! statuses in the legacy form, type 64. It is disconnected if `auto` opens
-//! nothing.
+//! A client reaches no device until a control request opens a target, and
+//! it hears each link status as a `PROXY_RX` link packet. A client that
+//! sends no control request opens nothing.
 //!
 //! # Choosing a proxy
 //!
@@ -615,17 +614,10 @@ mod tests {
 
         /// Wait for the client to hear that the proxy stopped, then for its
         /// connection to close.
-        fn expect_stopped(&self, legacy: bool) {
+        fn expect_stopped(&self) {
             self.expect(|pkt| {
-                let status = match pkt.payload() {
-                    Payload::ProxyRx(ProxyRx::Link(status)) if !legacy => status,
-                    // A legacy client knows no stop, so it hears that
-                    // reconnecting failed.
-                    Payload::LegacyStatus(status) if legacy => match status {
-                        LinkStatus::FailedToReconnect => LinkStatus::Stopped,
-                        status => status,
-                    },
-                    _ => return None,
+                let Payload::ProxyRx(ProxyRx::Link(status)) = pkt.payload() else {
+                    return None;
                 };
                 assert_eq!(status, LinkStatus::Stopped);
                 assert_eq!(pkt.route(), DeviceRoute::root());
@@ -901,8 +893,8 @@ mod tests {
     }
 
     /// A device that never comes back is given up once the reconnect timeout
-    /// passes. Each client using it hears so in its own form and is then
-    /// disconnected, and its link is closed and forgotten.
+    /// passes. Each client using it hears so and is then disconnected, and
+    /// its link is closed and forgotten.
     #[test]
     fn the_clients_of_a_device_given_up_hear_so_and_are_disconnected() {
         let device = FakeDevice::start();
@@ -914,33 +906,25 @@ mod tests {
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open(&device.url).unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
+        let auto = TestClient::connect(&proxy.endpoint());
+        auto.hello(4243, "auto");
+        assert_eq!(auto.open("auto"), Ok(device.url.clone()));
 
         device.die();
 
-        control.expect(|pkt| match pkt.payload() {
-            Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorDisconnected)) => None,
-            Payload::ProxyRx(ProxyRx::Link(status)) => {
-                assert_eq!(status, LinkStatus::FailedToReconnect);
-                assert_eq!(pkt.route(), DeviceRoute::root());
-                Some(())
-            }
-            Payload::LegacyStatus(status) => panic!("a control client was sent {status:?}"),
-            _ => None,
-        });
-        legacy.expect(|pkt| match pkt.payload() {
-            Payload::LegacyStatus(LinkStatus::SensorDisconnected) => None,
-            Payload::LegacyStatus(status) => {
-                assert_eq!(pkt.ptype(), PacketType::PROXY_STATUS);
-                assert_eq!(status, LinkStatus::FailedToReconnect);
-                Some(())
-            }
-            Payload::ProxyRx(rx) => panic!("a legacy client was sent {rx:?}"),
-            _ => None,
-        });
-        control.expect_closed();
-        legacy.expect_closed();
+        for client in [&control, &auto] {
+            client.expect(|pkt| match pkt.payload() {
+                Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorDisconnected)) => None,
+                Payload::ProxyRx(ProxyRx::Link(status)) => {
+                    assert_eq!(status, LinkStatus::FailedToReconnect);
+                    assert_eq!(pkt.route(), DeviceRoute::root());
+                    Some(())
+                }
+                Payload::LegacyStatus(status) => panic!("a client was sent {status:?}"),
+                _ => None,
+            });
+            client.expect_closed();
+        }
         let deadline = Instant::now() + WAIT;
         while !proxy.links.urls().is_empty() || !proxy.clients().is_empty() {
             assert!(Instant::now() < deadline, "the link given up stayed open");
@@ -1298,11 +1282,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
         let auto = TestClient::connect(&proxy.endpoint());
         auto.hello(4244, "auto");
         assert_eq!(auto.open("auto"), Ok(device.url.clone()));
+        assert_eq!(auto.dev_name(7), "FAKE");
     }
 
     /// `auto` shares the link it chose as it is. A replug that moved the
@@ -1463,10 +1446,10 @@ mod tests {
         assert_eq!(proxy.clients().len(), 2);
     }
 
-    /// A client whose first packet is not a control request, or that sends
-    /// nothing at first, is served `auto` at once.
+    /// A client whose first packet is not a control request opens nothing,
+    /// so what it sends reaches no device, though `auto` would resolve.
     #[test]
-    fn a_legacy_client_is_bound_to_auto() {
+    fn a_client_that_opens_nothing_reaches_no_device() {
         let device = FakeDevice::start();
         let proxy = Proxy::host(options()).unwrap();
         let opener = TestClient::connect(&proxy.endpoint());
@@ -1474,35 +1457,51 @@ mod tests {
         opener.open(&device.url).unwrap();
 
         let talker = TestClient::connect(&proxy.endpoint());
-        assert_eq!(talker.dev_name(7), "FAKE");
+        let request = Packet::rpc_request("dev.name", &[], 7, DeviceRoute::root());
+        talker.send(request.unwrap());
 
-        let silent = TestClient::connect(&proxy.endpoint());
-        silent.expect(|pkt| matches!(pkt.payload(), Payload::Heartbeat(_)).then_some(()));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Ok(heard) = talker.rx.recv_deadline(deadline) {
+            if let Ok(transport::TransportEvent::Packet(pkt)) = heard {
+                assert!(
+                    !matches!(pkt.payload(), Payload::RpcReply(_)),
+                    "a device answered"
+                );
+            }
+        }
         assert_eq!(device.accepted(), 1);
     }
 
+    /// A proxy refuses to open its own port at a loopback address or at
+    /// `localhost`, as its link would be a client of the proxy itself.
     #[test]
-    fn each_client_hears_link_statuses_in_its_own_form() {
+    fn a_proxy_refuses_to_mount_itself() {
+        let proxy = Proxy::host(options()).unwrap();
+        let client = TestClient::connect(&proxy.endpoint());
+        client.hello(4242, "itself");
+        let port = proxy.endpoint().rsplit(':').next().unwrap().to_string();
+
+        for url in [proxy.endpoint(), format!("tcp://localhost:{port}")] {
+            let (code, message) = client.open(&url).unwrap_err();
+            assert_eq!(code, RpcError::Invalid);
+            assert_eq!(
+                message,
+                format!("{url} is this proxy, which cannot mount itself")
+            );
+        }
+        assert!(proxy.links.urls().is_empty(), "a link to the proxy opened");
+    }
+
+    #[test]
+    fn a_client_hears_link_statuses_as_link_packets() {
         let device = FakeDevice::start();
         let proxy = Proxy::host(options()).unwrap();
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open(&device.url).unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
 
         device.drop_connections();
 
-        legacy.expect(|pkt| match pkt.payload() {
-            Payload::LegacyStatus(status) => {
-                assert_eq!(pkt.ptype(), PacketType::PROXY_STATUS);
-                assert_eq!(pkt.route(), DeviceRoute::root());
-                assert_eq!(status, LinkStatus::SensorDisconnected);
-                Some(())
-            }
-            Payload::ProxyRx(rx) => panic!("a legacy client was sent {rx:?}"),
-            _ => None,
-        });
         control.expect(|pkt| match pkt.payload() {
             Payload::ProxyRx(ProxyRx::Link(status)) => {
                 assert_eq!(pkt.route(), DeviceRoute::root());
@@ -1536,13 +1535,15 @@ mod tests {
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open("default").unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name_at(prefix, 7), "FAKE");
+        let auto = TestClient::connect(&proxy.endpoint());
+        auto.hello(4243, "auto");
+        auto.open("auto").unwrap();
+        assert_eq!(auto.dev_name_at(prefix, 7), "FAKE");
         let (user, _) = Packet::from_slice_prefix(&[64, 0, 3, 0, 4, 0xAA, 0xBB]).unwrap();
 
         device.send(user.clone());
 
-        for client in [&control, &legacy] {
+        for client in [&control, &auto] {
             client.expect(|pkt| match pkt.payload() {
                 Payload::ProxyRx(rx) => panic!("the USER packet arrived as {rx:?}"),
                 _ if pkt.ptype() == PacketType::PROXY_STATUS => {
@@ -1553,31 +1554,13 @@ mod tests {
             });
         }
 
-        for client in [&control, &legacy] {
+        for client in [&control, &auto] {
             client.send(user.with_route(prefix));
         }
 
         for pkt in device.expect_received(PacketType::PROXY_STATUS, 2) {
             assert_eq!(pkt.as_bytes(), user.as_bytes());
         }
-    }
-
-    /// A legacy client cannot be told why, so it is disconnected.
-    #[test]
-    fn a_legacy_client_whose_auto_cannot_open_is_closed() {
-        let url = UNREACHABLE.to_string();
-        let proxy = Proxy::host(HostOptions {
-            default: Some(Layout::single(&url)),
-            ..options()
-        })
-        .unwrap();
-
-        let legacy = TestClient::connect(&proxy.endpoint());
-
-        assert!(matches!(
-            legacy.rx.recv_timeout(WAIT),
-            Err(flume::RecvTimeoutError::Disconnected)
-        ));
     }
 
     /// Whether `proxy` stops within the time a test waits, waited for on
@@ -1641,8 +1624,8 @@ mod tests {
         assert_eq!(proxy.links.users(), 1);
 
         assert!(shuts_down_in_time(proxy));
-        first.expect_stopped(false);
-        second.expect_stopped(false);
+        first.expect_stopped();
+        second.expect_stopped();
     }
 
     /// Hosts a proxy, and connects a client that opened `device` and one
@@ -1679,7 +1662,7 @@ mod tests {
 
         proxy.links.panic();
 
-        watcher.expect_stopped(false);
+        watcher.expect_stopped();
         // Its link ended with the registry, before or after the stop.
         user.expect_closed();
         assert!(stops_in_time(proxy.clone()));
@@ -1709,13 +1692,13 @@ mod tests {
         let control = TestClient::connect(&proxy.endpoint());
         control.hello(4242, "control");
         control.open(&device.url).unwrap();
-        let legacy = TestClient::connect(&proxy.endpoint());
-        assert_eq!(legacy.dev_name(7), "FAKE");
+        let idle = TestClient::connect(&proxy.endpoint());
+        idle.hello(4243, "idle");
 
         proxy.shutdown();
 
-        control.expect_stopped(false);
-        legacy.expect_stopped(true);
+        control.expect_stopped();
+        idle.expect_stopped();
         let deadline = Instant::now() + WAIT;
         while !proxy.clients().is_empty() {
             assert!(Instant::now() < deadline, "a client stayed listed");
@@ -1743,7 +1726,7 @@ mod tests {
 
         proxy.shutdown();
 
-        client.expect_stopped(false);
+        client.expect_stopped();
         sending.join().unwrap();
     }
 
@@ -1763,7 +1746,7 @@ mod tests {
             .collect();
         stopped.shutdown();
         for client in &clients {
-            client.expect_stopped(false);
+            client.expect_stopped();
         }
         drop(clients);
 
@@ -1838,7 +1821,7 @@ mod tests {
 
         stop(Some(&stoppable.endpoint())).unwrap();
 
-        watcher.expect_stopped(false);
+        watcher.expect_stopped();
         let endpoint = stoppable.endpoint();
         assert!(stops_in_time(Arc::new(stoppable)));
         assert_eq!(

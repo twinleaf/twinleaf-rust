@@ -367,8 +367,8 @@ impl Packet {
         finish(&mut buf, len, routing)
     }
 
-    /// Creates a link status in the legacy form, type 64, for a client that
-    /// predates `PROXY_RX`. [`LinkStatus::Stopped`] goes out as
+    /// Creates a link status in the legacy form, type 64, as a proxy that
+    /// predates `PROXY_RX` sends it. [`LinkStatus::Stopped`] goes out as
     /// [`LinkStatus::FailedToReconnect`]. The packet has no route.
     // A one byte payload always fits a packet.
     #[allow(clippy::missing_panics_doc)]
@@ -866,7 +866,7 @@ mod tests {
         ]);
     }
 
-    /// A legacy client knows no stop, so it hears that reconnecting failed.
+    /// The legacy form knows no stop, so it says that reconnecting failed.
     #[test]
     fn a_legacy_stop_encodes_as_failed_to_reconnect() {
         let packet = Packet::legacy_status(LinkStatus::Stopped);
