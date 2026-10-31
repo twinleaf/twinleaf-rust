@@ -563,7 +563,9 @@ fn advertise_tcp(instance: &str, host_name: &str, port: u16) -> Option<MdnsServi
 }
 
 /// Returns the `dev.name` of each device the proxy serves by default, read
-/// over a connection to the proxy itself.
+/// over a connection to the proxy itself. The proxy's endpoint is a TCP URL
+/// on this machine, so the connection opens the proxy's `auto`, which is the
+/// default it holds.
 #[cfg(feature = "mdns")]
 fn discover_sensor_models(proxy: &Proxy) -> Vec<String> {
     match twinleaf::Connection::open(&proxy.endpoint()) {

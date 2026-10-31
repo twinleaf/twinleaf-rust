@@ -1,13 +1,33 @@
 //! The [`SettingsCache`] of setting values a device announces.
 
-use super::error::CallError;
-use super::registry::RpcRegistry;
-use super::reply::{pipelined, PendingReply};
-use crate::device::stream::DeviceEvent;
+use crate::device::rpc::{pipelined, CallError, PendingReply, RpcRegistry};
+use crate::device::SettingChange;
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
 use crate::tio::rpc::RpcReply;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// A fact about one device, which the engine takes to keep the device's RPC
+/// table and settings current.
+#[derive(Debug, Clone)]
+pub(crate) enum DeviceEvent {
+    /// A heartbeat from the device.
+    Heartbeat {
+        /// The session the device reports, when its heartbeat carries one.
+        session_id: Option<SessionId>,
+        /// The sequence number of the device's last setting announcement, when
+        /// its heartbeat carries one.
+        settings: Option<u32>,
+    },
+    /// A new RPC table hash. `Some(hash)` comes from the `rpc.hash`
+    /// announcement firmware whose table changes with `dev.priv` sends.
+    /// `None` follows a reconnection and asks for a refresh.
+    NewHash(Option<u32>),
+    /// A setting the device announced. An `rpc.hash` announcement arrives
+    /// here as well as in [`NewHash`](Self::NewHash), and one whose name is
+    /// not UTF-8 never arrives.
+    Setting(SettingChange),
+}
 
 /// The counter a device raises on every setting announcement, numbering each.
 const SETTINGS_VERSION: &str = "settings.version";
@@ -101,15 +121,15 @@ impl SettingsCache {
                     None => CacheAction::Snapshot,
                 }
             }
-            DeviceEvent::Setting { seq: None, .. } => {
+            DeviceEvent::Setting(SettingChange { seq: None, .. }) => {
                 self.forget();
                 CacheAction::Keep
             }
-            DeviceEvent::Setting {
+            DeviceEvent::Setting(SettingChange {
                 name,
                 seq: Some(seq),
                 reply,
-            } => match self.applied {
+            }) => match self.applied {
                 None => CacheAction::Snapshot,
                 Some(applied) if *seq == applied.wrapping_add(1) => {
                     if self.cached.contains(name) {
@@ -139,11 +159,6 @@ impl SettingsCache {
     /// `None` while the cache waits for a snapshot.
     pub(crate) fn version(&self) -> Option<u32> {
         self.applied
-    }
-
-    /// Returns the session the values were read in.
-    pub(crate) fn session(&self) -> Option<SessionId> {
-        self.session
     }
 
     /// Returns every value held, by name.
@@ -213,10 +228,8 @@ fn ahead(seq: u32, applied: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::error::RpcErrorPayload;
-    use super::super::registry::RpcDescriptor;
-    use super::super::reply::resolved;
     use super::*;
+    use crate::device::rpc::{resolved, RpcDescriptor, RpcErrorPayload};
     use crate::proto::rpc::RpcError;
 
     /// The metadata words of an announced read-write byte, an announced
@@ -272,11 +285,11 @@ mod tests {
     }
 
     fn setting(name: &str, seq: Option<u32>, reply: u8) -> DeviceEvent {
-        DeviceEvent::Setting {
+        DeviceEvent::Setting(SettingChange {
             name: name.to_string(),
             seq,
             reply: vec![reply],
-        }
+        })
     }
 
     fn heartbeat(session: SessionId, settings: Option<u32>) -> DeviceEvent {

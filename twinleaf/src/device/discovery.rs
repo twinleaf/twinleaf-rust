@@ -6,11 +6,12 @@
 //! appear and disappear. [`enumerate_serial`] returns a one-shot list of
 //! serial devices, and [`query_name`] reads one device's name.
 
+use super::connection::NamedRoute;
 use super::connection::{Connection, DeviceTree};
 use super::rpc::RpcReply;
 use super::runtime::ProxyAddress;
 use super::session::Session;
-use super::stream::{NamedRoute, RecvError};
+use super::stream::RecvError;
 use crate::proto::DeviceRoute;
 use crate::proxy::Purpose;
 use crate::rt::{BoxFuture, Supervisor};
@@ -206,16 +207,18 @@ struct Backend {
 }
 
 /// Opens a probe connection to `url` through the proxy [`Connection::open`]
-/// uses. A TCP `url` on this machine is reached directly. A probe does not
-/// make the device a choice for `auto`. Fails if the proxy does not open the
-/// device within `timeout`.
+/// uses. A probe does not make the device a choice for `auto`. A TCP `url`
+/// on this machine names a proxy instead, and the connection opens that
+/// proxy's `auto`. Fails if the proxy does not open the device within
+/// `timeout`.
 async fn probe(url: String, timeout: Duration) -> io::Result<Connection> {
     Connection::open_at_async(&ProxyAddress::chosen(), &url, Purpose::Probe, timeout).await
 }
 
 /// Connects briefly to `url` and reads its `dev.name`, through the proxy
-/// [`Connection::open`] uses. A TCP `url` on this machine is read directly.
-/// The probe does not make the device a choice for `auto`.
+/// [`Connection::open`] uses. The probe does not make the device a choice
+/// for `auto`. A TCP `url` on this machine names a proxy instead, and the
+/// name read is that of the root device of its `auto`.
 ///
 /// Returns `None` if the port is busy, nothing answers at a proxy that
 /// `TWINLEAF_PROXY` names, or the device does not answer within about twice
@@ -1120,17 +1123,18 @@ mod tests {
         assert_eq!(device.accepted(), 1);
     }
 
-    /// A TCP URL on this machine names what serves the device already, so
-    /// the name is read from there, whatever proxy `TWINLEAF_PROXY` names.
+    /// A TCP URL on this machine names a proxy, so the name is read through
+    /// it, whatever proxy `TWINLEAF_PROXY` names.
     #[test]
-    fn a_name_at_a_local_tcp_url_is_read_directly() {
+    fn a_name_at_a_local_tcp_url_is_read_through_that_proxy() {
         let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
         let device = FakeDevice::start();
+        let named = fixtures::proxy_serving(&device.url);
         let closed = fixtures::ClosedPort::new();
         let silent = closed.url();
 
         std::env::set_var("TWINLEAF_PROXY", &silent);
-        let name = query_name(&device.url, WAIT);
+        let name = query_name(&named.endpoint(), WAIT);
 
         std::env::remove_var("TWINLEAF_PROXY");
         assert_eq!(name.as_deref(), Some("FAKE"));

@@ -4,28 +4,30 @@
 
 use super::auto::{self, Choice};
 use super::control::encode;
-use super::control::{self, Purpose, Refusal, Request, Watch};
+use super::control::{self, Purpose, Refusal, Request, Update, Watch};
 use super::link::{self, Lease, Link};
-use super::server::{Notice, Shared, Update};
+use super::server::{self, Notice, Shared};
 use super::worker;
 use super::Layout;
-use crate::device::rpc::RpcRegistry;
-use crate::device::{Device, MetadataState, RecvError};
+use crate::device::store::{lock, Store, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
+use crate::device::stream::Scope;
+use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
+use futures_util::future;
 use futures_util::stream::{self, BoxStream};
 use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
 
 /// How long a new client has to send a control request before it is taken
@@ -188,8 +190,8 @@ pub(super) struct Session {
     opening: Option<Opening>,
     held: Option<Held>,
     /// The updates of each device the client watches, by the id of its
-    /// `proxy.watch`.
-    watches: StreamMap<u16, BoxStream<'static, control::Update>>,
+    /// `proxy.watch`, each ending with `None`.
+    watches: StreamMap<u16, StreamNotifyClose<BoxStream<'static, Update>>>,
     /// Whether the client is a legacy client, whose first packet was not a
     /// control request. A legacy client reads link statuses in the legacy
     /// form. It is `true` until the client is classified.
@@ -274,9 +276,20 @@ impl Session {
                 .binding
                 .as_ref()
                 .is_some_and(|binding| !binding.incoming.is_empty());
+            // State goes out ahead of the devices' packets.
             tokio::select! {
                 biased;
                 _ = &mut self.alive => return Err(self.stopped()),
+                Some((id, update)) = self.watches.next(), if !self.watches.is_empty() => {
+                    let replies = match update {
+                        Some(update) => control::parts(id, &update),
+                        None => {
+                            let ended = "the proxy no longer follows this device";
+                            vec![control::answer(id, Err(Refusal::new(RpcError::State, ended)))]
+                        }
+                    };
+                    self.send_state(replies).await?
+                }
                 received = self.incoming.next() => {
                     let Some(received) = received else { return Err(ClientError::HungUp); };
                     if let Some(pkt) = self.delivered(received)? {
@@ -294,9 +307,6 @@ impl Session {
                         return Err(binding.expect("a mount is bound").closed(index));
                     };
                     self.mount_packet(pkt, index)?;
-                }
-                Some((id, update)) = self.watches.next(), if !self.watches.is_empty() => {
-                    self.send_update(id, &update)?;
                 }
                 (request, outcome) = finish(&mut self.opening) => {
                     self.opened(request, outcome).await?;
@@ -469,7 +479,7 @@ impl Session {
 
     /// Changes the client's entry in the table, and waits until the table
     /// shows it or the server has ended.
-    async fn update(&mut self, update: Update) {
+    async fn update(&mut self, update: server::Update) {
         let (done, shown) = oneshot::channel();
         let notice = Notice::Update {
             id: self.id,
@@ -504,7 +514,7 @@ impl Session {
         match request {
             Request::Hello(client) => {
                 log::debug!("Client {} is {client}", self.addr);
-                self.update(Update::Hello(client)).await;
+                self.update(server::Update::Hello(client)).await;
                 let host = control::Introduction::of_this_process(&self.shared.options.name);
                 self.answer(id, Ok(encode(&host)))
             }
@@ -516,7 +526,11 @@ impl Session {
                 self.request(id, binding)
             }
             Request::Default(layout) => self.hold_default(id, layout),
-            Request::Watch(watch) => self.watch(id, watch),
+            Request::Watch(watch) => self.watch(id, watch).await,
+            Request::Unwatch(watched) => {
+                self.watches.remove(&watched);
+                Ok(())
+            }
             Request::Stop if self.shared.options.stoppable => {
                 self.answer(id, Ok(Vec::new()))?;
                 log::info!("Stopped by proxy.stop from client {}", self.addr);
@@ -538,57 +552,44 @@ impl Session {
     }
 
     /// Follows the device that control request `id` names, answering with
-    /// its state now and then each change. The client inside the proxy that
-    /// keeps the state of the device's link starts with the first watch.
-    fn watch(&mut self, id: u16, watch: Watch) -> Result<(), ClientError> {
-        match self.watched(watch.route) {
-            Ok(device) => {
-                self.watches.insert(id, updates(&device, watch.table));
+    /// its state now and then each change. A watch under an id the client
+    /// already watches with replaces it.
+    async fn watch(&mut self, id: u16, watch: Watch) -> Result<(), ClientError> {
+        let opened = self.binding.as_ref();
+        let opened =
+            opened.ok_or_else(|| Refusal::new(RpcError::State, "this connection opened nothing"));
+        match opened.and_then(|binding| updates(binding, watch)) {
+            Ok(updates) => {
+                self.watches.insert(id, StreamNotifyClose::new(updates));
                 Ok(())
             }
-            Err(refusal) => self.answer(id, Err(refusal)),
+            Err(refusal) => {
+                self.send_state(vec![control::answer(id, Err(refusal))])
+                    .await
+            }
         }
     }
 
-    /// Returns the device at `route`, as the client sees it, from the client
-    /// inside the proxy that keeps the state of its mount's link.
+    /// Sends `packets`, the replies to a watch that carry state or its end.
+    /// State is never dropped, so it waits for room in the client's queue,
+    /// unless the proxy stops meanwhile.
     ///
-    /// Returns a [`Refusal`] if the client opened nothing, no mount shows
-    /// `route`, or the link takes no more ports.
-    fn watched(&self, route: DeviceRoute) -> Result<Device, Refusal> {
-        let Some(binding) = &self.binding else {
-            return Err(Refusal::new(
-                RpcError::State,
-                "this connection opened nothing",
-            ));
-        };
-        let mounted = binding.mounts.iter().zip(&binding.leases);
-        let found = mounted.into_iter().find_map(|(mount, lease)| {
-            let below = mount.prefix.relative_route(&route).ok()?;
-            Some((mount.source.absolute_route(&below).ok()?, lease.link()))
-        });
-        let Some((source, link)) = found else {
-            let message = format!("no mount shows {route}");
-            return Err(Refusal::new(RpcError::Invalid, message));
-        };
-        let state = link.state(&self.shared.tasks);
-        let state = state.map_err(|reason| Refusal::new(RpcError::Load, reason))?;
-        Ok(state.device(source))
-    }
-
-    /// Sends `update` to the client in the parts of replies to watch `id`.
-    ///
-    /// Returns an error if the client is gone, or if it falls behind a proxy
-    /// that kicks slow clients.
-    fn send_update(&mut self, id: u16, update: &control::Update) -> Result<(), ClientError> {
-        for part in control::parts(id, update) {
-            match self.client.try_send(part) {
-                Ok(()) => self.slow.packet_delivered(&self.addr),
-                Err(transport::SendError::Full) if !self.shared.options.kick_slow => {
-                    self.slow.packet_dropped(&self.addr)
-                }
-                Err(transport::SendError::Full) => return Err(ClientError::TooSlow),
-                Err(_) => return Err(ClientError::HungUp),
+    /// Returns [`ClientError::Stopped`] once the proxy stops,
+    /// [`ClientError::TooSlow`] if the client makes no room within
+    /// the time a quiet client is given, and [`ClientError::HungUp`] if it
+    /// is gone.
+    async fn send_state(&mut self, packets: Vec<Packet>) -> Result<(), ClientError> {
+        for part in packets {
+            let quiet = control::PROXY_KEEPALIVE.quiet;
+            let sent = tokio::select! {
+                biased;
+                _ = &mut self.alive => return Err(self.stopped()),
+                sent = timeout(quiet, self.client.send_async(part)) => sent,
+            };
+            match sent {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(ClientError::HungUp),
+                Err(_) => return Err(ClientError::TooSlow),
             }
         }
         Ok(())
@@ -686,7 +687,7 @@ impl Session {
         let outcome = match outcome {
             Ok(binding) => {
                 let target = binding.target.clone();
-                self.update(Update::Target(target.clone())).await;
+                self.update(server::Update::Target(target.clone())).await;
                 self.binding = Some(binding);
                 Ok(encode(&target))
             }
@@ -835,72 +836,149 @@ async fn resolve(
     }
 }
 
-/// Returns the updates a watch of `device` sends, of its presence, metadata
-/// and announced settings, or with `table` of its RPC table and settings. A table goes out ahead of the first
-/// settings read with it. The stream ends with the client that keeps them.
-fn updates(device: &Device, table: bool) -> BoxStream<'static, control::Update> {
-    if !table {
-        let followed = (
-            device.presence_updates(),
-            device.metadata_updates(),
-            device.setting_changes(),
-        );
-        return stream::unfold(followed, |(presence, metadata, changes)| async move {
-            let update = tokio::select! {
-                now = presence.recv_async() => Some(control::Update::presence(now.ok()?)),
-                state = metadata.recv_async() => match state.ok()? {
-                    MetadataState::Ready(snapshot) => control::Update::metadata(&snapshot),
-                    MetadataState::Unsupported => Some(control::Update::Unsupported),
-                    MetadataState::Pending => None,
-                },
-                change = changes.recv_async() => match change {
-                    Ok(change) => Some(control::Update::setting(change)),
-                    Err(RecvError::Lagged(_)) => None,
-                    Err(_) => return None,
-                },
-            };
-            Some((stream::iter(update), (presence, metadata, changes)))
-        })
-        .flatten()
-        .boxed();
+/// Returns the updates `watch` sends through the mounts of `binding`.
+///
+/// With `table`, they are the RPC table and settings of the device the
+/// watch names, and a table goes out ahead of the first settings read with
+/// it. Without, they are the routes heard at or below it, from every mount
+/// there, and the presence, metadata and announced settings of the device
+/// it names, if a mount shows it. The updates end when the link's engine
+/// does.
+///
+/// Returns a [`Refusal`] if no mount shows what the watch follows.
+fn updates(binding: &Binding, watch: Watch) -> Result<BoxStream<'static, Update>, Refusal> {
+    let refused = || Refusal::new(RpcError::Invalid, format!("no mount shows {}", watch.route));
+    let device = binding.device(watch.route);
+    if watch.table {
+        let (store, route) = device.ok_or_else(refused)?;
+        return Ok(table_updates(&store, route));
     }
+    let routes = binding.routes(watch.route).ok_or_else(refused)?;
+    Ok(match device {
+        Some((store, route)) => stream::select(routes, device_updates(&store, route)).boxed(),
+        None => routes,
+    })
+}
+
+impl Binding {
+    /// Returns the store of the link whose mount shows `route`, and the
+    /// route there.
+    fn device(&self, route: DeviceRoute) -> Option<(Arc<Mutex<Store>>, DeviceRoute)> {
+        let mounted = self.mounts.iter().zip(&self.leases);
+        mounted.into_iter().find_map(|(mount, lease)| {
+            let below = mount.prefix.relative_route(&route).ok()?;
+            Some((
+                lease.link().store(),
+                mount.source.absolute_route(&below).ok()?,
+            ))
+        })
+    }
+
+    /// Returns the updates of the routes heard at or below `route`, as the
+    /// client sees them, from every mount there. Each change of any mount's
+    /// list sends the whole list, read from every mount's store then.
+    /// Returns `None` if no mount is there.
+    fn routes(&self, route: DeviceRoute) -> Option<BoxStream<'static, Update>> {
+        let mounted = self.mounts.iter().zip(&self.leases);
+        let shown: Vec<_> = mounted
+            .filter_map(|(mount, lease)| {
+                let below = match mount.prefix.relative_route(&route) {
+                    Ok(below) => mount.source.absolute_route(&below).ok()?,
+                    Err(_) if mount.prefix.starts_with(&route) => mount.source,
+                    Err(_) => return None,
+                };
+                Some((
+                    lease.link().store(),
+                    Scope::subtree(below),
+                    (mount.prefix, mount.source),
+                ))
+            })
+            .collect();
+        if shown.is_empty() {
+            return None;
+        }
+        let changes = shown
+            .iter()
+            .map(|(store, scope, _)| values(lock(store).follow_routes(*scope)));
+        let changes = stream::select_all(changes.collect::<Vec<_>>());
+        Some(
+            changes
+                .map(move |_| {
+                    let all = shown.iter().flat_map(|(store, scope, (prefix, source))| {
+                        let heard = lock(store).routes().clone().into_iter();
+                        let heard = heard.filter(|heard| scope.covers(*heard));
+                        let below = heard.filter_map(|heard| source.relative_route(&heard).ok());
+                        below.filter_map(|below| prefix.absolute_route(&below).ok())
+                    });
+                    Update::Routes(all.map(|route| route.as_slice().to_vec().into()).collect())
+                })
+                .boxed(),
+        )
+    }
+}
+
+/// Returns the updates of the presence, metadata and announced settings of
+/// the device at `route` that `store` holds.
+fn device_updates(store: &Mutex<Store>, route: DeviceRoute) -> BoxStream<'static, Update> {
+    let mut store = lock(store);
+    let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
+    let metadata = values(store.follow(route, METADATA));
+    let metadata = metadata.filter_map(|state| future::ready(Update::metadata(&state)));
+    let changes = announced(store.follow(route, CHANGES));
+    stream::select_all([presence.boxed(), metadata.boxed(), changes]).boxed()
+}
+
+/// Returns the updates of the RPC table and settings of the device at
+/// `route` that `store` holds. A table goes out ahead of the first settings
+/// read with it, and settings read with any other table than the one sent
+/// last never go out.
+fn table_updates(store: &Mutex<Store>, route: DeviceRoute) -> BoxStream<'static, Update> {
+    let mut store = lock(store);
     let followed = (
-        device.rpc_registry_updates(),
-        device.settings_updates(),
+        store.follow(route, REGISTRY),
+        store.follow(route, SETTINGS),
         None,
     );
-    stream::unfold(followed, |(registry, settings, mut sent)| async move {
-        let updates = tokio::select! {
-            loaded = registry.recv_async() => match loaded.ok()? {
-                Ok(table) => new_table(&mut sent, &table).into_iter().collect(),
-                Err(error) => {
-                    sent = None;
-                    vec![control::Update::unloaded(&error)]
-                }
-            },
+    let updates = stream::unfold(followed, |(registry, settings, mut table)| async move {
+        let update = tokio::select! {
+            biased;
+            loaded = registry.recv_async() => {
+                let loaded = loaded.ok()?;
+                table = loaded.as_ref().ok().cloned();
+                Some(Update::table(&loaded))
+            }
             read = settings.recv_async() => {
                 let read = read.ok()?;
-                let table = new_table(&mut sent, read.rpc_registry());
-                table.into_iter().chain([control::Update::settings(&read)]).collect()
+                let current = table.as_ref().is_some_and(|sent| Arc::ptr_eq(sent, read.rpc_registry()));
+                current.then(|| Update::settings(&read))
             }
         };
-        Some((stream::iter(updates), (registry, settings, sent)))
+        Some((update, (registry, settings, table)))
+    });
+    updates.filter_map(future::ready).boxed()
+}
+
+/// Returns what the latest-value `receiver` yields until it ends.
+fn values<T: Send + 'static>(receiver: Receiver<T>) -> BoxStream<'static, T> {
+    stream::unfold(receiver, |receiver| async move {
+        let value = receiver.recv_async().await.ok()?;
+        Some((value, receiver))
     })
-    .flatten()
     .boxed()
 }
 
-/// Returns the update of `table` unless it is the table `sent` holds, and
-/// then holds it there.
-fn new_table(
-    sent: &mut Option<Arc<RpcRegistry>>,
-    table: &Arc<RpcRegistry>,
-) -> Option<control::Update> {
-    if sent.as_ref().is_some_and(|sent| Arc::ptr_eq(sent, table)) {
-        return None;
-    }
-    *sent = Some(Arc::clone(table));
-    Some(control::Update::table(table))
+/// Returns the updates of each setting `changes` yields, and of each count
+/// of those it missed, until it ends.
+fn announced(changes: Receiver<SettingChange>) -> BoxStream<'static, Update> {
+    stream::unfold(changes, |changes| async move {
+        let update = match changes.recv_async().await {
+            Ok(change) => Update::setting(change),
+            Err(RecvError::Lagged(missed)) => Update::Lagged(missed),
+            Err(_) => return None,
+        };
+        Some((update, changes))
+    })
+    .boxed()
 }
 
 /// Returns the refusal of an open whose blocking step failed with `error`.
@@ -916,7 +994,9 @@ mod tests {
     use crate::proxy::DumpFlags;
     use crate::rt::Supervisor;
     use crate::tio::transport::{FakeEnd, TransportKind, DEFAULT_RX_CHANNEL_SIZE};
+    use futures_util::FutureExt;
     use tokio::sync::{mpsc, watch};
+
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -1180,5 +1260,132 @@ mod tests {
                 Some(route.parse().unwrap())
             );
         }
+    }
+
+    /// Takes what `updates` yields without waiting.
+    fn ready(updates: &mut BoxStream<'static, Update>) -> Vec<Update> {
+        std::iter::from_fn(|| updates.next().now_or_never().flatten()).collect()
+    }
+
+    /// A stop reaches a client whose queue is too full for its state at
+    /// once, rather than once the wait for room runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_reaches_a_client_waiting_to_send_state() {
+        let Client {
+            mut end,
+            mut devices,
+            served,
+            _lifeline,
+            links: _links,
+            _registry,
+        } = connect(None, None);
+        end.send(&open(DEVICE, 2)).await;
+        let mut device = opened(&mut devices).await;
+        let root = DeviceRoute::root();
+        device.end.send(&Packet::heartbeat(root)).await;
+        assert_eq!(answer(&next(&mut end).await).0, 2);
+        for _ in 0..transport::DEFAULT_TX_CHANNEL_SIZE * 2 {
+            device.end.send(&Packet::heartbeat(root)).await;
+        }
+        let watch = encode(&Watch {
+            route: root,
+            table: false,
+        });
+        end.send(&Packet::proxy_request(control::WATCH, &watch, 3).unwrap())
+            .await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+
+        let stopping = Instant::now();
+        drop(_lifeline);
+        let served = timeout(PAUSED_WAIT, served).await.unwrap().unwrap();
+        assert!(
+            matches!(served, Some(Err(ClientError::Stopped))),
+            "{served:?}"
+        );
+        assert!(stopping.elapsed() < control::PROXY_KEEPALIVE.quiet);
+    }
+
+    /// A table watch that falls behind a new table sends the new table, and
+    /// never the settings read with the table before, which the store's
+    /// lanes may still hold.
+    #[test]
+    fn a_table_watch_never_sends_settings_of_an_older_table() {
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let table = |hash| {
+            Arc::new(crate::device::rpc::RpcRegistry::from_entries(
+                Vec::new(),
+                Some(hash),
+                None,
+            ))
+        };
+        let (old, new) = (table(1), table(2));
+        let settings = crate::device::Settings::new(Arc::clone(&old), Some(1), Default::default());
+        lock(&store).set_registry(route, Ok(Arc::clone(&old)));
+        lock(&store).set_settings(route, Arc::new(settings));
+        let mut updates = table_updates(&store, route);
+
+        lock(&store).set_registry(route, Ok(Arc::clone(&new)));
+
+        assert_eq!(ready(&mut updates), [Update::table(&Ok(new))]);
+    }
+
+    /// A watch whose client reads nothing while a device's presence changes
+    /// sends only the newest presence once it is read again, as the store's
+    /// latest values coalesce what it missed.
+    #[test]
+    fn a_slow_watch_converges_to_the_newest_presence() {
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route);
+        let first = ready(&mut updates);
+        assert_eq!(
+            first,
+            [
+                Update::Presence(Err(None)),
+                Update::Metadata(Some(Vec::new()))
+            ]
+        );
+
+        for session in 0..1000 {
+            let alive = crate::device::Presence::Alive {
+                session: Some(crate::proto::SessionId::new(session)),
+            };
+            lock(&store).set(route, PRESENCE, alive);
+        }
+
+        assert_eq!(ready(&mut updates), [Update::Presence(Ok(Some(999)))]);
+    }
+
+    /// A watch that falls behind the device's announcements says how many
+    /// it missed, and goes on with the next one.
+    #[test]
+    fn a_watch_that_misses_announcements_says_how_many() {
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route);
+        ready(&mut updates);
+        let change = |seq: usize| SettingChange {
+            name: "test.amplitude".to_string(),
+            seq: u32::try_from(seq).ok(),
+            reply: vec![1],
+        };
+        let missed = 10;
+        let sent = crate::device::store::CHANGE_QUEUE_LEN + missed;
+        for seq in 0..sent {
+            lock(&store).set(route, CHANGES, change(seq));
+        }
+        assert_eq!(
+            ready(&mut updates).len(),
+            crate::device::store::CHANGE_QUEUE_LEN
+        );
+
+        lock(&store).set(route, CHANGES, change(sent));
+        assert_eq!(
+            ready(&mut updates),
+            [Update::Lagged(missed as u64), Update::setting(change(sent))]
+        );
     }
 }

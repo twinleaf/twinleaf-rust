@@ -28,7 +28,7 @@ enum Schedule {
 }
 
 /// What a finished `dev.metadata` call left behind.
-pub(crate) enum Completed {
+pub(super) enum Completed {
     /// The reply reached the parser, which may now describe more of its route.
     Applied,
     /// The route's firmware has no `dev.metadata`, learned by this call.
@@ -40,7 +40,7 @@ pub(crate) enum Completed {
 
 /// When each route is asked for metadata, through one view's session handle.
 /// It holds each route's backoff and the channel finished calls arrive on.
-pub(crate) struct MetadataSchedule {
+pub(super) struct MetadataSchedule {
     handle: Handle,
     schedule: HashMap<DeviceRoute, Schedule>,
     resolve: flume::Sender<(MetadataQuery, RawCallResult)>,
@@ -49,7 +49,7 @@ pub(crate) struct MetadataSchedule {
 
 impl MetadataSchedule {
     /// Creates a schedule that asks through `handle`.
-    pub(crate) fn new(handle: Handle) -> MetadataSchedule {
+    pub(super) fn new(handle: Handle) -> MetadataSchedule {
         let (resolve, replies) = flume::unbounded();
         MetadataSchedule {
             handle,
@@ -60,13 +60,13 @@ impl MetadataSchedule {
     }
 
     /// Returns the channel of finished calls, to receive from or select on.
-    pub(crate) fn replies(&self) -> &flume::Receiver<(MetadataQuery, RawCallResult)> {
+    pub(super) fn replies(&self) -> &flume::Receiver<(MetadataQuery, RawCallResult)> {
         &self.replies
     }
 
     /// Returns which of `routes` may be asked now. Marks each backoff that
     /// has passed as due, and [`next_retry`](Self::next_retry) then skips it.
-    pub(crate) fn due(
+    pub(super) fn due(
         &mut self,
         routes: impl IntoIterator<Item = DeviceRoute>,
         now: Instant,
@@ -89,7 +89,7 @@ impl MetadataSchedule {
     }
 
     /// Asks `route` for whatever metadata `parser` still wants.
-    pub(crate) fn submit(&mut self, parser: &mut PacketParser, route: DeviceRoute) {
+    pub(super) fn submit(&mut self, parser: &mut PacketParser, route: DeviceRoute) {
         for query in parser.take_metadata_queries_for(route) {
             let resolve = self.resolve.clone();
             let args = query.args();
@@ -105,7 +105,7 @@ impl MetadataSchedule {
     }
 
     /// Applies a finished call to `parser`, or schedules when to ask again.
-    pub(crate) fn complete(
+    pub(super) fn complete(
         &mut self,
         parser: &mut PacketParser,
         query: MetadataQuery,
@@ -122,17 +122,12 @@ impl MetadataSchedule {
                 error: wire_rpc::RpcError::NotFound,
                 ..
             })) => self.give_up(parser, query),
-            Err(CallError::DeviceError(_))
-            | Err(CallError::InvalidRoute(_))
-            | Err(CallError::RequestNotSubmitted)
-            | Err(CallError::Timeout)
-            | Err(CallError::ResponseLost)
-            | Err(CallError::InvalidReply(_)) => self.back_off(parser, query),
+            Err(_) => self.back_off(parser, query),
         }
     }
 
     /// Returns the earliest moment a backed-off route is due again.
-    pub(crate) fn next_retry(&self) -> Option<Instant> {
+    pub(super) fn next_retry(&self) -> Option<Instant> {
         self.schedule
             .values()
             .filter_map(|state| match state {
@@ -144,7 +139,7 @@ impl MetadataSchedule {
 
     /// Clears the schedule of every route in `subtree`. The next session
     /// there is asked from the start.
-    pub(crate) fn forget(&mut self, subtree: DeviceRoute) {
+    pub(super) fn forget(&mut self, subtree: DeviceRoute) {
         self.schedule
             .retain(|route, _| !route.starts_with(&subtree));
     }

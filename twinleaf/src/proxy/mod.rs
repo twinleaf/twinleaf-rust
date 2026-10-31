@@ -128,16 +128,21 @@
 mod auto;
 mod client;
 mod control;
+mod engine;
 mod link;
+mod metadata;
 mod server;
+mod settings;
+#[cfg(test)]
+mod settings_sim;
 mod worker;
 
-#[cfg(test)]
-pub(crate) use control::{parts, CLIENT_KEEPALIVE};
 pub(crate) use control::{
-    call, decode, encode, executable_name, handshake, Part, Purpose, Update, Watch, DEFAULT_LAYOUT,
-    MOUNT, WATCH,
+    call, encode, executable_name, handshake, Joined, Purpose, Update, Watch, DEFAULT_LAYOUT,
+    MOUNT, UNWATCH, WATCH,
 };
+#[cfg(test)]
+pub(crate) use control::{decode, parts, CLIENT_KEEPALIVE};
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
 use crate::rt::Supervisor;
@@ -153,8 +158,8 @@ use tokio::sync::{mpsc, watch};
 /// completes it at once.
 // A listening socket completes the handshake in the kernel before it
 // accepts. A closed port can hang instead of refusing, as on WSL2 with
-// mirrored networking. Windows would take about 2 s to refuse, but a
-// loopback connect is told not to resend its handshake there.
+// mirrored networking. Windows resends an unanswered handshake before it
+// refuses, and a loopback connect is told not to resend it there.
 const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long [`stop`] waits for the proxy to reply.
@@ -490,7 +495,8 @@ impl Proxy {
     /// Stops the proxy and blocks until it has stopped. Each client hears the
     /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
     /// connection closes. The proxy stops accepting clients and closes every
-    /// device. A stop takes about 1.5 s at most, and then ends what still runs.
+    /// device. A stop waits at most 1.5 s for the clients and devices to
+    /// close, and then ends what still runs.
     /// Calling it again does nothing.
     pub fn shutdown(&self) {
         let _ = self.server.send(server::Notice::Stop);
@@ -560,7 +566,7 @@ mod tests {
     impl TestClient {
         fn connect(endpoint: &str) -> TestClient {
             let (sender, rx) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
-            let port = transport::Port::new(endpoint, sender);
+            let port = transport::Port::new_on(endpoint, sender, &Supervisor::new());
             TestClient {
                 port: port.unwrap(),
                 rx,
@@ -972,10 +978,7 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
         assert_eq!(
             refused.to_string(),
-            format!(
-                "tcp://127.0.0.1:{port} is not a Twinleaf 2.0 proxy; \
-                 reach it with -r tcp://localhost:{port}"
-            )
+            format!("tcp://127.0.0.1:{port} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it")
         );
     }
 
@@ -1029,12 +1032,11 @@ mod tests {
             Duration::from_millis(800),
         );
         let legacy = legacy.unwrap_err();
-        let port = device.url.rsplit(':').next().unwrap();
         assert_eq!(legacy.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             legacy.to_string(),
             format!(
-                "{} is not a Twinleaf 2.0 proxy; reach it with -r tcp://localhost:{port}",
+                "{} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it",
                 device.url
             )
         );

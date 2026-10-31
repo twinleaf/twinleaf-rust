@@ -513,13 +513,7 @@ impl Port {
     /// - `udp://address[:port]`. The schemes `udp4` and `udp6` force IPv4 or
     ///   IPv6.
     ///
-    /// Returns an error if `url` is not valid or the link cannot be opened.
-    pub(crate) fn new(url: &str, rx: Delivery) -> io::Result<Port> {
-        Port::new_on(url, rx, &Supervisor::new())
-    }
-
-    /// Opens a [`Port`] for `url` as [`new`](Self::new) does, with its task
-    /// on `tasks`. Blocks while it resolves the address and opens the link.
+    /// Its task runs on `tasks`.
     ///
     /// # Errors
     ///
@@ -642,13 +636,17 @@ impl Port {
     }
 
     /// Sends `packet` to the port, and waits while the port's queue is full.
+    /// The wait holds no borrow of the port.
     ///
     /// # Errors
     ///
     /// Returns [`SendError::Disconnected`] if the port's task has stopped.
-    pub(crate) async fn send_async(&self, packet: Packet) -> Result<(), SendError> {
-        let sent = self.tx.send(PacketOrControl::Pkt(packet)).await;
-        sent.map_err(|_| SendError::Disconnected)
+    pub(crate) fn send_async(&self, packet: Packet) -> impl Future<Output = Result<(), SendError>> {
+        let tx = self.tx.clone();
+        async move {
+            let sent = tx.send(PacketOrControl::Pkt(packet)).await;
+            sent.map_err(|_| SendError::Disconnected)
+        }
     }
 
     /// Sends `packet` to the port without blocking.
@@ -1370,7 +1368,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("tcp://{}", listener.local_addr().unwrap());
         let (received, results) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
-        let port = Port::new(&url, received).unwrap();
+        let port = Port::new_on(&url, received, &Supervisor::new()).unwrap();
         let (peer, _) = listener.accept().unwrap();
         (port, peer, results)
     }

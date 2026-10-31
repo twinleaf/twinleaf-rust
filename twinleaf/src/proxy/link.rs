@@ -23,22 +23,23 @@
 
 use super::auto::Candidate;
 use super::control::Refusal;
+use super::engine;
 use super::worker::{self, Command, Opener, Readiness, Subscriber};
 use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
 use crate::device::session::Session;
+use crate::device::store::Store;
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::Packet;
 use crate::tio::transport;
-use crate::Connection;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::env;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
@@ -137,9 +138,8 @@ pub(super) struct Link {
     commands: mpsc::WeakSender<Command>,
     /// The link's readiness, as its worker reports it.
     readiness: watch::Receiver<Readiness>,
-    /// The client inside the proxy that keeps the state of the link's
-    /// device for every watch, from the first watch on.
-    state: Arc<Mutex<Option<Connection>>>,
+    /// The state of the link's devices, which its engine keeps.
+    store: Arc<Mutex<Store>>,
 }
 
 impl Link {
@@ -181,11 +181,17 @@ impl Link {
     /// Returns an error message if the link is closed, the worker's queue is
     /// full, or the worker is gone.
     pub(super) fn open_port(&self, source: DeviceRoute) -> Result<Port, String> {
+        self.open_port_with(source, client_rx_channel_size())
+    }
+
+    /// Queues a port as [`open_port`](Self::open_port) does, whose queue
+    /// holds `capacity` packets.
+    fn open_port_with(&self, source: DeviceRoute, capacity: usize) -> Result<Port, String> {
         let Some(commands) = self.commands.upgrade() else {
             return Err(format!("the link to {} closed", self.url));
         };
         let (to_worker, from_port) = mpsc::channel(client_tx_channel_size());
-        let (to_port, from_worker) = mpsc::channel(client_rx_channel_size());
+        let (to_port, from_worker) = mpsc::channel(capacity);
         let subscriber = Subscriber::new(to_port, from_port, source);
         let reason = match commands.try_send(Command::OpenPort(subscriber)) {
             Ok(()) => {
@@ -204,24 +210,23 @@ impl Link {
         Err(format!("could not open a port on {}: {reason}", self.url))
     }
 
-    /// Returns the client inside the proxy that keeps the state of the
-    /// link's device, the one place its metadata, RPC table and settings are
-    /// asked for. The first call starts it over a port of its own, with its
-    /// tasks on `tasks`, and so does a call once it has ended.
+    /// Returns the state of the link's devices.
+    pub(super) fn store(&self) -> Arc<Mutex<Store>> {
+        Arc::clone(&self.store)
+    }
+
+    /// Starts a session over a port on the whole device whose queue never
+    /// fills, so the worker never drops it and it misses no packet. Its
+    /// tasks run on `tasks`. Only the link's engine opens one.
     ///
     /// # Errors
     ///
     /// Returns why a port could not be opened, as [`open_port`](Self::open_port) does.
-    pub(super) fn state(&self, tasks: &Supervisor) -> Result<Connection, String> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(connection) = state.as_ref().filter(|state| !state.is_closed()) {
-            return Ok(connection.clone());
-        }
-        let (sender, received) = self.open_port(DeviceRoute::root())?.into_split();
+    pub(super) fn open_session(&self, tasks: &Supervisor) -> Result<Session, String> {
+        let port = self.open_port_with(DeviceRoute::root(), Semaphore::MAX_PERMITS)?;
+        let (sender, received) = port.into_split();
         let peer = format!("the state of {}", self.url);
-        let connection = Connection::over(Session::over_port(sender.tx, received, peer, tasks));
-        *state = Some(connection.clone());
-        Ok(connection)
+        Ok(Session::over_port(sender.tx, received, peer, tasks))
     }
 }
 
@@ -643,8 +648,10 @@ impl Registry {
             url: url.into(),
             commands: commands.downgrade(),
             readiness,
-            state: Arc::default(),
+            store: Arc::new(Mutex::new(Store::new(true))),
         };
+        let engine = engine::run(link.clone(), self.tasks.clone());
+        self.tasks.spawn(format_args!("proxy state {url}"), engine);
         let entry = Entry {
             link,
             commands: Some(commands),
@@ -738,7 +745,7 @@ mod tests {
                 url: url.into(),
                 commands: commands.downgrade(),
                 readiness: watch::channel(Readiness::Pending).1,
-                state: Arc::default(),
+                store: Arc::new(Mutex::new(Store::new(true))),
             };
             (link, commands, receiver)
         }

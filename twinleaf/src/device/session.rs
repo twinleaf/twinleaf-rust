@@ -7,10 +7,9 @@
 //! `proxy.hello`. It then asks the proxy to open a target with `proxy.open`,
 //! or to look a device over with `proxy.probe`, and returns once the proxy
 //! has answered. It fails with the proxy's refusal, or when the peer does not
-//! answer as a 2.0 proxy does. [`Session::direct`] connects to a loopback
-//! target with no handshake, as a client older than tio 2.0 does.
+//! answer as a 2.0 proxy does.
 //!
-//! Either way one task on the crate's runtime then owns the socket. It sends
+//! One task on the crate's runtime then owns the socket. It sends
 //! each call, and a reply completes the call it answers. Every other packet
 //! goes to the pump. The session ends when its socket closes or the proxy
 //! stops, and every call still waiting fails. The session does not
@@ -30,12 +29,12 @@ use super::stream::{End, Lane, Queued};
 use crate::device::rpc::{CallError, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
 use crate::proxy::{encode, handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
-use crate::rt::{sleep_until_some, Supervisor};
+use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
-use std::collections::HashMap;
+use futures_util::{FutureExt, StreamExt};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::time::Duration;
@@ -82,6 +81,20 @@ impl Socket {
             Socket::Channel(sent) => sent.send(packet).map_err(|_| CallError::ResponseLost),
         }
     }
+
+    /// Returns what sends `packet` once the socket has room, and resolves to
+    /// `false` once the socket has closed. It holds no borrow of the socket.
+    fn send_later(&self, packet: Packet) -> BoxFuture<'static, bool> {
+        match self {
+            Socket::Transport(port) => Box::pin(port.send_async(packet).map(|sent| sent.is_ok())),
+            Socket::Port(port) => {
+                let port = port.clone();
+                Box::pin(async move { port.send(packet).await.is_ok() })
+            }
+            #[cfg(test)]
+            Socket::Channel(sent) => Box::pin(std::future::ready(sent.send(packet).is_ok())),
+        }
+    }
 }
 
 /// A call on its way to the session's task.
@@ -100,8 +113,9 @@ struct Pending {
 /// What the session's task is asked to do.
 enum Command {
     Call(Call),
-    /// Feeds the pump through this inlet. A second inlet is dropped.
-    Attach(Lane<Packet>),
+    /// Feeds the pump through this inlet, and the replies to its control
+    /// requests through this lane. A second attach is dropped.
+    Attach(Lane<Packet>, flume::Sender<Packet>),
     /// Sends a packet that expects no reply the session would complete.
     Send(Packet),
     /// Ends the session, as its owner closed it.
@@ -112,14 +126,15 @@ enum Command {
 /// replies, in order, a gap where the session had no room, and the stop.
 pub(crate) type Inlet = flume::Receiver<Queued<Packet>>;
 
+/// The replies to the pump's control requests, each a `PROXY_RX` packet. No
+/// reply is ever dropped.
+pub(crate) type Replies = flume::Receiver<Packet>;
+
 /// One session with a proxy. Every clone is the same session, and dropping
 /// the last ends the session's task, which closes the socket.
 #[derive(Clone)]
 pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
-    /// Whether the proxy keeps the device state and the pump watches it,
-    /// which is so for a session the proxy opened with a handshake.
-    watches: bool,
 }
 
 impl Session {
@@ -204,28 +219,12 @@ impl Session {
         };
         let socket = Socket::Transport(port);
         let received = received.into_stream().boxed();
-        Ok(Session {
-            watches: true,
-            ..Session::start(socket, received, peer, &tasks)
-        })
-    }
-
-    /// Connects to the proxy at the loopback `url` with no handshake, as a
-    /// client older than tio 2.0 does. Blocks while it connects.
-    pub(crate) fn direct(url: &str) -> io::Result<Session> {
-        let (sender, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
-        let port = transport::Port::new(url, sender).map_err(|error| {
-            io::Error::new(error.kind(), format!("cannot reach {url}: {error}"))
-        })?;
-        let socket = Socket::Transport(port);
-        let peer = format!("the proxy at {url}");
-        let received = received.into_stream().boxed();
-        Ok(Session::start(socket, received, peer, &Supervisor::new()))
+        Ok(Session::start(socket, received, peer, &tasks))
     }
 
     /// Starts a session inside the proxy over a port on one of its links,
-    /// which sends on `sent` and delivers on `received`. Its pump asks the
-    /// device for its state itself. `peer` names the link in the log.
+    /// which sends on `sent` and delivers on `received`. `peer` names the
+    /// link in the log.
     pub(crate) fn over_port(
         sent: mpsc::Sender<Packet>,
         received: mpsc::Receiver<Packet>,
@@ -256,27 +255,16 @@ impl Session {
             next_id: 0,
             next_deadline: None,
             inlet: None,
+            replies: None,
+            queued: VecDeque::new(),
+            sending: None,
         };
         tasks.spawn("twinleaf session", worker.run(mailbox));
-        Session {
-            commands,
-            watches: false,
-        }
-    }
-
-    /// Returns `true` if the proxy keeps the device state of this session,
-    /// which its pump then watches rather than asks the devices for.
-    pub(crate) fn watches(&self) -> bool {
-        self.watches
-    }
-
-    /// Returns `true` once the session has ended.
-    pub(crate) fn is_closed(&self) -> bool {
-        self.commands.is_closed()
+        Session { commands }
     }
 
     /// Sends `packet`, such as a control request whose replies the pump
-    /// reads. A packet the socket cannot take is dropped.
+    /// reads, once the socket has room. It is lost only with the socket.
     pub(crate) fn send(&self, packet: Packet) {
         let _ = self.commands.send(Command::Send(packet));
     }
@@ -313,12 +301,14 @@ impl Session {
         let _ = self.commands.send(Command::Close);
     }
 
-    /// Attaches the pump, with room for `capacity` packets. The first inlet
-    /// is live, and any later one has already ended.
-    pub(crate) fn attach(&self, capacity: usize) -> Inlet {
+    /// Attaches the pump, with room for `capacity` packets in its inlet, and
+    /// returns the inlet and the replies to its control requests. The first
+    /// attach is live, and any later one has already ended.
+    pub(crate) fn attach(&self, capacity: usize) -> (Inlet, Replies) {
         let (inlet, packets) = Lane::new(capacity);
-        let _ = self.commands.send(Command::Attach(inlet));
-        packets
+        let (replies, received) = flume::unbounded();
+        let _ = self.commands.send(Command::Attach(inlet, replies));
+        (packets, received)
     }
 }
 
@@ -400,6 +390,13 @@ struct Worker {
     /// The pump's inlet, once it attached. Until then the session drops what
     /// it would queue.
     inlet: Option<Lane<Packet>>,
+    /// Where the replies to the pump's control requests go, once it
+    /// attached.
+    replies: Option<flume::Sender<Packet>>,
+    /// The packets the pump sent, in order, which wait for room in the
+    /// socket, and the send of the first of them under way.
+    queued: VecDeque<Packet>,
+    sending: Option<BoxFuture<'static, bool>>,
 }
 
 impl Worker {
@@ -407,18 +404,22 @@ impl Worker {
     /// socket closes, the proxy stops or every handle is gone.
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let ending = loop {
+            if self.sending.is_none() {
+                self.sending = self
+                    .queued
+                    .pop_front()
+                    .map(|packet| self.socket.send_later(packet));
+            }
             tokio::select! {
                 biased;
                 command = commands.recv() => match command {
                     Some(Command::Call(call)) => self.call(call),
-                    Some(Command::Attach(inlet)) => {
-                        self.inlet.get_or_insert(inlet);
-                    }
-                    Some(Command::Send(packet)) => {
-                        if let Err(error) = self.socket.send(packet) {
-                            log::debug!("could not send to {}: {error}", self.peer);
+                    Some(Command::Attach(inlet, replies)) => {
+                        if self.inlet.is_none() {
+                            (self.inlet, self.replies) = (Some(inlet), Some(replies));
                         }
                     }
+                    Some(Command::Send(packet)) => self.queued.push_back(packet),
                     Some(Command::Close) => break Ending::Closed,
                     None => break Ending::HandlesGone,
                 },
@@ -428,6 +429,9 @@ impl Worker {
                         break ending;
                     }
                 }
+                sent = finish(&mut self.sending) => if !sent {
+                    log::debug!("could not send to {}, which closed", self.peer);
+                },
                 () = sleep_until_some(self.next_deadline) => self.expire(),
             }
         };
@@ -453,7 +457,7 @@ impl Worker {
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Call(call) => (call.complete)(Err(CallError::ResponseLost)),
-                Command::Attach(_) | Command::Send(_) | Command::Close => {}
+                Command::Attach(..) | Command::Send(_) | Command::Close => {}
             }
         }
         for (_, pending) in self.pending.drain() {
@@ -527,8 +531,15 @@ impl Worker {
             }
             return true;
         }
-        if let Payload::ProxyRx(ProxyRx::Alive) = packet.payload() {
-            return true;
+        match packet.payload() {
+            Payload::ProxyRx(ProxyRx::Alive) => return true,
+            Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_)) => {
+                if let Some(replies) = &self.replies {
+                    let _ = replies.send(packet);
+                }
+                return true;
+            }
+            _ => {}
         }
         let stopped =
             packet.route().is_empty() && packet.link_status() == Some(LinkStatus::Stopped);
@@ -742,15 +753,6 @@ impl Session {
     /// task runs on the crate's runtime.
     pub(crate) fn test_pair() -> (Session, TestProxy) {
         Session::test_pair_on(&Supervisor::new())
-    }
-
-    /// The same session, its pump watching the proxy's state as a session
-    /// the proxy opened does.
-    pub(crate) fn watching(self) -> Session {
-        Session {
-            watches: true,
-            ..self
-        }
     }
 
     /// [`test_pair`](Self::test_pair) with the session's task on `tasks`.
@@ -1143,7 +1145,7 @@ mod tests {
     fn a_stop_ends_the_session() {
         let proxy = FakeProxy::start();
         let (session, mut end) = opened(&proxy);
-        let inlet = session.attach(64);
+        let inlet = session.attach(64).0;
         let root = Handle::root(session);
         let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
         end.expect_call();
@@ -1188,7 +1190,7 @@ mod tests {
     fn a_dropped_socket_fails_pending_calls_and_ends_the_stream_for_good() {
         let proxy = FakeProxy::start();
         let (session, mut end) = opened(&proxy);
-        let inlet = session.attach(64);
+        let inlet = session.attach(64).0;
         let root = Handle::root(session);
         let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
         end.expect_call();
@@ -1206,6 +1208,56 @@ mod tests {
         assert!(
             !proxy.arrives(Duration::from_secs(2)),
             "the session reconnected after its socket dropped"
+        );
+    }
+
+    /// A packet the pump sends, such as a watch, waits for room in a full
+    /// socket rather than being dropped.
+    #[tokio::test]
+    async fn a_packet_sent_to_a_full_socket_waits_for_room() {
+        let tasks = Supervisor::current();
+        let (sent, mut written) = mpsc::channel(1);
+        let (_deliver, received) = mpsc::channel(1);
+        let session = Session::over_port(sent.clone(), received, "a full port".to_string(), &tasks);
+        sent.send(Packet::heartbeat(DeviceRoute::root()))
+            .await
+            .unwrap();
+
+        session.send(Packet::heartbeat_session(9, DeviceRoute::root()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            written.recv().await.is_some(),
+            "the packet that filled the port"
+        );
+        let waited = tokio::time::timeout(WAIT, written.recv()).await.unwrap();
+        let waited = waited.expect("the packet sent");
+        let Payload::Heartbeat(beat) = waited.payload() else {
+            panic!("expected the heartbeat, got {:?}", waited.payload());
+        };
+        assert_eq!(beat.session(), Some(crate::proto::SessionId::new(9)));
+    }
+
+    /// A packet waiting for room in a full socket leaves the session
+    /// responsive, so a close ends it at once.
+    #[tokio::test]
+    async fn a_packet_waiting_for_room_leaves_the_session_responsive() {
+        let tasks = Supervisor::current();
+        let (sent, _written) = mpsc::channel(1);
+        let (_deliver, received) = mpsc::channel(1);
+        let session = Session::over_port(sent.clone(), received, "a full port".to_string(), &tasks);
+        sent.send(Packet::heartbeat(DeviceRoute::root()))
+            .await
+            .unwrap();
+        let inlet = session.attach(64).0;
+        session.send(Packet::heartbeat(DeviceRoute::root()));
+
+        session.close();
+
+        let ended = tokio::time::timeout(WAIT, inlet.recv_async()).await;
+        assert!(
+            matches!(ended, Ok(Ok(Queued::Ended(End::Closed)))),
+            "{ended:?}"
         );
     }
 
@@ -1240,24 +1292,6 @@ mod tests {
         ));
     }
 
-    /// A loopback target is a proxy already, so its first packet from the
-    /// session is the app's own, with no hello ahead of it.
-    #[test]
-    fn a_loopback_target_is_reached_directly_with_no_hello() {
-        let proxy = FakeProxy::start();
-        let url = proxy.url();
-        let connecting = thread::spawn(move || Session::direct(&url));
-        let mut end = proxy.accept();
-        let root = Handle::root(connecting.join().unwrap().unwrap());
-
-        let reply = root.submit(DeviceRoute::root(), "dev.name", &[]);
-
-        let (name, id) = end.expect_call();
-        assert_eq!(name, "dev.name");
-        end.send(&Packet::rpc_reply(id, b"FAKE", DeviceRoute::root()).unwrap());
-        assert_eq!(reply.recv_timeout(WAIT).unwrap().unwrap(), b"FAKE");
-    }
-
     /// A peer that never answers as a 2.0 proxy does, as a proxy older than
     /// tio 2.0 does not, fails every open, `auto` too, saying how to reach
     /// it.
@@ -1268,8 +1302,6 @@ mod tests {
             url: legacy.url.clone(),
             ensure: None,
         };
-        let port = legacy.url.rsplit(':').next().unwrap();
-
         for target in ["auto", TARGET] {
             let opened = Session::open(&address, target, Purpose::Use, Duration::from_millis(500));
 
@@ -1278,7 +1310,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "{} is not a Twinleaf 2.0 proxy; reach it with -r tcp://localhost:{port}",
+                    "{} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it",
                     legacy.url
                 )
             );
@@ -1456,7 +1488,7 @@ mod tests {
         };
         proxy.send(Packet::heartbeat(DeviceRoute::root()));
         settled(b"before");
-        let inlet = session.attach(2);
+        let inlet = session.attach(2).0;
 
         for _ in 0..3 {
             proxy.send(Packet::heartbeat(DeviceRoute::root()));
@@ -1469,7 +1501,7 @@ mod tests {
         assert!(matches!(inlet.try_recv(), Ok(Queued::Gap(1))));
         assert!(matches!(inlet.try_recv(), Ok(Queued::Item(_))));
         assert_eq!(
-            next(&session.attach(2)).err(),
+            next(&session.attach(2).0).err(),
             Some(flume::RecvTimeoutError::Disconnected),
             "a second pump gets an inlet that has ended"
         );

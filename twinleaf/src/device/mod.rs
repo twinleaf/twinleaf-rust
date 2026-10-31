@@ -107,13 +107,14 @@ pub mod rpc;
 pub(crate) mod runtime;
 pub(crate) mod session;
 mod state;
-mod stream;
+pub(crate) mod store;
+pub(crate) mod stream;
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 
 #[doc(no_inline)]
 pub use crate::proto::RouteError;
-pub use connection::{Connection, Device, DeviceTree, MetadataError};
+pub use connection::{Connection, Device, DeviceTree, MetadataError, NamedRoute};
 pub use state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-pub use stream::{NamedRoute, Receiver, RecvError};
+pub use stream::{Receiver, RecvError};

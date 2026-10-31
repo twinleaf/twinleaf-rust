@@ -5,9 +5,10 @@
 //! [`handshake`] make requests as a client.
 
 use super::Layout;
-use crate::data::DeviceMetadataSnapshot;
+use crate::data::PacketParser;
 use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use crate::device::{Presence, RegistryState, SettingChange, Settings};
+use crate::device::store::{Store, CHANGES, METADATA, PRESENCE, REGISTRY};
+use crate::device::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
@@ -43,6 +44,8 @@ pub(crate) const DEFAULT_LAYOUT: &str = "proxy.default";
 pub(super) const STOP: &str = "proxy.stop";
 /// The method that follows the state of one device a connection opened.
 pub(crate) const WATCH: &str = "proxy.watch";
+/// The method that stops a watch.
+pub(crate) const UNWATCH: &str = "proxy.unwatch";
 
 /// The version of the control protocol this build speaks. Version 2 encodes
 /// every argument and reply in CBOR.
@@ -152,186 +155,226 @@ pub(super) mod hops {
 }
 
 /// What `proxy.watch` follows, the device at `route` as the client sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) struct Watch {
     #[n(0)]
     #[cbor(with = "hops")]
     pub(crate) route: DeviceRoute,
     /// Whether the watch follows the RPC table and the settings, rather
-    /// than the presence, the metadata and the announced settings.
+    /// than the presence, the metadata and the announced settings of the
+    /// device and the routes heard below it.
     #[n(1)]
     pub(crate) table: bool,
 }
+
+/// The code of a table error that says a call timed out, that the table
+/// changed during every walk, or that a call got no reply. Any other code
+/// is the device's refusal.
+const TIMED_OUT: u16 = 0xfffd;
+const CHANGED: u16 = 0xfffe;
+const UNANSWERED: u16 = 0xffff;
+
+/// The RPC table as its hash, the session it was read in, and the name and
+/// metadata word of each entry, or why it did not load as an error code and
+/// message.
+type WireTable = Result<(Option<u32>, Option<u32>, Vec<(String, u16)>), (u16, ByteVec)>;
 
 /// One value of a watched device's state, as a reply to `proxy.watch`
 /// carries it in [`Part`]s.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum Update {
-    /// The device's complete metadata, as its own metadata packets, each
-    /// addressed to the root.
+    /// The device's presence. `Ok` holds the session its heartbeats report
+    /// while it sends. `Err(None)` says it is connecting, and `Err(Some)`
+    /// says its link lost it this many milliseconds before the update went
+    /// out, as the two ends share no clock.
     #[n(0)]
-    Metadata(#[n(0)] Vec<ByteVec>),
-    /// The device has no `dev.metadata`.
+    Presence(#[n(0)] Result<Option<u32>, Option<u64>>),
+    /// The device's complete metadata as its own metadata packets, each
+    /// addressed to the root, none while it is collected, or `None` for a
+    /// device with no `dev.metadata`.
     #[n(1)]
-    Unsupported,
-    /// The RPC table, as its hash, the session it was read in, and the
-    /// name and metadata word of each entry.
+    Metadata(#[n(0)] Option<Vec<ByteVec>>),
+    /// The RPC table, or why it did not load.
     #[n(2)]
-    Table {
-        #[n(0)]
-        hash: Option<u32>,
-        #[n(1)]
-        session: Option<u32>,
-        #[n(2)]
-        entries: Vec<(String, u16)>,
-    },
-    /// The RPC table did not load, as the device refused a call with this
-    /// code and message.
-    #[n(3)]
-    Refused(#[n(0)] u16, #[n(1)] ByteVec),
-    /// The RPC table did not load, as it changed during every walk.
-    #[n(4)]
-    Changed,
-    /// The RPC table did not load, as a call timed out.
-    #[n(5)]
-    TimedOut,
-    /// The RPC table did not load, as a call got no reply.
-    #[n(6)]
-    Unanswered,
+    Table(#[n(0)] WireTable),
     /// The values of the announced settings, as the hash of the table they
-    /// were read with, their session and version, and each value by name.
-    #[n(7)]
-    Settings {
-        #[n(0)]
-        hash: Option<u32>,
-        #[n(1)]
-        session: Option<u32>,
-        #[n(2)]
-        version: Option<u32>,
-        #[n(3)]
-        values: BTreeMap<String, ByteVec>,
-    },
-    /// The device has not been heard yet, or its link reconnected and it has
-    /// not spoken since.
-    #[n(8)]
-    Connecting,
-    /// The device is sending, in the session its heartbeats report.
-    #[n(9)]
-    Alive(#[n(0)] Option<u32>),
-    /// The device's link lost it this many milliseconds before the update
-    /// went out.
-    #[n(10)]
-    Lost(#[n(0)] u64),
-    /// One setting the device announced, its name, its `settings.version`
-    /// once counted and its value.
-    #[n(11)]
-    Setting {
-        #[n(0)]
-        name: String,
-        #[n(1)]
-        seq: Option<u32>,
-        #[n(2)]
-        reply: ByteVec,
-    },
+    /// were read with, their version, and each value by name.
+    #[n(3)]
+    Settings(
+        #[n(0)] Option<u32>,
+        #[n(1)] Option<u32>,
+        #[n(2)] BTreeMap<String, ByteVec>,
+    ),
+    /// One setting the device announced, as its name, its
+    /// `settings.version` once counted and its value.
+    #[n(4)]
+    Setting(#[n(0)] String, #[n(1)] Option<u32>, #[n(2)] ByteVec),
+    /// Every route heard at or below the watched one, each as its hops.
+    #[n(5)]
+    Routes(#[n(0)] Vec<ByteVec>),
+    /// The watch missed this many announced settings, as the client fell
+    /// behind.
+    #[n(6)]
+    Lagged(#[n(0)] u64),
 }
 
 impl Update {
-    /// Returns the update of a device's complete metadata, or `None` if a
-    /// record does not fit a packet.
-    pub(crate) fn metadata(snapshot: &DeviceMetadataSnapshot) -> Option<Update> {
+    /// Returns the update of a device's presence.
+    pub(crate) fn presence(presence: Presence) -> Update {
+        Update::Presence(match presence {
+            Presence::Connecting => Err(None),
+            Presence::Alive { session } => Ok(session.map(SessionId::value)),
+            Presence::Lost { since } => Err(Some(
+                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
+        })
+    }
+
+    /// Returns the update of a device's metadata, or `None` if a record
+    /// does not fit a packet.
+    pub(crate) fn metadata(state: &MetadataState) -> Option<Update> {
+        let snapshot = match state {
+            MetadataState::Ready(snapshot) => snapshot,
+            MetadataState::Pending => return Some(Update::Metadata(Some(Vec::new()))),
+            MetadataState::Unsupported => return Some(Update::Metadata(None)),
+        };
         let packets = snapshot.metadata_packets().ok()?;
-        let records = packets.iter().map(|packet| {
-            packet
-                .with_route(DeviceRoute::root())
-                .as_bytes()
-                .to_vec()
-                .into()
-        });
-        Some(Update::Metadata(records.collect()))
+        let root = DeviceRoute::root();
+        let records = packets
+            .iter()
+            .map(|packet| packet.with_route(root).as_bytes().to_vec());
+        Some(Update::Metadata(Some(records.map(ByteVec::from).collect())))
     }
 
-    /// Returns the update of an RPC table as loaded.
-    pub(crate) fn table(registry: &RpcRegistry) -> Update {
-        Update::Table {
-            hash: registry.hash,
-            session: registry.session.map(SessionId::value),
-            entries: registry
-                .iter()
-                .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()))
-                .collect(),
-        }
-    }
-
-    /// Returns the update of why an RPC table did not load.
-    pub(crate) fn unloaded(error: &RpcRegistryError) -> Update {
-        match error {
-            RpcRegistryError::DeviceRpcError(CallError::DeviceError(refusal)) => {
-                Update::Refused(refusal.error.value(), refusal.extra.clone().into())
+    /// Returns the update of an RPC table as loaded, or of why it did not
+    /// load.
+    pub(crate) fn table(registry: &RegistryState) -> Update {
+        let none = || ByteVec::from(Vec::new());
+        Update::Table(match registry {
+            Ok(table) => {
+                let entries = table
+                    .iter()
+                    .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()));
+                Ok((
+                    table.hash,
+                    table.session.map(SessionId::value),
+                    entries.collect(),
+                ))
             }
-            RpcRegistryError::DeviceRpcError(CallError::Timeout) => Update::TimedOut,
-            RpcRegistryError::TableChanged => Update::Changed,
-            RpcRegistryError::DeviceRpcError(_) => Update::Unanswered,
-        }
+            Err(RpcRegistryError::DeviceRpcError(CallError::DeviceError(refusal))) => {
+                Err((refusal.error.value(), refusal.extra.clone().into()))
+            }
+            Err(RpcRegistryError::DeviceRpcError(CallError::Timeout)) => Err((TIMED_OUT, none())),
+            Err(RpcRegistryError::TableChanged) => Err((CHANGED, none())),
+            Err(RpcRegistryError::DeviceRpcError(_)) => Err((UNANSWERED, none())),
+        })
     }
 
     /// Returns the update of the values of a device's announced settings.
     pub(crate) fn settings(settings: &Settings) -> Update {
-        Update::Settings {
-            hash: settings.rpc_registry().hash,
-            session: settings.session().map(SessionId::value),
-            version: settings.version(),
-            values: settings
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.to_vec().into()))
-                .collect(),
-        }
-    }
-
-    /// Returns the update of a device's presence. How long ago it was lost
-    /// travels as a duration, as the two ends share no clock.
-    pub(crate) fn presence(presence: Presence) -> Update {
-        match presence {
-            Presence::Connecting => Update::Connecting,
-            Presence::Alive { session } => Update::Alive(session.map(SessionId::value)),
-            Presence::Lost { since } => {
-                let ago = since.elapsed().as_millis();
-                Update::Lost(u64::try_from(ago).unwrap_or(u64::MAX))
-            }
-        }
+        let values = settings.iter();
+        let values = values.map(|(name, value)| (name.to_string(), value.to_vec().into()));
+        Update::Settings(
+            settings.rpc_registry().hash,
+            settings.version(),
+            values.collect(),
+        )
     }
 
     /// Returns the update of one announced setting.
     pub(crate) fn setting(change: SettingChange) -> Update {
-        Update::Setting {
-            name: change.name,
-            seq: change.seq,
-            reply: change.reply.into(),
-        }
+        Update::Setting(change.name, change.seq, change.reply.into())
     }
 
-    /// Returns the RPC table, or why it did not load, that the update
-    /// carries, or `None` for an update of something else.
-    pub(crate) fn registry(self) -> Option<RegistryState> {
-        let failed = |error: CallError| Some(Err(RpcRegistryError::DeviceRpcError(error)));
+    /// Keeps what the update says of the device at `route` in `store`. Its
+    /// metadata records reach `parser` as the device's own, and the
+    /// metadata the parser then holds is the value kept, and no metadata
+    /// resets any route but `route`. Settings are kept only when they were
+    /// read with the table the store holds, and a table with the hash and
+    /// session of the one held keeps them.
+    pub(crate) fn apply(self, route: DeviceRoute, store: &mut Store, parser: &mut PacketParser) {
         match self {
-            Update::Table {
-                hash,
-                session,
-                entries,
-            } => {
-                let session = session.map(SessionId::new);
-                Some(Ok(Arc::new(RpcRegistry::from_entries(
-                    entries, hash, session,
-                ))))
+            Update::Presence(presence) => {
+                let now = std::time::Instant::now();
+                let presence = match presence.map(|session| session.map(SessionId::new)) {
+                    Ok(session) => Presence::Alive { session },
+                    Err(None) => Presence::Connecting,
+                    Err(Some(ago)) => {
+                        let since = now.checked_sub(Duration::from_millis(ago));
+                        Presence::Lost {
+                            since: since.unwrap_or(now),
+                        }
+                    }
+                };
+                store.set(route, PRESENCE, presence);
             }
-            Update::Refused(code, message) => failed(CallError::DeviceError(RpcErrorPayload {
-                error: RpcError::from(code),
-                extra: message.into(),
-            })),
-            Update::TimedOut => failed(CallError::Timeout),
-            Update::Unanswered => failed(CallError::ResponseLost),
-            Update::Changed => Some(Err(RpcRegistryError::TableChanged)),
-            _ => None,
+            Update::Metadata(None) => store.set(route, METADATA, MetadataState::Unsupported),
+            Update::Metadata(Some(records)) if records.is_empty() => {
+                parser.reset_route(route);
+                store.set(route, METADATA, MetadataState::Pending);
+            }
+            Update::Metadata(Some(records)) => {
+                for record in records {
+                    let applied = Packet::from_slice_prefix(&record)
+                        .map_err(|error| error.to_string())
+                        .and_then(|(packet, _)| {
+                            let packet = packet.with_route(route);
+                            parser
+                                .push_packet(&packet)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = applied {
+                        log::warn!("dropping a metadata record of {route}: {error}");
+                    }
+                }
+                if let Some(snapshot) = parser.metadata(route) {
+                    store.set(route, METADATA, MetadataState::Ready(snapshot));
+                }
+            }
+            Update::Table(Ok((hash, session, entries))) => {
+                let session = session.map(SessionId::new);
+                // The same table again keeps the settings read with it.
+                let held = store.value(route, REGISTRY);
+                if !held.is_some_and(|held| {
+                    held.is_ok_and(|held| (held.hash, held.session) == (hash, session))
+                }) {
+                    let table = RpcRegistry::from_entries(entries, hash, session);
+                    store.set_registry(route, Ok(Arc::new(table)));
+                }
+            }
+            Update::Table(Err((CHANGED, _))) => {
+                store.set_registry(route, Err(RpcRegistryError::TableChanged))
+            }
+            Update::Table(Err((code, message))) => {
+                let error = match code {
+                    TIMED_OUT => CallError::Timeout,
+                    UNANSWERED => CallError::ResponseLost,
+                    code => CallError::DeviceError(RpcErrorPayload {
+                        error: RpcError::from(code),
+                        extra: message.into(),
+                    }),
+                };
+                store.set_registry(route, Err(RpcRegistryError::DeviceRpcError(error)));
+            }
+            Update::Settings(hash, version, values) => match store.value(route, REGISTRY) {
+                Some(Ok(registry)) if registry.hash == hash => {
+                    let values = values.into_iter().map(|(name, value)| (name, value.into()));
+                    let settings = Settings::new(registry, version, values.collect());
+                    store.set_settings(route, Arc::new(settings));
+                }
+                _ => log::warn!("dropping settings of {route} read with a table it does not hold"),
+            },
+            Update::Setting(name, seq, reply) => {
+                let reply = reply.into();
+                store.set(route, CHANGES, SettingChange { name, seq, reply });
+            }
+            Update::Routes(routes) => {
+                let routes = routes
+                    .iter()
+                    .filter_map(|hops| DeviceRoute::from_hops(hops).ok());
+                store.list(route, routes);
+            }
+            Update::Lagged(missed) => store.lag(route, missed),
         }
     }
 }
@@ -368,6 +411,41 @@ pub(crate) fn parts(id: u16, update: &Update) -> Vec<Packet> {
             Packet::proxy_reply(id, &encode(&part)).expect("a part fits a reply")
         })
         .collect()
+}
+
+/// What has arrived of the next update of one watch.
+#[derive(Default)]
+pub(crate) struct Joined {
+    bytes: Vec<u8>,
+    /// The index of the part due next, or `None` until the first part of
+    /// the next update.
+    next: Option<u16>,
+}
+
+impl Joined {
+    /// Takes the reply `value`, a part of an update. Returns the update once
+    /// its last part is in and it decodes. An update starts at its first
+    /// part, so the tail of one that lost a part is dropped.
+    pub(crate) fn join(&mut self, value: &[u8]) -> Option<Update> {
+        let part: Part = decode(value).ok()?;
+        if part.index == 0 {
+            self.bytes.clear();
+            self.next = Some(0);
+        }
+        if self.next != Some(part.index) {
+            self.next = None;
+            return None;
+        }
+        self.bytes.extend_from_slice(&part.bytes);
+        self.next = part.index.checked_add(1).filter(|next| *next < part.count);
+        if self.next.is_some() {
+            return None;
+        }
+        let decoded = decode(&std::mem::take(&mut self.bytes));
+        decoded
+            .map_err(|error| log::warn!("dropping a state update that does not decode: {error}"))
+            .ok()
+    }
 }
 
 /// Why a client binds a connection to a device. It names the control method
@@ -426,6 +504,8 @@ pub(super) enum Request {
     Stop,
     /// `proxy.watch`, naming the device to follow.
     Watch(Watch),
+    /// `proxy.unwatch`, naming the id of the watch to stop.
+    Unwatch(u16),
     /// `proxy.test.panic`, which makes the task serving the client panic.
     #[cfg(test)]
     Panic,
@@ -451,6 +531,7 @@ impl Request {
             b"proxy.default" => Ok(Request::Default(checked(decode(args).map_err(malformed)?)?)),
             b"proxy.stop" => Ok(Request::Stop),
             b"proxy.watch" => Ok(Request::Watch(decode(args).map_err(malformed)?)),
+            b"proxy.unwatch" => Ok(Request::Unwatch(decode(args).map_err(malformed)?)),
             #[cfg(test)]
             b"proxy.test.panic" => Ok(Request::Panic),
             other => Err(Refusal::new(
@@ -470,6 +551,7 @@ impl Request {
             Request::Default(layout) => (DEFAULT_LAYOUT, encode(layout)),
             Request::Stop => (STOP, Vec::new()),
             Request::Watch(watch) => (WATCH, encode(watch)),
+            Request::Unwatch(id) => (UNWATCH, encode(id)),
             #[cfg(test)]
             Request::Panic => ("proxy.test.panic", Vec::new()),
         }
@@ -713,16 +795,11 @@ fn older_build(endpoint: &str) -> io::Error {
 }
 
 /// Returns the error for a peer at `endpoint` that is not a 2.0 proxy, such
-/// as a proxy older than tio 2.0. Its message says how to reach the peer.
+/// as a proxy older than tio 2.0, which this build cannot reach.
 pub(super) fn not_a_proxy(endpoint: &str) -> io::Error {
-    let port = endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok());
-    let port = port.unwrap_or(TCP_DEFAULT_PORT);
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("{endpoint} is not a Twinleaf 2.0 proxy; reach it with -r tcp://localhost:{port}"),
+        format!("{endpoint} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it"),
     )
 }
 

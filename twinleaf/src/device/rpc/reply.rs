@@ -77,7 +77,7 @@ pub fn pipelined(
 }
 
 #[cfg(test)]
-pub(super) fn resolved(reply: Option<Vec<u8>>) -> PendingReply {
+pub(crate) fn resolved(reply: Option<Vec<u8>>) -> PendingReply {
     let (resolve, reply_rx) = flume::bounded(1);
     if let Some(reply) = reply {
         resolve.send(Ok(reply)).expect("the receiver is held");

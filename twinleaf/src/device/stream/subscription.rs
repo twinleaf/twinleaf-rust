@@ -193,8 +193,8 @@ impl<T> Receiver<T> {
 /// The subtree one view covers, `depth` levels below `route`.
 #[derive(Clone, Copy)]
 pub(crate) struct Scope {
-    pub(super) route: DeviceRoute,
-    pub(super) depth: usize,
+    pub(crate) route: DeviceRoute,
+    pub(crate) depth: usize,
 }
 
 impl Scope {
@@ -220,7 +220,7 @@ impl Scope {
     }
 
     /// Returns `true` if `route` lies within this scope.
-    pub(super) fn covers(&self, route: DeviceRoute) -> bool {
+    pub(crate) fn covers(&self, route: DeviceRoute) -> bool {
         self.route
             .relative_route(&route)
             .is_ok_and(|below| below.len() <= self.depth)
@@ -307,6 +307,14 @@ impl<T> Lane<T> {
         }
     }
 
+    /// Counts `missed` items that never reached the lane, and reports them
+    /// as [`report_lag`](Self::report_lag) does. Returns `false` once the
+    /// receiver is gone.
+    pub(crate) fn lag(&mut self, missed: u64) -> bool {
+        self.skipped += missed;
+        self.report_lag()
+    }
+
     /// Sends the count of missed items once the queue has room. Returns
     /// `false` once the receiver is gone.
     pub(crate) fn report_lag(&mut self) -> bool {
@@ -339,21 +347,21 @@ impl<T> Lane<T> {
 }
 
 /// One subscriber's queue, with its scope.
-pub(super) struct Sink<T> {
-    pub(super) lane: Lane<T>,
+pub(crate) struct Sink<T> {
+    pub(crate) lane: Lane<T>,
     /// Closes when the subscriber drops its receiver, waking the pump.
-    pub(super) alive: oneshot::Receiver<Infallible>,
-    pub(super) scope: Scope,
+    pub(crate) alive: oneshot::Receiver<Infallible>,
+    pub(crate) scope: Scope,
 }
 
 impl<T> Sink<T> {
-    pub(super) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
+    pub(crate) fn new(capacity: usize, scope: Scope) -> (Sink<T>, Receiver<T>) {
         Self::with_lane(Lane::new(capacity), scope)
     }
 
     /// Returns a sink whose [latest-value](Lane::latest) lane holds only the
     /// newest item, and its receiver.
-    pub(super) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
+    pub(crate) fn latest(scope: Scope) -> (Sink<T>, Receiver<T>) {
         Self::with_lane(Lane::latest(), scope)
     }
 

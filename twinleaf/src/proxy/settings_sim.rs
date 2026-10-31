@@ -7,11 +7,9 @@
 //! own [`SettingsCache::snapshot_with`] runs on a thread that runs only while
 //! the world waits on its next call.
 
-use super::error::{CallError, RpcErrorPayload};
-use super::registry::{RpcDescriptor, RpcRegistry};
-use super::reply::PendingReply;
-use super::settings::{CacheAction, SettingsCache};
-use crate::device::stream::DeviceEvent;
+use super::settings::{CacheAction, DeviceEvent, SettingsCache};
+use crate::device::rpc::{CallError, PendingReply, RpcDescriptor, RpcErrorPayload, RpcRegistry};
+use crate::device::SettingChange;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::packet::{PacketType, PacketView};
 use crate::proto::rpc::{self as wire, Method, Request, RpcError, RpcMetaFlags};
@@ -916,11 +914,11 @@ impl<'c> World<'c> {
                 settings: beat.settings(),
             },
             Payload::Setting(setting) => match setting.name_str() {
-                Some(name) => DeviceEvent::Setting {
+                Some(name) => DeviceEvent::Setting(SettingChange {
                     name: name.to_string(),
                     seq: setting.seq,
                     reply: setting.reply.to_vec(),
-                },
+                }),
                 None => return,
             },
             _ => return,
@@ -1062,14 +1060,14 @@ impl<'c> World<'c> {
                 client.foreign |= client.session.is_some_and(|known| known != *session);
                 true
             }
-            DeviceEvent::Setting { seq: None, .. } => {
+            DeviceEvent::Setting(SettingChange { seq: None, .. }) => {
                 client.legacy = true;
                 false
             }
             DeviceEvent::Heartbeat {
                 session_id: None, ..
             }
-            | DeviceEvent::Setting { seq: Some(_), .. }
+            | DeviceEvent::Setting(SettingChange { seq: Some(_), .. })
             | DeviceEvent::NewHash(_) => false,
         };
         let action = client
@@ -1092,7 +1090,7 @@ impl<'c> World<'c> {
                     session_id.map(SessionId::value)
                 )
             }
-            DeviceEvent::Setting { name, seq, .. } => format!("{name} {seq:?}"),
+            DeviceEvent::Setting(SettingChange { name, seq, .. }) => format!("{name} {seq:?}"),
             DeviceEvent::NewHash(_) => "another event".to_string(),
         };
         let client = &mut self.clients[c];
