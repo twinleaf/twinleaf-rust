@@ -162,9 +162,20 @@ impl Port {
         rates: Option<RateInfo>,
         rx: Delivery,
     ) -> (Port, FakeEnd) {
+        Port::fake_queue(kind, rates, rx, DEFAULT_TX_CHANNEL_SIZE)
+    }
+
+    /// Returns a port as [`fake`](Self::fake) does, that queues up to
+    /// `tx_size` packets to send.
+    pub(crate) fn fake_queue(
+        kind: TransportKind,
+        rates: Option<RateInfo>,
+        rx: Delivery,
+        tx_size: usize,
+    ) -> (Port, FakeEnd) {
         let (pipe, peer) = tokio::io::duplex(PIPE_SIZE);
         let (stream, released, fail) = FakeStream::new(pipe);
-        let (port, task) = Port::with_task(kind, rates, Rules::NONE, rx, DEFAULT_TX_CHANNEL_SIZE);
+        let (port, task) = Port::with_task(kind, rates, Rules::NONE, rx, tx_size);
         let run = task.run_stream(stream, Codec::default());
         let port = port.start(&Supervisor::current(), "a fake port", run);
         let end = FakeEnd {

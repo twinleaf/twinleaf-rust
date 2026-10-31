@@ -23,7 +23,8 @@
 
 use super::auto::Candidate;
 use super::control::Refusal;
-use super::engine;
+use super::engine::{self, Taps};
+use super::outbox::Outlet;
 use super::worker::{self, Command, Opener, Readiness, Subscriber};
 use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
 use crate::device::session::Session;
@@ -55,8 +56,8 @@ pub(super) type Opens = Box<dyn FnMut(&str) -> Opener + Send>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct LinkId(u64);
 
-/// A client's port on a link. It carries the packets of one subtree of the
-/// device, with routes relative to that subtree.
+/// A port on a link. It carries the packets of one subtree of the device,
+/// with routes relative to that subtree.
 pub(super) struct Port {
     sender: PortSender,
     rx: mpsc::Receiver<Packet>,
@@ -107,17 +108,6 @@ impl Port {
     }
 }
 
-/// Returns the depth of the queue the proxy fills for each of its ports.
-/// `TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE` may raise it above the default.
-pub(super) fn client_rx_channel_size() -> usize {
-    let min_size = transport::DEFAULT_RX_CHANNEL_SIZE;
-    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_RX_BUFSIZE") {
-        std::cmp::max(req.parse().unwrap_or(0), min_size)
-    } else {
-        min_size
-    }
-}
-
 /// Returns the depth of the queue each port fills for the proxy.
 /// `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` may raise it above the default.
 pub(super) fn client_tx_channel_size() -> usize {
@@ -140,6 +130,8 @@ pub(super) struct Link {
     readiness: watch::Receiver<Readiness>,
     /// The state of the link's devices, which its engine keeps.
     store: Arc<Mutex<Store>>,
+    /// The clients' mounts of the link, which its engine feeds.
+    taps: Arc<Taps>,
 }
 
 impl Link {
@@ -175,34 +167,48 @@ impl Link {
         }
     }
 
-    /// Queues a client's port on the subtree at `source` for the worker to
-    /// adopt, without blocking.
+    /// Mounts the subtree at `source` for the client of `outlet`, which sees
+    /// it at `prefix`. Queues a port for the worker to adopt, without
+    /// blocking, that takes what the client sends and queues the answers to
+    /// its requests on `outlet`. The link's engine feeds the client every
+    /// other packet of the subtree until the port drops.
     ///
     /// Returns an error message if the link is closed, the worker's queue is
     /// full, or the worker is gone.
-    pub(super) fn open_port(&self, source: DeviceRoute) -> Result<Port, String> {
-        self.open_port_with(source, client_rx_channel_size())
+    pub(super) fn mount(
+        &self,
+        source: DeviceRoute,
+        prefix: DeviceRoute,
+        outlet: &Arc<Outlet>,
+    ) -> Result<PortSender, String> {
+        let (tx, from_port) = mpsc::channel(client_tx_channel_size());
+        // The engine feeds the port before the worker adopts it. An engine
+        // that ends lets the client go, and a port asked for after that is
+        // refused, as the worker ended first.
+        self.taps.add(source, prefix, outlet, &tx);
+        let outlet = Arc::clone(outlet);
+        self.adopt(Subscriber::client(outlet, prefix, from_port, source))?;
+        Ok(PortSender { tx, scope: source })
     }
 
-    /// Queues a port as [`open_port`](Self::open_port) does, whose queue
-    /// holds `capacity` packets.
+    /// Queues a port on the subtree at `source` for the worker to adopt, as
+    /// [`mount`](Self::mount) does, that delivers every packet of the subtree
+    /// to a queue of `capacity` packets.
     fn open_port_with(&self, source: DeviceRoute, capacity: usize) -> Result<Port, String> {
+        let (tx, from_port) = mpsc::channel(client_tx_channel_size());
+        let (to_port, rx) = mpsc::channel(capacity);
+        self.adopt(Subscriber::new(to_port, from_port, source))?;
+        let sender = PortSender { tx, scope: source };
+        Ok(Port { sender, rx })
+    }
+
+    /// Hands `subscriber` to the worker to adopt, without blocking.
+    fn adopt(&self, subscriber: Subscriber) -> Result<(), String> {
         let Some(commands) = self.commands.upgrade() else {
             return Err(format!("the link to {} closed", self.url));
         };
-        let (to_worker, from_port) = mpsc::channel(client_tx_channel_size());
-        let (to_port, from_worker) = mpsc::channel(capacity);
-        let subscriber = Subscriber::new(to_port, from_port, source);
         let reason = match commands.try_send(Command::OpenPort(subscriber)) {
-            Ok(()) => {
-                return Ok(Port {
-                    sender: PortSender {
-                        tx: to_worker,
-                        scope: source,
-                    },
-                    rx: from_worker,
-                })
-            }
+            Ok(()) => return Ok(()),
             // Transient, as the worker still runs.
             Err(mpsc::error::TrySendError::Full(_)) => "the proxy is busy",
             Err(mpsc::error::TrySendError::Closed(_)) => "failed to set up new proxy client",
@@ -213,6 +219,11 @@ impl Link {
     /// Returns the state of the link's devices.
     pub(super) fn store(&self) -> Arc<Mutex<Store>> {
         Arc::clone(&self.store)
+    }
+
+    /// Returns the clients' mounts of the link.
+    pub(super) fn taps(&self) -> Arc<Taps> {
+        Arc::clone(&self.taps)
     }
 
     /// Starts a session over a port on the whole device whose queue never
@@ -649,6 +660,7 @@ impl Registry {
             commands: commands.downgrade(),
             readiness,
             store: Arc::new(Mutex::new(Store::new(true))),
+            taps: Taps::new(url),
         };
         let engine = engine::run(link.clone(), self.tasks.clone());
         self.tasks.spawn(format_args!("proxy state {url}"), engine);
@@ -746,8 +758,15 @@ mod tests {
                 commands: commands.downgrade(),
                 readiness: watch::channel(Readiness::Pending).1,
                 store: Arc::new(Mutex::new(Store::new(true))),
+                taps: Taps::new(url),
             };
             (link, commands, receiver)
+        }
+
+        /// Queues a port on the subtree at `source` for the worker to adopt,
+        /// as a link's engine opens its own.
+        fn open_port(&self, source: DeviceRoute) -> Result<Port, String> {
+            self.open_port_with(source, transport::DEFAULT_RX_CHANNEL_SIZE)
         }
     }
 

@@ -22,6 +22,9 @@
 //! [`Stopped`](crate::tio::packet::LinkStatus::Stopped) at the root and
 //! closes each connection. A client must not reconnect after that status.
 //!
+//! A client that falls behind loses samples, the oldest first, and nothing
+//! else. A client that stops reading is disconnected.
+//!
 //! # Control requests
 //!
 //! A client connects over TCP and speaks the packet protocol, plus control
@@ -130,6 +133,7 @@ mod control;
 mod engine;
 mod link;
 mod metadata;
+mod outbox;
 mod server;
 mod settings;
 #[cfg(test)]
@@ -332,9 +336,6 @@ pub struct HostOptions {
     /// How long a link keeps trying to reconnect to a device it lost, or
     /// `None` to try forever. A link that gives up disconnects its clients.
     pub reconnect_timeout: Option<Duration>,
-    /// Whether to disconnect a client that falls behind. When `false`, the
-    /// proxy drops the packets the client cannot take.
-    pub kick_slow: bool,
     /// The traffic to log.
     pub dump: DumpFlags,
 }
@@ -342,8 +343,7 @@ pub struct HostOptions {
 /// The options a tool hosts the machine's proxy with. The proxy listens on
 /// loopback at the default port and runs until it is shut down. No client
 /// may stop it, it has no default layout, and its name is this executable's.
-/// It reconnects forever, drops what a slow client cannot take, and logs no
-/// traffic.
+/// It reconnects forever and logs no traffic.
 impl Default for HostOptions {
     fn default() -> Self {
         HostOptions {
@@ -354,7 +354,6 @@ impl Default for HostOptions {
             default: None,
             name: executable_name(),
             reconnect_timeout: None,
-            kick_slow: false,
             dump: DumpFlags::default(),
         }
     }

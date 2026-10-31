@@ -233,8 +233,9 @@ impl Scope {
     }
 }
 
-/// The sending end of a queue that counts the items it had no room for, and
-/// keeps one place for the end.
+/// The sending end of a queue that counts the items it had no room for. The
+/// end, and an item sent with [`send_always`](Self::send_always), go in
+/// however full the queue is.
 ///
 /// A [latest-value](Self::latest) lane holds one item, and a new item takes
 /// the place of one still unread instead of being counted as missed.
@@ -251,7 +252,7 @@ pub(crate) struct Lane<T> {
 impl<T> Lane<T> {
     /// Returns a lane with room for `capacity` items, and its receiving end.
     pub(crate) fn new(capacity: usize) -> (Lane<T>, flume::Receiver<Queued<T>>) {
-        let (items, received) = flume::bounded(capacity + 1);
+        let (items, received) = flume::unbounded();
         let lane = Lane {
             items,
             room: capacity,
@@ -307,6 +308,11 @@ impl<T> Lane<T> {
         }
     }
 
+    /// Sends one item that is never missed, however full the queue is.
+    pub(crate) fn send_always(&mut self, item: T) {
+        let _ = self.items.send(Queued::Item(item));
+    }
+
     /// Counts `missed` items that never reached the lane, and reports them
     /// as [`report_lag`](Self::report_lag) does. Returns `false` once the
     /// receiver is gone.
@@ -331,12 +337,12 @@ impl<T> Lane<T> {
         }
     }
 
-    /// Ends the queue saying why, for which it always has room.
+    /// Ends the queue saying why.
     pub(crate) fn end(self, end: End) {
-        let _ = self.items.try_send(Queued::Ended(end));
+        let _ = self.items.send(Queued::Ended(end));
     }
 
-    /// Sends `queued` if it leaves the place kept for the stop.
+    /// Sends `queued` if the queue has room for it.
     fn push(&self, queued: Queued<T>) -> Result<(), flume::TrySendError<Queued<T>>> {
         if self.items.len() < self.room {
             self.items.try_send(queued)

@@ -34,6 +34,7 @@
 //! device's own log packets under `device::<route>` at their own level, and
 //! the traffic [`DumpFlags`] asks for.
 
+use super::outbox::Outlet;
 use super::{control, DumpFlags, Layout, MAX_RPC_TIMEOUT};
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogLevel;
@@ -73,19 +74,26 @@ pub(super) enum Readiness {
 }
 
 /// The two channels of a port before the worker adopts it.
-#[derive(Debug)]
 pub(super) struct Subscriber {
     sender: SubscriberSender,
     rx: mpsc::Receiver<Packet>,
 }
 
 /// Delivers packets to one port, with routes relative to its subtree.
-#[derive(Debug)]
 struct SubscriberSender {
-    tx: mpsc::Sender<Packet>,
-    /// The slot kept for the status that the worker gave up the device.
-    last: mpsc::OwnedPermit<Packet>,
+    to: Delivery,
     scope: DeviceRoute,
+}
+
+/// Where a port's packets go.
+enum Delivery {
+    /// A queue that takes every packet of the port's subtree, and the slot
+    /// kept in it for the status that the worker gave up the device.
+    Queue(mpsc::Sender<Packet>, mpsc::OwnedPermit<Packet>),
+    /// The outlet of a client that sees the port's subtree at this prefix.
+    /// It takes only the answers to the port's own requests, as the link's
+    /// engine feeds the client everything else.
+    Client(Arc<Outlet>, DeviceRoute),
 }
 
 /// What a link asks of its worker.
@@ -103,34 +111,79 @@ impl Subscriber {
         scope: DeviceRoute,
     ) -> Subscriber {
         let last = tx.clone().try_reserve_owned().expect("a new port has room");
+        let to = Delivery::Queue(tx, last);
         Subscriber {
-            sender: SubscriberSender { tx, last, scope },
+            sender: SubscriberSender { to, scope },
+            rx,
+        }
+    }
+
+    /// Creates the port of a client that sees the subtree at `scope` at
+    /// `prefix`. The worker reads what the client sends from `rx`, and queues
+    /// the answers to its requests on `outlet`.
+    pub(super) fn client(
+        outlet: Arc<Outlet>,
+        prefix: DeviceRoute,
+        rx: mpsc::Receiver<Packet>,
+        scope: DeviceRoute,
+    ) -> Subscriber {
+        let to = Delivery::Client(outlet, prefix);
+        Subscriber {
+            sender: SubscriberSender { to, scope },
             rx,
         }
     }
 }
 
+/// Returns the route of `pkt` relative to the subtree at `scope`, or `None`
+/// for a packet outside it. A link status whose route is above the subtree
+/// concerns the subtree's root.
+pub(super) fn within(scope: DeviceRoute, pkt: &Packet) -> Option<DeviceRoute> {
+    match scope.relative_route(&pkt.route()) {
+        Ok(below) => Some(below),
+        Err(_) if pkt.link_status().is_some() && scope.starts_with(&pkt.route()) => {
+            Some(DeviceRoute::root())
+        }
+        Err(_) => None,
+    }
+}
+
 impl SubscriberSender {
-    /// Delivers `pkt` to the port with its route relative to the port's
-    /// subtree. Skips a packet outside the subtree. A link status whose route
-    /// is above the subtree reaches the port at its root. Returns `false` if
-    /// the port's queue is full or the port has closed.
+    /// Delivers `pkt`, which every port of its subtree hears, to a queue,
+    /// with its route relative to the port's subtree. Skips a packet outside
+    /// the subtree. Returns `false` if the port's queue is full or the port
+    /// has closed.
     fn try_send(&self, pkt: &Packet) -> bool {
-        let route = match self.scope.relative_route(&pkt.route()) {
-            Ok(below) => below,
-            Err(_) if pkt.link_status().is_some() && self.scope.starts_with(&pkt.route()) => {
-                DeviceRoute::root()
-            }
-            Err(_) => return true,
-        };
-        self.tx.try_send(pkt.with_route(route)).is_ok()
+        match &self.to {
+            Delivery::Queue(..) => self.deliver(pkt),
+            Delivery::Client(..) => true,
+        }
     }
 
-    /// Delivers the status that the worker gave up the device, at the port's
-    /// root, however full its queue is.
+    /// Delivers `pkt` to this port alone, such as an answer to one of its own
+    /// requests, as [`try_send`](Self::try_send) does. A client takes it at
+    /// the route it sees.
+    fn deliver(&self, pkt: &Packet) -> bool {
+        let Some(route) = within(self.scope, pkt) else {
+            return true;
+        };
+        match &self.to {
+            Delivery::Queue(tx, _) => tx.try_send(pkt.with_route(route)).is_ok(),
+            Delivery::Client(outlet, prefix) => {
+                if let Ok(route) = prefix.absolute_route(&route) {
+                    outlet.push(pkt.with_route(route));
+                }
+                true
+            }
+        }
+    }
+
+    /// Delivers the status that the worker gave up the device, at a queue's
+    /// root, however full the queue is.
     fn give_up(self) {
-        self.last
-            .send(Packet::link(packet::LinkStatus::FailedToReconnect));
+        if let Delivery::Queue(_, last) = self.to {
+            last.send(Packet::link(packet::LinkStatus::FailedToReconnect));
+        }
     }
 }
 
@@ -763,7 +816,7 @@ impl Worker {
             .is_some_and(|device| device.seen_since_connect);
         if self.ever_connected && !answering {
             let lost = Packet::link(packet::LinkStatus::SensorDisconnected);
-            sender.try_send(&lost);
+            sender.deliver(&lost);
         }
         self.inputs
             .insert(port, StreamNotifyClose::new(ReceiverStream::new(rx)));
@@ -825,7 +878,7 @@ impl Worker {
                 .subscribers
                 .get(&port)
                 .expect("the port that sent is open");
-            if !subscriber.try_send(&Packet::rpc_error(id, error, route)) {
+            if !subscriber.deliver(&Packet::rpc_error(id, error, route)) {
                 log::trace!(target: &self.log_target, "Port {port} fell behind");
                 self.drop_subscriber(port);
             }
@@ -1019,7 +1072,7 @@ impl Worker {
                     "Reply {wire_id} goes to port {port} as {original_id}"
                 );
                 let restored = pkt.with_rpc_id(original_id);
-                if !subscriber.try_send(&restored) {
+                if !subscriber.deliver(&restored) {
                     log::trace!(target: &self.log_target, "Port {port} fell behind");
                     self.drop_subscriber(port);
                 }
@@ -1060,7 +1113,7 @@ impl Worker {
                     let Some(subscriber) = self.subscribers.get(&port) else {
                         continue;
                     };
-                    if !subscriber.try_send(&Packet::rpc_error(
+                    if !subscriber.deliver(&Packet::rpc_error(
                         original_id,
                         failure.wire_error(),
                         remap.route,
@@ -1627,15 +1680,8 @@ mod tests {
     /// A port at `scope`, and what it is delivered.
     fn subscriber(scope: DeviceRoute) -> (SubscriberSender, mpsc::Receiver<Packet>) {
         let (to_port, delivered) = mpsc::channel(DELIVERED);
-        let last = to_port.clone().try_reserve_owned().unwrap();
-        (
-            SubscriberSender {
-                tx: to_port,
-                last,
-                scope,
-            },
-            delivered,
-        )
+        let (_, rx) = mpsc::channel(1);
+        (Subscriber::new(to_port, rx, scope).sender, delivered)
     }
 
     fn insert_rpc(

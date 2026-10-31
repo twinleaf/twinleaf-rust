@@ -1,12 +1,13 @@
 //! The stream pump, one task per connection.
 //!
-//! The pump drains the session's inlet into the parser, and sends packets
-//! and sample batches to owned [`Receiver`]s, each filtered to the subtree
-//! its view covers. The state of each device comes from the proxy alone. The
-//! pump watches each device a receiver follows with `proxy.watch`, and keeps
-//! what the proxy sends in the connection's [`Store`]. The metadata in it
-//! reaches the parser too, which takes metadata from nothing else and
-//! decodes the samples with it.
+//! The pump takes what the session's inlet carries in the order it arrived,
+//! and sends packets and sample batches to owned [`Receiver`]s, each filtered
+//! to the subtree its view covers. The state of each device comes from the
+//! proxy alone. The pump watches each device a receiver follows with
+//! `proxy.watch`, and keeps what the proxy sends in the connection's
+//! [`Store`]. The proxy sends an update ahead of every packet its device
+//! sent after the change. The metadata of an update reaches the parser too,
+//! which decodes the samples after it with it.
 
 mod subscription;
 
@@ -107,11 +108,10 @@ impl Stream {
 /// watches, and runs whether or not anything receives from it.
 struct Pump {
     root: Handle,
+    /// What the session carries, with the replies to the pump's control
+    /// requests, and `None` each time the session's socket is lost, which
+    /// ends every watch.
     inlet: Inlet,
-    /// The replies to the pump's control requests, each a `PROXY_RX`
-    /// packet, and `None` each time the session's socket is lost, which
-    /// ends every watch. No reply is ever dropped.
-    replies: flume::Receiver<Option<Packet>>,
     parser: PacketParser,
     store: Arc<Mutex<Store>>,
     taps: mpsc::UnboundedReceiver<Tap>,
@@ -126,14 +126,13 @@ struct Pump {
 impl Pump {
     fn new(
         root: &Handle,
-        (inlet, replies): (Inlet, flume::Receiver<Option<Packet>>),
+        inlet: Inlet,
         store: Arc<Mutex<Store>>,
         taps: mpsc::UnboundedReceiver<Tap>,
     ) -> Pump {
         Pump {
             root: root.clone(),
             inlet,
-            replies,
             parser: PacketParser::new(false),
             store,
             taps,
@@ -151,17 +150,13 @@ impl Pump {
         let followed = Arc::clone(&lock(&self.store).followed);
         let end = loop {
             // A tap takes the packets that arrive after it was made, so new
-            // taps, replies and pruning go ahead of the inlet.
+            // taps and pruning go ahead of the inlet.
             tokio::select! {
                 biased;
                 tap = self.taps.recv() => match tap {
                     Some(Tap::Batches(sink)) => self.batches.push(sink),
                     Some(Tap::Packets(sink)) => self.packets.push(sink),
                     None => return,
-                },
-                Ok(reply) = self.replies.recv_async() => match reply {
-                    Some(reply) => self.take_reply(&reply),
-                    None => self.lose(),
                 },
                 () = followed.notified() => {}
                 () = pruned(|cx| {
@@ -287,7 +282,7 @@ impl Pump {
 
     /// Takes `first` from the inlet, and what else the inlet held then, up
     /// to the end.
-    fn take_input(&mut self, first: Queued<tio::Packet>) -> Option<End> {
+    fn take_input(&mut self, first: Queued<Option<tio::Packet>>) -> Option<End> {
         let inlet = self.inlet.clone();
         let held = inlet.try_iter().take(inlet.len());
         std::iter::once(first)
@@ -295,12 +290,18 @@ impl Pump {
             .find_map(|queued| self.take(queued))
     }
 
-    /// Takes one packet from the inlet, or reports the gap the session left.
-    /// Returns why the session ended, at its end. Only the samples of a
-    /// route a tap covers reach the parser.
-    fn take(&mut self, queued: Queued<tio::Packet>) -> Option<End> {
+    /// Takes one entry of the inlet, a packet, a reply to a watch or the
+    /// loss of the socket, or reports the gap the session left. Returns why
+    /// the session ended, at its end. The packets of a route a tap covers
+    /// reach the parser, but for metadata, which it takes from the proxy's
+    /// updates alone.
+    fn take(&mut self, queued: Queued<Option<tio::Packet>>) -> Option<End> {
         let packet = &match queued {
-            Queued::Item(packet) => packet,
+            Queued::Item(Some(packet)) => packet,
+            Queued::Item(None) => {
+                self.lose();
+                return None;
+            }
             // The parser marks the gap in the samples.
             Queued::Gap(lost) => {
                 log::warn!("the stream's inlet overflowed and {lost} packets were lost");
@@ -308,12 +309,16 @@ impl Pump {
             }
             Queued::Ended(end) => return Some(end),
         };
+        if let packet::Payload::ProxyRx(ProxyRx::Reply(_) | ProxyRx::Error(_)) = packet.payload() {
+            self.take_reply(packet);
+            return None;
+        }
         self.tap(packet);
         let covered = self
             .batches
             .iter()
             .any(|sink| sink.scope.covers(packet.route()));
-        if !covered || !matches!(packet.payload(), packet::Payload::Samples(_)) {
+        if !covered || matches!(packet.payload(), packet::Payload::Metadata(..)) {
             return None;
         }
         if let Err(error) = self.parser.push_packet(packet) {
@@ -496,26 +501,27 @@ mod tests {
         assert!(batch.is_initial());
     }
 
-    /// A heartbeat of the session before reaches the pump after the proxy's
-    /// metadata of the new one, and the metadata stays in place, as the
-    /// parser takes metadata from the proxy alone.
+    /// A heartbeat of the session before reaches the pump ahead of the
+    /// proxy's metadata of the new one, as the proxy sends an update ahead
+    /// of every packet the device sent after the change. The metadata stays
+    /// in place, and the samples after it decode with it.
     #[test]
-    fn an_old_heartbeat_behind_the_proxys_metadata_leaves_it_in_place() {
+    fn an_old_heartbeat_ahead_of_the_proxys_new_metadata_leaves_it_in_place() {
         let (stream, proxy) = stream();
         let root = DeviceRoute::root();
         let batches = stream.batches(everything());
-        let metadata = stream.state(root, METADATA);
         let list = watch_of(&proxy, device(root));
         reply_update(&proxy, list, &routes_update(&[root]));
-        reply_update(&proxy, list, &metadata_update(2));
-        wait_for(&metadata, |state| matches!(state, MetadataState::Ready(_)));
+        reply_update(&proxy, list, &metadata_update(1));
 
         proxy.send(Packet::heartbeat_session(1, root));
+        reply_update(&proxy, list, &metadata_update(2));
         proxy.send(samples(5, root));
         let batch = batches
             .recv_timeout(Duration::from_secs(5))
             .expect("a batch");
         assert_eq!(batch.sample_numbers(), [5]);
+        assert_eq!(batch.metadata().device().session().value(), 2);
     }
 
     /// A device's metadata going pending resets that device alone, so the
@@ -573,16 +579,11 @@ mod tests {
     fn a_lost_socket_loses_every_device_and_watches_again() {
         let (session, proxy) = Session::test_pair();
         let root = Handle::root(session);
-        let (mut inlet, inlet_received) = Lane::new(INLET_LEN);
-        let (replies, replies_received) = flume::unbounded();
+        let (inlet, inlet_received) = Lane::new(INLET_LEN);
+        let inlet = std::cell::RefCell::new(inlet);
         let store = Arc::new(Mutex::new(Store::new(false)));
         let (taps, taps_received) = mpsc::unbounded_channel();
-        let pump = Pump::new(
-            &root,
-            (inlet_received, replies_received),
-            Arc::clone(&store),
-            taps_received,
-        );
+        let pump = Pump::new(&root, inlet_received, Arc::clone(&store), taps_received);
         Supervisor::new().spawn("twinleaf stream", pump.run());
         let route = DeviceRoute::root();
         let (sink, batches) = Sink::new(BATCH_QUEUE_LEN, everything());
@@ -590,9 +591,10 @@ mod tests {
         let (sink, packets) = Sink::new(PACKET_QUEUE_LEN, everything());
         let _ = taps.send(Tap::Packets(sink));
         let presence = lock(&store).follow(route, PRESENCE);
+        let deliver = |packet| inlet.borrow_mut().send(Some(packet));
         let reply = |id: u16, update: &Update| {
             for part in crate::proxy::parts(id, update) {
-                replies.send(Some(part)).unwrap();
+                inlet.borrow_mut().send_always(Some(part));
             }
         };
         let id = watch_of(&proxy, device(route));
@@ -603,10 +605,10 @@ mod tests {
         wait_for(&presence, |presence| {
             matches!(presence, Presence::Alive { .. })
         });
-        inlet.send(samples(0, route));
+        deliver(samples(0, route));
         assert!(batches.recv_timeout(wait).unwrap().is_initial());
 
-        replies.send(None).unwrap();
+        inlet.borrow_mut().send_always(None);
         wait_for(&presence, lost);
         let marked = wait_for(&packets, |packet| packet.link_status().is_some());
         assert_eq!(
@@ -617,7 +619,7 @@ mod tests {
         assert_ne!(again, id, "the watch is new");
         reply(again, &routes_update(&[route]));
         reply(again, &metadata_update(1));
-        inlet.send(samples(1, route));
+        deliver(samples(1, route));
         let resumed = batches.recv_timeout(wait).unwrap();
         assert_eq!(resumed.sample_numbers(), [1]);
         assert!(
@@ -626,21 +628,20 @@ mod tests {
         );
     }
 
-    /// A disconnect status that reaches the pump after the proxy's newer
-    /// metadata leaves that metadata in place, so the samples after it
-    /// decode.
+    /// A disconnect status reaches the pump ahead of the proxy's metadata of
+    /// the device once it is back, which stays in place, so the samples after
+    /// it decode.
     #[test]
-    fn a_status_behind_the_proxys_metadata_leaves_it_in_place() {
+    fn a_status_ahead_of_the_proxys_metadata_leaves_it_in_place() {
         let (stream, proxy) = stream();
         let root = DeviceRoute::root();
         let batches = stream.batches(everything());
-        let metadata = stream.state(root, METADATA);
         let list = watch_of(&proxy, device(root));
         reply_update(&proxy, list, &routes_update(&[root]));
-        reply_update(&proxy, list, &metadata_update(2));
-        wait_for(&metadata, |state| matches!(state, MetadataState::Ready(_)));
+        reply_update(&proxy, list, &metadata_update(1));
 
         proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
+        reply_update(&proxy, list, &metadata_update(2));
         proxy.send(samples(5, root));
         let batch = batches
             .recv_timeout(Duration::from_secs(5))
@@ -742,14 +743,13 @@ mod tests {
         let (session, proxy) = Session::test_pair();
         let root = Handle::root(session);
         let (inlet, packets) = flume::unbounded();
-        let (_replies, replied) = flume::unbounded();
         let store = Arc::new(Mutex::new(Store::new(true)));
         let (taps, received) = mpsc::unbounded_channel();
-        let pump = Pump::new(&root, (packets, replied), Arc::clone(&store), received);
+        let pump = Pump::new(&root, packets, Arc::clone(&store), received);
         Supervisor::new().spawn("twinleaf stream", pump.run());
         let (sink, tapped) = Sink::new(PACKET_QUEUE_LEN, everything());
         taps.send(Tap::Packets(sink)).unwrap();
-        let deliver = |packet| inlet.send(Queued::Item(packet)).unwrap();
+        let deliver = |packet| inlet.send(Queued::Item(Some(packet))).unwrap();
 
         deliver(samples(0, DeviceRoute::root()));
         inlet.send(Queued::Gap(1)).unwrap();

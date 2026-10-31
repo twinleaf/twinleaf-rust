@@ -1,11 +1,13 @@
 //! The task that serves each client connection. It answers the client's
-//! control requests and routes packets between the client and its mounts.
+//! control requests, forwards what the client sends to its mounts, and writes
+//! what the engines of the links it mounts queue for it on its [`Outlet`].
 //! [`Session::run`] runs it.
 
 use super::auto::{self, Choice};
 use super::control::encode;
 use super::control::{self, Purpose, Refusal, Request, Update, Watch};
-use super::link::{self, Lease, Link};
+use super::link::{self, Lease, Link, PortSender};
+use super::outbox::Outlet;
 use super::server::{self, Notice, Shared};
 use super::worker;
 use super::Layout;
@@ -15,11 +17,11 @@ use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, TCP_DEFAULT_PORT};
 use crate::rt::{finish, BoxFuture};
-use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
+use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::future;
 use futures_util::stream::{self, BoxStream};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
@@ -27,7 +29,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use tokio::time::{timeout, timeout_at, Instant};
-use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
+
+/// How many packets a client's socket queues. The outlet holds what waits
+/// for the client, and this queue only keeps the socket's task busy while
+/// the next batch is taken.
+pub(super) const SOCKET_QUEUE: usize = 64;
 
 /// Why a client's connection ended. The task serving the client logs it
 /// once.
@@ -39,7 +45,8 @@ pub(super) enum ClientError {
     /// The proxy stopped and told the client.
     #[error("the proxy stopped")]
     Stopped,
-    /// The client fell behind a proxy that kicks slow clients.
+    /// The client did not read what it was sent within the time a quiet
+    /// client is given, or let more pile up than its outbox holds.
     #[error("it fell behind")]
     TooSlow,
     /// The link to the device at this URL, which the client had opened,
@@ -63,72 +70,22 @@ fn is_rpc(pkt: &Packet) -> bool {
     )
 }
 
-/// A record of whether a client is keeping up. The first dropped packet and
-/// the recovery are each logged once.
-#[derive(Default)]
-struct SlowTracker {
-    is_slow: bool,
-    dropped: usize,
-}
-
-impl SlowTracker {
-    /// Counts a packet dropped for the client at `addr`.
-    fn packet_dropped(&mut self, addr: &str) {
-        if !log::log_enabled!(log::Level::Debug) {
-            return;
-        }
-        if !self.is_slow {
-            self.is_slow = true;
-            log::debug!("Client {} is not keeping up and is dropping packets", addr);
-        }
-        self.dropped += 1;
-    }
-
-    /// Notes a packet delivered to the client at `addr`.
-    fn packet_delivered(&mut self, addr: &str) {
-        if self.is_slow {
-            log::debug!(
-                "Client {} resuming after having dropped {} packets",
-                addr,
-                self.dropped
-            );
-            self.is_slow = false;
-            self.dropped = 0;
-        }
-    }
-}
-
-/// One mount a client opened. It holds the port on the device and the prefix
-/// where the client sees it.
+/// One mount a client opened. It holds the port on the device, which the
+/// link's engine feeds the client for, and the prefix where the client sees
+/// it.
 struct Mounted {
     prefix: DeviceRoute,
     /// The subtree of the device the mount shows at its prefix.
     source: DeviceRoute,
-    port: link::PortSender,
-    /// Whether the last link status the mount heard is `FailedToReconnect`.
-    gave_up: bool,
+    port: PortSender,
 }
 
 /// What a client opened. It holds a lease on each mount's link until dropped.
 struct Binding {
     target: String,
     mounts: Vec<Mounted>,
-    /// Packets from mounted links, keyed by their stable mount index.
-    incoming: StreamMap<usize, StreamNotifyClose<ReceiverStream<Packet>>>,
     /// The lease on the link of each mount, in the order of `mounts`.
     leases: Vec<Lease>,
-}
-
-impl Binding {
-    /// Returns why the port of mount `index` closed, [`ClientError::GaveUp`]
-    /// if the mount last heard `FailedToReconnect`.
-    fn closed(&self, index: usize) -> ClientError {
-        let url = self.leases[index].link().url().to_string();
-        match self.mounts[index].gave_up {
-            true => ClientError::GaveUp(url),
-            false => ClientError::LinkEnded(url),
-        }
-    }
 }
 
 /// The default a client holds with `proxy.default`. Dropping it gives the
@@ -165,13 +122,13 @@ pub(super) struct Session {
     alive: oneshot::Receiver<Infallible>,
     /// Packets the client sent that wait their turn while an open waits.
     backlog: VecDeque<Packet>,
-    slow: SlowTracker,
+    /// What goes to the client, with the client's watches.
+    outlet: Arc<Outlet>,
+    /// The write of what was last taken from the outlet, while it lasts.
+    writing: Option<BoxFuture<'static, Result<(), ClientError>>>,
     binding: Option<Binding>,
     opening: Option<Opening>,
     held: Option<Held>,
-    /// The updates of each device the client watches, by the id of its
-    /// `proxy.watch`, each ending with `None`.
-    watches: StreamMap<u16, StreamNotifyClose<BoxStream<'static, Update>>>,
 }
 
 impl Session {
@@ -194,11 +151,11 @@ impl Session {
             incoming: incoming.into_stream(),
             alive,
             backlog: VecDeque::new(),
-            slow: SlowTracker::default(),
+            outlet: Arc::default(),
+            writing: None,
             binding: None,
             opening: None,
             held: None,
-            watches: StreamMap::new(),
         }
     }
 
@@ -223,22 +180,49 @@ impl Session {
     /// [`CLOSE_TIMEOUT`].
     async fn close(self) {
         let Session {
-            client, incoming, ..
+            client,
+            incoming,
+            outlet,
+            writing,
+            binding,
+            ..
         } = self;
-        // The transport writes the queue before it ends. It would end at
+        // The links stop feeding the client first.
+        drop(binding);
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        let flushed = async {
+            if let Some(writing) = writing {
+                let _ = writing.await;
+            }
+            loop {
+                let queued = outlet.drain();
+                if queued.is_empty() {
+                    return;
+                }
+                for pkt in queued {
+                    if client.send_async(pkt).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = timeout_at(deadline, flushed).await;
+        // The transport writes its queue before it ends. It would end at
         // once if what the client sends found no receiver.
-        client.close(CLOSE_TIMEOUT).await;
+        client
+            .close(deadline.saturating_duration_since(Instant::now()))
+            .await;
         drop(incoming);
     }
 
-    /// Forwards packets between the client and its mounts until the
-    /// connection ends, keeping the client's link alive. Returns why it
-    /// ended.
+    /// Forwards what the client sends to its mounts, and writes its outlet,
+    /// until the connection ends, keeping the client's link alive. Returns
+    /// why it ended.
     async fn serve(&mut self) -> Result<(), ClientError> {
         self.client.keep_alive(control::PROXY_KEEPALIVE).await;
         loop {
             if self.stopping() {
-                return Err(self.stopped().await);
+                return Err(self.stopped());
             }
             // What the client sent while an open waited goes first, in
             // order.
@@ -248,44 +232,63 @@ impl Session {
                 };
                 self.client_packet(pkt).await?;
             }
-            let mounted = self
-                .binding
-                .as_ref()
-                .is_some_and(|binding| !binding.incoming.is_empty());
-            // State goes out ahead of the devices' packets.
+            if self.writing.is_none() {
+                self.write()?;
+            }
+            let outlet = Arc::clone(&self.outlet);
             tokio::select! {
-                biased;
-                _ = &mut self.alive => return Err(self.stopped().await),
-                Some((id, update)) = self.watches.next(), if !self.watches.is_empty() => {
-                    let replies = match update {
-                        Some(update) => control::parts(id, &update),
-                        None => {
-                            let ended = "the proxy no longer follows this device";
-                            vec![control::answer(id, Err(Refusal::new(RpcError::State, ended)))]
-                        }
-                    };
-                    self.send_state(replies).await?
-                }
+                _ = &mut self.alive => return Err(self.stopped()),
                 received = self.incoming.next() => {
                     let Some(received) = received else { return Err(ClientError::HungUp); };
                     if let Some(pkt) = self.delivered(received)? {
                         self.backlog.push_back(pkt);
                     }
                 }
-                Some((index, pkt)) = async {
-                    self.binding.as_mut().expect("a mount is bound").incoming.next().await
-                }, if mounted => {
-                    let Some(pkt) = pkt else {
-                        let binding = self.binding.as_ref();
-                        return Err(binding.expect("a mount is bound").closed(index));
-                    };
-                    self.mount_packet(pkt, index)?;
-                }
+                () = outlet.ready.notified(), if self.writing.is_none() => {}
+                written = finish(&mut self.writing) => written?,
                 (request, outcome) = finish(&mut self.opening) => {
                     self.opened(request, outcome).await?;
                 }
             }
         }
+    }
+
+    /// Starts writing what the outlet holds for the client, if it holds
+    /// anything. The write fails as [`ClientError::TooSlow`] if it takes
+    /// longer than a quiet client is given.
+    ///
+    /// Returns why the client must be let go, if the outlet says so.
+    fn write(&mut self) -> Result<(), ClientError> {
+        let (queued, dropped) = self.outlet.take()?;
+        if dropped > 0 {
+            log::debug!(
+                "Client {} is not keeping up and lost {dropped} samples",
+                self.addr
+            );
+        }
+        if queued.is_empty() {
+            return Ok(());
+        }
+        if self.shared.options.dump.traffic {
+            for pkt in queued.iter().filter(|pkt| is_rpc(pkt)) {
+                log::info!("{}->{} -- {:?}", pkt.route(), self.addr, pkt.payload());
+            }
+        }
+        let sends: Vec<_> = queued
+            .into_iter()
+            .map(|pkt| self.client.send_async(pkt))
+            .collect();
+        let written = async {
+            for send in sends {
+                send.await.map_err(|_| ClientError::HungUp)?;
+            }
+            Ok(())
+        };
+        let quiet = control::PROXY_KEEPALIVE.quiet;
+        let written =
+            timeout(quiet, written).map(|written| written.unwrap_or(Err(ClientError::TooSlow)));
+        self.writing = Some(Box::pin(written));
+        Ok(())
     }
 
     /// Returns the packet in what the client's transport delivered, or `None`
@@ -308,15 +311,13 @@ impl Session {
         matches!(self.alive.try_recv(), Err(TryRecvError::Closed))
     }
 
-    /// Tells the client at the root that the proxy stopped, waiting at most
-    /// [`CLOSE_TIMEOUT`] for room in its queue, and returns
-    /// [`ClientError::Stopped`].
-    fn stopped(&self) -> impl Future<Output = ClientError> {
-        let stop = self.client.send_async(Packet::link(LinkStatus::Stopped));
-        async move {
-            let _ = timeout(CLOSE_TIMEOUT, stop).await;
-            ClientError::Stopped
-        }
+    /// Stops feeding the client, queues the status that the proxy stopped
+    /// behind what was queued for it, and returns [`ClientError::Stopped`].
+    /// The close writes it as it writes the rest.
+    fn stopped(&mut self) -> ClientError {
+        self.binding = None;
+        self.outlet.stop();
+        ClientError::Stopped
     }
 
     /// Handles a packet from the client. Answers a control request, and
@@ -330,7 +331,10 @@ impl Session {
             log::info!("{}->{} -- {:?}", self.addr, pkt.route(), pkt.payload());
         }
         match pkt.ptype() {
-            PacketType::PROXY_TX => return self.control(&pkt).await,
+            PacketType::PROXY_TX => {
+                self.control(&pkt).await;
+                return Ok(());
+            }
             PacketType::HEARTBEAT if pkt.route().is_empty() => return Ok(()),
             PacketType::PROXY_RX => {
                 log::debug!("Dropping a control reply from client {}", self.addr);
@@ -364,55 +368,9 @@ impl Session {
         sent.map_err(|_| ClientError::ForwardFailed)
     }
 
-    /// Forwards a packet from mount `index` to the client.
-    ///
-    /// Returns an error if the client is gone, or if it falls behind a proxy
-    /// that kicks slow clients.
-    fn mount_packet(&mut self, pkt: Packet, index: usize) -> Result<(), ClientError> {
-        let binding = self.binding.as_mut().expect("a mount is bound");
-        let mount = &mut binding.mounts[index];
-        let Ok(routing) = mount.prefix.absolute_route(&pkt.route()) else {
-            log::warn!(
-                "Dropping packet for client {}: route {} exceeds max depth",
-                self.addr,
-                pkt.route()
-            );
-            return Ok(());
-        };
-        let status = match pkt.payload() {
-            Payload::ProxyRx(ProxyRx::Link(status)) => Some(status),
-            _ => None,
-        };
-        if let Some(status) = status {
-            mount.gave_up = status == LinkStatus::FailedToReconnect;
-        }
-        let pkt = pkt.with_route(routing);
-        if self.shared.options.dump.traffic && is_rpc(&pkt) {
-            log::info!("{}->{} -- {:?}", pkt.route(), self.addr, pkt.payload());
-        }
-        match self.client.try_send(pkt) {
-            Ok(()) => self.slow.packet_delivered(&self.addr),
-            Err(transport::SendError::Full) if !self.shared.options.kick_slow => {
-                self.slow.packet_dropped(&self.addr)
-            }
-            Err(transport::SendError::Full) => return Err(ClientError::TooSlow),
-            Err(_) => return Err(ClientError::HungUp),
-        }
-        Ok(())
-    }
-
     /// Queues the answer to control request `id` for the client.
-    ///
-    /// Returns [`ClientError::HungUp`] if the client is gone.
-    fn answer(&self, id: u16, outcome: Result<Vec<u8>, Refusal>) -> Result<(), ClientError> {
-        match self.client.try_send(control::answer(id, outcome)) {
-            Ok(()) => Ok(()),
-            Err(transport::SendError::Full) => {
-                log::debug!("Dropping a control reply to client {}", self.addr);
-                Ok(())
-            }
-            Err(_) => Err(ClientError::HungUp),
-        }
+    fn answer(&self, id: u16, outcome: Result<Vec<u8>, Refusal>) {
+        self.outlet.push(control::answer(id, outcome));
     }
 
     /// Changes the client's entry in the table, and waits until the table
@@ -433,9 +391,9 @@ impl Session {
     /// Answers the control request in `pkt`. Begins the proxy's stop after
     /// queuing the reply to `proxy.stop`. An open or a probe is answered once
     /// it is done.
-    async fn control(&mut self, pkt: &Packet) -> Result<(), ClientError> {
+    async fn control(&mut self, pkt: &Packet) {
         let Payload::ProxyTx(request) = pkt.payload() else {
-            return Ok(());
+            return;
         };
         let id = request.id.value();
         let decoded = match request.method {
@@ -460,22 +418,20 @@ impl Session {
             Request::Probe { url } => self.request_open(id, url, Purpose::Probe),
             Request::Mount(layout) => {
                 let (shared, addr) = (self.shared.clone(), self.addr.clone());
-                let binding = attach(shared, addr, layout.to_string(), layout, None, Purpose::Use);
+                let outlet = Arc::clone(&self.outlet);
+                let target = layout.to_string();
+                let binding = attach(shared, addr, target, layout, None, Purpose::Use, outlet);
                 self.request(id, binding)
             }
             Request::Default(layout) => self.hold_default(id, layout),
-            Request::Watch(watch) => self.watch(id, watch).await,
-            Request::Unwatch(watched) => {
-                self.watches.remove(&watched);
-                Ok(())
-            }
+            Request::Watch(watch) => self.watch(id, watch),
+            Request::Unwatch(watched) => self.outlet.unwatch(watched),
             Request::Stop if self.shared.options.stoppable => {
-                self.answer(id, Ok(Vec::new()))?;
+                self.answer(id, Ok(Vec::new()));
                 log::info!("Stopped by proxy.stop from client {}", self.addr);
                 if let Some(server) = self.shared.server.upgrade() {
                     let _ = server.send(Notice::Stop);
                 }
-                Ok(())
             }
             Request::Stop => {
                 let message = format!(
@@ -492,51 +448,20 @@ impl Session {
     /// Follows the device that control request `id` names, answering with
     /// its state now and then each change. A watch under an id the client
     /// already watches with replaces it.
-    async fn watch(&mut self, id: u16, watch: Watch) -> Result<(), ClientError> {
+    fn watch(&mut self, id: u16, watch: Watch) {
         let opened = self.binding.as_ref();
         let opened =
             opened.ok_or_else(|| Refusal::new(RpcError::State, "this connection opened nothing"));
         match opened.and_then(|binding| updates(binding, watch)) {
-            Ok(updates) => {
-                self.watches.insert(id, StreamNotifyClose::new(updates));
-                Ok(())
-            }
-            Err(refusal) => {
-                self.send_state(vec![control::answer(id, Err(refusal))])
-                    .await
-            }
+            Ok(updates) => self.outlet.watch(id, watch.route, updates),
+            Err(refusal) => self.answer(id, Err(refusal)),
         }
-    }
-
-    /// Sends `packets`, the replies to a watch that carry state or its end.
-    /// State is never dropped, so it waits for room in the client's queue,
-    /// unless the proxy stops meanwhile.
-    ///
-    /// Returns [`ClientError::Stopped`] once the proxy stops,
-    /// [`ClientError::TooSlow`] if the client makes no room within
-    /// the time a quiet client is given, and [`ClientError::HungUp`] if it
-    /// is gone.
-    async fn send_state(&mut self, packets: Vec<Packet>) -> Result<(), ClientError> {
-        for part in packets {
-            let quiet = control::PROXY_KEEPALIVE.quiet;
-            let sent = tokio::select! {
-                biased;
-                _ = &mut self.alive => return Err(self.stopped().await),
-                sent = timeout(quiet, self.client.send_async(part)) => sent,
-            };
-            match sent {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(ClientError::HungUp),
-                Err(_) => return Err(ClientError::TooSlow),
-            }
-        }
-        Ok(())
     }
 
     /// Makes `layout` the default until this client leaves, answering control
     /// request `id`. Only a background proxy lets a client hold its default,
     /// and one client at a time.
-    fn hold_default(&mut self, id: u16, layout: Layout) -> Result<(), ClientError> {
+    fn hold_default(&mut self, id: u16, layout: Layout) {
         if !self.shared.options.stoppable {
             let message = format!(
                 "the proxy at {} is hosted by {} and keeps its own default",
@@ -575,13 +500,9 @@ impl Session {
 
     /// Begins the open of `target` for `purpose` that control request `id`
     /// asks for.
-    fn request_open(
-        &mut self,
-        id: u16,
-        target: String,
-        purpose: Purpose,
-    ) -> Result<(), ClientError> {
-        let binding = bind(self.shared.clone(), self.addr.clone(), target, purpose);
+    fn request_open(&mut self, id: u16, target: String, purpose: Purpose) {
+        let (shared, addr) = (self.shared.clone(), self.addr.clone());
+        let binding = bind(shared, addr, target, purpose, Arc::clone(&self.outlet));
         self.request(id, binding)
     }
 
@@ -591,13 +512,12 @@ impl Session {
         &mut self,
         id: u16,
         binding: impl Future<Output = Result<Binding, Refusal>> + Send + 'static,
-    ) -> Result<(), ClientError> {
+    ) {
         if let Some(binding) = &self.binding {
             let message = format!("this connection already opened {}", binding.target);
             return self.answer(id, Err(Refusal::new(RpcError::State, message)));
         }
         self.opening = Some(Box::pin(async move { (id, binding.await) }));
-        Ok(())
     }
 
     /// Answers the open that ended with `outcome`. Once the table shows what
@@ -617,18 +537,19 @@ impl Session {
                 self.binding = Some(binding);
                 Ok(encode(&target))
             }
-            Err(_) if self.stopping() => return Err(self.stopped().await),
+            Err(_) if self.stopping() => return Err(self.stopped()),
             Err(refusal) => Err(refusal),
         };
-        self.answer(request, outcome)
+        self.answer(request, outcome);
+        Ok(())
     }
 }
 
 /// Binds a connection of the client at `addr` to `target` for `purpose`.
 /// Resolves the target, takes a lease on each mount's link, waits for each
-/// link's device to answer, and opens a port on each. A binding for
-/// [`Purpose::Use`] marks each link as chosen. A probe's target is a device
-/// URL.
+/// link's device to answer, and mounts each for the client of `outlet`. A
+/// binding for [`Purpose::Use`] marks each link as chosen. A probe's target
+/// is a device URL.
 ///
 /// Returns a [`Refusal`] if the target does not resolve, a link is refused,
 /// or a link is not ready within [`link::READY_TIMEOUT`].
@@ -637,12 +558,13 @@ async fn bind(
     addr: String,
     target: String,
     purpose: Purpose,
+    outlet: Arc<Outlet>,
 ) -> Result<Binding, Refusal> {
     let (target, layout, chosen) = match purpose {
         Purpose::Use => resolve(&shared, target).await?,
         Purpose::Probe => (target.clone(), Layout::single(&target), None),
     };
-    attach(shared, addr, target, layout, chosen, purpose).await
+    attach(shared, addr, target, layout, chosen, purpose, outlet).await
 }
 
 /// Binds the connection to `layout`, named `target`, as [`bind`] does once
@@ -658,6 +580,7 @@ async fn attach(
     layout: Layout,
     chosen: Option<Link>,
     purpose: Purpose,
+    outlet: Arc<Outlet>,
 ) -> Result<Binding, Refusal> {
     let deadline = Instant::now() + link::READY_TIMEOUT;
     let mut leases = Vec::with_capacity(layout.mounts.len());
@@ -691,22 +614,15 @@ async fn attach(
         return Err(Refusal::new(RpcError::Load, message));
     }
     let mut mounts = Vec::with_capacity(layout.mounts.len());
-    let mut incoming = StreamMap::with_capacity(layout.mounts.len());
     for (mount, lease) in layout.mounts.iter().zip(&leases) {
         let port = lease
             .link()
-            .open_port(mount.source)
+            .mount(mount.source, mount.prefix, &outlet)
             .map_err(|reason| Refusal::new(RpcError::Load, reason))?;
-        let (port, received) = port.into_split();
-        incoming.insert(
-            mounts.len(),
-            StreamNotifyClose::new(ReceiverStream::new(received)),
-        );
         mounts.push(Mounted {
             prefix: mount.prefix,
             source: mount.source,
             port,
-            gave_up: false,
         });
     }
     match purpose {
@@ -721,7 +637,6 @@ async fn attach(
     Ok(Binding {
         target,
         mounts,
-        incoming,
         leases,
     })
 }
@@ -849,7 +764,10 @@ impl Binding {
 
 /// Returns the updates of the presence, metadata and announced settings of
 /// the device at `route` that `store` holds.
-fn device_updates(store: &Mutex<Store>, route: DeviceRoute) -> BoxStream<'static, Update> {
+pub(super) fn device_updates(
+    store: &Mutex<Store>,
+    route: DeviceRoute,
+) -> BoxStream<'static, Update> {
     let mut store = lock(store);
     let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
     let metadata = values(store.follow(route, METADATA));
@@ -933,8 +851,8 @@ mod tests {
     use crate::proxy::link::{Links, Owner};
     use crate::proxy::DumpFlags;
     use crate::rt::Supervisor;
+    use crate::tio::packet::{LinkStatus, ProxyRx};
     use crate::tio::transport::{FakeEnd, TransportKind, DEFAULT_RX_CHANNEL_SIZE};
-    use futures_util::FutureExt;
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
@@ -980,7 +898,8 @@ mod tests {
             holder: std::sync::Mutex::new(None),
         });
         let (deliver, incoming) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
-        let (port, end) = transport::Port::fake(TransportKind::Tcp, None, deliver);
+        let (port, end) =
+            transport::Port::fake_queue(TransportKind::Tcp, None, deliver, SOCKET_QUEUE);
         let peer = "127.0.0.1:50000".parse().unwrap();
         let (lifeline, alive) = oneshot::channel();
         let mut session = Session::new(shared, 1, peer, port, incoming, alive);
@@ -1073,6 +992,132 @@ mod tests {
         let served = timeout(PAUSED_WAIT, client.served).await.unwrap();
         assert!(matches!(served.unwrap(), Some(Err(ClientError::Stopped))));
         assert_took(stopping.elapsed(), CLOSE_TIMEOUT, "the close");
+    }
+
+    /// A packet of 100 samples of stream 1 at the root, numbered from
+    /// `first`.
+    fn hundred(first: u32) -> Packet {
+        Packet::samples(1, 0, first, &[0; 400], DeviceRoute::root()).unwrap()
+    }
+
+    /// Reads what `end` is sent until a packet `done` picks, and returns the
+    /// sessions of the heartbeats and the first sample numbers of the
+    /// samples it read, in order.
+    async fn read_until(end: &mut FakeEnd, done: impl Fn(&Packet) -> bool) -> (Vec<u32>, Vec<u32>) {
+        let (mut beats, mut samples) = (Vec::new(), Vec::new());
+        loop {
+            let pkt = next(end).await;
+            match pkt.payload() {
+                Payload::Heartbeat(beat) => beats.extend(beat.session().map(|s| s.value())),
+                Payload::Samples(data) => samples.push(data.first.value()),
+                _ => {}
+            }
+            if done(&pkt) {
+                return (beats, samples);
+            }
+        }
+    }
+
+    /// A client that stops reading for a while loses samples, the oldest
+    /// first, and nothing else. Everything it is sent keeps its order. Once
+    /// it stops reading for longer than a write may take, it is let go.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_reading_loses_samples_and_nothing_else_until_it_is_let_go() {
+        let mut client = connect(None, None);
+        let mut device = opened_and_answered(&mut client).await;
+        // More samples than the outbox holds, with a numbered heartbeat
+        // ahead of every 60 packets of them.
+        let (beats, per) = (60, 60);
+        for beat in 0..beats {
+            let route = DeviceRoute::root();
+            device
+                .end
+                .send(&Packet::heartbeat_session(beat, route))
+                .await;
+            for first in 0..per {
+                device.end.send(&hundred((beat * per + first) * 100)).await;
+            }
+        }
+        // The client reads again before a write runs out of time.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let last = |pkt: &Packet| match pkt.payload() {
+            Payload::Heartbeat(beat) => beat.session().map(|s| s.value()) == Some(beats - 1),
+            _ => false,
+        };
+        let (heard, mut samples) = read_until(&mut client.end, last).await;
+        assert_eq!(
+            heard,
+            (0..beats).collect::<Vec<_>>(),
+            "a heartbeat was lost"
+        );
+        let rest = |pkt: &Packet| match pkt.payload() {
+            Payload::Samples(data) => data.first.value() == (beats * per - 1) * 100,
+            _ => false,
+        };
+        samples.extend(read_until(&mut client.end, rest).await.1);
+        assert!(samples.len() < (beats * per) as usize, "no sample was lost");
+        let gaps: Vec<_> = samples.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(gaps.iter().all(|gap| gap % 100 == 0 && *gap > 0));
+        let lost: Vec<_> = gaps.iter().filter(|gap| **gap > 100).collect();
+        assert_eq!(
+            lost.len(),
+            1,
+            "the oldest samples waiting were lost, and only those"
+        );
+
+        client
+            .end
+            .send(&Packet::heartbeat(DeviceRoute::root()))
+            .await;
+        let stalled = Instant::now();
+        for first in 0..1000 {
+            device.end.send(&hundred(first * 100)).await;
+        }
+        let error = ended(client).await;
+        assert!(
+            matches!(error, ClientError::HungUp | ClientError::TooSlow),
+            "{error}"
+        );
+        assert!(stalled.elapsed() < control::PROXY_KEEPALIVE.quiet);
+    }
+
+    /// A proxy that stops queues its status behind everything a stalled
+    /// client was not yet sent. The client hears all of it, and the stop
+    /// last, once it reads again within the close.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_goes_out_behind_what_a_stalled_client_was_not_yet_sent() {
+        let Client {
+            mut end,
+            mut devices,
+            served,
+            _lifeline,
+            links: _links,
+            _registry,
+        } = connect(None, None);
+        end.send(&open(DEVICE, 2)).await;
+        let mut device = opened(&mut devices).await;
+        let root = DeviceRoute::root();
+        device.end.send(&Packet::heartbeat(root)).await;
+        assert_eq!(answer(&next(&mut end).await).0, 2);
+        for beat in 0..2000 {
+            device
+                .end
+                .send(&Packet::heartbeat_session(beat, root))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        drop(_lifeline);
+        let stop = |pkt: &Packet| pkt.link_status() == Some(LinkStatus::Stopped);
+        let (beats, _) = read_until(&mut end, stop).await;
+
+        assert_eq!(beats, (0..2000).collect::<Vec<_>>());
+        let served = timeout(PAUSED_WAIT, served).await.unwrap().unwrap();
+        assert!(
+            matches!(served, Some(Err(ClientError::Stopped))),
+            "{served:?}"
+        );
     }
 
     /// Returns the request to open `target`, with `id`.

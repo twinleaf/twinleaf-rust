@@ -1361,6 +1361,60 @@ mod tests {
         );
     }
 
+    /// A sample the device sends right after the record of its segment
+    /// reaches the client after the record, through every rollover of the
+    /// segment ring, so none is dropped and none decodes under another
+    /// record.
+    #[test]
+    fn a_sample_right_after_its_segment_record_decodes_with_it() {
+        use crate::proto::data as wire;
+        let device = FakeDevice::start();
+        let proxy = fixtures::proxy();
+        let connection = open_through(&proxy, &device.url).unwrap();
+        let batches = connection.samples();
+        let root = DeviceRoute::root();
+        let first = (0..).find_map(|first| {
+            assert!(first < 100, "no samples");
+            device.send(fixtures::samples(first, root));
+            batches.recv_timeout(Duration::from_millis(100)).ok()
+        });
+        let wire::Metadata::Segment(base) = crate::proxy::fixtures::description()[2] else {
+            panic!("the third record describes the segment");
+        };
+        assert_eq!(
+            first.unwrap().metadata().segment().segment_id(),
+            base.segment_id
+        );
+
+        for rollover in 1..=6u8 {
+            let (segment, start) = (rollover % 2, u32::from(rollover) * 10);
+            let record = wire::Segment {
+                segment_id: crate::proto::SegmentId::new(segment),
+                start_time: start,
+                ..base
+            };
+            device.send(fixtures::broadcast(wire::Metadata::Segment(record), root));
+            for first in 0..3 {
+                device.send(crate::tio::Packet::samples(1, segment, first, &[0; 4], root).unwrap());
+            }
+            let mut decoded = Vec::new();
+            while decoded.len() < 3 {
+                let batch = batches.recv_timeout(WAIT).expect("a sample was dropped");
+                let held = batch.metadata().segment();
+                if held.segment_id().value() != segment {
+                    continue;
+                }
+                assert_eq!(
+                    held.start_time(),
+                    start,
+                    "a sample decoded under another record"
+                );
+                decoded.extend(batch.sample_numbers().iter().map(|number| number.value()));
+            }
+            assert_eq!(decoded, [0, 1, 2], "rollover {rollover} lost a sample");
+        }
+    }
+
     /// A proxy lost without a stop does not end the connection. Every device
     /// is lost and every call fails meanwhile. Once a proxy answers on the
     /// same port again, the connection opens the device it had opened and

@@ -2,7 +2,7 @@
 //! clients, runs the task of each, keeps the client table, and owns the
 //! registry of links. [`Shared`] holds what every client's task reads.
 
-use super::client::Session;
+use super::client::{Session, SOCKET_QUEUE};
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
 use super::link::{self, Links, Owner};
 use super::{
@@ -314,13 +314,11 @@ impl Server {
     /// Adds the client at `peer` connected on `stream` to the table, and
     /// spawns its task.
     fn serve(&mut self, stream: TcpStream, peer: SocketAddr) {
-        // A client from the proxy perspective is a port in reverse, i.e. what it receives
-        // is what a client transmits, and vice-versa. Therefore, the channel size settings
-        // for rx and tx are inverted. Also, we use the proxy port channel size setting
-        // instead of the physical ports setting.
+        // What a client sends goes to its ports, so it is queued as deep as
+        // they are. What it is sent waits in its outlet.
         let (deliver, incoming) = flume::bounded(link::client_tx_channel_size());
-        let size = link::client_rx_channel_size();
-        let port = match transport::Port::from_tcp(stream, deliver, size, &self.shared.tasks) {
+        let tasks = &self.shared.tasks;
+        let port = match transport::Port::from_tcp(stream, deliver, SOCKET_QUEUE, tasks) {
             Ok(port) => port,
             Err(error) => {
                 log::warn!("Failed to set up client {peer}: {error}");

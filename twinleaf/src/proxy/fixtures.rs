@@ -388,7 +388,7 @@ pub(crate) fn description() -> [wire::Metadata<'static>; 4] {
         wire::Metadata::Stream(wire::Stream {
             stream_id,
             n_columns: 1,
-            n_segments: 1,
+            n_segments: 2,
             sample_size: 4,
             buf_samples: 128,
             name: "field",

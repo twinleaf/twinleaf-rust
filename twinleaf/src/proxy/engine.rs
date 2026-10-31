@@ -1,4 +1,5 @@
-//! The engine of one link, the one place its devices' state is computed.
+//! The engine of one link, the one place its devices' state is computed, and
+//! the one reader of its packets.
 //!
 //! The engine reads every packet of its link through a session over a port
 //! of its own, which never fills, so it loses nothing. It follows each
@@ -10,10 +11,18 @@
 //! device that stops once no watch has followed the table for [`LINGER`].
 //! It keeps all of this in the link's [`Store`], which every client's
 //! watches follow, for as long as the link runs.
+//!
+//! The engine then hands each packet, in the order the link delivered it, to
+//! each client that mounts its route, through the client's [`Outlet`]. A
+//! state update the packet caused reaches the outlet first, so a client
+//! hears a record ahead of every sample the device sent after it.
 
+use super::client::ClientError;
 use super::link::Link;
 use super::metadata::{Completed, MetadataSchedule};
+use super::outbox::Outlet;
 use super::settings::{CacheAction, DeviceEvent, SettingsCache};
+use super::worker::within;
 use super::Watch;
 use crate::data::{MetadataQuery, PacketParser};
 use crate::device::rpc::{PendingReply, RpcRegistry};
@@ -25,8 +34,9 @@ use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 /// How long a device may be silent before the engine loses it. The link
@@ -46,22 +56,32 @@ const LINGER: Duration = Duration::from_secs(10);
 const LINGER: Duration = Duration::from_millis(500);
 
 /// Runs the engine of `link` until the link ends, with the tasks of its
-/// session on `tasks`. Every receiver of the link's store then ends.
+/// session on `tasks`. Every receiver of the link's store then ends, and
+/// every client that mounts the link is let go.
 pub(super) async fn run(link: Link, tasks: Supervisor) {
     match link.open_session(&tasks) {
-        Ok(session) => serve(link.store(), session).await,
-        Err(_) => lock(&link.store()).end_all(None),
+        Ok(session) => serve(link.store(), link.taps(), session).await,
+        Err(_) => {
+            lock(&link.store()).end_all(None);
+            link.taps().end();
+        }
     }
 }
 
-/// Keeps `store` from what arrives over `session` until the session ends,
-/// then ends every receiver of the store. It attaches to the session at
-/// once, so it takes every packet that arrives from then on.
-fn serve(store: Arc<Mutex<Store>>, session: Session) -> impl std::future::Future<Output = ()> {
-    let inlet = session.attach(usize::MAX / 2).0;
+/// Keeps `store` from what arrives over `session`, and feeds `taps`, until
+/// the session ends. Then ends every receiver of the store and lets every
+/// client of `taps` go. It attaches to the session at once, so it takes every
+/// packet that arrives from then on.
+fn serve(
+    store: Arc<Mutex<Store>>,
+    taps: Arc<Taps>,
+    session: Session,
+) -> impl std::future::Future<Output = ()> {
+    let inlet = session.attach(usize::MAX / 2);
     lock(&store).list(DeviceRoute::root(), []);
     let engine = Engine {
         store: Arc::clone(&store),
+        taps: Arc::clone(&taps),
         schedule: MetadataSchedule::new(Handle::root(session.clone())),
         handle: Handle::root(session),
         inlet,
@@ -74,12 +94,100 @@ fn serve(store: Arc<Mutex<Store>>, session: Session) -> impl std::future::Future
     async move {
         engine.run().await;
         lock(&store).end_all(None);
+        taps.end();
+    }
+}
+
+/// The clients' mounts of one link, which the link's engine feeds.
+pub(super) struct Taps {
+    /// The link's URL, which names it when a client is let go.
+    url: String,
+    mounts: Mutex<Vec<Feed>>,
+}
+
+/// One client's mount of a subtree of the link.
+struct Feed {
+    source: DeviceRoute,
+    /// Where the client sees the subtree.
+    prefix: DeviceRoute,
+    outlet: Arc<Outlet>,
+    /// The client's port on the link, which the mount lasts as long as.
+    port: mpsc::WeakSender<Packet>,
+    /// Whether the last link status the mount heard is `FailedToReconnect`.
+    gave_up: bool,
+}
+
+impl Taps {
+    /// Creates the mounts of the link to `url`, none yet.
+    pub(super) fn new(url: &str) -> Arc<Taps> {
+        let mounts = Mutex::default();
+        let url = url.to_string();
+        Arc::new(Taps { url, mounts })
+    }
+
+    /// Locks the mounts, and forgets each whose client let go of its port.
+    fn lock(&self) -> MutexGuard<'_, Vec<Feed>> {
+        let mut mounts = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        mounts.retain(|feed| feed.port.strong_count() > 0);
+        mounts
+    }
+
+    /// Feeds the client of `outlet` the packets of the subtree at `source`,
+    /// at the routes it sees under `prefix`, for as long as it holds `port`.
+    pub(super) fn add(
+        &self,
+        source: DeviceRoute,
+        prefix: DeviceRoute,
+        outlet: &Arc<Outlet>,
+        port: &mpsc::Sender<Packet>,
+    ) {
+        self.lock().push(Feed {
+            source,
+            prefix,
+            outlet: Arc::clone(outlet),
+            port: port.downgrade(),
+            gave_up: false,
+        });
+    }
+
+    /// Hands `packet` to each client whose mount it falls in, at the route
+    /// the client sees.
+    fn feed(&self, packet: &Packet) {
+        let status = packet.link_status();
+        for feed in self.lock().iter_mut() {
+            let Some(below) = within(feed.source, packet) else {
+                continue;
+            };
+            let Ok(route) = feed.prefix.absolute_route(&below) else {
+                log::warn!("Dropping a packet whose route {below} exceeds the max depth");
+                continue;
+            };
+            if let Some(status) = status {
+                feed.gave_up = status == LinkStatus::FailedToReconnect;
+            }
+            feed.outlet.push(packet.with_route(route));
+        }
+    }
+
+    /// Lets each client go, as the link ended. A mount that last heard
+    /// `FailedToReconnect` hears that the proxy gave up on the link.
+    pub(super) fn end(&self) {
+        for feed in self.lock().drain(..) {
+            let url = self.url.clone();
+            let error = match feed.gave_up {
+                true => ClientError::GaveUp(url),
+                false => ClientError::LinkEnded(url),
+            };
+            feed.outlet.end(error);
+        }
     }
 }
 
 /// The engine's state, besides what it keeps in the store.
 struct Engine {
     store: Arc<Mutex<Store>>,
+    /// The clients the engine feeds.
+    taps: Arc<Taps>,
     handle: Handle,
     inlet: Inlet,
     parser: PacketParser,
@@ -120,7 +228,11 @@ impl Engine {
                     let held = inlet.try_iter().take(inlet.len());
                     for queued in std::iter::once(first).chain(held) {
                         match queued {
-                            Queued::Item(packet) => self.take(&packet),
+                            Queued::Item(Some(packet)) => {
+                                self.take(&packet);
+                                self.taps.feed(&packet);
+                            }
+                            Queued::Item(None) => {}
                             Queued::Gap(lost) => log::error!("the engine lost {lost} packets"),
                             Queued::Ended(_) => return,
                         }
@@ -192,7 +304,7 @@ impl Engine {
         }
     }
 
-    /// Takes one packet the link delivered.
+    /// Takes one packet the link delivered into the store.
     fn take(&mut self, packet: &Packet) {
         let route = packet.route();
         if let Some(status) = packet.link_status() {
@@ -521,17 +633,199 @@ mod tests {
     use crate::device::stream::{Receiver, RecvError, Scope};
     use crate::proto::data as wire;
     use crate::proto::rpc as wire_rpc;
+    use crate::proto::SessionId;
+    use crate::proxy::client::device_updates;
+    use crate::proxy::control::{Joined, Update};
+    use crate::tio::packet::{Payload, ProxyRx};
     use std::time::Instant as StdInstant;
+
+    /// Feeds a client the whole link, with a watch of the device at the
+    /// root, from the engine whose store is `store`, for as long as the
+    /// client holds the port returned.
+    fn client_of(store: &Mutex<Store>, taps: &Taps) -> (Arc<Outlet>, mpsc::Sender<Packet>) {
+        let (outlet, root) = (Arc::<Outlet>::default(), DeviceRoute::root());
+        outlet.watch(1, root, device_updates(store, root));
+        let port = mpsc::channel(1).0;
+        taps.add(root, root, &outlet, &port);
+        (outlet, port)
+    }
+
+    /// Takes what `outlet` holds, as a client's task does, pausing between
+    /// takes for a while that `seed` picks, until a packet `done` picks has
+    /// gone. Returns everything taken, in order.
+    fn take_until(outlet: &Arc<Outlet>, seed: u64, done: impl Fn(&Packet) -> bool) -> Vec<Packet> {
+        let deadline = StdInstant::now() + Duration::from_secs(20);
+        let (mut taken, mut pause) = (Vec::new(), seed);
+        loop {
+            assert!(
+                StdInstant::now() < deadline,
+                "the last packet never went out"
+            );
+            let (queued, _) = outlet.take().expect("the client is kept");
+            let finished = queued.iter().any(&done);
+            taken.extend(queued);
+            if finished {
+                return taken;
+            }
+            pause = (pause * 7 + 3) % 11;
+            std::thread::sleep(Duration::from_micros(pause * 200));
+        }
+    }
+
+    /// A metadata update's place in what a client took, the id and start of
+    /// each segment it holds, and its device's session.
+    type Renewal = (usize, Vec<(u8, u32)>, u32);
+
+    /// Each metadata update in `taken`, as the client joins them.
+    fn segment_updates(taken: &[Packet]) -> Vec<Renewal> {
+        let mut joined = Joined::default();
+        let mut updates = Vec::new();
+        for (place, packet) in taken.iter().enumerate() {
+            let Payload::ProxyRx(ProxyRx::Reply(reply)) = packet.payload() else {
+                continue;
+            };
+            let Some(Update::Metadata(Some(records))) = joined.join(reply.value) else {
+                continue;
+            };
+            let (mut segments, mut session) = (Vec::new(), 0);
+            for record in records {
+                let (record, _) = Packet::from_slice_prefix(&record).unwrap();
+                match record.payload() {
+                    Payload::Metadata(wire::Metadata::Segment(segment), _) => {
+                        segments.push((segment.segment_id.value(), segment.start_time))
+                    }
+                    Payload::Metadata(wire::Metadata::Device(device), _) => {
+                        session = device.session.value()
+                    }
+                    _ => {}
+                }
+            }
+            updates.push((place, segments, session));
+        }
+        updates
+    }
+
+    /// Whatever the interleaving of segment records and samples, and however
+    /// the client's task takes from its outlet meanwhile, the client hears
+    /// each record ahead of every sample the device sent after it. A sample
+    /// that goes out goes out under the record it was sent under.
+    #[test]
+    fn a_client_hears_each_record_ahead_of_every_sample_sent_after_it() {
+        let root = DeviceRoute::root();
+        let done = route("/9");
+        for seed in 1..=4u64 {
+            let (store, taps, proxy) = engine_with_taps(&Supervisor::new());
+            let (outlet, _tap) = client_of(&store, &taps);
+            let taking = Arc::clone(&outlet);
+            let taker = std::thread::spawn(move || {
+                take_until(&taking, seed, |packet| packet.route() == done)
+            });
+            describe(&proxy, root, 1);
+            let mut random = seed;
+            let mut next = move || {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                random >> 60
+            };
+            let (mut segment, mut start, mut first) = (0, 0, 0);
+            let mut sent = HashMap::new();
+            for _ in 0..3000 {
+                match next() {
+                    0 => {
+                        (segment, start) = (segment ^ 1, start + 1);
+                        proxy.send(broadcast(record(segment, start), root));
+                    }
+                    1 => proxy.send(broadcast(record(segment, start), root)),
+                    _ => {
+                        sent.insert(first, (segment, start));
+                        proxy.send(Packet::samples(1, segment, first, &[0; 400], root).unwrap());
+                        first += 100;
+                    }
+                }
+            }
+            proxy.send(Packet::heartbeat(done));
+            let taken = taker.join().unwrap();
+
+            let updates = segment_updates(&taken);
+            let mut held = HashMap::new();
+            let mut updates = updates.into_iter().peekable();
+            let mut decoded = 0;
+            for (place, packet) in taken.iter().enumerate() {
+                while let Some((_, segments, _)) = updates.next_if(|(at, ..)| *at <= place) {
+                    held.extend(segments);
+                }
+                let Payload::Samples(data) = packet.payload() else {
+                    continue;
+                };
+                let (segment, start) = sent[&data.first.value()];
+                assert_eq!(
+                    held.get(&segment),
+                    Some(&start),
+                    "seed {seed}: sample {} went out under another record",
+                    data.first.value()
+                );
+                decoded += 1;
+            }
+            assert!(decoded > 0, "seed {seed}: no sample went out");
+        }
+    }
+
+    /// The segment record of `segment` that starts at `start`.
+    fn record(segment: u8, start: u32) -> wire::Metadata<'static> {
+        wire::Metadata::Segment(wire::Segment {
+            start_time: start,
+            ..segment_record(segment)
+        })
+    }
+
+    /// A heartbeat of the old session goes out ahead of the metadata of the
+    /// new one, and the samples the device sent after it go out after it,
+    /// so a client never meets a stale heartbeat behind newer metadata.
+    #[test]
+    fn an_old_sessions_heartbeat_goes_out_ahead_of_the_new_sessions_metadata() {
+        let root = DeviceRoute::root();
+        let (store, taps, proxy) = engine_with_taps(&Supervisor::new());
+        let (outlet, _tap) = client_of(&store, &taps);
+        describe(&proxy, root, 1);
+        proxy.send(Packet::heartbeat_session(1, root));
+        proxy.send(Packet::heartbeat_session(2, root));
+        describe(&proxy, root, 2);
+        proxy.send(samples(5, root));
+
+        let is_sample = |packet: &Packet| matches!(packet.payload(), Payload::Samples(_));
+        let taken = take_until(&outlet, 0, is_sample);
+        let beat = taken.iter().position(|packet| match packet.payload() {
+            Payload::Heartbeat(beat) => beat.session().map(SessionId::value) == Some(1),
+            _ => false,
+        });
+        let updates = segment_updates(&taken);
+        let renewed = updates.iter().find(|(_, _, session)| *session == 2);
+        let sample = taken.iter().position(is_sample);
+        let renewed = renewed.map(|(place, ..)| *place);
+        assert!(
+            beat < renewed && renewed < sample,
+            "{beat:?} {renewed:?} {sample:?}"
+        );
+        assert!(beat.is_some());
+    }
 
     /// An engine over a session whose socket is a pair of channels, with
     /// its tasks on `tasks`. Returns its store and the session's far end,
     /// which plays the link.
     fn engine_on(tasks: &Supervisor) -> (Arc<Mutex<Store>>, TestProxy) {
+        let (store, _, proxy) = engine_with_taps(tasks);
+        (store, proxy)
+    }
+
+    /// An engine as [`engine_on`] starts it, with the mounts it feeds.
+    fn engine_with_taps(tasks: &Supervisor) -> (Arc<Mutex<Store>>, Arc<Taps>, TestProxy) {
         let (session, proxy) = Session::test_pair_on(tasks);
         let store = Arc::new(Mutex::new(Store::new(true)));
-        tasks.spawn("proxy state", serve(Arc::clone(&store), session));
-
-        (store, proxy)
+        let taps = Taps::new("tcp://device");
+        let serving = serve(Arc::clone(&store), Arc::clone(&taps), session);
+        tasks.spawn("proxy state", serving);
+        (store, taps, proxy)
     }
 
     fn engine() -> (Arc<Mutex<Store>>, TestProxy) {
