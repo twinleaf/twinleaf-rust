@@ -20,7 +20,7 @@ targets = []
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)", "cfg(shuttle)"] }
 
 [features]
-default = ["serial", "firmware-update"]
+default = ["serial", "firmware-update", "hdf5"]
 serial = ["dep:tokio-serial", "dep:serialport"]
 hdf5 = ["dep:hdf5-pure"]
 # Built-in GitHub-backed firmware catalog (pulls in an HTTP client + TLS).

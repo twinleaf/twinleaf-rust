@@ -12,11 +12,8 @@ With rust language tools, install the tools using:
 cargo install twinleaf-tools
 ```
 
-It can be installed with the ability to convert to HDF5 using
-
-```sh
-cargo install twinleaf-tools --features hdf5
-```
+It converts logs to HDF5 as installed. `--no-default-features --features
+serial,mdns` leaves HDF5 out.
 
 ## Basic Usage
 
