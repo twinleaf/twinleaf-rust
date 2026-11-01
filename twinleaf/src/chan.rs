@@ -17,6 +17,15 @@
 //! RUSTFLAGS="--cfg shuttle" cargo test -p twinleaf --lib --target-dir target/shuttle shuttle
 //! ```
 //!
+//! Each test runs its scenario under shuttle's random scheduler and then its
+//! PCT scheduler, as `check` says. A failing test prints the schedule that
+//! broke it. The command above, filtered to that test and run with
+//! `TWINLEAF_SHUTTLE_SCHEDULE` set to the schedule, replays only that
+//! schedule. `TWINLEAF_SHUTTLE_ITERATIONS` sets how many schedules each
+//! scheduler runs, 1000 by default. The tests reach the session, the pump,
+//! their lanes and the store, and none of the proxy, whose sockets shuttle
+//! does not model.
+//!
 //! Under shuttle the channels are the stand-in of the `modeled` module. It
 //! differs from flume in these ways.
 //!
@@ -185,6 +194,38 @@ where
     F::Output: Send + 'static,
 {
     shuttle_tokio::spawn(future)
+}
+
+/// The depth of the PCT scheduler, one more than the number of times per
+/// schedule it lowers the priority of the running thread.
+#[cfg(all(test, shuttle))]
+const PCT_DEPTH: usize = 3;
+
+/// Runs `scenario` under shuttle's random scheduler, then under its PCT
+/// scheduler, for `iterations` schedules each, or the number that
+/// `TWINLEAF_SHUTTLE_ITERATIONS` holds. With `TWINLEAF_SHUTTLE_SCHEDULE` set,
+/// it replays that schedule alone.
+///
+/// # Panics
+///
+/// Panics with the failing schedule when `scenario` panics or deadlocks under
+/// one.
+#[cfg(all(test, shuttle))]
+pub(crate) fn check(iterations: usize, scenario: impl Fn() + Send + Sync + 'static) {
+    let scenario = std::sync::Arc::new(scenario);
+    let run = move || {
+        let scenario = std::sync::Arc::clone(&scenario);
+        move || scenario()
+    };
+    if let Ok(schedule) = std::env::var("TWINLEAF_SHUTTLE_SCHEDULE") {
+        return shuttle::replay(run(), schedule.trim());
+    }
+    let iterations = std::env::var("TWINLEAF_SHUTTLE_ITERATIONS")
+        .ok()
+        .and_then(|iterations| iterations.parse().ok())
+        .unwrap_or(iterations);
+    shuttle::check_random(run(), iterations);
+    shuttle::check_pct(run(), iterations, PCT_DEPTH);
 }
 
 /// Spawns `future` as a task of the runtime it is called from.

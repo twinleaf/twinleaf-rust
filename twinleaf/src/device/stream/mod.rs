@@ -11,6 +11,8 @@
 //! updates may overtake the device's packets, as each is the latest value of
 //! one field of the store.
 
+#[cfg(all(test, shuttle))]
+mod shuttle;
 mod subscription;
 
 pub(crate) use subscription::{BatchLane, End, Lane, Queued, Scope, Sink};

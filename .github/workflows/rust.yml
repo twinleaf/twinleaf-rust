@@ -38,6 +38,11 @@ jobs:
       - name: Lint
         if: matrix.platform == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets
+      - name: Test under shuttle's schedulers
+        if: matrix.platform == 'ubuntu-latest'
+        env:
+          RUSTFLAGS: --cfg shuttle
+        run: cargo test -p twinleaf --lib --target-dir target/shuttle shuttle
       - name: Strip binaries
         if: matrix.platform != 'windows-latest'
         run: |

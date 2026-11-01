@@ -619,3 +619,6 @@ impl<L> Sink<L> {
         (Sink { lane, alive, scope }, receiver)
     }
 }
+
+#[cfg(all(test, shuttle))]
+mod shuttle;
