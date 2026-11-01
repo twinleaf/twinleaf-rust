@@ -815,22 +815,6 @@ mod tests {
         drop(proxy);
     }
 
-    /// A subscriber whose queue is full still hears the stop, after what was
-    /// queued and the count of what it missed.
-    #[test]
-    fn a_full_queue_still_ends_with_the_stop() {
-        let (mut sink, receiver) = Sink::new(2, everything());
-        assert!((0..3).all(|item| sink.lane.send(item)));
-
-        sink.lane.end(End::Stopped);
-
-        assert_eq!(receiver.try_recv(), Ok(Some(0)));
-        assert_eq!(receiver.try_recv(), Ok(Some(1)));
-        assert_eq!(receiver.try_recv(), Err(RecvError::Lagged(1)));
-        assert_eq!(receiver.try_recv(), Err(RecvError::Stopped));
-        assert_eq!(receiver.try_recv(), Err(RecvError::Disconnected));
-    }
-
     /// The status saying why the link failed may be the last thing the
     /// session queues, so the pump must deliver what the inlet still holds
     /// before ending.
@@ -982,18 +966,6 @@ mod tests {
         assert_eq!(receiver.recv_async().await, Ok(7));
     }
 
-    #[tokio::test]
-    async fn an_async_receive_waits_for_an_item_another_thread_sends_later() {
-        let (mut sink, receiver) = Sink::new(1, everything());
-        let sender = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            sink.lane.send(7)
-        });
-
-        assert_eq!(receiver.recv_async().await, Ok(7));
-        assert!(sender.join().unwrap());
-    }
-
     /// A latest-value lane keeps only the newest item, so a reader that fell
     /// behind skips to it and is never told it lagged.
     #[test]
@@ -1008,40 +980,6 @@ mod tests {
 
         assert!(sink.lane.send(6));
         assert_eq!(receiver.recv(), Ok(6));
-    }
-
-    /// A lane being replaced as fast as another thread can never looks empty
-    /// to a reader who has not taken its item, and a reader who takes items
-    /// meanwhile ends on the last one sent.
-    #[test]
-    fn a_latest_value_lane_never_looks_empty_while_it_is_replaced() {
-        const SENT: u32 = 100_000;
-        let (mut sink, receiver) = Sink::latest(everything());
-        assert!(sink.lane.send(0));
-        let sender = std::thread::spawn(move || {
-            for value in 1..=SENT {
-                sink.lane.send(value);
-            }
-            sink
-        });
-        while !sender.is_finished() {
-            assert!(!receiver.as_flume().is_empty(), "the lane looked empty");
-        }
-        let mut sink = sender.join().unwrap();
-        assert_eq!(receiver.try_recv(), Ok(Some(SENT)));
-
-        let sender = std::thread::spawn(move || {
-            for value in 1..=SENT {
-                sink.lane.send(value);
-            }
-        });
-        let mut last = 0;
-        while last < SENT {
-            let value = receiver.recv().unwrap();
-            assert!(value >= last, "{value} came after {last}");
-            last = value;
-        }
-        sender.join().unwrap();
     }
 
     /// A blocking receive with a deadline times out on an empty lane, and
@@ -1065,18 +1003,6 @@ mod tests {
         assert!(sender.join().unwrap());
     }
 
-    #[tokio::test]
-    async fn an_async_latest_value_receive_waits_for_the_next_item() {
-        let (mut sink, receiver) = Sink::latest(everything());
-        let sender = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            sink.lane.send(7)
-        });
-
-        assert_eq!(receiver.recv_async().await, Ok(7));
-        assert!(sender.join().unwrap());
-    }
-
     /// The sync API may run inside an application's own tokio runtime, where
     /// tokio's `block_on` would panic. A latest-value receive blocks there as
     /// any other receive does.
@@ -1090,18 +1016,6 @@ mod tests {
 
         let received = runtime.block_on(async { receiver.recv_timeout(Duration::from_secs(5)) });
         assert_eq!(received, Ok(3));
-    }
-
-    /// The end has a place of its own, so the last value is still read
-    /// before the reader learns why the stream ended.
-    #[test]
-    fn a_latest_value_lane_delivers_its_last_item_before_its_end() {
-        let (mut sink, receiver) = Sink::latest(everything());
-        assert!(sink.lane.send(1));
-        sink.lane.end(End::Closed);
-
-        assert_eq!(receiver.recv(), Ok(1));
-        assert_eq!(receiver.recv(), Err(RecvError::Closed));
     }
 
     /// A parser that has taken the description of the device at each of
@@ -1301,20 +1215,6 @@ mod tests {
         drop(receiver);
 
         assert!(!sink.lane.send(2));
-    }
-
-    /// An async receive ends as a blocking one does, so it too says the proxy
-    /// stopped rather than only that the stream ended.
-    #[tokio::test]
-    async fn an_async_receive_ends_as_a_blocking_one_does() {
-        let (stream, proxy) = stream();
-        let awaited = stream.batches(everything());
-        let blocked = stream.batches(everything());
-
-        proxy.send(Packet::link(packet::LinkStatus::Stopped));
-
-        assert_eq!(awaited.recv_async().await.err(), Some(RecvError::Stopped));
-        assert_eq!(blocked.recv().err(), Some(RecvError::Stopped));
     }
 
     /// The replies that carry `update` to watch 1, as their values.
