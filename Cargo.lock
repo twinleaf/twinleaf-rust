@@ -2124,6 +2124,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest-state-machine"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76fe42bc434fdb72020f41a6e9dbc6d29fdcc3ac43fb3470dba5147039cf5220"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3120,6 +3129,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "proptest",
+ "proptest-state-machine",
  "rustfft",
  "serde_json",
  "serialport",

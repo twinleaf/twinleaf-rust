@@ -262,9 +262,12 @@ impl StreamTracker {
         }
 
         if segment.segment_id() != self.last_segment_id {
-            // A benign rollover is time-continuous; a stream restart leaves a
-            // forward gap. Backward jumps already returned above.
-            let time_continuous = time_gap < half_period;
+            // A rollover lands on a whole second of the undecimated clock and
+            // drops the group of inputs it leaves incomplete, so the last
+            // segment's last output ends short of the new start by less than
+            // one period. A longer gap is a restart, and backward jumps
+            // already returned above.
+            let time_continuous = time_gap < 2.0 * half_period;
             return Some(if is_segment_rollover && time_continuous {
                 BoundaryReason::SegmentRollover {
                     old_id: self.last_segment_id,
@@ -326,7 +329,37 @@ impl StreamTracker {
                 segment_count: n_segments,
             });
         }
-        if self.current_segment_id != data.segment_id {
+        // The current segment is the one the last broadcast record or rows
+        // named, so a segment other than the last rows' is announced when
+        // the device broadcast its record since them.
+        let announced = self.current_segment_id == data.segment_id;
+        // A stream moving onto a segment in one device session finds a stale
+        // ring entry when the record is left from an earlier lap of the ring.
+        // In the stream's clock, that record's timestamps run backward. A
+        // record of another clock is not comparable, and describes the
+        // segment only when announced, as the device sends a segment's record
+        // before its first sample. A new session clears the ring, so every
+        // record after a reboot is the new session's.
+        if data.segment_id != self.last_segment_id
+            && self.established
+            && device.session() == self.last_session_id
+        {
+            let stale = self.segment(data.segment_id).is_some_and(|record| {
+                let seg = record.get();
+                if seg.timeref_session() != self.last_time_ref_session_id {
+                    return !announced;
+                }
+                seg.decimation() != 0 && seg.sampling_rate() != 0 && {
+                    let half_period =
+                        0.5 * f64::from(seg.decimation()) / f64::from(seg.sampling_rate());
+                    sample_time(seg, data.first.value()) < self.last_timestamp - half_period
+                }
+            });
+            if stale {
+                self.segments[usize::from(data.segment_id.value())] = None;
+            }
+        }
+        if !announced {
             self.current_segment_id = data.segment_id;
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
@@ -400,29 +433,6 @@ impl StreamTracker {
         let next_segment =
             SegmentId::new(self.last_segment_id.value().wrapping_add(1) % n_segments);
 
-        // Infer stale ring entries from backward timestamps within the same
-        // device and clock sessions. Comparing across sessions would repeatedly
-        // evict valid metadata after a reboot.
-        if data.segment_id != self.last_segment_id
-            && self.established
-            && device.session() == self.last_session_id
-        {
-            let stale = self.segment(data.segment_id).is_some_and(|record| {
-                let seg = record.get();
-                seg.timeref_session() == self.last_time_ref_session_id
-                    && seg.decimation() != 0
-                    && seg.sampling_rate() != 0
-                    && {
-                        let half_period =
-                            0.5 * f64::from(seg.decimation()) / f64::from(seg.sampling_rate());
-                        sample_time(seg, data.first.value()) < self.last_timestamp - half_period
-                    }
-            });
-            if stale {
-                self.segments[usize::from(data.segment_id.value())] = None;
-            }
-        }
-
         let (segment_record, is_segment_rollover) = match (
             self.segment(data.segment_id).cloned(),
             self.segment(self.last_segment_id).cloned(),
@@ -437,22 +447,30 @@ impl StreamTracker {
             // descriptor while discovery requests the real one.
             (None, Some(previous)) => {
                 let mut rolled = previous.get().fields();
-                // Segments roll on whole seconds of the undecimated clock, on
-                // which output sample n sits at sample n * decimation.
-                let seconds_at = |sample: u64| {
-                    sample * u64::from(rolled.decimation) / u64::from(rolled.sampling_rate)
-                };
-                let next_sample = u64::from(next_sample);
-                let forced_rollover = self.established
-                    && data.first.value() == 0
-                    && rolled.sampling_rate != 0
-                    && rolled.decimation != 0
-                    && seconds_at(next_sample) > seconds_at(next_sample - 1)
-                    && data.segment_id == next_segment;
-                if !forced_rollover {
+                // A device switches segments on a whole second of its
+                // undecimated clock, wherever in a group of inputs it is
+                // asked to, and drops the group that switch leaves
+                // incomplete. The last segment's `next_sample` outputs took
+                // its first `next_sample * decimation` inputs, so it switched
+                // on a whole second from that input on and before the input
+                // that completes one more output. A forced rollover is
+                // inferred only when exactly one whole second lies there.
+                let switch_second = (rolled.sampling_rate != 0 && rolled.decimation != 0)
+                    .then(|| {
+                        let rate = u64::from(rolled.sampling_rate);
+                        let decimation = u64::from(rolled.decimation);
+                        let inputs = u64::from(next_sample) * decimation;
+                        let at = inputs.div_ceil(rate) * rate;
+                        let end = inputs + decimation;
+                        (at < end && at + rate >= end).then_some(at / rate)
+                    })
+                    .flatten();
+                let forced_rollover =
+                    self.established && data.first.value() == 0 && data.segment_id == next_segment;
+                let Some(seconds) = switch_second.filter(|_| forced_rollover) else {
                     return Ok(PacketEvent::WaitingForMetadata);
-                }
-                rolled.start_time += seconds_at(next_sample) as u32;
+                };
+                rolled.start_time = rolled.start_time.wrapping_add(seconds as u32);
                 rolled.segment_id = data.segment_id;
                 let rolled = SegmentRecord::encode(rolled)
                     .expect("a re-timed copy of a retained record is the same length");

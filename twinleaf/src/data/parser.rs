@@ -352,7 +352,7 @@ impl Batcher {
 mod tests {
     use super::*;
     use crate::data::buffer::Buffer;
-    use crate::data::continuity::{BoundaryClass, BoundaryReason, Generations};
+    use crate::data::continuity::{BoundaryReason, Generations};
     use crate::data::fixtures;
     use crate::data::sample::ColumnData;
     use crate::data::state::StreamDataError;
@@ -802,27 +802,29 @@ mod tests {
     }
 
     #[test]
-    fn forced_rollover_follows_the_undecimated_clock() {
-        // 10 Hz sampled, decimated by 3: the device switches at undecimated
-        // sample 20 (t = 2 s), which follows the 7th output sample.
-        let batch = rollover_batch(10, 3, 7);
-        assert_eq!(batch.metadata().segment().start_time(), 2);
-        assert!(matches!(
-            batch.boundary().map(BoundaryReason::class),
-            Some(BoundaryClass::Seamless)
-        ));
-    }
-
-    #[test]
-    fn forced_rollover_is_unchanged_when_decimation_divides_the_rate() {
-        // 10 Hz sampled, decimated by 2: the switch at undecimated sample 10
-        // (t = 1 s) is also the 5th output sample.
-        let batch = rollover_batch(10, 2, 5);
-        assert_eq!(batch.metadata().segment().start_time(), 1);
-        assert!(matches!(
-            batch.boundary().map(BoundaryReason::class),
-            Some(BoundaryClass::Seamless)
-        ));
+    fn a_forced_rollover_that_fits_no_switch_or_several_waits_for_its_record() {
+        // At 10 Hz decimated by 3, a segment of 7 outputs takes inputs 0 to
+        // 20, and the next whole second, input 30, completes 3 more outputs,
+        // so no device switch leaves 7 outputs. At 1 Hz decimated by 2, a
+        // segment of 1 output ends on a switch at input 2 or input 3.
+        for (sampling_rate, decimation, outputs) in [(10, 3, 7), (1, 2, 1)] {
+            let mut parser = parser_with_clock(&[DataType::F32], 4, 2, sampling_rate, decimation);
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4 * outputs]))
+                .expect("valid rows");
+            parser.pop_batch().expect("the first batch");
+            assert_eq!(
+                parser
+                    .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+                    .expect("valid rows"),
+                PacketOutcome::WaitingForMetadata,
+                "{outputs} outputs at {sampling_rate} Hz decimated by {decimation}"
+            );
+            assert_eq!(
+                take_query(&mut parser).selectors,
+                [wire::MetadataSelector::segment(STREAM_ID, 1)]
+            );
+        }
     }
 
     #[test]
