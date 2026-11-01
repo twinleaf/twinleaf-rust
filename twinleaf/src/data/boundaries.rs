@@ -3,14 +3,20 @@
 //! Each case simulates one device stream, which takes samples, rolls into
 //! its next segment with or without sending the segment's record first,
 //! changes its rate or decimation, takes a new time reference, reboots and
-//! drops samples. After the first lap of its ring, a rollover without the
-//! record lands on a slot whose record the parser holds from the lap
-//! before, and that record can be of an older time reference. Its packets
-//! go through the parser, and the batches through a [`Lane`] as the pump
-//! sends them, to a reader whose reads interleave with the device's steps.
-//! A lane with little room drops batches, as for a slow app. Every sample
-//! carries its position in the device's sequence, so the harness knows what
-//! the reader missed and when each sample was taken.
+//! drops samples. It switches segments as `twinleaf_device`'s segment ring
+//! does, at the next whole second of its undecimated clock from wherever in
+//! a group of inputs it is asked to, and drops the group of inputs that
+//! switch leaves incomplete, so a decimated stream's last sample can end
+//! short of the new segment's start by less than a period. When a period
+//! spans more than a second, several whole seconds can leave the same last
+//! sample. After the first lap of its ring, a rollover without the record
+//! lands on a slot whose record the parser holds from the lap before, and
+//! that record can be of an older time reference. Its packets go through
+//! the parser, and the batches through a [`Lane`] as the pump sends them,
+//! to a reader whose reads interleave with the device's steps. A lane with
+//! little room drops batches, as for a slow app. Every sample carries its
+//! position in the device's sequence, so the harness knows what the reader
+//! missed and when each sample was taken.
 //!
 //! The first batch says [`BoundaryReason::Initial`], and a first batch after
 //! a gap says only the gap, as the reader missed the start of the stream.
@@ -39,11 +45,14 @@
 //!
 //! Two properties hold. A reader that keeps up learns every change, when no
 //! sample is lost next to a new segment, and a reader that lags learns every
-//! loss of a device that changes nothing. They catch faults in the parser's
-//! rollovers, forced or not, the ring records it keeps or evicts, its
-//! boundaries and their payloads, its clock, and the lane's gaps.
+//! loss of a device that changes nothing. A parser without the record of a
+//! rollover that several whole seconds fit waits for it, and the segment's
+//! first packet is lost, so the reader that keeps up meets no such forced
+//! rollover. They catch faults in the parser's rollovers, forced or not,
+//! the ring records it keeps or evicts, its boundaries and their payloads,
+//! its clock, and the lane's gaps.
 //!
-//! Three properties fail, and are ignored until the parser and the lane
+//! Two properties fail, and are ignored until the parser and the lane
 //! change.
 //!
 //! - Problem A. A lane that drops batches drops the boundaries they carry,
@@ -54,15 +63,6 @@
 //!   [`BoundaryReason`] cannot say both that the segment rolled over and
 //!   that samples were lost, so a loss across a rollover comes as a
 //!   [`BoundaryReason::SegmentChanged`].
-//! - Problem D. A device switches segments at the next whole second of its
-//!   undecimated clock, and drops the group of inputs that switch leaves
-//!   incomplete, so a decimated stream's last sample can end short of the
-//!   new segment's start, by less than a period. The parser takes that gap
-//!   past half a period for a [`BoundaryReason::SegmentChanged`], and for a
-//!   forced rollover it infers the start at the whole second before the
-//!   last sample ends, where the device switched at the one after. The
-//!   other properties switch segments only where a whole group ends on a
-//!   whole second.
 
 use super::fixtures;
 use super::{BoundaryReason, PacketParser, SampleBatch};
@@ -118,10 +118,6 @@ trait Case: 'static {
     /// Whether the device changes its rate and time reference, and reboots.
     const RECONFIGURES: bool;
     const DROPS: Drops;
-    /// Whether the device switches segments at the next whole second of its
-    /// undecimated clock and drops the incomplete group of inputs, rather
-    /// than only where a whole group ends on a whole second.
-    const SPLITS_GROUPS: bool = false;
 }
 
 /// A reader that keeps up, and a device that changes everything and drops
@@ -167,18 +163,6 @@ impl Case for LosesAtRollover {
     const DROPS: Drops = Drops::Anywhere;
 }
 
-/// A reader that keeps up, and a device that also switches segments inside
-/// a group of inputs. Problem D.
-struct SplitsAGroup;
-
-impl Case for SplitsAGroup {
-    const ROOM: RangeInclusive<usize> = ROOMY..=ROOMY;
-    const ROLLS_OVER: bool = true;
-    const RECONFIGURES: bool = false;
-    const DROPS: Drops = Drops::Never;
-    const SPLITS_GROUPS: bool = true;
-}
-
 /// One step of a case.
 #[derive(Clone, Debug)]
 enum Step {
@@ -187,16 +171,23 @@ enum Step {
     Samples { count: u32, rows: u32 },
     /// The device drops its next `count` samples.
     Drop { count: u32 },
-    /// The device takes samples to its next whole second, and rolls into its
-    /// next segment. Unless `forced`, it sends the new segment's record
-    /// first, and otherwise the record follows the segment's first packet.
-    Rollover { forced: bool },
-    /// The device takes samples to its next whole second, and goes on at
-    /// `RATES[rate]` decimated by `decimation` in its next segment.
-    Rate { rate: usize, decimation: u32 },
-    /// The device takes samples to its next whole second, and goes on with
-    /// a new time reference in its next segment.
-    TimeRef,
+    /// The device is asked `within` inputs into its next sample's group to
+    /// roll into its next segment, takes samples to the switch, and rolls
+    /// over. Unless `forced`, it sends the new segment's record first, and
+    /// otherwise the record follows the segment's first packet.
+    Rollover { forced: bool, within: u32 },
+    /// The device is asked `within` inputs into its next sample's group to
+    /// go on at `RATES[rate]` decimated by `decimation`, takes samples to
+    /// the switch, and goes on so in its next segment.
+    Rate {
+        rate: usize,
+        decimation: u32,
+        within: u32,
+    },
+    /// The device is asked `within` inputs into its next sample's group to
+    /// take a new time reference, takes samples to the switch, and goes on
+    /// with it in its next segment.
+    TimeRef { within: u32 },
     /// The device reboots into a new session, and describes itself again.
     Reboot,
     /// The reader takes up to `count` entries off its lane.
@@ -288,8 +279,6 @@ struct At {
 #[derive(Clone, Debug)]
 struct Device {
     room: usize,
-    /// Whether a segment switch drops an incomplete group of inputs.
-    splits_groups: bool,
     session: u32,
     timeref: u32,
     rate: u32,
@@ -317,10 +306,9 @@ struct Device {
 }
 
 impl Device {
-    fn new(room: usize, splits_groups: bool, rate: u32, decimation: u32) -> Device {
+    fn new(room: usize, rate: u32, decimation: u32) -> Device {
         let mut device = Device {
             room,
-            splits_groups,
             session: 1,
             timeref: 7,
             rate,
@@ -406,37 +394,48 @@ impl Device {
         }
     }
 
-    /// Returns `true` if the next sample's group of inputs starts on a whole
-    /// second of the undecimated clock.
-    fn on_a_second(&self) -> bool {
-        (self.next * self.decimation).is_multiple_of(self.rate)
+    /// The input a segment switch asked for `within` inputs into the next
+    /// sample's group lands on. As in `twinleaf_device`'s segment ring, it is
+    /// the next whole second of the inputs from there.
+    fn switch_at(&self, within: u32) -> u32 {
+        (self.next * self.decimation + within).div_ceil(self.rate) * self.rate
     }
 
-    /// Takes samples up to the segment switch. A device that splits groups
-    /// switches as `twinleaf_device`'s segment ring does, at the next whole
-    /// second of its inputs, after the last whole group before it.
-    fn finish_second(&mut self) {
-        if self.splits_groups {
-            let at = (self.next * self.decimation).div_ceil(self.rate) * self.rate;
-            while (self.next + 1) * self.decimation <= at {
-                self.take(1, 1);
-            }
-        } else {
-            while !self.on_a_second() {
-                self.take(1, 1);
-            }
-        }
+    /// The samples whose groups complete by a switch at input `at`.
+    fn samples_to(&self, at: u32) -> u32 {
+        at / self.decimation - self.next
     }
 
-    /// Opens a new segment from the current second on, after `change`.
-    fn change(&mut self, change: Change) {
+    /// Returns `true` if a switch at input `at` is the only whole second that
+    /// leaves the outputs it does, so a parser without the new segment's
+    /// record infers it.
+    fn only_switch(&self, at: u32) -> bool {
+        let (rate, decimation) = (self.rate, self.decimation);
+        let outputs = at / decimation;
+        (outputs * decimation).div_ceil(rate) * rate + rate >= (outputs + 1) * decimation
+    }
+
+    /// Takes the samples whose groups complete by a switch at input `at`,
+    /// and drops the inputs of the group that switch leaves incomplete.
+    fn finish_segment(&mut self, at: u32) {
+        (0..self.samples_to(at)).for_each(|_| self.take(1, 1));
+    }
+
+    /// Switches segments after `change`, asked for `within` inputs into the
+    /// next sample's group. The switch is set once, as the ring sets it.
+    fn switch(&mut self, change: Change, within: u32) {
+        let at = self.switch_at(within);
+        self.finish_segment(at);
+        self.change(change, at / self.rate);
+    }
+
+    /// Opens a new segment `seconds` after the current one starts, after
+    /// `change`.
+    fn change(&mut self, change: Change, seconds: u32) {
         if self.record_due {
             self.send_record();
         }
-        self.start += match change {
-            Change::Reboot => (self.next * self.decimation).div_ceil(self.rate) + 10,
-            _ => (self.next * self.decimation).div_ceil(self.rate),
-        };
+        self.start += seconds;
         self.next = 0;
         self.changes.push((self.position(), change));
         self.since_change = 0;
@@ -452,24 +451,45 @@ impl Device {
     /// segment holds a sample or a dropped one, as a device rolls over once
     /// a second at most.
     fn allows<C: Case>(&self, step: &Step) -> bool {
-        // Nothing comes between the last dropped sample and a new segment.
-        let after_a_drop =
-            C::DROPS == Drops::ApartFromSegments && self.dropped_last && self.on_a_second();
-        let segment = self.since_change > 0 && !after_a_drop;
-        match step {
+        // A switch asked for `within` inputs into a group, with nothing
+        // between the last dropped sample and the new segment.
+        let segment = |within: u32| {
+            within < self.decimation && self.since_change > 0 && {
+                let at = self.switch_at(within);
+                let after_a_drop = C::DROPS == Drops::ApartFromSegments
+                    && self.dropped_last
+                    && self.samples_to(at) == 0;
+                !after_a_drop
+            }
+        };
+        match *step {
             Step::Samples { .. } | Step::Read { .. } => true,
             Step::Drop { .. } => match C::DROPS {
                 Drops::Never => false,
                 Drops::ApartFromSegments => !(self.segmented_last && self.sent_since_change == 0),
                 Drops::Anywhere => true,
             },
-            Step::Rollover { .. } => C::ROLLS_OVER && segment,
-            Step::Rate { rate, decimation } => {
-                let old = f64::from(self.rate) / f64::from(self.decimation);
-                let new = f64::from(RATES[*rate]) / f64::from(*decimation);
-                C::RECONFIGURES && segment && old != new
+            // A parser without the record waits through a forced rollover
+            // that several whole seconds fit, and so loses the segment's
+            // first packet. Only a device that drops anywhere loses a sample
+            // next to a new segment.
+            Step::Rollover { forced, within } => {
+                C::ROLLS_OVER
+                    && segment(within)
+                    && (!forced
+                        || C::DROPS == Drops::Anywhere
+                        || self.only_switch(self.switch_at(within)))
             }
-            Step::TimeRef => C::RECONFIGURES && segment,
+            Step::Rate {
+                rate,
+                decimation,
+                within,
+            } => {
+                let old = f64::from(self.rate) / f64::from(self.decimation);
+                let new = f64::from(RATES[rate]) / f64::from(decimation);
+                C::RECONFIGURES && segment(within) && old != new
+            }
+            Step::TimeRef { within } => C::RECONFIGURES && segment(within),
             Step::Reboot => C::RECONFIGURES && self.since_change > 0,
         }
     }
@@ -484,19 +504,26 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
 
     fn init_state() -> BoxedStrategy<Device> {
         (C::ROOM, 0..RATES.len(), DECIMATIONS)
-            .prop_map(|(room, rate, decimation)| {
-                Device::new(room, C::SPLITS_GROUPS, RATES[rate], decimation)
-            })
+            .prop_map(|(room, rate, decimation)| Device::new(room, RATES[rate], decimation))
             .boxed()
     }
 
-    fn transitions(_: &Device) -> BoxedStrategy<Step> {
+    fn transitions(device: &Device) -> BoxedStrategy<Step> {
+        let within = 0..device.decimation;
         let samples = (1..=6u32, 1..=3u32).prop_map(|(count, rows)| Step::Samples { count, rows });
         let read = (1..=4usize).prop_map(|count| Step::Read { count });
         let drop = (1..=3u32).prop_map(|count| Step::Drop { count });
-        let rollover = any::<bool>().prop_map(|forced| Step::Rollover { forced });
-        let rate = (0..RATES.len(), DECIMATIONS)
-            .prop_map(|(rate, decimation)| Step::Rate { rate, decimation });
+        let rollover = (any::<bool>(), within.clone())
+            .prop_map(|(forced, within)| Step::Rollover { forced, within });
+        let rate =
+            (0..RATES.len(), DECIMATIONS, within.clone()).prop_map(|(rate, decimation, within)| {
+                Step::Rate {
+                    rate,
+                    decimation,
+                    within,
+                }
+            });
+        let timeref = within.prop_map(|within| Step::TimeRef { within });
         let mut steps = vec![(6, samples.boxed()), (4, read.boxed())];
         if C::DROPS != Drops::Never {
             steps.push((2, drop.boxed()));
@@ -506,7 +533,7 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
         }
         if C::RECONFIGURES {
             steps.push((1, rate.boxed()));
-            steps.push((1, Just(Step::TimeRef).boxed()));
+            steps.push((1, timeref.boxed()));
             steps.push((1, Just(Step::Reboot).boxed()));
         }
         proptest::strategy::Union::new_weighted(steps).boxed()
@@ -524,28 +551,30 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                 (0..count).for_each(|_| device.advance());
                 device.dropped_last = true;
             }
-            Step::Rollover { forced } => {
-                device.finish_second();
-                device.change(Change::Rollover);
+            Step::Rollover { forced, within } => {
+                device.switch(Change::Rollover, within);
                 device.record_due = true;
                 if !forced {
                     device.send_record();
                 }
             }
-            Step::Rate { rate, decimation } => {
-                device.finish_second();
-                device.change(Change::Rate);
+            Step::Rate {
+                rate,
+                decimation,
+                within,
+            } => {
+                device.switch(Change::Rate, within);
                 (device.rate, device.decimation) = (RATES[rate], decimation);
                 device.send_record();
             }
-            Step::TimeRef => {
-                device.finish_second();
-                device.change(Change::TimeRef);
+            Step::TimeRef { within } => {
+                device.switch(Change::TimeRef, within);
                 device.timeref += 1;
                 device.send_record();
             }
             Step::Reboot => {
-                device.change(Change::Reboot);
+                let seconds = (device.next * device.decimation).div_ceil(device.rate) + 10;
+                device.change(Change::Reboot, seconds);
                 device.session += 1;
                 device.describe();
             }
@@ -829,9 +858,4 @@ prop_state_machine! {
     #[ignore = "fails until the boundary fix; see Problem B in data/boundaries.rs, after which only `reported` changes"]
     fn a_loss_across_a_rollover_is_a_loss_and_a_rollover(sequential 1..40 => Boundaries<LosesAtRollover>);
 
-    /// A segment switch that drops an incomplete group of inputs reaches the
-    /// reader as a rollover, from the whole second the device switched at.
-    #[test]
-    #[ignore = "fails until validate_rows infers a forced rollover's start as twinleaf-device's segments.rs switches, at the next whole second of the inputs after its last sample rather than floor(L * decimation / rate), and detect_boundary takes the gap that switch leaves for a rollover; see Problem D in data/boundaries.rs"]
-    fn a_switch_inside_a_group_is_a_rollover(sequential 1..40 => Boundaries<SplitsAGroup>);
 }
