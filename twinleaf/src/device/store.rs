@@ -14,7 +14,7 @@
 //! it has not received.
 
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-use super::stream::{End, Receiver, Scope, Sink};
+use super::stream::{End, Lane, Receiver, Scope, Sink};
 use crate::proto::DeviceRoute;
 use crate::proxy::Watch;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +31,7 @@ pub(crate) const CHANGE_QUEUE_LEN: usize = 4096;
 /// queues holds no value, and queues each one in full for each receiver.
 pub(crate) struct Slot<T> {
     value: Option<T>,
-    sinks: Vec<Sink<T>>,
+    sinks: Vec<Sink<Lane<T>>>,
     queues: bool,
 }
 
@@ -119,7 +119,7 @@ pub(crate) struct Store {
     routes: BTreeSet<DeviceRoute>,
     /// The roots of the subtrees whose routes are all in `routes`.
     listed: BTreeSet<DeviceRoute>,
-    route_sinks: Vec<Sink<Vec<DeviceRoute>>>,
+    route_sinks: Vec<Sink<Lane<Vec<DeviceRoute>>>>,
     /// Whether the store has ended, and why when it was told.
     ended: Option<Option<End>>,
     /// Wakes whoever fills the store when a receiver starts to follow it.
@@ -340,7 +340,7 @@ impl Store {
 }
 
 /// Ends each of `sinks`, saying why if `end` does.
-pub(crate) fn end_sinks<T>(sinks: &mut Vec<Sink<T>>, end: Option<End>) {
+pub(crate) fn end_sinks<T>(sinks: &mut Vec<Sink<Lane<T>>>, end: Option<End>) {
     for sink in sinks.drain(..) {
         if let Some(end) = end {
             sink.lane.end(end);
@@ -349,7 +349,7 @@ pub(crate) fn end_sinks<T>(sinks: &mut Vec<Sink<T>>, end: Option<End>) {
 }
 
 /// Drops each of `sinks` whose receiver is gone. Returns `true` if any was.
-pub(crate) fn prune<T>(sinks: &mut Vec<Sink<T>>, cx: &mut Context<'_>) -> bool {
+pub(crate) fn prune<L>(sinks: &mut Vec<Sink<L>>, cx: &mut Context<'_>) -> bool {
     let held = sinks.len();
     // A lifeline resolves only once its receiver is gone, and its sink is
     // dropped before it is polled again.

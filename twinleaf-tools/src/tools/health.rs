@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryClass, BoundaryReason, SampleBatch, StreamKey, StreamMetadataSnapshot},
+    data::{Boundary, BoundaryClass, Change, SampleBatch, StreamKey, StreamMetadataSnapshot},
     device::{MetadataState, Presence, RecvError},
     Connection, DeviceRoute, SampleNumber, StreamId,
 };
@@ -170,7 +170,7 @@ struct StreamStats {
 
     // Last-known metadata; deliberately survives the reset methods.
     metadata: Option<StreamMetadataSnapshot>,
-    recent_boundaries: VecDeque<(SystemTime, BoundaryReason)>,
+    recent_boundaries: VecDeque<(SystemTime, Boundary)>,
 }
 
 impl StreamStats {
@@ -290,8 +290,8 @@ struct LoggedEvent {
 }
 
 /// Returns how much a boundary matters, by the class the library gives it.
-fn boundary_severity(reason: &BoundaryReason) -> Severity {
-    match reason.class() {
+fn boundary_severity(class: BoundaryClass) -> Severity {
+    match class {
         BoundaryClass::Startup | BoundaryClass::Seamless => Severity::Info,
         BoundaryClass::Reconfig => Severity::Warning,
         BoundaryClass::DataLoss | BoundaryClass::Anomaly => Severity::Error,
@@ -519,7 +519,7 @@ impl HealthState {
 
     fn handle_boundary(
         &mut self,
-        reason: &BoundaryReason,
+        boundary: &Boundary,
         route: &DeviceRoute,
         stream_name: &str,
         stream_id: StreamId,
@@ -527,20 +527,43 @@ impl HealthState {
         let key = StreamKey::new(*route, stream_id);
         if let Some(st) = self.stats.get_mut(&key) {
             st.recent_boundaries
-                .push_front((SystemTime::now(), reason.clone()));
+                .push_front((SystemTime::now(), boundary.clone()));
             if st.recent_boundaries.len() > RECENT_BOUNDARIES_CAP {
                 st.recent_boundaries.pop_back();
             }
         }
-        let severity = boundary_severity(reason);
-        match reason {
-            BoundaryReason::Initial => {
+        if let Some(change) = &boundary.change {
+            self.handle_change(change, &key, stream_name);
+        }
+        if let Some(loss) = &boundary.loss {
+            let behind = match loss.dropped_batches {
+                0 => String::new(),
+                batches => format!(", {batches} batches skipped while behind"),
+            };
+            self.log_event(
+                format!(
+                    "[{}/{}] DROPPED: {} samples{}",
+                    route, stream_name, loss.samples, behind
+                ),
+                boundary_severity(BoundaryClass::DataLoss),
+            );
+            if let Some(st) = self.stats.get_mut(&key) {
+                st.samples_dropped += loss.samples;
+            }
+        }
+    }
+
+    fn handle_change(&mut self, change: &Change, key: &StreamKey, stream_name: &str) {
+        let (route, key) = (key.route, *key);
+        let severity = boundary_severity(change.class());
+        match change {
+            Change::Initial => {
                 self.log_event(
                     format!("[{}/{}] STREAM STARTED", route, stream_name),
                     severity,
                 );
             }
-            BoundaryReason::SessionChanged { old, new } => {
+            Change::SessionChanged { old, new } => {
                 self.log_event(
                     format!("[{}/{}] SESSION: {} → {}", route, stream_name, old, new),
                     severity,
@@ -549,17 +572,7 @@ impl HealthState {
                     st.reset_all();
                 }
             }
-            BoundaryReason::SamplesLost { expected, received } => {
-                let count = received.wrapping_sub(*expected);
-                self.log_event(
-                    format!("[{}/{}] DROPPED: {} samples", route, stream_name, count),
-                    severity,
-                );
-                if let Some(st) = self.stats.get_mut(&key) {
-                    st.samples_dropped += count as u64;
-                }
-            }
-            BoundaryReason::TimeBackward { gap_seconds } => {
+            Change::TimeBackward { gap_seconds } => {
                 self.log_event(
                     format!(
                         "[{}/{}] TIME BACKWARD: {:.3}s",
@@ -568,7 +581,7 @@ impl HealthState {
                     severity,
                 );
             }
-            BoundaryReason::TimeForward { gap_seconds } => {
+            Change::TimeForward { gap_seconds } => {
                 self.log_event(
                     format!(
                         "[{}/{}] TIME FORWARD: {:.3}s",
@@ -577,7 +590,7 @@ impl HealthState {
                     severity,
                 );
             }
-            BoundaryReason::RateChanged { old_rate, new_rate } => {
+            Change::RateChanged { old_rate, new_rate } => {
                 self.log_event(
                     format!(
                         "[{}/{}] RATE: {:.1} → {:.1} Hz",
@@ -590,7 +603,7 @@ impl HealthState {
                     st.reset_rate();
                 }
             }
-            BoundaryReason::TimeRefSessionChanged { old, new } => {
+            Change::TimeRefSessionChanged { old, new } => {
                 self.log_event(
                     format!("[{}/{}] TIME REF: {} → {}", route, stream_name, old, new),
                     severity,
@@ -600,7 +613,7 @@ impl HealthState {
                     st.reset_rate();
                 }
             }
-            BoundaryReason::SegmentRollover { old_id, new_id } => {
+            Change::SegmentRollover { old_id, new_id } => {
                 self.log_event(
                     format!(
                         "[{}/{}] SEGMENT: {} → {}",
@@ -609,21 +622,9 @@ impl HealthState {
                     severity,
                 );
             }
-            BoundaryReason::SegmentChanged { old_id, new_id } => {
-                self.log_event(
-                    format!(
-                        "[{}/{}] SEGMENT CHANGED: {} → {}",
-                        route, stream_name, old_id, new_id
-                    ),
-                    severity,
-                );
-                if let Some(st) = self.stats.get_mut(&key) {
-                    st.reset_timing();
-                }
-            }
             _ => {
                 self.log_event(
-                    format!("[{}/{}] BOUNDARY: {:?}", route, stream_name, reason),
+                    format!("[{}/{}] BOUNDARY: {:?}", route, stream_name, change),
                     severity,
                 );
             }
@@ -1098,7 +1099,7 @@ fn draw_detail_pane(
     let mut lines = meta_lines;
     for (ts, reason) in st.recent_boundaries.iter().skip(offset).take(visible_lines) {
         let dt: DateTime<Local> = (*ts).into();
-        let color = boundary_severity(reason).color();
+        let color = boundary_severity(reason.class()).color();
         lines.push(Line::from(vec![
             Span::styled(
                 format!("[{}] ", dt.format("%H:%M:%S%.3f")),

@@ -41,7 +41,8 @@ pub trait Screen {
     /// Takes how far the metadata of the device at `route` is collected now.
     fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState);
 
-    /// Takes note that the tool fell behind and lost what `error` says.
+    /// Takes note that a receiver of device state fell behind and lost what
+    /// `error` says. The batches report their own losses.
     fn on_lagged(&mut self, error: RecvError);
 
     /// Takes a key or mouse event. Returns `true` to quit.
@@ -82,10 +83,10 @@ pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Resul
             }
         }
         let mut selector = Selector::new()
-            .recv(batches.as_flume(), |batch| {
-                batches
-                    .resolve(batch)
-                    .map_or_else(Woken::Failed, Woken::Batch)
+            .recv(batches.as_flume(), |batch| match batches.resolve(batch) {
+                Ok(batch) => Woken::Batch(batch),
+                Err(RecvError::Lagged(_)) => Woken::Behind,
+                Err(error) => Woken::Failed(error),
             })
             .recv(routes.as_flume(), |heard| {
                 routes
@@ -125,6 +126,7 @@ pub fn run(tree: &DeviceTree, fps: u64, screen: &mut impl Screen) -> eyre::Resul
         }
         match selector.wait_deadline(next_frame) {
             Ok(Woken::Batch(batch)) => screen.on_batch(batch),
+            Ok(Woken::Behind) => {}
             Ok(Woken::Routes(heard)) => {
                 for &route in &heard {
                     if devices.iter().all(|device| device.route != route) {
@@ -191,7 +193,10 @@ enum Woken {
     Settings(DeviceRoute, Arc<Settings>),
     Input(term::Event),
     Reply(Reply),
-    /// The stream lagged or ended.
+    /// The batches fell behind, which the next batch of each stream that
+    /// lost some says.
+    Behind,
+    /// A stream lagged or ended.
     Failed(RecvError),
     /// The input reader or an RPC worker has stopped.
     Closed,

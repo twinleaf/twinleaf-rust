@@ -86,7 +86,9 @@
 //! hands each sample batch to each receiver's queue of 1024 batches, and
 //! each packet to each packet receiver's queue of 8192 packets. A receiver
 //! that falls behind loses what does not fit in its queue, and hears
-//! [`RecvError::Lagged`](crate::RecvError::Lagged) with the count. The
+//! [`RecvError::Lagged`](crate::RecvError::Lagged) with the count. The next
+//! batch of each stream that lost batches carries a
+//! [`Loss`](crate::data::Loss). The
 //! state the proxy sends goes into the connection's store, whose presence,
 //! metadata, RPC table and settings hold only their latest value, so a slow
 //! reader sees the newest and misses none it needs. Announced settings

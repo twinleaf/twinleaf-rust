@@ -4,7 +4,7 @@
 //! materializing sample values. Packet consumers decide whether to decode the
 //! validated bytes immediately or retain only their metadata and boundaries.
 
-use super::continuity::{BoundaryReason, Generations};
+use super::continuity::{Boundary, Change, Generations, Loss};
 use super::decode::{decode_samples, decodes};
 use super::metadata::{
     rate_hz, ColumnRecord, DeviceMetadataSnapshot, DeviceRecord, MetadataQuery, SegmentRecord,
@@ -132,6 +132,13 @@ struct StreamTracker {
     last_timestamp: f64,
     last_session_id: SessionId,
     last_time_ref_session_id: SessionId,
+    /// The record of the segment the last accepted rows were in, whose start
+    /// and clock place the rows a rollover lost.
+    last_segment: Option<SegmentRecord>,
+    /// Whether the device announced a segment other than the last rows'
+    /// since them, so that rows in the last rows' slot are of a later lap of
+    /// the ring.
+    moved_on: bool,
     rate_hz: f64,
 }
 
@@ -151,6 +158,8 @@ impl StreamTracker {
             last_timestamp: 0.0,
             last_session_id: SessionId::new(0),
             last_time_ref_session_id: SessionId::new(0),
+            last_segment: None,
+            moved_on: false,
             rate_hz: 0.0,
         }
     }
@@ -225,79 +234,105 @@ impl StreamTracker {
         device: wire::DeviceView<'_>,
         segment: wire::SegmentView<'_>,
         new_rate: f64,
-        is_segment_rollover: bool,
-    ) -> Option<BoundaryReason> {
+    ) -> Option<Boundary> {
         if !self.established {
-            return Some(BoundaryReason::Initial);
+            return Some(Boundary::of(Change::Initial));
         }
 
         if device.session() != self.last_session_id {
-            return Some(BoundaryReason::SessionChanged {
+            return Some(Boundary::of(Change::SessionChanged {
                 old: self.last_session_id,
                 new: device.session(),
-            });
+            }));
         }
 
         if segment.timeref_session() != self.last_time_ref_session_id {
-            return Some(BoundaryReason::TimeRefSessionChanged {
+            return Some(Boundary::of(Change::TimeRefSessionChanged {
                 old: self.last_time_ref_session_id,
                 new: segment.timeref_session(),
-            });
+            }));
         }
 
         if (new_rate - self.rate_hz).abs() > 1e-9 {
-            return Some(BoundaryReason::RateChanged {
+            return Some(Boundary::of(Change::RateChanged {
                 old_rate: self.rate_hz,
                 new_rate,
-            });
+            }));
         }
 
         let half_period = 0.5 / new_rate;
         let time_gap = first_timestamp - self.last_timestamp;
 
         if time_gap < -half_period {
-            return Some(BoundaryReason::TimeBackward {
+            return Some(Boundary::of(Change::TimeBackward {
                 gap_seconds: -time_gap,
+            }));
+        }
+
+        let expected = SampleNumber::new(self.last_sample_number.value() + 1);
+        let lost = |samples: u64| Loss {
+            samples,
+            expected: Some(expected),
+            dropped_batches: 0,
+        };
+
+        // Rows in the last rows' slot are of a later lap of the ring after
+        // the device announced another segment, or when that slot's segment
+        // starts later and the rows do not follow on from the last ones.
+        let lapped = self.moved_on
+            || first_sample_n != expected
+                && self
+                    .last_segment
+                    .as_ref()
+                    .is_some_and(|last| last.get().start_time() != segment.start_time());
+        if segment.segment_id() != self.last_segment_id || lapped {
+            let missing = self.missing_before(segment, first_sample_n);
+            return Some(Boundary {
+                change: Some(Change::SegmentRollover {
+                    old_id: self.last_segment_id,
+                    new_id: segment.segment_id(),
+                }),
+                loss: u64::try_from(missing).ok().filter(|&n| n >= 1).map(lost),
             });
         }
 
-        if segment.segment_id() != self.last_segment_id {
-            // A rollover lands on a whole second of the undecimated clock and
-            // drops the group of inputs it leaves incomplete, so the last
-            // segment's last output ends short of the new start by less than
-            // one period. A longer gap is a restart, and backward jumps
-            // already returned above.
-            let time_continuous = time_gap < 2.0 * half_period;
-            return Some(if is_segment_rollover && time_continuous {
-                BoundaryReason::SegmentRollover {
-                    old_id: self.last_segment_id,
-                    new_id: segment.segment_id(),
-                }
-            } else {
-                BoundaryReason::SegmentChanged {
-                    old_id: self.last_segment_id,
-                    new_id: segment.segment_id(),
-                }
-            });
-        }
-
-        let expected_sample = SampleNumber::new(self.last_sample_number.value() + 1);
-        if first_sample_n != expected_sample {
+        if first_sample_n != expected {
+            // Time runs with the sample numbers in one segment, and a
+            // backward jump returned above, so the rows came after a loss.
             if time_gap.abs() > half_period {
-                return Some(BoundaryReason::SamplesLost {
-                    expected: expected_sample,
-                    received: first_sample_n,
+                let samples = first_sample_n.value() - expected.value();
+                return Some(Boundary {
+                    change: None,
+                    loss: Some(lost(u64::from(samples))),
                 });
             }
         } else if time_gap > half_period {
             // Sample numbers are contiguous, so the segment's metadata (e.g. start_time)
             // was corrected in place, and must not pass silently as a continuous batch.
-            return Some(BoundaryReason::TimeForward {
+            return Some(Boundary::of(Change::TimeForward {
                 gap_seconds: time_gap,
-            });
+            }));
         }
 
         None
+    }
+
+    /// Returns how many rows were missed between the last accepted row and
+    /// row `first` of `segment`, a later segment at the same rate.
+    ///
+    /// A device switches segments on a whole second of its undecimated
+    /// clock, and drops the group of inputs that switch leaves incomplete.
+    /// So the whole output periods from the last segment's start to the new
+    /// one's are the rows the last segment held, and a split group leaves no
+    /// gap of a whole period. The count is below 1 when no row was missed.
+    fn missing_before(&self, segment: wire::SegmentView<'_>, first: SampleNumber) -> i128 {
+        let Some(last) = self.last_segment.as_ref().map(SegmentRecord::get) else {
+            return 0;
+        };
+        let elapsed = i128::from(segment.start_time()) - i128::from(last.start_time());
+        let held =
+            (elapsed * i128::from(last.sampling_rate())).div_euclid(i128::from(last.decimation()));
+        held + i128::from(first.value()) - i128::from(self.last_sample_number.value()) - 1
     }
 
     /// Validates one encoded payload and updates continuity state.
@@ -333,33 +368,19 @@ impl StreamTracker {
         // named, so a segment other than the last rows' is announced when
         // the device broadcast its record since them.
         let announced = self.current_segment_id == data.segment_id;
-        // A stream moving onto a segment in one device session finds a stale
-        // ring entry when the record is left from an earlier lap of the ring.
-        // In the stream's clock, that record's timestamps run backward. A
-        // record of another clock is not comparable, and describes the
-        // segment only when announced, as the device sends a segment's record
-        // before its first sample. A new session clears the ring, so every
-        // record after a reboot is the new session's.
-        if data.segment_id != self.last_segment_id
-            && self.established
-            && device.session() == self.last_session_id
-        {
-            let stale = self.segment(data.segment_id).is_some_and(|record| {
-                let seg = record.get();
-                if seg.timeref_session() != self.last_time_ref_session_id {
-                    return !announced;
-                }
-                seg.decimation() != 0 && seg.sampling_rate() != 0 && {
-                    let half_period =
-                        0.5 * f64::from(seg.decimation()) / f64::from(seg.sampling_rate());
-                    sample_time(seg, data.first.value()) < self.last_timestamp - half_period
-                }
-            });
-            if stale {
-                self.segments[usize::from(data.segment_id.value())] = None;
+        // A device sends a segment's record before the segment's first
+        // sample, so the record of the segment rows arrive in is announced.
+        // Rows in a segment the device did not announce find a ring record
+        // left from an earlier lap, and the parser drops it. The rows wait
+        // for the segment's record, and name the segment current, so the
+        // record a metadata reply brings for it stands.
+        if !announced {
+            if let Some(stale) = self.segments.get_mut(usize::from(data.segment_id.value())) {
+                *stale = None;
             }
         }
         if !announced {
+            self.moved_on |= data.segment_id != self.last_segment_id;
             self.current_segment_id = data.segment_id;
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
@@ -429,54 +450,10 @@ impl StreamTracker {
             });
         }
 
-        let next_sample = self.last_sample_number.value() + 1;
-        let next_segment =
-            SegmentId::new(self.last_segment_id.value().wrapping_add(1) % n_segments);
-
-        let (segment_record, is_segment_rollover) = match (
-            self.segment(data.segment_id).cloned(),
-            self.segment(self.last_segment_id).cloned(),
-        ) {
-            (Some(seg), _) => {
-                let is_segment_rollover =
-                    data.segment_id == next_segment && data.first.value() == 0;
-                (seg, is_segment_rollover)
-            }
-            // Infer rollover metadata assuming unchanged settings; configuration
-            // changes can also match this pattern. The batch uses the inferred
-            // descriptor while discovery requests the real one.
-            (None, Some(previous)) => {
-                let mut rolled = previous.get().fields();
-                // A device switches segments on a whole second of its
-                // undecimated clock, wherever in a group of inputs it is
-                // asked to, and drops the group that switch leaves
-                // incomplete. The last segment's `next_sample` outputs took
-                // its first `next_sample * decimation` inputs, so it switched
-                // on a whole second from that input on and before the input
-                // that completes one more output. A forced rollover is
-                // inferred only when exactly one whole second lies there.
-                let switch_second = (rolled.sampling_rate != 0 && rolled.decimation != 0)
-                    .then(|| {
-                        let rate = u64::from(rolled.sampling_rate);
-                        let decimation = u64::from(rolled.decimation);
-                        let inputs = u64::from(next_sample) * decimation;
-                        let at = inputs.div_ceil(rate) * rate;
-                        let end = inputs + decimation;
-                        (at < end && at + rate >= end).then_some(at / rate)
-                    })
-                    .flatten();
-                let forced_rollover =
-                    self.established && data.first.value() == 0 && data.segment_id == next_segment;
-                let Some(seconds) = switch_second.filter(|_| forced_rollover) else {
-                    return Ok(PacketEvent::WaitingForMetadata);
-                };
-                rolled.start_time = rolled.start_time.wrapping_add(seconds as u32);
-                rolled.segment_id = data.segment_id;
-                let rolled = SegmentRecord::encode(rolled)
-                    .expect("a re-timed copy of a retained record is the same length");
-                (rolled, true)
-            }
-            (None, None) => return Ok(PacketEvent::WaitingForMetadata),
+        // Rows decode only with their own segment's record. Rows without it
+        // are lost, and the first batch once it is known reports them.
+        let Some(segment_record) = self.segment(data.segment_id).cloned() else {
+            return Ok(PacketEvent::WaitingForMetadata);
         };
         let segment = segment_record.get();
 
@@ -493,7 +470,6 @@ impl StreamTracker {
             device,
             segment,
             new_rate,
-            is_segment_rollover,
         );
 
         if let Some(boundary) = boundary.as_ref().filter(|b| !b.is_continuous()) {
@@ -511,6 +487,8 @@ impl StreamTracker {
         self.last_session_id = device.session();
         self.last_time_ref_session_id = segment.timeref_session();
         self.last_segment_id = segment.segment_id();
+        self.last_segment = Some(segment_record.clone());
+        self.moved_on = false;
         self.rate_hz = new_rate;
         self.established = true;
 
@@ -561,10 +539,16 @@ impl StreamTracker {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSource {
-    /// A reply may describe an explicitly requested older ring segment.
+    /// A reply to a query that names its records may describe an older ring
+    /// segment.
     Reply,
     /// Broadcasts describe the current output segment.
     Broadcast,
+    /// A bootstrap reply, to a query that names no records, holds the
+    /// records the device chose, its current segments among them. It names
+    /// a segment current only while the parser holds no record of the
+    /// current one, as a broadcast since the query names a newer segment.
+    Bootstrap,
 }
 
 /// Metadata and stream state for one absolute device route.
@@ -722,9 +706,16 @@ impl DeviceState {
                 let stream = self.stream_mut(stream_id);
                 let learned = stream.segment(segment_id) != Some(&incoming);
                 stream.set_segment(segment_id, incoming);
-                let switched =
-                    source == MetadataSource::Broadcast && stream.current_segment_id != segment_id;
+                let switched = stream.current_segment_id != segment_id
+                    && match source {
+                        MetadataSource::Broadcast => true,
+                        MetadataSource::Bootstrap => {
+                            stream.segment(stream.current_segment_id).is_none()
+                        }
+                        MetadataSource::Reply => false,
+                    };
                 if switched {
+                    stream.moved_on |= segment_id != stream.last_segment_id;
                     stream.current_segment_id = segment_id;
                 }
                 if learned || switched {
@@ -865,10 +856,14 @@ impl DeviceState {
         if !self.complete_metadata_query(&query) {
             return;
         }
+        let source = match query.selectors.is_empty() {
+            true => MetadataSource::Bootstrap,
+            false => MetadataSource::Reply,
+        };
         match wire::MetadataReply::parse(reply) {
             Some(records) => {
                 for (kind, record) in records {
-                    self.apply_metadata(kind, record, MetadataSource::Reply, global_generation);
+                    self.apply_metadata(kind, record, source, global_generation);
                 }
             }
             None => log::warn!("dropping a dev.metadata reply with broken framing"),
@@ -1045,7 +1040,7 @@ pub(crate) struct ScannedRows<'a> {
     schema: &'a Arc<StreamSchema>,
     device: DeviceRecord,
     segment: SegmentRecord,
-    boundary: Option<BoundaryReason>,
+    boundary: Option<Boundary>,
     generations: Generations,
     first_sample_n: SampleNumber,
     last_sample_n: SampleNumber,
@@ -1081,7 +1076,7 @@ impl RowSource for ScannedRows<'_> {
         self.row_count
     }
 
-    fn boundary(&self) -> Option<&BoundaryReason> {
+    fn boundary(&self) -> Option<&Boundary> {
         self.boundary.as_ref()
     }
 

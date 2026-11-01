@@ -468,7 +468,8 @@ impl DeviceTree {
     /// The first subscription on the connection starts its stream task.
     /// The receiver queues up to 1024 batches. Batches that arrive while it
     /// is full are dropped, and their count arrives as
-    /// [`RecvError::Lagged`].
+    /// [`RecvError::Lagged`]. The next batch of each stream that lost
+    /// batches carries a [`Loss`](crate::data::Loss).
     ///
     /// # Examples
     ///

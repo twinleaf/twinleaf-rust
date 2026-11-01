@@ -31,7 +31,7 @@
 //! decides which breaks start a new run at all. [`RunSplitLevel`] decides
 //! which streams roll to a new table when one does.
 
-use super::continuity::{BoundaryReason, Generations};
+use super::continuity::{Boundary, Generations};
 use super::filter::ColumnFilter;
 use super::metadata::{StreamKey, StreamMetadataSnapshot};
 use super::sample::{native_types, ColumnArray, SampleBatch};
@@ -180,7 +180,7 @@ impl RunTables {
         &mut self,
         key: StreamKey,
         generations: Generations,
-        boundary: Option<&BoundaryReason>,
+        boundary: Option<&Boundary>,
     ) -> bool {
         let splits = boundary.is_some_and(|b| {
             !b.is_initial()
@@ -703,6 +703,7 @@ fn hdf_name_component(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::{Change, Loss};
     use crate::data::fixtures;
     use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
     use crate::proto::data::DataType;
@@ -724,11 +725,23 @@ mod tests {
         }
     }
 
-    fn lost() -> BoundaryReason {
-        BoundaryReason::SamplesLost {
-            expected: SampleNumber::new(2),
-            received: SampleNumber::new(9),
+    fn loss() -> Loss {
+        Loss {
+            samples: 7,
+            expected: Some(SampleNumber::new(2)),
+            dropped_batches: 0,
         }
+    }
+
+    fn lost() -> Boundary {
+        Boundary {
+            change: None,
+            loss: Some(loss()),
+        }
+    }
+
+    fn initial() -> Boundary {
+        Boundary::of(Change::Initial)
     }
 
     fn batch(stream_id: u8, stream_name: &str, column_name: &str) -> SampleBatch {
@@ -807,18 +820,27 @@ mod tests {
 
     #[test]
     fn only_qualifying_boundaries_advance_the_table_index() {
+        let rolled_over_with_loss = Boundary {
+            change: Some(Change::SegmentRollover {
+                old_id: crate::proto::SegmentId::new(0),
+                new_id: crate::proto::SegmentId::new(1),
+            }),
+            loss: Some(loss()),
+        };
         let opened = [
-            BoundaryReason::Initial,
+            initial(),
             lost(),
-            BoundaryReason::SessionChanged {
+            rolled_over_with_loss,
+            Boundary::of(Change::SessionChanged {
                 old: crate::proto::SessionId::new(1),
                 new: crate::proto::SessionId::new(2),
-            },
+            }),
         ];
-        // Data loss is still monotonic, so only the session change splits there.
+        // Data loss is still monotonic, with a rollover or without, so only
+        // the session change splits there.
         for (policy, expected) in [
-            (SplitPolicy::Continuous, [0, 1, 2]),
-            (SplitPolicy::Monotonic, [0, 0, 1]),
+            (SplitPolicy::Continuous, [0, 1, 2, 3]),
+            (SplitPolicy::Monotonic, [0, 0, 0, 1]),
         ] {
             let mut runs = RunTables::new(policy, RunSplitLevel::PerStream);
             let indices: Vec<TableIndex> = opened
@@ -836,7 +858,7 @@ mod tests {
     #[test]
     fn a_device_generation_moves_every_stream_of_the_device_to_one_table() {
         let mut runs = RunTables::new(SplitPolicy::Continuous, RunSplitLevel::PerDevice);
-        runs.observe(key(1), generations(1), Some(&BoundaryReason::Initial));
+        runs.observe(key(1), generations(1), Some(&initial()));
         runs.observe(key(1), generations(2), Some(&lost()));
         assert_eq!(runs.index(key(1)), Some(1));
         // A stream that never saw the boundary reads the generation's table back.
