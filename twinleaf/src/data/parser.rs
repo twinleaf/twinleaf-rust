@@ -986,32 +986,6 @@ mod tests {
         })
     }
 
-    /// Rows lost across a rollover come as a rollover and a loss, counted
-    /// from the whole periods between the two segments' starts, whether the
-    /// new segment's first rows or a whole segment went missing.
-    #[test]
-    fn a_loss_across_a_rollover_is_a_rollover_and_a_loss() {
-        // 5 outputs at 10 Hz decimated by 2 fill the first second, so rows 0
-        // and 1 of the segment after it are lost.
-        let lost_at_start = boundary_across((10, 2), 5, (1, 1, 2));
-        // Segment 1 held the second after, 5 more rows, and segment 2 starts
-        // with its row 0.
-        let lost_segment = boundary_across((10, 2), 5, (2, 2, 0));
-        for (boundary, new, samples) in [(lost_at_start, 1, 2), (lost_segment, 2, 5)] {
-            assert_eq!(
-                boundary,
-                Some(Boundary {
-                    change: rollover(0, new),
-                    loss: Some(Loss {
-                        samples,
-                        expected: Some(SampleNumber::new(5)),
-                        dropped_batches: 0,
-                    }),
-                })
-            );
-        }
-    }
-
     /// A ring that came round to the last rows' slot holds a segment that
     /// starts later, which is a rollover onto the same id.
     #[test]
@@ -1019,47 +993,6 @@ mod tests {
         // 4 segments of one row at 1 Hz, all after the first lost.
         assert_eq!(
             boundary_across((1, 1), 1, (0, 4, 0)),
-            Some(Boundary {
-                change: rollover(0, 0),
-                loss: Some(Loss {
-                    samples: 3,
-                    expected: Some(SampleNumber::new(1)),
-                    dropped_batches: 0,
-                }),
-            })
-        );
-    }
-
-    /// Rows in the last rows' slot after the stream named another segment
-    /// are of a later lap, though their sample numbers follow on.
-    #[test]
-    fn rows_after_a_lap_that_follow_on_by_number_roll_over() {
-        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
-        let segment = |id: u8, start_time: u32| {
-            wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(id),
-                start_time,
-                ..fixtures::segment(STREAM_ID)
-            })
-        };
-        parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
-            .expect("valid rows");
-        parser.pop_batch().expect("the first batch");
-        // Segment 1 held rows 0 and 1, and the parser waits through row 1.
-        parser
-            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
-            .expect("valid rows");
-        assert!(parser.pop_batch().is_none());
-        announce(&mut parser, segment(1, 1));
-        announce(&mut parser, segment(0, 3));
-        parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
-            .expect("valid rows");
-
-        let batch = parser.pop_batch().expect("the batch after the lap");
-        assert_eq!(
-            batch.boundary().cloned(),
             Some(Boundary {
                 change: rollover(0, 0),
                 loss: Some(Loss {
@@ -1523,36 +1456,6 @@ mod tests {
                 .is_empty());
             assert_eq!(parser.metadata_revision(route), revision);
         }
-    }
-
-    #[test]
-    fn a_new_time_reference_can_start_before_the_previous_clock() {
-        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
-        parser
-            .push_packet(&stream_data_packet(1000, vec![0; 4]))
-            .unwrap();
-        parser.pop_batch().unwrap();
-        announce(
-            &mut parser,
-            wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(1),
-                timeref_session: crate::proto::SessionId::new(99),
-                ..fixtures::segment(STREAM_ID)
-            }),
-        );
-        parser
-            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
-            .unwrap();
-        let batch = parser
-            .pop_batch()
-            .expect("timestamps in different time references are not comparable");
-        assert!(matches!(
-            batch.boundary().and_then(|b| b.change.as_ref()),
-            Some(Change::TimeRefSessionChanged { .. })
-        ));
-        assert!(parser
-            .take_metadata_queries_for(DeviceRoute::root())
-            .is_empty());
     }
 
     #[test]

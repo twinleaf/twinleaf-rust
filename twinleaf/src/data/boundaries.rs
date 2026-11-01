@@ -2,8 +2,9 @@
 //!
 //! Each case simulates one device stream, which takes samples, rolls into
 //! its next segment with or without sending the segment's record first,
-//! changes its rate or decimation, takes a new time reference, reboots,
-//! stops and starts again, and drops samples. It switches segments as
+//! changes its rate or decimation, takes a new time reference whose clock
+//! starts before or after the old one's last sample, reboots, stops and
+//! starts again, and drops samples. It switches segments as
 //! `twinleaf_device`'s segment ring does, at the next whole second of its
 //! undecimated clock from wherever in a group of inputs it is asked to, and
 //! drops the group of inputs that switch leaves incomplete, so a decimated
@@ -50,6 +51,12 @@
 //!   dropped batches, so a loss across a rollover comes as both. A loss
 //!   says it follows dropped batches exactly when the lane reported a gap
 //!   ahead of it, and the gaps count each batch the lane dropped.
+//! - Next to a rollover or no change at all, a loss names the sample due
+//!   and counts the samples lost. Across segments that passed unseen it
+//!   counts the whole output periods of their time, so it can exceed the
+//!   samples lost by one for each of them whose time ends inside a group
+//!   of inputs. Next to a bigger change, a loss names no sample due and
+//!   counts no more than that.
 //! - A batch with nothing of these before it carries no boundary.
 //! - Each batch's first timestamp is the time the device took its sample.
 //!
@@ -66,11 +73,12 @@
 //! from a device that drops samples anywhere, rolls over with or without
 //! the record and restarts. The properties catch faults in the parser's
 //! rollovers and restarts, the ring records it keeps or evicts, its
-//! boundaries and their payloads, its clock, and the lane's gaps and the
-//! boundaries it carries over.
+//! boundaries and their payloads, the samples its losses count, its clock,
+//! and the lane's gaps and the boundaries and losses it carries over.
 //!
-//! A stop and start no host asked for, with no refresh between them,
-//! announce nothing, and a one-off test states what the parser makes of it.
+//! A case announces every stop. A stop and start no host asked for, with
+//! no refresh between them, announce nothing, and their packets are those
+//! of a rollover after lost samples.
 //! A segment that published nothing sends no record, so the ring can
 //! come round to the slot the parser takes as current with no record
 //! between. A start there sends its record first, as the parser has no
@@ -97,6 +105,11 @@ const RATES: [u32; 4] = [1, 2, 4, 10];
 
 /// The decimations the device applies.
 const DECIMATIONS: RangeInclusive<u32> = 1..=3;
+
+/// The seconds from where the old time reference puts a segment switch to
+/// where the new one puts it. At the least of them the new clock starts
+/// before the old one's last sample at every rate and decimation.
+const SHIFTS: RangeInclusive<i32> = -7..=2;
 
 /// The room in the lane of a reader that never falls behind, as much as a
 /// case ever sends it.
@@ -203,9 +216,10 @@ enum Step {
         within: u32,
     },
     /// The device is asked `within` inputs into its next sample's group to
-    /// take a new time reference, takes samples to the switch, and goes on
-    /// with it in its next segment.
-    TimeRef { within: u32 },
+    /// take a new time reference, which puts the switch `shift` seconds
+    /// after where the old one puts it, takes samples to the switch, and
+    /// goes on with it in its next segment.
+    TimeRef { within: u32, shift: i32 },
     /// The device reboots into a new session, describes itself again and
     /// acquires. It announces `dev.running` turning on after its first
     /// packet.
@@ -321,6 +335,8 @@ struct At {
     session: u32,
     timeref: u32,
     segment: u8,
+    /// The segment's place among those the device opened, from 0.
+    ordinal: usize,
     /// The rate after decimation, in Hz.
     rate: f64,
     number: u32,
@@ -362,6 +378,9 @@ struct Device {
     settings: u32,
     /// Each change, at the position of the first sample after it.
     changes: Vec<(u64, Change)>,
+    /// Whether the time of each segment the device left, in the order it
+    /// opened them, ends inside a group of inputs.
+    splits: Vec<bool>,
     /// Where the device was at each position, sent or dropped.
     history: Vec<At>,
     /// What the last step sent.
@@ -389,6 +408,7 @@ impl Device {
             running_due: false,
             settings: 0,
             changes: Vec::new(),
+            splits: Vec::new(),
             history: Vec::new(),
             sent: Vec::new(),
         };
@@ -443,6 +463,7 @@ impl Device {
             session: self.session,
             timeref: self.timeref,
             segment: self.segment,
+            ordinal: self.splits.len(),
             rate: f64::from(self.rate) / f64::from(self.decimation),
             number: self.next,
             time: f64::from(self.start) + period * f64::from(self.next + 1),
@@ -508,6 +529,8 @@ impl Device {
         if self.record_due {
             self.send_record();
         }
+        let inputs = seconds * self.rate;
+        self.splits.push(!inputs.is_multiple_of(self.decimation));
         self.start += seconds;
         self.next = 0;
         self.changes.push((self.position(), change));
@@ -572,7 +595,7 @@ impl Device {
                 let new = f64::from(RATES[rate]) / f64::from(decimation);
                 C::RECONFIGURES && segment(within) && old != new
             }
-            Step::TimeRef { within } => C::RECONFIGURES && segment(within),
+            Step::TimeRef { within, .. } => C::RECONFIGURES && segment(within),
             Step::Reboot => C::RECONFIGURES && self.since_change > 0,
         }
     }
@@ -616,7 +639,8 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                 })
             })
         });
-        let timerefs = within.map(|within| Step::TimeRef { within });
+        let timerefs =
+            within.flat_map(|within| SHIFTS.map(move |shift| Step::TimeRef { within, shift }));
         let stops = (0..=2).map(|staged| Step::Stop { staged });
         let starts = (0..=2).flat_map(|pause| {
             [(false, false), (false, true), (true, false), (true, true)].map(|(early, forced)| {
@@ -676,8 +700,9 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                 (device.rate, device.decimation) = (RATES[rate], decimation);
                 device.send_record();
             }
-            Step::TimeRef { within } => {
+            Step::TimeRef { within, shift } => {
                 device.switch(Change::TimeRef, within);
+                device.start = device.start.saturating_add_signed(shift);
                 device.timeref += 1;
                 device.send_record();
             }
@@ -752,11 +777,11 @@ enum Told {
 
 /// A loss a reader learns of.
 #[derive(Clone, Debug, PartialEq)]
-enum Loss {
-    /// The samples from `expected` up to `received` were lost.
-    Samples { expected: u32, received: u32 },
-    /// The lane dropped batches.
-    Gap,
+struct Loss {
+    /// The samples it counts.
+    samples: u64,
+    /// The sample number it names due.
+    expected: Option<u32>,
 }
 
 /// Returns the change and the loss that `batch` reports, after a gap if
@@ -774,13 +799,13 @@ fn reported(batch: &SampleBatch, gap: bool) -> (Option<Told>, Option<Loss>) {
             gap,
             "a loss of {lost:?} says it follows dropped batches when a gap was reported"
         );
-        match lost.expected {
-            _ if lost.dropped_batches > 0 => Loss::Gap,
-            Some(expected) => Loss::Samples {
-                expected: expected.value(),
-                received: batch.sample_numbers()[0].value(),
-            },
-            None => panic!("a loss of {lost:?} the parser found names the sample due"),
+        assert!(
+            gap || lost.expected.is_some(),
+            "a loss of {lost:?} the parser found names the sample due"
+        );
+        Loss {
+            samples: lost.samples,
+            expected: lost.expected.map(|expected| expected.value()),
         }
     });
     assert!(
@@ -891,52 +916,68 @@ impl Reader {
             now.time,
             "the time of the sample at {first}"
         );
-        let Some(previous) = self.last else {
-            let due = (Some(Told::Initial), (self.gap > 0).then_some(Loss::Gap));
-            assert_eq!((change, loss), due, "the first batch, at position {first}");
-            self.last = Some(last);
-            self.gap = 0;
-            return;
+        assert_eq!(
+            batch.sample_numbers()[0].value(),
+            now.number,
+            "the number of the sample at {first}"
+        );
+        // The change the reader is due, the samples it lost, the segments
+        // that passed unseen, and the sample number after its last batch.
+        let (due, lost, unseen, next) = match self.last {
+            None => (
+                Some(Told::Initial),
+                first,
+                &device.splits[..now.ordinal],
+                None,
+            ),
+            Some(previous) => {
+                assert!(first > previous, "the batches came out of order");
+                let was = device.history[previous as usize];
+                let between = |kind: Change| {
+                    device
+                        .changes
+                        .iter()
+                        .any(|&(at, change)| change == kind && previous < at && at <= first)
+                };
+                let due = if between(Change::Reboot) {
+                    Some(Told::Reboot {
+                        old: was.session,
+                        new: now.session,
+                    })
+                } else if between(Change::TimeRef) {
+                    Some(Told::TimeRef {
+                        old: was.timeref,
+                        new: now.timeref,
+                    })
+                } else if between(Change::Rate) {
+                    Some(Told::Rate {
+                        old: was.rate,
+                        new: now.rate,
+                    })
+                } else if between(Change::Restart) {
+                    Some(Told::Restart {
+                        old: was.segment,
+                        new: now.segment,
+                    })
+                } else if between(Change::Rollover) {
+                    Some(Told::Rollover {
+                        old: was.segment,
+                        new: now.segment,
+                    })
+                } else {
+                    None
+                };
+                let unseen = &device.splits[now.ordinal.min(was.ordinal + 1)..now.ordinal];
+                (due, first - previous - 1, unseen, Some(was.number + 1))
+            }
         };
-        assert!(first > previous, "the batches came out of order");
-        let lost = first - previous - 1;
-        let was = device.history[previous as usize];
-        let between = |kind: Change| {
-            device
-                .changes
-                .iter()
-                .any(|&(at, change)| change == kind && previous < at && at <= first)
-        };
-        let due = if between(Change::Reboot) {
-            Some(Told::Reboot {
-                old: was.session,
-                new: now.session,
-            })
-        } else if between(Change::TimeRef) {
-            Some(Told::TimeRef {
-                old: was.timeref,
-                new: now.timeref,
-            })
-        } else if between(Change::Rate) {
-            Some(Told::Rate {
-                old: was.rate,
-                new: now.rate,
-            })
-        } else if between(Change::Restart) {
-            Some(Told::Restart {
-                old: was.segment,
-                new: now.segment,
-            })
-        } else if between(Change::Rollover) {
-            Some(Told::Rollover {
-                old: was.segment,
-                new: now.segment,
-            })
-        } else {
-            None
-        };
+        let split = unseen.iter().filter(|&&split| split).count() as u64;
+        let since = self
+            .last
+            .map_or_else(|| "the start".to_string(), |at| format!("position {at}"));
         let after = format!(
-            "between positions {previous} and {first}, which lost {lost} samples, the batch after {} dropped batches reports {change:?} and {loss:?}",
+            "between {since} and position {first}, which lost {lost} samples across {} unseen segments of which {split} end inside a group, the batch after {} dropped batches reports {change:?} and {loss:?}",
+            unseen.len(),
             self.gap
         );
         assert_eq!(
@@ -944,25 +985,20 @@ impl Reader {
             "the change {after}, of the changes {:?}",
             device.changes
         );
-        let stands_for_loss = matches!(
-            due,
-            Some(
-                Told::Reboot { .. }
-                    | Told::TimeRef { .. }
-                    | Told::Rate { .. }
-                    | Told::Restart { .. }
-            )
-        );
+        // Every change but a rollover stands for the loss next to it.
+        let stands_for_loss = due
+            .as_ref()
+            .is_some_and(|due| !matches!(due, Told::Rollover { .. }));
         if lost == 0 || stands_for_loss && self.gap == 0 {
             assert_eq!(loss, None, "the loss {after}");
-        } else if !stands_for_loss {
-            let named = Loss::Samples {
-                expected: was.number + 1,
-                received: now.number,
-            };
+        } else {
+            let loss = loss.unwrap_or_else(|| panic!("the loss {after}"));
+            let named = next.filter(|_| !stands_for_loss);
+            assert_eq!(loss.expected, named, "the sample due {after}");
+            let least = if stands_for_loss { 1 } else { lost };
             assert!(
-                loss == Some(Loss::Gap) || loss == Some(named),
-                "the loss {after}"
+                (least..=lost + split).contains(&loss.samples),
+                "the samples counted {after}"
             );
         }
         self.last = Some(last);
@@ -1072,73 +1108,4 @@ fn a_start_that_comes_round_the_ring_to_the_current_slot_is_a_restart() {
         Step::Read { count: 2 },
     ]);
     run::<LosesAtRollover>(1, 1, &steps);
-}
-
-/// A stop and start no host asked for, with no refresh between them,
-/// announce nothing, as `dev.running` ends where it began. The parser then
-/// reads the restart as a rollover, with a loss of the sample periods from
-/// the stopped segment's start to the new one's that its rows do not fill.
-/// With the stop announced, the same packets read as a restart.
-#[test]
-fn a_restart_within_one_refresh_reads_as_a_rollover_and_a_loss() {
-    use super::{Change as Reported, Loss as Lost};
-    let (mut announced, mut unannounced) = (Reader::new(ROOMY), Reader::new(ROOMY));
-    let mut deliver = |device: &Device| {
-        for sent in &device.sent {
-            announced.pump(&sent.packet());
-            if !matches!(sent, Sent::Running { .. }) {
-                unannounced.pump(&sent.packet());
-            }
-        }
-    };
-    let mut device = Device::new(ROOMY, 10, 1);
-    deliver(&device);
-    let steps = [
-        Step::Samples { count: 5, rows: 5 },
-        Step::Stop { staged: 0 },
-        Step::Start {
-            pause: 1,
-            early: true,
-            forced: false,
-        },
-        Step::Samples { count: 3, rows: 3 },
-    ];
-    for step in &steps {
-        assert!(
-            device.allows::<KeepsUp>(step),
-            "{step:?} is a step the device takes"
-        );
-        device = Pipeline::<KeepsUp>::apply(device, step);
-        deliver(&device);
-    }
-    let boundaries = |reader: &Reader| -> Vec<_> {
-        reader
-            .queue
-            .try_iter()
-            .filter_map(|queued| match queued {
-                Queued::Item(batch) => Some(batch.boundary().cloned()),
-                _ => None,
-            })
-            .collect()
-    };
-    let (old_id, new_id) = (SegmentId::new(0), SegmentId::new(1));
-    let restarted = boundaries(&announced);
-    assert_eq!(restarted.len(), 2, "{restarted:?}");
-    let restart = restarted[1].as_ref().expect("the restart's boundary");
-    assert_eq!(restart.change, Some(Reported::Restarted { old_id, new_id }));
-    assert_eq!(restart.loss, None);
-    // Samples 0 to 4 fill the first half second of the segment at 1000 s.
-    // The new one starts at 1002 s, so 15 periods of 0.1 s go unfilled.
-    let unseen = boundaries(&unannounced);
-    assert_eq!(unseen.len(), 2, "{unseen:?}");
-    let rollover = unseen[1].as_ref().expect("the rollover's boundary");
-    assert_eq!(
-        rollover.change,
-        Some(Reported::SegmentRollover { old_id, new_id })
-    );
-    let loss = rollover
-        .loss
-        .as_ref()
-        .map(|loss: &Lost| (loss.samples, loss.expected));
-    assert_eq!(loss, Some((15, Some(crate::proto::SampleNumber::new(5)))));
 }
