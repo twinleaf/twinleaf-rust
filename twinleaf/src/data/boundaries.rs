@@ -508,37 +508,48 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
             .boxed()
     }
 
+    /// Draws only the steps `device` takes now, so no case is rejected.
     fn transitions(device: &Device) -> BoxedStrategy<Step> {
-        let within = 0..device.decimation;
         let samples = (1..=6u32, 1..=3u32).prop_map(|(count, rows)| Step::Samples { count, rows });
         let read = (1..=4usize).prop_map(|count| Step::Read { count });
-        let drop = (1..=3u32).prop_map(|count| Step::Drop { count });
-        let rollover = (any::<bool>(), within.clone())
-            .prop_map(|(forced, within)| Step::Rollover { forced, within });
-        let rate =
-            (0..RATES.len(), DECIMATIONS, within.clone()).prop_map(|(rate, decimation, within)| {
-                Step::Rate {
+        let mut steps = vec![(6, samples.boxed()), (4, read.boxed())];
+        if device.allows::<C>(&Step::Drop { count: 1 }) {
+            let drop = (1..=3u32).prop_map(|count| Step::Drop { count });
+            steps.push((2, drop.boxed()));
+        }
+        let within = 0..device.decimation;
+        let rollovers = within
+            .clone()
+            .flat_map(|within| [false, true].map(|forced| Step::Rollover { forced, within }));
+        let rates = (0..RATES.len()).flat_map(|rate| {
+            DECIMATIONS.flat_map(move |decimation| {
+                (0..device.decimation).map(move |within| Step::Rate {
                     rate,
                     decimation,
                     within,
-                }
-            });
-        let timeref = within.prop_map(|within| Step::TimeRef { within });
-        let mut steps = vec![(6, samples.boxed()), (4, read.boxed())];
-        if C::DROPS != Drops::Never {
-            steps.push((2, drop.boxed()));
-        }
-        if C::ROLLS_OVER {
-            steps.push((3, rollover.boxed()));
-        }
-        if C::RECONFIGURES {
-            steps.push((1, rate.boxed()));
-            steps.push((1, timeref.boxed()));
-            steps.push((1, Just(Step::Reboot).boxed()));
+                })
+            })
+        });
+        let timerefs = within.map(|within| Step::TimeRef { within });
+        let changes: [(u32, Vec<Step>); 4] = [
+            (3, rollovers.collect()),
+            (1, rates.collect()),
+            (1, timerefs.collect()),
+            (1, vec![Step::Reboot]),
+        ];
+        for (weight, candidates) in changes {
+            let allowed: Vec<Step> = candidates
+                .into_iter()
+                .filter(|step| device.allows::<C>(step))
+                .collect();
+            if !allowed.is_empty() {
+                steps.push((weight, proptest::sample::select(allowed).boxed()));
+            }
         }
         proptest::strategy::Union::new_weighted(steps).boxed()
     }
 
+    /// Keeps a shrunk case to the steps its device takes.
     fn preconditions(device: &Device, step: &Step) -> bool {
         device.allows::<C>(step)
     }
