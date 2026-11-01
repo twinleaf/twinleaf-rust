@@ -437,7 +437,11 @@ struct Snapshotting {
 
 type Taken = (SettingsCache, Result<(), CallError>);
 
-type Submitted = (String, Vec<u8>, flume::Sender<Result<Vec<u8>, CallError>>);
+type Submitted = (
+    String,
+    Vec<u8>,
+    crate::chan::Sender<Result<Vec<u8>, CallError>>,
+);
 
 enum Wake {
     Timeout(usize, u64),
@@ -1187,7 +1191,7 @@ impl<'c> World<'c> {
         let submit = {
             let submitted = Rc::clone(&submitted);
             move |name: &str, arg: &[u8]| {
-                let (resolve, reply) = flume::bounded(1);
+                let (resolve, reply) = crate::chan::bounded(1);
                 let call = (name.to_string(), arg.to_vec(), resolve);
                 submitted.borrow_mut().push_back(call);
                 PendingReply { reply }

@@ -2,6 +2,7 @@
 //! [`Sink`], and a [`Scope`] filters what passes between them.
 
 use super::Stream;
+use crate::chan::oneshot;
 use crate::data::{Boundary, Change, Loss, SampleBatch, StreamKey, StreamMetadataSnapshot};
 use crate::device::session::Handle;
 use crate::proto::{DeviceRoute, SampleNumber};
@@ -9,7 +10,6 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
 
 /// Why a receive returned no item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -69,7 +69,7 @@ impl From<End> for RecvError {
 /// Holding it keeps the connection and its stream running after every view
 /// is dropped.
 pub struct Receiver<T> {
-    items: flume::Receiver<Queued<T>>,
+    items: crate::chan::Receiver<Queued<T>>,
     /// Dropped with the receiver, which wakes the pump to drop its sink.
     _lifeline: oneshot::Sender<Infallible>,
     /// The stream this came from, which it keeps running. `None` only until
@@ -120,8 +120,8 @@ impl<T> Receiver<T> {
             Ok(Queued::Item(item)) => Ok(Some(item)),
             Ok(Queued::Gap(skipped)) => Err(RecvError::Lagged(skipped)),
             Ok(Queued::Ended(end)) => Err(end.into()),
-            Err(flume::TryRecvError::Empty) => Ok(None),
-            Err(flume::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
+            Err(crate::chan::TryRecvError::Empty) => Ok(None),
+            Err(crate::chan::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
@@ -157,23 +157,26 @@ impl<T> Receiver<T> {
     /// Returns [`RecvError::Lagged`] for a gap, [`RecvError::Stopped`] or
     /// [`RecvError::Closed`] for the end, and [`RecvError::Disconnected`] for
     /// a disconnected channel.
-    pub fn resolve(&self, received: Result<Queued<T>, flume::RecvError>) -> Result<T, RecvError> {
+    pub fn resolve(
+        &self,
+        received: Result<Queued<T>, crate::chan::RecvError>,
+    ) -> Result<T, RecvError> {
         match received {
             Ok(Queued::Item(item)) => Ok(item),
             Ok(Queued::Gap(skipped)) => Err(RecvError::Lagged(skipped)),
             Ok(Queued::Ended(end)) => Err(end.into()),
-            Err(flume::RecvError::Disconnected) => Err(RecvError::Disconnected),
+            Err(crate::chan::RecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
     fn resolve_timed(
         &self,
-        received: Result<Queued<T>, flume::RecvTimeoutError>,
+        received: Result<Queued<T>, crate::chan::RecvTimeoutError>,
     ) -> Result<T, RecvError> {
         match received {
             Ok(item) => self.resolve(Ok(item)),
-            Err(flume::RecvTimeoutError::Timeout) => Err(RecvError::Timeout),
-            Err(flume::RecvTimeoutError::Disconnected) => Err(RecvError::Disconnected),
+            Err(crate::chan::RecvTimeoutError::Timeout) => Err(RecvError::Timeout),
+            Err(crate::chan::RecvTimeoutError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
@@ -181,7 +184,7 @@ impl<T> Receiver<T> {
     /// with a [`flume::Selector`]. Pass what it yields to
     /// [`resolve`](Self::resolve). To await it alone, use
     /// [`recv_async`](Self::recv_async).
-    pub fn as_flume(&self) -> &flume::Receiver<Queued<T>> {
+    pub fn as_flume(&self) -> &crate::chan::Receiver<Queued<T>> {
         &self.items
     }
 
@@ -239,22 +242,29 @@ impl Scope {
 /// end, and an item sent with [`send_always`](Self::send_always), go in
 /// however full the queue is.
 ///
+/// The count of missed items goes in just ahead of the next item that goes
+/// in, or of the end, or alone when [`report_lag`](Self::report_lag) finds
+/// room. It takes no room of its own, so an item goes in whenever the queue
+/// has room for one. A FIFO queue holds at most one entry more than its
+/// room, besides the end, the items that go in however full it is, and the
+/// count ahead of either.
+///
 /// A [latest-value](Self::latest) lane holds one item, and a new item takes
 /// the place of one still unread instead of being counted as missed.
 pub(crate) struct Lane<T> {
-    items: flume::Sender<Queued<T>>,
+    items: crate::chan::Sender<Queued<T>>,
     room: usize,
     skipped: u64,
     /// A latest-value lane's own hold on its queue, through which it takes
     /// back an unread item to make room for a newer one. `None` for a FIFO
     /// lane.
-    unread: Option<flume::Receiver<Queued<T>>>,
+    unread: Option<crate::chan::Receiver<Queued<T>>>,
 }
 
 impl<T> Lane<T> {
     /// Returns a lane with room for `capacity` items, and its receiving end.
-    pub(crate) fn new(capacity: usize) -> (Lane<T>, flume::Receiver<Queued<T>>) {
-        let (items, received) = flume::unbounded();
+    pub(crate) fn new(capacity: usize) -> (Lane<T>, crate::chan::Receiver<Queued<T>>) {
+        let (items, received) = crate::chan::unbounded();
         let lane = Lane {
             items,
             room: capacity,
@@ -268,7 +278,7 @@ impl<T> Lane<T> {
     /// end. Its reader never lags. One that falls behind receives the newest
     /// item next. It suits state, where each item is a whole value and the
     /// latest one is what matters.
-    pub(crate) fn latest() -> (Lane<T>, flume::Receiver<Queued<T>>) {
+    pub(crate) fn latest() -> (Lane<T>, crate::chan::Receiver<Queued<T>>) {
         let (mut lane, received) = Lane::new(1);
         lane.unread = Some(received.clone());
         (lane, received)
@@ -297,28 +307,39 @@ impl<T> Lane<T> {
             }
             return true;
         }
-        if !self.report_lag() {
-            return false;
+        if !self.has_room() {
+            self.skipped += 1;
+            return true;
         }
-        match self.push(Queued::Item(item)) {
-            Ok(()) => true,
-            Err(flume::TrySendError::Full(_)) => {
-                self.skipped += 1;
-                true
-            }
-            Err(flume::TrySendError::Disconnected(_)) => false,
-        }
+        self.enqueue(item)
     }
 
-    /// Returns `true` if a FIFO lane's queue has room for one more entry.
-    /// Only the lane adds entries, so an entry it sends next goes in.
+    /// Returns `true` if a FIFO lane's queue has room for one more item.
+    /// Only the lane adds entries, so it stays `true` until the lane sends.
     fn has_room(&self) -> bool {
         self.items.len() < self.room
     }
 
-    /// Sends one item that is never missed, however full the queue is.
+    /// Sends one item that is never missed, however full the queue is, after
+    /// the count of any items missed before it.
     pub(crate) fn send_always(&mut self, item: T) {
-        let _ = self.items.send(Queued::Item(item));
+        let _ = self.enqueue(item);
+    }
+
+    /// Sends `item` after the count of any items missed before it, however
+    /// full the queue is. Returns `false` once the receiver is gone.
+    fn enqueue(&mut self, item: T) -> bool {
+        self.send_gap();
+        self.items.send(Queued::Item(item)).is_ok()
+    }
+
+    /// Sends the count of missed items, if any, however full the queue is.
+    fn send_gap(&mut self) {
+        if self.skipped > 0 {
+            let _ = self
+                .items
+                .send(Queued::Gap(std::mem::take(&mut self.skipped)));
+        }
     }
 
     /// Counts `missed` items that never reached the lane, and reports them
@@ -329,34 +350,23 @@ impl<T> Lane<T> {
         self.report_lag()
     }
 
-    /// Sends the count of missed items once the queue has room. Returns
-    /// `false` once the receiver is gone.
+    /// Sends the count of missed items if the queue has room now, and
+    /// otherwise leaves it for the next entry that goes in. Returns `false`
+    /// once the receiver is gone.
     pub(crate) fn report_lag(&mut self) -> bool {
-        if self.skipped == 0 {
+        if self.skipped == 0 || !self.has_room() {
             return true;
         }
-        match self.push(Queued::Gap(self.skipped)) {
-            Ok(()) => {
-                self.skipped = 0;
-                true
-            }
-            Err(flume::TrySendError::Full(_)) => true,
-            Err(flume::TrySendError::Disconnected(_)) => false,
-        }
+        self.items
+            .send(Queued::Gap(std::mem::take(&mut self.skipped)))
+            .is_ok()
     }
 
-    /// Ends the queue saying why.
-    pub(crate) fn end(self, end: End) {
+    /// Ends the queue saying why, after the count of any items missed before
+    /// the end.
+    pub(crate) fn end(mut self, end: End) {
+        self.send_gap();
         let _ = self.items.send(Queued::Ended(end));
-    }
-
-    /// Sends `queued` if the queue has room for it.
-    fn push(&self, queued: Queued<T>) -> Result<(), flume::TrySendError<Queued<T>>> {
-        if self.has_room() {
-            self.items.try_send(queued)
-        } else {
-            Err(flume::TrySendError::Full(queued))
-        }
     }
 }
 
@@ -398,7 +408,7 @@ struct Pending {
 impl BatchLane {
     /// Returns a lane with room for `capacity` batches, and its receiving
     /// end.
-    pub(crate) fn new(capacity: usize) -> (BatchLane, flume::Receiver<Queued<SampleBatch>>) {
+    pub(crate) fn new(capacity: usize) -> (BatchLane, crate::chan::Receiver<Queued<SampleBatch>>) {
         let (lane, received) = Lane::new(capacity);
         let lane = BatchLane {
             lane,
@@ -411,20 +421,17 @@ impl BatchLane {
     /// of its stream if the queue is full. Returns `false` once the receiver
     /// is gone.
     pub(crate) fn send(&mut self, batch: SampleBatch) -> bool {
-        if !self.lane.report_lag() {
-            return false;
-        }
         let carried = self.streams.entry(batch.stream_key()).or_default();
         if !self.lane.has_room() {
             carried.miss(&batch);
             return self.lane.lag(1);
         }
         let batch = carried.queue(batch);
-        self.lane.send(batch)
+        self.lane.enqueue(batch)
     }
 
-    /// Sends the count of missed batches once the queue has room. Returns
-    /// `false` once the receiver is gone.
+    /// Sends the count of missed batches if the queue has room now, as
+    /// [`Lane::report_lag`] does. Returns `false` once the receiver is gone.
     pub(crate) fn report_lag(&mut self) -> bool {
         self.lane.report_lag()
     }
@@ -600,7 +607,7 @@ impl Sink<BatchLane> {
 
 impl<L> Sink<L> {
     fn with_lane<T>(
-        (lane, items): (L, flume::Receiver<Queued<T>>),
+        (lane, items): (L, crate::chan::Receiver<Queued<T>>),
         scope: Scope,
     ) -> (Sink<L>, Receiver<T>) {
         let (lifeline, alive) = oneshot::channel();
@@ -612,3 +619,6 @@ impl<L> Sink<L> {
         (Sink { lane, alive, scope }, receiver)
     }
 }
+
+#[cfg(all(test, shuttle))]
+mod shuttle;

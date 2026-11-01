@@ -8,6 +8,7 @@ use super::link::{self, Links, Owner};
 use super::{
     answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
 };
+use crate::chan::oneshot;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
 
@@ -152,7 +153,7 @@ pub(super) struct Server {
     lifelines: HashMap<u64, oneshot::Sender<Infallible>>,
     registry: Owner,
     /// Disconnects once the server has ended.
-    _stopped: flume::Sender<()>,
+    _stopped: crate::chan::Sender<()>,
     next_id: u64,
     /// When a proxy that exits once idle exits, if no client connects
     /// before.
@@ -175,7 +176,7 @@ impl Server {
     ) -> (Proxy, Server) {
         let (notices, mailbox) = mpsc::unbounded_channel();
         let (table, clients) = watch::channel(Vec::new());
-        let (stopped, waited) = flume::bounded(0);
+        let (stopped, waited) = crate::chan::bounded(0);
         let proxy = Proxy {
             server: notices.clone(),
             stopped: waited,
@@ -314,7 +315,7 @@ impl Server {
     fn serve(&mut self, stream: TcpStream, peer: SocketAddr) {
         // What a client sends goes to its ports, so it is queued as deep as
         // they are. What it is sent waits in its outbox.
-        let (deliver, incoming) = flume::bounded(link::client_tx_channel_size());
+        let (deliver, incoming) = crate::chan::bounded(link::client_tx_channel_size());
         let tasks = &self.shared.tasks;
         let port = match transport::Port::from_tcp(stream, deliver, SOCKET_QUEUE, tasks) {
             Ok(port) => port,
@@ -589,7 +590,7 @@ mod tests {
     /// Waits until `proxy` has stopped.
     async fn stopped(proxy: &Proxy) {
         let waited = timeout(PAUSED_WAIT, proxy.stopped.recv_async()).await;
-        assert_eq!(waited, Ok(Err(flume::RecvError::Disconnected)));
+        assert_eq!(waited, Ok(Err(crate::chan::RecvError::Disconnected)));
     }
 
     /// A proxy that exits once idle, and that no client connects to, stops

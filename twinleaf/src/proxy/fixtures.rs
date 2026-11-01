@@ -138,12 +138,12 @@ impl FakeDevice {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(READ_POLL)).unwrap();
                 let clone = stream.try_clone().unwrap();
-                serving.live.lock().unwrap().push((id, clone));
+                crate::chan::lock(&serving.live).push((id, clone));
                 serving.open.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
                     serve_device(stream, &serving, born);
                     serving.open.fetch_sub(1, Ordering::SeqCst);
-                    serving.live.lock().unwrap().retain(|(live, _)| *live != id);
+                    crate::chan::lock(&serving.live).retain(|(live, _)| *live != id);
                 });
             }
         });
@@ -207,7 +207,7 @@ impl FakeDevice {
 
     /// Returns how many calls of the RPC `name` the device has received.
     pub(crate) fn calls(&self, name: &str) -> usize {
-        let received = self.state.received.lock().unwrap();
+        let received = crate::chan::lock(&self.state.received);
         let called = |pkt: &&Packet| match pkt.payload() {
             Payload::RpcRequest(request) => request.method == Method::ByName(name.as_bytes()),
             _ => false,
@@ -218,12 +218,12 @@ impl FakeDevice {
     /// Delays each answer to `dev.name` by `delay`. Heartbeats continue
     /// meanwhile.
     pub(crate) fn delay_replies(&self, delay: Duration) {
-        *self.state.reply_delay.lock().unwrap() = delay;
+        *crate::chan::lock(&self.state.reply_delay) = delay;
     }
 
     /// Sends `pkt` on the device's connection.
     pub(crate) fn send(&self, pkt: Packet) {
-        self.state.outbox.lock().unwrap().push(pkt);
+        crate::chan::lock(&self.state.outbox).push(pkt);
     }
 
     /// Blocks until the device has received `count` packets of type `ptype`,
@@ -231,11 +231,7 @@ impl FakeDevice {
     pub(crate) fn expect_received(&self, ptype: PacketType, count: usize) -> Vec<Packet> {
         let deadline = Instant::now() + WAIT;
         loop {
-            let received: Vec<_> = self
-                .state
-                .received
-                .lock()
-                .unwrap()
+            let received: Vec<_> = crate::chan::lock(&self.state.received)
                 .iter()
                 .filter(|pkt| pkt.ptype() == ptype)
                 .cloned()
@@ -262,7 +258,7 @@ impl Drop for FakeDevice {
 impl DeviceState {
     /// Returns `true` if a connection is open that its peer has not closed.
     fn held(&self) -> bool {
-        let live = self.live.lock().unwrap();
+        let live = crate::chan::lock(&self.live);
         live.iter().any(|(_, stream)| !peer_closed(stream))
     }
 }
@@ -314,7 +310,7 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
             }
             next_beat += Duration::from_millis(300);
         }
-        let mut outbox: Vec<_> = state.outbox.lock().unwrap().drain(..).collect();
+        let mut outbox: Vec<_> = crate::chan::lock(&state.outbox).drain(..).collect();
         let now = Instant::now();
         outbox.extend(
             replies
@@ -339,7 +335,7 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
         }
         while let Ok((pkt, used)) = Packet::from_slice_prefix(&received) {
             received.drain(..used);
-            state.received.lock().unwrap().push(pkt.clone());
+            crate::chan::lock(&state.received).push(pkt.clone());
             let Payload::RpcRequest(request) = pkt.payload() else {
                 continue;
             };
@@ -347,7 +343,7 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
                 continue;
             };
             let due = match name {
-                b"dev.name" => Instant::now() + *state.reply_delay.lock().unwrap(),
+                b"dev.name" => Instant::now() + *crate::chan::lock(&state.reply_delay),
                 _ => Instant::now(),
             };
             if let Some(value) = answer(name, request.args, state.table_hash) {

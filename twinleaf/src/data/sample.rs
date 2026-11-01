@@ -635,7 +635,7 @@ impl SampleBatch {
             .is_none_or(|b| b.is_monotonic())
     }
 
-    /// Returns `true` if the batch's boundary marks the stream's first sample.
+    /// Returns `true` if the batch's boundary is [`Change::Initial`](crate::data::Change::Initial).
     pub fn is_initial(&self) -> bool {
         self.context
             .boundary

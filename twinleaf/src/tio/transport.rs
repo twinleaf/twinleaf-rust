@@ -28,6 +28,7 @@ pub(crate) use fake::FakeEnd;
 pub(crate) use tcp::{connect_socket, CONNECT_TIMEOUT};
 
 use super::packet::{self, Packet};
+use crate::chan::{oneshot, JoinHandle};
 use crate::proto;
 use crate::rt::Supervisor;
 use std::fmt::Display;
@@ -36,8 +37,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use task::{Rules, Task};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
 
 /// One item received from a port. Text and rejected frames leave the link usable.
 #[derive(Debug)]
@@ -342,7 +342,7 @@ fn ip_address(url: &str) -> Option<(IpLink, &str, AddrFamilyRestrict)> {
 
 /// The channel a port's task delivers what its link receives to. The task
 /// drops what does not fit.
-type Delivery = flume::Sender<ReceiveResult>;
+type Delivery = crate::chan::Sender<ReceiveResult>;
 
 /// A message to a port's task, a packet or a control request. Both share
 /// one queue.
@@ -731,10 +731,10 @@ impl Port {
 
 #[cfg(test)]
 mod tests {
+    use crate::chan::{Receiver, RecvTimeoutError};
     #[cfg(feature = "serial")]
     use bytes::BytesMut;
     use fake::{FakeStream, PIPE_SIZE};
-    use flume::{Receiver, RecvTimeoutError};
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -925,7 +925,7 @@ mod tests {
     {
         let (pipe, peer) = tokio::io::duplex(PIPE_SIZE);
         let (mut stream, gone, _) = FakeStream::new(pipe);
-        let (rx, results) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
+        let (rx, results) = crate::chan::bounded(DEFAULT_RX_CHANNEL_SIZE);
         let (port, task) =
             Port::with_task(TransportKind::Tcp, None, rules, rx, DEFAULT_TX_CHANNEL_SIZE);
         let run = async move {
@@ -1012,7 +1012,7 @@ mod tests {
         peer.read_to_end(&mut read).await.unwrap();
 
         let beat = Packet::heartbeat(proto::DeviceRoute::root());
-        let sending = tokio::spawn(async move {
+        let sending = crate::chan::spawn(async move {
             while peer.write_all(beat.as_bytes()).await.is_ok() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1057,7 +1057,7 @@ mod tests {
     /// sends, and gives the peer up once it has been quiet too long.
     #[tokio::test(start_paused = true)]
     async fn a_kept_alive_port_beats_and_gives_up_a_quiet_peer() {
-        let (send, receive) = flume::unbounded();
+        let (send, receive) = crate::chan::unbounded();
         let (port, mut peer) = Port::fake(TransportKind::Tcp, None, send);
         let keep_alive = KeepAlive {
             beat: Packet::alive,
@@ -1088,7 +1088,7 @@ mod tests {
     /// while the caller retains its port handle.
     #[tokio::test]
     async fn a_read_error_ends_the_transport_without_dropping_the_port() {
-        let (send, receive) = flume::unbounded();
+        let (send, receive) = crate::chan::unbounded();
         let (port, mut peer) = Port::fake(TransportKind::Tcp, None, send);
         peer.fail(io::ErrorKind::ConnectionReset);
         assert!(matches!(
@@ -1097,7 +1097,7 @@ mod tests {
         ));
         assert!(matches!(
             receive.recv_async().await,
-            Err(flume::RecvError::Disconnected)
+            Err(crate::chan::RecvError::Disconnected)
         ));
         assert!(peer.released());
         assert!(matches!(
@@ -1136,7 +1136,7 @@ mod tests {
     async fn a_udp_link_to_localhost_reaches_an_ipv4_device() {
         let device = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let url = format!("udp://localhost:{}", device.local_addr().unwrap().port());
-        let (send, _received) = flume::unbounded();
+        let (send, _received) = crate::chan::unbounded();
         let _port = Port::open(&url, send, &Supervisor::current())
             .await
             .unwrap();
@@ -1156,7 +1156,7 @@ mod tests {
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = socket.local_addr().unwrap();
-        let (send, received) = flume::unbounded();
+        let (send, received) = crate::chan::unbounded();
         let (port, task) = Port::with_task(
             TransportKind::Udp,
             None,
@@ -1371,7 +1371,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
-        let (rx, _results) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
+        let (rx, _results) = crate::chan::bounded(DEFAULT_RX_CHANNEL_SIZE);
         let port = Port::from_tcp_stream(stream, rx, 1).unwrap();
 
         let packets: Vec<Packet> = (0..2000)
@@ -1384,7 +1384,7 @@ mod tests {
             peer.read_to_end(&mut sunk).unwrap();
             sunk
         });
-        rt::handle().spawn(async move {
+        crate::chan::spawn_on(rt::handle(), async move {
             for packet in packets {
                 port.send_async(packet).await.unwrap();
             }
@@ -1398,7 +1398,7 @@ mod tests {
     fn tcp_port_reporting() -> (Port, std::net::TcpStream, Receiver<ReceiveResult>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("tcp://{}", listener.local_addr().unwrap());
-        let (received, results) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
+        let (received, results) = crate::chan::bounded(DEFAULT_RX_CHANNEL_SIZE);
         let port = Port::new_on(&url, received, &Supervisor::new()).unwrap();
         let (peer, _) = listener.accept().unwrap();
         (port, peer, results)
@@ -1456,7 +1456,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("tcp://{}", listener.local_addr().unwrap());
         assert!(Port::opens_as_future(&url));
-        let (received, results) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
+        let (received, results) = crate::chan::bounded(DEFAULT_RX_CHANNEL_SIZE);
         let tasks = Supervisor::new();
         let opening = tasks.run("a test open", {
             let tasks = tasks.clone();

@@ -17,8 +17,9 @@ pub struct Generations {
     /// that is not continuous.
     pub stream: u32,
     /// Per-device generation. It bumps at any boundary the parser finds on
-    /// the device's streams that is not continuous, other than a stream's
-    /// [`Change::Initial`], and when the device's state resets.
+    /// the device's streams that is not continuous, other than the
+    /// [`Change::Initial`] of a stream's first data, and when the device's
+    /// state resets.
     pub device: u32,
     /// Whole-parse generation. It bumps as `device` does, across all routed
     /// devices.
@@ -28,7 +29,8 @@ pub struct Generations {
 /// What a boundary says about the data around it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryClass {
-    /// The first data observed for a stream.
+    /// The first data observed for a stream, or its first after it started
+    /// over, as [`Change::Initial`] says.
     Startup,
     /// The stream continues without a gap.
     Seamless,
@@ -130,8 +132,8 @@ impl Boundary {
         self.change.as_ref().is_none_or(Change::is_monotonic)
     }
 
-    /// Returns `true` only for the first data a stream has delivered to its
-    /// receiver.
+    /// Returns `true` for the first data a stream delivers to its receiver,
+    /// and for its first after it started over, as [`Change::Initial`] says.
     pub fn is_initial(&self) -> bool {
         self.change.as_ref().is_some_and(Change::is_initial)
     }
@@ -162,7 +164,11 @@ impl Boundary {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Change {
-    /// The stream's first sample.
+    /// The stream's first sample, or its first after it started over. It
+    /// starts over when another device answers at its route, when new
+    /// firmware or a layout change comes with no new session, and when
+    /// metadata contradicts what was learned. Nothing ties it to the samples
+    /// before.
     Initial,
     /// The device session changed.
     SessionChanged {
@@ -200,6 +206,11 @@ pub enum Change {
     /// on in a segment of the new acquisition, in the same session, time
     /// reference and rate, with time not going backward. The device took no
     /// sample in the time between, so the change names no loss for it.
+    ///
+    /// Rows in another segment after the device's link was lost are told
+    /// so too, as the parser cannot tell a restart while the link was down
+    /// from a rollover. Samples may then have been lost, and the change does
+    /// not count them.
     Restarted {
         /// Segment of the preceding rows.
         old_id: SegmentId,
@@ -238,7 +249,7 @@ impl Change {
         )
     }
 
-    /// Returns `true` only for the first data a stream has delivered.
+    /// Returns `true` for [`Change::Initial`].
     pub fn is_initial(&self) -> bool {
         matches!(self, Change::Initial)
     }

@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 #[must_use = "the RPC is in flight; wait on the reply"]
 #[derive(Debug)]
 pub struct PendingReply {
-    pub(crate) reply: flume::Receiver<Result<Vec<u8>, CallError>>,
+    pub(crate) reply: crate::chan::Receiver<Result<Vec<u8>, CallError>>,
 }
 
 impl PendingReply {
@@ -40,7 +40,7 @@ impl IntoFuture for PendingReply {
 
 /// A [`PendingReply`] being awaited.
 #[derive(Debug)]
-pub struct ReplyFuture(flume::r#async::RecvFut<'static, Result<Vec<u8>, CallError>>);
+pub struct ReplyFuture(crate::chan::RecvFut<'static, Result<Vec<u8>, CallError>>);
 
 impl Future for ReplyFuture {
     type Output = Result<Vec<u8>, CallError>;
@@ -121,7 +121,7 @@ pub(crate) fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Outp
 
 #[cfg(test)]
 pub(crate) fn resolved(reply: Option<Vec<u8>>) -> PendingReply {
-    let (resolve, reply_rx) = flume::bounded(1);
+    let (resolve, reply_rx) = crate::chan::bounded(1);
     if let Some(reply) = reply {
         resolve.send(Ok(reply)).expect("the receiver is held");
     }
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_pending_reply_can_be_awaited() {
-        let (resolve, reply) = flume::bounded(1);
+        let (resolve, reply) = crate::chan::bounded(1);
         let pending = PendingReply { reply };
         let resolver = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));

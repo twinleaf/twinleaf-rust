@@ -3,8 +3,10 @@
 
 mod one_shot;
 
-use crate::rt::{lock, Supervisor};
-use mdns_sd::{HostnameResolutionEvent, Receiver, ScopedIp, ServiceDaemon};
+use crate::chan::lock;
+use crate::chan::MdnsReceiver as Receiver;
+use crate::rt::Supervisor;
+use mdns_sd::{HostnameResolutionEvent, ScopedIp, ServiceDaemon};
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::sync::{Arc, Mutex};

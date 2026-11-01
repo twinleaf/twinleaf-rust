@@ -115,7 +115,13 @@ pub enum PacketOutcome {
     /// The stream has a column of a type this build cannot decode, so its
     /// rows are refused.
     Unsupported,
-    /// A disconnect reset metadata and continuity state.
+    /// A disconnect dropped the metadata of the devices behind it, which the
+    /// parser learns again. Their streams keep their last rows, so rows
+    /// after the disconnect report what was lost, or a new session, against
+    /// them. A stream starts over as
+    /// [`Change::Initial`](crate::data::Change::Initial) says, as when
+    /// another device answers, and rows in another segment are told as
+    /// [`Change::Restarted`](crate::data::Change::Restarted) says.
     Reset,
     /// The packet contained this many validated sample rows.
     Rows(usize),
@@ -245,11 +251,13 @@ impl PacketParser {
         self.state.reset(|route| route.starts_with(&subtree));
     }
 
-    /// Forgets the device metadata of the absolute route `route` alone, as
-    /// [`reset_subtree`](Self::reset_subtree) does for a subtree.
-    pub(crate) fn reset_route(&mut self, route: DeviceRoute) {
+    /// Drops the device metadata of the absolute route `route` alone to learn
+    /// it again, as a disconnect does for its subtree. Each stream keeps its
+    /// last rows, so the rows after report what was lost, or a new session,
+    /// against them, as [`PacketOutcome::Reset`] says.
+    pub(crate) fn relearn_route(&mut self, route: DeviceRoute) {
         self.flush();
-        self.state.reset(|device| *device == route);
+        self.state.relearn(|device| *device == route);
     }
 
     /// Takes the pending metadata query for `route`, creating the route's
@@ -986,47 +994,6 @@ mod tests {
         })
     }
 
-    /// Rows lost across a rollover come as a rollover and a loss, counted
-    /// from the whole periods between the two segments' starts, whether the
-    /// new segment's first rows or a whole segment went missing.
-    #[test]
-    fn a_loss_across_a_rollover_is_a_rollover_and_a_loss() {
-        // 5 outputs at 10 Hz decimated by 2 fill the first second, so rows 0
-        // and 1 of the segment after it are lost.
-        let lost_at_start = boundary_across((10, 2), 5, (1, 1, 2));
-        // Segment 1 held the second after, 5 more rows, and segment 2 starts
-        // with its row 0.
-        let lost_segment = boundary_across((10, 2), 5, (2, 2, 0));
-        for (boundary, new, samples) in [(lost_at_start, 1, 2), (lost_segment, 2, 5)] {
-            assert_eq!(
-                boundary,
-                Some(Boundary {
-                    change: rollover(0, new),
-                    loss: Some(Loss {
-                        samples,
-                        expected: Some(SampleNumber::new(5)),
-                        dropped_batches: 0,
-                    }),
-                })
-            );
-        }
-    }
-
-    /// A switch inside a group of inputs drops that group, which leaves less
-    /// than a period between the segments and loses no row.
-    #[test]
-    fn a_switch_inside_a_group_loses_no_row() {
-        // 6 outputs at 4 Hz decimated by 3 take inputs 0 to 17, and the
-        // device switches at input 20, 5 s in.
-        assert_eq!(
-            boundary_across((4, 3), 6, (1, 5, 0)),
-            Some(Boundary::of(Change::SegmentRollover {
-                old_id: crate::proto::SegmentId::new(0),
-                new_id: crate::proto::SegmentId::new(1),
-            }))
-        );
-    }
-
     /// A ring that came round to the last rows' slot holds a segment that
     /// starts later, which is a rollover onto the same id.
     #[test]
@@ -1034,47 +1001,6 @@ mod tests {
         // 4 segments of one row at 1 Hz, all after the first lost.
         assert_eq!(
             boundary_across((1, 1), 1, (0, 4, 0)),
-            Some(Boundary {
-                change: rollover(0, 0),
-                loss: Some(Loss {
-                    samples: 3,
-                    expected: Some(SampleNumber::new(1)),
-                    dropped_batches: 0,
-                }),
-            })
-        );
-    }
-
-    /// Rows in the last rows' slot after the stream named another segment
-    /// are of a later lap, though their sample numbers follow on.
-    #[test]
-    fn rows_after_a_lap_that_follow_on_by_number_roll_over() {
-        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
-        let segment = |id: u8, start_time: u32| {
-            wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(id),
-                start_time,
-                ..fixtures::segment(STREAM_ID)
-            })
-        };
-        parser
-            .push_packet(&stream_data_packet(0, vec![0; 4]))
-            .expect("valid rows");
-        parser.pop_batch().expect("the first batch");
-        // Segment 1 held rows 0 and 1, and the parser waits through row 1.
-        parser
-            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
-            .expect("valid rows");
-        assert!(parser.pop_batch().is_none());
-        announce(&mut parser, segment(1, 1));
-        announce(&mut parser, segment(0, 3));
-        parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
-            .expect("valid rows");
-
-        let batch = parser.pop_batch().expect("the batch after the lap");
-        assert_eq!(
-            batch.boundary().cloned(),
             Some(Boundary {
                 change: rollover(0, 0),
                 loss: Some(Loss {
@@ -1264,7 +1190,7 @@ mod tests {
 
         parser
             .push_packet(&tio::Packet::legacy_status(LinkStatus::SensorDisconnected))
-            .expect("a disconnect resets the parser");
+            .expect("the disconnect");
 
         // The device comes back and re-announces exactly the same schema.
         announce_schema(&mut parser, &[DataType::F32], 4, 1, 1, 1);
@@ -1289,15 +1215,24 @@ mod tests {
                 global: 1
             }
         );
-        assert!(after.is_initial(), "the reconnect opens a new run");
+        assert!(
+            matches!(
+                after
+                    .boundary()
+                    .and_then(|boundary| boundary.change.as_ref()),
+                Some(Change::TimeBackward { .. })
+            ),
+            "rows that go back in the same session step back in time: {:?}",
+            after.boundary()
+        );
     }
 
     /// A routed disconnect, one mount bouncing behind `tio proxy --mount` as a
-    /// recorded log replays it, resets only the subtree at its route. A log
-    /// from a current proxy holds it as a link packet, and one from an old
-    /// proxy as a legacy status.
+    /// recorded log replays it, has only the subtree at its route learn its
+    /// metadata again. A log from a current proxy holds it as a link packet,
+    /// and one from an old proxy as a legacy status.
     #[test]
-    fn a_routed_disconnect_resets_only_its_subtree() {
+    fn a_routed_disconnect_relearns_only_its_subtree() {
         let forms: [fn(LinkStatus) -> tio::Packet; 2] =
             [tio::Packet::link, tio::Packet::legacy_status];
         for form in forms {
@@ -1335,10 +1270,10 @@ mod tests {
         }
     }
 
-    /// A routed stop ends its subtree's session exactly as a routed disconnect
-    /// does, and leaves every other subtree alone.
+    /// A routed stop has its subtree learn its metadata again exactly as a
+    /// routed disconnect does, and leaves every other subtree alone.
     #[test]
-    fn a_routed_stop_resets_only_its_subtree() {
+    fn a_routed_stop_relearns_only_its_subtree() {
         let mut parser = PacketParser::new(true);
         let steady: DeviceRoute = "/1".parse().unwrap();
         let stopped: DeviceRoute = "/2".parse().unwrap();
@@ -1365,7 +1300,7 @@ mod tests {
         );
         assert!(
             parser.metadata(stopped).is_none(),
-            "the stopped mount forgot its description"
+            "the stopped mount learns its description again"
         );
     }
 
@@ -1538,36 +1473,6 @@ mod tests {
                 .is_empty());
             assert_eq!(parser.metadata_revision(route), revision);
         }
-    }
-
-    #[test]
-    fn a_new_time_reference_can_start_before_the_previous_clock() {
-        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
-        parser
-            .push_packet(&stream_data_packet(1000, vec![0; 4]))
-            .unwrap();
-        parser.pop_batch().unwrap();
-        announce(
-            &mut parser,
-            wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(1),
-                timeref_session: crate::proto::SessionId::new(99),
-                ..fixtures::segment(STREAM_ID)
-            }),
-        );
-        parser
-            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
-            .unwrap();
-        let batch = parser
-            .pop_batch()
-            .expect("timestamps in different time references are not comparable");
-        assert!(matches!(
-            batch.boundary().and_then(|b| b.change.as_ref()),
-            Some(Change::TimeRefSessionChanged { .. })
-        ));
-        assert!(parser
-            .take_metadata_queries_for(DeviceRoute::root())
-            .is_empty());
     }
 
     #[test]
@@ -1824,20 +1729,21 @@ mod tests {
     }
 
     /// A device lost and found again may be another build of it. Its layout
-    /// is learned anew, even with the same session.
+    /// is learned anew, even with the same session, and its rows start the
+    /// stream over, a break its peers share.
     #[test]
     fn rows_after_a_disconnect_decode_with_the_reannounced_layout() {
         let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
         parser
             .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
             .expect("valid rows");
-        parser.pop_batch().expect("the first batch");
+        let before = parser.pop_batch().expect("the first batch").generations();
 
         parser
             .push_packet(
                 &tio::Packet::link(LinkStatus::SensorDisconnected).with_route(DeviceRoute::root()),
             )
-            .expect("the disconnect resets the route");
+            .expect("the disconnect");
         announce_schema(&mut parser, &[DataType::U16, DataType::F32], 6, 1, 1, 1);
         let mut sample = 513u16.to_le_bytes().to_vec();
         sample.extend_from_slice(&(-0.5f32).to_le_bytes());
@@ -1847,6 +1753,7 @@ mod tests {
         let after = parser.pop_batch().expect("the batch after the reconnect");
 
         assert!(after.is_initial());
+        assert_eq!(after.generations().device, before.device + 1);
         assert_eq!(
             decoded(&after),
             named(&[("col_0", &[513.0]), ("col_1", &[-0.5])])

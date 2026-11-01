@@ -34,11 +34,11 @@
 
 use super::super::client::ClientError;
 use super::{Outbox, Taken, HARD_LIMIT, SAMPLE_BUDGET, TAKE_LIMIT};
+use crate::chan::lock;
 use crate::device::fixtures::{broadcast, segment_record};
 use crate::proto::data::Metadata;
 use crate::proto::DeviceRoute;
 use crate::proxy::control::{decode, parts, Part, Update};
-use crate::rt::lock;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};

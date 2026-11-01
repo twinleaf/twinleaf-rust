@@ -3,6 +3,7 @@
 use super::codec::tcp::Codec;
 use super::task::{ByteStream, Rules};
 use super::{Delivery, Port, RateInfo, TransportKind, DEFAULT_TX_CHANNEL_SIZE};
+use crate::chan::oneshot;
 use crate::rt::Supervisor;
 use crate::tio::packet::Packet;
 use bytes::BytesMut;
@@ -12,7 +13,6 @@ use std::pin::Pin;
 use std::sync::mpsc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::oneshot;
 
 /// The size of a fake stream's pipe in each direction.
 pub(super) const PIPE_SIZE: usize = 4096;

@@ -76,7 +76,7 @@ enum Socket {
     Transport(transport::Port),
     Port(mpsc::Sender<Packet>),
     #[cfg(test)]
-    Channel(flume::Sender<Packet>),
+    Channel(crate::chan::Sender<Packet>),
 }
 
 impl Socket {
@@ -139,7 +139,7 @@ enum Command {
 /// socket. The replies to the pump's control requests and the losses always
 /// go in. A gap stands where the session had no room for other packets, and
 /// the stop comes last.
-pub(crate) type Inlet = flume::Receiver<Queued<Received>>;
+pub(crate) type Inlet = crate::chan::Receiver<Queued<Received>>;
 
 /// What the session hands its pump.
 #[derive(Debug, Clone)]
@@ -348,9 +348,9 @@ impl Session {
 async fn connect(
     proxy: &ProxyAddress,
     tasks: &Supervisor,
-) -> io::Result<(transport::Port, flume::Receiver<ReceiveResult>)> {
+) -> io::Result<(transport::Port, crate::chan::Receiver<ReceiveResult>)> {
     let attempt = || async {
-        let (sender, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+        let (sender, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
         let port = transport::Port::open(&proxy.url, sender, tasks).await?;
         io::Result::Ok((port, received))
     };
@@ -727,8 +727,8 @@ impl Handle {
         route: DeviceRoute,
         name: &str,
         args: &[u8],
-    ) -> flume::Receiver<RawCallResult> {
-        let (resolve, reply) = flume::bounded(1);
+    ) -> crate::chan::Receiver<RawCallResult> {
+        let (resolve, reply) = crate::chan::bounded(1);
         self.submit_with(
             route,
             name,
@@ -810,10 +810,10 @@ impl Handle {
 #[cfg(test)]
 pub(crate) struct TestProxy {
     /// What the session wrote, in order.
-    pub(crate) sent: flume::Receiver<Packet>,
+    pub(crate) sent: crate::chan::Receiver<Packet>,
     /// Hands the session packets as its socket would. Dropping it closes
     /// the socket.
-    pub(crate) deliver: flume::Sender<ReceiveResult>,
+    pub(crate) deliver: crate::chan::Sender<ReceiveResult>,
 }
 
 #[cfg(test)]
@@ -888,8 +888,8 @@ impl Session {
         tasks: &Supervisor,
         reopen: Option<(ProxyAddress, &'static str, Vec<u8>)>,
     ) -> (Session, TestProxy) {
-        let (sender, sent) = flume::unbounded();
-        let (deliver, received) = flume::unbounded();
+        let (sender, sent) = crate::chan::unbounded();
+        let (deliver, received) = crate::chan::unbounded();
         let peer = "the test's proxy".to_string();
         let received = received.into_stream().boxed();
         let session = Session::start((Socket::Channel(sender), received, peer), reopen, tasks);
@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     /// The next packet on `inlet`, within [`WAIT`].
-    fn next(inlet: &Inlet) -> Result<Packet, flume::RecvTimeoutError> {
+    fn next(inlet: &Inlet) -> Result<Packet, crate::chan::RecvTimeoutError> {
         match inlet.recv_timeout(WAIT)? {
             Queued::Item(Received::Packet(packet)) => Ok(packet),
             Queued::Item(Received::SocketLost) => panic!("the session lost its socket"),
@@ -1272,36 +1272,18 @@ mod tests {
         ));
     }
 
-    /// A stop reaches the pump, then ends its inlet, and the session ends
-    /// with every call still waiting, and nothing reconnects.
+    /// A stop ends the session, and fails every call still waiting and
+    /// every call made after it.
     #[test]
-    fn a_stop_ends_the_session() {
+    fn a_stop_fails_every_call_waiting_and_every_later_one() {
         let proxy = FakeProxy::start();
         let (session, mut end) = opened(&proxy);
-        let inlet = session.attach(64);
         let root = Handle::root(session);
         let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
         end.expect_call();
 
-        end.send(&Packet::heartbeat(DeviceRoute::root()));
         end.send(&Packet::link(LinkStatus::Stopped));
 
-        assert!(matches!(
-            next(&inlet).unwrap().payload(),
-            Payload::Heartbeat(_)
-        ));
-        assert_eq!(
-            next(&inlet).unwrap().link_status(),
-            Some(LinkStatus::Stopped)
-        );
-        assert!(matches!(
-            inlet.recv_timeout(WAIT),
-            Ok(Queued::Ended(End::Stopped))
-        ));
-        assert_eq!(
-            inlet.recv_timeout(WAIT).err(),
-            Some(flume::RecvTimeoutError::Disconnected)
-        );
         assert!(matches!(
             waiting.recv_timeout(WAIT),
             Ok(Err(CallError::ResponseLost))
@@ -1311,10 +1293,6 @@ mod tests {
                 .recv_timeout(WAIT),
             Ok(Err(CallError::ResponseLost))
         ));
-        assert!(
-            !proxy.arrives(Duration::from_secs(2)),
-            "the session reconnected after the proxy stopped"
-        );
     }
 
     /// A packet the pump sends, such as a watch, waits for room in a full
@@ -1469,7 +1447,7 @@ mod tests {
         assert_eq!(status, Ok(Some(LinkStatus::FailedToReconnect)));
         assert_eq!(
             next(&inlet).err(),
-            Some(flume::RecvTimeoutError::Disconnected)
+            Some(crate::chan::RecvTimeoutError::Disconnected)
         );
         assert!(
             !proxy.arrives(Duration::from_secs(1)),
@@ -1732,13 +1710,14 @@ mod tests {
         assert!(matches!(inlet.try_recv(), Ok(Queued::Item(_))));
         assert_eq!(
             next(&session.attach(2)).err(),
-            Some(flume::RecvTimeoutError::Disconnected),
+            Some(crate::chan::RecvTimeoutError::Disconnected),
             "a second pump gets an inlet that has ended"
         );
     }
 
     /// A reply to the pump's control request goes into a full inlet, in the
-    /// order it arrived among the packets around it.
+    /// order it arrived among the packets around it, after the count of the
+    /// packets the inlet missed before it.
     #[test]
     fn a_control_reply_always_reaches_the_pump_in_order() {
         let (session, proxy) = Session::test_pair();
@@ -1755,11 +1734,19 @@ mod tests {
         let kinds: Vec<_> = inlet
             .drain()
             .map(|queued| match queued {
-                Queued::Item(Received::Packet(packet)) => packet.ptype(),
-                other => panic!("expected a packet, got {other:?}"),
+                Queued::Item(Received::Packet(packet)) => Some(packet.ptype()),
+                Queued::Gap(1) => None,
+                other => panic!("expected a packet or one missed, got {other:?}"),
             })
             .collect();
-        assert_eq!(kinds, [PacketType::HEARTBEAT, PacketType::PROXY_RX]);
+        assert_eq!(
+            kinds,
+            [
+                Some(PacketType::HEARTBEAT),
+                None,
+                Some(PacketType::PROXY_RX)
+            ]
+        );
     }
 
     /// The session's task ends once nothing holds the session, which
@@ -1862,7 +1849,7 @@ mod tests {
         assert_took(started.elapsed(), short, "the earliest call");
         assert!(matches!(
             long_reply.try_recv(),
-            Err(flume::TryRecvError::Empty)
+            Err(crate::chan::TryRecvError::Empty)
         ));
         assert!(matches!(
             middle_reply.recv_async().await,

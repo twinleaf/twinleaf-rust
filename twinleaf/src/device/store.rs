@@ -24,6 +24,7 @@
 use super::rpc::RpcRegistry;
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use super::stream::{End, Lane, Receiver, Scope, Sink};
+use crate::chan::Notify;
 use crate::proto::{DeviceRoute, SessionId};
 use crate::proxy::Watch;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +32,6 @@ use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::Notify;
 
 /// How many setting changes a receiver's queue holds.
 pub(crate) const CHANGE_QUEUE_LEN: usize = 4096;

@@ -83,6 +83,7 @@ pub type Result<T> = std::result::Result<T, ExportError>;
 /// | Segment rollover                     | append        | append        |
 /// | Samples lost, rate changed           | **new table** | append        |
 /// | Session changed, time went backward  | **new table** | **new table** |
+/// | Stream started over                  | **new table** | **new table** |
 ///
 /// `Continuous` yields tables whose rows are contiguous, one per parser run
 /// ([`Generations::stream`]). `Monotonic` yields fewer tables, each possibly
@@ -146,23 +147,30 @@ enum RunScope {
 
 /// Table numbering driven by the parser's continuity generations.
 ///
-/// The first batch stamped with a new generation carries the boundary that
-/// opened it. That batch decides whether the generation gets its own table or
-/// shares the current one. Later batches in scope, from any stream, read the
-/// index back.
-struct RunTables {
+/// The first batch in scope stamped with a new generation decides whether the
+/// generation gets its own table or shares the current one. A boundary the
+/// policy splits at gives it one, and so does a
+/// [`Change::Initial`](crate::data::Change::Initial), since a
+/// stream's first data never moves a generation its peers share. A new
+/// generation at an Initial is of a device that started over. Later batches
+/// in scope, from any stream, read the index back.
+pub(super) struct RunTables {
     policy: SplitPolicy,
     level: RunSplitLevel,
     /// `(generation in use, table index)` per scope.
     open: HashMap<RunScope, (u32, TableIndex)>,
+    /// The streams a batch was seen of. A stream seen before that starts
+    /// over counts as a split whatever the policy.
+    seen: HashSet<StreamKey>,
 }
 
 impl RunTables {
-    fn new(policy: SplitPolicy, level: RunSplitLevel) -> Self {
+    pub(super) fn new(policy: SplitPolicy, level: RunSplitLevel) -> Self {
         Self {
             policy,
             level,
             open: HashMap::new(),
+            seen: HashSet::new(),
         }
     }
 
@@ -176,19 +184,24 @@ impl RunTables {
     }
 
     /// Accounts for one batch and returns `true` if its boundary split the run.
-    fn observe(
+    pub(super) fn observe(
         &mut self,
         key: StreamKey,
         generations: Generations,
         boundary: Option<&Boundary>,
     ) -> bool {
-        let splits = boundary.is_some_and(|b| {
-            !b.is_initial()
-                && match self.policy {
+        let seen = !self.seen.insert(key);
+        let (splits, advances) = match boundary {
+            Some(b) if b.is_initial() => (seen, true),
+            Some(b) => {
+                let splits = match self.policy {
                     SplitPolicy::Continuous => !b.is_continuous(),
                     SplitPolicy::Monotonic => !b.is_monotonic(),
-                }
-        });
+                };
+                (splits, splits)
+            }
+            None => (false, false),
+        };
         if let Some(scope) = self.scope(key) {
             let generation = match self.level {
                 RunSplitLevel::PerDevice => generations.device,
@@ -197,7 +210,7 @@ impl RunTables {
             };
             let open = self.open.entry(scope).or_insert((generation, 0));
             if open.0 != generation {
-                *open = (generation, open.1 + splits as TableIndex);
+                *open = (generation, open.1 + advances as TableIndex);
             }
         }
         splits
@@ -205,7 +218,7 @@ impl RunTables {
 
     /// Returns the table index for a stream's current run, or `None` if runs
     /// do not split.
-    fn index(&self, key: StreamKey) -> Option<TableIndex> {
+    pub(super) fn index(&self, key: StreamKey) -> Option<TableIndex> {
         Some(self.open.get(&self.scope(key)?).map_or(0, |open| open.1))
     }
 }
@@ -815,7 +828,7 @@ mod tests {
 
     fn hdf_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().expect("lock HDF5 tests")
+        crate::chan::lock(&LOCK)
     }
 
     #[test]
@@ -853,6 +866,26 @@ mod tests {
                 .collect();
             assert_eq!(indices, expected, "{policy:?}");
         }
+    }
+
+    /// A device that starts over moves to a new table at the device level,
+    /// whether the first of its streams to send after is one seen before or
+    /// not. A stream's first data at startup moves nothing.
+    #[test]
+    fn a_device_that_starts_over_moves_every_stream_to_a_new_table() {
+        let mut runs = RunTables::new(SplitPolicy::Continuous, RunSplitLevel::PerDevice);
+        let stamped = |stream, device| Generations {
+            stream,
+            device,
+            global: device,
+        };
+        runs.observe(key(1), stamped(1, 0), Some(&initial()));
+        runs.observe(key(2), stamped(1, 0), Some(&initial()));
+        assert_eq!(runs.index(key(2)), Some(0), "a second stream starting up");
+        runs.observe(key(3), stamped(1, 1), Some(&initial()));
+        runs.observe(key(1), stamped(2, 1), Some(&initial()));
+        assert_eq!(runs.index(key(1)), Some(1), "the device started over");
+        assert_eq!(runs.index(key(3)), Some(1));
     }
 
     #[test]

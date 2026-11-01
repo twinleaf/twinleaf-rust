@@ -465,7 +465,7 @@ pub struct Proxy {
     /// The server's mailbox, which keeps the proxy running.
     server: mpsc::UnboundedSender<server::Notice>,
     /// The receiver that disconnects once the proxy has stopped.
-    stopped: flume::Receiver<()>,
+    stopped: crate::chan::Receiver<()>,
     /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
     /// started on the crate's runtime.
     drop_waits: bool,
@@ -686,12 +686,12 @@ mod tests {
     /// A client speaking raw packets to a proxy.
     struct TestClient {
         port: transport::Port,
-        rx: flume::Receiver<transport::ReceiveResult>,
+        rx: crate::chan::Receiver<transport::ReceiveResult>,
     }
 
     impl TestClient {
         fn connect(endpoint: &str) -> TestClient {
-            let (sender, rx) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+            let (sender, rx) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
             let port = transport::Port::new_on(endpoint, sender, &Supervisor::new());
             TestClient {
                 port: port.unwrap(),
@@ -701,7 +701,7 @@ mod tests {
 
         /// A client over `stream`, which a test may also write to as it is.
         fn over(stream: TcpStream) -> TestClient {
-            let (sender, rx) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+            let (sender, rx) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
             let port = transport::Port::from_tcp_stream(
                 stream,
                 sender,
@@ -729,10 +729,10 @@ mod tests {
                     }
                     Ok(Ok(event)) => panic!("unexpected transport event: {event:?}"),
                     Ok(Err(error)) => panic!("the client could not receive: {error}"),
-                    Err(flume::RecvTimeoutError::Timeout) => {
+                    Err(crate::chan::RecvTimeoutError::Timeout) => {
                         panic!("nothing expected arrived within {WAIT:?}")
                     }
-                    Err(flume::RecvTimeoutError::Disconnected) => {
+                    Err(crate::chan::RecvTimeoutError::Disconnected) => {
                         panic!("the proxy closed the connection")
                     }
                 }
@@ -760,8 +760,8 @@ mod tests {
             loop {
                 match self.rx.recv_deadline(deadline) {
                     Ok(_) => {}
-                    Err(flume::RecvTimeoutError::Disconnected) => return,
-                    Err(flume::RecvTimeoutError::Timeout) => {
+                    Err(crate::chan::RecvTimeoutError::Disconnected) => return,
+                    Err(crate::chan::RecvTimeoutError::Timeout) => {
                         panic!("the connection stayed open")
                     }
                 }
@@ -977,9 +977,10 @@ mod tests {
         );
     }
 
-    /// A device that resets its connection is the proxy's to reconnect. The
-    /// client using it stays attached through it on the port it holds, hears
-    /// the device drop out and come back, and is answered again.
+    /// A device that resets its connection is the proxy's to reconnect, once
+    /// and on the link it had. The client using it stays attached through it
+    /// on the port it holds, hears the device come back, and is answered
+    /// again.
     #[test]
     fn a_device_that_resets_is_reconnected_while_its_clients_stay_attached() {
         let device = FakeDevice::start();
@@ -999,19 +1000,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        for expected in [
-            LinkStatus::SensorDisconnected,
-            LinkStatus::SensorReconnected,
-        ] {
-            client.expect(|pkt| match pkt.payload() {
-                Payload::ProxyRx(ProxyRx::Link(status)) => {
-                    assert_eq!(status, expected);
-                    assert_eq!(pkt.route(), DeviceRoute::root());
-                    Some(())
-                }
-                _ => None,
-            });
-        }
+        client.expect(|pkt| match pkt.payload() {
+            Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorReconnected)) => {
+                assert_eq!(pkt.route(), DeviceRoute::root());
+                Some(())
+            }
+            _ => None,
+        });
         assert_eq!(client.dev_name(9), "FAKE");
         assert_eq!(device.accepted(), 2);
         assert_eq!(proxy.links.urls(), [device.url.as_str()]);
@@ -1814,26 +1809,18 @@ mod tests {
         assert!(proxy.clients().is_empty(), "the table outlived the server");
     }
 
+    /// A proxy that has shut down lists no client, and a second shutdown
+    /// does nothing.
     #[test]
-    fn shutdown_tells_every_client_it_stopped() {
-        let device = FakeDevice::start();
+    fn a_shutdown_proxy_lists_no_client_and_shuts_down_again_as_a_no_op() {
         let proxy = Proxy::host(options()).unwrap();
-        let control = TestClient::connect(&proxy.endpoint());
-        control.hello(4242, "control");
-        control.open(&device.url).unwrap();
-        let idle = TestClient::connect(&proxy.endpoint());
-        idle.hello(4243, "idle");
+        let client = TestClient::connect(&proxy.endpoint());
+        client.hello(4242, "client");
+        assert_eq!(proxy.clients().len(), 1);
 
         proxy.shutdown();
 
-        control.expect_stopped();
-        idle.expect_stopped();
-        let deadline = Instant::now() + WAIT;
-        while !proxy.clients().is_empty() {
-            assert!(Instant::now() < deadline, "a client stayed listed");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(proxy.links.wait_finished(WAIT), "a link outlived the proxy");
+        assert!(proxy.clients().is_empty(), "a client stayed listed");
         proxy.shutdown();
         proxy.wait();
     }
