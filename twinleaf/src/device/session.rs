@@ -1716,7 +1716,8 @@ mod tests {
     }
 
     /// A reply to the pump's control request goes into a full inlet, in the
-    /// order it arrived among the packets around it.
+    /// order it arrived among the packets around it, after the count of the
+    /// packets the inlet missed before it.
     #[test]
     fn a_control_reply_always_reaches_the_pump_in_order() {
         let (session, proxy) = Session::test_pair();
@@ -1733,11 +1734,19 @@ mod tests {
         let kinds: Vec<_> = inlet
             .drain()
             .map(|queued| match queued {
-                Queued::Item(Received::Packet(packet)) => packet.ptype(),
-                other => panic!("expected a packet, got {other:?}"),
+                Queued::Item(Received::Packet(packet)) => Some(packet.ptype()),
+                Queued::Gap(1) => None,
+                other => panic!("expected a packet or one missed, got {other:?}"),
             })
             .collect();
-        assert_eq!(kinds, [PacketType::HEARTBEAT, PacketType::PROXY_RX]);
+        assert_eq!(
+            kinds,
+            [
+                Some(PacketType::HEARTBEAT),
+                None,
+                Some(PacketType::PROXY_RX)
+            ]
+        );
     }
 
     /// The session's task ends once nothing holds the session, which

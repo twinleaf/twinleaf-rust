@@ -814,7 +814,7 @@ mod tests {
     }
 
     /// A subscriber whose queue is full still hears the stop, after what was
-    /// queued.
+    /// queued and the count of what it missed.
     #[test]
     fn a_full_queue_still_ends_with_the_stop() {
         let (mut sink, receiver) = Sink::new(2, everything());
@@ -824,6 +824,7 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(Some(0)));
         assert_eq!(receiver.try_recv(), Ok(Some(1)));
+        assert_eq!(receiver.try_recv(), Err(RecvError::Lagged(1)));
         assert_eq!(receiver.try_recv(), Err(RecvError::Stopped));
         assert_eq!(receiver.try_recv(), Err(RecvError::Disconnected));
     }

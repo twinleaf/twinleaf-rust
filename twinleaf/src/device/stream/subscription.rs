@@ -242,6 +242,13 @@ impl Scope {
 /// end, and an item sent with [`send_always`](Self::send_always), go in
 /// however full the queue is.
 ///
+/// The count of missed items goes in just ahead of the next item that goes
+/// in, or of the end, or alone when [`report_lag`](Self::report_lag) finds
+/// room. It takes no room of its own, so an item goes in whenever the queue
+/// has room for one. A FIFO queue holds at most one entry more than its
+/// room, besides the end, the items that go in however full it is, and the
+/// count ahead of either.
+///
 /// A [latest-value](Self::latest) lane holds one item, and a new item takes
 /// the place of one still unread instead of being counted as missed.
 pub(crate) struct Lane<T> {
@@ -300,28 +307,39 @@ impl<T> Lane<T> {
             }
             return true;
         }
-        if !self.report_lag() {
-            return false;
+        if !self.has_room() {
+            self.skipped += 1;
+            return true;
         }
-        match self.push(Queued::Item(item)) {
-            Ok(()) => true,
-            Err(crate::chan::TrySendError::Full(_)) => {
-                self.skipped += 1;
-                true
-            }
-            Err(crate::chan::TrySendError::Disconnected(_)) => false,
-        }
+        self.enqueue(item)
     }
 
-    /// Returns `true` if a FIFO lane's queue has room for one more entry.
-    /// Only the lane adds entries, so an entry it sends next goes in.
+    /// Returns `true` if a FIFO lane's queue has room for one more item.
+    /// Only the lane adds entries, so it stays `true` until the lane sends.
     fn has_room(&self) -> bool {
         self.items.len() < self.room
     }
 
-    /// Sends one item that is never missed, however full the queue is.
+    /// Sends one item that is never missed, however full the queue is, after
+    /// the count of any items missed before it.
     pub(crate) fn send_always(&mut self, item: T) {
-        let _ = self.items.send(Queued::Item(item));
+        let _ = self.enqueue(item);
+    }
+
+    /// Sends `item` after the count of any items missed before it, however
+    /// full the queue is. Returns `false` once the receiver is gone.
+    fn enqueue(&mut self, item: T) -> bool {
+        self.send_gap();
+        self.items.send(Queued::Item(item)).is_ok()
+    }
+
+    /// Sends the count of missed items, if any, however full the queue is.
+    fn send_gap(&mut self) {
+        if self.skipped > 0 {
+            let _ = self
+                .items
+                .send(Queued::Gap(std::mem::take(&mut self.skipped)));
+        }
     }
 
     /// Counts `missed` items that never reached the lane, and reports them
@@ -332,34 +350,23 @@ impl<T> Lane<T> {
         self.report_lag()
     }
 
-    /// Sends the count of missed items once the queue has room. Returns
-    /// `false` once the receiver is gone.
+    /// Sends the count of missed items if the queue has room now, and
+    /// otherwise leaves it for the next entry that goes in. Returns `false`
+    /// once the receiver is gone.
     pub(crate) fn report_lag(&mut self) -> bool {
-        if self.skipped == 0 {
+        if self.skipped == 0 || !self.has_room() {
             return true;
         }
-        match self.push(Queued::Gap(self.skipped)) {
-            Ok(()) => {
-                self.skipped = 0;
-                true
-            }
-            Err(crate::chan::TrySendError::Full(_)) => true,
-            Err(crate::chan::TrySendError::Disconnected(_)) => false,
-        }
+        self.items
+            .send(Queued::Gap(std::mem::take(&mut self.skipped)))
+            .is_ok()
     }
 
-    /// Ends the queue saying why.
-    pub(crate) fn end(self, end: End) {
+    /// Ends the queue saying why, after the count of any items missed before
+    /// the end.
+    pub(crate) fn end(mut self, end: End) {
+        self.send_gap();
         let _ = self.items.send(Queued::Ended(end));
-    }
-
-    /// Sends `queued` if the queue has room for it.
-    fn push(&self, queued: Queued<T>) -> Result<(), crate::chan::TrySendError<Queued<T>>> {
-        if self.has_room() {
-            self.items.try_send(queued)
-        } else {
-            Err(crate::chan::TrySendError::Full(queued))
-        }
     }
 }
 
@@ -414,20 +421,17 @@ impl BatchLane {
     /// of its stream if the queue is full. Returns `false` once the receiver
     /// is gone.
     pub(crate) fn send(&mut self, batch: SampleBatch) -> bool {
-        if !self.lane.report_lag() {
-            return false;
-        }
         let carried = self.streams.entry(batch.stream_key()).or_default();
         if !self.lane.has_room() {
             carried.miss(&batch);
             return self.lane.lag(1);
         }
         let batch = carried.queue(batch);
-        self.lane.send(batch)
+        self.lane.enqueue(batch)
     }
 
-    /// Sends the count of missed batches once the queue has room. Returns
-    /// `false` once the receiver is gone.
+    /// Sends the count of missed batches if the queue has room now, as
+    /// [`Lane::report_lag`] does. Returns `false` once the receiver is gone.
     pub(crate) fn report_lag(&mut self) -> bool {
         self.lane.report_lag()
     }
