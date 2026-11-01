@@ -843,7 +843,7 @@ fn reported(batch: &SampleBatch, gap: bool) -> (Option<Told>, Option<Loss>) {
 struct Reader {
     parser: PacketParser,
     lane: BatchLane,
-    queue: flume::Receiver<Queued<SampleBatch>>,
+    queue: crate::chan::Receiver<Queued<SampleBatch>>,
     /// The first position of each batch sent to the lane and not yet
     /// received or counted as dropped.
     sent: VecDeque<u64>,

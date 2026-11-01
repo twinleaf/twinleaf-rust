@@ -275,7 +275,7 @@ impl<W: Write> Recorder<W> {
     /// Waits for a packet or a device's metadata, until the caller's
     /// deadline. Returns what woke it, or `None` once the time is up.
     fn wait(&self, deadline: Option<Instant>) -> Option<Woken> {
-        let tap = flume::Selector::new().recv(self.tap.as_flume(), |item| {
+        let tap = crate::chan::Selector::new().recv(self.tap.as_flume(), |item| {
             Woken::Tap(self.tap.resolve(item))
         });
         let selector = self.metadata.values().fold(tap, |selector, metadata| {

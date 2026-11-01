@@ -465,7 +465,7 @@ pub struct Proxy {
     /// The server's mailbox, which keeps the proxy running.
     server: mpsc::UnboundedSender<server::Notice>,
     /// The receiver that disconnects once the proxy has stopped.
-    stopped: flume::Receiver<()>,
+    stopped: crate::chan::Receiver<()>,
     /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
     /// started on the crate's runtime.
     drop_waits: bool,
@@ -686,12 +686,12 @@ mod tests {
     /// A client speaking raw packets to a proxy.
     struct TestClient {
         port: transport::Port,
-        rx: flume::Receiver<transport::ReceiveResult>,
+        rx: crate::chan::Receiver<transport::ReceiveResult>,
     }
 
     impl TestClient {
         fn connect(endpoint: &str) -> TestClient {
-            let (sender, rx) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+            let (sender, rx) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
             let port = transport::Port::new_on(endpoint, sender, &Supervisor::new());
             TestClient {
                 port: port.unwrap(),
@@ -701,7 +701,7 @@ mod tests {
 
         /// A client over `stream`, which a test may also write to as it is.
         fn over(stream: TcpStream) -> TestClient {
-            let (sender, rx) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+            let (sender, rx) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
             let port = transport::Port::from_tcp_stream(
                 stream,
                 sender,
@@ -729,10 +729,10 @@ mod tests {
                     }
                     Ok(Ok(event)) => panic!("unexpected transport event: {event:?}"),
                     Ok(Err(error)) => panic!("the client could not receive: {error}"),
-                    Err(flume::RecvTimeoutError::Timeout) => {
+                    Err(crate::chan::RecvTimeoutError::Timeout) => {
                         panic!("nothing expected arrived within {WAIT:?}")
                     }
-                    Err(flume::RecvTimeoutError::Disconnected) => {
+                    Err(crate::chan::RecvTimeoutError::Disconnected) => {
                         panic!("the proxy closed the connection")
                     }
                 }
@@ -760,8 +760,8 @@ mod tests {
             loop {
                 match self.rx.recv_deadline(deadline) {
                     Ok(_) => {}
-                    Err(flume::RecvTimeoutError::Disconnected) => return,
-                    Err(flume::RecvTimeoutError::Timeout) => {
+                    Err(crate::chan::RecvTimeoutError::Disconnected) => return,
+                    Err(crate::chan::RecvTimeoutError::Timeout) => {
                         panic!("the connection stayed open")
                     }
                 }

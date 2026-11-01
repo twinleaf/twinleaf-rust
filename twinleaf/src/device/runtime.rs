@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
@@ -271,10 +271,7 @@ async fn embed(port: u16, embedded: &Mutex<Option<Proxy>>) -> io::Result<()> {
     let hosted = hosting.await.map_err(io::Error::other)?;
     match hosted.unwrap_or_else(|| Err(io::Error::other("hosting the proxy panicked"))) {
         Ok(proxy) => {
-            let stopped = embedded
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .replace(proxy);
+            let stopped = crate::chan::lock(embedded).replace(proxy);
             if let Some(stopped) = stopped {
                 stopped.shutdown_async().await;
             }
@@ -495,7 +492,7 @@ mod tests {
     /// later finds it answering.
     #[test]
     fn a_proxy_is_embedded_when_tio_cannot_be_started() {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TWINLEAF_TIO", dir.path().join("no-such-tio"));
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
@@ -532,7 +529,7 @@ mod tests {
     fn a_proxy_is_embedded_when_tio_cannot_run_it() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         let old_tio = dir.path().join("tio");
         let script =
@@ -566,7 +563,7 @@ mod tests {
     fn a_sandboxed_process_embeds_the_proxy_without_starting_tio() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         let tio = dir.path().join("tio");
         fs::write(&tio, "#!/bin/sh\ntouch \"$0.ran\"\nexit 2\n").unwrap();
@@ -593,16 +590,16 @@ mod tests {
     /// A hosted proxy that has stopped is replaced by a new one that answers.
     #[test]
     fn a_stopped_embedded_proxy_is_hosted_again() {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let attempt = fixtures::on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, true, Mutex::default());
-            let hosted = embedded.lock().unwrap().is_some();
+            let hosted = crate::chan::lock(&embedded).is_some();
             hosted.then_some((port, ensured, embedded))
         });
 
         let (port, ensured, embedded) = attempt.expect("no proxy was embedded");
         ensured.unwrap();
-        embedded.lock().unwrap().as_ref().unwrap().shutdown();
+        crate::chan::lock(&embedded).as_ref().unwrap().shutdown();
         assert!(!proxy::answers(port), "the stopped proxy still answers");
         let (ensured, embedded) = ensure_at(port, true, embedded);
         ensured.unwrap();

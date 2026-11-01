@@ -43,14 +43,14 @@ pub(super) enum Completed {
 pub(super) struct MetadataSchedule {
     handle: Handle,
     schedule: HashMap<DeviceRoute, Schedule>,
-    resolve: flume::Sender<(MetadataQuery, RawCallResult)>,
-    replies: flume::Receiver<(MetadataQuery, RawCallResult)>,
+    resolve: crate::chan::Sender<(MetadataQuery, RawCallResult)>,
+    replies: crate::chan::Receiver<(MetadataQuery, RawCallResult)>,
 }
 
 impl MetadataSchedule {
     /// Creates a schedule that asks through `handle`.
     pub(super) fn new(handle: Handle) -> MetadataSchedule {
-        let (resolve, replies) = flume::unbounded();
+        let (resolve, replies) = crate::chan::unbounded();
         MetadataSchedule {
             handle,
             schedule: HashMap::new(),
@@ -60,7 +60,7 @@ impl MetadataSchedule {
     }
 
     /// Returns the channel of finished calls, to receive from or select on.
-    pub(super) fn replies(&self) -> &flume::Receiver<(MetadataQuery, RawCallResult)> {
+    pub(super) fn replies(&self) -> &crate::chan::Receiver<(MetadataQuery, RawCallResult)> {
         &self.replies
     }
 

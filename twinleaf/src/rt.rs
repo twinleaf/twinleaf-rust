@@ -52,6 +52,7 @@
 //! A child process forked after the crate's runtime started has none of its
 //! threads. The child panics on its first use of the runtime.
 
+use crate::chan;
 use std::fmt::Display;
 use std::future::Future;
 use std::hash::Hash;
@@ -59,10 +60,9 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::process;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use tokio::runtime::{Builder, Handle, Runtime};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::task::{JoinMap, TaskTracker};
 
@@ -155,13 +155,17 @@ impl Supervisor {
 
     /// Spawns `future` as the task named `task`. Returns the task's handle,
     /// which resolves to `None` if the task panicked.
-    pub(crate) fn spawn<F>(&self, task: impl Display, future: F) -> JoinHandle<Option<F::Output>>
+    pub(crate) fn spawn<F>(
+        &self,
+        task: impl Display,
+        future: F,
+    ) -> chan::JoinHandle<Option<F::Output>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let supervised = Supervised::new(task, future);
-        self.tracker.spawn_on(supervised, &self.handle)
+        let supervised = self.tracker.track_future(Supervised::new(task, future));
+        chan::spawn_on(&self.handle, supervised)
     }
 
     /// Spawns a supervised task under its application key. Tracking and panic
@@ -193,7 +197,7 @@ impl Supervisor {
         task: &str,
         future: impl Future<Output = io::Result<T>> + Send + 'static,
     ) -> io::Result<T> {
-        let (answer, answered) = flume::bounded(1);
+        let (answer, answered) = chan::bounded(1);
         self.spawn(task, async move {
             let _ = answer.send(future.await);
         });
@@ -206,7 +210,7 @@ impl Supervisor {
     pub(crate) fn spawn_blocking<R>(
         &self,
         work: impl FnOnce() -> R + Send + 'static,
-    ) -> JoinHandle<R>
+    ) -> tokio::task::JoinHandle<R>
     where
         R: Send + 'static,
     {
@@ -221,16 +225,10 @@ impl Supervisor {
     }
 }
 
-/// Locks `mutex`, past a panic of another holder. It suits a lock that
-/// guards no change a panic could leave half made.
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Waits until `deadline`, or forever if there is none.
 pub(crate) async fn sleep_until_some(deadline: Option<Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        Some(deadline) => chan::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
 }
@@ -303,7 +301,7 @@ impl Activity {
     /// Returns a new hold on the activity `awake` refers to, and begins the
     /// activity if no hold on it is kept.
     fn hold_on(awake: &Mutex<Weak<Awake>>) -> Activity {
-        let mut awake = awake.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut awake = chan::lock(awake);
         let held = awake.upgrade().unwrap_or_else(|| {
             let held = Arc::new(Awake::begin());
             *awake = Arc::downgrade(&held);
@@ -493,7 +491,7 @@ mod tests {
     #[test]
     fn the_first_hold_begins_and_the_last_release_ends() {
         let awake = Mutex::new(Weak::new());
-        let active = || awake.lock().unwrap().strong_count();
+        let active = || crate::chan::lock(&awake).strong_count();
 
         let first = Activity::hold_on(&awake);
         let second = Activity::hold_on(&awake);

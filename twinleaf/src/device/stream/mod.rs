@@ -18,10 +18,10 @@ pub use subscription::{Receiver, RecvError};
 
 use super::session::{Handle, Inlet, Received};
 use super::store::{end_sinks, prune, pruned, Field, Store};
+use crate::chan::lock;
 use crate::data::{PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proxy::{encode, Joined, Update, Watch, UNWATCH, WATCH};
-use crate::rt::lock;
 use crate::tio;
 use crate::tio::packet::{self, LinkStatus, Packet, ProxyRx};
 use crate::tio::transport;
@@ -763,7 +763,7 @@ mod tests {
     fn the_stream_goes_on_after_an_inlet_overrun() {
         let (session, proxy) = Session::test_pair();
         let root = Handle::root(session);
-        let (inlet, packets) = flume::unbounded();
+        let (inlet, packets) = crate::chan::unbounded();
         let store = Arc::new(Mutex::new(Store::new(true)));
         let (taps, received) = mpsc::unbounded_channel();
         let pump = Pump::new(&root, packets, Arc::clone(&store), received);
@@ -868,8 +868,10 @@ mod tests {
         loop {
             match proxy.sent.recv_deadline(deadline) {
                 Ok(_) => {}
-                Err(flume::RecvTimeoutError::Disconnected) => break,
-                Err(flume::RecvTimeoutError::Timeout) => panic!("the session outlived the pump"),
+                Err(crate::chan::RecvTimeoutError::Disconnected) => break,
+                Err(crate::chan::RecvTimeoutError::Timeout) => {
+                    panic!("the session outlived the pump")
+                }
             }
         }
     }
@@ -1119,7 +1121,7 @@ mod tests {
 
     /// The next batch on `queue`, after the gaps ahead of it, and what those
     /// gaps counted.
-    fn next_batch(queue: &flume::Receiver<Queued<SampleBatch>>) -> (u64, SampleBatch) {
+    fn next_batch(queue: &crate::chan::Receiver<Queued<SampleBatch>>) -> (u64, SampleBatch) {
         let mut gaps = 0;
         loop {
             match queue.try_recv().expect("a queued batch") {

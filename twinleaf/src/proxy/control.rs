@@ -684,7 +684,7 @@ pub(crate) async fn call_at(
         }
         _ => error,
     })?;
-    let (sender, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+    let (sender, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
     let port =
         transport::Port::over_tcp(stream, sender, transport::DEFAULT_TX_CHANNEL_SIZE, tasks)?;
     let goal = format!("answer {method}");
@@ -706,7 +706,7 @@ pub(crate) async fn call_at(
 /// connection, or does not answer in time.
 pub(crate) async fn handshake(
     port: &transport::Port,
-    received: &flume::Receiver<ReceiveResult>,
+    received: &crate::chan::Receiver<ReceiveResult>,
     endpoint: &str,
     method: &str,
     args: &[u8],
@@ -863,7 +863,7 @@ mod tests {
     /// Events skipped during the handshake do not restart its absolute deadline.
     #[tokio::test(start_paused = true)]
     async fn handshake_noise_does_not_extend_the_deadline() {
-        let (send, received) = flume::unbounded();
+        let (send, received) = crate::chan::unbounded();
         let (port, _peer) =
             transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
         let started = Instant::now();
@@ -898,7 +898,7 @@ mod tests {
     /// through the channel's ordinary stream adapter.
     #[tokio::test]
     async fn handshake_accepts_a_reply_after_rejected_frames() {
-        let (send, received) = flume::unbounded();
+        let (send, received) = crate::chan::unbounded();
         let (port, _peer) =
             transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
         send.send(Ok(TransportEvent::Text("boot".into()))).unwrap();
@@ -991,7 +991,7 @@ mod tests {
     /// though the call may wait longer.
     #[tokio::test(start_paused = true)]
     async fn a_hello_with_no_control_reply_is_a_proxy_from_an_older_build() {
-        let (send, received) = flume::unbounded();
+        let (send, received) = crate::chan::unbounded();
         let (port, _peer) =
             transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
         let started = Instant::now();

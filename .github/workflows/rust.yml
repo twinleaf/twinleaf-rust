@@ -35,6 +35,9 @@ jobs:
         run: cargo build --all --release --verbose
       - name: Test
         run: cargo test --workspace
+      - name: Lint
+        if: matrix.platform == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets
       - name: Strip binaries
         if: matrix.platform != 'windows-latest'
         run: |

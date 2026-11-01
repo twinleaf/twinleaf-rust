@@ -160,7 +160,7 @@ impl Task {
         }
         let receiving = !matches!(
             self.rx.try_send(result),
-            Err(flume::TrySendError::Disconnected(_))
+            Err(crate::chan::TrySendError::Disconnected(_))
         );
         receiving && !terminal
     }

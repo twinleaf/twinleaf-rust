@@ -27,6 +27,7 @@ use super::engine::{self, Mount, Mounts};
 use super::outbox::Outbox;
 use super::worker::{self, OpenPort, Opener, Readiness};
 use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
+use crate::chan::{oneshot, JoinHandle};
 use crate::device::store::Store;
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
@@ -39,8 +40,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
 
@@ -993,7 +993,7 @@ mod tests {
         let (links, _owner, mut devices) = registry(vec![(DEVICE, First::Blocks(gate.clone()))]);
         drop(acquire(&links, DEVICE).await);
 
-        let reopening = tokio::spawn({
+        let reopening = crate::chan::spawn({
             let links = links.clone();
             async move { acquire(&links, DEVICE).await }
         });
@@ -1041,7 +1041,7 @@ mod tests {
         drop(mounted);
         let ending = Instant::now();
 
-        let ended = tokio::spawn(owner.close());
+        let ended = crate::chan::spawn(owner.close());
         tokio::time::sleep(Duration::from_millis(500)).await;
         let mut written = 0;
         while let Some(_pkt) = timeout(PAUSED_WAIT, device.end.recv()).await.unwrap() {

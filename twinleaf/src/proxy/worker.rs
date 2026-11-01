@@ -113,7 +113,7 @@ pub(super) struct Started {
 /// What opens a device's port. It takes the sender the port delivers to,
 /// and returns a future of the open port.
 pub(super) struct Opener {
-    opens: Box<dyn Fn(flume::Sender<ReceiveResult>) -> Opening + Send + Sync>,
+    opens: Box<dyn Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync>,
     /// Whether the worker may drop an open in flight when it stops.
     droppable: bool,
 }
@@ -125,7 +125,7 @@ impl Opener {
     /// Returns an opener that opens with `open`. The worker lets an open in
     /// flight run to its end before it stops.
     pub(super) fn new(
-        open: impl Fn(flume::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
     ) -> Opener {
         Opener {
             opens: Box::new(open),
@@ -136,7 +136,7 @@ impl Opener {
     /// Returns an opener that opens with `open`, whose open in flight the
     /// worker drops when it stops. Dropping the open must leave nothing open.
     pub(super) fn droppable(
-        open: impl Fn(flume::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
     ) -> Opener {
         Opener {
             opens: Box::new(open),
@@ -145,7 +145,7 @@ impl Opener {
     }
 
     /// Returns a future that opens a port delivering to `results`.
-    pub(super) fn open(&self, results: flume::Sender<ReceiveResult>) -> Opening {
+    pub(super) fn open(&self, results: crate::chan::Sender<ReceiveResult>) -> Opening {
         (self.opens)(results)
     }
 }
@@ -186,10 +186,10 @@ enum Peer {
 /// answers, or a proxy at the other end refuses the hello or the open.
 async fn open_tcp(
     url: &str,
-    results: flume::Sender<ReceiveResult>,
+    results: crate::chan::Sender<ReceiveResult>,
     tasks: &Supervisor,
 ) -> io::Result<HardwarePort> {
-    let (deliver, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+    let (deliver, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
     let port = HardwarePort::open(url, deliver, tasks).await?;
     let peer = greet(&port, &received, url).await?;
     let proxied = matches!(peer, Peer::Proxy);
@@ -219,7 +219,7 @@ async fn open_tcp(
 /// what is at `url`. Opens the `auto` of a proxy that answers.
 async fn greet(
     port: &HardwarePort,
-    received: &flume::Receiver<ReceiveResult>,
+    received: &crate::chan::Receiver<ReceiveResult>,
     url: &str,
 ) -> io::Result<Peer> {
     let (name, hello) =
@@ -426,7 +426,7 @@ enum RateChange {
 struct Device {
     port: HardwarePort,
     /// What the port receives.
-    results: flume::r#async::RecvStream<'static, ReceiveResult>,
+    results: crate::chan::RecvStream<'static, ReceiveResult>,
     rate_change_state: RateChange,
     last_rx: Instant,
     seen_since_connect: bool,
@@ -437,7 +437,7 @@ struct Device {
 impl Device {
     /// Creates a device reached through `port`, whose results arrive on
     /// `results`.
-    fn new(port: HardwarePort, results: flume::Receiver<ReceiveResult>) -> Device {
+    fn new(port: HardwarePort, results: crate::chan::Receiver<ReceiveResult>) -> Device {
         // Kickstart rate autonegotiation only if the port supports
         // changing rates and the target rate differs from the default.
         let mut rate_change_state = RateChange::DoNothing;
@@ -712,7 +712,7 @@ impl Worker {
 
     /// Returns a future that opens the device's port.
     fn open_device(&self) -> BoxFuture<'static, io::Result<Device>> {
-        let (sender, results) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+        let (sender, results) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
         let opening = self.open.open(sender);
         Box::pin(async move { Ok(Device::new(opening.await?, results)) })
     }
@@ -1505,6 +1505,7 @@ fn usb_identity(_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chan::{JoinHandle, Notify};
     use crate::proxy::fixtures::{assert_took, UNREACHABLE, WAIT};
     use crate::proxy::outbox::Outbox;
     use crate::rt;
@@ -1512,8 +1513,6 @@ mod tests {
     use std::future::{self, Future};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc::error::TryRecvError;
-    use tokio::sync::Notify;
-    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     /// An opener that never opens anything.
@@ -1637,8 +1636,8 @@ mod tests {
 
     /// Waits for a worker's `task` to end, and checks that it did not panic.
     fn join(task: JoinHandle<Option<()>>) {
-        let (ended, outcome) = flume::bounded(1);
-        rt::handle().spawn(async move {
+        let (ended, outcome) = crate::chan::bounded(1);
+        crate::chan::spawn_on(rt::handle(), async move {
             let _ = ended.send(task.await);
         });
         let outcome = outcome
@@ -1851,7 +1850,7 @@ mod tests {
     /// Returns an opener whose attempt number `n`, counted from 0, runs
     /// `attempt(n, results)`.
     fn scripted<F>(
-        attempt: impl Fn(usize, flume::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+        attempt: impl Fn(usize, crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
     ) -> Opener
     where
         F: Future<Output = io::Result<HardwarePort>> + Send + 'static,
@@ -1867,7 +1866,7 @@ mod tests {
     /// end to the test through `ends`.
     fn fake(
         kind: TransportKind,
-        results: flume::Sender<ReceiveResult>,
+        results: crate::chan::Sender<ReceiveResult>,
         ends: &mpsc::UnboundedSender<FakeEnd>,
     ) -> io::Result<HardwarePort> {
         let (port, end) = HardwarePort::fake(kind, None, results);
@@ -2335,15 +2334,15 @@ mod tests {
     fn droppable_hang(
         first_opens: bool,
         ends: mpsc::UnboundedSender<FakeEnd>,
-    ) -> (Opener, tokio::sync::oneshot::Receiver<()>) {
-        let (held, dropped) = tokio::sync::oneshot::channel();
+    ) -> (Opener, crate::chan::oneshot::Receiver<()>) {
+        let (held, dropped) = crate::chan::oneshot::channel();
         let held = std::sync::Mutex::new(Some(held));
         let attempts = AtomicUsize::new(0);
         let open = Opener::droppable(move |results| -> Opening {
             if first_opens && attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                 return Box::pin(future::ready(fake(TransportKind::Tcp, results, &ends)));
             }
-            let held = held.lock().unwrap().take();
+            let held = crate::chan::lock(&held).take();
             Box::pin(async move {
                 let _held = held;
                 future::pending().await
@@ -2398,7 +2397,7 @@ mod tests {
         assert!(
             dropped
                 .try_recv()
-                .is_err_and(|error| error == tokio::sync::oneshot::error::TryRecvError::Empty),
+                .is_err_and(|error| error == crate::chan::oneshot::error::TryRecvError::Empty),
             "no reopen is in flight"
         );
 
@@ -2414,7 +2413,7 @@ mod tests {
         assert!(
             dropped
                 .try_recv()
-                .is_err_and(|error| error == tokio::sync::oneshot::error::TryRecvError::Closed),
+                .is_err_and(|error| error == crate::chan::oneshot::error::TryRecvError::Closed),
             "the reopen in flight was kept"
         );
     }
@@ -2450,7 +2449,7 @@ mod tests {
         // The device starts a session, and offers its default rate when it
         // is asked for the target.
         let mut device = opened(&mut opened_ends).await;
-        tokio::spawn(async move {
+        crate::chan::spawn(async move {
             device
                 .send(&Packet::heartbeat_session(1, DeviceRoute::root()))
                 .await;

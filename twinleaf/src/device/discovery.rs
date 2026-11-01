@@ -12,6 +12,7 @@ use super::rpc::RpcReply;
 use super::runtime::ProxyAddress;
 use super::session::Session;
 use super::stream::RecvError;
+use crate::chan::oneshot;
 use crate::proto::DeviceRoute;
 use crate::proxy::Purpose;
 use crate::rt::{BoxFuture, Supervisor};
@@ -23,7 +24,7 @@ use std::io;
 use std::panic;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::{StreamExt, StreamMap};
@@ -107,7 +108,7 @@ pub enum DiscoveryEvent {
 /// been dropped before it goes on.
 #[derive(Debug)]
 pub struct Discovery {
-    events: flume::Receiver<DiscoveryEvent>,
+    events: crate::chan::Receiver<DiscoveryEvent>,
     /// Ends the session's scan and browse once dropped.
     lifelines: Vec<oneshot::Sender<Infallible>>,
     tasks: Supervisor,
@@ -192,7 +193,7 @@ impl Discovery {
         backend: Backend,
         tasks: &Supervisor,
     ) -> Discovery {
-        let (tx, events) = flume::unbounded();
+        let (tx, events) = crate::chan::unbounded();
 
         for device in &serial {
             let _ = tx.send(DiscoveryEvent::Added(device.clone()));
@@ -228,7 +229,7 @@ impl Discovery {
 
     /// Returns the channel of discovery events. Drain it with `try_recv`, or
     /// wait on it with `recv` or `recv_async`.
-    pub fn events(&self) -> &flume::Receiver<DiscoveryEvent> {
+    pub fn events(&self) -> &crate::chan::Receiver<DiscoveryEvent> {
         &self.events
     }
 }
@@ -386,7 +387,7 @@ async fn scan_serial(
     known: Vec<DiscoveredDevice>,
     backend: Backend,
     mut probes: Probes,
-    tx: flume::Sender<DiscoveryEvent>,
+    tx: crate::chan::Sender<DiscoveryEvent>,
     mut alive: oneshot::Receiver<Infallible>,
 ) {
     let tasks = probes.tasks.clone();
@@ -634,7 +635,7 @@ async fn heard_routes(
     loop {
         let received = tokio::select! {
             received = packets.recv_async() => received,
-            () = tokio::time::sleep_until(deadline) => return Ok(heard),
+            () = crate::chan::sleep_until(deadline) => return Ok(heard),
         };
         match received {
             Ok(packet) if packet.link_status().is_none() => {
@@ -703,7 +704,7 @@ impl Instance {
 /// Reports that network browsing could not start, as an event and in the
 /// log.
 #[cfg(feature = "mdns")]
-fn network_unavailable(tx: &flume::Sender<DiscoveryEvent>, reason: String) {
+fn network_unavailable(tx: &crate::chan::Sender<DiscoveryEvent>, reason: String) {
     log::warn!("network discovery unavailable: {reason}");
     let _ = tx.send(DiscoveryEvent::NetworkUnavailable { reason });
 }
@@ -718,7 +719,7 @@ fn sync_instance(
     instances: &mut HashMap<String, Instance>,
     label: &str,
     preferred: &str,
-    tx: &flume::Sender<DiscoveryEvent>,
+    tx: &crate::chan::Sender<DiscoveryEvent>,
     probes: &mut Probes,
 ) -> Result<(), ()> {
     let Some(instance) = instances.get_mut(label) else {
@@ -752,7 +753,7 @@ fn sync_instance(
 /// instances as they resolve, move, or leave, and probes each with `probes`.
 #[cfg(feature = "mdns")]
 async fn browse_network(
-    tx: flume::Sender<DiscoveryEvent>,
+    tx: crate::chan::Sender<DiscoveryEvent>,
     mut probes: Probes,
     prefer_udp: bool,
     mut alive: oneshot::Receiver<Infallible>,
@@ -889,6 +890,7 @@ fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chan::lock;
     use crate::device::fixtures::{self, FakeDevice, ENVIRONMENT, WAIT};
     use crate::device::session::TestProxy;
     use crate::proto::rpc::Method;
@@ -898,15 +900,9 @@ mod tests {
     use crate::tio::packet::Payload;
     use crate::tio::Packet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Instant;
-
-    /// Locks `mutex`, even if a thread panicked while holding it. It suits locks
-    /// that guard no change a panic could leave half made.
-    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 
     /// A URL no test device listens at, which only a test's own opener
     /// handles.
@@ -1022,7 +1018,7 @@ mod tests {
         let proxy = fixtures::proxy();
         let ports = Arc::new(Mutex::new(vec![twinleaf(SLOW), twinleaf(&device.url)]));
         let mut backend = backend(&proxy, &ports);
-        let (release, held) = flume::bounded::<()>(0);
+        let (release, held) = crate::chan::bounded::<()>(0);
         let slow_done = Arc::new(AtomicBool::new(false));
         let through = backend.open.clone();
         let done = slow_done.clone();
@@ -1224,7 +1220,7 @@ mod tests {
     /// it, whatever proxy `TWINLEAF_PROXY` names.
     #[test]
     fn a_name_at_a_local_tcp_url_is_read_through_that_proxy() {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = lock(&ENVIRONMENT);
         let device = FakeDevice::start();
         let named = fixtures::proxy_serving(&device.url);
         let closed = fixtures::ClosedPort::new();
@@ -1259,7 +1255,7 @@ mod tests {
     /// and no proxy is started in its place.
     #[test]
     fn no_name_is_read_where_the_named_proxy_does_not_answer() {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TWINLEAF_TIO", dir.path().join("no-such-tio"));
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
@@ -1330,8 +1326,8 @@ mod tests {
     /// An opener whose every open succeeds over a session whose socket is a
     /// pair of channels, with its task on `sessions`. Returns the far end of
     /// each session it opens, which keeps the session open.
-    fn test_pairs(sessions: Supervisor) -> (Opener, flume::Receiver<TestProxy>) {
-        let (opened, proxies) = flume::unbounded();
+    fn test_pairs(sessions: Supervisor) -> (Opener, crate::chan::Receiver<TestProxy>) {
+        let (opened, proxies) = crate::chan::unbounded();
         let open: Opener = Arc::new(move |_, _| {
             let (session, proxy) = Session::test_pair_on(&sessions);
             let _ = opened.send(proxy);
@@ -1373,7 +1369,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failing_probe_backs_off_up_to_the_longest_delay() {
         let ports = Arc::new(Mutex::new(vec![twinleaf(FIRST)]));
-        let (tried, tries) = flume::unbounded();
+        let (tried, tries) = crate::chan::unbounded();
         let open: Opener = Arc::new(move |_, patience| {
             let _ = tried.send((tokio::time::Instant::now(), patience));
             Box::pin(async { Err(io::Error::other("the device is not up yet")) })
@@ -1410,7 +1406,7 @@ mod tests {
     async fn each_check_listens_for_the_route_window_then_waits_a_period() {
         let sessions = Supervisor::current();
         let ports = Arc::new(Mutex::new(vec![twinleaf(FIRST)]));
-        let (opened, proxies) = flume::unbounded();
+        let (opened, proxies) = crate::chan::unbounded();
         let open: Opener = Arc::new(move |_, _| {
             let (session, proxy) = Session::test_pair_on(&sessions);
             let _ = opened.send(proxy);
@@ -1451,16 +1447,16 @@ mod tests {
     /// Runs `test` on a thread of its own and returns what it returns.
     /// Panics if `test` panics, or does not return within twice [`WAIT`].
     fn on_a_thread<T: Send + 'static>(test: impl FnOnce() -> T + Send + 'static) -> T {
-        let (done, returned) = flume::bounded(1);
+        let (done, returned) = crate::chan::bounded(1);
         let caller = thread::spawn(move || {
             let _ = done.send(test());
         });
         match returned.recv_timeout(WAIT * 2) {
             Ok(value) => value,
-            Err(flume::RecvTimeoutError::Timeout) => {
+            Err(crate::chan::RecvTimeoutError::Timeout) => {
                 panic!("the test did not return within {:?}", WAIT * 2)
             }
-            Err(flume::RecvTimeoutError::Disconnected) => match caller.join() {
+            Err(crate::chan::RecvTimeoutError::Disconnected) => match caller.join() {
                 Err(panic) => std::panic::resume_unwind(panic),
                 Ok(()) => unreachable!("the test returned without an answer"),
             },
@@ -1488,7 +1484,7 @@ mod tests {
                 let proxy = crate::proxy::host(options()).await.unwrap();
                 let ports = Arc::new(Mutex::new(vec![twinleaf(&url)]));
                 let mut backend = backend(&proxy, &ports);
-                let (listed, listings) = flume::unbounded();
+                let (listed, listings) = crate::chan::unbounded();
                 let list = backend.list.clone();
                 backend.list = Arc::new(move || {
                     let thread = thread::current();
@@ -1566,7 +1562,7 @@ mod tests {
                 let next = tokio::time::timeout(WAIT, proxies.recv_async()).await;
                 let _far_end = next.expect("the probe opens").unwrap();
 
-                let dropping = tokio::spawn(async move {
+                let dropping = crate::chan::spawn(async move {
                     let started = Instant::now();
                     drop(discovery);
                     started.elapsed()

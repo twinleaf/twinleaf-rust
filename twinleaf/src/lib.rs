@@ -9,7 +9,9 @@
 )]
 #![warn(rustdoc::all)]
 #![deny(clippy::await_holding_lock)]
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod chan;
 pub mod data;
 pub mod device;
 pub mod firmware;

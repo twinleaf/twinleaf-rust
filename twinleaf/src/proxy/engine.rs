@@ -44,6 +44,8 @@ use super::metadata::{Completed, MetadataSchedule};
 use super::outbox::Outbox;
 use super::settings::{CacheAction, DeviceEvent, SettingsCache};
 use super::Watch;
+use crate::chan::lock;
+use crate::chan::AbortOnDropHandle;
 use crate::data::{MetadataQuery, PacketParser};
 use crate::device::rpc::{PendingReply, RpcRegistry};
 use crate::device::session::{Handle, Inlet, RawCallResult, Received, Session};
@@ -51,14 +53,13 @@ use crate::device::store::{pruned, rpc_hash, Store, METADATA, PRESENCE};
 use crate::device::stream::Queued;
 use crate::device::{MetadataState, Presence, Settings};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::rt::{lock, sleep_until_some, Supervisor};
+use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
-use tokio_util::task::AbortOnDropHandle;
 
 /// How long a device may be silent before the engine loses it. The link
 /// loses the device at its root sooner, as it goes quiet.
@@ -325,7 +326,7 @@ struct Engine {
 /// hold drops.
 struct WorkerHold {
     /// The device's events, which the worker takes.
-    events: flume::Sender<DeviceEvent>,
+    events: crate::chan::Sender<DeviceEvent>,
     /// Since when no receiver has followed the device's table.
     unwatched: Option<Instant>,
     /// The worker's task, aborted once the hold drops.
@@ -693,7 +694,7 @@ fn start_worker(
     route: DeviceRoute,
     store: &Arc<Mutex<Store>>,
 ) -> WorkerHold {
-    let (events, received) = flume::unbounded();
+    let (events, received) = crate::chan::unbounded();
     let worker = Worker {
         handle,
         route,
@@ -714,7 +715,7 @@ fn start_worker(
 struct Worker {
     handle: Handle,
     route: DeviceRoute,
-    events: flume::Receiver<DeviceEvent>,
+    events: crate::chan::Receiver<DeviceEvent>,
     store: Arc<Mutex<Store>>,
 }
 
@@ -816,7 +817,7 @@ impl Worker {
             match timeout_at(deadline, self.events.recv_async()).await {
                 Ok(Ok(DeviceEvent::NewHash(_))) => return true,
                 Ok(Ok(_)) => {}
-                Ok(Err(flume::RecvError::Disconnected)) => return false,
+                Ok(Err(crate::chan::RecvError::Disconnected)) => return false,
                 Err(_elapsed) => return self.events.recv_async().await.is_ok(),
             }
         }
@@ -2284,7 +2285,7 @@ mod tests {
             } else {
                 engine.apply_status(device, LinkStatus::FailedToReconnect);
             }
-            tokio::time::sleep_until(retry + Duration::from_millis(1)).await;
+            crate::chan::sleep_until(retry + Duration::from_millis(1)).await;
             let wake = engine.next_wake();
             assert!(
                 wake.is_none_or(|wake| wake > Instant::now()),

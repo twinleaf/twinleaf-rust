@@ -815,7 +815,7 @@ mod tests {
 
     fn hdf_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().expect("lock HDF5 tests")
+        crate::chan::lock(&LOCK)
     }
 
     #[test]

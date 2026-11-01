@@ -20,12 +20,14 @@ use super::outbox::Taken;
 use super::server::{self, Notice, Shared};
 use super::worker;
 use super::Layout;
+use crate::chan::lock;
+use crate::chan::oneshot::{self, error::TryRecvError};
 use crate::device::store::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
 use crate::device::stream::Scope;
 use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
-use crate::rt::{finish, lock, BoxFuture};
+use crate::rt::{finish, BoxFuture};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::future;
@@ -36,7 +38,6 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot::{self, error::TryRecvError};
 use tokio::time::{timeout_at, Instant};
 use tokio_stream::{StreamMap, StreamNotifyClose};
 
@@ -115,7 +116,7 @@ pub(super) struct Session {
     addr: String,
     client: transport::Port,
     /// The packets the client sends.
-    incoming: flume::r#async::RecvStream<'static, ReceiveResult>,
+    incoming: crate::chan::RecvStream<'static, ReceiveResult>,
     /// Closes once the server drops its lifeline, as the proxy stops.
     alive: oneshot::Receiver<Infallible>,
     /// Packets the client sent that wait their turn while an open waits.
@@ -141,7 +142,7 @@ impl Session {
         id: u64,
         peer: SocketAddr,
         client: transport::Port,
-        incoming: flume::Receiver<ReceiveResult>,
+        incoming: crate::chan::Receiver<ReceiveResult>,
         alive: oneshot::Receiver<Infallible>,
     ) -> Session {
         Session {
@@ -880,8 +881,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
+    use crate::chan::JoinHandle;
     use futures_util::FutureExt;
-    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     /// The device a test opens.
@@ -945,7 +946,7 @@ mod tests {
             default: watch::channel(default).0,
             holder: std::sync::Mutex::new(None),
         });
-        let (deliver, incoming) = flume::bounded(DEFAULT_RX_CHANNEL_SIZE);
+        let (deliver, incoming) = crate::chan::bounded(DEFAULT_RX_CHANNEL_SIZE);
         let (port, end) =
             transport::Port::fake_queue(TransportKind::Tcp, None, deliver, SOCKET_QUEUE);
         let peer = "127.0.0.1:50000".parse().unwrap();
@@ -1329,7 +1330,7 @@ mod tests {
     fn app_over(mut end: FakeEnd) -> (AppSession, Inlet) {
         let (app, proxy) = AppSession::test_pair_reopening(&Supervisor::current());
         let inlet = app.attach(usize::MAX);
-        tokio::spawn(async move {
+        crate::chan::spawn(async move {
             loop {
                 tokio::select! {
                     from_proxy = end.recv() => match from_proxy {

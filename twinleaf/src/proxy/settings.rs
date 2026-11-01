@@ -346,7 +346,7 @@ mod tests {
         ]
         .into_iter();
         let taken = poll_once(std::pin::pin!(cache.snapshot_with(|_, _| {
-            let (resolve, reply) = flume::bounded(1);
+            let (resolve, reply) = crate::chan::bounded(1);
             resolve.send(replies.next().expect("four reads")).unwrap();
             PendingReply { reply }
         })));

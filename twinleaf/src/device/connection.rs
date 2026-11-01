@@ -1595,9 +1595,7 @@ mod tests {
     /// proxy on a port of its own, which opens what the connection asks for.
     #[test]
     fn twinleaf_proxy_names_the_proxy_a_connection_goes_through() {
-        let _environment = fixtures::ENVIRONMENT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _environment = crate::chan::lock(&fixtures::ENVIRONMENT);
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
         let dir = tempfile::tempdir().unwrap();
@@ -1617,9 +1615,7 @@ mod tests {
     /// embeds one in its place.
     #[test]
     fn a_connection_through_a_proxy_that_does_not_answer_starts_none() {
-        let _environment = fixtures::ENVIRONMENT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _environment = crate::chan::lock(&fixtures::ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         no_tio_in(dir.path());
         let closed = fixtures::ClosedPort::new();

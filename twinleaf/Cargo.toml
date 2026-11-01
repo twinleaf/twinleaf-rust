@@ -17,7 +17,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 targets = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)", "cfg(shuttle)"] }
 
 [features]
 default = ["serial", "firmware-update"]
@@ -65,6 +65,12 @@ proptest = "1"
 proptest-state-machine = "0.9"
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
+
+# Built with `--cfg shuttle`, the crate's tests run its channels, locks and
+# tasks on shuttle's scheduler, as `src/chan.rs` says.
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9.9"
+shuttle-tokio = { version = "1.0.0", features = ["shuttle", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
