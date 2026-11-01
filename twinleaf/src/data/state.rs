@@ -326,7 +326,37 @@ impl StreamTracker {
                 segment_count: n_segments,
             });
         }
-        if self.current_segment_id != data.segment_id {
+        // The current segment is the one the last broadcast record or rows
+        // named, so a segment other than the last rows' is announced when
+        // the device broadcast its record since them.
+        let announced = self.current_segment_id == data.segment_id;
+        // A stream moving onto a segment in one device session finds a stale
+        // ring entry when the record is left from an earlier lap of the ring.
+        // In the stream's clock, that record's timestamps run backward. A
+        // record of another clock is not comparable, and describes the
+        // segment only when announced, as the device sends a segment's record
+        // before its first sample. A new session clears the ring, so every
+        // record after a reboot is the new session's.
+        if data.segment_id != self.last_segment_id
+            && self.established
+            && device.session() == self.last_session_id
+        {
+            let stale = self.segment(data.segment_id).is_some_and(|record| {
+                let seg = record.get();
+                if seg.timeref_session() != self.last_time_ref_session_id {
+                    return !announced;
+                }
+                seg.decimation() != 0 && seg.sampling_rate() != 0 && {
+                    let half_period =
+                        0.5 * f64::from(seg.decimation()) / f64::from(seg.sampling_rate());
+                    sample_time(seg, data.first.value()) < self.last_timestamp - half_period
+                }
+            });
+            if stale {
+                self.segments[usize::from(data.segment_id.value())] = None;
+            }
+        }
+        if !announced {
             self.current_segment_id = data.segment_id;
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
@@ -399,29 +429,6 @@ impl StreamTracker {
         let next_sample = self.last_sample_number.value() + 1;
         let next_segment =
             SegmentId::new(self.last_segment_id.value().wrapping_add(1) % n_segments);
-
-        // Infer stale ring entries from backward timestamps within the same
-        // device and clock sessions. Comparing across sessions would repeatedly
-        // evict valid metadata after a reboot.
-        if data.segment_id != self.last_segment_id
-            && self.established
-            && device.session() == self.last_session_id
-        {
-            let stale = self.segment(data.segment_id).is_some_and(|record| {
-                let seg = record.get();
-                seg.timeref_session() == self.last_time_ref_session_id
-                    && seg.decimation() != 0
-                    && seg.sampling_rate() != 0
-                    && {
-                        let half_period =
-                            0.5 * f64::from(seg.decimation()) / f64::from(seg.sampling_rate());
-                        sample_time(seg, data.first.value()) < self.last_timestamp - half_period
-                    }
-            });
-            if stale {
-                self.segments[usize::from(data.segment_id.value())] = None;
-            }
-        }
 
         let (segment_record, is_segment_rollover) = match (
             self.segment(data.segment_id).cloned(),

@@ -3,11 +3,14 @@
 //! Each case simulates one device stream, which takes samples, rolls into
 //! its next segment with or without sending the segment's record first,
 //! changes its rate or decimation, takes a new time reference, reboots and
-//! drops samples. Its packets go through the parser, and the batches through
-//! a [`Lane`] as the pump sends them, to a reader whose reads interleave with
-//! the device's steps. A lane with little room drops batches, as for a slow
-//! app. Every sample carries its position in the device's sequence, so the
-//! harness knows what the reader missed and when each sample was taken.
+//! drops samples. After the first lap of its ring, a rollover without the
+//! record lands on a slot whose record the parser holds from the lap
+//! before, and that record can be of an older time reference. Its packets
+//! go through the parser, and the batches through a [`Lane`] as the pump
+//! sends them, to a reader whose reads interleave with the device's steps.
+//! A lane with little room drops batches, as for a slow app. Every sample
+//! carries its position in the device's sequence, so the harness knows what
+//! the reader missed and when each sample was taken.
 //!
 //! The first batch says [`BoundaryReason::Initial`], and a first batch after
 //! a gap says only the gap, as the reader missed the start of the stream.
@@ -37,10 +40,10 @@
 //! Two properties hold. A reader that keeps up learns every change, when no
 //! sample is lost next to a new segment, and a reader that lags learns every
 //! loss of a device that changes nothing. They catch faults in the parser's
-//! rollovers, forced or not, its boundaries and their payloads, its clock,
-//! and the lane's gaps.
+//! rollovers, forced or not, the ring records it keeps or evicts, its
+//! boundaries and their payloads, its clock, and the lane's gaps.
 //!
-//! Four properties fail, and are ignored until the parser and the lane
+//! Three properties fail, and are ignored until the parser and the lane
 //! change.
 //!
 //! - Problem A. A lane that drops batches drops the boundaries they carry,
@@ -51,13 +54,6 @@
 //!   [`BoundaryReason`] cannot say both that the segment rolled over and
 //!   that samples were lost, so a loss across a rollover comes as a
 //!   [`BoundaryReason::SegmentChanged`].
-//! - Problem C. Before a forced rollover the parser evicts a stale record
-//!   from the ring only when its time reference is the current one. A
-//!   forced rollover onto a slot whose record is from an older time
-//!   reference decodes with that record, so it reports a
-//!   [`BoundaryReason::TimeRefSessionChanged`] back to the older reference
-//!   and stamps the samples from the record's start. The other properties
-//!   leave out exactly that rollover.
 //! - Problem D. A device switches segments at the next whole second of its
 //!   undecimated clock, and drops the group of inputs that switch leaves
 //!   incomplete, so a decimated stream's last sample can end short of the
@@ -122,9 +118,6 @@ trait Case: 'static {
     /// Whether the device changes its rate and time reference, and reboots.
     const RECONFIGURES: bool;
     const DROPS: Drops;
-    /// Whether the device rolls over without the record onto a slot whose
-    /// record is from an older time reference.
-    const STALE_RING: bool = false;
     /// Whether the device switches segments at the next whole second of its
     /// undecimated clock and drops the incomplete group of inputs, rather
     /// than only where a whole group ends on a whole second.
@@ -172,18 +165,6 @@ impl Case for LosesAtRollover {
     const ROLLS_OVER: bool = true;
     const RECONFIGURES: bool = false;
     const DROPS: Drops = Drops::Anywhere;
-}
-
-/// A reader that keeps up, and a device that also rolls over without the
-/// record onto a slot of an older time reference. Problem C.
-struct RollsOntoAStaleRecord;
-
-impl Case for RollsOntoAStaleRecord {
-    const ROOM: RangeInclusive<usize> = ROOMY..=ROOMY;
-    const ROLLS_OVER: bool = true;
-    const RECONFIGURES: bool = true;
-    const DROPS: Drops = Drops::ApartFromSegments;
-    const STALE_RING: bool = true;
 }
 
 /// A reader that keeps up, and a device that also switches segments inside
@@ -327,9 +308,6 @@ struct Device {
     segmented_last: bool,
     /// Whether the current segment's record waits for its first packet.
     record_due: bool,
-    /// The time reference of the record last sent for each slot of the ring
-    /// in this session.
-    ring: [Option<u32>; SEGMENTS as usize],
     /// Each change, at the position of the first sample after it.
     changes: Vec<(u64, Change)>,
     /// Where the device was at each position, sent or dropped.
@@ -355,7 +333,6 @@ impl Device {
             dropped_last: false,
             segmented_last: false,
             record_due: false,
-            ring: [None; SEGMENTS as usize],
             changes: Vec::new(),
             history: Vec::new(),
             sent: Vec::new(),
@@ -371,7 +348,6 @@ impl Device {
 
     /// Sends every record of the device.
     fn describe(&mut self) {
-        self.ring = [None; SEGMENTS as usize];
         self.sent.extend([
             Sent::Device {
                 session: self.session,
@@ -384,7 +360,6 @@ impl Device {
 
     /// Sends the current segment's record.
     fn send_record(&mut self) {
-        self.ring[usize::from(self.segment)] = Some(self.timeref);
         self.record_due = false;
         self.sent.push(Sent::Segment {
             id: self.segment,
@@ -481,8 +456,6 @@ impl Device {
         let after_a_drop =
             C::DROPS == Drops::ApartFromSegments && self.dropped_last && self.on_a_second();
         let segment = self.since_change > 0 && !after_a_drop;
-        let next = usize::from((self.segment + 1) % SEGMENTS);
-        let stale = self.ring[next].is_some_and(|timeref| timeref != self.timeref);
         match step {
             Step::Samples { .. } | Step::Read { .. } => true,
             Step::Drop { .. } => match C::DROPS {
@@ -490,9 +463,7 @@ impl Device {
                 Drops::ApartFromSegments => !(self.segmented_last && self.sent_since_change == 0),
                 Drops::Anywhere => true,
             },
-            Step::Rollover { forced } => {
-                C::ROLLS_OVER && segment && (!forced || !stale || C::STALE_RING)
-            }
+            Step::Rollover { .. } => C::ROLLS_OVER && segment,
             Step::Rate { rate, decimation } => {
                 let old = f64::from(self.rate) / f64::from(self.decimation);
                 let new = f64::from(RATES[*rate]) / f64::from(*decimation);
@@ -857,12 +828,6 @@ prop_state_machine! {
     #[test]
     #[ignore = "fails until the boundary fix; see Problem B in data/boundaries.rs, after which only `reported` changes"]
     fn a_loss_across_a_rollover_is_a_loss_and_a_rollover(sequential 1..40 => Boundaries<LosesAtRollover>);
-
-    /// A forced rollover onto a slot of an older time reference reaches the
-    /// reader as a rollover, stamped from the new segment's start.
-    #[test]
-    #[ignore = "fails until the parser evicts stale ring records of older time references; see Problem C in data/boundaries.rs (state.rs evicts a record only under the current time reference)"]
-    fn a_forced_rollover_onto_an_older_time_reference_is_a_rollover(sequential 1..40 => Boundaries<RollsOntoAStaleRecord>);
 
     /// A segment switch that drops an incomplete group of inputs reaches the
     /// reader as a rollover, from the whole second the device switched at.
