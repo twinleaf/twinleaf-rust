@@ -178,6 +178,7 @@ fn socket_addr(address: &ScopedIp, port: u16) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::fixtures::binds_every_interface;
     use std::net::IpAddr;
 
     /// A resolution dropped while it waits stops its search and gives up the
@@ -185,6 +186,11 @@ mod tests {
     /// its own timeout.
     #[tokio::test]
     async fn a_resolution_dropped_while_it_waits_gives_up_its_turn() {
+        // The daemon and the one-shot query join the mDNS group on every
+        // interface.
+        if !binds_every_interface("a_resolution_dropped_while_it_waits_gives_up_its_turn") {
+            return;
+        }
         let host = "twinleaf-test-nobody-answers.local";
         let short = Duration::from_millis(100);
         let _ = tokio::time::timeout(short, resolve(host, 7855, &Supervisor::current())).await;

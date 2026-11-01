@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use twinleaf::DeviceRoute;
 
-use super::{nonneg_f64, parse_device_route};
+use super::{nonneg_f64, parse_device_route, ListenOn};
 
 #[derive(Parser, Debug)]
 pub struct SimulateCli {
@@ -39,6 +39,10 @@ pub struct SimulateCli {
     /// UDP port to listen on
     #[arg(long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Interfaces to listen on
+    #[arg(long = "listen", value_enum, default_value_t = ListenOn::All)]
+    pub(crate) listen: ListenOn,
 
     /// Disable random sample drops (the 'd' key still drops one manually)
     #[arg(long = "no-drop")]

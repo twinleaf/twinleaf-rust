@@ -1,6 +1,6 @@
 //! The arguments of `tio proxy` and its subcommands.
 
-use super::{parse_device_route, ListCli, TioOpts};
+use super::{parse_device_route, ListCli, ListenOn, TioOpts};
 use clap::{Parser, Subcommand, ValueHint};
 use twinleaf::DeviceRoute;
 
@@ -25,6 +25,10 @@ pub struct ProxyCli {
     /// TCP port to listen on for clients
     #[arg(short = 'p', long = "port", default_value = "7855")]
     pub(crate) port: u16,
+
+    /// Interfaces to listen on for clients
+    #[arg(long = "listen", value_enum, default_value_t = ListenOn::All)]
+    pub(crate) listen: ListenOn,
 
     /// Advertise this proxy over mDNS (off by default)
     #[arg(long = "mdns")]

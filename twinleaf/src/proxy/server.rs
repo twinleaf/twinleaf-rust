@@ -396,24 +396,34 @@ fn accept(
     })
 }
 
-/// Binds the listening sockets for `listen` on `port`. The IPv4 sockets come
-/// first, on `127.0.0.1` or every interface, and the first holds the proxy's
-/// port. On macOS and Windows, where a socket on every interface shares its
-/// port with one on `127.0.0.1`, a proxy on every interface holds
-/// `127.0.0.1` too, so that no other proxy binds it. Windows hands each
-/// connection to `127.0.0.1` to the socket bound there rather than to the
-/// one on every interface. An IPv6 only socket follows on the same
-/// port, on `::1` or every interface. A host without IPv6 gets the IPv4
-/// sockets alone. Returns an error if an IPv4 socket cannot be bound.
-fn bind(listen: Listen, port: u16) -> io::Result<Vec<std::net::TcpListener>> {
-    let (v4, v6): (&[Ipv4Addr], _) = match listen {
-        Listen::Loopback => (&[Ipv4Addr::LOCALHOST], Ipv6Addr::LOCALHOST),
-        Listen::AllInterfaces if cfg!(any(target_os = "macos", windows)) => (
+/// Whether a socket on every interface shares its port with one on
+/// `127.0.0.1` on this OS. It does on macOS and Windows.
+const LOOPBACK_SHARES_PORT: bool = cfg!(any(target_os = "macos", windows));
+
+/// Returns the addresses a proxy binds for `listen`, its IPv4 addresses in
+/// the order they are bound and then its IPv6 address. `loopback_shares_port`
+/// says whether a socket on every interface shares its port with one on
+/// `127.0.0.1`, as [`LOOPBACK_SHARES_PORT`] says of this OS. Where it does,
+/// a proxy on every interface holds `127.0.0.1` too, so that no other proxy
+/// binds it. Windows hands each connection to `127.0.0.1` to the socket bound
+/// there rather than to the one on every interface.
+fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr], Ipv6Addr) {
+    match (listen, loopback_shares_port) {
+        (Listen::Loopback, _) => (&[Ipv4Addr::LOCALHOST], Ipv6Addr::LOCALHOST),
+        (Listen::AllInterfaces, true) => (
             &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED],
             Ipv6Addr::UNSPECIFIED,
         ),
-        Listen::AllInterfaces => (&[Ipv4Addr::UNSPECIFIED], Ipv6Addr::UNSPECIFIED),
-    };
+        (Listen::AllInterfaces, false) => (&[Ipv4Addr::UNSPECIFIED], Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+/// Binds the listening sockets for `listen` on `port`, at the [`addresses`]
+/// of this OS. The first IPv4 socket holds the proxy's port. An IPv6 only
+/// socket follows on the same port. A host without IPv6 gets the IPv4
+/// sockets alone. Returns an error if an IPv4 socket cannot be bound.
+fn bind(listen: Listen, port: u16) -> io::Result<Vec<std::net::TcpListener>> {
+    let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
     let first = std::net::TcpListener::bind((v4[0], port))?;
     let port = first.local_addr()?.port();
     let rest = v4[1..]
@@ -444,49 +454,74 @@ fn bind_v6_only(address: SocketAddr) -> io::Result<std::net::TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::fixtures::{assert_took, options, PAUSED_WAIT};
+    use crate::proxy::fixtures::{assert_took, binds_every_interface, options, PAUSED_WAIT};
     use crate::proxy::DumpFlags;
     use crate::rt;
     use std::net::TcpListener;
     use std::thread;
     use tokio::time::timeout;
 
+    /// A proxy on loopback binds `127.0.0.1` and `::1` on every OS. One on
+    /// every interface binds `127.0.0.1` beside every interface where the
+    /// two share a port, and every interface alone elsewhere.
+    #[test]
+    fn each_mode_binds_its_addresses_on_each_os() {
+        for shares in [false, true] {
+            assert_eq!(
+                addresses(Listen::Loopback, shares),
+                (&[Ipv4Addr::LOCALHOST][..], Ipv6Addr::LOCALHOST)
+            );
+        }
+        assert_eq!(
+            addresses(Listen::AllInterfaces, true),
+            (
+                &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED][..],
+                Ipv6Addr::UNSPECIFIED
+            )
+        );
+        assert_eq!(
+            addresses(Listen::AllInterfaces, false),
+            (&[Ipv4Addr::UNSPECIFIED][..], Ipv6Addr::UNSPECIFIED)
+        );
+    }
+
     /// IPv4 is held on sockets of their own, the first as the lock and the
     /// endpoint, and IPv6 on another that takes no IPv4, in either mode.
     #[test]
     fn ipv4_and_ipv6_are_bound_apart() {
-        let everywhere: &[Ipv4Addr] = if cfg!(any(target_os = "macos", windows)) {
-            &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED]
-        } else {
-            &[Ipv4Addr::UNSPECIFIED]
-        };
-        for (listen, v4, v6) in [
-            (
-                Listen::Loopback,
-                &[Ipv4Addr::LOCALHOST][..],
-                Ipv6Addr::LOCALHOST,
-            ),
-            (Listen::AllInterfaces, everywhere, Ipv6Addr::UNSPECIFIED),
-        ] {
-            let listeners = bind(listen, 0).unwrap();
-            let port = listeners[0].local_addr().unwrap().port();
-            let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-            let expected = v4.iter().map(|v4| SocketAddr::from((*v4, port)));
-            assert_eq!(bound[..v4.len()], expected.collect::<Vec<_>>()[..]);
-            if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
-                eprintln!("skipped IPv6: this host cannot bind ::1");
-                continue;
-            }
-            assert_eq!(listeners.len(), v4.len() + 1, "{listen:?}");
-            assert_eq!(bound[v4.len()], (v6, port).into());
-            assert!(SockRef::from(&listeners[v4.len()]).only_v6().unwrap());
+        assert_bound_apart(Listen::Loopback);
+        if binds_every_interface("ipv4_and_ipv6_are_bound_apart with Listen::AllInterfaces") {
+            assert_bound_apart(Listen::AllInterfaces);
         }
+    }
+
+    /// Asserts that `bind` holds the [`addresses`] of `listen`, IPv4 on
+    /// sockets of their own and IPv6 on one that takes no IPv4.
+    fn assert_bound_apart(listen: Listen) {
+        let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
+        let listeners = bind(listen, 0).unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let expected = v4.iter().map(|v4| SocketAddr::from((*v4, port)));
+        assert_eq!(bound[..v4.len()], expected.collect::<Vec<_>>()[..]);
+        if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+            eprintln!("skipped IPv6: this host cannot bind ::1");
+            return;
+        }
+        assert_eq!(listeners.len(), v4.len() + 1, "{listen:?}");
+        assert_eq!(bound[v4.len()], (v6, port).into());
+        assert!(SockRef::from(&listeners[v4.len()]).only_v6().unwrap());
     }
 
     /// A proxy on every interface and one on loopback never both hold the
     /// port, whichever binds first.
     #[test]
     fn a_proxy_on_every_interface_and_one_on_loopback_exclude_each_other() {
+        if !binds_every_interface(
+            "a_proxy_on_every_interface_and_one_on_loopback_exclude_each_other",
+        ) {
+            return;
+        }
         for (first, second) in [
             (Listen::AllInterfaces, Listen::Loopback),
             (Listen::Loopback, Listen::AllInterfaces),

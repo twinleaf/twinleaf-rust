@@ -141,14 +141,15 @@ struct Simulator {
 }
 
 impl Simulator {
-    /// Binds the UDP port and boots a device at each route of the layout.
+    /// Binds the UDP port on the interfaces `--listen` names and boots a
+    /// device at each route of the layout.
     ///
     /// # Errors
     ///
     /// Returns an error if the port cannot be bound, or the layout gives a
     /// route twice or reaches one through a device's empty port.
     fn new(cli: &SimulateCli) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
+        let socket = UdpSocket::bind((cli.listen.ipv4(), cli.port))?;
         socket.set_nonblocking(true)?;
         let booted = Instant::now();
         let mut routes = cli.layout.clone();
@@ -185,8 +186,9 @@ impl Simulator {
             }
         };
 
-        let port = self.socket.local_addr()?.port();
-        terminal_println!("tio test listening on udp://0.0.0.0:{port}");
+        let address = self.socket.local_addr()?;
+        let port = address.port();
+        terminal_println!("tio test listening on udp://{address}");
         match &self.routes.iter().collect::<Vec<_>>()[..] {
             [route] if route.is_empty() => {}
             [route] => terminal_println!("  device at {route}"),
@@ -397,12 +399,20 @@ impl Simulator {
     }
 }
 
-/// Serves the simulator `args` start on a free port from a thread until
-/// `stop` is set, and returns the URL a proxy opens it at.
+/// Returns the arguments `args` give a simulator that a test starts, on a
+/// free port of loopback.
+#[cfg(test)]
+fn test_cli(args: &[&str]) -> SimulateCli {
+    use clap::Parser;
+    let on_loopback = ["tio-simulate", "--port", "0", "--listen", "loopback"];
+    SimulateCli::parse_from(on_loopback.iter().chain(args))
+}
+
+/// Serves the simulator `args` start on a free port of loopback from a
+/// thread until `stop` is set, and returns the URL a proxy opens it at.
 #[cfg(test)]
 pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
-    use clap::Parser;
-    let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
+    let cli = test_cli(args);
     let (bound, port) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut simulator = Simulator::new(&cli).unwrap();
@@ -427,9 +437,12 @@ mod tests {
     /// Returns the simulator `args` start on a free port of loopback, and a
     /// host socket connected to it.
     fn start_simulator(args: &[&str]) -> (Simulator, UdpSocket) {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
+        let cli = test_cli(args);
         let simulator = Simulator::new(&cli).unwrap();
-        simulator.socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        simulator
+            .socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let port = simulator.socket.local_addr().unwrap().port();
         let host = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         host.connect(("127.0.0.1", port)).unwrap();
@@ -448,7 +461,10 @@ mod tests {
         host.send(packet.as_bytes()).unwrap();
         // The datagram may reach the socket after send returns.
         simulator.socket.set_nonblocking(false).unwrap();
-        simulator.socket.peek_from(&mut [0; Packet::MAX_SIZE]).unwrap();
+        simulator
+            .socket
+            .peek_from(&mut [0; Packet::MAX_SIZE])
+            .unwrap();
         simulator.socket.set_nonblocking(true).unwrap();
         simulator.receive_packets().unwrap();
         received(host)
@@ -822,7 +838,7 @@ mod tests {
 
     #[test]
     fn a_route_given_twice_is_refused() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0", "--layout", "/0,/1,/0"]);
+        let cli = test_cli(&["--layout", "/0,/1,/0"]);
         let refused = Simulator::new(&cli).map(drop).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
     }
@@ -831,9 +847,22 @@ mod tests {
     /// a layout that routes through one is refused.
     #[test]
     fn a_route_through_a_devices_empty_port_is_refused() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0", "--layout", "/,/2/0"]);
+        let cli = test_cli(&["--layout", "/,/2/0"]);
         let refused = Simulator::new(&cli).map(drop).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// `tio simulate` listens on every interface unless `--listen` names
+    /// loopback, as a test's simulator does.
+    #[test]
+    fn the_simulator_listens_where_listen_says() {
+        let cli = SimulateCli::parse_from(["tio-simulate"]);
+        assert_eq!(cli.listen, crate::ListenOn::All);
+        assert_eq!(cli.listen.ipv4(), std::net::Ipv4Addr::UNSPECIFIED);
+
+        let (simulator, _host) = start_simulator(&[]);
+        let bound = simulator.socket.local_addr().unwrap().ip();
+        assert_eq!(bound, std::net::Ipv4Addr::LOCALHOST);
     }
 
     /// A route whose parent the layout leaves out names that parent, the
