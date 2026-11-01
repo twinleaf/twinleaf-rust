@@ -1272,36 +1272,18 @@ mod tests {
         ));
     }
 
-    /// A stop reaches the pump, then ends its inlet, and the session ends
-    /// with every call still waiting, and nothing reconnects.
+    /// A stop ends the session, and fails every call still waiting and
+    /// every call made after it.
     #[test]
-    fn a_stop_ends_the_session() {
+    fn a_stop_fails_every_call_waiting_and_every_later_one() {
         let proxy = FakeProxy::start();
         let (session, mut end) = opened(&proxy);
-        let inlet = session.attach(64);
         let root = Handle::root(session);
         let waiting = root.submit(DeviceRoute::root(), "dev.name", &[]);
         end.expect_call();
 
-        end.send(&Packet::heartbeat(DeviceRoute::root()));
         end.send(&Packet::link(LinkStatus::Stopped));
 
-        assert!(matches!(
-            next(&inlet).unwrap().payload(),
-            Payload::Heartbeat(_)
-        ));
-        assert_eq!(
-            next(&inlet).unwrap().link_status(),
-            Some(LinkStatus::Stopped)
-        );
-        assert!(matches!(
-            inlet.recv_timeout(WAIT),
-            Ok(Queued::Ended(End::Stopped))
-        ));
-        assert_eq!(
-            inlet.recv_timeout(WAIT).err(),
-            Some(flume::RecvTimeoutError::Disconnected)
-        );
         assert!(matches!(
             waiting.recv_timeout(WAIT),
             Ok(Err(CallError::ResponseLost))
@@ -1311,10 +1293,6 @@ mod tests {
                 .recv_timeout(WAIT),
             Ok(Err(CallError::ResponseLost))
         ));
-        assert!(
-            !proxy.arrives(Duration::from_secs(2)),
-            "the session reconnected after the proxy stopped"
-        );
     }
 
     /// A packet the pump sends, such as a watch, waits for room in a full

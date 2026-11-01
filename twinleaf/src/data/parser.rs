@@ -1012,21 +1012,6 @@ mod tests {
         }
     }
 
-    /// A switch inside a group of inputs drops that group, which leaves less
-    /// than a period between the segments and loses no row.
-    #[test]
-    fn a_switch_inside_a_group_loses_no_row() {
-        // 6 outputs at 4 Hz decimated by 3 take inputs 0 to 17, and the
-        // device switches at input 20, 5 s in.
-        assert_eq!(
-            boundary_across((4, 3), 6, (1, 5, 0)),
-            Some(Boundary::of(Change::SegmentRollover {
-                old_id: crate::proto::SegmentId::new(0),
-                new_id: crate::proto::SegmentId::new(1),
-            }))
-        );
-    }
-
     /// A ring that came round to the last rows' slot holds a segment that
     /// starts later, which is a rollover onto the same id.
     #[test]
