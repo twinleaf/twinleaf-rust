@@ -53,16 +53,16 @@ pub struct SimulateCli {
     )]
     pub(crate) layout: Vec<DeviceRoute>,
 
-    /// The firmware images the devices take, as one kind of real device does
-    #[arg(long = "upload", value_enum, default_value_t = UploadKind::TlChibi)]
+    /// The kind of firmware the devices take, as a real device of that kind does
+    #[arg(long = "upload", value_enum, default_value_t = UploadKind::Image)]
     pub(crate) upload: UploadKind,
 }
 
 /// What kind of firmware image a simulated device takes.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadKind {
-    /// tl-chibi images, whose chunks carry their own envelope
-    TlChibi,
+    /// Images in the chunked format tl-chibi firmware takes, whose chunks carry their own envelope
+    Image,
     /// Signed packages for board `tio-test`, as a device built on twinleaf-device takes
     Signed,
 }

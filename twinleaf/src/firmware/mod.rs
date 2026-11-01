@@ -461,11 +461,12 @@ pub fn download_cached(
 /// Uploads `firmware_data` to `device` and commits the upgrade. Reports
 /// progress through `on_event` and prints nothing.
 ///
-/// The image is either a tl-chibi image, whose chunks carry their own
-/// envelope, or a signed package for a device built on `twinleaf-device`. A
-/// device built on `twinleaf-device` answers `dev.firmware.abort` and tl-chibi
-/// does not, which tells them apart before anything is stopped or sent. An
-/// image the device cannot take is refused then.
+/// The firmware is either a signed package or an image, whose chunks carry
+/// their own envelope. Images are in the chunked format tl-chibi firmware
+/// takes, for devices that run it. A device that answers `dev.firmware.abort` takes signed
+/// packages, and one that does not takes images. That answer tells them apart
+/// before anything is stopped or sent, and firmware the device cannot take is
+/// refused then.
 ///
 /// A chunk lost in either direction fails the upload window it is in. The
 /// upload then reads the device's upload cursor and resumes from that chunk.
@@ -489,12 +490,12 @@ pub fn flash(
     match (package, takes_packages(device)?) {
         (true, false) => {
             return Err(FirmwareError::Refused(
-                "this is a signed package, and the device takes tl-chibi images".into(),
+                "this is a signed package, and the device takes images".into(),
             ))
         }
         (false, true) => {
             return Err(FirmwareError::Refused(
-                "the device takes signed packages, and this is a tl-chibi image".into(),
+                "the device takes signed packages, and this is an image".into(),
             ))
         }
         (true, true) | (false, false) => {}
@@ -531,8 +532,8 @@ pub fn flash(
 }
 
 /// Whether `data` is a signed package. Its header names the format version
-/// and size `twinleaf-device` reads, and exactly the image behind it, which a
-/// tl-chibi image matches only by chance in eight bytes.
+/// and size `twinleaf-device` reads, and exactly the image behind it, which an
+/// image matches only by chance in eight bytes.
 fn is_package(data: &[u8]) -> bool {
     if data.len() <= PACKAGE_HEADER_SIZE {
         return false;
@@ -563,8 +564,8 @@ fn takes_packages(device: &Device) -> Result<bool, FirmwareError> {
     }
 }
 
-/// Uploads a tl-chibi image, whose chunks each carry the envelope the device
-/// checks before appending them.
+/// Uploads an image, whose chunks each carry the envelope the device checks
+/// before appending them.
 fn upload_image(
     device: &Device,
     firmware_data: &[u8],
@@ -893,11 +894,11 @@ mod tests {
         image
     }
 
-    /// Run [`flash`] against a fake device that keeps tl-chibi's upload
-    /// cursor: an empty request reads it, a chunk whose offset is elsewhere is
-    /// rejected, and `fault` decides what happens to one that matches. Control
-    /// RPCs are always acknowledged. Returns the outcome, the events, the
-    /// chunk indices sent in order, and the device's final cursor.
+    /// Run [`flash`] against a fake device that takes images and keeps an
+    /// upload cursor. An empty request reads it, a chunk whose offset is
+    /// elsewhere is rejected, and `fault` decides what happens to one that
+    /// matches. Control RPCs are always acknowledged. Returns the outcome, the
+    /// events, the chunk indices sent in order, and the device's final cursor.
     fn flash_against(
         firmware: Vec<u8>,
         cursor: u32,
@@ -918,7 +919,7 @@ mod tests {
                 let wire_rpc::Method::ByName(name) = request.method else {
                     panic!("expected a call by name");
                 };
-                // tl-chibi has no way to abort an upload.
+                // A device that takes images does not answer dev.firmware.abort.
                 if name == b"dev.firmware.abort" {
                     proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
                     continue;
@@ -1201,7 +1202,7 @@ mod tests {
     const PACKAGE_IMAGE: usize = 2 * PACKAGE_CHUNK_DATA + 88;
 
     #[test]
-    fn a_package_is_told_from_a_tl_chibi_image() {
+    fn a_package_is_told_from_an_image() {
         let board = board();
         assert!(is_package(&package(&board, PACKAGE_IMAGE)));
         assert!(!is_package(&image(THREE_CHUNKS)));
@@ -1300,10 +1301,7 @@ mod tests {
         let (result, events, sent, _) =
             flash_against(package(&board(), PACKAGE_IMAGE), 0, |_| Fault::Deliver);
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("takes tl-chibi images"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("takes images"), "unexpected error: {err}");
         assert!(events.is_empty() && sent.is_empty());
     }
 

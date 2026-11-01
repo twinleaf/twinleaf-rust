@@ -268,9 +268,9 @@ impl Simulator {
             device::CAPTURE_DELAY_NS as f64 / 1e9
         );
         match cli.upload {
-            crate::UploadKind::TlChibi => {
+            crate::UploadKind::Image => {
                 terminal_println!(
-                    "  firmware upload: tl-chibi images (--upload signed for packages)"
+                    "  firmware upload: tl-chibi compatible images (--upload signed for packages)"
                 )
             }
             crate::UploadKind::Signed => {
@@ -729,8 +729,8 @@ mod tests {
         }
     }
 
-    /// An upload counts the image bytes of each chunk as tl-chibi does, and an
-    /// upgrade reboots into a new build.
+    /// An upload counts the image bytes of each chunk, and an upgrade reboots
+    /// into a new build.
     #[test]
     fn an_upgrade_reboots_into_a_new_build() {
         let (mut simulator, host) = start_simulator(&[]);
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(
             call(&mut simulator, &host, "dev.firmware.abort", &[], "/"),
             Err(RpcError::NotFound.value()),
-            "tl-chibi has no abort"
+            "a device that takes images does not answer dev.firmware.abort"
         );
     }
 
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(
             upload(&mut simulator, &[0; 288]),
             Err(RpcError::Invalid.value()),
-            "a tl-chibi chunk is no package header"
+            "an image chunk is no package header"
         );
         upload(&mut simulator, &package_header(300)).unwrap();
         upload(&mut simulator, &chunk(0, 256)).unwrap();

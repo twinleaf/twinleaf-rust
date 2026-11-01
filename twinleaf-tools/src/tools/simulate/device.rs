@@ -47,7 +47,7 @@ pub(super) const CAPTURE_DELAY_NS: u64 = 500_000_000;
 const CAPTURE_BLOCK_SIZE: u16 = 256;
 pub(super) const CAPTURE_SAMPLES_MIN: usize = 800;
 pub(super) const CAPTURE_SAMPLES_MAX: usize = 1200;
-/// The bytes of a tl-chibi upload chunk that are envelope rather than image.
+/// The bytes of an image's upload chunk that are envelope rather than image.
 const CHUNK_ENVELOPE: usize = 32;
 
 /// What a signed package for the simulator names.
@@ -61,8 +61,8 @@ pub(super) const PACKAGE: Package = Package {
 
 /// The firmware slot, as the kind of device being simulated keeps it.
 enum Slot {
-    /// tl-chibi's, counting the image bytes of each chunk it takes.
-    TlChibi { uploaded: u32 },
+    /// One that takes images, counting the image bytes of each chunk it takes.
+    Image { uploaded: u32 },
     /// A `twinleaf-device` firmware's, keeping the crate's own cursor.
     Signed(Upload),
 }
@@ -70,14 +70,14 @@ enum Slot {
 impl Slot {
     fn new(kind: UploadKind) -> Self {
         match kind {
-            UploadKind::TlChibi => Self::TlChibi { uploaded: 0 },
+            UploadKind::Image => Self::Image { uploaded: 0 },
             UploadKind::Signed => Self::Signed(Upload::new()),
         }
     }
 
     fn kind(&self) -> UploadKind {
         match self {
-            Self::TlChibi { .. } => UploadKind::TlChibi,
+            Self::Image { .. } => UploadKind::Image,
             Self::Signed(_) => UploadKind::Signed,
         }
     }
@@ -86,8 +86,8 @@ impl Slot {
     /// empty one. The image goes nowhere, so every write lands.
     fn upload(&mut self, chunk: &[u8], now_ns: u64) -> Result<Vec<u8>, RpcError> {
         match self {
-            Self::TlChibi { uploaded } if chunk.is_empty() => Ok(uploaded.to_le_bytes().to_vec()),
-            Self::TlChibi { uploaded } => {
+            Self::Image { uploaded } if chunk.is_empty() => Ok(uploaded.to_le_bytes().to_vec()),
+            Self::Image { uploaded } => {
                 let image = chunk.len().saturating_sub(CHUNK_ENVELOPE) as u32;
                 *uploaded = uploaded.saturating_add(image);
                 Ok(Vec::new())
@@ -109,7 +109,7 @@ impl Slot {
     /// package's signature goes unchecked.
     fn upgrade(&mut self, now_ns: u64) -> Result<(), RpcError> {
         match self {
-            Self::TlChibi { .. } => Ok(()),
+            Self::Image { .. } => Ok(()),
             Self::Signed(upload) => {
                 upload.upgrade(now_ns)?;
                 upload.armed();
@@ -118,10 +118,10 @@ impl Slot {
         }
     }
 
-    /// `dev.firmware.abort`, which tl-chibi does not have.
+    /// `dev.firmware.abort`, which a device that takes images does not answer.
     fn abort(&mut self) -> Result<(), RpcError> {
         match self {
-            Self::TlChibi { .. } => Err(RpcError::NotFound),
+            Self::Image { .. } => Err(RpcError::NotFound),
             Self::Signed(upload) => upload.abort(),
         }
     }
