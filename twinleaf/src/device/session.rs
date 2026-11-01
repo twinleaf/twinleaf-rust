@@ -867,11 +867,32 @@ impl Session {
 
     /// [`test_pair`](Self::test_pair) with the session's task on `tasks`.
     pub(crate) fn test_pair_on(tasks: &Supervisor) -> (Session, TestProxy) {
+        Session::test_pair_with(tasks, None)
+    }
+
+    /// [`test_pair_on`](Self::test_pair_on) for a session that opens again
+    /// once its socket closes without a stop, through an address that never
+    /// answers. The pump hears each such loss.
+    pub(crate) fn test_pair_reopening(tasks: &Supervisor) -> (Session, TestProxy) {
+        let nowhere = ProxyAddress {
+            url: crate::proxy::fixtures::UNREACHABLE.to_string(),
+            ensure: None,
+        };
+        let reopen = (nowhere, Purpose::Use.method(), encode(&"auto"));
+        Session::test_pair_with(tasks, Some(reopen))
+    }
+
+    /// A session whose socket is a pair of channels. With `reopen`, it opens
+    /// again as [`start`](Self::start) says.
+    fn test_pair_with(
+        tasks: &Supervisor,
+        reopen: Option<(ProxyAddress, &'static str, Vec<u8>)>,
+    ) -> (Session, TestProxy) {
         let (sender, sent) = flume::unbounded();
         let (deliver, received) = flume::unbounded();
         let peer = "the test's proxy".to_string();
         let received = received.into_stream().boxed();
-        let session = Session::start((Socket::Channel(sender), received, peer), None, tasks);
+        let session = Session::start((Socket::Channel(sender), received, peer), reopen, tasks);
         (session, TestProxy { sent, deliver })
     }
 }
