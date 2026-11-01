@@ -32,6 +32,23 @@ use std::collections::{HashMap, VecDeque};
 /// only if the device announced its segment since the stream's last rows,
 /// by a broadcast, a proxy metadata update or a bootstrap reply.
 ///
+/// A device announces `dev.running` turning off as it hands a stop or
+/// restart a host asked for to its platform, and otherwise at a refresh
+/// after it stops acquiring, so ahead of the record of any segment a later
+/// start begins. Rows of a segment the device announced after such a stop
+/// come as a [`Change::Restarted`](super::Change::Restarted), and rows of
+/// the stopped acquisition that arrive after the stop come as before. A
+/// new segment that starts before the last rows end comes as a backward
+/// step in time.
+///
+/// Two restarts reach the parser with no stop announced, and come as a
+/// rollover with a loss of the sample periods between the acquisitions.
+///
+/// - A restart whose announcement was lost, in a gap on the link or in a
+///   client's inlet.
+/// - A stop and start no host asked for, with no refresh between them,
+///   which leave `dev.running` where it was.
+///
 /// # Examples
 ///
 /// Decode a recorded log packet by packet.

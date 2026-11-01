@@ -179,4 +179,5 @@ pub use pipeline::{ColumnOp, ColumnProcessor};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
 pub(crate) use sample::RowSource;
 pub use sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
+pub(crate) use state::announces_stop;
 pub use state::{DataError, StreamDataError};

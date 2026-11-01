@@ -538,6 +538,10 @@ fn restate(change: Change, old: &StreamMetadataSnapshot, new: &StreamMetadataSna
             old_rate: old.rate_hz(),
             new_rate: new.rate_hz(),
         },
+        Change::Restarted { .. } => Change::Restarted {
+            old_id: old.segment().segment_id(),
+            new_id: new.segment().segment_id(),
+        },
         Change::SegmentRollover { .. } => Change::SegmentRollover {
             old_id: old.segment().segment_id(),
             new_id: new.segment().segment_id(),

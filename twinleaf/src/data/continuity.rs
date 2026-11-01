@@ -34,7 +34,8 @@ pub enum BoundaryClass {
     Seamless,
     /// Samples are missing, but time remains monotonic.
     DataLoss,
-    /// The session, time reference or rate changed.
+    /// The session, time reference or rate changed, or the device started
+    /// acquiring again after a stop.
     Reconfig,
     /// The timeline is inconsistent, possibly from corrupted data or a device clock error.
     Anomaly,
@@ -151,6 +152,7 @@ impl Boundary {
 /// | `SessionChanged`        | `Reconfig` | no  | no  |
 /// | `TimeRefSessionChanged` | `Reconfig` | no  | no  |
 /// | `RateChanged`           | `Reconfig` | no  | yes |
+/// | `Restarted`             | `Reconfig` | no  | yes |
 /// | `TimeForward`           | `Anomaly`  | no  | yes |
 /// | `TimeBackward`          | `Anomaly`  | no  | no  |
 ///
@@ -194,6 +196,16 @@ pub enum Change {
         /// Rate now in force, in Hz after decimation.
         new_rate: f64,
     },
+    /// The device stopped acquiring and started again, and the stream went
+    /// on in a segment of the new acquisition, in the same session, time
+    /// reference and rate, with time not going backward. The device took no
+    /// sample in the time between, so the change names no loss for it.
+    Restarted {
+        /// Segment of the preceding rows.
+        old_id: SegmentId,
+        /// Segment of the new acquisition the rows go on in.
+        new_id: SegmentId,
+    },
     /// The stream went on into another segment in the same session, time
     /// reference and rate, with time not going backward. Segments between
     /// may have passed unseen.
@@ -220,6 +232,7 @@ impl Change {
         matches!(
             self,
             Change::RateChanged { .. }
+                | Change::Restarted { .. }
                 | Change::SegmentRollover { .. }
                 | Change::TimeForward { .. }
         )
@@ -238,20 +251,28 @@ impl Change {
             Change::Initial => BoundaryClass::Startup,
             Change::SessionChanged { .. }
             | Change::TimeRefSessionChanged { .. }
-            | Change::RateChanged { .. } => BoundaryClass::Reconfig,
+            | Change::RateChanged { .. }
+            | Change::Restarted { .. } => BoundaryClass::Reconfig,
             Change::TimeForward { .. } | Change::TimeBackward { .. } => BoundaryClass::Anomaly,
         }
     }
 
     /// Returns how much of what happened before it the change stands for.
     /// Of two changes a receiver learns of at once, it is told the higher.
+    ///
+    /// The ranks follow the order the parser tells changes in, so a receiver
+    /// told of two at once learns what the parser tells of both at once. A
+    /// restart ranks below a backward step in time, which it does not stand
+    /// for, and above the forward step in time and the rollover it stands
+    /// for.
     pub(crate) fn rank(&self) -> u8 {
         match self {
-            Change::Initial => 7,
-            Change::SessionChanged { .. } => 6,
-            Change::TimeRefSessionChanged { .. } => 5,
-            Change::RateChanged { .. } => 4,
-            Change::TimeBackward { .. } => 3,
+            Change::Initial => 8,
+            Change::SessionChanged { .. } => 7,
+            Change::TimeRefSessionChanged { .. } => 6,
+            Change::RateChanged { .. } => 5,
+            Change::TimeBackward { .. } => 4,
+            Change::Restarted { .. } => 3,
             Change::TimeForward { .. } => 2,
             Change::SegmentRollover { .. } => 1,
         }

@@ -214,7 +214,10 @@ pub trait Lanes {
     fn reply(&mut self, packet: &[u8]);
 
     /// Every port's ordered lane: a setting announcement, behind every one
-    /// before it and ahead of any reply after it.
+    /// before it and ahead of any reply after it. A platform sends the
+    /// announcements and its publishers' sample packets and records in the
+    /// order they were written, which a host's parser relies on to tell a
+    /// stop from the acquisition after it.
     fn announce(&mut self, packet: &[u8]);
 
     /// The lane every port drains: what the device logged or beat on its own account.
@@ -321,9 +324,11 @@ pub struct Device<S: Group> {
     time_status: u8,
     /// `sync.status`, moved to what the platform published at each refresh.
     sync_status: Setting<u8>,
-    /// What the platform last published of its acquisition.
+    /// What the platform last published of its acquisition, or `Stopping`
+    /// once a stop or restart of a running acquisition is handed to it.
     acquisition: AcquisitionState,
-    /// `dev.running`, moved to whether that acquisition runs at each refresh.
+    /// `dev.running`, moved to whether that acquisition runs at each refresh,
+    /// and turned off as a stop or restart is handed to the platform.
     running: Setting<bool>,
 }
 
@@ -410,7 +415,9 @@ impl<S: Group> Device<S> {
     }
 
     /// Publish the state of the platform's acquisition, for `dev.running` to
-    /// announce at the next refresh.
+    /// announce at the next refresh. The platform publishes a state once it
+    /// has acted on it. A stop or restart the device hands over leaves the
+    /// acquisition stopping until the platform publishes again.
     pub fn set_acquisition(&mut self, state: AcquisitionState) {
         self.acquisition = state;
     }
@@ -649,9 +656,13 @@ impl<S: Group> Device<S> {
                     }
                 }),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
-                Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
+                Std::Stop => {
+                    self.stopping(&mut announcements(lanes));
+                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop));
+                }
                 Std::Restart => {
-                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Restart))
+                    self.stopping(&mut announcements(lanes));
+                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Restart));
                 }
                 Std::Abort => return actions.defer(pending, Deferred::Flash(FlashOp::Abort)),
                 Std::SettingsVersion => {
@@ -933,6 +944,31 @@ impl<S: Group> Device<S> {
             &mut self.running,
             self.acquisition == AcquisitionState::Running,
         );
+    }
+
+    /// Turns `dev.running` off for a stop or restart about to be handed to
+    /// the platform, and announces it into `out` ahead of anything the
+    /// platform does with the request. The announcement goes out on every
+    /// such request, though `dev.running` was already off, as while the
+    /// platform is starting and its first sample may be out. A running
+    /// acquisition counts as stopping until the platform publishes its
+    /// state, so no refresh before that announces it running again. A stop
+    /// or restart a host asks for thus announces `dev.running` off before
+    /// the first sample of the acquisition after it.
+    fn stopping(&mut self, out: &mut impl Sink) {
+        if self.acquisition == AcquisitionState::Running {
+            self.acquisition = AcquisitionState::Stopping;
+        }
+        let mut announced = Reply::new();
+        let off = self.running.put(false).is_ok() && false.encode(&mut announced).is_ok();
+        if off {
+            announce(
+                &mut self.settings_version,
+                out,
+                self.running.name(),
+                &announced,
+            );
+        }
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
@@ -2604,7 +2640,11 @@ mod tests {
             ("dev.restart", SyncRequest::Restart),
         ] {
             let answered = device.ask(name, &[]);
-            assert!(answered.0.is_empty(), "{name} was answered here");
+            assert_eq!(
+                answered.0.len(),
+                answered.announced().len(),
+                "{name} was answered here"
+            );
             let Some((_, Deferred::Acquire(request))) = device.deferred.take() else {
                 panic!("{name} did not reach the acquisition");
             };
@@ -2635,6 +2675,63 @@ mod tests {
         assert_eq!(answered.announced(), [("dev.running".to_owned(), vec![1])]);
         assert_eq!(answered.value(), [1]);
         assert_eq!(device.ask("dev.running", &[1]).error(), RpcError::ReadOnly);
+    }
+
+    /// A stop or restart of a running acquisition announces `dev.running` off
+    /// in the request that asks for it, before the platform acts on it. A
+    /// refresh before the platform publishes again leaves it off, and the
+    /// first refresh after the platform publishes it running announces it on.
+    #[test]
+    fn a_stop_or_restart_announces_dev_running_off_as_it_is_handed_over() {
+        for name in ["dev.stop", "dev.restart"] {
+            let mut device = harness();
+            device.device.set_acquisition(AcquisitionState::Running);
+            device.ask("dev.running", &[]);
+            let asked = device.ask(name, &[]);
+            assert_eq!(
+                asked.announced(),
+                [("dev.running".to_owned(), vec![0])],
+                "{name} announces the stop"
+            );
+            assert!(asked.0.len() == 1, "{name} is answered by the platform");
+            assert!(matches!(
+                device.deferred.take(),
+                Some((_, Deferred::Acquire(_)))
+            ));
+
+            let mut sent = Sent::default();
+            let beat = BOOT + HEARTBEAT_INTERVAL;
+            device.device.tick(beat, &mut OneLane(&mut sent));
+            assert_eq!(sent.announced(), [], "{name} stays off while it stops");
+
+            device.device.set_acquisition(AcquisitionState::Running);
+            let mut sent = Sent::default();
+            device
+                .device
+                .tick(beat + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent));
+            assert_eq!(
+                sent.announced(),
+                [("dev.running".to_owned(), vec![1])],
+                "{name} is on again once the platform runs"
+            );
+        }
+    }
+
+    /// A stop or restart handed over while the platform starts, before it
+    /// ran and so with `dev.running` never on, announces `dev.running` off,
+    /// as the starting acquisition's first sample may be out already.
+    #[test]
+    fn a_stop_or_restart_while_starting_announces_dev_running_off() {
+        for name in ["dev.stop", "dev.restart"] {
+            let mut device = harness();
+            device.device.set_acquisition(AcquisitionState::Starting);
+            assert_eq!(device.ask("dev.running", &[]).value(), [0]);
+            assert_eq!(
+                device.ask(name, &[]).announced(),
+                [("dev.running".to_owned(), vec![0])],
+                "{name} announces the stop"
+            );
+        }
     }
 
     /// The standard reports that move are announced as they move, at the

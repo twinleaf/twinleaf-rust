@@ -613,6 +613,21 @@ impl HealthState {
                     st.reset_rate();
                 }
             }
+            Change::Restarted { old_id, new_id } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] RESTARTED: segment {} → {}",
+                        route, stream_name, old_id, new_id
+                    ),
+                    severity,
+                );
+                // The pause between the acquisitions is no part of either's
+                // timing or rate.
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.reset_timing();
+                    st.reset_rate();
+                }
+            }
             Change::SegmentRollover { old_id, new_id } => {
                 self.log_event(
                     format!(

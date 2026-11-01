@@ -14,6 +14,7 @@ use super::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::heartbeat::Heartbeat;
+use crate::proto::settings::Setting;
 use crate::proto::DeviceRoute;
 use crate::proto::{SampleNumber, SegmentId, SessionId, StreamId};
 use crate::tio;
@@ -110,6 +111,15 @@ pub enum StreamDataError {
     },
 }
 
+/// Returns `true` if `setting` announces that the device stopped acquiring,
+/// as `dev.running` turning off. The device announces it as it hands a stop
+/// or restart a host asked for to its platform, and otherwise at a refresh
+/// after the stop, in either case ahead of the record of any segment a later
+/// start begins.
+pub(crate) fn announces_stop(setting: &Setting<'_>) -> bool {
+    setting.name == b"dev.running" && setting.reply == [0]
+}
+
 /// Metadata and continuity state for one stream on one device.
 #[derive(Debug, Clone)]
 struct StreamTracker {
@@ -140,6 +150,15 @@ struct StreamTracker {
     /// the ring.
     moved_on: bool,
     rate_hz: f64,
+    /// The stops the device announced, each as `dev.running` turning off.
+    stops: u32,
+    /// The stops announced before the current segment became current. A
+    /// segment that became current after a stop is of an acquisition the
+    /// device started after it, as the device announces the stop before the
+    /// record of any segment it starts later.
+    current_stops: u32,
+    /// The stops announced before the last rows' segment became current.
+    last_stops: u32,
 }
 
 impl StreamTracker {
@@ -161,7 +180,18 @@ impl StreamTracker {
             last_segment: None,
             moved_on: false,
             rate_hz: 0.0,
+            stops: 0,
+            current_stops: 0,
+            last_stops: 0,
         }
+    }
+
+    /// Names `segment_id` the current segment, of the acquisition in force
+    /// after the stops announced so far.
+    fn switch_to(&mut self, segment_id: SegmentId) {
+        self.moved_on |= segment_id != self.last_segment_id;
+        self.current_segment_id = segment_id;
+        self.current_stops = self.stops;
     }
 
     fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
@@ -285,6 +315,16 @@ impl StreamTracker {
                     .last_segment
                     .as_ref()
                     .is_some_and(|last| last.get().start_time() != segment.start_time());
+        // Rows are of the current segment. A stop announced between the
+        // last rows' segment and this one becoming current puts the rows in
+        // a later acquisition, and the time between holds no sample to lose.
+        let restarted = self.current_stops != self.last_stops;
+        if restarted {
+            return Some(Boundary::of(Change::Restarted {
+                old_id: self.last_segment_id,
+                new_id: segment.segment_id(),
+            }));
+        }
         if segment.segment_id() != self.last_segment_id || lapped {
             let missing = self.missing_before(segment, first_sample_n);
             return Some(Boundary {
@@ -380,8 +420,7 @@ impl StreamTracker {
             }
         }
         if !announced {
-            self.moved_on |= data.segment_id != self.last_segment_id;
-            self.current_segment_id = data.segment_id;
+            self.switch_to(data.segment_id);
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
 
@@ -489,6 +528,7 @@ impl StreamTracker {
         self.last_segment_id = segment.segment_id();
         self.last_segment = Some(segment_record.clone());
         self.moved_on = false;
+        self.last_stops = self.current_stops;
         self.rate_hz = new_rate;
         self.established = true;
 
@@ -514,11 +554,22 @@ impl StreamTracker {
         }))
     }
 
+    /// Forgets the stream's metadata, and the stops announced under it, as
+    /// a new session starts its acquisitions afresh.
     fn invalidate_metadata(&mut self) {
         self.metadata = None;
         self.segments.clear();
         self.columns.clear();
         self.schema = None;
+        self.stops = 0;
+        self.current_stops = 0;
+        self.last_stops = 0;
+    }
+
+    /// Counts a stop the device announced. Segments that become current
+    /// after it are of a later acquisition.
+    fn stop(&mut self) {
+        self.stops = self.stops.wrapping_add(1);
     }
 
     /// Forgets metadata and ends the current run. The run counter is kept, and
@@ -703,8 +754,17 @@ impl DeviceState {
                 if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
+                let start_time = segment.start_time();
                 let stream = self.stream_mut(stream_id);
                 let learned = stream.segment(segment_id) != Some(&incoming);
+                // A broadcast of the current slot at another start names a
+                // segment begun there since, as the ring came round to it
+                // through segments that published nothing.
+                let begun = source == MetadataSource::Broadcast
+                    && stream.current_segment_id == segment_id
+                    && stream
+                        .segment(segment_id)
+                        .is_some_and(|held| held.get().start_time() != start_time);
                 stream.set_segment(segment_id, incoming);
                 let switched = stream.current_segment_id != segment_id
                     && match source {
@@ -715,8 +775,9 @@ impl DeviceState {
                         MetadataSource::Reply => false,
                     };
                 if switched {
-                    stream.moved_on |= segment_id != stream.last_segment_id;
-                    stream.current_segment_id = segment_id;
+                    stream.switch_to(segment_id);
+                } else if begun {
+                    stream.current_stops = stream.stops;
                 }
                 if learned || switched {
                     self.revise_metadata();
@@ -781,6 +842,11 @@ impl DeviceState {
                         self.metadata = None;
                         self.rediscover_metadata();
                     }
+                }
+            }
+            packet::Payload::Setting(setting) if announces_stop(&setting) => {
+                for stream in self.streams.iter_mut().flatten() {
+                    stream.stop();
                 }
             }
             _ => {}
