@@ -26,12 +26,11 @@ use crate::Sink;
 
 pub use calls::{CallCounters, Calls, Full, Origin, DEADLINE_NS};
 
-/// Silence after which a child is unplugged, as tl-chibi's
-/// `TL_HEARTBEAT_KEEPALIVE` is: two heartbeats and room for a late one.
+/// Silence after which a child is unplugged, two heartbeats and room for a
+/// late one.
 pub const UNPLUG_NS: u64 = 9 * HEARTBEAT_INTERVAL / 4;
 
-/// Requests a hub has in flight at once unless sized otherwise, as tl-chibi's
-/// remap has.
+/// Requests a hub has in flight at once unless sized otherwise.
 pub const CALL_SLOTS: usize = 32;
 
 /// Where a hub's downward packets go, one child port at a time.

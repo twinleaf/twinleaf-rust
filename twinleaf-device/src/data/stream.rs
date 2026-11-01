@@ -566,8 +566,8 @@ mod tests {
         assert_eq!(streams[0].current().timeref().start_time, 1001);
     }
 
-    /// As tl-chibi's `sample_index`: a host hears of a pending segment with
-    /// its first sample, and until then of the one its samples are on.
+    /// A host hears of a pending segment with its first sample, and until then
+    /// of the one its samples are on.
     #[test]
     fn a_pending_segment_is_current_from_its_first_sample() {
         let mut streams = started();
@@ -668,8 +668,8 @@ mod tests {
         assert_eq!(record.filter_type, FilterType::NONE);
     }
 
-    /// A retune only recomputes coefficients, as tl-chibi's `setup` does, so
-    /// the new segment carries on from where the old one settled.
+    /// A retune only recomputes coefficients, so the new segment carries on
+    /// from where the old one settled.
     #[test]
     fn a_retune_carries_the_filter_across_the_segment_switch() {
         let mut stream = decimated(butterworth::<1>(), 4);

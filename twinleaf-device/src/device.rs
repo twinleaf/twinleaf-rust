@@ -33,14 +33,13 @@ use crate::Sink;
 /// Nanoseconds between heartbeats.
 pub const HEARTBEAT_INTERVAL: u64 = 200_000_000;
 
-/// Nanoseconds a changed configuration waits before it saves itself, as
-/// tl-chibi's `dev.conf.autosave` defaults to.
+/// Nanoseconds a changed configuration waits before it saves itself.
 pub const AUTOSAVE_INTERVAL: u64 = 60_000_000_000;
 
-/// The level `dev.loglevel` boots at, as tl-chibi's `logThreshold` does.
+/// The level `dev.loglevel` boots at.
 pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 
-/// Seconds `dev.autostart` waits at boot before acquiring, as tl-chibi's `TL_AUTOSTART_AFTER_SEC`.
+/// Seconds `dev.autostart` waits at boot before acquiring.
 pub const DEFAULT_AUTOSTART: u8 = 5;
 
 /// As much flash as a stored configuration may take.
@@ -49,7 +48,7 @@ pub const IMAGE_MAX: usize = 1024;
 /// Why a locked session's call to a privileged entry is refused.
 pub const LOCKED: &str = "privileged: unlock with dev.priv";
 
-/// As big a cell as `dev.priv.password` keeps, NUL and all, as tl-chibi's is.
+/// As big a cell as `dev.priv.password` keeps, NUL and all.
 pub const PASSWORD_MAX: usize = 16;
 
 /// The bytes a stored configuration is built in and read back into.
@@ -1869,7 +1868,7 @@ mod tests {
         assert_eq!(written.announced(), []);
     }
 
-    /// `dev.autostart` boots at tl-chibi's five seconds, and a written value
+    /// `dev.autostart` boots at five seconds, and a written value
     /// is announced and restored at the next boot.
     #[test]
     fn a_written_autostart_is_announced_and_restored_at_the_next_boot() {
@@ -2113,8 +2112,8 @@ mod tests {
         );
     }
 
-    /// tl-chibi's `dev.loglevel` (`lib/tlfirmware.c:766-773`): a write reaches
-    /// the gate the platform's own logging is checked against.
+    /// A write to `dev.loglevel` reaches the gate the platform's own logging is
+    /// checked against.
     #[test]
     fn writing_dev_loglevel_carries_the_threshold_back_to_the_platform() {
         let mut device = harness();
@@ -2812,9 +2811,8 @@ mod tests {
         );
     }
 
-    /// tl-chibi's autosave (`lib/firmware/tlfw_persist.c:305`): a written
-    /// setting is saved a period after the write, once, and the heartbeat is
-    /// still the sooner deadline.
+    /// A written setting is saved a period after the write, once, and the
+    /// heartbeat is still the sooner deadline.
     #[test]
     fn a_written_setting_saves_itself_a_period_later() {
         let mut device = harness();
@@ -2866,7 +2864,7 @@ mod tests {
         assert!(device.tick(BOOT + AUTOSAVE_INTERVAL).is_some());
     }
 
-    /// tl-chibi stores `dev.loglevel` with whatever else a save writes, but writing it owes none.
+    /// A save stores `dev.loglevel` with whatever else it writes, but writing it owes none.
     #[test]
     fn a_write_to_dev_loglevel_owes_no_save() {
         let mut device = harness();
@@ -2900,7 +2898,7 @@ mod tests {
     }
 
     /// A restore says what the flash already stores, whether a boot or a host
-    /// asked for it, so tl-chibi's `tl_persist_load` leaves nothing owing.
+    /// asked for it, so it leaves nothing owing.
     #[test]
     fn a_restored_configuration_owes_no_save() {
         let mut device = harness();
@@ -2917,7 +2915,7 @@ mod tests {
         assert!(device.tick(later + 2 * AUTOSAVE_INTERVAL).is_none());
     }
 
-    /// A read leaves `Changed::Unchanged`, which tl-chibi does not stamp.
+    /// A read leaves `Changed::Unchanged`, so it owes no save.
     #[test]
     fn a_read_of_a_stored_setting_owes_no_save() {
         let mut device = harness();
@@ -2954,8 +2952,8 @@ mod tests {
             .is_none());
     }
 
-    /// A save that does not fit its image is owed for another period, as
-    /// tl-chibi's systick retries the one its storage refused.
+    /// A save that does not fit its image is owed for another period, and
+    /// tried again when that period ends.
     #[test]
     fn a_save_too_large_for_its_image_is_owed_for_another_period() {
         let cells = (0..IMAGE_MAX / 16)

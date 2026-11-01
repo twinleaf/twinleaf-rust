@@ -52,8 +52,8 @@ number! {
     f64 => Float,
 }
 
-/// A short string a setting holds, bounded as tl-chibi's `password[16]` is:
-/// `N - 1` bytes, since the NUL that ends them is one of them.
+/// A short string a setting holds, at most `N - 1` bytes, since the NUL that
+/// ends them is one of the `N`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Text<const N: usize> {
     bytes: [u8; N],
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(
             answer(&mut password, b"opensesame\0\0"),
             Ok((Changed::Changed, b"opensesame".to_vec())),
-            "a write is cut at the first NUL, as tl-chibi cuts it"
+            "a write is cut at the first NUL"
         );
         assert_eq!(
             answer(&mut password, &[b'x'; 15]),

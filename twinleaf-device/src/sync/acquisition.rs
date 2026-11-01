@@ -536,8 +536,8 @@ mod tests {
         );
     }
 
-    /// tl-chibi's rows: a stop from idle succeeds, a restart from idle starts,
-    /// and a restart while stopping is remembered.
+    /// A stop from idle succeeds, a restart from idle starts, and a restart
+    /// while stopping is remembered.
     #[test]
     fn stop_and_restart_answer_from_every_resting_state() {
         let mut machine = AcquisitionMachine::new(0);
