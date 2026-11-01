@@ -475,7 +475,7 @@ impl Store {
     /// Makes every device the store holds lost, as no one can say more of
     /// them. A device lost already keeps the moment it was lost.
     pub(crate) fn mark_lost(&mut self) {
-        let since = std::time::Instant::now();
+        let since = tokio::time::Instant::now().into_std();
         for entry in self.devices.values_mut() {
             if !matches!(entry.presence.value, Some(Presence::Lost { .. })) {
                 entry.presence.set(Presence::Lost { since });
@@ -749,6 +749,20 @@ mod tests {
 
         store.mark_lost();
 
+        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
+    }
+
+    /// Every device made lost is lost at that moment on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_made_lost_is_dated_on_the_paused_clock() {
+        let mut store = Store::new(false);
+        let route = DeviceRoute::root();
+        store.set(route, PRESENCE, Presence::Connecting);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        store.mark_lost();
+
+        let since = tokio::time::Instant::now().into_std();
         assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
     }
 

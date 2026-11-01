@@ -238,9 +238,10 @@ impl Update {
         Update::Presence(match presence {
             Presence::Connecting => Err(None),
             Presence::Alive { session } => Ok(session.map(SessionId::value)),
-            Presence::Lost { since } => Err(Some(
-                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
-            )),
+            Presence::Lost { since } => {
+                let ago = Instant::now().into_std().saturating_duration_since(since);
+                Err(Some(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX)))
+            }
         })
     }
 
@@ -307,7 +308,7 @@ impl Update {
     pub(crate) fn apply(self, route: DeviceRoute, store: &mut Store, parser: &mut PacketParser) {
         match self {
             Update::Presence(presence) => {
-                let now = std::time::Instant::now();
+                let now = Instant::now().into_std();
                 let presence = match presence.map(|session| session.map(SessionId::new)) {
                     Ok(session) => Presence::Alive { session },
                     Err(None) => Presence::Connecting,
@@ -1175,5 +1176,21 @@ mod tests {
             received[3].value(),
             Err(SettingValueError::NoTable)
         ));
+    }
+
+    /// A client counts back how long ago the proxy says a device was lost
+    /// from the paused clock, and a presence update made of that moment says
+    /// the same again.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_presence_counts_back_from_the_paused_clock() {
+        let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
+        let route = DeviceRoute::root();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        Update::Presence(Err(Some(1500))).apply(route, &mut store, &mut parser);
+        let since = (Instant::now() - Duration::from_millis(1500)).into_std();
+        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
+        let again = Update::presence(Presence::Lost { since });
+        assert_eq!(again, Update::Presence(Err(Some(1500))));
     }
 }

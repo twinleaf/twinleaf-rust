@@ -528,7 +528,7 @@ impl Engine {
             | LinkStatus::Stopped
             | LinkStatus::FailedToConnect
             | LinkStatus::FailedToReconnect => Presence::Lost {
-                since: std::time::Instant::now(),
+                since: Instant::now().into_std(),
             },
             LinkStatus::SensorReconnected => Presence::Connecting,
             LinkStatus::Unknown(_) => return,
@@ -591,7 +591,7 @@ impl Engine {
         self.heard.retain(|route, at| {
             let heard = *at + QUIET > now;
             if !heard {
-                let since = std::time::Instant::now();
+                let since = now.into_std();
                 store.set(*route, PRESENCE, Presence::Lost { since });
             }
             heard
@@ -1529,6 +1529,36 @@ mod tests {
         while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
     }
 
+    /// A device silent for [`QUIET`] is lost then on the paused clock, the
+    /// moment its presence gives is that one, and how long ago the proxy
+    /// says it was lost follows the paused clock after. The device has no
+    /// `dev.metadata`, so no query of it waits to be asked again.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_loss_and_its_moment_follow_the_paused_clock() {
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
+        let device = route("/1");
+        let followed = presence(&store, device);
+        proxy.send(Packet::heartbeat(device));
+        let asked = proxy.sent.recv_async().await.unwrap();
+        let packet::Payload::RpcRequest(request) = asked.payload() else {
+            panic!("expected a metadata query, got {:?}", asked.payload());
+        };
+        proxy.refuse(request.id.value(), wire_rpc::RpcError::NotFound, device);
+        while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
+        let heard = Instant::now();
+
+        let now = followed.recv_async().await;
+        let Ok(Presence::Lost { since }) = now else {
+            panic!("the device was not lost, got {now:?}");
+        };
+        assert_eq!(heard.elapsed(), QUIET);
+        assert_eq!(since, (heard + QUIET).into_std());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let lost = Update::presence(Presence::Lost { since });
+        assert_eq!(lost, Update::Presence(Err(Some(60_000))));
+    }
+
     /// A device's metadata is pending until it is complete, and pending
     /// again once its link drops it.
     #[test]
@@ -1953,18 +1983,16 @@ mod tests {
     /// at once. Then the worker stops and the table is dropped, so a device
     /// no one asks is never walked again and no one is handed a table no
     /// one keeps current.
-    #[test]
-    fn a_table_no_receiver_follows_is_dropped_after_its_linger() {
+    #[tokio::test(start_paused = true)]
+    async fn a_table_no_receiver_follows_is_dropped_after_its_linger() {
         forget_table();
-        let (store, proxy) = engine();
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
         let root = DeviceRoute::root();
-        let answering = answer_table(&proxy);
         proxy.send(Packet::heartbeat(root));
         let registry = follow(&store, root, REGISTRY);
-        registry
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        answer_until_loaded(&proxy, &registry, TABLE_HASH).await;
+        answer_until_idle(&proxy, TABLE_HASH).await;
         drop(registry);
         let again = follow(&store, root, REGISTRY);
         assert!(
@@ -1973,26 +2001,36 @@ mod tests {
         );
         drop(again);
 
-        std::thread::sleep(LINGER * 4);
+        tokio::time::sleep(LINGER / 2).await;
+        assert!(
+            lock(&store).value(root, REGISTRY).is_some(),
+            "the table was dropped before its linger ended"
+        );
+        tokio::time::sleep(LINGER).await;
         assert!(
             lock(&store).value(root, REGISTRY).is_none(),
             "the table outlived its worker"
         );
         proxy.send(Packet::link(LinkStatus::SensorReconnected));
-        assert_eq!(answering.join().expect("the device answers"), 1);
+        let asked = tokio::time::timeout(RELOAD_DELAY * 2, proxy.sent.recv_async()).await;
+        assert!(asked.is_err(), "a stopped worker loaded the table again");
         forget_table();
     }
 
     /// A table that failed to load is loaded again after [`RELOAD_DELAY`]
     /// only once its device is heard, so a worker never asks a device that
-    /// is not there again and again.
-    #[test]
-    fn a_table_that_failed_loads_again_only_once_its_device_is_heard() {
-        let (store, proxy) = engine();
+    /// is not there again and again. The device stays alive over the wait
+    /// on samples, which its worker does not hear.
+    #[tokio::test(start_paused = true)]
+    async fn a_table_that_failed_loads_again_only_once_its_device_is_heard() {
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
         let device = route("/9");
         let registry = follow(&store, device, REGISTRY);
         proxy.send(Packet::heartbeat(device));
-        while let Ok(packet) = proxy.sent.recv_timeout(Duration::from_millis(500)) {
+        let idle = Duration::from_millis(500);
+        while let Ok(packet) = tokio::time::timeout(idle, proxy.sent.recv_async()).await {
+            let packet = packet.unwrap();
             if let packet::Payload::RpcRequest(request) = packet.payload() {
                 proxy.refuse(
                     request.id.value(),
@@ -2001,18 +2039,24 @@ mod tests {
                 );
             }
         }
-        let failed = registry
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the failure");
+        let failed = registry.recv_async().await.expect("the failure");
         assert!(failed.is_err(), "{failed:?}");
 
-        assert!(
-            !wrote_within(&proxy, RELOAD_DELAY + Duration::from_secs(1)),
-            "a device never heard was asked again"
-        );
+        let sampling = async {
+            loop {
+                proxy.send(samples(0, device));
+                tokio::time::sleep(QUIET / 2).await;
+            }
+        };
+        tokio::select! {
+            () = sampling => unreachable!(),
+            asked = tokio::time::timeout(RELOAD_DELAY * 2, proxy.sent.recv_async()) => {
+                assert!(asked.is_err(), "a device not heard since was asked again");
+            }
+        }
         proxy.send(Packet::heartbeat(device));
-        let (asked, ..) = proxy.call();
-        assert_eq!(asked, device);
+        let asked = proxy.sent.recv_async().await.unwrap();
+        assert_eq!(asked.route(), device);
     }
 
     /// A worker's task ends once the engine lets go of its device, sooner
@@ -2118,6 +2162,27 @@ mod tests {
             "lost after {:?}",
             reconnected.elapsed()
         );
+    }
+
+    /// A device whose link fails to reconnect is lost at the moment of the
+    /// status on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_loss_by_status_is_dated_on_the_paused_clock() {
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
+        let device = route("/1");
+        let followed = presence(&store, device);
+        proxy.send(Packet::heartbeat(device));
+        while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
+        tokio::time::sleep(QUIET / 3).await;
+
+        proxy.send(Packet::link(LinkStatus::FailedToReconnect).with_route(device));
+        let failed = Instant::now();
+        let now = followed.recv_async().await;
+        let Ok(Presence::Lost { since }) = now else {
+            panic!("the device was not lost, got {now:?}");
+        };
+        assert_eq!(since, failed.into_std());
     }
 
     /// The engine follows every packet its link sends, however many, so a
