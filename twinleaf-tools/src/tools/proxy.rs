@@ -157,8 +157,8 @@ fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
 }
 
 /// Hosts a proxy with `options`. When the port is taken, the error says
-/// whether a proxy or something else, such as a 1.x `tio proxy`, holds it,
-/// and suggests what to do.
+/// whether a proxy of this build or something else, such as a `tio proxy`
+/// from an older build, holds it, and suggests what to do.
 fn host(options: HostOptions) -> eyre::Result<Proxy> {
     use color_eyre::Help;
 

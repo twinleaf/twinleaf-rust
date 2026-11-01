@@ -130,9 +130,6 @@ pub(super) struct Session {
     binding: Option<Binding>,
     opening: Option<Opening>,
     held: Option<Held>,
-    /// Whether the client's hello said it reads the table each announced
-    /// setting was recorded under.
-    names_tables: bool,
 }
 
 impl Session {
@@ -161,7 +158,6 @@ impl Session {
             binding: None,
             opening: None,
             held: None,
-            names_tables: false,
         }
     }
 
@@ -427,7 +423,6 @@ impl Session {
         match request {
             Request::Hello(client) => {
                 log::debug!("Client {} is {client}", self.addr);
-                self.names_tables = client.protocol >= control::NAMES_TABLES;
                 self.update(server::Update::Hello(client)).await;
                 let host = control::Introduction::of_this_process(&self.shared.options.name);
                 self.answer(id, Ok(encode(&host)))
@@ -471,7 +466,7 @@ impl Session {
             let refusal = Refusal::new(RpcError::State, "this connection opened nothing");
             return self.answer(id, Err(refusal));
         };
-        match binding.watch(id, watch, self.names_tables) {
+        match binding.watch(id, watch) {
             Ok(updates) => {
                 self.watches.insert(id, StreamNotifyClose::new(updates));
             }
@@ -703,18 +698,13 @@ impl Binding {
     /// with it. Without, they are the routes heard at or below it, from every
     /// mount there, and the presence and announced settings of the device it
     /// names, if a mount shows it, each setting after the table it was
-    /// recorded under when `names_tables` is set. The engine of that mount's
-    /// link then queues the device's metadata updates for the watch itself.
-    /// The updates end when the link's engine does.
+    /// recorded under. The engine of that mount's link then queues the
+    /// device's metadata updates for the watch itself. The updates end when
+    /// the link's engine does.
     ///
     /// Returns a [`Refusal`] if no mount shows what the watch follows, and
     /// leaves the watch the client had under that id as it was.
-    fn watch(
-        &self,
-        id: u16,
-        watch: Watch,
-        names_tables: bool,
-    ) -> Result<BoxStream<'static, Update>, Refusal> {
+    fn watch(&self, id: u16, watch: Watch) -> Result<BoxStream<'static, Update>, Refusal> {
         let refused = || Refusal::new(RpcError::Invalid, format!("no mount shows {}", watch.route));
         let device = self.device(watch.route);
         if watch.table {
@@ -729,7 +719,7 @@ impl Binding {
         };
         let store = mounted.lease.link().store();
         mounted.mount.watch_metadata(id, route, &store);
-        let device = device_updates(&store, route, names_tables);
+        let device = device_updates(&store, route);
         Ok(stream::select(routes, device).boxed())
     }
 
@@ -783,15 +773,14 @@ impl Binding {
 
 /// Returns the updates of the presence and announced settings of the device
 /// at `route` that `store` holds, each setting after the table it was
-/// recorded under when `names_tables` is set.
+/// recorded under.
 pub(super) fn device_updates(
     store: &Mutex<Store>,
     route: DeviceRoute,
-    names_tables: bool,
 ) -> BoxStream<'static, Update> {
     let mut store = lock(store);
     let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
-    let changes = announced(store.follow(route, CHANGES), names_tables);
+    let changes = announced(store.follow(route, CHANGES));
     stream::select_all([presence.boxed(), changes]).boxed()
 }
 
@@ -835,10 +824,10 @@ fn values<T: Send + 'static>(receiver: Receiver<T>) -> BoxStream<'static, T> {
 }
 
 /// Returns the updates of each setting `changes` yields, and of each count
-/// of those it missed, until it ends. With `names_tables`, the table a
-/// setting was recorded under goes out ahead of it, unless it has the hash
-/// and session of the table of the setting before.
-fn announced(changes: Receiver<SettingChange>, names_tables: bool) -> BoxStream<'static, Update> {
+/// of those it missed, until it ends. The table a setting was recorded under
+/// goes out ahead of it, unless it has the hash and session of the table of
+/// the setting before.
+fn announced(changes: Receiver<SettingChange>) -> BoxStream<'static, Update> {
     // The hash and session of the table named last, or `None` for no
     // table, once one is named.
     type Identity = Option<(Option<u32>, Option<SessionId>)>;
@@ -848,8 +837,7 @@ fn announced(changes: Receiver<SettingChange>, names_tables: bool) -> BoxStream<
             Ok(change) => {
                 let table = change.rpc_registry();
                 let identity = table.map(|table| (table.hash, table.session));
-                let name =
-                    (names_tables && named != Some(identity)).then(|| Update::recorded(table));
+                let name = (named != Some(identity)).then(|| Update::recorded(table));
                 named = Some(identity);
                 name.into_iter().chain([Update::setting(change)]).collect()
             }
@@ -1624,7 +1612,7 @@ mod tests {
     fn a_slow_watch_converges_to_the_newest_presence() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route, true);
+        let mut updates = device_updates(&store, route);
         assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
 
         for session in 0..1000 {
@@ -1643,7 +1631,7 @@ mod tests {
     fn a_watch_that_misses_announcements_says_how_many() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route, true);
+        let mut updates = device_updates(&store, route);
         ready(&mut updates);
         let change = |seq: usize| {
             let seq = u32::try_from(seq).ok();
@@ -1673,7 +1661,7 @@ mod tests {
     fn a_watch_names_each_table_ahead_of_the_settings_recorded_under_it() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route, true);
+        let mut updates = device_updates(&store, route);
         ready(&mut updates);
         let table = |hash| Arc::new(RpcRegistry::from_entries(Vec::new(), Some(hash), None));
         let (old, new) = (table(1), table(2));
@@ -1703,21 +1691,5 @@ mod tests {
                 Update::setting(reloaded),
             ]
         );
-    }
-
-    /// A watch of a client whose protocol reads no named tables names none,
-    /// and sends each announced setting alone.
-    #[test]
-    fn a_watch_of_an_older_client_names_no_table() {
-        let store = Mutex::new(Store::new(true));
-        let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route, false);
-        ready(&mut updates);
-        let table = Arc::new(RpcRegistry::from_entries(Vec::new(), Some(1), None));
-        lock(&store).set_registry(route, Ok(table));
-        let name = "test.amplitude".to_string();
-        let change = lock(&store).record_change(route, name, Some(1), vec![1]);
-
-        assert_eq!(ready(&mut updates), [Update::setting(change)]);
     }
 }

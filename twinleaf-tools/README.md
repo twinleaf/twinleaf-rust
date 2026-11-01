@@ -58,7 +58,8 @@ tio monitor -r tcp://localhost:17855
 ```
 
 A loopback URL like this connects to that proxy and opens its `auto`, which
-is its default device. It reaches only a 2.0 proxy.
+is its default device. It reaches only a proxy from the same build of
+twinleaf.
 
 `tio proxy` listens on every interface, so other machines can connect.
 `--listen loopback` keeps it to this machine. A proxy that a tool starts in

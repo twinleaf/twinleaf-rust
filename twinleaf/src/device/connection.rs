@@ -121,8 +121,9 @@ impl Connection {
     /// address within 1.5 s.
     ///
     /// A TCP URL whose host is this machine, such as `tcp://localhost:17855`,
-    /// names a running 2.0 proxy. The connection goes through that proxy
-    /// and opens what it resolves `auto` to. No proxy is started for it.
+    /// names a running proxy of this build. The connection goes through that
+    /// proxy and opens what it resolves `auto` to. No proxy is started for
+    /// it.
     ///
     /// The `TWINLEAF_PROXY` environment variable, when set and not empty,
     /// names a different proxy as `tcp://host:port`. For example,
@@ -173,8 +174,9 @@ impl Connection {
     /// - The proxy refuses to open the device, or does not open it within
     ///   15 s. A refusal carries the proxy's reason, such as the candidates
     ///   an ambiguous `auto` could mean.
-    /// - The peer that answers is not a Twinleaf 2.0 proxy, such as a 1.x
-    ///   `tio proxy`, which this build cannot reach.
+    /// - The peer that answers gives no introduction to the hello, as a
+    ///   `tio proxy` from an older build gives none. This build cannot reach
+    ///   such a proxy.
     /// - Nothing answers at the proxy `TWINLEAF_PROXY` names. The message
     ///   names the variable.
     ///

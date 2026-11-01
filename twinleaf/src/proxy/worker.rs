@@ -159,19 +159,21 @@ const OPEN_ID: u16 = 2;
 
 /// What answers at the other end of a TCP link.
 enum Peer {
-    /// A Twinleaf 2.0 proxy, whose `auto` the link opened.
+    /// A proxy of this build, whose `auto` the link opened.
     Proxy,
-    /// A device, or a proxy older than 2.0, with what it sent first if it
-    /// sent anything.
+    /// A device, or a proxy from an older build, with what it sent first if
+    /// it sent anything.
     Device(Option<ReceiveResult>),
 }
 
 /// Connects to the TCP peer at `url`, and returns its port, which delivers
-/// to `results`. The link says hello first. A Twinleaf 2.0 proxy answers,
+/// to `results`. The link says hello first. A proxy of this build answers,
 /// and the link then opens its `auto` as a control client does, so that it
 /// hears the proxy's link statuses for each route and keeps the connection
 /// alive. Any other peer answers with something else, or with nothing
-/// within [`control::HELLO_TIMEOUT`], and its packets are a device's.
+/// within [`control::HELLO_TIMEOUT`], and its packets are a device's. A
+/// proxy from an older build forwards its device's packets, so it is such a
+/// peer.
 ///
 /// The task `link relay <url>` on `tasks` hands what the port receives to
 /// `results`. No one holds it. It ends once the port's task has ended and
@@ -234,7 +236,8 @@ async fn greet(
             packet::Payload::ProxyRx(packet::ProxyRx::Reply(reply))
                 if reply.req_id.value() == HELLO_ID =>
             {
-                control::decode::<control::Introduction>(reply.value).map_err(io::Error::other)?
+                control::decode::<control::Introduction>(reply.value)
+                    .map_err(|_| control::older_build(url))?
             }
             packet::Payload::ProxyRx(packet::ProxyRx::Error(error))
                 if error.req_id.value() == HELLO_ID =>
@@ -245,12 +248,7 @@ async fn greet(
         },
         _ => return Ok(Peer::Device(Some(first))),
     };
-    if host.protocol < control::VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("{url} is {host}, which speaks an older proxy protocol"),
-        ));
-    }
+    log::debug!("the proxy at {url} is {host}");
     let (name, target) = control::Request::Open {
         target: super::auto::AUTO.to_string(),
     }

@@ -99,7 +99,7 @@ pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
                 }
                 Err(_) => format!("a Twinleaf proxy already runs at {endpoint}"),
             },
-            Err(_) => control::not_a_proxy(&endpoint).to_string(),
+            Err(_) => control::older_build(&endpoint).to_string(),
         };
         return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
     }

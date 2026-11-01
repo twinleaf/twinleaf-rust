@@ -47,15 +47,6 @@ pub(crate) const WATCH: &str = "proxy.watch";
 /// The method that stops a watch.
 pub(crate) const UNWATCH: &str = "proxy.unwatch";
 
-/// The version of the control protocol this build speaks. It encodes every
-/// argument and reply in CBOR, and a device watch names the RPC table each
-/// announced setting was recorded under.
-pub(super) const VERSION: u8 = 3;
-
-/// The lowest protocol of a client that reads [`Update::Recorded`]. A
-/// device watch of a client that speaks a lower one names no table.
-pub(super) const NAMES_TABLES: u8 = 3;
-
 /// How a client keeps its link to the proxy alive once the hello is done.
 pub(crate) const CLIENT_KEEPALIVE: KeepAlive = KeepAlive {
     beat: || Packet::heartbeat(DeviceRoute::root()),
@@ -77,15 +68,12 @@ pub(crate) struct Introduction {
     /// The process id.
     #[n(0)]
     pub(crate) pid: u32,
-    /// The version of the control protocol it speaks.
-    #[n(1)]
-    pub(crate) protocol: u8,
     /// The version of the `twinleaf` crate it was built with, as major,
     /// minor and patch.
-    #[n(2)]
+    #[n(1)]
     pub(crate) version: [u16; 3],
     /// Its name, such as `tio monitor` or `tio proxy`.
-    #[n(3)]
+    #[n(2)]
     pub(crate) name: String,
 }
 
@@ -95,7 +83,6 @@ impl Introduction {
         let part = |text: &str| text.parse().unwrap_or(0);
         Introduction {
             pid: std::process::id(),
-            protocol: VERSION,
             version: [
                 part(env!("CARGO_PKG_VERSION_MAJOR")),
                 part(env!("CARGO_PKG_VERSION_MINOR")),
@@ -507,7 +494,8 @@ const HELLO_ID: u16 = 1;
 /// The id a [`handshake`] tags its request with.
 const REQUEST_ID: u16 = 2;
 /// How long a proxy may take to accept a connection and answer anything at
-/// all. A peer that is silent this long is not a 2.0 proxy.
+/// all. A peer that is silent this long is a proxy from an older build, or
+/// no proxy.
 pub(super) const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The longest refusal message that fits a `PROXY_RX` error.
@@ -709,13 +697,12 @@ pub(crate) async fn call_at(
 /// Returns the proxy's [`Introduction`], if it gave one before the reply, and
 /// the reply's bytes.
 ///
-/// Returns an [`io::ErrorKind::Unsupported`] error naming the proxy if it
-/// speaks an older control protocol than this build. Returns an error with
-/// the proxy's message if the proxy refuses the hello or the request. Returns an error saying it could not do `goal`, such as
-/// `open auto`, if the proxy stops, closes the connection, or does not answer
-/// in time. Returns an [`io::ErrorKind::InvalidData`] error saying how to
-/// reach the peer if it sends no control reply within [`HELLO_TIMEOUT`]. A
-/// proxy older than tio 2.0 is such a peer.
+/// Returns the [`older_build`] error if the peer sends no control reply
+/// within [`HELLO_TIMEOUT`], as a proxy from an older build does, or answers
+/// the hello with no introduction. Returns an error with the proxy's message
+/// if the proxy refuses the hello or the request. Returns an error saying it
+/// could not do `goal`, such as `open auto`, if the proxy stops, closes the
+/// connection, or does not answer in time.
 pub(crate) async fn handshake(
     port: &transport::Port,
     received: &flume::Receiver<ReceiveResult>,
@@ -734,13 +721,14 @@ pub(crate) async fn handshake(
         port.send_async(request).await.map_err(io::Error::other)?;
     }
     // The proxy hangs up on a client that is quiet too long, and an open may
-    // wait longer than that for its device. A peer that is no proxy hears a
-    // heartbeat or two, as it would from a client older than tio 2.0.
+    // wait longer than that for its device. A peer that is no proxy of this
+    // build hears a heartbeat or two.
     port.keep_alive(CLIENT_KEEPALIVE).await;
     let started = Instant::now();
     let deadline = started + timeout;
     let hello_deadline = deadline.min(started + HELLO_TIMEOUT);
-    // Whether the peer has sent any PROXY_RX, which only a 2.0 proxy does.
+    // Whether the peer has sent any PROXY_RX, which only a proxy of this
+    // build does.
     let mut answered = false;
     let mut host = None;
     let mut incoming = received.stream();
@@ -753,7 +741,7 @@ pub(crate) async fn handshake(
                     format!("the proxy at {endpoint} did not {goal} within {timeout:?}"),
                 )
             } else {
-                not_a_proxy(endpoint)
+                older_build(endpoint)
             }
         };
         if Instant::now() >= until {
@@ -783,25 +771,14 @@ pub(crate) async fn handshake(
         };
         answered = true;
         match rx {
-            // A proxy from before protocol 2 can neither read this hello nor
-            // write one this build reads.
             ProxyRx::Reply(reply) if reply.req_id.value() == HELLO_ID => {
                 let introduction: Introduction =
                     decode(reply.value).map_err(|_| older_build(endpoint))?;
-                if introduction.protocol < VERSION {
-                    return Err(older_protocol(endpoint, &introduction));
-                }
                 log::debug!("the proxy at {endpoint} is {introduction}");
                 host = Some(introduction);
             }
             ProxyRx::Reply(reply) if reply.req_id.value() == REQUEST_ID => {
                 return Ok((host, reply.value.to_vec()))
-            }
-            ProxyRx::Error(error)
-                if error.req_id.value() == HELLO_ID
-                    && RpcError::from(error.code) == RpcError::ArgsSize =>
-            {
-                return Err(older_build(endpoint))
             }
             ProxyRx::Error(error) if matches!(error.req_id.value(), HELLO_ID | REQUEST_ID) => {
                 return Err(io::Error::other(
@@ -819,37 +796,17 @@ pub(crate) async fn handshake(
     }
 }
 
-/// Returns the error for the proxy at `endpoint`, introduced as `host`, that
-/// speaks an older control protocol than this build.
-fn older_protocol(endpoint: &str, host: &Introduction) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "the proxy at {endpoint} is {host}, which speaks proxy protocol {}, older than {VERSION}; \
-             update it, or stop it and let this program start its own",
-            host.protocol
-        ),
-    )
-}
-
-/// Returns the error for the proxy at `endpoint` from a build of twinleaf
-/// before protocol 2, which cannot read this build's hello.
-fn older_build(endpoint: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "the proxy at {endpoint} is from an older build of twinleaf and speaks another \
-             proxy protocol; update tio, or stop it and let this program start its own"
-        ),
-    )
-}
-
-/// Returns the error for a peer at `endpoint` that is not a 2.0 proxy, such
-/// as a proxy older than tio 2.0, which this build cannot reach.
-pub(super) fn not_a_proxy(endpoint: &str) -> io::Error {
+/// Returns the error for a peer at `endpoint` that does not answer
+/// `proxy.hello` with an introduction, as a proxy from an older build of
+/// twinleaf does not. Such a proxy forwards the hello to its device as a
+/// packet of a type it does not know, and sends no control reply.
+pub(super) fn older_build(endpoint: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("{endpoint} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it"),
+        format!(
+            "{endpoint} is a proxy from an older build of twinleaf, or no proxy; \
+             update tio, or stop it"
+        ),
     )
 }
 
@@ -986,7 +943,6 @@ mod tests {
             Request::Hello(Introduction::of_this_process("tio monitor")),
             Request::Hello(Introduction {
                 pid: u32::MAX,
-                protocol: u8::MAX,
                 version: [u16::MAX; 3],
                 name: String::new(),
             }),
@@ -1011,13 +967,12 @@ mod tests {
         }
     }
 
-    /// An introduction is a CBOR array of the pid, the protocol, the version
-    /// as an array of three, and the name.
+    /// An introduction is a CBOR array of the pid, the version as an array
+    /// of three, and the name.
     #[test]
     fn a_hello_matches_the_wire_layout() {
         let (name, args) = Request::Hello(Introduction {
             pid: 0x0102_0304,
-            protocol: 1,
             version: [2, 0x0304, 5],
             name: "ab".to_string(),
         })
@@ -1026,19 +981,19 @@ mod tests {
         assert_eq!(name, "proxy.hello");
         let pid = [0x1a, 1, 2, 3, 4];
         let version = [0x83, 2, 0x19, 3, 4, 5];
-        let expected = [&[0x84][..], &pid, &[1], &version, &[0x62, b'a', b'b']].concat();
+        let expected = [&[0x83][..], &pid, &version, &[0x62, b'a', b'b']].concat();
         assert_eq!(args, expected);
     }
 
-    /// A proxy from before protocol 2 refuses this build's hello as cut
-    /// short, which the client reports as a proxy to update.
-    #[tokio::test]
-    async fn a_hello_refused_as_cut_short_is_a_proxy_from_an_older_build() {
+    /// A peer that sends no control reply to the hello, as a proxy from an
+    /// older build does, is reported as one once [`HELLO_TIMEOUT`] passes,
+    /// though the call may wait longer.
+    #[tokio::test(start_paused = true)]
+    async fn a_hello_with_no_control_reply_is_a_proxy_from_an_older_build() {
         let (send, received) = flume::unbounded();
         let (port, _peer) =
             transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
-        let refusal = Packet::proxy_error(HELLO_ID, RpcError::ArgsSize, "short").unwrap();
-        send.send(Ok(TransportEvent::Packet(refusal))).unwrap();
+        let started = Instant::now();
 
         let error = handshake(
             &port,
@@ -1047,12 +1002,17 @@ mod tests {
             OPEN,
             &[],
             "open the device",
-            Duration::from_secs(1),
+            Duration::from_secs(15),
         )
         .await
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("older build"), "{error}");
+        assert_eq!(started.elapsed(), HELLO_TIMEOUT);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "tcp://127.0.0.1:7855 is a proxy from an older build of twinleaf, or no proxy; \
+             update tio, or stop it"
+        );
     }
 
     /// Returns the mount of `source` of the device at `url`, seen at `prefix`.
@@ -1106,13 +1066,12 @@ mod tests {
         assert_eq!(decode::<String>(&encode(&target)).unwrap(), target);
     }
 
-    /// This build introduces itself with its own protocol and crate version.
+    /// This build introduces itself with its own pid and crate version.
     #[test]
-    fn this_process_gives_its_protocol_and_version() {
+    fn this_process_gives_its_pid_and_version() {
         let introduction = Introduction::of_this_process("tio monitor");
 
         assert_eq!(introduction.pid, std::process::id());
-        assert_eq!(introduction.protocol, VERSION);
         assert_eq!(introduction.version_text(), env!("CARGO_PKG_VERSION"));
         assert_eq!(
             introduction.to_string(),
