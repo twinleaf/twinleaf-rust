@@ -7,7 +7,7 @@
 use super::Layout;
 use crate::data::PacketParser;
 use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use crate::device::store::{Store, CHANGES, METADATA, PRESENCE, REGISTRY};
+use crate::device::store::{Store, METADATA, PRESENCE, REGISTRY};
 use crate::device::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
@@ -47,9 +47,14 @@ pub(crate) const WATCH: &str = "proxy.watch";
 /// The method that stops a watch.
 pub(crate) const UNWATCH: &str = "proxy.unwatch";
 
-/// The version of the control protocol this build speaks. Version 2 encodes
-/// every argument and reply in CBOR.
-pub(super) const VERSION: u8 = 2;
+/// The version of the control protocol this build speaks. It encodes every
+/// argument and reply in CBOR, and a device watch names the RPC table each
+/// announced setting was recorded under.
+pub(super) const VERSION: u8 = 3;
+
+/// The lowest protocol of a client that reads [`Update::Recorded`]. A
+/// device watch of a client that speaks a lower one names no table.
+pub(super) const NAMES_TABLES: u8 = 3;
 
 /// How a client keeps its link to the proxy alive once the hello is done.
 pub(crate) const CLIENT_KEEPALIVE: KeepAlive = KeepAlive {
@@ -130,6 +135,18 @@ pub(crate) fn decode<'b, T: Decode<'b, ()>>(bytes: &'b [u8]) -> Result<T, minicb
     minicbor::decode(bytes)
 }
 
+/// Returns `table` as its hash, its session and its entries.
+fn entries(table: &RpcRegistry) -> WireEntries {
+    let entries = table
+        .iter()
+        .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()));
+    (
+        table.hash,
+        table.session.map(SessionId::value),
+        entries.collect(),
+    )
+}
+
 /// Encodes a [`DeviceRoute`] as the byte string of its hops, for
 /// `#[cbor(with = "...")]`.
 pub(super) mod hops {
@@ -174,10 +191,12 @@ const TIMED_OUT: u16 = 0xfffd;
 const CHANGED: u16 = 0xfffe;
 const UNANSWERED: u16 = 0xffff;
 
-/// The RPC table as its hash, the session it was read in, and the name and
-/// metadata word of each entry, or why it did not load as an error code and
-/// message.
-type WireTable = Result<(Option<u32>, Option<u32>, Vec<(String, u16)>), (u16, ByteVec)>;
+/// An RPC table as its hash, the session it was read in, and the name and
+/// metadata word of each entry.
+type WireEntries = (Option<u32>, Option<u32>, Vec<(String, u16)>);
+
+/// The RPC table, or why it did not load as an error code and message.
+type WireTable = Result<WireEntries, (u16, ByteVec)>;
 
 /// One value of a watched device's state, as a reply to `proxy.watch`
 /// carries it in [`Part`]s.
@@ -206,7 +225,8 @@ pub(crate) enum Update {
         #[n(2)] BTreeMap<String, ByteVec>,
     ),
     /// One setting the device announced, as its name, its
-    /// `settings.version` once counted and its value.
+    /// `settings.version` once counted and its value. It was recorded under
+    /// the table the last [`Recorded`](Self::Recorded) update named.
     #[n(4)]
     Setting(#[n(0)] String, #[n(1)] Option<u32>, #[n(2)] ByteVec),
     /// Every route heard at or below the watched one, each as its hops.
@@ -216,6 +236,13 @@ pub(crate) enum Update {
     /// behind.
     #[n(6)]
     Lagged(#[n(0)] u64),
+    /// The RPC table the announced settings after it were recorded under,
+    /// up to the next such update, or `None` for settings recorded while no
+    /// table was in force. One goes out ahead of the first setting of a
+    /// watch, and ahead of each setting recorded under another table than
+    /// the setting before.
+    #[n(7)]
+    Recorded(#[n(0)] Option<WireEntries>),
 }
 
 impl Update {
@@ -250,16 +277,7 @@ impl Update {
     pub(crate) fn table(registry: &RegistryState) -> Update {
         let none = || ByteVec::from(Vec::new());
         Update::Table(match registry {
-            Ok(table) => {
-                let entries = table
-                    .iter()
-                    .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()));
-                Ok((
-                    table.hash,
-                    table.session.map(SessionId::value),
-                    entries.collect(),
-                ))
-            }
+            Ok(table) => Ok(entries(table)),
             Err(RpcRegistryError::DeviceRpcError(CallError::DeviceError(refusal))) => {
                 Err((refusal.error.value(), refusal.extra.clone().into()))
             }
@@ -285,12 +303,20 @@ impl Update {
         Update::Setting(change.name, change.seq, change.reply.into())
     }
 
+    /// Returns the update that names `table` as the one the announced
+    /// settings after it were recorded under.
+    pub(crate) fn recorded(table: Option<&Arc<RpcRegistry>>) -> Update {
+        Update::Recorded(table.map(|table| entries(table)))
+    }
+
     /// Keeps what the update says of the device at `route` in `store`. Its
     /// metadata records reach `parser` as the device's own, and the
     /// metadata the parser then holds is the value kept, and no metadata
     /// resets any route but `route`. Settings are kept only when they were
     /// read with the table the store holds, and a table with the hash and
-    /// session of the one held keeps them.
+    /// session of the one held keeps them. A table with the hash and session
+    /// of one the store holds already is that one, so the device's table and
+    /// the table its changes carry are one value while they are the same.
     pub(crate) fn apply(self, route: DeviceRoute, store: &mut Store, parser: &mut PacketParser) {
         match self {
             Update::Presence(presence) => {
@@ -337,8 +363,10 @@ impl Update {
                 if !held.is_some_and(|held| {
                     held.is_ok_and(|held| (held.hash, held.session) == (hash, session))
                 }) {
-                    let table = RpcRegistry::from_entries(entries, hash, session);
-                    store.set_registry(route, Ok(Arc::new(table)));
+                    let table = store.table_of(route, hash, session).unwrap_or_else(|| {
+                        Arc::new(RpcRegistry::from_entries(entries, hash, session))
+                    });
+                    store.set_registry(route, Ok(table));
                 }
             }
             Update::Table(Err((CHANGED, _))) => {
@@ -364,8 +392,13 @@ impl Update {
                 _ => log::warn!("dropping settings of {route} read with a table it does not hold"),
             },
             Update::Setting(name, seq, reply) => {
-                let reply = reply.into();
-                store.set(route, CHANGES, SettingChange { name, seq, reply });
+                store.record_change(route, name, seq, reply.into());
+            }
+            Update::Recorded(table) => {
+                let table = table.map(|(hash, session, entries)| {
+                    RpcRegistry::from_entries(entries, hash, session.map(SessionId::new))
+                });
+                store.name_table(route, table);
             }
             Update::Routes(routes) => {
                 let routes = routes
@@ -1131,5 +1164,57 @@ mod tests {
             socket_addr("tcp://127.0.0.1").unwrap(),
             SocketAddr::from(([127, 0, 0, 1], TCP_DEFAULT_PORT))
         );
+    }
+
+    /// A client's store records each change under the table the proxy
+    /// named for it, which is the client's own copy of the device's table
+    /// while the two have one hash and session. A change decodes with its
+    /// own table after the device's table has moved on to one that types
+    /// its entry otherwise, and one named with no table does not decode.
+    #[test]
+    fn a_client_records_each_change_under_the_table_named_for_it() {
+        use crate::device::rpc::RpcValue;
+        use crate::device::store::{CHANGES, REGISTRY};
+        use crate::device::SettingValueError;
+
+        let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
+        let route = DeviceRoute::root();
+        let changes = store.follow(route, CHANGES);
+        let table = |hash, meta| {
+            let entries = vec![("test.amplitude".to_string(), meta)];
+            Arc::new(RpcRegistry::from_entries(entries, Some(hash), None))
+        };
+        let (old, new) = (table(1, 0xA310), table(2, 0xA321));
+        let reply = 0x1234i16.to_le_bytes();
+        let setting = || Update::Setting("test.amplitude".to_string(), None, reply.to_vec().into());
+        let mut apply = |update: Update| update.apply(route, &mut store, &mut parser);
+
+        apply(Update::table(&Ok(Arc::clone(&old))));
+        apply(Update::recorded(Some(&old)));
+        apply(setting());
+        apply(Update::table(&Ok(Arc::clone(&new))));
+        apply(setting());
+        apply(Update::recorded(Some(&new)));
+        apply(setting());
+        apply(Update::recorded(None));
+        apply(setting());
+
+        let held = store.value(route, REGISTRY).unwrap().unwrap();
+        let received: Vec<_> = std::iter::from_fn(|| changes.try_recv().unwrap()).collect();
+        let values: Vec<_> = received.iter().map(|change| change.value().ok()).collect();
+        let byte = Some(RpcValue::U64(0x34));
+        assert_eq!(
+            values,
+            [byte.clone(), byte, Some(RpcValue::I64(0x1234)), None]
+        );
+        assert!(Arc::ptr_eq(received[2].rpc_registry().unwrap(), &held));
+        assert!(Arc::ptr_eq(
+            received[0].rpc_registry().unwrap(),
+            received[1].rpc_registry().unwrap()
+        ));
+        assert!(matches!(
+            received[3].value(),
+            Err(SettingValueError::NoTable)
+        ));
     }
 }

@@ -129,6 +129,7 @@ impl SettingsCache {
                 name,
                 seq: Some(seq),
                 reply,
+                ..
             }) => match self.applied {
                 None => CacheAction::Snapshot,
                 Some(applied) if *seq == applied.wrapping_add(1) => {
@@ -296,11 +297,7 @@ mod tests {
     }
 
     fn setting(name: &str, seq: Option<u32>, reply: u8) -> DeviceEvent {
-        DeviceEvent::Setting(SettingChange {
-            name: name.to_string(),
-            seq,
-            reply: vec![reply],
-        })
+        DeviceEvent::Setting(SettingChange::new(name.to_string(), seq, vec![reply], None))
     }
 
     fn heartbeat(session: SessionId, settings: Option<u32>) -> DeviceEvent {

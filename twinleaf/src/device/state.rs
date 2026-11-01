@@ -6,7 +6,7 @@
 //! one first and then each new one. A reader that falls behind skips to the
 //! newest, so it never lags.
 
-use super::rpc::{RpcRegistry, RpcRegistryError};
+use super::rpc::{RpcRegistry, RpcRegistryError, RpcValue, RpcValueDecodeError, RpcValueTypeExt};
 use crate::data::DeviceMetadataSnapshot;
 use crate::proto::SessionId;
 use std::collections::BTreeMap;
@@ -26,9 +26,10 @@ pub enum Presence {
         /// The session its last heartbeat reported, when one did.
         session: Option<SessionId>,
     },
-    /// The link that serves the device lost it or stopped.
+    /// The proxy lost the device, as the link that serves it lost it or
+    /// stopped, or as the device was silent for 3 s.
     Lost {
-        /// When the link reported it.
+        /// When the proxy lost it.
         since: Instant,
     },
 }
@@ -50,8 +51,24 @@ pub enum MetadataState {
 /// A device's RPC table as last loaded, or why it could not be loaded.
 pub type RegistryState = Result<Arc<RpcRegistry>, RpcRegistryError>;
 
-/// One setting a device announced, in the order it announced them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One setting a device announced, in the order it announced them, with the
+/// RPC table it was recorded under.
+///
+/// The table is the one in force for the device when the change was
+/// recorded, and the change keeps it after the device moves on to another.
+/// A table is never changed in place, so [`value`](Self::value) decodes the
+/// reply as the device meant it, without waiting for anything.
+///
+/// A table is in force from its load until the device reconnects, the
+/// device reports another session, or the device announces another
+/// `rpc.hash`, and the next table is in force once it loads. A device
+/// reconnects as its link reconnects, and as the proxy hears it again after
+/// losing it. Only a load that started after the device last reconnected
+/// counts, so a table read before a reconnect is never in force after it.
+/// No table is in force before the first loads or while a load fails. A
+/// change recorded while no table is in force carries none, and its value
+/// does not decode. Its reply still holds the bytes.
+#[derive(Debug, Clone)]
 pub struct SettingChange {
     /// The setting's RPC name.
     pub name: String,
@@ -60,6 +77,60 @@ pub struct SettingChange {
     pub seq: Option<u32>,
     /// Its new value, the bytes that RPC would reply.
     pub reply: Vec<u8>,
+    table: Option<Arc<RpcRegistry>>,
+}
+
+impl SettingChange {
+    /// Creates the change of `name` to `reply`, counted as `seq`, recorded
+    /// under `table`.
+    pub(crate) fn new(
+        name: String,
+        seq: Option<u32>,
+        reply: Vec<u8>,
+        table: Option<Arc<RpcRegistry>>,
+    ) -> SettingChange {
+        SettingChange {
+            name,
+            seq,
+            reply,
+            table,
+        }
+    }
+
+    /// Returns the RPC table the change was recorded under, or `None` for a
+    /// change recorded while no table was in force.
+    pub fn rpc_registry(&self) -> Option<&Arc<RpcRegistry>> {
+        self.table.as_ref()
+    }
+
+    /// Decodes the new value with the type its entry has in the table the
+    /// change was recorded under.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SettingValueError`] if no table was in force when the
+    /// change was recorded, if that table has no entry of its name, or if
+    /// the reply does not decode as the entry's type.
+    pub fn value(&self) -> Result<RpcValue, SettingValueError> {
+        let table = self.table.as_ref().ok_or(SettingValueError::NoTable)?;
+        let entry = table.find(&self.name).ok_or(SettingValueError::NoEntry)?;
+        Ok(entry.meta.kind().decode(&self.reply)?)
+    }
+}
+
+/// Why a [`SettingChange`] has no value.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SettingValueError {
+    /// No RPC table was in force when the change was recorded.
+    #[error("no RPC table was in force when the setting changed")]
+    NoTable,
+    /// The table the change was recorded under has no entry of its name.
+    #[error("the RPC table the setting changed under has no such entry")]
+    NoEntry,
+    /// The reply does not decode as the type of its entry.
+    #[error(transparent)]
+    Decode(#[from] RpcValueDecodeError),
 }
 
 /// The values of a device's announced settings, read with one RPC table.

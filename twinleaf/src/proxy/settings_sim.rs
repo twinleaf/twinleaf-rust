@@ -926,11 +926,12 @@ impl<'c> World<'c> {
                 settings: beat.settings(),
             },
             Payload::Setting(setting) => match setting.name_str() {
-                Some(name) => DeviceEvent::Setting(SettingChange {
-                    name: name.to_string(),
-                    seq: setting.seq,
-                    reply: setting.reply.to_vec(),
-                }),
+                Some(name) => DeviceEvent::Setting(SettingChange::new(
+                    name.to_string(),
+                    setting.seq,
+                    setting.reply.to_vec(),
+                    None,
+                )),
                 None => return,
             },
             _ => return,

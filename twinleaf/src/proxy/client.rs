@@ -4,7 +4,8 @@
 //! [`Session::run`] runs it.
 //!
 //! A device watch follows the device's presence, announced settings and
-//! routes here, and these updates go on the outbox's urgent queue. The
+//! routes here, and the RPC table each announced setting was recorded
+//! under, and these updates go on the outbox's urgent queue. The
 //! device's metadata update says how to decode its samples, so the engine of
 //! the device's link queues it on the stream instead, as it sets it. A table
 //! watch follows the RPC table and settings here.
@@ -23,7 +24,7 @@ use crate::device::store::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
 use crate::device::stream::Scope;
 use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
-use crate::proto::{DeviceRoute, PacketType, TCP_DEFAULT_PORT};
+use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::{finish, lock, BoxFuture};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
@@ -129,6 +130,9 @@ pub(super) struct Session {
     binding: Option<Binding>,
     opening: Option<Opening>,
     held: Option<Held>,
+    /// Whether the client's hello said it reads the table each announced
+    /// setting was recorded under.
+    names_tables: bool,
 }
 
 impl Session {
@@ -157,6 +161,7 @@ impl Session {
             binding: None,
             opening: None,
             held: None,
+            names_tables: false,
         }
     }
 
@@ -422,6 +427,7 @@ impl Session {
         match request {
             Request::Hello(client) => {
                 log::debug!("Client {} is {client}", self.addr);
+                self.names_tables = client.protocol >= control::NAMES_TABLES;
                 self.update(server::Update::Hello(client)).await;
                 let host = control::Introduction::of_this_process(&self.shared.options.name);
                 self.answer(id, Ok(encode(&host)))
@@ -465,7 +471,7 @@ impl Session {
             let refusal = Refusal::new(RpcError::State, "this connection opened nothing");
             return self.answer(id, Err(refusal));
         };
-        match binding.watch(id, watch) {
+        match binding.watch(id, watch, self.names_tables) {
             Ok(updates) => {
                 self.watches.insert(id, StreamNotifyClose::new(updates));
             }
@@ -696,13 +702,19 @@ impl Binding {
     /// the watch names, and a table goes out ahead of the first settings read
     /// with it. Without, they are the routes heard at or below it, from every
     /// mount there, and the presence and announced settings of the device it
-    /// names, if a mount shows it. The engine of that mount's link then queues
-    /// the device's metadata updates for the watch itself. The updates end
-    /// when the link's engine does.
+    /// names, if a mount shows it, each setting after the table it was
+    /// recorded under when `names_tables` is set. The engine of that mount's
+    /// link then queues the device's metadata updates for the watch itself.
+    /// The updates end when the link's engine does.
     ///
     /// Returns a [`Refusal`] if no mount shows what the watch follows, and
     /// leaves the watch the client had under that id as it was.
-    fn watch(&self, id: u16, watch: Watch) -> Result<BoxStream<'static, Update>, Refusal> {
+    fn watch(
+        &self,
+        id: u16,
+        watch: Watch,
+        names_tables: bool,
+    ) -> Result<BoxStream<'static, Update>, Refusal> {
         let refused = || Refusal::new(RpcError::Invalid, format!("no mount shows {}", watch.route));
         let device = self.device(watch.route);
         if watch.table {
@@ -717,7 +729,8 @@ impl Binding {
         };
         let store = mounted.lease.link().store();
         mounted.mount.watch_metadata(id, route, &store);
-        Ok(stream::select(routes, device_updates(&store, route)).boxed())
+        let device = device_updates(&store, route, names_tables);
+        Ok(stream::select(routes, device).boxed())
     }
 
     /// Stops the metadata updates of watch `id` on every mount.
@@ -769,14 +782,16 @@ impl Binding {
 }
 
 /// Returns the updates of the presence and announced settings of the device
-/// at `route` that `store` holds.
+/// at `route` that `store` holds, each setting after the table it was
+/// recorded under when `names_tables` is set.
 pub(super) fn device_updates(
     store: &Mutex<Store>,
     route: DeviceRoute,
+    names_tables: bool,
 ) -> BoxStream<'static, Update> {
     let mut store = lock(store);
     let presence = values(store.follow(route, PRESENCE)).map(Update::presence);
-    let changes = announced(store.follow(route, CHANGES));
+    let changes = announced(store.follow(route, CHANGES), names_tables);
     stream::select_all([presence.boxed(), changes]).boxed()
 }
 
@@ -820,16 +835,30 @@ fn values<T: Send + 'static>(receiver: Receiver<T>) -> BoxStream<'static, T> {
 }
 
 /// Returns the updates of each setting `changes` yields, and of each count
-/// of those it missed, until it ends.
-fn announced(changes: Receiver<SettingChange>) -> BoxStream<'static, Update> {
-    stream::unfold(changes, |changes| async move {
-        let update = match changes.recv_async().await {
-            Ok(change) => Update::setting(change),
-            Err(RecvError::Lagged(missed)) => Update::Lagged(missed),
+/// of those it missed, until it ends. With `names_tables`, the table a
+/// setting was recorded under goes out ahead of it, unless it has the hash
+/// and session of the table of the setting before.
+fn announced(changes: Receiver<SettingChange>, names_tables: bool) -> BoxStream<'static, Update> {
+    // The hash and session of the table named last, or `None` for no
+    // table, once one is named.
+    type Identity = Option<(Option<u32>, Option<SessionId>)>;
+    let named: Option<Identity> = None;
+    stream::unfold((changes, named), move |(changes, mut named)| async move {
+        let updates = match changes.recv_async().await {
+            Ok(change) => {
+                let table = change.rpc_registry();
+                let identity = table.map(|table| (table.hash, table.session));
+                let name =
+                    (names_tables && named != Some(identity)).then(|| Update::recorded(table));
+                named = Some(identity);
+                name.into_iter().chain([Update::setting(change)]).collect()
+            }
+            Err(RecvError::Lagged(missed)) => vec![Update::Lagged(missed)],
             Err(_) => return None,
         };
-        Some((update, changes))
+        Some((stream::iter(updates), (changes, named)))
     })
+    .flatten()
     .boxed()
 }
 
@@ -851,6 +880,7 @@ fn failed(error: &tokio::task::JoinError) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::rpc::RpcRegistry;
     use crate::device::session::{Inlet, Received, Session as AppSession};
     use crate::device::stream::{End, Queued};
     use crate::proxy::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
@@ -1594,7 +1624,7 @@ mod tests {
     fn a_slow_watch_converges_to_the_newest_presence() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route);
+        let mut updates = device_updates(&store, route, true);
         assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
 
         for session in 0..1000 {
@@ -1613,27 +1643,81 @@ mod tests {
     fn a_watch_that_misses_announcements_says_how_many() {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
-        let mut updates = device_updates(&store, route);
+        let mut updates = device_updates(&store, route, true);
         ready(&mut updates);
-        let change = |seq: usize| SettingChange {
-            name: "test.amplitude".to_string(),
-            seq: u32::try_from(seq).ok(),
-            reply: vec![1],
+        let change = |seq: usize| {
+            let seq = u32::try_from(seq).ok();
+            SettingChange::new("test.amplitude".to_string(), seq, vec![1], None)
         };
         let missed = 10;
         let sent = crate::device::store::CHANGE_QUEUE_LEN + missed;
         for seq in 0..sent {
             lock(&store).set(route, CHANGES, change(seq));
         }
-        assert_eq!(
-            ready(&mut updates).len(),
-            crate::device::store::CHANGE_QUEUE_LEN
-        );
+        let first = ready(&mut updates);
+        assert_eq!(first[0], Update::Recorded(None));
+        assert_eq!(first.len(), crate::device::store::CHANGE_QUEUE_LEN + 1);
 
         lock(&store).set(route, CHANGES, change(sent));
         assert_eq!(
             ready(&mut updates),
             [Update::Lagged(missed as u64), Update::setting(change(sent))]
         );
+    }
+
+    /// A watch names the table each announced setting was recorded under
+    /// ahead of the first setting recorded under it, and names no table
+    /// ahead of a setting recorded while none was in force. A table loaded
+    /// again with the hash and session of the one named is not named again.
+    #[test]
+    fn a_watch_names_each_table_ahead_of_the_settings_recorded_under_it() {
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route, true);
+        ready(&mut updates);
+        let table = |hash| Arc::new(RpcRegistry::from_entries(Vec::new(), Some(hash), None));
+        let (old, new) = (table(1), table(2));
+        let record = |seq| {
+            let name = "test.amplitude".to_string();
+            lock(&store).record_change(route, name, Some(seq), vec![1])
+        };
+
+        let before = record(0);
+        lock(&store).set_registry(route, Ok(Arc::clone(&old)));
+        let (first, second) = (record(1), record(2));
+        lock(&store).set_registry(route, Ok(Arc::clone(&new)));
+        let after = record(3);
+        lock(&store).set_registry(route, Ok(table(2)));
+        let reloaded = record(4);
+
+        assert_eq!(
+            ready(&mut updates),
+            [
+                Update::recorded(None),
+                Update::setting(before),
+                Update::recorded(Some(&old)),
+                Update::setting(first),
+                Update::setting(second),
+                Update::recorded(Some(&new)),
+                Update::setting(after),
+                Update::setting(reloaded),
+            ]
+        );
+    }
+
+    /// A watch of a client whose protocol reads no named tables names none,
+    /// and sends each announced setting alone.
+    #[test]
+    fn a_watch_of_an_older_client_names_no_table() {
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route, false);
+        ready(&mut updates);
+        let table = Arc::new(RpcRegistry::from_entries(Vec::new(), Some(1), None));
+        lock(&store).set_registry(route, Ok(table));
+        let name = "test.amplitude".to_string();
+        let change = lock(&store).record_change(route, name, Some(1), vec![1]);
+
+        assert_eq!(ready(&mut updates), [Update::setting(change)]);
     }
 }

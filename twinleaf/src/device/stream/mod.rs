@@ -367,6 +367,7 @@ mod tests {
     use crate::device::fixtures::{
         announcement, broadcast, description, metadata_records, samples, wait_for,
     };
+    use crate::device::rpc::RpcValue;
     use crate::device::session::{Session, TestProxy};
     use crate::device::store::{CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
     use crate::device::{MetadataState, Presence};
@@ -1366,31 +1367,34 @@ mod tests {
         assert!(spliced.is_empty(), "a tail was joined without its head");
     }
 
-    /// A table receiver taken with a change receiver holds the table by the
-    /// time a change arrives. A reader decodes each change with that table.
+    /// A change receiver alone follows the device's table too, and each
+    /// change carries the table the proxy named ahead of it, which is the
+    /// pump's own copy of the device's table. A reader decodes the change
+    /// with it at once.
     #[test]
-    fn a_table_followed_with_the_changes_is_held_when_a_change_arrives() {
+    fn a_change_carries_the_table_the_proxy_named_for_it() {
         let (stream, proxy) = stream();
         let route = DeviceRoute::root();
-        let loaded = stream.state(route, REGISTRY);
+        let changes = stream.state(route, CHANGES);
+        let device_watch = watch_of(&proxy, device(route));
         let table_watch = watch_of(&proxy, table(route));
         reply_update(&proxy, table_watch, &table_update(1));
-        loaded.recv().unwrap().expect("the table loads");
-
-        let changes = stream.state(route, CHANGES);
-        let tables = stream.state(route, REGISTRY);
-        let device_watch = watch_of(&proxy, device(route));
+        let Update::Table(Ok(entries)) = table_update(1) else {
+            unreachable!("a table update holds a table");
+        };
+        reply_update(&proxy, device_watch, &Update::Recorded(Some(entries)));
         let announced = Update::Setting(
             "test.gain".to_string(),
             Some(2),
             1.5f32.to_le_bytes().to_vec().into(),
         );
         reply_update(&proxy, device_watch, &announced);
-        reply_update(&proxy, table_watch, &settings_update(1, 2));
 
-        assert_eq!(changes.recv().unwrap().seq, Some(2));
-        let held = tables.try_recv().unwrap().expect("the table is held");
-        assert!(held.unwrap().find("test.gain").is_some());
+        let change = changes.recv().unwrap();
+        assert_eq!(change.value().unwrap(), RpcValue::F64(1.5));
+        let held = stream.state(route, REGISTRY).try_recv().unwrap();
+        let held = held.expect("the table is held").unwrap();
+        assert!(Arc::ptr_eq(change.rpc_registry().unwrap(), &held));
     }
 
     /// Settings read with a table the pump does not hold are dropped, as the
@@ -1459,7 +1463,7 @@ mod tests {
         proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
         let quiet = Duration::from_millis(200);
         assert_eq!(presence.recv_timeout(quiet), Err(RecvError::Timeout));
-        assert_eq!(changes.recv_timeout(quiet), Err(RecvError::Timeout));
+        assert_eq!(changes.recv_timeout(quiet).err(), Some(RecvError::Timeout));
         assert!(matches!(
             metadata.recv_timeout(quiet),
             Err(RecvError::Timeout)
@@ -1608,7 +1612,7 @@ mod tests {
         reply_update(&proxy, id, &announced);
 
         let wait = Duration::from_secs(5);
-        assert_eq!(changes.recv_timeout(wait), Err(RecvError::Lagged(5)));
+        assert_eq!(changes.recv_timeout(wait).err(), Some(RecvError::Lagged(5)));
         assert_eq!(
             changes.recv_timeout(wait).map(|change| change.seq),
             Ok(Some(9))
