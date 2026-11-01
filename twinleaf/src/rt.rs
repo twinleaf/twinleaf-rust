@@ -19,17 +19,26 @@
 //! entry points wait on flume channels, which block without that check, and
 //! block the calling thread until they are done.
 //!
-//! The async entry points are internal to the crate.
-//! `Session::open_async`, `Session::mount_async`,
-//! `Session::hold_default_async`, `Connection::open_at_async` and
-//! `proxy::host` run every task they start on the runtime they are awaited
-//! on. `Port::open` and `control::call_at` run their task on the supervisor
-//! they are given, which each caller takes from the runtime it runs on. The
-//! synchronous API runs each of them on the crate's runtime. Only the machine's own proxy, which an open
-//! finds or starts when nothing answers at the machine's address, runs on the
-//! crate's runtime whatever runtime the open is awaited on, as it outlives
-//! the open. Discovery has only a synchronous entry point, and runs on the
-//! crate's runtime.
+//! The async entry points run every task they start on the runtime they are
+//! awaited on. The public one is
+//! [`Discovery::start_async`](crate::device::discovery::Discovery::start_async).
+//! The others are internal to the crate. They are `Session::open_async`,
+//! `Session::mount_async`, `Session::hold_default_async`,
+//! `Connection::open_at_async` and `proxy::host`. `Port::open` and
+//! `control::call_at` run their task on the supervisor they are given, which
+//! each caller takes from the runtime it runs on. The synchronous API runs
+//! each of them on the crate's runtime. When an open, such as a discovery
+//! probe, finds nothing at the machine's proxy address and this process
+//! hosts the proxy itself, that proxy runs on the crate's runtime whatever
+//! runtime the open is awaited on, as it outlives the open.
+//!
+//! A proxy that [`Proxy::host`](crate::proxy::Proxy::host) starts and a
+//! discovery session that
+//! [`Discovery::start`](crate::device::discovery::Discovery::start) starts
+//! block on drop until they have stopped, each for a bounded time. One
+//! that an async entry point starts asks its tasks to end on drop and does
+//! not wait, since on a runtime of one thread a wait would block the tasks
+//! themselves. Its async shutdown waits for them.
 //!
 //! Each open port holds an [`Activity`], which keeps the system from idle
 //! sleep on macOS and Windows.
