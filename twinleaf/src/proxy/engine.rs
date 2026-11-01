@@ -87,22 +87,7 @@ pub(super) fn serve(
     session: Session,
     tasks: &Supervisor,
 ) -> impl std::future::Future<Output = ()> {
-    // An inlet with room for every packet a `usize` can count has no limit.
-    let inlet = session.attach(usize::MAX);
-    lock(&store).list(DeviceRoute::root(), []);
-    let engine = Engine {
-        store: Arc::clone(&store),
-        mounts: Arc::clone(&mounts),
-        schedule: MetadataSchedule::new(Handle::root(session.clone())),
-        handle: Handle::root(session),
-        inlet,
-        parser: PacketParser::new(false),
-        metadata_seen: HashMap::new(),
-        heard: HashMap::new(),
-        demand: BTreeSet::new(),
-        tasks: tasks.clone(),
-        workers: HashMap::new(),
-    };
+    let engine = Engine::new(&store, &mounts, session, tasks);
     async move {
         engine.run().await;
         lock(&store).end_all(None);
@@ -348,16 +333,39 @@ struct WorkerHold {
 }
 
 impl Engine {
+    /// Returns the engine of the link that `session` reaches, which keeps
+    /// `store` and feeds `mounts`, with its workers on `tasks`. It attaches
+    /// to the session at once.
+    fn new(
+        store: &Arc<Mutex<Store>>,
+        mounts: &Arc<Mounts>,
+        session: Session,
+        tasks: &Supervisor,
+    ) -> Engine {
+        // An inlet with room for every packet a `usize` can count has no limit.
+        let inlet = session.attach(usize::MAX);
+        lock(store).list(DeviceRoute::root(), []);
+        Engine {
+            store: Arc::clone(store),
+            mounts: Arc::clone(mounts),
+            schedule: MetadataSchedule::new(Handle::root(session.clone())),
+            handle: Handle::root(session),
+            inlet,
+            parser: PacketParser::new(false),
+            metadata_seen: HashMap::new(),
+            heard: HashMap::new(),
+            demand: BTreeSet::new(),
+            tasks: tasks.clone(),
+            workers: HashMap::new(),
+        }
+    }
+
     /// Runs until the session over the link's port ends.
     async fn run(mut self) {
         let store = Arc::clone(&self.store);
         let followed = Arc::clone(&lock(&self.store).followed);
         loop {
-            let quiet = self.heard.values().map(|at| *at + QUIET).min();
-            let unwatched = self.workers.values().filter_map(|hold| hold.unwatched);
-            let linger = unwatched.min().map(|since| since + LINGER);
-            let wake = [self.schedule.next_retry(), quiet, linger];
-            let wake = wake.into_iter().flatten().min();
+            let wake = self.next_wake();
             tokio::select! {
                 biased;
                 () = followed.notified() => self.follow_demand(),
@@ -376,6 +384,18 @@ impl Engine {
             }
             self.discover();
         }
+    }
+
+    /// Returns the earliest moment the engine has work that no packet
+    /// brings, which is a metadata retry of a route it asks, a device going
+    /// quiet, or the end of a worker's linger. A retry of a route the engine
+    /// does not ask is never due, so it sets no wake.
+    fn next_wake(&self) -> Option<Instant> {
+        let retry = self.schedule.next_retry(asked(&self.heard, &self.demand));
+        let quiet = self.heard.values().map(|at| *at + QUIET).min();
+        let unwatched = self.workers.values().filter_map(|hold| hold.unwatched);
+        let linger = unwatched.min().map(|since| since + LINGER);
+        [retry, quiet, linger].into_iter().flatten().min()
     }
 
     /// Takes `first` and what else the inlet holds now, in order. Takes each
@@ -634,22 +654,34 @@ impl Engine {
         }
     }
 
-    /// Asks each device a receiver follows, heard and due, for whatever
-    /// metadata the parser still wants.
+    /// Asks each device the engine asks that is due for whatever metadata
+    /// the parser still wants.
     fn discover(&mut self) {
-        let demand = &self.demand;
-        let followed = self.heard.keys().copied();
-        let followed = followed.filter(|route| {
-            demand.contains(&Watch {
-                route: *route,
-                table: false,
-            })
-        });
-        let due = self.schedule.due(followed, Instant::now());
+        let asked = asked(&self.heard, &self.demand);
+        let due = self.schedule.due(asked, Instant::now());
         for route in due {
             self.schedule.submit(&mut self.parser, route);
         }
     }
+}
+
+/// Returns each route the engine asks for metadata, given when each device
+/// was `heard` and the `demand` of the store's receivers. That is each
+/// device heard whose metadata a receiver follows. [`Engine::discover`]
+/// asks these routes and [`Engine::next_wake`] wakes for their retries
+/// alone. A route that is not asked, as its device was lost or no receiver
+/// follows it, keeps its backoff, and sets no wake until it is asked again.
+fn asked<'a>(
+    heard: &'a HashMap<DeviceRoute, Instant>,
+    demand: &'a BTreeSet<Watch>,
+) -> impl Iterator<Item = DeviceRoute> + 'a {
+    let followed = |route: &DeviceRoute| {
+        demand.contains(&Watch {
+            route: *route,
+            table: false,
+        })
+    };
+    heard.keys().copied().filter(followed)
 }
 
 /// Starts the worker that loads the RPC table of the device at `route`
@@ -1531,8 +1563,7 @@ mod tests {
 
     /// A device silent for [`QUIET`] is lost then on the paused clock, the
     /// moment its presence gives is that one, and how long ago the proxy
-    /// says it was lost follows the paused clock after. The device has no
-    /// `dev.metadata`, so no query of it waits to be asked again.
+    /// says it was lost follows the paused clock after.
     #[tokio::test(start_paused = true)]
     async fn a_quiet_loss_and_its_moment_follow_the_paused_clock() {
         let tasks = Supervisor::current();
@@ -1540,11 +1571,6 @@ mod tests {
         let device = route("/1");
         let followed = presence(&store, device);
         proxy.send(Packet::heartbeat(device));
-        let asked = proxy.sent.recv_async().await.unwrap();
-        let packet::Payload::RpcRequest(request) = asked.payload() else {
-            panic!("expected a metadata query, got {:?}", asked.payload());
-        };
-        proxy.refuse(request.id.value(), wire_rpc::RpcError::NotFound, device);
         while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
         let heard = Instant::now();
 
@@ -2228,6 +2254,74 @@ mod tests {
         let again = proxy.sent.recv_async().await.unwrap();
         assert_eq!(again.route(), asked.route());
         assert_eq!(refused.elapsed(), super::super::metadata::RETRY_FIRST);
+    }
+
+    /// A route whose metadata query is backing off and that the engine
+    /// stops asking, as its device is lost or no receiver follows it, sets
+    /// no wake for the retry, so the engine sleeps past the moment it was
+    /// due. Asked again, it is asked at once as its backoff has passed, and
+    /// its next failure doubles the delay as the schedule says.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_the_engine_will_not_make_sets_no_wake() {
+        for unfollowed in [false, true] {
+            let tasks = Supervisor::current();
+            let (session, proxy) = Session::test_pair_on(&tasks);
+            let store = Arc::new(Mutex::new(Store::new(true)));
+            let mounts = Mounts::new("tcp://device");
+            let mut engine = Engine::new(&store, &mounts, session, &tasks);
+            let device = route("/1");
+            let mut followed = Some(presence(&store, device));
+            engine.take(&Packet::heartbeat(device));
+            engine.discover();
+            refuse_busy(&proxy, &mut engine, device).await;
+            let retry = Instant::now() + super::super::metadata::RETRY_FIRST;
+            assert_eq!(engine.next_wake(), Some(retry));
+
+            if unfollowed {
+                followed = None;
+                pruned(|cx| lock(&store).prune_gone(cx)).await;
+                engine.follow_demand();
+            } else {
+                engine.apply_status(device, LinkStatus::FailedToReconnect);
+            }
+            tokio::time::sleep_until(retry + Duration::from_millis(1)).await;
+            let wake = engine.next_wake();
+            assert!(
+                wake.is_none_or(|wake| wake > Instant::now()),
+                "unfollowed {unfollowed}, the engine wakes at once for a retry it will not make"
+            );
+
+            if followed.is_none() {
+                followed = Some(presence(&store, device));
+                engine.follow_demand();
+            }
+            engine.take(&Packet::heartbeat(device));
+            engine.discover();
+            let asked_at = Instant::now();
+            refuse_busy(&proxy, &mut engine, device).await;
+            assert_eq!(
+                asked_at,
+                Instant::now(),
+                "unfollowed {unfollowed}, asked late"
+            );
+            let doubled = asked_at + super::super::metadata::RETRY_FIRST * 2;
+            assert_eq!(engine.next_wake(), Some(doubled), "unfollowed {unfollowed}");
+            drop(followed);
+        }
+    }
+
+    /// Refuses the one `dev.metadata` call to `device` that the engine has
+    /// sent as busy, and has the engine take the refusal.
+    async fn refuse_busy(proxy: &TestProxy, engine: &mut Engine, device: DeviceRoute) {
+        let asking = tokio::time::timeout(Duration::from_secs(1), proxy.sent.recv_async());
+        let asked = asking.await.expect("the engine asks").unwrap();
+        let packet::Payload::RpcRequest(request) = asked.payload() else {
+            panic!("expected a metadata query, got {:?}", asked.payload());
+        };
+        assert_eq!(asked.route(), device);
+        proxy.refuse(request.id.value(), wire_rpc::RpcError::Busy, device);
+        let reply = engine.schedule.replies().recv_async().await.unwrap();
+        engine.take_metadata_replies(reply);
     }
 
     /// A status supersedes the presence of every device in the subtree it
