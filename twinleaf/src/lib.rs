@@ -15,6 +15,7 @@ mod chan;
 pub mod data;
 pub mod device;
 pub mod firmware;
+mod net;
 pub mod proxy;
 mod rt;
 pub mod tio;

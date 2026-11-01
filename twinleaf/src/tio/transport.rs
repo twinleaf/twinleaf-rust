@@ -282,7 +282,7 @@ async fn resolve(
             None => log::debug!("mDNS found no address for {host}, so the system resolves it"),
         }
     }
-    let looking_up = tokio::net::lookup_host(with_port(addr));
+    let looking_up = crate::net::lookup_host(with_port(addr));
     let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, looking_up).await;
     let late = |_| {
         let message = format!("{addr} did not resolve within {LOOKUP_TIMEOUT:?}");
@@ -290,6 +290,7 @@ async fn resolve(
     };
     let found: Vec<_> = looked_up
         .map_err(late)??
+        .into_iter()
         .filter(|found| family.allows(found))
         .collect();
     match found.is_empty() {
@@ -492,7 +493,7 @@ impl Port {
     /// The task delivers what it receives to `rx`, and the port queues up to
     /// `tx_size` packets to send.
     fn start_tcp(
-        stream: tokio::net::TcpStream,
+        stream: crate::net::TcpStream,
         rules: Rules,
         rx: Delivery,
         tx_size: usize,
@@ -609,7 +610,7 @@ impl Port {
     ///
     /// Returns an error if Nagle's algorithm cannot be turned off.
     pub(crate) fn over_tcp(
-        stream: tokio::net::TcpStream,
+        stream: crate::net::TcpStream,
         rx: Delivery,
         tx_size: usize,
         tasks: &Supervisor,
@@ -623,7 +624,7 @@ impl Port {
     /// Creates a [`Port`] over the connected TCP `stream`, a socket of no
     /// runtime yet, as [`over_tcp`](Self::over_tcp) does on the crate's
     /// runtime.
-    #[cfg(test)]
+    #[cfg(all(test, not(turmoil)))]
     pub(crate) fn from_tcp_stream(
         stream: std::net::TcpStream,
         rx: Delivery,
@@ -633,7 +634,7 @@ impl Port {
         stream.set_nonblocking(true)?;
         let stream = {
             let _runtime = tasks.enter();
-            tokio::net::TcpStream::from_std(stream)?
+            crate::net::TcpStream::from_std(stream)?
         };
         Port::over_tcp(stream, rx, tx_size, &tasks)
     }
@@ -651,7 +652,7 @@ impl Port {
     ///
     /// Returns an error if Nagle's algorithm cannot be turned off.
     pub(crate) fn from_tcp(
-        stream: tokio::net::TcpStream,
+        stream: crate::net::TcpStream,
         rx: Delivery,
         tx_size: usize,
         tasks: &Supervisor,
@@ -730,6 +731,7 @@ impl Port {
 }
 
 #[cfg(test)]
+#[cfg(not(turmoil))]
 mod tests {
     use crate::chan::{Receiver, RecvTimeoutError};
     #[cfg(feature = "serial")]

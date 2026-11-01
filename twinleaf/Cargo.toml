@@ -17,7 +17,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 targets = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)", "cfg(shuttle)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)", "cfg(shuttle)", "cfg(turmoil)"] }
 
 [features]
 default = ["serial", "firmware-update", "hdf5"]
@@ -71,6 +71,10 @@ tokio = { version = "1.47", features = ["test-util"] }
 [target.'cfg(shuttle)'.dev-dependencies]
 shuttle = "0.9.9"
 shuttle-tokio = { version = "1.0.0", features = ["shuttle", "rt", "sync", "time"] }
+
+# Built with `--cfg turmoil`, the crate's TCP sockets are turmoil's simulated ones.
+[target.'cfg(turmoil)'.dev-dependencies]
+turmoil = "0.7.2"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

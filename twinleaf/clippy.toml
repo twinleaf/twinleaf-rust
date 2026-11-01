@@ -3,6 +3,10 @@
 # Only that module may name what it swaps. A blocking wait or lock outside it
 # would stall shuttle's one OS thread, so those are refused too. The proxy's
 # `JoinMap` stays allowed, as the shuttle tests do not reach the proxy.
+#
+# The crate's TCP sockets and name lookups come from `src/net.rs`, which swaps
+# them for turmoil's simulated ones when the tests are built with
+# `--cfg turmoil`. Tests over real sockets name tokio's and say so.
 disallowed-types = [
     { path = "flume::Sender", reason = "use crate::chan::Sender" },
     { path = "flume::Receiver", reason = "use crate::chan::Receiver" },
@@ -15,6 +19,8 @@ disallowed-types = [
     { path = "tokio_util::task::AbortOnDropHandle", reason = "use crate::chan::AbortOnDropHandle" },
     { path = "std::sync::Condvar", reason = "a blocking wait stalls shuttle, so wait on a crate::chan channel or Notify" },
     { path = "std::sync::RwLock", reason = "a blocking lock stalls shuttle, so use a std Mutex through crate::chan::lock" },
+    { path = "tokio::net::TcpStream", reason = "use crate::net::TcpStream" },
+    { path = "tokio::net::TcpListener", reason = "use crate::net::TcpListener" },
 ]
 disallowed-methods = [
     { path = "flume::bounded", reason = "use crate::chan::bounded" },
@@ -30,4 +36,5 @@ disallowed-methods = [
     { path = "tokio_util::task::TaskTracker::spawn", reason = "use a Supervisor" },
     { path = "tokio_util::task::TaskTracker::spawn_on", reason = "use a Supervisor" },
     { path = "std::sync::Mutex::lock", reason = "use crate::chan::lock" },
+    { path = "tokio::net::lookup_host", reason = "use crate::net::lookup_host" },
 ]

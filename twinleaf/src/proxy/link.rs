@@ -742,6 +742,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(all(test, turmoil), allow(dead_code))]
     impl Links {
         /// Has the registry run `inspect`. Returns the receiver of what it
         /// returns, which disconnects if the registry has ended.

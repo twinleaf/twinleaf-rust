@@ -215,6 +215,8 @@ mod server;
 mod settings;
 #[cfg(test)]
 mod settings_sim;
+#[cfg(all(test, turmoil))]
+mod turmoil;
 mod worker;
 
 pub(crate) use control::{
@@ -474,6 +476,7 @@ pub struct Proxy {
     default: watch::Sender<Option<Layout>>,
     endpoint: String,
     #[cfg(test)]
+    #[cfg_attr(all(test, turmoil), allow(dead_code))]
     links: link::Links,
 }
 
@@ -651,6 +654,7 @@ pub(crate) use control::{client_name, Introduction};
 pub(crate) mod fixtures;
 
 #[cfg(test)]
+#[cfg(not(turmoil))]
 mod tests {
     use super::fixtures::{options, FakeDevice, UNREACHABLE, WAIT};
     use super::*;

@@ -2,6 +2,8 @@
 //! this module and of the modules above it. It also has fake openers of
 //! devices, for tests on a paused clock.
 
+#![cfg_attr(all(test, turmoil), allow(dead_code))]
+
 use super::link::Opens;
 use super::worker::Opener;
 use super::HostOptions;
@@ -362,7 +364,7 @@ const TABLE: [(&str, u16); 2] = [("test.amplitude", 0xA310), ("settings.version"
 /// Returns the fake device's answer to the RPC `name` with `args`, or `None`
 /// for an RPC it leaves unanswered. It describes itself as one stream of one
 /// column, in session 7, and its table has the hash `table_hash`.
-fn answer(name: &[u8], args: &[u8], table_hash: u32) -> Option<Vec<u8>> {
+pub(crate) fn answer(name: &[u8], args: &[u8], table_hash: u32) -> Option<Vec<u8>> {
     Some(match name {
         b"dev.name" => b"FAKE".to_vec(),
         b"rpc.hash" => table_hash.to_le_bytes().to_vec(),
