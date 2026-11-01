@@ -133,8 +133,8 @@ struct StreamTracker {
     key: StreamKey,
     current_segment_id: SegmentId,
 
-    // Accepted sample history survives metadata invalidation so the next
-    // batch can report SessionChanged.
+    // Accepted sample history survives metadata invalidation, so the first
+    // rows under new metadata are told against the last rows.
     established: bool,
     run: u32,
     last_segment_id: SegmentId,
@@ -145,12 +145,20 @@ struct StreamTracker {
     /// The record of the segment the last accepted rows were in, whose start
     /// and clock place the rows a rollover lost.
     last_segment: Option<SegmentRecord>,
+    /// The layout of the last accepted rows. Rows in another layout in the
+    /// same session start a new run, as nothing ties them to the rows before.
+    last_schema: Option<Arc<StreamSchema>>,
+    /// Whether the stream's records were dropped to be learned again since
+    /// its last rows, as after its link was lost. Rows of another segment
+    /// then may be of a restart whose stop went unseen.
+    relearned: bool,
     /// Whether the device announced a segment other than the last rows'
     /// since them, so that rows in the last rows' slot are of a later lap of
     /// the ring.
     moved_on: bool,
     rate_hz: f64,
-    /// The stops the device announced, each as `dev.running` turning off.
+    /// The stops the device announced since the stream's records were last
+    /// learned, each as `dev.running` turning off.
     stops: u32,
     /// The stops announced before the current segment became current. A
     /// segment that became current after a stop is of an acquisition the
@@ -178,6 +186,8 @@ impl StreamTracker {
             last_session_id: SessionId::new(0),
             last_time_ref_session_id: SessionId::new(0),
             last_segment: None,
+            last_schema: None,
+            relearned: false,
             moved_on: false,
             rate_hz: 0.0,
             stops: 0,
@@ -276,6 +286,12 @@ impl StreamTracker {
             }));
         }
 
+        // A new session may bring a new layout. In the same session, rows in
+        // another layout are of another stream.
+        if self.last_schema != self.schema {
+            return Some(Boundary::of(Change::Initial));
+        }
+
         if segment.timeref_session() != self.last_time_ref_session_id {
             return Some(Boundary::of(Change::TimeRefSessionChanged {
                 old: self.last_time_ref_session_id,
@@ -318,14 +334,17 @@ impl StreamTracker {
         // Rows are of the current segment. A stop announced between the
         // last rows' segment and this one becoming current puts the rows in
         // a later acquisition, and the time between holds no sample to lose.
+        // Rows in another segment after the records were dropped may be of a
+        // restart that went unseen, whose time cannot be told from time lost.
+        let opened = segment.segment_id() != self.last_segment_id || lapped;
         let restarted = self.current_stops != self.last_stops;
-        if restarted {
+        if restarted || opened && self.relearned {
             return Some(Boundary::of(Change::Restarted {
                 old_id: self.last_segment_id,
                 new_id: segment.segment_id(),
             }));
         }
-        if segment.segment_id() != self.last_segment_id || lapped {
+        if opened {
             let missing = self.missing_before(segment, first_sample_n);
             return Some(Boundary {
                 change: Some(Change::SegmentRollover {
@@ -514,8 +533,9 @@ impl StreamTracker {
         if let Some(boundary) = boundary.as_ref().filter(|b| !b.is_continuous()) {
             self.run += 1;
             // Streams start up independently, so their first data must not bump
-            // the generations their peers share.
-            if !boundary.is_initial() {
+            // the generations their peers share. A stream that starts over
+            // bumps them as any other break does.
+            if !boundary.is_initial() || self.established {
                 *device_generation += 1;
                 *global_generation += 1;
             }
@@ -527,6 +547,8 @@ impl StreamTracker {
         self.last_time_ref_session_id = segment.timeref_session();
         self.last_segment_id = segment.segment_id();
         self.last_segment = Some(segment_record.clone());
+        self.last_schema = self.schema.clone();
+        self.relearned = false;
         self.moved_on = false;
         self.last_stops = self.current_stops;
         self.rate_hz = new_rate;
@@ -554,9 +576,10 @@ impl StreamTracker {
         }))
     }
 
-    /// Forgets the stream's metadata, and the stops announced under it, as
-    /// a new session starts its acquisitions afresh.
-    fn invalidate_metadata(&mut self) {
+    /// Drops the stream's records to learn them again, and the stops
+    /// announced under them. Its last rows stay, so the rows under the new
+    /// records are told against them.
+    fn relearn(&mut self) {
         self.metadata = None;
         self.segments.clear();
         self.columns.clear();
@@ -564,6 +587,7 @@ impl StreamTracker {
         self.stops = 0;
         self.current_stops = 0;
         self.last_stops = 0;
+        self.relearned = true;
     }
 
     /// Counts a stop the device announced. Segments that become current
@@ -575,8 +599,9 @@ impl StreamTracker {
     /// Forgets metadata and ends the current run. The run counter is kept, and
     /// the rebuilt stream numbers its runs after it.
     fn reset(&mut self) {
-        self.invalidate_metadata();
+        self.relearn();
         self.established = false;
+        self.relearned = false;
     }
 
     fn metadata_snapshot(&self, device: DeviceRecord) -> Option<StreamMetadataSnapshot> {
@@ -607,6 +632,9 @@ enum MetadataSource {
 struct DeviceState {
     route: DeviceRoute,
     metadata: Option<DeviceRecord>,
+    /// The record held when the metadata was last dropped to be learned
+    /// again, which the next record is told against until it arrives.
+    previous: Option<DeviceRecord>,
     streams: Vec<Option<StreamTracker>>,
     ignore_session: bool,
     query_in_flight: bool,
@@ -622,6 +650,7 @@ impl DeviceState {
         Self {
             route,
             metadata: None,
+            previous: None,
             streams: Vec::new(),
             ignore_session,
             query_in_flight: false,
@@ -656,11 +685,27 @@ impl DeviceState {
     /// device generation.
     fn reset(&mut self) {
         self.metadata = None;
+        self.previous = None;
         self.rediscover_metadata();
         self.generation += 1;
         for stream in self.streams.iter_mut().flatten() {
             stream.reset();
         }
+    }
+
+    /// Drops the device's metadata to learn it again, as after its link was
+    /// lost or it reported a new session. Each stream keeps its last rows,
+    /// which the rows under the new metadata are told against. The next
+    /// device record is told against the one held now, and one with another
+    /// serial resets every stream.
+    fn relearn_metadata(&mut self) {
+        if let Some(held) = self.metadata.take() {
+            self.previous = Some(held);
+        }
+        for stream in self.streams.iter_mut().flatten() {
+            stream.relearn();
+        }
+        self.rediscover_metadata();
     }
 
     /// Opens a new metadata generation and arms discovery again. Queries
@@ -702,17 +747,21 @@ impl DeviceState {
                 if self.metadata.as_ref() != Some(&incoming) {
                     self.revise_metadata();
                 }
-                if let Some(previous) = self.metadata.take() {
+                // A record in force is replaced. A record from before the
+                // metadata was dropped tells only whether the device is the
+                // same one, as the rest is already being learned again.
+                let held = self.metadata.take();
+                let in_force = held.is_some();
+                if let Some(previous) = held.or_else(|| self.previous.take()) {
                     let (old, new) = (previous.get(), incoming.get());
                     if old.serial() != new.serial() {
                         self.forget_all_metadata(global_generation);
                     } else if old.session() != new.session() {
                         // Keeping continuity state lets the first rows under the
                         // new metadata report a specific SessionChanged boundary.
-                        for stream in self.streams.iter_mut().flatten() {
-                            stream.invalidate_metadata();
+                        if in_force {
+                            self.relearn_metadata();
                         }
-                        self.rediscover_metadata();
                     } else if old.firmware() != new.firmware() {
                         // A firmware change can alter a schema without changing
                         // the session or timeline, so it must explicitly end all
@@ -836,11 +885,7 @@ impl DeviceState {
             packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
                 if let Some(device) = &self.metadata {
                     if device.get().session() != session && !self.ignore_session {
-                        for stream in self.streams.iter_mut().flatten() {
-                            stream.invalidate_metadata();
-                        }
-                        self.metadata = None;
-                        self.rediscover_metadata();
+                        self.relearn_metadata();
                     }
                 }
             }
@@ -1031,7 +1076,7 @@ impl ParseState {
                 status,
                 packet::LinkStatus::SensorDisconnected | packet::LinkStatus::Stopped
             ) {
-                self.reset(|device| device.starts_with(&route));
+                self.relearn(|device| device.starts_with(&route));
                 return Ok(PacketEvent::Reset);
             }
             return Ok(PacketEvent::Applied);
@@ -1056,7 +1101,20 @@ impl ParseState {
         }
     }
 
-    /// Forgets the metadata of every route at and below `subtree` and ends its
+    /// Drops the metadata of every route `routes` accepts, to learn it again,
+    /// as after the link that serves them was lost. A link may bring back
+    /// another device, or the same one with another layout. Each stream keeps
+    /// its last rows, and each device's next record says whether it is the
+    /// same device, as [`DeviceState::relearn_metadata`] does.
+    pub(super) fn relearn(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {
+        for device in &mut self.devices {
+            if routes(&device.route) {
+                device.relearn_metadata();
+            }
+        }
+    }
+
+    /// Forgets the metadata of every route `routes` accepts and ends its
     /// runs. The generation counters keep counting, and no stamp from before
     /// the reset recurs after it.
     pub(super) fn reset(&mut self, routes: impl Fn(&DeviceRoute) -> bool) {

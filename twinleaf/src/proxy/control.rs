@@ -323,7 +323,7 @@ impl Update {
             }
             Update::Metadata(None) => store.set(route, METADATA, MetadataState::Unsupported),
             Update::Metadata(Some(records)) if records.is_empty() => {
-                parser.reset_route(route);
+                parser.relearn_route(route);
                 store.set(route, METADATA, MetadataState::Pending);
             }
             Update::Metadata(Some(records)) => {

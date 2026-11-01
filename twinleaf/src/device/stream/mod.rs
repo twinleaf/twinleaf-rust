@@ -238,15 +238,18 @@ impl Pump {
     }
 
     /// Drops every watch, as the session's socket is lost, and makes every
-    /// device lost. The raw taps get a disconnect status at the root. The watches go out again at once, and the session sends
-    /// them once it is open again. The parser starts again, so the samples
-    /// after begin a new run.
+    /// device lost. The raw taps and the parser get a disconnect status at
+    /// the root, as a link's loss gives them. The parser learns each device's
+    /// metadata again and keeps its last rows, so the samples after report
+    /// what the outage lost, or a new session, against them. The watches go
+    /// out again at once, and the session sends them once it is open again.
     fn lose(&mut self) {
         // A recording marks the outage as it marks a link's loss.
-        self.tap(&Packet::link(LinkStatus::SensorDisconnected));
+        let lost = Packet::link(LinkStatus::SensorDisconnected);
+        self.tap(&lost);
         lock(&self.store).mark_lost();
         self.watches.clear();
-        self.parser = PacketParser::new(false);
+        self.parse(&lost);
     }
 
     /// Takes a reply to one of the pump's watches, a part of an update or a
@@ -329,6 +332,13 @@ impl Pump {
         if !covered || matches!(packet.payload(), packet::Payload::Metadata(..)) {
             return None;
         }
+        self.parse(packet);
+        None
+    }
+
+    /// Hands `packet` to the parser, and offers each batch it completes to
+    /// the batch sinks.
+    fn parse(&mut self, packet: &Packet) {
         if let Err(error) = self.parser.push_packet(packet) {
             log::warn!("dropping invalid stream packet: {error}");
         }
@@ -338,7 +348,6 @@ impl Pump {
                 .retain_mut(|sink| sink.offer(scope, || batch.clone()));
         }
         self.batches.retain_mut(|sink| sink.lane.report_lag());
-        None
     }
 
     /// Offers a packet to the raw taps, unparsed and with its absolute route.
@@ -597,7 +606,8 @@ mod tests {
 
     /// When the session's socket is lost, every device the pump follows is
     /// lost and every watch goes out again under a new id, which the session
-    /// sends once it is open again. The samples after begin a new run.
+    /// sends once it is open again. The samples after count what the outage
+    /// lost against the samples before.
     #[test]
     fn a_lost_socket_loses_every_device_and_watches_again() {
         let (session, proxy) = Session::test_pair();
@@ -642,13 +652,59 @@ mod tests {
         assert_ne!(again, id, "the watch is new");
         reply(again, &routes_update(&[route]));
         reply(again, &metadata_update(1));
-        deliver(samples(1, route));
+        deliver(samples(3, route));
         let resumed = batches.recv_timeout(wait).unwrap();
-        assert_eq!(resumed.sample_numbers(), [1]);
-        assert!(
-            resumed.is_initial(),
-            "the samples after the outage continue a run"
+        assert_eq!(resumed.sample_numbers(), [3]);
+        let loss = resumed
+            .boundary()
+            .and_then(|boundary| boundary.loss.as_ref());
+        assert_eq!(
+            loss.map(|loss| (loss.samples, loss.expected)),
+            Some((2, Some(SampleNumber::new(1)))),
+            "{:?}",
+            resumed.boundary()
         );
+    }
+
+    /// A device whose link reconnects behind the proxy, which says its
+    /// metadata is pending and then sends it again, goes on from its samples
+    /// before. In the same session the samples after count what it lost, and
+    /// in a new one they say the session changed.
+    #[test]
+    fn a_device_that_reconnects_behind_the_proxy_goes_on_from_its_samples_before() {
+        for (session, first) in [(1, 3), (2, 0)] {
+            let (stream, proxy) = stream();
+            let root = DeviceRoute::root();
+            let batches = stream.batches(everything());
+            let list = watch_of(&proxy, device(root));
+            reply_update(&proxy, list, &routes_update(&[root]));
+            reply_update(&proxy, list, &metadata_update(1));
+            proxy.send(samples(0, root));
+            let wait = Duration::from_secs(5);
+            assert!(batches.recv_timeout(wait).unwrap().is_initial());
+
+            proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
+            reply_update(&proxy, list, &Update::Metadata(Some(Vec::new())));
+            reply_update(&proxy, list, &metadata_update(session));
+            proxy.send(samples(first, root));
+            let after = batches.recv_timeout(wait).unwrap();
+            let boundary = after.boundary().cloned();
+            let expected = match session {
+                1 => Boundary {
+                    change: None,
+                    loss: Some(Loss {
+                        samples: 2,
+                        expected: Some(SampleNumber::new(1)),
+                        dropped_batches: 0,
+                    }),
+                },
+                _ => Boundary::of(Change::SessionChanged {
+                    old: WireSessionId::new(1),
+                    new: WireSessionId::new(2),
+                }),
+            };
+            assert_eq!(boundary, Some(expected), "session {session}");
+        }
     }
 
     /// A disconnect status reaches the pump ahead of the proxy's metadata of

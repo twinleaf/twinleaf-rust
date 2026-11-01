@@ -484,11 +484,12 @@ mod tests {
         batches
     }
 
-    /// Behind `--mount`, the marker carries its subtree: replay resets only the
-    /// mount that bounced. A live proxy sends the marker as a link packet and
-    /// an old one as a legacy status, and the file keeps whichever arrived.
+    /// Behind `--mount`, the marker carries its subtree, so on replay only the
+    /// mount that bounced learns its layout again. A live proxy sends the
+    /// marker as a link packet and an old one as a legacy status, and the
+    /// file keeps whichever arrived.
     #[test]
-    fn a_mounted_disconnect_marker_resets_only_its_subtree_on_replay() {
+    fn a_mounted_disconnect_marker_relearns_only_its_subtree_on_replay() {
         let steady: DeviceRoute = "/1".parse().unwrap();
         let bounced: DeviceRoute = "/2".parse().unwrap();
         for (name, marker) in [
@@ -533,9 +534,9 @@ mod tests {
                     (steady, true, 0),
                     (bounced, true, 0),
                     (steady, false, 1),
-                    (bounced, true, 1),
+                    (bounced, false, 1),
                 ],
-                "{name}: only the bounced mount's run splits at the marker"
+                "{name}: only the bounced mount learns its layout again, and both runs go on"
             );
         }
     }

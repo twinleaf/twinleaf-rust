@@ -115,7 +115,13 @@ pub enum PacketOutcome {
     /// The stream has a column of a type this build cannot decode, so its
     /// rows are refused.
     Unsupported,
-    /// A disconnect reset metadata and continuity state.
+    /// A disconnect dropped the metadata of the devices behind it, which the
+    /// parser learns again. Their streams keep their last rows, so rows
+    /// after the disconnect report what was lost, or a new session, against
+    /// them. A stream starts over as
+    /// [`Change::Initial`](crate::data::Change::Initial) says, as when
+    /// another device answers, and rows in another segment are told as
+    /// [`Change::Restarted`](crate::data::Change::Restarted) says.
     Reset,
     /// The packet contained this many validated sample rows.
     Rows(usize),
@@ -245,11 +251,13 @@ impl PacketParser {
         self.state.reset(|route| route.starts_with(&subtree));
     }
 
-    /// Forgets the device metadata of the absolute route `route` alone, as
-    /// [`reset_subtree`](Self::reset_subtree) does for a subtree.
-    pub(crate) fn reset_route(&mut self, route: DeviceRoute) {
+    /// Drops the device metadata of the absolute route `route` alone to learn
+    /// it again, as a disconnect does for its subtree. Each stream keeps its
+    /// last rows, so the rows after report what was lost, or a new session,
+    /// against them, as [`PacketOutcome::Reset`] says.
+    pub(crate) fn relearn_route(&mut self, route: DeviceRoute) {
         self.flush();
-        self.state.reset(|device| *device == route);
+        self.state.relearn(|device| *device == route);
     }
 
     /// Takes the pending metadata query for `route`, creating the route's
@@ -1182,7 +1190,7 @@ mod tests {
 
         parser
             .push_packet(&tio::Packet::legacy_status(LinkStatus::SensorDisconnected))
-            .expect("a disconnect resets the parser");
+            .expect("the disconnect");
 
         // The device comes back and re-announces exactly the same schema.
         announce_schema(&mut parser, &[DataType::F32], 4, 1, 1, 1);
@@ -1207,15 +1215,24 @@ mod tests {
                 global: 1
             }
         );
-        assert!(after.is_initial(), "the reconnect opens a new run");
+        assert!(
+            matches!(
+                after
+                    .boundary()
+                    .and_then(|boundary| boundary.change.as_ref()),
+                Some(Change::TimeBackward { .. })
+            ),
+            "rows that go back in the same session step back in time: {:?}",
+            after.boundary()
+        );
     }
 
     /// A routed disconnect, one mount bouncing behind `tio proxy --mount` as a
-    /// recorded log replays it, resets only the subtree at its route. A log
-    /// from a current proxy holds it as a link packet, and one from an old
-    /// proxy as a legacy status.
+    /// recorded log replays it, has only the subtree at its route learn its
+    /// metadata again. A log from a current proxy holds it as a link packet,
+    /// and one from an old proxy as a legacy status.
     #[test]
-    fn a_routed_disconnect_resets_only_its_subtree() {
+    fn a_routed_disconnect_relearns_only_its_subtree() {
         let forms: [fn(LinkStatus) -> tio::Packet; 2] =
             [tio::Packet::link, tio::Packet::legacy_status];
         for form in forms {
@@ -1253,10 +1270,10 @@ mod tests {
         }
     }
 
-    /// A routed stop ends its subtree's session exactly as a routed disconnect
-    /// does, and leaves every other subtree alone.
+    /// A routed stop has its subtree learn its metadata again exactly as a
+    /// routed disconnect does, and leaves every other subtree alone.
     #[test]
-    fn a_routed_stop_resets_only_its_subtree() {
+    fn a_routed_stop_relearns_only_its_subtree() {
         let mut parser = PacketParser::new(true);
         let steady: DeviceRoute = "/1".parse().unwrap();
         let stopped: DeviceRoute = "/2".parse().unwrap();
@@ -1283,7 +1300,7 @@ mod tests {
         );
         assert!(
             parser.metadata(stopped).is_none(),
-            "the stopped mount forgot its description"
+            "the stopped mount learns its description again"
         );
     }
 
@@ -1712,20 +1729,21 @@ mod tests {
     }
 
     /// A device lost and found again may be another build of it. Its layout
-    /// is learned anew, even with the same session.
+    /// is learned anew, even with the same session, and its rows start the
+    /// stream over, a break its peers share.
     #[test]
     fn rows_after_a_disconnect_decode_with_the_reannounced_layout() {
         let mut parser = parser_with_schema(&[DataType::F32, DataType::I16], 6);
         parser
             .push_packet(&stream_data_packet(0, first_layout_sample(1.5, -7)))
             .expect("valid rows");
-        parser.pop_batch().expect("the first batch");
+        let before = parser.pop_batch().expect("the first batch").generations();
 
         parser
             .push_packet(
                 &tio::Packet::link(LinkStatus::SensorDisconnected).with_route(DeviceRoute::root()),
             )
-            .expect("the disconnect resets the route");
+            .expect("the disconnect");
         announce_schema(&mut parser, &[DataType::U16, DataType::F32], 6, 1, 1, 1);
         let mut sample = 513u16.to_le_bytes().to_vec();
         sample.extend_from_slice(&(-0.5f32).to_le_bytes());
@@ -1735,6 +1753,7 @@ mod tests {
         let after = parser.pop_batch().expect("the batch after the reconnect");
 
         assert!(after.is_initial());
+        assert_eq!(after.generations().device, before.device + 1);
         assert_eq!(
             decoded(&after),
             named(&[("col_0", &[513.0]), ("col_1", &[-0.5])])
