@@ -86,7 +86,9 @@
 //! hands each sample batch to each receiver's queue of 1024 batches, and
 //! each packet to each packet receiver's queue of 8192 packets. A receiver
 //! that falls behind loses what does not fit in its queue, and hears
-//! [`RecvError::Lagged`](crate::RecvError::Lagged) with the count. The
+//! [`RecvError::Lagged`](crate::RecvError::Lagged) with the count. The next
+//! batch of each stream that lost batches carries a
+//! [`Loss`](crate::data::Loss). The
 //! state the proxy sends goes into the connection's store, whose presence,
 //! metadata, RPC table and settings hold only their latest value, so a slow
 //! reader sees the newest and misses none it needs. Announced settings
@@ -104,11 +106,11 @@
 //! methods are these.
 //!
 //! - `proxy.hello` takes the client's introduction and replies with the
-//!   proxy's own. An introduction is the pid, the protocol version, the
-//!   `twinleaf` version as an array of major, minor and patch, and the name.
-//!   The protocol version is 2. A client refuses a proxy whose protocol is
-//!   older than its own. A proxy of protocol 1 cannot read the hello, and
-//!   the client then says to update it.
+//!   proxy's own. An introduction is the pid, the `twinleaf` version as an
+//!   array of major, minor and patch, and the name. A peer that sends no
+//!   control reply within two seconds, as a proxy from an older build of
+//!   `twinleaf` does, or that answers with no introduction, is no proxy the
+//!   client can use, and the client says to update it.
 //! - `proxy.open` takes a target as a text string and replies what it
 //!   resolved to, a device URL or `default`. A connection opens once.
 //! - `proxy.probe` takes a device URL and opens that device for a client
@@ -794,8 +796,7 @@ mod tests {
                 ..Introduction::of_this_process(name)
             };
             let reply = self.control("proxy.hello", &encode(&client), 1);
-            let host = decode::<Introduction>(&reply.unwrap()).unwrap();
-            assert_eq!(host.protocol, control::VERSION);
+            decode::<Introduction>(&reply.unwrap()).unwrap();
         }
 
         fn open(&self, target: &str) -> Result<String, (RpcError, String)> {
@@ -1087,7 +1088,10 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
         assert_eq!(
             refused.to_string(),
-            format!("tcp://127.0.0.1:{port} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it")
+            format!(
+                "tcp://127.0.0.1:{port} is a proxy from an older build of twinleaf, or no proxy; \
+                 update tio, or stop it"
+            )
         );
     }
 
@@ -1145,7 +1149,7 @@ mod tests {
         assert_eq!(
             legacy.to_string(),
             format!(
-                "{} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it",
+                "{} is a proxy from an older build of twinleaf, or no proxy; update tio, or stop it",
                 device.url
             )
         );

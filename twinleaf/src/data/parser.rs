@@ -24,6 +24,31 @@ use std::collections::{HashMap, VecDeque};
 /// produce no rows, and [`PacketParser::take_metadata_queries_for`] returns
 /// the metadata the caller must fetch before later packets decode.
 ///
+/// The parser decodes a segment's rows only with that segment's record,
+/// which the device sends before the segment's first sample. Rows that
+/// arrive without it are lost, and the first batch of the stream once the
+/// record is known reports them as a [`Loss`](super::Loss), unless a change
+/// other than a rollover stands for them. A record the parser holds counts
+/// only if the device announced its segment since the stream's last rows,
+/// by a broadcast, a proxy metadata update or a bootstrap reply.
+///
+/// A device announces `dev.running` turning off as it hands a stop or
+/// restart a host asked for to its platform, and otherwise at a refresh
+/// after it stops acquiring, so ahead of the record of any segment a later
+/// start begins. Rows of a segment the device announced after such a stop
+/// come as a [`Change::Restarted`](super::Change::Restarted), and rows of
+/// the stopped acquisition that arrive after the stop come as before. A
+/// new segment that starts before the last rows end comes as a backward
+/// step in time.
+///
+/// Two restarts reach the parser with no stop announced, and come as a
+/// rollover with a loss of the sample periods between the acquisitions.
+///
+/// - A restart whose announcement was lost, in a gap on the link or in a
+///   client's inlet.
+/// - A stop and start no host asked for, with no refresh between them,
+///   which leave `dev.running` where it was.
+///
 /// # Examples
 ///
 /// Decode a recorded log packet by packet.
@@ -352,12 +377,13 @@ impl Batcher {
 mod tests {
     use super::*;
     use crate::data::buffer::Buffer;
-    use crate::data::continuity::{BoundaryReason, Generations};
+    use crate::data::continuity::{Boundary, Change, Generations, Loss};
     use crate::data::fixtures;
     use crate::data::sample::ColumnData;
     use crate::data::state::StreamDataError;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
+    use crate::proto::SampleNumber;
     use crate::tio::packet::LinkStatus;
 
     const STREAM_ID: u8 = 1;
@@ -380,7 +406,7 @@ mod tests {
     }
 
     /// As [`parser_with_schema`], with an explicit segment ring and clock. Only
-    /// segment 0 is announced, so later segments must be synthesized.
+    /// segment 0 is announced.
     fn parser_with_clock(
         column_types: &[DataType],
         sample_size: u16,
@@ -520,35 +546,29 @@ mod tests {
         stream_data_packet_in_segment(0, first_sample_n, data)
     }
 
-    /// A data packet can switch the current segment without any metadata
-    /// record changing; the snapshot revision must move with it.
+    /// A data packet in a segment the device did not announce switches the
+    /// current segment without any metadata record arriving, so the snapshot
+    /// revision moves, and the snapshot waits for that segment's record.
     #[test]
     fn a_data_packet_switching_segments_revises_the_metadata() {
         let route = DeviceRoute::root();
         let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
-        // Cache both segments, then let data select which one it uses.
-        announce(
-            &mut parser,
-            wire::Metadata::Segment(wire::Segment {
-                segment_id: crate::proto::SegmentId::new(1),
-                ..fixtures::segment(STREAM_ID)
-            }),
-        );
         parser
             .push_packet(&stream_data_packet_in_segment(0, 0, vec![0; 4]))
             .expect("valid samples");
+        assert!(parser.metadata(route).is_some());
         let before = parser.metadata_revision(route);
 
         parser
-            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
             .expect("valid samples");
 
         assert_ne!(parser.metadata_revision(route), before);
-        let snapshot = parser.metadata(route).expect("complete metadata");
-        let stream = snapshot
-            .stream(crate::proto::StreamId::new(STREAM_ID))
-            .expect("the described stream");
-        assert_eq!(stream.segment().segment_id().value(), 1);
+        assert!(parser.metadata(route).is_none(), "segment 1 has no record");
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 1)]
+        );
     }
 
     /// One `dev.metadata` reply carrying `records`, in wire framing.
@@ -573,6 +593,46 @@ mod tests {
             "one query per route with anything missing"
         );
         queries.pop().expect("the query")
+    }
+
+    /// A bootstrap reply holds the device's current segments, so it
+    /// announces them, and rows in a segment other than 0 decode at once.
+    #[test]
+    fn a_bootstrap_reply_announces_the_current_segment() {
+        let mut parser = PacketParser::new(true);
+        let query = take_query(&mut parser);
+        assert!(query.selectors.is_empty(), "a bootstrap query");
+        let segment = wire::Segment {
+            segment_id: crate::proto::SegmentId::new(2),
+            ..fixtures::segment(STREAM_ID)
+        };
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[
+                wire::Metadata::Device(fixtures::device()),
+                wire::Metadata::Stream(wire::Stream {
+                    n_segments: 4,
+                    sample_size: 4,
+                    ..fixtures::stream(STREAM_ID)
+                }),
+                wire::Metadata::Segment(segment),
+                wire::Metadata::Column(fixtures::column(STREAM_ID, 0, DataType::F32)),
+            ]),
+        );
+
+        let batches: Vec<SampleBatch> = [5, 6]
+            .map(|first| {
+                parser
+                    .push_packet(&stream_data_packet_in_segment(2, first, vec![0; 4]))
+                    .expect("valid rows");
+                parser.pop_batch().expect("rows that decode at once")
+            })
+            .into();
+        assert!(batches[0].is_initial());
+        assert_eq!(batches[1].boundary(), None, "nothing lost");
+        assert!(parser
+            .take_metadata_queries_for(DeviceRoute::root())
+            .is_empty());
     }
 
     #[test]
@@ -787,49 +847,95 @@ mod tests {
         assert_eq!(batch.sample_numbers(), [MAX_SAMPLE_NUMBER]);
     }
 
-    /// Drive a forced rollover: `output_rows` samples of segment 0, then the
-    /// first sample of segment 1 whose metadata has not arrived.
-    fn rollover_batch(sampling_rate: u32, decimation: u32, output_rows: usize) -> SampleBatch {
-        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, sampling_rate, decimation);
+    /// Rows of a segment whose record the parser lacks wait for it, and the
+    /// parser asks for that record.
+    #[test]
+    fn rows_without_their_record_wait_for_it() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 10, 2);
         parser
-            .push_packet(&stream_data_packet(0, vec![0; 4 * output_rows]))
+            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
             .expect("valid rows");
         parser.pop_batch().expect("the first batch");
+        assert_eq!(
+            parser
+                .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+                .expect("valid rows"),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert!(parser.pop_batch().is_none());
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 1)]
+        );
+    }
+
+    /// A stream's first rows in a segment the device did not announce wait
+    /// for that segment's record, as the record the parser holds is left
+    /// from an earlier lap of the ring.
+    #[test]
+    fn a_streams_first_rows_after_a_lap_wait_for_their_record() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+        let segment = |id: u8, start_time: u32| {
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(id),
+                start_time,
+                ..fixtures::segment(STREAM_ID)
+            })
+        };
+        // Every row of a lap of the ring is lost, and the device is back in
+        // segment 0, 4 s after it first opened it.
+        for id in 1..4 {
+            announce(&mut parser, segment(id, u32::from(id)));
+        }
+        assert_eq!(
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .expect("valid rows"),
+            PacketOutcome::WaitingForMetadata
+        );
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+        announce(&mut parser, segment(0, 4));
+        parser
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .expect("valid rows");
+
+        let batch = parser.pop_batch().expect("the stream's first batch");
+        assert!(batch.is_initial());
+        assert_eq!(batch.timestamps(), [6.0], "row 1 ends 2 s into the segment");
+    }
+
+    /// A rollover whose record comes first continues the current run.
+    #[test]
+    fn a_rollover_continues_the_current_run() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 10, 2);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                start_time: 1,
+                sampling_rate: 10,
+                decimation: 2,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
         parser
             .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
             .expect("valid rows");
-        parser.pop_batch().expect("the rollover batch")
-    }
-
-    #[test]
-    fn a_forced_rollover_that_fits_no_switch_or_several_waits_for_its_record() {
-        // At 10 Hz decimated by 3, a segment of 7 outputs takes inputs 0 to
-        // 20, and the next whole second, input 30, completes 3 more outputs,
-        // so no device switch leaves 7 outputs. At 1 Hz decimated by 2, a
-        // segment of 1 output ends on a switch at input 2 or input 3.
-        for (sampling_rate, decimation, outputs) in [(10, 3, 7), (1, 2, 1)] {
-            let mut parser = parser_with_clock(&[DataType::F32], 4, 2, sampling_rate, decimation);
-            parser
-                .push_packet(&stream_data_packet(0, vec![0; 4 * outputs]))
-                .expect("valid rows");
-            parser.pop_batch().expect("the first batch");
-            assert_eq!(
-                parser
-                    .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
-                    .expect("valid rows"),
-                PacketOutcome::WaitingForMetadata,
-                "{outputs} outputs at {sampling_rate} Hz decimated by {decimation}"
-            );
-            assert_eq!(
-                take_query(&mut parser).selectors,
-                [wire::MetadataSelector::segment(STREAM_ID, 1)]
-            );
-        }
-    }
-
-    #[test]
-    fn a_rollover_continues_the_current_run() {
-        let batch = rollover_batch(10, 2, 5);
+        let batch = parser.pop_batch().expect("the rollover batch");
+        assert_eq!(
+            batch.boundary(),
+            Some(&Boundary::of(Change::SegmentRollover {
+                old_id: crate::proto::SegmentId::new(0),
+                new_id: crate::proto::SegmentId::new(1),
+            }))
+        );
         assert_eq!(
             batch.generations(),
             Generations {
@@ -837,6 +943,200 @@ mod tests {
                 device: 0,
                 global: 0
             }
+        );
+    }
+
+    /// The boundary of `outputs` rows of segment 0, at `sampling_rate`
+    /// decimated by `decimation`, then row `first` of segment `next`, which
+    /// starts `seconds` after segment 0.
+    fn boundary_across(
+        (sampling_rate, decimation): (u32, u32),
+        outputs: usize,
+        (next, seconds, first): (u8, u32, u32),
+    ) -> Option<Boundary> {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 4, sampling_rate, decimation);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4 * outputs]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(next),
+                start_time: seconds,
+                sampling_rate,
+                decimation,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet_in_segment(next, first, vec![0; 4]))
+            .expect("valid rows");
+        parser
+            .pop_batch()
+            .expect("the batch after")
+            .boundary()
+            .cloned()
+    }
+
+    fn rollover(old: u8, new: u8) -> Option<Change> {
+        Some(Change::SegmentRollover {
+            old_id: crate::proto::SegmentId::new(old),
+            new_id: crate::proto::SegmentId::new(new),
+        })
+    }
+
+    /// Rows lost across a rollover come as a rollover and a loss, counted
+    /// from the whole periods between the two segments' starts, whether the
+    /// new segment's first rows or a whole segment went missing.
+    #[test]
+    fn a_loss_across_a_rollover_is_a_rollover_and_a_loss() {
+        // 5 outputs at 10 Hz decimated by 2 fill the first second, so rows 0
+        // and 1 of the segment after it are lost.
+        let lost_at_start = boundary_across((10, 2), 5, (1, 1, 2));
+        // Segment 1 held the second after, 5 more rows, and segment 2 starts
+        // with its row 0.
+        let lost_segment = boundary_across((10, 2), 5, (2, 2, 0));
+        for (boundary, new, samples) in [(lost_at_start, 1, 2), (lost_segment, 2, 5)] {
+            assert_eq!(
+                boundary,
+                Some(Boundary {
+                    change: rollover(0, new),
+                    loss: Some(Loss {
+                        samples,
+                        expected: Some(SampleNumber::new(5)),
+                        dropped_batches: 0,
+                    }),
+                })
+            );
+        }
+    }
+
+    /// A switch inside a group of inputs drops that group, which leaves less
+    /// than a period between the segments and loses no row.
+    #[test]
+    fn a_switch_inside_a_group_loses_no_row() {
+        // 6 outputs at 4 Hz decimated by 3 take inputs 0 to 17, and the
+        // device switches at input 20, 5 s in.
+        assert_eq!(
+            boundary_across((4, 3), 6, (1, 5, 0)),
+            Some(Boundary::of(Change::SegmentRollover {
+                old_id: crate::proto::SegmentId::new(0),
+                new_id: crate::proto::SegmentId::new(1),
+            }))
+        );
+    }
+
+    /// A ring that came round to the last rows' slot holds a segment that
+    /// starts later, which is a rollover onto the same id.
+    #[test]
+    fn a_ring_that_came_round_rolls_over_onto_the_same_slot() {
+        // 4 segments of one row at 1 Hz, all after the first lost.
+        assert_eq!(
+            boundary_across((1, 1), 1, (0, 4, 0)),
+            Some(Boundary {
+                change: rollover(0, 0),
+                loss: Some(Loss {
+                    samples: 3,
+                    expected: Some(SampleNumber::new(1)),
+                    dropped_batches: 0,
+                }),
+            })
+        );
+    }
+
+    /// Rows in the last rows' slot after the stream named another segment
+    /// are of a later lap, though their sample numbers follow on.
+    #[test]
+    fn rows_after_a_lap_that_follow_on_by_number_roll_over() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
+        let segment = |id: u8, start_time: u32| {
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(id),
+                start_time,
+                ..fixtures::segment(STREAM_ID)
+            })
+        };
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+        // Segment 1 held rows 0 and 1, and the parser waits through row 1.
+        parser
+            .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
+            .expect("valid rows");
+        assert!(parser.pop_batch().is_none());
+        announce(&mut parser, segment(1, 1));
+        announce(&mut parser, segment(0, 3));
+        parser
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .expect("valid rows");
+
+        let batch = parser.pop_batch().expect("the batch after the lap");
+        assert_eq!(
+            batch.boundary().cloned(),
+            Some(Boundary {
+                change: rollover(0, 0),
+                loss: Some(Loss {
+                    samples: 3,
+                    expected: Some(SampleNumber::new(1)),
+                    dropped_batches: 0,
+                }),
+            })
+        );
+    }
+
+    /// A device announces only the segment it is publishing, so the parser
+    /// takes rows of a segment after the record of another one for rows of a
+    /// later lap of the ring. It drops the segment's record, waits for the
+    /// record again, and reports the rows after it as a rollover onto the
+    /// same slot, with the rows it waited through lost.
+    #[test]
+    fn rows_after_a_broadcast_of_another_segment_wait_for_their_record_and_roll_over() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                start_time: 1,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .expect("valid rows");
+        assert!(
+            parser.pop_batch().is_none(),
+            "the rows wait for their record"
+        );
+        let query = take_query(&mut parser);
+        assert_eq!(
+            query.selectors,
+            vec![wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+        parser.apply_metadata_reply(
+            query,
+            &metadata_reply(&[wire::Metadata::Segment(fixtures::segment(STREAM_ID))]),
+        );
+        parser
+            .push_packet(&stream_data_packet(2, vec![0; 4]))
+            .expect("valid rows");
+
+        let batch = parser.pop_batch().expect("the rows after the reply");
+        assert_eq!(
+            batch.boundary().cloned(),
+            Some(Boundary {
+                change: rollover(0, 0),
+                loss: Some(Loss {
+                    samples: 1,
+                    expected: Some(SampleNumber::new(1)),
+                    dropped_batches: 0,
+                }),
+            })
         );
     }
 
@@ -1184,8 +1484,8 @@ mod tests {
         assert_eq!(after.generations().device, before.generations().device + 1);
         assert_eq!(after.generations().global, before.generations().global + 1);
         assert!(matches!(
-            after.boundary(),
-            Some(BoundaryReason::SessionChanged { old, new })
+            after.boundary().and_then(|b| b.change.as_ref()),
+            Some(Change::SessionChanged { old, new })
                 if old.value() == 42 && new.value() == 43
         ));
     }
@@ -1228,8 +1528,8 @@ mod tests {
                 .expect("rebooted samples must decode immediately");
             if first == 0 {
                 assert!(matches!(
-                    batch.boundary(),
-                    Some(BoundaryReason::SessionChanged { .. })
+                    batch.boundary().and_then(|b| b.change.as_ref()),
+                    Some(Change::SessionChanged { .. })
                 ));
                 assert_eq!(batch.generations().stream, before.generations().stream + 1);
             }
@@ -1262,8 +1562,8 @@ mod tests {
             .pop_batch()
             .expect("timestamps in different time references are not comparable");
         assert!(matches!(
-            batch.boundary(),
-            Some(BoundaryReason::TimeRefSessionChanged { .. })
+            batch.boundary().and_then(|b| b.change.as_ref()),
+            Some(Change::TimeRefSessionChanged { .. })
         ));
         assert!(parser
             .take_metadata_queries_for(DeviceRoute::root())
@@ -1304,11 +1604,16 @@ mod tests {
                 ..fixtures::segment(STREAM_ID)
             }),
         );
+        // Segment 0 is announced again, so its rows decode, and segment 1's
+        // record is left from before.
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(fixtures::segment(STREAM_ID)),
+        );
         parser
             .push_packet(&stream_data_packet(1000, vec![0; 4]))
             .unwrap();
         parser.pop_batch().unwrap();
-        // Not sample zero, so synthesis cannot hide the missing descriptor.
         parser
             .push_packet(&stream_data_packet_in_segment(1, 1, vec![0; 4]))
             .unwrap();
@@ -1509,8 +1814,8 @@ mod tests {
         let after = parser.pop_batch().expect("the new session's batch");
 
         assert!(matches!(
-            after.boundary(),
-            Some(BoundaryReason::SessionChanged { .. })
+            after.boundary().and_then(|b| b.change.as_ref()),
+            Some(Change::SessionChanged { .. })
         ));
         assert_eq!(
             decoded(&after),
@@ -1611,8 +1916,8 @@ mod tests {
         let after = parser.pop_batch().expect("the decimated batch");
 
         assert!(matches!(
-            after.boundary(),
-            Some(BoundaryReason::RateChanged { .. })
+            after.boundary().and_then(|b| b.change.as_ref()),
+            Some(Change::RateChanged { .. })
         ));
         assert_eq!(decoded(&after), named(&[("col_0", &[-20.0, -21.0])]));
         let step = after.timestamps()[1] - after.timestamps()[0];

@@ -121,8 +121,9 @@ impl Connection {
     /// address within 1.5 s.
     ///
     /// A TCP URL whose host is this machine, such as `tcp://localhost:17855`,
-    /// names a running 2.0 proxy. The connection goes through that proxy
-    /// and opens what it resolves `auto` to. No proxy is started for it.
+    /// names a running proxy of this build. The connection goes through that
+    /// proxy and opens what it resolves `auto` to. No proxy is started for
+    /// it.
     ///
     /// The `TWINLEAF_PROXY` environment variable, when set and not empty,
     /// names a different proxy as `tcp://host:port`. For example,
@@ -173,8 +174,9 @@ impl Connection {
     /// - The proxy refuses to open the device, or does not open it within
     ///   15 s. A refusal carries the proxy's reason, such as the candidates
     ///   an ambiguous `auto` could mean.
-    /// - The peer that answers is not a Twinleaf 2.0 proxy, such as a 1.x
-    ///   `tio proxy`, which this build cannot reach.
+    /// - The peer that answers gives no introduction to the hello, as a
+    ///   `tio proxy` from an older build gives none. This build cannot reach
+    ///   such a proxy.
     /// - Nothing answers at the proxy `TWINLEAF_PROXY` names. The message
     ///   names the variable.
     ///
@@ -468,7 +470,8 @@ impl DeviceTree {
     /// The first subscription on the connection starts its stream task.
     /// The receiver queues up to 1024 batches. Batches that arrive while it
     /// is full are dropped, and their count arrives as
-    /// [`RecvError::Lagged`].
+    /// [`RecvError::Lagged`]. The next batch of each stream that lost
+    /// batches carries a [`Loss`](crate::data::Loss).
     ///
     /// # Examples
     ///
@@ -892,8 +895,12 @@ impl Device {
     }
 
     /// Subscribes to every setting this device announces from now on, in
-    /// the order it announces them. The receiver queues up to 4096 of them,
-    /// and one that falls behind gets [`RecvError::Lagged`]. Read
+    /// the order it announces them. Each carries the RPC table it was
+    /// recorded under, which decodes its value. Subscribing follows the
+    /// table too, so the proxy loads the table and reads every setting once,
+    /// as for [`settings_updates`](Self::settings_updates). The receiver
+    /// queues up to 4096 of them, and one
+    /// that falls behind gets [`RecvError::Lagged`]. Read
     /// [`settings`](Self::settings) then to catch up.
     pub fn setting_changes(&self) -> Receiver<SettingChange> {
         self.state(CHANGES)
@@ -923,6 +930,7 @@ impl Device {
 mod tests {
     use super::*;
     use crate::device::fixtures::{self, open_through, FakeDevice, WAIT};
+    use crate::device::rpc::RpcValue;
     use crate::device::session::TestProxy;
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::{call, Proxy};
@@ -1342,7 +1350,10 @@ mod tests {
             };
             assert_eq!(kept.get("test.amplitude"), Some(&[2u8][..]));
             let change = changes.recv_deadline(deadline).expect("the announcement");
-            assert_eq!((change.seq, change.reply), (Some(8), vec![2]));
+            assert_eq!((change.seq, &change.reply), (Some(8), &vec![2]));
+            let table = change.rpc_registry().expect("the change carries its table");
+            assert!(Arc::ptr_eq(table, &view.rpc_registry().unwrap()));
+            assert_eq!(change.value().unwrap(), RpcValue::U64(2));
             assert_eq!(view.presence(), Presence::Alive { session: None });
         }
 
@@ -1363,6 +1374,37 @@ mod tests {
             [1, 1 + 2, 1],
             "one discovery, one walk of the two entries, and one snapshot for every client"
         );
+    }
+
+    /// A device that follows only its setting changes gets each recorded
+    /// once the table loads with that table, as following the changes loads
+    /// the table they are recorded under.
+    #[test]
+    fn a_device_that_follows_only_its_changes_gets_each_with_its_table() {
+        let device = FakeDevice::start();
+        let proxy = fixtures::proxy();
+        let view = open_through(&proxy, &device.url)
+            .unwrap()
+            .device(DeviceRoute::root());
+        let changes = view.setting_changes();
+        let deadline = Instant::now() + WAIT;
+        let decoded = (8..).find_map(|seq| {
+            assert!(Instant::now() < deadline, "no change carried a table");
+            let root = DeviceRoute::root();
+            device.send(super::super::fixtures::announcement(
+                "test.amplitude",
+                Some(seq),
+                &[2],
+                root,
+            ));
+            let change = changes.recv_timeout(Duration::from_millis(100)).ok()?;
+            change.rpc_registry().is_some().then_some(change)
+        });
+
+        let decoded = decoded.unwrap();
+        let table = decoded.rpc_registry().unwrap();
+        assert_eq!(table.hash, Some(device.table_hash()));
+        assert_eq!(decoded.value().unwrap(), RpcValue::U64(2));
     }
 
     /// A sample the device sends right after the record of its segment

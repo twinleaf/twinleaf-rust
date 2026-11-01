@@ -3,7 +3,7 @@
 //! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
-use super::continuity::{BoundaryClass, BoundaryReason};
+use super::continuity::{Boundary, BoundaryClass};
 use super::metadata::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
 use super::sample::{sample_time, RowSource, SampleBatch};
@@ -290,7 +290,7 @@ impl LogSummary {
         {
             runs.push(StreamSummary {
                 run: rows.generations().stream,
-                opened_by: rows.boundary().map(BoundaryReason::class),
+                opened_by: rows.boundary().map(Boundary::class),
                 metadata: rows.metadata(),
                 sample_count: 0,
                 first_timestamp: None,
@@ -682,6 +682,35 @@ mod tests {
         assert!((runs[1].last_timestamp().unwrap() - 0.4).abs() < 1e-9);
         assert_eq!(summary.boundaries(BoundaryClass::Reconfig), 1);
         assert_eq!(summary.boundaries(BoundaryClass::Anomaly), 0);
+    }
+
+    #[test]
+    fn a_loss_across_a_rollover_counts_once_as_data_loss() {
+        let mut packets = schema_packets();
+        packets[1] = metadata_packet(wire::Metadata::Stream(wire::Stream {
+            n_segments: 2,
+            ..stream(1)
+        }));
+        packets.extend([data_packet(0, 0), data_packet(1, 0)]);
+        packets.push(metadata_packet(wire::Metadata::Segment(wire::Segment {
+            segment_id: crate::proto::SegmentId::new(1),
+            start_time: 2,
+            ..segment(1)
+        })));
+        packets.push(data_packet(1, 1));
+        let log = LogFile {
+            data: encoded_log(packets),
+        };
+
+        let summary = log.scan(true);
+        let summary = summary.summary();
+        let runs = &summary.streams()
+            [&StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1))];
+
+        let counts = BoundaryClass::ALL.map(|class| summary.boundaries(class));
+        assert_eq!(counts, [1, 0, 1, 0, 0], "a startup and a data loss");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].opened_by(), Some(BoundaryClass::DataLoss));
     }
 
     #[test]

@@ -126,15 +126,19 @@ impl MetadataSchedule {
         }
     }
 
-    /// Returns the earliest moment a backed-off route is due again.
-    pub(super) fn next_retry(&self) -> Option<Instant> {
-        self.schedule
-            .values()
-            .filter_map(|state| match state {
-                Schedule::Backoff { until, .. } => Some(*until),
-                Schedule::Due { .. } | Schedule::Unsupported => None,
-            })
-            .min()
+    /// Returns the earliest moment one of `routes` that is backed off is
+    /// due again. The caller passes the routes it asks, the same ones it
+    /// passes to [`due`](Self::due), so a backoff of a route it does not ask
+    /// never wakes it.
+    pub(super) fn next_retry(
+        &self,
+        routes: impl IntoIterator<Item = DeviceRoute>,
+    ) -> Option<Instant> {
+        let until = |route| match self.schedule.get(&route) {
+            Some(Schedule::Backoff { until, .. }) => Some(*until),
+            Some(Schedule::Due { .. } | Schedule::Unsupported) | None => None,
+        };
+        routes.into_iter().filter_map(until).min()
     }
 
     /// Clears the schedule of every route in `subtree`. The next session
@@ -211,7 +215,7 @@ mod tests {
 
         assert_eq!(schedule.due([route], Instant::now()), [route]);
         assert!(
-            schedule.next_retry().is_none(),
+            schedule.next_retry([route]).is_none(),
             "an elapsed deadline never wakes the caller again"
         );
         let query = parser

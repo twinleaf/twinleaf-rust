@@ -116,5 +116,7 @@ pub(crate) mod fixtures;
 #[doc(no_inline)]
 pub use crate::proto::RouteError;
 pub use connection::{Connection, Device, DeviceTree, MetadataError, NamedRoute};
-pub use state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+pub use state::{
+    MetadataState, Presence, RegistryState, SettingChange, SettingValueError, Settings,
+};
 pub use stream::{Receiver, RecvError};

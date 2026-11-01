@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use twinleaf::DeviceRoute;
 
-use super::{nonneg_f64, parse_device_route};
+use super::{nonneg_f64, parse_device_route, ListenOn};
 
 #[derive(Parser, Debug)]
 pub struct SimulateCli {
@@ -40,6 +40,10 @@ pub struct SimulateCli {
     #[arg(long = "port", default_value = "7855")]
     pub(crate) port: u16,
 
+    /// Interfaces to listen on
+    #[arg(long = "listen", value_enum, default_value_t = ListenOn::All)]
+    pub(crate) listen: ListenOn,
+
     /// Disable random sample drops (the 'd' key still drops one manually)
     #[arg(long = "no-drop")]
     pub(crate) no_drop: bool,
@@ -53,16 +57,16 @@ pub struct SimulateCli {
     )]
     pub(crate) layout: Vec<DeviceRoute>,
 
-    /// The firmware images the devices take, as one kind of real device does
-    #[arg(long = "upload", value_enum, default_value_t = UploadKind::TlChibi)]
+    /// The kind of firmware the devices take, as a real device of that kind does
+    #[arg(long = "upload", value_enum, default_value_t = UploadKind::Image)]
     pub(crate) upload: UploadKind,
 }
 
 /// What kind of firmware image a simulated device takes.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadKind {
-    /// tl-chibi images, whose chunks carry their own envelope
-    TlChibi,
+    /// Images in the chunked format tl-chibi firmware takes, whose chunks carry their own envelope
+    Image,
     /// Signed packages for board `tio-test`, as a device built on twinleaf-device takes
     Signed,
 }

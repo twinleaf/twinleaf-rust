@@ -20,6 +20,7 @@ pub use crate::tio::transport::{enumerate_serial, DiscoveredDevice, PortInterfac
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::io;
+use std::panic;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -93,20 +94,26 @@ pub enum DiscoveryEvent {
 /// and, when enabled, the network.
 ///
 /// With [`DiscoveryConfig::probe_names`] set, each recognized device gets a
-/// probe task of its own on the crate's runtime. The task keeps one probe
-/// connection to the device through the proxy. Dropping the session stops
-/// browsing and probing. It blocks until every task of the session has
-/// ended, each probe with its connection dropped, for at most five seconds.
+/// probe task of its own. The task keeps one probe connection to the device
+/// through the proxy. Dropping the session stops browsing and probing.
 ///
-/// A session has only a synchronous entry point, so all of its tasks run on
-/// the crate's runtime, whatever runtime [`start`](Discovery::start) is
-/// called from.
+/// Call [`start`](Discovery::start) from synchronous code. Its session runs
+/// its tasks on the crate's runtime, and its drop blocks until every task has
+/// ended, each probe with its connection dropped, for at most five seconds.
+/// Await [`start_async`](Discovery::start_async) from a task of a tokio
+/// runtime. Its session runs its tasks on that runtime, and its drop ends
+/// them without waiting. Await [`shutdown_async`](Discovery::shutdown_async)
+/// in place of the drop when the caller must know every probe connection has
+/// been dropped before it goes on.
 #[derive(Debug)]
 pub struct Discovery {
     events: flume::Receiver<DiscoveryEvent>,
     /// Ends the session's scan and browse once dropped.
     lifelines: Vec<oneshot::Sender<Infallible>>,
     tasks: Supervisor,
+    /// Whether a drop waits for the session's tasks, as for a session from
+    /// [`start`](Discovery::start), which runs on the crate's runtime.
+    drop_waits: bool,
 }
 
 impl Discovery {
@@ -119,22 +126,74 @@ impl Discovery {
     /// after a delay that grows from half a second to four seconds. Each try
     /// may take longer to open than the one before, up to four seconds.
     pub fn start(config: DiscoveryConfig) -> Discovery {
-        let include_unknown = config.include_unknown;
-        let backend = Backend {
-            list: Arc::new(move || enumerate_serial(include_unknown)),
-            open: Arc::new(|url, timeout| Box::pin(probe(url, timeout))),
-            period: REPROBE_PERIOD,
-            retry: RETRY_FIRST,
-        };
-        Self::start_with(config, backend, &Supervisor::new())
+        Self::start_with(config, Backend::system(config), &Supervisor::new())
+    }
+
+    /// Starts a discovery session with `config` as [`start`](Self::start)
+    /// does, without blocking. Must be awaited on a tokio runtime, which runs
+    /// every task of the session. When a probe finds nothing at the
+    /// machine's proxy address and this process hosts the proxy itself, that
+    /// proxy runs on the crate's runtime, as it outlives the session.
+    ///
+    /// Lists the serial ports on a blocking thread of that runtime before it
+    /// returns, and reports them as the first events. Dropping the session
+    /// ends its tasks without waiting for them. Await
+    /// [`shutdown_async`](Self::shutdown_async) to wait until they have
+    /// ended.
+    ///
+    /// # Panics
+    ///
+    /// Panics if it is awaited outside a tokio runtime, and if listing the
+    /// serial ports panics.
+    pub async fn start_async(config: DiscoveryConfig) -> Discovery {
+        Self::start_async_with(config, Backend::system(config)).await
+    }
+
+    /// Ends the session as dropping it does, and waits until every task of
+    /// the session has ended, each probe with its connection dropped, for at
+    /// most five seconds. Waits without blocking the thread it runs on.
+    pub async fn shutdown_async(mut self) {
+        self.lifelines.clear();
+        if !ended(&self.tasks).await {
+            log::warn!("the discovery tasks did not end within {STOP_TIMEOUT:?}");
+        }
+        self.drop_waits = false;
     }
 
     /// Starts a discovery session as [`start`](Self::start) does, with
     /// `backend` to list ports and open probes, and its tasks on `tasks`.
     fn start_with(config: DiscoveryConfig, backend: Backend, tasks: &Supervisor) -> Discovery {
+        let serial = (backend.list)();
+        let mut discovery = Self::run(config, serial, backend, tasks);
+        discovery.drop_waits = true;
+        discovery
+    }
+
+    /// Starts a discovery session as [`start_async`](Self::start_async)
+    /// does, with `backend` to list ports and open probes.
+    async fn start_async_with(config: DiscoveryConfig, backend: Backend) -> Discovery {
+        let tasks = Supervisor::current();
+        let list = backend.list.clone();
+        let serial = match tasks.spawn_blocking(move || list()).await {
+            Ok(serial) => serial,
+            Err(failed) if failed.is_panic() => panic::resume_unwind(failed.into_panic()),
+            // The runtime is shutting down, and runs no task of the session.
+            Err(_) => Vec::new(),
+        };
+        Self::run(config, serial, backend, &tasks)
+    }
+
+    /// Reports the serial ports in `serial` as the first events, and starts
+    /// the session's scan, browse and probes on `tasks`. Its drop does not
+    /// wait for them.
+    fn run(
+        config: DiscoveryConfig,
+        serial: Vec<DiscoveredDevice>,
+        backend: Backend,
+        tasks: &Supervisor,
+    ) -> Discovery {
         let (tx, events) = flume::unbounded();
 
-        let serial = (backend.list)();
         for device in &serial {
             let _ = tx.send(DiscoveryEvent::Added(device.clone()));
         }
@@ -163,6 +222,7 @@ impl Discovery {
             events,
             lifelines: [Some(scanning), browsing].into_iter().flatten().collect(),
             tasks: tasks.clone(),
+            drop_waits: false,
         }
     }
 
@@ -174,17 +234,32 @@ impl Discovery {
 }
 
 impl Drop for Discovery {
+    /// Ends the session's tasks. A session from [`start`](Discovery::start)
+    /// blocks until they have ended, for at most five seconds. A session from
+    /// [`start_async`](Discovery::start_async) runs on its caller's runtime
+    /// and does not wait, since on a runtime of one thread a wait
+    /// would block the tasks themselves. Await
+    /// [`shutdown_async`](Discovery::shutdown_async) to wait for them.
     fn drop(&mut self) {
         self.lifelines.clear();
+        if !self.drop_waits {
+            return;
+        }
         let tasks = self.tasks.clone();
-        let ended = Supervisor::new().run("twinleaf discovery stop", async move {
-            let waited = tokio::time::timeout(STOP_TIMEOUT, tasks.wait()).await;
-            Ok(waited.is_ok())
-        });
-        if !matches!(ended, Ok(true)) {
+        let stopping = async move { Ok(ended(&tasks).await) };
+        let waited = Supervisor::new().run("twinleaf discovery stop", stopping);
+        if !matches!(waited, Ok(true)) {
             log::warn!("the discovery tasks did not end within {STOP_TIMEOUT:?}");
         }
     }
+}
+
+/// Waits until every task on `tasks` has ended, for at most
+/// [`STOP_TIMEOUT`]. Returns `false` if one outlasts it.
+async fn ended(tasks: &Supervisor) -> bool {
+    tokio::time::timeout(STOP_TIMEOUT, tasks.wait())
+        .await
+        .is_ok()
 }
 
 /// Lists the serial ports.
@@ -198,7 +273,8 @@ type Opener =
 /// What a discovery session lists ports and opens probes with, and how often.
 #[derive(Clone)]
 struct Backend {
-    /// Lists the serial ports. It may block, and runs on a blocking thread.
+    /// Lists the serial ports. It may block, so a task runs it on a blocking
+    /// thread.
     list: Lister,
     /// Opens each probe connection.
     open: Opener,
@@ -208,6 +284,21 @@ struct Backend {
     /// How long a probe waits before it tries a failed open again. The wait
     /// doubles after each failure in a row, up to [`RETRY_MAX`].
     retry: Duration,
+}
+
+impl Backend {
+    /// Returns the backend that lists this host's serial ports as `config`
+    /// asks, and opens each probe through the proxy [`Connection::open`]
+    /// uses.
+    fn system(config: DiscoveryConfig) -> Backend {
+        let include_unknown = config.include_unknown;
+        Backend {
+            list: Arc::new(move || enumerate_serial(include_unknown)),
+            open: Arc::new(|url, timeout| Box::pin(probe(url, timeout))),
+            period: REPROBE_PERIOD,
+            retry: RETRY_FIRST,
+        }
+    }
 }
 
 /// Opens a probe connection to `url` through the proxy [`Connection::open`]
@@ -276,7 +367,8 @@ const RETRY_FIRST: Duration = Duration::from_millis(500);
 /// later try may take to open.
 const RETRY_MAX: Duration = Duration::from_secs(4);
 
-/// How long dropping a [`Discovery`] waits for its tasks to end.
+/// How long [`Discovery::shutdown_async`], and dropping a session from
+/// [`Discovery::start`], wait for its tasks to end.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Returns `true` if a device found on a serial port is a Twinleaf device,
@@ -800,8 +892,9 @@ mod tests {
     use crate::device::fixtures::{self, FakeDevice, ENVIRONMENT, WAIT};
     use crate::device::session::TestProxy;
     use crate::proto::rpc::Method;
-    use crate::proxy::fixtures::{assert_took, PAUSED_WAIT};
+    use crate::proxy::fixtures::{assert_took, options, PAUSED_WAIT};
     use crate::proxy::Proxy;
+    use crate::rt;
     use crate::tio::packet::Payload;
     use crate::tio::Packet;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1234,11 +1327,17 @@ mod tests {
         )
     }
 
-    /// Stops `discovery` and waits for its tasks to end. Unlike its drop, it
-    /// does not block the test's runtime.
-    async fn stop(mut discovery: Discovery) {
-        discovery.lifelines.clear();
-        discovery.tasks.wait().await;
+    /// An opener whose every open succeeds over a session whose socket is a
+    /// pair of channels, with its task on `sessions`. Returns the far end of
+    /// each session it opens, which keeps the session open.
+    fn test_pairs(sessions: Supervisor) -> (Opener, flume::Receiver<TestProxy>) {
+        let (opened, proxies) = flume::unbounded();
+        let open: Opener = Arc::new(move |_, _| {
+            let (session, proxy) = Session::test_pair_on(&sessions);
+            let _ = opened.send(proxy);
+            Box::pin(async { Ok(Connection::over(session)) })
+        });
+        (open, proxies)
     }
 
     /// The serial ports are listed again every period, and a port that
@@ -1265,7 +1364,7 @@ mod tests {
         let event = next_event(&discovery).await;
         assert!(matches!(&event, DiscoveryEvent::Removed { url } if url == FIRST));
         assert_took(started.elapsed(), REPROBE_PERIOD * 2, "the third listing");
-        stop(discovery).await;
+        discovery.shutdown_async().await;
     }
 
     /// A probe that keeps failing waits twice as long before each try, from
@@ -1301,7 +1400,7 @@ mod tests {
             assert_eq!(given, patience, "the time try {index} may take");
             last = Some(at);
         }
-        stop(discovery).await;
+        discovery.shutdown_async().await;
     }
 
     /// Each check of a probe connection listens for routes for the route
@@ -1346,6 +1445,146 @@ mod tests {
         proxy.reply(id, b"FAKE", DeviceRoute::root());
         let event = next_event(&discovery).await;
         assert!(matches!(&event, DiscoveryEvent::Named { name, .. } if name == "FAKE"));
-        stop(discovery).await;
+        discovery.shutdown_async().await;
+    }
+
+    /// Runs `test` on a thread of its own and returns what it returns.
+    /// Panics if `test` panics, or does not return within twice [`WAIT`].
+    fn on_a_thread<T: Send + 'static>(test: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, returned) = flume::bounded(1);
+        let caller = thread::spawn(move || {
+            let _ = done.send(test());
+        });
+        match returned.recv_timeout(WAIT * 2) {
+            Ok(value) => value,
+            Err(flume::RecvTimeoutError::Timeout) => {
+                panic!("the test did not return within {:?}", WAIT * 2)
+            }
+            Err(flume::RecvTimeoutError::Disconnected) => match caller.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => unreachable!("the test returned without an answer"),
+            },
+        }
+    }
+
+    /// A session the async entry point starts runs every task on the runtime
+    /// it is awaited on, here one of a single thread, and never reaches the
+    /// crate's runtime. It lists the serial ports on a blocking thread of
+    /// that runtime, reports them as its first events, and probes them.
+    #[test]
+    fn an_async_session_runs_on_the_runtime_it_is_awaited_on() {
+        let device = FakeDevice::start();
+        let url = device.url.clone();
+        on_a_thread(move || {
+            rt::forbid_crate_runtime();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name("a test caller")
+                .on_thread_start(rt::forbid_crate_runtime)
+                .build()
+                .unwrap();
+            let caller = thread::current().id();
+            runtime.block_on(async {
+                let proxy = crate::proxy::host(options()).await.unwrap();
+                let ports = Arc::new(Mutex::new(vec![twinleaf(&url)]));
+                let mut backend = backend(&proxy, &ports);
+                let (listed, listings) = flume::unbounded();
+                let list = backend.list.clone();
+                backend.list = Arc::new(move || {
+                    let thread = thread::current();
+                    let _ = listed.send((thread.id(), thread.name().map(str::to_string)));
+                    list()
+                });
+
+                let discovery = Discovery::start_async_with(serial_only(), backend).await;
+
+                let first = discovery.events().try_recv();
+                let reported =
+                    matches!(&first, Ok(DiscoveryEvent::Added(found)) if found.url == url);
+                assert!(reported, "the first event is {first:?}");
+                let (lister, named) = listings.try_recv().expect("the ports were listed");
+                assert_ne!(
+                    lister, caller,
+                    "the ports were listed on the runtime's thread"
+                );
+                assert_eq!(named.as_deref(), Some("a test caller"));
+                let name = async {
+                    loop {
+                        match discovery.events().recv_async().await {
+                            Ok(DiscoveryEvent::Named { name, .. }) => return name,
+                            Ok(_) => {}
+                            Err(error) => panic!("discovery ended: {error}"),
+                        }
+                    }
+                };
+                let name = tokio::time::timeout(WAIT, name).await;
+                assert_eq!(name.expect("the name in time"), "FAKE");
+                discovery.shutdown_async().await;
+                proxy.shutdown_async().await;
+            });
+        });
+    }
+
+    /// The async shutdown returns once every probe has dropped its
+    /// connection. A probe holds the opener for as long as it holds its
+    /// connection, so once each has dropped it the test alone holds the
+    /// opener.
+    #[tokio::test(start_paused = true)]
+    async fn the_async_shutdown_returns_once_every_probe_dropped_its_connection() {
+        let ports = Arc::new(Mutex::new(vec![twinleaf(FIRST), twinleaf(SECOND)]));
+        let (open, proxies) = test_pairs(Supervisor::current());
+        let held = open.clone();
+        let backend = paused_backend(&ports, open);
+        let discovery = Discovery::start_async_with(serial_only(), backend).await;
+        let mut far_ends = Vec::new();
+        for _ in 0..2 {
+            let next = tokio::time::timeout(PAUSED_WAIT, proxies.recv_async()).await;
+            far_ends.push(next.expect("each probe opens").unwrap());
+        }
+
+        discovery.shutdown_async().await;
+
+        assert_eq!(Arc::strong_count(&held), 1, "a probe kept its connection");
+    }
+
+    /// Dropping a session the async entry point starts, inside a task of a
+    /// runtime of one thread, does not block the task, and the session's
+    /// tasks end after the drop.
+    #[test]
+    fn dropping_an_async_session_does_not_block_its_task() {
+        let took = on_a_thread(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let ports = Arc::new(Mutex::new(vec![twinleaf(FIRST)]));
+                let (open, proxies) = test_pairs(Supervisor::current());
+                let held = open.clone();
+                let backend = paused_backend(&ports, open);
+                let discovery = Discovery::start_async_with(serial_only(), backend).await;
+                let next = tokio::time::timeout(WAIT, proxies.recv_async()).await;
+                let _far_end = next.expect("the probe opens").unwrap();
+
+                let dropping = tokio::spawn(async move {
+                    let started = Instant::now();
+                    drop(discovery);
+                    started.elapsed()
+                });
+                let took = dropping.await.expect("the drop returns");
+
+                let ended = async {
+                    while Arc::strong_count(&held) > 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                let ended = tokio::time::timeout(WAIT, ended).await;
+                assert!(ended.is_ok(), "the session's tasks did not end");
+                took
+            })
+        });
+        // On a runtime of one thread, a drop that waits waits out the whole
+        // STOP_TIMEOUT, as the tasks cannot run during it.
+        assert!(took < STOP_TIMEOUT, "the drop blocked for {took:?}");
     }
 }

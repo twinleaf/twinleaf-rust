@@ -28,6 +28,22 @@ pub(crate) const WAIT: Duration = Duration::from_secs(5);
 /// timeout of the proxy, and costs no time.
 pub(crate) const PAUSED_WAIT: Duration = Duration::from_secs(60);
 
+/// The variable that, set to `1`, runs the tests that bind every interface
+/// or join a multicast group. Windows asks whether to let each new build of
+/// a binary open such a socket, so every other test binds loopback alone.
+/// Run them with `TWINLEAF_TEST_ALL_INTERFACES=1 cargo test`.
+pub(crate) const ALL_INTERFACES: &str = "TWINLEAF_TEST_ALL_INTERFACES";
+
+/// Returns `true` if [`ALL_INTERFACES`] is `1`. Otherwise says on stderr
+/// that `test` is skipped and how to run it, and returns `false`.
+pub(crate) fn binds_every_interface(test: &str) -> bool {
+    if std::env::var_os(ALL_INTERFACES).is_some_and(|value| value == "1") {
+        return true;
+    }
+    eprintln!("skipped {test}, which binds every interface. Run it with {ALL_INTERFACES}=1");
+    false
+}
+
 /// Returns the options a test hosts a proxy with. The proxy listens on
 /// loopback on a free port and has no default.
 pub(crate) fn options() -> HostOptions {

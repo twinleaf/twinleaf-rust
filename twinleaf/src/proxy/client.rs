@@ -4,7 +4,8 @@
 //! [`Session::run`] runs it.
 //!
 //! A device watch follows the device's presence, announced settings and
-//! routes here, and these updates go on the outbox's urgent queue. The
+//! routes here, and the RPC table each announced setting was recorded
+//! under, and these updates go on the outbox's urgent queue. The
 //! device's metadata update says how to decode its samples, so the engine of
 //! the device's link queues it on the stream instead, as it sets it. A table
 //! watch follows the RPC table and settings here.
@@ -23,7 +24,7 @@ use crate::device::store::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
 use crate::device::stream::Scope;
 use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
-use crate::proto::{DeviceRoute, PacketType, TCP_DEFAULT_PORT};
+use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::{finish, lock, BoxFuture};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
@@ -696,9 +697,10 @@ impl Binding {
     /// the watch names, and a table goes out ahead of the first settings read
     /// with it. Without, they are the routes heard at or below it, from every
     /// mount there, and the presence and announced settings of the device it
-    /// names, if a mount shows it. The engine of that mount's link then queues
-    /// the device's metadata updates for the watch itself. The updates end
-    /// when the link's engine does.
+    /// names, if a mount shows it, each setting after the table it was
+    /// recorded under. The engine of that mount's link then queues the
+    /// device's metadata updates for the watch itself. The updates end when
+    /// the link's engine does.
     ///
     /// Returns a [`Refusal`] if no mount shows what the watch follows, and
     /// leaves the watch the client had under that id as it was.
@@ -717,7 +719,8 @@ impl Binding {
         };
         let store = mounted.lease.link().store();
         mounted.mount.watch_metadata(id, route, &store);
-        Ok(stream::select(routes, device_updates(&store, route)).boxed())
+        let device = device_updates(&store, route);
+        Ok(stream::select(routes, device).boxed())
     }
 
     /// Stops the metadata updates of watch `id` on every mount.
@@ -769,7 +772,8 @@ impl Binding {
 }
 
 /// Returns the updates of the presence and announced settings of the device
-/// at `route` that `store` holds.
+/// at `route` that `store` holds, each setting after the table it was
+/// recorded under.
 pub(super) fn device_updates(
     store: &Mutex<Store>,
     route: DeviceRoute,
@@ -820,16 +824,29 @@ fn values<T: Send + 'static>(receiver: Receiver<T>) -> BoxStream<'static, T> {
 }
 
 /// Returns the updates of each setting `changes` yields, and of each count
-/// of those it missed, until it ends.
+/// of those it missed, until it ends. The table a setting was recorded under
+/// goes out ahead of it, unless it has the hash and session of the table of
+/// the setting before.
 fn announced(changes: Receiver<SettingChange>) -> BoxStream<'static, Update> {
-    stream::unfold(changes, |changes| async move {
-        let update = match changes.recv_async().await {
-            Ok(change) => Update::setting(change),
-            Err(RecvError::Lagged(missed)) => Update::Lagged(missed),
+    // The hash and session of the table named last, or `None` for no
+    // table, once one is named.
+    type Identity = Option<(Option<u32>, Option<SessionId>)>;
+    let named: Option<Identity> = None;
+    stream::unfold((changes, named), move |(changes, mut named)| async move {
+        let updates = match changes.recv_async().await {
+            Ok(change) => {
+                let table = change.rpc_registry();
+                let identity = table.map(|table| (table.hash, table.session));
+                let name = (named != Some(identity)).then(|| Update::recorded(table));
+                named = Some(identity);
+                name.into_iter().chain([Update::setting(change)]).collect()
+            }
+            Err(RecvError::Lagged(missed)) => vec![Update::Lagged(missed)],
             Err(_) => return None,
         };
-        Some((update, changes))
+        Some((stream::iter(updates), (changes, named)))
     })
+    .flatten()
     .boxed()
 }
 
@@ -851,6 +868,9 @@ fn failed(error: &tokio::task::JoinError) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::rpc::RpcRegistry;
+    use crate::device::session::{Inlet, Received, Session as AppSession};
+    use crate::device::stream::{End, Queued};
     use crate::proxy::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
     use crate::proxy::link::{Links, Owner};
     use crate::proxy::DumpFlags;
@@ -867,6 +887,9 @@ mod tests {
     /// The device a test opens.
     const DEVICE: &str = "tcp://device";
 
+    /// What resolves to why a client's session ended.
+    type Served = JoinHandle<Option<Result<(), ClientError>>>;
+
     /// A client's session on the test's runtime, over a fake connection, of
     /// a proxy whose devices are fake.
     struct Client {
@@ -876,7 +899,7 @@ mod tests {
         devices: mpsc::UnboundedReceiver<Opened>,
         links: Links,
         /// Resolves to why the session ended.
-        served: JoinHandle<Option<Result<(), ClientError>>>,
+        served: Served,
         _registry: Owner,
         _lifeline: oneshot::Sender<Infallible>,
     }
@@ -893,6 +916,26 @@ mod tests {
             super::link::no_default(),
             opens,
         );
+        let (end, served, lifeline) = join(&links, default);
+        Client {
+            end,
+            devices,
+            links,
+            served,
+            _registry: registry,
+            _lifeline: lifeline,
+        }
+    }
+
+    /// Connects a client to the proxy whose links are `links` and whose
+    /// default is `default`. Returns the client's end of its connection,
+    /// what resolves to why its session ended, and the lifeline whose drop
+    /// stops the proxy for it.
+    fn join(
+        links: &Links,
+        default: Option<Layout>,
+    ) -> (FakeEnd, Served, oneshot::Sender<Infallible>) {
+        let tasks = Supervisor::current();
         let shared = Arc::new(Shared {
             options: options(),
             endpoint: "tcp://127.0.0.1:7855".to_string(),
@@ -913,14 +956,7 @@ mod tests {
             session.close().await;
             served
         });
-        Client {
-            end,
-            devices,
-            links,
-            served,
-            _registry: registry,
-            _lifeline: lifeline,
-        }
+        (end, served, lifeline)
     }
 
     /// Opens [`DEVICE`] for `client`, and has the device answer. Returns the
@@ -1034,17 +1070,45 @@ mod tests {
         Packet::samples(1, 0, first, &[0; 400], DeviceRoute::root()).unwrap()
     }
 
+    /// The bytes of the payload of a [`big_beat`].
+    const BIG_BEAT: usize = 496;
+
+    /// A heartbeat at the root with a payload of [`BIG_BEAT`] bytes that
+    /// carries `number`. It is no sample.
+    fn big_beat(number: u32) -> Packet {
+        let mut raw = vec![PacketType::HEARTBEAT.value(), 0];
+        raw.extend((BIG_BEAT as u16).to_le_bytes());
+        raw.extend(number.to_le_bytes());
+        raw.resize(4 + BIG_BEAT, 0);
+        Packet::from_slice_prefix(&raw).unwrap().0
+    }
+
+    /// Returns the number a heartbeat carries, its session or the number of
+    /// a [`big_beat`].
+    fn beat_number(pkt: &Packet) -> Option<u32> {
+        let Payload::Heartbeat(beat) = pkt.payload() else {
+            return None;
+        };
+        let bytes = pkt.payload_bytes();
+        match beat.session() {
+            Some(session) => Some(session.value()),
+            None if bytes.len() == BIG_BEAT => {
+                Some(u32::from_le_bytes(bytes[..4].try_into().ok()?))
+            }
+            None => None,
+        }
+    }
+
     /// Reads what `end` is sent until a packet `done` picks, and returns the
-    /// sessions of the heartbeats and the first sample numbers of the
-    /// samples it read, in order.
+    /// numbers of the heartbeats and the first sample numbers of the samples
+    /// it read, in order.
     async fn read_until(end: &mut FakeEnd, done: impl Fn(&Packet) -> bool) -> (Vec<u32>, Vec<u32>) {
         let (mut beats, mut samples) = (Vec::new(), Vec::new());
         loop {
             let pkt = next(end).await;
-            match pkt.payload() {
-                Payload::Heartbeat(beat) => beats.extend(beat.session().map(|s| s.value())),
-                Payload::Samples(data) => samples.push(data.first.value()),
-                _ => {}
+            beats.extend(beat_number(&pkt));
+            if let Payload::Samples(data) = pkt.payload() {
+                samples.push(data.first.value());
             }
             if done(&pkt) {
                 return (beats, samples);
@@ -1149,6 +1213,198 @@ mod tests {
             matches!(served, Some(Err(ClientError::Stopped))),
             "{served:?}"
         );
+    }
+
+    /// Connects another client to the proxy whose links are `links`, and
+    /// opens [`DEVICE`] for it, which the link has open already. Returns what
+    /// [`join`] returns.
+    async fn joined(links: &Links) -> (FakeEnd, Served, oneshot::Sender<Infallible>) {
+        let (mut end, served, lifeline) = join(links, None);
+        end.send(&open(DEVICE, 2)).await;
+        assert_eq!(answer(&next(&mut end).await), (2, Ok(encode(&DEVICE))));
+        (end, served, lifeline)
+    }
+
+    /// A client that falls behind loses samples, the oldest first, and
+    /// nothing else, and holds up neither its link nor another client of the
+    /// link, which hears every packet the device sent. Once more than the
+    /// hard limit of other packets waits for it, it is let go as too slow,
+    /// and the link and the other client go on.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_falls_behind_loses_only_samples_and_holds_up_no_other() {
+        let mut behind = connect(None, None);
+        let mut device = opened_and_answered(&mut behind).await;
+        let (mut other, other_served, _other_lifeline) = joined(&behind.links).await;
+        let limit = super::super::outbox::HARD_LIMIT;
+        let beats = (limit / BIG_BEAT / 100 + 10) as u32 * 100;
+        // The clock stands still while packets flow, so the client that
+        // reads nothing falls behind before any write runs out of time.
+        let (mut heard, mut samples) = (Vec::new(), Vec::new());
+        for beat in 0..beats {
+            device.end.send(&big_beat(beat)).await;
+            if beat % 4 == 0 {
+                device.end.send(&hundred(beat * 100)).await;
+            }
+            if beat % 100 == 99 {
+                let caught_up = |pkt: &Packet| beat_number(pkt) == Some(beat);
+                let (more, more_samples) = read_until(&mut other, caught_up).await;
+                heard.extend(more);
+                samples.extend(more_samples);
+            }
+        }
+        let sent = (0..beats).step_by(4).map(|beat| beat * 100);
+        let whole = heard.into_iter().eq(0..beats) && samples.into_iter().eq(sent);
+        assert!(whole, "the other client lost a packet");
+
+        let (mut kept, mut kept_samples) = (Vec::new(), Vec::new());
+        while let Some(pkt) = timeout(PAUSED_WAIT, behind.end.recv()).await.unwrap() {
+            kept.extend(beat_number(&pkt));
+            if let Payload::Samples(data) = pkt.payload() {
+                kept_samples.push(data.first.value());
+            }
+        }
+        let in_order = kept.iter().copied().eq(0..kept.len() as u32);
+        assert!(in_order, "a beat was lost");
+        let refused_early = kept.len() * big_beat(0).as_bytes().len() <= limit;
+        assert!(!refused_early, "beats were refused below the hard limit");
+        let gaps = kept_samples
+            .windows(2)
+            .filter(|pair| pair[1] - pair[0] > 400);
+        assert_eq!(gaps.count(), 1, "the oldest samples waiting were lost");
+        let served = timeout(PAUSED_WAIT, &mut behind.served).await.unwrap();
+        assert!(matches!(served, Ok(Some(Err(ClientError::TooSlow)))));
+
+        device.end.send(&big_beat(beats)).await;
+        read_until(&mut other, |pkt| beat_number(pkt) == Some(beats)).await;
+        assert!(!other_served.is_finished());
+    }
+
+    /// Each client of a device that drops out and comes back hears that the
+    /// device was lost and then that it is back, ahead of anything the device
+    /// sends once back. It stays attached, and its requests reach the device
+    /// again.
+    #[tokio::test(start_paused = true)]
+    async fn the_clients_of_a_device_that_comes_back_hear_so_ahead_of_its_data() {
+        let mut first = connect(None, None);
+        let device = opened_and_answered(&mut first).await;
+        let (mut second, second_served, _second_lifeline) = joined(&first.links).await;
+
+        drop(device);
+        let mut back = opened(&mut first.devices).await;
+        let root = DeviceRoute::root();
+        back.end.send(&Packet::heartbeat_session(2, root)).await;
+        back.end.send(&hundred(0)).await;
+
+        for end in [&mut first.end, &mut second] {
+            let mut heard = Vec::new();
+            while heard.last().map(String::as_str) != Some("samples") {
+                let pkt = next(end).await;
+                heard.push(
+                    match (pkt.link_status(), beat_number(&pkt), pkt.payload()) {
+                        (Some(status), ..) => format!("{status:?}"),
+                        (_, Some(beat), _) => format!("beat {beat}"),
+                        (.., Payload::Samples(_)) => "samples".to_string(),
+                        // The heartbeat the device answered the open with.
+                        (.., Payload::Heartbeat(_)) => continue,
+                        (.., other) => format!("{other:?}"),
+                    },
+                );
+            }
+            let expected = [
+                "SensorDisconnected",
+                "SensorReconnected",
+                "beat 2",
+                "samples",
+            ];
+            assert_eq!(heard, expected);
+        }
+        let request = Packet::rpc_request("dev.name", &[], 7, root).unwrap();
+        second.send(&request).await;
+        let asked = timeout(PAUSED_WAIT, back.end.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Payload::RpcRequest(asked) = asked.payload() else {
+            panic!("the device was asked {:?}", asked.payload());
+        };
+        let reply = Packet::rpc_reply(asked.id.value(), b"FAKE", root).unwrap();
+        back.end.send(&reply).await;
+        let answered = next(&mut second).await;
+        assert!(
+            matches!(answered.payload(), Payload::RpcReply(reply) if reply.req_id.value() == 7)
+        );
+        assert!(!first.served.is_finished() && !second_served.is_finished());
+    }
+
+    /// Runs an app's session over `end`, a client's connection, as its
+    /// socket. The session opens again once its socket closes without a
+    /// stop. Returns the session and the inlet of its pump.
+    fn app_over(mut end: FakeEnd) -> (AppSession, Inlet) {
+        let (app, proxy) = AppSession::test_pair_reopening(&Supervisor::current());
+        let inlet = app.attach(usize::MAX);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    from_proxy = end.recv() => match from_proxy {
+                        Some(pkt) => drop(proxy.deliver.send(Ok(TransportEvent::Packet(pkt)))),
+                        None => return,
+                    },
+                    from_app = proxy.sent.recv_async() => match from_app {
+                        Ok(pkt) => end.send(&pkt).await,
+                        Err(_) => return,
+                    },
+                }
+            }
+        });
+        (app, inlet)
+    }
+
+    /// A graceful stop of either end ends both, and neither end takes it for
+    /// a lost connection, so nothing opens again. A proxy that stops lets
+    /// its client go as stopped, and the app hears the stop last and ends
+    /// its session as stopped. An app that closes its session ends it as
+    /// closed, and the proxy lets its client go as hung up.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_stop_of_either_end_ends_both_and_is_never_a_lost_connection() {
+        for proxy_stops in [true, false] {
+            let mut client = connect(None, None);
+            let mut device = opened_and_answered(&mut client).await;
+            let (app, inlet) = app_over(client.end);
+            device
+                .end
+                .send(&Packet::heartbeat_session(5, DeviceRoute::root()))
+                .await;
+            while !matches!(
+                timeout(PAUSED_WAIT, inlet.recv_async()).await.unwrap(),
+                Ok(Queued::Item(Received::Packet(pkt))) if beat_number(&pkt) == Some(5)
+            ) {}
+
+            if proxy_stops {
+                drop(client._lifeline);
+            } else {
+                app.close();
+            }
+
+            let mut rest = Vec::new();
+            while let Ok(item) = timeout(PAUSED_WAIT, inlet.recv_async()).await.unwrap() {
+                rest.push(item);
+            }
+            let lost = |item: &Queued<Received>| matches!(item, Queued::Item(Received::SocketLost));
+            assert!(!rest.iter().any(lost), "{rest:?}");
+            let (end, error) = match proxy_stops {
+                true => (End::Stopped, ClientError::Stopped),
+                false => (End::Closed, ClientError::HungUp),
+            };
+            assert!(matches!(rest.pop(), Some(Queued::Ended(ended)) if ended == end));
+            if proxy_stops {
+                let stop = matches!(rest.pop(), Some(Queued::Item(Received::Packet(pkt)))
+                    if pkt.link_status() == Some(LinkStatus::Stopped));
+                assert!(stop, "the stop was not the last the app heard");
+            }
+            let served = timeout(PAUSED_WAIT, client.served).await.unwrap().unwrap();
+            let served = served.expect("the session panicked").unwrap_err();
+            assert_eq!(served.to_string(), error.to_string());
+        }
     }
 
     /// Returns the request to open `target`, with `id`.
@@ -1377,25 +1633,63 @@ mod tests {
         let route = DeviceRoute::root();
         let mut updates = device_updates(&store, route);
         ready(&mut updates);
-        let change = |seq: usize| SettingChange {
-            name: "test.amplitude".to_string(),
-            seq: u32::try_from(seq).ok(),
-            reply: vec![1],
+        let change = |seq: usize| {
+            let seq = u32::try_from(seq).ok();
+            SettingChange::new("test.amplitude".to_string(), seq, vec![1], None)
         };
         let missed = 10;
         let sent = crate::device::store::CHANGE_QUEUE_LEN + missed;
         for seq in 0..sent {
             lock(&store).set(route, CHANGES, change(seq));
         }
-        assert_eq!(
-            ready(&mut updates).len(),
-            crate::device::store::CHANGE_QUEUE_LEN
-        );
+        let first = ready(&mut updates);
+        assert_eq!(first[0], Update::Recorded(None));
+        assert_eq!(first.len(), crate::device::store::CHANGE_QUEUE_LEN + 1);
 
         lock(&store).set(route, CHANGES, change(sent));
         assert_eq!(
             ready(&mut updates),
             [Update::Lagged(missed as u64), Update::setting(change(sent))]
+        );
+    }
+
+    /// A watch names the table each announced setting was recorded under
+    /// ahead of the first setting recorded under it, and names no table
+    /// ahead of a setting recorded while none was in force. A table loaded
+    /// again with the hash and session of the one named is not named again.
+    #[test]
+    fn a_watch_names_each_table_ahead_of_the_settings_recorded_under_it() {
+        let store = Mutex::new(Store::new(true));
+        let route = DeviceRoute::root();
+        let mut updates = device_updates(&store, route);
+        ready(&mut updates);
+        let table = |hash| Arc::new(RpcRegistry::from_entries(Vec::new(), Some(hash), None));
+        let (old, new) = (table(1), table(2));
+        let record = |seq| {
+            let name = "test.amplitude".to_string();
+            lock(&store).record_change(route, name, Some(seq), vec![1])
+        };
+
+        let before = record(0);
+        lock(&store).set_registry(route, Ok(Arc::clone(&old)));
+        let (first, second) = (record(1), record(2));
+        lock(&store).set_registry(route, Ok(Arc::clone(&new)));
+        let after = record(3);
+        lock(&store).set_registry(route, Ok(table(2)));
+        let reloaded = record(4);
+
+        assert_eq!(
+            ready(&mut updates),
+            [
+                Update::recorded(None),
+                Update::setting(before),
+                Update::recorded(Some(&old)),
+                Update::setting(first),
+                Update::setting(second),
+                Update::recorded(Some(&new)),
+                Update::setting(after),
+                Update::setting(reloaded),
+            ]
         );
     }
 }

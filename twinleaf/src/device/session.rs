@@ -7,7 +7,7 @@
 //! `proxy.hello`. It then asks the proxy to open a target with `proxy.open`,
 //! or to look a device over with `proxy.probe`, and returns once the proxy
 //! has answered. It fails with the proxy's refusal, or when the peer does not
-//! answer as a 2.0 proxy does.
+//! answer the hello as a proxy of this build does.
 //!
 //! One task then owns the socket, on the runtime the open ran on. It sends
 //! each call, and a reply completes the call it answers. Every other packet
@@ -167,8 +167,8 @@ impl Session {
     ///
     /// When nothing answers at the machine's own address, finds or starts the
     /// proxy there first. Fails with the proxy's message when it refuses the
-    /// open. Fails with how to reach the peer when it does not answer as a
-    /// 2.0 proxy within two seconds, as a proxy older than tio 2.0 does not.
+    /// open. Fails saying to update the peer when it gives no introduction
+    /// within two seconds, as a proxy from an older build gives none.
     pub(crate) fn open(
         proxy: &ProxyAddress,
         target: &str,
@@ -867,11 +867,32 @@ impl Session {
 
     /// [`test_pair`](Self::test_pair) with the session's task on `tasks`.
     pub(crate) fn test_pair_on(tasks: &Supervisor) -> (Session, TestProxy) {
+        Session::test_pair_with(tasks, None)
+    }
+
+    /// [`test_pair_on`](Self::test_pair_on) for a session that opens again
+    /// once its socket closes without a stop, through an address that never
+    /// answers. The pump hears each such loss.
+    pub(crate) fn test_pair_reopening(tasks: &Supervisor) -> (Session, TestProxy) {
+        let nowhere = ProxyAddress {
+            url: crate::proxy::fixtures::UNREACHABLE.to_string(),
+            ensure: None,
+        };
+        let reopen = (nowhere, Purpose::Use.method(), encode(&"auto"));
+        Session::test_pair_with(tasks, Some(reopen))
+    }
+
+    /// A session whose socket is a pair of channels. With `reopen`, it opens
+    /// again as [`start`](Self::start) says.
+    fn test_pair_with(
+        tasks: &Supervisor,
+        reopen: Option<(ProxyAddress, &'static str, Vec<u8>)>,
+    ) -> (Session, TestProxy) {
         let (sender, sent) = flume::unbounded();
         let (deliver, received) = flume::unbounded();
         let peer = "the test's proxy".to_string();
         let received = received.into_stream().boxed();
-        let session = Session::start((Socket::Channel(sender), received, peer), None, tasks);
+        let session = Session::start((Socket::Channel(sender), received, peer), reopen, tasks);
         (session, TestProxy { sent, deliver })
     }
 }
@@ -1141,26 +1162,21 @@ mod tests {
         assert_eq!(error.to_string(), "auto finds two devices");
     }
 
-    /// A proxy older than this build's control protocol is named, and the
-    /// open fails before the proxy answers it.
+    /// A peer that answers the hello with no introduction is a proxy from an
+    /// older build, and the open fails before the peer answers it.
     #[test]
-    fn an_open_through_an_older_proxy_fails_and_names_it() {
+    fn an_open_through_a_proxy_that_gives_no_introduction_fails() {
         let proxy = FakeProxy::start();
         let opening = proxy.open(TARGET, Purpose::Use);
         let mut end = proxy.accept();
 
         let (hello, _) = end.expect_handshake("proxy.open", TARGET);
-        let older = Introduction {
-            protocol: 0,
-            ..fake_host()
-        };
-        end.send(&Packet::proxy_reply(hello, &encode(&older)).unwrap());
+        end.send(&Packet::proxy_reply(hello, &encode(&0u8)).unwrap());
 
         let error = opening.join().unwrap().err().expect("the open failed");
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let message = error.to_string();
-        assert!(message.contains(&older.to_string()), "{message}");
-        assert!(message.contains("protocol 0"), "{message}");
+        assert!(message.contains("older build"), "{message}");
     }
 
     #[test]
@@ -1507,9 +1523,8 @@ mod tests {
         ));
     }
 
-    /// A peer that never answers as a 2.0 proxy does, as a proxy older than
-    /// tio 2.0 does not, fails every open, `auto` too, saying how to reach
-    /// it.
+    /// A peer that never answers the hello, such as a proxy from an older
+    /// build, fails every open, `auto` too, saying to update it.
     #[test]
     fn a_peer_that_never_answers_as_a_proxy_fails_every_open() {
         let legacy = FakeDevice::start();
@@ -1525,7 +1540,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "{} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it",
+                    "{} is a proxy from an older build of twinleaf, or no proxy; update tio, or stop it",
                     legacy.url
                 )
             );

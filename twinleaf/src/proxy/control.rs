@@ -7,7 +7,7 @@
 use super::Layout;
 use crate::data::PacketParser;
 use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use crate::device::store::{Store, CHANGES, METADATA, PRESENCE, REGISTRY};
+use crate::device::store::{Store, METADATA, PRESENCE, REGISTRY};
 use crate::device::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
@@ -47,10 +47,6 @@ pub(crate) const WATCH: &str = "proxy.watch";
 /// The method that stops a watch.
 pub(crate) const UNWATCH: &str = "proxy.unwatch";
 
-/// The version of the control protocol this build speaks. Version 2 encodes
-/// every argument and reply in CBOR.
-pub(super) const VERSION: u8 = 2;
-
 /// How a client keeps its link to the proxy alive once the hello is done.
 pub(crate) const CLIENT_KEEPALIVE: KeepAlive = KeepAlive {
     beat: || Packet::heartbeat(DeviceRoute::root()),
@@ -72,15 +68,12 @@ pub(crate) struct Introduction {
     /// The process id.
     #[n(0)]
     pub(crate) pid: u32,
-    /// The version of the control protocol it speaks.
-    #[n(1)]
-    pub(crate) protocol: u8,
     /// The version of the `twinleaf` crate it was built with, as major,
     /// minor and patch.
-    #[n(2)]
+    #[n(1)]
     pub(crate) version: [u16; 3],
     /// Its name, such as `tio monitor` or `tio proxy`.
-    #[n(3)]
+    #[n(2)]
     pub(crate) name: String,
 }
 
@@ -90,7 +83,6 @@ impl Introduction {
         let part = |text: &str| text.parse().unwrap_or(0);
         Introduction {
             pid: std::process::id(),
-            protocol: VERSION,
             version: [
                 part(env!("CARGO_PKG_VERSION_MAJOR")),
                 part(env!("CARGO_PKG_VERSION_MINOR")),
@@ -128,6 +120,18 @@ pub(crate) fn encode<T: Encode<()> + ?Sized>(value: &T) -> Vec<u8> {
 /// Decodes a control request's arguments or reply.
 pub(crate) fn decode<'b, T: Decode<'b, ()>>(bytes: &'b [u8]) -> Result<T, minicbor::decode::Error> {
     minicbor::decode(bytes)
+}
+
+/// Returns `table` as its hash, its session and its entries.
+fn entries(table: &RpcRegistry) -> WireEntries {
+    let entries = table
+        .iter()
+        .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()));
+    (
+        table.hash,
+        table.session.map(SessionId::value),
+        entries.collect(),
+    )
 }
 
 /// Encodes a [`DeviceRoute`] as the byte string of its hops, for
@@ -174,10 +178,12 @@ const TIMED_OUT: u16 = 0xfffd;
 const CHANGED: u16 = 0xfffe;
 const UNANSWERED: u16 = 0xffff;
 
-/// The RPC table as its hash, the session it was read in, and the name and
-/// metadata word of each entry, or why it did not load as an error code and
-/// message.
-type WireTable = Result<(Option<u32>, Option<u32>, Vec<(String, u16)>), (u16, ByteVec)>;
+/// An RPC table as its hash, the session it was read in, and the name and
+/// metadata word of each entry.
+type WireEntries = (Option<u32>, Option<u32>, Vec<(String, u16)>);
+
+/// The RPC table, or why it did not load as an error code and message.
+type WireTable = Result<WireEntries, (u16, ByteVec)>;
 
 /// One value of a watched device's state, as a reply to `proxy.watch`
 /// carries it in [`Part`]s.
@@ -206,7 +212,8 @@ pub(crate) enum Update {
         #[n(2)] BTreeMap<String, ByteVec>,
     ),
     /// One setting the device announced, as its name, its
-    /// `settings.version` once counted and its value.
+    /// `settings.version` once counted and its value. It was recorded under
+    /// the table the last [`Recorded`](Self::Recorded) update named.
     #[n(4)]
     Setting(#[n(0)] String, #[n(1)] Option<u32>, #[n(2)] ByteVec),
     /// Every route heard at or below the watched one, each as its hops.
@@ -216,6 +223,13 @@ pub(crate) enum Update {
     /// behind.
     #[n(6)]
     Lagged(#[n(0)] u64),
+    /// The RPC table the announced settings after it were recorded under,
+    /// up to the next such update, or `None` for settings recorded while no
+    /// table was in force. One goes out ahead of the first setting of a
+    /// watch, and ahead of each setting recorded under another table than
+    /// the setting before.
+    #[n(7)]
+    Recorded(#[n(0)] Option<WireEntries>),
 }
 
 impl Update {
@@ -224,9 +238,10 @@ impl Update {
         Update::Presence(match presence {
             Presence::Connecting => Err(None),
             Presence::Alive { session } => Ok(session.map(SessionId::value)),
-            Presence::Lost { since } => Err(Some(
-                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
-            )),
+            Presence::Lost { since } => {
+                let ago = Instant::now().into_std().saturating_duration_since(since);
+                Err(Some(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX)))
+            }
         })
     }
 
@@ -250,16 +265,7 @@ impl Update {
     pub(crate) fn table(registry: &RegistryState) -> Update {
         let none = || ByteVec::from(Vec::new());
         Update::Table(match registry {
-            Ok(table) => {
-                let entries = table
-                    .iter()
-                    .map(|rpc| (rpc.full_name.clone(), rpc.meta.bits()));
-                Ok((
-                    table.hash,
-                    table.session.map(SessionId::value),
-                    entries.collect(),
-                ))
-            }
+            Ok(table) => Ok(entries(table)),
             Err(RpcRegistryError::DeviceRpcError(CallError::DeviceError(refusal))) => {
                 Err((refusal.error.value(), refusal.extra.clone().into()))
             }
@@ -285,16 +291,24 @@ impl Update {
         Update::Setting(change.name, change.seq, change.reply.into())
     }
 
+    /// Returns the update that names `table` as the one the announced
+    /// settings after it were recorded under.
+    pub(crate) fn recorded(table: Option<&Arc<RpcRegistry>>) -> Update {
+        Update::Recorded(table.map(|table| entries(table)))
+    }
+
     /// Keeps what the update says of the device at `route` in `store`. Its
     /// metadata records reach `parser` as the device's own, and the
     /// metadata the parser then holds is the value kept, and no metadata
     /// resets any route but `route`. Settings are kept only when they were
     /// read with the table the store holds, and a table with the hash and
-    /// session of the one held keeps them.
+    /// session of the one held keeps them. A table with the hash and session
+    /// of one the store holds already is that one, so the device's table and
+    /// the table its changes carry are one value while they are the same.
     pub(crate) fn apply(self, route: DeviceRoute, store: &mut Store, parser: &mut PacketParser) {
         match self {
             Update::Presence(presence) => {
-                let now = std::time::Instant::now();
+                let now = Instant::now().into_std();
                 let presence = match presence.map(|session| session.map(SessionId::new)) {
                     Ok(session) => Presence::Alive { session },
                     Err(None) => Presence::Connecting,
@@ -337,8 +351,10 @@ impl Update {
                 if !held.is_some_and(|held| {
                     held.is_ok_and(|held| (held.hash, held.session) == (hash, session))
                 }) {
-                    let table = RpcRegistry::from_entries(entries, hash, session);
-                    store.set_registry(route, Ok(Arc::new(table)));
+                    let table = store.table_of(route, hash, session).unwrap_or_else(|| {
+                        Arc::new(RpcRegistry::from_entries(entries, hash, session))
+                    });
+                    store.set_registry(route, Ok(table));
                 }
             }
             Update::Table(Err((CHANGED, _))) => {
@@ -364,8 +380,13 @@ impl Update {
                 _ => log::warn!("dropping settings of {route} read with a table it does not hold"),
             },
             Update::Setting(name, seq, reply) => {
-                let reply = reply.into();
-                store.set(route, CHANGES, SettingChange { name, seq, reply });
+                store.record_change(route, name, seq, reply.into());
+            }
+            Update::Recorded(table) => {
+                let table = table.map(|(hash, session, entries)| {
+                    RpcRegistry::from_entries(entries, hash, session.map(SessionId::new))
+                });
+                store.name_table(route, table);
             }
             Update::Routes(routes) => {
                 let routes = routes
@@ -474,7 +495,8 @@ const HELLO_ID: u16 = 1;
 /// The id a [`handshake`] tags its request with.
 const REQUEST_ID: u16 = 2;
 /// How long a proxy may take to accept a connection and answer anything at
-/// all. A peer that is silent this long is not a 2.0 proxy.
+/// all. A peer that is silent this long is a proxy from an older build, or
+/// no proxy.
 pub(super) const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The longest refusal message that fits a `PROXY_RX` error.
@@ -676,13 +698,12 @@ pub(crate) async fn call_at(
 /// Returns the proxy's [`Introduction`], if it gave one before the reply, and
 /// the reply's bytes.
 ///
-/// Returns an [`io::ErrorKind::Unsupported`] error naming the proxy if it
-/// speaks an older control protocol than this build. Returns an error with
-/// the proxy's message if the proxy refuses the hello or the request. Returns an error saying it could not do `goal`, such as
-/// `open auto`, if the proxy stops, closes the connection, or does not answer
-/// in time. Returns an [`io::ErrorKind::InvalidData`] error saying how to
-/// reach the peer if it sends no control reply within [`HELLO_TIMEOUT`]. A
-/// proxy older than tio 2.0 is such a peer.
+/// Returns the [`older_build`] error if the peer sends no control reply
+/// within [`HELLO_TIMEOUT`], as a proxy from an older build does, or answers
+/// the hello with no introduction. Returns an error with the proxy's message
+/// if the proxy refuses the hello or the request. Returns an error saying it
+/// could not do `goal`, such as `open auto`, if the proxy stops, closes the
+/// connection, or does not answer in time.
 pub(crate) async fn handshake(
     port: &transport::Port,
     received: &flume::Receiver<ReceiveResult>,
@@ -701,13 +722,14 @@ pub(crate) async fn handshake(
         port.send_async(request).await.map_err(io::Error::other)?;
     }
     // The proxy hangs up on a client that is quiet too long, and an open may
-    // wait longer than that for its device. A peer that is no proxy hears a
-    // heartbeat or two, as it would from a client older than tio 2.0.
+    // wait longer than that for its device. A peer that is no proxy of this
+    // build hears a heartbeat or two.
     port.keep_alive(CLIENT_KEEPALIVE).await;
     let started = Instant::now();
     let deadline = started + timeout;
     let hello_deadline = deadline.min(started + HELLO_TIMEOUT);
-    // Whether the peer has sent any PROXY_RX, which only a 2.0 proxy does.
+    // Whether the peer has sent any PROXY_RX, which only a proxy of this
+    // build does.
     let mut answered = false;
     let mut host = None;
     let mut incoming = received.stream();
@@ -720,7 +742,7 @@ pub(crate) async fn handshake(
                     format!("the proxy at {endpoint} did not {goal} within {timeout:?}"),
                 )
             } else {
-                not_a_proxy(endpoint)
+                older_build(endpoint)
             }
         };
         if Instant::now() >= until {
@@ -750,25 +772,14 @@ pub(crate) async fn handshake(
         };
         answered = true;
         match rx {
-            // A proxy from before protocol 2 can neither read this hello nor
-            // write one this build reads.
             ProxyRx::Reply(reply) if reply.req_id.value() == HELLO_ID => {
                 let introduction: Introduction =
                     decode(reply.value).map_err(|_| older_build(endpoint))?;
-                if introduction.protocol < VERSION {
-                    return Err(older_protocol(endpoint, &introduction));
-                }
                 log::debug!("the proxy at {endpoint} is {introduction}");
                 host = Some(introduction);
             }
             ProxyRx::Reply(reply) if reply.req_id.value() == REQUEST_ID => {
                 return Ok((host, reply.value.to_vec()))
-            }
-            ProxyRx::Error(error)
-                if error.req_id.value() == HELLO_ID
-                    && RpcError::from(error.code) == RpcError::ArgsSize =>
-            {
-                return Err(older_build(endpoint))
             }
             ProxyRx::Error(error) if matches!(error.req_id.value(), HELLO_ID | REQUEST_ID) => {
                 return Err(io::Error::other(
@@ -786,37 +797,17 @@ pub(crate) async fn handshake(
     }
 }
 
-/// Returns the error for the proxy at `endpoint`, introduced as `host`, that
-/// speaks an older control protocol than this build.
-fn older_protocol(endpoint: &str, host: &Introduction) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "the proxy at {endpoint} is {host}, which speaks proxy protocol {}, older than {VERSION}; \
-             update it, or stop it and let this program start its own",
-            host.protocol
-        ),
-    )
-}
-
-/// Returns the error for the proxy at `endpoint` from a build of twinleaf
-/// before protocol 2, which cannot read this build's hello.
-fn older_build(endpoint: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "the proxy at {endpoint} is from an older build of twinleaf and speaks another \
-             proxy protocol; update tio, or stop it and let this program start its own"
-        ),
-    )
-}
-
-/// Returns the error for a peer at `endpoint` that is not a 2.0 proxy, such
-/// as a proxy older than tio 2.0, which this build cannot reach.
-pub(super) fn not_a_proxy(endpoint: &str) -> io::Error {
+/// Returns the error for a peer at `endpoint` that does not answer
+/// `proxy.hello` with an introduction, as a proxy from an older build of
+/// twinleaf does not. Such a proxy forwards the hello to its device as a
+/// packet of a type it does not know, and sends no control reply.
+pub(super) fn older_build(endpoint: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("{endpoint} is not a Twinleaf 2.0 proxy; update it to tio 2.0, or stop it"),
+        format!(
+            "{endpoint} is a proxy from an older build of twinleaf, or no proxy; \
+             update tio, or stop it"
+        ),
     )
 }
 
@@ -953,7 +944,6 @@ mod tests {
             Request::Hello(Introduction::of_this_process("tio monitor")),
             Request::Hello(Introduction {
                 pid: u32::MAX,
-                protocol: u8::MAX,
                 version: [u16::MAX; 3],
                 name: String::new(),
             }),
@@ -978,13 +968,12 @@ mod tests {
         }
     }
 
-    /// An introduction is a CBOR array of the pid, the protocol, the version
-    /// as an array of three, and the name.
+    /// An introduction is a CBOR array of the pid, the version as an array
+    /// of three, and the name.
     #[test]
     fn a_hello_matches_the_wire_layout() {
         let (name, args) = Request::Hello(Introduction {
             pid: 0x0102_0304,
-            protocol: 1,
             version: [2, 0x0304, 5],
             name: "ab".to_string(),
         })
@@ -993,19 +982,19 @@ mod tests {
         assert_eq!(name, "proxy.hello");
         let pid = [0x1a, 1, 2, 3, 4];
         let version = [0x83, 2, 0x19, 3, 4, 5];
-        let expected = [&[0x84][..], &pid, &[1], &version, &[0x62, b'a', b'b']].concat();
+        let expected = [&[0x83][..], &pid, &version, &[0x62, b'a', b'b']].concat();
         assert_eq!(args, expected);
     }
 
-    /// A proxy from before protocol 2 refuses this build's hello as cut
-    /// short, which the client reports as a proxy to update.
-    #[tokio::test]
-    async fn a_hello_refused_as_cut_short_is_a_proxy_from_an_older_build() {
+    /// A peer that sends no control reply to the hello, as a proxy from an
+    /// older build does, is reported as one once [`HELLO_TIMEOUT`] passes,
+    /// though the call may wait longer.
+    #[tokio::test(start_paused = true)]
+    async fn a_hello_with_no_control_reply_is_a_proxy_from_an_older_build() {
         let (send, received) = flume::unbounded();
         let (port, _peer) =
             transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
-        let refusal = Packet::proxy_error(HELLO_ID, RpcError::ArgsSize, "short").unwrap();
-        send.send(Ok(TransportEvent::Packet(refusal))).unwrap();
+        let started = Instant::now();
 
         let error = handshake(
             &port,
@@ -1014,12 +1003,17 @@ mod tests {
             OPEN,
             &[],
             "open the device",
-            Duration::from_secs(1),
+            Duration::from_secs(15),
         )
         .await
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("older build"), "{error}");
+        assert_eq!(started.elapsed(), HELLO_TIMEOUT);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "tcp://127.0.0.1:7855 is a proxy from an older build of twinleaf, or no proxy; \
+             update tio, or stop it"
+        );
     }
 
     /// Returns the mount of `source` of the device at `url`, seen at `prefix`.
@@ -1073,13 +1067,12 @@ mod tests {
         assert_eq!(decode::<String>(&encode(&target)).unwrap(), target);
     }
 
-    /// This build introduces itself with its own protocol and crate version.
+    /// This build introduces itself with its own pid and crate version.
     #[test]
-    fn this_process_gives_its_protocol_and_version() {
+    fn this_process_gives_its_pid_and_version() {
         let introduction = Introduction::of_this_process("tio monitor");
 
         assert_eq!(introduction.pid, std::process::id());
-        assert_eq!(introduction.protocol, VERSION);
         assert_eq!(introduction.version_text(), env!("CARGO_PKG_VERSION"));
         assert_eq!(
             introduction.to_string(),
@@ -1131,5 +1124,73 @@ mod tests {
             socket_addr("tcp://127.0.0.1").unwrap(),
             SocketAddr::from(([127, 0, 0, 1], TCP_DEFAULT_PORT))
         );
+    }
+
+    /// A client's store records each change under the table the proxy
+    /// named for it, which is the client's own copy of the device's table
+    /// while the two have one hash and session. A change decodes with its
+    /// own table after the device's table has moved on to one that types
+    /// its entry otherwise, and one named with no table does not decode.
+    #[test]
+    fn a_client_records_each_change_under_the_table_named_for_it() {
+        use crate::device::rpc::RpcValue;
+        use crate::device::store::{CHANGES, REGISTRY};
+        use crate::device::SettingValueError;
+
+        let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
+        let route = DeviceRoute::root();
+        let changes = store.follow(route, CHANGES);
+        let table = |hash, meta| {
+            let entries = vec![("test.amplitude".to_string(), meta)];
+            Arc::new(RpcRegistry::from_entries(entries, Some(hash), None))
+        };
+        let (old, new) = (table(1, 0xA310), table(2, 0xA321));
+        let reply = 0x1234i16.to_le_bytes();
+        let setting = || Update::Setting("test.amplitude".to_string(), None, reply.to_vec().into());
+        let mut apply = |update: Update| update.apply(route, &mut store, &mut parser);
+
+        apply(Update::table(&Ok(Arc::clone(&old))));
+        apply(Update::recorded(Some(&old)));
+        apply(setting());
+        apply(Update::table(&Ok(Arc::clone(&new))));
+        apply(setting());
+        apply(Update::recorded(Some(&new)));
+        apply(setting());
+        apply(Update::recorded(None));
+        apply(setting());
+
+        let held = store.value(route, REGISTRY).unwrap().unwrap();
+        let received: Vec<_> = std::iter::from_fn(|| changes.try_recv().unwrap()).collect();
+        let values: Vec<_> = received.iter().map(|change| change.value().ok()).collect();
+        let byte = Some(RpcValue::U64(0x34));
+        assert_eq!(
+            values,
+            [byte.clone(), byte, Some(RpcValue::I64(0x1234)), None]
+        );
+        assert!(Arc::ptr_eq(received[2].rpc_registry().unwrap(), &held));
+        assert!(Arc::ptr_eq(
+            received[0].rpc_registry().unwrap(),
+            received[1].rpc_registry().unwrap()
+        ));
+        assert!(matches!(
+            received[3].value(),
+            Err(SettingValueError::NoTable)
+        ));
+    }
+
+    /// A client counts back how long ago the proxy says a device was lost
+    /// from the paused clock, and a presence update made of that moment says
+    /// the same again.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_presence_counts_back_from_the_paused_clock() {
+        let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
+        let route = DeviceRoute::root();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        Update::Presence(Err(Some(1500))).apply(route, &mut store, &mut parser);
+        let since = (Instant::now() - Duration::from_millis(1500)).into_std();
+        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
+        let again = Update::presence(Presence::Lost { since });
+        assert_eq!(again, Update::Presence(Err(Some(1500))));
     }
 }

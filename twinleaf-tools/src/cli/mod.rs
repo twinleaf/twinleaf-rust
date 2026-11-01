@@ -27,9 +27,11 @@ pub use rpc::{RPCSubcommands, RpcCli};
 pub use simulate::{SimulateCli, UploadKind};
 pub use upgrade::UpgradeCli;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use twinleaf::proxy::Listen;
 use twinleaf::DeviceRoute;
 
 pub(crate) fn parse_device_route(s: &str) -> Result<DeviceRoute, String> {
@@ -54,6 +56,34 @@ pub(crate) fn nonneg_f64(s: &str) -> Result<f64, String> {
         Err("must be >= 0".into())
     } else {
         Ok(v)
+    }
+}
+
+/// The interfaces a server listens on, as `--listen` names them.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenOn {
+    /// This machine only, on loopback
+    Loopback,
+    /// Every interface, so other machines can connect too
+    All,
+}
+
+impl ListenOn {
+    /// Returns the IPv4 address a socket binds to listen on these interfaces.
+    pub fn ipv4(self) -> Ipv4Addr {
+        match self {
+            ListenOn::Loopback => Ipv4Addr::LOCALHOST,
+            ListenOn::All => Ipv4Addr::UNSPECIFIED,
+        }
+    }
+}
+
+impl From<ListenOn> for Listen {
+    fn from(listen: ListenOn) -> Listen {
+        match listen {
+            ListenOn::Loopback => Listen::Loopback,
+            ListenOn::All => Listen::AllInterfaces,
+        }
     }
 }
 

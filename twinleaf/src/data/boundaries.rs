@@ -2,71 +2,83 @@
 //!
 //! Each case simulates one device stream, which takes samples, rolls into
 //! its next segment with or without sending the segment's record first,
-//! changes its rate or decimation, takes a new time reference, reboots and
-//! drops samples. It switches segments as `twinleaf_device`'s segment ring
-//! does, at the next whole second of its undecimated clock from wherever in
-//! a group of inputs it is asked to, and drops the group of inputs that
-//! switch leaves incomplete, so a decimated stream's last sample can end
-//! short of the new segment's start by less than a period. When a period
-//! spans more than a second, several whole seconds can leave the same last
-//! sample. After the first lap of its ring, a rollover without the record
-//! lands on a slot whose record the parser holds from the lap before, and
-//! that record can be of an older time reference. Its packets go through
-//! the parser, and the batches through a [`Lane`] as the pump sends them,
-//! to a reader whose reads interleave with the device's steps. A lane with
-//! little room drops batches, as for a slow app. Every sample carries its
-//! position in the device's sequence, so the harness knows what the reader
-//! missed and when each sample was taken.
+//! changes its rate or decimation, takes a new time reference, reboots,
+//! stops and starts again, and drops samples. It switches segments as
+//! `twinleaf_device`'s segment ring does, at the next whole second of its
+//! undecimated clock from wherever in a group of inputs it is asked to, and
+//! drops the group of inputs that switch leaves incomplete, so a decimated
+//! stream's last sample can end short of the new segment's start by less
+//! than a period. When a period spans more than a second, several whole
+//! seconds can leave the same last sample. A rollover without the record
+//! sends the segment's record after its first packet, whose rows the parser
+//! loses, as it decodes a segment's rows only with that segment's record.
+//! After the first lap of its ring, such a rollover lands on a slot whose
+//! record the parser holds from the lap before, and that record can be of
+//! an older time reference. A stop announces `dev.running` turning off, and
+//! the samples its publisher held of the stopped acquisition follow the
+//! announcement. A start begins the segment after the stopped one at a
+//! whole second, with or without sending the segment's record first as a
+//! rollover does, and announces `dev.running` turning on before or after
+//! the segment's first packet. Its packets go through the parser, and the
+//! batches through a [`BatchLane`] as the pump sends them, to a reader
+//! whose reads interleave with the device's steps. A lane with little room
+//! drops batches, as for a slow app. Every sample carries its position in
+//! the device's sequence, so the harness knows what the reader missed and
+//! when each sample was taken.
 //!
-//! The first batch says [`BoundaryReason::Initial`], and a first batch after
-//! a gap says only the gap, as the reader missed the start of the stream.
-//! Between two batches the reader receives, it learns of each change the
-//! device made there and of each sample it lost, and of nothing else.
+//! The first batch the reader receives says
+//! [`Change::Initial`](super::Change::Initial), and after a gap it also says
+//! the loss, as the reader missed the start of the stream. Between two
+//! batches the reader receives, it learns
+//! of each change the device made there and of each sample it lost, and of
+//! nothing else.
 //!
-//! - A reboot comes as a [`BoundaryReason::SessionChanged`] naming both
-//!   sessions, and stands for whatever else changed and was lost before it.
-//! - Otherwise a new time reference comes as a
-//!   [`BoundaryReason::TimeRefSessionChanged`], and a rate change as a
-//!   [`BoundaryReason::RateChanged`] naming both rates, each standing for
+//! - A reboot comes as a `SessionChanged` naming the sessions of the two
+//!   batches, and stands for whatever else changed and was lost before it.
+//! - Otherwise a new time reference comes as a `TimeRefSessionChanged`, and
+//!   a rate change as a `RateChanged` naming both rates, each standing for
 //!   what else changed and was lost before it.
-//! - Otherwise a rollover comes as a [`BoundaryReason::SegmentRollover`]
-//!   naming both segments.
-//! - A lost sample comes as a [`BoundaryReason::SamplesLost`] naming the
-//!   sample due and the sample received, or as a gap the lane reports, so a
-//!   loss across a rollover needs a rollover and a loss. The gaps count each
-//!   batch the lane dropped.
+//! - Otherwise a restart comes as a `Restarted` naming the segments of the
+//!   two batches, and stands for what else was lost before it and for any
+//!   rollover.
+//! - Otherwise a rollover comes as a `SegmentRollover` naming the segments
+//!   of the two batches, even when segments passed between them.
+//! - A lost sample, the rows the parser lost waiting for a record among
+//!   them, comes as a [`Loss`](super::Loss). A change other than a
+//!   rollover names a loss only of the batches the lane dropped. Next to a
+//!   rollover or no change at all, it names the sample due, unless the lane
+//!   dropped batches, so a loss across a rollover comes as both. A loss
+//!   says it follows dropped batches exactly when the lane reported a gap
+//!   ahead of it, and the gaps count each batch the lane dropped.
 //! - A batch with nothing of these before it carries no boundary.
 //! - Each batch's first timestamp is the time the device took its sample.
 //!
 //! `reported` turns a batch and the gap ahead of it into the change and the
-//! loss the harness compares with what the device did. A boundary that
-//! carries a change and a loss apart, as the fix of Problems A and B gives
-//! it, changes `reported` alone.
+//! loss the harness compares with what the device did.
 //!
-//! Two properties hold. A reader that keeps up learns every change, when no
-//! sample is lost next to a new segment, and a reader that lags learns every
-//! loss of a device that changes nothing. A parser without the record of a
-//! rollover that several whole seconds fit waits for it, and the segment's
-//! first packet is lost, so the reader that keeps up meets no such forced
-//! rollover. They catch faults in the parser's rollovers, forced or not,
-//! the ring records it keeps or evicts, its boundaries and their payloads,
-//! its clock, and the lane's gaps.
+//! Four properties hold, each of a reader and a device that between them
+//! reach part of what can happen. A reader that keeps up learns every
+//! change of a device that drops no sample next to a new segment. A reader
+//! that lags learns every loss of a device that changes nothing, and every
+//! change of a device that drops nothing, as its lane carries what each
+//! batch it drops changed onto the next batch it queues. A reader that
+//! keeps up learns a loss across a rollover as both a loss and a rollover,
+//! from a device that drops samples anywhere, rolls over with or without
+//! the record and restarts. The properties catch faults in the parser's
+//! rollovers and restarts, the ring records it keeps or evicts, its
+//! boundaries and their payloads, its clock, and the lane's gaps and the
+//! boundaries it carries over.
 //!
-//! Two properties fail, and are ignored until the parser and the lane
-//! change.
-//!
-//! - Problem A. A lane that drops batches drops the boundaries they carry,
-//!   and the gap it reports carries only a count, so a reader that lags
-//!   misses the changes in the batches it lost.
-//! - Problem B. The parser takes a segment change for a rollover only when
-//!   the new segment starts at sample 0 and the old one ended whole, and one
-//!   [`BoundaryReason`] cannot say both that the segment rolled over and
-//!   that samples were lost, so a loss across a rollover comes as a
-//!   [`BoundaryReason::SegmentChanged`].
+//! A stop and start no host asked for, with no refresh between them,
+//! announce nothing, and a one-off test states what the parser makes of it.
+//! A segment that published nothing sends no record, so the ring can
+//! come round to the slot the parser takes as current with no record
+//! between. A start there sends its record first, as the parser has no
+//! other sign that the slot moved on.
 
 use super::fixtures;
-use super::{BoundaryReason, PacketParser, SampleBatch};
-use crate::device::stream::{Lane, Queued};
+use super::{PacketParser, SampleBatch};
+use crate::device::stream::{BatchLane, Queued};
 use crate::proto::data as wire;
 use crate::proto::data::DataType;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
@@ -77,8 +89,8 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
 
-/// The segments in the device's ring.
-const SEGMENTS: u8 = 4;
+/// The segments in the device's ring, the fewest a `twinleaf_device` ring holds.
+const SEGMENTS: u8 = 3;
 
 /// The rates the device samples at before decimation, in Hz.
 const RATES: [u32; 4] = [1, 2, 4, 10];
@@ -97,14 +109,14 @@ enum Change {
     Rate,
     TimeRef,
     Reboot,
+    Restart,
 }
 
 /// Where the device drops samples.
 #[derive(Clone, Copy, PartialEq)]
 enum Drops {
     Never,
-    /// Never on either side of a new segment in one session, so every
-    /// segment the device opens reaches the parser.
+    /// Never on either side of a new segment in one session.
     ApartFromSegments,
     Anywhere,
 }
@@ -117,6 +129,8 @@ trait Case: 'static {
     const ROLLS_OVER: bool;
     /// Whether the device changes its rate and time reference, and reboots.
     const RECONFIGURES: bool;
+    /// Whether the device stops acquiring and starts again.
+    const RESTARTS: bool;
     const DROPS: Drops;
 }
 
@@ -128,6 +142,7 @@ impl Case for KeepsUp {
     const ROOM: RangeInclusive<usize> = ROOMY..=ROOMY;
     const ROLLS_OVER: bool = true;
     const RECONFIGURES: bool = true;
+    const RESTARTS: bool = true;
     const DROPS: Drops = Drops::ApartFromSegments;
 }
 
@@ -138,28 +153,31 @@ impl Case for Lags {
     const ROOM: RangeInclusive<usize> = 1..=3;
     const ROLLS_OVER: bool = false;
     const RECONFIGURES: bool = false;
+    const RESTARTS: bool = false;
     const DROPS: Drops = Drops::Anywhere;
 }
 
 /// A reader that lags, and a device that changes everything and drops no
-/// sample. Problem A.
+/// sample.
 struct LagsAcrossChanges;
 
 impl Case for LagsAcrossChanges {
     const ROOM: RangeInclusive<usize> = 1..=3;
     const ROLLS_OVER: bool = true;
     const RECONFIGURES: bool = true;
+    const RESTARTS: bool = true;
     const DROPS: Drops = Drops::Never;
 }
 
-/// A reader that keeps up, and a device that rolls over and drops samples
-/// anywhere, the first sample of a segment among them. Problem B.
+/// A reader that keeps up, and a device that rolls over, restarts and drops
+/// samples anywhere, the first sample of a segment among them.
 struct LosesAtRollover;
 
 impl Case for LosesAtRollover {
     const ROOM: RangeInclusive<usize> = ROOMY..=ROOMY;
     const ROLLS_OVER: bool = true;
     const RECONFIGURES: bool = false;
+    const RESTARTS: bool = true;
     const DROPS: Drops = Drops::Anywhere;
 }
 
@@ -188,8 +206,26 @@ enum Step {
     /// take a new time reference, takes samples to the switch, and goes on
     /// with it in its next segment.
     TimeRef { within: u32 },
-    /// The device reboots into a new session, and describes itself again.
+    /// The device reboots into a new session, describes itself again and
+    /// acquires. It announces `dev.running` turning on after its first
+    /// packet.
     Reboot,
+    /// A host stops the device, which announces `dev.running` off in that
+    /// request, whether or not it announced it on, and the on it owed goes
+    /// unannounced. Its publisher holds `staged` samples of the stopped
+    /// acquisition, and sends them after the announcement.
+    Stop { staged: u32 },
+    /// The device starts acquiring again in a fresh segment, `pause` whole
+    /// seconds after the second its stop fell in. Unless `forced`, it sends
+    /// the segment's record first, and otherwise the record follows the
+    /// segment's first packet, as for a rollover. It announces `dev.running`
+    /// turning on ahead of the segment if `early`, and otherwise after the
+    /// segment's first packet.
+    Start {
+        pause: u32,
+        early: bool,
+        forced: bool,
+    },
     /// The reader takes up to `count` entries off its lane.
     Read { count: usize },
 }
@@ -217,11 +253,28 @@ enum Sent {
         position: u64,
         rows: u32,
     },
+    /// The announcement of `dev.running`, numbered `seq` in the device's
+    /// settings version.
+    Running {
+        on: bool,
+        seq: u32,
+    },
 }
 
 impl Sent {
     fn packet(&self) -> tio::Packet {
         let record = match *self {
+            Sent::Running { on, seq } => {
+                let mut raw = [0u8; 64];
+                let announcement = crate::proto::settings::Setting {
+                    name: b"dev.running",
+                    seq: Some(seq),
+                    reply: &[u8::from(on)],
+                };
+                let len = announcement.write(&mut raw).expect("the announcement fits");
+                let (packet, _) = tio::Packet::from_slice_prefix(&raw[..len]).expect("a packet");
+                return packet.with_route(DeviceRoute::root());
+            }
             Sent::Device { session } => wire::Metadata::Device(wire::Device {
                 session: SessionId::new(session),
                 ..fixtures::device()
@@ -297,6 +350,16 @@ struct Device {
     segmented_last: bool,
     /// Whether the current segment's record waits for its first packet.
     record_due: bool,
+    /// The segment of the last record or packet sent, which the parser
+    /// takes as current.
+    told: u8,
+    /// Whether the device is acquiring.
+    running: bool,
+    /// Whether `dev.running` turning on waits for the current segment's
+    /// first packet.
+    running_due: bool,
+    /// The device's settings version, which counts its announcements.
+    settings: u32,
     /// Each change, at the position of the first sample after it.
     changes: Vec<(u64, Change)>,
     /// Where the device was at each position, sent or dropped.
@@ -321,6 +384,10 @@ impl Device {
             dropped_last: false,
             segmented_last: false,
             record_due: false,
+            told: 0,
+            running: true,
+            running_due: false,
+            settings: 0,
             changes: Vec::new(),
             history: Vec::new(),
             sent: Vec::new(),
@@ -349,12 +416,23 @@ impl Device {
     /// Sends the current segment's record.
     fn send_record(&mut self) {
         self.record_due = false;
+        self.told = self.segment;
         self.sent.push(Sent::Segment {
             id: self.segment,
             start: self.start,
             rate: self.rate,
             decimation: self.decimation,
             timeref: self.timeref,
+        });
+    }
+
+    /// Announces `dev.running` as `on`.
+    fn announce_running(&mut self, on: bool) {
+        self.running_due = false;
+        self.settings += 1;
+        self.sent.push(Sent::Running {
+            on,
+            seq: self.settings,
         });
     }
 
@@ -378,6 +456,7 @@ impl Device {
         let mut left = count;
         while left > 0 {
             let rows = left.min(rows);
+            self.told = self.segment;
             self.sent.push(Sent::Samples {
                 segment: self.segment,
                 first: self.next,
@@ -386,6 +465,9 @@ impl Device {
             });
             if self.record_due {
                 self.send_record();
+            }
+            if self.running_due {
+                self.announce_running(true);
             }
             (0..rows).for_each(|_| self.advance());
             self.sent_since_change += u64::from(rows);
@@ -404,15 +486,6 @@ impl Device {
     /// The samples whose groups complete by a switch at input `at`.
     fn samples_to(&self, at: u32) -> u32 {
         at / self.decimation - self.next
-    }
-
-    /// Returns `true` if a switch at input `at` is the only whole second that
-    /// leaves the outputs it does, so a parser without the new segment's
-    /// record infers it.
-    fn only_switch(&self, at: u32) -> bool {
-        let (rate, decimation) = (self.rate, self.decimation);
-        let outputs = at / decimation;
-        (outputs * decimation).div_ceil(rate) * rate + rate >= (outputs + 1) * decimation
     }
 
     /// Takes the samples whose groups complete by a switch at input `at`,
@@ -443,43 +516,53 @@ impl Device {
         self.segmented_last = change != Change::Reboot;
         self.segment = match change {
             Change::Reboot => 0,
-            _ => (self.segment + 1) % SEGMENTS,
+            _ => self.next_segment(),
         };
+    }
+
+    /// The segment after the current one in the ring.
+    fn next_segment(&self) -> u8 {
+        (self.segment + 1) % SEGMENTS
     }
 
     /// Returns `true` if `step` is one a device of `C` takes now. Every
     /// segment holds a sample or a dropped one, as a device rolls over once
-    /// a second at most.
+    /// a second at most. A stopped device only starts again or reboots. A
+    /// stop comes whether or not the device announced that it runs. A start
+    /// whose record follows its first packet does not land on the segment
+    /// the parser takes as current, whose earlier record the parser would
+    /// decode that packet with.
     fn allows<C: Case>(&self, step: &Step) -> bool {
-        // A switch asked for `within` inputs into a group, with nothing
-        // between the last dropped sample and the new segment.
+        // Whether a switch asked for `within` inputs into a group comes with
+        // nothing between the last dropped sample and the new segment.
+        let after_a_drop =
+            |within: u32| self.dropped_last && self.samples_to(self.switch_at(within)) == 0;
+        let apart = C::DROPS == Drops::ApartFromSegments;
         let segment = |within: u32| {
-            within < self.decimation && self.since_change > 0 && {
-                let at = self.switch_at(within);
-                let after_a_drop = C::DROPS == Drops::ApartFromSegments
-                    && self.dropped_last
-                    && self.samples_to(at) == 0;
-                !after_a_drop
-            }
+            self.running
+                && within < self.decimation
+                && self.since_change > 0
+                && !(apart && after_a_drop(within))
         };
         match *step {
-            Step::Samples { .. } | Step::Read { .. } => true,
+            Step::Read { .. } => true,
+            Step::Samples { .. } => self.running,
             Step::Drop { .. } => match C::DROPS {
+                _ if !self.running => false,
                 Drops::Never => false,
                 Drops::ApartFromSegments => !(self.segmented_last && self.sent_since_change == 0),
                 Drops::Anywhere => true,
             },
-            // A parser without the record waits through a forced rollover
-            // that several whole seconds fit, and so loses the segment's
-            // first packet. Only a device that drops anywhere loses a sample
-            // next to a new segment.
-            Step::Rollover { forced, within } => {
-                C::ROLLS_OVER
-                    && segment(within)
-                    && (!forced
-                        || C::DROPS == Drops::Anywhere
-                        || self.only_switch(self.switch_at(within)))
+            Step::Stop { staged } => {
+                C::RESTARTS
+                    && self.running
+                    && self.since_change > 0
+                    && !(apart && self.dropped_last && staged == 0)
             }
+            Step::Start { forced, .. } => {
+                C::RESTARTS && !self.running && !(forced && self.next_segment() == self.told)
+            }
+            Step::Rollover { within, .. } => C::ROLLS_OVER && segment(within),
             Step::Rate {
                 rate,
                 decimation,
@@ -512,7 +595,10 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
     fn transitions(device: &Device) -> BoxedStrategy<Step> {
         let samples = (1..=6u32, 1..=3u32).prop_map(|(count, rows)| Step::Samples { count, rows });
         let read = (1..=4usize).prop_map(|count| Step::Read { count });
-        let mut steps = vec![(6, samples.boxed()), (4, read.boxed())];
+        let mut steps = vec![(4, read.boxed())];
+        if device.allows::<C>(&Step::Samples { count: 1, rows: 1 }) {
+            steps.push((6, samples.boxed()));
+        }
         if device.allows::<C>(&Step::Drop { count: 1 }) {
             let drop = (1..=3u32).prop_map(|count| Step::Drop { count });
             steps.push((2, drop.boxed()));
@@ -531,11 +617,23 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
             })
         });
         let timerefs = within.map(|within| Step::TimeRef { within });
-        let changes: [(u32, Vec<Step>); 4] = [
+        let stops = (0..=2).map(|staged| Step::Stop { staged });
+        let starts = (0..=2).flat_map(|pause| {
+            [(false, false), (false, true), (true, false), (true, true)].map(|(early, forced)| {
+                Step::Start {
+                    pause,
+                    early,
+                    forced,
+                }
+            })
+        });
+        let changes: [(u32, Vec<Step>); 6] = [
             (3, rollovers.collect()),
             (1, rates.collect()),
             (1, timerefs.collect()),
             (1, vec![Step::Reboot]),
+            (1, stops.collect()),
+            (3, starts.collect()),
         ];
         for (weight, candidates) in changes {
             let allowed: Vec<Step> = candidates
@@ -588,6 +686,35 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                 device.change(Change::Reboot, seconds);
                 device.session += 1;
                 device.describe();
+                device.running = true;
+                device.running_due = true;
+            }
+            Step::Stop { staged } => {
+                device.running_due = false;
+                device.take(staged, staged.max(1));
+                let held = std::mem::take(&mut device.sent);
+                device.running = false;
+                // A segment that published nothing never sends its record.
+                device.record_due = false;
+                device.announce_running(false);
+                device.sent.extend(held);
+            }
+            Step::Start {
+                pause,
+                early,
+                forced,
+            } => {
+                let seconds = (device.next * device.decimation).div_ceil(device.rate) + pause;
+                device.change(Change::Restart, seconds);
+                device.running = true;
+                device.running_due = true;
+                if early {
+                    device.announce_running(true);
+                }
+                device.record_due = true;
+                if !forced {
+                    device.send_record();
+                }
             }
             Step::Read { .. } => {}
         }
@@ -611,6 +738,10 @@ enum Told {
         old: f64,
         new: f64,
     },
+    Restart {
+        old: u8,
+        new: u8,
+    },
     Rollover {
         old: u8,
         new: u8,
@@ -631,42 +762,62 @@ enum Loss {
 /// Returns the change and the loss that `batch` reports, after a gap if
 /// `gap`.
 fn reported(batch: &SampleBatch, gap: bool) -> (Option<Told>, Option<Loss>) {
-    let mut loss = gap.then_some(Loss::Gap);
-    let change = match batch.boundary() {
-        None => None,
-        Some(BoundaryReason::SamplesLost { expected, received }) => {
-            loss.get_or_insert(Loss::Samples {
+    use super::{Change as Reported, Loss as Lost};
+    let Some(boundary) = batch.boundary() else {
+        assert!(!gap, "the batch after a gap names its loss");
+        return (None, None);
+    };
+    let loss = boundary.loss.as_ref().map(|lost: &Lost| {
+        assert!(lost.samples >= 1, "a loss of {lost:?} names no sample");
+        assert_eq!(
+            lost.dropped_batches > 0,
+            gap,
+            "a loss of {lost:?} says it follows dropped batches when a gap was reported"
+        );
+        match lost.expected {
+            _ if lost.dropped_batches > 0 => Loss::Gap,
+            Some(expected) => Loss::Samples {
                 expected: expected.value(),
-                received: received.value(),
-            });
-            None
+                received: batch.sample_numbers()[0].value(),
+            },
+            None => panic!("a loss of {lost:?} the parser found names the sample due"),
         }
-        Some(BoundaryReason::Initial) => Some(Told::Initial),
-        Some(BoundaryReason::SessionChanged { old, new }) => Some(Told::Reboot {
+    });
+    assert!(
+        loss.is_some() || !gap,
+        "the batch after a gap names its loss"
+    );
+    let change = boundary.change.as_ref().map(|change| match change {
+        Reported::Initial => Told::Initial,
+        Reported::SessionChanged { old, new } => Told::Reboot {
             old: old.value(),
             new: new.value(),
-        }),
-        Some(BoundaryReason::TimeRefSessionChanged { old, new }) => Some(Told::TimeRef {
+        },
+        Reported::TimeRefSessionChanged { old, new } => Told::TimeRef {
             old: old.value(),
             new: new.value(),
-        }),
-        Some(&BoundaryReason::RateChanged { old_rate, new_rate }) => Some(Told::Rate {
+        },
+        &Reported::RateChanged { old_rate, new_rate } => Told::Rate {
             old: old_rate,
             new: new_rate,
-        }),
-        Some(BoundaryReason::SegmentRollover { old_id, new_id }) => Some(Told::Rollover {
+        },
+        Reported::Restarted { old_id, new_id } => Told::Restart {
             old: old_id.value(),
             new: new_id.value(),
-        }),
-        Some(other) => Some(Told::Other(format!("{other:?}"))),
-    };
+        },
+        Reported::SegmentRollover { old_id, new_id } => Told::Rollover {
+            old: old_id.value(),
+            new: new_id.value(),
+        },
+        other => Told::Other(format!("{other:?}")),
+    });
     (change, loss)
 }
 
 /// The parser, the lane and the reader under test.
 struct Reader {
     parser: PacketParser,
-    lane: Lane<SampleBatch>,
+    lane: BatchLane,
     queue: flume::Receiver<Queued<SampleBatch>>,
     /// The first position of each batch sent to the lane and not yet
     /// received or counted as dropped.
@@ -679,7 +830,7 @@ struct Reader {
 
 impl Reader {
     fn new(room: usize) -> Reader {
-        let (lane, queue) = Lane::new(room);
+        let (lane, queue) = BatchLane::new(room);
         Reader {
             parser: PacketParser::new(false),
             lane,
@@ -741,11 +892,7 @@ impl Reader {
             "the time of the sample at {first}"
         );
         let Some(previous) = self.last else {
-            let due = if self.gap > 0 {
-                (None, Some(Loss::Gap))
-            } else {
-                (Some(Told::Initial), None)
-            };
+            let due = (Some(Told::Initial), (self.gap > 0).then_some(Loss::Gap));
             assert_eq!((change, loss), due, "the first batch, at position {first}");
             self.last = Some(last);
             self.gap = 0;
@@ -775,6 +922,11 @@ impl Reader {
                 old: was.rate,
                 new: now.rate,
             })
+        } else if between(Change::Restart) {
+            Some(Told::Restart {
+                old: was.segment,
+                new: now.segment,
+            })
         } else if between(Change::Rollover) {
             Some(Told::Rollover {
                 old: was.segment,
@@ -794,9 +946,14 @@ impl Reader {
         );
         let stands_for_loss = matches!(
             due,
-            Some(Told::Reboot { .. } | Told::TimeRef { .. } | Told::Rate { .. })
+            Some(
+                Told::Reboot { .. }
+                    | Told::TimeRef { .. }
+                    | Told::Rate { .. }
+                    | Told::Restart { .. }
+            )
         );
-        if lost == 0 {
+        if lost == 0 || stands_for_loss && self.gap == 0 {
             assert_eq!(loss, None, "the loss {after}");
         } else if !stands_for_loss {
             let named = Loss::Samples {
@@ -860,13 +1017,128 @@ prop_state_machine! {
     /// A reader that lags learns of every change in the batches its lane
     /// dropped.
     #[test]
-    #[ignore = "fails until the boundary fix; see Problem A in data/boundaries.rs, after which only `reported` changes"]
     fn a_reader_that_lags_learns_every_change(sequential 1..40 => Boundaries<LagsAcrossChanges>);
 
     /// A loss across a rollover reaches the reader as both a loss and a
     /// rollover.
     #[test]
-    #[ignore = "fails until the boundary fix; see Problem B in data/boundaries.rs, after which only `reported` changes"]
     fn a_loss_across_a_rollover_is_a_loss_and_a_rollover(sequential 1..40 => Boundaries<LosesAtRollover>);
 
+}
+
+/// Takes `steps` with the device and reader of `C`, checking each batch the
+/// reader receives as the properties do.
+fn run<C: Case>(rate: u32, decimation: u32, steps: &[Step]) {
+    let mut device = Device::new(*C::ROOM.start(), rate, decimation);
+    let mut reader = Boundaries::<C>::init_test(&device);
+    for step in steps {
+        assert!(
+            device.allows::<C>(step),
+            "{step:?} is a step the device takes"
+        );
+        device = Pipeline::<C>::apply(device, step);
+        reader = Boundaries::<C>::apply(reader, &device, step.clone());
+    }
+    Boundaries::<C>::teardown(reader, device);
+}
+
+/// Acquisitions that publish nothing send no record, so the ring comes
+/// round to the slot the parser takes as current with nothing between. The
+/// record the next start sends there names another start, and its rows
+/// come as a restart.
+#[test]
+fn a_start_that_comes_round_the_ring_to_the_current_slot_is_a_restart() {
+    let empty = [
+        Step::Stop { staged: 0 },
+        Step::Start {
+            pause: 0,
+            early: true,
+            forced: true,
+        },
+        Step::Drop { count: 1 },
+    ];
+    let mut steps = vec![Step::Samples { count: 1, rows: 1 }];
+    for _ in 1..SEGMENTS {
+        steps.extend(empty.clone());
+    }
+    steps.extend([
+        Step::Stop { staged: 0 },
+        Step::Start {
+            pause: 0,
+            early: true,
+            forced: false,
+        },
+        Step::Samples { count: 1, rows: 1 },
+        Step::Read { count: 2 },
+    ]);
+    run::<LosesAtRollover>(1, 1, &steps);
+}
+
+/// A stop and start no host asked for, with no refresh between them,
+/// announce nothing, as `dev.running` ends where it began. The parser then
+/// reads the restart as a rollover, with a loss of the sample periods from
+/// the stopped segment's start to the new one's that its rows do not fill.
+/// With the stop announced, the same packets read as a restart.
+#[test]
+fn a_restart_within_one_refresh_reads_as_a_rollover_and_a_loss() {
+    use super::{Change as Reported, Loss as Lost};
+    let (mut announced, mut unannounced) = (Reader::new(ROOMY), Reader::new(ROOMY));
+    let mut deliver = |device: &Device| {
+        for sent in &device.sent {
+            announced.pump(&sent.packet());
+            if !matches!(sent, Sent::Running { .. }) {
+                unannounced.pump(&sent.packet());
+            }
+        }
+    };
+    let mut device = Device::new(ROOMY, 10, 1);
+    deliver(&device);
+    let steps = [
+        Step::Samples { count: 5, rows: 5 },
+        Step::Stop { staged: 0 },
+        Step::Start {
+            pause: 1,
+            early: true,
+            forced: false,
+        },
+        Step::Samples { count: 3, rows: 3 },
+    ];
+    for step in &steps {
+        assert!(
+            device.allows::<KeepsUp>(step),
+            "{step:?} is a step the device takes"
+        );
+        device = Pipeline::<KeepsUp>::apply(device, step);
+        deliver(&device);
+    }
+    let boundaries = |reader: &Reader| -> Vec<_> {
+        reader
+            .queue
+            .try_iter()
+            .filter_map(|queued| match queued {
+                Queued::Item(batch) => Some(batch.boundary().cloned()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (old_id, new_id) = (SegmentId::new(0), SegmentId::new(1));
+    let restarted = boundaries(&announced);
+    assert_eq!(restarted.len(), 2, "{restarted:?}");
+    let restart = restarted[1].as_ref().expect("the restart's boundary");
+    assert_eq!(restart.change, Some(Reported::Restarted { old_id, new_id }));
+    assert_eq!(restart.loss, None);
+    // Samples 0 to 4 fill the first half second of the segment at 1000 s.
+    // The new one starts at 1002 s, so 15 periods of 0.1 s go unfilled.
+    let unseen = boundaries(&unannounced);
+    assert_eq!(unseen.len(), 2, "{unseen:?}");
+    let rollover = unseen[1].as_ref().expect("the rollover's boundary");
+    assert_eq!(
+        rollover.change,
+        Some(Reported::SegmentRollover { old_id, new_id })
+    );
+    let loss = rollover
+        .loss
+        .as_ref()
+        .map(|loss: &Lost| (loss.samples, loss.expected));
+    assert_eq!(loss, Some((15, Some(crate::proto::SampleNumber::new(5)))));
 }

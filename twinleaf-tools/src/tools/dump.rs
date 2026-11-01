@@ -147,13 +147,14 @@ fn recv_before<T>(
     }
 }
 
-/// Prints a batch's boundary, and the metadata in force from it, when the
-/// batch starts at one.
+/// Prints a batch's boundary and segment when the batch starts at a
+/// boundary, and the rest of the metadata in force from it when the boundary
+/// names a change other than a rollover.
 fn print_batch_meta(batch: &SampleBatch) {
     let route = batch.route();
     if let Some(boundary) = batch.boundary() {
         println!("# {} BOUNDARY {:?}", route, boundary);
-        if !boundary.is_continuous() {
+        if boundary.change.as_ref().is_some_and(|c| !c.is_continuous()) {
             println!("# {} DEVICE {:?}", route, batch.metadata().device());
             println!("# {} STREAM {:?}", route, batch.schema().stream());
             for column in batch.schema().columns() {

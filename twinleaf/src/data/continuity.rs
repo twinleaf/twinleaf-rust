@@ -1,22 +1,24 @@
 //! The continuity the parser reports with every batch.
 //!
-//! [`BoundaryReason`] says why a stream started or changed, and
-//! [`BoundaryClass`] groups the reasons. [`Generations`] number the runs that
-//! boundaries separate.
+//! A [`Boundary`] says what changed ahead of a batch, as a [`Change`], and
+//! what was lost there, as a [`Loss`]. [`BoundaryClass`] groups boundaries.
+//! [`Generations`] number the runs that boundaries separate.
 
 use crate::proto::{SampleNumber, SegmentId, SessionId};
 
 /// Parser-assigned continuity generations, constant within a batch.
 ///
 /// The parser stamps them in arrival order. Comparing them tells runs apart
-/// without re-reading boundaries.
+/// without re-reading boundaries. A receiver's queue hands them on as the
+/// parser assigned them, so a loss in that queue alone bumps none of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generations {
-    /// Per-stream run ordinal. It bumps at every non-continuous boundary.
+    /// Per-stream run ordinal. It bumps at every boundary the parser finds
+    /// that is not continuous.
     pub stream: u32,
-    /// Per-device generation. It bumps at any non-continuous boundary on the
-    /// device's streams other than [`BoundaryReason::Initial`], and when the
-    /// device's state resets.
+    /// Per-device generation. It bumps at any boundary the parser finds on
+    /// the device's streams that is not continuous, other than a stream's
+    /// [`Change::Initial`], and when the device's state resets.
     pub device: u32,
     /// Whole-parse generation. It bumps as `device` does, across all routed
     /// devices.
@@ -32,7 +34,8 @@ pub enum BoundaryClass {
     Seamless,
     /// Samples are missing, but time remains monotonic.
     DataLoss,
-    /// The session, time reference, rate, or segment changed.
+    /// The session, time reference or rate changed, or the device started
+    /// acquiring again after a stop.
     Reconfig,
     /// The timeline is inconsistent, possibly from corrupted data or a device clock error.
     Anomaly,
@@ -63,31 +66,102 @@ impl std::fmt::Display for BoundaryClass {
     }
 }
 
-/// Why a stream started or changed.
+/// What changed and what was lost between a receiver's previous batch of a
+/// stream and this one.
 ///
-/// Attached to the first batch affected. These methods classify it.
+/// A batch has no boundary exactly when nothing that its receiver can
+/// detect changed or was lost since that receiver's previous batch of the
+/// stream. A boundary names a change, a loss, or both. The `old` values of
+/// its change come from the receiver's previous batch, and the `new` values
+/// from this one. These methods classify it.
 ///
 /// - [`class`](Self::class) categorizes the cause.
 /// - [`is_continuous`](Self::is_continuous) checks for an unbroken timeline.
 /// - [`is_monotonic`](Self::is_monotonic) checks that time did not move backward.
 ///
-/// | Reason                  | [`class`](Self::class) | [`is_continuous`](Self::is_continuous) | [`is_monotonic`](Self::is_monotonic) |
+/// | Boundary                   | [`class`](Self::class) | [`is_continuous`](Self::is_continuous) | [`is_monotonic`](Self::is_monotonic) |
+/// |----------------------------|----------------|-----|-----------------|
+/// | change alone               | the change's   | the change's | the change's |
+/// | loss alone                 | `DataLoss`     | no  | yes             |
+/// | `SegmentRollover` and loss | `DataLoss`     | no  | yes             |
+/// | another change and loss    | the change's   | no  | the change's    |
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Boundary {
+    /// What changed, or `None` when only samples were lost.
+    pub change: Option<Change>,
+    /// The samples lost, or `None` when none were lost, or when a change
+    /// other than a rollover stands for the loss and the receiver's queue
+    /// dropped no batch of the stream.
+    pub loss: Option<Loss>,
+}
+
+impl Boundary {
+    /// Returns a boundary that names `change` and no loss.
+    pub(crate) fn of(change: Change) -> Boundary {
+        Boundary {
+            change: Some(change),
+            loss: None,
+        }
+    }
+
+    /// Returns the class of the boundary. It is the change's class, or
+    /// [`BoundaryClass::DataLoss`] when the boundary names a loss and its
+    /// change is none or a rollover.
+    pub fn class(&self) -> BoundaryClass {
+        match (&self.change, &self.loss) {
+            (None, Some(_)) => BoundaryClass::DataLoss,
+            (Some(change), Some(_)) if change.is_continuous() => BoundaryClass::DataLoss,
+            (Some(change), _) => change.class(),
+            (None, None) => BoundaryClass::Seamless,
+        }
+    }
+
+    /// Returns `true` if the timeline continues unbroken, which is when no
+    /// sample was lost and the change is none or a rollover. A continuous
+    /// boundary is also monotonic.
+    pub fn is_continuous(&self) -> bool {
+        self.loss.is_none() && self.change.as_ref().is_none_or(Change::is_continuous)
+    }
+
+    /// Returns `true` if time stays monotonic across the boundary, though
+    /// rows may be missing. A loss alone is monotonic.
+    pub fn is_monotonic(&self) -> bool {
+        self.change.as_ref().is_none_or(Change::is_monotonic)
+    }
+
+    /// Returns `true` only for the first data a stream has delivered to its
+    /// receiver.
+    pub fn is_initial(&self) -> bool {
+        self.change.as_ref().is_some_and(Change::is_initial)
+    }
+}
+
+/// Why a stream started or changed.
+///
+/// These methods classify it.
+///
+/// - [`class`](Self::class) categorizes the cause.
+/// - [`is_continuous`](Self::is_continuous) checks for an unbroken timeline.
+/// - [`is_monotonic`](Self::is_monotonic) checks that time did not move backward.
+///
+/// | Change                  | [`class`](Self::class) | [`is_continuous`](Self::is_continuous) | [`is_monotonic`](Self::is_monotonic) |
 /// |-------------------------|------------|-----|-----|
 /// | `SegmentRollover`       | `Seamless` | yes | yes |
 /// | `Initial`               | `Startup`  | no  | no  |
-/// | `SamplesLost`           | `DataLoss` | no  | yes |
 /// | `SessionChanged`        | `Reconfig` | no  | no  |
 /// | `TimeRefSessionChanged` | `Reconfig` | no  | no  |
 /// | `RateChanged`           | `Reconfig` | no  | yes |
-/// | `SegmentChanged`        | `Reconfig` | no  | yes |
+/// | `Restarted`             | `Reconfig` | no  | yes |
 /// | `TimeForward`           | `Anomaly`  | no  | yes |
 /// | `TimeBackward`          | `Anomaly`  | no  | no  |
 ///
-/// Continuous boundaries are always monotonic. The class describes the cause,
-/// not its effect on the timeline.
-#[derive(Debug, Clone)]
+/// Continuous changes are always monotonic. The class describes the cause,
+/// not its effect on the timeline. Every change other than a rollover stands
+/// for any loss next to it, so its boundary names no loss of the parser's.
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub enum BoundaryReason {
+pub enum Change {
     /// The stream's first sample.
     Initial,
     /// The device session changed.
@@ -122,72 +196,112 @@ pub enum BoundaryReason {
         /// Rate now in force, in Hz after decimation.
         new_rate: f64,
     },
-
-    /// The segment rolled over. The timeline continues in a new segment.
+    /// The device stopped acquiring and started again, and the stream went
+    /// on in a segment of the new acquisition, in the same session, time
+    /// reference and rate, with time not going backward. The device took no
+    /// sample in the time between, so the change names no loss for it.
+    Restarted {
+        /// Segment of the preceding rows.
+        old_id: SegmentId,
+        /// Segment of the new acquisition the rows go on in.
+        new_id: SegmentId,
+    },
+    /// The stream went on into another segment in the same session, time
+    /// reference and rate, with time not going backward. Segments between
+    /// may have passed unseen.
     SegmentRollover {
-        /// Segment that ended.
+        /// Segment of the preceding rows.
         old_id: SegmentId,
         /// Segment the rows continue into.
         new_id: SegmentId,
     },
-    /// The segment changed other than by a rollover.
-    SegmentChanged {
-        /// Segment the stream had been in.
-        old_id: SegmentId,
-        /// Segment the rows arrived in.
-        new_id: SegmentId,
-    },
-    /// Samples were lost, leaving a gap in sample numbers.
-    SamplesLost {
-        /// Sample number the first row should have carried.
-        expected: SampleNumber,
-        /// Sample number the first row actually carried.
-        received: SampleNumber,
-    },
 }
 
-impl BoundaryReason {
-    /// Returns `true` only for a segment rollover, the one boundary that
-    /// preserves continuity. A continuous boundary is also monotonic.
+impl Change {
+    /// Returns `true` only for a segment rollover, the one change that
+    /// preserves continuity. A continuous change is also monotonic.
     pub fn is_continuous(&self) -> bool {
-        matches!(self, BoundaryReason::SegmentRollover { .. })
+        matches!(self, Change::SegmentRollover { .. })
     }
 
-    /// Returns `true` if time stays monotonic across the boundary, though rows
-    /// may be missing.
+    /// Returns `true` if time stays monotonic across the change.
     ///
-    /// Every [`is_continuous`](Self::is_continuous) boundary is also
+    /// Every [`is_continuous`](Self::is_continuous) change is also
     /// monotonic.
     pub fn is_monotonic(&self) -> bool {
         matches!(
             self,
-            BoundaryReason::SamplesLost { .. }
-                | BoundaryReason::RateChanged { .. }
-                | BoundaryReason::SegmentRollover { .. }
-                | BoundaryReason::SegmentChanged { .. }
-                | BoundaryReason::TimeForward { .. }
+            Change::RateChanged { .. }
+                | Change::Restarted { .. }
+                | Change::SegmentRollover { .. }
+                | Change::TimeForward { .. }
         )
     }
 
-    /// Returns `true` only for the first data a stream has ever delivered.
+    /// Returns `true` only for the first data a stream has delivered.
     pub fn is_initial(&self) -> bool {
-        matches!(self, BoundaryReason::Initial)
+        matches!(self, Change::Initial)
     }
 
-    /// Returns the class of the boundary's cause, independent of continuity
+    /// Returns the class of the change's cause, independent of continuity
     /// and monotonicity.
     pub fn class(&self) -> BoundaryClass {
         match self {
-            BoundaryReason::SegmentRollover { .. } => BoundaryClass::Seamless,
-            BoundaryReason::Initial => BoundaryClass::Startup,
-            BoundaryReason::SamplesLost { .. } => BoundaryClass::DataLoss,
-            BoundaryReason::SessionChanged { .. }
-            | BoundaryReason::TimeRefSessionChanged { .. }
-            | BoundaryReason::RateChanged { .. }
-            | BoundaryReason::SegmentChanged { .. } => BoundaryClass::Reconfig,
-            BoundaryReason::TimeForward { .. } | BoundaryReason::TimeBackward { .. } => {
-                BoundaryClass::Anomaly
-            }
+            Change::SegmentRollover { .. } => BoundaryClass::Seamless,
+            Change::Initial => BoundaryClass::Startup,
+            Change::SessionChanged { .. }
+            | Change::TimeRefSessionChanged { .. }
+            | Change::RateChanged { .. }
+            | Change::Restarted { .. } => BoundaryClass::Reconfig,
+            Change::TimeForward { .. } | Change::TimeBackward { .. } => BoundaryClass::Anomaly,
         }
     }
+
+    /// Returns how much of what happened before it the change stands for.
+    /// Of two changes a receiver learns of at once, it is told the higher.
+    ///
+    /// The ranks follow the order the parser tells changes in, so a receiver
+    /// told of two at once learns what the parser tells of both at once. A
+    /// restart ranks below a backward step in time, which it does not stand
+    /// for, and above the forward step in time and the rollover it stands
+    /// for.
+    pub(crate) fn rank(&self) -> u8 {
+        match self {
+            Change::Initial => 8,
+            Change::SessionChanged { .. } => 7,
+            Change::TimeRefSessionChanged { .. } => 6,
+            Change::RateChanged { .. } => 5,
+            Change::TimeBackward { .. } => 4,
+            Change::Restarted { .. } => 3,
+            Change::TimeForward { .. } => 2,
+            Change::SegmentRollover { .. } => 1,
+        }
+    }
+}
+
+/// The rows of a stream that a receiver did not get, between its previous
+/// batch of the stream and this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Loss {
+    /// The rows lost, never 0.
+    ///
+    /// Next to no change or a rollover, it counts the rows lost, plus up to
+    /// one for each segment that passed unseen whose time ends inside a
+    /// decimation group, as it counts the whole output periods of the
+    /// unseen segments' time.
+    ///
+    /// Next to another change, it counts the rows of the batches the
+    /// receiver's queue dropped and the losses they and this batch name,
+    /// which has the same upper bound.
+    pub samples: u64,
+    /// The sample number after the receiver's previous row. It is `Some`
+    /// exactly when the receiver had a previous batch of the stream and the
+    /// change is none or a rollover.
+    pub expected: Option<SampleNumber>,
+    /// The batches of this stream that this receiver's queue dropped, and 0
+    /// when only the device or the link lost samples. For each stream, these
+    /// add up over its batches to that stream's share of the counts
+    /// [`RecvError::Lagged`](crate::RecvError::Lagged) reports.
+    pub dropped_batches: u64,
 }

@@ -3,7 +3,7 @@
 //! [`SampleBatch`] holds immutable columnar rows, one [`ColumnArray`] per
 //! column of its [`StreamSchema`], and [`SampleRow`] views one row.
 
-use super::continuity::{BoundaryReason, Generations};
+use super::continuity::{Boundary, Generations};
 use super::metadata::{SegmentRecord, StreamKey, StreamMetadataSnapshot, StreamSchema};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
@@ -277,7 +277,7 @@ native_types!(define_columns);
 pub(super) struct BatchContext {
     pub(super) metadata: StreamMetadataSnapshot,
     /// At most one boundary per batch, anchored at its first row.
-    pub(super) boundary: Option<BoundaryReason>,
+    pub(super) boundary: Option<Boundary>,
     pub(super) generations: Generations,
 }
 
@@ -303,7 +303,7 @@ pub struct SampleBatch {
 /// form and append themselves onto an accumulating builder.
 pub(crate) trait RowSource {
     fn len(&self) -> usize;
-    fn boundary(&self) -> Option<&BoundaryReason>;
+    fn boundary(&self) -> Option<&Boundary>;
     fn generations(&self) -> Generations;
     fn schema(&self) -> &Arc<StreamSchema>;
     fn segment_record(&self) -> &SegmentRecord;
@@ -334,7 +334,7 @@ impl RowSource for SampleBatch {
         self.sample_numbers.len()
     }
 
-    fn boundary(&self) -> Option<&BoundaryReason> {
+    fn boundary(&self) -> Option<&Boundary> {
         self.context.boundary.as_ref()
     }
 
@@ -546,9 +546,17 @@ impl SampleBatch {
     }
 
     /// Returns the batch's boundary, anchored at its first row, or `None` if
-    /// the batch continues its run.
-    pub fn boundary(&self) -> Option<&BoundaryReason> {
+    /// nothing its receiver can detect changed or was lost since that
+    /// receiver's previous batch of the stream.
+    pub fn boundary(&self) -> Option<&Boundary> {
         self.context.boundary.as_ref()
+    }
+
+    /// Returns this batch with `boundary` in place of its own, and the same
+    /// rows, metadata and generations.
+    pub(crate) fn with_boundary(mut self, boundary: Option<Boundary>) -> SampleBatch {
+        self.context.boundary = boundary;
+        self
     }
 
     /// Returns the continuity generations this batch's rows belong to.
@@ -705,6 +713,7 @@ impl std::fmt::Display for SampleRow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::continuity::Change;
     use crate::data::fixtures::{self, column, device, segment, stream};
     use crate::proto::data::DataType;
 
@@ -733,7 +742,7 @@ mod tests {
         let mut builder = SampleBatchBuilder::new(
             BatchContext {
                 metadata: metadata(1, "col_0"),
-                boundary: Some(BoundaryReason::Initial),
+                boundary: Some(Boundary::of(Change::Initial)),
                 generations: Generations {
                     stream: 1,
                     device: 0,

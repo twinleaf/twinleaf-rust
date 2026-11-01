@@ -26,9 +26,10 @@
 //! urgent queue. What goes there may overtake the stream, and keeps its own
 //! order. It is an answer, which the client matches by its id, the latest
 //! value of a device's presence, RPC table, settings or routes, which the
-//! client keeps in its store whatever it overtook, or a setting the device
-//! announced, which the client's store takes in the order the urgent queue
-//! keeps.
+//! client keeps in its store whatever it overtook, a setting the device
+//! announced, or the RPC table the settings after it were recorded under.
+//! The client's store takes the settings and those tables in the order the
+//! urgent queue keeps.
 //!
 //! The outbox takes a watch's update whole, and splits it into the packets
 //! the client joins by the id of its watch, all on one queue in one step, so

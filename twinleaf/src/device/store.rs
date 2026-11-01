@@ -7,15 +7,24 @@
 //! Setting changes are the one ordered stream, queued in full for each
 //! receiver and held by no one.
 //!
+//! Each setting change carries the RPC table in force for its device when
+//! the store records it. In the proxy's store a table is in force from its
+//! load until the device reconnects, the device reports another session, or
+//! the device announces another `rpc.hash`. A device reconnects as its link
+//! reconnects, and as it is heard again after it was lost. Only a load that
+//! started after the device last reconnected counts. A client's store
+//! takes the table the proxy names ahead of the changes recorded under it.
+//!
 //! The proxy keeps one store per link, which its engine fills, and each
 //! client's watches follow it. A device the proxy has not heard is
 //! connecting with its metadata pending. A client keeps one store per
 //! connection, which its pump fills from those watches, and holds no value
 //! it has not received.
 
+use super::rpc::RpcRegistry;
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-use super::stream::{End, Receiver, Scope, Sink};
-use crate::proto::DeviceRoute;
+use super::stream::{End, Lane, Receiver, Scope, Sink};
+use crate::proto::{DeviceRoute, SessionId};
 use crate::proxy::Watch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{poll_fn, Future};
@@ -31,7 +40,7 @@ pub(crate) const CHANGE_QUEUE_LEN: usize = 4096;
 /// queues holds no value, and queues each one in full for each receiver.
 pub(crate) struct Slot<T> {
     value: Option<T>,
-    sinks: Vec<Sink<T>>,
+    sinks: Vec<Sink<Lane<T>>>,
     queues: bool,
 }
 
@@ -71,6 +80,62 @@ pub(crate) struct Entry {
     registry: Slot<RegistryState>,
     settings: Slot<Arc<Settings>>,
     changes: Slot<SettingChange>,
+    /// The last `rpc.hash` the device announced to the proxy, and the
+    /// session it reported then.
+    announced: Option<(Option<SessionId>, u32)>,
+    /// How many times the device has reconnected.
+    epoch: u64,
+    /// The epoch the load of the table the store holds started in.
+    loaded_in: u64,
+    /// The table the proxy names for the changes a client records next.
+    named: Option<Arc<RpcRegistry>>,
+}
+
+impl Entry {
+    /// Returns the table the proxy's store holds in force for the device.
+    /// That is the table it holds when its load started after the device
+    /// last reconnected, while the device reports the session the
+    /// table was read in or reports none, and while the table has the hash
+    /// the device last announced in that session.
+    fn in_force(&self) -> Option<Arc<RpcRegistry>> {
+        let Some(Ok(table)) = &self.registry.value else {
+            return None;
+        };
+        let session = match self.presence.value {
+            Some(Presence::Alive { session }) => session,
+            _ => None,
+        };
+        let same_boot = match (table.session, session) {
+            (Some(read_in), Some(reported)) => read_in == reported,
+            _ => true,
+        };
+        let same_hash = match self.announced {
+            Some((announced_in, hash)) if announced_in == session => table.hash == Some(hash),
+            _ => true,
+        };
+        let current = self.loaded_in == self.epoch;
+        (current && same_boot && same_hash).then(|| Arc::clone(table))
+    }
+
+    /// Returns the table of this device the store holds with `hash` and
+    /// `session`, if any.
+    fn table_of(&self, hash: Option<u32>, session: Option<SessionId>) -> Option<Arc<RpcRegistry>> {
+        let held = match &self.registry.value {
+            Some(Ok(table)) => Some(table),
+            _ => None,
+        };
+        held.into_iter()
+            .chain(&self.named)
+            .find(|table| (table.hash, table.session) == (hash, session))
+            .cloned()
+    }
+}
+
+/// Returns the RPC table hash an announcement of `name` with `reply` gives,
+/// a little endian `u32` from `rpc.hash`, or `None` for any other setting.
+pub(crate) fn rpc_hash(name: &[u8], reply: &[u8]) -> Option<u32> {
+    let value = reply.get(..4).filter(|_| name == b"rpc.hash")?;
+    Some(u32::from_le_bytes(value.try_into().ok()?))
 }
 
 /// Evaluates `$body` with `$sinks` bound to the receivers of each slot of
@@ -119,7 +184,7 @@ pub(crate) struct Store {
     routes: BTreeSet<DeviceRoute>,
     /// The roots of the subtrees whose routes are all in `routes`.
     listed: BTreeSet<DeviceRoute>,
-    route_sinks: Vec<Sink<Vec<DeviceRoute>>>,
+    route_sinks: Vec<Sink<Lane<Vec<DeviceRoute>>>>,
     /// Whether the store has ended, and why when it was told.
     ended: Option<Option<End>>,
     /// Wakes whoever fills the store when a receiver starts to follow it.
@@ -146,6 +211,10 @@ impl Store {
             registry: Slot::new(None, false),
             settings: Slot::new(None, false),
             changes: Slot::new(None, true),
+            announced: None,
+            epoch: 0,
+            loaded_in: 0,
+            named: None,
         })
     }
 
@@ -187,12 +256,35 @@ impl Store {
         field(self.devices.get_mut(&route)?).value.clone()
     }
 
-    /// Sets the RPC table of the device at `route`, and drops the settings
-    /// read with the table before.
+    /// Sets the RPC table of the device at `route`, as loaded in the current
+    /// epoch, and drops the settings read with the table before.
     pub(crate) fn set_registry(&mut self, route: DeviceRoute, registry: RegistryState) {
+        let epoch = self.epoch(route);
+        self.set_loaded(route, registry, epoch);
+    }
+
+    /// Sets the RPC table of the device at `route`, from a load that started
+    /// in `started`, which [`epoch`](Self::epoch) gave then, and drops the
+    /// settings read with the table before. A table whose load started
+    /// before the device last reconnected is held but not in force.
+    pub(crate) fn set_loaded(&mut self, route: DeviceRoute, registry: RegistryState, started: u64) {
         let entry = self.entry(route);
         entry.settings.value = None;
+        entry.loaded_in = started;
         entry.registry.set(registry);
+    }
+
+    /// Returns the epoch of the device at `route`, which counts how many
+    /// times it has reconnected. A table load reads it as it starts.
+    pub(crate) fn epoch(&mut self, route: DeviceRoute) -> u64 {
+        self.entry(route).epoch
+    }
+
+    /// Starts a new epoch for the device at `route`, as it reconnected and
+    /// may have restarted with another table. The table held is out of force
+    /// until a table whose load started after this is set.
+    pub(crate) fn reconnect(&mut self, route: DeviceRoute) {
+        self.entry(route).epoch += 1;
     }
 
     /// Sets the settings of the device at `route` if they were read with the
@@ -204,6 +296,63 @@ impl Store {
                 entry.settings.set(settings);
             }
         }
+    }
+
+    /// Records a setting the device at `route` announced, the change of
+    /// `name` to `reply` counted as `seq`, and sends it to each receiver of
+    /// its changes. The change carries the table in force for the device
+    /// then. Returns the change.
+    ///
+    /// In the proxy's store an `rpc.hash` announcement first sets the hash
+    /// that the table in force must have, from this change on.
+    pub(crate) fn record_change(
+        &mut self,
+        route: DeviceRoute,
+        name: String,
+        seq: Option<u32>,
+        reply: Vec<u8>,
+    ) -> SettingChange {
+        let proxy = self.proxy;
+        let entry = self.entry(route);
+        let table = if proxy {
+            if let Some(hash) = rpc_hash(name.as_bytes(), &reply) {
+                let session = match entry.presence.value {
+                    Some(Presence::Alive { session }) => session,
+                    _ => None,
+                };
+                entry.announced = Some((session, hash));
+            }
+            entry.in_force()
+        } else {
+            entry.named.clone()
+        };
+        let change = SettingChange::new(name, seq, reply, table);
+        entry.changes.set(change.clone());
+        change
+    }
+
+    /// Names `table` as the table the changes of the device at `route` that
+    /// a client's store records next were recorded under, or no table. A
+    /// table with the hash and session of one the store holds is that one.
+    pub(crate) fn name_table(&mut self, route: DeviceRoute, table: Option<RpcRegistry>) {
+        let entry = self.entry(route);
+        entry.named = table.map(|table| {
+            entry
+                .table_of(table.hash, table.session)
+                .unwrap_or_else(|| Arc::new(table))
+        });
+    }
+
+    /// Returns the table of the device at `route` the store holds with
+    /// `hash` and `session`, either as its table or as the one named for its
+    /// changes, if any.
+    pub(crate) fn table_of(
+        &self,
+        route: DeviceRoute,
+        hash: Option<u32>,
+        session: Option<SessionId>,
+    ) -> Option<Arc<RpcRegistry>> {
+        self.devices.get(&route)?.table_of(hash, session)
     }
 
     /// Tells each receiver of the changes of the device at `route` that it
@@ -248,18 +397,21 @@ impl Store {
     }
 
     /// Returns the watch of each device a receiver follows. A list of
-    /// routes counts as following the device at its root.
+    /// routes counts as following the device at its root. In a client's
+    /// store a receiver of the changes follows the table too, so that the
+    /// proxy loads the table the changes are recorded under.
     pub(crate) fn demand(&mut self) -> BTreeSet<Watch> {
         let lists = self.route_sinks.iter().map(|sink| Watch {
             route: sink.scope.route,
             table: false,
         });
-        let devices = self.devices.iter_mut().flat_map(|(route, entry)| {
+        let client = !self.proxy;
+        let devices = self.devices.iter_mut().flat_map(move |(route, entry)| {
             let [presence, metadata, registry, settings, changes] =
                 each_slot!(entry, |sinks| !sinks.is_empty());
             [
                 (presence || metadata || changes, false),
-                (registry || settings, true),
+                (registry || settings || (client && changes), true),
             ]
             .into_iter()
             .filter(|(followed, _)| *followed)
@@ -305,7 +457,10 @@ impl Store {
         if let Some(entry) = self.devices.get_mut(&watch.route) {
             match watch.table {
                 true => (entry.registry.value, entry.settings.value) = (None, None),
-                false => (entry.presence.value, entry.metadata.value) = (None, None),
+                false => {
+                    (entry.presence.value, entry.metadata.value) = (None, None);
+                    entry.named = None;
+                }
             }
         }
         if !watch.table && self.listed.remove(&watch.route) {
@@ -320,7 +475,7 @@ impl Store {
     /// Makes every device the store holds lost, as no one can say more of
     /// them. A device lost already keeps the moment it was lost.
     pub(crate) fn mark_lost(&mut self) {
-        let since = std::time::Instant::now();
+        let since = tokio::time::Instant::now().into_std();
         for entry in self.devices.values_mut() {
             if !matches!(entry.presence.value, Some(Presence::Lost { .. })) {
                 entry.presence.set(Presence::Lost { since });
@@ -340,7 +495,7 @@ impl Store {
 }
 
 /// Ends each of `sinks`, saying why if `end` does.
-pub(crate) fn end_sinks<T>(sinks: &mut Vec<Sink<T>>, end: Option<End>) {
+pub(crate) fn end_sinks<T>(sinks: &mut Vec<Sink<Lane<T>>>, end: Option<End>) {
     for sink in sinks.drain(..) {
         if let Some(end) = end {
             sink.lane.end(end);
@@ -349,7 +504,7 @@ pub(crate) fn end_sinks<T>(sinks: &mut Vec<Sink<T>>, end: Option<End>) {
 }
 
 /// Drops each of `sinks` whose receiver is gone. Returns `true` if any was.
-pub(crate) fn prune<T>(sinks: &mut Vec<Sink<T>>, cx: &mut Context<'_>) -> bool {
+pub(crate) fn prune<L>(sinks: &mut Vec<Sink<L>>, cx: &mut Context<'_>) -> bool {
     let held = sinks.len();
     // A lifeline resolves only once its receiver is gone, and its sink is
     // dropped before it is polled again.
@@ -374,16 +529,139 @@ fn in_scope(routes: &BTreeSet<DeviceRoute>, scope: Scope) -> Vec<DeviceRoute> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::rpc::RpcRegistry;
+    use crate::device::rpc::{RpcRegistry, RpcRegistryError, RpcValue};
     use crate::device::stream::RecvError;
+    use crate::device::SettingValueError;
     use std::time::Duration;
 
     fn change(seq: u32) -> SettingChange {
-        SettingChange {
-            name: "test.amplitude".to_string(),
-            seq: Some(seq),
-            reply: vec![1],
-        }
+        SettingChange::new("test.amplitude".to_string(), Some(seq), vec![1], None)
+    }
+
+    /// The metadata words of an announced read and write `u8` and `i16`.
+    const BYTE: u16 = 0xA310;
+    const SHORT: u16 = 0xA321;
+
+    /// A table with `hash`, read in `session`, whose one entry
+    /// `test.amplitude` has the type of `meta`, or no entry without.
+    fn table_in(hash: u32, session: u32, meta: Option<u16>) -> Arc<RpcRegistry> {
+        let entries = meta.map(|meta| ("test.amplitude".to_string(), meta));
+        let session = Some(SessionId::new(session));
+        let table = RpcRegistry::from_entries(entries.into_iter().collect(), Some(hash), session);
+        Arc::new(table)
+    }
+
+    /// Makes the device at the root alive in `session`.
+    fn alive(store: &mut Store, session: u32) {
+        let session = Some(SessionId::new(session));
+        store.set(DeviceRoute::root(), PRESENCE, Presence::Alive { session });
+    }
+
+    /// Records the device at the root announcing `name` as `reply`.
+    fn record(store: &mut Store, name: &str, reply: &[u8]) -> SettingChange {
+        let route = DeviceRoute::root();
+        store.record_change(route, name.to_string(), None, reply.to_vec())
+    }
+
+    /// The proxy's store records each change under the table in force for
+    /// its device then. None is in force before the first table loads, from
+    /// an `rpc.hash` that names another table until that table loads, or
+    /// from a new session until its table loads. A change recorded meanwhile
+    /// reaches each receiver all the same, with no table.
+    #[test]
+    fn a_change_carries_the_table_in_force_when_it_is_recorded() {
+        let mut store = Store::new(true);
+        let route = DeviceRoute::root();
+        let changes = store.follow(route, CHANGES);
+        let (old, new) = (table_in(1, 7, Some(BYTE)), table_in(2, 7, Some(BYTE)));
+        alive(&mut store, 7);
+
+        record(&mut store, "test.amplitude", &[1]);
+        store.set_registry(route, Ok(Arc::clone(&old)));
+        record(&mut store, "test.amplitude", &[2]);
+        record(&mut store, "rpc.hash", &2u32.to_le_bytes());
+        record(&mut store, "test.amplitude", &[3]);
+        store.set_registry(route, Ok(Arc::clone(&new)));
+        record(&mut store, "test.amplitude", &[4]);
+        alive(&mut store, 8);
+        record(&mut store, "test.amplitude", &[5]);
+
+        let carried: Vec<_> = std::iter::from_fn(|| changes.try_recv().unwrap())
+            .map(|change| change.rpc_registry().map(Arc::as_ptr))
+            .collect();
+        let (old, new) = (Some(Arc::as_ptr(&old)), Some(Arc::as_ptr(&new)));
+        assert_eq!(carried, [None, old, None, None, new, None]);
+    }
+
+    /// A table is out of force from the moment the device's link
+    /// reconnects, whatever session the device reports then, until a table
+    /// whose load started after the reconnect is set. One whose load started
+    /// before is held but not in force.
+    #[test]
+    fn a_change_after_a_reconnect_carries_no_table_until_the_table_loads_again() {
+        let mut store = Store::new(true);
+        let route = DeviceRoute::root();
+        alive(&mut store, 7);
+        store.set_registry(route, Ok(table_in(1, 7, Some(BYTE))));
+
+        let started = store.epoch(route);
+        store.reconnect(route);
+        store.set(route, PRESENCE, Presence::Alive { session: None });
+        let unheard = record(&mut store, "test.amplitude", &[1]);
+        alive(&mut store, 7);
+        let beat = record(&mut store, "test.amplitude", &[2]);
+        store.set_loaded(route, Ok(table_in(1, 7, Some(BYTE))), started);
+        let across = record(&mut store, "test.amplitude", &[3]);
+        let reloaded = table_in(1, 7, Some(BYTE));
+        let started = store.epoch(route);
+        store.set_loaded(route, Ok(Arc::clone(&reloaded)), started);
+        let loaded = record(&mut store, "test.amplitude", &[4]);
+
+        assert!(unheard.rpc_registry().is_none());
+        assert!(beat.rpc_registry().is_none());
+        assert!(across.rpc_registry().is_none());
+        assert!(Arc::ptr_eq(loaded.rpc_registry().unwrap(), &reloaded));
+    }
+
+    /// A device whose heartbeats carry no session has its table in force
+    /// once it loads, though the table was read in a session, and its
+    /// changes decode.
+    #[test]
+    fn a_table_is_in_force_for_a_device_whose_heartbeats_carry_no_session() {
+        let mut store = Store::new(true);
+        let route = DeviceRoute::root();
+        store.set(route, PRESENCE, Presence::Alive { session: None });
+        store.set_registry(route, Ok(table_in(1, 7, Some(BYTE))));
+
+        let change = record(&mut store, "test.amplitude", &[5]);
+
+        assert_eq!(change.value().unwrap(), RpcValue::U64(5));
+    }
+
+    /// A change decodes with the table it was recorded under, after the
+    /// store holds a table that types its entry otherwise or lacks it, and a
+    /// change recorded under no table does not decode.
+    #[test]
+    fn a_change_decodes_with_its_own_table_after_the_store_moves_on() {
+        let mut store = Store::new(true);
+        let route = DeviceRoute::root();
+        alive(&mut store, 7);
+        let reply = 0x1234i16.to_le_bytes();
+
+        store.set_registry(route, Ok(table_in(1, 7, Some(BYTE))));
+        let byte = record(&mut store, "test.amplitude", &reply);
+        store.set_registry(route, Ok(table_in(2, 7, Some(SHORT))));
+        let short = record(&mut store, "test.amplitude", &reply);
+        store.set_registry(route, Ok(table_in(3, 7, None)));
+        let lacking = record(&mut store, "test.amplitude", &reply);
+        store.set_registry(route, Err(RpcRegistryError::TableChanged));
+        let unloaded = record(&mut store, "test.amplitude", &reply);
+
+        assert_eq!(byte.value().unwrap(), RpcValue::U64(0x34));
+        assert_eq!(short.value().unwrap(), RpcValue::I64(0x1234));
+        assert!(matches!(lacking.value(), Err(SettingValueError::NoEntry)));
+        assert!(matches!(unloaded.value(), Err(SettingValueError::NoTable)));
+        assert_eq!(unloaded.reply, reply);
     }
 
     /// A receiver that follows a value already held gets it at once, and a
@@ -474,6 +752,20 @@ mod tests {
         assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
     }
 
+    /// Every device made lost is lost at that moment on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_made_lost_is_dated_on_the_paused_clock() {
+        let mut store = Store::new(false);
+        let route = DeviceRoute::root();
+        store.set(route, PRESENCE, Presence::Connecting);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        store.mark_lost();
+
+        let since = tokio::time::Instant::now().into_std();
+        assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
+    }
+
     /// Setting changes are queued in full, and a receiver that overflows its
     /// queue is told how many it missed.
     #[test]
@@ -493,7 +785,7 @@ mod tests {
         }
 
         store.set(route, CHANGES, change(sent));
-        assert_eq!(changes.try_recv(), Err(RecvError::Lagged(10)));
+        assert_eq!(changes.try_recv().err(), Some(RecvError::Lagged(10)));
         assert_eq!(
             changes.try_recv().unwrap().map(|change| change.seq),
             Some(Some(sent))

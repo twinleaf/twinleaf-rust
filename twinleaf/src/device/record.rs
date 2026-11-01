@@ -8,7 +8,7 @@
 use super::connection::DeviceTree;
 use super::state::MetadataState;
 use super::stream::{Receiver, RecvError};
-use crate::data::{BoundaryReason, PacketParser, RowSource};
+use crate::data::{announces_stop, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
 use crate::tio;
 use crate::tio::packet;
@@ -80,25 +80,25 @@ impl<W: Write> Transcript<W> {
     }
 
     /// Scans one tapped packet as replay will, then writes what replay needs.
-    /// That is the samples the parser validated and the markers replay resets
-    /// on.
+    /// That is the samples the parser validated, the markers replay resets
+    /// on, and the stops a device announces, which replay tells restarts by.
     fn packet(&mut self, packet: &tio::Packet) -> Result<(), RecordError> {
         if let RecordMode::Raw = self.mode {
             return self.write(packet);
         }
         let route = packet.route();
         let (validated, lost) = match self.parser.scan_packet(packet) {
-            Ok(Some(rows)) => match rows.boundary() {
-                Some(BoundaryReason::SamplesLost { expected, received }) => {
-                    let lost = received.wrapping_sub(*expected);
+            Ok(Some(rows)) => match rows.boundary().and_then(|b| b.loss.as_ref()) {
+                Some(loss) => {
                     log::warn!(
-                        "{}/{} dropped {lost} samples",
+                        "{}/{} dropped {} samples",
                         rows.stream_key().route,
-                        rows.schema().stream().name()
+                        rows.schema().stream().name(),
+                        loss.samples
                     );
-                    (true, u64::from(lost))
+                    (true, loss.samples)
                 }
-                Some(_) | None => (true, 0),
+                None => (true, 0),
             },
             Ok(None) => (false, 0),
             Err(error) => {
@@ -123,6 +123,7 @@ impl<W: Write> Transcript<W> {
                 None => Ok(()),
             },
             packet::Payload::Metadata(..) => self.describe(route),
+            packet::Payload::Setting(setting) if announces_stop(&setting) => self.write(packet),
             packet::Payload::ProxyTx(_)
             | packet::Payload::ProxyRx(
                 packet::ProxyRx::Reply(_)
@@ -366,7 +367,7 @@ enum Woken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{LogFile, SampleBatch};
+    use crate::data::{Change, LogFile, SampleBatch};
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::sync::Epoch;
@@ -630,11 +631,77 @@ mod tests {
 
         assert_eq!(file.samples_lost, 4, "the samples between the two packets");
         let recorded = recorded(&file, "gap");
-        let Some(BoundaryReason::SamplesLost { expected, received }) = recorded[1].boundary()
-        else {
-            panic!("replay reports the same gap the recorder did");
+        let boundary = recorded[1].boundary().expect("replay reports the gap");
+        let loss = boundary.loss.as_ref().expect("replay reports the gap");
+        assert_eq!(boundary.change, None);
+        assert_eq!(
+            (loss.samples, loss.expected.map(|n| n.value())),
+            (4, Some(1)),
+            "replay reports the same gap the recorder did"
+        );
+    }
+
+    /// Samples lost across a rollover count as lost, as the rollover names
+    /// them.
+    #[test]
+    fn a_loss_across_a_rollover_is_counted() {
+        let route = DeviceRoute::root();
+        let mut file = transcript();
+
+        describe(&mut file, 1, route);
+        file.packet(&samples_in(0, 0, route)).unwrap();
+        let wire::Metadata::Segment(mut next) = metadata_records(1)[2] else {
+            panic!("the third record describes a segment");
         };
-        assert_eq!((expected.value(), received.value()), (1, 5));
+        (next.segment_id, next.start_time) = (SegmentId::new(1), 1);
+        file.packet(&broadcast(wire::Metadata::Segment(next), route))
+            .unwrap();
+        file.packet(&samples_in(1, 2, route)).unwrap();
+
+        assert_eq!(
+            file.samples_lost, 2,
+            "sample 0 of the first segment ends at its rollover, and sample 2 follows two lost"
+        );
+    }
+
+    /// A device's stop is recorded where it came, so replay reads the
+    /// samples of its next acquisition as a restart, and the recorder counts
+    /// no sample lost in the pause.
+    #[test]
+    fn a_recorded_stop_replays_as_a_restart() {
+        let route = DeviceRoute::root();
+        let mut file = transcript();
+
+        describe(&mut file, 1, route);
+        file.packet(&samples_in(0, 0, route)).unwrap();
+        let mut raw = [0u8; 64];
+        let stopped = crate::proto::settings::Setting {
+            name: b"dev.running",
+            seq: Some(1),
+            reply: &[0],
+        };
+        let len = stopped.write(&mut raw).expect("the announcement fits");
+        let (stopped, _) = Packet::from_slice_prefix(&raw[..len]).expect("a packet");
+        file.packet(&stopped.with_route(route)).unwrap();
+        let wire::Metadata::Segment(mut next) = metadata_records(1)[2] else {
+            panic!("the third record describes a segment");
+        };
+        (next.segment_id, next.start_time) = (SegmentId::new(1), 5);
+        file.packet(&broadcast(wire::Metadata::Segment(next), route))
+            .unwrap();
+        file.packet(&samples_in(1, 0, route)).unwrap();
+
+        assert_eq!(file.samples_lost, 0, "the pause holds no sample to lose");
+        let recorded = recorded(&file, "restart");
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[1].boundary().and_then(|b| b.change.clone()),
+            Some(Change::Restarted {
+                old_id: SegmentId::new(0),
+                new_id: SegmentId::new(1),
+            }),
+            "the recorded stop marks the restart on replay"
+        );
     }
 
     /// A reboot mid-recording: the samples of the new session wait for the
@@ -673,8 +740,8 @@ mod tests {
         );
         assert!(
             matches!(
-                recorded[1].boundary(),
-                Some(BoundaryReason::SessionChanged { .. })
+                recorded[1].boundary().and_then(|b| b.change.as_ref()),
+                Some(Change::SessionChanged { .. })
             ),
             "the recorded heartbeat splits the runs on replay"
         );

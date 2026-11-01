@@ -138,11 +138,11 @@ fn stop() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Returns the options a terminal hosts the proxy with, from `-p`, `-T` and
-/// the `--dump` flags. `name` says who hosts it.
+/// Returns the options a terminal hosts the proxy with, from `-p`,
+/// `--listen`, `-T` and the `--dump` flags. `name` says who hosts it.
 fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
     HostOptions {
-        listen: Listen::AllInterfaces,
+        listen: cli.listen.into(),
         port: cli.port,
         name: format!("{name} (pid {})", std::process::id()),
         reconnect_timeout: cli.reconnect_timeout.map(Duration::from_secs),
@@ -157,8 +157,8 @@ fn host_options(cli: &ProxyCli, name: &str) -> HostOptions {
 }
 
 /// Hosts a proxy with `options`. When the port is taken, the error says
-/// whether a proxy or something else, such as a 1.x `tio proxy`, holds it,
-/// and suggests what to do.
+/// whether a proxy of this build or something else, such as a `tio proxy`
+/// from an older build, holds it, and suggests what to do.
 fn host(options: HostOptions) -> eyre::Result<Proxy> {
     use color_eyre::Help;
 
@@ -667,6 +667,20 @@ mod mdns_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal proxy listens on every interface unless `--listen` names
+    /// loopback.
+    #[test]
+    fn a_terminal_proxy_listens_where_listen_says() {
+        use clap::Parser;
+        let listen = |args: &[&str]| {
+            let cli = ProxyCli::parse_from(["tio-proxy"].iter().chain(args));
+            host_options(&cli, "a test").listen
+        };
+        assert_eq!(listen(&[]), Listen::AllInterfaces);
+        assert_eq!(listen(&["--listen", "all"]), Listen::AllInterfaces);
+        assert_eq!(listen(&["--listen", "loopback"]), Listen::Loopback);
+    }
 
     fn route(path: &str) -> DeviceRoute {
         path.parse().unwrap()

@@ -6,9 +6,10 @@
 //! reads through a session, as an app does, so its [`Handle`] can call
 //! `dev.metadata`, load the RPC table and read the settings of each device.
 //! It follows each device's presence from the packets it hears and the
-//! link's statuses,
-//! and loses a device silent for [`QUIET`], or one a reconnect left
-//! connecting that stays silent as long. It collects the metadata of each
+//! link's statuses, and loses a device silent for [`QUIET`], or one a
+//! reconnect left connecting that stays silent as long. A device heard again
+//! after it was lost has reconnected, just as one whose link reconnected
+//! has, and its table is loaded again. It collects the metadata of each
 //! device a watch follows, and publishes it once it is complete. It loads
 //! the RPC table and keeps the settings of each device it has heard whose
 //! table a watch follows, on a worker task per device. The engine holds each
@@ -46,9 +47,9 @@ use super::Watch;
 use crate::data::{MetadataQuery, PacketParser};
 use crate::device::rpc::{PendingReply, RpcRegistry};
 use crate::device::session::{Handle, Inlet, RawCallResult, Received, Session};
-use crate::device::store::{pruned, Store, CHANGES, METADATA, PRESENCE};
+use crate::device::store::{pruned, rpc_hash, Store, METADATA, PRESENCE};
 use crate::device::stream::Queued;
-use crate::device::{MetadataState, Presence, SettingChange, Settings};
+use crate::device::{MetadataState, Presence, Settings};
 use crate::proto::{DeviceRoute, RouteError};
 use crate::rt::{lock, sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
@@ -86,22 +87,7 @@ pub(super) fn serve(
     session: Session,
     tasks: &Supervisor,
 ) -> impl std::future::Future<Output = ()> {
-    // An inlet with room for every packet a `usize` can count has no limit.
-    let inlet = session.attach(usize::MAX);
-    lock(&store).list(DeviceRoute::root(), []);
-    let engine = Engine {
-        store: Arc::clone(&store),
-        mounts: Arc::clone(&mounts),
-        schedule: MetadataSchedule::new(Handle::root(session.clone())),
-        handle: Handle::root(session),
-        inlet,
-        parser: PacketParser::new(false),
-        metadata_seen: HashMap::new(),
-        heard: HashMap::new(),
-        demand: BTreeSet::new(),
-        tasks: tasks.clone(),
-        workers: HashMap::new(),
-    };
+    let engine = Engine::new(&store, &mounts, session, tasks);
     async move {
         engine.run().await;
         lock(&store).end_all(None);
@@ -347,16 +333,39 @@ struct WorkerHold {
 }
 
 impl Engine {
+    /// Returns the engine of the link that `session` reaches, which keeps
+    /// `store` and feeds `mounts`, with its workers on `tasks`. It attaches
+    /// to the session at once.
+    fn new(
+        store: &Arc<Mutex<Store>>,
+        mounts: &Arc<Mounts>,
+        session: Session,
+        tasks: &Supervisor,
+    ) -> Engine {
+        // An inlet with room for every packet a `usize` can count has no limit.
+        let inlet = session.attach(usize::MAX);
+        lock(store).list(DeviceRoute::root(), []);
+        Engine {
+            store: Arc::clone(store),
+            mounts: Arc::clone(mounts),
+            schedule: MetadataSchedule::new(Handle::root(session.clone())),
+            handle: Handle::root(session),
+            inlet,
+            parser: PacketParser::new(false),
+            metadata_seen: HashMap::new(),
+            heard: HashMap::new(),
+            demand: BTreeSet::new(),
+            tasks: tasks.clone(),
+            workers: HashMap::new(),
+        }
+    }
+
     /// Runs until the session over the link's port ends.
     async fn run(mut self) {
         let store = Arc::clone(&self.store);
         let followed = Arc::clone(&lock(&self.store).followed);
         loop {
-            let quiet = self.heard.values().map(|at| *at + QUIET).min();
-            let unwatched = self.workers.values().filter_map(|hold| hold.unwatched);
-            let linger = unwatched.min().map(|since| since + LINGER);
-            let wake = [self.schedule.next_retry(), quiet, linger];
-            let wake = wake.into_iter().flatten().min();
+            let wake = self.next_wake();
             tokio::select! {
                 biased;
                 () = followed.notified() => self.follow_demand(),
@@ -375,6 +384,18 @@ impl Engine {
             }
             self.discover();
         }
+    }
+
+    /// Returns the earliest moment the engine has work that no packet
+    /// brings, which is a metadata retry of a route it asks, a device going
+    /// quiet, or the end of a worker's linger. A retry of a route the engine
+    /// does not ask is never due, so it sets no wake.
+    fn next_wake(&self) -> Option<Instant> {
+        let retry = self.schedule.next_retry(asked(&self.heard, &self.demand));
+        let quiet = self.heard.values().map(|at| *at + QUIET).min();
+        let unwatched = self.workers.values().filter_map(|hold| hold.unwatched);
+        let linger = unwatched.min().map(|since| since + LINGER);
+        [retry, quiet, linger].into_iter().flatten().min()
     }
 
     /// Takes `first` and what else the inlet holds now, in order. Takes each
@@ -462,13 +483,18 @@ impl Engine {
             return self.apply_status(route, status);
         }
         self.heard.insert(route, Instant::now());
-        let mut store = lock(&self.store);
+        let shared = Arc::clone(&self.store);
+        let mut store = lock(&shared);
         let new = !store.routes().contains(&route);
         if new {
             store.list(DeviceRoute::root(), [route]);
         }
         let held = match store.value(route, PRESENCE) {
             Some(Presence::Alive { session }) => Some(session),
+            Some(Presence::Lost { .. }) => {
+                self.reconnect(&mut store, route);
+                None
+            }
             _ => None,
         };
         let session = match packet.payload() {
@@ -491,16 +517,16 @@ impl Engine {
                 },
             ),
             packet::Payload::Setting(setting) => {
-                if let Some(hash) = rpc_hash(&setting) {
+                if let Some(hash) = rpc_hash(setting.name, setting.reply) {
                     self.tell(route, DeviceEvent::NewHash(Some(hash)));
                 }
                 if let Some(name) = setting.name_str() {
-                    let change = SettingChange {
-                        name: name.to_string(),
-                        seq: setting.seq,
-                        reply: setting.reply.to_vec(),
-                    };
-                    lock(&self.store).set(route, CHANGES, change.clone());
+                    let change = lock(&self.store).record_change(
+                        route,
+                        name.to_string(),
+                        setting.seq,
+                        setting.reply.to_vec(),
+                    );
                     self.tell(route, DeviceEvent::Setting(change));
                 }
             }
@@ -522,7 +548,7 @@ impl Engine {
             | LinkStatus::Stopped
             | LinkStatus::FailedToConnect
             | LinkStatus::FailedToReconnect => Presence::Lost {
-                since: std::time::Instant::now(),
+                since: Instant::now().into_std(),
             },
             LinkStatus::SensorReconnected => Presence::Connecting,
             LinkStatus::Unknown(_) => return,
@@ -538,7 +564,8 @@ impl Engine {
         // A device a receiver follows that was not heard yet goes with its
         // link too.
         let mut forgotten = Vec::new();
-        let mut store = lock(&self.store);
+        let shared = Arc::clone(&self.store);
+        let mut store = lock(&shared);
         let followed = self.demand.iter().map(|watch| &watch.route);
         let served: BTreeSet<_> = store
             .routes()
@@ -557,14 +584,24 @@ impl Engine {
                 forgotten.push(route);
             }
             if presence == Presence::Connecting {
-                self.heard.insert(route, Instant::now());
-                self.tell(route, DeviceEvent::NewHash(None));
+                self.reconnect(&mut store, route);
             }
         }
         drop(store);
         for route in forgotten {
             self.set_metadata(route, MetadataState::Pending);
         }
+    }
+
+    /// Takes the device at `route` as reconnected, as its link reconnected
+    /// or it was heard again after it was lost. A reconnected device may run
+    /// another table, so `store` holds its table out of force until the
+    /// worker loads it again, and the engine loses the device unless it
+    /// speaks within [`QUIET`].
+    fn reconnect(&mut self, store: &mut Store, route: DeviceRoute) {
+        self.heard.insert(route, Instant::now());
+        store.reconnect(route);
+        self.tell(route, DeviceEvent::NewHash(None));
     }
 
     /// Loses each device silent for [`QUIET`].
@@ -574,7 +611,7 @@ impl Engine {
         self.heard.retain(|route, at| {
             let heard = *at + QUIET > now;
             if !heard {
-                let since = std::time::Instant::now();
+                let since = now.into_std();
                 store.set(*route, PRESENCE, Presence::Lost { since });
             }
             heard
@@ -617,32 +654,34 @@ impl Engine {
         }
     }
 
-    /// Asks each device a receiver follows, heard and due, for whatever
-    /// metadata the parser still wants.
+    /// Asks each device the engine asks that is due for whatever metadata
+    /// the parser still wants.
     fn discover(&mut self) {
-        let demand = &self.demand;
-        let followed = self.heard.keys().copied();
-        let followed = followed.filter(|route| {
-            demand.contains(&Watch {
-                route: *route,
-                table: false,
-            })
-        });
-        let due = self.schedule.due(followed, Instant::now());
+        let asked = asked(&self.heard, &self.demand);
+        let due = self.schedule.due(asked, Instant::now());
         for route in due {
             self.schedule.submit(&mut self.parser, route);
         }
     }
 }
 
-/// Returns the RPC table hash from an `rpc.hash` setting, a little-endian
-/// `u32`, or `None` for any other setting.
-fn rpc_hash(setting: &crate::proto::settings::Setting<'_>) -> Option<u32> {
-    let value = setting
-        .reply
-        .get(..4)
-        .filter(|_| setting.name == b"rpc.hash")?;
-    Some(u32::from_le_bytes(value.try_into().ok()?))
+/// Returns each route the engine asks for metadata, given when each device
+/// was `heard` and the `demand` of the store's receivers. That is each
+/// device heard whose metadata a receiver follows. [`Engine::discover`]
+/// asks these routes and [`Engine::next_wake`] wakes for their retries
+/// alone. A route that is not asked, as its device was lost or no receiver
+/// follows it, keeps its backoff, and sets no wake until it is asked again.
+fn asked<'a>(
+    heard: &'a HashMap<DeviceRoute, Instant>,
+    demand: &'a BTreeSet<Watch>,
+) -> impl Iterator<Item = DeviceRoute> + 'a {
+    let followed = |route: &DeviceRoute| {
+        demand.contains(&Watch {
+            route: *route,
+            table: false,
+        })
+    };
+    heard.keys().copied().filter(followed)
 }
 
 /// Starts the worker that loads the RPC table of the device at `route`
@@ -684,6 +723,9 @@ impl Worker {
     /// session calls for loading it again, until the engine lets go.
     async fn run(self) {
         while !self.events.is_disconnected() {
+            // A load that started before the device last reconnected may have
+            // read the device as it was before, so it puts no table in force.
+            let started = lock(&self.store).epoch(self.route);
             let loaded = RpcRegistry::load_with(|name, arg| self.submit(name, arg)).await;
             let registry = loaded.map(Arc::new);
             {
@@ -691,7 +733,7 @@ impl Worker {
                 if self.events.is_disconnected() {
                     return;
                 }
-                store.set_registry(self.route, registry.clone());
+                store.set_loaded(self.route, registry.clone(), started);
             }
             let tracked = match registry {
                 Ok(registry) => self.track(&registry).await,
@@ -794,15 +836,18 @@ mod tests {
     use crate::device::fixtures::{
         announcement, broadcast, description, device_reply, samples, segment_record, wait_for,
     };
+    use crate::device::rpc::RpcValue;
     use crate::device::session::TestProxy;
-    use crate::device::store::{Field, REGISTRY, SETTINGS};
+    use crate::device::store::{Field, CHANGES, REGISTRY, SETTINGS};
     use crate::device::stream::{Receiver, RecvError, Scope};
+    use crate::device::RegistryState;
     use crate::proto::data as wire;
     use crate::proto::rpc as wire_rpc;
     use crate::proto::SessionId;
     use crate::proxy::control::Joined;
     use crate::rt::Supervisor;
     use crate::tio::packet::{Payload, ProxyRx};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant as StdInstant;
 
     /// Feeds a client the whole link, with watch 1 following the metadata
@@ -1516,6 +1561,30 @@ mod tests {
         while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
     }
 
+    /// A device silent for [`QUIET`] is lost then on the paused clock, the
+    /// moment its presence gives is that one, and how long ago the proxy
+    /// says it was lost follows the paused clock after.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_loss_and_its_moment_follow_the_paused_clock() {
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
+        let device = route("/1");
+        let followed = presence(&store, device);
+        proxy.send(Packet::heartbeat(device));
+        while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
+        let heard = Instant::now();
+
+        let now = followed.recv_async().await;
+        let Ok(Presence::Lost { since }) = now else {
+            panic!("the device was not lost, got {now:?}");
+        };
+        assert_eq!(heard.elapsed(), QUIET);
+        assert_eq!(since, (heard + QUIET).into_std());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let lost = Update::presence(Presence::Lost { since });
+        assert_eq!(lost, Update::Presence(Err(Some(60_000))));
+    }
+
     /// A device's metadata is pending until it is complete, and pending
     /// again once its link drops it.
     #[test]
@@ -1564,18 +1633,14 @@ mod tests {
         proxy.send(announcement("rpc.hash", None, &7u32.to_le_bytes(), device));
         let first = changes.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
-            first,
-            SettingChange {
-                name: "test.amplitude".to_string(),
-                seq: Some(9),
-                reply: vec![1],
-            }
+            (first.name.as_str(), first.seq, first.reply),
+            ("test.amplitude", Some(9), vec![1])
         );
         let hash = changes.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((hash.name.as_str(), hash.seq), ("rpc.hash", None));
         assert_eq!(
-            elsewhere.recv_timeout(Duration::from_millis(200)),
-            Err(RecvError::Timeout),
+            elsewhere.recv_timeout(Duration::from_millis(200)).err(),
+            Some(RecvError::Timeout),
             "another device's announcement is not this device's change"
         );
     }
@@ -1588,47 +1653,288 @@ mod tests {
     /// setting and `settings.version` would, until no call comes for a
     /// while. Returns how many times the table was loaded.
     fn answer_table(proxy: &TestProxy) -> std::thread::JoinHandle<usize> {
+        answer_tables(proxy, Arc::new(AtomicU32::new(TABLE_HASH)))
+    }
+
+    /// Answers as [`answer_table`] does, as a device whose table has the
+    /// hash that `hash` holds at each call. A table with an odd hash lists
+    /// the announced setting, and one with an even hash hides it.
+    fn answer_tables(proxy: &TestProxy, hash: Arc<AtomicU32>) -> std::thread::JoinHandle<usize> {
         let (sent, deliver) = (proxy.sent.clone(), proxy.deliver.clone());
         std::thread::spawn(move || {
             let proxy = TestProxy { sent, deliver };
-            let table = [("test.amplitude", 0xA310u16), ("settings.version", 0x8140)];
             let mut loads = 0;
             while let Ok(packet) = proxy.sent.recv_timeout(Duration::from_secs(2)) {
-                let packet::Payload::RpcRequest(request) = packet.payload() else {
-                    continue;
-                };
-                let wire_rpc::Method::ByName(name) = request.method else {
-                    continue;
-                };
-                let (id, route) = (request.id.value(), packet.route());
-                let reply = match std::str::from_utf8(name).expect("a UTF-8 name") {
-                    "dev.name" => {
-                        loads += 1;
-                        TABLE_DEVICE.as_bytes().to_vec()
-                    }
-                    "rpc.hash" => TABLE_HASH.to_le_bytes().to_vec(),
-                    "dev.session" => 7u32.to_le_bytes().to_vec(),
-                    "rpc.listinfo" if request.args.is_empty() => {
-                        (table.len() as u16).to_le_bytes().to_vec()
-                    }
-                    "rpc.listinfo" => {
-                        let index = u16::from_le_bytes([request.args[0], request.args[1]]);
-                        let (name, meta) = table[usize::from(index)];
-                        let mut reply = meta.to_le_bytes().to_vec();
-                        reply.extend_from_slice(name.as_bytes());
-                        reply
-                    }
-                    "settings.version" => 5u32.to_le_bytes().to_vec(),
-                    "test.amplitude" => vec![1],
-                    _ => {
-                        proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
-                        continue;
-                    }
-                };
-                proxy.reply(id, &reply, route);
+                let asked = answer(&proxy, &packet, hash.load(Ordering::SeqCst));
+                loads += usize::from(asked.as_deref() == Some("dev.name"));
             }
             loads
         })
+    }
+
+    /// Answers `packet` as the device of [`answer_tables`] does, with the
+    /// table of hash `hash`. Returns the name of the RPC it calls, if it is
+    /// a call by name.
+    fn answer(proxy: &TestProxy, packet: &Packet, hash: u32) -> Option<String> {
+        let listed = [("test.amplitude", 0xA310u16), ("settings.version", 0x8140)];
+        let table = &listed[usize::from(hash.is_multiple_of(2))..];
+        let packet::Payload::RpcRequest(request) = packet.payload() else {
+            return None;
+        };
+        let wire_rpc::Method::ByName(name) = request.method else {
+            return None;
+        };
+        let (id, route) = (request.id.value(), packet.route());
+        let name = std::str::from_utf8(name).expect("a UTF-8 name");
+        let reply = match name {
+            "dev.name" => TABLE_DEVICE.as_bytes().to_vec(),
+            "rpc.hash" => hash.to_le_bytes().to_vec(),
+            "dev.session" => 7u32.to_le_bytes().to_vec(),
+            "rpc.listinfo" if request.args.is_empty() => {
+                (table.len() as u16).to_le_bytes().to_vec()
+            }
+            "rpc.listinfo" => {
+                let index = u16::from_le_bytes([request.args[0], request.args[1]]);
+                let (name, meta) = table[usize::from(index)];
+                let mut reply = meta.to_le_bytes().to_vec();
+                reply.extend_from_slice(name.as_bytes());
+                reply
+            }
+            "settings.version" => 5u32.to_le_bytes().to_vec(),
+            "test.amplitude" => vec![1],
+            _ => {
+                proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
+                return Some(name.to_string());
+            }
+        };
+        proxy.reply(id, &reply, route);
+        Some(name.to_string())
+    }
+
+    /// A change the device announces after an `rpc.hash` that names another
+    /// table carries no table until that table loads, and the new table
+    /// after. A change recorded before keeps the old table, and decodes with
+    /// it while the store holds a new one that lacks its entry.
+    #[test]
+    fn a_change_after_a_new_table_carries_the_new_table() {
+        const SWITCHED: u32 = 0x5747_e101;
+        let forget = || {
+            for hash in [SWITCHED, SWITCHED + 1] {
+                if let Some(cached) = crate::device::rpc::cache::path(TABLE_DEVICE, hash) {
+                    let _ = std::fs::remove_file(cached);
+                }
+            }
+        };
+        forget();
+        let (store, proxy) = engine();
+        let root = DeviceRoute::root();
+        let hash = Arc::new(AtomicU32::new(SWITCHED));
+        let answering = answer_tables(&proxy, Arc::clone(&hash));
+        proxy.send(Packet::heartbeat(root));
+        let (tables, changes) = (
+            follow(&store, root, REGISTRY),
+            follow(&store, root, CHANGES),
+        );
+        let wait = Duration::from_secs(5);
+        let old = tables.recv_timeout(wait).unwrap().expect("the table loads");
+
+        proxy.send(announcement("test.amplitude", Some(6), &[2], root));
+        let before = changes.recv_timeout(wait).unwrap();
+        hash.store(SWITCHED + 1, Ordering::SeqCst);
+        let announced = (SWITCHED + 1).to_le_bytes();
+        proxy.send(announcement("rpc.hash", Some(7), &announced, root));
+        proxy.send(announcement("test.amplitude", Some(8), &[3], root));
+        let new = tables
+            .recv_timeout(wait)
+            .unwrap()
+            .expect("the new table loads");
+        proxy.send(announcement("test.amplitude", Some(9), &[4], root));
+        let carried: Vec<_> = (0..3)
+            .map(|_| changes.recv_timeout(wait).unwrap())
+            .map(|change| change.rpc_registry().map(Arc::as_ptr))
+            .collect();
+
+        assert_eq!(new.hash, Some(SWITCHED + 1));
+        assert!(Arc::ptr_eq(before.rpc_registry().unwrap(), &old));
+        assert_eq!(carried, [None, None, Some(Arc::as_ptr(&new))]);
+        assert_eq!(before.value().unwrap(), RpcValue::U64(2));
+        drop((tables, changes));
+        answering.join().expect("the device answers");
+        forget();
+    }
+
+    /// A device heard again after its link reconnects reports no session
+    /// until its next heartbeat, so a setting it announces before then
+    /// carries no table, while the store still holds the table read in its
+    /// session.
+    #[test]
+    fn a_change_before_the_first_heartbeat_after_a_reconnect_carries_no_table() {
+        forget_table();
+        let (store, proxy) = engine();
+        let root = DeviceRoute::root();
+        let answering = answer_table(&proxy);
+        proxy.send(Packet::heartbeat(root));
+        let (tables, changes) = (
+            follow(&store, root, REGISTRY),
+            follow(&store, root, CHANGES),
+        );
+        let wait = Duration::from_secs(5);
+        let table = tables.recv_timeout(wait).unwrap().expect("the table loads");
+
+        proxy.send(announcement("test.amplitude", Some(6), &[2], root));
+        let before = changes.recv_timeout(wait).unwrap();
+        proxy.send(Packet::link(LinkStatus::SensorReconnected));
+        proxy.send(announcement("test.amplitude", Some(7), &[3], root));
+        let after = changes.recv_timeout(wait).unwrap();
+
+        assert!(Arc::ptr_eq(before.rpc_registry().unwrap(), &table));
+        assert!(after.rpc_registry().is_none());
+        drop((tables, changes));
+        answering.join().expect("the device answers");
+        forget_table();
+    }
+
+    /// A table whose load was in flight when the link reconnected is held
+    /// once it lands, but is not in force, so a change recorded then carries
+    /// no table. The load the reconnect calls for puts its table in force.
+    #[test]
+    fn a_table_loaded_across_a_reconnect_is_not_in_force() {
+        forget_table();
+        let (store, proxy) = engine();
+        let root = DeviceRoute::root();
+        proxy.send(Packet::heartbeat(root));
+        let (tables, changes) = (
+            follow(&store, root, REGISTRY),
+            follow(&store, root, CHANGES),
+        );
+        let wait = Duration::from_secs(5);
+        let deadline = StdInstant::now() + wait;
+        let name_of = |packet: &Packet| match packet.payload() {
+            packet::Payload::RpcRequest(request) => match request.method {
+                wire_rpc::Method::ByName(name) => name.to_vec(),
+                wire_rpc::Method::ById(_) => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+
+        // The load is in flight once the worker asks the device's name.
+        let mut asked = Vec::new();
+        while asked
+            .last()
+            .is_none_or(|packet| name_of(packet) != b"dev.name")
+        {
+            asked.push(proxy.sent.recv_timeout(wait).expect("the worker loads"));
+        }
+        proxy.send(Packet::link(LinkStatus::SensorReconnected));
+        for packet in &asked {
+            answer(&proxy, packet, TABLE_HASH);
+        }
+        let landed = loop {
+            assert!(StdInstant::now() < deadline, "the load never landed");
+            if let Ok(Some(loaded)) = tables.try_recv() {
+                break loaded.expect("the table loads");
+            }
+            if let Ok(packet) = proxy.sent.recv_timeout(Duration::from_millis(20)) {
+                answer(&proxy, &packet, TABLE_HASH);
+            }
+        };
+        proxy.send(announcement("test.amplitude", Some(6), &[2], root));
+        let across = changes.recv_timeout(wait).unwrap();
+
+        let answering = answer_table(&proxy);
+        let reloaded = tables
+            .recv_timeout(wait)
+            .unwrap()
+            .expect("the table loads again");
+        proxy.send(announcement("test.amplitude", Some(7), &[3], root));
+        let after = changes.recv_timeout(wait).unwrap();
+
+        assert!(across.rpc_registry().is_none());
+        assert!(!Arc::ptr_eq(&landed, &reloaded));
+        assert!(Arc::ptr_eq(after.rpc_registry().unwrap(), &reloaded));
+        drop((tables, changes));
+        answering.join().expect("the device answers");
+        forget_table();
+    }
+
+    /// A device heard again after it went quiet has reconnected, though its
+    /// link reported nothing, as a port of a hub that is plugged in again
+    /// does. A change it announces before its table loads again carries no
+    /// table, even as its heartbeats report no session, and the table the
+    /// reconnect calls for is in force once it loads.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_heard_again_after_going_quiet_loads_its_table_again() {
+        const QUIETED: u32 = 0x5747_e201;
+        let forget = || {
+            if let Some(cached) = crate::device::rpc::cache::path(TABLE_DEVICE, QUIETED) {
+                let _ = std::fs::remove_file(cached);
+            }
+        };
+        forget();
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
+        let device = route("/1");
+        let (tables, changes, followed) = (
+            follow(&store, device, REGISTRY),
+            follow(&store, device, CHANGES),
+            presence(&store, device),
+        );
+        proxy.send(Packet::heartbeat(device));
+        let old = answer_until_loaded(&proxy, &tables, QUIETED).await;
+        answer_until_idle(&proxy, QUIETED).await;
+        proxy.send(announcement("test.amplitude", Some(6), &[2], device));
+        let before = changes.recv_async().await.unwrap();
+
+        let quiet = Instant::now();
+        while !followed.recv_async().await.as_ref().is_ok_and(lost) {}
+        assert!(quiet.elapsed() >= QUIET, "lost after {:?}", quiet.elapsed());
+        proxy.send(Packet::heartbeat(device));
+        proxy.send(announcement("test.amplitude", Some(7), &[3], device));
+        let after_quiet = changes.recv_async().await.unwrap();
+        assert!(
+            after_quiet.rpc_registry().is_none(),
+            "the table read before the device went quiet is in force"
+        );
+        let reloading = answer_until_loaded(&proxy, &tables, QUIETED);
+        let new = tokio::time::timeout(QUIET, reloading)
+            .await
+            .expect("the table loads again");
+        answer_until_idle(&proxy, QUIETED).await;
+        proxy.send(announcement("test.amplitude", Some(8), &[4], device));
+        let after_reload = changes.recv_async().await.unwrap();
+
+        assert!(Arc::ptr_eq(before.rpc_registry().unwrap(), &old));
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(Arc::ptr_eq(after_reload.rpc_registry().unwrap(), &new));
+        forget();
+    }
+
+    /// Answers each call the session writes as the device of
+    /// [`answer_tables`] with the table of hash `hash` does, until a table
+    /// lands in `tables`. Returns the table.
+    async fn answer_until_loaded(
+        proxy: &TestProxy,
+        tables: &Receiver<RegistryState>,
+        hash: u32,
+    ) -> Arc<RpcRegistry> {
+        loop {
+            tokio::select! {
+                biased;
+                table = tables.recv_async() => return table.unwrap().expect("the table loads"),
+                packet = proxy.sent.recv_async() => {
+                    answer(proxy, &packet.unwrap(), hash);
+                }
+            }
+        }
+    }
+
+    /// Answers each call the session writes as [`answer_until_loaded`]
+    /// does, until none comes for a while.
+    async fn answer_until_idle(proxy: &TestProxy, hash: u32) {
+        let idle = Duration::from_millis(100);
+        while let Ok(packet) = tokio::time::timeout(idle, proxy.sent.recv_async()).await {
+            answer(proxy, &packet.unwrap(), hash);
+        }
     }
 
     fn forget_table() {
@@ -1703,18 +2009,16 @@ mod tests {
     /// at once. Then the worker stops and the table is dropped, so a device
     /// no one asks is never walked again and no one is handed a table no
     /// one keeps current.
-    #[test]
-    fn a_table_no_receiver_follows_is_dropped_after_its_linger() {
+    #[tokio::test(start_paused = true)]
+    async fn a_table_no_receiver_follows_is_dropped_after_its_linger() {
         forget_table();
-        let (store, proxy) = engine();
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
         let root = DeviceRoute::root();
-        let answering = answer_table(&proxy);
         proxy.send(Packet::heartbeat(root));
         let registry = follow(&store, root, REGISTRY);
-        registry
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        answer_until_loaded(&proxy, &registry, TABLE_HASH).await;
+        answer_until_idle(&proxy, TABLE_HASH).await;
         drop(registry);
         let again = follow(&store, root, REGISTRY);
         assert!(
@@ -1723,26 +2027,36 @@ mod tests {
         );
         drop(again);
 
-        std::thread::sleep(LINGER * 4);
+        tokio::time::sleep(LINGER / 2).await;
+        assert!(
+            lock(&store).value(root, REGISTRY).is_some(),
+            "the table was dropped before its linger ended"
+        );
+        tokio::time::sleep(LINGER).await;
         assert!(
             lock(&store).value(root, REGISTRY).is_none(),
             "the table outlived its worker"
         );
         proxy.send(Packet::link(LinkStatus::SensorReconnected));
-        assert_eq!(answering.join().expect("the device answers"), 1);
+        let asked = tokio::time::timeout(RELOAD_DELAY * 2, proxy.sent.recv_async()).await;
+        assert!(asked.is_err(), "a stopped worker loaded the table again");
         forget_table();
     }
 
     /// A table that failed to load is loaded again after [`RELOAD_DELAY`]
     /// only once its device is heard, so a worker never asks a device that
-    /// is not there again and again.
-    #[test]
-    fn a_table_that_failed_loads_again_only_once_its_device_is_heard() {
-        let (store, proxy) = engine();
+    /// is not there again and again. The device stays alive over the wait
+    /// on samples, which its worker does not hear.
+    #[tokio::test(start_paused = true)]
+    async fn a_table_that_failed_loads_again_only_once_its_device_is_heard() {
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
         let device = route("/9");
         let registry = follow(&store, device, REGISTRY);
         proxy.send(Packet::heartbeat(device));
-        while let Ok(packet) = proxy.sent.recv_timeout(Duration::from_millis(500)) {
+        let idle = Duration::from_millis(500);
+        while let Ok(packet) = tokio::time::timeout(idle, proxy.sent.recv_async()).await {
+            let packet = packet.unwrap();
             if let packet::Payload::RpcRequest(request) = packet.payload() {
                 proxy.refuse(
                     request.id.value(),
@@ -1751,18 +2065,24 @@ mod tests {
                 );
             }
         }
-        let failed = registry
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the failure");
+        let failed = registry.recv_async().await.expect("the failure");
         assert!(failed.is_err(), "{failed:?}");
 
-        assert!(
-            !wrote_within(&proxy, RELOAD_DELAY + Duration::from_secs(1)),
-            "a device never heard was asked again"
-        );
+        let sampling = async {
+            loop {
+                proxy.send(samples(0, device));
+                tokio::time::sleep(QUIET / 2).await;
+            }
+        };
+        tokio::select! {
+            () = sampling => unreachable!(),
+            asked = tokio::time::timeout(RELOAD_DELAY * 2, proxy.sent.recv_async()) => {
+                assert!(asked.is_err(), "a device not heard since was asked again");
+            }
+        }
         proxy.send(Packet::heartbeat(device));
-        let (asked, ..) = proxy.call();
-        assert_eq!(asked, device);
+        let asked = proxy.sent.recv_async().await.unwrap();
+        assert_eq!(asked.route(), device);
     }
 
     /// A worker's task ends once the engine lets go of its device, sooner
@@ -1870,6 +2190,27 @@ mod tests {
         );
     }
 
+    /// A device whose link fails to reconnect is lost at the moment of the
+    /// status on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_loss_by_status_is_dated_on_the_paused_clock() {
+        let tasks = Supervisor::current();
+        let (store, proxy) = engine_on(&tasks);
+        let device = route("/1");
+        let followed = presence(&store, device);
+        proxy.send(Packet::heartbeat(device));
+        while !followed.recv_async().await.as_ref().is_ok_and(alive) {}
+        tokio::time::sleep(QUIET / 3).await;
+
+        proxy.send(Packet::link(LinkStatus::FailedToReconnect).with_route(device));
+        let failed = Instant::now();
+        let now = followed.recv_async().await;
+        let Ok(Presence::Lost { since }) = now else {
+            panic!("the device was not lost, got {now:?}");
+        };
+        assert_eq!(since, failed.into_std());
+    }
+
     /// The engine follows every packet its link sends, however many, so a
     /// status after a flood of samples still reaches the receivers.
     #[test]
@@ -1913,6 +2254,74 @@ mod tests {
         let again = proxy.sent.recv_async().await.unwrap();
         assert_eq!(again.route(), asked.route());
         assert_eq!(refused.elapsed(), super::super::metadata::RETRY_FIRST);
+    }
+
+    /// A route whose metadata query is backing off and that the engine
+    /// stops asking, as its device is lost or no receiver follows it, sets
+    /// no wake for the retry, so the engine sleeps past the moment it was
+    /// due. Asked again, it is asked at once as its backoff has passed, and
+    /// its next failure doubles the delay as the schedule says.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_the_engine_will_not_make_sets_no_wake() {
+        for unfollowed in [false, true] {
+            let tasks = Supervisor::current();
+            let (session, proxy) = Session::test_pair_on(&tasks);
+            let store = Arc::new(Mutex::new(Store::new(true)));
+            let mounts = Mounts::new("tcp://device");
+            let mut engine = Engine::new(&store, &mounts, session, &tasks);
+            let device = route("/1");
+            let mut followed = Some(presence(&store, device));
+            engine.take(&Packet::heartbeat(device));
+            engine.discover();
+            refuse_busy(&proxy, &mut engine, device).await;
+            let retry = Instant::now() + super::super::metadata::RETRY_FIRST;
+            assert_eq!(engine.next_wake(), Some(retry));
+
+            if unfollowed {
+                followed = None;
+                pruned(|cx| lock(&store).prune_gone(cx)).await;
+                engine.follow_demand();
+            } else {
+                engine.apply_status(device, LinkStatus::FailedToReconnect);
+            }
+            tokio::time::sleep_until(retry + Duration::from_millis(1)).await;
+            let wake = engine.next_wake();
+            assert!(
+                wake.is_none_or(|wake| wake > Instant::now()),
+                "unfollowed {unfollowed}, the engine wakes at once for a retry it will not make"
+            );
+
+            if followed.is_none() {
+                followed = Some(presence(&store, device));
+                engine.follow_demand();
+            }
+            engine.take(&Packet::heartbeat(device));
+            engine.discover();
+            let asked_at = Instant::now();
+            refuse_busy(&proxy, &mut engine, device).await;
+            assert_eq!(
+                asked_at,
+                Instant::now(),
+                "unfollowed {unfollowed}, asked late"
+            );
+            let doubled = asked_at + super::super::metadata::RETRY_FIRST * 2;
+            assert_eq!(engine.next_wake(), Some(doubled), "unfollowed {unfollowed}");
+            drop(followed);
+        }
+    }
+
+    /// Refuses the one `dev.metadata` call to `device` that the engine has
+    /// sent as busy, and has the engine take the refusal.
+    async fn refuse_busy(proxy: &TestProxy, engine: &mut Engine, device: DeviceRoute) {
+        let asking = tokio::time::timeout(Duration::from_secs(1), proxy.sent.recv_async());
+        let asked = asking.await.expect("the engine asks").unwrap();
+        let packet::Payload::RpcRequest(request) = asked.payload() else {
+            panic!("expected a metadata query, got {:?}", asked.payload());
+        };
+        assert_eq!(asked.route(), device);
+        proxy.refuse(request.id.value(), wire_rpc::RpcError::Busy, device);
+        let reply = engine.schedule.replies().recv_async().await.unwrap();
+        engine.take_metadata_replies(reply);
     }
 
     /// A status supersedes the presence of every device in the subtree it

@@ -47,7 +47,7 @@ pub(super) const CAPTURE_DELAY_NS: u64 = 500_000_000;
 const CAPTURE_BLOCK_SIZE: u16 = 256;
 pub(super) const CAPTURE_SAMPLES_MIN: usize = 800;
 pub(super) const CAPTURE_SAMPLES_MAX: usize = 1200;
-/// The bytes of a tl-chibi upload chunk that are envelope rather than image.
+/// The bytes of an image's upload chunk that are envelope rather than image.
 const CHUNK_ENVELOPE: usize = 32;
 
 /// What a signed package for the simulator names.
@@ -61,8 +61,8 @@ pub(super) const PACKAGE: Package = Package {
 
 /// The firmware slot, as the kind of device being simulated keeps it.
 enum Slot {
-    /// tl-chibi's, counting the image bytes of each chunk it takes.
-    TlChibi { uploaded: u32 },
+    /// One that takes images, counting the image bytes of each chunk it takes.
+    Image { uploaded: u32 },
     /// A `twinleaf-device` firmware's, keeping the crate's own cursor.
     Signed(Upload),
 }
@@ -70,14 +70,14 @@ enum Slot {
 impl Slot {
     fn new(kind: UploadKind) -> Self {
         match kind {
-            UploadKind::TlChibi => Self::TlChibi { uploaded: 0 },
+            UploadKind::Image => Self::Image { uploaded: 0 },
             UploadKind::Signed => Self::Signed(Upload::new()),
         }
     }
 
     fn kind(&self) -> UploadKind {
         match self {
-            Self::TlChibi { .. } => UploadKind::TlChibi,
+            Self::Image { .. } => UploadKind::Image,
             Self::Signed(_) => UploadKind::Signed,
         }
     }
@@ -86,8 +86,8 @@ impl Slot {
     /// empty one. The image goes nowhere, so every write lands.
     fn upload(&mut self, chunk: &[u8], now_ns: u64) -> Result<Vec<u8>, RpcError> {
         match self {
-            Self::TlChibi { uploaded } if chunk.is_empty() => Ok(uploaded.to_le_bytes().to_vec()),
-            Self::TlChibi { uploaded } => {
+            Self::Image { uploaded } if chunk.is_empty() => Ok(uploaded.to_le_bytes().to_vec()),
+            Self::Image { uploaded } => {
                 let image = chunk.len().saturating_sub(CHUNK_ENVELOPE) as u32;
                 *uploaded = uploaded.saturating_add(image);
                 Ok(Vec::new())
@@ -109,7 +109,7 @@ impl Slot {
     /// package's signature goes unchecked.
     fn upgrade(&mut self, now_ns: u64) -> Result<(), RpcError> {
         match self {
-            Self::TlChibi { .. } => Ok(()),
+            Self::Image { .. } => Ok(()),
             Self::Signed(upload) => {
                 upload.upgrade(now_ns)?;
                 upload.armed();
@@ -118,10 +118,10 @@ impl Slot {
         }
     }
 
-    /// `dev.firmware.abort`, which tl-chibi does not have.
+    /// `dev.firmware.abort`, which a device that takes images does not answer.
     fn abort(&mut self) -> Result<(), RpcError> {
         match self {
-            Self::TlChibi { .. } => Err(RpcError::NotFound),
+            Self::Image { .. } => Err(RpcError::NotFound),
             Self::Signed(upload) => upload.abort(),
         }
     }
@@ -351,6 +351,11 @@ pub(super) struct SimDevice {
     no_drop: bool,
     /// When the acquisition started, while it runs.
     started_ns: Option<u64>,
+    /// The second sample zero of the acquisition belongs to.
+    start_second: u32,
+    /// The first whole second a new acquisition may start at, the one at
+    /// or after the end of the last sample of the acquisition before it.
+    resume_second: u32,
     main: Clock,
     aux: Clock,
     rng: GaussianRng,
@@ -409,6 +414,8 @@ impl SimDevice {
             segment_seconds: cli.segment_seconds,
             no_drop: cli.no_drop,
             started_ns: None,
+            start_second: 0,
+            resume_second: 0,
             main: Clock::stopped(cli.samplerate),
             aux: Clock::stopped(AUX_SAMPLE_RATE),
             rng,
@@ -593,14 +600,17 @@ impl SimDevice {
         device::answer(pending, answered.as_deref().map_err(|&error| error), out);
     }
 
-    /// Starts acquiring every stream, from a segment at the current second.
+    /// Starts acquiring every stream, from a segment at the current whole
+    /// second, or at the first whole second after the acquisition before
+    /// when that is later, so time never goes back across a restart.
     fn start(&mut self, now_ns: u64) {
         if self.started_ns.is_some() {
             return;
         }
+        self.start_second = (unix_duration().as_secs() as u32).max(self.resume_second);
         let timeref = Timeref::new(
             Epoch::UNIX,
-            unix_duration().as_secs() as u32,
+            self.start_second,
             self.device.session,
             &self.device.identity.serial,
         )
@@ -626,7 +636,18 @@ impl SimDevice {
         }
     }
 
+    /// Stops acquiring every stream. A clock's sample `n` ends `n + 1`
+    /// periods after the start, so the last one taken ends by the whole
+    /// second its count of periods rounds up to.
     fn stop(&mut self) {
+        if self.started_ns.is_some() {
+            let seconds = [&self.main, &self.aux]
+                .map(|clock| clock.taken.div_ceil(u64::from(clock.rate)))
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            self.resume_second = self.start_second.saturating_add(seconds as u32);
+        }
         for stream in &mut self.streams {
             stream.stop();
         }
@@ -826,4 +847,112 @@ fn next_session(rng: &mut GaussianRng) -> SessionId {
 
 fn next_log_delay_ns(rng: &mut GaussianRng) -> u64 {
     LOG_MESSAGE_MIN_INTERVAL_NS + (LOG_MESSAGE_JITTER_NS as f64 * rng.next_unit()) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tree::Queue;
+    use super::*;
+    use clap::Parser;
+    use std::collections::BTreeMap;
+    use twinleaf::data::{Boundary, Change, PacketParser};
+    use twinleaf::tio::packet::Packet;
+
+    const TICK_NS: u64 = 100_000_000;
+
+    /// One simulated device, driven in process on a clock of the test's own,
+    /// and a parser that reads what it sends.
+    struct Driven {
+        sim: SimDevice,
+        now_ns: u64,
+        parser: PacketParser,
+        /// Each stream's batches, as their first timestamp, their last, and
+        /// their boundary.
+        batches: BTreeMap<u8, Vec<(f64, f64, Option<Boundary>)>>,
+    }
+
+    impl Driven {
+        fn new() -> Driven {
+            let cli = SimulateCli::parse_from(["tio-simulate", "--samplerate", "10", "--no-drop"]);
+            let mut driven = Driven {
+                sim: SimDevice::new(&cli, DeviceRoute::root(), 0, 0),
+                now_ns: 0,
+                parser: PacketParser::new(false),
+                batches: BTreeMap::new(),
+            };
+            let mut out = Queue::default();
+            driven.sim.connected(0, &mut out);
+            driven.parse(out);
+            driven
+        }
+
+        fn parse(&mut self, out: Queue) {
+            for raw in out.0 {
+                let (packet, _) = Packet::from_slice_prefix(&raw).unwrap();
+                self.parser.push_packet(&packet).unwrap();
+                while let Some(batch) = self.parser.pop_batch() {
+                    let times = batch.timestamps();
+                    self.batches
+                        .entry(batch.stream_key().stream_id.value())
+                        .or_default()
+                        .push((times[0], times[times.len() - 1], batch.boundary().cloned()));
+                }
+            }
+        }
+
+        /// Runs the device for `seconds` of its clock.
+        fn run(&mut self, seconds: u64) {
+            for _ in 0..seconds * 1_000_000_000 / TICK_NS {
+                self.now_ns += TICK_NS;
+                let mut out = Queue::default();
+                self.sim.tick(self.now_ns, &mut out);
+                self.parse(out);
+            }
+        }
+
+        /// Asks for `name` with no argument.
+        fn ask(&mut self, name: &str) {
+            let request = Packet::rpc_request(name, &[], 1, DeviceRoute::root()).unwrap();
+            let mut out = Queue::default();
+            self.sim.handle(request.as_bytes(), self.now_ns, &mut out);
+            self.parse(out);
+        }
+    }
+
+    /// A restart, by one `dev.restart` or by `dev.stop` and then `dev.start`,
+    /// reaches a host as a restart of every stream with no loss, and the new
+    /// acquisition's samples come after the last of the one before.
+    #[test]
+    fn a_restart_reads_as_a_restart_with_no_loss_and_goes_on_in_time() {
+        for asks in [&["dev.restart"][..], &["dev.stop", "dev.start"]] {
+            let mut driven = Driven::new();
+            driven.run(3);
+            for name in asks {
+                driven.ask(name);
+                driven.run(1);
+            }
+            driven.run(2);
+            assert_eq!(driven.batches.len(), 3, "{asks:?}");
+            for (stream, batches) in &driven.batches {
+                let boundaries: Vec<_> = batches
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, (_, _, boundary))| Some((at, boundary.clone()?)))
+                    .collect();
+                let [(0, initial), (at, restart)] = &boundaries[..] else {
+                    panic!("{asks:?} stream {stream} reports {boundaries:?}");
+                };
+                assert_eq!(initial.change, Some(Change::Initial));
+                assert!(
+                    matches!(restart.change, Some(Change::Restarted { .. })),
+                    "{asks:?} stream {stream} reports {restart:?}"
+                );
+                assert_eq!(restart.loss, None, "{asks:?} stream {stream}");
+                assert!(
+                    batches[*at].0 > batches[at - 1].1,
+                    "{asks:?} stream {stream} goes back in time"
+                );
+            }
+        }
+    }
 }

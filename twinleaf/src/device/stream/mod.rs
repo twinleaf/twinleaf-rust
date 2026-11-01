@@ -13,7 +13,7 @@
 
 mod subscription;
 
-pub(crate) use subscription::{End, Lane, Queued, Scope, Sink};
+pub(crate) use subscription::{BatchLane, End, Lane, Queued, Scope, Sink};
 pub use subscription::{Receiver, RecvError};
 
 use super::session::{Handle, Inlet, Received};
@@ -41,8 +41,8 @@ const INLET_LEN: usize = transport::DEFAULT_RX_CHANNEL_SIZE;
 
 /// A subscription to the pump's batches or packets, on its way to the pump.
 enum Tap {
-    Batches(Sink<SampleBatch>),
-    Packets(Sink<tio::Packet>),
+    Batches(Sink<BatchLane>),
+    Packets(Sink<Lane<tio::Packet>>),
 }
 
 /// The connection's one stream, shared by every view. Its pump starts at the
@@ -65,7 +65,7 @@ impl Stream {
 
     /// Subscribes to the sample batches in `scope`.
     pub(super) fn batches(self: &Arc<Stream>, scope: Scope) -> Receiver<SampleBatch> {
-        let (sink, receiver) = Sink::new(BATCH_QUEUE_LEN, scope);
+        let (sink, receiver) = Sink::batches(BATCH_QUEUE_LEN, scope);
         let _ = self.pump().send(Tap::Batches(sink));
         receiver.tied_to(self)
     }
@@ -119,8 +119,8 @@ struct Pump {
     parser: PacketParser,
     store: Arc<Mutex<Store>>,
     taps: mpsc::UnboundedReceiver<Tap>,
-    batches: Vec<Sink<SampleBatch>>,
-    packets: Vec<Sink<tio::Packet>>,
+    batches: Vec<Sink<BatchLane>>,
+    packets: Vec<Sink<Lane<tio::Packet>>>,
     /// Each watch the pump sent, by its id, and what has arrived of its
     /// next update.
     watches: HashMap<u16, (Watch, Joined)>,
@@ -181,11 +181,11 @@ impl Pump {
             store.mark_lost();
             store.end_all(end);
         }
-        end_sinks(&mut self.batches, end);
+        end_batches(&mut self.batches, end);
         end_sinks(&mut self.packets, end);
         while let Some(tap) = self.taps.recv().await {
             match tap {
-                Tap::Batches(sink) => end_sinks(&mut vec![sink], end),
+                Tap::Batches(sink) => end_batches(&mut vec![sink], end),
                 Tap::Packets(sink) => end_sinks(&mut vec![sink], end),
             }
         }
@@ -351,13 +351,27 @@ impl Pump {
     }
 }
 
+/// Ends each batch sink of `sinks`, saying why if `end` does.
+fn end_batches(sinks: &mut Vec<Sink<BatchLane>>, end: Option<End>) {
+    for sink in sinks.drain(..) {
+        if let Some(end) = end {
+            sink.lane.end(end);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::fixtures::{announcement, description, samples, wait_for};
+    use crate::data::{Boundary, Change, Loss};
+    use crate::device::fixtures::{
+        announcement, broadcast, description, metadata_records, samples, wait_for,
+    };
+    use crate::device::rpc::RpcValue;
     use crate::device::session::{Session, TestProxy};
     use crate::device::store::{CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
     use crate::device::{MetadataState, Presence};
+    use crate::proto::SampleNumber;
     use crate::proto::SessionId as WireSessionId;
     use crate::proxy::{decode, Update};
     use crate::rt::Supervisor;
@@ -593,7 +607,7 @@ mod tests {
         let pump = Pump::new(&root, inlet_received, Arc::clone(&store), taps_received);
         Supervisor::new().spawn("twinleaf stream", pump.run());
         let route = DeviceRoute::root();
-        let (sink, batches) = Sink::new(BATCH_QUEUE_LEN, everything());
+        let (sink, batches) = Sink::batches(BATCH_QUEUE_LEN, everything());
         let _ = taps.send(Tap::Batches(sink));
         let (sink, packets) = Sink::new(PACKET_QUEUE_LEN, everything());
         let _ = taps.send(Tap::Packets(sink));
@@ -660,7 +674,7 @@ mod tests {
     fn a_paused_consumer_never_stalls_the_pump_and_learns_it_lagged() {
         let (stream, proxy) = stream();
         let (root, marker) = (DeviceRoute::root(), "/9".parse().unwrap());
-        let (sink, batches) = Sink::new(2, everything());
+        let (sink, batches) = Sink::batches(2, everything());
         let _ = stream.pump().send(Tap::Batches(sink));
         let packets = stream.packets(Scope::point(marker));
         let list = watch_of(&proxy, device(root));
@@ -1085,6 +1099,194 @@ mod tests {
         assert_eq!(receiver.recv(), Err(RecvError::Closed));
     }
 
+    /// A parser that has taken the description of the device at each of
+    /// `routes` in session 1.
+    fn described(routes: &[DeviceRoute]) -> PacketParser {
+        let mut parser = PacketParser::new(false);
+        for &route in routes {
+            for packet in description(route, 1) {
+                parser.push_packet(&packet).expect("a record");
+            }
+        }
+        parser
+    }
+
+    /// The batch `parser` makes of `packet`.
+    fn parse(parser: &mut PacketParser, packet: &Packet) -> SampleBatch {
+        parser.push_packet(packet).expect("valid samples");
+        parser.pop_batch().expect("a batch")
+    }
+
+    /// The next batch on `queue`, after the gaps ahead of it, and what those
+    /// gaps counted.
+    fn next_batch(queue: &flume::Receiver<Queued<SampleBatch>>) -> (u64, SampleBatch) {
+        let mut gaps = 0;
+        loop {
+            match queue.try_recv().expect("a queued batch") {
+                Queued::Item(batch) => return (gaps, batch),
+                Queued::Gap(dropped) => gaps += dropped,
+                Queued::Ended(end) => panic!("the lane ended with {end:?}"),
+            }
+        }
+    }
+
+    /// A batch lane carries the rows it dropped of each stream onto that
+    /// stream's next batch, which counts the stream's share of the gaps and
+    /// names the sample due. The generations stay the parser's.
+    #[test]
+    fn a_batch_lane_carries_each_streams_dropped_batches_onto_its_next_batch() {
+        let (a, b): (DeviceRoute, DeviceRoute) = ("/1".parse().unwrap(), "/2".parse().unwrap());
+        let mut parser = described(&[a, b]);
+        let (mut lane, queue) = BatchLane::new(2);
+        for packet in [samples(0, a), samples(0, b)] {
+            assert!(lane.send(parse(&mut parser, &packet)));
+        }
+        for packet in [samples(1, a), samples(2, a), samples(1, b)] {
+            assert!(lane.send(parse(&mut parser, &packet)));
+        }
+        let first: Vec<_> = (0..2).map(|_| next_batch(&queue).1.route()).collect();
+        assert_eq!(first, [a, b]);
+
+        let resumed = parse(&mut parser, &samples(3, a));
+        assert_eq!(resumed.boundary(), None, "the parser lost nothing");
+        let generations = resumed.generations();
+        assert!(lane.send(resumed));
+        let (gaps_a, batch_a) = next_batch(&queue);
+        assert!(lane.send(parse(&mut parser, &samples(2, b))));
+        let (gaps_b, batch_b) = next_batch(&queue);
+
+        let loss = |batch: &SampleBatch| batch.boundary().and_then(|b| b.loss.clone());
+        let lost = |samples, dropped_batches| Loss {
+            samples,
+            expected: Some(SampleNumber::new(1)),
+            dropped_batches,
+        };
+        assert_eq!(loss(&batch_a), Some(lost(2, 2)));
+        assert_eq!(loss(&batch_b), Some(lost(1, 1)));
+        assert_eq!(gaps_a + gaps_b, 3, "the gaps count every batch dropped");
+        assert_eq!(batch_a.boundary().unwrap().change, None);
+        assert_eq!(batch_a.generations(), generations);
+    }
+
+    /// The change of a batch a lane dropped reaches the next batch it
+    /// queues, naming the session of the batch queued before. A loss next to
+    /// a reboot names no sample due.
+    #[test]
+    fn a_batch_lane_names_the_change_of_a_batch_it_dropped() {
+        let root = DeviceRoute::root();
+        let mut parser = described(&[root]);
+        let (mut lane, queue) = BatchLane::new(2);
+        for first in [0, 1] {
+            assert!(lane.send(parse(&mut parser, &samples(first, root))));
+        }
+        for packet in description(root, 2) {
+            parser.push_packet(&packet).expect("a record");
+        }
+        let rebooted = parse(&mut parser, &samples(0, root));
+        assert!(rebooted.boundary().is_some_and(|b| b.change.is_some()));
+        assert!(lane.send(rebooted));
+        next_batch(&queue);
+        next_batch(&queue);
+
+        assert!(lane.send(parse(&mut parser, &samples(1, root))));
+        let (gaps, batch) = next_batch(&queue);
+        let boundary = batch.boundary().expect("the dropped reboot");
+        assert_eq!(
+            boundary.change,
+            Some(Change::SessionChanged {
+                old: WireSessionId::new(1),
+                new: WireSessionId::new(2),
+            })
+        );
+        let loss = boundary.loss.as_ref().expect("the dropped batch");
+        assert_eq!((loss.expected, loss.dropped_batches, gaps), (None, 1, 1));
+    }
+
+    /// A lane that dropped the first batches of a stream starts it at the
+    /// first batch it queues, with the loss, which names no sample due.
+    #[test]
+    fn a_batch_lane_that_dropped_a_streams_start_starts_it_with_the_loss() {
+        let (a, b): (DeviceRoute, DeviceRoute) = ("/1".parse().unwrap(), "/2".parse().unwrap());
+        let mut parser = described(&[a, b]);
+        let (mut lane, queue) = BatchLane::new(2);
+        for packet in [samples(0, a), samples(1, a), samples(0, b)] {
+            assert!(lane.send(parse(&mut parser, &packet)));
+        }
+        next_batch(&queue);
+        next_batch(&queue);
+        assert!(lane.send(parse(&mut parser, &samples(1, b))));
+
+        let (gaps, batch) = next_batch(&queue);
+        let boundary = batch.boundary().expect("the start of the stream");
+        assert_eq!((batch.route(), gaps), (b, 1));
+        assert_eq!(boundary.change, Some(Change::Initial));
+        assert_eq!(boundary.class(), crate::data::BoundaryClass::Startup);
+        assert_eq!(
+            boundary.loss,
+            Some(Loss {
+                samples: 1,
+                expected: None,
+                dropped_batches: 1,
+            })
+        );
+    }
+
+    /// The time jumps of the batches a lane dropped add up on the next batch
+    /// it queues.
+    #[test]
+    fn a_batch_lane_adds_up_the_time_jumps_it_dropped() {
+        let root = DeviceRoute::root();
+        let mut parser = described(&[root]);
+        let (mut lane, queue) = BatchLane::new(2);
+        for first in [0, 1] {
+            assert!(lane.send(parse(&mut parser, &samples(first, root))));
+        }
+        // The segment's start moves on in place, so time jumps forward with
+        // the sample numbers following on.
+        let [_, _, crate::proto::data::Metadata::Segment(mut moved), _] = metadata_records(1)
+        else {
+            panic!("the third record describes a segment");
+        };
+        for (start_time, first) in [(5, 2), (7, 3)] {
+            moved.start_time = start_time;
+            parser
+                .push_packet(&broadcast(
+                    crate::proto::data::Metadata::Segment(moved),
+                    root,
+                ))
+                .expect("a record");
+            let jumped = parse(&mut parser, &samples(first, root));
+            assert!(jumped.boundary().is_some_and(|b| b.change.is_some()));
+            assert!(lane.send(jumped));
+        }
+        next_batch(&queue);
+        next_batch(&queue);
+
+        assert!(lane.send(parse(&mut parser, &samples(4, root))));
+        let change = next_batch(&queue)
+            .1
+            .boundary()
+            .and_then(|b| b.change.clone());
+        assert_eq!(change, Some(Change::TimeForward { gap_seconds: 7.0 }));
+    }
+
+    /// A lane that joins a stream after its start says the first batch it
+    /// queues of each stream starts it.
+    #[test]
+    fn a_batch_lane_that_joins_late_starts_each_stream() {
+        let root = DeviceRoute::root();
+        let mut parser = described(&[root]);
+        assert!(parse(&mut parser, &samples(0, root)).is_initial());
+        let (mut lane, queue) = BatchLane::new(4);
+        for first in [1, 2] {
+            assert!(lane.send(parse(&mut parser, &samples(first, root))));
+        }
+
+        let boundaries =
+            [next_batch(&queue).1, next_batch(&queue).1].map(|batch| batch.boundary().cloned());
+        assert_eq!(boundaries, [Some(Boundary::of(Change::Initial)), None]);
+    }
+
     /// The lane holds its own end of the queue, which must not hide that the
     /// reader is gone.
     #[test]
@@ -1165,31 +1367,34 @@ mod tests {
         assert!(spliced.is_empty(), "a tail was joined without its head");
     }
 
-    /// A table receiver taken with a change receiver holds the table by the
-    /// time a change arrives. A reader decodes each change with that table.
+    /// A change receiver alone follows the device's table too, and each
+    /// change carries the table the proxy named ahead of it, which is the
+    /// pump's own copy of the device's table. A reader decodes the change
+    /// with it at once.
     #[test]
-    fn a_table_followed_with_the_changes_is_held_when_a_change_arrives() {
+    fn a_change_carries_the_table_the_proxy_named_for_it() {
         let (stream, proxy) = stream();
         let route = DeviceRoute::root();
-        let loaded = stream.state(route, REGISTRY);
+        let changes = stream.state(route, CHANGES);
+        let device_watch = watch_of(&proxy, device(route));
         let table_watch = watch_of(&proxy, table(route));
         reply_update(&proxy, table_watch, &table_update(1));
-        loaded.recv().unwrap().expect("the table loads");
-
-        let changes = stream.state(route, CHANGES);
-        let tables = stream.state(route, REGISTRY);
-        let device_watch = watch_of(&proxy, device(route));
+        let Update::Table(Ok(entries)) = table_update(1) else {
+            unreachable!("a table update holds a table");
+        };
+        reply_update(&proxy, device_watch, &Update::Recorded(Some(entries)));
         let announced = Update::Setting(
             "test.gain".to_string(),
             Some(2),
             1.5f32.to_le_bytes().to_vec().into(),
         );
         reply_update(&proxy, device_watch, &announced);
-        reply_update(&proxy, table_watch, &settings_update(1, 2));
 
-        assert_eq!(changes.recv().unwrap().seq, Some(2));
-        let held = tables.try_recv().unwrap().expect("the table is held");
-        assert!(held.unwrap().find("test.gain").is_some());
+        let change = changes.recv().unwrap();
+        assert_eq!(change.value().unwrap(), RpcValue::F64(1.5));
+        let held = stream.state(route, REGISTRY).try_recv().unwrap();
+        let held = held.expect("the table is held").unwrap();
+        assert!(Arc::ptr_eq(change.rpc_registry().unwrap(), &held));
     }
 
     /// Settings read with a table the pump does not hold are dropped, as the
@@ -1258,7 +1463,7 @@ mod tests {
         proxy.send(Packet::link(packet::LinkStatus::SensorDisconnected));
         let quiet = Duration::from_millis(200);
         assert_eq!(presence.recv_timeout(quiet), Err(RecvError::Timeout));
-        assert_eq!(changes.recv_timeout(quiet), Err(RecvError::Timeout));
+        assert_eq!(changes.recv_timeout(quiet).err(), Some(RecvError::Timeout));
         assert!(matches!(
             metadata.recv_timeout(quiet),
             Err(RecvError::Timeout)
@@ -1407,7 +1612,7 @@ mod tests {
         reply_update(&proxy, id, &announced);
 
         let wait = Duration::from_secs(5);
-        assert_eq!(changes.recv_timeout(wait), Err(RecvError::Lagged(5)));
+        assert_eq!(changes.recv_timeout(wait).err(), Some(RecvError::Lagged(5)));
         assert_eq!(
             changes.recv_timeout(wait).map(|change| change.seq),
             Ok(Some(9))

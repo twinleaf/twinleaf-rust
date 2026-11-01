@@ -105,7 +105,7 @@ impl BatchCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::continuity::BoundaryReason;
+    use crate::data::continuity::{Boundary, Loss};
     use crate::data::fixtures;
     use crate::data::metadata::StreamMetadataSnapshot;
     use crate::data::sample::{BatchContext, ColumnArray, ColumnData};
@@ -138,7 +138,7 @@ mod tests {
         metadata: &StreamMetadataSnapshot,
         first: u32,
         rows: u32,
-        boundary: Option<BoundaryReason>,
+        boundary: Option<Boundary>,
         generations: Generations,
     ) -> SampleBatch {
         let mut builder = SampleBatchBuilder::new(
@@ -226,9 +226,13 @@ mod tests {
             &segment,
             2,
             2,
-            Some(BoundaryReason::SamplesLost {
-                expected: crate::proto::SampleNumber::new(2),
-                received: crate::proto::SampleNumber::new(2),
+            Some(Boundary {
+                change: None,
+                loss: Some(Loss {
+                    samples: 3,
+                    expected: Some(crate::proto::SampleNumber::new(2)),
+                    dropped_batches: 0,
+                }),
             }),
             generations(1),
         ));

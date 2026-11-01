@@ -29,11 +29,11 @@ const FLAG_DEVELOPMENT: u16 = 1;
 
 /// How long an upload may sit idle before the next chunk starts a new one.
 ///
-/// tl-chibi has no timeout at all, so a host that dies mid-transfer strands the
-/// session until the next reset and no later host can upload anything. Thirty
-/// seconds sits far above any gap a live host produces — a 288-byte chunk is
-/// ~30 ms on a 115200 control port, and the page erase behind it tens of
-/// milliseconds — and far below how long a person takes to retry.
+/// Once it passes, a session left by a host that died mid-transfer is free
+/// again, so a later host can upload without a reset. Thirty seconds sits far
+/// above any gap a live host produces, since a 288-byte chunk takes under
+/// 30 ms on a 115200 control port and the page erase behind it tens of
+/// milliseconds, and far below how long a person takes to retry.
 pub const IDLE_TIMEOUT_NS: u64 = 30_000_000_000;
 
 /// What a board takes a package for: who it is, and how big an image fits.
@@ -150,10 +150,7 @@ impl Upload {
         }
     }
 
-    /// `dev.firmware.abort`: throw away a part-uploaded image.
-    ///
-    /// tl-chibi has no equivalent — there, `dev.reboot` is the only way out of
-    /// a stranded upload.
+    /// Throw away a part-uploaded image, as `dev.firmware.abort` asks.
     pub fn abort(&mut self) -> Result<(), RpcError> {
         match self.state {
             // The swap is armed in flash. Clearing the cursor here would claim
@@ -479,8 +476,8 @@ mod tests {
     }
 
     /// A finished-but-uncommitted upload also times out, or a host that walked
-    /// away between the last chunk and `dev.firmware.upgrade` would strand the
-    /// device exactly as it does in tl-chibi.
+    /// away between the last chunk and `dev.firmware.upgrade` would strand
+    /// the device.
     #[test]
     fn a_complete_upload_left_uncommitted_also_expires() {
         let package = package();
