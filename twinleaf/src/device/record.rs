@@ -972,7 +972,7 @@ mod tests {
         use crate::proto::data::MAX_SAMPLE_NUMBER;
         use crate::proxy::{decode, Watch, WATCH};
         use proptest::prelude::*;
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, BTreeSet};
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
@@ -1231,10 +1231,15 @@ mod tests {
                     }
                 }
                 let mut last_number: BTreeMap<(DeviceRoute, u8), u32> = BTreeMap::new();
+                // Rows numbered at or below the last rows of their segment
+                // are of a new acquisition whose record never comes, so the
+                // stream's later rows wait and count no loss.
+                let mut waiting = BTreeSet::new();
                 let mut lost = 0;
                 for (device, stream, stride) in &samples {
                     let route = devices[device.index(devices.len())];
-                    let number = match (last_number.get(&(route, *stream)), stride) {
+                    let key = (route, *stream);
+                    let number = match (last_number.get(&key), stride) {
                         (None, _) => start,
                         (Some(&before), Stride::Back(back)) if before >= *back => before - back,
                         (Some(&before), Stride::Back(_)) => before + 1,
@@ -1243,13 +1248,18 @@ mod tests {
                             match after > MAX_SAMPLE_NUMBER {
                                 true => after - MAX_SAMPLE_NUMBER - 1,
                                 false => {
-                                    lost += u64::from(*skip);
+                                    if !waiting.contains(&key) {
+                                        lost += u64::from(*skip);
+                                    }
                                     after
                                 }
                             }
                         }
                     };
-                    last_number.insert((route, *stream), number);
+                    if last_number.get(&key).is_some_and(|&before| number <= before) {
+                        waiting.insert(key);
+                    }
+                    last_number.insert(key, number);
                     let packet = Packet::samples(*stream, 0, number, &[0; 4], route).unwrap();
                     proxy.send(packet);
                 }

@@ -881,6 +881,51 @@ mod tests {
         );
     }
 
+    /// Rows numbered back from the last rows, in their segment, with no
+    /// record of it since, are of a new acquisition in that slot, as after
+    /// a reboot of a child behind a hub. They wait for the slot's record,
+    /// and rows after it decode with it, not with the record before.
+    #[test]
+    fn rows_numbered_back_in_their_segment_wait_for_its_new_record() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+
+        for first in [2, 4] {
+            assert_eq!(
+                parser
+                    .push_packet(&stream_data_packet(first, vec![0; 4]))
+                    .expect("valid rows"),
+                PacketOutcome::WaitingForMetadata,
+                "the rows at {first}"
+            );
+        }
+        assert!(parser.pop_batch().is_none());
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                start_time: 100,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet(5, vec![0; 4]))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the new acquisition's rows");
+        assert_eq!(
+            after.timestamps(),
+            [106.0],
+            "the end of sample 5 from 100 s"
+        );
+    }
+
     /// A stream's first rows in a segment the device did not announce wait
     /// for that segment's record, as the record the parser holds is left
     /// from an earlier lap of the ring.
