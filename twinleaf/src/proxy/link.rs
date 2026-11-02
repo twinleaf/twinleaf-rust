@@ -789,14 +789,26 @@ mod tests {
 
         /// Returns the total number of leases on the open links.
         pub(crate) fn users(&self) -> usize {
-            let users = self.inspect(|registry| {
+            self.counting_users().blocking_recv().unwrap_or_default()
+        }
+
+        /// Returns the total number of leases on the open links, as
+        /// [`users`](Self::users) does, without blocking.
+        #[cfg(all(test, turmoil))]
+        pub(crate) async fn users_async(&self) -> usize {
+            self.counting_users().await.unwrap_or_default()
+        }
+
+        /// Has the registry count the leases on the open links. Returns the
+        /// receiver of the count.
+        fn counting_users(&self) -> oneshot::Receiver<usize> {
+            self.inspect(|registry| {
                 let open = registry
                     .links
                     .values()
                     .filter(|entry| entry.commands.is_some());
                 open.map(|entry| entry.users).sum()
-            });
-            users.blocking_recv().unwrap_or_default()
+            })
         }
 
         /// Files the link to `url` under `key`, where `url` no longer finds
@@ -911,6 +923,29 @@ mod tests {
         Instant::now()
     }
 
+    /// Has `device` act as a live device for at most `long`. It beats each
+    /// second, from 300 ms on so that no beat meets a whole second of the
+    /// test, and leaves what it is sent unanswered. A TCP device that stays
+    /// silent is reopened, so a test that keeps one port open needs this.
+    /// Returns when the port lets go of the device, if it does.
+    async fn live(device: &mut Opened, long: Duration) -> Option<Instant> {
+        let start = Instant::now();
+        let mut beats =
+            tokio::time::interval_at(start + Duration::from_millis(300), Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                sent = device.end.recv() => if sent.is_none() {
+                    return Some(Instant::now());
+                },
+                () = crate::chan::sleep_until(start + long) => return None,
+                _ = beats.tick() => {
+                    device.end.send(&Packet::heartbeat(DeviceRoute::root())).await;
+                }
+            }
+        }
+    }
+
     /// A link that only probes have used gets no grace. It closes as soon as
     /// its last user leaves.
     #[tokio::test(start_paused = true)]
@@ -947,9 +982,10 @@ mod tests {
         drop(open);
         let left = Instant::now();
 
-        tokio::time::sleep(IDLE / 2).await;
+        assert_eq!(live(&mut device, IDLE / 2).await, None);
         assert_eq!(urls(&links).await, [DEVICE]);
-        assert_took(released(&mut device).await - left, IDLE, "closing");
+        let closed = live(&mut device, PAUSED_WAIT).await.expect("it closed");
+        assert_took(closed - left, IDLE, "closing");
         assert!(urls(&links).await.is_empty());
     }
 
@@ -972,7 +1008,7 @@ mod tests {
         let mut device = opened(&mut devices).await;
         drop(open);
 
-        tokio::time::sleep(IDLE * 4).await;
+        assert_eq!(live(&mut device, IDLE * 4).await, None);
         assert_eq!(urls(&links).await, [DEVICE]);
 
         default.send_replace(Some(Layout::single(OTHER)));

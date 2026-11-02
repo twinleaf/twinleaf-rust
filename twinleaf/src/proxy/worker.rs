@@ -3,10 +3,16 @@
 //! [`Readiness`].
 //!
 //! The worker reopens a device whose port closes, fails with an I/O error,
-//! or goes quiet. A device that has answered goes quiet after 1 s without a
-//! packet, or 3 s over TCP. The worker follows a serial device that a replug
-//! moved to another port. Its ports stay open meanwhile. The link's engine
-//! hears the device drop out as
+//! or goes quiet. A serial or UDP device that has answered goes quiet after
+//! 1 s without a packet. A device on a TCP connection goes quiet after 3 s
+//! without one, counted from the start of the attempt that opened the
+//! connection. A proxy of this build at the other end of a TCP connection
+//! goes quiet after 10 s without one, counted from its answer to the open,
+//! as the open waits for that proxy's own device. Its connection ends first
+//! if it hears nothing for 5 s, the quiet time of the link's keep alive,
+//! while a proxy that is serving beats each second. The worker follows a
+//! serial device that a replug moved to another port. Its ports stay open
+//! meanwhile. The link's engine hears the device drop out as
 //! [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
 //! and come back as
 //! [`SensorReconnected`](crate::tio::packet::LinkStatus::SensorReconnected).
@@ -113,37 +119,85 @@ pub(super) struct Started {
 }
 
 /// What opens a device's port. It takes the sender the port delivers to,
-/// and returns a future of the open port.
+/// and returns a future of the open port and of what answers at its other
+/// end.
 pub(super) struct Opener {
     opens: Box<dyn Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync>,
     /// Whether the worker may drop an open in flight when it stops.
     droppable: bool,
 }
 
-/// A future of an open port.
-type Opening = BoxFuture<'static, io::Result<HardwarePort>>;
+/// A future of an open port and of what answers at its other end.
+type Opening = BoxFuture<'static, io::Result<Reached>>;
+
+/// A port an open opened, and what answers at its other end.
+pub(super) struct Reached {
+    pub(super) port: HardwarePort,
+    pub(super) peer: PeerKind,
+}
+
+/// What answers at the other end of a device's port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PeerKind {
+    /// The device, or a proxy from an older build, which forwards its
+    /// device's packets as its own.
+    Device,
+    /// A proxy of this build, whose `auto` the open opened.
+    Proxy,
+}
+
+/// A port alone is one a device answers on.
+impl From<HardwarePort> for Reached {
+    fn from(port: HardwarePort) -> Reached {
+        Reached {
+            port,
+            peer: PeerKind::Device,
+        }
+    }
+}
 
 impl Opener {
     /// Returns an opener that opens with `open`. The worker lets an open in
     /// flight run to its end before it stops.
-    pub(super) fn new(
-        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
-    ) -> Opener {
+    pub(super) fn new<F, R>(
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    ) -> Opener
+    where
+        F: std::future::Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
+    {
         Opener {
-            opens: Box::new(open),
+            opens: Opener::boxed(open),
             droppable: false,
         }
     }
 
     /// Returns an opener that opens with `open`, whose open in flight the
     /// worker drops when it stops. Dropping the open must leave nothing open.
-    pub(super) fn droppable(
-        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
-    ) -> Opener {
+    pub(super) fn droppable<F, R>(
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    ) -> Opener
+    where
+        F: std::future::Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
+    {
         Opener {
-            opens: Box::new(open),
+            opens: Opener::boxed(open),
             droppable: true,
         }
+    }
+
+    /// Returns `open` as an opener's function, whose future resolves to what
+    /// the open reached.
+    #[allow(clippy::type_complexity)]
+    fn boxed<F, R>(
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    ) -> Box<dyn Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync>
+    where
+        F: std::future::Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
+    {
+        Box::new(move |results| Box::pin(open(results).map(|opened| opened.map(Into::into))))
     }
 
     /// Returns a future that opens a port delivering to `results`.
@@ -169,7 +223,7 @@ enum Peer {
 }
 
 /// Connects to the TCP peer at `url`, and returns its port, which delivers
-/// to `results`. The link says hello first. A proxy of this build answers,
+/// to `results`, and what answers on it. The link says hello first. A proxy of this build answers,
 /// and the link then opens its `auto` as a control client does, so that it
 /// hears the proxy's link statuses for each route and keeps the connection
 /// alive. Any other peer answers with something else, or with nothing
@@ -190,15 +244,14 @@ async fn open_tcp(
     url: &str,
     results: crate::chan::Sender<ReceiveResult>,
     tasks: &Supervisor,
-) -> io::Result<HardwarePort> {
+) -> io::Result<Reached> {
     let (deliver, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
     let port = HardwarePort::open(url, deliver, tasks).await?;
-    let peer = greet(&port, &received, url).await?;
-    let proxied = matches!(peer, Peer::Proxy);
-    let first = match peer {
-        Peer::Proxy => None,
-        Peer::Device(first) => first,
+    let (peer, first) = match greet(&port, &received, url).await? {
+        Peer::Proxy => (PeerKind::Proxy, None),
+        Peer::Device(first) => (PeerKind::Device, first),
     };
+    let proxied = peer == PeerKind::Proxy;
     tasks.spawn(format_args!("link relay {url}"), async move {
         if let Some(first) = first {
             if results.send_async(first).await.is_err() {
@@ -214,7 +267,7 @@ async fn open_tcp(
             }
         }
     });
-    Ok(port)
+    Ok(Reached { port, peer })
 }
 
 /// Says hello on `port` and tells from the answer, read from `received`,
@@ -384,12 +437,14 @@ pub(super) fn opener(tasks: &Supervisor, url: &str) -> Opener {
     if HardwarePort::opens_as_future(&url) {
         return Opener::droppable(move |results| {
             let (url, tasks) = (url.clone(), tasks.clone());
-            Box::pin(async move {
+            async move {
                 match url.starts_with("tcp") {
                     true => open_tcp(&url, results, &tasks).await,
-                    false => HardwarePort::open(&url, results, &tasks).await,
+                    false => HardwarePort::open(&url, results, &tasks)
+                        .await
+                        .map(Reached::from),
                 }
-            })
+            }
         });
     }
     // The key of a serial device, taken on the first attempt while the
@@ -407,7 +462,7 @@ pub(super) fn opener(tasks: &Supervisor, url: &str) -> Opener {
                 },
             }
         });
-        Box::pin(async move { opening.await.map_err(io::Error::other)? })
+        async move { opening.await.map_err(io::Error::other)? }
     })
 }
 
@@ -427,9 +482,14 @@ enum RateChange {
 /// A device's port and the state of its rate negotiation.
 struct Device {
     port: HardwarePort,
+    /// What answers at the other end of the port.
+    peer: PeerKind,
     /// What the port receives.
     results: crate::chan::RecvStream<'static, ReceiveResult>,
     rate_change_state: RateChange,
+    /// When the port last received a packet or text. Before it has received
+    /// either, it is when a proxy's open of its `auto` answered, or for any
+    /// other peer when the attempt that opened the port started.
     last_rx: Instant,
     seen_since_connect: bool,
     last_session: Option<u32>,
@@ -437,9 +497,15 @@ struct Device {
 }
 
 impl Device {
-    /// Creates a device reached through `port`, whose results arrive on
-    /// `results`.
-    fn new(port: HardwarePort, results: crate::chan::Receiver<ReceiveResult>) -> Device {
+    /// Creates a device reached as `reached` says, whose results arrive on
+    /// `results`, by an attempt to open it that started at `started`. It is
+    /// called as the open ends.
+    fn new(
+        reached: Reached,
+        results: crate::chan::Receiver<ReceiveResult>,
+        started: Instant,
+    ) -> Device {
+        let Reached { port, peer } = reached;
         // Kickstart rate autonegotiation only if the port supports
         // changing rates and the target rate differs from the default.
         let mut rate_change_state = RateChange::DoNothing;
@@ -448,11 +514,19 @@ impl Device {
                 rate_change_state = RateChange::WaitingForSession;
             }
         }
+        // A proxy's answer to the open is a sign of life. The open itself
+        // may wait for the proxy's own device for as long as
+        // `link::READY_TIMEOUT`.
+        let last_rx = match peer {
+            PeerKind::Proxy => Instant::now(),
+            PeerKind::Device => started,
+        };
         Device {
             port,
+            peer,
             results: results.into_stream(),
             rate_change_state,
-            last_rx: Instant::now(),
+            last_rx,
             seen_since_connect: false,
             last_session: None,
             restarted: false,
@@ -485,17 +559,23 @@ impl Device {
     /// Returns how long the device may stay silent before the watchdog tears
     /// it down.
     fn liveness_timeout(&self) -> Duration {
-        match self.port.kind() {
-            transport::TransportKind::Tcp => LIVENESS_TIMEOUT_TCP,
-            transport::TransportKind::Serial | transport::TransportKind::Udp => LIVENESS_TIMEOUT,
+        match (self.peer, self.port.kind()) {
+            (PeerKind::Proxy, _) => LIVENESS_TIMEOUT_PROXY,
+            (PeerKind::Device, transport::TransportKind::Tcp) => LIVENESS_TIMEOUT_TCP,
+            (
+                PeerKind::Device,
+                transport::TransportKind::Serial | transport::TransportKind::Udp,
+            ) => LIVENESS_TIMEOUT,
         }
     }
 
-    /// Returns when the device counts as lost if it stays silent, or `None`
-    /// before it has answered.
+    /// Returns when the device counts as lost if nothing more arrives. A TCP
+    /// port's clock runs from the moment [`Device::new`] sets, so a
+    /// connection nothing ever answers on is lost too. Any other port has no
+    /// deadline, and returns `None`, before the device has answered.
     fn liveness_deadline(&self) -> Option<Instant> {
-        self.seen_since_connect
-            .then(|| self.last_rx + self.liveness_timeout())
+        let tcp = matches!(self.port.kind(), transport::TransportKind::Tcp);
+        (tcp || self.seen_since_connect).then(|| self.last_rx + self.liveness_timeout())
     }
 
     /// Returns when the port goes back to its default rate if nothing
@@ -625,13 +705,27 @@ struct Worker {
     rpc_timeouts: BTreeMap<Instant, BTreeSet<u16>>,
 }
 
-/// How long a device that has already sent a packet may stay silent before
-/// its port is torn down and reopened.
+/// How long a device on a serial or UDP port that has already sent a packet
+/// may stay silent before its port is torn down and reopened.
 const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// How long a TCP device that has already sent a packet may stay silent. It
-/// allows one RTO plus slack.
+/// How long a device on a TCP connection may stay silent. It allows one RTO
+/// plus slack. The silence counts from the start of the attempt to open the
+/// connection, so the connect, the hello and the wait for the first packet
+/// together take at most this long.
 const LIVENESS_TIMEOUT_TCP: Duration = Duration::from_millis(3000);
+
+/// How long a proxy of this build at the other end of a TCP connection may
+/// stay silent. The silence counts from the proxy's answer to the open of
+/// its `auto`, as that open may itself take up to [`link::READY_TIMEOUT`]
+/// while the proxy waits for its own device.
+///
+/// The connection ends sooner on its own. The link keeps it alive as a
+/// client does, with [`control::CLIENT_KEEPALIVE`], whose transport ends a
+/// connection that hears nothing for 5 s, and the worker then loses the
+/// device as on any failed port. The proxy beats each second it sends
+/// nothing else, so a proxy that is serving is never silent that long.
+const LIVENESS_TIMEOUT_PROXY: Duration = Duration::from_secs(10);
 
 /// How long the worker waits after an attempt to reopen a device fails, or
 /// opens a port the device never answers on, before the next attempt.
@@ -715,8 +809,9 @@ impl Worker {
     /// Returns a future that opens the device's port.
     fn open_device(&self) -> BoxFuture<'static, io::Result<Device>> {
         let (sender, results) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+        let started = Instant::now();
         let opening = self.open.open(sender);
-        Box::pin(async move { Ok(Device::new(opening.await?, results)) })
+        Box::pin(async move { Ok(Device::new(opening.await?, results, started)) })
     }
 
     /// Drops the port after it closed, failed, or went quiet. The ports
@@ -1508,7 +1603,7 @@ fn usb_identity(_path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chan::{JoinHandle, Notify};
-    use crate::proxy::fixtures::{assert_took, UNREACHABLE, WAIT};
+    use crate::proxy::fixtures::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use crate::proxy::outbox::Outbox;
     use crate::rt;
     use crate::tio::transport::{FakeEnd, RateInfo, TransportKind};
@@ -1519,7 +1614,7 @@ mod tests {
 
     /// An opener that never opens anything.
     fn never() -> Opener {
-        Opener::new(|_| Box::pin(future::pending()))
+        Opener::new(|_| future::pending::<io::Result<Reached>>())
     }
 
     fn idle_worker() -> Worker {
@@ -1851,16 +1946,17 @@ mod tests {
 
     /// Returns an opener whose attempt number `n`, counted from 0, runs
     /// `attempt(n, results)`.
-    fn scripted<F>(
+    fn scripted<F, R>(
         attempt: impl Fn(usize, crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
     ) -> Opener
     where
-        F: Future<Output = io::Result<HardwarePort>> + Send + 'static,
+        F: Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
     {
         let attempts = AtomicUsize::new(0);
         Opener::new(move |results| {
             let number = attempts.fetch_add(1, Ordering::Relaxed);
-            Box::pin(attempt(number, results))
+            attempt(number, results)
         })
     }
 
@@ -2225,6 +2321,148 @@ mod tests {
         }
     }
 
+    /// How long each attempt after the first takes to open its port, unless
+    /// a test says otherwise.
+    const CONNECT: Duration = Duration::from_millis(1200);
+
+    /// Runs a worker of fake ports of `kind`, at whose other end `peer`
+    /// answers. The device answers on the first port and then loses it.
+    /// Each later attempt takes `connect` to open its port. Returns the
+    /// worker, the receiver of when each later attempt starts, the end of the
+    /// port the second attempt opens, and when the second attempt started.
+    async fn reopened(
+        kind: TransportKind,
+        peer: PeerKind,
+        connect: Duration,
+    ) -> (Running, mpsc::UnboundedReceiver<Instant>, FakeEnd, Instant) {
+        let (ends, mut opened_ends) = mpsc::unbounded_channel();
+        let (starts, mut started) = mpsc::unbounded_channel();
+        let open = scripted(move |attempt, results| {
+            let _ = starts.send(Instant::now());
+            let port = fake(kind, results, &ends);
+            async move {
+                if attempt > 0 {
+                    tokio::time::sleep(connect).await;
+                }
+                port.map(|port| Reached { port, peer })
+            }
+        });
+        let mut worker = Running::start(open, None);
+        let mut first = opened(&mut opened_ends).await;
+        first.send(&heartbeat()).await;
+        assert_eq!(worker.settled(Readiness::Pending).await, Readiness::Ready);
+        first.fail(io::ErrorKind::ConnectionReset);
+        let silent = opened(&mut opened_ends).await;
+        started.recv().await.expect("the first attempt");
+        let second = started.recv().await.expect("the second attempt");
+        (worker, started, silent, second)
+    }
+
+    /// A TCP connection reopened after the device was lost, on which nothing
+    /// ever arrives, is a failed attempt once `LIVENESS_TIMEOUT_TCP` has
+    /// passed from the start of the attempt, the connect included. The ports
+    /// hear nothing of it, and the next attempt waits the reconnect interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_tcp_reconnection_the_device_never_answers_on_is_given_up() {
+        let (mut worker, mut started, silent, second) =
+            reopened(TransportKind::Tcp, PeerKind::Device, CONNECT).await;
+
+        let third = timeout(WAIT, started.recv()).await.expect("never given up");
+        let third = third.expect("the worker stopped");
+
+        assert!(silent.released(), "the silent connection was kept");
+        assert_took(
+            third - second,
+            LIVENESS_TIMEOUT_TCP + RECONNECT_INTERVAL,
+            "giving up the silent connection and trying again",
+        );
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        assert!(
+            matches!(worker.port.try_recv(), Err(TryRecvError::Empty)),
+            "a failed attempt was reported to the port"
+        );
+        worker.stop().await;
+    }
+
+    /// A serial port reopened after the device was lost, on which nothing
+    /// ever arrives, is kept, as a serial port has no deadline before the
+    /// device answers on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_serial_port_the_device_never_answers_on_is_kept() {
+        let (mut worker, mut started, silent, _) =
+            reopened(TransportKind::Serial, PeerKind::Device, CONNECT).await;
+
+        tokio::time::sleep(10 * LIVENESS_TIMEOUT_TCP).await;
+
+        assert!(!silent.released(), "the silent port was given up");
+        assert!(started.try_recv().is_err(), "the worker tried again");
+        assert!(!worker.task.is_finished(), "the worker stopped");
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        worker.stop().await;
+    }
+
+    /// A proxy reopened after its device was lost, from which nothing more
+    /// arrives, is kept until `LIVENESS_TIMEOUT_PROXY` has passed from its
+    /// answer to the open, and is then a failed attempt. The ports hear
+    /// nothing of it, and the next attempt waits the reconnect interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopened_proxy_is_given_up_once_silent_for_its_timeout_from_its_open() {
+        let (mut worker, mut started, silent, second) =
+            reopened(TransportKind::Tcp, PeerKind::Proxy, CONNECT).await;
+        let answered = second + CONNECT;
+
+        crate::chan::sleep_until(answered + LIVENESS_TIMEOUT_PROXY - Duration::from_millis(1))
+            .await;
+        assert!(!silent.released(), "the proxy was given up before its time");
+        assert!(started.try_recv().is_err(), "the worker tried again");
+
+        let third = timeout(PAUSED_WAIT, started.recv()).await;
+        let third = third.expect("never given up").expect("the worker stopped");
+        assert!(silent.released(), "the silent proxy was kept");
+        assert_took(
+            third - answered,
+            LIVENESS_TIMEOUT_PROXY + RECONNECT_INTERVAL,
+            "giving up the silent proxy and trying again",
+        );
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        assert!(
+            matches!(worker.port.try_recv(), Err(TryRecvError::Empty)),
+            "a failed attempt was reported to the port"
+        );
+        worker.stop().await;
+    }
+
+    /// A proxy whose open took nearly as long as an open may, as it waited
+    /// for its own device, is kept once the open ends, for longer than
+    /// `LIVENESS_TIMEOUT_TCP`. Its silence counts from its answer to the
+    /// open, not from the start of the attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_proxy_whose_open_outlasts_the_tcp_timeout_is_not_given_up_at_once() {
+        let slow = link::READY_TIMEOUT - Duration::from_secs(1);
+        let (mut worker, mut started, silent, second) =
+            reopened(TransportKind::Tcp, PeerKind::Proxy, slow).await;
+
+        crate::chan::sleep_until(second + slow + 2 * LIVENESS_TIMEOUT_TCP).await;
+
+        assert!(!silent.released(), "the proxy was given up as it opened");
+        assert!(started.try_recv().is_err(), "the worker tried again");
+        assert!(!worker.task.is_finished(), "the worker stopped");
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        worker.stop().await;
+    }
+
     /// While an attempt to reopen the device hangs, a port that joins is
     /// adopted at once. A port's request fails at once, as does the request
     /// the device took before it was lost.
@@ -2342,7 +2580,8 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let open = Opener::droppable(move |results| -> Opening {
             if first_opens && attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                return Box::pin(future::ready(fake(TransportKind::Tcp, results, &ends)));
+                let port = fake(TransportKind::Tcp, results, &ends);
+                return Box::pin(future::ready(port.map(Reached::from)));
             }
             let held = crate::chan::lock(&held).take();
             Box::pin(async move {
@@ -2587,14 +2826,15 @@ mod tests {
             // `url`.
             let (ends, mut opened_ends) = mpsc::unbounded_channel();
             let reopen = opener(&Supervisor::current(), &url);
-            let open = scripted(
-                move |attempt, results| -> BoxFuture<'static, io::Result<HardwarePort>> {
-                    match attempt {
-                        0 => Box::pin(future::ready(fake(TransportKind::Tcp, results, &ends))),
-                        _ => reopen.open(results),
+            let open = scripted(move |attempt, results| -> Opening {
+                match attempt {
+                    0 => {
+                        let port = fake(TransportKind::Tcp, results, &ends);
+                        Box::pin(future::ready(port.map(Reached::from)))
                     }
-                },
-            );
+                    _ => reopen.open(results),
+                }
+            });
             let mut worker = Running::start(open, Some(Duration::from_millis(200)));
             let mut first = opened(&mut opened_ends).await;
             first.send(&heartbeat()).await;
