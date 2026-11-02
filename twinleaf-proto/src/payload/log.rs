@@ -89,18 +89,70 @@ impl<'a> LogMessage<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload::strategy::{buffer, bytes, bytes_to, octet, slack, word, write_over_any};
+    use proptest::prelude::*;
 
-    #[test]
-    fn round_trip() {
-        let log = LogMessage {
-            level: LogLevel::WARNING,
-            data: 12_345,
-            message: b"vbus low",
-        };
-        let mut buf = [0u8; 64];
-        let len = log.write(&mut buf).unwrap();
-        assert_eq!(len, Header::SIZE + LOG_HEADER_SIZE + 8);
-        assert_eq!(LogMessage::parse(&buf[Header::SIZE..len]), Some(log));
+    /// A level byte of any value. Two in three are 0 or 0xFF.
+    fn level() -> impl Strategy<Value = LogLevel> {
+        octet().prop_map(LogLevel::new)
+    }
+
+    /// A message of any length up to one past the longest a packet carries.
+    fn any_length() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            bytes_to(MAX_MESSAGE_SIZE),
+            bytes(MAX_MESSAGE_SIZE + 1),
+            bytes(MAX_MESSAGE_SIZE + 2),
+        ]
+    }
+
+    proptest! {
+        /// A message of up to [`MAX_MESSAGE_SIZE`] bytes writes a `LOG` packet
+        /// of exactly its length, whose payload parses back to it, whatever
+        /// the buffer held before.
+        #[test]
+        fn a_log_message_decodes_as_it_was_encoded(
+            level in level(),
+            data in word(),
+            message in bytes_to(MAX_MESSAGE_SIZE),
+        ) {
+            let log = LogMessage { level, data, message: &message };
+            let payload_len = LOG_HEADER_SIZE + message.len();
+            let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| log.write(buf))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
+            prop_assert_eq!(header, Header::new(PacketType::LOG, payload_len as u16));
+            prop_assert_eq!(LogMessage::parse(&buf[Header::SIZE..]), Some(log));
+        }
+
+        /// A payload of five bytes or more parses, and writing what was parsed
+        /// gives back the same payload, whatever the buffer held before. A
+        /// shorter one does not parse.
+        #[test]
+        fn any_payload_parses_when_it_holds_the_head(payload in prop_oneof![
+            (0..=LOG_HEADER_SIZE + 1).prop_flat_map(bytes),
+            bytes_to(Packet::MAX_PAYLOAD),
+        ]) {
+            let Some(log) = LogMessage::parse(&payload) else {
+                prop_assert!(payload.len() < LOG_HEADER_SIZE);
+                return Ok(());
+            };
+            prop_assert!(payload.len() >= LOG_HEADER_SIZE);
+            let (len, buf) = write_over_any(Header::SIZE + payload.len(), |buf| log.write(buf))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(&buf[Header::SIZE..], &payload[..]);
+        }
+
+        /// A message is written when it is at most [`MAX_MESSAGE_SIZE`] bytes
+        /// and the buffer holds the whole packet, and refused otherwise.
+        #[test]
+        fn a_log_message_is_written_only_when_it_fits(message in any_length(), slack in slack()) {
+            let log = LogMessage { level: LogLevel::INFO, data: 0, message: &message };
+            let needed = Header::SIZE + LOG_HEADER_SIZE + message.len();
+            let mut buf = buffer(needed, slack);
+            let fits = message.len() <= MAX_MESSAGE_SIZE && buf.len() >= needed;
+            prop_assert_eq!(log.write(&mut buf), fits.then_some(needed));
+        }
     }
 
     /// Byte-exact packed layout of the log payload behind its packet header
@@ -161,41 +213,6 @@ mod tests {
         // info threshold and critical never is.
         assert!(LogLevel::DEBUG > LogLevel::INFO);
         assert!(LogLevel::CRITICAL < LogLevel::INFO);
-    }
-
-    #[test]
-    fn an_empty_message_is_a_valid_packet() {
-        let log = LogMessage {
-            level: LogLevel::DEBUG,
-            data: 0,
-            message: b"",
-        };
-        let mut buf = [0u8; 16];
-        let len = log.write(&mut buf).unwrap();
-        assert_eq!(len, Header::SIZE + LOG_HEADER_SIZE);
-        assert_eq!(LogMessage::parse(&buf[Header::SIZE..len]), Some(log));
-    }
-
-    #[test]
-    fn rejects_truncated_payload_and_oversize_message() {
-        assert_eq!(LogMessage::parse(&[0; LOG_HEADER_SIZE - 1]), None);
-        let log = LogMessage {
-            level: LogLevel::INFO,
-            data: 0,
-            message: &[b'x'; MAX_MESSAGE_SIZE + 1],
-        };
-        assert_eq!(log.write(&mut [0u8; Packet::MAX_SIZE]), None);
-        // A message that fits exactly still does.
-        let full = LogMessage {
-            message: &[b'x'; MAX_MESSAGE_SIZE],
-            ..log
-        };
-        let mut buf = [0u8; Packet::MAX_SIZE];
-        assert_eq!(
-            full.write(&mut buf),
-            Some(Header::SIZE + Packet::MAX_PAYLOAD),
-            "the longest message fills the payload exactly"
-        );
     }
 
     #[test]

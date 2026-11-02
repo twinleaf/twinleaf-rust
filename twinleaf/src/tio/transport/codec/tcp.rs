@@ -178,8 +178,8 @@ mod tests {
     //! # Exclusions
     //!
     //! Whether a metadata record of a type with a defined layout, 1 to 4,
-    //! parses is left to a suite of metadata records, which does not exist
-    //! yet. The generator builds valid device records, type 1, and no valid
+    //! parses is left to the metadata record properties of `twinleaf-proto`.
+    //! The generator builds valid device records, type 1, and no valid
     //! records of types 2 to 4. For a record of a defined type whose framing
     //! holds, the model takes the packet or `InvalidPayload`. The bytes
     //! [`Codec::encode`] appends are the packet's own, which T2 covers.

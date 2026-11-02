@@ -363,20 +363,312 @@ impl<'a> Timeref<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload::strategy::{buffer, bytes, len_to, octet, slack, word, write_over_any};
+    use proptest::prelude::*;
+    use proptest::sample::Index;
 
-    #[test]
-    fn round_trip() {
-        let timeref = Timeref {
-            epoch: Epoch::UNIX,
-            time: 1_774_137_600,
-            session: SessionId::new(0xBAE5_B410),
-            serial: b"twinleaf-37383731",
-            clock: None,
-        };
-        let mut buf = [0u8; 64];
-        let len = timeref.write(&mut buf).unwrap();
-        assert_eq!(len, Header::SIZE + TIMEREF_HEADER_SIZE + 17);
-        assert_eq!(Timeref::parse(&buf[Header::SIZE..len]), Some(timeref));
+    /// The four value bytes of a clock TLV, steps removed, source code,
+    /// accuracy code and flags, each of any value. A third of the source
+    /// codes are ones IEEE 1588 names.
+    fn clock_bytes() -> impl Strategy<Value = [u8; 4]> {
+        let source = prop_oneof![
+            2 => octet(),
+            1 => prop::sample::select(vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x90, 0xA0]),
+        ];
+        (octet(), source, octet(), octet())
+            .prop_map(|(steps, source, accuracy, flags)| [steps, source, accuracy, flags])
+    }
+
+    /// The clock that four value bytes describe.
+    fn clock_of([steps_removed, source, accuracy, flags]: [u8; 4]) -> Clock {
+        Clock {
+            steps_removed,
+            time_source: TimeSource::from_code(source),
+            accuracy: ClockAccuracy::new(accuracy),
+            flags: ClockFlags::new(flags),
+        }
+    }
+
+    /// A clock of any field values.
+    fn clock() -> impl Strategy<Value = Clock> {
+        clock_bytes().prop_map(clock_of)
+    }
+
+    /// Where the bytes after a serial are cut short.
+    #[derive(Debug, Clone)]
+    enum Cut {
+        /// Not at all.
+        Whole,
+        /// Exactly at the end of the clock TLV.
+        AtClockEnd,
+        /// One byte before the end of the clock TLV.
+        BeforeClockEnd,
+        /// Anywhere.
+        Anywhere(Index),
+    }
+
+    /// A cut, a quarter of them each whole, at the end of the clock TLV, a
+    /// byte before it, or anywhere.
+    fn cut() -> impl Strategy<Value = Cut> {
+        prop_oneof![
+            Just(Cut::Whole),
+            Just(Cut::AtClockEnd),
+            Just(Cut::BeforeClockEnd),
+            any::<Index>().prop_map(Cut::Anywhere),
+        ]
+    }
+
+    /// The fields of a timeref, owning its serial.
+    #[derive(Debug, Clone)]
+    struct Fields {
+        epoch: u8,
+        time: u32,
+        session: u32,
+        serial: Vec<u8>,
+        clock: Option<Clock>,
+    }
+
+    impl Fields {
+        fn timeref(&self) -> Timeref<'_> {
+            Timeref {
+                epoch: Epoch::new(self.epoch),
+                time: self.time,
+                session: SessionId::new(self.session),
+                serial: &self.serial,
+                clock: self.clock,
+            }
+        }
+
+        /// The length of the packet that carries them.
+        fn packet_len(&self) -> usize {
+            let clock = self.clock.map_or(0, |_| CLOCK_TLV_SIZE);
+            Header::SIZE + TIMEREF_HEADER_SIZE + self.serial.len() + clock
+        }
+    }
+
+    /// Timeref fields with a serial of up to `max_serial` bytes and a clock
+    /// or none.
+    fn fields(max_serial: usize) -> impl Strategy<Value = Fields> {
+        (
+            octet(),
+            word(),
+            word(),
+            len_to(max_serial).prop_flat_map(bytes),
+            prop::option::of(clock()),
+        )
+            .prop_map(|(epoch, time, session, serial, clock)| Fields {
+                epoch,
+                time,
+                session,
+                serial,
+                clock,
+            })
+    }
+
+    /// The bytes that follow a serial. Up to three TLVs of a type other than
+    /// a clock, then a clock TLV or none, its value up to eight bytes and
+    /// most often three to five, then any bytes after a clock. Returned with
+    /// the clock TLV's value and where it ends.
+    fn tlvs() -> impl Strategy<Value = (Vec<u8>, Option<(Clock, usize, usize)>)> {
+        let other = (
+            prop_oneof![Just(0), Just(u8::MAX), CLOCK_TLV + 1..=u8::MAX],
+            len_to(8).prop_flat_map(bytes),
+        );
+        let clock_value = (
+            clock_bytes(),
+            prop_oneof![Just(3), Just(4), Just(5), 0..=8usize],
+            bytes(4),
+        );
+        (
+            prop::collection::vec(other, 0..=3),
+            prop::option::of(clock_value),
+            len_to(8).prop_flat_map(bytes),
+        )
+            .prop_map(|(others, clock, after)| {
+                let mut tail = Vec::new();
+                for (kind, value) in others {
+                    tail.extend([kind, value.len() as u8]);
+                    tail.extend(value);
+                }
+                let clock = clock.map(|(fields, len, extra)| {
+                    let value = [&fields[..], &extra].concat();
+                    tail.extend([CLOCK_TLV, len as u8]);
+                    tail.extend(&value[..len]);
+                    tail.extend(&after);
+                    (clock_of(fields), len, tail.len() - after.len())
+                });
+                (tail, clock)
+            })
+    }
+
+    /// A payload too short for the header, or a header of type 0, 1, or any,
+    /// a serial length of 0, 32, 33, 255, or any, and a body that holds the
+    /// serial, a byte short of it, or a few bytes over.
+    fn any_payload() -> impl Strategy<Value = Vec<u8>> {
+        let head = (
+            prop_oneof![Just(0), Just(1), any::<u8>()],
+            prop_oneof![
+                Just(0),
+                Just(MAX_SERIAL_SIZE as u8),
+                Just(MAX_SERIAL_SIZE as u8 + 1),
+                Just(u8::MAX),
+                any::<u8>()
+            ],
+            bytes(TIMEREF_HEADER_SIZE),
+            prop_oneof![Just(-1), Just(0), 1..=8isize],
+        );
+        prop_oneof![
+            1 => (0..TIMEREF_HEADER_SIZE).prop_flat_map(bytes),
+            4 => head.prop_flat_map(|(kind, serial_len, mut header, over)| {
+                header[0] = kind;
+                header[2] = serial_len;
+                let body = (serial_len as usize).checked_add_signed(over).unwrap_or(0);
+                bytes(body).prop_map(move |body| [&header[..], &body].concat())
+            }),
+        ]
+    }
+
+    proptest! {
+        /// A timeref with a serial of up to [`MAX_SERIAL_SIZE`] bytes writes
+        /// a `SYNC` packet of exactly its length, with the clock TLV after the
+        /// serial when there is a clock and the pad byte as given. Its payload
+        /// parses back to the timeref and the pad. A plain write is the same
+        /// packet with a zero pad. Without the clock the payload is the same
+        /// up to the end of the serial, which is all a reader of the layout
+        /// without TLVs takes. Each is the same whatever the buffer held
+        /// before.
+        #[test]
+        fn a_timeref_decodes_as_it_was_encoded(
+            fields in fields(MAX_SERIAL_SIZE),
+            pad in octet(),
+        ) {
+            let timeref = fields.timeref();
+            let (len, buf) =
+                write_over_any(fields.packet_len(), |buf| timeref.write_with_pad(buf, pad))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
+            let payload = &buf[Header::SIZE..];
+            prop_assert_eq!(header, Header::new(PacketType::SYNC, payload.len() as u16));
+            prop_assert_eq!(Timeref::pad(payload), pad);
+            prop_assert_eq!(Timeref::parse(payload), Some(timeref));
+
+            let (len, mut plain) = write_over_any(buf.len(), |buf| timeref.write(buf))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            prop_assert_eq!(Timeref::pad(&plain[Header::SIZE..]), 0);
+            plain[Header::SIZE + 3] = pad;
+            prop_assert_eq!(&plain, &buf);
+
+            let old = Timeref { clock: None, ..timeref };
+            let (len, old_buf) = write_over_any(
+                Header::SIZE + TIMEREF_HEADER_SIZE + fields.serial.len(),
+                |buf| old.write_with_pad(buf, pad),
+            )?;
+            prop_assert_eq!(len, Some(old_buf.len()));
+            prop_assert_eq!(&old_buf[Header::SIZE..], &buf[Header::SIZE..old_buf.len()]);
+        }
+
+        /// The TLVs after the serial are walked by their lengths. The clock is
+        /// the first clock TLV when the whole of it is there with a value of
+        /// four bytes or more, and none when the TLVs before it or the clock
+        /// TLV itself are cut short. Bytes after the clock TLV are ignored.
+        #[test]
+        fn the_clock_is_the_first_whole_clock_tlv(
+            fields in fields(MAX_SERIAL_SIZE),
+            (mut tail, clock) in tlvs(),
+            cut in cut(),
+        ) {
+            let base = Fields { clock: None, ..fields };
+            let mut buf = vec![0u8; base.packet_len()];
+            base.timeref().write(&mut buf).unwrap();
+            let clock_end = clock.map_or(tail.len(), |(.., end)| end);
+            let kept = match cut {
+                Cut::Whole => tail.len(),
+                Cut::AtClockEnd => clock_end,
+                Cut::BeforeClockEnd => clock_end.saturating_sub(1),
+                Cut::Anywhere(at) => at.index(tail.len() + 1),
+            };
+            tail.truncate(kept);
+            let expected = clock
+                .filter(|&(_, len, end)| len >= 4 && kept >= end)
+                .map(|(clock, ..)| clock);
+            let payload = [&buf[Header::SIZE..], &tail].concat();
+            prop_assert_eq!(
+                Timeref::parse(&payload),
+                Some(Timeref { clock: expected, ..base.timeref() })
+            );
+        }
+
+        /// A payload parses when it holds the 12-byte header with type 0 and
+        /// the serial the header measures. Writing what was parsed, with the
+        /// payload's pad, gives back the payload up to the end of the serial,
+        /// or nothing when the serial is over [`MAX_SERIAL_SIZE`] bytes,
+        /// whatever the buffer held before. The pad of a payload too short to
+        /// hold one is zero.
+        #[test]
+        fn any_payload_parses_when_it_holds_its_header_and_serial(payload in any_payload()) {
+            let Some(timeref) = Timeref::parse(&payload) else {
+                let holds = payload.len() >= TIMEREF_HEADER_SIZE
+                    && payload.len() >= TIMEREF_HEADER_SIZE + payload[2] as usize;
+                prop_assert!(!holds || payload[0] != 0);
+                if payload.len() < 4 {
+                    prop_assert_eq!(Timeref::pad(&payload), 0);
+                }
+                return Ok(());
+            };
+            let serial_end = TIMEREF_HEADER_SIZE + payload[2] as usize;
+            prop_assert_eq!(payload[0], 0);
+            prop_assert!(payload.len() >= serial_end);
+            prop_assert_eq!(timeref.serial, &payload[TIMEREF_HEADER_SIZE..serial_end]);
+            let (written, buf) = write_over_any(Header::SIZE + payload.len() + CLOCK_TLV_SIZE, |buf| {
+                timeref.write_with_pad(buf, Timeref::pad(&payload))
+            })?;
+            if timeref.serial.len() > MAX_SERIAL_SIZE {
+                prop_assert_eq!(written, None);
+            } else {
+                prop_assert!(written.is_some());
+                prop_assert_eq!(&buf[Header::SIZE..][..serial_end], &payload[..serial_end]);
+            }
+        }
+
+        /// A timeref is written when its serial is at most
+        /// [`MAX_SERIAL_SIZE`] bytes and the buffer holds the whole packet,
+        /// and refused otherwise.
+        #[test]
+        fn a_timeref_is_written_only_when_it_fits(
+            fields in fields(MAX_SERIAL_SIZE + 1),
+            slack in slack(),
+        ) {
+            let needed = fields.packet_len();
+            let mut buf = buffer(needed, slack);
+            let fits = fields.serial.len() <= MAX_SERIAL_SIZE && buf.len() >= needed;
+            prop_assert_eq!(fields.timeref().write(&mut buf), fits.then_some(needed));
+        }
+
+        /// Each named clock flag is the bit IEEE 1588 gives it in the first
+        /// octet of flagField, from leap61 at bit 0 to frequencyTraceable at
+        /// bit 5, and an octet contains a set of flags when it has all their
+        /// bits.
+        #[test]
+        fn clock_flags_are_the_bits_ptp_names(bits in octet(), other in octet()) {
+            let flags = ClockFlags::new(bits);
+            prop_assert_eq!(flags.bits(), bits);
+            for (bit, named) in [
+                ClockFlags::LEAP_61,
+                ClockFlags::LEAP_59,
+                ClockFlags::UTC_OFFSET_VALID,
+                ClockFlags::PTP_TIMESCALE,
+                ClockFlags::TIME_TRACEABLE,
+                ClockFlags::FREQUENCY_TRACEABLE,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                prop_assert_eq!(named.bits(), 1 << bit);
+                prop_assert_eq!(flags.contains(named), bits & 1 << bit != 0);
+            }
+            prop_assert!(flags.contains(ClockFlags::EMPTY));
+            prop_assert_eq!(flags.contains(ClockFlags::new(other)), bits & other == other);
+        }
     }
 
     /// Byte-exact packed layout of the timeref payload.
@@ -401,37 +693,6 @@ mod tests {
         ]);
     }
 
-    #[test]
-    fn a_pad_byte_rides_beside_the_serial_length() {
-        let timeref = Timeref {
-            epoch: Epoch::UNIX,
-            time: 7,
-            session: SessionId::new(1),
-            serial: b"AB",
-            clock: None,
-        };
-        let mut buf = [0u8; 32];
-        let len = timeref.write_with_pad(&mut buf, 0xC5).unwrap();
-        let payload = &buf[Header::SIZE..len];
-        assert_eq!(Timeref::pad(payload), 0xC5);
-        assert_eq!(Timeref::parse(payload), Some(timeref));
-
-        let mut plain = [0u8; 32];
-        assert_eq!(timeref.write(&mut plain), Some(len));
-        assert_eq!(Timeref::pad(&plain[Header::SIZE..len]), 0);
-    }
-
-    #[test]
-    fn rejects_truncated_and_unknown_type() {
-        assert_eq!(Timeref::parse(&[0; TIMEREF_HEADER_SIZE - 1]), None);
-        let mut unknown_type = [0u8; TIMEREF_HEADER_SIZE];
-        unknown_type[0] = 1;
-        assert_eq!(Timeref::parse(&unknown_type), None);
-        let mut short_serial = [0u8; TIMEREF_HEADER_SIZE];
-        short_serial[2] = 1; // serial_len beyond payload
-        assert_eq!(Timeref::parse(&short_serial), None);
-    }
-
     fn gps_two_hops() -> Timeref<'static> {
         Timeref {
             epoch: Epoch::UNIX,
@@ -448,17 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_round_trips() {
-        let mut buf = [0u8; 64];
-        let len = gps_two_hops().write(&mut buf).unwrap();
-        assert_eq!(len, Header::SIZE + TIMEREF_HEADER_SIZE + 2 + CLOCK_TLV_SIZE);
-        assert_eq!(
-            Timeref::parse(&buf[Header::SIZE..len]),
-            Some(gps_two_hops())
-        );
-    }
-
-    #[test]
     fn a_clock_tlv_follows_the_serial() {
         let mut buf = [0u8; 32];
         let len = gps_two_hops().write(&mut buf).unwrap();
@@ -471,72 +721,6 @@ mod tests {
             b'A', b'B',
             CLOCK_TLV, 4, 2, 0x20, 0x21, 0x34,
         ]);
-    }
-
-    /// A reader of the old layout takes the header and `serial_len` bytes,
-    /// which a clock leaves exactly as they were.
-    #[test]
-    fn a_reader_of_the_old_layout_sees_the_same_timeref() {
-        let mut new = [0u8; 64];
-        let new_len = gps_two_hops().write(&mut new).unwrap();
-        let mut old = [0u8; 64];
-        let old_len = Timeref {
-            clock: None,
-            ..gps_two_hops()
-        }
-        .write(&mut old)
-        .unwrap();
-        assert_eq!(new[Header::SIZE..old_len], old[Header::SIZE..old_len]);
-        assert_eq!(new_len - old_len, CLOCK_TLV_SIZE);
-    }
-
-    #[test]
-    fn an_old_packet_parses_with_no_clock() {
-        let mut buf = [0u8; 64];
-        let len = Timeref {
-            clock: None,
-            ..gps_two_hops()
-        }
-        .write(&mut buf)
-        .unwrap();
-        assert_eq!(Timeref::parse(&buf[Header::SIZE..len]).unwrap().clock, None);
-    }
-
-    #[test]
-    fn an_unknown_tlv_is_skipped_by_its_length() {
-        let mut buf = [0u8; 64];
-        let len = Timeref {
-            clock: None,
-            ..gps_two_hops()
-        }
-        .write(&mut buf)
-        .unwrap();
-        let mut payload = buf[Header::SIZE..len].to_vec();
-        payload.extend_from_slice(&[0x7F, 3, 9, 9, 9, CLOCK_TLV, 4, 2, 0x20, 0x21, 0x34]);
-        assert_eq!(Timeref::parse(&payload), Some(gps_two_hops()));
-    }
-
-    #[test]
-    fn a_truncated_tlv_leaves_the_timeref_without_a_clock() {
-        let mut buf = [0u8; 64];
-        let len = gps_two_hops().write(&mut buf).unwrap();
-        let payload = &buf[Header::SIZE..len];
-        for cut in 1..CLOCK_TLV_SIZE {
-            let parsed = Timeref::parse(&payload[..payload.len() - cut]);
-            assert_eq!(
-                parsed,
-                Some(Timeref {
-                    clock: None,
-                    ..gps_two_hops()
-                })
-            );
-        }
-        let short_clock = [
-            &payload[..payload.len() - CLOCK_TLV_SIZE],
-            &[CLOCK_TLV, 1, 2],
-        ]
-        .concat();
-        assert_eq!(Timeref::parse(&short_clock).unwrap().clock, None);
     }
 
     #[test]
@@ -611,17 +795,5 @@ mod tests {
             .steps_removed,
             u8::MAX
         );
-    }
-
-    #[test]
-    fn rejects_oversize_serial() {
-        let timeref = Timeref {
-            epoch: Epoch::SYSTIME,
-            time: 0,
-            session: SessionId::new(0),
-            serial: &[b'x'; MAX_SERIAL_SIZE + 1],
-            clock: None,
-        };
-        assert_eq!(timeref.write(&mut [0u8; 64]), None);
     }
 }
