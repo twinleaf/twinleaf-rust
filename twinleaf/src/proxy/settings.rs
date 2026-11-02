@@ -56,11 +56,15 @@ pub(crate) enum CacheAction {
 ///
 /// It holds every readable, announced entry that is neither a capture nor
 /// privileged, as the registry describes them, read in one snapshot and kept
-/// by the numbered announcements after it. A sequence number out of order, or
-/// a heartbeat ahead of the last one applied, drops every value until the next
-/// snapshot, and a new session drops the cache. A value it holds is at most
-/// one heartbeat old. A device without `settings.version`, or one that does
-/// not number its announcements, is never cached.
+/// by the numbered announcements after it. An announcement numbered at or
+/// before the last one applied is already held and changes nothing. One
+/// numbered past the next, or a heartbeat ahead of the last one applied,
+/// drops every value until the next snapshot, and a new session drops the
+/// cache. While it waits for a snapshot, every numbered announcement and
+/// every heartbeat of its session that carries the count asks for one. A
+/// value it holds is at most one heartbeat old. A device without
+/// `settings.version`, or one that does not number its announcements, is
+/// never cached.
 #[derive(Debug)]
 pub(crate) struct SettingsCache {
     cached: BTreeSet<String>,
