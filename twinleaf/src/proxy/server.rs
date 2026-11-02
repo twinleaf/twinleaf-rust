@@ -49,9 +49,6 @@ pub(super) enum Notice {
     },
     /// A stop of the proxy.
     Stop,
-    /// A panic of the server.
-    #[cfg(test)]
-    Panic,
 }
 
 /// A change to a client's entry in the table.
@@ -238,13 +235,6 @@ impl Server {
                 notice = self.notices.recv() => match notice {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
                     Some(Notice::Stop) | None => break,
-                    // The clients' tasks end before they could hear a stop,
-                    // as a proxy that crashes tells no client.
-                    #[cfg(test)]
-                    Some(Notice::Panic) => {
-                        self.sessions.abort_all();
-                        panic!("a test asked the server to panic")
-                    }
                 },
                 accepted = accept(&self.listeners), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),

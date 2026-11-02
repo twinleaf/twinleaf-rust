@@ -1016,6 +1016,32 @@ mod tests {
         );
     }
 
+    /// A request the proxy refuses fails with the proxy's message, as the
+    /// proxy words it for a method it does not have.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_request_fails_with_the_proxy_message() {
+        let (send, received) = crate::chan::unbounded();
+        let (port, _peer) =
+            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let refusal = Request::decode(b"proxy.reboot", &[]).unwrap_err();
+        send.send(Ok(TransportEvent::Packet(answer(REQUEST_ID, Err(refusal)))))
+            .unwrap();
+
+        let error = handshake(
+            &port,
+            &received,
+            "tcp://127.0.0.1:7855",
+            "proxy.reboot",
+            &[],
+            "reboot",
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "the proxy has no method proxy.reboot");
+    }
+
     /// Returns the mount of `source` of the device at `url`, seen at `prefix`.
     fn mount(url: &str, source: &str, prefix: &str) -> Mount {
         Mount {
