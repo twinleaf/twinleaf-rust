@@ -8,3 +8,7 @@ members = [
 ]
 
 resolver = "2"
+
+[profile.mutants]
+inherits = "test"
+debug = "none"

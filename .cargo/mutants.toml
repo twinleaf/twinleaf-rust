@@ -1,0 +1,14 @@
+# cargo-mutants settings, so that a plain `cargo mutants` runs as intended.
+# Test-only code is not mutated.
+exclude_globs = [
+    "twinleaf/src/chan/modeled.rs",
+    "twinleaf/src/proxy/turmoil.rs",
+    "**/fixtures.rs",
+    "**/shuttle.rs",
+    "twinleaf/src/data/boundaries.rs",
+    "twinleaf/src/proxy/settings_sim.rs",
+]
+# The crates deny some lints, and a mutant that trips only a lint still runs.
+cap_lints = true
+# A build without debug info links faster.
+profile = "mutants"
