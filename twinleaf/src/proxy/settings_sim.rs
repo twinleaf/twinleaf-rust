@@ -1613,13 +1613,14 @@ fn case() -> impl Strategy<Value = Case> {
 fn config(cases: u32) -> ProptestConfig {
     ProptestConfig {
         cases,
-        failure_persistence: None,
+        source_file: Some(file!()),
         ..ProptestConfig::default()
     }
 }
 
 /// Runs `cases` cases, printing what they counted, and panics with the
-/// minimal failing case and the invariant it broke.
+/// minimal failing case and the invariant it broke, or when no case reached
+/// the exact, quiet and own write checks.
 fn exercise(cases: u32) {
     let totals = RefCell::new(Stats::default());
     let started = Instant::now();
@@ -1632,6 +1633,11 @@ fn exercise(cases: u32) {
     if let Err(failure) = outcome {
         panic!("{failure}");
     }
+    let totals = totals.borrow();
+    assert!(
+        totals.exact_checks > 0 && totals.quiet_checks > 0 && totals.own_writes_held > 0,
+        "the invariants were never checked: {totals:?}"
+    );
 }
 
 /// Every cache stays exact through faults, races, reboots and wraps.
