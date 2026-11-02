@@ -329,9 +329,9 @@ mod tests {
     }
 
     /// Two windows of two that each keep their minimum emit the first one's
-    /// deferred maximum between them. The first, (t0: -1, t1: 100), keeps its
-    /// minimum at t0 and defers the maximum at t1. The second, (t2: -20,
-    /// t3: 150), keeps its minimum at t2 again, so 100 goes between them.
+    /// deferred maximum between them. The first, -1 at t0 and 100 at t1, keeps
+    /// its minimum at t0 and defers the maximum at t1. The second, -20 at t2
+    /// and 150 at t3, keeps its minimum at t2 again, so 100 goes between them.
     #[test]
     fn compensation_emits_deferred_extremum_between_same_kind_windows() {
         let ts = vec![0.0, 1.0, 2.0, 3.0];

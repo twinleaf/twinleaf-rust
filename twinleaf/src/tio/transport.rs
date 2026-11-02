@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 
-    /// Backpressure delays packets, it never eats them: every packet a caller
+    /// Backpressure delays packets and never eats them. Every packet a caller
     /// queued reaches the peer once the peer starts reading again.
     #[test]
     fn a_peer_that_stops_reading_loses_no_queued_packet() {

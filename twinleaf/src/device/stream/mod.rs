@@ -894,8 +894,8 @@ mod tests {
         assert_eq!(ended, RecvError::Disconnected);
     }
 
-    /// The pump ends once nothing can reach it any more: no view left to
-    /// subscribe, and no receiver left holding the stream open.
+    /// The pump ends once nothing can reach it any more, with no view left to
+    /// subscribe and no receiver left holding the stream open.
     #[test]
     fn dropping_the_last_view_and_receiver_ends_the_pump() {
         let (stream, proxy) = stream();
@@ -921,7 +921,7 @@ mod tests {
 
     /// A raw tap sees the wire, absolutely routed and filtered to its scope,
     /// and asks nothing of anyone. A status filters as the subtree at its
-    /// route: it is a recorded stream's reset marker.
+    /// route, as it is a recorded stream's reset marker.
     #[test]
     fn a_packet_tap_is_filtered_absolute_and_passive() {
         let (stream, proxy) = stream();
@@ -959,7 +959,7 @@ mod tests {
         );
     }
 
-    /// A receiver is the subscription: it keeps the pump running on its own,
+    /// A receiver is the subscription. It keeps the pump running on its own,
     /// so a caller need not hold the view it was minted from.
     #[test]
     fn a_receiver_keeps_the_pump_running_without_its_view() {

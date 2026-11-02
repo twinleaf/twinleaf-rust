@@ -2,8 +2,9 @@
 //!
 //! The test reads every `///` and `//!` line of the `twinleaf`,
 //! `twinleaf-proto` and `twinleaf-tools` sources. It fails on a semicolon, a
-//! colon, an em or en dash, or a spaced hyphen in prose. Code blocks,
-//! headings, code spans, link targets and URLs are not prose.
+//! colon, an em or en dash, or a spaced hyphen in prose, the docs of tests
+//! included. Code blocks, headings, code spans, link targets and URLs are not
+//! prose.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,16 +57,12 @@ fn collect_sources(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 /// Returns the line number and text of each doc line whose prose breaks the
-/// rule. Scanning stops at an inline test module.
+/// rule.
 fn check_source(source: &str) -> Vec<(usize, String)> {
-    let lines: Vec<&str> = source.lines().collect();
     let mut findings = Vec::new();
     let mut in_fence = false;
     let mut code_span = None;
-    for (index, line) in lines.iter().enumerate() {
-        if starts_test_module(&lines[index..]) {
-            break;
-        }
+    for (index, line) in source.lines().enumerate() {
         let Some(text) = doc_text(line) else {
             in_fence = false;
             code_span = None;
@@ -95,32 +92,6 @@ fn doc_text(line: &str) -> Option<&str> {
     }
     line.strip_prefix("///")
         .or_else(|| line.strip_prefix("//!"))
-}
-
-/// Returns `true` if `lines` start with `#[cfg(test)]` on an inline module.
-fn starts_test_module(lines: &[&str]) -> bool {
-    let Some(rest) = lines[0].trim().strip_prefix("#[cfg(test)]") else {
-        return false;
-    };
-    if !rest.trim().is_empty() {
-        return is_inline_mod(rest);
-    }
-    lines[1..]
-        .iter()
-        .map(|line| line.trim())
-        .find(|line| !line.is_empty() && !line.starts_with("#["))
-        .is_some_and(is_inline_mod)
-}
-
-/// Returns `true` if `line` opens a module whose body follows inline.
-fn is_inline_mod(line: &str) -> bool {
-    let line = line.trim();
-    let line = match line.strip_prefix("pub") {
-        Some(rest) if rest.starts_with(' ') => rest.trim_start(),
-        Some(rest) if rest.starts_with('(') => rest.split_once(')').map_or(rest, |(_, r)| r),
-        _ => line,
-    };
-    line.trim_start().starts_with("mod ") && line.ends_with('{')
 }
 
 /// Returns `true` if `text` is a Markdown heading.
@@ -236,8 +207,8 @@ fn rule_flags_punctuation_in_prose() {
 }
 
 #[test]
-fn scanning_stops_at_an_inline_test_module() {
-    let source = "#[cfg(test)]\nfn helper() {}\n/// A: b.\n#[cfg(test)]\nmod tests {\n/// C: d.\n";
+fn scanning_reads_the_docs_of_tests_too() {
+    let source = "#[cfg(test)]\nmod tests {\n/// C: d.\n";
     let lines: Vec<usize> = check_source(source).into_iter().map(|(n, _)| n).collect();
     assert_eq!(lines, [3]);
 }

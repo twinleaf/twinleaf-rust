@@ -967,7 +967,7 @@ mod tests {
         (result, events, sent, cursor)
     }
 
-    /// Three chunks: two full ones and a short tail.
+    /// Three chunks, two full ones and a short tail.
     const THREE_CHUNKS: usize = 2 * UPLOAD_CHUNK_SIZE + 64;
     const THREE_CHUNKS_DATA: u32 = (THREE_CHUNKS - 3 * CHUNK_ENVELOPE) as u32;
 
@@ -1022,7 +1022,7 @@ mod tests {
         assert_eq!(cursor, THREE_CHUNKS_DATA);
     }
 
-    /// A chunk the device applied but whose ack was lost is not resent: the
+    /// A chunk the device applied but whose ack was lost is not resent, as the
     /// cursor is already past it.
     #[test]
     fn a_lost_ack_is_not_resent() {

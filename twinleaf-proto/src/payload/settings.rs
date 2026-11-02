@@ -287,8 +287,8 @@ mod tests {
         ]);
     }
 
-    /// What a receiver does with the packet: `name_len` bytes of name, then
-    /// the rest of the payload as the value.
+    /// A receiver takes `name_len` bytes of name, then the rest of the
+    /// payload as the value.
     #[test]
     fn decodes_name_and_value_from_the_payload() {
         let raw = [
@@ -310,8 +310,8 @@ mod tests {
         assert_eq!(setting.reply, b"X");
     }
 
-    /// Byte-exact: the head with [`VERSION`] set, the sequence number, then
-    /// the name and value as before.
+    /// Byte for byte, the head with [`VERSION`] set, the sequence number,
+    /// then the name and value as before.
     #[test]
     fn a_numbered_announcement_puts_its_sequence_before_the_name() {
         let setting = Setting {

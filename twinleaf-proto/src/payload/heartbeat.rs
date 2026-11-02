@@ -198,7 +198,7 @@ mod tests {
         }
     }
 
-    /// Byte-exact: a HEARTBEAT header with no routing over the session id
+    /// Byte for byte, a HEARTBEAT header with no routing over the session id
     /// and the settings sequence, little-endian.
     #[test]
     fn matches_the_packed_wire_layout() {

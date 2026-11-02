@@ -336,8 +336,8 @@ mod tests {
     }
 
     impl Fixture {
-        /// Push one batch stamped with `stream_generation`; a change of generation is what
-        /// starts a new run.
+        /// Pushes one batch stamped with `stream_generation`. A change of
+        /// generation starts a new run.
         fn push_rows(
             &self,
             buffer: &mut Buffer,

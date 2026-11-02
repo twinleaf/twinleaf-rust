@@ -375,8 +375,8 @@ mod tests {
         (ts, vals)
     }
 
-    /// Box-Muller over a xorshift stream: repeatable normal noise for tests
-    /// without pulling in an RNG dependency.
+    /// Box-Muller over a xorshift stream, which makes repeatable normal noise
+    /// for tests without pulling in an RNG dependency.
     fn gaussian_noise(seed: u64) -> impl FnMut() -> f64 {
         let mut state = seed;
         move || {

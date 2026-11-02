@@ -559,7 +559,7 @@ mod tests {
     }
 
     /// A segment update is described before the first sample of the segment it
-    /// switched to, and only through the snapshot: never as the update itself.
+    /// switched to, and only through the snapshot, never as the update itself.
     #[test]
     fn a_segment_update_is_described_before_the_samples_that_follow_it() {
         let route = DeviceRoute::root();
@@ -619,8 +619,8 @@ mod tests {
         );
     }
 
-    /// A tap that lagged leaves a gap in the samples and nothing else: the file
-    /// still decodes, and reports the loss the recorder counted.
+    /// A tap that lagged leaves a gap in the samples and nothing else. The
+    /// file still decodes, and reports the loss the recorder counted.
     #[test]
     fn a_gap_in_the_tap_is_recorded_as_lost_samples() {
         let route = DeviceRoute::root();
@@ -705,8 +705,8 @@ mod tests {
         );
     }
 
-    /// A reboot mid-recording: the samples of the new session wait for the
-    /// metadata describing them, and replay splits the runs where it did.
+    /// After a reboot mid-recording, the samples of the new session wait for
+    /// the metadata describing them, and replay splits the runs where it did.
     #[test]
     fn a_session_change_splits_the_recorded_runs() {
         let route = DeviceRoute::root();

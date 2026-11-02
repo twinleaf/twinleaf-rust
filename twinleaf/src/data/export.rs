@@ -728,8 +728,9 @@ mod tests {
         StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(stream_id))
     }
 
-    /// Generations as the parser stamps them for a stream whose own run is `stream`:
-    /// only the boundaries after the initial one bump the shared generations.
+    /// Generations as the parser stamps them for a stream whose own run is
+    /// `stream`. Only the boundaries after the initial one bump the shared
+    /// generations.
     fn generations(stream: u32) -> Generations {
         Generations {
             stream,

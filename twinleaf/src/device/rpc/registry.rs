@@ -304,8 +304,8 @@ mod tests {
         ));
     }
 
-    /// `dev.priv` mid-walk: the descriptors came partly from each table, so
-    /// the walk is neither cached nor returned, and the new table is walked.
+    /// After `dev.priv` mid-walk, the descriptors came partly from each table,
+    /// so the walk is neither cached nor returned, and the new table is walked.
     #[test]
     fn a_hash_that_moves_during_the_walk_walks_the_new_table() {
         let _cache = cache::Scratch::new();

@@ -1559,8 +1559,8 @@ mod tests {
         ]);
     }
 
-    /// `tl_metadata_stream`: a 9-byte head with two little-endian u16s, then
-    /// the name.
+    /// A `tl_metadata_stream` is a 9-byte head with two little-endian u16s,
+    /// then the name.
     #[test]
     fn stream_record_matches_the_packed_wire_layout() {
         let record = Stream {
@@ -1587,7 +1587,7 @@ mod tests {
         ]);
     }
 
-    /// `tl_metadata_column`: a 7-byte head, then name, units, description.
+    /// A `tl_metadata_column` is a 7-byte head, then name, units, description.
     #[test]
     fn column_record_matches_the_packed_wire_layout() {
         let record = Column {
@@ -1610,8 +1610,8 @@ mod tests {
         ]);
     }
 
-    /// `tl_metadata_segment`: 27-byte head with four little-endian u32s and an
-    /// f32 cutoff, then the timeref serial.
+    /// A `tl_metadata_segment` is a 27-byte head with four little-endian u32s
+    /// and an f32 cutoff, then the timeref serial.
     #[test]
     fn segment_record_matches_the_packed_wire_layout() {
         let record = Segment {

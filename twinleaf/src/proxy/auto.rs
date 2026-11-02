@@ -104,8 +104,8 @@ mod tests {
             .collect()
     }
 
-    /// What `resolve` chose, in words: `default`, `open` and the URL of a
-    /// link open, or `attached` and the URL of a device attached.
+    /// What `resolve` chose, in words. That is `default`, `open` and the URL of
+    /// a link open, or `attached` and the URL of a device attached.
     fn chose(choice: Result<Choice, String>) -> Result<String, String> {
         choice.map(|choice| match choice {
             Choice::Default(_) => "default".to_string(),

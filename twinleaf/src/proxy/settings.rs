@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(cache.version(), Some(4));
     }
 
-    /// A counter that moves during a read is read again; one that never
+    /// A counter that moves during a read is read again. One that never
     /// settles keeps the last read at its first count, for the announcements
     /// between to finish.
     #[test]
@@ -438,7 +438,7 @@ mod tests {
     }
 
     /// A heartbeat ahead of the last announcement applied shows one was
-    /// missed; one behind or level does not.
+    /// missed, and one behind or level does not.
     #[test]
     fn a_heartbeat_ahead_of_the_cache_drops_the_values() {
         let mut cache = snapshotted(4);

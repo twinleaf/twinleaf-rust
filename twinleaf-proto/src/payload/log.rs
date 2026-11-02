@@ -176,8 +176,8 @@ mod tests {
         ]);
     }
 
-    /// What a receiver does with the packet: level and data from the fixed
-    /// header, the message running from there to the end of the payload.
+    /// A receiver takes the level and data from the fixed header, and the
+    /// message running from there to the end of the payload.
     #[test]
     fn decodes_level_data_and_message() {
         // A packet as it arrives on the wire.

@@ -1107,8 +1107,8 @@ mod tests {
         }
     }
 
-    /// The `dev.metadata` call the engine submitted: its route, its args,
-    /// and its id.
+    /// The route, args and id of the `dev.metadata` call the engine
+    /// submitted.
     fn metadata_call(proxy: &TestProxy) -> (DeviceRoute, Vec<u8>, u16) {
         let (route, name, args, id) = proxy.call();
         assert_eq!(name, wire::METADATA_RPC_METHOD);
@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(heard, [child], "only the heartbeat's route exists");
     }
 
-    /// Behind `tio proxy --mount`, a status arrives on its mount's prefix:
+    /// Behind `tio proxy --mount`, a status arrives on its mount's prefix, so
     /// one sensor bouncing redescribes its own subtree and no one else's.
     #[test]
     fn a_mounts_disconnect_resets_only_its_own_subtree() {
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     /// A mount that stopped on purpose ends its session as a disconnected one
-    /// does: its own subtree redescribes and no one else's does.
+    /// does. Its own subtree redescribes and no one else's does.
     #[test]
     fn a_mounts_stop_resets_only_its_own_subtree() {
         let (steady, stopped) = (route("/1"), route("/2"));
@@ -1419,7 +1419,7 @@ mod tests {
         assert!(lost(&link), "the link status lost the mount, got {link:?}");
     }
 
-    /// The affected subtree contains the device, not the other way around: a
+    /// The affected subtree contains the device, not the other way around. A
     /// device below a mount follows that mount's status, and a device on
     /// another mount does not.
     #[test]
@@ -1442,7 +1442,7 @@ mod tests {
         );
     }
 
-    /// Link state is a level, not an edge: a receiver that joins during an
+    /// Link state is a level, not an edge, so a receiver that joins during an
     /// outage learns what it did not watch happen.
     #[test]
     fn a_late_receiver_starts_from_the_link_state_it_did_not_watch() {

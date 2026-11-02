@@ -948,8 +948,8 @@ mod tests {
         (tree, proxy)
     }
 
-    /// A view may not mint one that reaches further than itself: containment is
-    /// checked here, existence at the first RPC.
+    /// A view may not mint one that reaches further than itself. Containment
+    /// is checked here, and existence at the first RPC.
     #[test]
     fn a_device_must_lie_within_the_trees_scope_and_depth() {
         let route = |text: &str| text.parse::<DeviceRoute>().expect("a valid route");

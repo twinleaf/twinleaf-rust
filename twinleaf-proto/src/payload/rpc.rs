@@ -1180,8 +1180,8 @@ mod tests {
         assert_eq!(&buf[..n], &[4, 0, 6, 0, 1, 0, 17, 0, b'n', b'o']);
     }
 
-    /// The request layout on the wire: header, id, `BY_NAME | len`, the
-    /// name, then the argument, and no routing.
+    /// On the wire a request is the header, id, `BY_NAME | len`, the name,
+    /// then the argument, and no routing.
     #[test]
     fn request_layout() {
         let mut buf = [0u8; 32];
@@ -1212,8 +1212,8 @@ mod tests {
         assert_eq!(&buf[..n], &[2, 0, 4, 0, 1, 0, 4, 0]);
     }
 
-    /// A code this crate has no name for still reaches the caller: everything
-    /// from `TL_RPC_ERROR_USER` = 18 up is defined per RPC.
+    /// A code this crate has no name for still reaches the caller, as every
+    /// code from `TL_RPC_ERROR_USER` = 18 up is defined per RPC.
     #[test]
     fn an_unnamed_error_code_survives_parsing() {
         let payload = [7, 0, 20, 0, b'w', b'h', b'y'];
@@ -1293,7 +1293,7 @@ mod tests {
         assert_eq!(any.size_bytes(), None);
     }
 
-    /// A bool is its own type code; the retired `0x0800` flag on a `u8` still
+    /// A bool is its own type code. The retired `0x0800` flag on a `u8` still
     /// reads as one, and on anything else is ignored.
     #[test]
     fn a_bool_is_a_type_and_the_retired_flag_still_decodes() {
