@@ -10,9 +10,9 @@ use super::state::MetadataState;
 use super::stream::{Receiver, RecvError};
 use crate::data::{announces_stop, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
+use crate::rand::HashMap;
 use crate::tio;
 use crate::tio::packet;
-use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
@@ -73,7 +73,7 @@ impl<W: Write> Transcript<W> {
             writer,
             mode,
             parser: PacketParser::new(false),
-            described: HashMap::new(),
+            described: HashMap::default(),
             bytes_written: 0,
             samples_lost: 0,
         }
@@ -218,7 +218,7 @@ impl<W: Write> Recorder<W> {
         Recorder {
             tree: tree.clone(),
             tap: tree.packets(),
-            metadata: HashMap::new(),
+            metadata: HashMap::default(),
             transcript: Transcript::new(writer, mode),
         }
     }
@@ -880,5 +880,387 @@ mod tests {
             file.writer, expected,
             "an undescribed sample and a bare heartbeat are recorded all the same"
         );
+    }
+
+    mod end_to_end {
+        //! Properties of a [`Recorder`] over a live tree.
+        //!
+        //! # Observations
+        //!
+        //! The bytes a recorder hands its writer and when it flushes them,
+        //! what [`Recorder::bytes_written`], [`Recorder::samples_lost`] and
+        //! [`Recorder::flush`] return, and the requests its connection sends
+        //! the proxy. The tree is the root of a connection over a session
+        //! whose far end the test plays, so the test sends what the tap
+        //! carries.
+        //!
+        //! # Sources
+        //!
+        //! The doc of [`RecordMode::Raw`], every packet the tap carries, byte
+        //! for byte, and no discovery. The doc of [`Recorder::samples_lost`],
+        //! the samples the recording lacks as the devices reported them lost.
+        //! The doc of [`Recorder::flush`], which flushes the writer and
+        //! returns [`RecordError::Write`] if the writer fails to. The doc of
+        //! [`Recorder::bytes_written`]. The doc of
+        //! [`MAX_SAMPLE_NUMBER`](crate::proto::data::MAX_SAMPLE_NUMBER),
+        //! sample numbers wrap at 24 bits. The doc of
+        //! [`Change`](crate::data::Change), where time going backward is a
+        //! change, and a change other than a rollover stands for any loss
+        //! next to it, so its boundary names none.
+        //!
+        //! # Model
+        //!
+        //! The tap is what the proxy sent, in order. A device reports a loss
+        //! as a gap in a stream's sample numbers, so a stream whose samples
+        //! are numbered `a` then a greater `b` lacks `b - a - 1`. A stream
+        //! whose numbers go back, or wrap past the 24 bit limit to small
+        //! ones, went back in time, which names no loss.
+        //!
+        //! # Laws
+        //!
+        //! - R1, round trip. A raw recording is the packets the proxy sent
+        //!   back to back, as a second packet receiver of the tree also
+        //!   yields them, and `bytes_written` is its length. Source, the doc
+        //!   of `Raw`. It rules out a raw recording that drops, reorders or
+        //!   adds packets, and a stream that changes every packet for every
+        //!   receiver alike.
+        //! - R2, postcondition. A raw recorder sends the proxy nothing, so
+        //!   the first packet the connection sends after it has recorded
+        //!   everything is a request the test makes. Source, the doc of
+        //!   `Raw`, no discovery. It rules out a raw recorder that follows the
+        //!   metadata of the devices it hears, or calls their RPCs.
+        //! - R3, postcondition. A described recording of described devices
+        //!   reports the sum of the gaps in each stream's sample numbers lost,
+        //!   none when nothing skips, and none for a step back or a wrap.
+        //!   Source, the doc of `samples_lost` and the model. It rules out a
+        //!   count fixed at 0 or 1, one that sums the gaps of a device's
+        //!   streams together, and one that counts a step back as a loss.
+        //! - R4, postcondition. Once `flush` returns, the writer has flushed
+        //!   every byte written, and a writer that fails to flush gives
+        //!   `RecordError::Write`. Source, the doc of `flush`. It rules out a
+        //!   flush that never reaches the writer.
+        //!
+        //! # Generator obligations
+        //!
+        //! For R1 and R2, 1 to 16 packets of samples, heartbeats with and
+        //! without a session, metadata records, link statuses and setting
+        //! announcements, from routes of 0 to 2 hops. For R3, one or two
+        //! devices at routes of 0 to 2 hops, each of two streams, and 1 to 24
+        //! sample packets among the streams. Each stream starts at 0 or 3
+        //! below the 24 bit limit. Each step skips 0 to 3 samples, no skip
+        //! half the time, or goes back 1 to 3 samples one time in four, and a
+        //! skip past the limit wraps. A writer that flushes and one that
+        //! fails to, for each.
+        //!
+        //! # Exclusions
+        //!
+        //! What a described recording holds besides samples, metadata and the
+        //! markers replay needs. [`RecordMode::Described`] does not say it
+        //! holds nothing else, so whether a setting other than a stop is
+        //! written is not checked. Whether a described recorder follows a
+        //! device it already follows again, which only a proxy that answers
+        //! the watches would show.
+        //!
+        //! # Examples that stay
+        //!
+        //! None.
+
+        use super::*;
+        use crate::device::fixtures::{self, WAIT};
+        use crate::device::session::{Session, TestProxy};
+        use crate::device::Connection;
+        use crate::proto::data::MAX_SAMPLE_NUMBER;
+        use crate::proxy::{decode, Watch, WATCH};
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        /// What a [`Spy`] saw, the bytes written, the number written at each
+        /// flush, and whether it fails to flush.
+        #[derive(Default)]
+        struct Seen {
+            written: Vec<u8>,
+            flushed: Vec<usize>,
+            fails: bool,
+        }
+
+        /// A writer the test reads back.
+        #[derive(Clone, Default)]
+        struct Spy(Arc<Mutex<Seen>>);
+
+        impl Write for Spy {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                crate::chan::lock(&self.0).written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                let mut seen = crate::chan::lock(&self.0);
+                if seen.fails {
+                    return Err(std::io::Error::other("the disk is gone"));
+                }
+                let written = seen.written.len();
+                seen.flushed.push(written);
+                Ok(())
+            }
+        }
+
+        impl Spy {
+            fn failing(fails: bool) -> Spy {
+                let spy = Spy::default();
+                crate::chan::lock(&spy.0).fails = fails;
+                spy
+            }
+
+            fn written(&self) -> Vec<u8> {
+                crate::chan::lock(&self.0).written.clone()
+            }
+        }
+
+        fn route_of(hops: &[u8]) -> DeviceRoute {
+            DeviceRoute::from_hops(hops).unwrap()
+        }
+
+        fn hops() -> impl Strategy<Value = Vec<u8>> {
+            prop::collection::vec(0u8..3, 0..=2)
+        }
+
+        /// One packet a device sends, from the route of `hops`.
+        fn tapped() -> impl Strategy<Value = Packet> {
+            let route = hops().prop_map(|hops| route_of(&hops));
+            (route, 0u8..6, any::<u16>()).prop_map(|(route, kind, n)| match kind {
+                0 => fixtures::samples(u32::from(n), route),
+                1 => Packet::heartbeat(route),
+                2 => Packet::heartbeat_session(u32::from(n), route),
+                3 => fixtures::broadcast(fixtures::metadata_records(1)[usize::from(n % 4)], route),
+                4 => Packet::link(LinkStatus::SensorReconnected).with_route(route),
+                _ => fixtures::announcement("test.amplitude", Some(u32::from(n)), &[1], route),
+            })
+        }
+
+        /// A connection's root tree over a session whose far end the test
+        /// plays.
+        fn tree() -> (Connection, DeviceTree, TestProxy) {
+            let (session, proxy) = Session::test_pair();
+            let connection = Connection::over(session);
+            let tree = connection.tree(DeviceRoute::root());
+            (connection, tree, proxy)
+        }
+
+        /// Steps `recorder` until `done` holds, or fails the case at
+        /// [`WAIT`].
+        fn record_until<W: Write>(
+            recorder: &mut Recorder<W>,
+            done: impl Fn(&Recorder<W>) -> bool,
+        ) -> Result<(), TestCaseError> {
+            let deadline = Instant::now() + WAIT;
+            while !done(recorder) {
+                prop_assert!(Instant::now() < deadline, "the recorder never caught up");
+                let wake = Instant::now() + Duration::from_millis(20);
+                prop_assert!(recorder.step(Some(wake)).is_ok());
+            }
+            Ok(())
+        }
+
+        /// Checks R4 of `recorder` over `spy`.
+        fn check_flush(recorder: &mut Recorder<Spy>, spy: &Spy) -> Result<(), TestCaseError> {
+            let fails = crate::chan::lock(&spy.0).fails;
+            match (fails, recorder.flush()) {
+                (false, Ok(())) => {
+                    let seen = crate::chan::lock(&spy.0);
+                    prop_assert_eq!(seen.flushed.last().copied(), Some(seen.written.len()));
+                }
+                (true, Err(RecordError::Write(_))) => {}
+                (fails, outcome) => {
+                    prop_assert!(
+                        false,
+                        "a writer that fails {} flushed with {:?}",
+                        fails,
+                        outcome
+                    )
+                }
+            }
+            Ok(())
+        }
+
+        /// Whether `packet` asks the proxy to watch the device at `route`.
+        fn watches(packet: &Packet, route: DeviceRoute) -> bool {
+            let packet::Payload::ProxyTx(request) = packet.payload() else {
+                return false;
+            };
+            request.method == crate::proto::rpc::Method::ByName(WATCH.as_bytes())
+                && decode::<Watch>(request.args).is_ok_and(|watch| watch.route == route)
+        }
+
+        /// Every packet the connection sends, up to and including the watch
+        /// of `last`.
+        fn sent_until(proxy: &TestProxy, last: DeviceRoute) -> Vec<Packet> {
+            let mut sent = Vec::new();
+            loop {
+                let packet = proxy
+                    .sent
+                    .recv_timeout(WAIT)
+                    .expect("the watch of the last route");
+                let done = watches(&packet, last);
+                sent.push(packet);
+                if done {
+                    return sent;
+                }
+            }
+        }
+
+        /// The records of a device in session 1 with streams 1 and 2, each as
+        /// the fixtures' one stream describes it.
+        fn two_streams(route: DeviceRoute) -> Vec<Packet> {
+            let [device, stream, segment, column] = fixtures::metadata_records(1);
+            let (
+                wire::Metadata::Device(device),
+                wire::Metadata::Stream(stream),
+                wire::Metadata::Segment(segment),
+                wire::Metadata::Column(column),
+            ) = (device, stream, segment, column)
+            else {
+                panic!("the fixtures describe a device, a stream, a segment and a column");
+            };
+            let mut records = vec![wire::Metadata::Device(wire::Device {
+                n_streams: 2,
+                ..device
+            })];
+            for id in [StreamId::new(1), StreamId::new(2)] {
+                records.extend([
+                    wire::Metadata::Stream(wire::Stream {
+                        stream_id: id,
+                        ..stream
+                    }),
+                    wire::Metadata::Segment(wire::Segment {
+                        stream_id: id,
+                        ..segment
+                    }),
+                    wire::Metadata::Column(wire::Column {
+                        stream_id: id,
+                        ..column
+                    }),
+                ]);
+            }
+            records
+                .into_iter()
+                .map(|record| fixtures::broadcast(record, route))
+                .collect()
+        }
+
+        /// One step of a stream's sample numbers, a skip of 0 to 3 samples
+        /// forward or a step back of 1 to 3.
+        #[derive(Debug, Clone, Copy)]
+        enum Stride {
+            Skip(u32),
+            Back(u32),
+        }
+
+        fn stride() -> impl Strategy<Value = Stride> {
+            prop_oneof![
+                2 => Just(Stride::Skip(0)),
+                1 => (1u32..4).prop_map(Stride::Skip),
+                1 => (1u32..4).prop_map(Stride::Back),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(32))]
+
+            /// R1, R2 and R4. A raw recording is the tap, and asks the proxy
+            /// for nothing.
+            #[test]
+            fn a_raw_recording_is_the_tap_and_asks_nothing(
+                sent in prop::collection::vec(tapped(), 1..=16),
+                fails in any::<bool>(),
+            ) {
+                let (_connection, tree, proxy) = tree();
+                let tap = tree.packets();
+                let spy = Spy::failing(fails);
+                let mut recorder = Recorder::new(&tree, spy.clone(), RecordMode::Raw);
+                for packet in &sent {
+                    proxy.send(packet.clone());
+                }
+                let expected: Vec<u8> = sent
+                    .iter()
+                    .flat_map(|packet| packet.as_bytes().to_vec())
+                    .collect();
+                let mut tapped = Vec::new();
+                for _ in &sent {
+                    let packet = tap.recv_timeout(WAIT).expect("the tap carries each packet");
+                    tapped.extend_from_slice(packet.as_bytes());
+                }
+                prop_assert_eq!(&tapped, &expected, "the tap is what the proxy sent");
+
+                record_until(&mut recorder, |recorder| {
+                    recorder.bytes_written() >= expected.len() as u64
+                })?;
+                prop_assert_eq!(spy.written(), expected.clone());
+                prop_assert_eq!(recorder.bytes_written(), expected.len() as u64);
+                check_flush(&mut recorder, &spy)?;
+
+                // Every route the generator makes sorts before `/255`, so a
+                // watch of one is requested no later than this one, and
+                // anything else the recorder sent is already on its way.
+                let last = route_of(&[255]);
+                let _followed = tree.device(last).unwrap().metadata_updates();
+                let asked = sent_until(&proxy, last);
+                prop_assert_eq!(asked.len(), 1, "the recorder sent {:?}", asked);
+            }
+
+            /// R3 and R4. A described recording counts the samples its
+            /// devices' streams skipped.
+            #[test]
+            fn a_described_recording_counts_the_samples_skipped(
+                devices in prop::collection::btree_set(hops(), 1..=2),
+                start in prop_oneof![Just(0), Just(MAX_SAMPLE_NUMBER - 3)],
+                samples in prop::collection::vec(
+                    (any::<prop::sample::Index>(), 1u8..=2, stride()),
+                    1..=24,
+                ),
+                fails in any::<bool>(),
+            ) {
+                let devices: Vec<DeviceRoute> = devices.iter().map(|hops| route_of(hops)).collect();
+                let (_connection, tree, proxy) = tree();
+                let spy = Spy::failing(fails);
+                let mut recorder = Recorder::new(&tree, spy.clone(), RecordMode::Described);
+                for &route in &devices {
+                    for packet in two_streams(route) {
+                        proxy.send(packet);
+                    }
+                }
+                let mut last_number: BTreeMap<(DeviceRoute, u8), u32> = BTreeMap::new();
+                let mut lost = 0;
+                for (device, stream, stride) in &samples {
+                    let route = devices[device.index(devices.len())];
+                    let number = match (last_number.get(&(route, *stream)), stride) {
+                        (None, _) => start,
+                        (Some(&before), Stride::Back(back)) if before >= *back => before - back,
+                        (Some(&before), Stride::Back(_)) => before + 1,
+                        (Some(&before), Stride::Skip(skip)) => {
+                            let after = before + 1 + skip;
+                            match after > MAX_SAMPLE_NUMBER {
+                                true => after - MAX_SAMPLE_NUMBER - 1,
+                                false => {
+                                    lost += u64::from(*skip);
+                                    after
+                                }
+                            }
+                        }
+                    };
+                    last_number.insert((route, *stream), number);
+                    let packet = Packet::samples(*stream, 0, number, &[0; 4], route).unwrap();
+                    proxy.send(packet);
+                }
+                let last = Packet::heartbeat_session(1, devices[0]);
+                proxy.send(last.clone());
+
+                record_until(&mut recorder, |_| spy.written().ends_with(last.as_bytes()))?;
+                prop_assert_eq!(recorder.samples_lost(), lost);
+                prop_assert_eq!(recorder.bytes_written(), spy.written().len() as u64);
+                check_flush(&mut recorder, &spy)?;
+            }
+        }
     }
 }

@@ -1015,10 +1015,16 @@ mod tests {
         responder.join().unwrap();
     }
 
+    /// A refusal, a call nothing answers, and a call lost with the socket
+    /// each fail as their own error. Only the unanswered call has a short
+    /// timeout, so the refusal and the loss never wait on it.
     #[test]
     fn raw_call_failures_map_to_typed_call_errors() {
         let (tree, proxy) = test_tree();
-        let tree = tree.with_timeout(Duration::from_millis(150));
+        let (patient, hasty) = (
+            tree.with_timeout(WAIT * 2),
+            tree.with_timeout(Duration::from_millis(150)),
+        );
         let responder = thread::spawn(move || {
             let (route, _, _, id) = proxy.call();
             proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
@@ -1028,17 +1034,17 @@ mod tests {
             proxy.call();
         });
 
-        let refused = tree.raw_rpc(DeviceRoute::root(), "dev.name", b"");
+        let refused = patient.raw_rpc(DeviceRoute::root(), "dev.name", b"");
         assert!(matches!(
             refused,
             Err(CallError::DeviceError(payload))
                 if matches!(payload.error, wire_rpc::RpcError::NotFound)
         ));
         assert!(matches!(
-            tree.raw_rpc(DeviceRoute::root(), "dev.name", b""),
+            hasty.raw_rpc(DeviceRoute::root(), "dev.name", b""),
             Err(CallError::Timeout)
         ));
-        let lost = tree.raw_rpc(DeviceRoute::root(), "dev.name", b"");
+        let lost = patient.raw_rpc(DeviceRoute::root(), "dev.name", b"");
         assert!(matches!(lost, Err(CallError::ResponseLost)), "{lost:?}");
         responder.join().unwrap();
     }
@@ -1085,7 +1091,8 @@ mod tests {
     }
 
     /// The call's own timeout decides how long a device may take, so a reply
-    /// within it arrives through the proxy however long it took.
+    /// within it arrives through the proxy however long it took. The call
+    /// waits twice [`WAIT`], so a slow test thread never runs it out.
     #[test]
     fn a_slow_reply_within_the_calls_timeout_arrives() {
         let device = FakeDevice::start();
@@ -1094,7 +1101,10 @@ mod tests {
 
         let connection = open_through(&proxy, &device.url).unwrap();
 
-        assert_eq!(root_name(&connection), "FAKE");
+        let root = connection
+            .device(DeviceRoute::root())
+            .with_timeout(WAIT * 2);
+        assert_eq!(root.get::<String>("dev.name").unwrap(), "FAKE");
     }
 
     /// Closing one clone ends every subscription and view of the connection,
@@ -1161,12 +1171,6 @@ mod tests {
     #[test]
     fn clients_of_a_proxy_behind_a_proxy_share_its_state() {
         let device = FakeDevice::start();
-        let forget_table = || {
-            if let Some(cached) = super::super::rpc::cache::path("FAKE", device.table_hash()) {
-                let _ = std::fs::remove_file(cached);
-            }
-        };
-        forget_table();
         let upstream = fixtures::proxy_serving(&device.url);
         let downstream = fixtures::proxy();
         for _ in 0..2 {
@@ -1178,7 +1182,6 @@ mod tests {
             assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
         }
 
-        forget_table();
         let asked =
             ["dev.metadata", "rpc.listinfo", "test.amplitude"].map(|name| device.calls(name));
         assert_eq!(asked, [1, 1 + 2, 1]);
@@ -1305,6 +1308,232 @@ mod tests {
                 left, 0,
                 "tasks left with the proxy dropped first: {proxy_first}"
             );
+        }
+    }
+
+    mod scope {
+        //! Properties of the packets a view delivers.
+        //!
+        //! # Observations
+        //!
+        //! The packets each of several views' [`DeviceTree::packets`]
+        //! receivers yields, in order, while the proxy sends packets from
+        //! routes of 0 to 3 hops, inside the views and out of them. The views
+        //! share one connection.
+        //!
+        //! # Sources
+        //!
+        //! The [`device`](crate::device) module doc, where a connection's
+        //! scope is every route on the link and a tree at `/1` covers `/1`
+        //! and its descendants. The doc of [`DeviceTree`], whose
+        //! subscriptions are filtered to its subtree and carry absolute
+        //! routes. The doc of [`DeviceTree::to_depth`], which reaches no
+        //! deeper than `depth` levels below the view's root, and on which a
+        //! depth beyond the view's own has no effect. The doc of
+        //! [`DeviceTree::packets`].
+        //!
+        //! # Model
+        //!
+        //! A view at route `s` reaching `d` levels covers a route `r` when
+        //! the hops of `s` begin the hops of `r` and `r` has at most `d` hops
+        //! more. A view never narrowed reaches every depth, and a view
+        //! narrowed several times reaches the least depth it was narrowed to.
+        //! The model reads the hops alone, not the crate's own route checks.
+        //!
+        //! # Laws
+        //!
+        //! - V1, model. Each view delivers each packet from a route it covers,
+        //!   in the order the proxy sent them, with its absolute route, and
+        //!   nothing from a route it does not cover, whatever the other views
+        //!   on the connection cover. Source, the module doc and the docs of
+        //!   `DeviceTree`, `to_depth` and `packets`. It rules out a view that
+        //!   loses what lies two or more hops below its root, one that ignores
+        //!   the depth it was narrowed to or keeps the last depth rather than
+        //!   the least, one that leaks a sibling's packets of any type, and a
+        //!   connection that delivers a packet only to the first view that
+        //!   covers it.
+        //!
+        //! # Generator obligations
+        //!
+        //! One to three views on one connection, at routes of 0 to 2 hops
+        //! mostly and up to the eight a route holds, each never narrowed or
+        //! narrowed up to three times to 0 to 8 levels, eight among them.
+        //! Packets of samples, heartbeats with and without a session,
+        //! metadata records, setting announcements and RPC requests and
+        //! replies. Their routes are a view's root followed by more hops, or
+        //! any route, mostly a few hops and one time in four as many as a
+        //! route holds. Hops are 0 to 2 mostly, so views overlap and siblings
+        //! and prefixes collide often, and sometimes 254 or 255.
+        //!
+        //! # Exclusions
+        //!
+        //! Decoded batches from [`DeviceTree::samples`], which take the same
+        //! scope and also need the proxy's metadata of each device. Link
+        //! statuses, which reach every view their subtree overlaps and which
+        //! the stream tests cover. RPC replies from a route a view covers,
+        //! which the session takes as the answers to its own calls, so a
+        //! reply is sent only from a route no view covers.
+        //!
+        //! # Examples that stay
+        //!
+        //! None.
+
+        use super::*;
+        use crate::tio::packet::{Packet, Payload};
+        use proptest::prelude::*;
+
+        /// The sample number of the packet that closes view `i`'s part of a
+        /// case is `LAST + i`. No generated packet numbers a sample so high.
+        const LAST: u32 = 999_000;
+
+        /// A view, its root's hops and each depth it was narrowed to.
+        #[derive(Debug, Clone)]
+        struct View {
+            scope: Vec<u8>,
+            narrowed: Vec<usize>,
+        }
+
+        impl View {
+            /// Whether the view covers `route`, from their hops alone.
+            fn covers(&self, route: &[u8]) -> bool {
+                let below = route.len().wrapping_sub(self.scope.len());
+                let depth = self.narrowed.iter().min();
+                route.starts_with(&self.scope) && depth.is_none_or(|&depth| below <= depth)
+            }
+        }
+
+        fn route_of(hops: &[u8]) -> DeviceRoute {
+            DeviceRoute::from_hops(hops).unwrap()
+        }
+
+        /// A hop, mostly 0 to 2 so that routes collide, sometimes the
+        /// largest hop values.
+        fn hop() -> impl Strategy<Value = u8> {
+            prop_oneof![8 => 0u8..3, 1 => Just(254u8), 1 => Just(u8::MAX)]
+        }
+
+        /// Up to `most` hops, a few most of the time, and all `most` of
+        /// them one time in four.
+        fn hops_up_to(most: usize) -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                3 => prop::collection::vec(hop(), 0..=most.min(3)),
+                1 => prop::collection::vec(hop(), most..=most),
+            ]
+        }
+
+        fn view() -> impl Strategy<Value = View> {
+            let most = DeviceRoute::MAX_HOPS;
+            (
+                prop_oneof![3 => prop::collection::vec(hop(), 0..=2), 1 => hops_up_to(most)],
+                prop::collection::vec(
+                    prop_oneof![3 => 0usize..=4, 1 => 5usize..=most, 1 => Just(most)],
+                    0..=3,
+                ),
+            )
+                .prop_map(|(scope, narrowed)| View { scope, narrowed })
+        }
+
+        /// The hops of a sent packet's route, below one of `views` or
+        /// anywhere, never more than a route holds.
+        fn hops(views: Vec<View>) -> impl Strategy<Value = Vec<u8>> {
+            let most = DeviceRoute::MAX_HOPS;
+            let below =
+                (any::<prop::sample::Index>(), hops_up_to(most)).prop_map(move |(view, suffix)| {
+                    let mut hops = views[view.index(views.len())].scope.clone();
+                    hops.extend(suffix);
+                    hops.truncate(most);
+                    hops
+                });
+            prop_oneof![below, hops_up_to(most)]
+        }
+
+        /// The packet of kind `kind` numbered `n`, from the route of `hops`.
+        fn packet(kind: u8, n: u32, hops: &[u8]) -> Packet {
+            let route = route_of(hops);
+            match kind {
+                0 => fixtures::samples(n, route),
+                1 => Packet::heartbeat(route),
+                2 => Packet::heartbeat_session(n, route),
+                3 => fixtures::broadcast(fixtures::metadata_records(n)[n as usize % 4], route),
+                4 => fixtures::announcement("test.amplitude", Some(n), &[1], route),
+                5 => Packet::rpc_request("dev.name", &[], n as u16, route).unwrap(),
+                _ => Packet::rpc_reply(n as u16, b"FAKE", route).unwrap(),
+            }
+        }
+
+        fn case() -> impl Strategy<Value = (Vec<View>, Vec<(u8, Vec<u8>)>)> {
+            prop::collection::vec(view(), 1..=3).prop_flat_map(|views| {
+                let sent = (0u8..7, hops(views.clone()));
+                (Just(views), prop::collection::vec(sent, 1..=16))
+            })
+        }
+
+        /// Whether `packet` closes a view's part of a case.
+        fn closing(packet: &Packet) -> Option<u32> {
+            match packet.payload() {
+                Payload::Samples(samples) if samples.first.value() >= LAST => {
+                    Some(samples.first.value() - LAST)
+                }
+                _ => None,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// V1. Each view delivers the packets of exactly the routes it
+            /// covers, two and three hops deep among them, beside other views.
+            #[test]
+            fn each_view_delivers_the_packets_of_exactly_the_routes_it_covers(
+                (views, sent) in case(),
+            ) {
+                let (session, proxy) = Session::test_pair();
+                let connection = Connection::over(session);
+                let receivers: Vec<_> = views
+                    .iter()
+                    .map(|view| {
+                        let tree = connection.tree(route_of(&view.scope));
+                        let tree = view
+                            .narrowed
+                            .iter()
+                            .fold(tree, |tree, &depth| tree.to_depth(depth));
+                        tree.packets()
+                    })
+                    .collect();
+
+                let mut packets = Vec::new();
+                for (n, (kind, hops)) in sent.iter().enumerate() {
+                    let covered = views.iter().any(|view| view.covers(hops));
+                    if *kind == 6 && covered {
+                        continue;
+                    }
+                    packets.push((hops.clone(), packet(*kind, n as u32, hops)));
+                }
+                for (_, packet) in &packets {
+                    proxy.send(packet.clone());
+                }
+                for (i, view) in views.iter().enumerate() {
+                    proxy.send(fixtures::samples(LAST + i as u32, route_of(&view.scope)));
+                }
+
+                for (i, (view, receiver)) in views.iter().zip(&receivers).enumerate() {
+                    let mut delivered = Vec::new();
+                    loop {
+                        let packet = receiver.recv_timeout(WAIT).expect("the closing packet");
+                        match closing(&packet) {
+                            Some(closes) if closes == i as u32 => break,
+                            Some(_) => {}
+                            None => delivered.push(packet.as_bytes().to_vec()),
+                        }
+                    }
+                    let expected: Vec<Vec<u8>> = packets
+                        .iter()
+                        .filter(|(hops, _)| view.covers(hops))
+                        .map(|(_, packet)| packet.as_bytes().to_vec())
+                        .collect();
+                    prop_assert_eq!(delivered, expected, "view {:?}", view);
+                }
+            }
         }
     }
 }

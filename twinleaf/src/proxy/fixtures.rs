@@ -11,9 +11,9 @@ use crate::proto::data as wire;
 use crate::proto::rpc::Method;
 use crate::proto::sync::Epoch;
 use crate::proto::{ColumnId, DeviceRoute, PacketType, SegmentId, SessionId, StreamId};
+use crate::rand::HashMap;
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{FakeEnd, Port, TransportKind};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::io::{self, Read, Write};
@@ -156,11 +156,6 @@ impl FakeDevice {
     /// Closes every connection, as a device that resets does.
     pub(crate) fn drop_connections(&self) {
         self.state.generation.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Returns the hash of the device's RPC table.
-    pub(crate) fn table_hash(&self) -> u32 {
-        self.state.table_hash
     }
 
     /// Returns how many calls of the RPC `name` the device has received.

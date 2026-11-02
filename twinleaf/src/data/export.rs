@@ -38,11 +38,11 @@ use super::sample::{native_types, ColumnArray, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
+use crate::rand::{HashMap, HashSet};
 use hdf5_pure::{
     AttrValue, CompoundTypeBuilder, Dataset, File, FileAccessProperties, FileCreateProperties,
     Group, MaxExtent, SyncPolicy,
 };
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 type TableIndex = u64;
@@ -169,8 +169,8 @@ impl RunTables {
         Self {
             policy,
             level,
-            open: HashMap::new(),
-            seen: HashSet::new(),
+            open: HashMap::default(),
+            seen: HashSet::default(),
         }
     }
 
@@ -224,6 +224,9 @@ impl RunTables {
 }
 
 /// What one export wrote, returned by [`Hdf5Appender::finish`].
+// The sets of stream names are the standard library's `HashSet`, as their
+// type is part of the crate's API.
+#[allow(clippy::disallowed_types)]
 #[derive(Debug, Clone, Default)]
 pub struct ExportStats {
     /// Rows written across every table.
@@ -233,9 +236,9 @@ pub struct ExportStats {
     /// Latest `time` written, or `None` if nothing was.
     pub end_time: Option<f64>,
     /// Streams that reached the file, as `/{route}/{stream}[{id}]`.
-    pub streams_written: HashSet<String>,
+    pub streams_written: std::collections::HashSet<String>,
     /// Streams seen in the input, including any the filter dropped.
-    pub streams_seen: HashSet<String>,
+    pub streams_seen: std::collections::HashSet<String>,
     /// Breaks that [`SplitPolicy`] counted as a split.
     pub discontinuities_detected: u64,
 }
@@ -333,9 +336,9 @@ impl Hdf5Appender {
             let _ = std::fs::remove_file(path);
         })?;
         Ok(Self {
-            groups: HashMap::from([("/".to_string(), file.root())]),
+            groups: [("/".to_string(), file.root())].into_iter().collect(),
             file,
-            tables: HashMap::new(),
+            tables: HashMap::default(),
             filter,
             compress,
             runs: RunTables::new(split_policy, split_level),
@@ -1016,5 +1019,494 @@ mod tests {
         }
         drop(file);
         std::fs::remove_file(path).expect("remove output");
+    }
+
+    mod read_back {
+        //! Properties of an export, read back.
+        //!
+        //! # Observations
+        //!
+        //! The tables of a finished export, opened with `hdf5-pure`. For each
+        //! table, its compound type, the name, offset and type of each field,
+        //! the row size, and the bytes of every row.
+        //!
+        //! # Sources
+        //!
+        //! The module doc of the export. Its tree puts a stream at route `/0`
+        //! in the group `0`. Its table of fields gives `sample` as the sample
+        //! number, `time` as the end of sample timestamp and one field per
+        //! column of the column's wire type. Fields are little endian at
+        //! C aligned offsets. [`RunSplitLevel::None`] gives each stream one
+        //! table, `/{route}/{stream}`. [`ExportStats::total_samples`] counts
+        //! the rows written across every table.
+        //!
+        //! # Model
+        //!
+        //! A stream's table holds the rows of its batches in the order they
+        //! were written. Row `i` holds the batch's sample number, its time and
+        //! each column's value, read from the [`SampleBatch`] itself.
+        //!
+        //! # Laws
+        //!
+        //! - E1, round trip. Every field of every row reads back as the batch
+        //!   holds it, bit for bit, in a table at the route's group named for
+        //!   the stream, with as many rows as were written. A stream given no
+        //!   batch has no table, and one given only empty batches has no rows.
+        //!   Source, the table of fields and the tree. It rules out a writer
+        //!   that puts every row's sample number or time at one place in the
+        //!   buffer, one whose 1 byte column shares its offset with the next
+        //!   field, one that keys its tables by stream id or name without the
+        //!   route, and one that loses rows past the first chunk of a table.
+        //! - E2, postcondition. The fields are `sample`, `time`, then each
+        //!   column in index order, each of its own type. Each sits at a
+        //!   multiple of its size, after the end of the one before, with less
+        //!   padding between them than its size. The row ends at the first
+        //!   multiple of 8 after the last field, as a C struct holding an
+        //!   `f64` does. Source, the sentence on C aligned offsets. It rules
+        //!   out a row that leaves gaps no C compiler leaves, or packs fields
+        //!   at offsets a C reader of the struct would not find them at.
+        //! - E3, postcondition. The stats count every row written. Source,
+        //!   [`ExportStats::total_samples`].
+        //!
+        //! # Generator obligations
+        //!
+        //! One to three streams, each a distinct pair of a route of 0 to 2
+        //! hops and a stream id of 1 or 2, so one id often sits at two routes
+        //! and one route often holds two ids. Each stream has one to five
+        //! columns of every native type, with `u8` and `i8` three times as
+        //! likely as the others so that 1 byte columns sit next to each other
+        //! and next to wider ones, or else 33 to 36 columns, whose rows of
+        //! 256 bytes or more fill an HDF5 chunk of the smallest size in 256
+        //! rows. Values of arbitrary bits, so floats include NaNs and
+        //! infinities. Each stream gets batches of 0 to 24 rows, or of 257 to
+        //! 600, interleaved with the others' and with gaps in the sample
+        //! numbers between them, so a table spans several appends and, with
+        //! the long batches, several chunks. Compression on and off.
+        //!
+        //! # Exclusions
+        //!
+        //! The table attributes, which the docs do not list, so whether
+        //! `time_ref_serial` is written is not checked. Whether an empty batch
+        //! creates its stream's table, which the doc of
+        //! [`Hdf5Appender::write_batch`] leaves open, so only its row count is
+        //! checked. Run splitting and the column filter, which the run table
+        //! tests cover.
+        //!
+        //! # Examples that stay
+        //!
+        //! One literal layout, as the export's own C struct of five columns
+        //! and one row, since the writer and this reader could agree on a
+        //! wrong layout.
+
+        use super::*;
+        use crate::data::sample::ColumnBuilder;
+        use hdf5_pure::{CompoundMember, Datatype};
+        use proptest::prelude::*;
+
+        /// One stream of a generated export, its route's hops, its id and
+        /// the wire type of each column.
+        #[derive(Debug, Clone)]
+        struct StreamPlan {
+            hops: Vec<u8>,
+            id: u8,
+            types: Vec<DataType>,
+        }
+
+        /// One batch of a generated export, its stream, the gap in sample
+        /// numbers before it, and a seed per row that its cells' bits come
+        /// from.
+        #[derive(Debug, Clone)]
+        struct BatchPlan {
+            stream: usize,
+            gap: u32,
+            rows: Vec<u64>,
+        }
+
+        /// The bits of cell `column` of the row whose seed is `seed`, mixed
+        /// as `SplitMix64` mixes, so neighbouring cells share no pattern.
+        fn cell(seed: u64, column: usize) -> u64 {
+            let mut bits = seed ^ (column as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            bits = (bits ^ (bits >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            bits = (bits ^ (bits >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            bits ^ (bits >> 31)
+        }
+
+        /// The cells of each row of `plan`, for a stream of `width` columns.
+        fn cells(plan: &BatchPlan, width: usize) -> Vec<Vec<u64>> {
+            let row = |seed: &u64| (0..width).map(|column| cell(*seed, column)).collect();
+            plan.rows.iter().map(row).collect()
+        }
+
+        fn native_type() -> impl Strategy<Value = DataType> {
+            prop_oneof![
+                3 => Just(DataType::U8),
+                3 => Just(DataType::I8),
+                1 => Just(DataType::U16),
+                1 => Just(DataType::I16),
+                1 => Just(DataType::U32),
+                1 => Just(DataType::I32),
+                1 => Just(DataType::U64),
+                1 => Just(DataType::I64),
+                1 => Just(DataType::F32),
+                1 => Just(DataType::F64),
+            ]
+        }
+
+        /// The column types of a stream, a few narrow ones three times in
+        /// five, or else enough to make a row of 256 bytes or more.
+        fn column_types() -> impl Strategy<Value = Vec<DataType>> {
+            prop_oneof![
+                3 => prop::collection::vec(native_type(), 1..=5),
+                2 => prop::collection::vec(native_type(), 33..=36),
+            ]
+        }
+
+        /// One to three streams, each a distinct route and id.
+        fn stream_plans() -> impl Strategy<Value = Vec<StreamPlan>> {
+            let key = (prop::collection::vec(0u8..3, 0..=2), 1u8..=2);
+            prop::collection::btree_map(key, column_types(), 1..=3).prop_map(|streams| {
+                streams
+                    .into_iter()
+                    .map(|((hops, id), types)| StreamPlan { hops, id, types })
+                    .collect()
+            })
+        }
+
+        /// Streams, then batches of them, with the first sample number and
+        /// the rate every stream shares.
+        fn export_plan() -> impl Strategy<Value = (Vec<StreamPlan>, Vec<BatchPlan>, u32, u32)> {
+            stream_plans().prop_flat_map(|streams| {
+                let rows = prop_oneof![
+                    3 => prop::collection::vec(any::<u64>(), 0..=24),
+                    2 => prop::collection::vec(any::<u64>(), 257..=600),
+                ];
+                let batch = (0..streams.len(), 0u32..4, rows)
+                    .prop_map(|(stream, gap, rows)| BatchPlan { stream, gap, rows });
+                (
+                    Just(streams),
+                    prop::collection::vec(batch, 1..=8),
+                    0u32..=u32::MAX - 8 * 1024,
+                    1u32..=1000,
+                )
+            })
+        }
+
+        /// Appends one row's cells to `column`, each the low bytes of its
+        /// bits in the column's native type.
+        fn push_cells(column: &mut ColumnBuilder, cells: impl Iterator<Item = u64>) {
+            macro_rules! push {
+                ($($variant:ident $native:ty),* $(,)?) => {
+                    match column {
+                        $(
+                            ColumnBuilder::$variant(values) => values.extend(cells.map(|bits| {
+                                let bytes = bits.to_le_bytes();
+                                <$native>::from_le_bytes(
+                                    bytes[..size_of::<$native>()].try_into().unwrap(),
+                                )
+                            })),
+                        )*
+                    }
+                };
+            }
+            native_types!(push)
+        }
+
+        /// The little endian bytes of row `row` of `values`.
+        fn cell_bytes(values: &ColumnArray, row: usize) -> Vec<u8> {
+            macro_rules! bytes {
+                ($($variant:ident $native:ty),* $(,)?) => {
+                    match values {
+                        $(ColumnArray::$variant(values) => values[row].to_le_bytes().to_vec(),)*
+                    }
+                };
+            }
+            native_types!(bytes)
+        }
+
+        /// The HDF5 type of a column of `data_type`, as `hdf5-pure` builds it.
+        fn hdf_type(data_type: DataType) -> Datatype {
+            match data_type {
+                DataType::U8 => hdf5_pure::make_u8_type(),
+                DataType::I8 => hdf5_pure::make_i8_type(),
+                DataType::U16 => hdf5_pure::make_u16_type(),
+                DataType::I16 => hdf5_pure::make_i16_type(),
+                DataType::U32 => hdf5_pure::make_u32_type(),
+                DataType::I32 => hdf5_pure::make_i32_type(),
+                DataType::U64 => hdf5_pure::make_u64_type(),
+                DataType::I64 => hdf5_pure::make_i64_type(),
+                DataType::F32 => hdf5_pure::make_f32_type(),
+                DataType::F64 => hdf5_pure::make_f64_type(),
+                other => panic!("no native type {other:?}"),
+            }
+        }
+
+        /// A batch of the stream `plan` describes, rows numbered from
+        /// `first`.
+        fn plan_batch(plan: &StreamPlan, rows: &[Vec<u64>], first: u32, rate: u32) -> SampleBatch {
+            let id = plan.id;
+            let names: Vec<String> = (0..plan.types.len()).map(|i| format!("c{i}")).collect();
+            let columns: Vec<wire::Column<'_>> = plan
+                .types
+                .iter()
+                .zip(&names)
+                .enumerate()
+                .map(|(index, (&data_type, name))| wire::Column {
+                    name,
+                    ..fixtures::column(id, index as u8, data_type)
+                })
+                .collect();
+            let stream_name = format!("s{id}");
+            let metadata = fixtures::metadata(
+                DeviceRoute::from_hops(&plan.hops).unwrap(),
+                wire::Device {
+                    n_streams: 3,
+                    ..fixtures::device()
+                },
+                wire::Stream {
+                    name: &stream_name,
+                    n_columns: columns.len() as u8,
+                    ..fixtures::stream(id)
+                },
+                wire::Segment {
+                    sampling_rate: rate,
+                    start_time: first % 1000,
+                    ..fixtures::segment(id)
+                },
+                &columns,
+            );
+            let mut builder = SampleBatchBuilder::new(
+                BatchContext {
+                    metadata,
+                    boundary: None,
+                    generations: Generations {
+                        stream: 1,
+                        device: 0,
+                        global: 0,
+                    },
+                },
+                rows.len(),
+            );
+            let columns = builder.push_samples(SampleNumber::new(first), rows.len());
+            for (index, column) in columns.enumerate() {
+                push_cells(column, rows.iter().map(|row| row[index]));
+            }
+            builder.finish()
+        }
+
+        /// The table of stream `id` at `hops`, as the module doc's tree
+        /// places it.
+        fn table_path(hops: &[u8], id: u8) -> String {
+            let groups: Vec<String> = hops.iter().map(u8::to_string).collect();
+            let name = format!("s{id}");
+            match groups.is_empty() {
+                true => name,
+                false => format!("{}/{name}", groups.join("/")),
+            }
+        }
+
+        /// The size and fields of `table`'s compound type.
+        fn compound(table: &Dataset) -> (u64, Vec<CompoundMember>) {
+            match table.datatype().expect("read the table's type") {
+                Datatype::Compound { size, members } => (u64::from(size), members),
+                other => panic!("a table is a compound, not {other:?}"),
+            }
+        }
+
+        /// The bytes of the field named `name` in `row`.
+        fn field<'a>(members: &[CompoundMember], row: &'a [u8], name: &str) -> &'a [u8] {
+            let member = members
+                .iter()
+                .find(|member| member.name == name)
+                .unwrap_or_else(|| panic!("a field named {name}"));
+            let at = member.byte_offset as usize;
+            &row[at..at + member.datatype.type_size() as usize]
+        }
+
+        /// Checks E2 on the fields of one table, whose columns have `types`.
+        fn check_c_layout(
+            size: u64,
+            members: &[CompoundMember],
+            types: &[DataType],
+        ) -> std::result::Result<(), TestCaseError> {
+            let mut expected = vec![
+                ("sample".to_string(), hdf5_pure::make_u32_type()),
+                ("time".to_string(), hdf5_pure::make_f64_type()),
+            ];
+            expected.extend(
+                types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &data_type)| (format!("c{i}"), hdf_type(data_type))),
+            );
+            let mut placed: Vec<&CompoundMember> = members.iter().collect();
+            placed.sort_by_key(|member| member.byte_offset);
+            let fields: Vec<(String, Datatype)> = placed
+                .iter()
+                .map(|member| (member.name.clone(), member.datatype.clone()))
+                .collect();
+            prop_assert_eq!(fields, expected, "the fields in order, each of its type");
+            let mut end = 0;
+            for member in placed {
+                let width = u64::from(member.datatype.type_size());
+                let at = member.byte_offset;
+                prop_assert!(
+                    at.is_multiple_of(width),
+                    "{} sits at a multiple of its size",
+                    member.name
+                );
+                prop_assert!(at >= end, "{} overlaps the field before", member.name);
+                prop_assert!(
+                    at - end < width,
+                    "{} has more padding than C adds",
+                    member.name
+                );
+                end = at + width;
+            }
+            prop_assert!(
+                size >= end && size.is_multiple_of(8) && size - end < 8,
+                "row size {size}"
+            );
+            Ok(())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// E1, E2 and E3. Every field of every row reads back as written,
+            /// at the offsets a C struct of the fields has.
+            #[test]
+            fn every_field_of_every_row_reads_back_as_written(
+                (streams, batches, start, rate) in export_plan(),
+                compress in any::<bool>(),
+            ) {
+                let _guard = hdf_test_lock();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("export.h5");
+                let mut writer = Hdf5Appender::with_options(
+                    &path,
+                    compress,
+                    None,
+                    SplitPolicy::Continuous,
+                    RunSplitLevel::None,
+                )
+                .unwrap();
+                let mut next: Vec<u32> = vec![start; streams.len()];
+                let mut written: Vec<Vec<SampleBatch>> = vec![Vec::new(); streams.len()];
+                for plan in &batches {
+                    let first = next[plan.stream] + plan.gap;
+                    next[plan.stream] = first + plan.rows.len() as u32;
+                    let stream = &streams[plan.stream];
+                    let rows = cells(plan, stream.types.len());
+                    let batch = plan_batch(stream, &rows, first, rate);
+                    writer.write_batch(batch.clone()).unwrap();
+                    written[plan.stream].push(batch);
+                }
+                let stats = writer.finish().unwrap();
+                let rows: usize = batches.iter().map(|plan| plan.rows.len()).sum();
+                prop_assert_eq!(stats.total_samples, rows as u64);
+
+                let file = File::open(&path).unwrap();
+                for (plan, batches) in streams.iter().zip(&written) {
+                    let path = table_path(&plan.hops, plan.id);
+                    let expected: usize = batches.iter().map(SampleBatch::len).sum();
+                    let table = match (batches.is_empty(), file.dataset(&path)) {
+                        (true, found) => {
+                            prop_assert!(found.is_err(), "{} has a table but no batch", path);
+                            continue;
+                        }
+                        (false, Err(_)) if expected == 0 => continue,
+                        (false, found) => found.unwrap(),
+                    };
+                    let (size, members) = compound(&table);
+                    check_c_layout(size, &members, &plan.types)?;
+                    prop_assert_eq!(table.shape().unwrap(), vec![expected as u64]);
+                    let raw = table.read_raw().unwrap();
+                    let mut rows = raw.chunks_exact(size as usize);
+                    for batch in batches {
+                        for i in 0..batch.len() {
+                            let row = rows.next().expect("a row per sample");
+                            prop_assert_eq!(
+                                field(&members, row, "sample"),
+                                &batch.sample_numbers()[i].value().to_le_bytes()[..],
+                                "{} sample of row {}", path, i
+                            );
+                            prop_assert_eq!(
+                                field(&members, row, "time"),
+                                &batch.timestamps()[i].to_le_bytes()[..],
+                                "{} time of row {}", path, i
+                            );
+                            for (column, values) in batch.columns().iter().enumerate() {
+                                prop_assert_eq!(
+                                    field(&members, row, &format!("c{column}")),
+                                    &cell_bytes(values, i)[..],
+                                    "{} column {} of row {}", path, column, i
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The layout of a table of five columns and one row, as a C compiler
+        /// lays out the struct of its fields. Sample 7 of a 1 Hz segment that
+        /// starts at 7 s ends at 15 s.
+        ///
+        /// ```text
+        /// struct row { uint32_t sample; double time; uint8_t c0; int16_t c1;
+        ///              uint8_t c2; double c3; int8_t c4; };
+        /// ```
+        #[test]
+        fn a_table_is_laid_out_as_its_c_struct() {
+            let _guard = hdf_test_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("literal.h5");
+            let plan = StreamPlan {
+                hops: vec![0],
+                id: 1,
+                types: vec![
+                    DataType::U8,
+                    DataType::I16,
+                    DataType::U8,
+                    DataType::F64,
+                    DataType::I8,
+                ],
+            };
+            let cells = vec![0xAB, 0xFFFF_FFFF_FFFF_8001, 0xCD, 2.5f64.to_bits(), 0xFE];
+            let batch = plan_batch(&plan, &[cells], 7, 1);
+            let mut writer = appender(&path);
+            writer.write_batch(batch).unwrap();
+            writer.finish().unwrap();
+
+            let file = File::open(&path).unwrap();
+            let table = file.dataset("0/s1").unwrap();
+            let (size, members) = compound(&table);
+            let offsets: Vec<(&str, u64)> = members
+                .iter()
+                .map(|member| (member.name.as_str(), member.byte_offset))
+                .collect();
+            assert_eq!(
+                offsets,
+                [
+                    ("sample", 0),
+                    ("time", 8),
+                    ("c0", 16),
+                    ("c1", 18),
+                    ("c2", 20),
+                    ("c3", 24),
+                    ("c4", 32),
+                ]
+            );
+            assert_eq!(size, 40);
+            #[rustfmt::skip]
+            let row = [
+                7, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0x2E, 0x40,
+                0xAB, 0, 0x01, 0x80, 0xCD, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0x04, 0x40,
+                0xFE, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            assert_eq!(table.read_raw().unwrap(), row);
+        }
     }
 }

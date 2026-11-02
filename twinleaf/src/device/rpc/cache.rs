@@ -1,11 +1,16 @@
 //! The on-disk cache of RPC registries, the RPC layer's only file access.
+//!
+//! The crate's own tests have no cache directory, so none of them reads or
+//! writes the user's. A test of the cache holds a `Scratch` directory.
 
 use crc::{Crc, CRC_32_ISO_HDLC};
-use directories::BaseDirs;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+pub(crate) use scratch::Scratch;
 
 pub(super) type Entries = Vec<(String, u16)>;
 
@@ -16,11 +21,7 @@ static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 /// cache directory exists.
 // TODO: evict stale cache files from old firmware versions (<dev_name>.*.rpcs)
 pub(crate) fn path(dev_name: &str, hash: u32) -> Option<PathBuf> {
-    let Some(dirs) = BaseDirs::new() else {
-        log::debug!("no cache directory, so RPC tables are not cached");
-        return None;
-    };
-    let dir = dirs.cache_dir().join("twinleaf");
+    let dir = dir()?;
     if let Err(error) = fs::create_dir_all(&dir) {
         log::warn!(
             "could not create RPC cache directory {}: {error}",
@@ -29,6 +30,73 @@ pub(crate) fn path(dev_name: &str, hash: u32) -> Option<PathBuf> {
         return None;
     }
     Some(dir.join(format!("{}.{hash:x}.rpcs", stem(dev_name))))
+}
+
+/// Returns the `twinleaf` directory in the user's cache directory.
+#[cfg(not(test))]
+fn dir() -> Option<PathBuf> {
+    let Some(dirs) = directories::BaseDirs::new() else {
+        log::debug!("no cache directory, so RPC tables are not cached");
+        return None;
+    };
+    Some(dirs.cache_dir().join("twinleaf"))
+}
+
+/// Returns the [`Scratch`] directory this thread holds, or `None`, which
+/// leaves the test without a cache.
+#[cfg(test)]
+fn dir() -> Option<PathBuf> {
+    scratch::current()
+}
+
+#[cfg(test)]
+mod scratch {
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static CURRENT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<PathBuf> {
+        CURRENT.with(|current| current.borrow().clone())
+    }
+
+    /// A fresh cache directory, in force on the thread that made it until it
+    /// drops. Dropping it removes the directory and puts back the one the
+    /// thread held before, which outside another `Scratch` is none.
+    pub(crate) struct Scratch {
+        dir: tempfile::TempDir,
+        previous: Option<PathBuf>,
+        /// The directory is in force on one thread, so the guard stays there.
+        _thread: PhantomData<*const ()>,
+    }
+
+    impl Scratch {
+        pub(crate) fn new() -> Scratch {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let held = Some(dir.path().to_path_buf());
+            let previous = CURRENT.with(|current| current.replace(held));
+            Scratch {
+                dir,
+                previous,
+                _thread: PhantomData,
+            }
+        }
+
+        /// Returns the directory.
+        pub(crate) fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            CURRENT.with(|current| current.replace(previous));
+        }
+    }
 }
 
 /// Returns the cache file stem for a device's name, restricted to characters
@@ -153,7 +221,28 @@ fn write(path: &Path, entries: &[(String, u16)]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, stem, store};
+    use super::{load, path, stem, store, Scratch};
+
+    /// A test has no cache until it holds a scratch directory, which holds
+    /// the cache until it drops and is then removed.
+    #[test]
+    fn a_test_has_no_cache_outside_a_scratch_directory() {
+        assert_eq!(path("test-device", 0x1234), None);
+
+        let outer = Scratch::new();
+        let in_outer = path("test-device", 0x1234).expect("a cache in the scratch directory");
+        assert_eq!(in_outer, outer.path().join("test-device.1234.rpcs"));
+        let inner = Scratch::new();
+        let in_inner = path("test-device", 0x1234).expect("a cache in the scratch directory");
+        assert_eq!(in_inner, inner.path().join("test-device.1234.rpcs"));
+        let inner_dir = inner.path().to_path_buf();
+        drop(inner);
+        assert!(!inner_dir.exists());
+        assert_eq!(path("test-device", 0x1234), Some(in_outer));
+
+        drop(outer);
+        assert_eq!(path("test-device", 0x1234), None);
+    }
 
     /// A cache that cannot be read is a miss, so the table is walked again.
     #[test]

@@ -3,8 +3,16 @@
 //! cuts, delays and restarts the links between them. The device is the
 //! fake device of the proxy's fixtures, over TCP, and samples once a second.
 //!
-//! Each scenario runs with several seeds, which set its messages' delays.
-//! `TWINLEAF_TURMOIL_SEED` runs one alone. The command is in `crate::net`.
+//! Each scenario runs with several seeds. A seed sets its messages' delays,
+//! the order each host's `select!` tries its branches in, and what
+//! `crate::rand` draws, so a scenario run twice with one seed runs the same
+//! way, as one test checks. `TWINLEAF_TURMOIL_SEED` runs one seed alone.
+//! The command is in `crate::net`.
+
+#[cfg(not(tokio_unstable))]
+compile_error!(
+    "the turmoil tests need `--cfg tokio_unstable`, under which turmoil seeds each host's runtime"
+);
 
 use super::control::Purpose;
 use super::fixtures::answer;
@@ -29,8 +37,9 @@ const PROXY_PORT: u16 = 7856;
 const TABLE_HASH: u32 = 0x5157_0001;
 
 /// How long a test lets the simulation after its last phase take in real
-/// time. The simulation runs in about a second, and one that spins never
-/// returns from a step.
+/// time. The simulation runs in about a second. A spawned task that spins
+/// fails it at once, as [`polls`](crate::chan::polls) says, and a host's
+/// own future that spins never returns from a step.
 const SPIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// What the hosts of one scenario share, and how its device behaves.
@@ -217,8 +226,11 @@ impl Drop for Seed {
 }
 
 /// A simulation of `world` with the device and the proxy on their hosts,
-/// whose message delays come from `seed`.
+/// whose randomness comes from `seed`. It seeds this thread's
+/// `crate::rand`, which every host draws from, and installs the [`Tracer`].
 fn simulation(world: &Arc<World>, seed: u64) -> ::turmoil::Sim<'static> {
+    Tracer::install();
+    crate::rand::seed(seed);
     let mut sim = ::turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(120))
         .rng_seed(seed)
@@ -240,11 +252,10 @@ fn step_until(sim: &mut ::turmoil::Sim<'_>, world: &World, phase: u8) {
     }
 }
 
-/// Runs `sim` to its end, and returns how much real time that took. Fails
-/// the test process if the run takes longer than [`SPIN_LIMIT`], as a host
-/// that spins never gives a step back. A run that fails ends the watchdog
-/// with it.
-fn run_timed(sim: &mut ::turmoil::Sim<'_>) -> Duration {
+/// Runs `sim` to its end. Fails the test process if the run takes longer
+/// than [`SPIN_LIMIT`], as a host that spins outside a spawned task never
+/// gives a step back. A run that fails ends the watchdog with it.
+fn run_to_end(sim: &mut ::turmoil::Sim<'_>) {
     let (done, finished) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
         let waited = finished.recv_timeout(SPIN_LIMIT);
@@ -257,12 +268,9 @@ fn run_timed(sim: &mut ::turmoil::Sim<'_>) -> Duration {
             std::process::exit(101);
         }
     });
-    let real = std::time::Instant::now();
     while !sim.step().expect("a step") {}
-    let took = real.elapsed();
     let _ = done.send(());
     watchdog.join().expect("the watchdog");
-    took
 }
 
 /// Opens the device through the proxy, as an app does, once the proxy
@@ -474,6 +482,33 @@ fn a_device_that_restarts_comes_back_in_a_new_session() {
     }
 }
 
+/// Runs the scenario of a proxy that crashes under an app that has the
+/// device open, and is back 2 s later, with `seed`. The app opens the device
+/// again through it, and its samples count the seconds lost.
+fn proxy_crash(seed: u64) {
+    let world = Arc::new(World::default());
+    let mut sim = simulation(&world, seed);
+    let app = world.clone();
+    sim.client("app", async move {
+        let mut opened = App::open(&app).await?;
+        app.reach(1);
+        wait_for(&opened.presence, Duration::from_secs(10), |p| !alive(p)).await;
+        wait_for(&opened.presence, Duration::from_secs(30), alive).await;
+        opened.watch(Duration::from_secs(5)).await;
+        answers(&opened.device).await;
+        assert!(opened.watched.lost > 0, "{:?}", opened.watched.boundaries);
+        Ok(())
+    });
+    step_until(&mut sim, &world, 1);
+    sim.crash("proxy");
+    let crashed = sim.elapsed();
+    while sim.elapsed() < crashed + Duration::from_secs(2) {
+        sim.step().expect("a step");
+    }
+    sim.bounce("proxy");
+    sim.run().expect("the scenario");
+}
+
 /// The proxy crashes under an app that has the device open, and is back
 /// 2 s later. The app opens the device again through it, and its samples
 /// count the seconds lost.
@@ -481,27 +516,195 @@ fn a_device_that_restarts_comes_back_in_a_new_session() {
 fn an_app_opens_its_device_again_once_a_crashed_proxy_is_back() {
     for seed in seeds() {
         let _seed = Seed(seed);
-        let world = Arc::new(World::default());
-        let mut sim = simulation(&world, seed);
-        let app = world.clone();
-        sim.client("app", async move {
-            let mut opened = App::open(&app).await?;
-            app.reach(1);
-            wait_for(&opened.presence, Duration::from_secs(10), |p| !alive(p)).await;
-            wait_for(&opened.presence, Duration::from_secs(30), alive).await;
-            opened.watch(Duration::from_secs(5)).await;
-            answers(&opened.device).await;
-            assert!(opened.watched.lost > 0, "{:?}", opened.watched.boundaries);
-            Ok(())
-        });
-        step_until(&mut sim, &world, 1);
-        sim.crash("proxy");
-        let crashed = sim.elapsed();
-        while sim.elapsed() < crashed + Duration::from_secs(2) {
-            sim.step().expect("a step");
+        proxy_crash(seed);
+    }
+}
+
+/// How many seeds the determinism check runs its scenario twice with.
+const REPLAYED: usize = 4;
+
+/// The crashed proxy's scenario, run twice with one seed, has turmoil do
+/// the same things in the same order, on the same hosts at the same virtual
+/// times. The scenario's sends, deliveries and receives, its crash and its
+/// restart are all on the trace. A failure names the first event that
+/// differs.
+#[test]
+fn a_scenario_run_twice_with_one_seed_runs_the_same_way() {
+    for seed in seeds().into_iter().take(REPLAYED) {
+        let _seed = Seed(seed);
+        let first = traced(|| proxy_crash(seed));
+        let second = traced(|| proxy_crash(seed));
+        assert!(!first.is_empty(), "the trace recorded nothing");
+        let longest = first.len().max(second.len());
+        if let Some(at) = (0..longest).find(|&at| first.get(at) != second.get(at)) {
+            panic!(
+                "the runs differ at event {at} of {} and {}\nfirst  {:?}\nsecond {:?}",
+                first.len(),
+                second.len(),
+                first.get(at),
+                second.get(at),
+            );
         }
-        sim.bounce("proxy");
-        sim.run().expect("the scenario");
+    }
+}
+
+/// One event of turmoil's, as a trace keeps it.
+#[derive(Debug, PartialEq)]
+struct Traced {
+    /// How many steps of the simulation had finished when the step it
+    /// happened in began, which is its virtual time in milliseconds.
+    step: u64,
+    /// The host it happened on, or `sim` for the simulation's own.
+    host: String,
+    /// The event's message and its fields, as turmoil gave them.
+    what: String,
+}
+
+thread_local! {
+    /// What this thread records while [`traced`] runs a scenario on it.
+    static TRACE: std::cell::RefCell<Option<Trace>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The events one thread records, and what it needs to place them.
+#[derive(Default)]
+struct Trace {
+    events: Vec<Traced>,
+    /// The name of each span, whose id is its place here plus one. A host's
+    /// span on each step reuses the id of its first.
+    spans: Vec<String>,
+    /// The ids of the spans entered, innermost last.
+    entered: Vec<u64>,
+    /// How many steps had finished when the one that runs now began.
+    step: u64,
+}
+
+/// Returns the events turmoil makes on this thread while `scenario` runs,
+/// in order.
+fn traced(scenario: impl FnOnce()) -> Vec<Traced> {
+    Tracer::install();
+    TRACE.with(|trace| *trace.borrow_mut() = Some(Trace::default()));
+    scenario();
+    let trace = TRACE.with(|trace| trace.borrow_mut().take());
+    trace.expect("the thread's trace").events
+}
+
+/// The process's `tracing` subscriber, which hands each of turmoil's events
+/// to the [`Trace`] of the thread it happens on, if that thread records one.
+/// Turmoil marks the start of each step with an event, and runs each host
+/// inside a span that names it.
+///
+/// It is the global default rather than a thread's own, as `tracing` asks
+/// each new callsite of the default of the thread that reaches it first.
+/// A scenario on another thread would then turn off turmoil's callsites
+/// for every thread.
+struct Tracer;
+
+impl Tracer {
+    /// Makes the tracer the process's subscriber, once. Every scenario
+    /// installs it before turmoil runs, so turmoil's callsites are on from
+    /// the start.
+    fn install() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            ::tracing::subscriber::set_global_default(Tracer).expect("no other subscriber");
+            // A callsite reached while the tracer was not yet the default
+            // took the interest of none.
+            ::tracing::callsite::rebuild_interest_cache();
+        });
+    }
+}
+
+/// The fields of one event or span, written out in order.
+#[derive(Default)]
+struct Fields {
+    message: String,
+    name: String,
+    rest: String,
+}
+
+impl ::tracing::field::Visit for Fields {
+    fn record_str(&mut self, field: &::tracing::field::Field, value: &str) {
+        match field.name() {
+            "name" => self.name = value.to_string(),
+            _ => self.record_debug(field, &value),
+        }
+    }
+
+    fn record_debug(&mut self, field: &::tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            name => {
+                let _ = write!(self.rest, " {name}={value:?}");
+            }
+        }
+    }
+}
+
+/// Runs `f` on this thread's trace, if it records one.
+fn with_trace(f: impl FnOnce(&mut Trace)) {
+    TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            f(trace);
+        }
+    });
+}
+
+impl ::tracing::Subscriber for Tracer {
+    fn enabled(&self, metadata: &::tracing::Metadata<'_>) -> bool {
+        metadata.target().starts_with("turmoil")
+    }
+
+    fn new_span(&self, span: &::tracing::span::Attributes<'_>) -> ::tracing::span::Id {
+        let mut fields = Fields::default();
+        span.record(&mut fields);
+        let mut id = 1;
+        with_trace(|trace| {
+            let spans = &mut trace.spans;
+            let at = match spans.iter().position(|name| *name == fields.name) {
+                Some(at) => at,
+                None => {
+                    spans.push(fields.name);
+                    spans.len() - 1
+                }
+            };
+            id = at as u64 + 1;
+        });
+        ::tracing::span::Id::from_u64(id)
+    }
+
+    fn record(&self, _: &::tracing::span::Id, _: &::tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &::tracing::span::Id, _: &::tracing::span::Id) {}
+
+    fn event(&self, event: &::tracing::Event<'_>) {
+        with_trace(|trace| {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if let Some(step) = fields.message.strip_prefix("step ") {
+                trace.step = step.parse().expect("a step number");
+                return;
+            }
+            let host = match trace.entered.last() {
+                Some(&id) => trace.spans[id as usize - 1].clone(),
+                None => "sim".to_string(),
+            };
+            trace.events.push(Traced {
+                step: trace.step,
+                host,
+                what: fields.message + &fields.rest,
+            });
+        });
+    }
+
+    fn enter(&self, span: &::tracing::span::Id) {
+        with_trace(|trace| trace.entered.push(span.into_u64()));
+    }
+
+    fn exit(&self, _: &::tracing::span::Id) {
+        with_trace(|trace| {
+            trace.entered.pop();
+        });
     }
 }
 
@@ -565,10 +768,13 @@ fn a_device_on_a_slow_link_stays_alive_and_answers() {
 
 /// The device behind a hub, which never sends its metadata, goes quiet
 /// while the proxy waits to ask for it again, and the link stays up. The
-/// proxy goes on idling, so 60 s of the simulation after take little real
-/// time.
+/// proxy goes on idling for the next 60 s. No task spins, as
+/// [`polls`](crate::chan::polls) fails a run in which one does, and the
+/// hosts' tasks are polled fewer times than those 60 s have ticks of 1 ms,
+/// so none wakes on every tick.
 #[test]
 fn a_hub_child_lost_while_its_metadata_is_retried_leaves_the_proxy_idle() {
+    const IDLE: Duration = Duration::from_secs(60);
     for seed in seeds() {
         let _seed = Seed(seed);
         let world = Arc::new(World::default());
@@ -586,15 +792,18 @@ fn a_hub_child_lost_while_its_metadata_is_retried_leaves_the_proxy_idle() {
             app.child_silent.store(true, Ordering::SeqCst);
             wait_for(&presence, Duration::from_secs(10), lost).await;
             app.reach(1);
-            sleep(Duration::from_secs(60)).await;
+            sleep(IDLE).await;
             drop(connection);
             Ok(())
         });
         step_until(&mut sim, &world, 1);
-        let took = run_timed(&mut sim);
+        let before = crate::chan::polls::count();
+        run_to_end(&mut sim);
+        let polls = crate::chan::polls::count() - before;
+        let ticks = IDLE.as_millis() as u64;
         assert!(
-            took < Duration::from_secs(10),
-            "the proxy spun for {took:?}"
+            polls < ticks,
+            "the tasks were polled {polls} times in {ticks} ticks"
         );
     }
 }

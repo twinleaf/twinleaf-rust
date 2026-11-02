@@ -6,7 +6,7 @@ use crate::chan::oneshot;
 use crate::data::{Boundary, Change, Loss, SampleBatch, StreamKey, StreamMetadataSnapshot};
 use crate::device::session::Handle;
 use crate::proto::{DeviceRoute, SampleNumber};
-use std::collections::HashMap;
+use crate::rand::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -412,7 +412,7 @@ impl BatchLane {
         let (lane, received) = Lane::new(capacity);
         let lane = BatchLane {
             lane,
-            streams: HashMap::new(),
+            streams: HashMap::default(),
         };
         (lane, received)
     }

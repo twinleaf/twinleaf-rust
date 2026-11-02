@@ -27,6 +27,7 @@ use crate::device::stream::Scope;
 use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
+use crate::rand::StreamMap;
 use crate::rt::{finish, BoxFuture};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
@@ -39,7 +40,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::time::{timeout_at, Instant};
-use tokio_stream::{StreamMap, StreamNotifyClose};
+use tokio_stream::StreamNotifyClose;
 
 /// How many packets a client's socket queues. The outbox holds what waits
 /// for the client, and this queue only keeps the socket's task busy while

@@ -44,11 +44,18 @@
 //! how many went, and logs it at debug level. The client is not told. The
 //! packets that are not samples are never dropped, so a client whose other
 //! packets take more than [`HARD_LIMIT`] bytes is let go as
-//! [`ClientError::TooSlow`].
+//! [`ClientError::TooSlow`]. The client counts as too slow while the packets
+//! other than samples its outbox holds take more than [`HARD_LIMIT`] bytes.
+//! Meanwhile the outbox refuses whatever is queued, and once takes bring
+//! those packets back under the limit it takes what is queued again. The
+//! call that takes them past the limit is taken whole, and asks that the
+//! client be let go as [`ClientError::TooSlow`].
 //!
 //! A client is let go once something it mounts ends, or once it falls that
-//! far behind. [`Outbox::take`] then hands the writer the reason, and the
-//! client's task writes what was queued for at most
+//! far behind. [`Outbox::take`] then hands the writer the reason. Each take
+//! hands the first reason asked for since the last take that handed one, and
+//! a reason asked for while another waits is dropped. The client's task
+//! writes what was queued for at most
 //! [`CLOSE_TIMEOUT`](crate::tio::transport::CLOSE_TIMEOUT) before it closes
 //! the socket. The status that the proxy stopped is never refused. It goes
 //! to the writer behind everything queued before it, and nothing goes after
@@ -229,7 +236,7 @@ impl Outbox {
     }
 
     /// Lets the client go for `error` once what is queued is written, unless
-    /// it is let go for another reason already.
+    /// another reason already waits for the next take.
     pub(super) fn end(&self, error: ClientError) {
         lock(&self.queues).end.get_or_insert(error);
         self.ready.notify_one();
@@ -246,12 +253,14 @@ impl Outbox {
         self.ready.notify_one();
     }
 
-    /// Takes the whole urgent queue, and then the oldest part of the stream,
-    /// up to [`TAKE_LIMIT`] bytes of it and at least one packet. A take that
-    /// reaches the limit inside an update takes the rest of the update too.
-    /// Once the stream is empty, the status that the proxy stopped goes last
-    /// if it is due. Says how many samples were dropped since the last take,
-    /// and why the client must be let go, once something asked for that.
+    /// Takes the whole urgent queue, and then as much of the front of the
+    /// stream as fits under [`TAKE_LIMIT`] bytes, and at least one packet of
+    /// it. The take stops only at the end of the stream, or at a packet that
+    /// would take it past the limit. A take that reaches the limit inside an
+    /// update takes the rest of the update too. Once the stream is empty, the
+    /// status that the proxy stopped goes last if it is due. Says how many
+    /// samples were dropped since the last take, and the first reason to let
+    /// the client go asked for since the last take that handed one.
     pub(super) fn take(&self) -> Taken {
         let mut queues = lock(&self.queues);
         let mut packets = std::mem::take(&mut queues.urgent);

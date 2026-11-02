@@ -181,8 +181,13 @@ impl Supervisor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let supervised = Supervised::new(task, future);
-        map.spawn_on(key, self.tracker.track_future(supervised), &self.handle);
+        let supervised = self.tracker.track_future(Supervised::new(task, future));
+        // Under turmoil the task joins the host's tasks, as `chan::spawn_on`
+        // says.
+        #[cfg(all(test, turmoil, not(shuttle)))]
+        map.spawn_local(key, chan::polls::Counted::new(supervised));
+        #[cfg(not(all(test, turmoil, not(shuttle))))]
+        map.spawn_on(key, supervised, &self.handle);
     }
 
     /// Runs `future` as the task named `task`, and blocks the calling thread
@@ -466,7 +471,7 @@ mod tests {
         );
         assert!(running.abort(&"abort"));
         let completed = async {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = crate::rand::HashSet::default();
             while let Some((key, result)) = running.join_next().await {
                 assert!(seen.insert(key));
                 match key {

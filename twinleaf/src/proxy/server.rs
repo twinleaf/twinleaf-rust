@@ -16,7 +16,7 @@ use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
 #[cfg(not(all(test, turmoil)))]
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future;
 #[cfg(not(all(test, turmoil)))]
@@ -160,7 +160,7 @@ pub(super) struct Server {
     /// The task of each client.
     sessions: JoinMap<u64, Option<()>>,
     /// The lifeline of each client's task, dropped to tell it the proxy stops.
-    lifelines: HashMap<u64, oneshot::Sender<Infallible>>,
+    lifelines: BTreeMap<u64, oneshot::Sender<Infallible>>,
     registry: Owner,
     /// Disconnects once the server has ended.
     _stopped: crate::chan::Sender<()>,
@@ -213,7 +213,7 @@ impl Server {
             clients: BTreeMap::new(),
             table,
             sessions: JoinMap::new(),
-            lifelines: HashMap::new(),
+            lifelines: BTreeMap::new(),
             registry,
             _stopped: stopped,
             next_id: 1,

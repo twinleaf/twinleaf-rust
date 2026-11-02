@@ -2,10 +2,13 @@
 //!
 //! Built with `--cfg turmoil`, the crate's tests run them over turmoil's
 //! simulated network, where hosts in one process connect, lose their links
-//! and restart on a virtual clock. The command is
+//! and restart on a virtual clock. They are built with
+//! `--cfg tokio_unstable` too, under which turmoil seeds each host's tokio
+//! runtime, so the order a `select!` tries its branches in comes from the
+//! scenario's seed. The command is
 //!
 //! ```text
-//! RUSTFLAGS="--cfg turmoil" cargo test -p twinleaf --lib --target-dir target/turmoil turmoil
+//! RUSTFLAGS="--cfg turmoil --cfg tokio_unstable" cargo test -p twinleaf --lib --target-dir target/turmoil turmoil
 //! ```
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]

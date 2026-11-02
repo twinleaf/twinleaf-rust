@@ -53,9 +53,10 @@ use crate::device::store::{pruned, rpc_hash, Store, METADATA, PRESENCE};
 use crate::device::stream::Queued;
 use crate::device::{MetadataState, Presence, Settings};
 use crate::proto::{DeviceRoute, RouteError};
+use crate::rand::HashMap;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -124,7 +125,7 @@ pub(super) struct Mount {
     outbox: Arc<Outbox>,
     /// The device each watch follows the metadata of here, by the id of its
     /// `proxy.watch`, as its route on the link.
-    metadata: Mutex<HashMap<u16, DeviceRoute>>,
+    metadata: Mutex<BTreeMap<u16, DeviceRoute>>,
 }
 
 impl Mount {
@@ -313,13 +314,13 @@ struct Engine {
     metadata_seen: HashMap<DeviceRoute, u32>,
     /// When each device alive or connecting was last heard, or set
     /// connecting.
-    heard: HashMap<DeviceRoute, Instant>,
+    heard: BTreeMap<DeviceRoute, Instant>,
     /// What the store's receivers follow, as it last said.
     demand: BTreeSet<Watch>,
     /// The spawner of the workers.
     tasks: Supervisor,
     /// The worker of each device whose RPC table a receiver follows.
-    workers: HashMap<DeviceRoute, WorkerHold>,
+    workers: BTreeMap<DeviceRoute, WorkerHold>,
 }
 
 /// The engine's hold on the worker of one device. The worker ends once the
@@ -353,11 +354,11 @@ impl Engine {
             handle: Handle::root(session),
             inlet,
             parser: PacketParser::new(false),
-            metadata_seen: HashMap::new(),
-            heard: HashMap::new(),
+            metadata_seen: HashMap::default(),
+            heard: BTreeMap::new(),
             demand: BTreeSet::new(),
             tasks: tasks.clone(),
-            workers: HashMap::new(),
+            workers: BTreeMap::new(),
         }
     }
 
@@ -673,7 +674,7 @@ impl Engine {
 /// alone. A route that is not asked, as its device was lost or no receiver
 /// follows it, keeps its backoff, and sets no wake until it is asked again.
 fn asked<'a>(
-    heard: &'a HashMap<DeviceRoute, Instant>,
+    heard: &'a BTreeMap<DeviceRoute, Instant>,
     demand: &'a BTreeSet<Watch>,
 ) -> impl Iterator<Item = DeviceRoute> + 'a {
     let followed = |route: &DeviceRoute| {
@@ -941,7 +942,7 @@ mod tests {
                 random >> 60
             };
             let (mut segment, mut start, mut first) = (0, 0, 0);
-            let mut sent = HashMap::new();
+            let mut sent = HashMap::default();
             for _ in 0..3000 {
                 match next() {
                     0 => {
@@ -960,7 +961,7 @@ mod tests {
             let taken = taker.join().unwrap();
 
             let updates = segment_updates(&taken);
-            let mut held = HashMap::new();
+            let mut held = HashMap::default();
             let mut updates = updates.into_iter().peekable();
             let mut decoded = 0;
             for (place, packet) in taken.iter().enumerate() {
@@ -1719,14 +1720,6 @@ mod tests {
     #[test]
     fn a_change_after_a_new_table_carries_the_new_table() {
         const SWITCHED: u32 = 0x5747_e101;
-        let forget = || {
-            for hash in [SWITCHED, SWITCHED + 1] {
-                if let Some(cached) = crate::device::rpc::cache::path(TABLE_DEVICE, hash) {
-                    let _ = std::fs::remove_file(cached);
-                }
-            }
-        };
-        forget();
         let (store, proxy) = engine();
         let root = DeviceRoute::root();
         let hash = Arc::new(AtomicU32::new(SWITCHED));
@@ -1761,7 +1754,6 @@ mod tests {
         assert_eq!(before.value().unwrap(), RpcValue::U64(2));
         drop((tables, changes));
         answering.join().expect("the device answers");
-        forget();
     }
 
     /// A device heard again after its link reconnects reports no session
@@ -1770,7 +1762,6 @@ mod tests {
     /// session.
     #[test]
     fn a_change_before_the_first_heartbeat_after_a_reconnect_carries_no_table() {
-        forget_table();
         let (store, proxy) = engine();
         let root = DeviceRoute::root();
         let answering = answer_table(&proxy);
@@ -1792,7 +1783,6 @@ mod tests {
         assert!(after.rpc_registry().is_none());
         drop((tables, changes));
         answering.join().expect("the device answers");
-        forget_table();
     }
 
     /// A table whose load was in flight when the link reconnected is held
@@ -1800,7 +1790,6 @@ mod tests {
     /// no table. The load the reconnect calls for puts its table in force.
     #[test]
     fn a_table_loaded_across_a_reconnect_is_not_in_force() {
-        forget_table();
         let (store, proxy) = engine();
         let root = DeviceRoute::root();
         proxy.send(Packet::heartbeat(root));
@@ -1855,7 +1844,6 @@ mod tests {
         assert!(Arc::ptr_eq(after.rpc_registry().unwrap(), &reloaded));
         drop((tables, changes));
         answering.join().expect("the device answers");
-        forget_table();
     }
 
     /// A device heard again after it went quiet has reconnected, though its
@@ -1866,12 +1854,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_device_heard_again_after_going_quiet_loads_its_table_again() {
         const QUIETED: u32 = 0x5747_e201;
-        let forget = || {
-            if let Some(cached) = crate::device::rpc::cache::path(TABLE_DEVICE, QUIETED) {
-                let _ = std::fs::remove_file(cached);
-            }
-        };
-        forget();
         let tasks = Supervisor::current();
         let (store, proxy) = engine_on(&tasks);
         let device = route("/1");
@@ -1907,7 +1889,6 @@ mod tests {
         assert!(Arc::ptr_eq(before.rpc_registry().unwrap(), &old));
         assert!(!Arc::ptr_eq(&old, &new));
         assert!(Arc::ptr_eq(after_reload.rpc_registry().unwrap(), &new));
-        forget();
     }
 
     /// Answers each call the session writes as the device of
@@ -1938,18 +1919,11 @@ mod tests {
         }
     }
 
-    fn forget_table() {
-        if let Some(cached) = crate::device::rpc::cache::path(TABLE_DEVICE, TABLE_HASH) {
-            let _ = std::fs::remove_file(cached);
-        }
-    }
-
     /// The table is loaded once for every receiver, the settings are read
     /// and then kept by each announcement, and a new table hash loads the
     /// table again, which drops the settings read with the old one.
     #[test]
     fn the_table_and_settings_load_once_and_follow_announcements() {
-        forget_table();
         let (store, proxy) = engine();
         let root = DeviceRoute::root();
         let answering = answer_table(&proxy);
@@ -2002,7 +1976,6 @@ mod tests {
         assert_eq!(reread.version(), Some(5));
         drop((settings, stale, tables));
         assert_eq!(answering.join().expect("the device answers"), 2);
-        forget_table();
     }
 
     /// A worker keeps its device's table while a receiver follows it and
@@ -2012,7 +1985,6 @@ mod tests {
     /// one keeps current.
     #[tokio::test(start_paused = true)]
     async fn a_table_no_receiver_follows_is_dropped_after_its_linger() {
-        forget_table();
         let tasks = Supervisor::current();
         let (store, proxy) = engine_on(&tasks);
         let root = DeviceRoute::root();
@@ -2041,7 +2013,6 @@ mod tests {
         proxy.send(Packet::link(LinkStatus::SensorReconnected));
         let asked = tokio::time::timeout(RELOAD_DELAY * 2, proxy.sent.recv_async()).await;
         assert!(asked.is_err(), "a stopped worker loaded the table again");
-        forget_table();
     }
 
     /// A table that failed to load is loaded again after [`RELOAD_DELAY`]

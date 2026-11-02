@@ -8,7 +8,7 @@ use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, StreamId};
 use crate::tio;
 use crate::tio::packet::{EncodeError, Packet};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -381,14 +381,14 @@ pub struct DeviceMetadataSnapshot(Arc<DeviceMetadataInner>);
 struct DeviceMetadataInner {
     route: DeviceRoute,
     device: DeviceRecord,
-    streams: HashMap<StreamId, StreamMetadataSnapshot>,
+    streams: BTreeMap<StreamId, StreamMetadataSnapshot>,
 }
 
 impl DeviceMetadataSnapshot {
     pub(super) fn new(
         route: DeviceRoute,
         device: DeviceRecord,
-        streams: HashMap<StreamId, StreamMetadataSnapshot>,
+        streams: BTreeMap<StreamId, StreamMetadataSnapshot>,
     ) -> DeviceMetadataSnapshot {
         DeviceMetadataSnapshot(Arc::new(DeviceMetadataInner {
             route,
@@ -408,8 +408,7 @@ impl DeviceMetadataSnapshot {
         self.0.streams.get(&stream_id)
     }
 
-    /// Returns every advertised stream paired with its id, in no particular
-    /// order.
+    /// Returns every advertised stream paired with its id, in order of id.
     pub fn streams(
         &self,
     ) -> impl ExactSizeIterator<Item = (StreamId, &StreamMetadataSnapshot)> + '_ {
@@ -417,7 +416,7 @@ impl DeviceMetadataSnapshot {
     }
 
     /// Encodes every retained descriptor as a byte-faithful UPDATE packet, with
-    /// the device record once ahead of its streams.
+    /// the device record once ahead of its streams, which go in order of id.
     ///
     /// # Errors
     ///

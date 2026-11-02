@@ -17,6 +17,7 @@ pub mod device;
 pub mod firmware;
 mod net;
 pub mod proxy;
+mod rand;
 mod rt;
 pub mod tio;
 
