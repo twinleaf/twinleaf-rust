@@ -207,7 +207,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    tokio::task::spawn_local(polls::Counted::new(future))
+    tokio::task::spawn_local(polls::Counted::new(counted(future)))
 }
 
 /// The polls of the tasks spawned under turmoil, which tell a host that
@@ -274,6 +274,67 @@ pub(crate) mod polls {
             self.future.as_mut().poll(cx)
         }
     }
+}
+
+/// The count of live tasks of one runtime.
+#[cfg(all(test, turmoil, not(shuttle)))]
+type LiveCount = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+#[cfg(all(test, turmoil, not(shuttle)))]
+thread_local! {
+    /// The count of live tasks of each runtime on this thread, which runs
+    /// the hosts of one turmoil simulation at a time.
+    static LIVE_TASKS: std::cell::RefCell<Vec<(tokio::runtime::Id, LiveCount)>> =
+        std::cell::RefCell::default();
+}
+
+/// Returns `future` counted as a live task of the runtime it is made on,
+/// from now until it is dropped. tokio's own count leaves out the tasks of a
+/// `LocalSet`, where every task of a turmoil host runs.
+#[cfg(all(test, turmoil, not(shuttle)))]
+pub(crate) fn counted<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    use std::sync::atomic::Ordering;
+    struct Live(LiveCount);
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let count = live_count();
+    count.fetch_add(1, Ordering::SeqCst);
+    let live = Live(count);
+    async move {
+        let _live = live;
+        future.await
+    }
+}
+
+/// Returns how many tasks of the runtime it is called on live now, of those
+/// [`counted`] counts.
+#[cfg(all(test, turmoil, not(shuttle)))]
+pub(crate) fn live_tasks() -> usize {
+    live_count().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Forgets every count, as a new simulation starts on this thread.
+#[cfg(all(test, turmoil, not(shuttle)))]
+pub(crate) fn forget_live_tasks() {
+    LIVE_TASKS.with(|live| live.borrow_mut().clear());
+}
+
+/// The count of live tasks of the runtime it is called on.
+#[cfg(all(test, turmoil, not(shuttle)))]
+fn live_count() -> LiveCount {
+    let runtime = tokio::runtime::Handle::current().id();
+    LIVE_TASKS.with(|live| {
+        let mut live = live.borrow_mut();
+        if let Some((_, count)) = live.iter().find(|(id, _)| *id == runtime) {
+            return count.clone();
+        }
+        let count = LiveCount::default();
+        live.push((runtime, count.clone()));
+        count
+    })
 }
 
 /// Spawns `future` as a shuttle task, whatever runtime `handle` names.

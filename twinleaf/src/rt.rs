@@ -185,7 +185,7 @@ impl Supervisor {
         // Under turmoil the task joins the host's tasks, as `chan::spawn_on`
         // says.
         #[cfg(all(test, turmoil, not(shuttle)))]
-        map.spawn_local(key, chan::polls::Counted::new(supervised));
+        map.spawn_local(key, chan::polls::Counted::new(chan::counted(supervised)));
         #[cfg(not(all(test, turmoil, not(shuttle))))]
         map.spawn_on(key, supervised, &self.handle);
     }
@@ -212,6 +212,10 @@ impl Supervisor {
 
     /// Runs `work` on a thread where it may block. Returns the handle of its
     /// task, which resolves to what `work` returns.
+    ///
+    /// Under turmoil it runs as a task of the host instead. A blocking thread
+    /// ends in real time, so the step of the simulation that hears it would
+    /// vary with the machine's load.
     pub(crate) fn spawn_blocking<R>(
         &self,
         work: impl FnOnce() -> R + Send + 'static,
@@ -219,6 +223,12 @@ impl Supervisor {
     where
         R: Send + 'static,
     {
+        #[cfg(all(test, turmoil, not(shuttle)))]
+        return chan::spawn_on(
+            &self.handle,
+            self.tracker.track_future(async move { work() }),
+        );
+        #[cfg(not(all(test, turmoil, not(shuttle))))]
         self.tracker.spawn_blocking_on(work, &self.handle)
     }
 
