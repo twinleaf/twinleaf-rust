@@ -57,12 +57,14 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::rand::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::rand::StreamMap;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
-use tokio_stream::{StreamMap, StreamNotifyClose};
+use tokio_stream::StreamNotifyClose;
 
 /// Whether a link's device has answered. The worker sets it, and the
 /// proxy's link table reads it.
@@ -614,13 +616,13 @@ struct Worker {
     /// Hears every packet of the device.
     to_engine: mpsc::UnboundedSender<Packet>,
     /// The mount of each client's port.
-    mounts: HashMap<u64, Arc<Mount>>,
+    mounts: BTreeMap<u64, Arc<Mount>>,
     /// Packet sources report their port ID and notify when the port closes.
     inputs: StreamMap<u64, StreamNotifyClose<ReceiverStream<Packet>>>,
 
     next_rpc_id: u16,
     rpc_map: HashMap<u16, RpcMapEntry>,
-    rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
+    rpc_timeouts: BTreeMap<Instant, BTreeSet<u16>>,
 }
 
 /// How long a device that has already sent a packet may stay silent before
@@ -676,10 +678,10 @@ impl Worker {
             // Start from port 1, as 0 is the engine's.
             next_port: 1,
             to_engine: engine.to_engine,
-            mounts: HashMap::new(),
+            mounts: BTreeMap::new(),
             inputs,
             next_rpc_id: 0,
-            rpc_map: HashMap::new(),
+            rpc_map: HashMap::default(),
             rpc_timeouts: BTreeMap::new(),
             default: None,
         }

@@ -43,8 +43,7 @@ use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
-use std::collections::{HashMap, VecDeque};
-use std::hash::BuildHasher;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -270,7 +269,7 @@ impl Session {
             socket,
             received,
             peer,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
             next_id: 0,
             next_deadline: None,
             inlet: None,
@@ -431,7 +430,7 @@ async fn open_again(
 
 /// Returns `wait` made up to a quarter longer or shorter at random.
 fn jittered(wait: Duration) -> Duration {
-    let random = std::collections::hash_map::RandomState::new().hash_one(());
+    let random = crate::rand::next_u64();
     wait.mul_f64(0.75 + random as f64 / u64::MAX as f64 / 2.0)
 }
 
@@ -456,7 +455,7 @@ struct Worker {
     /// The proxy, as the log names it.
     peer: String,
     /// The calls waiting for a reply, by the id each went out with.
-    pending: HashMap<u16, Pending>,
+    pending: BTreeMap<u16, Pending>,
     next_id: u16,
     /// When the earliest pending call runs out of time, as last looked up.
     next_deadline: Option<Instant>,
@@ -547,7 +546,7 @@ impl Worker {
                 Command::Attach(..) | Command::Send(_) | Command::Close => {}
             }
         }
-        for (_, pending) in self.pending.drain() {
+        for pending in std::mem::take(&mut self.pending).into_values() {
             (pending.complete)(Err(CallError::ResponseLost));
         }
     }
@@ -560,7 +559,7 @@ impl Worker {
             return false;
         };
         log::warn!("{} closed the connection, so it is opened again", self.peer);
-        for (_, pending) in self.pending.drain() {
+        for pending in std::mem::take(&mut self.pending).into_values() {
             (pending.complete)(Err(CallError::ResponseLost));
         }
         if let Some(inlet) = &mut self.inlet {

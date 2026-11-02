@@ -20,7 +20,7 @@ use crate::proto::{SampleNumber, SegmentId, SessionId, StreamId};
 use crate::tio;
 use crate::tio::packet;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Why a well-formed packet cannot be applied to the data state.
@@ -1018,7 +1018,7 @@ impl DeviceState {
                     .metadata_snapshot(device.clone())?;
                 Some((StreamId::new(stream_id), stream))
             })
-            .collect::<Option<HashMap<_, _>>>()?;
+            .collect::<Option<BTreeMap<_, _>>>()?;
         Some(DeviceMetadataSnapshot::new(self.route, device, streams))
     }
 }

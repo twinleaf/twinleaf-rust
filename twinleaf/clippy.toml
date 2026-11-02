@@ -7,6 +7,17 @@
 # The crate's TCP sockets and name lookups come from `src/net.rs`, which swaps
 # them for turmoil's simulated ones when the tests are built with
 # `--cfg turmoil`. Tests over real sockets name tokio's and say so.
+#
+# The crate's randomness comes from `src/rand.rs`, which the turmoil tests
+# seed, so that a scenario run twice with one seed runs the same way. Only
+# that module may call `RandomState::new`, name tokio's `StreamMap`, which
+# polls from a random stream, or name the standard library's `HashMap` and
+# `HashSet`, which hash with random keys. The turmoil tests swap the
+# `StreamMap` for a seeded copy and give `crate::rand::HashMap` and
+# `crate::rand::HashSet` fixed keys. The public `ExportStats` allows the
+# standard `HashSet`, as its type is part of the crate's API. A map whose
+# iteration order reaches a send, an event or a wakeup must still be an
+# ordered one, since a normal build walks a hash map in a random order.
 disallowed-types = [
     { path = "flume::Sender", reason = "use crate::chan::Sender" },
     { path = "flume::Receiver", reason = "use crate::chan::Receiver" },
@@ -21,6 +32,9 @@ disallowed-types = [
     { path = "std::sync::RwLock", reason = "a blocking lock stalls shuttle, so use a std Mutex through crate::chan::lock" },
     { path = "tokio::net::TcpStream", reason = "use crate::net::TcpStream" },
     { path = "tokio::net::TcpListener", reason = "use crate::net::TcpListener" },
+    { path = "tokio_stream::StreamMap", reason = "use crate::rand::StreamMap, which the turmoil tests seed" },
+    { path = "std::collections::HashMap", reason = "use crate::rand::HashMap, which hashes with fixed keys in the turmoil tests" },
+    { path = "std::collections::HashSet", reason = "use crate::rand::HashSet, which hashes with fixed keys in the turmoil tests" },
 ]
 disallowed-methods = [
     { path = "flume::bounded", reason = "use crate::chan::bounded" },
@@ -37,4 +51,5 @@ disallowed-methods = [
     { path = "tokio_util::task::TaskTracker::spawn_on", reason = "use a Supervisor" },
     { path = "std::sync::Mutex::lock", reason = "use crate::chan::lock" },
     { path = "tokio::net::lookup_host", reason = "use crate::net::lookup_host" },
+    { path = "std::collections::hash_map::RandomState::new", reason = "use crate::rand, which the turmoil tests seed" },
 ]

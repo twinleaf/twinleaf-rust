@@ -36,7 +36,7 @@ use crate::tio::packet::Packet;
 use crate::tio::transport;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,7 +52,7 @@ pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) type Opens = Box<dyn FnMut(&str) -> Opener + Send>;
 
 /// The number of a link, unique among the links of one registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct LinkId(u64);
 
 /// Returns the depth of the queue each port fills for the proxy.
@@ -299,8 +299,8 @@ impl Links {
         let registry = Registry {
             requests: mailbox,
             leases: links.requests.clone(),
-            links: HashMap::new(),
-            waiting: HashMap::new(),
+            links: BTreeMap::new(),
+            waiting: BTreeMap::new(),
             workers: JoinMap::new(),
             next_id: 0,
             tasks: tasks.clone(),
@@ -423,11 +423,11 @@ struct Registry {
     /// The mailbox each lease releases its link through. It does not keep
     /// the registry running.
     leases: mpsc::WeakUnboundedSender<Request>,
-    /// Every link whose task has not ended. At most one is filed under
-    /// each device key.
-    links: HashMap<LinkId, Entry>,
+    /// Every link whose task has not ended, in the order they opened. At
+    /// most one is filed under each device key.
+    links: BTreeMap<LinkId, Entry>,
     /// The acquires of each device key held until its earlier links end.
-    waiting: HashMap<String, Vec<Waiter>>,
+    waiting: BTreeMap<String, Vec<Waiter>>,
     /// The task of each link.
     workers: JoinMap<LinkId, Option<()>>,
     next_id: u64,

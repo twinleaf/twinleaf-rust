@@ -6,6 +6,13 @@
 //! panic of another holder, and takes `oneshot`, `Notify`, `sleep_until`, its
 //! task spawns and their abort handles from tokio.
 //!
+//! The crate's own tests built with `--cfg turmoil` spawn each task on the
+//! `LocalSet` of the turmoil host it is spawned from, whatever runtime it
+//! names. A host that crashes then drops its tasks in the order they
+//! started. Tasks of a tokio runtime would drop in an order set by their
+//! task ids, which count across the whole process, so a scenario run twice
+//! would crash two ways.
+//!
 //! The crate's own tests built with `--cfg shuttle` take each of them from
 //! shuttle instead. Every send, receive, lock, notification, sleep and spawn
 //! is then a point where shuttle's scheduler picks the thread or task that
@@ -177,13 +184,30 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Spawns `future` as a task of the runtime of `handle`.
-#[cfg(not(all(test, shuttle)))]
+#[cfg(not(all(test, any(shuttle, turmoil))))]
 pub(crate) fn spawn_on<F>(handle: &tokio::runtime::Handle, future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     handle.spawn(future)
+}
+
+/// Spawns `future` as a task of the turmoil host it is spawned from,
+/// whatever runtime `handle` names. That host is the one turmoil is
+/// ticking when the call is made, so a task spawned for another host's
+/// runtime runs on this one.
+///
+/// # Panics
+///
+/// Panics if it is called outside a turmoil host.
+#[cfg(all(test, turmoil, not(shuttle)))]
+pub(crate) fn spawn_on<F>(_handle: &tokio::runtime::Handle, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::task::spawn_local(future)
 }
 
 /// Spawns `future` as a shuttle task, whatever runtime `handle` names.
@@ -233,13 +257,27 @@ pub(crate) fn check(iterations: usize, scenario: impl Fn() + Send + Sync + 'stat
 /// # Panics
 ///
 /// Panics if it is called outside a runtime.
-#[cfg(all(test, not(shuttle)))]
+#[cfg(all(test, not(shuttle), not(turmoil)))]
 pub(crate) fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     tokio::spawn(future)
+}
+
+/// Spawns `future` as a task of the turmoil host it is called from.
+///
+/// # Panics
+///
+/// Panics if it is called outside a turmoil host.
+#[cfg(all(test, turmoil, not(shuttle)))]
+pub(crate) fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::task::spawn_local(future)
 }
 
 /// Spawns `future` as a shuttle task.

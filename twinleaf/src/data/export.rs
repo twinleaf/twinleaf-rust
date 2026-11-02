@@ -38,11 +38,11 @@ use super::sample::{native_types, ColumnArray, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
+use crate::rand::{HashMap, HashSet};
 use hdf5_pure::{
     AttrValue, CompoundTypeBuilder, Dataset, File, FileAccessProperties, FileCreateProperties,
     Group, MaxExtent, SyncPolicy,
 };
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 type TableIndex = u64;
@@ -169,8 +169,8 @@ impl RunTables {
         Self {
             policy,
             level,
-            open: HashMap::new(),
-            seen: HashSet::new(),
+            open: HashMap::default(),
+            seen: HashSet::default(),
         }
     }
 
@@ -224,6 +224,9 @@ impl RunTables {
 }
 
 /// What one export wrote, returned by [`Hdf5Appender::finish`].
+// The sets of stream names are the standard library's `HashSet`, as their
+// type is part of the crate's API.
+#[allow(clippy::disallowed_types)]
 #[derive(Debug, Clone, Default)]
 pub struct ExportStats {
     /// Rows written across every table.
@@ -233,9 +236,9 @@ pub struct ExportStats {
     /// Latest `time` written, or `None` if nothing was.
     pub end_time: Option<f64>,
     /// Streams that reached the file, as `/{route}/{stream}[{id}]`.
-    pub streams_written: HashSet<String>,
+    pub streams_written: std::collections::HashSet<String>,
     /// Streams seen in the input, including any the filter dropped.
-    pub streams_seen: HashSet<String>,
+    pub streams_seen: std::collections::HashSet<String>,
     /// Breaks that [`SplitPolicy`] counted as a split.
     pub discontinuities_detected: u64,
 }
@@ -333,9 +336,9 @@ impl Hdf5Appender {
             let _ = std::fs::remove_file(path);
         })?;
         Ok(Self {
-            groups: HashMap::from([("/".to_string(), file.root())]),
+            groups: [("/".to_string(), file.root())].into_iter().collect(),
             file,
-            tables: HashMap::new(),
+            tables: HashMap::default(),
             filter,
             compress,
             runs: RunTables::new(split_policy, split_level),

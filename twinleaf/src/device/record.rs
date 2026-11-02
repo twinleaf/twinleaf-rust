@@ -10,9 +10,9 @@ use super::state::MetadataState;
 use super::stream::{Receiver, RecvError};
 use crate::data::{announces_stop, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
+use crate::rand::HashMap;
 use crate::tio;
 use crate::tio::packet;
-use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
@@ -73,7 +73,7 @@ impl<W: Write> Transcript<W> {
             writer,
             mode,
             parser: PacketParser::new(false),
-            described: HashMap::new(),
+            described: HashMap::default(),
             bytes_written: 0,
             samples_lost: 0,
         }
@@ -218,7 +218,7 @@ impl<W: Write> Recorder<W> {
         Recorder {
             tree: tree.clone(),
             tap: tree.packets(),
-            metadata: HashMap::new(),
+            metadata: HashMap::default(),
             transcript: Transcript::new(writer, mode),
         }
     }

@@ -53,9 +53,10 @@ use crate::device::store::{pruned, rpc_hash, Store, METADATA, PRESENCE};
 use crate::device::stream::Queued;
 use crate::device::{MetadataState, Presence, Settings};
 use crate::proto::{DeviceRoute, RouteError};
+use crate::rand::HashMap;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -124,7 +125,7 @@ pub(super) struct Mount {
     outbox: Arc<Outbox>,
     /// The device each watch follows the metadata of here, by the id of its
     /// `proxy.watch`, as its route on the link.
-    metadata: Mutex<HashMap<u16, DeviceRoute>>,
+    metadata: Mutex<BTreeMap<u16, DeviceRoute>>,
 }
 
 impl Mount {
@@ -313,13 +314,13 @@ struct Engine {
     metadata_seen: HashMap<DeviceRoute, u32>,
     /// When each device alive or connecting was last heard, or set
     /// connecting.
-    heard: HashMap<DeviceRoute, Instant>,
+    heard: BTreeMap<DeviceRoute, Instant>,
     /// What the store's receivers follow, as it last said.
     demand: BTreeSet<Watch>,
     /// The spawner of the workers.
     tasks: Supervisor,
     /// The worker of each device whose RPC table a receiver follows.
-    workers: HashMap<DeviceRoute, WorkerHold>,
+    workers: BTreeMap<DeviceRoute, WorkerHold>,
 }
 
 /// The engine's hold on the worker of one device. The worker ends once the
@@ -353,11 +354,11 @@ impl Engine {
             handle: Handle::root(session),
             inlet,
             parser: PacketParser::new(false),
-            metadata_seen: HashMap::new(),
-            heard: HashMap::new(),
+            metadata_seen: HashMap::default(),
+            heard: BTreeMap::new(),
             demand: BTreeSet::new(),
             tasks: tasks.clone(),
-            workers: HashMap::new(),
+            workers: BTreeMap::new(),
         }
     }
 
@@ -673,7 +674,7 @@ impl Engine {
 /// alone. A route that is not asked, as its device was lost or no receiver
 /// follows it, keeps its backoff, and sets no wake until it is asked again.
 fn asked<'a>(
-    heard: &'a HashMap<DeviceRoute, Instant>,
+    heard: &'a BTreeMap<DeviceRoute, Instant>,
     demand: &'a BTreeSet<Watch>,
 ) -> impl Iterator<Item = DeviceRoute> + 'a {
     let followed = |route: &DeviceRoute| {
@@ -941,7 +942,7 @@ mod tests {
                 random >> 60
             };
             let (mut segment, mut start, mut first) = (0, 0, 0);
-            let mut sent = HashMap::new();
+            let mut sent = HashMap::default();
             for _ in 0..3000 {
                 match next() {
                     0 => {
@@ -960,7 +961,7 @@ mod tests {
             let taken = taker.join().unwrap();
 
             let updates = segment_updates(&taken);
-            let mut held = HashMap::new();
+            let mut held = HashMap::default();
             let mut updates = updates.into_iter().peekable();
             let mut decoded = 0;
             for (place, packet) in taken.iter().enumerate() {

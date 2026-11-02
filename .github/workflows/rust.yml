@@ -48,7 +48,7 @@ jobs:
       - name: Lint and test over turmoil's simulated network
         if: matrix.platform == 'ubuntu-latest'
         env:
-          RUSTFLAGS: --cfg turmoil
+          RUSTFLAGS: --cfg turmoil --cfg tokio_unstable
         run: |
           cargo clippy -p twinleaf --lib --tests --target-dir target/turmoil
           cargo test -p twinleaf --lib --target-dir target/turmoil turmoil

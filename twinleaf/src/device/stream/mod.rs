@@ -27,7 +27,7 @@ use crate::proxy::{encode, Joined, Update, Watch, UNWATCH, WATCH};
 use crate::tio;
 use crate::tio::packet::{self, LinkStatus, Packet, ProxyRx};
 use crate::tio::transport;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
@@ -125,7 +125,7 @@ struct Pump {
     packets: Vec<Sink<Lane<tio::Packet>>>,
     /// Each watch the pump sent, by its id, and what has arrived of its
     /// next update.
-    watches: HashMap<u16, (Watch, Joined)>,
+    watches: BTreeMap<u16, (Watch, Joined)>,
     next_id: u16,
 }
 
@@ -144,7 +144,7 @@ impl Pump {
             taps,
             batches: Vec::new(),
             packets: Vec::new(),
-            watches: HashMap::new(),
+            watches: BTreeMap::new(),
             next_id: 0,
         }
     }
