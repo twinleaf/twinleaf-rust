@@ -298,7 +298,7 @@ pub(crate) fn answers(port: u16) -> bool {
 /// runtime.
 pub(crate) async fn answers_async(port: u16) -> bool {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    answers_on_retry(|| crate::tio::transport::connect_socket(address)).await
+    answers_on_retry(|| crate::net::connect(address)).await
 }
 
 /// Returns `true` if `connect` completes within [`LOOPBACK_CONNECT_TIMEOUT`],

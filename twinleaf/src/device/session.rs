@@ -430,7 +430,9 @@ async fn open_again(
 
 /// Returns `wait` made up to a quarter longer or shorter at random.
 fn jittered(wait: Duration) -> Duration {
-    let random = crate::rand::next_u64();
+    use std::hash::BuildHasher;
+    // The standard library's random keys, as std has no generator of its own.
+    let random = std::collections::hash_map::RandomState::new().hash_one(());
     wait.mul_f64(0.75 + random as f64 / u64::MAX as f64 / 2.0)
 }
 

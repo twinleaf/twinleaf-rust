@@ -53,9 +53,9 @@ use crate::device::store::{pruned, rpc_hash, Store, METADATA, PRESENCE};
 use crate::device::stream::Queued;
 use crate::device::{MetadataState, Presence, Settings};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::rand::HashMap;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::{self, LinkStatus, Packet};
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
@@ -354,7 +354,7 @@ impl Engine {
             handle: Handle::root(session),
             inlet,
             parser: PacketParser::new(false),
-            metadata_seen: HashMap::default(),
+            metadata_seen: HashMap::new(),
             heard: BTreeMap::new(),
             demand: BTreeSet::new(),
             tasks: tasks.clone(),
@@ -952,7 +952,7 @@ mod tests {
                 random >> 60
             };
             let (mut segment, mut start, mut first) = (0, 0, 0);
-            let mut sent = HashMap::default();
+            let mut sent = HashMap::new();
             for _ in 0..3000 {
                 match next() {
                     0 => {
@@ -971,7 +971,7 @@ mod tests {
             let taken = taker.join().unwrap();
 
             let updates = segment_updates(&taken);
-            let mut held = HashMap::default();
+            let mut held = HashMap::new();
             let mut updates = updates.into_iter().peekable();
             let mut decoded = 0;
             for (place, packet) in taken.iter().enumerate() {

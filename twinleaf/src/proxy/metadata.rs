@@ -8,7 +8,7 @@ use crate::device::session::{Handle, RawCallResult};
 use crate::proto::data as wire;
 use crate::proto::rpc as wire_rpc;
 use crate::proto::DeviceRoute;
-use crate::rand::HashMap;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -53,7 +53,7 @@ impl MetadataSchedule {
         let (resolve, replies) = crate::chan::unbounded();
         MetadataSchedule {
             handle,
-            schedule: HashMap::default(),
+            schedule: HashMap::new(),
             resolve,
             replies,
         }

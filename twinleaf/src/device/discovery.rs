@@ -12,15 +12,14 @@ use super::rpc::RpcReply;
 use super::runtime::ProxyAddress;
 use super::session::Session;
 use super::stream::RecvError;
-use crate::chan::oneshot;
+use crate::chan::{oneshot, StreamMap};
 use crate::proto::DeviceRoute;
 use crate::proxy::Purpose;
-use crate::rand::HashMap;
-use crate::rand::StreamMap;
 use crate::rt::{BoxFuture, Supervisor};
 #[doc(inline)]
 pub use crate::tio::transport::{enumerate_serial, DiscoveredDevice, PortInterface};
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::panic;
@@ -564,7 +563,7 @@ async fn run_probe(backend: Backend, reporter: Reporter) {
 async fn watch(connection: &Connection, period: Duration, reporter: &Reporter) -> Interrupt {
     let root = DeviceRoute::root();
     let tree = connection.tree(root).with_timeout(PROBE_TIMEOUT);
-    let mut names: HashMap<DeviceRoute, String> = HashMap::default();
+    let mut names: HashMap<DeviceRoute, String> = HashMap::new();
     let mut named: Option<String> = None;
     let mut reported: Option<Vec<NamedRoute>> = None;
     loop {
@@ -797,7 +796,7 @@ async fn browse_network(
     }
     drop(found);
 
-    let mut instances: HashMap<String, Instance> = HashMap::default();
+    let mut instances: HashMap<String, Instance> = HashMap::new();
     let preferred = if prefer_udp { "udp" } else { "tcp" };
     loop {
         let event = tokio::select! {

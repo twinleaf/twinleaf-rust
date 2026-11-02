@@ -11,15 +11,15 @@
 #![deny(clippy::await_holding_lock)]
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
-mod chan;
 pub mod data;
 pub mod device;
 pub mod firmware;
-mod net;
 pub mod proxy;
-mod rand;
 mod rt;
+mod seam;
 pub mod tio;
+
+use seam::{chan, net};
 
 /// The wire protocol, shared with device firmware.
 pub use twinleaf_proto as proto;

@@ -1,13 +1,13 @@
-//! A stand-in for the flume channels the crate uses, built on shuttle's
-//! `Mutex` and `Condvar`.
+//! A channel with the interface of flume's, built on shuttle's `Mutex` and
+//! `Condvar`, so that shuttle schedules each of its operations.
 //!
 //! Every operation takes the channel's lock, which is a scheduling point. A
 //! blocking send or receive waits on the channel's condvar, and an async
 //! receive leaves its waker, which the next change to the channel wakes. The
-//! module's parent says where it differs from flume.
+//! parent module says where it differs from flume.
 
+use ::shuttle::sync::{Condvar, Mutex, MutexGuard};
 use futures_util::stream::{FusedStream, Stream};
-use shuttle::sync::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;

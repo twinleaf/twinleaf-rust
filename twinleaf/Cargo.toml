@@ -66,15 +66,14 @@ proptest-state-machine = "0.9"
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
 
-# Built with `--cfg shuttle`, the crate's tests run its channels, locks and
-# tasks on shuttle's scheduler, as `src/chan.rs` says.
+# The test backends of `src/seam`, which `cargo test-shuttle` and
+# `cargo test-turmoil` build.
 [target.'cfg(shuttle)'.dev-dependencies]
 shuttle = "0.9.9"
 shuttle-tokio = { version = "1.0.0", features = ["shuttle", "rt", "sync", "time"] }
 
-# Built with `--cfg turmoil`, the crate's TCP sockets are turmoil's simulated ones.
-# The tests record turmoil's network events through `tracing`, which turmoil
-# already depends on, to check that a scenario replays from its seed.
+# The turmoil tests record turmoil's network events through `tracing`, which
+# turmoil already depends on, to check that a scenario replays from its seed.
 [target.'cfg(turmoil)'.dev-dependencies]
 turmoil = "0.7.2"
 tracing = "0.1"

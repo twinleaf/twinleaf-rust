@@ -25,7 +25,7 @@ mod udp;
 
 #[cfg(test)]
 pub(crate) use fake::FakeEnd;
-pub(crate) use tcp::{connect_socket, CONNECT_TIMEOUT};
+pub(crate) use tcp::CONNECT_TIMEOUT;
 
 use super::packet::{self, Packet};
 use crate::chan::{oneshot, JoinHandle};

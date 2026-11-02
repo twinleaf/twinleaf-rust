@@ -1,8 +1,9 @@
 # cargo-mutants settings, so that a plain `cargo mutants` runs as intended.
 # Test-only code is not mutated.
 exclude_globs = [
-    "twinleaf/src/chan/modeled.rs",
-    "twinleaf/src/proxy/turmoil.rs",
+    "twinleaf/src/seam/shuttle/**",
+    "twinleaf/src/seam/turmoil/**",
+    "twinleaf/src/proxy/turmoil/**",
     "**/fixtures.rs",
     "**/shuttle.rs",
     "twinleaf/src/data/boundaries.rs",

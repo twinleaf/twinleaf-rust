@@ -45,6 +45,7 @@
 use super::engine::Mount;
 use super::link;
 use super::{control, DumpFlags, Layout, MAX_RPC_TIMEOUT};
+use crate::chan::StreamMap;
 use crate::device::session::Session;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogLevel;
@@ -63,10 +64,9 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::rand::HashMap;
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::rand::StreamMap;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
@@ -775,7 +775,7 @@ impl Worker {
             mounts: BTreeMap::new(),
             inputs,
             next_rpc_id: 0,
-            rpc_map: HashMap::default(),
+            rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
             default: None,
         }

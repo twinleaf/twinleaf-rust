@@ -40,18 +40,14 @@ jobs:
         run: cargo clippy --workspace --all-targets
       - name: Lint and test under shuttle's schedulers
         if: matrix.platform == 'ubuntu-latest'
-        env:
-          RUSTFLAGS: --cfg shuttle
         run: |
-          cargo clippy -p twinleaf --lib --tests --target-dir target/shuttle
-          cargo test -p twinleaf --lib --target-dir target/shuttle shuttle
+          cargo clippy-shuttle
+          cargo test-shuttle
       - name: Lint and test over turmoil's simulated network
         if: matrix.platform == 'ubuntu-latest'
-        env:
-          RUSTFLAGS: --cfg turmoil --cfg tokio_unstable
         run: |
-          cargo clippy -p twinleaf --lib --tests --target-dir target/turmoil
-          cargo test -p twinleaf --lib --target-dir target/turmoil turmoil
+          cargo clippy-turmoil
+          cargo test-turmoil
       - name: Strip binaries
         if: matrix.platform != 'windows-latest'
         run: |

@@ -5,30 +5,19 @@
 use super::client::{Session, SOCKET_QUEUE};
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
 use super::link::{self, Links, Owner};
-#[cfg(not(all(test, turmoil)))]
-use super::Listen;
 use super::{
-    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Proxy, IDLE, LEAVE_TIMEOUT,
+    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
 };
 use crate::chan::oneshot;
-use crate::net::{TcpListener, TcpStream};
+use crate::net::{Listeners, TcpStream};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
-#[cfg(not(all(test, turmoil)))]
-use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::future;
-#[cfg(not(all(test, turmoil)))]
-use std::future::Future;
 use std::io;
-#[cfg(not(all(test, turmoil)))]
-use std::net::Ipv6Addr;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
-#[cfg(not(all(test, turmoil)))]
-use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
@@ -109,18 +98,9 @@ pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
         };
         return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
     }
-    #[cfg(all(test, turmoil))]
-    let listeners = vec![TcpListener::bind((Ipv4Addr::UNSPECIFIED, options.port)).await?];
-    #[cfg(not(all(test, turmoil)))]
-    let listeners = {
-        let listeners = bind(options.listen, options.port)?;
-        let listening = listeners.into_iter().map(|listener| {
-            listener.set_nonblocking(true)?;
-            TcpListener::from_std(listener)
-        });
-        listening.collect::<io::Result<Vec<_>>>()?
-    };
-    let port = listeners[0].local_addr()?.port();
+    let (v4, v6) = addresses(options.listen, LOOPBACK_SHARES_PORT);
+    let listeners = Listeners::bind(v4, v6, options.port).await?;
+    let port = listeners.port()?;
     let default = watch::channel(options.default.take());
     let registry = Links::new(
         &tasks,
@@ -152,7 +132,7 @@ pub(super) struct Server {
     shared: Arc<Shared>,
     /// The listening sockets. They are dropped once the proxy stops
     /// accepting.
-    listeners: Vec<TcpListener>,
+    listeners: Listeners,
     notices: mpsc::UnboundedReceiver<Notice>,
     clients: BTreeMap<u64, ClientInfo>,
     /// The publisher of `clients`.
@@ -208,7 +188,7 @@ impl Server {
         });
         let server = Server {
             shared,
-            listeners: Vec::new(),
+            listeners: Listeners::default(),
             notices: mailbox,
             clients: BTreeMap::new(),
             table,
@@ -236,7 +216,7 @@ impl Server {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
                     Some(Notice::Stop) | None => break,
                 },
-                accepted = accept(&self.listeners), if accepting => match accepted {
+                accepted = self.listeners.accept(), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),
                     Err(error) => {
                         log::warn!("Error accepting client: {error}");
@@ -263,7 +243,7 @@ impl Server {
     /// links together. Waits [`LEAVE_TIMEOUT`] for the clients, as the
     /// registry does for its links.
     async fn stop(mut self) {
-        self.listeners.clear();
+        self.listeners.close();
         self.notices.close();
         while self.notices.try_recv().is_ok() {}
         self.lifelines.clear();
@@ -353,7 +333,7 @@ impl Server {
     /// Breaks to exit a proxy that has had no client for [`IDLE`]. Each
     /// connection already waiting on a listener is served instead.
     fn idle_out(&mut self) -> ControlFlow<()> {
-        let waiting = waiting(&self.listeners);
+        let waiting = self.listeners.waiting();
         if waiting.is_empty() {
             log::info!("no clients for {:?}; exiting", IDLE);
             return ControlFlow::Break(());
@@ -368,68 +348,8 @@ impl Server {
     }
 }
 
-/// Takes each connection already waiting on `listeners`, though the
-/// runtime may not have seen it arrive, with the error of any that cannot
-/// be served.
-#[cfg(not(all(test, turmoil)))]
-fn waiting(listeners: &[TcpListener]) -> Vec<io::Result<(TcpStream, SocketAddr)>> {
-    let mut waiting = Vec::new();
-    for listener in listeners {
-        loop {
-            let socket = match SockRef::from(listener).accept() {
-                Ok((socket, _)) => socket,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    log::warn!("Error accepting client: {error}");
-                    break;
-                }
-            };
-            let stream = std::net::TcpStream::from(socket);
-            waiting.push(stream.set_nonblocking(true).and_then(|()| {
-                let peer = stream.peer_addr()?;
-                Ok((TcpStream::from_std(stream)?, peer))
-            }));
-        }
-    }
-    waiting
-}
-
-/// Takes no connection, as a simulated listener holds none the runtime has
-/// not seen.
-#[cfg(all(test, turmoil))]
-fn waiting(_listeners: &[TcpListener]) -> Vec<io::Result<(TcpStream, SocketAddr)>> {
-    Vec::new()
-}
-
-/// Waits for a connection on any of `listeners`. Never returns while there is
-/// none.
-#[cfg(all(test, turmoil))]
-async fn accept(listeners: &[TcpListener]) -> io::Result<(TcpStream, SocketAddr)> {
-    match listeners.first() {
-        Some(listener) => listener.accept().await,
-        None => future::pending().await,
-    }
-}
-
-/// Waits for a connection on any of `listeners`. Never returns while there is
-/// none.
-#[cfg(not(all(test, turmoil)))]
-fn accept(
-    listeners: &[TcpListener],
-) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + '_ {
-    future::poll_fn(move |cx| {
-        for listener in listeners {
-            if let Poll::Ready(accepted) = listener.poll_accept(cx) {
-                return Poll::Ready(accepted);
-            }
-        }
-        Poll::Pending
-    })
-}
-
 /// Whether a socket on every interface shares its port with one on
 /// `127.0.0.1` on this OS. It does on macOS and Windows.
-#[cfg(not(all(test, turmoil)))]
 const LOOPBACK_SHARES_PORT: bool = cfg!(any(target_os = "macos", windows));
 
 /// Returns the addresses a proxy binds for `listen`, its IPv4 addresses in
@@ -439,7 +359,6 @@ const LOOPBACK_SHARES_PORT: bool = cfg!(any(target_os = "macos", windows));
 /// a proxy on every interface holds `127.0.0.1` too, so that no other proxy
 /// binds it. Windows hands each connection to `127.0.0.1` to the socket bound
 /// there rather than to the one on every interface.
-#[cfg(not(all(test, turmoil)))]
 fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr], Ipv6Addr) {
     match (listen, loopback_shares_port) {
         (Listen::Loopback, _) => (&[Ipv4Addr::LOCALHOST], Ipv6Addr::LOCALHOST),
@@ -451,41 +370,6 @@ fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr]
     }
 }
 
-/// Binds the listening sockets for `listen` on `port`, at the [`addresses`]
-/// of this OS. The first IPv4 socket holds the proxy's port. An IPv6 only
-/// socket follows on the same port. A host without IPv6 gets the IPv4
-/// sockets alone. Returns an error if an IPv4 socket cannot be bound.
-#[cfg(not(all(test, turmoil)))]
-fn bind(listen: Listen, port: u16) -> io::Result<Vec<std::net::TcpListener>> {
-    let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
-    let first = std::net::TcpListener::bind((v4[0], port))?;
-    let port = first.local_addr()?.port();
-    let rest = v4[1..]
-        .iter()
-        .map(|v4| std::net::TcpListener::bind((*v4, port)));
-    let mut listeners = std::iter::once(Ok(first))
-        .chain(rest)
-        .collect::<io::Result<Vec<_>>>()?;
-    match bind_v6_only((v6, port).into()) {
-        Ok(v6) => listeners.push(v6),
-        Err(error) => log::debug!("Not listening on [{v6}]:{port}: {error}"),
-    }
-    Ok(listeners)
-}
-
-/// Listens on the IPv6 `address` like [`std::net::TcpListener::bind`], with
-/// a socket that takes no IPv4.
-#[cfg(not(all(test, turmoil)))]
-fn bind_v6_only(address: SocketAddr) -> io::Result<std::net::TcpListener> {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_only_v6(true)?;
-    #[cfg(not(windows))]
-    socket.set_reuse_address(true)?;
-    socket.bind(&address.into())?;
-    socket.listen(128)?;
-    Ok(socket.into())
-}
-
 #[cfg(test)]
 #[cfg(not(turmoil))]
 mod tests {
@@ -493,6 +377,7 @@ mod tests {
     use crate::proxy::fixtures::{assert_took, binds_every_interface, options, PAUSED_WAIT};
     use crate::proxy::DumpFlags;
     use crate::rt;
+    use socket2::SockRef;
     use std::net::TcpListener;
     use std::thread;
     use tokio::time::timeout;
@@ -531,11 +416,19 @@ mod tests {
         }
     }
 
+    /// Binds the listeners of a proxy for `listen` on `port`, on the crate's
+    /// runtime.
+    fn bind(listen: Listen, port: u16) -> io::Result<Listeners> {
+        let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
+        rt::handle().block_on(Listeners::bind(v4, v6, port))
+    }
+
     /// Asserts that `bind` holds the [`addresses`] of `listen`, IPv4 on
     /// sockets of their own and IPv6 on one that takes no IPv4.
     fn assert_bound_apart(listen: Listen) {
         let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
         let listeners = bind(listen, 0).unwrap();
+        let listeners = listeners.sockets();
         let port = listeners[0].local_addr().unwrap().port();
         let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
         let expected = v4.iter().map(|v4| SocketAddr::from((*v4, port)));
@@ -563,7 +456,7 @@ mod tests {
             (Listen::Loopback, Listen::AllInterfaces),
         ] {
             let held = bind(first, 0).unwrap();
-            let port = held[0].local_addr().unwrap().port();
+            let port = held.port().unwrap();
             let refused = bind(second, port).unwrap_err();
             assert_eq!(
                 refused.kind(),
@@ -576,7 +469,6 @@ mod tests {
     /// A connection that waits on a listener as the proxy idles out is
     /// served, though the runtime has not yet seen it arrive. The proxy
     /// keeps running.
-    #[cfg(not(all(test, turmoil)))]
     #[test]
     fn a_connection_waiting_as_the_proxy_idles_out_is_served() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -592,7 +484,7 @@ mod tests {
         let endpoint = endpoint_at(address.port());
         let (proxy, mut server) = Server::new(options, endpoint, tasks, registry, default.0);
         let _runtime = rt::handle().enter();
-        server.listeners = vec![crate::net::TcpListener::from_std(listener).unwrap()];
+        server.listeners = Listeners::from_std(vec![listener]).unwrap();
         let _client = std::net::TcpStream::connect(address).unwrap();
         // A connection may reach the listener's queue only after connect
         // returns, as with the mirrored networking of WSL2.
@@ -602,7 +494,7 @@ mod tests {
 
         assert!(idled.is_continue());
         assert_eq!(proxy.clients().len(), 1);
-        assert_eq!(server.listeners.len(), 1);
+        assert_eq!(server.listeners.sockets().len(), 1);
         drop(server);
     }
 
@@ -618,7 +510,7 @@ mod tests {
         let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
         let (proxy, mut server) =
             Server::new(options, endpoint, tasks.clone(), registry, default.0);
-        server.listeners = vec![crate::net::TcpListener::from_std(listener).unwrap()];
+        server.listeners = Listeners::from_std(vec![listener]).unwrap();
         tasks.spawn("a test proxy", server.run());
         proxy
     }

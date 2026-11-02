@@ -2,17 +2,14 @@
 //! lane sends on one thread while its reader takes items on another.
 
 use super::{BatchLane, End, Queued, Receiver, RecvError, Scope, Sink};
-use crate::chan;
 use crate::data::{Change, PacketParser, SampleBatch};
 use crate::device::fixtures::{description, samples};
 use crate::proto::{DeviceRoute, SessionId};
+use crate::seam::shuttle::check;
 use ::shuttle::future::block_on;
 use ::shuttle::sync::atomic::{AtomicBool, Ordering};
 use ::shuttle::thread;
 use std::sync::Arc;
-
-/// How many schedules each scheduler runs per property.
-const ITERATIONS: usize = 1000;
 
 /// How many values the pump sends in a scenario.
 const SENT: u32 = 4;
@@ -41,7 +38,7 @@ async fn read_to_the_end(receiver: &Receiver<u32>) -> (u32, RecvError) {
 /// sent, and reads the end after it.
 #[test]
 fn a_latest_value_reader_never_goes_back_and_ends_on_the_last_value() {
-    chan::check(ITERATIONS, || {
+    check(|| {
         let (mut sink, receiver) = Sink::latest(everything());
         let pump = thread::spawn(move || {
             for value in 1..=SENT {
@@ -62,7 +59,7 @@ fn a_latest_value_reader_never_goes_back_and_ends_on_the_last_value() {
 /// always wakes, up to the last value sent.
 #[test]
 fn a_latest_value_lane_never_looks_empty_while_it_holds_a_value() {
-    chan::check(ITERATIONS, || {
+    check(|| {
         let (mut sink, receiver) = Sink::latest(everything());
         assert!(sink.lane.send(0));
         let done = Arc::new(AtomicBool::new(false));
@@ -106,7 +103,7 @@ fn a_latest_value_lane_never_looks_empty_while_it_holds_a_value() {
 #[test]
 fn a_fifo_reader_gets_each_item_or_a_gap_in_its_place_then_the_stop() {
     const ITEMS: u64 = 6;
-    chan::check(ITERATIONS, || {
+    check(|| {
         let (mut sink, receiver) = Sink::new(2, everything());
         let pump = thread::spawn(move || {
             for item in 0..ITEMS {
@@ -181,7 +178,7 @@ struct Taken {
 fn a_batch_lane_carries_the_change_and_loss_of_dropped_batches_onto_the_next() {
     let sent = Arc::new(rebooting_batches());
     let rows: u64 = sent.iter().map(|batch| batch.len() as u64).sum();
-    chan::check(ITERATIONS, move || {
+    check(move || {
         let (mut lane, queue) = BatchLane::new(1);
         let batches = Arc::clone(&sent);
         let pump = thread::spawn(move || {

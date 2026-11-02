@@ -9,8 +9,8 @@ use super::metadata::{DeviceMetadataSnapshot, MetadataQuery, StreamKey};
 use super::sample::{RowSource, SampleBatch};
 use super::state::{DataError, PacketEvent, ParseState, ScannedRows};
 use crate::proto::DeviceRoute;
-use crate::rand::HashMap;
 use crate::tio;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 
 /// Incremental, route-aware parser for TIO packets.
@@ -330,7 +330,7 @@ impl Batcher {
     fn new() -> Self {
         Self {
             target_rows: None,
-            pending: HashMap::default(),
+            pending: HashMap::new(),
             ready: VecDeque::new(),
         }
     }
@@ -1975,7 +1975,7 @@ mod tests {
             (narrow, 1, narrow_sample(-2, 301)),
             (wide, 1, wide_sample(0.5, -100_001)),
         ];
-        let mut values: HashMap<DeviceRoute, Vec<Decoded>> = HashMap::default();
+        let mut values: HashMap<DeviceRoute, Vec<Decoded>> = HashMap::new();
         for (route, first, data) in packets {
             let packet =
                 tio::Packet::samples(STREAM_ID, 0, first, &data, route).expect("valid samples");

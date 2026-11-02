@@ -3,19 +3,16 @@
 //! drain after them must be what the model accepts with that call made whole
 //! at one place among the writer's calls, and each race must reach every
 //! place. A failure prints the schedule that broke it, which replays as
-//! `crate::chan` says.
+//! `crate::seam::shuttle` says.
 
 use super::super::{Taken, TAKE_LIMIT};
 use super::{drain, Classes, Client, Item, Kind, Model, Queue, CLASSES};
-use crate::chan;
 use crate::proto::DeviceRoute;
+use crate::seam::shuttle::{check, replaying};
 use crate::tio::packet::Packet;
 use ::shuttle::thread;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// How many schedules each scheduler runs per property.
-const ITERATIONS: usize = 1000;
 
 /// The id of the watch whose update races the takes.
 const ID: u16 = 1;
@@ -89,7 +86,7 @@ fn race<const PLACES: usize>(
     scenario: impl Fn() -> Result<usize, String> + Send + Sync + 'static,
 ) {
     let places = Arc::new([const { AtomicUsize::new(0) }; PLACES]);
-    chan::check(ITERATIONS, {
+    check({
         let places = Arc::clone(&places);
         move || {
             match scenario() {
@@ -108,7 +105,7 @@ fn race<const PLACES: usize>(
             "{name}, how often the call came after each number of the writer's calls {reached:?}"
         );
     }
-    if std::env::var_os("TWINLEAF_SHUTTLE_SCHEDULE").is_none() {
+    if !replaying() {
         assert!(
             !reached.contains(&0),
             "law 12, the {name} race never reached some places {reached:?}"

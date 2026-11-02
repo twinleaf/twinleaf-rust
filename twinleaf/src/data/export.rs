@@ -38,11 +38,11 @@ use super::sample::{native_types, ColumnArray, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::DeviceRoute;
 use crate::proto::{ColumnId, SampleNumber};
-use crate::rand::{HashMap, HashSet};
 use hdf5_pure::{
     AttrValue, CompoundTypeBuilder, Dataset, File, FileAccessProperties, FileCreateProperties,
     Group, MaxExtent, SyncPolicy,
 };
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 type TableIndex = u64;
@@ -169,8 +169,8 @@ impl RunTables {
         Self {
             policy,
             level,
-            open: HashMap::default(),
-            seen: HashSet::default(),
+            open: HashMap::new(),
+            seen: HashSet::new(),
         }
     }
 
@@ -224,9 +224,6 @@ impl RunTables {
 }
 
 /// What one export wrote, returned by [`Hdf5Appender::finish`].
-// The sets of stream names are the standard library's `HashSet`, as their
-// type is part of the crate's API.
-#[allow(clippy::disallowed_types)]
 #[derive(Debug, Clone, Default)]
 pub struct ExportStats {
     /// Rows written across every table.
@@ -338,7 +335,7 @@ impl Hdf5Appender {
         Ok(Self {
             groups: [("/".to_string(), file.root())].into_iter().collect(),
             file,
-            tables: HashMap::default(),
+            tables: HashMap::new(),
             filter,
             compress,
             runs: RunTables::new(split_policy, split_level),

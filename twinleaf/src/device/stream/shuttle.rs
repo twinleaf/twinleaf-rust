@@ -3,7 +3,7 @@
 //! proxy and readers as shuttle threads and tasks.
 
 use super::{Receiver, RecvError, Scope, Stream};
-use crate::chan::{self, lock};
+use crate::chan::lock;
 use crate::data::SampleBatch;
 use crate::device::fixtures::{broadcast, metadata_records, segment_record};
 use crate::device::session::{Handle, Session, TestProxy};
@@ -13,14 +13,12 @@ use crate::proto::data as wire;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
 use crate::proxy::{decode, parts, Update, Watch, WATCH};
 use crate::rt::Supervisor;
+use crate::seam::shuttle::{check, replaying};
 use crate::tio::packet::{LinkStatus, Packet, Payload};
 use ::shuttle::future::{block_on, spawn};
 use ::shuttle::thread;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// How many schedules each scheduler runs per property.
-const ITERATIONS: usize = 1000;
 
 /// The presence of a device alive in `session`.
 fn alive(session: u32) -> Presence {
@@ -52,7 +50,7 @@ fn change(seq: u32) -> SettingChange {
 #[test]
 fn a_new_subscriber_gets_the_held_value_or_a_newer_one_then_every_later_change() {
     const SET: u32 = 3;
-    chan::check(ITERATIONS, || {
+    check(|| {
         let route = DeviceRoute::root();
         let store = Arc::new(Mutex::new(Store::new(false)));
         let pump = thread::spawn({
@@ -157,7 +155,7 @@ fn wake_on(ending: Ending) -> (RecvError, RecvError) {
 /// connection closes both wake, and read that it was closed.
 #[test]
 fn a_reader_waiting_when_the_connection_closes_wakes_to_the_close() {
-    chan::check(ITERATIONS, || {
+    check(|| {
         assert_eq!(
             wake_on(Ending::Close),
             (RecvError::Closed, RecvError::Closed)
@@ -169,7 +167,7 @@ fn a_reader_waiting_when_the_connection_closes_wakes_to_the_close() {
 /// stops both wake, and read that it stopped.
 #[test]
 fn a_reader_waiting_when_the_proxy_stops_wakes_to_the_stop() {
-    chan::check(ITERATIONS, || {
+    check(|| {
         assert_eq!(
             wake_on(Ending::Stop),
             (RecvError::Stopped, RecvError::Stopped)
@@ -284,7 +282,7 @@ fn read_samples(batches: &Receiver<SampleBatch>) -> (Vec<Sample>, RecvError) {
 /// the segment record the proxy sent last before it, and none is dropped.
 #[test]
 fn every_sample_decodes_with_the_last_record_sent_before_it() {
-    chan::check(ITERATIONS, || {
+    check(|| {
         let (stream, session, proxy, tasks) = stream();
         let batches = stream.batches(Scope::subtree(DeviceRoute::root()));
         let id = watch_id(&proxy);
@@ -310,7 +308,7 @@ fn every_sample_decodes_with_the_last_record_sent_before_it() {
 fn a_late_subscriber_decodes_each_sample_with_the_record_in_force_for_it() {
     /// How many schedules gave the late subscriber a sample.
     static GOT_SAMPLES: AtomicUsize = AtomicUsize::new(0);
-    chan::check(ITERATIONS, || {
+    check(|| {
         let (stream, session, proxy, tasks) = stream();
         let root = DeviceRoute::root();
         let early = stream.batches(Scope::subtree(root));
@@ -344,7 +342,7 @@ fn a_late_subscriber_decodes_each_sample_with_the_record_in_force_for_it() {
         }
         finish(tasks, (early, stream, session, proxy));
     });
-    if std::env::var_os("TWINLEAF_SHUTTLE_SCHEDULE").is_none() {
+    if !replaying() {
         assert!(
             GOT_SAMPLES.load(Ordering::Relaxed) > 0,
             "no schedule gave the late subscriber a sample"

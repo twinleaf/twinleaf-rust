@@ -154,7 +154,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-#[cfg(shuttle)]
+#[cfg(all(test, shuttle))]
 mod shuttle;
 
 /// The most takes the writer makes to empty the outbox at the end of a case.

@@ -11,7 +11,7 @@ use super::continuity::Generations;
 use super::metadata::{StreamKey, StreamMetadataSnapshot};
 use super::sample::SampleBatch;
 use crate::proto::SampleNumber;
-use crate::rand::HashMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Instant;
@@ -72,7 +72,7 @@ impl Buffer {
     pub fn new(capacity: usize) -> Buffer {
         Buffer {
             capacity,
-            runs: HashMap::default(),
+            runs: HashMap::new(),
         }
     }
 

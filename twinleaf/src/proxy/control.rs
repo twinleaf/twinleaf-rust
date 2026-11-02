@@ -672,7 +672,7 @@ pub(crate) async fn call_at(
     tasks: &Supervisor,
 ) -> io::Result<Vec<u8>> {
     let connect = timeout.min(HELLO_TIMEOUT);
-    let connected = match tokio::time::timeout(connect, transport::connect_socket(address)).await {
+    let connected = match tokio::time::timeout(connect, crate::net::connect(address)).await {
         Ok(connected) => connected,
         Err(_elapsed) => Err(io::ErrorKind::TimedOut.into()),
     };
