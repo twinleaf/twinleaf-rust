@@ -228,15 +228,16 @@ impl CounterDomain {
         (value % self.period as u64) as u32
     }
 
-    /// Shortest signed displacement from `expected` to `observed`. An exactly
-    /// half-period ambiguity resolves negative.
+    /// Shortest signed displacement from `expected` to `observed`, both inside
+    /// the period. An exactly half-period ambiguity resolves negative.
     pub(crate) const fn signed_delta(self, observed: u32, expected: u32) -> i64 {
         let period = self.period as i64;
         let mut delta = observed as i64 - expected as i64;
-        let half = period / 2;
-        if delta >= half {
+        // Twice the delta against the whole period, so an odd period has no
+        // rounded half.
+        if 2 * delta >= period {
             delta -= period;
-        } else if delta < -half {
+        } else if 2 * delta < -period {
             delta += period;
         }
         delta
@@ -251,11 +252,42 @@ impl CounterDomain {
 #[cfg(test)]
 mod counter_tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::Index;
 
     #[test]
     #[should_panic(expected = "counter period must be nonzero")]
     fn a_zero_period_is_a_build_error() {
         CounterDomain::new(0);
+    }
+
+    proptest! {
+        /// The delta leads from `expected` to `observed` around the period,
+        /// and is the shortest such step, the negative one at exactly half a
+        /// period. Any period, odd or even, up to `u32::MAX`. `observed` lies
+        /// anywhere, or within two counts of `expected` or of the point half
+        /// a period away, where the shortest step changes sign.
+        #[test]
+        fn signed_delta_is_the_shortest_step_around_the_period(
+            period in prop_oneof![1..=16u32, 1..=u32::MAX],
+            expected in any::<Index>(),
+            aim in 0..3u8,
+            anywhere in any::<Index>(),
+            offset in -2i64..=2,
+        ) {
+            let domain = CounterDomain::new(period);
+            let expected = expected.index(period as usize) as i64;
+            let period = i64::from(period);
+            let step = match aim {
+                0 => anywhere.index(period as usize) as i64,
+                1 => offset,
+                _ => period / 2 + offset,
+            };
+            let observed = (expected + step).rem_euclid(period);
+            let delta = domain.signed_delta(observed as u32, expected as u32);
+            prop_assert_eq!((expected + delta).rem_euclid(period), observed);
+            prop_assert!(-period <= 2 * delta && 2 * delta < period, "delta {}", delta);
+        }
     }
 
     #[test]
