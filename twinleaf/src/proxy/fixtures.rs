@@ -158,11 +158,6 @@ impl FakeDevice {
         self.state.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Returns the hash of the device's RPC table.
-    pub(crate) fn table_hash(&self) -> u32 {
-        self.state.table_hash
-    }
-
     /// Returns how many calls of the RPC `name` the device has received.
     pub(crate) fn calls(&self, name: &str) -> usize {
         let received = crate::chan::lock(&self.state.received);

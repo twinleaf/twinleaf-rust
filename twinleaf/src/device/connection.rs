@@ -1161,12 +1161,6 @@ mod tests {
     #[test]
     fn clients_of_a_proxy_behind_a_proxy_share_its_state() {
         let device = FakeDevice::start();
-        let forget_table = || {
-            if let Some(cached) = super::super::rpc::cache::path("FAKE", device.table_hash()) {
-                let _ = std::fs::remove_file(cached);
-            }
-        };
-        forget_table();
         let upstream = fixtures::proxy_serving(&device.url);
         let downstream = fixtures::proxy();
         for _ in 0..2 {
@@ -1178,7 +1172,6 @@ mod tests {
             assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
         }
 
-        forget_table();
         let asked =
             ["dev.metadata", "rpc.listinfo", "test.amplitude"].map(|name| device.calls(name));
         assert_eq!(asked, [1, 1 + 2, 1]);

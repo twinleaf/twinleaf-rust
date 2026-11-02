@@ -181,24 +181,90 @@ mod tests {
         reply
     }
 
-    /// Answer `replies` in order, recording what was asked. A run out of
-    /// replies fails the walk, so no test ever writes the on-disk cache.
-    fn walk_recording(replies: Vec<Vec<u8>>) -> (Vec<(String, Vec<u8>)>, RpcRegistryError) {
+    type Asked = Vec<(String, Vec<u8>)>;
+
+    /// Loads a registry that answers `replies` in order, recording what was
+    /// asked. Each call after the last reply fails.
+    fn load_recording(replies: Vec<Vec<u8>>) -> (Asked, Result<RpcRegistry, RpcRegistryError>) {
         let mut asked = Vec::new();
         let mut replies = replies.into_iter();
         let loaded = poll_once(std::pin::pin!(RpcRegistry::load_with(|name, arg| {
             asked.push((name.to_string(), arg.to_vec()));
             resolved(replies.next())
         })));
-        let Poll::Ready(Err(error)) = loaded else {
+        let Poll::Ready(loaded) = loaded else {
+            panic!("the load waits on a reply it was given");
+        };
+        (asked, loaded)
+    }
+
+    /// Loads as [`load_recording`] does, for a walk that runs out of replies.
+    fn walk_recording(replies: Vec<Vec<u8>>) -> (Asked, RpcRegistryError) {
+        let (asked, loaded) = load_recording(replies);
+        let Err(error) = loaded else {
             panic!("the walk runs out of replies");
         };
         (asked, error)
     }
 
+    /// The replies of a device called `name` whose table of `dev.name` alone
+    /// keeps the hash `hash` through the walk.
+    fn finished_walk(name: &str, hash: u32) -> Vec<Vec<u8>> {
+        vec![
+            name.as_bytes().to_vec(),
+            hash.to_le_bytes().to_vec(),
+            7u32.to_le_bytes().to_vec(),
+            1u16.to_le_bytes().to_vec(),
+            descriptor("dev.name"),
+            hash.to_le_bytes().to_vec(),
+        ]
+    }
+
+    /// A walk whose hash holds is cached, and the next load of that hash
+    /// reads the table from the cache after the name, hash and session.
+    #[test]
+    fn a_finished_walk_is_cached_and_the_next_load_reads_the_cache() {
+        let _cache = cache::Scratch::new();
+        let hash = 0x0bad_cafe;
+        let (_, walked) = load_recording(finished_walk("test-device", hash));
+        let walked = walked.expect("the walk finishes");
+
+        let (asked, cached) = load_recording(finished_walk("test-device", hash)[..3].to_vec());
+        let cached = cached.expect("the table loads from the cache");
+
+        assert_eq!(asked.len(), 3, "the cached table was walked again");
+        assert_eq!(cached.names(), walked.names());
+        assert_eq!(cached.names(), ["dev.name"]);
+        assert_eq!(
+            (cached.hash, cached.session),
+            (Some(hash), Some(SessionId::new(7)))
+        );
+    }
+
+    /// A test holds no cache directory of its own unless it asks for one, so
+    /// a walk that finishes, as one does under a mutation that ignores a
+    /// moved hash, leaves no file in the user's cache for a later run to
+    /// load.
+    #[test]
+    fn a_finished_walk_writes_nothing_to_the_users_cache() {
+        const NAME: &str = "registry-test-without-a-cache";
+        let hash = 0x5eed_cafe;
+        let (_, loaded) = load_recording(finished_walk(NAME, hash));
+
+        assert!(loaded.is_ok(), "the walk finishes");
+        assert_eq!(cache::path(NAME, hash), None);
+        let users = directories::BaseDirs::new()
+            .map(|dirs| dirs.cache_dir().join("twinleaf"))
+            .map(|dir| dir.join(format!("{NAME}.{hash:x}.rpcs")));
+        assert!(
+            !users.is_some_and(|file| file.exists()),
+            "the walk wrote the user's cache"
+        );
+    }
+
     #[test]
     fn the_walk_asks_for_the_name_the_hash_the_session_then_each_descriptor() {
-        // A hash nothing has cached, so the walk has to enumerate.
+        // A test has no cache, so the walk has to enumerate.
         let (asked, error) = walk_recording(vec![
             b"test-device".to_vec(),
             0xdead_beefu32.to_le_bytes().to_vec(),
@@ -228,6 +294,7 @@ mod tests {
     /// the walk is neither cached nor returned, and the new table is walked.
     #[test]
     fn a_hash_that_moves_during_the_walk_walks_the_new_table() {
+        let _cache = cache::Scratch::new();
         let (before, after) = (0x0bad_c0deu32, 0x0bad_c0dfu32);
         let (asked, error) = walk_recording(vec![
             b"test-device".to_vec(),
@@ -254,7 +321,7 @@ mod tests {
             error,
             RpcRegistryError::DeviceRpcError(CallError::ResponseLost)
         ));
-        let stale = cache::path("test-device", before).expect("a cache directory");
+        let stale = cache::path("test-device", before).expect("the scratch directory");
         assert!(!stale.exists(), "the mixed walk was cached");
     }
 
