@@ -37,8 +37,9 @@ const PROXY_PORT: u16 = 7856;
 const TABLE_HASH: u32 = 0x5157_0001;
 
 /// How long a test lets the simulation after its last phase take in real
-/// time. The simulation runs in about a second, and one that spins never
-/// returns from a step.
+/// time. The simulation runs in about a second. A spawned task that spins
+/// fails it at once, as [`polls`](crate::chan::polls) says, and a host's
+/// own future that spins never returns from a step.
 const SPIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// What the hosts of one scenario share, and how its device behaves.
@@ -251,11 +252,10 @@ fn step_until(sim: &mut ::turmoil::Sim<'_>, world: &World, phase: u8) {
     }
 }
 
-/// Runs `sim` to its end, and returns how much real time that took. Fails
-/// the test process if the run takes longer than [`SPIN_LIMIT`], as a host
-/// that spins never gives a step back. A run that fails ends the watchdog
-/// with it.
-fn run_timed(sim: &mut ::turmoil::Sim<'_>) -> Duration {
+/// Runs `sim` to its end. Fails the test process if the run takes longer
+/// than [`SPIN_LIMIT`], as a host that spins outside a spawned task never
+/// gives a step back. A run that fails ends the watchdog with it.
+fn run_to_end(sim: &mut ::turmoil::Sim<'_>) {
     let (done, finished) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
         let waited = finished.recv_timeout(SPIN_LIMIT);
@@ -268,12 +268,9 @@ fn run_timed(sim: &mut ::turmoil::Sim<'_>) -> Duration {
             std::process::exit(101);
         }
     });
-    let real = std::time::Instant::now();
     while !sim.step().expect("a step") {}
-    let took = real.elapsed();
     let _ = done.send(());
     watchdog.join().expect("the watchdog");
-    took
 }
 
 /// Opens the device through the proxy, as an app does, once the proxy
@@ -771,10 +768,13 @@ fn a_device_on_a_slow_link_stays_alive_and_answers() {
 
 /// The device behind a hub, which never sends its metadata, goes quiet
 /// while the proxy waits to ask for it again, and the link stays up. The
-/// proxy goes on idling, so 60 s of the simulation after take little real
-/// time.
+/// proxy goes on idling for the next 60 s. No task spins, as
+/// [`polls`](crate::chan::polls) fails a run in which one does, and the
+/// hosts' tasks are polled fewer times than those 60 s have ticks of 1 ms,
+/// so none wakes on every tick.
 #[test]
 fn a_hub_child_lost_while_its_metadata_is_retried_leaves_the_proxy_idle() {
+    const IDLE: Duration = Duration::from_secs(60);
     for seed in seeds() {
         let _seed = Seed(seed);
         let world = Arc::new(World::default());
@@ -792,15 +792,18 @@ fn a_hub_child_lost_while_its_metadata_is_retried_leaves_the_proxy_idle() {
             app.child_silent.store(true, Ordering::SeqCst);
             wait_for(&presence, Duration::from_secs(10), lost).await;
             app.reach(1);
-            sleep(Duration::from_secs(60)).await;
+            sleep(IDLE).await;
             drop(connection);
             Ok(())
         });
         step_until(&mut sim, &world, 1);
-        let took = run_timed(&mut sim);
+        let before = crate::chan::polls::count();
+        run_to_end(&mut sim);
+        let polls = crate::chan::polls::count() - before;
+        let ticks = IDLE.as_millis() as u64;
         assert!(
-            took < Duration::from_secs(10),
-            "the proxy spun for {took:?}"
+            polls < ticks,
+            "the tasks were polled {polls} times in {ticks} ticks"
         );
     }
 }

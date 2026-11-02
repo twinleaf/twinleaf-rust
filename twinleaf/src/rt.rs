@@ -185,7 +185,7 @@ impl Supervisor {
         // Under turmoil the task joins the host's tasks, as `chan::spawn_on`
         // says.
         #[cfg(all(test, turmoil, not(shuttle)))]
-        map.spawn_local(key, supervised);
+        map.spawn_local(key, chan::polls::Counted::new(supervised));
         #[cfg(not(all(test, turmoil, not(shuttle))))]
         map.spawn_on(key, supervised, &self.handle);
     }

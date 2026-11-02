@@ -1033,18 +1033,7 @@ mod tests {
         /// The control request the session sends next, as its method, its
         /// arguments, and its id.
         fn expect_control(&mut self) -> (String, Vec<u8>, u16) {
-            let packet = self.expect();
-            let Payload::ProxyTx(request) = packet.payload() else {
-                panic!("expected a control request, got {:?}", packet.payload());
-            };
-            let Method::ByName(name) = request.method else {
-                panic!("a control request names its method");
-            };
-            (
-                String::from_utf8_lossy(name).into_owned(),
-                request.args.to_vec(),
-                request.id.value(),
-            )
+            control(&self.expect())
         }
 
         /// Expect `proxy.hello`, then `method` naming `target`, and answer
@@ -1092,6 +1081,22 @@ mod tests {
         fn send(&mut self, packet: &Packet) {
             self.stream.write_all(packet.as_bytes()).unwrap();
         }
+    }
+
+    /// The control request `packet` carries, as its method, its arguments,
+    /// and its id.
+    fn control(packet: &Packet) -> (String, Vec<u8>, u16) {
+        let Payload::ProxyTx(request) = packet.payload() else {
+            panic!("expected a control request, got {:?}", packet.payload());
+        };
+        let Method::ByName(name) = request.method else {
+            panic!("a control request names its method");
+        };
+        (
+            String::from_utf8_lossy(name).into_owned(),
+            request.args.to_vec(),
+            request.id.value(),
+        )
     }
 
     /// The introduction a fake proxy answers `proxy.hello` with.
@@ -1564,11 +1569,14 @@ mod tests {
         });
         assert!(gave_up.unwrap(), "the open ended before it was given up");
 
-        thread::sleep(Duration::from_millis(400));
-        assert!(
-            SLOW_ENSURE_ENDED.load(Ordering::SeqCst),
-            "the proxy's start was dropped with the open"
-        );
+        let deadline = Instant::now() + WAIT;
+        while !SLOW_ENSURE_ENDED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the proxy's start was dropped with the open"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// How often [`counted_refusal`] ran.
@@ -1649,33 +1657,53 @@ mod tests {
     }
 
     /// Once the proxy has said hello, a session beats while idle, and gives
-    /// up a proxy that goes quiet without closing its connection.
-    #[test]
-    fn a_session_beats_and_gives_up_a_quiet_proxy() {
-        let proxy = FakeProxy::start();
-        let address = ProxyAddress {
-            url: proxy.url(),
-            ensure: None,
+    /// up a proxy that goes quiet without closing its connection. The session
+    /// opens over an in-memory socket on the paused clock, as [`bind`] opens
+    /// one over TCP, so each beat and the give up come at exactly their time.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_beats_and_gives_up_a_quiet_proxy() {
+        let tasks = Supervisor::current();
+        let (deliver, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+        let (port, mut end) = transport::Port::fake(transport::TransportKind::Tcp, None, deliver);
+        let args = encode(&TARGET);
+        let open = Purpose::Use.method();
+        let opening = handshake(&port, &received, "fake", open, &args, "open", WAIT);
+        let answering = async {
+            let (_, _, hello) = control(&end.recv().await.expect("the hello"));
+            let (_, _, open) = control(&end.recv().await.expect("the open"));
+            let host = Packet::proxy_reply(hello, &encode(&fake_host())).unwrap();
+            end.send(&host).await;
+            end.send(&Packet::proxy_reply(open, &args).unwrap()).await;
         };
-        let opening = thread::spawn(move || Session::open(&address, TARGET, Purpose::Use, WAIT));
-        let mut end = proxy.accept();
-        end.accept_open(TARGET);
-        let _session = opening.join().unwrap().unwrap();
-        let quiet = Instant::now();
-
-        let mut beats = 0;
-        while let Some(packet) = end.next_within(CLIENT_KEEPALIVE.every * 2) {
-            assert!(matches!(packet.payload(), Payload::Heartbeat(_)));
-            beats += 1;
-        }
-
-        let given_up = quiet.elapsed();
-        assert!(beats >= 3, "the session sent {beats} heartbeats");
-        assert!(
-            (CLIENT_KEEPALIVE.quiet..CLIENT_KEEPALIVE.quiet + CLIENT_KEEPALIVE.every)
-                .contains(&given_up),
-            "the session gave the proxy up after {given_up:?}"
+        let (opened, ()) = tokio::join!(opening, answering);
+        opened.unwrap();
+        // The proxy sends nothing after the reply to the open, so the session
+        // has heard nothing since.
+        let quiet = tokio::time::Instant::now();
+        let peer = "the fake proxy".to_string();
+        let socket = (
+            Socket::Transport(port),
+            received.into_stream().boxed(),
+            peer,
         );
+        let _session = Session::start(socket, None, &tasks);
+
+        let mut beats = Vec::new();
+        let beating = async {
+            while let Some(packet) = end.recv().await {
+                assert!(matches!(packet.payload(), Payload::Heartbeat(_)));
+                beats.push(quiet.elapsed());
+            }
+        };
+        let gave_up = tokio::time::timeout(CLIENT_KEEPALIVE.quiet * 2, beating).await;
+
+        assert!(gave_up.is_ok(), "the session beat on at {beats:?}");
+        assert_took(quiet.elapsed(), CLIENT_KEEPALIVE.quiet, "the give up");
+        assert!(beats.len() >= 4, "the session beat at {beats:?}");
+        for (beat, at) in beats.iter().enumerate() {
+            let due = CLIENT_KEEPALIVE.every * (beat as u32 + 1);
+            assert_took(*at, due, format!("heartbeat {beat}"));
+        }
     }
 
     /// Nothing reads the inlet before the pump attaches, so the session drops

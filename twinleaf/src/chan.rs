@@ -11,7 +11,7 @@
 //! names. A host that crashes then drops its tasks in the order they
 //! started. Tasks of a tokio runtime would drop in an order set by their
 //! task ids, which count across the whole process, so a scenario run twice
-//! would crash two ways.
+//! would crash two ways. Each such task counts its polls, as `polls` says.
 //!
 //! The crate's own tests built with `--cfg shuttle` take each of them from
 //! shuttle instead. Every send, receive, lock, notification, sleep and spawn
@@ -207,7 +207,73 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    tokio::task::spawn_local(future)
+    tokio::task::spawn_local(polls::Counted::new(future))
+}
+
+/// The polls of the tasks spawned under turmoil, which tell a host that
+/// idles from one that spins in the simulation's own terms.
+///
+/// Turmoil's clock stands still while any task of the host it ticks is
+/// ready, so a task that is always ready holds one virtual instant forever.
+/// The [`SPIN`](polls::SPIN)th poll in a row at one instant of their host
+/// panics, which fails the simulation at once.
+#[cfg(all(test, turmoil, not(shuttle)))]
+pub(crate) mod polls {
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::time::Instant;
+
+    /// How many polls of tasks one virtual instant may take, far more than
+    /// an instant of a host that idles takes.
+    pub(crate) const SPIN: u64 = 10_000;
+
+    thread_local! {
+        /// The polls of tasks on this thread, which runs every host of its
+        /// simulation.
+        static POLLS: Cell<u64> = const { Cell::new(0) };
+        /// The instant of the last poll, on the clock of its host, and how
+        /// many polls in a row came at it.
+        static STREAK: Cell<Option<(Instant, u64)>> = const { Cell::new(None) };
+    }
+
+    /// Returns how many times a task spawned on this thread was polled.
+    pub(crate) fn count() -> u64 {
+        POLLS.with(Cell::get)
+    }
+
+    /// A task that counts its polls.
+    pub(crate) struct Counted<F> {
+        future: Pin<Box<F>>,
+    }
+
+    impl<F> Counted<F> {
+        pub(crate) fn new(future: F) -> Counted<F> {
+            Counted {
+                future: Box::pin(future),
+            }
+        }
+    }
+
+    impl<F: Future> Future for Counted<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+            POLLS.with(|polls| polls.set(polls.get() + 1));
+            let now = Instant::now();
+            let streak = match STREAK.get() {
+                Some((at, streak)) if at == now => streak + 1,
+                _ => 1,
+            };
+            STREAK.set(Some((now, streak)));
+            assert!(
+                streak < SPIN,
+                "tasks were polled {SPIN} times at one virtual instant, so a host spins"
+            );
+            self.future.as_mut().poll(cx)
+        }
+    }
 }
 
 /// Spawns `future` as a shuttle task, whatever runtime `handle` names.
@@ -277,7 +343,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    tokio::task::spawn_local(future)
+    tokio::task::spawn_local(polls::Counted::new(future))
 }
 
 /// Spawns `future` as a shuttle task.

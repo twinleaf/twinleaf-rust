@@ -1015,10 +1015,16 @@ mod tests {
         responder.join().unwrap();
     }
 
+    /// A refusal, a call nothing answers, and a call lost with the socket
+    /// each fail as their own error. Only the unanswered call has a short
+    /// timeout, so the refusal and the loss never wait on it.
     #[test]
     fn raw_call_failures_map_to_typed_call_errors() {
         let (tree, proxy) = test_tree();
-        let tree = tree.with_timeout(Duration::from_millis(150));
+        let (patient, hasty) = (
+            tree.with_timeout(WAIT * 2),
+            tree.with_timeout(Duration::from_millis(150)),
+        );
         let responder = thread::spawn(move || {
             let (route, _, _, id) = proxy.call();
             proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
@@ -1028,17 +1034,17 @@ mod tests {
             proxy.call();
         });
 
-        let refused = tree.raw_rpc(DeviceRoute::root(), "dev.name", b"");
+        let refused = patient.raw_rpc(DeviceRoute::root(), "dev.name", b"");
         assert!(matches!(
             refused,
             Err(CallError::DeviceError(payload))
                 if matches!(payload.error, wire_rpc::RpcError::NotFound)
         ));
         assert!(matches!(
-            tree.raw_rpc(DeviceRoute::root(), "dev.name", b""),
+            hasty.raw_rpc(DeviceRoute::root(), "dev.name", b""),
             Err(CallError::Timeout)
         ));
-        let lost = tree.raw_rpc(DeviceRoute::root(), "dev.name", b"");
+        let lost = patient.raw_rpc(DeviceRoute::root(), "dev.name", b"");
         assert!(matches!(lost, Err(CallError::ResponseLost)), "{lost:?}");
         responder.join().unwrap();
     }
@@ -1085,7 +1091,8 @@ mod tests {
     }
 
     /// The call's own timeout decides how long a device may take, so a reply
-    /// within it arrives through the proxy however long it took.
+    /// within it arrives through the proxy however long it took. The call
+    /// waits twice [`WAIT`], so a slow test thread never runs it out.
     #[test]
     fn a_slow_reply_within_the_calls_timeout_arrives() {
         let device = FakeDevice::start();
@@ -1094,7 +1101,10 @@ mod tests {
 
         let connection = open_through(&proxy, &device.url).unwrap();
 
-        assert_eq!(root_name(&connection), "FAKE");
+        let root = connection
+            .device(DeviceRoute::root())
+            .with_timeout(WAIT * 2);
+        assert_eq!(root.get::<String>("dev.name").unwrap(), "FAKE");
     }
 
     /// Closing one clone ends every subscription and view of the connection,
