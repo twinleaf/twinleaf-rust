@@ -1213,16 +1213,11 @@ mod tests {
         let root = DeviceRoute::root();
         let mut parser = described(&[root]);
         let (mut lane, queue) = BatchLane::new(2);
-        for first in [0, 1] {
-            assert!(lane.send(parse(&mut parser, &samples(first, root))));
-        }
-        // The segment's start moves on in place, so time jumps forward with
-        // the sample numbers following on.
         let [_, _, crate::proto::data::Metadata::Segment(mut moved), _] = metadata_records(1)
         else {
             panic!("the third record describes a segment");
         };
-        for (start_time, first) in [(5, 2), (7, 3)] {
+        let mut start = |parser: &mut PacketParser, start_time: u32| {
             moved.start_time = start_time;
             parser
                 .push_packet(&broadcast(
@@ -1230,8 +1225,21 @@ mod tests {
                     root,
                 ))
                 .expect("a record");
+        };
+        start(&mut parser, 20);
+        for first in [0, 1] {
+            assert!(lane.send(parse(&mut parser, &samples(first, root))));
+        }
+        // The segment's start moves back, so time jumps backward with the
+        // sample numbers following on.
+        let mut jumps = 0.0;
+        for (start_time, first) in [(15, 2), (13, 3)] {
+            start(&mut parser, start_time);
             let jumped = parse(&mut parser, &samples(first, root));
-            assert!(jumped.boundary().is_some_and(|b| b.change.is_some()));
+            match jumped.boundary().and_then(|b| b.change.clone()) {
+                Some(Change::TimeBackward { gap_seconds }) => jumps += gap_seconds,
+                change => panic!("a backward step in time, not {change:?}"),
+            }
             assert!(lane.send(jumped));
         }
         next_batch(&queue);
@@ -1242,7 +1250,7 @@ mod tests {
             .1
             .boundary()
             .and_then(|b| b.change.clone());
-        assert_eq!(change, Some(Change::TimeForward { gap_seconds: 7.0 }));
+        assert_eq!(change, Some(Change::TimeBackward { gap_seconds: jumps }));
     }
 
     /// A lane that joins a stream after its start says the first batch it

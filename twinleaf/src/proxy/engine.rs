@@ -738,7 +738,17 @@ impl Worker {
                 store.set_loaded(self.route, registry.clone(), started);
             }
             let tracked = match registry {
-                Ok(registry) => self.track(&registry).await,
+                Ok(registry) => {
+                    if registry.is_deprecated_firmware() {
+                        log::warn!(
+                            "the device at {} runs deprecated C firmware, which Twinleaf is \
+                             porting to Rust. Its stops and starts read as lost data. Ask \
+                             Twinleaf for its Rust firmware.",
+                            self.route
+                        );
+                    }
+                    self.track(&registry).await
+                }
                 Err(error) => {
                     log::warn!("could not load the RPC table of {}: {error}", self.route);
                     self.await_new_table().await

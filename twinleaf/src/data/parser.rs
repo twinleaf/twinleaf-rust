@@ -42,13 +42,16 @@ use std::collections::VecDeque;
 /// new segment that starts before the last rows end comes as a backward
 /// step in time.
 ///
-/// Two restarts reach the parser with no stop announced, and come as a
+/// Three kinds of restart reach the parser with no stop announced, and come as a
 /// rollover with a loss of the sample periods between the acquisitions.
 ///
 /// - A restart whose announcement was lost, in a gap on the link or in a
 ///   client's inlet.
 /// - A stop and start no host asked for, with no refresh between them,
 ///   which leave `dev.running` where it was.
+/// - Every restart of deprecated firmware, which has no `dev.running`, as
+///   [`RpcRegistry::is_deprecated_firmware`](crate::device::rpc::RpcRegistry::is_deprecated_firmware)
+///   tells.
 ///
 /// # Examples
 ///
@@ -875,6 +878,51 @@ mod tests {
         assert_eq!(
             take_query(&mut parser).selectors,
             [wire::MetadataSelector::segment(STREAM_ID, 1)]
+        );
+    }
+
+    /// Rows numbered back from the last rows, in their segment, with no
+    /// record of it since, are of a new acquisition in that slot, as after
+    /// a reboot of a child behind a hub. They wait for the slot's record,
+    /// and rows after it decode with it, not with the record before.
+    #[test]
+    fn rows_numbered_back_in_their_segment_wait_for_its_new_record() {
+        let mut parser = parser_with_clock(&[DataType::F32], 4, 2, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4 * 5]))
+            .expect("valid rows");
+        parser.pop_batch().expect("the first batch");
+
+        for first in [2, 4] {
+            assert_eq!(
+                parser
+                    .push_packet(&stream_data_packet(first, vec![0; 4]))
+                    .expect("valid rows"),
+                PacketOutcome::WaitingForMetadata,
+                "the rows at {first}"
+            );
+        }
+        assert!(parser.pop_batch().is_none());
+        assert_eq!(
+            take_query(&mut parser).selectors,
+            [wire::MetadataSelector::segment(STREAM_ID, 0)]
+        );
+
+        announce(
+            &mut parser,
+            wire::Metadata::Segment(wire::Segment {
+                start_time: 100,
+                ..fixtures::segment(STREAM_ID)
+            }),
+        );
+        parser
+            .push_packet(&stream_data_packet(5, vec![0; 4]))
+            .expect("valid rows");
+        let after = parser.pop_batch().expect("the new acquisition's rows");
+        assert_eq!(
+            after.timestamps(),
+            [106.0],
+            "the end of sample 5 from 100 s"
         );
     }
 

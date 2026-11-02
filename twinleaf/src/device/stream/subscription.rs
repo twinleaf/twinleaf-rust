@@ -511,7 +511,7 @@ fn lost(batch: &SampleBatch) -> u64 {
 }
 
 /// Returns the higher ranked of two changes a reader learns of at once. Two
-/// time anomalies of one direction add up.
+/// backward steps in time add up.
 fn higher(first: Option<Change>, then: Option<Change>) -> Option<Change> {
     let (first, then) = match (first, then) {
         (Some(first), Some(then)) => (first, then),
@@ -520,9 +520,6 @@ fn higher(first: Option<Change>, then: Option<Change>) -> Option<Change> {
     Some(match (first, then) {
         (Change::TimeBackward { gap_seconds: a }, Change::TimeBackward { gap_seconds: b }) => {
             Change::TimeBackward { gap_seconds: a + b }
-        }
-        (Change::TimeForward { gap_seconds: a }, Change::TimeForward { gap_seconds: b }) => {
-            Change::TimeForward { gap_seconds: a + b }
         }
         (first, then) if then.rank() > first.rank() => then,
         (first, _) => first,
@@ -553,9 +550,7 @@ fn restate(change: Change, old: &StreamMetadataSnapshot, new: &StreamMetadataSna
             old_id: old.segment().segment_id(),
             new_id: new.segment().segment_id(),
         },
-        change @ (Change::Initial | Change::TimeBackward { .. } | Change::TimeForward { .. }) => {
-            change
-        }
+        change @ (Change::Initial | Change::TimeBackward { .. }) => change,
     }
 }
 

@@ -424,27 +424,29 @@ pub(super) fn fakes(first: Vec<(&str, First)>) -> (Opens, mpsc::UnboundedReceive
     let opens = move |url: &str| -> Opener {
         let how = first.remove(url);
         let (url, sender) = (url.to_string(), sender.clone());
-        Opener::new(move |results| {
-            let open = {
-                let (url, sender) = (url.clone(), sender.clone());
-                move || {
-                    let (port, end) = Port::fake(TransportKind::Tcp, None, results);
-                    let _ = sender.send(Opened { url, end });
-                    Ok(port)
+        Opener::new(
+            move |results| -> crate::rt::BoxFuture<'static, io::Result<Port>> {
+                let open = {
+                    let (url, sender) = (url.clone(), sender.clone());
+                    move || {
+                        let (port, end) = Port::fake(TransportKind::Tcp, None, results);
+                        let _ = sender.send(Opened { url, end });
+                        Ok(port)
+                    }
+                };
+                match how.clone() {
+                    None => Box::pin(future::ready(open())),
+                    Some(First::Blocks(gate)) => Box::pin(async move {
+                        let opening = tokio::task::spawn_blocking(move || {
+                            gate.wait();
+                            open()
+                        });
+                        opening.await.map_err(io::Error::other)?
+                    }),
+                    Some(First::Panics) => panic!("the opener of {url} panics"),
                 }
-            };
-            match how.clone() {
-                None => Box::pin(future::ready(open())),
-                Some(First::Blocks(gate)) => Box::pin(async move {
-                    let opening = tokio::task::spawn_blocking(move || {
-                        gate.wait();
-                        open()
-                    });
-                    opening.await.map_err(io::Error::other)?
-                }),
-                Some(First::Panics) => panic!("the opener of {url} panics"),
-            }
-        })
+            },
+        )
     };
     (Box::new(opens), opened)
 }

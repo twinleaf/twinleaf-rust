@@ -156,6 +156,9 @@ struct StreamTracker {
     /// since them, so that rows in the last rows' slot are of a later lap of
     /// the ring.
     moved_on: bool,
+    /// Whether the device sent the record of the last rows' slot again since
+    /// them, so that the slot holds the record the device sent last.
+    renewed: bool,
     rate_hz: f64,
     /// The stops the device announced since the stream's records were last
     /// learned, each as `dev.running` turning off.
@@ -189,6 +192,7 @@ impl StreamTracker {
             last_schema: None,
             relearned: false,
             moved_on: false,
+            renewed: false,
             rate_hz: 0.0,
             stops: 0,
             current_stops: 0,
@@ -214,6 +218,7 @@ impl StreamTracker {
             self.segments.resize(index + 1, None);
         }
         self.segments[index] = Some(segment);
+        self.renewed |= segment_id == self.last_segment_id;
     }
 
     /// Learns the stream record of a stream that had none.
@@ -324,13 +329,13 @@ impl StreamTracker {
 
         // Rows in the last rows' slot are of a later lap of the ring after
         // the device announced another segment, or when that slot's segment
-        // starts later and the rows do not follow on from the last ones.
+        // starts at another time. A device never moves a segment's start, and
+        // never starts two acquisitions of one slot in the same second.
         let lapped = self.moved_on
-            || first_sample_n != expected
-                && self
-                    .last_segment
-                    .as_ref()
-                    .is_some_and(|last| last.get().start_time() != segment.start_time());
+            || self
+                .last_segment
+                .as_ref()
+                .is_some_and(|last| last.get().start_time() != segment.start_time());
         // Rows are of the current segment. A stop announced between the
         // last rows' segment and this one becoming current puts the rows in
         // a later acquisition, and the time between holds no sample to lose.
@@ -365,12 +370,6 @@ impl StreamTracker {
                     loss: Some(lost(u64::from(samples))),
                 });
             }
-        } else if time_gap > half_period {
-            // Sample numbers are contiguous, so the segment's metadata (e.g. start_time)
-            // was corrected in place, and must not pass silently as a continuous batch.
-            return Some(Boundary::of(Change::TimeForward {
-                gap_seconds: time_gap,
-            }));
         }
 
         None
@@ -426,7 +425,16 @@ impl StreamTracker {
         // The current segment is the one the last broadcast record or rows
         // named, so a segment other than the last rows' is announced when
         // the device broadcast its record since them.
-        let announced = self.current_segment_id == data.segment_id;
+        // A segment's sample numbers only go up, so rows numbered at or
+        // below the last rows, in their segment, while the device has sent
+        // no record of that slot since them, are of a new acquisition in the
+        // slot whose record has not come. A child behind a hub sends such
+        // rows after a reboot it has not yet announced.
+        let behind = self.established
+            && !self.renewed
+            && data.segment_id == self.last_segment_id
+            && data.first.value() <= self.last_sample_number.value();
+        let announced = self.current_segment_id == data.segment_id && !behind;
         // A device sends a segment's record before the segment's first
         // sample, so the record of the segment rows arrive in is announced.
         // Rows in a segment the device did not announce find a ring record
@@ -550,6 +558,7 @@ impl StreamTracker {
         self.last_schema = self.schema.clone();
         self.relearned = false;
         self.moved_on = false;
+        self.renewed = false;
         self.last_stops = self.current_stops;
         self.rate_hz = new_rate;
         self.established = true;

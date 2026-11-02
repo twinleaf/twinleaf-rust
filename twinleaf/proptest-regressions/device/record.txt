@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9816ddf7aa543dfe958d587b332ebac900612806630d86f983e283b1f7e9095b # shrinks to devices = {[]}, start = 0, samples = [(Index(0), 1, Skip(0)), (Index(505729), 1, Back(2)), (Index(7440852057038675230), 1, Back(1)), (Index(16138378585298619948), 1, Skip(2))], fails = true

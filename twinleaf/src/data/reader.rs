@@ -716,7 +716,17 @@ mod tests {
     #[test]
     fn a_backward_time_jump_counts_as_an_anomaly() {
         let mut packets = schema_packets();
-        packets.extend([data_packet(0, 0), data_packet(1, 0), data_packet(0, 0)]);
+        let starting = |start_time| {
+            metadata_packet(wire::Metadata::Segment(wire::Segment {
+                start_time,
+                ..segment(1)
+            }))
+        };
+        packets.push(starting(10));
+        packets.extend([data_packet(0, 0), data_packet(1, 0)]);
+        // The segment's record comes again starting earlier, so time steps
+        // back with the sample numbers following on.
+        packets.extend([starting(5), data_packet(2, 0)]);
         let log = LogFile {
             data: encoded_log(packets),
         };

@@ -1293,3 +1293,37 @@ fn a_start_that_comes_round_the_ring_to_the_current_slot_is_a_restart() {
     ]);
     run::<LosesAtRollover>(1, 1, &steps);
 }
+
+/// The ring comes round to the last rows' slot with no record between. A
+/// forced rollover drops its first sample and stops before its record goes
+/// out, a forced start publishes nothing before the link goes down, and the
+/// device rolls into the last rows' slot while it is down and describes
+/// that slot again. It drops that segment's first sample, so the rows after
+/// the link is back follow on by number from the last rows. They are in
+/// another segment after a lost link and a stop, and come as a restart.
+#[test]
+fn rows_in_the_last_slot_a_lap_later_after_a_lost_link_are_a_restart() {
+    let steps = [
+        Step::Samples { count: 1, rows: 1 },
+        Step::Read { count: 1 },
+        Step::Rollover {
+            forced: true,
+            within: 0,
+        },
+        Step::Drop { count: 1 },
+        Step::Stop { staged: 0 },
+        Step::Start {
+            pause: 0,
+            early: false,
+            forced: true,
+        },
+        Step::Outage {
+            lost: 1,
+            opens: true,
+        },
+        Step::Drop { count: 1 },
+        Step::Samples { count: 1, rows: 1 },
+        Step::Read { count: 1 },
+    ];
+    run::<LosesAtRollover>(1, 1, &steps);
+}
