@@ -109,19 +109,160 @@ impl<'a> Setting<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload::strategy::{buffer, bytes, len_to, slack, word, write_over_any};
+    use proptest::prelude::*;
 
-    #[test]
-    fn round_trip() {
-        let setting = Setting {
-            name: b"aux.data.decimation",
-            seq: None,
-            reply: &100u32.to_le_bytes(),
-        };
-        let mut buf = [0u8; 64];
-        let len = setting.write(&mut buf).unwrap();
-        assert_eq!(len, Header::SIZE + SETTING_HEADER_SIZE + 19 + 4);
-        assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
-        assert_eq!(setting.name_str(), Some("aux.data.decimation"));
+    /// The longest name a one-byte length field measures.
+    const MAX_NAME: usize = u8::MAX as usize;
+
+    /// A name's bytes, and the text they read as when that is known, `None`
+    /// inside for bytes that are not UTF-8.
+    type Name = (Vec<u8>, Option<Option<String>>);
+
+    /// A name of up to `max` bytes, with the text it reads as when that is
+    /// known. Half are bytes of any value, whose text is not known. A
+    /// quarter are text that may hold multibyte characters, cut to `max`
+    /// bytes on a character boundary, which read as that text. A quarter hold
+    /// a 0xFF byte, which no UTF-8 text holds, and read as no text.
+    fn name(max: usize) -> impl Strategy<Value = Name> {
+        prop_oneof![
+            2 => len_to(max).prop_flat_map(bytes).prop_map(|name| (name, None)),
+            1 => "\\PC{0,128}".prop_map(move |mut text| {
+                let mut end = text.len().min(max);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                (text.as_bytes().to_vec(), Some(Some(text)))
+            }),
+            1 => (len_to(max - 1).prop_flat_map(bytes), any::<prop::sample::Index>()).prop_map(
+                |(mut name, at)| {
+                    name.insert(at.index(name.len() + 1), 0xFF);
+                    (name, Some(None))
+                }
+            ),
+        ]
+    }
+
+    /// A name with the text it reads as when that is known, a sequence
+    /// number or none, and a value that together fit a payload. Two in five
+    /// values fill the payload or leave one byte of it, two in five are
+    /// empty or one byte long, and the rest are any length that fits.
+    fn setting() -> impl Strategy<Value = (Name, Option<u32>, Vec<u8>)> {
+        (name(MAX_NAME), prop::option::of(word())).prop_flat_map(|(name, seq)| {
+            let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
+            let room = Packet::MAX_PAYLOAD - head - name.0.len();
+            (Just(name), Just(seq), len_to(room).prop_flat_map(bytes))
+        })
+    }
+
+    /// A name of up to one past the longest, a sequence number or none, and
+    /// a value that brings the payload to the largest, one past it, or any
+    /// length up to it.
+    fn any_size() -> impl Strategy<Value = (Vec<u8>, Option<u32>, Vec<u8>)> {
+        (
+            prop_oneof![len_to(MAX_NAME + 1), Just(MAX_NAME)].prop_flat_map(bytes),
+            prop::option::of(Just(0)),
+        )
+            .prop_flat_map(|(name, seq)| {
+                let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
+                let room = Packet::MAX_PAYLOAD - head - name.len();
+                let reply = prop_oneof![Just(room), Just(room + 1), 0..=room + 1];
+                (Just(name), Just(seq), reply.prop_flat_map(bytes))
+            })
+    }
+
+    /// A payload too short for a head, or a head whose flags are none, all,
+    /// or any, whose name length is any, and a body that holds the name and
+    /// sequence number it claims, a byte short of that, or a few bytes over.
+    fn any_payload() -> impl Strategy<Value = Vec<u8>> {
+        let head = (
+            any::<u8>(),
+            prop_oneof![Just(0), Just(VERSION), Just(u8::MAX), any::<u8>()],
+            prop_oneof![Just(-1), Just(0), 1..=4isize],
+        );
+        prop_oneof![
+            1 => (0..SETTING_HEADER_SIZE).prop_flat_map(bytes),
+            4 => head.prop_flat_map(|(name_len, flags, over)| {
+                let claimed = (flags & VERSION) as usize * SEQUENCE_SIZE + name_len as usize;
+                let body = claimed.checked_add_signed(over).unwrap_or(0);
+                bytes(body).prop_map(move |body| [vec![name_len, flags], body].concat())
+            }),
+        ]
+    }
+
+    proptest! {
+        /// An announcement whose name is at most 255 bytes and whose payload
+        /// is at most [`Packet::MAX_PAYLOAD`] bytes writes a `SETTING` packet
+        /// of exactly its length, whose payload parses back to it, whatever
+        /// the buffer held before. Its name reads as text when the name is
+        /// UTF-8 and as none otherwise.
+        #[test]
+        fn a_setting_decodes_as_it_was_encoded(((name, text), seq, reply) in setting()) {
+            let setting = Setting { name: &name, seq, reply: &reply };
+            let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
+            let payload_len = head + name.len() + reply.len();
+            prop_assert_eq!(setting.payload_len(), Some(payload_len));
+            let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| setting.write(buf))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
+            prop_assert_eq!(header, Header::new(PacketType::SETTING, payload_len as u16));
+            prop_assert_eq!(Setting::parse(&buf[Header::SIZE..]), Some(setting));
+            let (len, payload) = write_over_any(payload_len, |out| setting.write_payload(out))?;
+            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
+            if let Some(text) = text {
+                prop_assert_eq!(setting.name_str(), text.as_deref());
+            }
+        }
+
+        /// A payload parses when it holds the head, the sequence number its
+        /// flags announce, and the name its length claims. The value is the
+        /// rest. Writing what was parsed gives back the same payload with the
+        /// reserved flag bits cleared, whatever the buffer held before.
+        #[test]
+        fn any_payload_parses_when_it_holds_what_its_head_claims(payload in any_payload()) {
+            let [name_len, flags, ..] = payload[..] else {
+                prop_assert_eq!(Setting::parse(&payload), None);
+                return Ok(());
+            };
+            let seq = flags & VERSION != 0;
+            let claimed = SETTING_HEADER_SIZE + usize::from(seq) * SEQUENCE_SIZE + name_len as usize;
+            let Some(setting) = Setting::parse(&payload) else {
+                prop_assert!(payload.len() < claimed);
+                return Ok(());
+            };
+            prop_assert!(payload.len() >= claimed);
+            prop_assert_eq!(setting.name.len(), name_len as usize);
+            prop_assert_eq!(setting.seq.is_some(), seq);
+            let (len, written) = write_over_any(payload.len(), |out| setting.write_payload(out))?;
+            prop_assert_eq!(len, Some(payload.len()));
+            let mut canonical = payload.clone();
+            canonical[1] = flags & VERSION;
+            prop_assert_eq!(written, canonical);
+        }
+
+        /// An announcement is written when its name is at most 255 bytes, its
+        /// payload at most [`Packet::MAX_PAYLOAD`] bytes, and the buffer holds
+        /// it, and refused otherwise. The payload alone needs room for itself.
+        #[test]
+        fn a_setting_is_written_only_when_it_fits(
+            (name, seq, reply) in any_size(),
+            slack in slack(),
+        ) {
+            let setting = Setting { name: &name, seq, reply: &reply };
+            let head = SETTING_HEADER_SIZE + seq.map_or(0, |_| SEQUENCE_SIZE);
+            let payload_len = head + name.len() + reply.len();
+            let valid = name.len() <= MAX_NAME && payload_len <= Packet::MAX_PAYLOAD;
+            prop_assert_eq!(setting.payload_len(), valid.then_some(payload_len));
+
+            let mut buf = buffer(Header::SIZE + payload_len, slack);
+            let fits = valid && buf.len() >= Header::SIZE + payload_len;
+            prop_assert_eq!(setting.write(&mut buf), fits.then_some(Header::SIZE + payload_len));
+            let mut out = buffer(payload_len, slack);
+            let fits = valid && out.len() >= payload_len;
+            prop_assert_eq!(setting.write_payload(&mut out), fits.then_some(payload_len));
+        }
     }
 
     /// Byte-exact packed layout of the setting payload behind its packet
@@ -169,30 +310,6 @@ mod tests {
         assert_eq!(setting.reply, b"X");
     }
 
-    /// The name is bytes on the wire; a host that wants text asks for it, and
-    /// a device sending something else does not break the parse.
-    #[test]
-    fn a_non_utf8_name_still_parses() {
-        let setting = Setting::parse(&[2, 0, 0xFF, 0xFE, 7]).unwrap();
-        assert_eq!(setting.name, &[0xFF, 0xFE]);
-        assert_eq!(setting.name_str(), None);
-        assert_eq!(setting.reply, &[7]);
-    }
-
-    /// An action RPC replies with nothing, and so does its announcement.
-    #[test]
-    fn an_empty_value_is_a_valid_announcement() {
-        let setting = Setting {
-            name: b"dev.stop",
-            seq: None,
-            reply: b"",
-        };
-        let mut buf = [0u8; 32];
-        let len = setting.write(&mut buf).unwrap();
-        assert_eq!(len, Header::SIZE + SETTING_HEADER_SIZE + 8);
-        assert_eq!(Setting::parse(&buf[Header::SIZE..len]), Some(setting));
-    }
-
     /// Byte-exact: the head with [`VERSION`] set, the sequence number, then
     /// the name and value as before.
     #[test]
@@ -219,48 +336,6 @@ mod tests {
             None,
             "a short sequence"
         );
-    }
-
-    #[test]
-    fn rejects_truncated_payloads() {
-        assert_eq!(Setting::parse(&[]), None);
-        assert_eq!(Setting::parse(&[4]), None, "no flags byte");
-        assert_eq!(
-            Setting::parse(&[4, 0, b'a']),
-            None,
-            "name shorter than claimed"
-        );
-    }
-
-    #[test]
-    fn rejects_an_overlong_name_and_an_oversize_payload() {
-        let long_name = Setting {
-            name: &[b'x'; 256],
-            seq: None,
-            reply: b"",
-        };
-        assert_eq!(long_name.payload_len(), None);
-        assert_eq!(long_name.write(&mut [0u8; Packet::MAX_SIZE]), None);
-
-        let oversize = Setting {
-            name: b"n",
-            seq: None,
-            reply: &[0u8; MAX_SETTING_SIZE],
-        };
-        assert_eq!(oversize.write(&mut [0u8; Packet::MAX_SIZE]), None);
-
-        // Name and value together fill the payload exactly.
-        let full = Setting {
-            reply: &[0u8; MAX_SETTING_SIZE - 1],
-            ..oversize
-        };
-        let mut buf = [0u8; Packet::MAX_SIZE];
-        assert_eq!(
-            full.write(&mut buf),
-            Some(Header::SIZE + Packet::MAX_PAYLOAD)
-        );
-        // A short buffer is refused rather than truncated.
-        assert_eq!(full.write(&mut [0u8; 16]), None);
     }
 
     #[test]

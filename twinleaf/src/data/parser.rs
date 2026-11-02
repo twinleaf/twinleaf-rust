@@ -1976,56 +1976,56 @@ mod tests {
             1usize..5,
             prop::collection::vec(any::<u8>(), 256),
         );
-        TestRunner::default()
-            .run(&case, |(types, padding, rows, bytes)| {
-                let sample_size = types
-                    .iter()
-                    .map(|data_type| data_type.size())
-                    .sum::<usize>()
-                    + padding;
-                let mut parser = parser_with_schema(&types, sample_size as u16);
-                let data = bytes[..rows * sample_size].to_vec();
-                parser
-                    .push_packet(&stream_data_packet(0, data.clone()))
-                    .expect("valid rows");
-                let batch = parser.pop_batch().expect("a batch");
+        TestRunner::new(ProptestConfig {
+            source_file: Some(file!()),
+            ..ProptestConfig::default()
+        })
+        .run(&case, |(types, padding, rows, bytes)| {
+            let sample_size = types
+                .iter()
+                .map(|data_type| data_type.size())
+                .sum::<usize>()
+                + padding;
+            let mut parser = parser_with_schema(&types, sample_size as u16);
+            let data = bytes[..rows * sample_size].to_vec();
+            parser
+                .push_packet(&stream_data_packet(0, data.clone()))
+                .expect("valid rows");
+            let batch = parser.pop_batch().expect("a batch");
 
-                let mut expected = Vec::new();
-                let mut offset = 0;
-                for (index, data_type) in types.iter().enumerate() {
-                    let cells: Vec<ColumnData> = (0..rows)
-                        .map(|row| {
-                            ColumnData::from_le_bytes(
-                                &data[row * sample_size + offset..],
-                                *data_type,
-                            )
-                        })
-                        .collect();
-                    expected.push((format!("col_{index}"), cells));
-                    offset += data_type.size();
-                }
+            let mut expected = Vec::new();
+            let mut offset = 0;
+            for (index, data_type) in types.iter().enumerate() {
+                let cells: Vec<ColumnData> = (0..rows)
+                    .map(|row| {
+                        ColumnData::from_le_bytes(&data[row * sample_size + offset..], *data_type)
+                    })
+                    .collect();
+                expected.push((format!("col_{index}"), cells));
+                offset += data_type.size();
+            }
 
-                prop_assert_eq!(batch.columns().len(), expected.len());
-                let columns = batch.schema().columns().zip(batch.columns());
-                for ((column, values), (name, cells)) in columns.zip(&expected) {
-                    prop_assert_eq!(column.name(), name.as_str());
-                    prop_assert_eq!(values.data_type(), column.data_type());
-                    for (row, cell) in cells.iter().enumerate() {
-                        // Floats compare by bits, so a NaN matches itself.
-                        let same = match (values.get(row), cell) {
-                            (ColumnData::F32(value), ColumnData::F32(cell)) => {
-                                value.to_bits() == cell.to_bits()
-                            }
-                            (ColumnData::F64(value), ColumnData::F64(cell)) => {
-                                value.to_bits() == cell.to_bits()
-                            }
-                            (value, cell) => value == *cell,
-                        };
-                        prop_assert!(same, "{name} row {row}: {cell:?}");
-                    }
+            prop_assert_eq!(batch.columns().len(), expected.len());
+            let columns = batch.schema().columns().zip(batch.columns());
+            for ((column, values), (name, cells)) in columns.zip(&expected) {
+                prop_assert_eq!(column.name(), name.as_str());
+                prop_assert_eq!(values.data_type(), column.data_type());
+                for (row, cell) in cells.iter().enumerate() {
+                    // Floats compare by bits, so a NaN matches itself.
+                    let same = match (values.get(row), cell) {
+                        (ColumnData::F32(value), ColumnData::F32(cell)) => {
+                            value.to_bits() == cell.to_bits()
+                        }
+                        (ColumnData::F64(value), ColumnData::F64(cell)) => {
+                            value.to_bits() == cell.to_bits()
+                        }
+                        (value, cell) => value == *cell,
+                    };
+                    prop_assert!(same, "{name} row {row}: {cell:?}");
                 }
-                Ok(())
-            })
-            .expect("every layout decodes at its offsets");
+            }
+            Ok(())
+        })
+        .expect("every layout decodes at its offsets");
     }
 }

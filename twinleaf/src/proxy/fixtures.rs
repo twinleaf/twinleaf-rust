@@ -2,6 +2,8 @@
 //! this module and of the modules above it. It also has fake openers of
 //! devices, for tests on a paused clock.
 
+#![cfg_attr(all(test, turmoil), allow(dead_code))]
+
 use super::link::Opens;
 use super::worker::Opener;
 use super::HostOptions;
@@ -68,14 +70,6 @@ struct DeviceState {
     refused: AtomicUsize,
     /// Bumped to drop every connection.
     generation: AtomicUsize,
-    /// Bumped to reset every connection.
-    reset_generation: AtomicUsize,
-    /// How many connections were reset.
-    resets: AtomicUsize,
-    /// Set once the device is gone.
-    dead: AtomicBool,
-    /// Set once the device sends no more heartbeats.
-    quiet: AtomicBool,
     /// Packets for a connection to send.
     outbox: Mutex<Vec<Packet>>,
     /// Every packet the device received.
@@ -85,14 +79,6 @@ struct DeviceState {
     /// The hash of the device's RPC table, one no other fake device shares.
     table_hash: u32,
     stop: AtomicBool,
-}
-
-/// The generations a connection was accepted in. The connection ends when
-/// either one changes.
-#[derive(Clone, Copy)]
-struct Generations {
-    drop: usize,
-    reset: usize,
 }
 
 /// A device behind a TCP port on this machine. Each connection gets a
@@ -123,18 +109,13 @@ impl FakeDevice {
                     continue;
                 };
                 let id = accepting.accepted.fetch_add(1, Ordering::SeqCst);
-                if accepting.dead.load(Ordering::SeqCst) {
-                    continue;
-                }
                 if accepting.exclusive.load(Ordering::SeqCst) && accepting.held() {
                     accepting.refused.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
                 let serving = accepting.clone();
-                let born = Generations {
-                    drop: serving.generation.load(Ordering::SeqCst),
-                    reset: serving.reset_generation.load(Ordering::SeqCst),
-                };
+                // The connection ends once the generation moves on.
+                let born = serving.generation.load(Ordering::SeqCst);
                 stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(READ_POLL)).unwrap();
                 let clone = stream.try_clone().unwrap();
@@ -175,29 +156,6 @@ impl FakeDevice {
     /// Closes every connection, as a device that resets does.
     pub(crate) fn drop_connections(&self) {
         self.state.generation.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Resets every connection once something it has not read arrives. The
-    /// proxy reads this as an I/O error.
-    pub(crate) fn reset_connections(&self) {
-        self.state.reset_generation.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Returns how many connections were reset.
-    pub(crate) fn resets(&self) -> usize {
-        self.state.resets.load(Ordering::SeqCst)
-    }
-
-    /// Closes every connection, and each new one at once, as a dead device
-    /// behind an endpoint that still answers does. Its port stays taken.
-    pub(crate) fn die(&self) {
-        self.state.dead.store(true, Ordering::SeqCst);
-    }
-
-    /// Stops sending heartbeats, and keeps every connection open, as a
-    /// device that hangs does.
-    pub(crate) fn go_quiet(&self) {
-        self.state.quiet.store(true, Ordering::SeqCst);
     }
 
     /// Returns the hash of the device's RPC table.
@@ -287,7 +245,7 @@ fn peer_closed(stream: &TcpStream) -> bool {
     false
 }
 
-fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
+fn serve_device(mut stream: TcpStream, state: &DeviceState, born: usize) {
     stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(READ_POLL)).unwrap();
     let heartbeat = Packet::heartbeat(DeviceRoute::root());
@@ -295,16 +253,8 @@ fn serve_device(mut stream: TcpStream, state: &DeviceState, born: Generations) {
     let mut received = Vec::new();
     // Each reply to send, and when.
     let mut replies: Vec<(Instant, Packet)> = Vec::new();
-    while !state.stop.load(Ordering::SeqCst)
-        && !state.dead.load(Ordering::SeqCst)
-        && state.generation.load(Ordering::SeqCst) == born.drop
-    {
-        if state.reset_generation.load(Ordering::SeqCst) != born.reset {
-            return reset(stream, state);
-        }
-        if state.quiet.load(Ordering::SeqCst) {
-            next_beat = Instant::now();
-        } else if Instant::now() >= next_beat {
+    while !state.stop.load(Ordering::SeqCst) && state.generation.load(Ordering::SeqCst) == born {
+        if Instant::now() >= next_beat {
             if stream.write_all(heartbeat.as_bytes()).is_err() {
                 return;
             }
@@ -362,7 +312,7 @@ const TABLE: [(&str, u16); 2] = [("test.amplitude", 0xA310), ("settings.version"
 /// Returns the fake device's answer to the RPC `name` with `args`, or `None`
 /// for an RPC it leaves unanswered. It describes itself as one stream of one
 /// column, in session 7, and its table has the hash `table_hash`.
-fn answer(name: &[u8], args: &[u8], table_hash: u32) -> Option<Vec<u8>> {
+pub(crate) fn answer(name: &[u8], args: &[u8], table_hash: u32) -> Option<Vec<u8>> {
     Some(match name {
         b"dev.name" => b"FAKE".to_vec(),
         b"rpc.hash" => table_hash.to_le_bytes().to_vec(),
@@ -427,27 +377,6 @@ pub(crate) fn description() -> [wire::Metadata<'static>; 4] {
             description: "",
         }),
     ]
-}
-
-/// Closes `stream` once bytes it has not read arrive, which makes the kernel
-/// reset the connection.
-fn reset(stream: TcpStream, state: &DeviceState) {
-    let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline {
-        match stream.peek(&mut [0]) {
-            Ok(0) => return,
-            Ok(_) => {
-                state.resets.fetch_add(1, Ordering::SeqCst);
-                return;
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => return,
-        }
-    }
 }
 
 /// A URL that nothing answers. Opening it fails at once on every platform.

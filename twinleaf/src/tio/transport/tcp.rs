@@ -5,10 +5,10 @@
 //! each header gives, as its [codec](super::codec::tcp::Codec) does.
 
 use super::task::{ByteStream, Rules};
+use crate::net::TcpStream;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 /// How long to wait for the handshake. It is one RTO plus slack, as long as
 /// the proxy lets a TCP link stay silent.
@@ -49,6 +49,7 @@ pub(super) async fn connect(addresses: &[SocketAddr]) -> io::Result<TcpStream> {
 
 /// Connects to `address` as [`TcpStream::connect`] does. A loopback address
 /// that nothing listens on refuses the connection at once, on Windows too.
+#[cfg(not(all(test, turmoil)))]
 pub(crate) async fn connect_socket(address: SocketAddr) -> io::Result<TcpStream> {
     let socket = match address {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -60,10 +61,16 @@ pub(crate) async fn connect_socket(address: SocketAddr) -> io::Result<TcpStream>
     socket.connect(address).await
 }
 
+/// Connects to the simulated host at `address`.
+#[cfg(all(test, turmoil))]
+pub(crate) async fn connect_socket(address: SocketAddr) -> io::Result<TcpStream> {
+    TcpStream::connect(address).await
+}
+
 /// Makes a connect on `socket` give up after the first refusal. Windows
 /// otherwise sends the handshake twice more, so a closed port takes about
 /// 2 s to refuse.
-#[cfg(windows)]
+#[cfg(all(windows, not(all(test, turmoil))))]
 fn refuse_at_once(socket: &impl std::os::windows::io::AsRawSocket) {
     use windows_sys::Win32::Networking::WinSock::{
         WSAIoctl, SIO_TCP_INITIAL_RTO, TCP_INITIAL_RTO_PARAMETERS,
@@ -100,7 +107,7 @@ fn refuse_at_once(socket: &impl std::os::windows::io::AsRawSocket) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(all(test, turmoil))))]
 fn refuse_at_once<T>(_socket: &T) {}
 
 /// Connects to `address`, waiting at most [`CONNECT_TIMEOUT`].

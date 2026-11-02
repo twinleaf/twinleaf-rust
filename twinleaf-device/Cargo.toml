@@ -18,3 +18,6 @@ defmt = ["dep:defmt", "twinleaf-proto/defmt"]
 defmt = { version = "1.1", optional = true }
 heapless = "0.9"
 twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }
+
+[dev-dependencies]
+proptest = "1"

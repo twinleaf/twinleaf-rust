@@ -125,7 +125,7 @@ Reading logs back:
 tio log inspect {file}                 # summarize what a log holds
 tio log dump {file} --data --meta      # print samples and metadata
 tio log csv {stream name/id} {file}    # one stream to CSV
-tio log hdf {file} -g "{route}/{stream}/{column}"   # HDF5, needs --features hdf5
+tio log hdf {file} -g "{route}/{stream}/{column}"   # HDF5
 tio log meta reroute {file} -s /0/1    # rewrite the route in a metadata file
 ```
 
@@ -219,7 +219,6 @@ may need to prepend `autoload -Uz compinit && compinit`.
 
 ```sh
 cargo install twinleaf-tools
-cargo install twinleaf-tools --features hdf5   # with HDF5 conversion
 ```
 
 Cargo reports where the binary is installed and which path to add to your

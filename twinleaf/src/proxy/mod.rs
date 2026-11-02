@@ -215,6 +215,8 @@ mod server;
 mod settings;
 #[cfg(test)]
 mod settings_sim;
+#[cfg(all(test, turmoil))]
+mod turmoil;
 mod worker;
 
 pub(crate) use control::{
@@ -474,6 +476,7 @@ pub struct Proxy {
     default: watch::Sender<Option<Layout>>,
     endpoint: String,
     #[cfg(test)]
+    #[cfg_attr(all(test, turmoil), allow(dead_code))]
     links: link::Links,
 }
 
@@ -621,16 +624,6 @@ impl fmt::Debug for Proxy {
     }
 }
 
-#[cfg(test)]
-impl Proxy {
-    /// Ends the proxy as a crash does, and waits until it has ended. No
-    /// client hears a stop, and each one's connection closes.
-    pub(crate) fn crash(&self) {
-        let _ = self.server.send(server::Notice::Panic);
-        self.wait();
-    }
-}
-
 impl Drop for Proxy {
     /// Stops the proxy. A proxy [`Proxy::host`] started is waited for as
     /// [`shutdown`](Proxy::shutdown) waits. Any other proxy runs on its
@@ -651,8 +644,9 @@ pub(crate) use control::{client_name, Introduction};
 pub(crate) mod fixtures;
 
 #[cfg(test)]
+#[cfg(not(turmoil))]
 mod tests {
-    use super::fixtures::{options, FakeDevice, UNREACHABLE, WAIT};
+    use super::fixtures::{options, FakeDevice, WAIT};
     use super::*;
     use crate::proto::rpc::RpcError;
     use crate::proto::PacketType;
@@ -804,11 +798,6 @@ mod tests {
                 .map(|reply| decode::<String>(&reply).unwrap())
         }
 
-        fn probe(&self, url: &str) -> Result<String, (RpcError, String)> {
-            self.control("proxy.probe", &encode(&url), 2)
-                .map(|reply| decode::<String>(&reply).unwrap())
-        }
-
         /// Ask the root device its name.
         fn dev_name(&self, id: u16) -> String {
             self.dev_name_at(DeviceRoute::root(), id)
@@ -835,25 +824,6 @@ mod tests {
         assert_eq!(named_by(Some(url.clone())), Some(url));
         assert_eq!(named_by(Some(String::new())), None);
         assert_eq!(named_by(None), None);
-    }
-
-    #[test]
-    fn a_listening_port_answers() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-
-        assert!(answers(listener.local_addr().unwrap().port()));
-    }
-
-    #[test]
-    fn a_refused_port_does_not_answer_at_once() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let started = Instant::now();
-
-        assert!(!answers(port));
-        let took = started.elapsed();
-        assert!(took < Duration::from_secs(1), "it took {took:?}");
     }
 
     /// A connect the machine stalls past the first try is given longer on a
@@ -897,164 +867,6 @@ mod tests {
     fn a_proxy_can_be_shared_between_threads() {
         fn shareable<T: Send + Sync>() {}
         shareable::<Proxy>();
-    }
-
-    #[test]
-    fn two_control_clients_share_one_link() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let first = TestClient::connect(&proxy.endpoint());
-        let second = TestClient::connect(&proxy.endpoint());
-
-        for (client, name) in [(&first, "first"), (&second, "second")] {
-            client.hello(4242, name);
-            assert_eq!(client.open(&device.url), Ok(device.url.clone()));
-        }
-
-        assert_eq!(first.dev_name(7), "FAKE");
-        assert_eq!(second.dev_name(7), "FAKE");
-        assert_eq!(device.accepted(), 1);
-        assert_eq!(first.open(&device.url).unwrap_err().0, RpcError::State);
-    }
-
-    #[test]
-    fn a_client_that_opened_nothing_hears_nothing() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let opener = TestClient::connect(&proxy.endpoint());
-        opener.hello(4242, "opener");
-        opener.open(&device.url).unwrap();
-        let idle = TestClient::connect(&proxy.endpoint());
-        idle.hello(4243, "idle");
-
-        let request = Packet::rpc_request("dev.name", &[], 7, DeviceRoute::root());
-        idle.send(request.unwrap());
-
-        // The device answers and beats every 300 ms, but none of it is the
-        // idle client's.
-        assert!(idle.rx.recv_timeout(Duration::from_millis(700)).is_err());
-        assert_eq!(opener.dev_name(8), "FAKE");
-    }
-
-    #[test]
-    fn a_device_that_cannot_be_reached_is_refused() {
-        let url = UNREACHABLE.to_string();
-        let proxy = Proxy::host(options()).unwrap();
-        let client = TestClient::connect(&proxy.endpoint());
-        client.hello(4242, "client");
-
-        let (code, message) = client.open(&url).unwrap_err();
-
-        assert_eq!(code, RpcError::Load);
-        assert!(message.contains(&url), "{message}");
-    }
-
-    /// A link that fails to open is tried afresh by the next open, and
-    /// forgotten once its task ends, however often it is tried, so none of
-    /// its tasks lingers.
-    #[test]
-    fn a_device_that_cannot_be_reached_leaves_no_link_open() {
-        let url = UNREACHABLE.to_string();
-        let proxy = Proxy::host(options()).unwrap();
-        let client = TestClient::connect(&proxy.endpoint());
-        client.hello(4242, "client");
-
-        for _ in 0..10 {
-            assert_eq!(client.open(&url).unwrap_err().0, RpcError::Load);
-        }
-
-        let deadline = Instant::now() + WAIT;
-        while !proxy.links.urls().is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "a link that failed to open stayed open"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            proxy.links.wait_finished(WAIT),
-            "a link that failed to open was never closed"
-        );
-    }
-
-    /// A device that resets its connection is the proxy's to reconnect, once
-    /// and on the link it had. The client using it stays attached through it
-    /// on the port it holds, hears the device come back, and is answered
-    /// again.
-    #[test]
-    fn a_device_that_resets_is_reconnected_while_its_clients_stay_attached() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let client = TestClient::connect(&proxy.endpoint());
-        client.hello(4242, "client");
-        client.open(&device.url).unwrap();
-        assert_eq!(client.dev_name(7), "FAKE");
-
-        device.reset_connections();
-        // The device resets once a request it has not read waits for it.
-        let deadline = Instant::now() + WAIT;
-        while device.resets() == 0 {
-            assert!(Instant::now() < deadline, "the device never reset");
-            let request = Packet::rpc_request("dev.name", &[], 8, DeviceRoute::root());
-            client.send(request.unwrap());
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        client.expect(|pkt| match pkt.payload() {
-            Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorReconnected)) => {
-                assert_eq!(pkt.route(), DeviceRoute::root());
-                Some(())
-            }
-            _ => None,
-        });
-        assert_eq!(client.dev_name(9), "FAKE");
-        assert_eq!(device.accepted(), 2);
-        assert_eq!(proxy.links.urls(), [device.url.as_str()]);
-        assert_eq!(proxy.clients().len(), 1);
-    }
-
-    /// A device that never comes back is given up once the reconnect timeout
-    /// passes. Each client using it hears so and is then disconnected, and
-    /// its link is closed and forgotten.
-    #[test]
-    fn the_clients_of_a_device_given_up_hear_so_and_are_disconnected() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(HostOptions {
-            reconnect_timeout: Some(Duration::from_millis(200)),
-            ..options()
-        })
-        .unwrap();
-        let control = TestClient::connect(&proxy.endpoint());
-        control.hello(4242, "control");
-        control.open(&device.url).unwrap();
-        let auto = TestClient::connect(&proxy.endpoint());
-        auto.hello(4243, "auto");
-        assert_eq!(auto.open("auto"), Ok(device.url.clone()));
-
-        device.die();
-
-        for client in [&control, &auto] {
-            client.expect(|pkt| match pkt.payload() {
-                Payload::ProxyRx(ProxyRx::Link(LinkStatus::SensorDisconnected)) => None,
-                Payload::ProxyRx(ProxyRx::Link(status)) => {
-                    assert_eq!(status, LinkStatus::FailedToReconnect);
-                    assert_eq!(pkt.route(), DeviceRoute::root());
-                    Some(())
-                }
-                Payload::LegacyStatus(status) => panic!("a client was sent {status:?}"),
-                _ => None,
-            });
-            client.expect_closed();
-        }
-        let deadline = Instant::now() + WAIT;
-        while !proxy.links.urls().is_empty() || !proxy.clients().is_empty() {
-            assert!(Instant::now() < deadline, "the link given up stayed open");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            proxy.links.wait_finished(WAIT),
-            "the link given up was never closed"
-        );
     }
 
     /// A second proxy on a port in use binds nothing, and says whether a
@@ -1118,84 +930,6 @@ mod tests {
             let connected = TcpStream::connect_timeout(&address, WAIT);
             assert!(connected.is_err(), "{address} still answers");
         }
-    }
-
-    #[test]
-    fn call_hears_a_proxy_and_knows_a_legacy_peer_is_not_one() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let hello = caller_hello();
-
-        assert_eq!(
-            host_of(call(&proxy.endpoint(), "proxy.hello", &hello, WAIT)),
-            hosted_by("a test")
-        );
-        let refused = call(&proxy.endpoint(), "proxy.reboot", &[], WAIT).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::Other);
-        assert_eq!(refused.to_string(), "the proxy has no method proxy.reboot");
-        let legacy = call(
-            &device.url,
-            "proxy.hello",
-            &hello,
-            Duration::from_millis(800),
-        );
-        let legacy = legacy.unwrap_err();
-        assert_eq!(legacy.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(
-            legacy.to_string(),
-            format!(
-                "{} is a proxy from an older build of twinleaf, or no proxy; update tio, or stop it",
-                device.url
-            )
-        );
-    }
-
-    /// A peer that never answers is known not to be a proxy once a hello
-    /// would have been answered, not at the end of a call allowed to wait
-    /// for a device.
-    #[test]
-    fn a_silent_peer_is_not_a_proxy_long_before_the_call_times_out() {
-        let device = FakeDevice::start();
-        let started = Instant::now();
-
-        let result = call(&device.url, "proxy.open", b"auto", Duration::from_secs(15));
-
-        let kind = result.as_ref().map_err(io::Error::kind);
-        assert_eq!(kind, Err(io::ErrorKind::InvalidData), "{result:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    /// Both `auto` and `default` open the host's layout, mounted where it
-    /// says, until the host clears it.
-    #[test]
-    fn auto_and_default_open_the_hosts_layout() {
-        let device = FakeDevice::start();
-        let prefix: DeviceRoute = "/3".parse().unwrap();
-        let layout = Layout {
-            mounts: vec![Mount {
-                url: device.url.clone(),
-                source: DeviceRoute::root(),
-                prefix,
-            }],
-        };
-        let proxy = Proxy::host(HostOptions {
-            default: Some(layout),
-            ..options()
-        })
-        .unwrap();
-
-        for target in ["auto", "default"] {
-            let client = TestClient::connect(&proxy.endpoint());
-            client.hello(4242, target);
-            assert_eq!(client.open(target), Ok("default".to_string()));
-            assert_eq!(client.dev_name_at(prefix, 7), "FAKE");
-        }
-
-        proxy.set_default(None);
-        let client = TestClient::connect(&proxy.endpoint());
-        client.hello(4242, "late");
-        assert_eq!(client.open("default").unwrap_err().0, RpcError::Invalid);
-        assert_eq!(client.open("auto"), Ok(device.url.clone()));
     }
 
     /// A client holds a background proxy's default for others to open with
@@ -1433,67 +1167,6 @@ mod tests {
         assert_eq!(proxy.links.users(), 2);
     }
 
-    /// A probe reaches its device as an open does, but a device only probes
-    /// have opened is nobody's choice for `auto`, until a client opens it.
-    #[test]
-    fn a_probed_device_is_no_choice_for_auto_until_it_is_opened() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let prober = TestClient::connect(&proxy.endpoint());
-        prober.hello(4242, "prober");
-        assert_eq!(prober.probe(&device.url), Ok(device.url.clone()));
-        assert_eq!(prober.dev_name(7), "FAKE");
-
-        // With one device attached, auto would open it rather than refuse.
-        if auto::attached().len() != 1 {
-            let auto = TestClient::connect(&proxy.endpoint());
-            auto.hello(4243, "auto");
-            let (code, message) = auto.open("auto").unwrap_err();
-            assert_eq!(code, RpcError::Invalid);
-            assert!(
-                message.contains("in use") && !message.contains(&device.url),
-                "{message}"
-            );
-        }
-
-        let opener = TestClient::connect(&proxy.endpoint());
-        opener.hello(4244, "opener");
-        assert_eq!(opener.open(&device.url), Ok(device.url.clone()));
-        let auto = TestClient::connect(&proxy.endpoint());
-        auto.hello(4245, "auto");
-        assert_eq!(auto.open("auto"), Ok(device.url.clone()));
-        assert_eq!(device.accepted(), 1);
-    }
-
-    /// A device that only a probe used closes as soon as the probe leaves.
-    /// A device a client opened stays open after the client leaves.
-    #[test]
-    fn a_probed_device_closes_once_the_probe_leaves_but_an_opened_one_stays() {
-        let probed = FakeDevice::start();
-        let opened = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let prober = TestClient::connect(&proxy.endpoint());
-        prober.hello(4242, "prober");
-        assert_eq!(prober.probe(&probed.url), Ok(probed.url.clone()));
-        let opener = TestClient::connect(&proxy.endpoint());
-        opener.hello(4243, "opener");
-        assert_eq!(opener.open(&opened.url), Ok(opened.url.clone()));
-        assert_eq!(proxy.links.urls().len(), 2);
-
-        drop(prober);
-        drop(opener);
-
-        // Well within the time an opened device stays open.
-        let deadline = Instant::now() + WAIT;
-        while proxy.links.urls() != [opened.url.clone()] {
-            let urls = proxy.links.urls();
-            assert!(Instant::now() < deadline, "the links stayed {urls:?}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(proxy.links.urls(), std::slice::from_ref(&opened.url));
-    }
-
     /// A client that hangs up while its open or probe waits for the device
     /// is let go at once, rather than when the device would have had to
     /// answer. Its task ends, and its use of the link with it.
@@ -1614,27 +1287,6 @@ mod tests {
             );
         }
         assert!(proxy.links.urls().is_empty(), "a link to the proxy opened");
-    }
-
-    #[test]
-    fn a_client_hears_link_statuses_as_link_packets() {
-        let device = FakeDevice::start();
-        let proxy = Proxy::host(options()).unwrap();
-        let control = TestClient::connect(&proxy.endpoint());
-        control.hello(4242, "control");
-        control.open(&device.url).unwrap();
-
-        device.drop_connections();
-
-        control.expect(|pkt| match pkt.payload() {
-            Payload::ProxyRx(ProxyRx::Link(status)) => {
-                assert_eq!(pkt.route(), DeviceRoute::root());
-                assert_eq!(status, LinkStatus::SensorDisconnected);
-                Some(())
-            }
-            Payload::LegacyStatus(status) => panic!("a control client was sent {status:?}"),
-            _ => None,
-        });
     }
 
     /// Type 64 is also `USER`, which a device and an app may send. Such a
@@ -1793,22 +1445,6 @@ mod tests {
         assert_let_go(&proxy, &device);
     }
 
-    /// A panic in the server stops the proxy. Its clients end with it, and
-    /// waiters return.
-    #[test]
-    fn a_panic_in_the_server_stops_the_proxy() {
-        let device = FakeDevice::start();
-        let (proxy, user, watcher) = hosted_with_clients(&device);
-
-        proxy.crash();
-
-        watcher.expect_closed();
-        user.expect_closed();
-        assert!(stops_in_time(proxy.clone()));
-        assert_let_go(&proxy, &device);
-        assert!(proxy.clients().is_empty(), "the table outlived the server");
-    }
-
     /// A proxy that has shut down lists no client, and a second shutdown
     /// does nothing.
     #[test]
@@ -1944,25 +1580,6 @@ mod tests {
             stop(Some(&endpoint)).unwrap_err().to_string(),
             format!("no proxy is running at {endpoint}")
         );
-    }
-
-    /// A hello is answered with the host's introduction, however the proxy
-    /// is hosted.
-    #[test]
-    fn hello_replies_with_the_hosts_introduction() {
-        let hello = caller_hello();
-
-        for stoppable in [false, true] {
-            let proxy = Proxy::host(HostOptions {
-                stoppable,
-                ..options()
-            })
-            .unwrap();
-
-            let reply = call(&proxy.endpoint(), "proxy.hello", &hello, WAIT);
-
-            assert_eq!(host_of(reply), hosted_by("a test"));
-        }
     }
 
     #[test]

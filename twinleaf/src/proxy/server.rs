@@ -5,23 +5,31 @@
 use super::client::{Session, SOCKET_QUEUE};
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
 use super::link::{self, Links, Owner};
+#[cfg(not(all(test, turmoil)))]
+use super::Listen;
 use super::{
-    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
+    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Proxy, IDLE, LEAVE_TIMEOUT,
 };
 use crate::chan::oneshot;
+use crate::net::{TcpListener, TcpStream};
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
+#[cfg(not(all(test, turmoil)))]
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
-use std::future::{self, Future};
+use std::future;
+#[cfg(not(all(test, turmoil)))]
+use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(not(all(test, turmoil)))]
+use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
+#[cfg(not(all(test, turmoil)))]
 use std::task::Poll;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
@@ -41,9 +49,6 @@ pub(super) enum Notice {
     },
     /// A stop of the proxy.
     Stop,
-    /// A panic of the server.
-    #[cfg(test)]
-    Panic,
 }
 
 /// A change to a client's entry in the table.
@@ -104,13 +109,18 @@ pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
         };
         return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
     }
-    let listeners = bind(options.listen, options.port)?;
+    #[cfg(all(test, turmoil))]
+    let listeners = vec![TcpListener::bind((Ipv4Addr::UNSPECIFIED, options.port)).await?];
+    #[cfg(not(all(test, turmoil)))]
+    let listeners = {
+        let listeners = bind(options.listen, options.port)?;
+        let listening = listeners.into_iter().map(|listener| {
+            listener.set_nonblocking(true)?;
+            TcpListener::from_std(listener)
+        });
+        listening.collect::<io::Result<Vec<_>>>()?
+    };
     let port = listeners[0].local_addr()?.port();
-    let listening = listeners.into_iter().map(|listener| {
-        listener.set_nonblocking(true)?;
-        TcpListener::from_std(listener)
-    });
-    let listeners = listening.collect::<io::Result<Vec<_>>>()?;
     let default = watch::channel(options.default.take());
     let registry = Links::new(
         &tasks,
@@ -225,13 +235,6 @@ impl Server {
                 notice = self.notices.recv() => match notice {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
                     Some(Notice::Stop) | None => break,
-                    // The clients' tasks end before they could hear a stop,
-                    // as a proxy that crashes tells no client.
-                    #[cfg(test)]
-                    Some(Notice::Panic) => {
-                        self.sessions.abort_all();
-                        panic!("a test asked the server to panic")
-                    }
                 },
                 accepted = accept(&self.listeners), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),
@@ -350,29 +353,12 @@ impl Server {
     /// Breaks to exit a proxy that has had no client for [`IDLE`]. Each
     /// connection already waiting on a listener is served instead.
     fn idle_out(&mut self) -> ControlFlow<()> {
-        let mut waiting = Vec::new();
-        for listener in &self.listeners {
-            loop {
-                match SockRef::from(listener).accept() {
-                    Ok((socket, _)) => waiting.push(socket),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        log::warn!("Error accepting client: {error}");
-                        break;
-                    }
-                }
-            }
-        }
+        let waiting = waiting(&self.listeners);
         if waiting.is_empty() {
             log::info!("no clients for {:?}; exiting", IDLE);
             return ControlFlow::Break(());
         }
-        for socket in waiting {
-            let stream = std::net::TcpStream::from(socket);
-            let accepted = stream.set_nonblocking(true).and_then(|()| {
-                let peer = stream.peer_addr()?;
-                Ok((TcpStream::from_std(stream)?, peer))
-            });
+        for accepted in waiting {
             match accepted {
                 Ok((stream, peer)) => self.serve(stream, peer),
                 Err(error) => log::warn!("Error accepting client: {error}"),
@@ -382,8 +368,52 @@ impl Server {
     }
 }
 
+/// Takes each connection already waiting on `listeners`, though the
+/// runtime may not have seen it arrive, with the error of any that cannot
+/// be served.
+#[cfg(not(all(test, turmoil)))]
+fn waiting(listeners: &[TcpListener]) -> Vec<io::Result<(TcpStream, SocketAddr)>> {
+    let mut waiting = Vec::new();
+    for listener in listeners {
+        loop {
+            let socket = match SockRef::from(listener).accept() {
+                Ok((socket, _)) => socket,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    log::warn!("Error accepting client: {error}");
+                    break;
+                }
+            };
+            let stream = std::net::TcpStream::from(socket);
+            waiting.push(stream.set_nonblocking(true).and_then(|()| {
+                let peer = stream.peer_addr()?;
+                Ok((TcpStream::from_std(stream)?, peer))
+            }));
+        }
+    }
+    waiting
+}
+
+/// Takes no connection, as a simulated listener holds none the runtime has
+/// not seen.
+#[cfg(all(test, turmoil))]
+fn waiting(_listeners: &[TcpListener]) -> Vec<io::Result<(TcpStream, SocketAddr)>> {
+    Vec::new()
+}
+
 /// Waits for a connection on any of `listeners`. Never returns while there is
 /// none.
+#[cfg(all(test, turmoil))]
+async fn accept(listeners: &[TcpListener]) -> io::Result<(TcpStream, SocketAddr)> {
+    match listeners.first() {
+        Some(listener) => listener.accept().await,
+        None => future::pending().await,
+    }
+}
+
+/// Waits for a connection on any of `listeners`. Never returns while there is
+/// none.
+#[cfg(not(all(test, turmoil)))]
 fn accept(
     listeners: &[TcpListener],
 ) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + '_ {
@@ -399,6 +429,7 @@ fn accept(
 
 /// Whether a socket on every interface shares its port with one on
 /// `127.0.0.1` on this OS. It does on macOS and Windows.
+#[cfg(not(all(test, turmoil)))]
 const LOOPBACK_SHARES_PORT: bool = cfg!(any(target_os = "macos", windows));
 
 /// Returns the addresses a proxy binds for `listen`, its IPv4 addresses in
@@ -408,6 +439,7 @@ const LOOPBACK_SHARES_PORT: bool = cfg!(any(target_os = "macos", windows));
 /// a proxy on every interface holds `127.0.0.1` too, so that no other proxy
 /// binds it. Windows hands each connection to `127.0.0.1` to the socket bound
 /// there rather than to the one on every interface.
+#[cfg(not(all(test, turmoil)))]
 fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr], Ipv6Addr) {
     match (listen, loopback_shares_port) {
         (Listen::Loopback, _) => (&[Ipv4Addr::LOCALHOST], Ipv6Addr::LOCALHOST),
@@ -423,6 +455,7 @@ fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr]
 /// of this OS. The first IPv4 socket holds the proxy's port. An IPv6 only
 /// socket follows on the same port. A host without IPv6 gets the IPv4
 /// sockets alone. Returns an error if an IPv4 socket cannot be bound.
+#[cfg(not(all(test, turmoil)))]
 fn bind(listen: Listen, port: u16) -> io::Result<Vec<std::net::TcpListener>> {
     let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
     let first = std::net::TcpListener::bind((v4[0], port))?;
@@ -442,6 +475,7 @@ fn bind(listen: Listen, port: u16) -> io::Result<Vec<std::net::TcpListener>> {
 
 /// Listens on the IPv6 `address` like [`std::net::TcpListener::bind`], with
 /// a socket that takes no IPv4.
+#[cfg(not(all(test, turmoil)))]
 fn bind_v6_only(address: SocketAddr) -> io::Result<std::net::TcpListener> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_only_v6(true)?;
@@ -453,6 +487,7 @@ fn bind_v6_only(address: SocketAddr) -> io::Result<std::net::TcpListener> {
 }
 
 #[cfg(test)]
+#[cfg(not(turmoil))]
 mod tests {
     use super::*;
     use crate::proxy::fixtures::{assert_took, binds_every_interface, options, PAUSED_WAIT};
@@ -541,6 +576,7 @@ mod tests {
     /// A connection that waits on a listener as the proxy idles out is
     /// served, though the runtime has not yet seen it arrive. The proxy
     /// keeps running.
+    #[cfg(not(all(test, turmoil)))]
     #[test]
     fn a_connection_waiting_as_the_proxy_idles_out_is_served() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -556,7 +592,7 @@ mod tests {
         let endpoint = endpoint_at(address.port());
         let (proxy, mut server) = Server::new(options, endpoint, tasks, registry, default.0);
         let _runtime = rt::handle().enter();
-        server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
+        server.listeners = vec![crate::net::TcpListener::from_std(listener).unwrap()];
         let _client = std::net::TcpStream::connect(address).unwrap();
         // A connection may reach the listener's queue only after connect
         // returns, as with the mirrored networking of WSL2.
@@ -582,7 +618,7 @@ mod tests {
         let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
         let (proxy, mut server) =
             Server::new(options, endpoint, tasks.clone(), registry, default.0);
-        server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
+        server.listeners = vec![crate::net::TcpListener::from_std(listener).unwrap()];
         tasks.spawn("a test proxy", server.run());
         proxy
     }
