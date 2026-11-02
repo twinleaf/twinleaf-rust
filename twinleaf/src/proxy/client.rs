@@ -39,6 +39,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{timeout_at, Instant};
 use tokio_stream::StreamNotifyClose;
 
@@ -341,8 +342,9 @@ impl Session {
     /// forwards any other packet to the mount its route falls under. Drops a
     /// packet that falls under no mount.
     ///
-    /// Returns [`ClientError::ForwardFailed`] if the mount's port cannot take
-    /// the packet, or its route reaches too deep on the device.
+    /// Returns [`ClientError::ForwardFailed`] if the mount's port is full, or
+    /// the packet's route reaches too deep on the device. Drops a packet for
+    /// a link that is ending, whose end lets the client go with the reason.
     async fn client_packet(&mut self, pkt: Packet) -> Result<(), ClientError> {
         if self.shared.options.dump.traffic {
             log::info!("{}->{} -- {:?}", self.addr, pkt.route(), pkt.payload());
@@ -379,8 +381,20 @@ impl Session {
             return Ok(());
         };
         let route = route.map_err(|_| ClientError::ForwardFailed)?;
-        let sent = mounted.port.try_send(pkt.with_route(route));
-        sent.map_err(|_| ClientError::ForwardFailed)
+        match mounted.port.try_send(pkt.with_route(route)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(ClientError::ForwardFailed),
+            // The link's worker lets its ports go as the link ends, a moment
+            // before the link tells its mounts why and lets their clients
+            // go. The client stays to hear that.
+            Err(TrySendError::Closed(_)) => {
+                log::debug!(
+                    "Dropping a packet from client {} to a link that is ending",
+                    self.addr
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Queues the answer to control request `id` for the client.
