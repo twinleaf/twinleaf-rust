@@ -581,15 +581,6 @@ impl HealthState {
                     severity,
                 );
             }
-            Change::TimeForward { gap_seconds } => {
-                self.log_event(
-                    format!(
-                        "[{}/{}] TIME FORWARD: {:.3}s",
-                        route, stream_name, gap_seconds
-                    ),
-                    severity,
-                );
-            }
             Change::RateChanged { old_rate, new_rate } => {
                 self.log_event(
                     format!(

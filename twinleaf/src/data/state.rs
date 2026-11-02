@@ -324,13 +324,13 @@ impl StreamTracker {
 
         // Rows in the last rows' slot are of a later lap of the ring after
         // the device announced another segment, or when that slot's segment
-        // starts later and the rows do not follow on from the last ones.
+        // starts at another time. A device never moves a segment's start, and
+        // never starts two acquisitions of one slot in the same second.
         let lapped = self.moved_on
-            || first_sample_n != expected
-                && self
-                    .last_segment
-                    .as_ref()
-                    .is_some_and(|last| last.get().start_time() != segment.start_time());
+            || self
+                .last_segment
+                .as_ref()
+                .is_some_and(|last| last.get().start_time() != segment.start_time());
         // Rows are of the current segment. A stop announced between the
         // last rows' segment and this one becoming current puts the rows in
         // a later acquisition, and the time between holds no sample to lose.
@@ -365,12 +365,6 @@ impl StreamTracker {
                     loss: Some(lost(u64::from(samples))),
                 });
             }
-        } else if time_gap > half_period {
-            // Sample numbers are contiguous, so the segment's metadata (e.g. start_time)
-            // was corrected in place, and must not pass silently as a continuous batch.
-            return Some(Boundary::of(Change::TimeForward {
-                gap_seconds: time_gap,
-            }));
         }
 
         None

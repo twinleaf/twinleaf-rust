@@ -155,7 +155,6 @@ impl Boundary {
 /// | `TimeRefSessionChanged` | `Reconfig` | no  | no  |
 /// | `RateChanged`           | `Reconfig` | no  | yes |
 /// | `Restarted`             | `Reconfig` | no  | yes |
-/// | `TimeForward`           | `Anomaly`  | no  | yes |
 /// | `TimeBackward`          | `Anomaly`  | no  | no  |
 ///
 /// Continuous changes are always monotonic. The class describes the cause,
@@ -187,12 +186,6 @@ pub enum Change {
     /// Time jumped backward unexpectedly.
     TimeBackward {
         /// How far time went back, in seconds, as a positive magnitude.
-        gap_seconds: f64,
-    },
-    /// Time jumped forward with no gap in sample numbers, for example after a
-    /// segment's start time was corrected in place.
-    TimeForward {
-        /// How far time skipped ahead, in seconds.
         gap_seconds: f64,
     },
     /// The sampling rate changed.
@@ -242,10 +235,7 @@ impl Change {
     pub fn is_monotonic(&self) -> bool {
         matches!(
             self,
-            Change::RateChanged { .. }
-                | Change::Restarted { .. }
-                | Change::SegmentRollover { .. }
-                | Change::TimeForward { .. }
+            Change::RateChanged { .. } | Change::Restarted { .. } | Change::SegmentRollover { .. }
         )
     }
 
@@ -264,7 +254,7 @@ impl Change {
             | Change::TimeRefSessionChanged { .. }
             | Change::RateChanged { .. }
             | Change::Restarted { .. } => BoundaryClass::Reconfig,
-            Change::TimeForward { .. } | Change::TimeBackward { .. } => BoundaryClass::Anomaly,
+            Change::TimeBackward { .. } => BoundaryClass::Anomaly,
         }
     }
 
@@ -274,17 +264,15 @@ impl Change {
     /// The ranks follow the order the parser tells changes in, so a receiver
     /// told of two at once learns what the parser tells of both at once. A
     /// restart ranks below a backward step in time, which it does not stand
-    /// for, and above the forward step in time and the rollover it stands
-    /// for.
+    /// for, and above the rollover it stands for.
     pub(crate) fn rank(&self) -> u8 {
         match self {
-            Change::Initial => 8,
-            Change::SessionChanged { .. } => 7,
-            Change::TimeRefSessionChanged { .. } => 6,
-            Change::RateChanged { .. } => 5,
-            Change::TimeBackward { .. } => 4,
-            Change::Restarted { .. } => 3,
-            Change::TimeForward { .. } => 2,
+            Change::Initial => 7,
+            Change::SessionChanged { .. } => 6,
+            Change::TimeRefSessionChanged { .. } => 5,
+            Change::RateChanged { .. } => 4,
+            Change::TimeBackward { .. } => 3,
+            Change::Restarted { .. } => 2,
             Change::SegmentRollover { .. } => 1,
         }
     }
