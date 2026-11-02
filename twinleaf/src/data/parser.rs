@@ -42,13 +42,16 @@ use std::collections::VecDeque;
 /// new segment that starts before the last rows end comes as a backward
 /// step in time.
 ///
-/// Two restarts reach the parser with no stop announced, and come as a
+/// Three kinds of restart reach the parser with no stop announced, and come as a
 /// rollover with a loss of the sample periods between the acquisitions.
 ///
 /// - A restart whose announcement was lost, in a gap on the link or in a
 ///   client's inlet.
 /// - A stop and start no host asked for, with no refresh between them,
 ///   which leave `dev.running` where it was.
+/// - Every restart of deprecated firmware, which has no `dev.running`, as
+///   [`RpcRegistry::is_deprecated_firmware`](crate::device::rpc::RpcRegistry::is_deprecated_firmware)
+///   tells.
 ///
 /// # Examples
 ///
