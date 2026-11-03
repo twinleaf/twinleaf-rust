@@ -23,12 +23,13 @@ use fake_device::device;
 use trace::{traced, Traced, Tracer};
 
 use crate::data::{Change, SampleBatch};
-use crate::device::session::ProxyAddress;
-use crate::device::{Connection, Device, Presence, Receiver, RecvError};
+use crate::device::{Connection, Device};
 use crate::proto::DeviceRoute;
-use crate::proxy::control::Purpose;
 use crate::proxy::{server, HostOptions, Listen};
 use crate::seam::turmoil::{polls, seeded};
+use crate::session::ProxyAddress;
+use crate::session::Purpose;
+use crate::session::{Presence, Receiver, RecvError};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

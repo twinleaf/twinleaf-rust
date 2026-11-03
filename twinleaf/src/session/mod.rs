@@ -1,4 +1,5 @@
-//! An app's [`Session`] with its proxy, over one socket.
+//! The call session between an app and its proxy, not a device's boot
+//! `SessionId`. An app's [`Session`] runs over one socket.
 //!
 //! The session carries the open that says what it is for, the RPCs its views
 //! make, and the packets its stream pump reads.
@@ -33,18 +34,40 @@
 //! session is quiet for longer than the keepalive allows. The session takes
 //! such a close as a socket that closes without a stop.
 
-use super::stream::{End, Lane, Queued};
-use crate::device::rpc::{CallError, RpcErrorPayload};
-use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{
-    encode, handshake, Layout, Purpose, AUTO, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT,
-    PROXY_VARIABLE,
+mod control;
+pub mod rpc;
+mod state;
+mod store;
+mod subscription;
+
+#[cfg(test)]
+pub(crate) use control::client_name;
+pub(crate) use control::{
+    answer, call, call_at, decode, encode, executable_name, handshake, older_build, parts,
+    Introduction, Joined, Part, Purpose, Refusal, Request, Update, Watch, AUTO, CLIENT_KEEPALIVE,
+    DEFAULT_LAYOUT, HELLO, HELLO_TIMEOUT, MAX_RPC_TIMEOUT, MOUNT, PROXY_KEEPALIVE, PROXY_VARIABLE,
+    STOP, UNWATCH, WATCH,
 };
+pub use control::{Layout, Mount};
+pub use state::{
+    MetadataState, Presence, RegistryState, SettingChange, SettingValueError, Settings,
+};
+#[cfg(test)]
+pub(crate) use store::CHANGE_QUEUE_LEN;
+pub(crate) use store::{
+    end_sinks, prune, pruned, rpc_hash, Field, Store, CHANGES, METADATA, PRESENCE, REGISTRY,
+    SETTINGS,
+};
+pub(crate) use subscription::{BatchLane, End, Lane, Queued, Scope, Sink};
+pub use subscription::{Receiver, RecvError};
+
+use crate::proto::{DeviceRoute, RouteError};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
+use rpc::{CallError, RpcErrorPayload};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time::Duration;
@@ -936,8 +959,6 @@ mod tests {
     use crate::proto::rpc::{Method, RpcError};
     use crate::proto::PacketType;
     use crate::proxy::tests::fixtures::assert_took;
-    use crate::proxy::CLIENT_KEEPALIVE;
-    use crate::proxy::{client_name, decode, Introduction};
     use crate::rt::BoxFuture;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};

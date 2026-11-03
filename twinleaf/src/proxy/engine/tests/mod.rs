@@ -2,19 +2,19 @@ mod settings_sim;
 
 use super::*;
 use crate::data::DeviceMetadataSnapshot;
-use crate::device::rpc::RpcValue;
-use crate::device::session::TestProxy;
-use crate::device::store::{Field, CHANGES, REGISTRY, SETTINGS};
-use crate::device::stream::{Receiver, RecvError, Scope};
 use crate::device::tests::fixtures::{
     announcement, broadcast, description, device_reply, samples, segment_record, wait_for,
 };
-use crate::device::RegistryState;
 use crate::proto::data as wire;
 use crate::proto::rpc as wire_rpc;
 use crate::proto::SessionId;
-use crate::proxy::control::Joined;
 use crate::rt::Supervisor;
+use crate::session::rpc::RpcValue;
+use crate::session::Joined;
+use crate::session::RegistryState;
+use crate::session::TestProxy;
+use crate::session::{Field, CHANGES, REGISTRY, SETTINGS};
+use crate::session::{Receiver, RecvError, Scope};
 use crate::tio::packet::{Payload, ProxyRx};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant as StdInstant;

@@ -3,11 +3,11 @@
 //! collects the replies.
 
 use crate::data::{MetadataQuery, PacketParser};
-use crate::device::rpc::{CallError, RpcErrorPayload};
-use crate::device::session::{Handle, RawCallResult};
 use crate::proto::data as wire;
 use crate::proto::rpc as wire_rpc;
 use crate::proto::DeviceRoute;
+use crate::session::rpc::{CallError, RpcErrorPayload};
+use crate::session::{Handle, RawCallResult};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -194,7 +194,7 @@ mod tests {
     use super::*;
 
     fn schedule() -> MetadataSchedule {
-        let (session, _proxy) = crate::device::session::Session::test_pair();
+        let (session, _proxy) = crate::session::Session::test_pair();
         MetadataSchedule::new(Handle::root(session))
     }
 

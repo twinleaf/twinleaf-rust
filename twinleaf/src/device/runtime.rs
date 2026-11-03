@@ -21,10 +21,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-use super::session::ProxyAddress;
 use crate::proto::TCP_DEFAULT_PORT;
 use crate::proxy::{self, HostOptions, Proxy};
 use crate::rt::{BoxFuture, Supervisor};
+use crate::session::ProxyAddress;
 
 /// How long [`ensure_proxy`] waits for the proxy it started to answer.
 const STARTUP: Duration = Duration::from_secs(15);
@@ -263,7 +263,7 @@ async fn ensure_proxy_at(
 async fn embed(port: u16, embedded: &Mutex<Option<Proxy>>) -> io::Result<()> {
     let options = HostOptions {
         port,
-        name: format!("{} (embedded)", proxy::executable_name()),
+        name: format!("{} (embedded)", crate::session::executable_name()),
         ..HostOptions::default()
     };
     // The embedded proxy is the machine's and outlives the open that starts
@@ -479,9 +479,9 @@ mod tests {
         let (port, ensured, hosted) = attempt.expect("no proxy was embedded");
         ensured.unwrap();
         assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
-        let hello = proxy::encode(&proxy::Introduction::of_this_process("test"));
-        let reply = proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
-        let host = proxy::decode::<proxy::Introduction>(&reply).unwrap();
+        let hello = crate::session::encode(&crate::session::Introduction::of_this_process("test"));
+        let reply = crate::session::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
+        let host = crate::session::decode::<crate::session::Introduction>(&reply).unwrap();
         assert!(host.name.ends_with("(embedded)"), "{host}");
         let (ensured, again) = ensure_at(port, false, Mutex::default());
         ensured.unwrap();
@@ -576,8 +576,8 @@ mod tests {
             .into_inner()
             .unwrap()
             .expect("no proxy was hosted again");
-        let hello = proxy::encode(&proxy::Introduction::of_this_process("test"));
-        proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
+        let hello = crate::session::encode(&crate::session::Introduction::of_this_process("test"));
+        crate::session::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
     }
 
     /// Only macOS has the App Sandbox.

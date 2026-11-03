@@ -143,7 +143,7 @@ use crate::chan::lock;
 use crate::device::tests::fixtures::{broadcast, segment_record};
 use crate::proto::data::Metadata;
 use crate::proto::DeviceRoute;
-use crate::proxy::control::{decode, parts, Part, Update};
+use crate::session::{decode, parts, Part, Update};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use futures_util::FutureExt;
 use proptest::prelude::*;

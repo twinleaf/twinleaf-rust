@@ -21,16 +21,16 @@
 //! The registry runs until its [`Owner`] drops. It then closes every link
 //! and waits [`LEAVE_TIMEOUT`] for their tasks before it ends.
 
-use super::control::Refusal;
 use super::engine::{self, Mount, Mounts};
 use super::outbox::Outbox;
 use super::worker::{self, OpenPort, Opener, Readiness};
 use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
 use crate::chan::{oneshot, JoinHandle};
-use crate::device::store::Store;
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
+use crate::session::Refusal;
+use crate::session::Store;
 use crate::tio::packet::Packet;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;

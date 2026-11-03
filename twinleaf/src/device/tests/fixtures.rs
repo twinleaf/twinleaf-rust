@@ -1,15 +1,16 @@
 //! Test fixtures for `device`, a proxy on a free port and the fake device
 //! of the proxy's own tests, and the packets a device sends.
 
-use crate::device::session::ProxyAddress;
-use crate::device::session::Session;
-use crate::device::stream::Receiver;
 use crate::device::Connection;
 use crate::proto::data::{self as wire, DataType};
 use crate::proto::sync::Epoch;
 use crate::proto::{ColumnId, DeviceRoute, SegmentId, SessionId, StreamId};
 pub(crate) use crate::proxy::tests::fixtures::{attached, FakeDevice, WAIT};
-use crate::proxy::{tests::fixtures, Layout, Mount, Proxy, Purpose};
+use crate::proxy::{tests::fixtures, Proxy};
+use crate::session::ProxyAddress;
+use crate::session::Receiver;
+use crate::session::Session;
+use crate::session::{Layout, Mount, Purpose};
 use crate::tio::packet::Packet;
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};

@@ -106,7 +106,7 @@ build, the first three in the turmoil backend of `seam/turmoil`.
   links without blocking, as the proxy host's loop runs on its runtime.
 
 No test reads or writes the user's RPC cache, as `path` in
-`device/rpc/cache.rs` says, so every load asks the device.
+`session/rpc/cache.rs` says, so every load asks the device.
 
 Each app is a host that runs one loop. It opens the device with
 `Connection::open_at_async`, `Purpose::Use` and a 10 s timeout, and writes
@@ -326,7 +326,7 @@ S6. A reply is the device's answer, from one delivery.
 - Safety invariant, checked at every `Done` and every device log entry.
 - Source the module doc of `proxy::worker`, which answers a request a
   lost or restarted device leaves with an RPC error, read as never
-  sending it again, and the module doc of `device::session`, on a socket
+  sending it again, and the module doc of `session`, on a socket
   that closes without a stop. Parts (b) and (c) are an assumption to
   confirm, open question 1.
 - It rules out a misrouted reply, a cached reply, and a retry of pending
@@ -356,8 +356,8 @@ S8. A connection ends only for a reason.
   it is the start of the device link's outage less 4 s, a connect timeout
   and the interval after it, or the first one heard if that is earlier.
 - Safety invariant, checked at every end and every status.
-- Source the last two paragraphs of the module doc of `device::session`,
-  `REOPEN_FOR` in `device/session.rs`, the module doc of `proxy` on
+- Source the last two paragraphs of the module doc of `session`,
+  `REOPEN_FOR` in `session/mod.rs`, the module doc of `proxy` on
   `HostOptions::reconnect_timeout` and `FailedToReconnect`, the doc of
   `HostOptions::reconnect_timeout`, and the module doc of `proxy::worker`
   on when the worker stops.
@@ -371,7 +371,7 @@ crash cancels every task of its host before any runs again.
   the status can fail to arrive when the proxy crashes. Open question 3
   asks whether that reading is meant.
 - It rules out a link's end told as a stop, which would end a session
-  that must open again (the module doc of `device::session`, where the
+  that must open again (the module doc of `session`, where the
   session ends when the proxy stops).
 
 L1. Every app is back. At `H' + B` every app has an open connection, and
@@ -381,7 +381,7 @@ child, its last presence of the child is `Alive` in the child's session.
   reach `Alive` and a batch within 15 s fails this law too.
 - Source the module doc of `proxy`, where a device that drops out is
   reconnected and its clients stay connected, the module doc of
-  `device::session` on a socket that closes without a stop, and the doc
+  `session` on a socket that closes without a stop, and the doc
   of `Presence::Alive`.
 - It rules out a half open link never noticed, a link or session that
   stops trying, and a stale session.
@@ -413,7 +413,7 @@ before the device's last reboot at that route is out of force. The
 settings half is not checked, as with S7.
 - Liveness, checked after the heal.
 - Source the module doc of `proxy::engine`, on presence and the table
-  loaded again, the doc of `RpcRegistry` in `device/rpc/registry.rs`, a
+  loaded again, the doc of `RpcRegistry` in `session/rpc/registry.rs`, a
   table read once per session that only a new session can change, and
   the doc of `CacheAction::Reload` in `proxy/engine/settings.rs`, which reads
   the registry again when the device starts a new session.
@@ -458,9 +458,9 @@ fault, and drops them if that stops holding.
   5 s, the app's close never reaches the proxy, so the 5 s count from
   that second cut. Source the keepalive item of the
   section When the proxy lets a client go in the module doc of `proxy`,
-  the module doc of `device::session` on the other reasons the proxy
+  the module doc of `session` on the other reasons the proxy
   closes the socket, `CLIENT_KEEPALIVE` and `PROXY_KEEPALIVE` in
-  `proxy/control.rs`, and `CLOSE_TIMEOUT` in `tio/transport/mod.rs`.
+  `session/control.rs`, and `CLOSE_TIMEOUT` in `tio/transport/mod.rs`.
 - (c) An app killed while the proxy runs is gone from `clients()` within
   1 s and `d`, also while its open waits for an unreachable device.
   Source the hung up item of the section When the proxy lets a client go
@@ -490,12 +490,12 @@ must come, each counted from the loss the apps observed.
   see its receivers end with `Disconnected` within T and `d` of the loss.
   Source the module doc of `proxy` on `HostOptions::reconnect_timeout`
   and `FailedToReconnect`, the doc of `HostOptions::reconnect_timeout`,
-  and the module doc of `device::session`, where calls made while the
+  and the module doc of `session`, where calls made while the
   device is out fail and `FailedToReconnect` ends the session.
 - (b) An app whose link or proxy stays unusable for 30 s and `d` after its
   socket loss sees its connection end within 30 s and `d` of the loss.
-  Source the module doc of `device::session`, where the session ends once
-  `REOPEN_FOR` has passed, and `REOPEN_FOR` in `device/session.rs`.
+  Source the module doc of `session`, where the session ends once
+  `REOPEN_FOR` has passed, and `REOPEN_FOR` in `session/mod.rs`.
 - Timeliness, checked at every event.
 - It rules out a session or link that never gives up, or gives up late.
 
@@ -521,7 +521,7 @@ module doc of `proxy`).
   tried less often than documented.
 
 L9. Calls end. Every call ends by its timeout and `d` (the doc of
-`Session::submit_with` in `device/session.rs`). Unless the device
+`Session::submit_with` in `session/mod.rs`). Unless the device
 connection is tainted while it waits, it ends within 10 s of being sent.
 The device answers at once, the proxy fails what a lost device leaves
 within its 3 s quiet time, and a lost socket fails every call in flight
@@ -529,7 +529,7 @@ within the 6 s of L6 (b).
 - Timeliness, checked at every event.
 - Source the module doc of `proxy::worker`, where a request a lost or
   restarted device leaves is answered with an RPC error, and the module
-  doc of `device::session`, on a socket that closes without a stop and
+  doc of `session`, on a socket that closes without a stop and
   where calls made while the device is out fail. The docs name no time,
   so the 10 s is an inference, open question 5.
 - It rules out a proxy that leaves a lost device's requests to time out,
@@ -568,7 +568,7 @@ again and the connection has not ended. The proxy listens again at the
 first bounce of the proxy after the kill in the log, as the driver may
 bounce the proxy and kill it again within one millisecond.
 - Timeliness, checked at every event.
-- Source the doc of `open_again` in `device/session.rs`, which says a
+- Source the doc of `open_again` in `session/mod.rs`, which says a
   proxy that is back is tried within 1.25 s.
 - It rules out a backoff that grows past its cap.
 
@@ -818,10 +818,10 @@ the last column.
 | Engine quiet time | 3 s | `QUIET` in `proxy/engine/mod.rs` | `QUIET` |
 | Reconnect interval | 1 s | `RECONNECT_INTERVAL` in `proxy/worker.rs` | `RECONNECT_INTERVAL` |
 | TCP connect timeout | 3 s | `CONNECT_TIMEOUT` in `tio/transport/tcp.rs` | `RECONNECT_TRY` |
-| Hello timeout | 2 s | `HELLO_TIMEOUT` in `proxy/control.rs` | |
-| Keepalive beat and quiet time | 1 s and 5 s | `CLIENT_KEEPALIVE` in `proxy/control.rs` | `KEEPALIVE_QUIET`, `SOCKET_LOSS` |
-| Reopen backoff | 250 ms doubling to 1 s, up to a quarter more | `open_again` and `jittered` in `device/session.rs` | `REOPEN_WAIT` |
-| Reopen limit | 30 s | `REOPEN_FOR` in `device/session.rs` | `REOPEN_FOR` |
+| Hello timeout | 2 s | `HELLO_TIMEOUT` in `session/control.rs` | |
+| Keepalive beat and quiet time | 1 s and 5 s | `CLIENT_KEEPALIVE` in `session/control.rs` | `KEEPALIVE_QUIET`, `SOCKET_LOSS` |
+| Reopen backoff | 250 ms doubling to 1 s, up to a quarter more | `open_again` and `jittered` in `session/mod.rs` | `REOPEN_WAIT` |
+| Reopen limit | 30 s | `REOPEN_FOR` in `session/mod.rs` | `REOPEN_FOR` |
 | First packet of a new link | 10 s | `READY_TIMEOUT` in `proxy/worker.rs` | |
 | Table reload after a failed load | 5 s | `RELOAD_DELAY` in `proxy/engine/mod.rs` | |
 | Drain and close | 3 s and 1 s | `DRAIN_TIMEOUT` and `CLOSE_TIMEOUT` in `tio/transport/mod.rs` | `SOCKET_LOSS`, `CLOSE_TIMEOUT` |

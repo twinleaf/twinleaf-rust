@@ -226,16 +226,16 @@
 //! refused read, a counter that never settles, the wrap of a heartbeat and
 //! a device that is never read.
 
-use crate::device::rpc::{
-    poll_once, CallError, PendingReply, RpcDescriptor, RpcErrorPayload, RpcRegistry,
-};
-use crate::device::SettingChange;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::packet::{PacketType, PacketView};
 use crate::proto::rpc::{self as wire, Method, Request, RpcError};
 use crate::proto::settings::Setting as Announcement;
 use crate::proto::{DeviceRoute, RpcRequestId, SessionId};
 use crate::proxy::engine::settings::{CacheAction, DeviceEvent, SettingsCache};
+use crate::session::rpc::{
+    poll_once, CallError, PendingReply, RpcDescriptor, RpcErrorPayload, RpcRegistry,
+};
+use crate::session::SettingChange;
 use crate::tio::packet::Payload;
 use crate::tio::rpc::RpcReply;
 use crate::tio::Packet;

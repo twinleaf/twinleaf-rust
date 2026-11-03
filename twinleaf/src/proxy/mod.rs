@@ -206,7 +206,6 @@
 
 mod auto;
 mod client;
-mod control;
 mod engine;
 mod link;
 mod outbox;
@@ -214,17 +213,12 @@ mod server;
 mod table;
 mod worker;
 
-pub(crate) use control::{
-    call, encode, executable_name, handshake, Joined, Purpose, Update, Watch, AUTO, CHANGED,
-    DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT, PROXY_VARIABLE, TIMED_OUT, UNANSWERED, UNWATCH, WATCH,
-};
-#[cfg(test)]
-pub(crate) use control::{decode, parts, CLIENT_KEEPALIVE};
-pub use control::{Layout, Mount};
+pub use crate::session::{Layout, Mount};
 pub(crate) use server::host;
 pub use server::Proxy;
 
 use crate::proto::TCP_DEFAULT_PORT;
+use crate::session::{call, executable_name, PROXY_VARIABLE, STOP};
 use crate::tio::transport::{CLOSE_TIMEOUT, CONNECT_TIMEOUT};
 use std::future::Future;
 use std::io;
@@ -422,11 +416,8 @@ pub fn stop(proxy: Option<&str>) -> io::Result<()> {
         Some(url) => url.to_string(),
         None => named().unwrap_or_else(|| endpoint_at(TCP_DEFAULT_PORT)),
     };
-    call(&url, control::STOP, &[], STOP_TIMEOUT).map(drop)
+    call(&url, STOP, &[], STOP_TIMEOUT).map(drop)
 }
-
-#[cfg(test)]
-pub(crate) use control::{client_name, Introduction};
 
 #[cfg(test)]
 pub(crate) mod tests;

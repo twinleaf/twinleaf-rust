@@ -118,7 +118,7 @@ const LONGEST_BLIP: u64 = 2_500;
 ///   `if self.device.is_none()` in `Worker::turn`, and sends every request
 ///   still in `rpc_map` in the arm `Ok(device) => self.device = Some(device)`
 ///   of `Worker::turn`, where it adopts the device.
-/// - S8. Make `REOPEN_FOR` in `device/session.rs` 25 s and 3 s. In
+/// - S8. Make `REOPEN_FOR` in `session/mod.rs` 25 s and 3 s. In
 ///   `Worker::device_received` in `proxy/worker.rs`, delete
 ///   `self.reconnect_deadline = None`. In `Worker::lose_device`, set
 ///   `self.reconnect_deadline` to `now + timeout / 2` for `now + timeout`.
@@ -140,33 +140,33 @@ const LONGEST_BLIP: u64 = 2_500;
 ///   `std::mem::forget(device)`, so the lost port's socket and task stay.
 /// - L6. (a) Make `LIVENESS_TIMEOUT_TCP` in `proxy/worker.rs` 4000 ms and
 ///   30000 ms. (b) Make the `quiet` of `CLIENT_KEEPALIVE` in
-///   `proxy/control.rs` 7 s. (c) In `Client::serve` in `proxy/client.rs`,
+///   `session/control.rs` 7 s. (c) In `Client::serve` in `proxy/client.rs`,
 ///   guard the arm `received = self.incoming.next()` of the `select!` with
 ///   `if self.opening.is_none()`. (d) Make `IDLE` in `proxy/mod.rs` 8 s.
 ///   (e) Make `QUIET` in `proxy/engine/mod.rs` 4 s.
 /// - L7. (a) In `Worker::lose_device` in `proxy/worker.rs`, set
 ///   `self.reconnect_deadline` to `now + timeout * 3 / 2`. In `Worker::packet`
-///   in `device/session.rs`, delete `self.reopen = None` on
-///   `FailedToReconnect`. (b) Make `REOPEN_FOR` in `device/session.rs` 35 s.
+///   in `session/mod.rs`, delete `self.reopen = None` on
+///   `FailedToReconnect`. (b) Make `REOPEN_FOR` in `session/mod.rs` 35 s.
 /// - L8. In `Worker::device_received` in `proxy/worker.rs`, delete
 ///   `self.status_to_engine(packet::LinkStatus::SensorReconnected)`. In
 ///   `Worker::turn`, wait 5 s in
 ///   `self.next_attempt = Instant::now() + RECONNECT_INTERVAL`.
 /// - L9. Empty `Worker::cancel_active_rpcs` in `proxy/worker.rs`. Delete the
 ///   loop `for pending in std::mem::take(&mut self.pending).into_values()`
-///   in `Worker::lose` in `device/session.rs`, which fails pending calls.
+///   in `Worker::lose` in `session/mod.rs`, which fails pending calls.
 /// - L10. In `Mounts::feed` in `proxy/engine/mod.rs`, put link statuses on the
 ///   first mount only.
 /// - L11. In `Engine::apply_status` in `proxy/engine/mod.rs`, never forget the
 ///   subtree on `SensorDisconnected`, at `let forget = matches!(status, ...)`,
 ///   so samples of a new boot wait on metadata the parser thinks it has. If
 ///   it survives, record whether the records sent first make it equivalent.
-/// - L12. In `open_again` in `device/session.rs`, cap the backoff at 5 s in
+/// - L12. In `open_again` in `session/mod.rs`, cap the backoff at 5 s in
 ///   `wait = (wait * 2).min(Duration::from_secs(1))`.
 /// - M1. In `Device::liveness_timeout` in `proxy/worker.rs`, use
 ///   `LIVENESS_TIMEOUT` for TCP in the arm
 ///   `transport::TransportKind::Tcp => LIVENESS_TIMEOUT_TCP`.
-/// - M2. In `jittered` in `device/session.rs`, draw from the nanoseconds of
+/// - M2. In `jittered` in `session/mod.rs`, draw from the nanoseconds of
 ///   `SystemTime::now()` for `RandomState::new().hash_one(())`.
 /// - M3. In `Mounts::feed` in `proxy/engine/mod.rs`, feed only the last mount
 ///   added, so an app that opens again starves the others.

@@ -1,9 +1,9 @@
 //! The [`SettingsCache`] of setting values a device announces.
 
-use crate::device::rpc::{CallError, PendingReply, Pipeline, RpcRegistry};
-use crate::device::SettingChange;
 use crate::proto::rpc::RpcMetaFlags;
 use crate::proto::SessionId;
+use crate::session::rpc::{CallError, PendingReply, Pipeline, RpcRegistry};
+use crate::session::SettingChange;
 use crate::tio::rpc::RpcReply;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -241,8 +241,8 @@ fn ahead(seq: u32, applied: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::rpc::{poll_once, resolved, RpcDescriptor, RpcErrorPayload};
     use crate::proto::rpc::RpcError;
+    use crate::session::rpc::{poll_once, resolved, RpcDescriptor, RpcErrorPayload};
     use std::task::Poll;
 
     /// The metadata words of an announced read-write byte, an announced

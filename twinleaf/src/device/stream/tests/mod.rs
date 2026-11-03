@@ -3,17 +3,17 @@ mod shuttle;
 
 use super::*;
 use crate::data::{Boundary, Change, Loss};
-use crate::device::rpc::RpcValue;
-use crate::device::session::{Session, TestProxy};
-use crate::device::store::{CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::device::tests::fixtures::{
     announcement, broadcast, description, metadata_records, samples, wait_for,
 };
-use crate::device::{MetadataState, Presence};
 use crate::proto::SampleNumber;
 use crate::proto::SessionId as WireSessionId;
-use crate::proxy::{decode, Update};
 use crate::rt::Supervisor;
+use crate::session::rpc::RpcValue;
+use crate::session::{decode, RecvError, Update};
+use crate::session::{MetadataState, Presence};
+use crate::session::{Session, TestProxy};
+use crate::session::{CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::tio::packet::Packet;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -89,7 +89,7 @@ fn table(route: DeviceRoute) -> Watch {
 
 /// Hands the pump `update` as the proxy's replies to watch `id`.
 fn reply_update(proxy: &TestProxy, id: u16, update: &Update) {
-    for part in crate::proxy::parts(id, update) {
+    for part in crate::session::parts(id, update) {
         proxy.send(part);
     }
 }
@@ -254,7 +254,7 @@ fn a_lost_socket_loses_every_device_and_watches_again() {
     let presence = lock(&store).follow(route, PRESENCE);
     let deliver = |packet| inlet.borrow_mut().send(Received::Packet(packet));
     let reply = |id: u16, update: &Update| {
-        for part in crate::proxy::parts(id, update) {
+        for part in crate::session::parts(id, update) {
             inlet.borrow_mut().send_always(Received::Packet(part));
         }
     };
@@ -910,7 +910,7 @@ fn a_latest_value_lane_reports_a_dropped_reader() {
 
 /// The replies that carry `update` to watch 1, as their values.
 fn parts_of(update: &Update) -> Vec<Vec<u8>> {
-    crate::proxy::parts(1, update)
+    crate::session::parts(1, update)
         .iter()
         .map(|packet| match packet.payload() {
             packet::Payload::ProxyRx(ProxyRx::Reply(reply)) => reply.value.to_vec(),

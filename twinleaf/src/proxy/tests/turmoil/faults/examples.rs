@@ -5,7 +5,7 @@ use super::driver::{simulate, Run};
 use super::hosts::{Event, Seen};
 use super::laws::{status_is, Broken, Judge, OPEN};
 use super::schedule::{Action, Case, Down, Host, Kinds, Pair, Step, Swarm};
-use crate::device::RecvError;
+use crate::session::RecvError;
 use crate::tio::packet::LinkStatus;
 
 /// The swarm of a fixed example with `apps` apps.

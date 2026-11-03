@@ -43,14 +43,17 @@
 //! the traffic [`DumpFlags`] asks for.
 
 use super::engine::Mount;
-use super::{control, DumpFlags, Layout, MAX_RPC_TIMEOUT};
+use super::DumpFlags;
 use crate::chan::StreamMap;
-use crate::device::session::Session;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogLevel;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
+use crate::session::{
+    decode, older_build, Introduction, Layout, Request, Session, AUTO, CLIENT_KEEPALIVE,
+    HELLO_TIMEOUT, MAX_RPC_TIMEOUT,
+};
 use crate::tio::packet::{self, Packet};
 use crate::tio::transport;
 use crate::tio::transport::Port as HardwarePort;
@@ -241,7 +244,7 @@ enum Peer {
 /// and the link then opens its `auto` as a control client does, so that it
 /// hears the proxy's link statuses for each route and keeps the connection
 /// alive. Any other peer answers with something else, or with nothing
-/// within [`control::HELLO_TIMEOUT`], and its packets are a device's. A
+/// within [`HELLO_TIMEOUT`], and its packets are a device's. A
 /// proxy from an older build forwards its device's packets, so it is such a
 /// peer.
 ///
@@ -291,11 +294,10 @@ async fn greet(
     received: &crate::chan::Receiver<ReceiveResult>,
     url: &str,
 ) -> io::Result<Peer> {
-    let (name, hello) =
-        control::Request::Hello(control::Introduction::of_this_process(LINK_NAME)).encode();
+    let (name, hello) = Request::Hello(Introduction::of_this_process(LINK_NAME)).encode();
     let request = Packet::proxy_request(name, &hello, HELLO_ID).map_err(io::Error::other)?;
     port.send_async(request).await.map_err(io::Error::other)?;
-    let first = match tokio::time::timeout(control::HELLO_TIMEOUT, received.recv_async()).await {
+    let first = match tokio::time::timeout(HELLO_TIMEOUT, received.recv_async()).await {
         Err(_) => return Ok(Peer::Device(None)),
         Ok(Err(_)) => return Err(closed(url)),
         Ok(Ok(first)) => first,
@@ -305,8 +307,7 @@ async fn greet(
             packet::Payload::ProxyRx(packet::ProxyRx::Reply(reply))
                 if reply.req_id.value() == HELLO_ID =>
             {
-                control::decode::<control::Introduction>(reply.value)
-                    .map_err(|_| control::older_build(url))?
+                decode::<Introduction>(reply.value).map_err(|_| older_build(url))?
             }
             packet::Payload::ProxyRx(packet::ProxyRx::Error(error))
                 if error.req_id.value() == HELLO_ID =>
@@ -318,15 +319,15 @@ async fn greet(
         _ => return Ok(Peer::Device(Some(first))),
     };
     log::debug!("the proxy at {url} is {host}");
-    let (name, target) = control::Request::Open {
-        target: super::control::AUTO.to_string(),
+    let (name, target) = Request::Open {
+        target: AUTO.to_string(),
     }
     .encode();
     let request = Packet::proxy_request(name, &target, OPEN_ID).map_err(io::Error::other)?;
     port.send_async(request).await.map_err(io::Error::other)?;
     // The other proxy hangs up on a client that is quiet too long, and an
     // open may wait longer than that for its device.
-    port.keep_alive(control::CLIENT_KEEPALIVE).await;
+    port.keep_alive(CLIENT_KEEPALIVE).await;
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         let event = tokio::time::timeout_at(deadline, received.recv_async())
@@ -735,7 +736,7 @@ const LIVENESS_TIMEOUT_TCP: Duration = Duration::from_millis(3000);
 /// while the proxy waits for its own device.
 ///
 /// The connection ends sooner on its own. The link keeps it alive as a
-/// client does, with [`control::CLIENT_KEEPALIVE`], whose transport ends a
+/// client does, with [`CLIENT_KEEPALIVE`], whose transport ends a
 /// connection that hears nothing for 5 s, and the worker then loses the
 /// device as on any failed port. The proxy beats each second it sends
 /// nothing else, so a proxy that is serving is never silent that long.
@@ -1660,7 +1661,7 @@ mod tests {
     #[test]
     fn a_device_is_logged_where_the_default_layout_mounts_it() {
         let route = |path: &str| path.parse::<DeviceRoute>().unwrap();
-        let mount = |url: &str, source: &str, prefix: &str| crate::proxy::Mount {
+        let mount = |url: &str, source: &str, prefix: &str| crate::session::Mount {
             url: url.into(),
             source: route(source),
             prefix: route(prefix),

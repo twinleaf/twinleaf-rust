@@ -11,19 +11,16 @@
 //! updates may overtake the device's packets, as each is the latest value of
 //! one field of the store.
 
-mod subscription;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use subscription::{BatchLane, End, Lane, Queued, Scope, Sink};
-pub use subscription::{Receiver, RecvError};
-
-use super::session::{Handle, Inlet, Received};
-use super::store::{end_sinks, prune, pruned, Field, Store};
 use crate::chan::lock;
 use crate::data::{PacketParser, SampleBatch};
 use crate::proto::DeviceRoute;
-use crate::proxy::{encode, Joined, Update, Watch, UNWATCH, WATCH};
+use crate::session::{
+    encode, end_sinks, prune, pruned, BatchLane, End, Field, Handle, Inlet, Joined, Lane, Queued,
+    Received, Receiver, Scope, Sink, Store, Update, Watch, UNWATCH, WATCH,
+};
 use crate::tio;
 use crate::tio::packet::{self, LinkStatus, Packet, ProxyRx};
 use crate::tio::transport;

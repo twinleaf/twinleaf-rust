@@ -4,12 +4,13 @@
 use super::schedule::Action;
 use super::{APPS, CALL_TIMEOUT, MOST_APPS, OPEN_TIMEOUT};
 use crate::data::{Change, SampleBatch};
-use crate::device::session::ProxyAddress;
-use crate::device::{Connection, Presence, Receiver, RecvError};
+use crate::device::Connection;
 use crate::proto::{ColumnId, DeviceRoute};
-use crate::proxy::control::Purpose;
 use crate::proxy::tests::turmoil::{child as child_route, World, DEVICE_PORT, PROXY_PORT};
 use crate::proxy::{server, HostOptions, Listen};
+use crate::session::ProxyAddress;
+use crate::session::Purpose;
+use crate::session::{Presence, Receiver, RecvError};
 use crate::tio::packet::LinkStatus;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -345,7 +346,7 @@ async fn follow(
         Presence::Alive { session } => Shown::Alive(session.map(|s| s.value())),
         Presence::Lost { .. } => Shown::Lost,
     };
-    let table_of = |table: crate::device::RegistryState| match table {
+    let table_of = |table: crate::session::RegistryState| match table {
         Ok(table) => Ok((table.hash, table.session.map(|s| s.value()))),
         Err(error) => Err(error.to_string()),
     };

@@ -3,7 +3,6 @@
 //! registry of links. [`Shared`] holds what every client's task reads.
 
 use super::client::{Client, SOCKET_QUEUE};
-use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
 use super::link::{Links, Owner};
 use super::table::{Notice, Shared, TableChange};
 use super::worker;
@@ -13,6 +12,7 @@ use super::{
 use crate::chan::oneshot;
 use crate::net::{Listeners, TcpStream};
 use crate::rt::{sleep_until_some, Supervisor};
+use crate::session::{call_at, decode, encode, older_build, Introduction, HELLO, HELLO_TIMEOUT};
 use crate::tio::transport;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -187,17 +187,16 @@ pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
     if options.port != 0 && answers_async(options.port).await {
         let endpoint = endpoint_at(options.port);
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, options.port));
-        let hello = control::encode(&Introduction::of_this_process(&options.name));
-        let called =
-            control::call_at(address, &endpoint, HELLO, &hello, HELLO_TIMEOUT, &tasks).await;
+        let hello = encode(&Introduction::of_this_process(&options.name));
+        let called = call_at(address, &endpoint, HELLO, &hello, HELLO_TIMEOUT, &tasks).await;
         let message = match called {
-            Ok(reply) => match control::decode::<Introduction>(&reply) {
+            Ok(reply) => match decode::<Introduction>(&reply) {
                 Ok(host) => {
                     format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
                 }
                 Err(_) => format!("a Twinleaf proxy already runs at {endpoint}"),
             },
-            Err(_) => control::older_build(&endpoint).to_string(),
+            Err(_) => older_build(&endpoint).to_string(),
         };
         return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
     }

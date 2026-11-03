@@ -4,8 +4,8 @@
 //! decodes a request, [`answer`] builds the reply, and [`call`] and
 //! [`handshake`] make requests as a client.
 
-use crate::device::rpc::{CallError, RpcRegistry, RpcRegistryError};
-use crate::device::{MetadataState, Presence, RegistryState, SettingChange, Settings};
+use super::rpc::{CallError, RpcRegistry, RpcRegistryError};
+use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId, TCP_DEFAULT_PORT};
@@ -37,10 +37,10 @@ pub(crate) const PROXY_VARIABLE: &str = "TWINLEAF_PROXY";
 pub(crate) const HELLO: &str = "proxy.hello";
 /// The method that binds a connection to a device and makes the device a
 /// choice for `auto`.
-pub(super) const OPEN: &str = "proxy.open";
+pub(crate) const OPEN: &str = "proxy.open";
 /// The method that binds a connection to a device to look it over. The
 /// device does not become a choice for `auto`.
-pub(super) const PROBE: &str = "proxy.probe";
+pub(crate) const PROBE: &str = "proxy.probe";
 /// The method that binds a connection to a layout of mounts the client
 /// names, each of which becomes a choice for `auto`.
 pub(crate) const MOUNT: &str = "proxy.mount";
@@ -48,7 +48,7 @@ pub(crate) const MOUNT: &str = "proxy.mount";
 /// the connection that names it stays open.
 pub(crate) const DEFAULT_LAYOUT: &str = "proxy.default";
 /// The method that stops a background proxy.
-pub(super) const STOP: &str = "proxy.stop";
+pub(crate) const STOP: &str = "proxy.stop";
 /// The method that follows the state of one device a connection opened.
 pub(crate) const WATCH: &str = "proxy.watch";
 /// The method that stops a watch.
@@ -63,7 +63,7 @@ pub(crate) const CLIENT_KEEPALIVE: KeepAlive = KeepAlive {
 
 /// How the proxy keeps its link to a client alive once the client is known
 /// to speak the control protocol.
-pub(super) const PROXY_KEEPALIVE: KeepAlive = KeepAlive {
+pub(crate) const PROXY_KEEPALIVE: KeepAlive = KeepAlive {
     beat: Packet::alive,
     ..CLIENT_KEEPALIVE
 };
@@ -238,9 +238,9 @@ pub(crate) struct Watch {
 /// The code of a table error that says a call timed out, that the table
 /// changed during every walk, or that a call got no reply. Any other code
 /// is the device's refusal.
-pub(crate) const TIMED_OUT: u16 = 0xfffd;
-pub(crate) const CHANGED: u16 = 0xfffe;
-pub(crate) const UNANSWERED: u16 = 0xffff;
+pub(super) const TIMED_OUT: u16 = 0xfffd;
+pub(super) const CHANGED: u16 = 0xfffe;
+pub(super) const UNANSWERED: u16 = 0xffff;
 
 /// An RPC table as its hash, the session it was read in, and the name and
 /// metadata word of each entry.
@@ -460,14 +460,14 @@ const REQUEST_ID: u16 = 2;
 /// How long a proxy may take to accept a connection and answer anything at
 /// all. A peer that is silent this long is a proxy from an older build, or
 /// no proxy.
-pub(super) const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The longest refusal message that fits a `PROXY_RX` error.
 const MAX_MESSAGE: usize = WirePacket::MAX_PAYLOAD - 5;
 
 /// A control request decoded from its method name and arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Request {
+pub(crate) enum Request {
     /// `proxy.hello`, introducing the client.
     Hello(Introduction),
     /// `proxy.open`, naming what to open.
@@ -500,7 +500,7 @@ impl Request {
     ///
     /// Returns a [`Refusal`] if the proxy has no method `name` or `args` do
     /// not decode.
-    pub(super) fn decode(name: &[u8], args: &[u8]) -> Result<Request, Refusal> {
+    pub(crate) fn decode(name: &[u8], args: &[u8]) -> Result<Request, Refusal> {
         let malformed =
             |error: minicbor::decode::Error| Refusal::new(RpcError::ArgsSize, error.to_string());
         match name {
@@ -526,7 +526,7 @@ impl Request {
     }
 
     /// Returns the method name and encoded arguments, as a client sends them.
-    pub(super) fn encode(&self) -> (&'static str, Vec<u8>) {
+    pub(crate) fn encode(&self) -> (&'static str, Vec<u8>) {
         match self {
             Request::Hello(introduction) => (HELLO, encode(introduction)),
             Request::Open { target } => (OPEN, encode(target)),
@@ -564,16 +564,16 @@ fn checked(layout: Layout) -> Result<Layout, Refusal> {
 
 /// A control request refused, with a code and a message saying why.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Refusal {
+pub(crate) struct Refusal {
     /// The error code.
-    pub(super) code: RpcError,
+    pub(crate) code: RpcError,
     /// Why, in words.
-    pub(super) message: String,
+    pub(crate) message: String,
 }
 
 impl Refusal {
     /// Creates a refusal with `code` and `message`.
-    pub(super) fn new(code: RpcError, message: impl Into<String>) -> Refusal {
+    pub(crate) fn new(code: RpcError, message: impl Into<String>) -> Refusal {
         Refusal {
             code,
             message: message.into(),
@@ -583,7 +583,7 @@ impl Refusal {
 
 /// Returns the `PROXY_RX` packet answering request `id` with `outcome`. A
 /// refusal's message too long for a packet is cut to fit.
-pub(super) fn answer(id: u16, outcome: Result<Vec<u8>, Refusal>) -> Packet {
+pub(crate) fn answer(id: u16, outcome: Result<Vec<u8>, Refusal>) -> Packet {
     let refusal = match outcome {
         Ok(value) => match Packet::proxy_reply(id, &value) {
             Ok(reply) => return reply,
@@ -764,7 +764,7 @@ pub(crate) async fn handshake(
 /// `proxy.hello` with an introduction, as a proxy from an older build of
 /// twinleaf does not. Such a proxy forwards the hello to its device as a
 /// packet of a type it does not know, and sends no control reply.
-pub(super) fn older_build(endpoint: &str) -> io::Error {
+pub(crate) fn older_build(endpoint: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
@@ -822,8 +822,7 @@ pub(crate) fn client_name() -> String {
 mod tests {
     use super::*;
     use crate::data::PacketParser;
-    use crate::device::store::{Store, PRESENCE};
-    use crate::proxy::Mount;
+    use crate::session::store::{Store, PRESENCE};
     use crate::tio::transport::tests::fake;
 
     /// Events skipped during the handshake do not restart its absolute deadline.
@@ -1121,9 +1120,9 @@ mod tests {
     /// its entry otherwise, and one named with no table does not decode.
     #[test]
     fn a_client_records_each_change_under_the_table_named_for_it() {
-        use crate::device::rpc::RpcValue;
-        use crate::device::store::{CHANGES, REGISTRY};
-        use crate::device::SettingValueError;
+        use crate::session::rpc::RpcValue;
+        use crate::session::state::SettingValueError;
+        use crate::session::store::{CHANGES, REGISTRY};
 
         let (mut store, mut parser) = (Store::new(false), PacketParser::new(false));
         let route = DeviceRoute::root();

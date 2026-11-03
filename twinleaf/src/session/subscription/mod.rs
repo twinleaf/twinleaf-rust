@@ -187,7 +187,7 @@ impl<T> Receiver<T> {
     }
 
     /// Ties this subscription to `stream`, which it then keeps running.
-    pub(super) fn tied_to(mut self, stream: &Arc<impl Send + Sync + 'static>) -> Receiver<T> {
+    pub(crate) fn tied_to(mut self, stream: &Arc<impl Send + Sync + 'static>) -> Receiver<T> {
         self.stream = Some(stream.clone());
         self
     }
@@ -223,7 +223,7 @@ impl Scope {
 
     /// Returns `true` if the two scopes share any route, that is if either
     /// root lies inside the other.
-    pub(super) fn intersects(&self, other: &Scope) -> bool {
+    pub(crate) fn intersects(&self, other: &Scope) -> bool {
         self.covers(other.route) || other.covers(self.route)
     }
 }
@@ -565,7 +565,7 @@ impl<T> Sink<Lane<T>> {
 
     /// Offers an item concerning `scope`, sent only if `scope` overlaps this
     /// subscriber's scope. Returns `false` once the subscriber is gone.
-    pub(super) fn offer(&mut self, scope: Scope, item: impl FnOnce() -> T) -> bool
+    pub(crate) fn offer(&mut self, scope: Scope, item: impl FnOnce() -> T) -> bool
     where
         T: Clone,
     {
@@ -585,7 +585,7 @@ impl Sink<BatchLane> {
 
     /// Offers a batch concerning `scope`, sent only if `scope` overlaps this
     /// subscriber's scope. Returns `false` once the subscriber is gone.
-    pub(super) fn offer(&mut self, scope: Scope, batch: impl FnOnce() -> SampleBatch) -> bool {
+    pub(crate) fn offer(&mut self, scope: Scope, batch: impl FnOnce() -> SampleBatch) -> bool {
         !self.scope.intersects(&scope) || self.lane.send(batch())
     }
 }

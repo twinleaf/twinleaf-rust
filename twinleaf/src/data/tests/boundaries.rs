@@ -102,10 +102,10 @@
 
 use super::fixtures;
 use crate::data::{PacketParser, SampleBatch};
-use crate::device::stream::{BatchLane, Queued};
 use crate::proto::data as wire;
 use crate::proto::data::DataType;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
+use crate::session::{BatchLane, Queued};
 use crate::tio;
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};

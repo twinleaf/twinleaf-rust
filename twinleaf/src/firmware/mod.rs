@@ -9,9 +9,9 @@
 //! module provides one backed by GitHub, behind the `firmware-update`
 //! feature.
 
-use crate::device::rpc::{pipelined, CallError};
 use crate::device::Device;
 use crate::proto::rpc as wire_rpc;
+use crate::session::rpc::{pipelined, CallError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

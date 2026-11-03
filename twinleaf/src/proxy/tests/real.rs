@@ -3,6 +3,7 @@ use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::proxy::*;
 use crate::rt::{self, Supervisor};
+use crate::session::{decode, encode, Introduction};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport;
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
@@ -1014,11 +1015,11 @@ fn a_proxy_and_a_connection_run_on_the_runtime_they_are_awaited_on() {
             .unwrap();
         runtime.block_on(async {
             let proxy = host(options()).await.unwrap();
-            let address = crate::device::session::ProxyAddress {
+            let address = crate::session::ProxyAddress {
                 url: proxy.endpoint(),
                 ensure: None,
             };
-            let session = crate::device::session::Session::mount_async(&address, &layout, WAIT);
+            let session = crate::session::Session::mount_async(&address, &layout, WAIT);
             let connection = crate::Connection::over(session.await.unwrap());
             for prefix in &prefixes {
                 let device = connection.device(*prefix);

@@ -1,19 +1,18 @@
 //! The [`Connection`] to a proxy and its [`DeviceTree`] and [`Device`] views.
 
-use super::rpc::{
-    CallError, PendingReply, RpcArgs, RpcMeta, RpcRegistry, RpcRegistryError, RpcReply,
-};
 use super::runtime::chosen_proxy;
-use super::session::ProxyAddress;
-use super::session::{Handle, Session};
-use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-use super::store::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
-use super::stream::{Receiver, RecvError, Scope, Stream};
+use super::stream::Stream;
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
-use crate::proxy::{Layout, Purpose};
 use crate::rt::Supervisor;
+use crate::session::rpc::{
+    CallError, PendingReply, RpcArgs, RpcMeta, RpcRegistry, RpcRegistryError, RpcReply,
+};
+use crate::session::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
+use crate::session::{Handle, Session};
+use crate::session::{Layout, ProxyAddress, Purpose, Receiver, RecvError, Scope};
+use crate::session::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::tio;
 use crate::tio::transport::is_local_tcp;
 use std::sync::Arc;
@@ -928,7 +927,7 @@ impl Device {
     /// Returns a test device at the root, over a session whose socket is a
     /// pair of channels, and the session's far end.
     #[cfg(test)]
-    pub(crate) fn test_pair() -> (Device, super::session::TestProxy) {
+    pub(crate) fn test_pair() -> (Device, crate::session::TestProxy) {
         let (session, proxy) = Session::test_pair();
         let connection = Connection::over(session);
         (connection.device(DeviceRoute::root()), proxy)
@@ -938,10 +937,10 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::session::TestProxy;
     use crate::device::tests::fixtures::{self, open_through, FakeDevice, WAIT};
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::Proxy;
+    use crate::session::TestProxy;
     use std::thread;
 
     fn test_tree() -> (DeviceTree, TestProxy) {
@@ -1156,7 +1155,7 @@ mod tests {
         let proxy = fixtures::proxy();
         let prefix: DeviceRoute = "/3".parse().unwrap();
         let mounted = Layout {
-            mounts: vec![crate::proxy::Mount {
+            mounts: vec![crate::session::Mount {
                 url: device.url.clone(),
                 source: DeviceRoute::root(),
                 prefix,

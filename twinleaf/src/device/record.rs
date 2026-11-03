@@ -6,10 +6,9 @@
 //! [`RecordMode`] picks this or a raw copy of every packet.
 
 use super::connection::DeviceTree;
-use super::state::MetadataState;
-use super::stream::{Receiver, RecvError};
 use crate::data::{announces_stop, PacketParser, RowSource};
 use crate::proto::DeviceRoute;
+use crate::session::{MetadataState, Receiver, RecvError};
 use crate::tio;
 use crate::tio::packet;
 use std::collections::HashMap;
@@ -966,11 +965,11 @@ mod tests {
         //! None.
 
         use super::*;
-        use crate::device::session::{Session, TestProxy};
         use crate::device::tests::fixtures::{self, WAIT};
         use crate::device::Connection;
         use crate::proto::data::MAX_SAMPLE_NUMBER;
-        use crate::proxy::{decode, Watch, WATCH};
+        use crate::session::{decode, Watch, WATCH};
+        use crate::session::{Session, TestProxy};
         use proptest::prelude::*;
         use std::collections::{BTreeMap, BTreeSet};
         use std::sync::{Arc, Mutex};

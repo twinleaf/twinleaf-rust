@@ -1,11 +1,11 @@
 //! The server's mailbox and what every client's task reads, which the
 //! proxy's server and its clients' tasks share.
 
-use super::control::Introduction;
 use super::link::Links;
 use super::{HostOptions, Layout};
 use crate::chan::oneshot;
 use crate::rt::Supervisor;
+use crate::session::Introduction;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, watch};
 

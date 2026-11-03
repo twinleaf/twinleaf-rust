@@ -17,6 +17,7 @@ pub mod firmware;
 pub mod proxy;
 mod rt;
 mod seam;
+mod session;
 pub mod tio;
 
 use seam::{chan, net};

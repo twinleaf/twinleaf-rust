@@ -11,8 +11,6 @@
 //! watch follows the RPC table and settings here.
 
 use super::auto::{self, Choice};
-use super::control::encode;
-use super::control::{self, Purpose, Refusal, Request, Update, Watch};
 use super::engine::Mount;
 use super::link::{Link, Mounted};
 use super::outbox::{ClientError, Outbox, Taken};
@@ -21,12 +19,14 @@ use super::worker;
 use super::Layout;
 use crate::chan::oneshot::{self, error::TryRecvError};
 use crate::chan::{lock, StreamMap};
-use crate::device::store::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
-use crate::device::stream::Scope;
-use crate::device::{Receiver, RecvError, SettingChange};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::{finish, BoxFuture};
+use crate::session::Scope;
+use crate::session::{answer, encode, Introduction, AUTO, PROXY_KEEPALIVE};
+use crate::session::{Purpose, Refusal, Request, Update, Watch};
+use crate::session::{Receiver, RecvError, SettingChange};
+use crate::session::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
 use crate::tio::packet::{Packet, Payload};
 use crate::tio::transport::{self, is_local_tcp, ReceiveResult, TransportEvent, CLOSE_TIMEOUT};
 use futures_util::future;
@@ -183,7 +183,7 @@ impl Client {
     /// and writes its outbox, until the connection ends, keeping the client's
     /// link alive. Returns why it ended.
     async fn serve(&mut self) -> Result<(), ClientError> {
-        self.client.keep_alive(control::PROXY_KEEPALIVE).await;
+        self.client.keep_alive(PROXY_KEEPALIVE).await;
         loop {
             if self.stopping() {
                 return Err(self.stopped());
@@ -366,7 +366,7 @@ impl Client {
 
     /// Queues the answer to control request `id` for the client.
     fn answer(&self, id: u16, outcome: Result<Vec<u8>, Refusal>) {
-        self.outbox.urgent(control::answer(id, outcome));
+        self.outbox.urgent(answer(id, outcome));
     }
 
     /// Changes the client's entry in the table, and waits until the table
@@ -407,7 +407,7 @@ impl Client {
             Request::Hello(client) => {
                 log::debug!("Client {} is {client}", self.addr);
                 self.update(TableChange::Hello(client)).await;
-                let host = control::Introduction::of_this_process(&self.shared.options.name);
+                let host = Introduction::of_this_process(&self.shared.options.name);
                 self.answer(id, Ok(encode(&host)))
             }
             Request::Open { target } => self.request_open(id, target, Purpose::Use),
@@ -643,7 +643,7 @@ async fn resolve(
 ) -> Result<(String, Layout, Option<Link>), Refusal> {
     let default = shared.default();
     match target.as_str() {
-        control::AUTO => {
+        AUTO => {
             let open = shared.links.answered().await;
             // Listing the attached devices enumerates serial ports.
             let resolved = shared.tasks.spawn_blocking(move || {
@@ -851,13 +851,14 @@ fn failed(error: &tokio::task::JoinError) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::rpc::RpcRegistry;
-    use crate::device::session::{Inlet, Received, Session};
-    use crate::device::stream::{End, Queued};
     use crate::proxy::link::{Links, Owner};
     use crate::proxy::tests::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
     use crate::proxy::DumpFlags;
     use crate::rt::Supervisor;
+    use crate::session::rpc::RpcRegistry;
+    use crate::session::{End, Queued};
+    use crate::session::{Inlet, Received, Session};
+    use crate::session::{MOUNT, WATCH};
     use crate::tio::packet::{LinkStatus, ProxyRx};
     use crate::tio::transport::tests::fake::{self, FakeEnd};
     use crate::tio::transport::{TransportKind, DEFAULT_RX_CHANNEL_SIZE};
@@ -988,13 +989,13 @@ mod tests {
         let mut client = connect(None, None);
         let source: DeviceRoute = "/1/2/3/4/5/6".parse().unwrap();
         let layout = Layout {
-            mounts: vec![crate::proxy::Mount {
+            mounts: vec![crate::session::Mount {
                 url: DEVICE.to_string(),
                 source,
                 prefix: DeviceRoute::root(),
             }],
         };
-        let mount = Packet::proxy_request(control::MOUNT, &encode(&layout), 2).unwrap();
+        let mount = Packet::proxy_request(MOUNT, &encode(&layout), 2).unwrap();
         client.end.send(&mount).await;
         let mut device = opened(&mut client.devices).await;
         let root = DeviceRoute::root();
@@ -1144,7 +1145,7 @@ mod tests {
         }
         let error = ended(client).await;
         assert!(matches!(error, ClientError::HungUp), "{error}");
-        assert!(stalled.elapsed() < control::PROXY_KEEPALIVE.quiet);
+        assert!(stalled.elapsed() < PROXY_KEEPALIVE.quiet);
     }
 
     /// A proxy that stops queues its status behind everything a stalled
@@ -1426,7 +1427,7 @@ mod tests {
             assert!(matches!(pkt.payload(), Payload::ProxyRx(ProxyRx::Alive)));
         }
 
-        assert_eq!(connected.elapsed(), control::PROXY_KEEPALIVE.quiet);
+        assert_eq!(connected.elapsed(), PROXY_KEEPALIVE.quiet);
         assert!(client.devices.try_recv().is_err(), "a device was opened");
     }
 
@@ -1444,7 +1445,7 @@ mod tests {
             alive += 1;
         }
 
-        assert_eq!(quiet.elapsed(), control::PROXY_KEEPALIVE.quiet);
+        assert_eq!(quiet.elapsed(), PROXY_KEEPALIVE.quiet);
         assert_eq!(alive, 4);
     }
 
@@ -1522,7 +1523,7 @@ mod tests {
             route: root,
             table: false,
         });
-        end.send(&Packet::proxy_request(control::WATCH, &watch, 3).unwrap())
+        end.send(&Packet::proxy_request(WATCH, &watch, 3).unwrap())
             .await;
         for _ in 0..1000 {
             tokio::task::yield_now().await;
@@ -1546,7 +1547,7 @@ mod tests {
             matches!(served, Some(Err(ClientError::Stopped))),
             "{served:?}"
         );
-        assert!(stopping.elapsed() < control::PROXY_KEEPALIVE.quiet);
+        assert!(stopping.elapsed() < PROXY_KEEPALIVE.quiet);
         assert!(stopped, "the stop never arrived");
     }
 
@@ -1565,7 +1566,7 @@ mod tests {
             ))
         };
         let (old, new) = (table(1), table(2));
-        let settings = crate::device::Settings::new(Arc::clone(&old), Some(1), Default::default());
+        let settings = crate::session::Settings::new(Arc::clone(&old), Some(1), Default::default());
         lock(&store).set_registry(route, Ok(Arc::clone(&old)));
         lock(&store).set_settings(route, Arc::new(settings));
         let mut updates = table_updates(&store, route);
@@ -1586,7 +1587,7 @@ mod tests {
         assert_eq!(ready(&mut updates), [Update::Presence(Err(None))]);
 
         for session in 0..1000 {
-            let alive = crate::device::Presence::Alive {
+            let alive = crate::session::Presence::Alive {
                 session: Some(crate::proto::SessionId::new(session)),
             };
             lock(&store).set(route, PRESENCE, alive);
@@ -1608,13 +1609,13 @@ mod tests {
             SettingChange::new("test.amplitude".to_string(), seq, vec![1], None)
         };
         let missed = 10;
-        let sent = crate::device::store::CHANGE_QUEUE_LEN + missed;
+        let sent = crate::session::CHANGE_QUEUE_LEN + missed;
         for seq in 0..sent {
             lock(&store).set(route, CHANGES, change(seq));
         }
         let first = ready(&mut updates);
         assert_eq!(first[0], Update::Recorded(None));
-        assert_eq!(first.len(), crate::device::store::CHANGE_QUEUE_LEN + 1);
+        assert_eq!(first.len(), crate::session::CHANGE_QUEUE_LEN + 1);
 
         lock(&store).set(route, CHANGES, change(sent));
         assert_eq!(

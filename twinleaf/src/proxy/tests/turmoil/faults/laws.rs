@@ -11,7 +11,7 @@ use super::{
     QUIET, RECONNECT, RECONNECT_INTERVAL, RECONNECT_TRY, REOPEN_FOR, REOPEN_WAIT, SAMPLE_GAP,
     SOCKET_LOSS, WINDOW,
 };
-use crate::device::RecvError;
+use crate::session::RecvError;
 use crate::tio::packet::LinkStatus;
 use std::collections::{BTreeMap, BTreeSet};
 

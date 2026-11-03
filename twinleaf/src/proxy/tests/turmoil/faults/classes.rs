@@ -5,7 +5,7 @@ use super::laws::{root_presence, status_is, Judge};
 use super::model::{meets, merged};
 use super::schedule::{plan, within_margin, Host, Pair, Step};
 use super::QUIET;
-use crate::device::RecvError;
+use crate::session::RecvError;
 use crate::tio::packet::LinkStatus;
 use std::collections::BTreeSet;
 

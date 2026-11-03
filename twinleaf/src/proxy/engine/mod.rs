@@ -41,19 +41,17 @@
 mod metadata;
 mod settings;
 
-use super::control::Update;
 use super::outbox::{ClientError, Outbox};
-use super::Watch;
 use crate::chan::lock;
 use crate::chan::AbortOnDropHandle;
 use crate::data::{MetadataQuery, PacketParser};
-use crate::device::rpc::{PendingReply, RpcRegistry};
-use crate::device::session::{Handle, Inlet, RawCallResult, Received, Session};
-use crate::device::store::{pruned, rpc_hash, Store, METADATA, PRESENCE};
-use crate::device::stream::Queued;
-use crate::device::{MetadataState, Presence, Settings};
 use crate::proto::{DeviceRoute, RouteError};
 use crate::rt::{sleep_until_some, Supervisor};
+use crate::session::rpc::{PendingReply, RpcRegistry};
+use crate::session::Queued;
+use crate::session::{pruned, rpc_hash, Store, METADATA, PRESENCE};
+use crate::session::{Handle, Inlet, RawCallResult, Received, Session, Update, Watch};
+use crate::session::{MetadataState, Presence, Settings};
 use crate::tio::packet::{self, LinkStatus, Packet};
 use metadata::{Completed, MetadataSchedule};
 use settings::{CacheAction, DeviceEvent, SettingsCache};

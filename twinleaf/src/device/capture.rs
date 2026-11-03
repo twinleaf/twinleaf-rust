@@ -6,11 +6,11 @@
 //! sequence.
 
 use super::connection::Device;
-use super::rpc::CallError;
 use crate::data::ColumnData;
 use crate::proto::capture as wire;
 use crate::proto::data::DataType;
 use crate::proto::rpc::RpcError;
+use crate::session::rpc::CallError;
 use std::time::{Duration, Instant};
 
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);

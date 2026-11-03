@@ -4,16 +4,17 @@
 
 use crate::chan::lock;
 use crate::data::SampleBatch;
-use crate::device::session::{Handle, Session, TestProxy};
-use crate::device::store::{Store, CHANGES, METADATA, PRESENCE};
-use crate::device::stream::{Receiver, RecvError, Scope, Stream};
+use crate::device::stream::Stream;
 use crate::device::tests::fixtures::{broadcast, metadata_records, segment_record};
-use crate::device::{MetadataState, Presence, SettingChange};
 use crate::proto::data as wire;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
-use crate::proxy::{decode, parts, Update, Watch, WATCH};
 use crate::rt::Supervisor;
 use crate::seam::shuttle::{check, replaying};
+use crate::session::{decode, parts, Update, Watch, WATCH};
+use crate::session::{Handle, Session, TestProxy};
+use crate::session::{MetadataState, Presence, SettingChange};
+use crate::session::{Receiver, RecvError, Scope};
+use crate::session::{Store, CHANGES, METADATA, PRESENCE};
 use crate::tio::packet::{LinkStatus, Packet, Payload};
 use ::shuttle::future::{block_on, spawn};
 use ::shuttle::thread;

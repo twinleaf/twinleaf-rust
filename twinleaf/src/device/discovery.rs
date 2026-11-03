@@ -8,15 +8,13 @@
 
 use super::connection::NamedRoute;
 use super::connection::{Connection, DeviceTree};
-use super::rpc::RpcReply;
 use super::runtime::chosen_proxy;
-use super::session::ProxyAddress;
-use super::session::Session;
-use super::stream::RecvError;
 use crate::chan::{oneshot, StreamMap};
 use crate::proto::DeviceRoute;
-use crate::proxy::Purpose;
 use crate::rt::{BoxFuture, Supervisor};
+use crate::session::rpc::RpcReply;
+use crate::session::Session;
+use crate::session::{ProxyAddress, Purpose, RecvError};
 #[doc(inline)]
 pub use crate::tio::transport::{enumerate_serial, DiscoveredDevice, PortInterface};
 use std::collections::BTreeSet;
@@ -893,12 +891,12 @@ fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chan::lock;
-    use crate::device::session::TestProxy;
     use crate::device::tests::fixtures::{self, FakeDevice, ENVIRONMENT, WAIT};
     use crate::proto::rpc::Method;
     use crate::proxy::tests::fixtures::{assert_took, options, PAUSED_WAIT};
     use crate::proxy::Proxy;
     use crate::rt;
+    use crate::session::TestProxy;
     use crate::tio::packet::Payload;
     use crate::tio::Packet;
     use std::sync::atomic::{AtomicBool, Ordering};

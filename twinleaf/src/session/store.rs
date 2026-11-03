@@ -21,14 +21,14 @@
 //! connection, which its pump fills from those watches, and holds no value
 //! it has not received.
 
+use super::control::{Update, Watch, CHANGED, TIMED_OUT, UNANSWERED};
 use super::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
-use super::stream::{End, Lane, Receiver, Scope, Sink};
+use super::subscription::{End, Lane, Receiver, Scope, Sink};
 use crate::chan::Notify;
 use crate::data::PacketParser;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId};
-use crate::proxy::{Update, Watch, CHANGED, TIMED_OUT, UNANSWERED};
 use crate::tio::packet::Packet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{poll_fn, Future};
@@ -635,9 +635,9 @@ fn in_scope(routes: &BTreeSet<DeviceRoute>, scope: Scope) -> Vec<DeviceRoute> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::rpc::{RpcRegistry, RpcRegistryError, RpcValue};
-    use crate::device::stream::RecvError;
-    use crate::device::SettingValueError;
+    use crate::session::rpc::{RpcRegistry, RpcRegistryError, RpcValue};
+    use crate::session::state::SettingValueError;
+    use crate::session::subscription::RecvError;
     use std::time::Duration;
 
     fn change(seq: u32) -> SettingChange {

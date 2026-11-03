@@ -61,10 +61,10 @@
 //! to the writer behind everything queued before it, and nothing goes after
 //! it.
 
-use super::control::{decode, parts, Part, Update};
 use crate::chan::lock;
 use crate::chan::Notify;
 use crate::proto::data::FIRST_STREAM_ID;
+use crate::session::{decode, parts, Part, Update};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use std::collections::VecDeque;
 use std::sync::Mutex;
