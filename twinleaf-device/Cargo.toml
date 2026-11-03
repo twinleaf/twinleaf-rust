@@ -21,3 +21,4 @@ twinleaf-proto = { version = "0.1", path = "../twinleaf-proto" }
 
 [dev-dependencies]
 proptest = "1"
+twinleaf-proto = { version = "0.1", path = "../twinleaf-proto", features = ["contract"] }

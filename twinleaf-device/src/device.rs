@@ -3092,4 +3092,297 @@ mod tests {
             "owed for another period"
         );
     }
+
+    /// A device and its streams on one port, run by a platform the way a board's tasks run them.
+    mod contract {
+        use super::*;
+        use crate::data::Timeref;
+        use proptest::prelude::*;
+        use twinleaf_proto::contract::{self, Observed, Sender};
+        use twinleaf_proto::sync::Epoch;
+        use twinleaf_proto::DeviceRoute;
+
+        const RATE: u32 = 10;
+        const SECOND: u64 = 1_000_000_000;
+
+        /// What a host asks or a platform does next.
+        #[derive(Debug, Clone)]
+        enum Step {
+            /// Every stream takes this many samples, a period apart.
+            Sample(u32),
+            /// Every stream loses this many samples.
+            Skip(u32),
+            /// A host asks this RPC by name with these argument bytes.
+            Ask(&'static str, Vec<u8>),
+            /// A stream acquires with this decimation, enabled or not, from its next segment.
+            Retune(usize, u32, bool),
+            /// A stream begins a new segment.
+            Rollover(usize),
+            /// The time reference is replaced by one this many seconds ahead, or behind.
+            Relabel(i32),
+            /// The clock moves this many nanoseconds on.
+            Wait(u64),
+            /// A host connects.
+            Connect,
+            /// The device boots again into the next session.
+            Reboot,
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                4 => (1..30u32).prop_map(Step::Sample),
+                1 => (1..20u32).prop_map(Step::Skip),
+                4 => prop::sample::select(&["dev.start", "dev.stop", "dev.restart"][..])
+                    .prop_map(|name| Step::Ask(name, Vec::new())),
+                1 => any::<u32>().prop_map(|value| Step::Ask("board.first", value.to_le_bytes().to_vec())),
+                2 => (0..2usize, 1..=3u32, any::<bool>())
+                    .prop_map(|(stream, decimation, enabled)| Step::Retune(stream, decimation, enabled)),
+                1 => (0..2usize).prop_map(Step::Rollover),
+                1 => (-5..=5i32).prop_map(Step::Relabel),
+                2 => (0..2 * HEARTBEAT_INTERVAL).prop_map(Step::Wait),
+                1 => Just(Step::Connect),
+                1 => Just(Step::Reboot),
+            ]
+        }
+
+        fn params(decimation: u32, enabled: bool) -> Params {
+            Params {
+                rate: NonZeroU32::new(RATE).unwrap(),
+                decimation: NonZeroU32::new(decimation).unwrap(),
+                enabled,
+            }
+        }
+
+        /// Two streams, one sending a packet every four samples and one only when full.
+        fn streams() -> [DataStream<4>; 2] {
+            let stream = |id| {
+                let filter = Box::leak(Box::new(Butterworth4::<1>::new()));
+                DataStream::new(StreamId::new(id), &AUX, filter, params(1, true)).unwrap()
+            };
+            [stream(1).batched(16), stream(2)]
+        }
+
+        /// The platform, and every packet on its port with the nanosecond it went.
+        struct Platform {
+            device: Device<Board>,
+            streams: [DataStream<4>; 2],
+            port: Sent,
+            times: Vec<u64>,
+            now: u64,
+            /// The time reference's seconds ahead of the clock's.
+            offset: i64,
+            /// The time reference's session, one more at each relabel.
+            reference: u32,
+            running: bool,
+        }
+
+        impl Platform {
+            fn new() -> Self {
+                let mut platform = Self {
+                    device: device(table()),
+                    streams: streams(),
+                    port: Sent::default(),
+                    times: Vec::new(),
+                    now: BOOT,
+                    offset: 0,
+                    reference: 1,
+                    running: false,
+                };
+                platform.take(&Step::Connect);
+                platform
+            }
+
+            fn timeref(&self) -> Timeref {
+                let second = (self.now / SECOND) as i64 + self.offset;
+                Timeref::new(
+                    Epoch::UNIX,
+                    second as u32,
+                    SessionId::new(self.reference),
+                    "REF",
+                )
+                .unwrap()
+            }
+
+            fn take(&mut self, step: &Step) {
+                match *step {
+                    Step::Sample(count) => (0..count).for_each(|_| {
+                        self.now += SECOND / u64::from(RATE);
+                        self.streams
+                            .iter_mut()
+                            .for_each(|stream| stream.push(&1.0f32.to_le_bytes(), &mut self.port));
+                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                    }),
+                    Step::Skip(count) => {
+                        self.now += u64::from(count) * SECOND / u64::from(RATE);
+                        self.streams
+                            .iter_mut()
+                            .for_each(|stream| stream.skip(count));
+                    }
+                    Step::Ask(name, ref args) => self.ask(name, args),
+                    Step::Retune(stream, decimation, enabled) => {
+                        self.streams[stream].retune(params(decimation, enabled))
+                    }
+                    Step::Rollover(stream) => self.streams[stream].rollover(),
+                    Step::Relabel(shift) => {
+                        let from = self.timeref().start_time;
+                        self.offset += i64::from(shift);
+                        self.reference += 1;
+                        let to = self.timeref();
+                        self.streams
+                            .iter_mut()
+                            .for_each(|stream| stream.relabel(from, to.clone()));
+                    }
+                    Step::Wait(ns) => {
+                        self.now += ns;
+                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                    }
+                    Step::Connect => {
+                        self.device
+                            .connected(&self.streams[..], self.now, &mut self.port)
+                    }
+                    Step::Reboot => {
+                        let session = SessionId::new(self.device.session.value().wrapping_add(1));
+                        self.device.reboot(session, self.now);
+                        self.device.set_acquisition(AcquisitionState::Idle);
+                        self.streams = streams();
+                        self.running = false;
+                        self.device
+                            .connected(&self.streams[..], self.now, &mut self.port);
+                    }
+                }
+                self.times.resize(self.port.0.len(), self.now);
+            }
+
+            /// A host's request and what the device and the platform answer, all on the port.
+            fn ask(&mut self, name: &str, args: &[u8]) {
+                let request = asking(Method::ByName(name.as_bytes()), args, &[]);
+                self.port.send(&request);
+                let (view, _) = PacketView::parse_prefix(&request).unwrap();
+                let Actions { call, deferred, .. } = self.device.handle(
+                    &self.streams[..],
+                    Input::Packet(view),
+                    self.now,
+                    &mut OneLane(&mut self.port),
+                );
+                if let Some((pending, _, _)) = call {
+                    answer(pending, Err(RpcError::NotFound), &mut self.port);
+                }
+                match deferred {
+                    Some((pending, Deferred::Acquire(request))) => self.acquire(pending, request),
+                    Some((pending, Deferred::Flash(_))) => {
+                        answer(pending, Err(RpcError::State), &mut self.port)
+                    }
+                    None => {}
+                }
+            }
+
+            /// Carry out a start, stop or restart: a stop flushes what its streams staged before it answers,
+            /// and a start answers first and begins on the second after next.
+            fn acquire(&mut self, pending: Pending<'_>, request: SyncRequest) {
+                match (request, self.running) {
+                    (SyncRequest::Start, true) => {
+                        answer(pending, Err(RpcError::State), &mut self.port)
+                    }
+                    (SyncRequest::Start, false) => {
+                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
+                        self.start();
+                    }
+                    (SyncRequest::Stop, _) => {
+                        self.stop();
+                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
+                    }
+                    (SyncRequest::Restart, _) => {
+                        self.stop();
+                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
+                        self.start();
+                    }
+                }
+            }
+
+            fn start(&mut self) {
+                self.now = (self.now / SECOND + 2) * SECOND;
+                let timeref = self.timeref();
+                self.streams.iter_mut().for_each(|stream| {
+                    stream
+                        .start(timeref.clone())
+                        .expect("a stopped stream starts")
+                });
+                self.device.set_acquisition(AcquisitionState::Running);
+                self.running = true;
+            }
+
+            fn stop(&mut self) {
+                self.streams.iter_mut().for_each(|stream| {
+                    stream.stop();
+                    stream.flush(&mut self.port);
+                });
+                self.device.set_acquisition(AcquisitionState::Idle);
+                self.running = false;
+            }
+
+            fn trace(&self) -> Vec<Observed<'_>> {
+                self.port
+                    .views()
+                    .into_iter()
+                    .zip(&self.times)
+                    .map(|(packet, &arrival_ns)| Observed {
+                        arrival_ns,
+                        route: DeviceRoute::root(),
+                        sender: match packet.header.ptype {
+                            PacketType::RPC_REQ => Sender::Host,
+                            _ => Sender::Device,
+                        },
+                        packet,
+                    })
+                    .collect()
+            }
+        }
+
+        proptest! {
+            /// Whatever a host asks and the platform does, starting, stopping, retuning, rolling
+            /// over, relabelling and rebooting, every packet on the port keeps the contract.
+            #[test]
+            fn a_device_keeps_the_contract(steps in prop::collection::vec(step(), 1..40)) {
+                let mut platform = Platform::new();
+                steps.iter().for_each(|step| platform.take(step));
+                prop_assert_eq!(contract::check(&platform.trace()), []);
+            }
+        }
+
+        /// A segment that reaches the sample numbers a packet carries rolls over at its next
+        /// whole second and keeps the contract across it.
+        #[test]
+        fn the_wire_limit_rollover_keeps_the_contract() {
+            let mut platform = Platform::new();
+            platform.take(&Step::Ask("dev.start", Vec::new()));
+            platform.take(&Step::Sample(5));
+            platform.take(&Step::Skip(15_999_990));
+            platform.take(&Step::Sample(30));
+            let rows =
+                platform.port.views().into_iter().filter_map(|view| {
+                    twinleaf_proto::data::Samples::parse(view.header, view.payload)
+                });
+            assert!(
+                rows.map(|row| row.segment_id.value()).any(|id| id == 1),
+                "it rolled over"
+            );
+            assert_eq!(contract::check(&platform.trace()), []);
+        }
+
+        /// A time reference four seconds behind lands a stream's fifth segment on the first's id
+        /// and start, which is lawful as the reference is another.
+        #[test]
+        fn a_reference_that_steps_back_keeps_the_contract() {
+            let mut platform = Platform::new();
+            platform.take(&Step::Ask("dev.start", Vec::new()));
+            platform.take(&Step::Sample(10));
+            platform.take(&Step::Relabel(-4));
+            (0..3).for_each(|_| {
+                platform.take(&Step::Sample(10));
+                platform.take(&Step::Rollover(0));
+            });
+            platform.take(&Step::Sample(10));
+            assert_eq!(contract::check(&platform.trace()), []);
+        }
+    }
 }
