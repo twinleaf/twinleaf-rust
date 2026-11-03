@@ -63,8 +63,8 @@ pub enum Law {
     /// A segment's rows never number back after a row of another segment of
     /// its stream, so no second acquisition reuses its id, start and reference.
     S4,
-    /// A record that moves a segment id's start or reference between two of its
-    /// rows restarts the count, so the next row numbers no higher than the last.
+    /// A record that moves a segment id's start or reference between two of its rows, with no
+    /// record of another id between them, restarts the count, so the next row numbers no higher.
     S5,
     /// After a host asks `dev.stop` or `dev.restart` by name, `dev.running` 0
     /// is announced before the first record of a segment not recorded before.
@@ -169,7 +169,7 @@ fn s5(stream: &Stream, row: Row) -> bool {
     let Some(before) = stream
         .last_row
         .as_ref()
-        .filter(|before| before.id == segment.id && *before != segment)
+        .filter(|before| !stream.crossed && before.id == segment.id && *before != segment)
     else {
         return true;
     };
@@ -214,6 +214,8 @@ struct Stream {
     /// Every segment recorded, with the last sample number of its rows.
     runs: BTreeMap<Segment, Option<u32>>,
     last_row: Option<Segment>,
+    /// Whether a record of another segment id came since the last row.
+    crossed: bool,
 }
 
 impl Stream {
@@ -338,6 +340,10 @@ impl Device {
             timeref_serial: record.timeref_serial.into(),
         };
         let stream = self.streams.entry(record.stream_id).or_default();
+        stream.crossed |= stream
+            .last_row
+            .as_ref()
+            .is_some_and(|last| last.id != segment.id);
         stream.records.insert(segment.id, segment.clone());
         stream.latest = Some(segment.clone());
         if stream.runs.contains_key(&segment) {
@@ -377,6 +383,7 @@ impl Device {
         ];
         let broken = laws.into_iter().find(|(_, holds)| !holds(stream, row));
         stream.last_row = stream.segment(row).cloned();
+        stream.crossed = false;
         if let Some(segment) = &stream.last_row {
             stream.runs.insert(segment.clone(), Some(row.last));
         }
@@ -634,6 +641,24 @@ mod tests {
                 ],
                 vec![record(0, 100), row(0, 4), record(0, 105), row(0, 5)],
                 3,
+            ),
+            (
+                Law::S5,
+                vec![
+                    record(0, 100),
+                    row(0, 4),
+                    record(1, 101),
+                    record(0, 105),
+                    row(0, 5),
+                ],
+                vec![
+                    record(0, 100),
+                    row(0, 4),
+                    record(0, 101),
+                    record(0, 105),
+                    row(0, 5),
+                ],
+                4,
             ),
             (
                 Law::R1,
