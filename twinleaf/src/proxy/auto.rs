@@ -2,7 +2,7 @@
 //! layout, the one device in use, or the one device attached.
 
 use super::link::{Candidate, Link};
-use super::Layout;
+use crate::session::Layout;
 use crate::tio::transport::{self, PortInterface};
 
 /// The target that opens the host's default layout.

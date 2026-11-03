@@ -24,13 +24,13 @@
 use super::engine::{self, Mount, Mounts};
 use super::outbox::Outbox;
 use super::worker::{self, OpenPort, Opener, Readiness};
-use super::{DumpFlags, Layout, IDLE, LEAVE_TIMEOUT};
+use super::{DumpFlags, IDLE, LEAVE_TIMEOUT};
 use crate::chan::{oneshot, JoinHandle};
 use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
-use crate::session::Refusal;
 use crate::session::Store;
+use crate::session::{Layout, Refusal};
 use crate::tio::packet::Packet;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;

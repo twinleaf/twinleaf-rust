@@ -6,14 +6,13 @@ use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
 use crate::rt::Supervisor;
-use crate::session::rpc::{
-    CallError, PendingReply, RpcArgs, RpcMeta, RpcRegistry, RpcRegistryError, RpcReply,
-};
+use crate::session::rpc::{CallError, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError};
 use crate::session::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
 use crate::session::{Handle, Session};
 use crate::session::{Layout, ProxyAddress, Purpose, Receiver, RecvError, Scope};
 use crate::session::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::tio;
+use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport::is_local_tcp;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

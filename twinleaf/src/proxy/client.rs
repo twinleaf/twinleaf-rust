@@ -16,14 +16,13 @@ use super::link::{Link, Mounted};
 use super::outbox::{ClientError, Outbox, Taken};
 use super::table::{Notice, Shared, TableChange};
 use super::worker;
-use super::Layout;
 use crate::chan::oneshot::{self, error::TryRecvError};
 use crate::chan::{lock, StreamMap};
 use crate::proto::rpc::{Method, RpcError};
 use crate::proto::{DeviceRoute, PacketType, SessionId, TCP_DEFAULT_PORT};
 use crate::rt::{finish, BoxFuture};
-use crate::session::Scope;
 use crate::session::{answer, encode, Introduction, AUTO, PROXY_KEEPALIVE};
+use crate::session::{Layout, Scope};
 use crate::session::{Purpose, Refusal, Request, Update, Watch};
 use crate::session::{Receiver, RecvError, SettingChange};
 use crate::session::{Store, CHANGES, PRESENCE, REGISTRY, SETTINGS};
@@ -1559,7 +1558,7 @@ mod tests {
         let store = Mutex::new(Store::new(true));
         let route = DeviceRoute::root();
         let table = |hash| {
-            Arc::new(crate::device::rpc::RpcRegistry::from_entries(
+            Arc::new(crate::session::rpc::RpcRegistry::from_entries(
                 Vec::new(),
                 Some(hash),
                 None,

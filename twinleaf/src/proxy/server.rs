@@ -6,13 +6,13 @@ use super::client::{Client, SOCKET_QUEUE};
 use super::link::{Links, Owner};
 use super::table::{Notice, Shared, TableChange};
 use super::worker;
-use super::{
-    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, IDLE, LEAVE_TIMEOUT,
-};
+use super::{answers_async, endpoint_at, ClientInfo, HostOptions, Listen, IDLE, LEAVE_TIMEOUT};
 use crate::chan::oneshot;
 use crate::net::{Listeners, TcpStream};
 use crate::rt::{sleep_until_some, Supervisor};
-use crate::session::{call_at, decode, encode, older_build, Introduction, HELLO, HELLO_TIMEOUT};
+use crate::session::{
+    call_at, decode, encode, older_build, Introduction, Layout, HELLO, HELLO_TIMEOUT,
+};
 use crate::tio::transport;
 use std::collections::BTreeMap;
 use std::convert::Infallible;

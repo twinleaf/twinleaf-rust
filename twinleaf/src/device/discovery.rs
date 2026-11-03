@@ -12,9 +12,9 @@ use super::runtime::chosen_proxy;
 use crate::chan::{oneshot, StreamMap};
 use crate::proto::DeviceRoute;
 use crate::rt::{BoxFuture, Supervisor};
-use crate::session::rpc::RpcReply;
 use crate::session::Session;
 use crate::session::{ProxyAddress, Purpose, RecvError};
+use crate::tio::rpc::RpcReply;
 #[doc(inline)]
 pub use crate::tio::transport::{enumerate_serial, DiscoveredDevice, PortInterface};
 use std::collections::BTreeSet;

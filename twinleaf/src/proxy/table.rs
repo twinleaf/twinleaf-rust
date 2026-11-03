@@ -2,10 +2,10 @@
 //! proxy's server and its clients' tasks share.
 
 use super::link::Links;
-use super::{HostOptions, Layout};
+use super::HostOptions;
 use crate::chan::oneshot;
 use crate::rt::Supervisor;
-use crate::session::Introduction;
+use crate::session::{Introduction, Layout};
 use std::sync::Mutex;
 use tokio::sync::{mpsc, watch};
 
