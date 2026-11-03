@@ -2,14 +2,15 @@
 mod shuttle;
 
 use super::*;
-use crate::data::{Boundary, Change, Loss};
-use crate::device::tests::fixtures::{
-    announcement, broadcast, description, metadata_records, samples, wait_for,
+use crate::data::tests::fixtures::{
+    announcement, broadcast, description, metadata_records, samples,
 };
+use crate::data::{Boundary, Change, Loss};
 use crate::proto::SampleNumber;
 use crate::proto::SessionId as WireSessionId;
 use crate::rt::Supervisor;
 use crate::session::rpc::RpcValue;
+use crate::session::tests::wait_for;
 use crate::session::{decode, RecvError, Update};
 use crate::session::{MetadataState, Presence};
 use crate::session::{Session, TestProxy};

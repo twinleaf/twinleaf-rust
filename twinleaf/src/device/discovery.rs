@@ -891,13 +891,15 @@ fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chan::lock;
-    use crate::device::tests::fixtures::{self, FakeDevice, ENVIRONMENT, WAIT};
+    use crate::device::tests::fixtures::{self, ENVIRONMENT};
     use crate::proto::rpc::Method;
-    use crate::proxy::tests::fixtures::{assert_took, options, PAUSED_WAIT};
+    use crate::proxy::tests::fixtures::{attached, options};
     use crate::proxy::Proxy;
     use crate::rt;
     use crate::session::TestProxy;
     use crate::tio::packet::Payload;
+    use crate::tio::tests::device::FakeDevice;
+    use crate::tio::tests::{assert_took, ClosedPort, PAUSED_WAIT, WAIT};
     use crate::tio::Packet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1223,7 +1225,7 @@ mod tests {
         let _environment = lock(&ENVIRONMENT);
         let device = FakeDevice::start();
         let named = fixtures::proxy_serving(&device.url);
-        let closed = fixtures::ClosedPort::new();
+        let closed = ClosedPort::new();
         let silent = closed.url();
 
         std::env::set_var("TWINLEAF_PROXY", &silent);
@@ -1245,7 +1247,7 @@ mod tests {
         assert_eq!(name.as_deref(), Some("FAKE"));
         assert_eq!(device.accepted(), 1);
         // With no device attached, auto finds the probed one no choice.
-        if fixtures::attached() == 0 {
+        if attached() == 0 {
             let auto = fixtures::open_through(&proxy, "auto");
             assert!(auto.is_err(), "a probe made the device a choice for auto");
         }
@@ -1259,7 +1261,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TWINLEAF_TIO", dir.path().join("no-such-tio"));
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
-        let closed = fixtures::ClosedPort::new();
+        let closed = ClosedPort::new();
         let silent = closed.url();
         std::env::set_var("TWINLEAF_PROXY", &silent);
 

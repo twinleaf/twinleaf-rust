@@ -930,7 +930,7 @@ impl Session {
     /// answers. The pump hears each such loss.
     pub(crate) fn test_pair_reopening(tasks: &Supervisor) -> (Session, TestProxy) {
         let nowhere = ProxyAddress {
-            url: crate::proxy::tests::fixtures::UNREACHABLE.to_string(),
+            url: crate::tio::tests::UNREACHABLE.to_string(),
             ensure: None,
         };
         let reopen = (nowhere, Purpose::Use.method(), encode(&AUTO));
@@ -953,21 +953,30 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::device::tests::fixtures::{self, FakeDevice};
     use crate::proto::rpc::{Method, RpcError};
     use crate::proto::PacketType;
-    use crate::proxy::tests::fixtures::assert_took;
     use crate::rt::BoxFuture;
+    use crate::tio::tests::device::FakeDevice;
+    use crate::tio::tests::{assert_took, ClosedPort, WAIT};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
 
-    /// The longest any step of a test waits.
-    const WAIT: Duration = Duration::from_secs(5);
+    /// Takes items until one matches and returns it, or panics rather than
+    /// block forever.
+    pub(crate) fn wait_for<T>(items: &Receiver<T>, wanted: impl Fn(&T) -> bool) -> T {
+        let deadline = std::time::Instant::now() + WAIT;
+        while let Ok(item) = items.recv_deadline(deadline) {
+            if wanted(&item) {
+                return item;
+            }
+        }
+        panic!("what the test waited for never came");
+    }
 
     /// What a fake proxy is asked to open. Nothing is ever dialed there.
     const TARGET: &str = "tcp://192.0.2.1:9";
@@ -1603,7 +1612,7 @@ mod tests {
     /// to finish, so a proxy it hosts stays up for the opens after it.
     #[test]
     fn an_open_given_up_leaves_the_proxy_it_starts_to_finish() {
-        let closed = fixtures::ClosedPort::new();
+        let closed = ClosedPort::new();
         let machine = ProxyAddress {
             url: closed.url(),
             ensure: Some(slow_refusal),
@@ -1648,7 +1657,7 @@ mod tests {
     /// answered there.
     #[test]
     fn only_a_refused_machine_address_finds_or_starts_the_proxy() {
-        let closed = fixtures::ClosedPort::new();
+        let closed = ClosedPort::new();
         let named = ProxyAddress {
             url: closed.url(),
             ensure: None,

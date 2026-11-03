@@ -1,2 +1,1 @@
-mod boundaries;
-pub(super) mod fixtures;
+pub(crate) mod fixtures;

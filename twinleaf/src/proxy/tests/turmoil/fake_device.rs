@@ -3,12 +3,12 @@
 
 use super::{child, faults, World, CHILD_REBOOT_STEP, DEVICE_PORT, TABLE_HASH};
 use crate::chan::sleep_until;
-use crate::device::tests::fixtures::{description, metadata_records};
+use crate::data::tests::fixtures::{description, metadata_records};
 use crate::net::{TcpListener, TcpStream};
 use crate::proto::rpc::Method;
 use crate::proto::DeviceRoute;
-use crate::proxy::tests::fixtures::answer;
 use crate::tio::packet::{Packet, Payload};
+use crate::tio::tests::device::answer;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;

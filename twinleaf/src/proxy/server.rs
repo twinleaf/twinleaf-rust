@@ -476,9 +476,10 @@ fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr]
 #[cfg(not(turmoil))]
 mod tests {
     use super::*;
-    use crate::proxy::tests::fixtures::{assert_took, binds_every_interface, options, PAUSED_WAIT};
+    use crate::proxy::tests::fixtures::options;
     use crate::proxy::DumpFlags;
     use crate::rt;
+    use crate::tio::tests::{assert_took, binds_every_interface, PAUSED_WAIT};
     use socket2::SockRef;
     use std::net::TcpListener;
     use std::thread;

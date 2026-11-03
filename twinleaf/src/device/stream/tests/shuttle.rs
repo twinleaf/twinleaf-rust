@@ -3,9 +3,9 @@
 //! proxy and readers as shuttle threads and tasks.
 
 use crate::chan::lock;
+use crate::data::tests::fixtures::{broadcast, metadata_records, segment_record};
 use crate::data::SampleBatch;
 use crate::device::stream::Stream;
-use crate::device::tests::fixtures::{broadcast, metadata_records, segment_record};
 use crate::proto::data as wire;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
 use crate::rt::Supervisor;

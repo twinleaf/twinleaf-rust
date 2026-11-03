@@ -25,6 +25,8 @@
 pub(crate) mod mdns;
 pub mod packet;
 pub(crate) mod rpc;
+#[cfg(test)]
+pub(crate) mod tests;
 pub(crate) mod transport;
 
 pub use packet::Packet;

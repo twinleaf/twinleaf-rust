@@ -1,10 +1,12 @@
-use super::fixtures::{options, FakeDevice, WAIT};
+use super::fixtures::options;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::proxy::*;
-use crate::rt::{self, Supervisor};
+use crate::rt::Supervisor;
 use crate::session::{decode, encode, Introduction};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
+use crate::tio::tests::device::FakeDevice;
+use crate::tio::tests::WAIT;
 use crate::tio::transport;
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -979,84 +981,4 @@ fn clients_lists_who_said_hello_and_what_they_opened() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(proxy.clients()[0].name.as_deref(), Some("mine"));
-}
-
-/// The layout that mounts each of `devices` at a prefix of its own, and
-/// the prefixes.
-fn each_at_its_own_prefix(devices: &[FakeDevice]) -> (Layout, Vec<DeviceRoute>) {
-    let prefixes: Vec<DeviceRoute> = (1..=devices.len())
-        .map(|place| format!("/{place}").parse().unwrap())
-        .collect();
-    let mounts = devices.iter().zip(&prefixes).map(|(device, prefix)| Mount {
-        url: device.url.clone(),
-        source: DeviceRoute::root(),
-        prefix: *prefix,
-    });
-    let layout = Layout {
-        mounts: mounts.collect(),
-    };
-    (layout, prefixes)
-}
-
-/// A proxy hosted and a connection opened through the async entry points
-/// run every task on the runtime they are awaited on, here one of a
-/// single thread, and never reach the crate's runtime. The proxy keeps
-/// the tables and settings of several devices there.
-#[test]
-fn a_proxy_and_a_connection_run_on_the_runtime_they_are_awaited_on() {
-    let devices: Vec<FakeDevice> = (0..3).map(|_| FakeDevice::start()).collect();
-    let (layout, prefixes) = each_at_its_own_prefix(&devices);
-    let caller = std::thread::spawn(move || {
-        rt::forbid_crate_runtime();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .on_thread_start(rt::forbid_crate_runtime)
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let proxy = host(options()).await.unwrap();
-            let address = crate::session::ProxyAddress {
-                url: proxy.endpoint(),
-                ensure: None,
-            };
-            let session = crate::session::Session::mount_async(&address, &layout, WAIT);
-            let connection = crate::Connection::over(session.await.unwrap());
-            for prefix in &prefixes {
-                let device = connection.device(*prefix);
-                assert_eq!(device.submit("dev.name", &[]).await.unwrap(), b"FAKE");
-                let followed = device.settings_updates();
-                let settings = tokio::time::timeout(WAIT, followed.recv_async()).await;
-                let settings = settings.expect("the settings in time").unwrap();
-                assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
-            }
-            connection.close();
-            proxy.shutdown_async().await;
-        });
-    });
-    if let Err(panic) = caller.join() {
-        std::panic::resume_unwind(panic);
-    }
-}
-
-/// The synchronous API works from inside an application's tokio runtime
-/// of one thread, where `block_on` panics. It runs on the crate's runtime
-/// and blocks the application's thread until each call is done.
-#[tokio::test]
-async fn the_sync_api_works_inside_an_applications_runtime() {
-    let device = FakeDevice::start();
-    let proxy = Proxy::host(HostOptions {
-        default: Some(Layout::single(&device.url)),
-        ..options()
-    })
-    .unwrap();
-    let connection = crate::Connection::open(&proxy.endpoint()).unwrap();
-
-    let name: String = connection
-        .device(DeviceRoute::root())
-        .get("dev.name")
-        .unwrap();
-
-    assert_eq!(name, "FAKE");
-    drop(connection);
-    drop(proxy);
 }

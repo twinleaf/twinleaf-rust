@@ -411,7 +411,8 @@ fn proxy_named_by(named: Option<String>) -> ProxyAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::tests::fixtures::{self, ENVIRONMENT, WAIT};
+    use crate::device::tests::fixtures::ENVIRONMENT;
+    use crate::tio::tests::{on_free_port, WAIT};
 
     /// Runs [`ensure_proxy_at`] for `port` with `embedded` as its slot.
     /// Returns its outcome and the slot.
@@ -466,7 +467,7 @@ mod tests {
         std::env::set_var("TWINLEAF_TIO", dir.path().join("no-such-tio"));
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, false, Mutex::default());
             embedded
                 .into_inner()
@@ -508,7 +509,7 @@ mod tests {
         std::env::set_var("TWINLEAF_TIO", &old_tio);
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, false, Mutex::default());
             embedded
                 .into_inner()
@@ -540,7 +541,7 @@ mod tests {
         std::env::set_var("TWINLEAF_TIO", &tio);
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, true, Mutex::default());
             embedded
                 .into_inner()
@@ -560,7 +561,7 @@ mod tests {
     #[test]
     fn a_stopped_embedded_proxy_is_hosted_again() {
         let _environment = crate::chan::lock(&ENVIRONMENT);
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, true, Mutex::default());
             let hosted = crate::chan::lock(&embedded).is_some();
             hosted.then_some((port, ensured, embedded))
@@ -605,7 +606,7 @@ mod tests {
             })
         };
 
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let port = closed.port();
         let (done, finished) = std::sync::mpsc::sync_channel::<()>(0);
         let winner = std::thread::spawn(move || {
@@ -617,7 +618,7 @@ mod tests {
         drop(done);
         winner.join().unwrap();
 
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let failed = wait_for_proxy(closed.port(), spawned(3), WAIT)
             .await
             .unwrap_err();
@@ -629,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_that_never_answers_is_killed() {
         let dir = tempfile::tempdir().unwrap();
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id().unwrap().to_string();
         let spawned = SpawnedProxy {
@@ -661,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn a_running_proxy_is_ready_once_its_port_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let port = closed.port();
         let _listener = closed.listen();
         let child = Command::new("sleep")

@@ -851,7 +851,7 @@ fn failed(error: &tokio::task::JoinError) -> Refusal {
 mod tests {
     use super::*;
     use crate::proxy::link::{Links, Owner};
-    use crate::proxy::tests::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
+    use crate::proxy::tests::fixtures::{fakes, opened, options, Opened};
     use crate::proxy::DumpFlags;
     use crate::rt::Supervisor;
     use crate::session::rpc::RpcRegistry;
@@ -859,6 +859,7 @@ mod tests {
     use crate::session::{Inlet, Received, Session};
     use crate::session::{MOUNT, WATCH};
     use crate::tio::packet::{LinkStatus, ProxyRx};
+    use crate::tio::tests::{assert_took, PAUSED_WAIT};
     use crate::tio::transport::tests::fake::{self, FakeEnd};
     use crate::tio::transport::{TransportKind, DEFAULT_RX_CHANNEL_SIZE};
     use std::time::Duration;

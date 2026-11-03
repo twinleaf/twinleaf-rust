@@ -161,7 +161,7 @@ pub mod export;
 pub mod ops;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[doc(no_inline)]
 pub use crate::proto::data::DataType;

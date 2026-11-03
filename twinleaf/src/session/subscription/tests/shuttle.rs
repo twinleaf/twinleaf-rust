@@ -1,8 +1,8 @@
 //! Properties of the lanes under shuttle's schedulers. The pump's end of a
 //! lane sends on one thread while its reader takes items on another.
 
+use crate::data::tests::fixtures::{description, samples};
 use crate::data::{Change, PacketParser, SampleBatch};
-use crate::device::tests::fixtures::{description, samples};
 use crate::proto::{DeviceRoute, SessionId};
 use crate::seam::shuttle::check;
 use crate::session::subscription::{BatchLane, End, Queued, Receiver, RecvError, Scope, Sink};

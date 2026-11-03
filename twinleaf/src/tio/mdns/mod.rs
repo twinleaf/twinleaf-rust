@@ -180,7 +180,7 @@ fn socket_addr(address: &ScopedIp, port: u16) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::tests::fixtures::binds_every_interface;
+    use crate::tio::tests::binds_every_interface;
     use std::net::IpAddr;
 
     /// A resolution dropped while it waits stops its search and gives up the

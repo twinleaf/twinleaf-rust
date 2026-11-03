@@ -154,7 +154,7 @@ enum RunScope {
 /// stream's first data never moves a generation its peers share. A new
 /// generation at an Initial is of a device that started over. Later batches
 /// in scope, from any stream, read the index back.
-pub(super) struct RunTables {
+pub(crate) struct RunTables {
     policy: SplitPolicy,
     level: RunSplitLevel,
     /// `(generation in use, table index)` per scope.
@@ -165,7 +165,7 @@ pub(super) struct RunTables {
 }
 
 impl RunTables {
-    pub(super) fn new(policy: SplitPolicy, level: RunSplitLevel) -> Self {
+    pub(crate) fn new(policy: SplitPolicy, level: RunSplitLevel) -> Self {
         Self {
             policy,
             level,
@@ -184,7 +184,7 @@ impl RunTables {
     }
 
     /// Accounts for one batch and returns `true` if its boundary split the run.
-    pub(super) fn observe(
+    pub(crate) fn observe(
         &mut self,
         key: StreamKey,
         generations: Generations,
@@ -218,7 +218,7 @@ impl RunTables {
 
     /// Returns the table index for a stream's current run, or `None` if runs
     /// do not split.
-    pub(super) fn index(&self, key: StreamKey) -> Option<TableIndex> {
+    pub(crate) fn index(&self, key: StreamKey) -> Option<TableIndex> {
         Some(self.open.get(&self.scope(key)?).map_or(0, |open| open.1))
     }
 }

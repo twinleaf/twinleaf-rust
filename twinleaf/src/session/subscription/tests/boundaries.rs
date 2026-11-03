@@ -29,7 +29,7 @@
 //! when each sample was taken.
 //!
 //! The first batch the reader receives says
-//! [`Change::Initial`](super::Change::Initial), and after a gap it also says
+//! [`Change::Initial`](crate::data::Change::Initial), and after a gap it also says
 //! the loss, as the reader missed the start of the stream. Between two
 //! batches the reader receives, it learns
 //! of each change the device made there and of each sample it lost, and of
@@ -51,7 +51,7 @@
 //! - Otherwise a rollover comes as a `SegmentRollover` naming the segments
 //!   of the two batches, even when segments passed between them.
 //! - A lost sample, the rows the parser lost waiting for a record among
-//!   them, comes as a [`Loss`](super::Loss). A change other than a
+//!   them, comes as a [`Loss`](crate::data::Loss). A change other than a
 //!   rollover names a loss only of the batches the lane dropped. Next to a
 //!   rollover or no change at all, it names the sample due, unless the lane
 //!   dropped batches, so a loss across a rollover comes as both. A loss
@@ -100,12 +100,12 @@
 //! between. A start there sends its record first, as the parser has no
 //! other sign that the slot moved on.
 
-use super::fixtures;
+use crate::data::tests::fixtures;
 use crate::data::{PacketParser, SampleBatch};
 use crate::proto::data as wire;
 use crate::proto::data::DataType;
 use crate::proto::{DeviceRoute, SegmentId, SessionId};
-use crate::session::{BatchLane, Queued};
+use crate::session::subscription::{BatchLane, Queued};
 use crate::tio;
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};

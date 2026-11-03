@@ -694,9 +694,9 @@ pub(super) fn no_default() -> watch::Receiver<Option<Layout>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::tests::fixtures::{
-        assert_took, fakes, opened, FakeDevice, First, Opened, PAUSED_WAIT, UNREACHABLE, WAIT,
-    };
+    use crate::proxy::tests::fixtures::{fakes, opened, First, Opened};
+    use crate::tio::tests::device::FakeDevice;
+    use crate::tio::tests::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Barrier;
     use std::thread;

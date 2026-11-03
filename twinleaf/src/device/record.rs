@@ -792,7 +792,9 @@ mod tests {
     /// only that its stream ended.
     #[test]
     fn a_recording_ends_saying_the_proxy_stopped() {
-        use crate::device::tests::fixtures::{self, FakeDevice, WAIT};
+        use crate::device::tests::fixtures;
+        use crate::tio::tests::device::FakeDevice;
+        use crate::tio::tests::WAIT;
 
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
@@ -822,7 +824,9 @@ mod tests {
     /// nothing itself.
     #[test]
     fn a_recording_describes_a_device_with_the_metadata_the_proxy_holds() {
-        use crate::device::tests::fixtures::{self, FakeDevice, WAIT};
+        use crate::device::tests::fixtures;
+        use crate::tio::tests::device::FakeDevice;
+        use crate::tio::tests::WAIT;
 
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
@@ -843,7 +847,7 @@ mod tests {
             recorder.step(Some(wake)).unwrap();
         }
 
-        let described: Vec<Vec<u8>> = crate::proxy::tests::fixtures::description()
+        let described: Vec<Vec<u8>> = crate::tio::tests::device::description()
             .into_iter()
             .map(|record| broadcast(record, route).as_bytes().to_vec())
             .collect();
@@ -965,11 +969,12 @@ mod tests {
         //! None.
 
         use super::*;
-        use crate::device::tests::fixtures::{self, WAIT};
+        use crate::data::tests::fixtures::{announcement, broadcast, metadata_records, samples};
         use crate::device::Connection;
         use crate::proto::data::MAX_SAMPLE_NUMBER;
         use crate::session::{decode, Watch, WATCH};
         use crate::session::{Session, TestProxy};
+        use crate::tio::tests::WAIT;
         use proptest::prelude::*;
         use std::collections::{BTreeMap, BTreeSet};
         use std::sync::{Arc, Mutex};
@@ -1029,12 +1034,12 @@ mod tests {
         fn tapped() -> impl Strategy<Value = Packet> {
             let route = hops().prop_map(|hops| route_of(&hops));
             (route, 0u8..6, any::<u16>()).prop_map(|(route, kind, n)| match kind {
-                0 => fixtures::samples(u32::from(n), route),
+                0 => samples(u32::from(n), route),
                 1 => Packet::heartbeat(route),
                 2 => Packet::heartbeat_session(u32::from(n), route),
-                3 => fixtures::broadcast(fixtures::metadata_records(1)[usize::from(n % 4)], route),
+                3 => broadcast(metadata_records(1)[usize::from(n % 4)], route),
                 4 => Packet::link(LinkStatus::SensorReconnected).with_route(route),
-                _ => fixtures::announcement("test.amplitude", Some(u32::from(n)), &[1], route),
+                _ => announcement("test.amplitude", Some(u32::from(n)), &[1], route),
             })
         }
 
@@ -1112,7 +1117,7 @@ mod tests {
         /// The records of a device in session 1 with streams 1 and 2, each as
         /// the fixtures' one stream describes it.
         fn two_streams(route: DeviceRoute) -> Vec<Packet> {
-            let [device, stream, segment, column] = fixtures::metadata_records(1);
+            let [device, stream, segment, column] = metadata_records(1);
             let (
                 wire::Metadata::Device(device),
                 wire::Metadata::Stream(stream),
@@ -1144,7 +1149,7 @@ mod tests {
             }
             records
                 .into_iter()
-                .map(|record| fixtures::broadcast(record, route))
+                .map(|record| broadcast(record, route))
                 .collect()
         }
 

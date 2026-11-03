@@ -1619,8 +1619,8 @@ mod tests {
     use super::*;
     use crate::chan::{JoinHandle, Notify};
     use crate::proxy::outbox::Outbox;
-    use crate::proxy::tests::fixtures::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use crate::rt;
+    use crate::tio::tests::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use crate::tio::transport::tests::fake::{self, FakeEnd};
     use crate::tio::transport::{RateInfo, TransportKind};
     use std::future::{self, Future};

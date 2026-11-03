@@ -140,7 +140,7 @@
 
 use super::{ClientError, Outbox, Taken, HARD_LIMIT, SAMPLE_BUDGET, TAKE_LIMIT};
 use crate::chan::lock;
-use crate::device::tests::fixtures::{broadcast, segment_record};
+use crate::data::tests::fixtures::{broadcast, segment_record};
 use crate::proto::data::Metadata;
 use crate::proto::DeviceRoute;
 use crate::session::{decode, parts, Part, Update};

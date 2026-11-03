@@ -936,10 +936,15 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::tests::fixtures::{self, open_through, FakeDevice, WAIT};
+    use crate::data::tests::fixtures::{announcement, broadcast, metadata_records, samples};
+    use crate::device::tests::fixtures::{self, open_through};
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::Proxy;
+    use crate::session::tests::wait_for;
     use crate::session::TestProxy;
+    use crate::tio::tests::device::FakeDevice;
+    use crate::tio::tests::ClosedPort;
+    use crate::tio::tests::WAIT;
     use std::thread;
 
     fn test_tree() -> (DeviceTree, TestProxy) {
@@ -1167,7 +1172,7 @@ mod tests {
         let connection = Connection::mount_at(&address, &mounted, WAIT).unwrap();
 
         let routes = connection.tree(DeviceRoute::root()).routes_updates();
-        let heard = super::super::tests::fixtures::wait_for(&routes, |routes| !routes.is_empty());
+        let heard = wait_for(&routes, |routes| !routes.is_empty());
         assert_eq!(heard, [prefix]);
         assert_eq!(connection.tree(prefix).routes(), [prefix]);
     }
@@ -1244,7 +1249,7 @@ mod tests {
         let _environment = crate::chan::lock(&fixtures::ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         no_tio_in(dir.path());
-        let closed = fixtures::ClosedPort::new();
+        let closed = ClosedPort::new();
         let (port, proxy) = (closed.port(), closed.url());
 
         std::env::set_var("TWINLEAF_PROXY", &proxy);
@@ -1458,11 +1463,11 @@ mod tests {
         fn packet(kind: u8, n: u32, hops: &[u8]) -> Packet {
             let route = route_of(hops);
             match kind {
-                0 => fixtures::samples(n, route),
+                0 => samples(n, route),
                 1 => Packet::heartbeat(route),
                 2 => Packet::heartbeat_session(n, route),
-                3 => fixtures::broadcast(fixtures::metadata_records(n)[n as usize % 4], route),
-                4 => fixtures::announcement("test.amplitude", Some(n), &[1], route),
+                3 => broadcast(metadata_records(n)[n as usize % 4], route),
+                4 => announcement("test.amplitude", Some(n), &[1], route),
                 5 => Packet::rpc_request("dev.name", &[], n as u16, route).unwrap(),
                 _ => Packet::rpc_reply(n as u16, b"FAKE", route).unwrap(),
             }
@@ -1520,7 +1525,7 @@ mod tests {
                     proxy.send(packet.clone());
                 }
                 for (i, view) in views.iter().enumerate() {
-                    proxy.send(fixtures::samples(LAST + i as u32, route_of(&view.scope)));
+                    proxy.send(samples(LAST + i as u32, route_of(&view.scope)));
                 }
 
                 for (i, (view, receiver)) in views.iter().zip(&receivers).enumerate() {
