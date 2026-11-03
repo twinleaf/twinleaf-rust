@@ -609,7 +609,7 @@ fn print_devices_json(entries: &[Entry]) -> eyre::Result<()> {
 /// is a single root mount unless some were marked with Space. Quitting
 /// prints the device tree gathered so far and returns `None`. Without a
 /// terminal, it collects devices for `browse`, prints them and returns
-/// `None`, and with `json` it prints them as [`print_devices_json`] does.
+/// `None`, and with `json` it prints them as JSON.
 ///
 /// # Errors
 ///

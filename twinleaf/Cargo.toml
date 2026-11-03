@@ -17,12 +17,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 targets = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)", "cfg(shuttle)", "cfg(turmoil)", "cfg(tokio_unstable)"] }
+
+[lints.clippy]
+self_named_module_files = "deny"
 
 [features]
-default = ["serial", "firmware-update"]
+default = ["serial", "firmware-update", "hdf5"]
 serial = ["dep:tokio-serial", "dep:serialport"]
-hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
+hdf5 = ["dep:hdf5-pure"]
 # Built-in GitHub-backed firmware catalog (pulls in an HTTP client + TLS).
 # The core firmware plumbing (types, update check, flashing) is always
 # available; this feature only adds `firmware::github`.
@@ -42,8 +45,7 @@ num_enum = "0.7"
 glob = "0.3"
 log = "0.4"
 memmap2 = "0.9"
-hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib", "blosc"], optional = true}
-hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true }
+hdf5-pure = { version = "=0.47.0", optional = true }
 ureq = { version = "3", features = ["json"], optional = true }
 serde_json = { version = "1", optional = true }
 mdns-sd = { version = "0.21", optional = true }
@@ -59,11 +61,27 @@ tokio-util = { version = "0.7", features = ["rt", "codec", "net", "join-map"] }
 tokio-stream = { version = "0.1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select", "eventual-fairness"] }
+minicbor = { version = "2.3", features = ["derive", "std"] }
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
 proptest = "1"
+proptest-state-machine = "0.9"
+syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
+
+# The test backends of `src/seam`, which `cargo test-shuttle` and
+# `cargo test-turmoil` build.
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9.9"
+shuttle-tokio = { version = "1.0.0", features = ["shuttle", "rt", "sync", "time"] }
+
+# The turmoil tests record turmoil's network events through `tracing`, which
+# turmoil already depends on, to check that a scenario replays from its seed.
+[target.'cfg(turmoil)'.dev-dependencies]
+turmoil = "0.7.2"
+tracing = "0.1"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

@@ -107,8 +107,8 @@ impl Printer {
         let matched = filter.as_ref().is_none_or(|f| {
             batch
                 .schema()
-                .iter()
-                .any(|series| f.matches(&route, batch.stream().name, series.metadata().name))
+                .columns()
+                .any(|column| f.matches(&route, batch.schema().stream().name(), column.name()))
         });
         if !matched {
             return false;
@@ -147,20 +147,21 @@ fn recv_before<T>(
     }
 }
 
-/// Prints a batch's boundary, and the metadata in force from it, when the
-/// batch starts at one.
+/// Prints a batch's boundary and segment when the batch starts at a
+/// boundary, and the rest of the metadata in force from it when the boundary
+/// names a change other than a rollover.
 fn print_batch_meta(batch: &SampleBatch) {
     let route = batch.route();
     if let Some(boundary) = batch.boundary() {
         println!("# {} BOUNDARY {:?}", route, boundary);
-        if !boundary.is_continuous() {
-            println!("# {} DEVICE {:?}", route, batch.device());
-            println!("# {} STREAM {:?}", route, batch.stream());
-            for series in batch.schema() {
-                println!("# {} COLUMN {:?}", route, series.metadata());
+        if boundary.change.as_ref().is_some_and(|c| !c.is_continuous()) {
+            println!("# {} DEVICE {:?}", route, batch.metadata().device());
+            println!("# {} STREAM {:?}", route, batch.schema().stream());
+            for column in batch.schema().columns() {
+                println!("# {} COLUMN {:?}", route, column);
             }
         }
-        println!("# {} SEGMENT {:?}", route, batch.segment());
+        println!("# {} SEGMENT {:?}", route, batch.metadata().segment());
     }
 }
 

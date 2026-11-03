@@ -6,7 +6,8 @@ use crate::{parse_csv_target, LogCsvCli, StreamSel};
 use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use twinleaf::data::{PacketParser, SampleBatch, StreamMetadataSnapshot};
+use std::sync::Arc;
+use twinleaf::data::{PacketParser, SampleBatch, StreamSchema};
 use twinleaf::DeviceRoute;
 
 struct CsvOutput {
@@ -17,7 +18,7 @@ struct CsvOutput {
     path: Option<String>,
     stream_name: Option<String>,
     writer: Option<BufWriter<File>>,
-    schema: Option<StreamMetadataSnapshot>,
+    schema: Option<Arc<StreamSchema>>,
     header: Vec<String>,
     row: String,
     rows_written: u64,
@@ -48,22 +49,22 @@ impl CsvOutput {
             return Ok(());
         }
         let is_match = match &self.stream {
-            StreamSel::Id(id) => batch.stream().stream_id.value() == *id,
-            StreamSel::Name(name) => batch.stream().name == name,
+            StreamSel::Id(id) => batch.stream_key().stream_id.value() == *id,
+            StreamSel::Name(name) => batch.schema().stream().name() == name,
         };
         if !is_match {
             return Ok(());
         }
 
         if let Some(existing) = &self.schema {
-            if !existing.matches_schema(&batch) {
+            if existing != batch.schema() {
                 return Err(eyre::eyre!(
                     "stream identity or schema changed while writing {}; refusing to emit rows under a stale CSV header",
                     self.path.as_deref().unwrap_or("CSV output")
                 ));
             }
         } else {
-            self.schema = Some(batch.metadata());
+            self.schema = Some(batch.schema().clone());
         }
 
         if self.writer.is_none() {
@@ -71,8 +72,8 @@ impl CsvOutput {
             self.header.extend(
                 batch
                     .schema()
-                    .iter()
-                    .map(|series| series.metadata().name.to_string()),
+                    .columns()
+                    .map(|column| column.name().to_string()),
             );
 
             let route_label = route_filename_label(&self.route);
@@ -80,7 +81,7 @@ impl CsvOutput {
                 "{}.{}.{}.csv",
                 self.prefix,
                 route_label,
-                filename_component(batch.stream().name)
+                filename_component(batch.schema().stream().name())
             );
             if !self.force && std::path::Path::new(&path).exists() {
                 return Err(eyre::eyre!("output {} already exists", path)
@@ -93,7 +94,7 @@ impl CsvOutput {
                 .open(&path)
                 .wrap_err_with(|| format!("could not open {}", path))?;
             self.writer = Some(BufWriter::new(file));
-            self.stream_name = Some(batch.stream().name.to_string());
+            self.stream_name = Some(batch.schema().stream().name().to_string());
             self.path = Some(path);
 
             let output_path = self.path.as_deref().unwrap_or_default();
@@ -305,7 +306,7 @@ fn filename_component(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::{metadata, samples, temp_path, write_log, DAMAGE};
+    use super::super::tests::fixtures::{metadata, samples, temp_path, write_log, DAMAGE};
     use super::*;
     use std::path::{Path, PathBuf};
 

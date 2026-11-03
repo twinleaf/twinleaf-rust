@@ -141,14 +141,15 @@ struct Simulator {
 }
 
 impl Simulator {
-    /// Binds the UDP port and boots a device at each route of the layout.
+    /// Binds the UDP port on the interfaces `--listen` names and boots a
+    /// device at each route of the layout.
     ///
     /// # Errors
     ///
     /// Returns an error if the port cannot be bound, or the layout gives a
     /// route twice or reaches one through a device's empty port.
     fn new(cli: &SimulateCli) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", cli.port))?;
+        let socket = UdpSocket::bind((cli.listen.ipv4(), cli.port))?;
         socket.set_nonblocking(true)?;
         let booted = Instant::now();
         let mut routes = cli.layout.clone();
@@ -185,8 +186,9 @@ impl Simulator {
             }
         };
 
-        let port = self.socket.local_addr()?.port();
-        terminal_println!("tio test listening on udp://0.0.0.0:{port}");
+        let address = self.socket.local_addr()?;
+        let port = address.port();
+        terminal_println!("tio test listening on udp://{address}");
         match &self.routes.iter().collect::<Vec<_>>()[..] {
             [route] if route.is_empty() => {}
             [route] => terminal_println!("  device at {route}"),
@@ -205,7 +207,9 @@ impl Simulator {
         }
         self.print_streams(cli);
         if raw_mode.is_some() {
-            terminal_println!("  press d to drop one sample now, r to reboot, Ctrl-C to quit");
+            terminal_println!(
+                "  press d to drop one sample now (test.drop), r to reboot (dev.reboot), Ctrl-C to quit"
+            );
         }
         terminal_println!("  connect with: tio proxy udp4://127.0.0.1:{port}");
 
@@ -266,9 +270,9 @@ impl Simulator {
             device::CAPTURE_DELAY_NS as f64 / 1e9
         );
         match cli.upload {
-            crate::UploadKind::TlChibi => {
+            crate::UploadKind::Image => {
                 terminal_println!(
-                    "  firmware upload: tl-chibi images (--upload signed for packages)"
+                    "  firmware upload: tl-chibi compatible images (--upload signed for packages)"
                 )
             }
             crate::UploadKind::Signed => {
@@ -395,12 +399,20 @@ impl Simulator {
     }
 }
 
-/// Serves the simulator `args` start on a free port from a thread until
-/// `stop` is set, and returns the URL a proxy opens it at.
+/// Returns the arguments `args` give a simulator that a test starts, on a
+/// free port of loopback.
+#[cfg(test)]
+fn test_cli(args: &[&str]) -> SimulateCli {
+    use clap::Parser;
+    let on_loopback = ["tio-simulate", "--port", "0", "--listen", "loopback"];
+    SimulateCli::parse_from(on_loopback.iter().chain(args))
+}
+
+/// Serves the simulator `args` start on a free port of loopback from a
+/// thread until `stop` is set, and returns the URL a proxy opens it at.
 #[cfg(test)]
 pub(crate) fn serve(args: &[&str], stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
-    use clap::Parser;
-    let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
+    let cli = test_cli(args);
     let (bound, port) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut simulator = Simulator::new(&cli).unwrap();
@@ -425,9 +437,12 @@ mod tests {
     /// Returns the simulator `args` start on a free port of loopback, and a
     /// host socket connected to it.
     fn start_simulator(args: &[&str]) -> (Simulator, UdpSocket) {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0"].iter().chain(args));
+        let cli = test_cli(args);
         let simulator = Simulator::new(&cli).unwrap();
-        simulator.socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        simulator
+            .socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let port = simulator.socket.local_addr().unwrap().port();
         let host = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         host.connect(("127.0.0.1", port)).unwrap();
@@ -446,7 +461,10 @@ mod tests {
         host.send(packet.as_bytes()).unwrap();
         // The datagram may reach the socket after send returns.
         simulator.socket.set_nonblocking(false).unwrap();
-        simulator.socket.peek_from(&mut [0; Packet::MAX_SIZE]).unwrap();
+        simulator
+            .socket
+            .peek_from(&mut [0; Packet::MAX_SIZE])
+            .unwrap();
         simulator.socket.set_nonblocking(true).unwrap();
         simulator.receive_packets().unwrap();
         received(host)
@@ -685,8 +703,50 @@ mod tests {
         assert!(samples(&sent) > 0);
     }
 
-    /// An upload counts the image bytes of each chunk as tl-chibi does, and an
-    /// upgrade reboots into a new build.
+    /// `test.drop rollover` drops the first sample of the next segment, so
+    /// the outgoing segment ends whole and the new one begins at sample 1.
+    /// Any other argument is invalid.
+    #[test]
+    fn a_drop_at_rollover_takes_the_first_sample_of_the_next_segment() {
+        let (mut simulator, host) = start_simulator(&["--no-drop", "--segment-seconds", "1"]);
+        assert_eq!(
+            call(&mut simulator, &host, "test.drop", b"later", "/"),
+            Err(RpcError::Invalid.value())
+        );
+        call(&mut simulator, &host, "test.drop", b"rollover", "/").unwrap();
+        let mut sent = Queue::default();
+        simulator
+            .tree
+            .tick(simulator.now_ns() + 1_100_000_000, &mut sent);
+
+        // The main clock's sine stream and the aux stream, each sample 16
+        // bytes, at 1000 and 25 samples a segment.
+        for (stream, per_segment) in [(1, 1000), (3, 25)] {
+            let mut numbers: [Vec<u32>; 2] = Default::default();
+            for bytes in &sent.0 {
+                let (packet, _) = packet::Packet::from_slice_prefix(bytes).unwrap();
+                if let packet::Payload::Samples(samples) = packet.payload() {
+                    if samples.stream_id.value() == stream {
+                        let first = samples.first.value();
+                        let count = (samples.data.len() / 16) as u32;
+                        let segment = usize::from(samples.segment_id.value());
+                        numbers[segment].extend(first..first + count);
+                    }
+                }
+            }
+            let [outgoing, next] = numbers;
+            assert_eq!(
+                outgoing,
+                (0..per_segment).collect::<Vec<_>>(),
+                "stream {stream}"
+            );
+            assert_eq!(next.first(), Some(&1), "stream {stream}: {next:?}");
+            assert!(next.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        }
+    }
+
+    /// An upload counts the image bytes of each chunk, and an upgrade reboots
+    /// into a new build.
     #[test]
     fn an_upgrade_reboots_into_a_new_build() {
         let (mut simulator, host) = start_simulator(&[]);
@@ -707,7 +767,7 @@ mod tests {
         assert_eq!(
             call(&mut simulator, &host, "dev.firmware.abort", &[], "/"),
             Err(RpcError::NotFound.value()),
-            "tl-chibi has no abort"
+            "a device that takes images does not answer dev.firmware.abort"
         );
     }
 
@@ -743,7 +803,7 @@ mod tests {
         assert_eq!(
             upload(&mut simulator, &[0; 288]),
             Err(RpcError::Invalid.value()),
-            "a tl-chibi chunk is no package header"
+            "an image chunk is no package header"
         );
         upload(&mut simulator, &package_header(300)).unwrap();
         upload(&mut simulator, &chunk(0, 256)).unwrap();
@@ -778,7 +838,7 @@ mod tests {
 
     #[test]
     fn a_route_given_twice_is_refused() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0", "--layout", "/0,/1,/0"]);
+        let cli = test_cli(&["--layout", "/0,/1,/0"]);
         let refused = Simulator::new(&cli).map(drop).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
     }
@@ -787,9 +847,22 @@ mod tests {
     /// a layout that routes through one is refused.
     #[test]
     fn a_route_through_a_devices_empty_port_is_refused() {
-        let cli = SimulateCli::parse_from(["tio-simulate", "--port", "0", "--layout", "/,/2/0"]);
+        let cli = test_cli(&["--layout", "/,/2/0"]);
         let refused = Simulator::new(&cli).map(drop).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// `tio simulate` listens on every interface unless `--listen` names
+    /// loopback, as a test's simulator does.
+    #[test]
+    fn the_simulator_listens_where_listen_says() {
+        let cli = SimulateCli::parse_from(["tio-simulate"]);
+        assert_eq!(cli.listen, crate::ListenOn::All);
+        assert_eq!(cli.listen.ipv4(), std::net::Ipv4Addr::UNSPECIFIED);
+
+        let (simulator, _host) = start_simulator(&[]);
+        let bound = simulator.socket.local_addr().unwrap().ip();
+        assert_eq!(bound, std::net::Ipv4Addr::LOCALHOST);
     }
 
     /// A route whose parent the layout leaves out names that parent, the

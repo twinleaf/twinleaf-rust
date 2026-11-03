@@ -10,9 +10,9 @@
 //!   the proto codecs. It also has the types a host adds,
 //!   [`Payload`](packet::Payload), [`LinkStatus`](packet::LinkStatus), and
 //!   [`ProxyRx`](packet::ProxyRx) for the proxy's control replies.
-//! - [`rpc`] provides the codec of RPC arguments and replies.
-//!   [`device::rpc`](crate::device::rpc) re-exports it, and the proxy's
-//!   control requests use it.
+//! - The codec of RPC arguments and replies is internal, and
+//!   [`device::rpc`](crate::device::rpc) re-exports it. The proxy's control
+//!   requests use it too.
 //!
 //! The transports are internal. Each port owns one serial, TCP, or UDP link,
 //! which a task on the crate's I/O runtime drives. A
@@ -23,9 +23,10 @@
 
 #[cfg(feature = "mdns")]
 pub(crate) mod mdns;
-pub(crate) mod os;
 pub mod packet;
-pub mod rpc;
+pub(crate) mod rpc;
+#[cfg(test)]
+pub(crate) mod tests;
 pub(crate) mod transport;
 
 pub use packet::Packet;

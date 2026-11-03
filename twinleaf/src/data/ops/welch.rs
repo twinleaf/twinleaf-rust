@@ -160,11 +160,7 @@ impl ColumnOp for Welch {
     }
 
     fn update_batch(&mut self, _timestamps: &[f64], values: &ColumnArray) {
-        match values {
-            ColumnArray::F64(v) => self.ring.extend(v.iter().copied()),
-            ColumnArray::I64(v) => self.ring.extend(v.iter().map(|&x| x as f64)),
-            ColumnArray::U64(v) => self.ring.extend(v.iter().map(|&x| x as f64)),
-        }
+        self.ring.extend(values.to_f64().iter().copied());
         while self.ring.len() > self.window_samples {
             self.ring.pop_front();
         }
@@ -379,8 +375,8 @@ mod tests {
         (ts, vals)
     }
 
-    /// Box-Muller over a xorshift stream: repeatable normal noise for tests
-    /// without pulling in an RNG dependency.
+    /// Box-Muller over a xorshift stream, which makes repeatable normal noise
+    /// for tests without pulling in an RNG dependency.
     fn gaussian_noise(seed: u64) -> impl FnMut() -> f64 {
         let mut state = seed;
         move || {

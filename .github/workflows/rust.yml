@@ -35,6 +35,19 @@ jobs:
         run: cargo build --all --release --verbose
       - name: Test
         run: cargo test --workspace
+      - name: Lint
+        if: matrix.platform == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets
+      - name: Lint and test under shuttle's schedulers
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          cargo clippy-shuttle
+          cargo test-shuttle
+      - name: Lint and test over turmoil's simulated network
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          cargo clippy-turmoil
+          cargo test-turmoil
       - name: Strip binaries
         if: matrix.platform != 'windows-latest'
         run: |

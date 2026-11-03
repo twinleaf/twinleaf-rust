@@ -6,7 +6,7 @@
 
 use super::task::Rules;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -24,25 +24,39 @@ pub(super) const RULES: Rules = Rules {
 ///
 /// Returns an error if binding fails.
 pub(super) async fn bind(address: &SocketAddr) -> io::Result<UdpSocket> {
-    let any = match address {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => "[::]:0",
-    };
-    UdpSocket::bind(any).await
+    UdpSocket::bind(local_address(address)).await
 }
 
-/// Returns `true` for an error that a connected UDP socket reports from ICMP,
-/// such as port or host unreachable. Receiving treats these errors as
-/// transient. The watchdog of the proxy's device link judges whether the
-/// device is gone.
-pub(super) fn is_advisory_network_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::HostUnreachable
-    )
+/// Returns the address a socket that reaches `address` binds, with a port
+/// the OS picks. That is the loopback address of its family when `address`
+/// is on loopback, and every interface of its family otherwise.
+fn local_address(address: &SocketAddr) -> SocketAddr {
+    let ip: IpAddr = match (address.ip().is_loopback(), address) {
+        (true, SocketAddr::V4(_)) => Ipv4Addr::LOCALHOST.into(),
+        (true, SocketAddr::V6(_)) => Ipv6Addr::LOCALHOST.into(),
+        (false, SocketAddr::V4(_)) => Ipv4Addr::UNSPECIFIED.into(),
+        (false, SocketAddr::V6(_)) => Ipv6Addr::UNSPECIFIED.into(),
+    };
+    (ip, 0).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket that reaches loopback binds loopback of the same family. One
+    /// that reaches any other address binds every interface of its family.
+    #[test]
+    fn a_socket_binds_loopback_only_to_reach_loopback() {
+        for (peer, local) in [
+            ("127.0.0.1:7855", "127.0.0.1:0"),
+            ("127.1.2.3:7855", "127.0.0.1:0"),
+            ("[::1]:7855", "[::1]:0"),
+            ("192.168.1.20:7855", "0.0.0.0:0"),
+            ("[fd00::5]:7855", "[::]:0"),
+        ] {
+            let peer: SocketAddr = peer.parse().unwrap();
+            assert_eq!(local_address(&peer), local.parse().unwrap(), "{peer}");
+        }
+    }
 }

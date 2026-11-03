@@ -14,8 +14,9 @@ wire types and codecs.
 - Discover serial devices and, with the [`mdns`](#cargo-features) Cargo feature,
   networked devices through [`Discovery`].
 - Address a routed subtree with [`DeviceTree`] or bind one route with [`Device`].
-- Call [typed or dynamic RPCs] and subscribe to [`SampleBatch`]es, [`Event`]s,
-  or raw [`Packet`]s.
+- Call [typed or dynamic RPCs], subscribe to [`SampleBatch`]es or raw
+  [`Packet`]s, and follow each device's presence, metadata, RPC table and
+  settings.
 - Buffer and process live data or read recorded `tio` logs with the [data module].
 - Query and update device firmware through the [firmware module].
 
@@ -50,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = device.samples();
     let batch = samples.recv_timeout(Duration::from_secs(5))?;
 
-    println!("{name}: {} rows from {}", batch.len(), batch.stream().name);
+    println!("{name}: {} rows from {}", batch.len(), batch.schema().stream().name());
     Ok(())
 }
 ```
@@ -71,7 +72,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 [`Device`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Device.html
 [`DeviceTree`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.DeviceTree.html
 [`Discovery`]: https://docs.rs/twinleaf/latest/twinleaf/device/discovery/struct.Discovery.html
-[`Event`]: https://docs.rs/twinleaf/latest/twinleaf/device/enum.Event.html
 [`Packet`]: https://docs.rs/twinleaf/latest/twinleaf/tio/packet/struct.Packet.html
 [`Receiver`]: https://docs.rs/twinleaf/latest/twinleaf/device/struct.Receiver.html
 [`SampleBatch`]: https://docs.rs/twinleaf/latest/twinleaf/data/struct.SampleBatch.html

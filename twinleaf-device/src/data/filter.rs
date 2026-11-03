@@ -4,10 +4,9 @@
 //! kinds a device never declares cost it neither flash nor RAM.
 //!
 //! [`Butterworth4`] is two trapezoidal state variable sections with Kahan
-//! compensated integrators, ported from tl-chibi's `filter/tl_lpf_bw4`: the
-//! state variable form reproduces a constant input exactly in single precision
-//! at the low normalized corners decimation asks for, where a direct form
-//! biquad stalls short of it.
+//! compensated integrators. The state variable form reproduces a constant
+//! input exactly in single precision at the low normalized corners decimation
+//! asks for, where a direct form biquad stalls short of it.
 
 use twinleaf_proto::data::FilterType;
 
@@ -75,8 +74,8 @@ struct Integrators {
     c2: f32,
 }
 
-/// One column's own state: whether it is settled, which tl-chibi reads off a
-/// non-finite state instead so that a filter at rest here is all zeros.
+/// One column's own state. Whether it is settled is a flag of its own, so a
+/// filter at rest is all zeros.
 #[derive(Clone, Copy)]
 struct Channel {
     integrators: [Integrators; SECTIONS],
@@ -274,8 +273,7 @@ mod tests {
         filter
     }
 
-    /// Drive `filter` to a settled state at zero, as tl-chibi's `initval(0.0)`
-    /// leaves it.
+    /// Drive `filter` to a settled state at zero.
     fn settled(cutoff: f32) -> Butterworth4<1> {
         let mut filter = tuned(cutoff);
         step(&mut filter, 0.0);
@@ -415,8 +413,8 @@ mod tests {
         assert!(filter.running());
     }
 
-    /// tl-chibi's `setup` recomputes coefficients and leaves the state alone,
-    /// so a retune does not restart a continuous input from a transient.
+    /// A `setup` recomputes coefficients and leaves the state alone, so a
+    /// retune does not restart a continuous input from a transient.
     #[test]
     fn a_setup_leaves_every_channel_where_it_was() {
         let mut filter = tuned(0.1);

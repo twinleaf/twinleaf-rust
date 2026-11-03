@@ -32,7 +32,7 @@ fn skew_note(run: &StreamSummary) -> String {
     use console::style;
 
     // End-of-sample timestamps for N samples span N-1 sample intervals.
-    let declared = declared_timestamp_span(run.sample_count(), run.rate_hz());
+    let declared = declared_timestamp_span(run.sample_count(), run.metadata().rate_hz());
     let observed = match (run.first_timestamp(), run.last_timestamp()) {
         (Some(a), Some(b)) => b - a,
         _ => 0.0,
@@ -115,9 +115,9 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
             println!(
                 "   • {}  {}  {}  {}",
                 route,
-                device.name,
-                style(format!("fw {}", device.firmware)).dim(),
-                style(format!("serial {}", device.serial)).dim(),
+                device.name(),
+                style(format!("fw {}", device.firmware())).dim(),
+                style(format!("serial {}", device.serial())).dim(),
             );
         }
     }
@@ -139,10 +139,10 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                 "   • {} {} {:<12} {:>6.0} {}  {:>4} {}  {:>10} {}{}",
                 key.route,
                 key.stream_id,
-                s.metadata().name,
-                s.rate_hz(),
+                s.metadata().schema().stream().name(),
+                s.metadata().rate_hz(),
                 unit("Hz"),
-                s.columns().len(),
+                s.metadata().schema().columns().len(),
                 unit("cols"),
                 samples,
                 unit("samples"),
@@ -156,7 +156,7 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                         style(format!("run {}", run.run())).dim(),
                         run.opened_by()
                             .map_or("—".to_string(), |class| class.to_string()),
-                        run.rate_hz(),
+                        run.metadata().rate_hz(),
                         unit("Hz"),
                         run.sample_count(),
                         unit("samples"),
@@ -166,19 +166,21 @@ fn inspect_one_log(path: &str) -> eyre::Result<()> {
                     );
                 }
             }
-            if s.columns().len() != 0 {
+            if s.metadata().schema().columns().len() != 0 {
                 let cols: Vec<String> = s
+                    .metadata()
+                    .schema()
                     .columns()
                     .map(|column| {
-                        let data_type = column.data_type.to_string();
-                        if column.units.is_empty() {
-                            format!("{} {}", column.name, style(data_type).dim())
+                        let data_type = column.data_type().to_string();
+                        if column.units().is_empty() {
+                            format!("{} {}", column.name(), style(data_type).dim())
                         } else {
                             format!(
                                 "{} {} {}",
-                                column.name,
+                                column.name(),
                                 style(data_type).dim(),
-                                style(&column.units).dim()
+                                style(&column.units()).dim()
                             )
                         }
                     })

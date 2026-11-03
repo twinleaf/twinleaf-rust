@@ -43,7 +43,7 @@ impl tokio_util::codec::Decoder for Codec {
         src.clear();
         match decoded {
             Ok(packet) => Ok(Some(Self::Item::Packet(packet))),
-            Err(error) => super::super::rejected_frame(error).map(Some),
+            Err(error) => super::rejected_frame(error).map(Some),
         }
     }
 }
@@ -59,34 +59,94 @@ impl tokio_util::codec::Encoder<Packet> for Codec {
 
 #[cfg(test)]
 mod tests {
+    //! Properties of the UDP framing.
+    //!
+    //! # Observations
+    //!
+    //! What [`decode`] returns for a datagram, the bytes [`encode`] gives for
+    //! a packet, and the events and buffer the [`Codec`] decoder leaves.
+    //!
+    //! # Sources
+    //!
+    //! The module doc, the docs of [`decode`] and [`Codec`], and the header
+    //! layout in the [`proto::packet`](crate::proto::packet) module doc.
+    //!
+    //! # Laws
+    //!
+    //! - U1, round trip. The datagram of any packet decodes as that packet.
+    //!   Source, the module doc. It rules out a codec that drops the routing
+    //!   or refuses a type it does not read.
+    //! - U2, postcondition. A datagram that is not exactly one packet gives
+    //!   one error. Bytes after the packet give `TrailingBytes`, a datagram
+    //!   that ends before its packet does, the empty one too, gives
+    //!   `PacketTooSmall`, and an invalid header or payload gives the error
+    //!   the packet gives. Source, the doc of `decode`. It rules out a codec
+    //!   that ignores trailing bytes.
+    //! - U3, the decoder adapter. Each datagram gives exactly one event, a
+    //!   packet or a rejected frame, then `None`, and leaves the buffer
+    //!   empty. Source, the doc of [`Codec`]. It rules out an adapter that
+    //!   repeats a datagram or loses the next one.
+    //!
+    //! # Generator obligations
+    //!
+    //! Packets as the TCP properties draw them, and each class
+    //! [`strategy::not_one_packet`] names.
+    //!
+    //! # Examples that stay
+    //!
+    //! None. U1 and U2 hold every case the examples held.
+
     use super::*;
-    use crate::proto::DeviceRoute;
-    use crate::tio::packet;
+    use crate::tio::transport::codec::tests::strategy;
+    use crate::tio::transport::TransportEvent;
+    use bytes::BytesMut;
+    use proptest::prelude::*;
+    use tokio_util::codec::Decoder;
 
-    #[test]
-    fn an_encoded_packet_decodes_unchanged() {
-        let packet = Packet::rpc_request("dev.name", &[], 7, "/1/2".parse().unwrap()).unwrap();
+    proptest! {
+        /// U1. The datagram of any packet decodes as that packet.
+        #[test]
+        fn any_packet_decodes_from_its_datagram(packet in strategy::packet()) {
+            let decoded = decode(encode(&packet)).unwrap();
+            prop_assert_eq!(decoded.as_bytes(), packet.as_bytes());
+        }
 
-        assert_eq!(
-            decode(encode(&packet)).unwrap().as_bytes(),
-            packet.as_bytes()
-        );
-    }
+        /// U2. A datagram that is not exactly one packet gives its error.
+        #[test]
+        fn a_datagram_that_is_not_one_packet_is_its_error(
+            (datagram, error, _) in strategy::not_one_packet(),
+        ) {
+            prop_assert_eq!(decode(&datagram).err(), Some(error));
+        }
 
-    #[test]
-    fn a_datagram_that_is_not_one_packet_is_an_error() {
-        let heartbeat = encode(&Packet::heartbeat(DeviceRoute::root())).to_vec();
-        let mut trailing = heartbeat.clone();
-        trailing.push(0);
-
-        assert_eq!(decode(&trailing).unwrap_err(), Error::TrailingBytes);
-        assert_eq!(
-            decode(&heartbeat[..3]).unwrap_err(),
-            Error::Invalid(packet::DecodeError::PacketTooSmall)
-        );
-        assert_eq!(
-            decode(&[0, 0, 0, 0]).unwrap_err(),
-            Error::Invalid(packet::DecodeError::InvalidPacketType)
-        );
+        /// U3. The decoder gives one event for each datagram, then `None`,
+        /// and empties the buffer. Trailing bytes are rejected as too big.
+        #[test]
+        fn the_decoder_gives_one_event_for_each_datagram(
+            datagrams in prop::collection::vec(prop_oneof![
+                strategy::packet().prop_map(|packet| (packet.as_bytes().to_vec(), None)),
+                strategy::not_one_packet().prop_map(|(datagram, error, _)| (datagram, Some(error))),
+            ], 1..4),
+        ) {
+            let mut codec = Codec::default();
+            for (datagram, error) in datagrams {
+                let mut src = BytesMut::from(&datagram[..]);
+                let event = codec.decode(&mut src).unwrap();
+                prop_assert!(src.is_empty());
+                match (error, event) {
+                    (None, Some(TransportEvent::Packet(packet))) => {
+                        prop_assert_eq!(packet.as_bytes(), &datagram[..]);
+                    }
+                    (Some(Error::TrailingBytes), Some(TransportEvent::RejectedFrame(rejected))) => {
+                        prop_assert_eq!(rejected, crate::tio::packet::DecodeError::PacketTooBig);
+                    }
+                    (Some(Error::Invalid(error)), Some(TransportEvent::RejectedFrame(rejected))) => {
+                        prop_assert_eq!(rejected, error);
+                    }
+                    (error, event) => prop_assert!(false, "{:?} gave {:?}", error, event),
+                }
+                prop_assert!(codec.decode(&mut src).unwrap().is_none());
+            }
+        }
     }
 }

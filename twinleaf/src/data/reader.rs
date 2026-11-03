@@ -3,10 +3,11 @@
 //! [`LogFile`] maps a log and iterates its packets. [`LogFile::scan`] builds a
 //! [`LogIndex`], which summarizes the log and decodes it in batches.
 
-use super::metadata::{ColumnRecord, DeviceRecord, SegmentRecord, StreamKey, StreamRecord};
+use super::continuity::{Boundary, BoundaryClass};
+use super::metadata::{DeviceRecord, StreamKey, StreamMetadataSnapshot};
 use super::parser::{PacketParser, ParserCheckpoint};
-use super::sample::{sample_time, BoundaryClass, BoundaryReason, SampleBatch};
-use super::state::{PacketError, ScannedRows};
+use super::sample::{sample_time, RowSource, SampleBatch};
+use super::state::{DataError, ScannedRows};
 use crate::proto::data as wire;
 use crate::tio::{self, Packet};
 use bytes::{Buf, Bytes};
@@ -58,7 +59,7 @@ const PROGRESS_BYTES: usize = 1024 * 1024;
 /// }
 /// for (stream, runs) in index.summary().streams() {
 ///     for run in runs {
-///         let (n, rate) = (run.sample_count(), run.rate_hz());
+///         let (n, rate) = (run.sample_count(), run.metadata().rate_hz());
 ///         println!("{stream} run {}: {n} samples at {rate} Hz", run.run());
 ///     }
 /// }
@@ -122,7 +123,7 @@ pub enum LogError {
         offset: usize,
         /// Why the packet could not be applied to the data state.
         #[source]
-        source: PacketError,
+        source: DataError,
     },
 }
 
@@ -180,9 +181,8 @@ impl Iterator for PacketIter {
 pub struct StreamSummary {
     run: u32,
     opened_by: Option<BoundaryClass>,
-    metadata: StreamRecord,
-    segment: SegmentRecord,
-    columns: Vec<ColumnRecord>,
+    /// The metadata of the run's first rows.
+    metadata: StreamMetadataSnapshot,
     sample_count: u64,
     first_timestamp: Option<f64>,
     last_timestamp: Option<f64>,
@@ -200,19 +200,10 @@ impl StreamSummary {
         self.opened_by
     }
 
-    /// Returns the stream record in effect for the whole run.
-    pub fn metadata(&self) -> wire::Stream<'_> {
-        self.metadata.get()
-    }
-
-    /// Returns the segment record the run began in.
-    pub fn segment(&self) -> wire::Segment<'_> {
-        self.segment.get()
-    }
-
-    /// Returns every column of a sample, in schema order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = wire::Column<'_>> + '_ {
-        self.columns.iter().map(ColumnRecord::get)
+    /// Returns the metadata of the run's first rows. Its schema holds for the
+    /// whole run, and its segment and rate are those the run began in.
+    pub fn metadata(&self) -> &StreamMetadataSnapshot {
+        &self.metadata
     }
 
     /// Returns the number of rows in this run alone.
@@ -230,13 +221,6 @@ impl StreamSummary {
     /// epoch, or `None` if the run counted no rows.
     pub fn last_timestamp(&self) -> Option<f64> {
         self.last_timestamp
-    }
-
-    /// Returns the output rate in hertz after decimation, or zero for a
-    /// segment whose rate or decimation is zero. The parser emits no rows from
-    /// such a segment.
-    pub fn rate_hz(&self) -> f64 {
-        self.segment.effective_rate().unwrap_or(0.0)
     }
 }
 
@@ -268,7 +252,7 @@ impl LogSummary {
     /// Returns the devices that produced rows, in route order.
     pub fn devices(
         &self,
-    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::Device<'_>)> + '_ {
+    ) -> impl ExactSizeIterator<Item = (crate::proto::DeviceRoute, wire::DeviceView<'_>)> + '_ {
         self.devices
             .iter()
             .map(|(&route, device)| (route, device.get()))
@@ -306,21 +290,19 @@ impl LogSummary {
         {
             runs.push(StreamSummary {
                 run: rows.generations().stream,
-                opened_by: rows.boundary().map(BoundaryReason::class),
-                metadata: rows.stream().clone(),
-                segment: rows.segment().clone(),
-                columns: rows.columns().to_vec(),
+                opened_by: rows.boundary().map(Boundary::class),
+                metadata: rows.metadata(),
                 sample_count: 0,
                 first_timestamp: None,
                 last_timestamp: None,
             });
         }
         let stream = runs.last_mut().expect("a run was just opened if empty");
-        stream.sample_count += rows.row_count() as u64;
+        stream.sample_count += rows.len() as u64;
 
         let (first_n, last_n) = rows.sample_number_bounds();
-        let first_timestamp = sample_time(rows.segment().get(), first_n.value() + 1);
-        let last_timestamp = sample_time(rows.segment().get(), last_n.value() + 1);
+        let first_timestamp = sample_time(rows.segment_record().get(), first_n.value() + 1);
+        let last_timestamp = sample_time(rows.segment_record().get(), last_n.value() + 1);
         stream.first_timestamp = Some(
             stream
                 .first_timestamp
@@ -576,9 +558,9 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fixtures::{column, device, segment, stream};
-    use crate::data::sample::Generations;
+    use crate::data::continuity::Generations;
     use crate::data::state::StreamDataError;
+    use crate::data::tests::fixtures::{column, device, segment, stream};
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 
@@ -659,7 +641,7 @@ mod tests {
             index.summary().error(),
             Some(LogError::Data {
                 offset,
-                source: PacketError::Stream {
+                source: DataError::Stream {
                     source: StreamDataError::SegmentOutOfRange { .. },
                     ..
                 },
@@ -688,13 +670,13 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run(), 1);
         assert_eq!(runs[0].opened_by(), Some(BoundaryClass::Startup));
-        assert_eq!(runs[0].rate_hz(), 1.0);
+        assert_eq!(runs[0].metadata().rate_hz(), 1.0);
         assert_eq!(runs[0].sample_count(), 2);
         assert_eq!(runs[0].first_timestamp(), Some(1.0));
         assert_eq!(runs[0].last_timestamp(), Some(2.0));
         assert_eq!(runs[1].run(), 2);
         assert_eq!(runs[1].opened_by(), Some(BoundaryClass::Reconfig));
-        assert_eq!(runs[1].rate_hz(), 10.0);
+        assert_eq!(runs[1].metadata().rate_hz(), 10.0);
         assert_eq!(runs[1].sample_count(), 2);
         assert!((runs[1].first_timestamp().unwrap() - 0.3).abs() < 1e-9);
         assert!((runs[1].last_timestamp().unwrap() - 0.4).abs() < 1e-9);
@@ -703,9 +685,48 @@ mod tests {
     }
 
     #[test]
+    fn a_loss_across_a_rollover_counts_once_as_data_loss() {
+        let mut packets = schema_packets();
+        packets[1] = metadata_packet(wire::Metadata::Stream(wire::Stream {
+            n_segments: 2,
+            ..stream(1)
+        }));
+        packets.extend([data_packet(0, 0), data_packet(1, 0)]);
+        packets.push(metadata_packet(wire::Metadata::Segment(wire::Segment {
+            segment_id: crate::proto::SegmentId::new(1),
+            start_time: 2,
+            ..segment(1)
+        })));
+        packets.push(data_packet(1, 1));
+        let log = LogFile {
+            data: encoded_log(packets),
+        };
+
+        let summary = log.scan(true);
+        let summary = summary.summary();
+        let runs = &summary.streams()
+            [&StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(1))];
+
+        let counts = BoundaryClass::ALL.map(|class| summary.boundaries(class));
+        assert_eq!(counts, [1, 0, 1, 0, 0], "a startup and a data loss");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].opened_by(), Some(BoundaryClass::DataLoss));
+    }
+
+    #[test]
     fn a_backward_time_jump_counts_as_an_anomaly() {
         let mut packets = schema_packets();
-        packets.extend([data_packet(0, 0), data_packet(1, 0), data_packet(0, 0)]);
+        let starting = |start_time| {
+            metadata_packet(wire::Metadata::Segment(wire::Segment {
+                start_time,
+                ..segment(1)
+            }))
+        };
+        packets.push(starting(10));
+        packets.extend([data_packet(0, 0), data_packet(1, 0)]);
+        // The segment's record comes again starting earlier, so time steps
+        // back with the sample numbers following on.
+        packets.extend([starting(5), data_packet(2, 0)]);
         let log = LogFile {
             data: encoded_log(packets),
         };
@@ -776,5 +797,266 @@ mod tests {
                 },
             ]
         );
+    }
+
+    mod summary {
+        //! Properties of a scan's summary.
+        //!
+        //! # Observations
+        //!
+        //! What [`LogFile::scan_with_progress`] returns for a log, the
+        //! summary's packet count, bytes scanned and error with its offset,
+        //! the index's chunk count, and each position the scan reports. Also
+        //! [`LogFile::len`] and [`LogFile::is_empty`] of a log opened from a
+        //! file.
+        //!
+        //! # Sources
+        //!
+        //! The docs of [`LogSummary::packet_count`], "the number of packets
+        //! of every type accepted before the scan stopped", of
+        //! [`LogSummary::bytes_scanned`], "the bytes consumed before the scan
+        //! stopped, excluding any failing packet", of [`LogError::offset`],
+        //! "the byte offset at which the failing packet begins", and of
+        //! [`LogFile::scan`], where a packet that fails ends the scan. The doc
+        //! of [`LogFile::scan_with_progress`], which reports the position
+        //! reached about every MiB and once at the end. The doc of
+        //! [`LogIndex`], a checkpoint about every 16 MiB of log, and of
+        //! [`LogIndex::chunk_count`], one range per checkpoint. The doc of
+        //! [`LogFile::is_empty`].
+        //!
+        //! # Model
+        //!
+        //! A log is a prefix of `n` packets the scan accepts, then possibly a
+        //! failing packet, then any bytes. The prefix is `k` bytes long.
+        //!
+        //! # Laws
+        //!
+        //! - S1, postcondition. The summary counts `n` packets and `k` bytes.
+        //!   It holds no error when nothing fails, and otherwise an error
+        //!   whose offset is `k`, a framing error for bytes that are not a
+        //!   packet and a data error for a packet the state refuses. Source,
+        //!   the docs of `packet_count`, `bytes_scanned`, `offset` and
+        //!   `scan`. It rules out a count of one, an offset of one, and a scan
+        //!   that counts or consumes the failing packet or reads past it.
+        //! - S2, postcondition. The positions reported never decrease, the
+        //!   last is the bytes scanned, and no more than a MiB and one packet
+        //!   pass between two reports. Source, the doc of
+        //!   `scan_with_progress`. It rules out a scan that reports only at
+        //!   the end, or a final position other than where it stopped.
+        //! - S3, postcondition. A log that scans more than no bytes and less
+        //!   than 16 MiB is one range. Source, the docs of `LogIndex` and
+        //!   `chunk_count`, a checkpoint about every 16 MiB and a range per
+        //!   checkpoint. It rules out a checkpoint per packet, and an index
+        //!   with no range to decode a log from.
+        //! - S4, postcondition. A log opened from a file is empty exactly when
+        //!   its length is 0, and its length is the file's. Source, the doc of
+        //!   `is_empty`. It rules out a log that is always empty.
+        //!
+        //! # Generator obligations
+        //!
+        //! Prefixes of 0 to 24 packets, with and without the stream's
+        //! metadata, of heartbeats, RPC replies of 0 to 400 bytes, and
+        //! samples once the metadata is in. Failing packets of three kinds, a
+        //! byte that is no packet type, a packet cut short at the end of the
+        //! log, inside its 4 byte header or after it, and samples of a segment
+        //! the stream does not have, drawn only when the prefix describes the
+        //! stream. Packets follow the first and the last kind. For S2, logs of
+        //! up to 3 MiB, and half the time of more than a MiB and one packet,
+        //! so that a scan reporting only at its end fails.
+        //!
+        //! # Exclusions
+        //!
+        //! The streams, runs and boundaries the summary lists, which the tests
+        //! above cover. Logs over 16 MiB, which the indexed batch test covers.
+        //!
+        //! # Examples that stay
+        //!
+        //! None.
+
+        use super::*;
+        use proptest::prelude::*;
+
+        /// One packet of a log's accepted prefix.
+        #[derive(Debug, Clone)]
+        enum Accepted {
+            Heartbeat,
+            Reply(u16, usize),
+            Samples,
+        }
+
+        /// What follows the accepted prefix.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Failure {
+            /// Nothing, the log ends.
+            None,
+            /// A byte that names no packet type.
+            NotAPacket,
+            /// The first bytes of [`whole`], at the end of the log.
+            CutShort(usize),
+            /// Samples of a segment the stream does not have.
+            Refused,
+        }
+
+        /// The packet a log cut short ends in part of.
+        fn whole() -> Packet {
+            Packet::heartbeat_session(3, DeviceRoute::root())
+        }
+
+        fn accepted() -> impl Strategy<Value = Accepted> {
+            prop_oneof![
+                Just(Accepted::Heartbeat),
+                (any::<u16>(), 0usize..=400).prop_map(|(id, len)| Accepted::Reply(id, len)),
+                Just(Accepted::Samples),
+            ]
+        }
+
+        /// What follows a prefix, a refusal only after the stream's
+        /// metadata, and a cut inside the header or after it.
+        fn failure(described: bool) -> impl Strategy<Value = Failure> {
+            let len = whole().as_bytes().len();
+            let cut = prop_oneof![1usize..=3, 4..len].prop_map(Failure::CutShort);
+            match described {
+                true => prop_oneof![
+                    Just(Failure::None),
+                    Just(Failure::NotAPacket),
+                    cut,
+                    Just(Failure::Refused),
+                ]
+                .boxed(),
+                false => prop_oneof![Just(Failure::None), Just(Failure::NotAPacket), cut].boxed(),
+            }
+        }
+
+        fn case() -> impl Strategy<Value = (bool, Failure)> {
+            any::<bool>().prop_flat_map(|described| (Just(described), failure(described)))
+        }
+
+        /// The packets of the prefix, the metadata first if `described`.
+        /// Samples come only after the metadata.
+        fn prefix(described: bool, items: &[Accepted]) -> Vec<Packet> {
+            let mut packets = if described {
+                schema_packets()
+            } else {
+                Vec::new()
+            };
+            let mut sample = 0;
+            for item in items {
+                match item {
+                    Accepted::Heartbeat => packets.push(Packet::heartbeat(DeviceRoute::root())),
+                    Accepted::Reply(id, len) => packets.push(
+                        Packet::rpc_reply(*id, &vec![0x5A; *len], DeviceRoute::root()).unwrap(),
+                    ),
+                    Accepted::Samples if described => {
+                        packets.push(data_packet(sample, 0));
+                        sample += 1;
+                    }
+                    Accepted::Samples => {}
+                }
+            }
+            packets
+        }
+
+        proptest! {
+            /// S1 and S3. The scan accepts the prefix and stops at the packet
+            /// that fails, at its first byte.
+            #[test]
+            fn the_summary_counts_the_packets_and_bytes_before_the_failure(
+                (described, failure) in case(),
+                items in prop::collection::vec(accepted(), 0..=24),
+                after in prop::collection::vec(accepted(), 0..=4),
+            ) {
+                let accepted = prefix(described, &items);
+                let k = encoded_log(accepted.clone()).len();
+                let mut log = encoded_log(accepted.clone()).to_vec();
+                match failure {
+                    Failure::None => {}
+                    Failure::NotAPacket => log.push(0),
+                    Failure::CutShort(kept) => log.extend_from_slice(&whole().as_bytes()[..kept]),
+                    Failure::Refused => log.extend_from_slice(data_packet(0, 1).as_bytes()),
+                }
+                if !matches!(failure, Failure::CutShort(_)) {
+                    log.extend_from_slice(&encoded_log(prefix(true, &after)));
+                }
+                let n = match failure {
+                    Failure::None => accepted.len() + prefix(true, &after).len(),
+                    _ => accepted.len(),
+                };
+                let k = match failure {
+                    Failure::None => log.len(),
+                    _ => k,
+                };
+
+                let index = LogFile { data: Bytes::from(log) }.scan(false);
+                let summary = index.summary();
+                prop_assert_eq!(summary.packet_count(), n as u64);
+                prop_assert_eq!(summary.bytes_scanned(), k);
+                match (failure, summary.error()) {
+                    (Failure::None, None) => {}
+                    (
+                        Failure::NotAPacket | Failure::CutShort(_),
+                        Some(error @ LogError::Packet { .. }),
+                    )
+                    | (Failure::Refused, Some(error @ LogError::Data { .. })) => {
+                        prop_assert_eq!(error.offset(), k);
+                    }
+                    (failure, error) => prop_assert!(false, "{:?} gave {:?}", failure, error),
+                }
+                if k > 0 {
+                    prop_assert_eq!(index.chunk_count(), 1, "{} bytes are one range", k);
+                }
+            }
+
+            /// S4. A log opened from a file is empty exactly when the file is.
+            #[test]
+            fn a_log_is_empty_exactly_when_its_file_is(
+                items in prop::collection::vec(accepted(), 0..=4),
+            ) {
+                let bytes = encoded_log(prefix(true, &items)).to_vec();
+                let bytes = if items.is_empty() { Vec::new() } else { bytes };
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                std::io::Write::write_all(&mut file, &bytes).unwrap();
+                let log = LogFile::open(file.path()).unwrap();
+                prop_assert_eq!(log.len(), bytes.len());
+                prop_assert_eq!(log.is_empty(), bytes.is_empty());
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(12))]
+
+            /// S2 and S3. The scan reports its position at least every MiB and
+            /// one packet, and last where it stopped.
+            #[test]
+            fn progress_is_reported_every_mib_and_at_the_end(
+                (fillers, len) in prop_oneof![
+                    (0usize..=8000, 0usize..=400),
+                    (4000usize..=8000, 300usize..=400),
+                ],
+                failure in prop_oneof![Just(Failure::None), Just(Failure::NotAPacket)],
+            ) {
+                const MIB: usize = 1 << 20;
+                let filler = Packet::rpc_reply(1, &vec![0; len], DeviceRoute::root()).unwrap();
+                let widest = filler.as_bytes().len();
+                let mut log = encoded_log(std::iter::repeat_n(filler, fillers)).to_vec();
+                if failure == Failure::NotAPacket {
+                    log.push(0);
+                }
+                let mut reports = Vec::new();
+                let index = LogFile { data: Bytes::from(log) }
+                    .scan_with_progress(false, |position| reports.push(position));
+                let scanned = index.summary().bytes_scanned();
+                prop_assert_eq!(reports.last().copied(), Some(scanned));
+                let mut before = 0;
+                for &position in &reports {
+                    prop_assert!(position >= before, "{:?}", reports);
+                    prop_assert!(position - before <= MIB + widest, "{:?}", reports);
+                    before = position;
+                }
+                if scanned > 0 {
+                    prop_assert!(scanned < 16 << 20);
+                    prop_assert_eq!(index.chunk_count(), 1, "{} bytes are one range", scanned);
+                }
+            }
+        }
     }
 }

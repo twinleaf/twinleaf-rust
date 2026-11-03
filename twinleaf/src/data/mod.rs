@@ -13,8 +13,9 @@
 //! [`Device::samples`](crate::device::Device::samples). Most applications
 //! receive batches from there and do not construct a parser.
 //!
-//! Restarts, rate changes, and packet loss start a new run. The run's first
-//! batch carries a [`BoundaryReason`]. Every batch carries the [`Generations`]
+//! Restarts, rate changes, and the packet loss the parser finds start a new
+//! run. The run's first batch carries a [`Boundary`], as does each batch
+//! after samples its receiver lost. Every batch carries the [`Generations`]
 //! of the run it belongs to.
 //!
 //! The module also provides these higher-level tools.
@@ -141,6 +142,8 @@ println!("{} samples", writer.finish()?.total_samples);
 
 mod buffer;
 mod coalesce;
+mod continuity;
+mod decode;
 mod filter;
 mod metadata;
 mod parser;
@@ -158,20 +161,21 @@ pub mod export;
 pub mod ops;
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod tests;
 
 #[doc(no_inline)]
 pub use crate::proto::data::DataType;
 pub use buffer::{Buffer, Run};
+pub use continuity::{Boundary, BoundaryClass, Change, Generations, Loss};
 pub use filter::ColumnFilter;
 pub use metadata::{
     ColumnKey, DeviceMetadataSnapshot, MetadataQuery, StreamKey, StreamMetadataSnapshot,
+    StreamSchema,
 };
 pub use parser::{PacketOutcome, PacketParser};
 pub use pipeline::{ColumnOp, ColumnProcessor};
 pub use reader::{LogError, LogFile, LogIndex, LogSummary, PacketIter, StreamSummary};
-pub use sample::{
-    BoundaryClass, BoundaryReason, ColumnArray, ColumnData, Generations, SampleBatch, SampleRow,
-    ScalarBuffer, Series,
-};
-pub use state::{PacketError, StreamDataError};
+pub(crate) use sample::RowSource;
+pub use sample::{ColumnArray, ColumnData, SampleBatch, SampleRow, ScalarBuffer};
+pub(crate) use state::announces_stop;
+pub use state::{DataError, StreamDataError};

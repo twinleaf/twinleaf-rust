@@ -175,6 +175,8 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
 
             if byte == SLIP_END {
                 if self.len == 0 {
+                    self.esc = false;
+                    self.errors = FrameErrors::default();
                     continue;
                 }
                 let mut errors = self.errors;
@@ -427,6 +429,16 @@ mod tests {
         let n2 = serialize(&[0, 7, 0], &mut wire2).unwrap();
         let frames = deserialize_all(&mut des, &wire2[..n2]);
         assert_eq!(frames, vec![(vec![0, 7, 0], 0)]);
+    }
+
+    #[test]
+    fn an_end_with_nothing_buffered_drops_a_pending_escape() {
+        let mut wire = vec![0xDB, 0xC0];
+        wire.resize(2 + max_serialized_size(3), 0);
+        let n = serialize(&[1, 2, 3], &mut wire[2..]).unwrap();
+        let mut des = Deserializer::<CAP>::new();
+        let frames = deserialize_all(&mut des, &wire[..2 + n]);
+        assert_eq!(frames, vec![(vec![1, 2, 3], 0)]);
     }
 
     #[test]

@@ -33,14 +33,13 @@ use crate::Sink;
 /// Nanoseconds between heartbeats.
 pub const HEARTBEAT_INTERVAL: u64 = 200_000_000;
 
-/// Nanoseconds a changed configuration waits before it saves itself, as
-/// tl-chibi's `dev.conf.autosave` defaults to.
+/// Nanoseconds a changed configuration waits before it saves itself.
 pub const AUTOSAVE_INTERVAL: u64 = 60_000_000_000;
 
-/// The level `dev.loglevel` boots at, as tl-chibi's `logThreshold` does.
+/// The level `dev.loglevel` boots at.
 pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 
-/// Seconds `dev.autostart` waits at boot before acquiring, as tl-chibi's `TL_AUTOSTART_AFTER_SEC`.
+/// Seconds `dev.autostart` waits at boot before acquiring.
 pub const DEFAULT_AUTOSTART: u8 = 5;
 
 /// As much flash as a stored configuration may take.
@@ -49,7 +48,7 @@ pub const IMAGE_MAX: usize = 1024;
 /// Why a locked session's call to a privileged entry is refused.
 pub const LOCKED: &str = "privileged: unlock with dev.priv";
 
-/// As big a cell as `dev.priv.password` keeps, NUL and all, as tl-chibi's is.
+/// As big a cell as `dev.priv.password` keeps, NUL and all.
 pub const PASSWORD_MAX: usize = 16;
 
 /// The bytes a stored configuration is built in and read back into.
@@ -215,7 +214,10 @@ pub trait Lanes {
     fn reply(&mut self, packet: &[u8]);
 
     /// Every port's ordered lane: a setting announcement, behind every one
-    /// before it and ahead of any reply after it.
+    /// before it and ahead of any reply after it. A platform sends the
+    /// announcements and its publishers' sample packets and records in the
+    /// order they were written, which a host's parser relies on to tell a
+    /// stop from the acquisition after it.
     fn announce(&mut self, packet: &[u8]);
 
     /// The lane every port drains: what the device logged or beat on its own account.
@@ -322,9 +324,11 @@ pub struct Device<S: Group> {
     time_status: u8,
     /// `sync.status`, moved to what the platform published at each refresh.
     sync_status: Setting<u8>,
-    /// What the platform last published of its acquisition.
+    /// What the platform last published of its acquisition, or `Stopping`
+    /// once a stop or restart of a running acquisition is handed to it.
     acquisition: AcquisitionState,
-    /// `dev.running`, moved to whether that acquisition runs at each refresh.
+    /// `dev.running`, moved to whether that acquisition runs at each refresh,
+    /// and turned off as a stop or restart is handed to the platform.
     running: Setting<bool>,
 }
 
@@ -411,7 +415,9 @@ impl<S: Group> Device<S> {
     }
 
     /// Publish the state of the platform's acquisition, for `dev.running` to
-    /// announce at the next refresh.
+    /// announce at the next refresh. The platform publishes a state once it
+    /// has acted on it. A stop or restart the device hands over leaves the
+    /// acquisition stopping until the platform publishes again.
     pub fn set_acquisition(&mut self, state: AcquisitionState) {
         self.acquisition = state;
     }
@@ -650,9 +656,13 @@ impl<S: Group> Device<S> {
                     }
                 }),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
-                Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
+                Std::Stop => {
+                    self.stopping(&mut announcements(lanes));
+                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop));
+                }
                 Std::Restart => {
-                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Restart))
+                    self.stopping(&mut announcements(lanes));
+                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Restart));
                 }
                 Std::Abort => return actions.defer(pending, Deferred::Flash(FlashOp::Abort)),
                 Std::SettingsVersion => {
@@ -934,6 +944,31 @@ impl<S: Group> Device<S> {
             &mut self.running,
             self.acquisition == AcquisitionState::Running,
         );
+    }
+
+    /// Turns `dev.running` off for a stop or restart about to be handed to
+    /// the platform, and announces it into `out` ahead of anything the
+    /// platform does with the request. The announcement goes out on every
+    /// such request, though `dev.running` was already off, as while the
+    /// platform is starting and its first sample may be out. A running
+    /// acquisition counts as stopping until the platform publishes its
+    /// state, so no refresh before that announces it running again. A stop
+    /// or restart a host asks for thus announces `dev.running` off before
+    /// the first sample of the acquisition after it.
+    fn stopping(&mut self, out: &mut impl Sink) {
+        if self.acquisition == AcquisitionState::Running {
+            self.acquisition = AcquisitionState::Stopping;
+        }
+        let mut announced = Reply::new();
+        let off = self.running.put(false).is_ok() && false.encode(&mut announced).is_ok();
+        if off {
+            announce(
+                &mut self.settings_version,
+                out,
+                self.running.name(),
+                &announced,
+            );
+        }
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
@@ -1260,7 +1295,7 @@ mod tests {
     use super::*;
     use crate::data::filter::Butterworth4;
     use crate::data::Params;
-    use crate::data::{ColumnDef, Stream, StreamDef};
+    use crate::data::{ColumnDef, DataStream, StreamDef};
     use crate::rpc::put;
     use core::num::NonZeroU32;
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -1513,7 +1548,7 @@ mod tests {
     /// One device, the streams it describes, and the two lanes.
     struct Harness {
         device: Device<Board>,
-        streams: [Stream<4>; 1],
+        streams: [DataStream<4>; 1],
         lanes: Both,
         reboot: bool,
         deferred: Option<(RpcRequestId, Deferred)>,
@@ -1553,7 +1588,7 @@ mod tests {
         };
         Harness {
             device: device(table()),
-            streams: [Stream::new(
+            streams: [DataStream::new(
                 StreamId::new(1),
                 &AUX,
                 Box::leak(Box::new(Butterworth4::<1>::new())),
@@ -1869,7 +1904,7 @@ mod tests {
         assert_eq!(written.announced(), []);
     }
 
-    /// `dev.autostart` boots at tl-chibi's five seconds, and a written value
+    /// `dev.autostart` boots at five seconds, and a written value
     /// is announced and restored at the next boot.
     #[test]
     fn a_written_autostart_is_announced_and_restored_at_the_next_boot() {
@@ -2113,8 +2148,8 @@ mod tests {
         );
     }
 
-    /// tl-chibi's `dev.loglevel` (`lib/tlfirmware.c:766-773`): a write reaches
-    /// the gate the platform's own logging is checked against.
+    /// A write to `dev.loglevel` reaches the gate the platform's own logging is
+    /// checked against.
     #[test]
     fn writing_dev_loglevel_carries_the_threshold_back_to_the_platform() {
         let mut device = harness();
@@ -2605,7 +2640,11 @@ mod tests {
             ("dev.restart", SyncRequest::Restart),
         ] {
             let answered = device.ask(name, &[]);
-            assert!(answered.0.is_empty(), "{name} was answered here");
+            assert_eq!(
+                answered.0.len(),
+                answered.announced().len(),
+                "{name} was answered here"
+            );
             let Some((_, Deferred::Acquire(request))) = device.deferred.take() else {
                 panic!("{name} did not reach the acquisition");
             };
@@ -2636,6 +2675,63 @@ mod tests {
         assert_eq!(answered.announced(), [("dev.running".to_owned(), vec![1])]);
         assert_eq!(answered.value(), [1]);
         assert_eq!(device.ask("dev.running", &[1]).error(), RpcError::ReadOnly);
+    }
+
+    /// A stop or restart of a running acquisition announces `dev.running` off
+    /// in the request that asks for it, before the platform acts on it. A
+    /// refresh before the platform publishes again leaves it off, and the
+    /// first refresh after the platform publishes it running announces it on.
+    #[test]
+    fn a_stop_or_restart_announces_dev_running_off_as_it_is_handed_over() {
+        for name in ["dev.stop", "dev.restart"] {
+            let mut device = harness();
+            device.device.set_acquisition(AcquisitionState::Running);
+            device.ask("dev.running", &[]);
+            let asked = device.ask(name, &[]);
+            assert_eq!(
+                asked.announced(),
+                [("dev.running".to_owned(), vec![0])],
+                "{name} announces the stop"
+            );
+            assert!(asked.0.len() == 1, "{name} is answered by the platform");
+            assert!(matches!(
+                device.deferred.take(),
+                Some((_, Deferred::Acquire(_)))
+            ));
+
+            let mut sent = Sent::default();
+            let beat = BOOT + HEARTBEAT_INTERVAL;
+            device.device.tick(beat, &mut OneLane(&mut sent));
+            assert_eq!(sent.announced(), [], "{name} stays off while it stops");
+
+            device.device.set_acquisition(AcquisitionState::Running);
+            let mut sent = Sent::default();
+            device
+                .device
+                .tick(beat + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent));
+            assert_eq!(
+                sent.announced(),
+                [("dev.running".to_owned(), vec![1])],
+                "{name} is on again once the platform runs"
+            );
+        }
+    }
+
+    /// A stop or restart handed over while the platform starts, before it
+    /// ran and so with `dev.running` never on, announces `dev.running` off,
+    /// as the starting acquisition's first sample may be out already.
+    #[test]
+    fn a_stop_or_restart_while_starting_announces_dev_running_off() {
+        for name in ["dev.stop", "dev.restart"] {
+            let mut device = harness();
+            device.device.set_acquisition(AcquisitionState::Starting);
+            assert_eq!(device.ask("dev.running", &[]).value(), [0]);
+            assert_eq!(
+                device.ask(name, &[]).announced(),
+                [("dev.running".to_owned(), vec![0])],
+                "{name} announces the stop"
+            );
+        }
     }
 
     /// The standard reports that move are announced as they move, at the
@@ -2812,9 +2908,8 @@ mod tests {
         );
     }
 
-    /// tl-chibi's autosave (`lib/firmware/tlfw_persist.c:305`): a written
-    /// setting is saved a period after the write, once, and the heartbeat is
-    /// still the sooner deadline.
+    /// A written setting is saved a period after the write, once, and the
+    /// heartbeat is still the sooner deadline.
     #[test]
     fn a_written_setting_saves_itself_a_period_later() {
         let mut device = harness();
@@ -2866,7 +2961,7 @@ mod tests {
         assert!(device.tick(BOOT + AUTOSAVE_INTERVAL).is_some());
     }
 
-    /// tl-chibi stores `dev.loglevel` with whatever else a save writes, but writing it owes none.
+    /// A save stores `dev.loglevel` with whatever else it writes, but writing it owes none.
     #[test]
     fn a_write_to_dev_loglevel_owes_no_save() {
         let mut device = harness();
@@ -2900,7 +2995,7 @@ mod tests {
     }
 
     /// A restore says what the flash already stores, whether a boot or a host
-    /// asked for it, so tl-chibi's `tl_persist_load` leaves nothing owing.
+    /// asked for it, so it leaves nothing owing.
     #[test]
     fn a_restored_configuration_owes_no_save() {
         let mut device = harness();
@@ -2917,7 +3012,7 @@ mod tests {
         assert!(device.tick(later + 2 * AUTOSAVE_INTERVAL).is_none());
     }
 
-    /// A read leaves `Changed::Unchanged`, which tl-chibi does not stamp.
+    /// A read leaves `Changed::Unchanged`, so it owes no save.
     #[test]
     fn a_read_of_a_stored_setting_owes_no_save() {
         let mut device = harness();
@@ -2954,8 +3049,8 @@ mod tests {
             .is_none());
     }
 
-    /// A save that does not fit its image is owed for another period, as
-    /// tl-chibi's systick retries the one its storage refused.
+    /// A save that does not fit its image is owed for another period, and
+    /// tried again when that period ends.
     #[test]
     fn a_save_too_large_for_its_image_is_owed_for_another_period() {
         let cells = (0..IMAGE_MAX / 16)
@@ -2976,7 +3071,7 @@ mod tests {
 
         let asked = asking(Method::ByName(b"board.filler000"), &1u32.to_le_bytes(), &[]);
         let (view, _) = PacketView::parse_prefix(&asked).unwrap();
-        let none: [Stream<4>; 0] = [];
+        let none: [DataStream<4>; 0] = [];
         let mut lanes = Both::default();
         device.handle(&none[..], Input::Packet(view), BOOT, &mut lanes);
         assert_eq!(lanes.to.value(), &1u32.to_le_bytes(), "the write it owes");
@@ -2996,5 +3091,319 @@ mod tests {
             BOOT + 2 * AUTOSAVE_INTERVAL,
             "owed for another period"
         );
+    }
+
+    /// A device and its streams on one port, run by a platform the way a board's tasks run them.
+    mod contract {
+        use super::*;
+        use crate::data::Timeref;
+        use proptest::prelude::*;
+        use twinleaf_proto::contract::{self, Observed, Sender};
+        use twinleaf_proto::sync::Epoch;
+        use twinleaf_proto::DeviceRoute;
+
+        const RATE: u32 = 10;
+        const SECOND: u64 = 1_000_000_000;
+
+        /// What a host asks or a platform does next.
+        #[derive(Debug, Clone)]
+        enum Step {
+            /// Every stream takes this many samples, a period apart.
+            Sample(u32),
+            /// Every stream loses this many samples.
+            Skip(u32),
+            /// A host asks this RPC by name with these argument bytes.
+            Ask(&'static str, Vec<u8>),
+            /// A stream acquires with this decimation, enabled or not, from its next segment.
+            Retune(usize, u32, bool),
+            /// A stream begins a new segment.
+            Rollover(usize),
+            /// The time reference is replaced by one this many seconds ahead, or behind.
+            Relabel(i32),
+            /// The clock moves this many nanoseconds on.
+            Wait(u64),
+            /// A host connects.
+            Connect,
+            /// The device boots again into the next session.
+            Reboot,
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                4 => (1..30u32).prop_map(Step::Sample),
+                1 => (1..20u32).prop_map(Step::Skip),
+                4 => prop::sample::select(&["dev.start", "dev.stop", "dev.restart"][..])
+                    .prop_map(|name| Step::Ask(name, Vec::new())),
+                1 => any::<u32>().prop_map(|value| Step::Ask("board.first", value.to_le_bytes().to_vec())),
+                2 => (0..2usize, 1..=3u32, any::<bool>())
+                    .prop_map(|(stream, decimation, enabled)| Step::Retune(stream, decimation, enabled)),
+                1 => (0..2usize).prop_map(Step::Rollover),
+                1 => (-5..=5i32).prop_map(Step::Relabel),
+                2 => (0..2 * HEARTBEAT_INTERVAL).prop_map(Step::Wait),
+                1 => Just(Step::Connect),
+                1 => Just(Step::Reboot),
+            ]
+        }
+
+        fn params(decimation: u32, enabled: bool) -> Params {
+            Params {
+                rate: NonZeroU32::new(RATE).unwrap(),
+                decimation: NonZeroU32::new(decimation).unwrap(),
+                enabled,
+            }
+        }
+
+        /// Two streams, one sending a packet every four samples and one only when full.
+        fn streams() -> [DataStream<4>; 2] {
+            let stream = |id| {
+                let filter = Box::leak(Box::new(Butterworth4::<1>::new()));
+                DataStream::new(StreamId::new(id), &AUX, filter, params(1, true)).unwrap()
+            };
+            [stream(1).batched(16), stream(2)]
+        }
+
+        /// The platform, and every packet on its port with the nanosecond it went.
+        struct Platform {
+            device: Device<Board>,
+            streams: [DataStream<4>; 2],
+            port: Sent,
+            times: Vec<u64>,
+            now: u64,
+            /// The time reference's seconds ahead of the clock's.
+            offset: i64,
+            /// The time reference's session, one more at each relabel.
+            reference: u32,
+            running: bool,
+        }
+
+        impl Platform {
+            fn new() -> Self {
+                let mut platform = Self {
+                    device: device(table()),
+                    streams: streams(),
+                    port: Sent::default(),
+                    times: Vec::new(),
+                    now: BOOT,
+                    offset: 0,
+                    reference: 1,
+                    running: false,
+                };
+                platform.take(&Step::Connect);
+                platform
+            }
+
+            fn timeref(&self) -> Timeref {
+                let second = (self.now / SECOND) as i64 + self.offset;
+                Timeref::new(
+                    Epoch::UNIX,
+                    second as u32,
+                    SessionId::new(self.reference),
+                    "REF",
+                )
+                .unwrap()
+            }
+
+            fn take(&mut self, step: &Step) {
+                match *step {
+                    Step::Sample(count) => (0..count).for_each(|_| {
+                        self.now += SECOND / u64::from(RATE);
+                        self.streams
+                            .iter_mut()
+                            .for_each(|stream| stream.push(&1.0f32.to_le_bytes(), &mut self.port));
+                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                    }),
+                    Step::Skip(count) => {
+                        self.now += u64::from(count) * SECOND / u64::from(RATE);
+                        self.streams
+                            .iter_mut()
+                            .for_each(|stream| stream.skip(count, &mut self.port));
+                    }
+                    Step::Ask(name, ref args) => self.ask(name, args),
+                    Step::Retune(stream, decimation, enabled) => {
+                        self.streams[stream].retune(params(decimation, enabled), &mut self.port)
+                    }
+                    Step::Rollover(stream) => self.streams[stream].rollover(&mut self.port),
+                    Step::Relabel(shift) => {
+                        let from = self.timeref().start_time;
+                        self.offset += i64::from(shift);
+                        self.reference += 1;
+                        let to = self.timeref();
+                        self.streams
+                            .iter_mut()
+                            .for_each(|stream| stream.relabel(from, to.clone(), &mut self.port));
+                    }
+                    Step::Wait(ns) => {
+                        self.now += ns;
+                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                    }
+                    Step::Connect => {
+                        self.device
+                            .connected(&self.streams[..], self.now, &mut self.port)
+                    }
+                    Step::Reboot => {
+                        let session = SessionId::new(self.device.session.value().wrapping_add(1));
+                        self.device.reboot(session, self.now);
+                        self.device.set_acquisition(AcquisitionState::Idle);
+                        self.streams = streams();
+                        self.running = false;
+                        self.device
+                            .connected(&self.streams[..], self.now, &mut self.port);
+                    }
+                }
+                self.times.resize(self.port.0.len(), self.now);
+            }
+
+            /// A host's request and what the device and the platform answer, all on the port.
+            fn ask(&mut self, name: &str, args: &[u8]) {
+                let request = asking(Method::ByName(name.as_bytes()), args, &[]);
+                self.port.send(&request);
+                let (view, _) = PacketView::parse_prefix(&request).unwrap();
+                let Actions { call, deferred, .. } = self.device.handle(
+                    &self.streams[..],
+                    Input::Packet(view),
+                    self.now,
+                    &mut OneLane(&mut self.port),
+                );
+                if let Some((pending, _, _)) = call {
+                    answer(pending, Err(RpcError::NotFound), &mut self.port);
+                }
+                match deferred {
+                    Some((pending, Deferred::Acquire(request))) => self.acquire(pending, request),
+                    Some((pending, Deferred::Flash(_))) => {
+                        answer(pending, Err(RpcError::State), &mut self.port)
+                    }
+                    None => {}
+                }
+            }
+
+            /// Carry out a start, stop or restart: a stop flushes what its streams staged before it answers,
+            /// and a start answers first and begins on the second after next.
+            fn acquire(&mut self, pending: Pending<'_>, request: SyncRequest) {
+                match (request, self.running) {
+                    (SyncRequest::Start, true) => {
+                        answer(pending, Err(RpcError::State), &mut self.port)
+                    }
+                    (SyncRequest::Start, false) => {
+                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
+                        self.start();
+                    }
+                    (SyncRequest::Stop, _) => {
+                        self.stop();
+                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
+                    }
+                    (SyncRequest::Restart, _) => {
+                        self.stop();
+                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
+                        self.start();
+                    }
+                }
+            }
+
+            fn start(&mut self) {
+                self.now = (self.now / SECOND + 2) * SECOND;
+                let timeref = self.timeref();
+                self.streams.iter_mut().for_each(|stream| {
+                    stream
+                        .start(timeref.clone(), &mut self.port)
+                        .expect("a stopped stream starts")
+                });
+                self.device.set_acquisition(AcquisitionState::Running);
+                self.running = true;
+            }
+
+            fn stop(&mut self) {
+                self.streams.iter_mut().for_each(|stream| {
+                    stream.stop();
+                    stream.flush(&mut self.port);
+                });
+                self.device.set_acquisition(AcquisitionState::Idle);
+                self.running = false;
+            }
+
+            fn trace(&self) -> Vec<Observed<'_>> {
+                self.port
+                    .views()
+                    .into_iter()
+                    .zip(&self.times)
+                    .map(|(packet, &arrival_ns)| Observed {
+                        arrival_ns,
+                        route: DeviceRoute::root(),
+                        sender: match packet.header.ptype {
+                            PacketType::RPC_REQ => Sender::Host,
+                            _ => Sender::Device,
+                        },
+                        packet,
+                    })
+                    .collect()
+            }
+        }
+
+        proptest! {
+            /// Whatever a host asks and the platform does, starting, stopping, retuning, rolling
+            /// over, relabelling and rebooting, every packet on the port keeps the contract.
+            #[test]
+            fn a_device_keeps_the_contract(steps in prop::collection::vec(step(), 1..40)) {
+                let mut platform = Platform::new();
+                steps.iter().for_each(|step| platform.take(step));
+                prop_assert_eq!(contract::check(&platform.trace()), []);
+            }
+        }
+
+        /// A segment that reaches the sample numbers a packet carries rolls over at its next
+        /// whole second and keeps the contract across it.
+        #[test]
+        fn the_wire_limit_rollover_keeps_the_contract() {
+            let mut platform = Platform::new();
+            platform.take(&Step::Ask("dev.start", Vec::new()));
+            platform.take(&Step::Sample(5));
+            platform.take(&Step::Skip(15_999_990));
+            platform.take(&Step::Sample(30));
+            let rows =
+                platform.port.views().into_iter().filter_map(|view| {
+                    twinleaf_proto::data::Samples::parse(view.header, view.payload)
+                });
+            assert!(
+                rows.map(|row| row.segment_id.value()).any(|id| id == 1),
+                "it rolled over"
+            );
+            assert_eq!(contract::check(&platform.trace()), []);
+        }
+
+        /// Restarts that take no samples each open a segment, so the ring comes back to the first's id
+        /// with a count that starts past zero, which is lawful as each record goes out as it opens.
+        #[test]
+        fn restarts_that_take_no_samples_keep_the_contract() {
+            let mut platform = Platform::new();
+            [
+                Step::Ask("dev.start", Vec::new()),
+                Step::Sample(1),
+                Step::Relabel(0),
+                Step::Skip(10),
+                Step::Ask("dev.restart", Vec::new()),
+                Step::Ask("dev.restart", Vec::new()),
+                Step::Ask("dev.restart", Vec::new()),
+                Step::Skip(1),
+                Step::Sample(5),
+            ]
+            .iter()
+            .for_each(|step| platform.take(step));
+            assert_eq!(contract::check(&platform.trace()), []);
+        }
+
+        /// A time reference four seconds behind lands a stream's fifth segment on the first's id
+        /// and start, which is lawful as the reference is another.
+        #[test]
+        fn a_reference_that_steps_back_keeps_the_contract() {
+            let mut platform = Platform::new();
+            platform.take(&Step::Ask("dev.start", Vec::new()));
+            platform.take(&Step::Sample(10));
+            platform.take(&Step::Relabel(-4));
+            (0..3).for_each(|_| {
+                platform.take(&Step::Sample(10));
+                platform.take(&Step::Rollover(0));
+            });
+            platform.take(&Step::Sample(10));
+            assert_eq!(contract::check(&platform.trace()), []);
+        }
     }
 }

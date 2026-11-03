@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(packet.routing, [7, 99]);
     }
 
-    /// A router edits the payload and nothing else: the header and the hops
+    /// A router edits the payload and nothing else. The header and the hops
     /// tagged after it stay where they were.
     #[test]
     fn payload_mut_reaches_the_payload_alone() {

@@ -1,31 +1,36 @@
 //! The [`Connection`] to a proxy and its [`DeviceTree`] and [`Device`] views.
 
-use super::rpc::{
-    CallError, PendingReply, RpcArgs, RpcMeta, RpcRegistry, RpcRegistryError, RpcReply,
-    SettingsCache,
-};
-use super::runtime::ProxyAddress;
-use super::session::{Handle, Session};
-use super::stream::{DeviceEvent, Event, NamedRoute, Receiver, RecvError, Scope, Stream};
+use super::runtime::chosen_proxy;
+use super::stream::Stream;
 use crate::data::{DeviceMetadataSnapshot, SampleBatch};
 use crate::proto::DeviceRoute;
 use crate::proto::RouteError;
-use crate::proxy::{Layout, Purpose};
 use crate::rt::Supervisor;
+use crate::session::rpc::{CallError, PendingReply, RpcMeta, RpcRegistry, RpcRegistryError};
+use crate::session::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
+use crate::session::{Handle, Session};
+use crate::session::{Layout, ProxyAddress, Purpose, Receiver, RecvError, Scope};
+use crate::session::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::tio;
+use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport::is_local_tcp;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How long [`DeviceTree::metadata`] waits for discovery to finish, across
-/// all its `dev.metadata` round trips.
+/// How long [`Device::metadata`] waits for discovery to finish, across all
+/// its `dev.metadata` round trips, and [`Device::presence`] and
+/// [`DeviceTree::routes`] wait for the proxy's first word.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`Device::rpc_registry`] and [`Device::settings`] wait for the
+/// table to load and the settings to be read.
+const TABLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long [`Connection::open`] waits for the proxy to open a device. The
 /// proxy itself gives a device 10 s to answer.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Why [`DeviceTree::metadata`] returned no metadata.
+/// Why [`Device::metadata`] returned no metadata.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[non_exhaustive]
 pub enum MetadataError {
@@ -114,10 +119,10 @@ impl Connection {
     /// mDNS. It falls back to the system's resolver when mDNS finds no
     /// address within 1.5 s.
     ///
-    /// A TCP URL whose host is this machine, such as `tcp://localhost`,
-    /// names a running proxy, of tio 2.0 or older. The connection reaches it
-    /// directly, with no handshake, and gets whatever that proxy resolves
-    /// `auto` to. No proxy is started for it.
+    /// A TCP URL whose host is this machine, such as `tcp://localhost:17855`,
+    /// names a running proxy of this build. The connection goes through that
+    /// proxy and opens what it resolves `auto` to. No proxy is started for
+    /// it.
     ///
     /// The `TWINLEAF_PROXY` environment variable, when set and not empty,
     /// names a different proxy as `tcp://host:port`. For example,
@@ -130,16 +135,31 @@ impl Connection {
     /// `$XDG_RUNTIME_DIR/twinleaf`, or in `twinleaf/runtime` under the local
     /// data directory. `TWINLEAF_RUNTIME_DIR` names another directory.
     ///
+    /// The connection's tasks run on the crate's own runtime. This may be
+    /// called from inside an application's tokio runtime, and blocks that
+    /// thread until the proxy has opened the device or the open fails.
+    ///
     /// # Lifetime
     ///
-    /// The connection does not reconnect. A device that drops out does not
-    /// end it. The proxy reconnects the device, and the views see each change
-    /// as a [`LinkEvent::Status`](crate::LinkEvent::Status) on
-    /// [`events`](Self::events).
+    /// A device that drops out does not end the connection. The proxy
+    /// reconnects the device, and each change shows in the device's
+    /// [`presence`](Device::presence).
     ///
-    /// The connection ends when its socket to the proxy closes, or when the
-    /// proxy stops, as `tio proxy` does at Ctrl-C. Then every subscription
-    /// ends and every RPC fails. At a stop the views first see a
+    /// A socket to the proxy that closes without a stop, as when the proxy
+    /// crashes, does not end it either. Every device is
+    /// [`Lost`](Presence::Lost) and every RPC fails with
+    /// [`CallError::ResponseLost`] until the connection is open again, and
+    /// the raw [`packets`](DeviceTree::packets) carry a
+    /// [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
+    /// status at the root. It opens the target that proxy resolved the first
+    /// time again at the same address, never starting a proxy, and watches
+    /// each device again, and the samples after begin a new run. A
+    /// connection that cannot open again within 30 s ends.
+    ///
+    /// The connection ends when the proxy stops, as `tio proxy` does at
+    /// Ctrl-C, and when the proxy gives a device up and closes the socket.
+    /// Then every subscription ends and every RPC fails. At a stop the raw
+    /// [`packets`](DeviceTree::packets) first carry a
     /// [`Stopped`](crate::tio::packet::LinkStatus::Stopped) status, and
     /// subscriptions end with [`RecvError::Stopped`]. After
     /// [`close`](Self::close) they end with [`RecvError::Closed`]. Any other
@@ -153,8 +173,9 @@ impl Connection {
     /// - The proxy refuses to open the device, or does not open it within
     ///   15 s. A refusal carries the proxy's reason, such as the candidates
     ///   an ambiguous `auto` could mean.
-    /// - The peer that answers is not a Twinleaf 2.0 proxy, such as a 1.x
-    ///   `tio proxy`. The message names the loopback URL that reaches it.
+    /// - The peer that answers gives no introduction to the hello, as a
+    ///   `tio proxy` from an older build gives none. This build cannot reach
+    ///   such a proxy.
     /// - Nothing answers at the proxy `TWINLEAF_PROXY` names. The message
     ///   names the variable.
     ///
@@ -172,7 +193,7 @@ impl Connection {
     /// # }
     /// ```
     pub fn open(url: &str) -> std::io::Result<Connection> {
-        Self::open_at(&ProxyAddress::chosen(), url, Purpose::Use, OPEN_TIMEOUT)
+        Self::open_at(&chosen_proxy(), url, Purpose::Use, OPEN_TIMEOUT)
     }
 
     /// Opens a connection that sees `layout` as one tree, each mount's
@@ -188,7 +209,7 @@ impl Connection {
     /// [`open`](Self::open) does.
     pub fn open_layout(layout: &Layout) -> std::io::Result<Connection> {
         fits_one_request(layout)?;
-        Self::mount_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+        Self::mount_at(&chosen_proxy(), layout, OPEN_TIMEOUT)
     }
 
     /// Makes `layout` the default of the machine's background proxy, the
@@ -203,7 +224,7 @@ impl Connection {
     /// holds its default.
     pub fn hold_default(layout: &Layout) -> std::io::Result<Connection> {
         fits_one_request(layout)?;
-        Self::hold_default_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+        Self::hold_default_at(&chosen_proxy(), layout, OPEN_TIMEOUT)
     }
 
     /// Holds `layout` as the default of `proxy`, waiting at most
@@ -246,8 +267,8 @@ impl Connection {
     }
 
     /// Opens `url` through `proxy` for `purpose`, waiting at most
-    /// `open_timeout` for the proxy to open it. A TCP URL on this machine is
-    /// reached directly.
+    /// `open_timeout` for the proxy to open it. A TCP URL on this machine
+    /// names the proxy to open `auto` through instead.
     pub(crate) fn open_at(
         proxy: &ProxyAddress,
         url: &str,
@@ -270,9 +291,17 @@ impl Connection {
     ) -> std::io::Result<Connection> {
         let session = match is_local_tcp(url) {
             true => {
-                let url = url.to_string();
-                let direct = Supervisor::new().spawn_blocking(move || Session::direct(&url));
-                direct.await.map_err(std::io::Error::other)??
+                let named = ProxyAddress {
+                    url: url.to_string(),
+                    ensure: None,
+                };
+                let opened = Session::open_async(&named, "auto", Purpose::Use, open_timeout).await;
+                opened.map_err(|error| match error.kind() {
+                    std::io::ErrorKind::ConnectionRefused => {
+                        std::io::Error::new(error.kind(), format!("no proxy answers at {url}"))
+                    }
+                    _ => error,
+                })?
             }
             false => Session::open_async(proxy, url, purpose, open_timeout).await?,
         };
@@ -323,11 +352,6 @@ impl Connection {
         self.tree.samples()
     }
 
-    /// Subscribes to the events of every route. See [`DeviceTree::events`].
-    pub fn events(&self) -> Receiver<Event> {
-        self.tree.events()
-    }
-
     /// Subscribes to every packet on the connection. See
     /// [`DeviceTree::packets`].
     pub fn packets(&self) -> Receiver<tio::Packet> {
@@ -349,6 +373,25 @@ fn fits_one_request(layout: &Layout) -> std::io::Result<()> {
         )),
         false => Ok(()),
     }
+}
+
+/// Returns why an RPC table or settings were not received, as `error`
+/// says.
+fn unreceived(error: RecvError) -> RpcRegistryError {
+    RpcRegistryError::DeviceRpcError(match error {
+        RecvError::Timeout => CallError::Timeout,
+        _ => CallError::ResponseLost,
+    })
+}
+
+/// A discovered route and its device's `dev.name`, from
+/// [`DeviceTree::named_routes`].
+#[derive(Debug, Clone)]
+pub struct NamedRoute {
+    /// The route discovered.
+    pub route: DeviceRoute,
+    /// Its `dev.name`, when the device answered.
+    pub name: Option<String>,
 }
 
 /// A routed view of a device tree.
@@ -384,6 +427,14 @@ impl std::fmt::Debug for DeviceTree {
 }
 
 impl DeviceTree {
+    /// Returns the subtree this view covers, as its stream subscribes to it.
+    fn scope(&self) -> Scope {
+        Scope {
+            route: self.handle.scope(),
+            depth: self.handle.depth(),
+        }
+    }
+
     /// Returns the device at `route`. Its first RPC learns whether a device
     /// is there.
     ///
@@ -426,7 +477,8 @@ impl DeviceTree {
     /// The first subscription on the connection starts its stream task.
     /// The receiver queues up to 1024 batches. Batches that arrive while it
     /// is full are dropped, and their count arrives as
-    /// [`RecvError::Lagged`].
+    /// [`RecvError::Lagged`]. The next batch of each stream that lost
+    /// batches carries a [`Loss`](crate::data::Loss).
     ///
     /// # Examples
     ///
@@ -447,86 +499,65 @@ impl DeviceTree {
     ///     };
     ///     for row in batch.iter() {
     ///         let values: Vec<String> = row.values().map(|v| v.to_string()).collect();
-    ///         println!("{} {}: {}", batch.route(), batch.stream().name, values.join(" "));
+    ///         println!("{} {}: {}", batch.route(), batch.schema().stream().name(), values.join(" "));
     ///     }
     /// }
     /// # }
     /// ```
     pub fn samples(&self) -> Receiver<SampleBatch> {
-        self.stream.batches(Scope::of(&self.handle))
-    }
-
-    /// Subscribes to the subtree's events. A new subscriber first receives
-    /// the routes, link statuses, and metadata already known.
-    pub fn events(&self) -> Receiver<Event> {
-        self.stream.events(Scope::of(&self.handle))
+        self.stream.batches(self.scope())
     }
 
     /// Subscribes to the subtree's packets before they are parsed.
     pub fn packets(&self) -> Receiver<tio::Packet> {
-        self.stream.packets(Scope::of(&self.handle))
+        self.stream.packets(self.scope())
     }
 
-    /// Returns the session handle behind this view.
-    pub(super) fn handle(&self) -> &Handle {
-        &self.handle
+    /// Returns the routes the proxy has heard in the subtree so far, sorted,
+    /// waiting up to 10 s for its answer. Sends nothing to the devices.
+    pub fn routes(&self) -> Vec<DeviceRoute> {
+        self.routes_updates()
+            .recv_timeout(METADATA_TIMEOUT)
+            .unwrap_or_default()
     }
 
-    /// Collects complete metadata for `route`, waiting up to 10 s.
+    /// Subscribes to the routes the proxy has heard in the subtree. The
+    /// receiver yields the sorted list of them once the proxy says it, then
+    /// the whole list again each time a new route is heard. A reader that
+    /// falls behind skips to the newest list.
+    pub fn routes_updates(&self) -> Receiver<Vec<DeviceRoute>> {
+        self.stream.routes(self.scope())
+    }
+
+    /// Collects complete metadata for `route`, waiting up to 10 s. See
+    /// [`Device::metadata`].
     ///
     /// # Errors
     ///
     /// Returns [`MetadataError::Route`] at once if `route` lies outside this
-    /// view. Returns [`MetadataError::Unsupported`] if the device has no
-    /// `dev.metadata`, [`MetadataError::Timeout`] if discovery does not
-    /// finish in time, and [`MetadataError::Disconnected`] if the connection
-    /// ends.
+    /// view. Otherwise fails as [`Device::metadata`] does.
     pub fn metadata(&self, route: DeviceRoute) -> Result<DeviceMetadataSnapshot, MetadataError> {
-        self.handle.scoped(route)?;
-        let events = self.events();
-        let deadline = Instant::now() + METADATA_TIMEOUT;
-        loop {
-            let event = match events.recv_deadline(deadline) {
-                Ok(event) => event,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Timeout) => return Err(MetadataError::Timeout),
-                Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
-                    return Err(MetadataError::Disconnected)
-                }
-            };
-            match event {
-                Event::Device { route: from, event } if from == route => match event {
-                    DeviceEvent::Metadata(snapshot) => return Ok(snapshot),
-                    DeviceEvent::MetadataUnavailable => return Err(MetadataError::Unsupported),
-                    DeviceEvent::Heartbeat { .. }
-                    | DeviceEvent::NewHash(_)
-                    | DeviceEvent::Setting { .. } => {}
-                },
-                Event::Device { .. } | Event::RouteDiscovered { .. } | Event::Link { .. } => {}
-            }
-        }
+        self.device(route)?.metadata()
     }
 
-    /// Listens to the subtree for `window` and returns the routes heard,
-    /// sorted. Sends nothing to the devices.
+    /// Listens to the subtree for `window` and returns the routes heard by
+    /// then, sorted. Sends nothing to the devices.
     pub fn discover_routes(&self, window: Duration) -> Vec<DeviceRoute> {
-        let events = self.events();
+        let updates = self.routes_updates();
         let deadline = Instant::now() + window;
         let mut routes = Vec::new();
         loop {
-            match events.recv_deadline(deadline) {
-                Ok(Event::RouteDiscovered { route }) => routes.push(route),
-                Ok(Event::Device { .. }) | Ok(Event::Link { .. }) | Err(RecvError::Lagged(_)) => {}
+            match updates.recv_deadline(deadline) {
+                Ok(heard) => routes = heard,
+                Err(RecvError::Lagged(_)) => {}
                 Err(
                     RecvError::Timeout
                     | RecvError::Disconnected
                     | RecvError::Stopped
                     | RecvError::Closed,
-                ) => break,
+                ) => return routes,
             }
         }
-        routes.sort();
-        routes
     }
 
     /// Discovers the subtree's routes as [`discover_routes`](Self::discover_routes)
@@ -609,18 +640,17 @@ impl DeviceTree {
         self.rpc(route, name, ())
     }
 
-    /// Returns the RPCs the device at `route` offers.
-    ///
-    /// The table comes from the on-disk cache when the device's `rpc.hash`
-    /// matches it. On a miss it is read with `rpc.listinfo` and cached. A
-    /// cache that cannot be read or written is logged and skipped.
+    /// Returns the RPCs the device at `route` offers. See
+    /// [`Device::rpc_registry`].
     ///
     /// # Errors
     ///
-    /// Returns [`RpcRegistryError::DeviceRpcError`] if a call fails, and
-    /// [`RpcRegistryError::TableChanged`] if the table changed during every walk.
-    pub fn rpc_registry(&self, route: DeviceRoute) -> Result<RpcRegistry, RpcRegistryError> {
-        RpcRegistry::load_with(|name, arg| self.submit(route, name, arg))
+    /// Returns [`RpcRegistryError::DeviceRpcError`] with
+    /// [`CallError::InvalidRoute`] if `route` lies outside this view.
+    /// Otherwise fails as [`Device::rpc_registry`] does.
+    pub fn rpc_registry(&self, route: DeviceRoute) -> Result<Arc<RpcRegistry>, RpcRegistryError> {
+        let device = self.device(route).map_err(CallError::InvalidRoute)?;
+        device.rpc_registry()
     }
 
     /// Returns the type, access, and flags of the RPC `name` at `route`, as
@@ -668,24 +698,74 @@ impl Device {
         self.tree.samples()
     }
 
-    /// Subscribes to this device's events and the events of the links that
-    /// serve it. See [`DeviceTree::events`].
-    pub fn events(&self) -> Receiver<Event> {
-        self.tree.events()
-    }
-
     /// Subscribes to this device's packets. See [`DeviceTree::packets`].
     pub fn packets(&self) -> Receiver<tio::Packet> {
         self.tree.packets()
     }
 
+    /// Returns whether this device is there now, as the proxy says, waiting
+    /// up to 10 s for its answer.
+    ///
+    /// The proxy follows each device from its packets and the statuses of
+    /// the link that serves it, and every client watches what it found. A
+    /// device not heard from yet, or one the proxy does not answer for in
+    /// time, is [`Presence::Connecting`]. A device silent for 3 s is lost.
+    /// Once the connection has ended, every device is [`Presence::Lost`].
+    pub fn presence(&self) -> Presence {
+        match self.presence_updates().recv_timeout(METADATA_TIMEOUT) {
+            Ok(presence) => presence,
+            Err(RecvError::Timeout) => Presence::Connecting,
+            Err(_) => Presence::Lost {
+                since: Instant::now(),
+            },
+        }
+    }
+
+    /// Subscribes to whether this device is there. The receiver yields the
+    /// presence once the proxy says it, then each change. A heartbeat
+    /// changes it only when it reports a new session. A reader that falls
+    /// behind skips to the newest.
+    pub fn presence_updates(&self) -> Receiver<Presence> {
+        self.state(PRESENCE)
+    }
+
     /// Collects this device's complete metadata, waiting up to 10 s.
+    ///
+    /// The proxy asks the device once, and every caller of every client of
+    /// the proxy shares what it collected.
     ///
     /// # Errors
     ///
-    /// Fails as [`DeviceTree::metadata`] does.
+    /// Returns [`MetadataError::Unsupported`] if the device has no
+    /// `dev.metadata`, [`MetadataError::Timeout`] if discovery does not
+    /// finish in time, and [`MetadataError::Disconnected`] if the connection
+    /// ends.
     pub fn metadata(&self) -> Result<DeviceMetadataSnapshot, MetadataError> {
-        self.tree.metadata(self.route())
+        let updates = self.metadata_updates();
+        let deadline = Instant::now() + METADATA_TIMEOUT;
+        loop {
+            match updates.recv_deadline(deadline) {
+                Ok(MetadataState::Ready(snapshot)) => return Ok(snapshot),
+                Ok(MetadataState::Unsupported) => return Err(MetadataError::Unsupported),
+                Ok(MetadataState::Pending) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Timeout) => return Err(MetadataError::Timeout),
+                Err(RecvError::Disconnected | RecvError::Stopped | RecvError::Closed) => {
+                    return Err(MetadataError::Disconnected)
+                }
+            }
+        }
+    }
+
+    /// Subscribes to this device's metadata. The receiver yields how far it
+    /// is collected now, then each change. Subscribing starts discovery. A
+    /// reader that falls behind skips to the newest.
+    pub fn metadata_updates(&self) -> Receiver<MetadataState> {
+        self.state(METADATA)
+    }
+
+    /// Subscribes to the `field` of this device's state.
+    fn state<T: Clone>(&self, field: Field<T>) -> Receiver<T> {
+        self.tree.stream.state(self.route(), field)
     }
 
     /// Returns the same device, with each RPC giving up after `rpc_timeout`.
@@ -766,13 +846,71 @@ impl Device {
         self.tree.get(self.route(), name)
     }
 
-    /// Returns the RPCs this device offers. See [`DeviceTree::rpc_registry`].
+    /// Returns the RPCs this device offers, waiting up to 30 s until the
+    /// table is loaded.
+    ///
+    /// The proxy loads the table once, and every caller of every client of
+    /// the proxy shares it. It comes from the on-disk cache when the device's `rpc.hash` matches it.
+    /// On a miss it is read with `rpc.listinfo` and cached. A cache that
+    /// cannot be read or written is logged and skipped. The table is loaded
+    /// again when the device announces a new `rpc.hash`, starts a new
+    /// session, or its link reconnects.
     ///
     /// # Errors
     ///
-    /// Fails as [`DeviceTree::rpc_registry`] does.
-    pub fn rpc_registry(&self) -> Result<RpcRegistry, RpcRegistryError> {
-        self.tree.rpc_registry(self.route())
+    /// Returns [`RpcRegistryError::DeviceRpcError`] if a call fails, with
+    /// [`CallError::Timeout`] if the table is not loaded in time, and
+    /// [`RpcRegistryError::TableChanged`] if the table changed during every
+    /// walk. The proxy loads it again later.
+    pub fn rpc_registry(&self) -> Result<Arc<RpcRegistry>, RpcRegistryError> {
+        let registry = self.rpc_registry_updates().recv_timeout(TABLE_TIMEOUT);
+        registry.map_err(unreceived)?
+    }
+
+    /// Subscribes to this device's RPC table. The receiver yields the table,
+    /// or why it could not be loaded, once it is known, then each new one.
+    /// Subscribing starts loading it. A reader that falls behind skips to the
+    /// newest.
+    pub fn rpc_registry_updates(&self) -> Receiver<RegistryState> {
+        self.state(REGISTRY)
+    }
+
+    /// Returns the values of this device's announced settings, waiting up
+    /// to 30 s until the RPC table is loaded and the values are read.
+    ///
+    /// The proxy reads them once and keeps them by the device's
+    /// announcements, and every caller of every client of the proxy shares
+    /// them. See [`Settings`].
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`rpc_registry`](Self::rpc_registry) does, as the values
+    /// cannot be read without the table.
+    pub fn settings(&self) -> Result<Arc<Settings>, RpcRegistryError> {
+        let (settings, deadline) = (self.settings_updates(), Instant::now() + TABLE_TIMEOUT);
+        let registry = self.rpc_registry_updates().recv_deadline(deadline);
+        registry.map_err(unreceived)??;
+        settings.recv_deadline(deadline).map_err(unreceived)
+    }
+
+    /// Subscribes to the values of this device's announced settings. The
+    /// receiver yields them once they are read, then again after each
+    /// change. Subscribing starts loading the RPC table and reading them. A
+    /// reader that falls behind skips to the newest values.
+    pub fn settings_updates(&self) -> Receiver<Arc<Settings>> {
+        self.state(SETTINGS)
+    }
+
+    /// Subscribes to every setting this device announces from now on, in
+    /// the order it announces them. Each carries the RPC table it was
+    /// recorded under, which decodes its value. Subscribing follows the
+    /// table too, so the proxy loads the table and reads every setting once,
+    /// as for [`settings_updates`](Self::settings_updates). The receiver
+    /// queues up to 4096 of them, and one
+    /// that falls behind gets [`RecvError::Lagged`]. Read
+    /// [`settings`](Self::settings) then to catch up.
+    pub fn setting_changes(&self) -> Receiver<SettingChange> {
+        self.state(CHANGES)
     }
 
     /// Returns the type, access, and flags of this device's RPC `name`. See
@@ -785,27 +923,10 @@ impl Device {
         self.tree.rpc_meta(self.route(), name)
     }
 
-    /// Fills `cache` with one consistent snapshot of this device's announced
-    /// values, read between two reads of `settings.version` that agree.
-    ///
-    /// Call it once the cache is built and whenever
-    /// [`SettingsCache::observe`] asks for it. Announcements received during
-    /// the call are observed after it, and those the snapshot already holds
-    /// are skipped by their sequence numbers. A device the cache does not
-    /// hold is not read.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CallError`] if reading `settings.version` or any value
-    /// fails. The cache then keeps what it held.
-    pub fn snapshot_settings(&self, cache: &mut SettingsCache) -> Result<(), CallError> {
-        cache.snapshot_with(|name, arg| self.submit(name, arg))
-    }
-
     /// Returns a test device at the root, over a session whose socket is a
     /// pair of channels, and the session's far end.
     #[cfg(test)]
-    pub(crate) fn test_pair() -> (Device, super::session::TestProxy) {
+    pub(crate) fn test_pair() -> (Device, crate::session::TestProxy) {
         let (session, proxy) = Session::test_pair();
         let connection = Connection::over(session);
         (connection.device(DeviceRoute::root()), proxy)
@@ -815,13 +936,15 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::fixtures::{self, open_through, FakeDevice, WAIT};
-    use crate::device::rpc::RpcArgs;
-    use crate::device::session::TestProxy;
-    use crate::device::LinkEvent;
+    use crate::data::tests::fixtures::{announcement, broadcast, metadata_records, samples};
+    use crate::device::tests::fixtures::{self, open_through};
     use crate::proto::rpc as wire_rpc;
-    use crate::proxy::{call, Proxy};
-    use crate::tio::packet::LinkStatus;
+    use crate::proxy::Proxy;
+    use crate::session::tests::wait_for;
+    use crate::session::TestProxy;
+    use crate::tio::tests::device::FakeDevice;
+    use crate::tio::tests::ClosedPort;
+    use crate::tio::tests::WAIT;
     use std::thread;
 
     fn test_tree() -> (DeviceTree, TestProxy) {
@@ -837,8 +960,8 @@ mod tests {
         (tree, proxy)
     }
 
-    /// A view may not mint one that reaches further than itself: containment is
-    /// checked here, existence at the first RPC.
+    /// A view may not mint one that reaches further than itself. Containment
+    /// is checked here, and existence at the first RPC.
     #[test]
     fn a_device_must_lie_within_the_trees_scope_and_depth() {
         let route = |text: &str| text.parse::<DeviceRoute>().expect("a valid route");
@@ -904,10 +1027,16 @@ mod tests {
         responder.join().unwrap();
     }
 
+    /// A refusal, a call nothing answers, and a call lost with the socket
+    /// each fail as their own error. Only the unanswered call has a short
+    /// timeout, so the refusal and the loss never wait on it.
     #[test]
     fn raw_call_failures_map_to_typed_call_errors() {
         let (tree, proxy) = test_tree();
-        let tree = tree.with_timeout(Duration::from_millis(150));
+        let (patient, hasty) = (
+            tree.with_timeout(WAIT * 2),
+            tree.with_timeout(Duration::from_millis(150)),
+        );
         let responder = thread::spawn(move || {
             let (route, _, _, id) = proxy.call();
             proxy.refuse(id, wire_rpc::RpcError::NotFound, route);
@@ -917,17 +1046,17 @@ mod tests {
             proxy.call();
         });
 
-        let refused = tree.raw_rpc(DeviceRoute::root(), "dev.name", b"");
+        let refused = patient.raw_rpc(DeviceRoute::root(), "dev.name", b"");
         assert!(matches!(
             refused,
             Err(CallError::DeviceError(payload))
                 if matches!(payload.error, wire_rpc::RpcError::NotFound)
         ));
         assert!(matches!(
-            tree.raw_rpc(DeviceRoute::root(), "dev.name", b""),
+            hasty.raw_rpc(DeviceRoute::root(), "dev.name", b""),
             Err(CallError::Timeout)
         ));
-        let lost = tree.raw_rpc(DeviceRoute::root(), "dev.name", b"");
+        let lost = patient.raw_rpc(DeviceRoute::root(), "dev.name", b"");
         assert!(matches!(lost, Err(CallError::ResponseLost)), "{lost:?}");
         responder.join().unwrap();
     }
@@ -957,10 +1086,6 @@ mod tests {
         responder.join().unwrap();
     }
 
-    fn never() -> crate::rt::BoxFuture<'static, std::io::Result<()>> {
-        panic!("a local TCP URL went looking for the proxy")
-    }
-
     /// The name of the root device of `connection`.
     fn root_name(connection: &Connection) -> String {
         connection
@@ -977,20 +1102,9 @@ mod tests {
             .any(|client| client.own_process && client.target.as_deref() == Some(target))
     }
 
-    /// A connection the proxy opened its device for reaches the device.
-    #[test]
-    fn a_connection_reaches_its_device_through_the_proxy() {
-        let device = FakeDevice::start();
-        let proxy = fixtures::proxy();
-
-        let connection = open_through(&proxy, &device.url).unwrap();
-
-        assert_eq!(root_name(&connection), "FAKE");
-        assert!(opened(&proxy, &device.url));
-    }
-
     /// The call's own timeout decides how long a device may take, so a reply
-    /// within it arrives through the proxy however long it took.
+    /// within it arrives through the proxy however long it took. The call
+    /// waits twice [`WAIT`], so a slow test thread never runs it out.
     #[test]
     fn a_slow_reply_within_the_calls_timeout_arrives() {
         let device = FakeDevice::start();
@@ -999,7 +1113,10 @@ mod tests {
 
         let connection = open_through(&proxy, &device.url).unwrap();
 
-        assert_eq!(root_name(&connection), "FAKE");
+        let root = connection
+            .device(DeviceRoute::root())
+            .with_timeout(WAIT * 2);
+        assert_eq!(root.get::<String>("dev.name").unwrap(), "FAKE");
     }
 
     /// Closing one clone ends every subscription and view of the connection,
@@ -1009,7 +1126,8 @@ mod tests {
         let device = FakeDevice::start();
         let proxy = fixtures::proxy();
         let connection = open_through(&proxy, &device.url).unwrap();
-        let (events, view) = (connection.events(), connection.device(DeviceRoute::root()));
+        let view = connection.device(DeviceRoute::root());
+        let presence = view.presence_updates();
         assert_eq!(root_name(&connection), "FAKE");
 
         connection.clone().close();
@@ -1017,7 +1135,7 @@ mod tests {
 
         let deadline = Instant::now() + WAIT;
         let ended = loop {
-            match events.recv_deadline(deadline) {
+            match presence.recv_deadline(deadline) {
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(ended) => break ended,
             }
@@ -1033,137 +1151,52 @@ mod tests {
         }
     }
 
-    /// A layout opens each of its devices, each seen at its own prefix.
+    /// The routes of a tree come from the proxy, each as the client sees it
+    /// through the mount that shows it.
     #[test]
-    fn a_layout_opens_each_device_at_its_prefix() {
-        let devices = [FakeDevice::start(), FakeDevice::start()];
+    fn the_routes_through_a_mount_come_from_the_proxy() {
+        let device = FakeDevice::start();
         let proxy = fixtures::proxy();
+        let prefix: DeviceRoute = "/3".parse().unwrap();
+        let mounted = Layout {
+            mounts: vec![crate::session::Mount {
+                url: device.url.clone(),
+                source: DeviceRoute::root(),
+                prefix,
+            }],
+        };
         let address = ProxyAddress {
             url: proxy.endpoint(),
             ensure: None,
         };
-        let prefixes: [DeviceRoute; 2] = ["/1".parse().unwrap(), "/2".parse().unwrap()];
-        let layout = Layout {
-            mounts: devices
-                .iter()
-                .zip(prefixes)
-                .map(|(device, prefix)| crate::proxy::Mount {
-                    url: device.url.clone(),
-                    source: DeviceRoute::root(),
-                    prefix,
-                })
-                .collect(),
-        };
+        let connection = Connection::mount_at(&address, &mounted, WAIT).unwrap();
 
-        let connection = Connection::mount_at(&address, &layout, WAIT).unwrap();
-
-        for prefix in prefixes {
-            let name: String = connection.device(prefix).get("dev.name").unwrap();
-            assert_eq!(name, "FAKE", "{prefix}");
-        }
+        let routes = connection.tree(DeviceRoute::root()).routes_updates();
+        let heard = wait_for(&routes, |routes| !routes.is_empty());
+        assert_eq!(heard, [prefix]);
+        assert_eq!(connection.tree(prefix).routes(), [prefix]);
     }
 
-    /// A TCP URL on this machine names a proxy already, of tio 2.0 or older,
-    /// so it is connected to as given.
+    /// A proxy whose link is another proxy keeps the state of the device
+    /// behind it as of any device. Its clients share one discovery, one walk
+    /// and one snapshot, which reach the device through the other proxy.
     #[test]
-    fn a_local_tcp_url_connects_directly() {
+    fn clients_of_a_proxy_behind_a_proxy_share_its_state() {
         let device = FakeDevice::start();
-
-        let machine = ProxyAddress {
-            url: "tcp://192.0.2.1:9".to_string(),
-            ensure: Some(never),
-        };
-
-        let connection = Connection::open_at(&machine, &device.url, Purpose::Use, WAIT).unwrap();
-
-        assert_eq!(root_name(&connection), "FAKE");
-    }
-
-    /// An `auto` that could mean several devices fails with the proxy's own
-    /// words, which name each candidate.
-    #[test]
-    fn an_ambiguous_auto_fails_with_the_proxys_message() {
-        let devices = [FakeDevice::start(), FakeDevice::start()];
-        let proxy = fixtures::proxy();
-        let _connections: Vec<Connection> = devices
-            .iter()
-            .map(|device| open_through(&proxy, &device.url).unwrap())
-            .collect();
-        if fixtures::attached() == 1 {
-            eprintln!("skipped: the one device attached makes auto unambiguous");
-            return;
+        let upstream = fixtures::proxy_serving(&device.url);
+        let downstream = fixtures::proxy();
+        for _ in 0..2 {
+            let connection = open_through(&downstream, &upstream.endpoint()).unwrap();
+            let view = connection.device(DeviceRoute::root());
+            let metadata = view.metadata().expect("the proxy collects the metadata");
+            assert_eq!(metadata.device().name(), "FAKE");
+            let settings = view.settings().expect("the proxy reads the settings");
+            assert_eq!(settings.get("test.amplitude"), Some(&[1u8][..]));
         }
-        let resolved = call(&proxy.endpoint(), "proxy.open", &"auto".encode_args(), WAIT);
-        let message = resolved.expect_err("the proxy resolved auto").to_string();
 
-        for target in ["auto", ""] {
-            let opened = open_through(&proxy, target);
-            let error = opened.expect_err("an ambiguous auto opens nothing");
-            assert_eq!(error.to_string(), message);
-        }
-        for device in &devices {
-            assert!(message.contains(&device.url), "{message}");
-        }
-    }
-
-    /// A connection whose proxy stops hears the stop, then ends with every
-    /// subscription saying so, and never starts a proxy in its place.
-    #[test]
-    fn a_connection_ends_when_its_proxy_stops() {
-        let device = FakeDevice::start();
-        let proxy = fixtures::proxy_serving(&device.url);
-        let connection = open_through(&proxy, "auto").unwrap();
-        let events = connection.events();
-        assert_eq!(root_name(&connection), "FAKE");
-
-        proxy.shutdown();
-
-        let deadline = Instant::now() + WAIT;
-        let mut stopped = false;
-        loop {
-            match events.recv_deadline(deadline) {
-                Ok(Event::Link {
-                    event: LinkEvent::Status(LinkStatus::Stopped),
-                    ..
-                }) => stopped = true,
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Stopped) => break,
-                Err(RecvError::Disconnected | RecvError::Closed) => {
-                    panic!("the events ended with no stop")
-                }
-                Err(RecvError::Timeout) => panic!("the connection outlived its proxy"),
-            }
-        }
-        assert!(stopped, "the stop never reached the events");
-        assert!(matches!(
-            connection
-                .device(DeviceRoute::root())
-                .get::<String>("dev.name"),
-            Err(CallError::ResponseLost)
-        ));
-    }
-
-    /// A sample stream carries no statuses, yet through a proxy that stops it
-    /// ends saying so.
-    #[test]
-    fn a_sample_stream_through_a_proxy_that_stops_says_so() {
-        let device = FakeDevice::start();
-        let proxy = fixtures::proxy_serving(&device.url);
-        let connection = open_through(&proxy, "auto").unwrap();
-        let samples = connection.tree(DeviceRoute::root()).samples();
-        assert_eq!(root_name(&connection), "FAKE");
-
-        proxy.shutdown();
-
-        let deadline = Instant::now() + WAIT;
-        let ended = loop {
-            match samples.recv_deadline(deadline) {
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(error) => break error,
-            }
-        };
-        assert_eq!(ended, RecvError::Stopped);
-        assert_eq!(ended.to_string(), "the proxy stopped");
+        let asked =
+            ["dev.metadata", "rpc.listinfo", "test.amplitude"].map(|name| device.calls(name));
+        assert_eq!(asked, [1, 1 + 2, 1]);
     }
 
     /// Point the variables a proxy is found or started by at `dir`, where
@@ -1193,9 +1226,7 @@ mod tests {
     /// proxy on a port of its own, which opens what the connection asks for.
     #[test]
     fn twinleaf_proxy_names_the_proxy_a_connection_goes_through() {
-        let _environment = fixtures::ENVIRONMENT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _environment = crate::chan::lock(&fixtures::ENVIRONMENT);
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
         let dir = tempfile::tempdir().unwrap();
@@ -1215,12 +1246,10 @@ mod tests {
     /// embeds one in its place.
     #[test]
     fn a_connection_through_a_proxy_that_does_not_answer_starts_none() {
-        let _environment = fixtures::ENVIRONMENT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _environment = crate::chan::lock(&fixtures::ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         no_tio_in(dir.path());
-        let closed = fixtures::ClosedPort::new();
+        let closed = ClosedPort::new();
         let (port, proxy) = (closed.port(), closed.url());
 
         std::env::set_var("TWINLEAF_PROXY", &proxy);
@@ -1291,6 +1320,232 @@ mod tests {
                 left, 0,
                 "tasks left with the proxy dropped first: {proxy_first}"
             );
+        }
+    }
+
+    mod scope {
+        //! Properties of the packets a view delivers.
+        //!
+        //! # Observations
+        //!
+        //! The packets each of several views' [`DeviceTree::packets`]
+        //! receivers yields, in order, while the proxy sends packets from
+        //! routes of 0 to 3 hops, inside the views and out of them. The views
+        //! share one connection.
+        //!
+        //! # Sources
+        //!
+        //! The [`device`](crate::device) module doc, where a connection's
+        //! scope is every route on the link and a tree at `/1` covers `/1`
+        //! and its descendants. The doc of [`DeviceTree`], whose
+        //! subscriptions are filtered to its subtree and carry absolute
+        //! routes. The doc of [`DeviceTree::to_depth`], which reaches no
+        //! deeper than `depth` levels below the view's root, and on which a
+        //! depth beyond the view's own has no effect. The doc of
+        //! [`DeviceTree::packets`].
+        //!
+        //! # Model
+        //!
+        //! A view at route `s` reaching `d` levels covers a route `r` when
+        //! the hops of `s` begin the hops of `r` and `r` has at most `d` hops
+        //! more. A view never narrowed reaches every depth, and a view
+        //! narrowed several times reaches the least depth it was narrowed to.
+        //! The model reads the hops alone, not the crate's own route checks.
+        //!
+        //! # Laws
+        //!
+        //! - V1, model. Each view delivers each packet from a route it covers,
+        //!   in the order the proxy sent them, with its absolute route, and
+        //!   nothing from a route it does not cover, whatever the other views
+        //!   on the connection cover. Source, the module doc and the docs of
+        //!   `DeviceTree`, `to_depth` and `packets`. It rules out a view that
+        //!   loses what lies two or more hops below its root, one that ignores
+        //!   the depth it was narrowed to or keeps the last depth rather than
+        //!   the least, one that leaks a sibling's packets of any type, and a
+        //!   connection that delivers a packet only to the first view that
+        //!   covers it.
+        //!
+        //! # Generator obligations
+        //!
+        //! One to three views on one connection, at routes of 0 to 2 hops
+        //! mostly and up to the eight a route holds, each never narrowed or
+        //! narrowed up to three times to 0 to 8 levels, eight among them.
+        //! Packets of samples, heartbeats with and without a session,
+        //! metadata records, setting announcements and RPC requests and
+        //! replies. Their routes are a view's root followed by more hops, or
+        //! any route, mostly a few hops and one time in four as many as a
+        //! route holds. Hops are 0 to 2 mostly, so views overlap and siblings
+        //! and prefixes collide often, and sometimes 254 or 255.
+        //!
+        //! # Exclusions
+        //!
+        //! Decoded batches from [`DeviceTree::samples`], which take the same
+        //! scope and also need the proxy's metadata of each device. Link
+        //! statuses, which reach every view their subtree overlaps and which
+        //! the stream tests cover. RPC replies from a route a view covers,
+        //! which the session takes as the answers to its own calls, so a
+        //! reply is sent only from a route no view covers.
+        //!
+        //! # Examples that stay
+        //!
+        //! None.
+
+        use super::*;
+        use crate::tio::packet::{Packet, Payload};
+        use proptest::prelude::*;
+
+        /// The sample number of the packet that closes view `i`'s part of a
+        /// case is `LAST + i`. No generated packet numbers a sample so high.
+        const LAST: u32 = 999_000;
+
+        /// A view, its root's hops and each depth it was narrowed to.
+        #[derive(Debug, Clone)]
+        struct View {
+            scope: Vec<u8>,
+            narrowed: Vec<usize>,
+        }
+
+        impl View {
+            /// Whether the view covers `route`, from their hops alone.
+            fn covers(&self, route: &[u8]) -> bool {
+                let below = route.len().wrapping_sub(self.scope.len());
+                let depth = self.narrowed.iter().min();
+                route.starts_with(&self.scope) && depth.is_none_or(|&depth| below <= depth)
+            }
+        }
+
+        fn route_of(hops: &[u8]) -> DeviceRoute {
+            DeviceRoute::from_hops(hops).unwrap()
+        }
+
+        /// A hop, mostly 0 to 2 so that routes collide, sometimes the
+        /// largest hop values.
+        fn hop() -> impl Strategy<Value = u8> {
+            prop_oneof![8 => 0u8..3, 1 => Just(254u8), 1 => Just(u8::MAX)]
+        }
+
+        /// Up to `most` hops, a few most of the time, and all `most` of
+        /// them one time in four.
+        fn hops_up_to(most: usize) -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                3 => prop::collection::vec(hop(), 0..=most.min(3)),
+                1 => prop::collection::vec(hop(), most..=most),
+            ]
+        }
+
+        fn view() -> impl Strategy<Value = View> {
+            let most = DeviceRoute::MAX_HOPS;
+            (
+                prop_oneof![3 => prop::collection::vec(hop(), 0..=2), 1 => hops_up_to(most)],
+                prop::collection::vec(
+                    prop_oneof![3 => 0usize..=4, 1 => 5usize..=most, 1 => Just(most)],
+                    0..=3,
+                ),
+            )
+                .prop_map(|(scope, narrowed)| View { scope, narrowed })
+        }
+
+        /// The hops of a sent packet's route, below one of `views` or
+        /// anywhere, never more than a route holds.
+        fn hops(views: Vec<View>) -> impl Strategy<Value = Vec<u8>> {
+            let most = DeviceRoute::MAX_HOPS;
+            let below =
+                (any::<prop::sample::Index>(), hops_up_to(most)).prop_map(move |(view, suffix)| {
+                    let mut hops = views[view.index(views.len())].scope.clone();
+                    hops.extend(suffix);
+                    hops.truncate(most);
+                    hops
+                });
+            prop_oneof![below, hops_up_to(most)]
+        }
+
+        /// The packet of kind `kind` numbered `n`, from the route of `hops`.
+        fn packet(kind: u8, n: u32, hops: &[u8]) -> Packet {
+            let route = route_of(hops);
+            match kind {
+                0 => samples(n, route),
+                1 => Packet::heartbeat(route),
+                2 => Packet::heartbeat_session(n, route),
+                3 => broadcast(metadata_records(n)[n as usize % 4], route),
+                4 => announcement("test.amplitude", Some(n), &[1], route),
+                5 => Packet::rpc_request("dev.name", &[], n as u16, route).unwrap(),
+                _ => Packet::rpc_reply(n as u16, b"FAKE", route).unwrap(),
+            }
+        }
+
+        fn case() -> impl Strategy<Value = (Vec<View>, Vec<(u8, Vec<u8>)>)> {
+            prop::collection::vec(view(), 1..=3).prop_flat_map(|views| {
+                let sent = (0u8..7, hops(views.clone()));
+                (Just(views), prop::collection::vec(sent, 1..=16))
+            })
+        }
+
+        /// Whether `packet` closes a view's part of a case.
+        fn closing(packet: &Packet) -> Option<u32> {
+            match packet.payload() {
+                Payload::Samples(samples) if samples.first.value() >= LAST => {
+                    Some(samples.first.value() - LAST)
+                }
+                _ => None,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// V1. Each view delivers the packets of exactly the routes it
+            /// covers, two and three hops deep among them, beside other views.
+            #[test]
+            fn each_view_delivers_the_packets_of_exactly_the_routes_it_covers(
+                (views, sent) in case(),
+            ) {
+                let (session, proxy) = Session::test_pair();
+                let connection = Connection::over(session);
+                let receivers: Vec<_> = views
+                    .iter()
+                    .map(|view| {
+                        let tree = connection.tree(route_of(&view.scope));
+                        let tree = view
+                            .narrowed
+                            .iter()
+                            .fold(tree, |tree, &depth| tree.to_depth(depth));
+                        tree.packets()
+                    })
+                    .collect();
+
+                let mut packets = Vec::new();
+                for (n, (kind, hops)) in sent.iter().enumerate() {
+                    let covered = views.iter().any(|view| view.covers(hops));
+                    if *kind == 6 && covered {
+                        continue;
+                    }
+                    packets.push((hops.clone(), packet(*kind, n as u32, hops)));
+                }
+                for (_, packet) in &packets {
+                    proxy.send(packet.clone());
+                }
+                for (i, view) in views.iter().enumerate() {
+                    proxy.send(samples(LAST + i as u32, route_of(&view.scope)));
+                }
+
+                for (i, (view, receiver)) in views.iter().zip(&receivers).enumerate() {
+                    let mut delivered = Vec::new();
+                    loop {
+                        let packet = receiver.recv_timeout(WAIT).expect("the closing packet");
+                        match closing(&packet) {
+                            Some(closes) if closes == i as u32 => break,
+                            Some(_) => {}
+                            None => delivered.push(packet.as_bytes().to_vec()),
+                        }
+                    }
+                    let expected: Vec<Vec<u8>> = packets
+                        .iter()
+                        .filter(|(hops, _)| view.covers(hops))
+                        .map(|(_, packet)| packet.as_bytes().to_vec())
+                        .collect();
+                    prop_assert_eq!(delivered, expected, "view {:?}", view);
+                }
+            }
         }
     }
 }

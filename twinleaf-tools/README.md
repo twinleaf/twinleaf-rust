@@ -57,8 +57,13 @@ tio proxy --port 17855 serial:///dev/ttyACM0
 tio monitor -r tcp://localhost:17855
 ```
 
-A loopback URL like this connects to that proxy and uses its default device.
-This is also how tio 1.x tools connect, and how to reach a 1.x `tio proxy`.
+A loopback URL like this connects to that proxy and opens its `auto`, which
+is its default device. It reaches only a proxy from the same build of
+twinleaf.
+
+`tio proxy` listens on every interface, so other machines can connect.
+`--listen loopback` keeps it to this machine. A proxy that a tool starts in
+the background listens on loopback alone.
 
 A background proxy logs to `proxy.log` in `$XDG_RUNTIME_DIR/twinleaf`, or in
 `twinleaf/runtime` under the local data directory.
@@ -120,7 +125,7 @@ Reading logs back:
 tio log inspect {file}                 # summarize what a log holds
 tio log dump {file} --data --meta      # print samples and metadata
 tio log csv {stream name/id} {file}    # one stream to CSV
-tio log hdf {file} -g "{route}/{stream}/{column}"   # HDF5, needs --features hdf5
+tio log hdf {file} -g "{route}/{stream}/{column}"   # HDF5
 tio log meta reroute {file} -s /0/1    # rewrite the route in a metadata file
 ```
 
@@ -186,6 +191,8 @@ tio simulate
 tio proxy udp://localhost
 ```
 
+It listens on every interface. `--listen loopback` keeps it to this machine.
+
 ## Shell completions
 
 `tio` can generate completion scripts for bash, zsh, fish, and PowerShell. Add
@@ -212,7 +219,6 @@ may need to prepend `autoload -Uz compinit && compinit`.
 
 ```sh
 cargo install twinleaf-tools
-cargo install twinleaf-tools --features hdf5   # with HDF5 conversion
 ```
 
 Cargo reports where the binary is installed and which path to add to your

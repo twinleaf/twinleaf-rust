@@ -1,12 +1,10 @@
 //! The resolution of the `auto` target. [`resolve`] picks the host's default
 //! layout, the one device in use, or the one device attached.
 
-use super::link::Link;
-use super::Layout;
+use super::link::{Candidate, Link};
+use crate::session::Layout;
 use crate::tio::transport::{self, PortInterface};
 
-/// The target the proxy resolves for the client.
-pub(super) const AUTO: &str = "auto";
 /// The target that opens the host's default layout.
 pub(super) const DEFAULT: &str = "default";
 
@@ -19,17 +17,6 @@ pub(super) enum Choice<'a> {
     Open(Link),
     /// The one device attached, by URL.
     Url(String),
-}
-
-/// A link the proxy has open whose device has answered, as `auto` weighs
-/// it.
-#[derive(Clone)]
-pub(super) struct Candidate {
-    /// The link.
-    pub(super) link: Link,
-    /// Whether a `proxy.open` has bound it. It is `false` while only probes
-    /// have.
-    pub(super) chosen: bool,
 }
 
 /// Resolves `auto` to the host's `default` layout, else the one link in
@@ -104,8 +91,8 @@ mod tests {
             .collect()
     }
 
-    /// What `resolve` chose, in words: `default`, `open` and the URL of a
-    /// link open, or `attached` and the URL of a device attached.
+    /// What `resolve` chose, in words. That is `default`, `open` and the URL of
+    /// a link open, or `attached` and the URL of a device attached.
     fn chose(choice: Result<Choice, String>) -> Result<String, String> {
         choice.map(|choice| match choice {
             Choice::Default(_) => "default".to_string(),

@@ -3,29 +3,37 @@
 //! [`Readiness`].
 //!
 //! The worker reopens a device whose port closes, fails with an I/O error,
-//! or goes quiet. A device that has answered goes quiet after 1 s without a
-//! packet, or 3 s over TCP. The worker follows a serial device that a replug
-//! moved to another port. Its ports stay open meanwhile. Each hears the
-//! device drop out as
+//! or goes quiet. A serial or UDP device that has answered goes quiet after
+//! 1 s without a packet. A device on a TCP connection goes quiet after 3 s
+//! without one, counted from the start of the attempt that opened the
+//! connection. A proxy of this build at the other end of a TCP connection
+//! goes quiet after 10 s without one, counted from its answer to the open,
+//! as the open waits for that proxy's own device. Its connection ends first
+//! if it hears nothing for 5 s, the quiet time of the link's keep alive,
+//! while a proxy that is serving beats each second. The worker follows a
+//! serial device that a replug moved to another port. Its ports stay open
+//! meanwhile. The link's engine hears the device drop out as
 //! [`SensorDisconnected`](crate::tio::packet::LinkStatus::SensorDisconnected)
 //! and come back as
 //! [`SensorReconnected`](crate::tio::packet::LinkStatus::SensorReconnected).
-//! A port that joins while the device is out hears the first at once. A
-//! reopened port counts only once the device answers on it. One the device
+//! A reopened port counts only once the device answers on it. One the device
 //! never answered on is a failed attempt, and the ports hear nothing of it.
 //! Attempts run beside the ports' traffic and are tried each second.
 //!
 //! The worker stops when its first open fails, when its command sender
-//! drops, or when a reconnect gives up after the reconnect timeout. Its ports
-//! hear a reconnect that gives up as
+//! drops, or when a reconnect gives up after the reconnect timeout. The engine
+//! hears a reconnect that gives up as
 //! [`FailedToReconnect`](crate::tio::packet::LinkStatus::FailedToReconnect).
 //! Its task ends once the device's port has let go of the device. An open in
 //! flight on a blocking thread runs to its end first. A TCP open in flight is
 //! dropped.
 //!
-//! The worker negotiates the serial rate and fans what arrives out to its
-//! ports, each restricted to a subtree. It renumbers the RPCs the ports make
-//! and gives each reply back its original id. A request the device does not
+//! The worker negotiates the serial rate and hands what arrives to the link's
+//! engine, the one port that hears every packet. Each other port takes what
+//! one client's mount sends, and the answers to that client's requests go
+//! straight to its mount, which queues them on the client's urgent queue.
+//! The worker renumbers the RPCs the ports make and gives each reply back its
+//! original id. A request the device does not
 //! answer in time, or that a lost or restarted device leaves, is answered
 //! with an RPC error. Control packets a port sends go to the proxy and never
 //! reach the device.
@@ -34,31 +42,52 @@
 //! device's own log packets under `device::<route>` at their own level, and
 //! the traffic [`DumpFlags`] asks for.
 
-use super::{control, DumpFlags, Layout, MAX_RPC_TIMEOUT};
+use super::engine::Mount;
+use super::DumpFlags;
+use crate::chan::StreamMap;
 use crate::proto::heartbeat::Heartbeat;
 use crate::proto::log::LogLevel;
 use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, PacketType};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
+use crate::session::{
+    decode, older_build, Introduction, Layout, Request, Session, AUTO, CLIENT_KEEPALIVE,
+    HELLO_TIMEOUT, MAX_RPC_TIMEOUT,
+};
 use crate::tio::packet::{self, Packet};
-use crate::tio::rpc::RpcReply;
 use crate::tio::transport;
 use crate::tio::transport::Port as HardwarePort;
 use crate::tio::transport::{ReceiveResult, TransportEvent};
 
 use futures_util::{FutureExt, StreamExt};
+use std::env;
 use std::fs;
-use std::future::Future;
 use std::io;
 use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_stream::StreamNotifyClose;
+
+/// How long a new link may take to deliver its first packet.
+pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns the depth of the queue each port fills for the proxy.
+/// `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` may raise it above the default.
+pub(super) fn client_tx_channel_size() -> usize {
+    let min_size = transport::DEFAULT_TX_CHANNEL_SIZE;
+    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
+        std::cmp::max(req.parse().unwrap_or(0), min_size)
+    } else {
+        min_size
+    }
+}
 
 /// Whether a link's device has answered. The worker sets it, and the
 /// proxy's link table reads it.
@@ -73,104 +102,123 @@ pub(super) enum Readiness {
     Failed(String),
 }
 
-/// The two channels of a port before the worker adopts it.
-#[derive(Debug)]
-pub(super) struct Subscriber {
-    sender: SubscriberSender,
-    rx: mpsc::Receiver<Packet>,
+/// What a link asks of its worker, to adopt the port of a client's mount.
+pub(super) struct OpenPort {
+    /// Where the answers to the client's requests go.
+    pub(super) mount: Arc<Mount>,
+    /// What the client sends, at the device's routes.
+    pub(super) from_client: mpsc::Receiver<Packet>,
 }
 
-/// Delivers packets to one port, with routes relative to its subtree.
-#[derive(Debug)]
-struct SubscriberSender {
-    tx: mpsc::Sender<Packet>,
-    /// The slot kept for the status that the worker gave up the device.
-    last: mpsc::OwnedPermit<Packet>,
-    scope: DeviceRoute,
+/// The port of the link's engine. It hears every packet of the device, and
+/// the answers to the engine's own requests.
+const ENGINE: u64 = 0;
+
+/// The two ends of the engine's port that the worker holds.
+struct EnginePort {
+    /// Hears every packet of the device, without limit.
+    to_engine: mpsc::UnboundedSender<Packet>,
+    /// What the engine sends.
+    from_engine: mpsc::Receiver<Packet>,
 }
 
-/// What a link asks of its worker.
-pub(super) enum Command {
-    /// A port for the worker to adopt.
-    OpenPort(Subscriber),
-}
-
-impl Subscriber {
-    /// Creates a port on the subtree at `scope`. The worker delivers to it on
-    /// `tx` and reads what it sends from `rx`.
-    pub(super) fn new(
-        tx: mpsc::Sender<Packet>,
-        rx: mpsc::Receiver<Packet>,
-        scope: DeviceRoute,
-    ) -> Subscriber {
-        let last = tx.clone().try_reserve_owned().expect("a new port has room");
-        Subscriber {
-            sender: SubscriberSender { tx, last, scope },
-            rx,
-        }
-    }
-}
-
-impl SubscriberSender {
-    /// Delivers `pkt` to the port with its route relative to the port's
-    /// subtree. Skips a packet outside the subtree. A link status whose route
-    /// is above the subtree reaches the port at its root. Returns `false` if
-    /// the port's queue is full or the port has closed.
-    fn try_send(&self, pkt: &Packet) -> bool {
-        let route = match self.scope.relative_route(&pkt.route()) {
-            Ok(below) => below,
-            Err(_) if pkt.link_status().is_some() && self.scope.starts_with(&pkt.route()) => {
-                DeviceRoute::root()
-            }
-            Err(_) => return true,
-        };
-        self.tx.try_send(pkt.with_route(route)).is_ok()
-    }
-
-    /// Delivers the status that the worker gave up the device, at the port's
-    /// root, however full its queue is.
-    fn give_up(self) {
-        self.last
-            .send(Packet::link(packet::LinkStatus::FailedToReconnect));
-    }
+/// A worker [`new`] created, and what its link holds of it.
+pub(super) struct Started {
+    /// The sender of the ports for the worker to adopt. The worker stops
+    /// once every clone of it has dropped.
+    pub(super) commands: mpsc::Sender<OpenPort>,
+    /// The worker's readiness.
+    pub(super) readiness: watch::Receiver<Readiness>,
+    /// The session over the port of the link's engine.
+    pub(super) engine: Session,
+    /// Runs the worker, as its link's task.
+    pub(super) run: BoxFuture<'static, ()>,
 }
 
 /// What opens a device's port. It takes the sender the port delivers to,
-/// and returns a future of the open port.
+/// and returns a future of the open port and of what answers at its other
+/// end.
 pub(super) struct Opener {
-    opens: Box<dyn Fn(flume::Sender<ReceiveResult>) -> Opening + Send + Sync>,
+    opens: Box<dyn Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync>,
     /// Whether the worker may drop an open in flight when it stops.
     droppable: bool,
 }
 
-/// A future of an open port.
-type Opening = BoxFuture<'static, io::Result<HardwarePort>>;
+/// A future of an open port and of what answers at its other end.
+type Opening = BoxFuture<'static, io::Result<Reached>>;
+
+/// A port an open opened, and what answers at its other end.
+pub(super) struct Reached {
+    pub(super) port: HardwarePort,
+    pub(super) peer: PeerKind,
+}
+
+/// What answers at the other end of a device's port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PeerKind {
+    /// The device, or a proxy from an older build, which forwards its
+    /// device's packets as its own.
+    Device,
+    /// A proxy of this build, whose `auto` the open opened.
+    Proxy,
+}
+
+/// A port alone is one a device answers on.
+impl From<HardwarePort> for Reached {
+    fn from(port: HardwarePort) -> Reached {
+        Reached {
+            port,
+            peer: PeerKind::Device,
+        }
+    }
+}
 
 impl Opener {
     /// Returns an opener that opens with `open`. The worker lets an open in
     /// flight run to its end before it stops.
-    pub(super) fn new(
-        open: impl Fn(flume::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
-    ) -> Opener {
+    pub(super) fn new<F, R>(
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    ) -> Opener
+    where
+        F: std::future::Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
+    {
         Opener {
-            opens: Box::new(open),
+            opens: Opener::boxed(open),
             droppable: false,
         }
     }
 
     /// Returns an opener that opens with `open`, whose open in flight the
     /// worker drops when it stops. Dropping the open must leave nothing open.
-    pub(super) fn droppable(
-        open: impl Fn(flume::Sender<ReceiveResult>) -> Opening + Send + Sync + 'static,
-    ) -> Opener {
+    pub(super) fn droppable<F, R>(
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    ) -> Opener
+    where
+        F: std::future::Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
+    {
         Opener {
-            opens: Box::new(open),
+            opens: Opener::boxed(open),
             droppable: true,
         }
     }
 
+    /// Returns `open` as an opener's function, whose future resolves to what
+    /// the open reached.
+    #[allow(clippy::type_complexity)]
+    fn boxed<F, R>(
+        open: impl Fn(crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    ) -> Box<dyn Fn(crate::chan::Sender<ReceiveResult>) -> Opening + Send + Sync>
+    where
+        F: std::future::Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
+    {
+        Box::new(move |results| Box::pin(open(results).map(|opened| opened.map(Into::into))))
+    }
+
     /// Returns a future that opens a port delivering to `results`.
-    pub(super) fn open(&self, results: flume::Sender<ReceiveResult>) -> Opening {
+    pub(super) fn open(&self, results: crate::chan::Sender<ReceiveResult>) -> Opening {
         (self.opens)(results)
     }
 }
@@ -184,19 +232,26 @@ const OPEN_ID: u16 = 2;
 
 /// What answers at the other end of a TCP link.
 enum Peer {
-    /// A Twinleaf 2.0 proxy, whose `auto` the link opened.
+    /// A proxy of this build, whose `auto` the link opened.
     Proxy,
-    /// A device, or a proxy older than 2.0, with what it sent first if it
-    /// sent anything.
+    /// A device, or a proxy from an older build, with what it sent first if
+    /// it sent anything.
     Device(Option<ReceiveResult>),
 }
 
 /// Connects to the TCP peer at `url`, and returns its port, which delivers
-/// to `results`. The link says hello first. A Twinleaf 2.0 proxy answers,
+/// to `results`, and what answers on it. The link says hello first. A proxy of this build answers,
 /// and the link then opens its `auto` as a control client does, so that it
 /// hears the proxy's link statuses for each route and keeps the connection
 /// alive. Any other peer answers with something else, or with nothing
-/// within [`control::HELLO_TIMEOUT`], and its packets are a device's.
+/// within [`HELLO_TIMEOUT`], and its packets are a device's. A
+/// proxy from an older build forwards its device's packets, so it is such a
+/// peer.
+///
+/// The task `link relay <url>` on `tasks` hands what the port receives to
+/// `results`. No one holds it. It ends once the port's task has ended and
+/// so closed what the relay reads, which the drop of the port brings about,
+/// or once nothing receives from `results`.
 ///
 /// # Errors
 ///
@@ -204,17 +259,16 @@ enum Peer {
 /// answers, or a proxy at the other end refuses the hello or the open.
 async fn open_tcp(
     url: &str,
-    results: flume::Sender<ReceiveResult>,
+    results: crate::chan::Sender<ReceiveResult>,
     tasks: &Supervisor,
-) -> io::Result<HardwarePort> {
-    let (deliver, received) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+) -> io::Result<Reached> {
+    let (deliver, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
     let port = HardwarePort::open(url, deliver, tasks).await?;
-    let peer = greet(&port, &received, url).await?;
-    let proxied = matches!(peer, Peer::Proxy);
-    let first = match peer {
-        Peer::Proxy => None,
-        Peer::Device(first) => first,
+    let (peer, first) = match greet(&port, &received, url).await? {
+        Peer::Proxy => (PeerKind::Proxy, None),
+        Peer::Device(first) => (PeerKind::Device, first),
     };
+    let proxied = peer == PeerKind::Proxy;
     tasks.spawn(format_args!("link relay {url}"), async move {
         if let Some(first) = first {
             if results.send_async(first).await.is_err() {
@@ -230,21 +284,20 @@ async fn open_tcp(
             }
         }
     });
-    Ok(port)
+    Ok(Reached { port, peer })
 }
 
 /// Says hello on `port` and tells from the answer, read from `received`,
 /// what is at `url`. Opens the `auto` of a proxy that answers.
 async fn greet(
     port: &HardwarePort,
-    received: &flume::Receiver<ReceiveResult>,
+    received: &crate::chan::Receiver<ReceiveResult>,
     url: &str,
 ) -> io::Result<Peer> {
-    let (name, hello) =
-        control::Request::Hello(control::Introduction::of_this_process(LINK_NAME)).encode();
+    let (name, hello) = Request::Hello(Introduction::of_this_process(LINK_NAME)).encode();
     let request = Packet::proxy_request(name, &hello, HELLO_ID).map_err(io::Error::other)?;
     port.send_async(request).await.map_err(io::Error::other)?;
-    let first = match tokio::time::timeout(control::HELLO_TIMEOUT, received.recv_async()).await {
+    let first = match tokio::time::timeout(HELLO_TIMEOUT, received.recv_async()).await {
         Err(_) => return Ok(Peer::Device(None)),
         Ok(Err(_)) => return Err(closed(url)),
         Ok(Ok(first)) => first,
@@ -254,7 +307,7 @@ async fn greet(
             packet::Payload::ProxyRx(packet::ProxyRx::Reply(reply))
                 if reply.req_id.value() == HELLO_ID =>
             {
-                control::Introduction::decode_reply(reply.value).map_err(io::Error::other)?
+                decode::<Introduction>(reply.value).map_err(|_| older_build(url))?
             }
             packet::Payload::ProxyRx(packet::ProxyRx::Error(error))
                 if error.req_id.value() == HELLO_ID =>
@@ -265,22 +318,17 @@ async fn greet(
         },
         _ => return Ok(Peer::Device(Some(first))),
     };
-    if host.protocol < control::VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("{url} is {host}, which speaks an older proxy protocol"),
-        ));
-    }
-    let (name, target) = control::Request::Open {
-        target: super::auto::AUTO.to_string(),
+    log::debug!("the proxy at {url} is {host}");
+    let (name, target) = Request::Open {
+        target: AUTO.to_string(),
     }
     .encode();
     let request = Packet::proxy_request(name, &target, OPEN_ID).map_err(io::Error::other)?;
     port.send_async(request).await.map_err(io::Error::other)?;
     // The other proxy hangs up on a client that is quiet too long, and an
     // open may wait longer than that for its device.
-    port.keep_alive(control::CLIENT_KEEPALIVE).await;
-    let deadline = Instant::now() + super::link::READY_TIMEOUT;
+    port.keep_alive(CLIENT_KEEPALIVE).await;
+    let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         let event = tokio::time::timeout_at(deadline, received.recv_async())
             .await
@@ -353,22 +401,23 @@ const COMMAND_LANE: usize = 64;
 /// Creates the worker of the device at `url`, which `open` opens. A lost
 /// device is retried for `reconnect_timeout`, or forever with `None`. The
 /// worker logs the traffic `dump` asks for, and names the device's routes as
-/// the proxy's `default` layout shows them. It stops once every command
-/// sender has dropped. Returns the command sender, the receiver of the
-/// worker's readiness, and the future that runs the worker as its link's task.
+/// the proxy's `default` layout shows them. The session over the engine's
+/// port runs its task on `tasks`, and the queue of what the engine hears has
+/// no limit.
 pub(super) fn new(
     url: &str,
     reconnect_timeout: Option<Duration>,
     dump: DumpFlags,
     default: watch::Receiver<Option<Layout>>,
     open: Opener,
-) -> (
-    mpsc::Sender<Command>,
-    watch::Receiver<Readiness>,
-    impl Future<Output = ()> + Send + 'static,
-) {
+    tasks: &Supervisor,
+) -> Started {
     let (commands, command_queue) = mpsc::channel(COMMAND_LANE);
     let (readiness, watched) = watch::channel(Readiness::Pending);
+    let (to_engine, heard) = mpsc::unbounded_channel();
+    let (sent, from_engine) = mpsc::channel(client_tx_channel_size());
+    let heard = UnboundedReceiverStream::new(heard);
+    let engine = Session::over_port(sent, heard, format!("the state of {url}"), tasks);
     let worker = Worker {
         default: Some(default),
         ..Worker::new(
@@ -378,9 +427,18 @@ pub(super) fn new(
             dump,
             readiness,
             open,
+            EnginePort {
+                to_engine,
+                from_engine,
+            },
         )
     };
-    (commands, watched, worker.run())
+    Started {
+        commands,
+        readiness: watched,
+        engine,
+        run: Box::pin(worker.run()),
+    }
 }
 
 /// Returns the opener of the device at `url`. A TCP device connects as a
@@ -394,12 +452,14 @@ pub(super) fn opener(tasks: &Supervisor, url: &str) -> Opener {
     if HardwarePort::opens_as_future(&url) {
         return Opener::droppable(move |results| {
             let (url, tasks) = (url.clone(), tasks.clone());
-            Box::pin(async move {
+            async move {
                 match url.starts_with("tcp") {
                     true => open_tcp(&url, results, &tasks).await,
-                    false => HardwarePort::open(&url, results, &tasks).await,
+                    false => HardwarePort::open(&url, results, &tasks)
+                        .await
+                        .map(Reached::from),
                 }
-            })
+            }
         });
     }
     // The key of a serial device, taken on the first attempt while the
@@ -417,7 +477,7 @@ pub(super) fn opener(tasks: &Supervisor, url: &str) -> Opener {
                 },
             }
         });
-        Box::pin(async move { opening.await.map_err(io::Error::other)? })
+        async move { opening.await.map_err(io::Error::other)? }
     })
 }
 
@@ -437,9 +497,14 @@ enum RateChange {
 /// A device's port and the state of its rate negotiation.
 struct Device {
     port: HardwarePort,
+    /// What answers at the other end of the port.
+    peer: PeerKind,
     /// What the port receives.
-    results: flume::r#async::RecvStream<'static, ReceiveResult>,
+    results: crate::chan::RecvStream<'static, ReceiveResult>,
     rate_change_state: RateChange,
+    /// When the port last received a packet or text. Before it has received
+    /// either, it is when a proxy's open of its `auto` answered, or for any
+    /// other peer when the attempt that opened the port started.
     last_rx: Instant,
     seen_since_connect: bool,
     last_session: Option<u32>,
@@ -447,9 +512,15 @@ struct Device {
 }
 
 impl Device {
-    /// Creates a device reached through `port`, whose results arrive on
-    /// `results`.
-    fn new(port: HardwarePort, results: flume::Receiver<ReceiveResult>) -> Device {
+    /// Creates a device reached as `reached` says, whose results arrive on
+    /// `results`, by an attempt to open it that started at `started`. It is
+    /// called as the open ends.
+    fn new(
+        reached: Reached,
+        results: crate::chan::Receiver<ReceiveResult>,
+        started: Instant,
+    ) -> Device {
+        let Reached { port, peer } = reached;
         // Kickstart rate autonegotiation only if the port supports
         // changing rates and the target rate differs from the default.
         let mut rate_change_state = RateChange::DoNothing;
@@ -458,11 +529,19 @@ impl Device {
                 rate_change_state = RateChange::WaitingForSession;
             }
         }
+        // A proxy's answer to the open is a sign of life. The open itself
+        // may wait for the proxy's own device for as long as
+        // `READY_TIMEOUT`.
+        let last_rx = match peer {
+            PeerKind::Proxy => Instant::now(),
+            PeerKind::Device => started,
+        };
         Device {
             port,
+            peer,
             results: results.into_stream(),
             rate_change_state,
-            last_rx: Instant::now(),
+            last_rx,
             seen_since_connect: false,
             last_session: None,
             restarted: false,
@@ -495,17 +574,23 @@ impl Device {
     /// Returns how long the device may stay silent before the watchdog tears
     /// it down.
     fn liveness_timeout(&self) -> Duration {
-        match self.port.kind() {
-            transport::TransportKind::Tcp => LIVENESS_TIMEOUT_TCP,
-            transport::TransportKind::Serial | transport::TransportKind::Udp => LIVENESS_TIMEOUT,
+        match (self.peer, self.port.kind()) {
+            (PeerKind::Proxy, _) => LIVENESS_TIMEOUT_PROXY,
+            (PeerKind::Device, transport::TransportKind::Tcp) => LIVENESS_TIMEOUT_TCP,
+            (
+                PeerKind::Device,
+                transport::TransportKind::Serial | transport::TransportKind::Udp,
+            ) => LIVENESS_TIMEOUT,
         }
     }
 
-    /// Returns when the device counts as lost if it stays silent, or `None`
-    /// before it has answered.
+    /// Returns when the device counts as lost if nothing more arrives. A TCP
+    /// port's clock runs from the moment [`Device::new`] sets, so a
+    /// connection nothing ever answers on is lost too. Any other port has no
+    /// deadline, and returns `None`, before the device has answered.
     fn liveness_deadline(&self) -> Option<Instant> {
-        self.seen_since_connect
-            .then(|| self.last_rx + self.liveness_timeout())
+        let tcp = matches!(self.port.kind(), transport::TransportKind::Tcp);
+        (tcp || self.seen_since_connect).then(|| self.last_rx + self.liveness_timeout())
     }
 
     /// Returns when the port goes back to its default rate if nothing
@@ -596,7 +681,7 @@ struct RpcMapEntry {
 struct Worker {
     url: String,
     reconnect_timeout: Option<Duration>,
-    command_queue: mpsc::Receiver<Command>,
+    command_queue: mpsc::Receiver<OpenPort>,
     /// The target the worker logs under, `proxy::<url>`.
     log_target: String,
     /// The traffic to log.
@@ -623,24 +708,39 @@ struct Worker {
 
     /// The number to give the next port.
     next_port: u64,
-    subscribers: HashMap<u64, SubscriberSender>,
+    /// Hears every packet of the device.
+    to_engine: mpsc::UnboundedSender<Packet>,
+    /// The mount of each client's port.
+    mounts: BTreeMap<u64, Arc<Mount>>,
     /// Packet sources report their port ID and notify when the port closes.
     inputs: StreamMap<u64, StreamNotifyClose<ReceiverStream<Packet>>>,
-    /// The ports to drop before the next wait.
-    leaving: HashSet<u64>,
 
     next_rpc_id: u16,
     rpc_map: HashMap<u16, RpcMapEntry>,
-    rpc_timeouts: BTreeMap<Instant, HashSet<u16>>,
+    rpc_timeouts: BTreeMap<Instant, BTreeSet<u16>>,
 }
 
-/// How long a device that has already sent a packet may stay silent before
-/// its port is torn down and reopened.
+/// How long a device on a serial or UDP port that has already sent a packet
+/// may stay silent before its port is torn down and reopened.
 const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// How long a TCP device that has already sent a packet may stay silent. It
-/// allows one RTO plus slack.
+/// How long a device on a TCP connection may stay silent. It allows one RTO
+/// plus slack. The silence counts from the start of the attempt to open the
+/// connection, so the connect, the hello and the wait for the first packet
+/// together take at most this long.
 const LIVENESS_TIMEOUT_TCP: Duration = Duration::from_millis(3000);
+
+/// How long a proxy of this build at the other end of a TCP connection may
+/// stay silent. The silence counts from the proxy's answer to the open of
+/// its `auto`, as that open may itself take up to [`READY_TIMEOUT`]
+/// while the proxy waits for its own device.
+///
+/// The connection ends sooner on its own. The link keeps it alive as a
+/// client does, with [`CLIENT_KEEPALIVE`], whose transport ends a
+/// connection that hears nothing for 5 s, and the worker then loses the
+/// device as on any failed port. The proxy beats each second it sends
+/// nothing else, so a proxy that is serving is never silent that long.
+const LIVENESS_TIMEOUT_PROXY: Duration = Duration::from_secs(10);
 
 /// How long the worker waits after an attempt to reopen a device fails, or
 /// opens a port the device never answers on, before the next attempt.
@@ -655,16 +755,22 @@ static SET_RATE_RPC_ID: u16 = 0x102;
 
 impl Worker {
     /// Creates the worker of the device at `url`, which `open` opens. It
-    /// adopts the ports `command_queue` brings, reports its state in
-    /// `readiness`, and stops once every command sender has dropped.
+    /// hands the engine every packet of the device, and the answers to the
+    /// engine's requests, through `engine`. It adopts the ports
+    /// `command_queue` brings, reports its state in `readiness`, and stops
+    /// once every command sender has dropped.
     fn new(
         url: String,
         reconnect_timeout: Option<Duration>,
-        command_queue: mpsc::Receiver<Command>,
+        command_queue: mpsc::Receiver<OpenPort>,
         dump: DumpFlags,
         readiness: watch::Sender<Readiness>,
         open: Opener,
+        engine: EnginePort,
     ) -> Worker {
+        let mut inputs = StreamMap::new();
+        let from_engine = StreamNotifyClose::new(ReceiverStream::new(engine.from_engine));
+        inputs.insert(ENGINE, from_engine);
         Worker {
             log_target: format!("proxy::{url}"),
             url,
@@ -678,11 +784,11 @@ impl Worker {
             ever_connected: false,
             reconnect_deadline: None,
             next_attempt: Instant::now(),
-            // Start from port 1, as 0 is reserved for internal RPCs.
+            // Start from port 1, as 0 is the engine's.
             next_port: 1,
-            subscribers: HashMap::new(),
-            leaving: HashSet::new(),
-            inputs: StreamMap::new(),
+            to_engine: engine.to_engine,
+            mounts: BTreeMap::new(),
+            inputs,
             next_rpc_id: 0,
             rpc_map: HashMap::new(),
             rpc_timeouts: BTreeMap::new(),
@@ -717,9 +823,10 @@ impl Worker {
 
     /// Returns a future that opens the device's port.
     fn open_device(&self) -> BoxFuture<'static, io::Result<Device>> {
-        let (sender, results) = flume::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+        let (sender, results) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
+        let started = Instant::now();
         let opening = self.open.open(sender);
-        Box::pin(async move { Ok(Device::new(opening.await?, results)) })
+        Box::pin(async move { Ok(Device::new(opening.await?, results, started)) })
     }
 
     /// Drops the port after it closed, failed, or went quiet. The ports
@@ -737,39 +844,40 @@ impl Worker {
         }
         if device.seen_since_connect {
             log::warn!(target: &self.log_target, "Sensor disconnected");
-            self.broadcast_status(packet::LinkStatus::SensorDisconnected);
+            self.status_to_engine(packet::LinkStatus::SensorDisconnected);
         } else {
             log::debug!("lost {} before it answered", self.url);
             self.next_attempt = now + RECONNECT_INTERVAL;
         }
     }
 
-    /// Marks `port` for the worker to drop before its next wait, and logs it
-    /// once.
-    fn drop_subscriber(&mut self, port: u64) {
-        if self.leaving.insert(port) {
-            log::trace!(target: &self.log_target, "Port {port} terminated");
+    /// Adopts the port of a client's mount that `open` brings.
+    fn adopt(&mut self, open: OpenPort) {
+        let port = self.next_port;
+        self.next_port += 1;
+        let from_client = ReceiverStream::new(open.from_client);
+        self.inputs
+            .insert(port, StreamNotifyClose::new(from_client));
+        self.mounts.insert(port, open.mount);
+        log::trace!(target: &self.log_target, "Port {port} opened");
+    }
+
+    /// Hands `pkt`, the answer to a request of `port`, to the port. The
+    /// engine takes it in order with every packet of the device. A client's
+    /// mount queues it ahead of the client's stream, as the client matches an
+    /// answer by its id.
+    fn answer(&self, port: u64, pkt: Packet) {
+        match self.mounts.get(&port) {
+            Some(mount) => mount.urgent(&pkt),
+            None if port == ENGINE => self.to_engine(pkt),
+            None => log::trace!(target: &self.log_target, "Port {port} left before its answer"),
         }
     }
 
-    /// Adopts a new port. A port that joins while the device is lost hears
-    /// so first, as the others did, and then hears it come back with them.
-    fn adopt(&mut self, subscriber: Subscriber) {
-        let Subscriber { sender, rx } = subscriber;
-        let port = self.next_port;
-        self.next_port += 1;
-        let answering = self
-            .device
-            .as_ref()
-            .is_some_and(|device| device.seen_since_connect);
-        if self.ever_connected && !answering {
-            let lost = Packet::link(packet::LinkStatus::SensorDisconnected);
-            sender.try_send(&lost);
-        }
-        self.inputs
-            .insert(port, StreamNotifyClose::new(ReceiverStream::new(rx)));
-        self.subscribers.insert(port, sender);
-        log::trace!(target: &self.log_target, "Port {port} opened");
+    /// Hands `pkt` to the link's engine, which takes every packet of the
+    /// device in the order the worker hands them over.
+    fn to_engine(&self, pkt: Packet) {
+        let _ = self.to_engine.send(pkt);
     }
 
     fn rpc_restore(&mut self, wire_id: u16, route: &DeviceRoute) -> Option<RpcMapEntry> {
@@ -822,14 +930,7 @@ impl Worker {
         };
         if let Err(error) = self.forward_to_device(pkt, RpcOrigin::Port(port)).await {
             let (route, id) = reply_target.expect("only RPC requests produce forwarding errors");
-            let subscriber = self
-                .subscribers
-                .get(&port)
-                .expect("the port that sent is open");
-            if !subscriber.try_send(&Packet::rpc_error(id, error, route)) {
-                log::trace!(target: &self.log_target, "Port {port} fell behind");
-                self.drop_subscriber(port);
-            }
+            self.answer(port, Packet::rpc_error(id, error, route));
         }
     }
 
@@ -906,11 +1007,8 @@ impl Worker {
         }
     }
 
-    fn broadcast_status(&self, status: packet::LinkStatus) {
-        let pkt = Packet::link(status);
-        for subscriber in self.subscribers.values() {
-            subscriber.try_send(&pkt);
-        }
+    fn status_to_engine(&self, status: packet::LinkStatus) {
+        self.to_engine(Packet::link(status));
     }
 
     /// Handles everything the device's port has received so far, without
@@ -947,9 +1045,9 @@ impl Worker {
                     self.reconnect_deadline = None;
                     if self.ever_connected {
                         log::info!(target: &self.log_target, "Sensor reconnected");
-                        self.broadcast_status(packet::LinkStatus::SensorReconnected);
+                        self.status_to_engine(packet::LinkStatus::SensorReconnected);
                     } else {
-                        // Initial connect needs no wire status broadcast.
+                        // Initial connect needs no wire status.
                         self.ever_connected = true;
                         log::trace!(target: &self.log_target, "Sensor connected");
                         self.readiness.send_replace(Readiness::Ready);
@@ -980,17 +1078,7 @@ impl Worker {
             packet::Payload::RpcError(error) => Some(error.req_id.value()),
             _ => None,
         }) else {
-            let mut to_drop = Vec::new();
-            for (port, subscriber) in self.subscribers.iter() {
-                if !subscriber.try_send(&pkt) {
-                    log::trace!(target: &self.log_target, "Port {port} fell behind");
-                    to_drop.push(*port);
-                }
-            }
-            for port in to_drop {
-                self.drop_subscriber(port);
-            }
-            return;
+            return self.to_engine(pkt);
         };
 
         let Some(remap) = self.rpc_restore(wire_id, &route) else {
@@ -1008,22 +1096,11 @@ impl Worker {
                 _ => unreachable!(),
             },
             RpcTarget::Port { port, original_id } => {
-                let Some(subscriber) = self.subscribers.get(&port) else {
-                    log::trace!(
-                        target: &self.log_target,
-                        "Port {port} left before reply {wire_id}"
-                    );
-                    return;
-                };
                 log::trace!(
                     target: &self.log_target,
                     "Reply {wire_id} goes to port {port} as {original_id}"
                 );
-                let restored = pkt.with_rpc_id(original_id);
-                if !subscriber.try_send(&restored) {
-                    log::trace!(target: &self.log_target, "Port {port} fell behind");
-                    self.drop_subscriber(port);
-                }
+                self.answer(port, pkt.with_rpc_id(original_id));
             }
         }
     }
@@ -1035,7 +1112,6 @@ impl Worker {
     fn dispatch_rpc_errors(&mut self, failure: RpcFailure, until: Option<Instant>) {
         let mut to_remove = Vec::new();
         let mut failed = Vec::new();
-        let mut to_drop = Vec::new();
         for (timeout, rpc_ids) in self.rpc_timeouts.iter() {
             if let Some(timeout_bound) = until {
                 if *timeout > timeout_bound {
@@ -1058,25 +1134,13 @@ impl Worker {
         for remap in failed {
             match remap.target {
                 RpcTarget::Port { port, original_id } => {
-                    let Some(subscriber) = self.subscribers.get(&port) else {
-                        continue;
-                    };
-                    if !subscriber.try_send(&Packet::rpc_error(
-                        original_id,
-                        failure.wire_error(),
-                        remap.route,
-                    )) {
-                        to_drop.push(port);
-                        log::debug!("Failed to send generated RPC error to port {port}");
-                    }
+                    let error = Packet::rpc_error(original_id, failure.wire_error(), remap.route);
+                    self.answer(port, error);
                 }
                 RpcTarget::Internal(_) => {
                     self.internal_rpc_error(failure.wire_error());
                 }
             }
-        }
-        for port in to_drop {
-            self.drop_subscriber(port);
         }
     }
 
@@ -1287,7 +1351,7 @@ impl Worker {
                 tokio::select! {
                     opened = &mut opening => break opened,
                     command = self.command_queue.recv() => match command {
-                        Some(Command::OpenPort(subscriber)) => self.adopt(subscriber),
+                        Some(open) => self.adopt(open),
                         None => {
                             log::trace!(target: &self.log_target, "The link closed while it opened");
                             self.shutdown().await;
@@ -1340,9 +1404,7 @@ impl Worker {
                 target: &self.log_target,
                 "Stopping reconnection attempts due to timeout"
             );
-            self.subscribers
-                .drain()
-                .for_each(|(_, subscriber)| subscriber.give_up());
+            self.status_to_engine(packet::LinkStatus::FailedToReconnect);
             return ControlFlow::Break(());
         }
         let liveness = self.device.as_ref().and_then(Device::liveness_deadline);
@@ -1357,10 +1419,6 @@ impl Worker {
         if restarted {
             log::trace!(target: &self.log_target, "The root device restarted");
             self.cancel_active_rpcs();
-        }
-        for port in self.leaving.drain() {
-            self.subscribers.remove(&port);
-            self.inputs.remove(&port);
         }
         // A step falls due when what the device sent was just handled, or
         // when the trial of a new rate runs out, which `next_deadline` wakes
@@ -1380,7 +1438,7 @@ impl Worker {
         let connected = self.device.is_some();
         tokio::select! {
             command = self.command_queue.recv() => match command {
-                Some(Command::OpenPort(subscriber)) => self.adopt(subscriber),
+                Some(open) => self.adopt(open),
                 None => {
                     log::trace!(target: &self.log_target, "The link closed");
                     return ControlFlow::Break(());
@@ -1388,13 +1446,11 @@ impl Worker {
             },
             Some((port, sent)) = self.inputs.next(), if forwarding && !self.inputs.is_empty() => {
                 match sent {
-                    Some(pkt) => {
-                        let scope = self.subscribers[&port].scope;
-                        let absolute = scope.absolute_route(&pkt.route())
-                            .expect("Port validates scoped routes before enqueueing them");
-                        self.port_packet(port, pkt.with_route(absolute)).await;
+                    Some(pkt) => self.port_packet(port, pkt).await,
+                    None => {
+                        self.mounts.remove(&port);
+                        log::trace!(target: &self.log_target, "Port {port} terminated");
                     }
-                    None => self.drop_subscriber(port),
                 }
             }
             received = async { self.device.as_mut().expect("a device is present").results.next().await }, if connected => {
@@ -1437,7 +1493,7 @@ impl Worker {
             }
         }
         self.inputs.clear();
-        self.subscribers.clear();
+        self.mounts.clear();
     }
 }
 
@@ -1561,26 +1617,43 @@ fn usb_identity(_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::fixtures::{assert_took, UNREACHABLE, WAIT};
+    use crate::chan::{JoinHandle, Notify};
+    use crate::proxy::outbox::Outbox;
     use crate::rt;
-    use crate::tio::transport::{FakeEnd, RateInfo, TransportKind};
-    use std::future;
+    use crate::tio::tests::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
+    use crate::tio::transport::tests::fake::{self, FakeEnd};
+    use crate::tio::transport::{RateInfo, TransportKind};
+    use std::future::{self, Future};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc::error::TryRecvError;
-    use tokio::sync::Notify;
-    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     /// An opener that never opens anything.
     fn never() -> Opener {
-        Opener::new(|_| Box::pin(future::pending()))
+        Opener::new(|_| future::pending::<io::Result<Reached>>())
     }
 
     fn idle_worker() -> Worker {
         let (_commands, command_queue) = mpsc::channel(1);
         let (readiness, _) = watch::channel(Readiness::Pending);
         let dump = DumpFlags::default();
-        Worker::new(String::new(), None, command_queue, dump, readiness, never())
+        Worker::new(
+            String::new(),
+            None,
+            command_queue,
+            dump,
+            readiness,
+            never(),
+            unheard(),
+        )
+    }
+
+    /// An engine's port that nobody hears.
+    fn unheard() -> EnginePort {
+        EnginePort {
+            to_engine: mpsc::unbounded_channel().0,
+            from_engine: mpsc::channel(1).1,
+        }
     }
 
     /// A device's routes are logged where the proxy's default layout mounts
@@ -1588,7 +1661,7 @@ mod tests {
     #[test]
     fn a_device_is_logged_where_the_default_layout_mounts_it() {
         let route = |path: &str| path.parse::<DeviceRoute>().unwrap();
-        let mount = |url: &str, source: &str, prefix: &str| crate::proxy::Mount {
+        let mount = |url: &str, source: &str, prefix: &str| crate::session::Mount {
             url: url.into(),
             source: route(source),
             prefix: route(prefix),
@@ -1622,21 +1695,17 @@ mod tests {
         assert_eq!(alone.shown(route("/1")), "udp://c /1");
     }
 
-    /// The depth of the queue a test port is delivered to.
-    const DELIVERED: usize = 64;
+    /// A client's mount of the subtree at `source`, seen at the root, and
+    /// its outbox.
+    fn mount(source: &str) -> (Arc<Mount>, Arc<Outbox>) {
+        let outbox = Arc::default();
+        let mount = Mount::new(source.parse().unwrap(), DeviceRoute::root(), &outbox);
+        (mount, outbox)
+    }
 
-    /// A port at `scope`, and what it is delivered.
-    fn subscriber(scope: DeviceRoute) -> (SubscriberSender, mpsc::Receiver<Packet>) {
-        let (to_port, delivered) = mpsc::channel(DELIVERED);
-        let last = to_port.clone().try_reserve_owned().unwrap();
-        (
-            SubscriberSender {
-                tx: to_port,
-                last,
-                scope,
-            },
-            delivered,
-        )
+    /// What `outbox` holds.
+    fn answers(outbox: &Outbox) -> Vec<Packet> {
+        outbox.take().packets.into()
     }
 
     fn insert_rpc(
@@ -1680,8 +1749,8 @@ mod tests {
 
     /// Waits for a worker's `task` to end, and checks that it did not panic.
     fn join(task: JoinHandle<Option<()>>) {
-        let (ended, outcome) = flume::bounded(1);
-        rt::handle().spawn(async move {
+        let (ended, outcome) = crate::chan::bounded(1);
+        crate::chan::spawn_on(rt::handle(), async move {
             let _ = ended.send(task.await);
         });
         let outcome = outcome
@@ -1702,20 +1771,12 @@ mod tests {
         let dump = DumpFlags::default();
         let tasks = Supervisor::new();
         let open = opener(&tasks, &url);
-        let (commands, _readiness, run) =
-            new(&url, None, dump, crate::proxy::link::no_default(), open);
-        let worker = tasks.spawn("a test worker", run);
+        let default = crate::proxy::link::no_default();
+        let started = new(&url, None, dump, default, open, &tasks);
+        let (commands, engine) = (started.commands, started.engine);
+        let worker = tasks.spawn("a test worker", started.run);
         let (mut device, _) = listener.accept().unwrap();
 
-        let (to_port, _delivered) = mpsc::channel(DELIVERED);
-        let (from_port, rx) = mpsc::channel(4);
-        commands
-            .try_send(Command::OpenPort(Subscriber::new(
-                to_port,
-                rx,
-                DeviceRoute::root(),
-            )))
-            .unwrap();
         let user = Packet::legacy_status(packet::LinkStatus::SensorReconnected);
         for pkt in [
             Packet::proxy_request("proxy.open", b"auto", 1).unwrap(),
@@ -1723,7 +1784,7 @@ mod tests {
             Packet::link(packet::LinkStatus::SensorReconnected),
             user.clone(),
         ] {
-            from_port.try_send(pkt).unwrap();
+            engine.send(pkt);
         }
 
         // The link's own hello comes first, as it asks whether a proxy is at
@@ -1752,11 +1813,11 @@ mod tests {
             device.read(&mut [0; 1]).is_err(),
             "the device was sent more"
         );
-        drop((commands, from_port));
+        drop((commands, engine));
         join(worker);
     }
 
-    /// A status names a subtree, so a scoped port must receive it in its own
+    /// A status names a subtree, so a mount must receive it in its own
     /// coordinates, never in the proxy's, and never for a disjoint mount. The
     /// link packet and the legacy status are clamped alike.
     #[test]
@@ -1767,8 +1828,9 @@ mod tests {
                 form(packet::LinkStatus::SensorDisconnected).with_route(route.parse().unwrap())
             };
             let ptype = status("/").ptype();
-            let delivered_routes = |mut delivered: mpsc::Receiver<Packet>| -> Vec<DeviceRoute> {
-                std::iter::from_fn(|| delivered.try_recv().ok())
+            let delivered_routes = |outbox: &Outbox| -> Vec<DeviceRoute> {
+                answers(outbox)
+                    .iter()
                     .map(|pkt| {
                         assert_eq!(pkt.ptype(), ptype, "the status keeps its form");
                         pkt.route()
@@ -1776,12 +1838,12 @@ mod tests {
                     .collect()
             };
 
-            let (port, delivered) = subscriber("/1".parse().unwrap());
-            assert!(port.try_send(&status("/")));
-            assert!(port.try_send(&status("/1/3")));
-            assert!(port.try_send(&status("/2")));
+            let (mount, outbox) = mount("/1");
+            mount.urgent(&status("/"));
+            mount.urgent(&status("/1/3"));
+            mount.urgent(&status("/2"));
             assert_eq!(
-                delivered_routes(delivered),
+                delivered_routes(&outbox),
                 [DeviceRoute::root(), "/3".parse().unwrap()],
                 "{ptype:?}: clamped into port coordinates, the disjoint mount skipped"
             );
@@ -1842,10 +1904,12 @@ mod tests {
     fn rpc_timeout_is_delivered_with_the_ports_request_id() {
         let mut worker = idle_worker();
 
-        let (to_port, mut delivered) = mpsc::channel(2);
-        let (_from_port, rx) = mpsc::channel(1);
+        let (mount, outbox) = mount("/");
         let port = 1;
-        worker.adopt(Subscriber::new(to_port, rx, DeviceRoute::root()));
+        worker.adopt(OpenPort {
+            mount,
+            from_client: mpsc::channel(1).1,
+        });
 
         let wire_id = 12;
         let original_id = 7855;
@@ -1861,7 +1925,7 @@ mod tests {
 
         worker.process_rpc_timeouts();
 
-        let packet = delivered.try_recv().unwrap();
+        let packet = answers(&outbox).remove(0);
         let packet::Payload::RpcError(error) = packet.payload() else {
             panic!("expected an RPC timeout packet");
         };
@@ -1877,24 +1941,20 @@ mod tests {
     #[test]
     fn a_disconnect_fails_every_ports_request_without_replaying_it() {
         let mut worker = idle_worker();
-        let (first, first_delivered) = subscriber(DeviceRoute::root());
-        let (second, second_delivered) = subscriber(DeviceRoute::root());
-        worker.subscribers.insert(1, first);
-        worker.subscribers.insert(2, second);
+        let (first, first_delivered) = mount("/");
+        let (second, second_delivered) = mount("/");
+        worker.mounts.insert(1, first);
+        worker.mounts.insert(2, second);
         let deadline = Instant::now() + Duration::from_secs(3);
         insert_rpc(&mut worker, 20, 1, 100, DeviceRoute::root(), deadline);
         insert_rpc(&mut worker, 21, 2, 200, DeviceRoute::root(), deadline);
 
         worker.cancel_active_rpcs();
 
-        for (mut delivered, id) in [(first_delivered, 100), (second_delivered, 200)] {
-            let failed = delivered.try_recv().unwrap();
-            let packet::Payload::RpcError(error) = failed.payload() else {
-                panic!("expected an RPC error, got {:?}", failed.payload());
-            };
-            assert_eq!(error.req_id.value(), id);
-            assert_eq!(RpcError::from(error.code), RpcError::Undefined);
-            assert!(delivered.try_recv().is_err(), "a request was failed twice");
+        for (delivered, id) in [(first_delivered, 100), (second_delivered, 200)] {
+            let failed = answers(&delivered);
+            assert_eq!(failed.len(), 1, "a request was failed twice");
+            assert_eq!(rpc_error(&failed[0]), (id, RpcError::Undefined));
         }
         assert!(worker.rpc_map.is_empty());
         assert!(worker.rpc_timeouts.is_empty());
@@ -1902,16 +1962,17 @@ mod tests {
 
     /// Returns an opener whose attempt number `n`, counted from 0, runs
     /// `attempt(n, results)`.
-    fn scripted<F>(
-        attempt: impl Fn(usize, flume::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
+    fn scripted<F, R>(
+        attempt: impl Fn(usize, crate::chan::Sender<ReceiveResult>) -> F + Send + Sync + 'static,
     ) -> Opener
     where
-        F: Future<Output = io::Result<HardwarePort>> + Send + 'static,
+        F: Future<Output = io::Result<R>> + Send + 'static,
+        R: Into<Reached>,
     {
         let attempts = AtomicUsize::new(0);
         Opener::new(move |results| {
             let number = attempts.fetch_add(1, Ordering::Relaxed);
-            Box::pin(attempt(number, results))
+            attempt(number, results)
         })
     }
 
@@ -1919,10 +1980,10 @@ mod tests {
     /// end to the test through `ends`.
     fn fake(
         kind: TransportKind,
-        results: flume::Sender<ReceiveResult>,
+        results: crate::chan::Sender<ReceiveResult>,
         ends: &mpsc::UnboundedSender<FakeEnd>,
     ) -> io::Result<HardwarePort> {
-        let (port, end) = HardwarePort::fake(kind, None, results);
+        let (port, end) = fake::port(kind, None, results);
         let _ = ends.send(end);
         Ok(port)
     }
@@ -1942,36 +2003,38 @@ mod tests {
         opened.expect("the worker stopped")
     }
 
-    /// A worker running as a task on the test's runtime, with one port on the
-    /// whole tree.
+    /// A worker running as a task on the test's runtime, with its engine's
+    /// port.
     struct Running {
-        commands: mpsc::Sender<Command>,
+        commands: mpsc::Sender<OpenPort>,
         readiness: watch::Receiver<Readiness>,
-        /// Sends what the port sends to the device.
+        /// Sends what the engine sends to the device.
         to_device: mpsc::Sender<Packet>,
-        /// What the port is delivered.
-        port: mpsc::Receiver<Packet>,
+        /// What the engine hears.
+        port: mpsc::UnboundedReceiver<Packet>,
         task: JoinHandle<Option<()>>,
     }
 
     impl Running {
         /// Runs a worker that opens its device with `open`, and gives up a
-        /// lost device after `reconnect_timeout`. The port is in place before
-        /// the worker starts, so it hears everything.
+        /// lost device after `reconnect_timeout`.
         fn start(open: Opener, reconnect_timeout: Option<Duration>) -> Running {
             let (commands, command_queue) = mpsc::channel(4);
             let (readiness, watched) = watch::channel(Readiness::Pending);
-            let mut worker = Worker::new(
+            let (to_engine, port) = mpsc::unbounded_channel();
+            let (to_device, from_engine) = mpsc::channel(4);
+            let worker = Worker::new(
                 "fake".to_string(),
                 reconnect_timeout,
                 command_queue,
                 DumpFlags::default(),
                 readiness,
                 open,
+                EnginePort {
+                    to_engine,
+                    from_engine,
+                },
             );
-            let (to_port, port) = mpsc::channel(DELIVERED);
-            let (to_device, rx) = mpsc::channel(4);
-            worker.adopt(Subscriber::new(to_port, rx, DeviceRoute::root()));
             let task = Supervisor::current().spawn("a test worker", worker.run());
             Running {
                 commands,
@@ -2006,7 +2069,7 @@ mod tests {
 
     /// Waits for the next packet delivered to `port`. Lets the other tasks
     /// run before it lets time pass, a millisecond at a time.
-    async fn next(port: &mut mpsc::Receiver<Packet>) -> Packet {
+    async fn next(port: &mut mpsc::UnboundedReceiver<Packet>) -> Packet {
         let deadline = Instant::now() + WAIT;
         for polls in 0.. {
             if let Ok(pkt) = port.try_recv() {
@@ -2022,9 +2085,26 @@ mod tests {
         unreachable!()
     }
 
+    /// Waits for the first packet queued in `outbox`, as [`next`] does.
+    async fn answered(outbox: &Outbox) -> Packet {
+        let deadline = Instant::now() + WAIT;
+        for polls in 0.. {
+            if let Some(pkt) = answers(outbox).into_iter().next() {
+                return pkt;
+            }
+            assert!(Instant::now() < deadline, "nothing was answered");
+            if polls < 10 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        unreachable!()
+    }
+
     /// Waits for the next `count` packets delivered to `port`, and returns
     /// each one's link status or packet type.
-    async fn delivered(port: &mut mpsc::Receiver<Packet>, count: usize) -> Vec<String> {
+    async fn delivered(port: &mut mpsc::UnboundedReceiver<Packet>, count: usize) -> Vec<String> {
         let mut seen = Vec::new();
         for _ in 0..count {
             let pkt = next(port).await;
@@ -2054,7 +2134,8 @@ mod tests {
     }
 
     /// A closed input drains its queued packets and releases its port.
-    /// Other inputs retain their scopes and keep forwarding both ways.
+    /// Other inputs keep forwarding both ways, and a mount hears the answer
+    /// to its request in its own coordinates.
     #[tokio::test(start_paused = true)]
     async fn a_closed_input_drains_without_disrupting_other_scoped_ports() {
         let (open, mut ends) = fakes(TransportKind::Tcp);
@@ -2063,34 +2144,22 @@ mod tests {
         device.send(&heartbeat()).await;
         assert_eq!(worker.settled(Readiness::Pending).await, Readiness::Ready);
 
-        let (first_output, mut first_port) = mpsc::channel(DELIVERED);
+        let (first, _) = mount("/1");
+        let (second, second_outbox) = mount("/2");
         let (first_input, first_rx) = mpsc::channel(4);
-        let (second_output, mut second_port) = mpsc::channel(DELIVERED);
         let (second_input, second_rx) = mpsc::channel(4);
-        for (tx, rx, scope) in [
-            (first_output, first_rx, "/1"),
-            (second_output, second_rx, "/2"),
-        ] {
-            worker
-                .commands
-                .send(Command::OpenPort(Subscriber::new(
-                    tx,
-                    rx,
-                    scope.parse().unwrap(),
-                )))
-                .await
-                .unwrap();
+        for (mount, rx) in [(&first, first_rx), (&second, second_rx)] {
+            let command = OpenPort {
+                mount: Arc::clone(mount),
+                from_client: rx,
+            };
+            worker.commands.send(command).await.unwrap();
         }
-        first_input.send(heartbeat()).await.unwrap();
-        first_input
-            .send(heartbeat().with_route("/3".parse().unwrap()))
-            .await
-            .unwrap();
+        let at = |route: &str| heartbeat().with_route(route.parse().unwrap());
+        first_input.send(at("/1")).await.unwrap();
+        first_input.send(at("/1/3")).await.unwrap();
         drop(first_input);
-        second_input
-            .send(heartbeat().with_route("/4".parse().unwrap()))
-            .await
-            .unwrap();
+        second_input.send(at("/2/4")).await.unwrap();
 
         let mut routes = Vec::new();
         for _ in 0..3 {
@@ -2099,18 +2168,25 @@ mod tests {
         }
         routes.sort();
         assert_eq!(routes, ["/1", "/1/3", "/2/4"]);
-        assert!(timeout(WAIT, first_port.recv()).await.unwrap().is_none());
+        while Arc::strong_count(&first) > 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
-        second_input
-            .send(heartbeat().with_route("/5".parse().unwrap()))
-            .await
-            .unwrap();
+        let request = Packet::rpc_request("dev.name", &[], 9, "/2/5".parse().unwrap());
+        second_input.send(request.unwrap()).await.unwrap();
         let sent = timeout(WAIT, device.recv()).await.unwrap().unwrap();
         assert_eq!(sent.route(), "/2/5".parse().unwrap());
-        device
-            .send(&heartbeat().with_route("/2/6".parse().unwrap()))
-            .await;
-        assert_eq!(next(&mut second_port).await.route(), "/6".parse().unwrap());
+        let packet::Payload::RpcRequest(request) = sent.payload() else {
+            panic!("expected the request, got {:?}", sent.payload());
+        };
+        let reply = Packet::rpc_reply(request.id.value(), b"d", sent.route()).unwrap();
+        device.send(&reply).await;
+        let answer = answered(&second_outbox).await;
+        assert_eq!(answer.route(), "/5".parse().unwrap());
+        let packet::Payload::RpcReply(reply) = answer.payload() else {
+            panic!("expected the reply, got {:?}", answer.payload());
+        };
+        assert_eq!(reply.req_id.value(), 9);
         worker.stop().await;
     }
 
@@ -2141,39 +2217,6 @@ mod tests {
         );
         assert!(!worker.task.is_finished());
         assert_eq!(*worker.readiness.borrow(), Readiness::Ready);
-        worker.stop().await;
-    }
-
-    /// A port that joins while the device is lost hears so at once, though
-    /// the device's port is open again, and then hears the device come back
-    /// along with the port that was there.
-    #[tokio::test(start_paused = true)]
-    async fn a_port_that_joins_while_the_device_is_lost_hears_so() {
-        let (open, mut ends) = fakes(TransportKind::Tcp);
-        let mut worker = Running::start(open, None);
-        let mut first = opened(&mut ends).await;
-        first.send(&heartbeat()).await;
-        first.fail(io::ErrorKind::ConnectionReset);
-        let mut second = opened(&mut ends).await;
-        assert_eq!(
-            delivered(&mut worker.port, 2).await,
-            [beat(), "SensorDisconnected".to_string()]
-        );
-
-        let (to_port, mut joined) = mpsc::channel(DELIVERED);
-        let (_to_device, rx) = mpsc::channel(1);
-        let subscriber = Subscriber::new(to_port, rx, DeviceRoute::root());
-        let opening = worker.commands.send(Command::OpenPort(subscriber));
-        opening.await.unwrap();
-        assert_eq!(delivered(&mut joined, 1).await, ["SensorDisconnected"]);
-        second.send(&heartbeat()).await;
-
-        for port in [&mut worker.port, &mut joined] {
-            assert_eq!(
-                delivered(port, 2).await,
-                ["SensorReconnected".to_string(), beat()]
-            );
-        }
         worker.stop().await;
     }
 
@@ -2209,38 +2252,6 @@ mod tests {
             worker.port.try_recv(),
             Err(TryRecvError::Disconnected)
         ));
-    }
-
-    /// A port whose queue is full, though it has not fallen behind, when the
-    /// worker gives up its device still hears that reconnecting failed.
-    #[tokio::test(start_paused = true)]
-    async fn a_port_with_a_full_queue_still_hears_failed_to_reconnect() {
-        let (ends, mut opened_ends) = mpsc::unbounded_channel();
-        let open = scripted(move |attempt, results| {
-            future::ready(match attempt {
-                0 => fake(TransportKind::Tcp, results, &ends),
-                _ => Err(io::ErrorKind::ConnectionRefused.into()),
-            })
-        });
-        let mut worker = Running::start(open, Some(Duration::from_millis(200)));
-        let mut first = opened(&mut opened_ends).await;
-        for _ in 1..DELIVERED {
-            first.send(&heartbeat()).await;
-        }
-        assert_eq!(worker.settled(Readiness::Pending).await, Readiness::Ready);
-
-        first.fail(io::ErrorKind::ConnectionReset);
-        ended(worker.task).await;
-
-        let mut queued = Vec::new();
-        while let Ok(pkt) = worker.port.try_recv() {
-            queued.push(pkt);
-        }
-        assert_eq!(queued.len(), DELIVERED);
-        assert_eq!(
-            queued.last().and_then(Packet::link_status),
-            Some(packet::LinkStatus::FailedToReconnect)
-        );
     }
 
     /// A port lost before its device answers on it is a failed attempt. The
@@ -2326,9 +2337,151 @@ mod tests {
         }
     }
 
-    /// While an attempt to reopen the device hangs, a port that joins still
-    /// hears at once that the device is lost. A port's request fails at once,
-    /// as does the request the device took before it was lost.
+    /// How long each attempt after the first takes to open its port, unless
+    /// a test says otherwise.
+    const CONNECT: Duration = Duration::from_millis(1200);
+
+    /// Runs a worker of fake ports of `kind`, at whose other end `peer`
+    /// answers. The device answers on the first port and then loses it.
+    /// Each later attempt takes `connect` to open its port. Returns the
+    /// worker, the receiver of when each later attempt starts, the end of the
+    /// port the second attempt opens, and when the second attempt started.
+    async fn reopened(
+        kind: TransportKind,
+        peer: PeerKind,
+        connect: Duration,
+    ) -> (Running, mpsc::UnboundedReceiver<Instant>, FakeEnd, Instant) {
+        let (ends, mut opened_ends) = mpsc::unbounded_channel();
+        let (starts, mut started) = mpsc::unbounded_channel();
+        let open = scripted(move |attempt, results| {
+            let _ = starts.send(Instant::now());
+            let port = fake(kind, results, &ends);
+            async move {
+                if attempt > 0 {
+                    tokio::time::sleep(connect).await;
+                }
+                port.map(|port| Reached { port, peer })
+            }
+        });
+        let mut worker = Running::start(open, None);
+        let mut first = opened(&mut opened_ends).await;
+        first.send(&heartbeat()).await;
+        assert_eq!(worker.settled(Readiness::Pending).await, Readiness::Ready);
+        first.fail(io::ErrorKind::ConnectionReset);
+        let silent = opened(&mut opened_ends).await;
+        started.recv().await.expect("the first attempt");
+        let second = started.recv().await.expect("the second attempt");
+        (worker, started, silent, second)
+    }
+
+    /// A TCP connection reopened after the device was lost, on which nothing
+    /// ever arrives, is a failed attempt once `LIVENESS_TIMEOUT_TCP` has
+    /// passed from the start of the attempt, the connect included. The ports
+    /// hear nothing of it, and the next attempt waits the reconnect interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_tcp_reconnection_the_device_never_answers_on_is_given_up() {
+        let (mut worker, mut started, silent, second) =
+            reopened(TransportKind::Tcp, PeerKind::Device, CONNECT).await;
+
+        let third = timeout(WAIT, started.recv()).await.expect("never given up");
+        let third = third.expect("the worker stopped");
+
+        assert!(silent.released(), "the silent connection was kept");
+        assert_took(
+            third - second,
+            LIVENESS_TIMEOUT_TCP + RECONNECT_INTERVAL,
+            "giving up the silent connection and trying again",
+        );
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        assert!(
+            matches!(worker.port.try_recv(), Err(TryRecvError::Empty)),
+            "a failed attempt was reported to the port"
+        );
+        worker.stop().await;
+    }
+
+    /// A serial port reopened after the device was lost, on which nothing
+    /// ever arrives, is kept, as a serial port has no deadline before the
+    /// device answers on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_serial_port_the_device_never_answers_on_is_kept() {
+        let (mut worker, mut started, silent, _) =
+            reopened(TransportKind::Serial, PeerKind::Device, CONNECT).await;
+
+        tokio::time::sleep(10 * LIVENESS_TIMEOUT_TCP).await;
+
+        assert!(!silent.released(), "the silent port was given up");
+        assert!(started.try_recv().is_err(), "the worker tried again");
+        assert!(!worker.task.is_finished(), "the worker stopped");
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        worker.stop().await;
+    }
+
+    /// A proxy reopened after its device was lost, from which nothing more
+    /// arrives, is kept until `LIVENESS_TIMEOUT_PROXY` has passed from its
+    /// answer to the open, and is then a failed attempt. The ports hear
+    /// nothing of it, and the next attempt waits the reconnect interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopened_proxy_is_given_up_once_silent_for_its_timeout_from_its_open() {
+        let (mut worker, mut started, silent, second) =
+            reopened(TransportKind::Tcp, PeerKind::Proxy, CONNECT).await;
+        let answered = second + CONNECT;
+
+        crate::chan::sleep_until(answered + LIVENESS_TIMEOUT_PROXY - Duration::from_millis(1))
+            .await;
+        assert!(!silent.released(), "the proxy was given up before its time");
+        assert!(started.try_recv().is_err(), "the worker tried again");
+
+        let third = timeout(PAUSED_WAIT, started.recv()).await;
+        let third = third.expect("never given up").expect("the worker stopped");
+        assert!(silent.released(), "the silent proxy was kept");
+        assert_took(
+            third - answered,
+            LIVENESS_TIMEOUT_PROXY + RECONNECT_INTERVAL,
+            "giving up the silent proxy and trying again",
+        );
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        assert!(
+            matches!(worker.port.try_recv(), Err(TryRecvError::Empty)),
+            "a failed attempt was reported to the port"
+        );
+        worker.stop().await;
+    }
+
+    /// A proxy whose open took nearly as long as an open may, as it waited
+    /// for its own device, is kept once the open ends, for longer than
+    /// `LIVENESS_TIMEOUT_TCP`. Its silence counts from its answer to the
+    /// open, not from the start of the attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_proxy_whose_open_outlasts_the_tcp_timeout_is_not_given_up_at_once() {
+        let slow = READY_TIMEOUT - Duration::from_secs(1);
+        let (mut worker, mut started, silent, second) =
+            reopened(TransportKind::Tcp, PeerKind::Proxy, slow).await;
+
+        crate::chan::sleep_until(second + slow + 2 * LIVENESS_TIMEOUT_TCP).await;
+
+        assert!(!silent.released(), "the proxy was given up as it opened");
+        assert!(started.try_recv().is_err(), "the worker tried again");
+        assert!(!worker.task.is_finished(), "the worker stopped");
+        assert_eq!(
+            delivered(&mut worker.port, 2).await,
+            [beat(), "SensorDisconnected".to_string()]
+        );
+        worker.stop().await;
+    }
+
+    /// While an attempt to reopen the device hangs, a port that joins is
+    /// adopted at once. A port's request fails at once, as does the request
+    /// the device took before it was lost.
     #[tokio::test(start_paused = true)]
     async fn a_hung_reopen_delays_neither_a_new_port_nor_a_ports_rpc_errors() {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
@@ -2360,17 +2513,18 @@ mod tests {
             rpc_error(&next(&mut worker.port).await),
             (7, RpcError::Undefined)
         );
-        let (to_port, mut joined) = mpsc::channel(DELIVERED);
+        let (mount, joined) = mount("/");
         let (to_device, rx) = mpsc::channel(1);
-        let subscriber = Subscriber::new(to_port, rx, DeviceRoute::root());
         worker
             .commands
-            .try_send(Command::OpenPort(subscriber))
+            .try_send(OpenPort {
+                mount,
+                from_client: rx,
+            })
             .unwrap();
-        assert_eq!(delivered(&mut joined, 1).await, ["SensorDisconnected"]);
         to_device.try_send(request(8)).unwrap();
         assert_eq!(
-            rpc_error(&next(&mut joined).await),
+            rpc_error(&answered(&joined).await),
             (8, RpcError::Undefined)
         );
         assert_eq!(
@@ -2436,15 +2590,16 @@ mod tests {
     fn droppable_hang(
         first_opens: bool,
         ends: mpsc::UnboundedSender<FakeEnd>,
-    ) -> (Opener, tokio::sync::oneshot::Receiver<()>) {
-        let (held, dropped) = tokio::sync::oneshot::channel();
+    ) -> (Opener, crate::chan::oneshot::Receiver<()>) {
+        let (held, dropped) = crate::chan::oneshot::channel();
         let held = std::sync::Mutex::new(Some(held));
         let attempts = AtomicUsize::new(0);
         let open = Opener::droppable(move |results| -> Opening {
             if first_opens && attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                return Box::pin(future::ready(fake(TransportKind::Tcp, results, &ends)));
+                let port = fake(TransportKind::Tcp, results, &ends);
+                return Box::pin(future::ready(port.map(Reached::from)));
             }
-            let held = held.lock().unwrap().take();
+            let held = crate::chan::lock(&held).take();
             Box::pin(async move {
                 let _held = held;
                 future::pending().await
@@ -2499,7 +2654,7 @@ mod tests {
         assert!(
             dropped
                 .try_recv()
-                .is_err_and(|error| error == tokio::sync::oneshot::error::TryRecvError::Empty),
+                .is_err_and(|error| error == crate::chan::oneshot::error::TryRecvError::Empty),
             "no reopen is in flight"
         );
 
@@ -2515,7 +2670,7 @@ mod tests {
         assert!(
             dropped
                 .try_recv()
-                .is_err_and(|error| error == tokio::sync::oneshot::error::TryRecvError::Closed),
+                .is_err_and(|error| error == crate::chan::oneshot::error::TryRecvError::Closed),
             "the reopen in flight was kept"
         );
     }
@@ -2531,7 +2686,7 @@ mod tests {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
         let open = scripted(move |_, results| {
             let kind = TransportKind::Serial;
-            let (port, end) = HardwarePort::fake(kind, Some(rates.clone()), results);
+            let (port, end) = fake::port(kind, Some(rates.clone()), results);
             let _ = ends.send(end);
             future::ready(Ok(port))
         });
@@ -2545,12 +2700,13 @@ mod tests {
             dump,
             readiness,
             open,
+            unheard(),
         );
         worker.device = Some(worker.open_device().await.unwrap());
         // The device starts a session, and offers its default rate when it
         // is asked for the target.
         let mut device = opened(&mut opened_ends).await;
-        tokio::spawn(async move {
+        crate::chan::spawn(async move {
             device
                 .send(&Packet::heartbeat_session(1, DeviceRoute::root()))
                 .await;
@@ -2598,7 +2754,7 @@ mod tests {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
         let open = scripted(move |_, results| {
             let kind = TransportKind::Serial;
-            let (port, end) = HardwarePort::fake(kind, Some(rates.clone()), results);
+            let (port, end) = fake::port(kind, Some(rates.clone()), results);
             let _ = ends.send(end);
             future::ready(Ok(port))
         });
@@ -2642,7 +2798,7 @@ mod tests {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
         let open = scripted(move |_, results| {
             let kind = TransportKind::Serial;
-            let (port, end) = HardwarePort::fake(kind, Some(rates.clone()), results);
+            let (port, end) = fake::port(kind, Some(rates.clone()), results);
             let _ = ends.send(end);
             future::ready(Ok(port))
         });
@@ -2656,6 +2812,7 @@ mod tests {
             dump,
             readiness,
             open,
+            unheard(),
         );
         worker.device = Some(worker.open_device().await.unwrap());
         worker.device.as_mut().unwrap().rate_change_state = RateChange::RateChanged;
@@ -2685,14 +2842,15 @@ mod tests {
             // `url`.
             let (ends, mut opened_ends) = mpsc::unbounded_channel();
             let reopen = opener(&Supervisor::current(), &url);
-            let open = scripted(
-                move |attempt, results| -> BoxFuture<'static, io::Result<HardwarePort>> {
-                    match attempt {
-                        0 => Box::pin(future::ready(fake(TransportKind::Tcp, results, &ends))),
-                        _ => reopen.open(results),
+            let open = scripted(move |attempt, results| -> Opening {
+                match attempt {
+                    0 => {
+                        let port = fake(TransportKind::Tcp, results, &ends);
+                        Box::pin(future::ready(port.map(Reached::from)))
                     }
-                },
-            );
+                    _ => reopen.open(results),
+                }
+            });
             let mut worker = Running::start(open, Some(Duration::from_millis(200)));
             let mut first = opened(&mut opened_ends).await;
             first.send(&heartbeat()).await;
@@ -2724,6 +2882,7 @@ mod tests {
             dump,
             readiness,
             open,
+            unheard(),
         )
         .run()
         .await;

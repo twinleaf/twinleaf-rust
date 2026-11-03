@@ -2,27 +2,27 @@
 //! clients, runs the task of each, keeps the client table, and owns the
 //! registry of links. [`Shared`] holds what every client's task reads.
 
-use super::client::Session;
-use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
-use super::link::{self, Links, Owner};
-use super::{
-    answers, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
+use super::client::{Client, SOCKET_QUEUE};
+use super::link::{Links, Owner};
+use super::table::{Notice, Shared, TableChange};
+use super::worker;
+use super::{answers_async, endpoint_at, ClientInfo, HostOptions, Listen, IDLE, LEAVE_TIMEOUT};
+use crate::chan::oneshot;
+use crate::net::{Listeners, TcpStream};
+use crate::rt::{sleep_until_some, Supervisor};
+use crate::session::{
+    call_at, decode, encode, older_build, Introduction, Layout, HELLO, HELLO_TIMEOUT,
 };
-use crate::rt::{self, sleep_until_some, Supervisor};
-use crate::tio::rpc::{RpcArgs, RpcReply};
 use crate::tio::transport;
-use socket2::{Domain, Protocol, SockRef, Socket, Type};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::future::{self, Future};
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
-use std::task::Poll;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
 
@@ -30,90 +30,179 @@ use tokio_util::task::JoinMap;
 // An accept that fails for want of file descriptors fails again at once.
 const ACCEPT_RETRY: Duration = Duration::from_millis(20);
 
-/// What the server is told, by the proxy's handle and its clients' tasks.
-pub(super) enum Notice {
-    /// A change to client `id`'s entry in the table. The server answers on
-    /// `done` once the table shows it.
-    Update {
-        id: u64,
-        update: Update,
-        done: oneshot::Sender<()>,
-    },
-    /// A stop of the proxy.
-    Stop,
-    /// A panic of the server.
+/// A running proxy. Dropping it stops it, and the drop blocks until the
+/// proxy has stopped, as [`shutdown`](Proxy::shutdown) does, for at most
+/// 1.5 s and the moment its aborts take.
+pub struct Proxy {
+    /// The server's mailbox, which keeps the proxy running.
+    server: mpsc::UnboundedSender<Notice>,
+    /// The receiver that disconnects once the proxy has stopped.
+    stopped: crate::chan::Receiver<()>,
+    /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
+    /// started on the crate's runtime.
+    drop_waits: bool,
+    /// The client table, as the server publishes it.
+    clients: watch::Receiver<Vec<ClientInfo>>,
+    default: watch::Sender<Option<Layout>>,
+    endpoint: String,
     #[cfg(test)]
-    Panic,
-}
-
-/// A change to a client's entry in the table.
-pub(super) enum Update {
-    /// The client introduced itself with `proxy.hello`.
-    Hello(Introduction),
-    /// The client opened this target.
-    Target(String),
-}
-
-/// What every client's task reads, none of which keeps the proxy running.
-pub(super) struct Shared {
-    /// How the proxy is hosted. Its default layout is held in `default`.
-    pub(super) options: HostOptions,
-    pub(super) endpoint: String,
+    #[cfg_attr(all(test, turmoil), allow(dead_code))]
     pub(super) links: Links,
-    /// The spawner of the clients' transports and blocking steps.
-    pub(super) tasks: Supervisor,
-    /// The server's mailbox.
-    pub(super) server: mpsc::WeakUnboundedSender<Notice>,
-    /// The default layout, which the host sets and a client may hold.
-    pub(super) default: watch::Sender<Option<Layout>>,
-    /// The id and address of the client holding the default with `proxy.default`.
-    pub(super) holder: Mutex<Option<(u64, String)>>,
 }
 
-impl Shared {
-    /// Returns the layout `default` opens.
-    pub(super) fn default(&self) -> Option<Layout> {
-        self.default.borrow().clone()
+impl Proxy {
+    /// Starts a proxy with `options`. Returns once it accepts clients.
+    ///
+    /// The proxy runs on the crate's own runtime. This may be called from
+    /// inside an application's tokio runtime, and blocks that thread until
+    /// the proxy accepts clients or fails to start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::ErrorKind::AddrInUse`] error if `options.port` is
+    /// nonzero and anything already answers on that port of `127.0.0.1`.
+    /// Nothing is bound then. The message says whether a Twinleaf proxy
+    /// already runs there. Also returns any error from binding the port or
+    /// listening on it.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
+    /// use twinleaf::DeviceRoute;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let proxy = Proxy::host(HostOptions {
+    ///     default: Some(Layout {
+    ///         mounts: vec![Mount {
+    ///             url: "serial:///dev/ttyACM0".to_string(),
+    ///             source: DeviceRoute::root(),
+    ///             prefix: DeviceRoute::root(),
+    ///         }],
+    ///     }),
+    ///     ..HostOptions::default()
+    /// })?;
+    /// println!("Serving at {}", proxy.endpoint());
+    /// proxy.wait();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn host(options: HostOptions) -> io::Result<Proxy> {
+        let mut proxy = Supervisor::new().run("proxy host", host(options))?;
+        proxy.drop_waits = true;
+        Ok(proxy)
+    }
+
+    /// Returns the URL a client on this machine connects to, such as
+    /// `tcp://127.0.0.1:7855`.
+    pub fn endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    /// Replaces the layout `default` opens and `auto` prefers, or clears it
+    /// with `None`. Clients that already opened one keep it.
+    pub fn set_default(&self, layout: Option<Layout>) {
+        self.default.send_replace(layout);
+    }
+
+    /// Returns the clients connected now, in the order they connected. A
+    /// proxy that has stopped has none.
+    pub fn clients(&self) -> Vec<ClientInfo> {
+        match self.clients.has_changed() {
+            Ok(_) => self.clients.borrow().clone(),
+            Err(_stopped) => Vec::new(),
+        }
+    }
+
+    /// Blocks until the proxy has stopped, by `proxy.stop`, by idling out, or
+    /// by [`shutdown`](Self::shutdown).
+    pub fn wait(&self) {
+        let _ = self.stopped.recv();
+    }
+
+    /// Stops the proxy and blocks until it has stopped. Each client hears the
+    /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
+    /// connection closes. The proxy stops accepting clients and closes every
+    /// link.
+    ///
+    /// The stop waits at most 1.5 s for the clients to close, and in the
+    /// same 1.5 s for each link to let go of its device. Then it aborts the
+    /// tasks of the clients and links that still run, and returns. So it
+    /// blocks for at most 1.5 s and the moment the aborts take. An open of a
+    /// serial device in flight on a blocking thread runs to its end after
+    /// that. The engine that keeps a link's state, and the tasks that read
+    /// its devices' settings, end once their link has ended, and the stop
+    /// does not wait for them.
+    ///
+    /// Calling it again does nothing. It may be called from inside an
+    /// application's tokio runtime, and blocks that thread as it would any
+    /// other.
+    pub fn shutdown(&self) {
+        let _ = self.server.send(Notice::Stop);
+        self.wait();
+    }
+
+    /// Stops the proxy as [`shutdown`](Self::shutdown) does, and waits for
+    /// it without blocking. A proxy hosted on its caller's runtime, as the
+    /// crate's async [`host`] starts it, is stopped this way, since its drop
+    /// only asks it to stop.
+    pub(crate) async fn shutdown_async(&self) {
+        let _ = self.server.send(Notice::Stop);
+        let _ = self.stopped.recv_async().await;
+    }
+}
+
+impl fmt::Debug for Proxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Proxy")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl Drop for Proxy {
+    /// Stops the proxy. A proxy [`Proxy::host`] started is waited for as
+    /// [`shutdown`](Proxy::shutdown) waits. Any other proxy runs on its
+    /// caller's runtime and is only asked to stop, since on a runtime of one
+    /// thread a wait would block the proxy itself.
+    fn drop(&mut self) {
+        let _ = self.server.send(Notice::Stop);
+        if self.drop_waits {
+            self.wait();
+        }
     }
 }
 
 /// Binds the listeners for `options`, and starts the server, which serves
-/// clients until the proxy stops. Returns the proxy's handle.
+/// clients until the proxy stops. Returns the proxy's handle. Must be
+/// awaited on a tokio runtime, which runs every task of the proxy.
 ///
 /// Returns an [`io::ErrorKind::AddrInUse`] error if anything already answers
 /// on a nonzero port. The message calls it a Twinleaf proxy if it answers
 /// `proxy.hello`. Also returns any error from binding the listeners or
-/// registering them with the crate's runtime.
-///
-/// # Panics
-///
-/// Panics if the crate's runtime cannot start.
-pub(super) fn host(mut options: HostOptions) -> io::Result<Proxy> {
-    if options.port != 0 && answers(options.port) {
+/// registering them with the runtime.
+pub(crate) async fn host(mut options: HostOptions) -> io::Result<Proxy> {
+    let tasks = Supervisor::current();
+    if options.port != 0 && answers_async(options.port).await {
         let endpoint = endpoint_at(options.port);
-        let hello = Introduction::of_this_process(&options.name).encode_args();
-        let message = match control::call(&endpoint, HELLO, &hello, HELLO_TIMEOUT) {
-            Ok(reply) => match Introduction::decode_reply(&reply) {
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, options.port));
+        let hello = encode(&Introduction::of_this_process(&options.name));
+        let called = call_at(address, &endpoint, HELLO, &hello, HELLO_TIMEOUT, &tasks).await;
+        let message = match called {
+            Ok(reply) => match decode::<Introduction>(&reply) {
                 Ok(host) => {
                     format!("a Twinleaf proxy already runs at {endpoint}, hosted by {host}")
                 }
                 Err(_) => format!("a Twinleaf proxy already runs at {endpoint}"),
             },
-            Err(_) => control::not_a_proxy(&endpoint).to_string(),
+            Err(_) => older_build(&endpoint).to_string(),
         };
         return Err(io::Error::new(io::ErrorKind::AddrInUse, message));
     }
-    let listeners = bind(options.listen, options.port)?;
-    let port = listeners[0].local_addr()?.port();
-    let listeners = {
-        let _runtime = rt::handle().enter();
-        let listening = listeners.into_iter().map(|listener| {
-            listener.set_nonblocking(true)?;
-            TcpListener::from_std(listener)
-        });
-        listening.collect::<io::Result<Vec<_>>>()?
-    };
-    let tasks = Supervisor::new();
+    let (v4, v6) = addresses(options.listen, LOOPBACK_SHARES_PORT);
+    let listeners = Listeners::bind(v4, v6, options.port).await?;
+    let port = listeners.port()?;
     let default = watch::channel(options.default.take());
     let registry = Links::new(
         &tasks,
@@ -145,7 +234,7 @@ pub(super) struct Server {
     shared: Arc<Shared>,
     /// The listening sockets. They are dropped once the proxy stops
     /// accepting.
-    listeners: Vec<TcpListener>,
+    listeners: Listeners,
     notices: mpsc::UnboundedReceiver<Notice>,
     clients: BTreeMap<u64, ClientInfo>,
     /// The publisher of `clients`.
@@ -153,10 +242,10 @@ pub(super) struct Server {
     /// The task of each client.
     sessions: JoinMap<u64, Option<()>>,
     /// The lifeline of each client's task, dropped to tell it the proxy stops.
-    lifelines: HashMap<u64, oneshot::Sender<Infallible>>,
+    lifelines: BTreeMap<u64, oneshot::Sender<Infallible>>,
     registry: Owner,
     /// Disconnects once the server has ended.
-    _stopped: flume::Sender<()>,
+    _stopped: crate::chan::Sender<()>,
     next_id: u64,
     /// When a proxy that exits once idle exits, if no client connects
     /// before.
@@ -179,10 +268,11 @@ impl Server {
     ) -> (Proxy, Server) {
         let (notices, mailbox) = mpsc::unbounded_channel();
         let (table, clients) = watch::channel(Vec::new());
-        let (stopped, waited) = flume::bounded(0);
+        let (stopped, waited) = crate::chan::bounded(0);
         let proxy = Proxy {
             server: notices.clone(),
             stopped: waited,
+            drop_waits: false,
             clients,
             default: default.clone(),
             endpoint: endpoint.clone(),
@@ -200,12 +290,12 @@ impl Server {
         });
         let server = Server {
             shared,
-            listeners: Vec::new(),
+            listeners: Listeners::default(),
             notices: mailbox,
             clients: BTreeMap::new(),
             table,
             sessions: JoinMap::new(),
-            lifelines: HashMap::new(),
+            lifelines: BTreeMap::new(),
             registry,
             _stopped: stopped,
             next_id: 1,
@@ -227,10 +317,8 @@ impl Server {
                 notice = self.notices.recv() => match notice {
                     Some(Notice::Update { id, update, done }) => self.update(id, update, done),
                     Some(Notice::Stop) | None => break,
-                    #[cfg(test)]
-                    Some(Notice::Panic) => panic!("a test asked the server to panic"),
                 },
-                accepted = accept(&self.listeners), if accepting => match accepted {
+                accepted = self.listeners.accept(), if accepting => match accepted {
                     Ok((stream, peer)) => self.serve(stream, peer),
                     Err(error) => {
                         log::warn!("Error accepting client: {error}");
@@ -257,7 +345,7 @@ impl Server {
     /// links together. Waits [`LEAVE_TIMEOUT`] for the clients, as the
     /// registry does for its links.
     async fn stop(mut self) {
-        self.listeners.clear();
+        self.listeners.close();
         self.notices.close();
         while self.notices.try_recv().is_ok() {}
         self.lifelines.clear();
@@ -274,16 +362,16 @@ impl Server {
     }
 
     /// Changes client `id`'s entry in the table, and answers on `done`.
-    fn update(&mut self, id: u64, update: Update, done: oneshot::Sender<()>) {
+    fn update(&mut self, id: u64, update: TableChange, done: oneshot::Sender<()>) {
         if let Some(info) = self.clients.get_mut(&id) {
             match update {
-                Update::Hello(client) => {
+                TableChange::Hello(client) => {
                     info.version = Some(client.version_text());
                     info.own_process = client.pid == std::process::id();
                     info.pid = Some(client.pid);
                     info.name = Some(client.name);
                 }
-                Update::Target(target) => info.target = Some(target),
+                TableChange::Target(target) => info.target = Some(target),
             }
             self.publish();
         }
@@ -310,13 +398,11 @@ impl Server {
     /// Adds the client at `peer` connected on `stream` to the table, and
     /// spawns its task.
     fn serve(&mut self, stream: TcpStream, peer: SocketAddr) {
-        // A client from the proxy perspective is a port in reverse, i.e. what it receives
-        // is what a client transmits, and vice-versa. Therefore, the channel size settings
-        // for rx and tx are inverted. Also, we use the proxy port channel size setting
-        // instead of the physical ports setting.
-        let (deliver, incoming) = flume::bounded(link::client_tx_channel_size());
-        let size = link::client_rx_channel_size();
-        let port = match transport::Port::from_tcp(stream, deliver, size, &self.shared.tasks) {
+        // What a client sends goes to its ports, so it is queued as deep as
+        // they are. What it is sent waits in its outbox.
+        let (deliver, incoming) = crate::chan::bounded(worker::client_tx_channel_size());
+        let tasks = &self.shared.tasks;
+        let port = match transport::Port::from_tcp(stream, deliver, SOCKET_QUEUE, tasks) {
             Ok(port) => port,
             Err(error) => {
                 log::warn!("Failed to set up client {peer}: {error}");
@@ -339,7 +425,7 @@ impl Server {
         self.publish();
         let (lifeline, alive) = oneshot::channel();
         self.lifelines.insert(id, lifeline);
-        let session = Session::new(self.shared.clone(), id, peer, port, incoming, alive);
+        let session = Client::new(self.shared.clone(), id, peer, port, incoming, alive);
         let task = format_args!("proxy client {id}");
         self.shared
             .tasks
@@ -349,29 +435,12 @@ impl Server {
     /// Breaks to exit a proxy that has had no client for [`IDLE`]. Each
     /// connection already waiting on a listener is served instead.
     fn idle_out(&mut self) -> ControlFlow<()> {
-        let mut waiting = Vec::new();
-        for listener in &self.listeners {
-            loop {
-                match SockRef::from(listener).accept() {
-                    Ok((socket, _)) => waiting.push(socket),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        log::warn!("Error accepting client: {error}");
-                        break;
-                    }
-                }
-            }
-        }
+        let waiting = self.listeners.waiting();
         if waiting.is_empty() {
             log::info!("no clients for {:?}; exiting", IDLE);
             return ControlFlow::Break(());
         }
-        for socket in waiting {
-            let stream = std::net::TcpStream::from(socket);
-            let accepted = stream.set_nonblocking(true).and_then(|()| {
-                let peer = stream.peer_addr()?;
-                Ok((TcpStream::from_std(stream)?, peer))
-            });
+        for accepted in waiting {
             match accepted {
                 Ok((stream, peer)) => self.serve(stream, peer),
                 Err(error) => log::warn!("Error accepting client: {error}"),
@@ -381,117 +450,116 @@ impl Server {
     }
 }
 
-/// Waits for a connection on any of `listeners`. Never returns while there is
-/// none.
-fn accept(
-    listeners: &[TcpListener],
-) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + '_ {
-    future::poll_fn(move |cx| {
-        for listener in listeners {
-            if let Poll::Ready(accepted) = listener.poll_accept(cx) {
-                return Poll::Ready(accepted);
-            }
-        }
-        Poll::Pending
-    })
-}
+/// Whether a socket on every interface shares its port with one on
+/// `127.0.0.1` on this OS. It does on macOS and Windows.
+const LOOPBACK_SHARES_PORT: bool = cfg!(any(target_os = "macos", windows));
 
-/// Binds the listening sockets for `listen` on `port`. The IPv4 sockets come
-/// first, on `127.0.0.1` or every interface, and the first holds the proxy's
-/// port. On macOS and Windows, where a socket on every interface shares its
-/// port with one on `127.0.0.1`, a proxy on every interface holds
-/// `127.0.0.1` too, so that no other proxy binds it. Windows hands each
-/// connection to `127.0.0.1` to the socket bound there rather than to the
-/// one on every interface. An IPv6 only socket follows on the same
-/// port, on `::1` or every interface. A host without IPv6 gets the IPv4
-/// sockets alone. Returns an error if an IPv4 socket cannot be bound.
-fn bind(listen: Listen, port: u16) -> io::Result<Vec<std::net::TcpListener>> {
-    let (v4, v6): (&[Ipv4Addr], _) = match listen {
-        Listen::Loopback => (&[Ipv4Addr::LOCALHOST], Ipv6Addr::LOCALHOST),
-        Listen::AllInterfaces if cfg!(any(target_os = "macos", windows)) => (
+/// Returns the addresses a proxy binds for `listen`, its IPv4 addresses in
+/// the order they are bound and then its IPv6 address. `loopback_shares_port`
+/// says whether a socket on every interface shares its port with one on
+/// `127.0.0.1`, as [`LOOPBACK_SHARES_PORT`] says of this OS. Where it does,
+/// a proxy on every interface holds `127.0.0.1` too, so that no other proxy
+/// binds it. Windows hands each connection to `127.0.0.1` to the socket bound
+/// there rather than to the one on every interface.
+fn addresses(listen: Listen, loopback_shares_port: bool) -> (&'static [Ipv4Addr], Ipv6Addr) {
+    match (listen, loopback_shares_port) {
+        (Listen::Loopback, _) => (&[Ipv4Addr::LOCALHOST], Ipv6Addr::LOCALHOST),
+        (Listen::AllInterfaces, true) => (
             &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED],
             Ipv6Addr::UNSPECIFIED,
         ),
-        Listen::AllInterfaces => (&[Ipv4Addr::UNSPECIFIED], Ipv6Addr::UNSPECIFIED),
-    };
-    let first = std::net::TcpListener::bind((v4[0], port))?;
-    let port = first.local_addr()?.port();
-    let rest = v4[1..]
-        .iter()
-        .map(|v4| std::net::TcpListener::bind((*v4, port)));
-    let mut listeners = std::iter::once(Ok(first))
-        .chain(rest)
-        .collect::<io::Result<Vec<_>>>()?;
-    match bind_v6_only((v6, port).into()) {
-        Ok(v6) => listeners.push(v6),
-        Err(error) => log::debug!("Not listening on [{v6}]:{port}: {error}"),
+        (Listen::AllInterfaces, false) => (&[Ipv4Addr::UNSPECIFIED], Ipv6Addr::UNSPECIFIED),
     }
-    Ok(listeners)
-}
-
-/// Listens on the IPv6 `address` like [`std::net::TcpListener::bind`], with
-/// a socket that takes no IPv4.
-fn bind_v6_only(address: SocketAddr) -> io::Result<std::net::TcpListener> {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_only_v6(true)?;
-    #[cfg(not(windows))]
-    socket.set_reuse_address(true)?;
-    socket.bind(&address.into())?;
-    socket.listen(128)?;
-    Ok(socket.into())
 }
 
 #[cfg(test)]
+#[cfg(not(turmoil))]
 mod tests {
     use super::*;
-    use crate::proxy::fixtures::{assert_took, options, PAUSED_WAIT};
+    use crate::proxy::tests::fixtures::options;
     use crate::proxy::DumpFlags;
+    use crate::rt;
+    use crate::tio::tests::{assert_took, binds_every_interface, PAUSED_WAIT};
+    use socket2::SockRef;
     use std::net::TcpListener;
     use std::thread;
     use tokio::time::timeout;
+
+    /// A proxy on loopback binds `127.0.0.1` and `::1` on every OS. One on
+    /// every interface binds `127.0.0.1` beside every interface where the
+    /// two share a port, and every interface alone elsewhere.
+    #[test]
+    fn each_mode_binds_its_addresses_on_each_os() {
+        for shares in [false, true] {
+            assert_eq!(
+                addresses(Listen::Loopback, shares),
+                (&[Ipv4Addr::LOCALHOST][..], Ipv6Addr::LOCALHOST)
+            );
+        }
+        assert_eq!(
+            addresses(Listen::AllInterfaces, true),
+            (
+                &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED][..],
+                Ipv6Addr::UNSPECIFIED
+            )
+        );
+        assert_eq!(
+            addresses(Listen::AllInterfaces, false),
+            (&[Ipv4Addr::UNSPECIFIED][..], Ipv6Addr::UNSPECIFIED)
+        );
+    }
 
     /// IPv4 is held on sockets of their own, the first as the lock and the
     /// endpoint, and IPv6 on another that takes no IPv4, in either mode.
     #[test]
     fn ipv4_and_ipv6_are_bound_apart() {
-        let everywhere: &[Ipv4Addr] = if cfg!(any(target_os = "macos", windows)) {
-            &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED]
-        } else {
-            &[Ipv4Addr::UNSPECIFIED]
-        };
-        for (listen, v4, v6) in [
-            (
-                Listen::Loopback,
-                &[Ipv4Addr::LOCALHOST][..],
-                Ipv6Addr::LOCALHOST,
-            ),
-            (Listen::AllInterfaces, everywhere, Ipv6Addr::UNSPECIFIED),
-        ] {
-            let listeners = bind(listen, 0).unwrap();
-            let port = listeners[0].local_addr().unwrap().port();
-            let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-            let expected = v4.iter().map(|v4| SocketAddr::from((*v4, port)));
-            assert_eq!(bound[..v4.len()], expected.collect::<Vec<_>>()[..]);
-            if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
-                eprintln!("skipped IPv6: this host cannot bind ::1");
-                continue;
-            }
-            assert_eq!(listeners.len(), v4.len() + 1, "{listen:?}");
-            assert_eq!(bound[v4.len()], (v6, port).into());
-            assert!(SockRef::from(&listeners[v4.len()]).only_v6().unwrap());
+        assert_bound_apart(Listen::Loopback);
+        if binds_every_interface("ipv4_and_ipv6_are_bound_apart with Listen::AllInterfaces") {
+            assert_bound_apart(Listen::AllInterfaces);
         }
+    }
+
+    /// Binds the listeners of a proxy for `listen` on `port`, on the crate's
+    /// runtime.
+    fn bind(listen: Listen, port: u16) -> io::Result<Listeners> {
+        let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
+        rt::handle().block_on(Listeners::bind(v4, v6, port))
+    }
+
+    /// Asserts that `bind` holds the [`addresses`] of `listen`, IPv4 on
+    /// sockets of their own and IPv6 on one that takes no IPv4.
+    fn assert_bound_apart(listen: Listen) {
+        let (v4, v6) = addresses(listen, LOOPBACK_SHARES_PORT);
+        let listeners = bind(listen, 0).unwrap();
+        let listeners = listeners.sockets();
+        let port = listeners[0].local_addr().unwrap().port();
+        let bound: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let expected = v4.iter().map(|v4| SocketAddr::from((*v4, port)));
+        assert_eq!(bound[..v4.len()], expected.collect::<Vec<_>>()[..]);
+        if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+            eprintln!("skipped IPv6: this host cannot bind ::1");
+            return;
+        }
+        assert_eq!(listeners.len(), v4.len() + 1, "{listen:?}");
+        assert_eq!(bound[v4.len()], (v6, port).into());
+        assert!(SockRef::from(&listeners[v4.len()]).only_v6().unwrap());
     }
 
     /// A proxy on every interface and one on loopback never both hold the
     /// port, whichever binds first.
     #[test]
     fn a_proxy_on_every_interface_and_one_on_loopback_exclude_each_other() {
+        if !binds_every_interface(
+            "a_proxy_on_every_interface_and_one_on_loopback_exclude_each_other",
+        ) {
+            return;
+        }
         for (first, second) in [
             (Listen::AllInterfaces, Listen::Loopback),
             (Listen::Loopback, Listen::AllInterfaces),
         ] {
             let held = bind(first, 0).unwrap();
-            let port = held[0].local_addr().unwrap().port();
+            let port = held.port().unwrap();
             let refused = bind(second, port).unwrap_err();
             assert_eq!(
                 refused.kind(),
@@ -519,7 +587,7 @@ mod tests {
         let endpoint = endpoint_at(address.port());
         let (proxy, mut server) = Server::new(options, endpoint, tasks, registry, default.0);
         let _runtime = rt::handle().enter();
-        server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
+        server.listeners = Listeners::from_std(vec![listener]).unwrap();
         let _client = std::net::TcpStream::connect(address).unwrap();
         // A connection may reach the listener's queue only after connect
         // returns, as with the mirrored networking of WSL2.
@@ -529,7 +597,7 @@ mod tests {
 
         assert!(idled.is_continue());
         assert_eq!(proxy.clients().len(), 1);
-        assert_eq!(server.listeners.len(), 1);
+        assert_eq!(server.listeners.sockets().len(), 1);
         drop(server);
     }
 
@@ -545,7 +613,7 @@ mod tests {
         let registry = Links::new(&tasks, None, DumpFlags::default(), default.1.clone());
         let (proxy, mut server) =
             Server::new(options, endpoint, tasks.clone(), registry, default.0);
-        server.listeners = vec![tokio::net::TcpListener::from_std(listener).unwrap()];
+        server.listeners = Listeners::from_std(vec![listener]).unwrap();
         tasks.spawn("a test proxy", server.run());
         proxy
     }
@@ -553,7 +621,7 @@ mod tests {
     /// Waits until `proxy` has stopped.
     async fn stopped(proxy: &Proxy) {
         let waited = timeout(PAUSED_WAIT, proxy.stopped.recv_async()).await;
-        assert_eq!(waited, Ok(Err(flume::RecvError::Disconnected)));
+        assert_eq!(waited, Ok(Err(crate::chan::RecvError::Disconnected)));
     }
 
     /// A proxy that exits once idle, and that no client connects to, stops

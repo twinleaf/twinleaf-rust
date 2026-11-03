@@ -797,25 +797,376 @@ impl From<RpcMeta> for u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload::strategy::{buffer, bytes, bytes_to, half, len_to, slack, write_over_any};
+    use proptest::prelude::*;
 
-    #[test]
-    fn parse_by_name() {
-        // id=7, method = BY_NAME | 8, "dev.name", no args
-        let mut p = alloc_req(7, REQUEST_BY_NAME | 8);
-        p.extend_from_slice(b"dev.name");
-        let r = Request::parse(&p).unwrap();
-        assert_eq!(r.id, RpcRequestId::new(7));
-        assert_eq!(r.method, Method::ByName(b"dev.name"));
-        assert!(r.args.is_empty());
+    /// Size of the `{ id, method }` head of a request.
+    const REQUEST_HEAD: usize = 4;
+    /// Size of the `{ req_id, code }` head of an error.
+    const ERROR_HEAD: usize = 4;
+
+    /// How a request names its method, owning the name.
+    #[derive(Debug, Clone)]
+    enum Named {
+        Id(u16),
+        Name(Vec<u8>),
     }
 
-    #[test]
-    fn parse_by_id_with_args() {
-        let mut p = alloc_req(1, 4);
-        p.extend_from_slice(&3u16.to_le_bytes());
-        let r = Request::parse(&p).unwrap();
-        assert_eq!(r.method, Method::ById(RpcMethodId::new(4)));
-        assert_eq!(r.args, &3u16.to_le_bytes());
+    impl Named {
+        fn method(&self) -> Method<'_> {
+            match self {
+                Self::Id(id) => Method::ById(RpcMethodId::new(*id)),
+                Self::Name(name) => Method::ByName(name),
+            }
+        }
+
+        fn name_len(&self) -> usize {
+            match self {
+                Self::Id(_) => 0,
+                Self::Name(name) => name.len(),
+            }
+        }
+    }
+
+    /// A method id of 0, the largest, or any.
+    fn method_id() -> impl Strategy<Value = u16> {
+        prop_oneof![Just(0), Just(RpcMethodId::MAX), 0..=RpcMethodId::MAX]
+    }
+
+    /// A method by id, or by a name whose length [`len_to`] draws up to
+    /// `max_name`.
+    fn named(max_name: usize) -> impl Strategy<Value = Named> {
+        prop_oneof![
+            method_id().prop_map(Named::Id),
+            bytes_to(max_name).prop_map(Named::Name),
+        ]
+    }
+
+    /// A request id of 0, the largest, or any.
+    fn req_id() -> impl Strategy<Value = RpcRequestId> {
+        half().prop_map(RpcRequestId::new)
+    }
+
+    /// An error code, a third of them the codes [`RpcError`] names and the
+    /// first it does not.
+    fn code() -> impl Strategy<Value = u16> {
+        prop_oneof![2 => half(), 1 => 0..=18u16]
+    }
+
+    /// The head of a request payload and its body. The head names a method
+    /// by id, or by a name of 0, 1, the longest a packet carries, the longest
+    /// the method word measures, or any length. The body holds the name, a
+    /// byte short of it, or a few bytes over.
+    fn request_payload() -> impl Strategy<Value = Vec<u8>> {
+        let word = prop_oneof![
+            method_id(),
+            prop_oneof![
+                Just(0),
+                Just(1),
+                Just(Packet::MAX_PAYLOAD - REQUEST_HEAD),
+                Just(NAMELEN_MASK as usize),
+                0..=40usize,
+            ]
+            .prop_map(|len| REQUEST_BY_NAME | len as u16),
+        ];
+        let head = (half(), word, prop_oneof![Just(-1), Just(0), 1..=8isize]);
+        prop_oneof![
+            1 => (0..REQUEST_HEAD).prop_flat_map(bytes),
+            4 => head.prop_flat_map(|(id, word, over)| {
+                let name_len = match word & REQUEST_BY_NAME {
+                    0 => 0,
+                    _ => (word & NAMELEN_MASK) as usize,
+                };
+                let body = name_len.checked_add_signed(over).unwrap_or(0);
+                bytes(body).prop_map(move |body| {
+                    [&id.to_le_bytes()[..], &word.to_le_bytes(), &body].concat()
+                })
+            }),
+        ]
+    }
+
+    /// A payload of 0 to 5 bytes, around the heads of a reply and an error,
+    /// or of any length up to the largest.
+    fn answer_payload() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            (0..=5usize).prop_flat_map(bytes),
+            bytes_to(Packet::MAX_PAYLOAD)
+        ]
+    }
+
+    proptest! {
+        /// A request that fits a packet writes an `RPC_REQ` packet of exactly
+        /// its length with no routing, whose payload parses back to it. The
+        /// payload alone is written the same. Both are the same whatever the
+        /// buffer held before.
+        #[test]
+        fn a_request_decodes_as_it_was_encoded(
+            id in req_id(),
+            (named, args) in named(Packet::MAX_PAYLOAD - REQUEST_HEAD).prop_flat_map(|named| {
+                let room = Packet::MAX_PAYLOAD - REQUEST_HEAD - named.name_len();
+                (Just(named), bytes_to(room))
+            }),
+        ) {
+            let method = named.method();
+            let payload_len = REQUEST_HEAD + named.name_len() + args.len();
+            prop_assert_eq!(request_payload_len(method, &args), Some(payload_len));
+            let (len, buf) =
+                write_over_any(Header::SIZE + payload_len, |buf| write_request(buf, id, method, &args))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
+            prop_assert_eq!(header, Header::new(PacketType::RPC_REQ, payload_len as u16));
+            let request = Request::parse(&buf[Header::SIZE..]).unwrap();
+            prop_assert_eq!(request.id, id);
+            prop_assert_eq!(request.method, method);
+            prop_assert_eq!(request.args, &args[..]);
+            let (len, payload) =
+                write_over_any(payload_len, |out| write_request_payload(out, id, method, &args))?;
+            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
+        }
+
+        /// A request payload parses when it holds the four-byte head and the
+        /// name the method word measures. Writing what was parsed gives back
+        /// the same payload, whatever the buffer held before.
+        #[test]
+        fn any_request_payload_parses_when_it_holds_its_name(payload in request_payload()) {
+            let Some(request) = Request::parse(&payload) else {
+                let holds = payload.len() >= REQUEST_HEAD && {
+                    let word = u16::from_le_bytes([payload[2], payload[3]]);
+                    word & REQUEST_BY_NAME == 0
+                        || payload.len() >= REQUEST_HEAD + (word & NAMELEN_MASK) as usize
+                };
+                prop_assert!(!holds);
+                return Ok(());
+            };
+            prop_assert!(payload.len() >= REQUEST_HEAD);
+            let (len, written) = write_over_any(payload.len(), |out| {
+                write_request_payload(out, request.id, request.method, request.args)
+            })?;
+            prop_assert_eq!(len, Some(payload.len()));
+            prop_assert_eq!(written, payload);
+        }
+
+        /// A request is written when its name is at most [`NAMELEN_MASK`]
+        /// bytes, its payload at most [`Packet::MAX_PAYLOAD`] bytes, and the
+        /// buffer holds the packet. The payload alone is written when the name
+        /// is at most [`NAMELEN_MASK`] bytes and the buffer holds the payload.
+        #[test]
+        fn a_request_is_written_only_when_it_fits(
+            (name_len, args_len) in prop_oneof![
+                len_to(Packet::MAX_PAYLOAD - REQUEST_HEAD + 1),
+                Just(NAMELEN_MASK as usize),
+                Just(NAMELEN_MASK as usize + 1),
+            ]
+            .prop_flat_map(|name_len| {
+                let room = Packet::MAX_PAYLOAD.saturating_sub(REQUEST_HEAD + name_len);
+                (Just(name_len), prop_oneof![Just(room), Just(room + 1), 0..=room + 1])
+            }),
+            by_id in any::<bool>(),
+            slack in slack(),
+        ) {
+            let name = vec![b'n'; name_len];
+            let args = vec![0u8; args_len];
+            let (method, name_len) = match by_id {
+                true => (Method::ById(RpcMethodId::new(RpcMethodId::MAX)), 0),
+                false => (Method::ByName(&name), name_len),
+            };
+            let id = RpcRequestId::new(1);
+            let payload_len = REQUEST_HEAD + name_len + args_len;
+            let named = name_len <= NAMELEN_MASK as usize;
+            prop_assert_eq!(request_payload_len(method, &args), named.then_some(payload_len));
+
+            let mut buf = buffer(Header::SIZE + payload_len, slack);
+            let fits = named && payload_len <= Packet::MAX_PAYLOAD
+                && buf.len() >= Header::SIZE + payload_len;
+            prop_assert_eq!(
+                write_request(&mut buf, id, method, &args),
+                fits.then_some(Header::SIZE + payload_len)
+            );
+            let mut out = buffer(payload_len, slack);
+            let fits = named && out.len() >= payload_len;
+            prop_assert_eq!(
+                write_request_payload(&mut out, id, method, &args),
+                fits.then_some(payload_len)
+            );
+        }
+
+        /// A reply that fits a packet writes an `RPC_REP` packet of exactly
+        /// its length with no routing, whose payload parses back to it as a
+        /// reply and as the answer its packet type names. The payload alone is
+        /// written the same. Both are the same whatever the buffer held
+        /// before.
+        #[test]
+        fn a_reply_decodes_as_it_was_encoded(
+            req_id in req_id(),
+            value in bytes_to(Packet::MAX_PAYLOAD - REPLY_HEADER_SIZE),
+        ) {
+            let payload_len = REPLY_HEADER_SIZE + value.len();
+            let (len, buf) =
+                write_over_any(Header::SIZE + payload_len, |buf| write_reply(buf, req_id, &value))?;
+            prop_assert_eq!(len, Some(buf.len()));
+            let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
+            prop_assert_eq!(header, Header::new(PacketType::RPC_REP, payload_len as u16));
+            let reply = Reply { req_id, value: &value };
+            prop_assert_eq!(Reply::parse(&buf[Header::SIZE..]), Some(reply));
+            let answer = Answer::parse(header.ptype, &buf[Header::SIZE..]);
+            prop_assert_eq!(answer, Some(Answer::Reply(reply)));
+            prop_assert_eq!(answer.unwrap().req_id(), req_id);
+            let (len, payload) =
+                write_over_any(payload_len, |out| write_reply_payload(out, req_id, &value))?;
+            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
+        }
+
+        /// An error with any code and a message that fits a packet writes an
+        /// `RPC_ERROR` packet of exactly its length with no routing, whose
+        /// payload parses back to it as an error and as the answer its packet
+        /// type names. The payload alone is written the same, and an error
+        /// without a message is written the same with or without one given.
+        /// Each is the same whatever the buffer held before.
+        #[test]
+        fn an_error_decodes_as_it_was_encoded(
+            req_id in req_id(),
+            code in code(),
+            message in bytes_to(Packet::MAX_PAYLOAD - ERROR_HEAD),
+        ) {
+            let error = RpcError::from(code);
+            prop_assert_eq!(error.value(), code);
+            prop_assert_eq!(u16::from(error), code);
+            let payload_len = ERROR_HEAD + message.len();
+            let (len, buf) = write_over_any(Header::SIZE + payload_len, |buf| {
+                write_error_with(buf, req_id, error, &message)
+            })?;
+            prop_assert_eq!(len, Some(buf.len()));
+            let header = Header::parse(buf[..Header::SIZE].try_into().unwrap()).unwrap();
+            prop_assert_eq!(header, Header::new(PacketType::RPC_ERROR, payload_len as u16));
+            let parsed = ErrorReply { req_id, code, message: &message };
+            prop_assert_eq!(ErrorReply::parse(&buf[Header::SIZE..]), Some(parsed));
+            let answer = Answer::parse(header.ptype, &buf[Header::SIZE..]);
+            prop_assert_eq!(answer, Some(Answer::Error(parsed)));
+            prop_assert_eq!(answer.unwrap().req_id(), req_id);
+            let (len, payload) =
+                write_over_any(payload_len, |out| write_error_payload(out, req_id, code, &message))?;
+            prop_assert_eq!(len, Some(payload_len));
+            prop_assert_eq!(&payload[..], &buf[Header::SIZE..]);
+
+            let (len, bare) =
+                write_over_any(Header::SIZE + ERROR_HEAD, |buf| write_error(buf, req_id, error))?;
+            prop_assert_eq!(len, Some(bare.len()));
+            let mut with_none = [0u8; Header::SIZE + ERROR_HEAD];
+            write_error_with(&mut with_none, req_id, error, &[]).unwrap();
+            prop_assert_eq!(&bare[..], &with_none[..]);
+        }
+
+        /// A reply or an error is written when its payload is at most
+        /// [`Packet::MAX_PAYLOAD`] bytes and the buffer holds the packet. The
+        /// payload alone is written when the buffer holds it.
+        #[test]
+        fn an_answer_is_written_only_when_it_fits(
+            len in prop_oneof![
+                len_to(Packet::MAX_PAYLOAD),
+                (Packet::MAX_PAYLOAD - ERROR_HEAD - 1..=Packet::MAX_PAYLOAD - 1),
+            ],
+            slack in slack(),
+        ) {
+            let id = RpcRequestId::new(1);
+            let bytes = vec![0u8; len];
+            for (head, packet, payload) in [
+                (
+                    REPLY_HEADER_SIZE,
+                    write_reply(&mut buffer(Header::SIZE + REPLY_HEADER_SIZE + len, slack), id, &bytes),
+                    write_reply_payload(&mut buffer(REPLY_HEADER_SIZE + len, slack), id, &bytes),
+                ),
+                (
+                    ERROR_HEAD,
+                    write_error_with(
+                        &mut buffer(Header::SIZE + ERROR_HEAD + len, slack),
+                        id,
+                        RpcError::Range,
+                        &bytes,
+                    ),
+                    write_error_payload(&mut buffer(ERROR_HEAD + len, slack), id, 17, &bytes),
+                ),
+            ] {
+                let payload_len = head + len;
+                let room = slack >= 0;
+                prop_assert_eq!(
+                    packet,
+                    (room && payload_len <= Packet::MAX_PAYLOAD).then_some(Header::SIZE + payload_len)
+                );
+                prop_assert_eq!(payload, room.then_some(payload_len));
+            }
+            prop_assert_eq!(
+                write_error(&mut buffer(Header::SIZE + ERROR_HEAD, slack), id, RpcError::Range),
+                (slack >= 0).then_some(Header::SIZE + ERROR_HEAD)
+            );
+        }
+
+        /// A reply payload parses when it holds the two-byte request id, as
+        /// that id and the rest, and an error payload when it holds the id and
+        /// the code, as those and the rest. Both are little endian. Writing
+        /// what was parsed gives back the same payload, whatever the buffer
+        /// held before. A packet of type 3 is a reply, one of type 4 an
+        /// error, and one of any other type no answer.
+        #[test]
+        fn any_answer_payload_parses_when_it_holds_its_head(
+            payload in answer_payload(),
+            ptype in prop_oneof![Just(3), Just(4), any::<u8>()]
+                .prop_filter_map("a packet type", PacketType::try_new),
+        ) {
+            let half = |at: usize| u16::from(payload[at]) | u16::from(payload[at + 1]) << 8;
+            let reply = (payload.len() >= 2).then(|| Reply {
+                req_id: RpcRequestId::new(half(0)),
+                value: &payload[2..],
+            });
+            let error = (payload.len() >= 4).then(|| ErrorReply {
+                req_id: RpcRequestId::new(half(0)),
+                code: half(2),
+                message: &payload[4..],
+            });
+            prop_assert_eq!(Reply::parse(&payload), reply);
+            prop_assert_eq!(ErrorReply::parse(&payload), error);
+            if let Some(reply) = reply {
+                let (len, written) = write_over_any(payload.len(), |out| {
+                    write_reply_payload(out, reply.req_id, reply.value)
+                })?;
+                prop_assert_eq!(len, Some(payload.len()));
+                prop_assert_eq!(&written, &payload);
+            }
+            if let Some(error) = error {
+                let (len, written) = write_over_any(payload.len(), |out| {
+                    write_error_payload(out, error.req_id, error.code, error.message)
+                })?;
+                prop_assert_eq!(len, Some(payload.len()));
+                prop_assert_eq!(&written, &payload);
+            }
+            let answer = Answer::parse(ptype, &payload);
+            if ptype.value() == 3 {
+                prop_assert_eq!(answer, reply.map(Answer::Reply));
+            } else if ptype.value() == 4 {
+                prop_assert_eq!(answer, error.map(Answer::Error));
+            } else {
+                prop_assert_eq!(answer, None);
+            }
+        }
+
+        /// Replacing the request id of a payload of two bytes or more changes
+        /// its first two bytes to the id and leaves the rest. A shorter
+        /// payload is left as it is and refused.
+        #[test]
+        fn a_request_id_is_replaced_without_moving_anything_else(
+            payload in answer_payload(),
+            id in req_id(),
+        ) {
+            let mut replaced = payload.clone();
+            prop_assert_eq!(set_req_id(&mut replaced, id), payload.len() >= 2);
+            if payload.len() >= 2 {
+                prop_assert_eq!(&replaced[..2], &id.to_le_bytes());
+                prop_assert_eq!(&replaced[2..], &payload[2..]);
+            } else {
+                prop_assert_eq!(replaced, payload);
+            }
+        }
     }
 
     #[test]
@@ -829,8 +1180,8 @@ mod tests {
         assert_eq!(&buf[..n], &[4, 0, 6, 0, 1, 0, 17, 0, b'n', b'o']);
     }
 
-    /// The request layout on the wire: header, id, `BY_NAME | len`, the
-    /// name, then the argument, and no routing.
+    /// On the wire a request is the header, id, `BY_NAME | len`, the name,
+    /// then the argument, and no routing.
     #[test]
     fn request_layout() {
         let mut buf = [0u8; 32];
@@ -861,143 +1212,8 @@ mod tests {
         assert_eq!(&buf[..n], &[2, 0, 4, 0, 1, 0, 4, 0]);
     }
 
-    /// What the hub builds is what a device parses, both ways of naming a
-    /// method.
-    #[test]
-    fn a_built_request_round_trips_through_the_server_parser() {
-        let mut buf = [0u8; 64];
-
-        let n = write_request(
-            &mut buf,
-            RpcRequestId::new(9),
-            Method::ByName(b"dev.port.rate"),
-            &1_843_200u32.to_le_bytes(),
-        )
-        .unwrap();
-        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
-        assert_eq!(header.ptype, PacketType::RPC_REQ);
-        assert_eq!(header.routing_size, 0, "the caller addresses it");
-        assert_eq!(header.packet_len(), n);
-
-        let request = Request::parse(&buf[header.payload_range()]).unwrap();
-        assert_eq!(request.id, RpcRequestId::new(9));
-        assert_eq!(request.method, Method::ByName(b"dev.port.rate"));
-        assert_eq!(request.args, &1_843_200u32.to_le_bytes());
-
-        let n = write_request(
-            &mut buf,
-            RpcRequestId::new(0xF001),
-            Method::ById(RpcMethodId::new(0x7FFF)),
-            b"args",
-        )
-        .unwrap();
-        let request = Request::parse(&buf[Header::SIZE..n]).unwrap();
-        assert_eq!(request.id, RpcRequestId::new(0xF001));
-        assert_eq!(request.method, Method::ById(RpcMethodId::new(0x7FFF)));
-        assert_eq!(request.args, b"args");
-    }
-
-    #[test]
-    fn a_request_that_does_not_fit_is_refused_rather_than_truncated() {
-        let mut small = [0u8; 8];
-        assert_eq!(
-            write_request(
-                &mut small,
-                RpcRequestId::new(1),
-                Method::ByName(b"dev.name"),
-                &[]
-            ),
-            None
-        );
-        let mut big = [0u8; Packet::MAX_SIZE];
-        assert_eq!(
-            write_request(
-                &mut big,
-                RpcRequestId::new(1),
-                Method::ByName(b"x"),
-                &[0; Packet::MAX_PAYLOAD]
-            ),
-            None,
-            "payload past what a header can describe"
-        );
-    }
-
-    #[test]
-    fn a_reply_past_what_a_packet_carries_is_refused_rather_than_emitted() {
-        let mut buf = [0u8; Packet::MAX_SIZE];
-        let longest = [0u8; Packet::MAX_PAYLOAD - 2];
-        assert_eq!(
-            write_reply(&mut buf, RpcRequestId::new(1), &longest),
-            Some(Header::SIZE + Packet::MAX_PAYLOAD),
-            "the longest value a reply carries"
-        );
-        let past = [0u8; Packet::MAX_PAYLOAD - 1];
-        assert_eq!(
-            write_reply(&mut buf, RpcRequestId::new(1), &past),
-            None,
-            "one byte more is a payload of 501, which no packet carries"
-        );
-    }
-
-    /// The client's parsers against the exact bytes the server side emits.
-    #[test]
-    fn answers_parse_what_the_server_wrote() {
-        let mut buf = [0u8; 32];
-
-        let n = write_reply(&mut buf, RpcRequestId::new(0x1234), b"ok").unwrap();
-        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
-        let Some(Answer::Reply(reply)) = Answer::parse(header.ptype, &buf[header.payload_range()])
-        else {
-            panic!("a reply packet parses as a reply");
-        };
-        assert_eq!(reply.req_id, RpcRequestId::new(0x1234));
-        assert_eq!(reply.value, b"ok");
-        assert_eq!(header.packet_len(), n);
-
-        let n = write_error(&mut buf, RpcRequestId::new(7), RpcError::NotFound).unwrap();
-        let header = Header::parse((&buf[..Header::SIZE]).try_into().unwrap()).unwrap();
-        let Some(Answer::Error(error)) = Answer::parse(header.ptype, &buf[header.payload_range()])
-        else {
-            panic!("an error packet parses as an error");
-        };
-        assert_eq!(error.req_id, RpcRequestId::new(7));
-        assert_eq!(error.error(), RpcError::NotFound);
-        assert!(error.message.is_empty());
-        assert_eq!(header.packet_len(), n);
-    }
-
-    /// The one field a hub rewrites, on the way down and on the way back.
-    #[test]
-    fn a_request_id_can_be_replaced_without_moving_anything_else() {
-        let mut buf = [0u8; 32];
-
-        let n = write_request(
-            &mut buf,
-            RpcRequestId::new(7),
-            Method::ByName(b"dev.name"),
-            b"x",
-        )
-        .unwrap();
-        assert!(set_req_id(
-            &mut buf[Header::SIZE..n],
-            RpcRequestId::new(0x1234)
-        ));
-        let request = Request::parse(&buf[Header::SIZE..n]).unwrap();
-        assert_eq!(request.id, RpcRequestId::new(0x1234));
-        assert_eq!(request.method, Method::ByName(b"dev.name"));
-        assert_eq!(request.args, b"x");
-
-        let n = write_reply(&mut buf, RpcRequestId::new(0x1234), b"ok").unwrap();
-        assert!(set_req_id(&mut buf[Header::SIZE..n], RpcRequestId::new(7)));
-        let reply = Reply::parse(&buf[Header::SIZE..n]).unwrap();
-        assert_eq!(reply.req_id, RpcRequestId::new(7));
-        assert_eq!(reply.value, b"ok");
-
-        assert!(!set_req_id(&mut [0; 1], RpcRequestId::new(1)), "no id here");
-    }
-
-    /// A code this crate has no name for still reaches the caller: everything
-    /// from `TL_RPC_ERROR_USER` = 18 up is defined per RPC.
+    /// A code this crate has no name for still reaches the caller, as every
+    /// code from `TL_RPC_ERROR_USER` = 18 up is defined per RPC.
     #[test]
     fn an_unnamed_error_code_survives_parsing() {
         let payload = [7, 0, 20, 0, b'w', b'h', b'y'];
@@ -1042,20 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_answer_does_not_parse() {
-        assert_eq!(Reply::parse(&[1]), None);
-        assert_eq!(ErrorReply::parse(&[1, 0, 2]), None);
-        assert_eq!(Answer::parse(PacketType::HEARTBEAT, &[1, 0]), None);
-    }
-
-    fn alloc_req(id: u16, method: u16) -> std::vec::Vec<u8> {
-        let mut v = std::vec::Vec::new();
-        v.extend_from_slice(&id.to_le_bytes());
-        v.extend_from_slice(&method.to_le_bytes());
-        v
-    }
-
-    #[test]
     fn metadata_matches_the_wire_encoding() {
         assert_eq!(
             RpcMeta::fixed_uint(2, RpcMetaFlags::READABLE).bits(),
@@ -1091,7 +1293,7 @@ mod tests {
         assert_eq!(any.size_bytes(), None);
     }
 
-    /// A bool is its own type code; the retired `0x0800` flag on a `u8` still
+    /// A bool is its own type code. The retired `0x0800` flag on a `u8` still
     /// reads as one, and on anything else is ignored.
     #[test]
     fn a_bool_is_a_type_and_the_retired_flag_still_decodes() {

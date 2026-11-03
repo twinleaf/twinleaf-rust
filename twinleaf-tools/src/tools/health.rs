@@ -16,41 +16,30 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque},
     io,
     time::{Duration, Instant, SystemTime},
 };
 use twinleaf::{
-    data::{BoundaryClass, BoundaryReason, SampleBatch, StreamKey, StreamMetadataSnapshot},
-    device::{DeviceEvent, Event as StreamEvent, LinkEvent, RecvError},
-    tio, Connection, DeviceRoute, SampleNumber, StreamId,
+    data::{Boundary, BoundaryClass, Change, SampleBatch, StreamKey, StreamMetadataSnapshot},
+    device::{MetadataState, Presence, RecvError},
+    Connection, DeviceRoute, SampleNumber, StreamId,
 };
 
 #[derive(Default)]
 struct DeviceState {
-    last_heartbeat: Option<Instant>,
-    heartbeat_toggle: bool,
+    /// The device is sending.
+    alive: bool,
+    /// The device's link lost it, and it has not been heard since.
+    lost: bool,
 }
 
 impl DeviceState {
-    fn heartbeat_char(&self, now: Instant) -> char {
-        let fresh = self
-            .last_heartbeat
-            .map(|t| now.duration_since(t) < Duration::from_millis(500))
-            .unwrap_or(false);
-
-        if !fresh {
-            '♡' // No recent heartbeat
-        } else if self.heartbeat_toggle {
-            '♥' // Filled
-        } else {
-            '♡' // Empty
+    fn heartbeat_char(&self) -> char {
+        match self.alive {
+            true => '♥',
+            false => '♡',
         }
-    }
-
-    fn on_heartbeat(&mut self, now: Instant) {
-        self.last_heartbeat = Some(now);
-        self.heartbeat_toggle = !self.heartbeat_toggle;
     }
 }
 
@@ -181,7 +170,7 @@ struct StreamStats {
 
     // Last-known metadata; deliberately survives the reset methods.
     metadata: Option<StreamMetadataSnapshot>,
-    recent_boundaries: VecDeque<(SystemTime, BoundaryReason)>,
+    recent_boundaries: VecDeque<(SystemTime, Boundary)>,
 }
 
 impl StreamStats {
@@ -301,8 +290,8 @@ struct LoggedEvent {
 }
 
 /// Returns how much a boundary matters, by the class the library gives it.
-fn boundary_severity(reason: &BoundaryReason) -> Severity {
-    match reason.class() {
+fn boundary_severity(class: BoundaryClass) -> Severity {
+    match class {
         BoundaryClass::Startup | BoundaryClass::Seamless => Severity::Info,
         BoundaryClass::Reconfig => Severity::Warning,
         BoundaryClass::DataLoss | BoundaryClass::Anomaly => Severity::Error,
@@ -491,7 +480,7 @@ impl HealthState {
 
     fn handle_batch(&mut self, batch: SampleBatch, now: Instant) {
         let route = batch.route();
-        let sid = batch.stream().stream_id;
+        let sid = batch.stream_key().stream_id;
 
         if let Some(filter) = &self.cli.streams {
             if !filter.contains(&sid.value()) {
@@ -501,31 +490,36 @@ impl HealthState {
 
         let key = StreamKey::new(route, sid);
         let st = self.stats.entry(key).or_insert_with(|| StreamStats {
-            name: batch.stream().name.to_string(),
+            name: batch.schema().stream().name().to_string(),
             ..Default::default()
         });
 
-        st.name = batch.stream().name.to_string();
+        st.name = batch.schema().stream().name().to_string();
         if st.metadata.is_none() || batch.boundary().is_some() {
-            st.metadata = Some(batch.metadata());
+            st.metadata = Some(batch.metadata().clone());
         }
 
         if let Some(boundary) = batch.boundary() {
-            self.handle_boundary(boundary, &route, batch.stream().name, sid);
+            self.handle_boundary(boundary, &route, batch.schema().stream().name(), sid);
         }
 
         let st = self.stats.get_mut(&StreamKey::new(route, sid)).unwrap();
         for row in batch.iter() {
-            if st.last_n.map(|n| row.n() != n).unwrap_or(true) {
+            if st.last_n.map(|n| row.sample_number() != n).unwrap_or(true) {
                 st.last_seen = Some(now);
             }
-            st.on_sample(row.n(), row.timestamp_end(), now, self.cli.jitter_window);
+            st.on_sample(
+                row.sample_number(),
+                row.timestamp_end(),
+                now,
+                self.cli.jitter_window,
+            );
         }
     }
 
     fn handle_boundary(
         &mut self,
-        reason: &BoundaryReason,
+        boundary: &Boundary,
         route: &DeviceRoute,
         stream_name: &str,
         stream_id: StreamId,
@@ -533,20 +527,43 @@ impl HealthState {
         let key = StreamKey::new(*route, stream_id);
         if let Some(st) = self.stats.get_mut(&key) {
             st.recent_boundaries
-                .push_front((SystemTime::now(), reason.clone()));
+                .push_front((SystemTime::now(), boundary.clone()));
             if st.recent_boundaries.len() > RECENT_BOUNDARIES_CAP {
                 st.recent_boundaries.pop_back();
             }
         }
-        let severity = boundary_severity(reason);
-        match reason {
-            BoundaryReason::Initial => {
+        if let Some(change) = &boundary.change {
+            self.handle_change(change, &key, stream_name);
+        }
+        if let Some(loss) = &boundary.loss {
+            let behind = match loss.dropped_batches {
+                0 => String::new(),
+                batches => format!(", {batches} batches skipped while behind"),
+            };
+            self.log_event(
+                format!(
+                    "[{}/{}] DROPPED: {} samples{}",
+                    route, stream_name, loss.samples, behind
+                ),
+                boundary_severity(BoundaryClass::DataLoss),
+            );
+            if let Some(st) = self.stats.get_mut(&key) {
+                st.samples_dropped += loss.samples;
+            }
+        }
+    }
+
+    fn handle_change(&mut self, change: &Change, key: &StreamKey, stream_name: &str) {
+        let (route, key) = (key.route, *key);
+        let severity = boundary_severity(change.class());
+        match change {
+            Change::Initial => {
                 self.log_event(
                     format!("[{}/{}] STREAM STARTED", route, stream_name),
                     severity,
                 );
             }
-            BoundaryReason::SessionChanged { old, new } => {
+            Change::SessionChanged { old, new } => {
                 self.log_event(
                     format!("[{}/{}] SESSION: {} → {}", route, stream_name, old, new),
                     severity,
@@ -555,17 +572,7 @@ impl HealthState {
                     st.reset_all();
                 }
             }
-            BoundaryReason::SamplesLost { expected, received } => {
-                let count = received.wrapping_sub(*expected);
-                self.log_event(
-                    format!("[{}/{}] DROPPED: {} samples", route, stream_name, count),
-                    severity,
-                );
-                if let Some(st) = self.stats.get_mut(&key) {
-                    st.samples_dropped += count as u64;
-                }
-            }
-            BoundaryReason::TimeBackward { gap_seconds } => {
+            Change::TimeBackward { gap_seconds } => {
                 self.log_event(
                     format!(
                         "[{}/{}] TIME BACKWARD: {:.3}s",
@@ -574,16 +581,7 @@ impl HealthState {
                     severity,
                 );
             }
-            BoundaryReason::TimeForward { gap_seconds } => {
-                self.log_event(
-                    format!(
-                        "[{}/{}] TIME FORWARD: {:.3}s",
-                        route, stream_name, gap_seconds
-                    ),
-                    severity,
-                );
-            }
-            BoundaryReason::RateChanged { old_rate, new_rate } => {
+            Change::RateChanged { old_rate, new_rate } => {
                 self.log_event(
                     format!(
                         "[{}/{}] RATE: {:.1} → {:.1} Hz",
@@ -596,7 +594,7 @@ impl HealthState {
                     st.reset_rate();
                 }
             }
-            BoundaryReason::TimeRefSessionChanged { old, new } => {
+            Change::TimeRefSessionChanged { old, new } => {
                 self.log_event(
                     format!("[{}/{}] TIME REF: {} → {}", route, stream_name, old, new),
                     severity,
@@ -606,7 +604,22 @@ impl HealthState {
                     st.reset_rate();
                 }
             }
-            BoundaryReason::SegmentRollover { old_id, new_id } => {
+            Change::Restarted { old_id, new_id } => {
+                self.log_event(
+                    format!(
+                        "[{}/{}] RESTARTED: segment {} → {}",
+                        route, stream_name, old_id, new_id
+                    ),
+                    severity,
+                );
+                // The pause between the acquisitions is no part of either's
+                // timing or rate.
+                if let Some(st) = self.stats.get_mut(&key) {
+                    st.reset_timing();
+                    st.reset_rate();
+                }
+            }
+            Change::SegmentRollover { old_id, new_id } => {
                 self.log_event(
                     format!(
                         "[{}/{}] SEGMENT: {} → {}",
@@ -615,81 +628,57 @@ impl HealthState {
                     severity,
                 );
             }
-            BoundaryReason::SegmentChanged { old_id, new_id } => {
-                self.log_event(
-                    format!(
-                        "[{}/{}] SEGMENT CHANGED: {} → {}",
-                        route, stream_name, old_id, new_id
-                    ),
-                    severity,
-                );
-                if let Some(st) = self.stats.get_mut(&key) {
-                    st.reset_timing();
-                }
-            }
             _ => {
                 self.log_event(
-                    format!("[{}/{}] BOUNDARY: {:?}", route, stream_name, reason),
+                    format!("[{}/{}] BOUNDARY: {:?}", route, stream_name, change),
                     severity,
                 );
             }
         }
     }
 
-    fn handle_event(&mut self, event: StreamEvent, now: Instant) {
-        match event {
-            StreamEvent::Link {
-                subtree,
-                event: LinkEvent::Status(status),
-            } => {
-                self.log_event(
-                    format!("[{}] STATUS: {:?}", subtree, status),
-                    Severity::Warning,
-                );
-                if matches!(
-                    status,
-                    tio::packet::LinkStatus::SensorDisconnected | tio::packet::LinkStatus::Stopped
-                ) {
-                    for (key, st) in &mut self.stats {
-                        if key.route.starts_with(&subtree) {
-                            st.reset_timing();
-                            st.reset_rate();
-                        }
+    fn handle_routes(&mut self, routes: &[DeviceRoute]) {
+        for &route in routes {
+            if let Entry::Vacant(state) = self.device_states.entry(route) {
+                state.insert(DeviceState::default());
+                self.log_event(format!("[{}] ROUTE DISCOVERED", route), Severity::Info);
+            }
+        }
+    }
+
+    fn handle_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        let state = self.device_states.entry(route).or_default();
+        state.alive = matches!(presence, Presence::Alive { .. });
+        match presence {
+            Presence::Lost { .. } if !state.lost => {
+                state.lost = true;
+                self.log_event(format!("[{}] LOST", route), Severity::Warning);
+                for (key, st) in &mut self.stats {
+                    if key.route == route {
+                        st.reset_timing();
+                        st.reset_rate();
                     }
                 }
             }
-            StreamEvent::Link {
-                event: LinkEvent::InputOverrun,
-                ..
-            } => {
-                self.log_event("INPUT OVERRUN: samples were lost".into(), Severity::Error);
+            Presence::Alive { .. } => {
+                let back = std::mem::take(&mut state.lost);
+                if back {
+                    self.log_event(format!("[{}] BACK", route), Severity::Info);
+                }
             }
-            StreamEvent::RouteDiscovered { route } => {
-                self.device_states.entry(route).or_default();
-                self.log_event(format!("[{}] ROUTE DISCOVERED", route), Severity::Info);
+            _ => {}
+        }
+    }
+
+    fn handle_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        match metadata {
+            MetadataState::Ready(snapshot) => self.log_event(
+                format!("[{}] METADATA: {}", route, snapshot.device().name()),
+                Severity::Info,
+            ),
+            MetadataState::Unsupported => {
+                self.log_event(format!("[{}] NO METADATA SUPPORT", route), Severity::Error)
             }
-            StreamEvent::Device { route, event } => match event {
-                DeviceEvent::Heartbeat { .. } => {
-                    self.device_states
-                        .entry(route)
-                        .or_default()
-                        .on_heartbeat(now);
-                }
-                DeviceEvent::Metadata(snapshot) => {
-                    self.log_event(
-                        format!("[{}] METADATA: {}", route, snapshot.device().name),
-                        Severity::Info,
-                    );
-                }
-                DeviceEvent::MetadataUnavailable => {
-                    self.log_event(format!("[{}] NO METADATA SUPPORT", route), Severity::Error);
-                }
-                DeviceEvent::NewHash(hash) => {
-                    self.log_event(format!("[{}] NEW HASH: {:?}", route, hash), Severity::Info);
-                }
-                DeviceEvent::Setting { .. } => {}
-                _ => {}
-            },
             _ => {}
         }
     }
@@ -982,20 +971,20 @@ fn draw_detail_pane(
     }
 
     fn column_cells<'a>(
-        schema: impl ExactSizeIterator<Item = twinleaf::proto::data::Column<'a>>,
+        schema: impl ExactSizeIterator<Item = twinleaf::proto::data::ColumnView<'a>>,
     ) -> Vec<(Vec<Span<'static>>, usize, usize)> {
         let len = schema.len();
         schema
             .enumerate()
             .map(|(i, column)| {
-                let mut spans = vec![Span::raw(column.name.to_string())];
-                let mut nat = column.name.len();
-                if !column.units.is_empty() {
+                let mut spans = vec![Span::raw(column.name().to_string())];
+                let mut nat = column.name().len();
+                if !column.units().is_empty() {
                     spans.push(Span::styled(
-                        format!(" ({})", column.units),
+                        format!(" ({})", column.units()),
                         Style::default().fg(Color::DarkGray),
                     ));
-                    nat += column.units.len() + 3;
+                    nat += column.units().len() + 3;
                 }
                 if i + 1 < len {
                     spans.push(Span::raw(", "));
@@ -1009,36 +998,36 @@ fn draw_detail_pane(
     let device_row = st.metadata.as_ref().map(|metadata| {
         let device = metadata.device();
         (
-            device.name.to_string(),
+            device.name().to_string(),
             vec![
-                ("serial", device.serial.to_string()),
-                ("session", format!("{:#010x}", device.session.value())),
-                ("firmware", device.firmware.to_string()),
+                ("serial", device.serial().to_string()),
+                ("session", format!("{:#010x}", device.session().value())),
+                ("firmware", device.firmware().to_string()),
             ],
         )
     });
     let stream_row = st.metadata.as_ref().map(|metadata| {
-        let stream = metadata.stream();
+        let stream = metadata.schema().stream();
         (
-            stream.name.to_string(),
+            stream.name().to_string(),
             vec![
-                ("columns", stream.n_columns.to_string()),
-                ("segments", stream.n_segments.to_string()),
+                ("columns", stream.n_columns().to_string()),
+                ("segments", stream.n_segments().to_string()),
             ],
         )
     });
     let segment_row = st.metadata.as_ref().map(|metadata| {
         let segment = metadata.segment();
         let mut pairs = vec![
-            ("id", segment.segment_id.to_string()),
-            ("rate", format!("{} Hz", segment.sampling_rate)),
-            ("decimation", segment.decimation.to_string()),
-            ("epoch", segment.epoch.to_string()),
+            ("id", segment.segment_id().to_string()),
+            ("rate", format!("{} Hz", segment.sampling_rate())),
+            ("decimation", segment.decimation().to_string()),
+            ("epoch", segment.epoch().to_string()),
         ];
-        if segment.filter_type != twinleaf::proto::data::FilterType::NONE {
+        if segment.filter_type() != twinleaf::proto::data::FilterType::NONE {
             pairs.push((
                 "filter",
-                format!("{} @ {} Hz", segment.filter_type, segment.filter_cutoff),
+                format!("{} @ {} Hz", segment.filter_type(), segment.filter_cutoff()),
             ));
         }
         pairs
@@ -1099,9 +1088,9 @@ fn draw_detail_pane(
     meta_lines.extend(flow(
         "columns",
         (None, 0),
-        st.metadata
-            .as_ref()
-            .map_or_else(Vec::new, |metadata| column_cells(metadata.columns())),
+        st.metadata.as_ref().map_or_else(Vec::new, |metadata| {
+            column_cells(metadata.schema().columns())
+        }),
         inner_w,
     ));
     meta_lines.push(Line::default());
@@ -1116,7 +1105,7 @@ fn draw_detail_pane(
     let mut lines = meta_lines;
     for (ts, reason) in st.recent_boundaries.iter().skip(offset).take(visible_lines) {
         let dt: DateTime<Local> = (*ts).into();
-        let color = boundary_severity(reason).color();
+        let color = boundary_severity(reason.class()).color();
         lines.push(Line::from(vec![
             Span::styled(
                 format!("[{}] ", dt.format("%H:%M:%S%.3f")),
@@ -1217,7 +1206,7 @@ fn draw_ui(terminal: &mut DefaultTerminal, app: &mut HealthState) -> io::Result<
     let mut heartbeat_entries: Vec<_> = app
         .device_states
         .iter()
-        .map(|(route, state)| (route.to_string(), state.heartbeat_char(now)))
+        .map(|(route, state)| (route.to_string(), state.heartbeat_char()))
         .collect();
     heartbeat_entries.sort_by(|a, b| a.0.cmp(&b.0));
     let heartbeat_display: String = heartbeat_entries
@@ -1626,8 +1615,16 @@ impl Screen for HealthState {
         self.handle_batch(batch, Instant::now());
     }
 
-    fn on_event(&mut self, event: StreamEvent) {
-        self.handle_event(event, Instant::now());
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        self.handle_routes(routes);
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.handle_presence(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        self.handle_metadata(route, metadata);
     }
 
     fn on_lagged(&mut self, error: RecvError) {

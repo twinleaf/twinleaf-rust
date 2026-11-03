@@ -7,11 +7,12 @@
 //! still-accumulating rows they ask for.
 
 use super::coalesce::BatchCoalescer;
-use super::metadata::{ColumnKey, ColumnRecord, SegmentRecord, StreamKey, StreamRecord};
-use super::sample::{Generations, SampleBatch};
-use crate::proto::data as wire;
-use crate::proto::{ColumnId, SampleNumber};
-use std::collections::{HashMap, VecDeque};
+use super::continuity::Generations;
+use super::metadata::{StreamKey, StreamMetadataSnapshot};
+use super::sample::SampleBatch;
+use crate::proto::SampleNumber;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -53,7 +54,7 @@ use std::time::Instant;
 /// let key = *buffer.stream_keys().next().expect("one stream");
 /// let run = buffer.run(&key).expect("a run");
 /// assert_eq!(run.retained_rows(), 1..3);
-/// assert_eq!(run.effective_rate(), 10.0);
+/// assert_eq!(run.metadata().rate_hz(), 10.0);
 ///
 /// let latest = buffer.latest_row(&key).expect("a retained row");
 /// println!("{}", latest.row(0).expect("one row"));
@@ -107,24 +108,14 @@ impl Buffer {
     pub fn latest_row(&self, stream_key: &StreamKey) -> Option<SampleBatch> {
         self.runs.get(stream_key)?.last_row()
     }
-
-    /// Returns a column's metadata as of its stream's newest batch, or `None`
-    /// if the stream has no run or no such column.
-    pub fn column_metadata(&self, col: &ColumnKey) -> Option<wire::Column<'_>> {
-        self.runs
-            .get(&col.stream_key())?
-            .column_metadata(col.column_id)
-    }
 }
 
 /// The retained rows of one stream's current run, oldest first.
 pub struct Run {
     /// The continuity generations stamped on every batch of this run.
     generations: Generations,
-    stream: StreamRecord,
-    segment: SegmentRecord,
-    /// Column metadata in schema order, constant within a run.
-    columns: Vec<ColumnRecord>,
+    /// The newest batch's metadata. Its schema is constant within a run.
+    metadata: StreamMetadataSnapshot,
     /// Completed chunks in row order. The coalescer holds the rows after them.
     chunks: VecDeque<SampleBatch>,
     coalescer: BatchCoalescer,
@@ -150,16 +141,9 @@ impl std::fmt::Debug for Run {
 
 impl Run {
     fn new(batch: &SampleBatch, capacity: usize) -> Run {
-        let (_, stream, segment) = batch.records();
         let mut run = Run {
             generations: batch.generations(),
-            stream: stream.clone(),
-            segment: segment.clone(),
-            columns: batch
-                .schema()
-                .iter()
-                .map(|column| column.record().clone())
-                .collect(),
+            metadata: batch.metadata().clone(),
             chunks: VecDeque::new(),
             coalescer: BatchCoalescer::new(Some((capacity / 16).clamp(256, 65_536))),
             next_row: 0,
@@ -172,17 +156,14 @@ impl Run {
     }
 
     fn append(&mut self, batch: &SampleBatch) {
-        debug_assert_eq!(
-            batch.schema().len(),
-            self.columns.len(),
+        debug_assert!(
+            batch.schema() == self.metadata.schema(),
             "the parser guarantees a constant schema within a run"
         );
-        self.coalescer.push_batch(batch);
+        self.coalescer.push(batch);
         self.take_completed_chunks();
 
-        let (_, stream, segment) = batch.records();
-        self.stream = stream.clone();
-        self.segment = segment.clone();
+        self.metadata = batch.metadata().clone();
         self.next_row += batch.len() as u64;
         self.rows += batch.len();
         self.last_seen = Instant::now();
@@ -264,13 +245,6 @@ impl Run {
         Some(chunk.slice(chunk.len() - 1..chunk.len()))
     }
 
-    fn column_metadata(&self, column_id: ColumnId) -> Option<wire::Column<'_>> {
-        self.columns
-            .iter()
-            .find(|column| column.get().index == column_id)
-            .map(ColumnRecord::get)
-    }
-
     /// Returns the continuity generations stamped on every batch of this run.
     pub fn generations(&self) -> Generations {
         self.generations
@@ -282,22 +256,10 @@ impl Run {
         self.last_seen
     }
 
-    /// Returns the run's stream descriptor as of its newest batch.
-    pub fn stream(&self) -> wire::Stream<'_> {
-        self.stream.get()
-    }
-
-    /// Returns the run's segment descriptor as of its newest batch. It holds
-    /// the raw sampling rate and decimation behind [`Self::effective_rate`].
-    pub fn segment(&self) -> wire::Segment<'_> {
-        self.segment.get()
-    }
-
-    /// Returns the sample rate in hertz after decimation, or zero for a
-    /// segment whose rate or decimation is zero. The parser emits no rows from
-    /// such a segment.
-    pub fn effective_rate(&self) -> f64 {
-        self.segment.effective_rate().unwrap_or(0.0)
+    /// Returns the metadata of the run's newest batch. Its schema is the
+    /// run's, and its segment and rate are the newest.
+    pub fn metadata(&self) -> &StreamMetadataSnapshot {
+        &self.metadata
     }
 
     /// Returns the end-of-sample time of the newest retained row, in seconds
@@ -322,11 +284,13 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fixtures;
-    use crate::data::metadata::{buffer_type, DeviceRecord};
+    use crate::data::metadata::{ColumnKey, DeviceRecord, SegmentRecord};
     use crate::data::pipeline::{ColumnOp, ColumnProcessor};
     use crate::data::sample::{BatchContext, ColumnArray, ColumnData, SampleBatchBuilder};
+    use crate::data::tests::fixtures;
+    use crate::proto::data as wire;
     use crate::proto::data::DataType;
+    use crate::proto::ColumnId;
     use crate::proto::DeviceRoute;
 
     /// Records every sample it is fed, plus the length of each span it was fed as,
@@ -367,23 +331,25 @@ mod tests {
 
     struct Fixture {
         stream_key: StreamKey,
-        columns: Vec<ColumnRecord>,
         column_keys: Vec<ColumnKey>,
-        device: DeviceRecord,
-        stream: StreamRecord,
-        segment: SegmentRecord,
+        metadata: StreamMetadataSnapshot,
     }
 
     impl Fixture {
-        /// Push one batch stamped with `stream_generation`; a change of generation is what
-        /// starts a new run.
+        /// Pushes one batch stamped with `stream_generation`. A change of
+        /// generation starts a new run.
         fn push_rows(
             &self,
             buffer: &mut Buffer,
             stream_generation: u32,
             rows: &[(u32, Vec<ColumnData>)],
         ) {
-            self.push_in_segment(buffer, stream_generation, &self.segment, rows);
+            self.push_in_segment(
+                buffer,
+                stream_generation,
+                self.metadata.segment_record(),
+                rows,
+            );
         }
 
         fn push_in_segment(
@@ -394,25 +360,23 @@ mod tests {
             rows: &[(u32, Vec<ColumnData>)],
         ) {
             let mut builder = SampleBatchBuilder::new(
-                BatchContext::new(
-                    self.stream_key,
-                    None,
-                    Generations {
+                BatchContext {
+                    metadata: StreamMetadataSnapshot::new(
+                        self.metadata.schema().clone(),
+                        DeviceRecord::encode(fixtures::device()).unwrap(),
+                        segment.clone(),
+                    ),
+                    boundary: None,
+                    generations: Generations {
                         stream: stream_generation,
                         device: 0,
                         global: 0,
                     },
-                    segment.clone(),
-                    self.stream.clone(),
-                    self.device.clone(),
-                ),
-                self.columns
-                    .iter()
-                    .map(|metadata| (metadata.clone(), buffer_type(metadata.get().data_type))),
+                },
                 rows.len(),
             );
             for &(sample_number, ref row) in rows {
-                assert_eq!(row.len(), self.columns.len());
+                assert_eq!(row.len(), self.column_keys.len());
                 builder.push_row(SampleNumber::new(sample_number), row.iter().cloned());
             }
             let batch = builder.finish();
@@ -423,7 +387,7 @@ mod tests {
         /// the sample numbers.
         fn push_floats(&self, buffer: &mut Buffer, stream_generation: u32, samples: Range<u32>) {
             let rows: Vec<_> = samples
-                .map(|n| (n, vec![ColumnData::Float(f64::from(n))]))
+                .map(|n| (n, vec![ColumnData::F64(f64::from(n))]))
                 .collect();
             self.push_rows(buffer, stream_generation, &rows);
         }
@@ -435,19 +399,27 @@ mod tests {
         let route = DeviceRoute::root();
         let stream_id = 1;
 
-        let columns: Vec<ColumnRecord> = column_types
-            .iter()
-            .enumerate()
-            .map(|(index, data_type)| {
-                let index = index as u8;
-                ColumnRecord::encode(wire::Column {
-                    name: &format!("col_{index}"),
-                    units: &format!("u{index}"),
-                    description: &format!("column {index}"),
-                    ..fixtures::column(stream_id, index, *data_type)
-                })
-                .unwrap()
+        let names: Vec<_> = (0..column_types.len())
+            .map(|index| {
+                (
+                    format!("col_{index}"),
+                    format!("u{index}"),
+                    format!("column {index}"),
+                )
             })
+            .collect();
+        let columns: Vec<_> = column_types
+            .iter()
+            .zip(&names)
+            .enumerate()
+            .map(
+                |(index, (data_type, (name, units, description)))| wire::Column {
+                    name,
+                    units,
+                    description,
+                    ..fixtures::column(stream_id, index as u8, *data_type)
+                },
+            )
             .collect();
 
         Fixture {
@@ -461,16 +433,18 @@ mod tests {
                     )
                 })
                 .collect(),
-            device: DeviceRecord::encode(fixtures::device()).unwrap(),
-            stream: StreamRecord::encode(wire::Stream {
-                n_columns: columns.len() as u8,
-                sample_size: 0,
-                buf_samples: 1024,
-                ..fixtures::stream(stream_id)
-            })
-            .unwrap(),
-            segment: SegmentRecord::encode(fixtures::segment(stream_id)).unwrap(),
-            columns,
+            metadata: fixtures::metadata(
+                route,
+                fixtures::device(),
+                wire::Stream {
+                    n_columns: columns.len() as u8,
+                    sample_size: 0,
+                    buf_samples: 1024,
+                    ..fixtures::stream(stream_id)
+                },
+                fixtures::segment(stream_id),
+                &columns,
+            ),
         }
     }
 
@@ -494,7 +468,7 @@ mod tests {
         assert_eq!(run.retained_rows(), 0..300);
         assert_eq!(run.last_timestamp(), Some(300.0));
         assert_eq!(run.last_sample_number(), Some(SampleNumber::new(299)));
-        assert_eq!(run.effective_rate(), 1.0);
+        assert_eq!(run.metadata().rate_hz(), 1.0);
 
         let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
         assert_eq!(processor.catch_up(&buffer), &expected(0..300));
@@ -568,17 +542,17 @@ mod tests {
         let rolled = SegmentRecord::encode(wire::Segment {
             segment_id: crate::proto::SegmentId::new(1),
             start_time: 4,
-            ..fx.segment.get()
+            ..fx.metadata.segment().fields()
         })
         .unwrap();
         let rows: Vec<_> = (0..3)
-            .map(|n| (n, vec![ColumnData::Float(f64::from(n) + 100.0)]))
+            .map(|n| (n, vec![ColumnData::F64(f64::from(n) + 100.0)]))
             .collect();
         fx.push_in_segment(&mut buffer, 1, &rolled, &rows);
 
         let run = buffer.run(&fx.stream_key).expect("the run");
         assert_eq!(run.retained_rows(), 0..7);
-        assert_eq!(run.segment(), rolled.get(), "the newest segment");
+        assert_eq!(run.metadata().segment(), rolled.get(), "the newest segment");
 
         let mut processor = ColumnProcessor::new(fx.column_keys[0], Collect::default());
         let out = processor.catch_up(&buffer).clone();
@@ -631,17 +605,17 @@ mod tests {
                 (
                     0,
                     vec![
-                        ColumnData::Float(0.5),
-                        ColumnData::Int(-1),
-                        ColumnData::UInt(10),
+                        ColumnData::F64(0.5),
+                        ColumnData::I64(-1),
+                        ColumnData::U64(10),
                     ],
                 ),
                 (
                     1,
                     vec![
-                        ColumnData::Float(1.5),
-                        ColumnData::Int(-2),
-                        ColumnData::UInt(11),
+                        ColumnData::F64(1.5),
+                        ColumnData::I64(-2),
+                        ColumnData::U64(11),
                     ],
                 ),
             ],
@@ -653,9 +627,9 @@ mod tests {
             &[(
                 2,
                 vec![
-                    ColumnData::Float(2.5),
-                    ColumnData::Int(-3),
-                    ColumnData::UInt(12),
+                    ColumnData::F64(2.5),
+                    ColumnData::I64(-3),
+                    ColumnData::U64(12),
                 ],
             )],
         );
@@ -664,15 +638,15 @@ mod tests {
         assert_eq!(row.len(), 1);
         assert_eq!(row.sample_numbers(), [2]);
         assert_eq!(row.timestamps(), [3.0]);
-        assert_eq!(row.stream(), fx.stream.get());
-        assert_eq!(row.segment(), fx.segment.get());
+        assert_eq!(row.schema(), fx.metadata.schema());
+        assert_eq!(row.metadata().segment(), fx.metadata.segment());
 
         // Values come back in schema order, each in its column's own variant.
         let values: Vec<ColumnData> = row.row(0).expect("the only row").values().collect();
         assert_eq!(values.len(), 3);
-        assert!(matches!(values[0], ColumnData::Float(v) if v == 2.5));
-        assert!(matches!(values[1], ColumnData::Int(-3)));
-        assert!(matches!(values[2], ColumnData::UInt(12)));
+        assert!(matches!(values[0], ColumnData::F64(v) if v == 2.5));
+        assert!(matches!(values[1], ColumnData::I64(-3)));
+        assert!(matches!(values[2], ColumnData::U64(12)));
 
         // No run for a stream that never received data.
         let other = StreamKey::new(DeviceRoute::root(), crate::proto::StreamId::new(99));
@@ -700,17 +674,27 @@ mod tests {
     }
 
     #[test]
-    fn column_metadata_comes_from_the_newest_schema() {
+    fn run_metadata_comes_from_the_newest_schema() {
+        /// The description, units and type of the column at `key`.
+        fn column(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String, DataType)> {
+            let run = buffer.run(&key.stream_key())?;
+            let column = run.metadata().schema().column(key.column_id)?;
+            Some((
+                column.description().to_string(),
+                column.units().to_string(),
+                column.data_type(),
+            ))
+        }
+
         let mut buffer = Buffer::new(16);
         let fx = test_fixture(&[DataType::F64]);
-        assert!(buffer.column_metadata(&fx.column_keys[0]).is_none());
+        assert!(column(&buffer, &fx.column_keys[0]).is_none());
 
         fx.push_floats(&mut buffer, 1, 0..2);
-        let metadata = buffer
-            .column_metadata(&fx.column_keys[0])
-            .expect("the column");
-        assert_eq!(metadata.description, "column 0");
-        assert_eq!(metadata.units, "u0");
+        assert_eq!(
+            column(&buffer, &fx.column_keys[0]),
+            Some(("column 0".to_string(), "u0".to_string(), DataType::F64))
+        );
 
         // A schema change rides a new stream generation, and the new run's columns
         // replace the old ones.
@@ -718,22 +702,18 @@ mod tests {
         changed.push_rows(
             &mut buffer,
             2,
-            &[(0, vec![ColumnData::Float(1.0), ColumnData::UInt(2)])],
+            &[(0, vec![ColumnData::F64(1.0), ColumnData::U64(2)])],
         );
         assert_eq!(
-            buffer
-                .column_metadata(&changed.column_keys[1])
-                .expect("the added column")
-                .data_type,
-            DataType::U64
+            column(&buffer, &changed.column_keys[1]).map(|(_, _, data_type)| data_type),
+            Some(DataType::U64)
         );
-        assert!(buffer
-            .column_metadata(&ColumnKey::new(
-                DeviceRoute::root(),
-                crate::proto::StreamId::new(1),
-                ColumnId::new(7),
-            ))
-            .is_none());
+        let missing = ColumnKey::new(
+            DeviceRoute::root(),
+            crate::proto::StreamId::new(1),
+            ColumnId::new(7),
+        );
+        assert!(column(&buffer, &missing).is_none());
     }
 
     #[test]

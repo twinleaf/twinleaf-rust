@@ -17,13 +17,14 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::proto::TCP_DEFAULT_PORT;
-use crate::proxy::{self, HostOptions, Proxy, PROXY_VARIABLE};
+use crate::proxy::{self, HostOptions, Proxy};
 use crate::rt::{BoxFuture, Supervisor};
+use crate::session::ProxyAddress;
 
 /// How long [`ensure_proxy`] waits for the proxy it started to answer.
 const STARTUP: Duration = Duration::from_secs(15);
@@ -98,7 +99,7 @@ fn spawn_proxy(port: u16) -> io::Result<SpawnedProxy> {
     // CommandExt::inherit_handles is stable (rust-lang/rust#146407), the
     // proxy can open proxy.log itself and be started inheriting nothing.
     #[cfg(windows)]
-    let _kept = crate::tio::os::windows_helpers::StdioGuard::keep();
+    let _kept = crate::rt::os::windows_helpers::StdioGuard::keep();
     let child = command.spawn().map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -164,7 +165,7 @@ async fn wait_for_proxy(
                     if !status.success() {
                         let log = log.clone();
                         let failed = move || failure(&log, status);
-                        let reading = Supervisor::new().spawn_blocking(failed);
+                        let reading = Supervisor::current().spawn_blocking(failed);
                         return Err(reading.await.unwrap_or_else(io::Error::other));
                     }
                 }
@@ -232,7 +233,7 @@ async fn ensure_proxy_at(
         log::debug!("hosting the proxy in this process, as it runs in the App Sandbox");
         return embed(port, embedded).await;
     }
-    let spawning = Supervisor::new().spawn_blocking(move || spawn_proxy(port));
+    let spawning = Supervisor::current().spawn_blocking(move || spawn_proxy(port));
     let waited = match spawning.await.map_err(io::Error::other)? {
         Ok(spawned) => wait_for_proxy(port, Some(spawned), STARTUP).await,
         Err(error)
@@ -262,19 +263,19 @@ async fn ensure_proxy_at(
 async fn embed(port: u16, embedded: &Mutex<Option<Proxy>>) -> io::Result<()> {
     let options = HostOptions {
         port,
-        name: format!("{} (embedded)", proxy::executable_name()),
+        name: format!("{} (embedded)", crate::session::executable_name()),
         ..HostOptions::default()
     };
-    // Hosting checks the port with a blocking connect, and may call the
-    // proxy that answers there.
-    let hosting = Supervisor::new().spawn_blocking(move || Proxy::host(options));
-    match hosting.await.map_err(io::Error::other)? {
+    // The embedded proxy is the machine's and outlives the open that starts
+    // it, so it runs on the crate's runtime.
+    let hosting = Supervisor::new().spawn("proxy host", proxy::host(options));
+    let hosted = hosting.await.map_err(io::Error::other)?;
+    match hosted.unwrap_or_else(|| Err(io::Error::other("hosting the proxy panicked"))) {
         Ok(proxy) => {
-            let stopped = embedded
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .replace(proxy);
-            Supervisor::new().spawn_blocking(move || drop(stopped));
+            let stopped = crate::chan::lock(embedded).replace(proxy);
+            if let Some(stopped) = stopped {
+                stopped.shutdown_async().await;
+            }
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
@@ -389,61 +390,29 @@ mod sandbox {
     }
 }
 
-/// The proxy a connection goes through, and whether it may be started.
-#[derive(Debug, Clone)]
-pub(crate) struct ProxyAddress {
-    /// Where it answers, such as `tcp://127.0.0.1:7855`.
-    pub(crate) url: String,
-    /// What finds or starts the proxy when nothing answers. Only the
-    /// machine's own proxy has one.
-    pub(crate) ensure: Option<fn() -> BoxFuture<'static, io::Result<()>>>,
+/// Returns the proxy `TWINLEAF_PROXY` names, or else the machine's own on
+/// `127.0.0.1:7855`, which may be started.
+pub(crate) fn chosen_proxy() -> ProxyAddress {
+    proxy_named_by(proxy::named())
 }
 
-impl ProxyAddress {
-    /// Returns the proxy `TWINLEAF_PROXY` names, or else the machine's own
-    /// on `127.0.0.1:7855`, which may be started.
-    pub(crate) fn chosen() -> ProxyAddress {
-        Self::of(proxy::named())
-    }
-
-    /// Returns the proxy as [`chosen`](Self::chosen) does, with `named` as
-    /// the variable's value.
-    fn of(named: Option<String>) -> ProxyAddress {
-        match named {
-            Some(url) => ProxyAddress { url, ensure: None },
-            None => ProxyAddress {
-                url: proxy::endpoint_at(TCP_DEFAULT_PORT),
-                ensure: Some(ensure_proxy),
-            },
-        }
-    }
-
-    /// Returns the error to report when reaching the proxy failed with
-    /// `error`. For a proxy `TWINLEAF_PROXY` names, the message names the
-    /// variable, and says nothing answers there if the connection was refused
-    /// or timed out.
-    pub(crate) fn unreachable(&self, error: io::Error) -> io::Error {
-        let (kind, url) = (error.kind(), &self.url);
-        let message = match self.ensure {
-            Some(_) => format!("cannot reach the proxy at {url}: {error}"),
-            None if matches!(
-                kind,
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
-            ) =>
-            {
-                format!("no proxy answers at {url} ({PROXY_VARIABLE})")
-            }
-            None => format!("cannot reach the proxy at {url} ({PROXY_VARIABLE}): {error}"),
-        };
-        io::Error::new(kind, message)
+/// Returns the proxy as [`chosen_proxy`] does, with `named` as the variable's
+/// value.
+fn proxy_named_by(named: Option<String>) -> ProxyAddress {
+    match named {
+        Some(url) => ProxyAddress { url, ensure: None },
+        None => ProxyAddress {
+            url: proxy::endpoint_at(TCP_DEFAULT_PORT),
+            ensure: Some(ensure_proxy),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::fixtures::{self, ENVIRONMENT, WAIT};
-    use crate::device::rpc::{RpcArgs, RpcReply};
+    use crate::device::tests::fixtures::ENVIRONMENT;
+    use crate::tio::tests::{on_free_port, WAIT};
 
     /// Runs [`ensure_proxy_at`] for `port` with `embedded` as its slot.
     /// Returns its outcome and the slot.
@@ -463,11 +432,11 @@ mod tests {
     /// named the machine's own proxy is.
     #[test]
     fn the_variable_names_the_proxy_else_the_machines_proxy() {
-        let named = ProxyAddress::of(Some("tcp://127.0.0.1:2".to_string()));
+        let named = proxy_named_by(Some("tcp://127.0.0.1:2".to_string()));
         assert_eq!(named.url, "tcp://127.0.0.1:2");
         assert!(named.ensure.is_none());
 
-        let machine = ProxyAddress::of(None);
+        let machine = proxy_named_by(None);
         assert_eq!(machine.url, "tcp://127.0.0.1:7855");
         assert!(machine.ensure.is_some());
     }
@@ -493,12 +462,12 @@ mod tests {
     /// later finds it answering.
     #[test]
     fn a_proxy_is_embedded_when_tio_cannot_be_started() {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TWINLEAF_TIO", dir.path().join("no-such-tio"));
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, false, Mutex::default());
             embedded
                 .into_inner()
@@ -511,9 +480,9 @@ mod tests {
         let (port, ensured, hosted) = attempt.expect("no proxy was embedded");
         ensured.unwrap();
         assert_eq!(hosted.endpoint(), proxy::endpoint_at(port));
-        let hello = proxy::Introduction::of_this_process("test").encode_args();
-        let reply = proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
-        let host = proxy::Introduction::decode_reply(&reply).unwrap();
+        let hello = crate::session::encode(&crate::session::Introduction::of_this_process("test"));
+        let reply = crate::session::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
+        let host = crate::session::decode::<crate::session::Introduction>(&reply).unwrap();
         assert!(host.name.ends_with("(embedded)"), "{host}");
         let (ensured, again) = ensure_at(port, false, Mutex::default());
         ensured.unwrap();
@@ -530,7 +499,7 @@ mod tests {
     fn a_proxy_is_embedded_when_tio_cannot_run_it() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         let old_tio = dir.path().join("tio");
         let script =
@@ -540,7 +509,7 @@ mod tests {
         std::env::set_var("TWINLEAF_TIO", &old_tio);
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, false, Mutex::default());
             embedded
                 .into_inner()
@@ -564,7 +533,7 @@ mod tests {
     fn a_sandboxed_process_embeds_the_proxy_without_starting_tio() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = crate::chan::lock(&ENVIRONMENT);
         let dir = tempfile::tempdir().unwrap();
         let tio = dir.path().join("tio");
         fs::write(&tio, "#!/bin/sh\ntouch \"$0.ran\"\nexit 2\n").unwrap();
@@ -572,7 +541,7 @@ mod tests {
         std::env::set_var("TWINLEAF_TIO", &tio);
         std::env::set_var("TWINLEAF_RUNTIME_DIR", dir.path());
 
-        let attempt = fixtures::on_free_port(|port| {
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, true, Mutex::default());
             embedded
                 .into_inner()
@@ -591,16 +560,16 @@ mod tests {
     /// A hosted proxy that has stopped is replaced by a new one that answers.
     #[test]
     fn a_stopped_embedded_proxy_is_hosted_again() {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
-        let attempt = fixtures::on_free_port(|port| {
+        let _environment = crate::chan::lock(&ENVIRONMENT);
+        let attempt = on_free_port(|port| {
             let (ensured, embedded) = ensure_at(port, true, Mutex::default());
-            let hosted = embedded.lock().unwrap().is_some();
+            let hosted = crate::chan::lock(&embedded).is_some();
             hosted.then_some((port, ensured, embedded))
         });
 
         let (port, ensured, embedded) = attempt.expect("no proxy was embedded");
         ensured.unwrap();
-        embedded.lock().unwrap().as_ref().unwrap().shutdown();
+        crate::chan::lock(&embedded).as_ref().unwrap().shutdown();
         assert!(!proxy::answers(port), "the stopped proxy still answers");
         let (ensured, embedded) = ensure_at(port, true, embedded);
         ensured.unwrap();
@@ -608,8 +577,8 @@ mod tests {
             .into_inner()
             .unwrap()
             .expect("no proxy was hosted again");
-        let hello = proxy::Introduction::of_this_process("test").encode_args();
-        proxy::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
+        let hello = crate::session::encode(&crate::session::Introduction::of_this_process("test"));
+        crate::session::call(&hosted.endpoint(), "proxy.hello", &hello, WAIT).unwrap();
     }
 
     /// Only macOS has the App Sandbox.
@@ -637,7 +606,7 @@ mod tests {
             })
         };
 
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let port = closed.port();
         let (done, finished) = std::sync::mpsc::sync_channel::<()>(0);
         let winner = std::thread::spawn(move || {
@@ -649,7 +618,7 @@ mod tests {
         drop(done);
         winner.join().unwrap();
 
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let failed = wait_for_proxy(closed.port(), spawned(3), WAIT)
             .await
             .unwrap_err();
@@ -661,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_that_never_answers_is_killed() {
         let dir = tempfile::tempdir().unwrap();
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id().unwrap().to_string();
         let spawned = SpawnedProxy {
@@ -693,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn a_running_proxy_is_ready_once_its_port_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let closed = fixtures::ClosedPort::new();
+        let closed = crate::tio::tests::ClosedPort::new();
         let port = closed.port();
         let _listener = closed.listen();
         let child = Command::new("sleep")

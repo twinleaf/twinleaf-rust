@@ -8,7 +8,7 @@
 
 use super::task::{ByteStream, Rules};
 use super::{RateInfo, RecvError};
-use crate::rt;
+use crate::rt::Supervisor;
 use std::io;
 use std::time::Duration;
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
@@ -74,7 +74,7 @@ pub(super) const RULES: Rules = Rules {
 /// to configure the device to. `default_rate` is the rate the device
 /// starts at, and the rate tio falls back to if communication fails. Both
 /// rates default to 115200. Returns the stream at `default_rate`, with both
-/// rates.
+/// rates. The stream belongs to the runtime of `tasks`.
 ///
 /// For example, `COM3:400000:115200` starts at 115.2k and tries to
 /// negotiate 400k. It falls back to 115.2k if that fails, then or later.
@@ -82,10 +82,10 @@ pub(super) const RULES: Rules = Rules {
 /// # Errors
 ///
 /// Returns an error if `url` is malformed or the port cannot be opened.
-pub(super) fn open(url: &str) -> io::Result<(SerialStream, RateInfo)> {
+pub(super) fn open(url: &str, tasks: &Supervisor) -> io::Result<(SerialStream, RateInfo)> {
     let (port_name, target_rate, default_rate) = parse_config(url)?;
     let port = {
-        let _runtime = rt::handle().enter();
+        let _runtime = tasks.enter();
         tokio_serial::new(port_name, default_rate)
             .open_native_async()
             .map_err(io_error)?

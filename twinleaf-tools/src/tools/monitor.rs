@@ -34,7 +34,7 @@ use twinleaf::{
         Buffer, ColumnData, ColumnKey, ColumnProcessor, DeviceMetadataSnapshot, Run, SampleBatch,
         StreamKey,
     },
-    device::{DeviceEvent, Event as StreamEvent, RecvError},
+    device::{MetadataState, Presence, RecvError},
     Connection, DeviceRoute,
 };
 
@@ -368,23 +368,6 @@ fn row_style(color: Color, selected: bool, stale: bool, in_plot_mode: bool) -> S
     s
 }
 
-#[derive(Debug, Clone, Default)]
-struct DeviceStatus {
-    last_heartbeat: Option<Instant>,
-}
-
-impl DeviceStatus {
-    fn on_heartbeat(&mut self) {
-        self.last_heartbeat = Some(Instant::now());
-    }
-
-    fn is_alive(&self, timeout: Duration) -> bool {
-        self.last_heartbeat
-            .map(|t| t.elapsed() < timeout)
-            .unwrap_or(false)
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Action {
     Quit,
@@ -472,7 +455,7 @@ struct MonitorState {
     nav_items: Vec<NavPos>,
 
     discovered_routes: HashSet<DeviceRoute>,
-    device_status: HashMap<DeviceRoute, DeviceStatus>,
+    device_presence: HashMap<DeviceRoute, Presence>,
     device_metadata: HashMap<DeviceRoute, DeviceMetadataSnapshot>,
     fft_series: Vec<FftSeries>,
     fft_status: FftStatus,
@@ -508,7 +491,7 @@ impl MonitorState {
             nav: Nav::default(),
             nav_items: Vec::new(),
             discovered_routes: HashSet::new(),
-            device_status: HashMap::new(),
+            device_presence: HashMap::new(),
             device_metadata: HashMap::new(),
             fft_series: Vec::new(),
             fft_status: FftStatus::WaitingForSelection,
@@ -749,17 +732,14 @@ impl MonitorState {
                 for (stream_idx, sid) in stream_ids.iter().enumerate() {
                     let key = StreamKey::new(*route, *sid);
                     if let Some(row) = buffer.latest_row(&key) {
-                        for (column_idx, _) in row.schema().iter().enumerate() {
+                        for column in row.schema().columns() {
                             new_items.push(NavPos::Column {
                                 device_idx: dev_idx,
                                 stream_idx,
                                 spec: ColumnKey {
                                     route: *route,
                                     stream_id: *sid,
-                                    column_id: twinleaf::ColumnId::new(
-                                        u8::try_from(column_idx)
-                                            .expect("wire schemas contain at most 256 columns"),
-                                    ),
+                                    column_id: column.index(),
                                 },
                             });
                         }
@@ -813,23 +793,19 @@ impl MonitorState {
         self.visible_routes().len()
     }
 
-    fn handle_event(&mut self, event: StreamEvent) {
-        match event {
-            StreamEvent::RouteDiscovered { route } => {
-                self.discovered_routes.insert(route);
-                self.device_status.entry(route).or_default();
-            }
-            StreamEvent::Device {
-                route,
-                event: DeviceEvent::Heartbeat { .. },
-            } => self.device_status.entry(route).or_default().on_heartbeat(),
-            StreamEvent::Device {
-                route,
-                event: DeviceEvent::Metadata(snapshot),
-            } => {
-                self.device_metadata.insert(route, snapshot);
-            }
-            _ => {}
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        for &route in routes {
+            self.discovered_routes.insert(route);
+        }
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.device_presence.insert(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        if let MetadataState::Ready(snapshot) = metadata {
+            self.device_metadata.insert(route, snapshot);
         }
     }
 
@@ -839,7 +815,7 @@ impl MonitorState {
 
     /// Returns how many samples of `run` span the plot window, at least 10.
     fn window_samples(&self, run: &Run) -> usize {
-        (self.view.plot_window_seconds * run.effective_rate())
+        (self.view.plot_window_seconds * run.metadata().rate_hz())
             .ceil()
             .max(10.0) as usize
     }
@@ -886,7 +862,7 @@ impl MonitorState {
                 continue;
             };
             let window_samples = self.window_samples(run);
-            let sampling_hz = run.effective_rate();
+            let sampling_hz = run.metadata().rate_hz();
 
             let pipe = self.fft_pipes.entry(key).or_insert_with(|| {
                 ColumnProcessor::new(key, Welch::new(window_samples, sampling_hz))
@@ -986,9 +962,9 @@ impl MonitorState {
 }
 
 fn column_label_units(buffer: &Buffer, key: &ColumnKey) -> Option<(String, String)> {
-    buffer
-        .column_metadata(key)
-        .map(|metadata| (metadata.description.to_string(), metadata.units.to_string()))
+    let run = buffer.run(&key.stream_key())?;
+    let column = run.metadata().schema().column(key.column_id)?;
+    Some((column.description().to_string(), column.units().to_string()))
 }
 
 fn get_action(ev: Event, app: &mut MonitorState) -> Option<Action> {
@@ -1319,14 +1295,14 @@ fn build_left_lines(
     let mut global_idx = 0;
     app.view.desc_width = latest
         .values()
-        .flat_map(|row| row.schema().iter())
-        .map(|column| column.metadata().description.len())
+        .flat_map(|row| row.schema().columns())
+        .map(|column| column.description().len())
         .max()
         .unwrap_or(0);
     app.view.units_width = latest
         .values()
-        .flat_map(|row| row.schema().iter())
-        .map(|column| column.metadata().units.len())
+        .flat_map(|row| row.schema().columns())
+        .map(|column| column.units().len())
         .max()
         .unwrap_or(0);
 
@@ -1335,10 +1311,7 @@ fn build_left_lines(
     for (dev_idx, route) in routes.iter().enumerate() {
         let dev = app.device_metadata.get(route).map(|m| m.device());
 
-        let status = app.device_status.get(route);
-        let is_alive = status
-            .map(|s| s.is_alive(Duration::from_millis(300)))
-            .unwrap_or(false);
+        let is_alive = matches!(app.device_presence.get(route), Some(Presence::Alive { .. }));
 
         let is_selected_header = if app.console.is_open() {
             *route == app.console.target(app.current_route())
@@ -1352,10 +1325,10 @@ fn build_left_lines(
         };
 
         let header_text = if let Some(d) = dev {
-            if d.serial.is_empty() {
-                d.name.to_string()
+            if d.serial().is_empty() {
+                d.name().to_string()
             } else {
-                format!("{}  Serial: {}", d.name, d.serial)
+                format!("{}  Serial: {}", d.name(), d.serial())
             }
         } else {
             format!("<{}>", route)
@@ -1407,13 +1380,10 @@ fn build_left_lines(
             if let Some(row) = latest.get(&key) {
                 let is_stale = buffer.run(&key).is_some_and(|run| {
                     now.saturating_duration_since(run.last_seen())
-                        > stale_threshold(run.effective_rate())
+                        > stale_threshold(run.metadata().rate_hz())
                 });
                 let sample = row.row(0).expect("latest_row is one row");
-                for (col_idx, (column, value)) in
-                    row.schema().iter().zip(sample.values()).enumerate()
-                {
-                    let metadata = column.metadata();
+                for (column, value) in row.schema().columns().zip(sample.values()) {
                     let nav_idx = global_idx;
                     global_idx += 1;
                     map.insert(nav_idx, lines.len());
@@ -1428,26 +1398,23 @@ fn build_left_lines(
                     let plot_slot = app.plot_slots.get(&ColumnKey {
                         route: *route,
                         stream_id: sid,
-                        column_id: twinleaf::ColumnId::new(
-                            u8::try_from(col_idx)
-                                .expect("wire schemas contain at most 256 columns"),
-                        ),
+                        column_id: column.index(),
                     });
                     let label_style = row_style(Color::Reset, is_sel, is_stale, app.view.show_plot);
                     let (val_str, val_f64) = fmt_value(&value);
                     let val_col = app
                         .view
                         .theme
-                        .get_value_color(row.stream().name, metadata.name, val_f64)
+                        .get_value_color(row.schema().stream().name(), column.name(), val_f64)
                         .unwrap_or(Color::Reset);
                     let val_style = row_style(val_col, is_sel, is_stale, app.view.show_plot);
 
-                    let mut desc = metadata.description.to_string();
+                    let mut desc = column.description().to_string();
                     if desc.len() < app.view.desc_width {
                         desc.push_str(&" ".repeat(app.view.desc_width - desc.len()));
                     }
 
-                    let units = metadata.units.to_string();
+                    let units = column.units().to_string();
                     let padded_units = if app.view.units_width > 0 && !units.is_empty() {
                         format!("{:>width$}", units, width = app.view.units_width)
                     } else if app.view.units_width > 0 {
@@ -1457,7 +1424,10 @@ fn build_left_lines(
                     };
 
                     let (pipe_glyph, pipe_style) = if is_current_stream {
-                        ("┃ ", Style::default().fg(stream_color(row.stream().name)))
+                        (
+                            "┃ ",
+                            Style::default().fg(stream_color(row.schema().stream().name())),
+                        )
                     } else {
                         ("│ ", Style::default().fg(Color::DarkGray))
                     };
@@ -1960,11 +1930,10 @@ fn generate_log_labels(
 }
 
 fn fmt_value(v: &ColumnData) -> (String, f64) {
-    match v {
-        ColumnData::Float(x) => (format!("{:15.4}", x), *x),
-        ColumnData::Int(x) => (format!("{:15}", x), *x as f64),
-        ColumnData::UInt(x) => (format!("{:15}", x), *x as f64),
-        _ => ("           type?".to_string(), f64::NAN),
+    match (v, v.try_as_f64()) {
+        (ColumnData::F32(_) | ColumnData::F64(_), Some(x)) => (format!("{:15.4}", x), x),
+        (_, Some(x)) => (format!("{:>15}", v.to_string()), x),
+        (_, None) => ("           type?".to_string(), f64::NAN),
     }
 }
 
@@ -2018,8 +1987,16 @@ impl Screen for Monitor {
         self.buffer.process_batch(&batch);
     }
 
-    fn on_event(&mut self, event: StreamEvent) {
-        self.app.handle_event(event);
+    fn on_routes(&mut self, routes: &[DeviceRoute]) {
+        self.app.on_routes(routes);
+    }
+
+    fn on_presence(&mut self, route: DeviceRoute, presence: Presence) {
+        self.app.on_presence(route, presence);
+    }
+
+    fn on_metadata(&mut self, route: DeviceRoute, metadata: MetadataState) {
+        self.app.on_metadata(route, metadata);
     }
 
     // Monitor keeps no log to report a lag in.

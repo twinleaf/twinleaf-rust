@@ -9,6 +9,11 @@
 )]
 #![warn(rustdoc::all)]
 
+#[cfg(feature = "contract")]
+extern crate alloc;
+
+#[cfg(feature = "contract")]
+pub mod contract;
 pub mod identifiers;
 pub mod packet;
 mod payload;

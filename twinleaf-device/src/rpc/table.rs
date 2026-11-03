@@ -96,8 +96,8 @@ impl Access {
         Self(self.0 | other.0)
     }
 
-    /// The same access granted to a privileged session only: read and write
-    /// move into the bits tl-chibi keeps them in, `0x4` and `0x8`.
+    /// The same access granted to a privileged session only. Read and write
+    /// move into bits `0x4` and `0x8`.
     pub const fn privileged(self) -> Self {
         Self((self.0 & Self::RW.0) << 2 | self.0 & !Self::RW.0)
     }
@@ -282,8 +282,7 @@ macro_rules! standard {
         }
 
         /// The RPCs every Twinleaf platform declares, in the id order that is
-        /// on the wire: tl-chibi's `tl_firmware_start`, then what it does not
-        /// fix.
+        /// on the wire.
         ///
         /// A platform that does not implement a listed RPC answers
         /// [`RpcError::State`].
@@ -390,18 +389,19 @@ pub fn list(
 /// a user typed.
 ///
 /// The argument is a name prefix, optionally followed by `|N` selecting the
-/// `N`-th (0-based) match:
+/// `N`-th (0-based) match.
 ///
-/// - `dev.na` — the unique completion `dev.name` as a string when exactly one
-///   name starts with the prefix, and a `u16` match count otherwise, zero when
-///   nothing matches. A caller tells the two apart by whether the reply starts
-///   with the prefix it sent.
-/// - `dev.na|0` — the 0-th matching name, so a caller can cycle through them
-///   all. Past the last match it is [`RpcError::Invalid`].
+/// - `dev.na` answers the unique completion `dev.name` as a string when exactly
+///   one name starts with the prefix, and a `u16` match count otherwise, zero
+///   when nothing matches. A caller tells the two apart by whether the reply
+///   starts with the prefix it sent.
+/// - `dev.na|0` answers the 0-th matching name, so a caller can cycle through
+///   them all. Past the last match it is [`RpcError::Invalid`].
 ///
-/// An empty argument is [`RpcError::Invalid`]. Byte-compatible with tl-chibi's
-/// `rpc_match`, down to its parser: only the first `|` separates, and a
-/// non-numeric tail after it still cuts the prefix but selects nothing.
+/// An empty argument is [`RpcError::Invalid`]. Only the first `|` separates
+/// the prefix from the index. An empty tail after it selects index zero. A
+/// tail that is not all decimal digits still cuts the prefix but selects
+/// nothing, so the reply is the completion or count for that prefix.
 pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(), RpcError> {
     if args.is_empty() {
         return Err(RpcError::Invalid);
@@ -433,7 +433,7 @@ pub fn match_name(table: &[RpcSpec], args: &[u8], out: &mut Reply) -> Result<(),
 }
 
 /// The decimal index after `|`, or `None` when the tail is not all digits. An
-/// empty tail is index zero, as tl-chibi's parser leaves it.
+/// empty tail is index zero.
 fn match_index(digits: &[u8]) -> Option<usize> {
     let mut index: usize = 0;
     for &byte in digits {
@@ -723,7 +723,7 @@ mod tests {
             "past the last match"
         );
         // An empty index is index zero, and a non-numeric tail selects nothing
-        // but still cuts the prefix — both as tl-chibi's parser leaves them.
+        // but still cuts the prefix.
         assert_eq!(matched(b"board.|").unwrap().as_slice(), b"board.first");
         assert_eq!(
             matched(b"board.|x").unwrap().as_slice(),
