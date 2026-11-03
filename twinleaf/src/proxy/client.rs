@@ -643,7 +643,7 @@ async fn resolve(
 ) -> Result<(String, Layout, Option<Link>), Refusal> {
     let default = shared.default();
     match target.as_str() {
-        auto::AUTO => {
+        control::AUTO => {
             let open = shared.links.answered().await;
             // Listing the attached devices enumerates serial ports.
             let resolved = shared.tasks.spawn_blocking(move || {

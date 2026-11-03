@@ -4,10 +4,7 @@
 //! decodes a request, [`answer`] builds the reply, and [`call`] and
 //! [`handshake`] make requests as a client.
 
-use super::Layout;
-use crate::data::PacketParser;
-use crate::device::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
-use crate::device::store::{Store, METADATA, PRESENCE, REGISTRY};
+use crate::device::rpc::{CallError, RpcRegistry, RpcRegistryError};
 use crate::device::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use crate::proto::packet::Packet as WirePacket;
 use crate::proto::rpc::RpcError;
@@ -25,6 +22,16 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
+
+/// The target the proxy resolves for the client.
+pub(crate) const AUTO: &str = "auto";
+/// The longest a client's RPC waits for its device's reply. The proxy holds
+/// a request this long, and a session's call may ask for no longer.
+pub(crate) const MAX_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The variable that names the proxy to go through, in place of the
+/// machine's own.
+pub(crate) const PROXY_VARIABLE: &str = "TWINLEAF_PROXY";
 
 /// The method by which a client and the proxy introduce themselves.
 pub(crate) const HELLO: &str = "proxy.hello";
@@ -136,7 +143,7 @@ fn entries(table: &RpcRegistry) -> WireEntries {
 
 /// Encodes a [`DeviceRoute`] as the byte string of its hops, for
 /// `#[cbor(with = "...")]`.
-pub(super) mod hops {
+mod hops {
     use crate::proto::DeviceRoute;
     use minicbor::{Decoder, Encoder};
 
@@ -158,6 +165,63 @@ pub(super) mod hops {
     }
 }
 
+/// One device subtree and where a client sees it.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+pub struct Mount {
+    /// The device's URL.
+    #[n(0)]
+    pub url: String,
+    /// The subtree of the device that is mounted.
+    #[n(1)]
+    #[cbor(with = "hops")]
+    pub source: DeviceRoute,
+    /// The route at which a client sees that subtree.
+    #[n(2)]
+    #[cbor(with = "hops")]
+    pub prefix: DeviceRoute,
+}
+
+/// Mounts a client sees together, as one tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+pub struct Layout {
+    /// Each mounted subtree.
+    #[n(0)]
+    pub mounts: Vec<Mount>,
+}
+
+/// Shows the device's URL, the subtree when it is not the whole device, and
+/// where the client sees it, as `serial:///dev/ttyACM0 /2 at /1`.
+impl fmt::Display for Mount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.source.is_empty() {
+            write!(formatter, "{} at {}", self.url, self.prefix)
+        } else {
+            write!(formatter, "{} {} at {}", self.url, self.source, self.prefix)
+        }
+    }
+}
+
+/// Shows each mount, separated by commas.
+impl fmt::Display for Layout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mounts: Vec<String> = self.mounts.iter().map(Mount::to_string).collect();
+        formatter.write_str(&mounts.join(", "))
+    }
+}
+
+impl Layout {
+    /// Creates a layout of the whole device at `url`, seen at the root.
+    pub(crate) fn single(url: &str) -> Layout {
+        Layout {
+            mounts: vec![Mount {
+                url: url.to_string(),
+                source: DeviceRoute::root(),
+                prefix: DeviceRoute::root(),
+            }],
+        }
+    }
+}
+
 /// What `proxy.watch` follows, the device at `route` as the client sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) struct Watch {
@@ -174,9 +238,9 @@ pub(crate) struct Watch {
 /// The code of a table error that says a call timed out, that the table
 /// changed during every walk, or that a call got no reply. Any other code
 /// is the device's refusal.
-const TIMED_OUT: u16 = 0xfffd;
-const CHANGED: u16 = 0xfffe;
-const UNANSWERED: u16 = 0xffff;
+pub(crate) const TIMED_OUT: u16 = 0xfffd;
+pub(crate) const CHANGED: u16 = 0xfffe;
+pub(crate) const UNANSWERED: u16 = 0xffff;
 
 /// An RPC table as its hash, the session it was read in, and the name and
 /// metadata word of each entry.
@@ -295,107 +359,6 @@ impl Update {
     /// settings after it were recorded under.
     pub(crate) fn recorded(table: Option<&Arc<RpcRegistry>>) -> Update {
         Update::Recorded(table.map(|table| entries(table)))
-    }
-
-    /// Keeps what the update says of the device at `route` in `store`. Its
-    /// metadata records reach `parser` as the device's own, and the
-    /// metadata the parser then holds is the value kept, and no metadata
-    /// resets any route but `route`. Settings are kept only when they were
-    /// read with the table the store holds, and a table with the hash and
-    /// session of the one held keeps them. A table with the hash and session
-    /// of one the store holds already is that one, so the device's table and
-    /// the table its changes carry are one value while they are the same.
-    pub(crate) fn apply(self, route: DeviceRoute, store: &mut Store, parser: &mut PacketParser) {
-        match self {
-            Update::Presence(presence) => {
-                let now = Instant::now().into_std();
-                let presence = match presence.map(|session| session.map(SessionId::new)) {
-                    Ok(session) => Presence::Alive { session },
-                    Err(None) => Presence::Connecting,
-                    Err(Some(ago)) => {
-                        let since = now.checked_sub(Duration::from_millis(ago));
-                        Presence::Lost {
-                            since: since.unwrap_or(now),
-                        }
-                    }
-                };
-                store.set(route, PRESENCE, presence);
-            }
-            Update::Metadata(None) => store.set(route, METADATA, MetadataState::Unsupported),
-            Update::Metadata(Some(records)) if records.is_empty() => {
-                parser.relearn_route(route);
-                store.set(route, METADATA, MetadataState::Pending);
-            }
-            Update::Metadata(Some(records)) => {
-                for record in records {
-                    let applied = Packet::from_slice_prefix(&record)
-                        .map_err(|error| error.to_string())
-                        .and_then(|(packet, _)| {
-                            let packet = packet.with_route(route);
-                            parser
-                                .push_packet(&packet)
-                                .map_err(|error| error.to_string())
-                        });
-                    if let Err(error) = applied {
-                        log::warn!("dropping a metadata record of {route}: {error}");
-                    }
-                }
-                if let Some(snapshot) = parser.metadata(route) {
-                    store.set(route, METADATA, MetadataState::Ready(snapshot));
-                }
-            }
-            Update::Table(Ok((hash, session, entries))) => {
-                let session = session.map(SessionId::new);
-                // The same table again keeps the settings read with it.
-                let held = store.value(route, REGISTRY);
-                if !held.is_some_and(|held| {
-                    held.is_ok_and(|held| (held.hash, held.session) == (hash, session))
-                }) {
-                    let table = store.table_of(route, hash, session).unwrap_or_else(|| {
-                        Arc::new(RpcRegistry::from_entries(entries, hash, session))
-                    });
-                    store.set_registry(route, Ok(table));
-                }
-            }
-            Update::Table(Err((CHANGED, _))) => {
-                store.set_registry(route, Err(RpcRegistryError::TableChanged))
-            }
-            Update::Table(Err((code, message))) => {
-                let error = match code {
-                    TIMED_OUT => CallError::Timeout,
-                    UNANSWERED => CallError::ResponseLost,
-                    code => CallError::DeviceError(RpcErrorPayload {
-                        error: RpcError::from(code),
-                        extra: message.into(),
-                    }),
-                };
-                store.set_registry(route, Err(RpcRegistryError::DeviceRpcError(error)));
-            }
-            Update::Settings(hash, version, values) => match store.value(route, REGISTRY) {
-                Some(Ok(registry)) if registry.hash == hash => {
-                    let values = values.into_iter().map(|(name, value)| (name, value.into()));
-                    let settings = Settings::new(registry, version, values.collect());
-                    store.set_settings(route, Arc::new(settings));
-                }
-                _ => log::warn!("dropping settings of {route} read with a table it does not hold"),
-            },
-            Update::Setting(name, seq, reply) => {
-                store.record_change(route, name, seq, reply.into());
-            }
-            Update::Recorded(table) => {
-                let table = table.map(|(hash, session, entries)| {
-                    RpcRegistry::from_entries(entries, hash, session.map(SessionId::new))
-                });
-                store.name_table(route, table);
-            }
-            Update::Routes(routes) => {
-                let routes = routes
-                    .iter()
-                    .filter_map(|hops| DeviceRoute::from_hops(hops).ok());
-                store.list(route, routes);
-            }
-            Update::Lagged(missed) => store.lag(route, missed),
-        }
     }
 }
 
@@ -858,6 +821,8 @@ pub(crate) fn client_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::PacketParser;
+    use crate::device::store::{Store, PRESENCE};
     use crate::proxy::Mount;
     use crate::tio::transport::tests::fake;
 
@@ -1170,7 +1135,7 @@ mod tests {
         let (old, new) = (table(1, 0xA310), table(2, 0xA321));
         let reply = 0x1234i16.to_le_bytes();
         let setting = || Update::Setting("test.amplitude".to_string(), None, reply.to_vec().into());
-        let mut apply = |update: Update| update.apply(route, &mut store, &mut parser);
+        let mut apply = |update: Update| store.apply(route, update, &mut parser);
 
         apply(Update::table(&Ok(Arc::clone(&old))));
         apply(Update::recorded(Some(&old)));
@@ -1210,7 +1175,7 @@ mod tests {
         let route = DeviceRoute::root();
         tokio::time::sleep(Duration::from_secs(60)).await;
 
-        Update::Presence(Err(Some(1500))).apply(route, &mut store, &mut parser);
+        store.apply(route, Update::Presence(Err(Some(1500))), &mut parser);
         let since = (Instant::now() - Duration::from_millis(1500)).into_std();
         assert_eq!(store.value(route, PRESENCE), Some(Presence::Lost { since }));
         let again = Update::presence(Presence::Lost { since });

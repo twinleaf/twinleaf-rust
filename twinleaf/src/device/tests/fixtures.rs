@@ -1,7 +1,7 @@
 //! Test fixtures for `device`, a proxy on a free port and the fake device
 //! of the proxy's own tests, and the packets a device sends.
 
-use crate::device::runtime::ProxyAddress;
+use crate::device::session::ProxyAddress;
 use crate::device::session::Session;
 use crate::device::stream::Receiver;
 use crate::device::Connection;

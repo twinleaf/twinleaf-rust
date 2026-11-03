@@ -9,7 +9,8 @@
 use super::connection::NamedRoute;
 use super::connection::{Connection, DeviceTree};
 use super::rpc::RpcReply;
-use super::runtime::ProxyAddress;
+use super::runtime::chosen_proxy;
+use super::session::ProxyAddress;
 use super::session::Session;
 use super::stream::RecvError;
 use crate::chan::{oneshot, StreamMap};
@@ -309,7 +310,7 @@ impl Backend {
 /// proxy's `auto`. Fails if the proxy does not open the device within
 /// `timeout`.
 async fn probe(url: String, timeout: Duration) -> io::Result<Connection> {
-    Connection::open_at_async(&ProxyAddress::chosen(), &url, Purpose::Probe, timeout).await
+    Connection::open_at_async(&chosen_proxy(), &url, Purpose::Probe, timeout).await
 }
 
 /// Connects briefly to `url` and reads its `dev.name`, through the proxy
@@ -321,7 +322,7 @@ async fn probe(url: String, timeout: Duration) -> io::Result<Connection> {
 /// `TWINLEAF_PROXY` names, or the device does not answer within about twice
 /// `timeout`.
 pub fn query_name(url: &str, timeout: Duration) -> Option<String> {
-    let proxy = ProxyAddress::chosen();
+    let proxy = chosen_proxy();
     let connection = Connection::open_at(&proxy, url, Purpose::Probe, timeout).ok()?;
     root_name(connection, timeout)
 }

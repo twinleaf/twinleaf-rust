@@ -23,7 +23,7 @@ use fake_device::device;
 use trace::{traced, Traced, Tracer};
 
 use crate::data::{Change, SampleBatch};
-use crate::device::runtime::ProxyAddress;
+use crate::device::session::ProxyAddress;
 use crate::device::{Connection, Device, Presence, Receiver, RecvError};
 use crate::proto::DeviceRoute;
 use crate::proxy::control::Purpose;

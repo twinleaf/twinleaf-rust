@@ -215,17 +215,17 @@ mod table;
 mod worker;
 
 pub(crate) use control::{
-    call, encode, executable_name, handshake, Joined, Purpose, Update, Watch, DEFAULT_LAYOUT,
-    MOUNT, UNWATCH, WATCH,
+    call, encode, executable_name, handshake, Joined, Purpose, Update, Watch, AUTO, CHANGED,
+    DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT, PROXY_VARIABLE, TIMED_OUT, UNANSWERED, UNWATCH, WATCH,
 };
 #[cfg(test)]
 pub(crate) use control::{decode, parts, CLIENT_KEEPALIVE};
+pub use control::{Layout, Mount};
 pub(crate) use server::host;
 pub use server::Proxy;
 
-use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
+use crate::proto::TCP_DEFAULT_PORT;
 use crate::tio::transport::{CLOSE_TIMEOUT, CONNECT_TIMEOUT};
-use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -250,14 +250,6 @@ pub(super) const LEAVE_TIMEOUT: Duration = CLOSE_TIMEOUT.saturating_add(Duration
 /// it, unless its default layout mounts the device, and how long a background
 /// proxy keeps running with no client at all.
 const IDLE: Duration = Duration::from_secs(5);
-
-/// The longest a client's RPC waits for its device's reply. The proxy holds
-/// a request this long, and a session's call may ask for no longer.
-pub(crate) const MAX_RPC_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The variable that names the proxy to go through, in place of the
-/// machine's own.
-pub(crate) const PROXY_VARIABLE: &str = "TWINLEAF_PROXY";
 
 /// Returns the URL of the proxy `TWINLEAF_PROXY` names, if it is set and not
 /// empty. A proxy named this way is not started.
@@ -322,63 +314,6 @@ pub enum Listen {
     Loopback,
     /// Every interface. Other machines can connect too.
     AllInterfaces,
-}
-
-/// One device subtree and where a client sees it.
-#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
-pub struct Mount {
-    /// The device's URL.
-    #[n(0)]
-    pub url: String,
-    /// The subtree of the device that is mounted.
-    #[n(1)]
-    #[cbor(with = "control::hops")]
-    pub source: DeviceRoute,
-    /// The route at which a client sees that subtree.
-    #[n(2)]
-    #[cbor(with = "control::hops")]
-    pub prefix: DeviceRoute,
-}
-
-/// Mounts a client sees together, as one tree.
-#[derive(Debug, Clone, Default, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
-pub struct Layout {
-    /// Each mounted subtree.
-    #[n(0)]
-    pub mounts: Vec<Mount>,
-}
-
-/// Shows the device's URL, the subtree when it is not the whole device, and
-/// where the client sees it, as `serial:///dev/ttyACM0 /2 at /1`.
-impl fmt::Display for Mount {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.source.is_empty() {
-            write!(formatter, "{} at {}", self.url, self.prefix)
-        } else {
-            write!(formatter, "{} {} at {}", self.url, self.source, self.prefix)
-        }
-    }
-}
-
-/// Shows each mount, separated by commas.
-impl fmt::Display for Layout {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mounts: Vec<String> = self.mounts.iter().map(Mount::to_string).collect();
-        formatter.write_str(&mounts.join(", "))
-    }
-}
-
-impl Layout {
-    /// Creates a layout of the whole device at `url`, seen at the root.
-    fn single(url: &str) -> Layout {
-        Layout {
-            mounts: vec![Mount {
-                url: url.to_string(),
-                source: DeviceRoute::root(),
-                prefix: DeviceRoute::root(),
-            }],
-        }
-    }
 }
 
 /// The traffic a proxy logs at info level.

@@ -3,7 +3,8 @@
 use super::rpc::{
     CallError, PendingReply, RpcArgs, RpcMeta, RpcRegistry, RpcRegistryError, RpcReply,
 };
-use super::runtime::ProxyAddress;
+use super::runtime::chosen_proxy;
+use super::session::ProxyAddress;
 use super::session::{Handle, Session};
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use super::store::{Field, CHANGES, METADATA, PRESENCE, REGISTRY, SETTINGS};
@@ -194,7 +195,7 @@ impl Connection {
     /// # }
     /// ```
     pub fn open(url: &str) -> std::io::Result<Connection> {
-        Self::open_at(&ProxyAddress::chosen(), url, Purpose::Use, OPEN_TIMEOUT)
+        Self::open_at(&chosen_proxy(), url, Purpose::Use, OPEN_TIMEOUT)
     }
 
     /// Opens a connection that sees `layout` as one tree, each mount's
@@ -210,7 +211,7 @@ impl Connection {
     /// [`open`](Self::open) does.
     pub fn open_layout(layout: &Layout) -> std::io::Result<Connection> {
         fits_one_request(layout)?;
-        Self::mount_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+        Self::mount_at(&chosen_proxy(), layout, OPEN_TIMEOUT)
     }
 
     /// Makes `layout` the default of the machine's background proxy, the
@@ -225,7 +226,7 @@ impl Connection {
     /// holds its default.
     pub fn hold_default(layout: &Layout) -> std::io::Result<Connection> {
         fits_one_request(layout)?;
-        Self::hold_default_at(&ProxyAddress::chosen(), layout, OPEN_TIMEOUT)
+        Self::hold_default_at(&chosen_proxy(), layout, OPEN_TIMEOUT)
     }
 
     /// Holds `layout` as the default of `proxy`, waiting at most
@@ -428,6 +429,14 @@ impl std::fmt::Debug for DeviceTree {
 }
 
 impl DeviceTree {
+    /// Returns the subtree this view covers, as its stream subscribes to it.
+    fn scope(&self) -> Scope {
+        Scope {
+            route: self.handle.scope(),
+            depth: self.handle.depth(),
+        }
+    }
+
     /// Returns the device at `route`. Its first RPC learns whether a device
     /// is there.
     ///
@@ -498,12 +507,12 @@ impl DeviceTree {
     /// # }
     /// ```
     pub fn samples(&self) -> Receiver<SampleBatch> {
-        self.stream.batches(Scope::of(&self.handle))
+        self.stream.batches(self.scope())
     }
 
     /// Subscribes to the subtree's packets before they are parsed.
     pub fn packets(&self) -> Receiver<tio::Packet> {
-        self.stream.packets(Scope::of(&self.handle))
+        self.stream.packets(self.scope())
     }
 
     /// Returns the routes the proxy has heard in the subtree so far, sorted,
@@ -519,7 +528,7 @@ impl DeviceTree {
     /// the whole list again each time a new route is heard. A reader that
     /// falls behind skips to the newest list.
     pub fn routes_updates(&self) -> Receiver<Vec<DeviceRoute>> {
-        self.stream.routes(Scope::of(&self.handle))
+        self.stream.routes(self.scope())
     }
 
     /// Collects complete metadata for `route`, waiting up to 10 s. See

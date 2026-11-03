@@ -319,7 +319,7 @@ async fn greet(
     };
     log::debug!("the proxy at {url} is {host}");
     let (name, target) = control::Request::Open {
-        target: super::auto::AUTO.to_string(),
+        target: super::control::AUTO.to_string(),
     }
     .encode();
     let request = Packet::proxy_request(name, &target, OPEN_ID).map_err(io::Error::other)?;

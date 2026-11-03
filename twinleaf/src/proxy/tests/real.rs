@@ -1,6 +1,6 @@
 use super::fixtures::{options, FakeDevice, WAIT};
 use crate::proto::rpc::RpcError;
-use crate::proto::PacketType;
+use crate::proto::{DeviceRoute, PacketType};
 use crate::proxy::*;
 use crate::rt::{self, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
@@ -1014,7 +1014,7 @@ fn a_proxy_and_a_connection_run_on_the_runtime_they_are_awaited_on() {
             .unwrap();
         runtime.block_on(async {
             let proxy = host(options()).await.unwrap();
-            let address = crate::device::runtime::ProxyAddress {
+            let address = crate::device::session::ProxyAddress {
                 url: proxy.endpoint(),
                 ensure: None,
             };

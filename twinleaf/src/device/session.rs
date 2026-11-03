@@ -33,11 +33,13 @@
 //! session is quiet for longer than the keepalive allows. The session takes
 //! such a close as a socket that closes without a stop.
 
-use super::runtime::ProxyAddress;
 use super::stream::{End, Lane, Queued};
 use crate::device::rpc::{CallError, RpcErrorPayload};
 use crate::proto::{DeviceRoute, RouteError};
-use crate::proxy::{encode, handshake, Layout, Purpose, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT};
+use crate::proxy::{
+    encode, handshake, Layout, Purpose, AUTO, DEFAULT_LAYOUT, MAX_RPC_TIMEOUT, MOUNT,
+    PROXY_VARIABLE,
+};
 use crate::rt::{finish, sleep_until_some, BoxFuture, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport::{self, ReceiveResult, TransportEvent};
@@ -49,9 +51,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-/// The target an empty target means.
-const AUTO: &str = "auto";
-
 /// How long a session whose socket closed without a stop tries to open
 /// again before it ends.
 const REOPEN_FOR: Duration = Duration::from_secs(30);
@@ -61,6 +60,38 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_millis(3000);
 /// The shortest RPC timeout a view may set. The longest is
 /// [`MAX_RPC_TIMEOUT`], how long the proxy holds a request.
 const MIN_RPC_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// The proxy a connection goes through, and whether it may be started.
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyAddress {
+    /// Where it answers, such as `tcp://127.0.0.1:7855`.
+    pub(crate) url: String,
+    /// What finds or starts the proxy when nothing answers. Only the
+    /// machine's own proxy has one.
+    pub(crate) ensure: Option<fn() -> BoxFuture<'static, io::Result<()>>>,
+}
+
+impl ProxyAddress {
+    /// Returns the error to report when reaching the proxy failed with
+    /// `error`. For a proxy `TWINLEAF_PROXY` names, the message names the
+    /// variable, and says nothing answers there if the connection was refused
+    /// or timed out.
+    pub(crate) fn unreachable(&self, error: io::Error) -> io::Error {
+        let (kind, url) = (error.kind(), &self.url);
+        let message = match self.ensure {
+            Some(_) => format!("cannot reach the proxy at {url}: {error}"),
+            None if matches!(
+                kind,
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+            ) =>
+            {
+                format!("no proxy answers at {url} ({PROXY_VARIABLE})")
+            }
+            None => format!("cannot reach the proxy at {url} ({PROXY_VARIABLE}): {error}"),
+        };
+        io::Error::new(kind, message)
+    }
+}
 
 /// What a call resolves to, the reply's bytes or why there are none.
 pub(crate) type RawCallResult = Result<Vec<u8>, CallError>;
@@ -879,7 +910,7 @@ impl Session {
             url: crate::proxy::tests::fixtures::UNREACHABLE.to_string(),
             ensure: None,
         };
-        let reopen = (nowhere, Purpose::Use.method(), encode(&"auto"));
+        let reopen = (nowhere, Purpose::Use.method(), encode(&AUTO));
         Session::test_pair_with(tasks, Some(reopen))
     }
 

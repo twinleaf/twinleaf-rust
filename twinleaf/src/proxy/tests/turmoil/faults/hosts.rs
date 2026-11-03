@@ -4,7 +4,7 @@
 use super::schedule::Action;
 use super::{APPS, CALL_TIMEOUT, MOST_APPS, OPEN_TIMEOUT};
 use crate::data::{Change, SampleBatch};
-use crate::device::runtime::ProxyAddress;
+use crate::device::session::ProxyAddress;
 use crate::device::{Connection, Presence, Receiver, RecvError};
 use crate::proto::{ColumnId, DeviceRoute};
 use crate::proxy::control::Purpose;

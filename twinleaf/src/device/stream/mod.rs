@@ -272,7 +272,7 @@ impl Pump {
                 let mut store = lock(&self.store);
                 if table {
                     let refused = Update::Table(Err((error.code, error.message.to_vec().into())));
-                    return refused.apply(route, &mut store, &mut self.parser);
+                    return store.apply(route, refused, &mut self.parser);
                 }
                 store.end_device(route);
                 self.batches.retain(|sink| sink.scope.route != route);
@@ -285,7 +285,7 @@ impl Pump {
             return;
         };
         if let Some(update) = joined.join(value) {
-            update.apply(watch.route, &mut lock(&self.store), &mut self.parser);
+            lock(&self.store).apply(watch.route, update, &mut self.parser);
         }
     }
 

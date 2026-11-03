@@ -1,10 +1,8 @@
 //! Owned subscriptions. A view hands out a [`Receiver`], the pump fills its
 //! [`Sink`], and a [`Scope`] filters what passes between them.
 
-use super::Stream;
 use crate::chan::oneshot;
 use crate::data::{Boundary, Change, Loss, SampleBatch, StreamKey, StreamMetadataSnapshot};
-use crate::device::session::Handle;
 use crate::proto::{DeviceRoute, SampleNumber};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -74,7 +72,7 @@ pub struct Receiver<T> {
     _lifeline: oneshot::Sender<Infallible>,
     /// The stream this came from, which it keeps running. `None` only until
     /// [`tied_to`](Self::tied_to) sets it.
-    stream: Option<Arc<Stream>>,
+    stream: Option<Arc<dyn Send + Sync>>,
 }
 
 impl<T> std::fmt::Debug for Receiver<T> {
@@ -189,8 +187,8 @@ impl<T> Receiver<T> {
     }
 
     /// Ties this subscription to `stream`, which it then keeps running.
-    pub(super) fn tied_to(mut self, stream: &Arc<Stream>) -> Receiver<T> {
-        self.stream = Some(Arc::clone(stream));
+    pub(super) fn tied_to(mut self, stream: &Arc<impl Send + Sync + 'static>) -> Receiver<T> {
+        self.stream = Some(stream.clone());
         self
     }
 }
@@ -203,14 +201,6 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    /// Returns the scope of a view's session handle.
-    pub(crate) fn of(handle: &Handle) -> Scope {
-        Scope {
-            route: handle.scope(),
-            depth: handle.depth(),
-        }
-    }
-
     /// Returns the scope of exactly `route`.
     pub(crate) fn point(route: DeviceRoute) -> Scope {
         Scope { route, depth: 0 }

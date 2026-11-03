@@ -21,17 +21,22 @@
 //! connection, which its pump fills from those watches, and holds no value
 //! it has not received.
 
-use super::rpc::RpcRegistry;
+use super::rpc::{CallError, RpcErrorPayload, RpcRegistry, RpcRegistryError};
 use super::state::{MetadataState, Presence, RegistryState, SettingChange, Settings};
 use super::stream::{End, Lane, Receiver, Scope, Sink};
 use crate::chan::Notify;
+use crate::data::PacketParser;
+use crate::proto::rpc::RpcError;
 use crate::proto::{DeviceRoute, SessionId};
-use crate::proxy::Watch;
+use crate::proxy::{Update, Watch, CHANGED, TIMED_OUT, UNANSWERED};
+use crate::tio::packet::Packet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// How many setting changes a receiver's queue holds.
 pub(crate) const CHANGE_QUEUE_LEN: usize = 4096;
@@ -490,6 +495,107 @@ impl Store {
         end_sinks(&mut self.route_sinks, end);
         for entry in self.devices.values_mut() {
             each_slot!(entry, |sinks| end_sinks(sinks, end));
+        }
+    }
+
+    /// Keeps what `update` says of the device at `route`. Its
+    /// metadata records reach `parser` as the device's own, and the
+    /// metadata the parser then holds is the value kept, and no metadata
+    /// resets any route but `route`. Settings are kept only when they were
+    /// read with the table the store holds, and a table with the hash and
+    /// session of the one held keeps them. A table with the hash and session
+    /// of one the store holds already is that one, so the device's table and
+    /// the table its changes carry are one value while they are the same.
+    pub(crate) fn apply(&mut self, route: DeviceRoute, update: Update, parser: &mut PacketParser) {
+        match update {
+            Update::Presence(presence) => {
+                let now = Instant::now().into_std();
+                let presence = match presence.map(|session| session.map(SessionId::new)) {
+                    Ok(session) => Presence::Alive { session },
+                    Err(None) => Presence::Connecting,
+                    Err(Some(ago)) => {
+                        let since = now.checked_sub(Duration::from_millis(ago));
+                        Presence::Lost {
+                            since: since.unwrap_or(now),
+                        }
+                    }
+                };
+                self.set(route, PRESENCE, presence);
+            }
+            Update::Metadata(None) => self.set(route, METADATA, MetadataState::Unsupported),
+            Update::Metadata(Some(records)) if records.is_empty() => {
+                parser.relearn_route(route);
+                self.set(route, METADATA, MetadataState::Pending);
+            }
+            Update::Metadata(Some(records)) => {
+                for record in records {
+                    let applied = Packet::from_slice_prefix(&record)
+                        .map_err(|error| error.to_string())
+                        .and_then(|(packet, _)| {
+                            let packet = packet.with_route(route);
+                            parser
+                                .push_packet(&packet)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = applied {
+                        log::warn!("dropping a metadata record of {route}: {error}");
+                    }
+                }
+                if let Some(snapshot) = parser.metadata(route) {
+                    self.set(route, METADATA, MetadataState::Ready(snapshot));
+                }
+            }
+            Update::Table(Ok((hash, session, entries))) => {
+                let session = session.map(SessionId::new);
+                // The same table again keeps the settings read with it.
+                let held = self.value(route, REGISTRY);
+                if !held.is_some_and(|held| {
+                    held.is_ok_and(|held| (held.hash, held.session) == (hash, session))
+                }) {
+                    let table = self.table_of(route, hash, session).unwrap_or_else(|| {
+                        Arc::new(RpcRegistry::from_entries(entries, hash, session))
+                    });
+                    self.set_registry(route, Ok(table));
+                }
+            }
+            Update::Table(Err((CHANGED, _))) => {
+                self.set_registry(route, Err(RpcRegistryError::TableChanged))
+            }
+            Update::Table(Err((code, message))) => {
+                let error = match code {
+                    TIMED_OUT => CallError::Timeout,
+                    UNANSWERED => CallError::ResponseLost,
+                    code => CallError::DeviceError(RpcErrorPayload {
+                        error: RpcError::from(code),
+                        extra: message.into(),
+                    }),
+                };
+                self.set_registry(route, Err(RpcRegistryError::DeviceRpcError(error)));
+            }
+            Update::Settings(hash, version, values) => match self.value(route, REGISTRY) {
+                Some(Ok(registry)) if registry.hash == hash => {
+                    let values = values.into_iter().map(|(name, value)| (name, value.into()));
+                    let settings = Settings::new(registry, version, values.collect());
+                    self.set_settings(route, Arc::new(settings));
+                }
+                _ => log::warn!("dropping settings of {route} read with a table it does not hold"),
+            },
+            Update::Setting(name, seq, reply) => {
+                self.record_change(route, name, seq, reply.into());
+            }
+            Update::Recorded(table) => {
+                let table = table.map(|(hash, session, entries)| {
+                    RpcRegistry::from_entries(entries, hash, session.map(SessionId::new))
+                });
+                self.name_table(route, table);
+            }
+            Update::Routes(routes) => {
+                let routes = routes
+                    .iter()
+                    .filter_map(|hops| DeviceRoute::from_hops(hops).ok());
+                self.list(route, routes);
+            }
+            Update::Lagged(missed) => self.lag(route, missed),
         }
     }
 }

@@ -5,8 +5,6 @@ use super::link::{Candidate, Link};
 use super::Layout;
 use crate::tio::transport::{self, PortInterface};
 
-/// The target the proxy resolves for the client.
-pub(super) const AUTO: &str = "auto";
 /// The target that opens the host's default layout.
 pub(super) const DEFAULT: &str = "default";
 

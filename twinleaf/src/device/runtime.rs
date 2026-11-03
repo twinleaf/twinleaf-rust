@@ -21,8 +21,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
+use super::session::ProxyAddress;
 use crate::proto::TCP_DEFAULT_PORT;
-use crate::proxy::{self, HostOptions, Proxy, PROXY_VARIABLE};
+use crate::proxy::{self, HostOptions, Proxy};
 use crate::rt::{BoxFuture, Supervisor};
 
 /// How long [`ensure_proxy`] waits for the proxy it started to answer.
@@ -389,53 +390,21 @@ mod sandbox {
     }
 }
 
-/// The proxy a connection goes through, and whether it may be started.
-#[derive(Debug, Clone)]
-pub(crate) struct ProxyAddress {
-    /// Where it answers, such as `tcp://127.0.0.1:7855`.
-    pub(crate) url: String,
-    /// What finds or starts the proxy when nothing answers. Only the
-    /// machine's own proxy has one.
-    pub(crate) ensure: Option<fn() -> BoxFuture<'static, io::Result<()>>>,
+/// Returns the proxy `TWINLEAF_PROXY` names, or else the machine's own on
+/// `127.0.0.1:7855`, which may be started.
+pub(crate) fn chosen_proxy() -> ProxyAddress {
+    proxy_named_by(proxy::named())
 }
 
-impl ProxyAddress {
-    /// Returns the proxy `TWINLEAF_PROXY` names, or else the machine's own
-    /// on `127.0.0.1:7855`, which may be started.
-    pub(crate) fn chosen() -> ProxyAddress {
-        Self::of(proxy::named())
-    }
-
-    /// Returns the proxy as [`chosen`](Self::chosen) does, with `named` as
-    /// the variable's value.
-    fn of(named: Option<String>) -> ProxyAddress {
-        match named {
-            Some(url) => ProxyAddress { url, ensure: None },
-            None => ProxyAddress {
-                url: proxy::endpoint_at(TCP_DEFAULT_PORT),
-                ensure: Some(ensure_proxy),
-            },
-        }
-    }
-
-    /// Returns the error to report when reaching the proxy failed with
-    /// `error`. For a proxy `TWINLEAF_PROXY` names, the message names the
-    /// variable, and says nothing answers there if the connection was refused
-    /// or timed out.
-    pub(crate) fn unreachable(&self, error: io::Error) -> io::Error {
-        let (kind, url) = (error.kind(), &self.url);
-        let message = match self.ensure {
-            Some(_) => format!("cannot reach the proxy at {url}: {error}"),
-            None if matches!(
-                kind,
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
-            ) =>
-            {
-                format!("no proxy answers at {url} ({PROXY_VARIABLE})")
-            }
-            None => format!("cannot reach the proxy at {url} ({PROXY_VARIABLE}): {error}"),
-        };
-        io::Error::new(kind, message)
+/// Returns the proxy as [`chosen_proxy`] does, with `named` as the variable's
+/// value.
+fn proxy_named_by(named: Option<String>) -> ProxyAddress {
+    match named {
+        Some(url) => ProxyAddress { url, ensure: None },
+        None => ProxyAddress {
+            url: proxy::endpoint_at(TCP_DEFAULT_PORT),
+            ensure: Some(ensure_proxy),
+        },
     }
 }
 
@@ -462,11 +431,11 @@ mod tests {
     /// named the machine's own proxy is.
     #[test]
     fn the_variable_names_the_proxy_else_the_machines_proxy() {
-        let named = ProxyAddress::of(Some("tcp://127.0.0.1:2".to_string()));
+        let named = proxy_named_by(Some("tcp://127.0.0.1:2".to_string()));
         assert_eq!(named.url, "tcp://127.0.0.1:2");
         assert!(named.ensure.is_none());
 
-        let machine = ProxyAddress::of(None);
+        let machine = proxy_named_by(None);
         assert_eq!(machine.url, "tcp://127.0.0.1:7855");
         assert!(machine.ensure.is_some());
     }
