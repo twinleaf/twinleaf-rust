@@ -891,7 +891,8 @@ mod tests {
     use crate::proxy::DumpFlags;
     use crate::rt::Supervisor;
     use crate::tio::packet::{LinkStatus, ProxyRx};
-    use crate::tio::transport::{FakeEnd, TransportKind, DEFAULT_RX_CHANNEL_SIZE};
+    use crate::tio::transport::tests::fake::{self, FakeEnd};
+    use crate::tio::transport::{TransportKind, DEFAULT_RX_CHANNEL_SIZE};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
@@ -961,8 +962,7 @@ mod tests {
             holder: std::sync::Mutex::new(None),
         });
         let (deliver, incoming) = crate::chan::bounded(DEFAULT_RX_CHANNEL_SIZE);
-        let (port, end) =
-            transport::Port::fake_queue(TransportKind::Tcp, None, deliver, SOCKET_QUEUE);
+        let (port, end) = fake::port_queue(TransportKind::Tcp, None, deliver, SOCKET_QUEUE);
         let peer = "127.0.0.1:50000".parse().unwrap();
         let (lifeline, alive) = oneshot::channel();
         let mut session = Session::new(shared, 1, peer, port, incoming, alive);

@@ -148,42 +148,36 @@ impl FakeEnd {
     }
 }
 
-impl Port {
-    /// Returns a port of `kind` with `rates` over an in-memory pipe, and the
-    /// test's end of the pipe. The port's task runs on the current runtime,
-    /// with no heartbeat or holdoff, and frames packets as TCP does. It
-    /// delivers what it receives to `rx`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if it is called outside a runtime.
-    pub(crate) fn fake(
-        kind: TransportKind,
-        rates: Option<RateInfo>,
-        rx: Delivery,
-    ) -> (Port, FakeEnd) {
-        Port::fake_queue(kind, rates, rx, DEFAULT_TX_CHANNEL_SIZE)
-    }
+/// Returns a port of `kind` with `rates` over an in-memory pipe, and the
+/// test's end of the pipe. The port's task runs on the current runtime,
+/// with no heartbeat or holdoff, and frames packets as TCP does. It
+/// delivers what it receives to `rx`.
+///
+/// # Panics
+///
+/// Panics if it is called outside a runtime.
+pub(crate) fn port(kind: TransportKind, rates: Option<RateInfo>, rx: Delivery) -> (Port, FakeEnd) {
+    port_queue(kind, rates, rx, DEFAULT_TX_CHANNEL_SIZE)
+}
 
-    /// Returns a port as [`fake`](Self::fake) does, that queues up to
-    /// `tx_size` packets to send.
-    pub(crate) fn fake_queue(
-        kind: TransportKind,
-        rates: Option<RateInfo>,
-        rx: Delivery,
-        tx_size: usize,
-    ) -> (Port, FakeEnd) {
-        let (pipe, peer) = tokio::io::duplex(PIPE_SIZE);
-        let (stream, released, fail) = FakeStream::new(pipe);
-        let (port, task) = Port::with_task(kind, rates, Rules::NONE, rx, tx_size);
-        let run = task.run_stream(stream, Codec::default());
-        let port = port.start(&Supervisor::current(), "a fake port", run);
-        let end = FakeEnd {
-            peer,
-            written: BytesMut::new(),
-            fail: Some(fail),
-            released,
-        };
-        (port, end)
-    }
+/// Returns a port as [`port`] does, that queues up to
+/// `tx_size` packets to send.
+pub(crate) fn port_queue(
+    kind: TransportKind,
+    rates: Option<RateInfo>,
+    rx: Delivery,
+    tx_size: usize,
+) -> (Port, FakeEnd) {
+    let (pipe, peer) = tokio::io::duplex(PIPE_SIZE);
+    let (stream, released, fail) = FakeStream::new(pipe);
+    let (port, task) = Port::with_task(kind, rates, Rules::NONE, rx, tx_size);
+    let run = task.run_stream(stream, Codec::default());
+    let port = port.start(&Supervisor::current(), "a fake port", run);
+    let end = FakeEnd {
+        peer,
+        written: BytesMut::new(),
+        fail: Some(fail),
+        released,
+    };
+    (port, end)
 }

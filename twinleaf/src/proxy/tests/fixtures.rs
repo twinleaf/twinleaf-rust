@@ -12,7 +12,8 @@ use crate::proxy::link::Opens;
 use crate::proxy::worker::Opener;
 use crate::proxy::HostOptions;
 use crate::tio::packet::{Packet, Payload};
-use crate::tio::transport::{FakeEnd, Port, TransportKind};
+use crate::tio::transport::tests::fake::{self, FakeEnd};
+use crate::tio::transport::{Port, TransportKind};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
@@ -431,7 +432,7 @@ pub(in crate::proxy) fn fakes(
                 let open = {
                     let (url, sender) = (url.clone(), sender.clone());
                     move || {
-                        let (port, end) = Port::fake(TransportKind::Tcp, None, results);
+                        let (port, end) = fake::port(TransportKind::Tcp, None, results);
                         let _ = sender.send(Opened { url, end });
                         Ok(port)
                     }

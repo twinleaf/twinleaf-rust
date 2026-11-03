@@ -1606,7 +1606,8 @@ mod tests {
     use crate::proxy::outbox::Outbox;
     use crate::proxy::tests::fixtures::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use crate::rt;
-    use crate::tio::transport::{FakeEnd, RateInfo, TransportKind};
+    use crate::tio::transport::tests::fake::{self, FakeEnd};
+    use crate::tio::transport::{RateInfo, TransportKind};
     use std::future::{self, Future};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc::error::TryRecvError;
@@ -1967,7 +1968,7 @@ mod tests {
         results: crate::chan::Sender<ReceiveResult>,
         ends: &mpsc::UnboundedSender<FakeEnd>,
     ) -> io::Result<HardwarePort> {
-        let (port, end) = HardwarePort::fake(kind, None, results);
+        let (port, end) = fake::port(kind, None, results);
         let _ = ends.send(end);
         Ok(port)
     }
@@ -2670,7 +2671,7 @@ mod tests {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
         let open = scripted(move |_, results| {
             let kind = TransportKind::Serial;
-            let (port, end) = HardwarePort::fake(kind, Some(rates.clone()), results);
+            let (port, end) = fake::port(kind, Some(rates.clone()), results);
             let _ = ends.send(end);
             future::ready(Ok(port))
         });
@@ -2738,7 +2739,7 @@ mod tests {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
         let open = scripted(move |_, results| {
             let kind = TransportKind::Serial;
-            let (port, end) = HardwarePort::fake(kind, Some(rates.clone()), results);
+            let (port, end) = fake::port(kind, Some(rates.clone()), results);
             let _ = ends.send(end);
             future::ready(Ok(port))
         });
@@ -2782,7 +2783,7 @@ mod tests {
         let (ends, mut opened_ends) = mpsc::unbounded_channel();
         let open = scripted(move |_, results| {
             let kind = TransportKind::Serial;
-            let (port, end) = HardwarePort::fake(kind, Some(rates.clone()), results);
+            let (port, end) = fake::port(kind, Some(rates.clone()), results);
             let _ = ends.send(end);
             future::ready(Ok(port))
         });

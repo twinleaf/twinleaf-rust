@@ -16,6 +16,7 @@ pub(crate) mod tcp;
 mod tests;
 pub(crate) mod udp;
 
+use super::{ReceiveResult, RecvError, TransportEvent};
 use crate::tio::packet::{self, Packet};
 
 /// Why received bytes did not decode as a packet.
@@ -48,5 +49,16 @@ fn decode_exact(raw: &[u8]) -> Result<Packet, Error> {
             Err(Error::Invalid(packet::DecodeError::PacketTooSmall))
         }
         Err(error) => Err(Error::Invalid(error)),
+    }
+}
+
+/// A consumed frame error is an event. Lost stream framing ends the link.
+fn rejected_frame(error: Error) -> ReceiveResult {
+    match error {
+        Error::Invalid(error) => Ok(TransportEvent::RejectedFrame(error)),
+        Error::TrailingBytes => Ok(TransportEvent::RejectedFrame(
+            packet::DecodeError::PacketTooBig,
+        )),
+        Error::LostFraming(error) => Err(RecvError::LostFraming(error)),
     }
 }

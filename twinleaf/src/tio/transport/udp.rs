@@ -40,22 +40,6 @@ fn local_address(address: &SocketAddr) -> SocketAddr {
     (ip, 0).into()
 }
 
-/// Returns `true` for an error that a connected UDP socket reports from ICMP,
-/// such as port or host unreachable. Receiving treats these errors as
-/// transient. The watchdog of the proxy's device link judges whether the
-/// device is gone.
-pub(super) fn is_advisory_network_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::HostUnreachable
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

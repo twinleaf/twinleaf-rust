@@ -859,13 +859,13 @@ pub(crate) fn client_name() -> String {
 mod tests {
     use super::*;
     use crate::proxy::Mount;
+    use crate::tio::transport::tests::fake;
 
     /// Events skipped during the handshake do not restart its absolute deadline.
     #[tokio::test(start_paused = true)]
     async fn handshake_noise_does_not_extend_the_deadline() {
         let (send, received) = crate::chan::unbounded();
-        let (port, _peer) =
-            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let (port, _peer) = fake::port(transport::TransportKind::Tcp, None, send.clone());
         let started = Instant::now();
         let within = Duration::from_millis(10);
         let greeting = handshake(
@@ -899,8 +899,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_accepts_a_reply_after_rejected_frames() {
         let (send, received) = crate::chan::unbounded();
-        let (port, _peer) =
-            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let (port, _peer) = fake::port(transport::TransportKind::Tcp, None, send.clone());
         send.send(Ok(TransportEvent::Text("boot".into()))).unwrap();
         send.send(Ok(TransportEvent::RejectedFrame(
             crate::tio::packet::DecodeError::CRC32,
@@ -992,8 +991,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hello_with_no_control_reply_is_a_proxy_from_an_older_build() {
         let (send, received) = crate::chan::unbounded();
-        let (port, _peer) =
-            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let (port, _peer) = fake::port(transport::TransportKind::Tcp, None, send.clone());
         let started = Instant::now();
 
         let error = handshake(
@@ -1021,8 +1019,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_refused_request_fails_with_the_proxy_message() {
         let (send, received) = crate::chan::unbounded();
-        let (port, _peer) =
-            transport::Port::fake(transport::TransportKind::Tcp, None, send.clone());
+        let (port, _peer) = fake::port(transport::TransportKind::Tcp, None, send.clone());
         let refusal = Request::decode(b"proxy.reboot", &[]).unwrap_err();
         send.send(Ok(TransportEvent::Packet(answer(REQUEST_ID, Err(refusal)))))
             .unwrap();

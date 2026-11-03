@@ -133,7 +133,7 @@ impl tokio_util::codec::Decoder for Codec {
             Ok(Some(Frame::Packet(packet))) => Ok(Some(Self::Item::Packet(packet))),
             Ok(Some(Frame::Text(text))) => Ok(Some(Self::Item::Text(text))),
             Ok(None) => Ok(None),
-            Err(error) => super::super::rejected_frame(error).map(Some),
+            Err(error) => super::rejected_frame(error).map(Some),
         }
     }
 }

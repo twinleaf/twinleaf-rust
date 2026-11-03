@@ -43,7 +43,7 @@ impl tokio_util::codec::Decoder for Codec {
         src.clear();
         match decoded {
             Ok(packet) => Ok(Some(Self::Item::Packet(packet))),
-            Err(error) => super::super::rejected_frame(error).map(Some),
+            Err(error) => super::rejected_frame(error).map(Some),
         }
     }
 }

@@ -1,4 +1,4 @@
-pub(super) mod fake;
+pub(crate) mod fake;
 /// The tests a turmoil build leaves out, as they run on the real network.
 #[cfg(not(turmoil))]
 mod real;

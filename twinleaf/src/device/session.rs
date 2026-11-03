@@ -1666,7 +1666,8 @@ mod tests {
     async fn a_session_beats_and_gives_up_a_quiet_proxy() {
         let tasks = Supervisor::current();
         let (deliver, received) = crate::chan::bounded(transport::DEFAULT_RX_CHANNEL_SIZE);
-        let (port, mut end) = transport::Port::fake(transport::TransportKind::Tcp, None, deliver);
+        let (port, mut end) =
+            transport::tests::fake::port(transport::TransportKind::Tcp, None, deliver);
         let args = encode(&TARGET);
         let open = Purpose::Use.method();
         let opening = handshake(&port, &received, "fake", open, &args, "open", WAIT);

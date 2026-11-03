@@ -14,8 +14,7 @@
 
 use super::codec::udp as datagram;
 use super::{
-    udp, Delivery, KeepAlive, PacketOrControl, ReceiveResult, RecvError, TransportEvent,
-    DRAIN_TIMEOUT,
+    Delivery, KeepAlive, PacketOrControl, ReceiveResult, RecvError, TransportEvent, DRAIN_TIMEOUT,
 };
 use crate::proto::DeviceRoute;
 use crate::rt::{self, sleep_until_some};
@@ -321,7 +320,7 @@ impl Task {
                             self.heard = Instant::now();
                             Ok(event)
                         }
-                        Some(Err(RecvError::IO(error))) if udp::is_advisory_network_error(&error) => continue,
+                        Some(Err(RecvError::IO(error))) if is_advisory_network_error(&error) => continue,
                         Some(Err(error)) => Err(error),
                         None => break,
                     };
@@ -330,7 +329,7 @@ impl Task {
                 flushed = flush_by(&mut sink, write_by), if writing => {
                     match flushed {
                         Ok(()) => {}
-                        Err(RecvError::IO(error)) if udp::is_advisory_network_error(&error) => {
+                        Err(RecvError::IO(error)) if is_advisory_network_error(&error) => {
                             // UdpFramed retains an unsent datagram after an error.
                             // Drop that datagram while keeping the socket.
                             let socket = sink.reunite(source)
@@ -392,4 +391,20 @@ async fn close_in_stages<T>(
         }
     };
     let _ = timeout_at(Instant::now() + within, closing).await;
+}
+
+/// Returns `true` for an error that a connected UDP socket reports from ICMP,
+/// such as port or host unreachable. Receiving treats these errors as
+/// transient. The watchdog of the proxy's device link judges whether the
+/// device is gone.
+fn is_advisory_network_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
 }

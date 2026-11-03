@@ -1,4 +1,4 @@
-use super::fake::{FakeStream, PIPE_SIZE};
+use super::fake::{self, FakeStream, PIPE_SIZE};
 use crate::chan::{Receiver, RecvTimeoutError};
 #[cfg(feature = "serial")]
 use bytes::BytesMut;
@@ -11,6 +11,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use crate::rt;
+use crate::tio::transport::task::Rules;
 use crate::tio::transport::*;
 
 /// A TCP URL on this machine is local by address or by `localhost`. Any
@@ -325,7 +326,7 @@ async fn closing_a_port_waits_for_its_task_and_then_ends_it() {
 #[tokio::test(start_paused = true)]
 async fn a_kept_alive_port_beats_and_gives_up_a_quiet_peer() {
     let (send, receive) = crate::chan::unbounded();
-    let (port, mut peer) = Port::fake(TransportKind::Tcp, None, send);
+    let (port, mut peer) = fake::port(TransportKind::Tcp, None, send);
     let keep_alive = KeepAlive {
         beat: Packet::alive,
         every: Duration::from_secs(1),
@@ -356,7 +357,7 @@ async fn a_kept_alive_port_beats_and_gives_up_a_quiet_peer() {
 #[tokio::test]
 async fn a_read_error_ends_the_transport_without_dropping_the_port() {
     let (send, receive) = crate::chan::unbounded();
-    let (port, mut peer) = Port::fake(TransportKind::Tcp, None, send);
+    let (port, mut peer) = fake::port(TransportKind::Tcp, None, send);
     peer.fail(io::ErrorKind::ConnectionReset);
     assert!(matches!(
         receive.recv_async().await.unwrap(),

@@ -66,7 +66,7 @@ impl tokio_util::codec::Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         match Codec::decode(self, src) {
             Ok(packet) => Ok(packet.map(Self::Item::Packet)),
-            Err(error) => super::super::rejected_frame(error).map(Some),
+            Err(error) => super::rejected_frame(error).map(Some),
         }
     }
 }
