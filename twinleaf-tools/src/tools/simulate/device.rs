@@ -340,6 +340,13 @@ impl Clock {
     }
 }
 
+/// The port of a device no host has reached yet, as at boot.
+struct Unheard;
+
+impl Sink for Unheard {
+    fn send(&mut self, _packet: &[u8]) {}
+}
+
 /// One simulated device.
 pub(super) struct SimDevice {
     pub(super) route: DeviceRoute,
@@ -427,7 +434,7 @@ impl SimDevice {
         };
         // Firmware waits `dev.autostart` seconds before it acquires; the
         // simulator acquires from boot.
-        sim.start(now_ns);
+        sim.start(now_ns, &mut Unheard);
         sim
     }
 
@@ -488,11 +495,11 @@ impl SimDevice {
             Some((pending, Deferred::Flash(op))) => self.flash(pending, op, now_ns, out),
             Some((pending, Deferred::Acquire(request))) => {
                 match request {
-                    SyncRequest::Start => self.start(now_ns),
+                    SyncRequest::Start => self.start(now_ns, out),
                     SyncRequest::Stop => self.stop(),
                     SyncRequest::Restart => {
                         self.stop();
-                        self.start(now_ns);
+                        self.start(now_ns, out);
                     }
                 }
                 device::answer(pending, Ok::<_, RpcError>(&[][..]), out);
@@ -603,7 +610,7 @@ impl SimDevice {
     /// Starts acquiring every stream, from a segment at the current whole
     /// second, or at the first whole second after the acquisition before
     /// when that is later, so time never goes back across a restart.
-    fn start(&mut self, now_ns: u64) {
+    fn start(&mut self, now_ns: u64, out: &mut impl Sink) {
         if self.started_ns.is_some() {
             return;
         }
@@ -617,7 +624,7 @@ impl SimDevice {
         .expect("a serial that fits the identity fits the time reference");
         for stream in &mut self.streams {
             stream
-                .start(timeref.clone())
+                .start(timeref.clone(), &mut *out)
                 .expect("a stopped stream starts");
         }
         self.main = self.started(self.main.rate);
@@ -678,7 +685,7 @@ impl SimDevice {
         self.slot = Slot::new(self.slot.kind());
         self.capture = Captured::idle();
         self.stop();
-        self.start(now_ns);
+        self.start(now_ns, out);
         terminal_println!(
             "{}: rebooted; new session id {}",
             self.route,
@@ -737,8 +744,8 @@ impl SimDevice {
     fn sample_main(&mut self, out: &mut impl Sink) {
         if self.main.taken == self.main.rollover_at {
             self.main.rollover_at += u64::from(self.main.rate) * u64::from(self.segment_seconds);
-            self.streams[0].rollover();
-            self.streams[1].rollover();
+            self.streams[0].rollover(out);
+            self.streams[1].rollover(out);
         }
         if self.main.taken == self.main.drop_at {
             terminal_println!(
@@ -746,8 +753,8 @@ impl SimDevice {
                 self.route,
                 self.main.taken
             );
-            self.streams[0].skip(1);
-            self.streams[1].skip(1);
+            self.streams[0].skip(1, out);
+            self.streams[1].skip(1, out);
             self.main.taken += 1;
             self.main.drop_at = self.next_drop_after(self.main.taken, self.main.rate);
             return;
@@ -772,7 +779,7 @@ impl SimDevice {
     fn sample_aux(&mut self, out: &mut impl Sink) {
         if self.aux.taken == self.aux.rollover_at {
             self.aux.rollover_at += u64::from(self.aux.rate) * u64::from(self.segment_seconds);
-            self.streams[2].rollover();
+            self.streams[2].rollover(out);
         }
         if self.aux.taken == self.aux.drop_at {
             terminal_println!(
@@ -780,7 +787,7 @@ impl SimDevice {
                 self.route,
                 self.aux.taken
             );
-            self.streams[2].skip(1);
+            self.streams[2].skip(1, out);
             self.aux.taken += 1;
             self.aux.drop_at = self.next_drop_after(self.aux.taken, self.aux.rate);
             return;

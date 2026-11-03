@@ -3216,13 +3216,13 @@ mod tests {
                         self.now += u64::from(count) * SECOND / u64::from(RATE);
                         self.streams
                             .iter_mut()
-                            .for_each(|stream| stream.skip(count));
+                            .for_each(|stream| stream.skip(count, &mut self.port));
                     }
                     Step::Ask(name, ref args) => self.ask(name, args),
                     Step::Retune(stream, decimation, enabled) => {
-                        self.streams[stream].retune(params(decimation, enabled))
+                        self.streams[stream].retune(params(decimation, enabled), &mut self.port)
                     }
-                    Step::Rollover(stream) => self.streams[stream].rollover(),
+                    Step::Rollover(stream) => self.streams[stream].rollover(&mut self.port),
                     Step::Relabel(shift) => {
                         let from = self.timeref().start_time;
                         self.offset += i64::from(shift);
@@ -3230,7 +3230,7 @@ mod tests {
                         let to = self.timeref();
                         self.streams
                             .iter_mut()
-                            .for_each(|stream| stream.relabel(from, to.clone()));
+                            .for_each(|stream| stream.relabel(from, to.clone(), &mut self.port));
                     }
                     Step::Wait(ns) => {
                         self.now += ns;
@@ -3304,7 +3304,7 @@ mod tests {
                 let timeref = self.timeref();
                 self.streams.iter_mut().for_each(|stream| {
                     stream
-                        .start(timeref.clone())
+                        .start(timeref.clone(), &mut self.port)
                         .expect("a stopped stream starts")
                 });
                 self.device.set_acquisition(AcquisitionState::Running);
@@ -3366,6 +3366,27 @@ mod tests {
                 rows.map(|row| row.segment_id.value()).any(|id| id == 1),
                 "it rolled over"
             );
+            assert_eq!(contract::check(&platform.trace()), []);
+        }
+
+        /// Restarts that take no samples each open a segment, so the ring comes back to the first's id
+        /// with a count that starts past zero, which is lawful as each record goes out as it opens.
+        #[test]
+        fn restarts_that_take_no_samples_keep_the_contract() {
+            let mut platform = Platform::new();
+            [
+                Step::Ask("dev.start", Vec::new()),
+                Step::Sample(1),
+                Step::Relabel(0),
+                Step::Skip(10),
+                Step::Ask("dev.restart", Vec::new()),
+                Step::Ask("dev.restart", Vec::new()),
+                Step::Ask("dev.restart", Vec::new()),
+                Step::Skip(1),
+                Step::Sample(5),
+            ]
+            .iter()
+            .for_each(|step| platform.take(step));
             assert_eq!(contract::check(&platform.trace()), []);
         }
 

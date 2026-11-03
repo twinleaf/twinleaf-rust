@@ -2,7 +2,7 @@
 //!
 //! A packet carries consecutive samples of one segment, so a new segment, a
 //! gap in sample numbers, a full packet, or a segment's last sample all send
-//! what is staged. The record of a segment goes out before its first sample.
+//! what is staged. A segment's record goes out as it opens, after what is staged.
 
 use twinleaf_proto::data::{self, Metadata, MetadataFlags, SAMPLE_HEADER_SIZE};
 use twinleaf_proto::packet::Packet;
@@ -58,15 +58,9 @@ impl Publisher {
 
     /// Stage one issued sample, sending packets as they close. A sample too
     /// large for a packet is never published.
-    pub fn push(
-        &mut self,
-        issued: Issued,
-        segment: data::Segment<'_>,
-        sample: &[u8],
-        out: &mut impl Sink,
-    ) {
+    pub fn push(&mut self, issued: Issued, stream: StreamId, sample: &[u8], out: &mut impl Sink) {
         if let Some(number) = issued.output {
-            self.stage(issued, segment, number, sample, out);
+            self.stage(stream, issued.segment, number, sample, out);
         }
         if issued.last {
             self.flush(out);
@@ -89,10 +83,21 @@ impl Publisher {
         out.send(&self.buf[..len]);
     }
 
+    /// Send the record of a segment that opened, after what is staged, so
+    /// rows of the segment before it never follow it.
+    pub fn record(&mut self, segment: data::Segment<'_>, out: &mut impl Sink) {
+        self.flush(out);
+        let flags = MetadataFlags::UPDATE | MetadataFlags::LAST;
+        let len = Metadata::Segment(segment)
+            .write(flags, &mut self.buf)
+            .expect("a segment record fits a packet");
+        out.send(&self.buf[..len]);
+    }
+
     fn stage(
         &mut self,
-        issued: Issued,
-        segment: data::Segment<'_>,
+        stream: StreamId,
+        segment: SegmentId,
         number: SampleNumber,
         sample: &[u8],
         out: &mut impl Sink,
@@ -100,13 +105,10 @@ impl Publisher {
         if sample.is_empty() || sample.len() > MAX_SAMPLE_BYTES {
             return;
         }
-        if !self.takes(segment.stream_id, issued.segment, number, sample.len()) {
+        if !self.takes(stream, segment, number, sample.len()) {
             self.flush(out);
         }
-        if issued.first {
-            record(segment, out);
-        }
-        self.write(segment.stream_id, issued.segment, number, sample);
+        self.write(stream, segment, number, sample);
     }
 
     /// Whether the staged packet ends right before `number` of the same run
@@ -146,16 +148,6 @@ impl Default for Publisher {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Send a segment's record, which its first sample follows.
-fn record(segment: data::Segment<'_>, out: &mut impl Sink) {
-    let mut buf = [0u8; Packet::MAX_SIZE];
-    let flags = MetadataFlags::UPDATE | MetadataFlags::LAST;
-    let len = Metadata::Segment(segment)
-        .write(flags, &mut buf)
-        .expect("a segment record fits a packet");
-    out.send(&buf[..len]);
 }
 
 #[cfg(test)]
@@ -218,58 +210,51 @@ mod tests {
         }
     }
 
-    fn issued(segment_id: u8, output: u32, first: bool, last: bool) -> Issued {
+    fn issued(segment_id: u8, output: u32, last: bool) -> Issued {
         Issued {
             segment: SegmentId::new(segment_id),
             output: Some(SampleNumber::new(output)),
-            first,
             last,
         }
     }
 
     fn push(publisher: &mut Publisher, issued: Issued, out: &mut Sent) {
-        publisher.push(issued, segment(issued.segment.value()), &[7; 4], out);
+        publisher.push(issued, STREAM, &[7; 4], out);
     }
 
     #[test]
-    fn a_segment_record_precedes_its_first_sample() {
+    fn a_segment_record_follows_what_was_staged_before_it() {
         let mut publisher = Publisher::new();
         let mut sent = Sent::default();
-        push(&mut publisher, issued(0, 0, true, false), &mut sent);
-        push(&mut publisher, issued(0, 1, false, false), &mut sent);
+        push(&mut publisher, issued(0, 0, false), &mut sent);
+        push(&mut publisher, issued(0, 1, false), &mut sent);
+        publisher.record(segment(1), &mut sent);
+        push(&mut publisher, issued(1, 0, false), &mut sent);
         publisher.flush(&mut sent);
-        assert_eq!(sent.packets(), [Ok(MetadataType::Segment), Err((0, 0, 8))]);
+        assert_eq!(
+            sent.packets(),
+            [Err((0, 0, 8)), Ok(MetadataType::Segment), Err((1, 0, 4))]
+        );
     }
 
     #[test]
     fn a_packet_never_spans_two_segments() {
         let mut publisher = Publisher::new();
         let mut sent = Sent::default();
-        push(&mut publisher, issued(0, 0, true, false), &mut sent);
-        push(&mut publisher, issued(1, 0, true, false), &mut sent);
+        push(&mut publisher, issued(0, 0, false), &mut sent);
+        push(&mut publisher, issued(1, 0, false), &mut sent);
         publisher.flush(&mut sent);
-        assert_eq!(
-            sent.packets(),
-            [
-                Ok(MetadataType::Segment),
-                Err((0, 0, 4)),
-                Ok(MetadataType::Segment),
-                Err((1, 0, 4)),
-            ]
-        );
+        assert_eq!(sent.packets(), [Err((0, 0, 4)), Err((1, 0, 4))]);
     }
 
     #[test]
     fn a_gap_in_sample_numbers_starts_a_new_packet() {
         let mut publisher = Publisher::new();
         let mut sent = Sent::default();
-        push(&mut publisher, issued(0, 0, true, false), &mut sent);
-        push(&mut publisher, issued(0, 2, false, false), &mut sent);
+        push(&mut publisher, issued(0, 0, false), &mut sent);
+        push(&mut publisher, issued(0, 2, false), &mut sent);
         publisher.flush(&mut sent);
-        assert_eq!(
-            sent.packets(),
-            [Ok(MetadataType::Segment), Err((0, 0, 4)), Err((0, 2, 4))]
-        );
+        assert_eq!(sent.packets(), [Err((0, 0, 4)), Err((0, 2, 4))]);
     }
 
     #[test]
@@ -278,18 +263,11 @@ mod tests {
         let mut sent = Sent::default();
         let per_packet = (MAX_SAMPLE_BYTES / 4) as u32;
         (0..per_packet + 1).for_each(|number| {
-            push(
-                &mut publisher,
-                issued(0, number, number == 0, false),
-                &mut sent,
-            );
+            push(&mut publisher, issued(0, number, false), &mut sent);
         });
         assert_eq!(
             sent.packets(),
-            [
-                Ok(MetadataType::Segment),
-                Err((0, 0, usize::try_from(per_packet).unwrap() * 4)),
-            ]
+            [Err((0, 0, usize::try_from(per_packet).unwrap() * 4))]
         );
     }
 
@@ -297,35 +275,28 @@ mod tests {
     fn a_packet_closes_at_the_capacity_chosen() {
         let mut publisher = Publisher::with_capacity(8);
         let mut sent = Sent::default();
-        (0..3).for_each(|number| {
-            push(
-                &mut publisher,
-                issued(0, number, number == 0, false),
-                &mut sent,
-            )
-        });
+        (0..3).for_each(|number| push(&mut publisher, issued(0, number, false), &mut sent));
         assert_eq!(publisher.staged(), 4);
-        assert_eq!(sent.packets(), [Ok(MetadataType::Segment), Err((0, 0, 8))]);
+        assert_eq!(sent.packets(), [Err((0, 0, 8))]);
     }
 
     #[test]
     fn the_last_sample_of_a_segment_flushes() {
         let mut publisher = Publisher::new();
         let mut sent = Sent::default();
-        push(&mut publisher, issued(0, 0, true, false), &mut sent);
-        push(&mut publisher, issued(0, 1, false, true), &mut sent);
-        assert_eq!(sent.packets(), [Ok(MetadataType::Segment), Err((0, 0, 8))]);
+        push(&mut publisher, issued(0, 0, false), &mut sent);
+        push(&mut publisher, issued(0, 1, true), &mut sent);
+        assert_eq!(sent.packets(), [Err((0, 0, 8))]);
 
         let mut sent = Sent::default();
-        push(&mut publisher, issued(0, 2, false, false), &mut sent);
+        push(&mut publisher, issued(0, 2, false), &mut sent);
         publisher.push(
             Issued {
                 segment: SegmentId::new(0),
                 output: None,
-                first: false,
                 last: true,
             },
-            segment(0),
+            STREAM,
             &[7; 4],
             &mut sent,
         );
@@ -341,10 +312,9 @@ mod tests {
             Issued {
                 segment: SegmentId::new(0),
                 output: None,
-                first: false,
                 last: true,
             },
-            segment(0),
+            STREAM,
             &[7; 4],
             &mut sent,
         );
@@ -356,8 +326,8 @@ mod tests {
         let mut publisher = Publisher::new();
         let mut sent = Sent::default();
         let sample = [0u8; MAX_SAMPLE_BYTES + 1];
-        publisher.push(issued(0, 0, true, false), segment(0), &sample, &mut sent);
-        publisher.push(issued(0, 1, true, false), segment(0), &[], &mut sent);
+        publisher.push(issued(0, 0, false), STREAM, &sample, &mut sent);
+        publisher.push(issued(0, 1, false), STREAM, &[], &mut sent);
         publisher.flush(&mut sent);
         assert!(sent.0.is_empty());
     }
