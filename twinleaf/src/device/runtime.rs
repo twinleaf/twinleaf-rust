@@ -98,7 +98,7 @@ fn spawn_proxy(port: u16) -> io::Result<SpawnedProxy> {
     // CommandExt::inherit_handles is stable (rust-lang/rust#146407), the
     // proxy can open proxy.log itself and be started inheriting nothing.
     #[cfg(windows)]
-    let _kept = crate::tio::os::windows_helpers::StdioGuard::keep();
+    let _kept = crate::rt::os::windows_helpers::StdioGuard::keep();
     let child = command.spawn().map_err(|e| {
         io::Error::new(
             e.kind(),

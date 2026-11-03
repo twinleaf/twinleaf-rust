@@ -52,6 +52,8 @@
 //! A child process forked after the crate's runtime started has none of its
 //! threads. The child panics on its first use of the runtime.
 
+pub(crate) mod os;
+
 use crate::chan;
 use std::fmt::Display;
 use std::future::Future;
@@ -314,7 +316,7 @@ impl Activity {
 /// What keeps the system awake, from when it begins until it drops.
 #[cfg(target_os = "macos")]
 struct Awake {
-    _activity: Option<crate::tio::os::macos_helpers::ActivityGuard>,
+    _activity: Option<os::macos_helpers::ActivityGuard>,
 }
 
 // SAFETY: NSProcessInfo's beginActivity and endActivity are thread safe.
@@ -331,7 +333,7 @@ unsafe impl Sync for Awake {}
 impl Awake {
     /// Begins the `NSProcessInfo` activity.
     fn begin() -> Awake {
-        use crate::tio::os::macos_helpers::ActivityGuard;
+        use os::macos_helpers::ActivityGuard;
         Awake {
             _activity: ActivityGuard::latency_critical("Twinleaf I/O"),
         }
@@ -350,7 +352,7 @@ struct Awake {
 impl Awake {
     /// Starts the thread `twinleaf-awake`, which keeps the system awake.
     fn begin() -> Awake {
-        use crate::tio::os::windows_helpers::SleepGuard;
+        use os::windows_helpers::SleepGuard;
         // The execution state that prevents sleep belongs to the thread that
         // sets it, so one thread sets it and waits until it is dropped.
         let (keep, kept) = std::sync::mpsc::channel::<()>();
@@ -383,7 +385,7 @@ impl Awake {
 
 #[cfg(target_os = "windows")]
 mod priority {
-    use crate::tio::os::windows_helpers::ActivityGuard;
+    use super::os::windows_helpers::ActivityGuard;
     use std::cell::OnceCell;
 
     thread_local! {

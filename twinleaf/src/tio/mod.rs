@@ -23,7 +23,6 @@
 
 #[cfg(feature = "mdns")]
 pub(crate) mod mdns;
-pub(crate) mod os;
 pub mod packet;
 pub mod rpc;
 pub(crate) mod transport;
