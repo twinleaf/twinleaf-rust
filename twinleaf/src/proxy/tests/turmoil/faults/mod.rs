@@ -95,7 +95,7 @@ const LONGEST_BLIP: u64 = 2_500;
 /// might plausibly write, as well as an extreme one. A survivor gets one
 /// answer. A law is missing, the generator cannot reach the case, or the
 /// mutant is equivalent, with the reason.
-/// - S1. In `Mounts::feed` in `proxy/engine.rs`, queue each packet twice,
+/// - S1. In `Mounts::feed` in `proxy/engine/mod.rs`, queue each packet twice,
 ///   `mount.outbox.stream(shown.clone())` before `mount.outbox.stream(shown)`.
 /// - S2. In `StreamTracker::detect_boundary` in `data/state.rs`, count one
 ///   more, `first_sample_n.value() - expected.value() + 1`. In the same
@@ -106,7 +106,7 @@ const LONGEST_BLIP: u64 = 2_500;
 ///   branch, `if device.session() != self.last_session_id`.
 /// - S4. In `Outbox::update` in `proxy/outbox/mod.rs`, put a metadata update on
 ///   `Queue::Urgent`, in the arm `Update::Metadata(_) => Queue::Stream`.
-/// - S5. In `Engine::take` in `proxy/engine.rs`, store the session plus one
+/// - S5. In `Engine::take` in `proxy/engine/mod.rs`, store the session plus one
 ///   in `store.set(route, PRESENCE, Presence::Alive { session })`. In the
 ///   heartbeat arm `beat.session().or(held.flatten())` of the same function,
 ///   prefer the held session to the heartbeat's,
@@ -128,22 +128,22 @@ const LONGEST_BLIP: u64 = 2_500;
 ///   `let liveness = self.device.as_ref().and_then(Device::liveness_deadline)`.
 ///   In the same function, wait 100 s in
 ///   `self.next_attempt = Instant::now() + RECONNECT_INTERVAL`.
-/// - L2. In `Mounts::feed` in `proxy/engine.rs`, feed only the first mount,
+/// - L2. In `Mounts::feed` in `proxy/engine/mod.rs`, feed only the first mount,
 ///   `list.mounts.iter().take(1)` for the loop `for mount in &list.mounts`.
 ///   In `Outbox::queue` in `proxy/outbox/mod.rs`, compare with 0 in the loop
 ///   `while queues.sample_bytes > SAMPLE_BUDGET`.
 /// - L3. The first S6 mutant, with one call in flight.
 /// - L4. Delete `self.reconnect(&mut store, route)` in `Engine::apply_status`
-///   in `proxy/engine.rs` for the root, and in the `Presence::Lost` arm of
+///   in `proxy/engine/mod.rs` for the root, and in the `Presence::Lost` arm of
 ///   `Engine::take` for the child.
 /// - L5. At the end of `Worker::lose_device` in `proxy/worker.rs`, add
 ///   `std::mem::forget(device)`, so the lost port's socket and task stay.
 /// - L6. (a) Make `LIVENESS_TIMEOUT_TCP` in `proxy/worker.rs` 4000 ms and
 ///   30000 ms. (b) Make the `quiet` of `CLIENT_KEEPALIVE` in
-///   `proxy/control.rs` 7 s. (c) In `Session::serve` in `proxy/client.rs`,
+///   `proxy/control.rs` 7 s. (c) In `Client::serve` in `proxy/client.rs`,
 ///   guard the arm `received = self.incoming.next()` of the `select!` with
 ///   `if self.opening.is_none()`. (d) Make `IDLE` in `proxy/mod.rs` 8 s.
-///   (e) Make `QUIET` in `proxy/engine.rs` 4 s.
+///   (e) Make `QUIET` in `proxy/engine/mod.rs` 4 s.
 /// - L7. (a) In `Worker::lose_device` in `proxy/worker.rs`, set
 ///   `self.reconnect_deadline` to `now + timeout * 3 / 2`. In `Worker::packet`
 ///   in `device/session.rs`, delete `self.reopen = None` on
@@ -155,9 +155,9 @@ const LONGEST_BLIP: u64 = 2_500;
 /// - L9. Empty `Worker::cancel_active_rpcs` in `proxy/worker.rs`. Delete the
 ///   loop `for pending in std::mem::take(&mut self.pending).into_values()`
 ///   in `Worker::lose` in `device/session.rs`, which fails pending calls.
-/// - L10. In `Mounts::feed` in `proxy/engine.rs`, put link statuses on the
+/// - L10. In `Mounts::feed` in `proxy/engine/mod.rs`, put link statuses on the
 ///   first mount only.
-/// - L11. In `Engine::apply_status` in `proxy/engine.rs`, never forget the
+/// - L11. In `Engine::apply_status` in `proxy/engine/mod.rs`, never forget the
 ///   subtree on `SensorDisconnected`, at `let forget = matches!(status, ...)`,
 ///   so samples of a new boot wait on metadata the parser thinks it has. If
 ///   it survives, record whether the records sent first make it equivalent.
@@ -168,9 +168,9 @@ const LONGEST_BLIP: u64 = 2_500;
 ///   `transport::TransportKind::Tcp => LIVENESS_TIMEOUT_TCP`.
 /// - M2. In `jittered` in `device/session.rs`, draw from the nanoseconds of
 ///   `SystemTime::now()` for `RandomState::new().hash_one(())`.
-/// - M3. In `Mounts::feed` in `proxy/engine.rs`, feed only the last mount
+/// - M3. In `Mounts::feed` in `proxy/engine/mod.rs`, feed only the last mount
 ///   added, so an app that opens again starves the others.
-/// - I2. In `Engine::next_wake` in `proxy/engine.rs`, make a pending retry
+/// - I2. In `Engine::next_wake` in `proxy/engine/mod.rs`, make a pending retry
 ///   due now, at
 ///   `let retry = self.schedule.next_retry(asked(&self.heard, &self.demand))`.
 ///

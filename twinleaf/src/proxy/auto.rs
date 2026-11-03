@@ -1,7 +1,7 @@
 //! The resolution of the `auto` target. [`resolve`] picks the host's default
 //! layout, the one device in use, or the one device attached.
 
-use super::link::Link;
+use super::link::{Candidate, Link};
 use super::Layout;
 use crate::tio::transport::{self, PortInterface};
 
@@ -19,17 +19,6 @@ pub(super) enum Choice<'a> {
     Open(Link),
     /// The one device attached, by URL.
     Url(String),
-}
-
-/// A link the proxy has open whose device has answered, as `auto` weighs
-/// it.
-#[derive(Clone)]
-pub(super) struct Candidate {
-    /// The link.
-    pub(super) link: Link,
-    /// Whether a `proxy.open` has bound it. It is `false` while only probes
-    /// have.
-    pub(super) chosen: bool,
 }
 
 /// Resolves `auto` to the host's `default` layout, else the one link in

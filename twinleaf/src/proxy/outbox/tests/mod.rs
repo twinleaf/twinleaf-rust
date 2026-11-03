@@ -138,8 +138,7 @@
 //!
 //! None. Every law is a property.
 
-use super::super::client::ClientError;
-use super::{Outbox, Taken, HARD_LIMIT, SAMPLE_BUDGET, TAKE_LIMIT};
+use super::{ClientError, Outbox, Taken, HARD_LIMIT, SAMPLE_BUDGET, TAKE_LIMIT};
 use crate::chan::lock;
 use crate::device::tests::fixtures::{broadcast, segment_record};
 use crate::proto::data::Metadata;

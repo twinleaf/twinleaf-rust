@@ -209,10 +209,9 @@ mod client;
 mod control;
 mod engine;
 mod link;
-mod metadata;
 mod outbox;
 mod server;
-mod settings;
+mod table;
 mod worker;
 
 pub(crate) use control::{
@@ -222,16 +221,15 @@ pub(crate) use control::{
 #[cfg(test)]
 pub(crate) use control::{decode, parts, CLIENT_KEEPALIVE};
 pub(crate) use server::host;
+pub use server::Proxy;
 
 use crate::proto::{DeviceRoute, TCP_DEFAULT_PORT};
-use crate::rt::Supervisor;
 use crate::tio::transport::{CLOSE_TIMEOUT, CONNECT_TIMEOUT};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
 
 /// How long to wait for the handshake on a loopback address. A running proxy
 /// completes it at once.
@@ -285,7 +283,10 @@ pub(crate) fn endpoint_at(port: u16) -> String {
 #[cfg(test)]
 pub(crate) fn answers(port: u16) -> bool {
     let probing = async move { Ok(answers_async(port).await) };
-    matches!(Supervisor::new().run("proxy probe", probing), Ok(true))
+    matches!(
+        crate::rt::Supervisor::new().run("proxy probe", probing),
+        Ok(true)
+    )
 }
 
 /// Returns `true` if anything answers a connection to `port` of
@@ -456,26 +457,6 @@ pub struct ClientInfo {
     pub own_process: bool,
 }
 
-/// A running proxy. Dropping it stops it, and the drop blocks until the
-/// proxy has stopped, as [`shutdown`](Proxy::shutdown) does, for at most
-/// 1.5 s and the moment its aborts take.
-pub struct Proxy {
-    /// The server's mailbox, which keeps the proxy running.
-    server: mpsc::UnboundedSender<server::Notice>,
-    /// The receiver that disconnects once the proxy has stopped.
-    stopped: crate::chan::Receiver<()>,
-    /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
-    /// started on the crate's runtime.
-    drop_waits: bool,
-    /// The client table, as the server publishes it.
-    clients: watch::Receiver<Vec<ClientInfo>>,
-    default: watch::Sender<Option<Layout>>,
-    endpoint: String,
-    #[cfg(test)]
-    #[cfg_attr(all(test, turmoil), allow(dead_code))]
-    links: link::Links,
-}
-
 /// Stops the background proxy at `proxy`, a `tcp://host:port`. With `None`
 /// it stops the proxy [`Connection::open`](crate::Connection::open) goes
 /// through. Only a proxy with [`HostOptions::stoppable`] set stops this way,
@@ -507,130 +488,6 @@ pub fn stop(proxy: Option<&str>) -> io::Result<()> {
         None => named().unwrap_or_else(|| endpoint_at(TCP_DEFAULT_PORT)),
     };
     call(&url, control::STOP, &[], STOP_TIMEOUT).map(drop)
-}
-
-impl Proxy {
-    /// Starts a proxy with `options`. Returns once it accepts clients.
-    ///
-    /// The proxy runs on the crate's own runtime. This may be called from
-    /// inside an application's tokio runtime, and blocks that thread until
-    /// the proxy accepts clients or fails to start.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`io::ErrorKind::AddrInUse`] error if `options.port` is
-    /// nonzero and anything already answers on that port of `127.0.0.1`.
-    /// Nothing is bound then. The message says whether a Twinleaf proxy
-    /// already runs there. Also returns any error from binding the port or
-    /// listening on it.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
-    /// use twinleaf::DeviceRoute;
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let proxy = Proxy::host(HostOptions {
-    ///     default: Some(Layout {
-    ///         mounts: vec![Mount {
-    ///             url: "serial:///dev/ttyACM0".to_string(),
-    ///             source: DeviceRoute::root(),
-    ///             prefix: DeviceRoute::root(),
-    ///         }],
-    ///     }),
-    ///     ..HostOptions::default()
-    /// })?;
-    /// println!("Serving at {}", proxy.endpoint());
-    /// proxy.wait();
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn host(options: HostOptions) -> io::Result<Proxy> {
-        let mut proxy = Supervisor::new().run("proxy host", host(options))?;
-        proxy.drop_waits = true;
-        Ok(proxy)
-    }
-
-    /// Returns the URL a client on this machine connects to, such as
-    /// `tcp://127.0.0.1:7855`.
-    pub fn endpoint(&self) -> String {
-        self.endpoint.clone()
-    }
-
-    /// Replaces the layout `default` opens and `auto` prefers, or clears it
-    /// with `None`. Clients that already opened one keep it.
-    pub fn set_default(&self, layout: Option<Layout>) {
-        self.default.send_replace(layout);
-    }
-
-    /// Returns the clients connected now, in the order they connected. A
-    /// proxy that has stopped has none.
-    pub fn clients(&self) -> Vec<ClientInfo> {
-        match self.clients.has_changed() {
-            Ok(_) => self.clients.borrow().clone(),
-            Err(_stopped) => Vec::new(),
-        }
-    }
-
-    /// Blocks until the proxy has stopped, by `proxy.stop`, by idling out, or
-    /// by [`shutdown`](Self::shutdown).
-    pub fn wait(&self) {
-        let _ = self.stopped.recv();
-    }
-
-    /// Stops the proxy and blocks until it has stopped. Each client hears the
-    /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
-    /// connection closes. The proxy stops accepting clients and closes every
-    /// link.
-    ///
-    /// The stop waits at most 1.5 s for the clients to close, and in the
-    /// same 1.5 s for each link to let go of its device. Then it aborts the
-    /// tasks of the clients and links that still run, and returns. So it
-    /// blocks for at most 1.5 s and the moment the aborts take. An open of a
-    /// serial device in flight on a blocking thread runs to its end after
-    /// that. The engine that keeps a link's state, and the tasks that read
-    /// its devices' settings, end once their link has ended, and the stop
-    /// does not wait for them.
-    ///
-    /// Calling it again does nothing. It may be called from inside an
-    /// application's tokio runtime, and blocks that thread as it would any
-    /// other.
-    pub fn shutdown(&self) {
-        let _ = self.server.send(server::Notice::Stop);
-        self.wait();
-    }
-
-    /// Stops the proxy as [`shutdown`](Self::shutdown) does, and waits for
-    /// it without blocking. A proxy hosted on its caller's runtime, as the
-    /// crate's async [`host`] starts it, is stopped this way, since its drop
-    /// only asks it to stop.
-    pub(crate) async fn shutdown_async(&self) {
-        let _ = self.server.send(server::Notice::Stop);
-        let _ = self.stopped.recv_async().await;
-    }
-}
-
-impl fmt::Debug for Proxy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Proxy")
-            .field("endpoint", &self.endpoint)
-            .finish()
-    }
-}
-
-impl Drop for Proxy {
-    /// Stops the proxy. A proxy [`Proxy::host`] started is waited for as
-    /// [`shutdown`](Proxy::shutdown) waits. Any other proxy runs on its
-    /// caller's runtime and is only asked to stop, since on a runtime of one
-    /// thread a wait would block the proxy itself.
-    fn drop(&mut self) {
-        let _ = self.server.send(server::Notice::Stop);
-        if self.drop_waits {
-            self.wait();
-        }
-    }
 }
 
 #[cfg(test)]

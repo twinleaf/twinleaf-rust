@@ -2,11 +2,13 @@
 //! clients, runs the task of each, keeps the client table, and owns the
 //! registry of links. [`Shared`] holds what every client's task reads.
 
-use super::client::{Session, SOCKET_QUEUE};
+use super::client::{Client, SOCKET_QUEUE};
 use super::control::{self, Introduction, HELLO, HELLO_TIMEOUT};
-use super::link::{self, Links, Owner};
+use super::link::{Links, Owner};
+use super::table::{Notice, Shared, TableChange};
+use super::worker;
 use super::{
-    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, Proxy, IDLE, LEAVE_TIMEOUT,
+    answers_async, endpoint_at, ClientInfo, HostOptions, Layout, Listen, IDLE, LEAVE_TIMEOUT,
 };
 use crate::chan::oneshot;
 use crate::net::{Listeners, TcpStream};
@@ -14,6 +16,7 @@ use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::transport;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::ControlFlow;
@@ -27,47 +30,147 @@ use tokio_util::task::JoinMap;
 // An accept that fails for want of file descriptors fails again at once.
 const ACCEPT_RETRY: Duration = Duration::from_millis(20);
 
-/// What the server is told, by the proxy's handle and its clients' tasks.
-pub(super) enum Notice {
-    /// A change to client `id`'s entry in the table. The server answers on
-    /// `done` once the table shows it.
-    Update {
-        id: u64,
-        update: Update,
-        done: oneshot::Sender<()>,
-    },
-    /// A stop of the proxy.
-    Stop,
-}
-
-/// A change to a client's entry in the table.
-pub(super) enum Update {
-    /// The client introduced itself with `proxy.hello`.
-    Hello(Introduction),
-    /// The client opened this target.
-    Target(String),
-}
-
-/// What every client's task reads, none of which keeps the proxy running.
-pub(super) struct Shared {
-    /// How the proxy is hosted. Its default layout is held in `default`.
-    pub(super) options: HostOptions,
-    pub(super) endpoint: String,
+/// A running proxy. Dropping it stops it, and the drop blocks until the
+/// proxy has stopped, as [`shutdown`](Proxy::shutdown) does, for at most
+/// 1.5 s and the moment its aborts take.
+pub struct Proxy {
+    /// The server's mailbox, which keeps the proxy running.
+    server: mpsc::UnboundedSender<Notice>,
+    /// The receiver that disconnects once the proxy has stopped.
+    stopped: crate::chan::Receiver<()>,
+    /// Whether a drop waits for the stop, as for a proxy [`Proxy::host`]
+    /// started on the crate's runtime.
+    drop_waits: bool,
+    /// The client table, as the server publishes it.
+    clients: watch::Receiver<Vec<ClientInfo>>,
+    default: watch::Sender<Option<Layout>>,
+    endpoint: String,
+    #[cfg(test)]
+    #[cfg_attr(all(test, turmoil), allow(dead_code))]
     pub(super) links: Links,
-    /// The spawner of the clients' transports and blocking steps.
-    pub(super) tasks: Supervisor,
-    /// The server's mailbox.
-    pub(super) server: mpsc::WeakUnboundedSender<Notice>,
-    /// The default layout, which the host sets and a client may hold.
-    pub(super) default: watch::Sender<Option<Layout>>,
-    /// The id and address of the client holding the default with `proxy.default`.
-    pub(super) holder: Mutex<Option<(u64, String)>>,
 }
 
-impl Shared {
-    /// Returns the layout `default` opens.
-    pub(super) fn default(&self) -> Option<Layout> {
-        self.default.borrow().clone()
+impl Proxy {
+    /// Starts a proxy with `options`. Returns once it accepts clients.
+    ///
+    /// The proxy runs on the crate's own runtime. This may be called from
+    /// inside an application's tokio runtime, and blocks that thread until
+    /// the proxy accepts clients or fails to start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::ErrorKind::AddrInUse`] error if `options.port` is
+    /// nonzero and anything already answers on that port of `127.0.0.1`.
+    /// Nothing is bound then. The message says whether a Twinleaf proxy
+    /// already runs there. Also returns any error from binding the port or
+    /// listening on it.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use twinleaf::proxy::{HostOptions, Layout, Mount, Proxy};
+    /// use twinleaf::DeviceRoute;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let proxy = Proxy::host(HostOptions {
+    ///     default: Some(Layout {
+    ///         mounts: vec![Mount {
+    ///             url: "serial:///dev/ttyACM0".to_string(),
+    ///             source: DeviceRoute::root(),
+    ///             prefix: DeviceRoute::root(),
+    ///         }],
+    ///     }),
+    ///     ..HostOptions::default()
+    /// })?;
+    /// println!("Serving at {}", proxy.endpoint());
+    /// proxy.wait();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn host(options: HostOptions) -> io::Result<Proxy> {
+        let mut proxy = Supervisor::new().run("proxy host", host(options))?;
+        proxy.drop_waits = true;
+        Ok(proxy)
+    }
+
+    /// Returns the URL a client on this machine connects to, such as
+    /// `tcp://127.0.0.1:7855`.
+    pub fn endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    /// Replaces the layout `default` opens and `auto` prefers, or clears it
+    /// with `None`. Clients that already opened one keep it.
+    pub fn set_default(&self, layout: Option<Layout>) {
+        self.default.send_replace(layout);
+    }
+
+    /// Returns the clients connected now, in the order they connected. A
+    /// proxy that has stopped has none.
+    pub fn clients(&self) -> Vec<ClientInfo> {
+        match self.clients.has_changed() {
+            Ok(_) => self.clients.borrow().clone(),
+            Err(_stopped) => Vec::new(),
+        }
+    }
+
+    /// Blocks until the proxy has stopped, by `proxy.stop`, by idling out, or
+    /// by [`shutdown`](Self::shutdown).
+    pub fn wait(&self) {
+        let _ = self.stopped.recv();
+    }
+
+    /// Stops the proxy and blocks until it has stopped. Each client hears the
+    /// status [`Stopped`](crate::tio::packet::LinkStatus::Stopped), then its
+    /// connection closes. The proxy stops accepting clients and closes every
+    /// link.
+    ///
+    /// The stop waits at most 1.5 s for the clients to close, and in the
+    /// same 1.5 s for each link to let go of its device. Then it aborts the
+    /// tasks of the clients and links that still run, and returns. So it
+    /// blocks for at most 1.5 s and the moment the aborts take. An open of a
+    /// serial device in flight on a blocking thread runs to its end after
+    /// that. The engine that keeps a link's state, and the tasks that read
+    /// its devices' settings, end once their link has ended, and the stop
+    /// does not wait for them.
+    ///
+    /// Calling it again does nothing. It may be called from inside an
+    /// application's tokio runtime, and blocks that thread as it would any
+    /// other.
+    pub fn shutdown(&self) {
+        let _ = self.server.send(Notice::Stop);
+        self.wait();
+    }
+
+    /// Stops the proxy as [`shutdown`](Self::shutdown) does, and waits for
+    /// it without blocking. A proxy hosted on its caller's runtime, as the
+    /// crate's async [`host`] starts it, is stopped this way, since its drop
+    /// only asks it to stop.
+    pub(crate) async fn shutdown_async(&self) {
+        let _ = self.server.send(Notice::Stop);
+        let _ = self.stopped.recv_async().await;
+    }
+}
+
+impl fmt::Debug for Proxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Proxy")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl Drop for Proxy {
+    /// Stops the proxy. A proxy [`Proxy::host`] started is waited for as
+    /// [`shutdown`](Proxy::shutdown) waits. Any other proxy runs on its
+    /// caller's runtime and is only asked to stop, since on a runtime of one
+    /// thread a wait would block the proxy itself.
+    fn drop(&mut self) {
+        let _ = self.server.send(Notice::Stop);
+        if self.drop_waits {
+            self.wait();
+        }
     }
 }
 
@@ -260,16 +363,16 @@ impl Server {
     }
 
     /// Changes client `id`'s entry in the table, and answers on `done`.
-    fn update(&mut self, id: u64, update: Update, done: oneshot::Sender<()>) {
+    fn update(&mut self, id: u64, update: TableChange, done: oneshot::Sender<()>) {
         if let Some(info) = self.clients.get_mut(&id) {
             match update {
-                Update::Hello(client) => {
+                TableChange::Hello(client) => {
                     info.version = Some(client.version_text());
                     info.own_process = client.pid == std::process::id();
                     info.pid = Some(client.pid);
                     info.name = Some(client.name);
                 }
-                Update::Target(target) => info.target = Some(target),
+                TableChange::Target(target) => info.target = Some(target),
             }
             self.publish();
         }
@@ -298,7 +401,7 @@ impl Server {
     fn serve(&mut self, stream: TcpStream, peer: SocketAddr) {
         // What a client sends goes to its ports, so it is queued as deep as
         // they are. What it is sent waits in its outbox.
-        let (deliver, incoming) = crate::chan::bounded(link::client_tx_channel_size());
+        let (deliver, incoming) = crate::chan::bounded(worker::client_tx_channel_size());
         let tasks = &self.shared.tasks;
         let port = match transport::Port::from_tcp(stream, deliver, SOCKET_QUEUE, tasks) {
             Ok(port) => port,
@@ -323,7 +426,7 @@ impl Server {
         self.publish();
         let (lifeline, alive) = oneshot::channel();
         self.lifelines.insert(id, lifeline);
-        let session = Session::new(self.shared.clone(), id, peer, port, incoming, alive);
+        let session = Client::new(self.shared.clone(), id, peer, port, incoming, alive);
         let task = format_args!("proxy client {id}");
         self.shared
             .tasks

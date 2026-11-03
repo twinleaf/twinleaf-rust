@@ -2,7 +2,7 @@ use super::fixtures::{options, FakeDevice, WAIT};
 use crate::proto::rpc::RpcError;
 use crate::proto::PacketType;
 use crate::proxy::*;
-use crate::rt;
+use crate::rt::{self, Supervisor};
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use crate::tio::transport;
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};

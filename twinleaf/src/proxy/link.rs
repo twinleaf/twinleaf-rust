@@ -21,7 +21,6 @@
 //! The registry runs until its [`Owner`] drops. It then closes every link
 //! and waits [`LEAVE_TIMEOUT`] for their tasks before it ends.
 
-use super::auto::Candidate;
 use super::control::Refusal;
 use super::engine::{self, Mount, Mounts};
 use super::outbox::Outbox;
@@ -33,19 +32,14 @@ use crate::proto::rpc::RpcError;
 use crate::proto::DeviceRoute;
 use crate::rt::{sleep_until_some, Supervisor};
 use crate::tio::packet::Packet;
-use crate::tio::transport;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;
 use std::collections::BTreeMap;
-use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::task::JoinMap;
-
-/// How long a new link may take to deliver its first packet.
-pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What opens the device of each new link. It takes the link's URL and
 /// returns the opener its worker opens the device with.
@@ -55,15 +49,15 @@ pub(super) type Opens = Box<dyn FnMut(&str) -> Opener + Send>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct LinkId(u64);
 
-/// Returns the depth of the queue each port fills for the proxy.
-/// `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` may raise it above the default.
-pub(super) fn client_tx_channel_size() -> usize {
-    let min_size = transport::DEFAULT_TX_CHANNEL_SIZE;
-    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
-        std::cmp::max(req.parse().unwrap_or(0), min_size)
-    } else {
-        min_size
-    }
+/// A link the proxy has open whose device has answered, as `auto` weighs
+/// it.
+#[derive(Clone)]
+pub(super) struct Candidate {
+    /// The link.
+    pub(super) link: Link,
+    /// Whether a `proxy.open` has bound it. It is `false` while only probes
+    /// have.
+    pub(super) chosen: bool,
 }
 
 /// One device's connection, shared by every client that mounts it.
@@ -167,7 +161,7 @@ impl Lease {
         prefix: DeviceRoute,
         outbox: &Arc<Outbox>,
     ) -> Result<Mounted, String> {
-        let (port, from_port) = mpsc::channel(client_tx_channel_size());
+        let (port, from_port) = mpsc::channel(worker::client_tx_channel_size());
         // The engine feeds the mount before the worker adopts its port. An
         // engine that ends lets the client go, and a port asked for after
         // that is refused, as the worker ended first.

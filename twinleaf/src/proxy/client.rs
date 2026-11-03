@@ -1,7 +1,7 @@
 //! The task that serves each client connection. It answers the client's
 //! control requests, forwards what the client sends to its mounts, follows
 //! the client's watches, and writes the client's [`Outbox`] to its socket.
-//! [`Session::run`] runs it.
+//! [`Client::run`] runs it.
 //!
 //! A device watch follows the device's presence, announced settings and
 //! routes here, and the RPC table each announced setting was recorded
@@ -14,10 +14,9 @@ use super::auto::{self, Choice};
 use super::control::encode;
 use super::control::{self, Purpose, Refusal, Request, Update, Watch};
 use super::engine::Mount;
-use super::link::{self, Link, Mounted};
-use super::outbox::Outbox;
-use super::outbox::Taken;
-use super::server::{self, Notice, Shared};
+use super::link::{Link, Mounted};
+use super::outbox::{ClientError, Outbox, Taken};
+use super::table::{Notice, Shared, TableChange};
 use super::worker;
 use super::Layout;
 use crate::chan::oneshot::{self, error::TryRecvError};
@@ -46,37 +45,6 @@ use tokio_stream::StreamNotifyClose;
 /// for the client, and this queue only keeps the socket's task busy while
 /// the next batch is taken.
 pub(super) const SOCKET_QUEUE: usize = 64;
-
-/// Why a client's connection ended. The task serving the client logs it
-/// once.
-#[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum ClientError {
-    /// The client closed its connection, or the connection failed. A write
-    /// to a client that stops reading fails so once the transport has
-    /// waited its drain timeout, `DRAIN_TIMEOUT`, for one packet to go out,
-    /// and the connection of a client quiet for longer than the keepalive
-    /// allows fails so too.
-    #[error("it hung up")]
-    HungUp,
-    /// The proxy stopped and told the client.
-    #[error("the proxy stopped")]
-    Stopped,
-    /// The client let more pile up than its outbox holds, its
-    /// [`HARD_LIMIT`](super::outbox::HARD_LIMIT).
-    #[error("it fell behind")]
-    TooSlow,
-    /// The link to the device at this URL, which the client had opened,
-    /// ended without giving up on it.
-    #[error("the link to {0} ended unexpectedly")]
-    LinkEnded(String),
-    /// The proxy gave up reconnecting to the device at this URL, which the
-    /// client had opened.
-    #[error("the proxy gave up on {0}")]
-    GaveUp(String),
-    /// A packet it sent could not be queued for its device.
-    #[error("a packet it sent could not reach its device")]
-    ForwardFailed,
-}
 
 /// Returns `true` if `pkt` is an RPC request, reply or error.
 fn is_rpc(pkt: &Packet) -> bool {
@@ -111,7 +79,7 @@ impl Drop for Held {
 type Opening = BoxFuture<'static, (u16, Result<Binding, Refusal>)>;
 
 /// A client's connection and what it opened.
-pub(super) struct Session {
+pub(super) struct Client {
     shared: Arc<Shared>,
     id: u64,
     addr: String,
@@ -134,7 +102,7 @@ pub(super) struct Session {
     held: Option<Held>,
 }
 
-impl Session {
+impl Client {
     /// Creates the session of client `id`, connected from `peer`. The client
     /// is reached through `client`, whose packets arrive on `incoming`. The
     /// session ends once `alive` closes.
@@ -145,8 +113,8 @@ impl Session {
         client: transport::Port,
         incoming: crate::chan::Receiver<ReceiveResult>,
         alive: oneshot::Receiver<Infallible>,
-    ) -> Session {
-        Session {
+    ) -> Client {
+        Client {
             shared,
             id,
             addr: peer.to_string(),
@@ -403,7 +371,7 @@ impl Session {
 
     /// Changes the client's entry in the table, and waits until the table
     /// shows it or the server has ended.
-    async fn update(&mut self, update: server::Update) {
+    async fn update(&mut self, update: TableChange) {
         let (done, shown) = oneshot::channel();
         let notice = Notice::Update {
             id: self.id,
@@ -438,7 +406,7 @@ impl Session {
         match request {
             Request::Hello(client) => {
                 log::debug!("Client {} is {client}", self.addr);
-                self.update(server::Update::Hello(client)).await;
+                self.update(TableChange::Hello(client)).await;
                 let host = control::Introduction::of_this_process(&self.shared.options.name);
                 self.answer(id, Ok(encode(&host)))
             }
@@ -568,7 +536,7 @@ impl Session {
         let outcome = match outcome {
             Ok(binding) => {
                 let target = binding.target.clone();
-                self.update(server::Update::Target(target.clone())).await;
+                self.update(TableChange::Target(target.clone())).await;
                 self.binding = Some(binding);
                 Ok(encode(&target))
             }
@@ -587,7 +555,7 @@ impl Session {
 /// is a device URL.
 ///
 /// Returns a [`Refusal`] if the target does not resolve, a link is refused,
-/// or a link is not ready within [`link::READY_TIMEOUT`].
+/// or a link is not ready within [`worker::READY_TIMEOUT`].
 async fn bind(
     shared: Arc<Shared>,
     addr: String,
@@ -617,7 +585,7 @@ async fn attach(
     purpose: Purpose,
     outbox: Arc<Outbox>,
 ) -> Result<Binding, Refusal> {
-    let deadline = Instant::now() + link::READY_TIMEOUT;
+    let deadline = Instant::now() + worker::READY_TIMEOUT;
     let mut leases = Vec::with_capacity(layout.mounts.len());
     for mount in &layout.mounts {
         if names_this_proxy(&mount.url, &shared.endpoint) {
@@ -642,7 +610,7 @@ async fn attach(
         let reason = match timeout_at(deadline, link.ready()).await {
             Ok(Ok(())) => continue,
             Ok(Err(reason)) => reason,
-            Err(_) => format!("it sent nothing within {:?}", link::READY_TIMEOUT),
+            Err(_) => format!("it sent nothing within {:?}", worker::READY_TIMEOUT),
         };
         log::warn!("Could not open {} for client {addr}: {reason}", link.url());
         let message = format!("could not open {}: {reason}", link.url());
@@ -884,7 +852,7 @@ fn failed(error: &tokio::task::JoinError) -> Refusal {
 mod tests {
     use super::*;
     use crate::device::rpc::RpcRegistry;
-    use crate::device::session::{Inlet, Received, Session as AppSession};
+    use crate::device::session::{Inlet, Received, Session};
     use crate::device::stream::{End, Queued};
     use crate::proxy::link::{Links, Owner};
     use crate::proxy::tests::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
@@ -929,7 +897,7 @@ mod tests {
             &tasks,
             reconnect_timeout,
             DumpFlags::default(),
-            super::link::no_default(),
+            crate::proxy::link::no_default(),
             opens,
         );
         let (end, served, lifeline) = join(&links, default);
@@ -965,7 +933,7 @@ mod tests {
         let (port, end) = fake::port_queue(TransportKind::Tcp, None, deliver, SOCKET_QUEUE);
         let peer = "127.0.0.1:50000".parse().unwrap();
         let (lifeline, alive) = oneshot::channel();
-        let mut session = Session::new(shared, 1, peer, port, incoming, alive);
+        let mut session = super::Client::new(shared, 1, peer, port, incoming, alive);
         let served = tasks.spawn("a test client", async move {
             let served = session.serve().await;
             session.close().await;
@@ -1341,8 +1309,8 @@ mod tests {
     /// Runs an app's session over `end`, a client's connection, as its
     /// socket. The session opens again once its socket closes without a
     /// stop. Returns the session and the inlet of its pump.
-    fn app_over(mut end: FakeEnd) -> (AppSession, Inlet) {
-        let (app, proxy) = AppSession::test_pair_reopening(&Supervisor::current());
+    fn app_over(mut end: FakeEnd) -> (Session, Inlet) {
+        let (app, proxy) = Session::test_pair_reopening(&Supervisor::current());
         let inlet = app.attach(usize::MAX);
         crate::chan::spawn(async move {
             loop {
@@ -1481,7 +1449,7 @@ mod tests {
     }
 
     /// An open of a device that sends nothing is refused once
-    /// [`link::READY_TIMEOUT`] has passed, and the refusal says so.
+    /// [`worker::READY_TIMEOUT`] has passed, and the refusal says so.
     #[tokio::test(start_paused = true)]
     async fn an_open_of_a_silent_device_is_refused_at_the_ready_timeout() {
         let mut client = connect(None, None);
@@ -1490,7 +1458,7 @@ mod tests {
 
         let refused = answer(&next(&mut client.end).await);
 
-        assert_took(asked.elapsed(), link::READY_TIMEOUT, "the refusal");
+        assert_took(asked.elapsed(), worker::READY_TIMEOUT, "the refusal");
         let message = format!("could not open {DEVICE}: it sent nothing within 10s");
         assert_eq!(refused, (2, Err((RpcError::Load, message))));
     }

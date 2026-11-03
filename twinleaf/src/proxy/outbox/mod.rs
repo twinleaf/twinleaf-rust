@@ -61,7 +61,6 @@
 //! to the writer behind everything queued before it, and nothing goes after
 //! it.
 
-use super::client::ClientError;
 use super::control::{decode, parts, Part, Update};
 use crate::chan::lock;
 use crate::chan::Notify;
@@ -69,6 +68,37 @@ use crate::proto::data::FIRST_STREAM_ID;
 use crate::tio::packet::{LinkStatus, Packet, Payload, ProxyRx};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+
+/// Why a client's connection ended. The task serving the client logs it
+/// once.
+#[derive(Debug, Clone, thiserror::Error)]
+pub(super) enum ClientError {
+    /// The client closed its connection, or the connection failed. A write
+    /// to a client that stops reading fails so once the transport has
+    /// waited its drain timeout, `DRAIN_TIMEOUT`, for one packet to go out,
+    /// and the connection of a client quiet for longer than the keepalive
+    /// allows fails so too.
+    #[error("it hung up")]
+    HungUp,
+    /// The proxy stopped and told the client.
+    #[error("the proxy stopped")]
+    Stopped,
+    /// The client let more pile up than its outbox holds, its
+    /// [`HARD_LIMIT`].
+    #[error("it fell behind")]
+    TooSlow,
+    /// The link to the device at this URL, which the client had opened,
+    /// ended without giving up on it.
+    #[error("the link to {0} ended unexpectedly")]
+    LinkEnded(String),
+    /// The proxy gave up reconnecting to the device at this URL, which the
+    /// client had opened.
+    #[error("the proxy gave up on {0}")]
+    GaveUp(String),
+    /// A packet it sent could not be queued for its device.
+    #[error("a packet it sent could not reach its device")]
+    ForwardFailed,
+}
 
 /// The bytes of samples the stream holds before it drops the oldest. It is
 /// one second of samples arriving at 8 Mbit/s, so a client that stalls for

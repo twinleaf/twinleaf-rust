@@ -149,7 +149,7 @@ The test cannot observe these, and no law names them.
   law that needs the proxy's or the pump's takes no one that may be
   either.
 - The status a mount hears as it is added, when the link has lost its
-  device (`Mounts::add` in `proxy/engine.rs`). It reaches the session
+  device (`Mounts::add` in `proxy/engine/mod.rs`). It reaches the session
   before the open returns, ahead of any receiver the app can make.
 - Which segments turmoil dropped. The model's taint covers that.
 - Real time, other than how long a whole case takes.
@@ -333,7 +333,7 @@ S6. A reply is the device's answer, from one delivery.
   requests on the reconnected device.
 
 S7. That settings are as the device announced them (the doc of
-`SettingsCache` in `proxy/settings.rs`) is not checked, as it needs a
+`SettingsCache` in `proxy/engine/settings.rs`) is not checked, as it needs a
 device built on `twinleaf_device`.
 
 S8. A connection ends only for a reason.
@@ -415,7 +415,7 @@ settings half is not checked, as with S7.
 - Source the module doc of `proxy::engine`, on presence and the table
   loaded again, the doc of `RpcRegistry` in `device/rpc/registry.rs`, a
   table read once per session that only a new session can change, and
-  the doc of `CacheAction::Reload` in `proxy/settings.rs`, which reads
+  the doc of `CacheAction::Reload` in `proxy/engine/settings.rs`, which reads
   the registry again when the device starts a new session.
 - It rules out a reconnected or rebooted device whose old table stays in
   force.
@@ -815,15 +815,15 @@ the last column.
 | Timer | Value | Where | Checker |
 |---|---|---|---|
 | Device quiet time over TCP | 3 s | `LIVENESS_TIMEOUT_TCP` in `proxy/worker.rs` | `QUIET` |
-| Engine quiet time | 3 s | `QUIET` in `proxy/engine.rs` | `QUIET` |
+| Engine quiet time | 3 s | `QUIET` in `proxy/engine/mod.rs` | `QUIET` |
 | Reconnect interval | 1 s | `RECONNECT_INTERVAL` in `proxy/worker.rs` | `RECONNECT_INTERVAL` |
 | TCP connect timeout | 3 s | `CONNECT_TIMEOUT` in `tio/transport/tcp.rs` | `RECONNECT_TRY` |
 | Hello timeout | 2 s | `HELLO_TIMEOUT` in `proxy/control.rs` | |
 | Keepalive beat and quiet time | 1 s and 5 s | `CLIENT_KEEPALIVE` in `proxy/control.rs` | `KEEPALIVE_QUIET`, `SOCKET_LOSS` |
 | Reopen backoff | 250 ms doubling to 1 s, up to a quarter more | `open_again` and `jittered` in `device/session.rs` | `REOPEN_WAIT` |
 | Reopen limit | 30 s | `REOPEN_FOR` in `device/session.rs` | `REOPEN_FOR` |
-| First packet of a new link | 10 s | `READY_TIMEOUT` in `proxy/link.rs` | |
-| Table reload after a failed load | 5 s | `RELOAD_DELAY` in `proxy/engine.rs` | |
+| First packet of a new link | 10 s | `READY_TIMEOUT` in `proxy/worker.rs` | |
+| Table reload after a failed load | 5 s | `RELOAD_DELAY` in `proxy/engine/mod.rs` | |
 | Drain and close | 3 s and 1 s | `DRAIN_TIMEOUT` and `CLOSE_TIMEOUT` in `tio/transport/mod.rs` | `SOCKET_LOSS`, `CLOSE_TIMEOUT` |
 | Idle link | 5 s | `IDLE` in `proxy/mod.rs` | `IDLE_CLOSE` |
 | Fake heartbeat and sample | 300 ms and 1 s | `serve` in `proxy/tests/turmoil/fake_device.rs` | `SAMPLE_GAP` |

@@ -43,7 +43,6 @@
 //! the traffic [`DumpFlags`] asks for.
 
 use super::engine::Mount;
-use super::link;
 use super::{control, DumpFlags, Layout, MAX_RPC_TIMEOUT};
 use crate::chan::StreamMap;
 use crate::device::session::Session;
@@ -58,6 +57,7 @@ use crate::tio::transport::Port as HardwarePort;
 use crate::tio::transport::{ReceiveResult, TransportEvent};
 
 use futures_util::{FutureExt, StreamExt};
+use std::env;
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
@@ -71,6 +71,20 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamNotifyClose;
+
+/// How long a new link may take to deliver its first packet.
+pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns the depth of the queue each port fills for the proxy.
+/// `TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE` may raise it above the default.
+pub(super) fn client_tx_channel_size() -> usize {
+    let min_size = transport::DEFAULT_TX_CHANNEL_SIZE;
+    if let Ok(req) = env::var("TWINLEAF_PROXY_INTERFACE_TX_BUFSIZE") {
+        std::cmp::max(req.parse().unwrap_or(0), min_size)
+    } else {
+        min_size
+    }
+}
 
 /// Whether a link's device has answered. The worker sets it, and the
 /// proxy's link table reads it.
@@ -313,7 +327,7 @@ async fn greet(
     // The other proxy hangs up on a client that is quiet too long, and an
     // open may wait longer than that for its device.
     port.keep_alive(control::CLIENT_KEEPALIVE).await;
-    let deadline = Instant::now() + super::link::READY_TIMEOUT;
+    let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         let event = tokio::time::timeout_at(deadline, received.recv_async())
             .await
@@ -400,7 +414,7 @@ pub(super) fn new(
     let (commands, command_queue) = mpsc::channel(COMMAND_LANE);
     let (readiness, watched) = watch::channel(Readiness::Pending);
     let (to_engine, heard) = mpsc::unbounded_channel();
-    let (sent, from_engine) = mpsc::channel(link::client_tx_channel_size());
+    let (sent, from_engine) = mpsc::channel(client_tx_channel_size());
     let heard = UnboundedReceiverStream::new(heard);
     let engine = Session::over_port(sent, heard, format!("the state of {url}"), tasks);
     let worker = Worker {
@@ -516,7 +530,7 @@ impl Device {
         }
         // A proxy's answer to the open is a sign of life. The open itself
         // may wait for the proxy's own device for as long as
-        // `link::READY_TIMEOUT`.
+        // `READY_TIMEOUT`.
         let last_rx = match peer {
             PeerKind::Proxy => Instant::now(),
             PeerKind::Device => started,
@@ -717,7 +731,7 @@ const LIVENESS_TIMEOUT_TCP: Duration = Duration::from_millis(3000);
 
 /// How long a proxy of this build at the other end of a TCP connection may
 /// stay silent. The silence counts from the proxy's answer to the open of
-/// its `auto`, as that open may itself take up to [`link::READY_TIMEOUT`]
+/// its `auto`, as that open may itself take up to [`READY_TIMEOUT`]
 /// while the proxy waits for its own device.
 ///
 /// The connection ends sooner on its own. The link keeps it alive as a
@@ -2448,7 +2462,7 @@ mod tests {
     /// open, not from the start of the attempt.
     #[tokio::test(start_paused = true)]
     async fn a_proxy_whose_open_outlasts_the_tcp_timeout_is_not_given_up_at_once() {
-        let slow = link::READY_TIMEOUT - Duration::from_secs(1);
+        let slow = READY_TIMEOUT - Duration::from_secs(1);
         let (mut worker, mut started, silent, second) =
             reopened(TransportKind::Tcp, PeerKind::Proxy, slow).await;
 

@@ -235,7 +235,7 @@ use crate::proto::packet::{PacketType, PacketView};
 use crate::proto::rpc::{self as wire, Method, Request, RpcError};
 use crate::proto::settings::Setting as Announcement;
 use crate::proto::{DeviceRoute, RpcRequestId, SessionId};
-use crate::proxy::settings::{CacheAction, DeviceEvent, SettingsCache};
+use crate::proxy::engine::settings::{CacheAction, DeviceEvent, SettingsCache};
 use crate::tio::packet::Payload;
 use crate::tio::rpc::RpcReply;
 use crate::tio::Packet;
