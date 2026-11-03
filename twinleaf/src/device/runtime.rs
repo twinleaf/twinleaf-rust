@@ -442,7 +442,7 @@ impl ProxyAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::fixtures::{self, ENVIRONMENT, WAIT};
+    use crate::device::tests::fixtures::{self, ENVIRONMENT, WAIT};
 
     /// Runs [`ensure_proxy_at`] for `port` with `embedded` as its slot.
     /// Returns its outcome and the slot.

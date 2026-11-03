@@ -1603,8 +1603,8 @@ fn usb_identity(_path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chan::{JoinHandle, Notify};
-    use crate::proxy::fixtures::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use crate::proxy::outbox::Outbox;
+    use crate::proxy::tests::fixtures::{assert_took, PAUSED_WAIT, UNREACHABLE, WAIT};
     use crate::rt;
     use crate::tio::transport::{FakeEnd, RateInfo, TransportKind};
     use std::future::{self, Future};

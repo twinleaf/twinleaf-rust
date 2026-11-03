@@ -3,11 +3,7 @@
 exclude_globs = [
     "twinleaf/src/seam/shuttle/**",
     "twinleaf/src/seam/turmoil/**",
-    "twinleaf/src/proxy/turmoil/**",
-    "**/fixtures.rs",
-    "**/shuttle.rs",
-    "twinleaf/src/data/boundaries.rs",
-    "twinleaf/src/proxy/settings_sim.rs",
+    "**/tests/**",
 ]
 # The crates deny some lints, and a mutant that trips only a lint still runs.
 cap_lints = true

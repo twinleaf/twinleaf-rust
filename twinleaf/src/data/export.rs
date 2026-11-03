@@ -717,8 +717,8 @@ fn hdf_name_component(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::data::continuity::{Change, Loss};
-    use crate::data::fixtures;
     use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::tests::fixtures;
     use crate::proto::data::DataType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

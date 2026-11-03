@@ -892,10 +892,10 @@ fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chan::lock;
-    use crate::device::fixtures::{self, FakeDevice, ENVIRONMENT, WAIT};
     use crate::device::session::TestProxy;
+    use crate::device::tests::fixtures::{self, FakeDevice, ENVIRONMENT, WAIT};
     use crate::proto::rpc::Method;
-    use crate::proxy::fixtures::{assert_took, options, PAUSED_WAIT};
+    use crate::proxy::tests::fixtures::{assert_took, options, PAUSED_WAIT};
     use crate::proxy::Proxy;
     use crate::rt;
     use crate::tio::packet::Payload;

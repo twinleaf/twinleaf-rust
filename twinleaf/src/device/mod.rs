@@ -111,7 +111,7 @@ pub(crate) mod store;
 pub(crate) mod stream;
 
 #[cfg(test)]
-pub(crate) mod fixtures;
+pub(crate) mod tests;
 
 #[doc(no_inline)]
 pub use crate::proto::RouteError;

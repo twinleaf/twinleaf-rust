@@ -119,9 +119,9 @@ impl<Op: ColumnOp> ColumnProcessor<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fixtures;
     use crate::data::metadata::{DeviceRecord, SegmentRecord, StreamMetadataSnapshot};
     use crate::data::sample::{BatchContext, ColumnData, SampleBatchBuilder};
+    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;

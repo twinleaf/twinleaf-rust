@@ -274,7 +274,7 @@ mod tests {
     use super::*;
     use crate::proto::rpc::RpcError;
     use crate::proto::DeviceRoute;
-    use crate::tio::transport::codec::strategy;
+    use crate::tio::transport::codec::tests::strategy;
     use proptest::prelude::*;
     use proptest::sample::Index;
 

@@ -306,7 +306,7 @@ fn filename_component(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::{metadata, samples, temp_path, write_log, DAMAGE};
+    use super::super::tests::fixtures::{metadata, samples, temp_path, write_log, DAMAGE};
     use super::*;
     use std::path::{Path, PathBuf};
 

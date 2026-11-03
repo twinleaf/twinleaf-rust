@@ -559,8 +559,8 @@ impl LogFile {
 mod tests {
     use super::*;
     use crate::data::continuity::Generations;
-    use crate::data::fixtures::{column, device, segment, stream};
     use crate::data::state::StreamDataError;
+    use crate::data::tests::fixtures::{column, device, segment, stream};
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
 

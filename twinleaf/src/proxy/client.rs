@@ -886,8 +886,8 @@ mod tests {
     use crate::device::rpc::RpcRegistry;
     use crate::device::session::{Inlet, Received, Session as AppSession};
     use crate::device::stream::{End, Queued};
-    use crate::proxy::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
     use crate::proxy::link::{Links, Owner};
+    use crate::proxy::tests::fixtures::{assert_took, fakes, opened, options, Opened, PAUSED_WAIT};
     use crate::proxy::DumpFlags;
     use crate::rt::Supervisor;
     use crate::tio::packet::{LinkStatus, ProxyRx};

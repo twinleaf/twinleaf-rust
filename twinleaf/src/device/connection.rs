@@ -929,8 +929,8 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::fixtures::{self, open_through, FakeDevice, WAIT};
     use crate::device::session::TestProxy;
+    use crate::device::tests::fixtures::{self, open_through, FakeDevice, WAIT};
     use crate::proto::rpc as wire_rpc;
     use crate::proxy::Proxy;
     use std::thread;
@@ -1160,7 +1160,7 @@ mod tests {
         let connection = Connection::mount_at(&address, &mounted, WAIT).unwrap();
 
         let routes = connection.tree(DeviceRoute::root()).routes_updates();
-        let heard = super::super::fixtures::wait_for(&routes, |routes| !routes.is_empty());
+        let heard = super::super::tests::fixtures::wait_for(&routes, |routes| !routes.is_empty());
         assert_eq!(heard, [prefix]);
         assert_eq!(connection.tree(prefix).routes(), [prefix]);
     }

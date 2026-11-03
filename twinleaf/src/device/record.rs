@@ -793,7 +793,7 @@ mod tests {
     /// only that its stream ended.
     #[test]
     fn a_recording_ends_saying_the_proxy_stopped() {
-        use crate::device::fixtures::{self, FakeDevice, WAIT};
+        use crate::device::tests::fixtures::{self, FakeDevice, WAIT};
 
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
@@ -823,7 +823,7 @@ mod tests {
     /// nothing itself.
     #[test]
     fn a_recording_describes_a_device_with_the_metadata_the_proxy_holds() {
-        use crate::device::fixtures::{self, FakeDevice, WAIT};
+        use crate::device::tests::fixtures::{self, FakeDevice, WAIT};
 
         let device = FakeDevice::start();
         let proxy = fixtures::proxy_serving(&device.url);
@@ -844,7 +844,7 @@ mod tests {
             recorder.step(Some(wake)).unwrap();
         }
 
-        let described: Vec<Vec<u8>> = crate::proxy::fixtures::description()
+        let described: Vec<Vec<u8>> = crate::proxy::tests::fixtures::description()
             .into_iter()
             .map(|record| broadcast(record, route).as_bytes().to_vec())
             .collect();
@@ -966,8 +966,8 @@ mod tests {
         //! None.
 
         use super::*;
-        use crate::device::fixtures::{self, WAIT};
         use crate::device::session::{Session, TestProxy};
+        use crate::device::tests::fixtures::{self, WAIT};
         use crate::device::Connection;
         use crate::proto::data::MAX_SAMPLE_NUMBER;
         use crate::proxy::{decode, Watch, WATCH};

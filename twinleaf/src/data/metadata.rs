@@ -436,7 +436,7 @@ impl DeviceMetadataSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fixtures;
+    use crate::data::tests::fixtures;
     use crate::proto::SessionId;
 
     /// A segment's rate is its sampling rate over its decimation, and a zero

@@ -714,7 +714,7 @@ impl std::fmt::Display for SampleRow<'_> {
 mod tests {
     use super::*;
     use crate::data::continuity::Change;
-    use crate::data::fixtures::{self, column, device, segment, stream};
+    use crate::data::tests::fixtures::{self, column, device, segment, stream};
     use crate::proto::data::DataType;
 
     fn metadata(stream_id: u8, column_name: &str) -> StreamMetadataSnapshot {

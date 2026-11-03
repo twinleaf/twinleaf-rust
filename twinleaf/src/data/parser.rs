@@ -390,9 +390,9 @@ mod tests {
     use super::*;
     use crate::data::buffer::Buffer;
     use crate::data::continuity::{Boundary, Change, Generations, Loss};
-    use crate::data::fixtures;
     use crate::data::sample::ColumnData;
     use crate::data::state::StreamDataError;
+    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::{DataType, MAX_SAMPLE_NUMBER};
     use crate::proto::SampleNumber;

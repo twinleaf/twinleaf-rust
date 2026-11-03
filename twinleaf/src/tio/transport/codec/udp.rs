@@ -97,7 +97,7 @@ mod tests {
     //! None. U1 and U2 hold every case the examples held.
 
     use super::*;
-    use crate::tio::transport::codec::strategy;
+    use crate::tio::transport::codec::tests::strategy;
     use crate::tio::transport::TransportEvent;
     use bytes::BytesMut;
     use proptest::prelude::*;

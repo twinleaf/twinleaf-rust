@@ -876,7 +876,7 @@ impl Session {
     /// answers. The pump hears each such loss.
     pub(crate) fn test_pair_reopening(tasks: &Supervisor) -> (Session, TestProxy) {
         let nowhere = ProxyAddress {
-            url: crate::proxy::fixtures::UNREACHABLE.to_string(),
+            url: crate::proxy::tests::fixtures::UNREACHABLE.to_string(),
             ensure: None,
         };
         let reopen = (nowhere, Purpose::Use.method(), encode(&"auto"));
@@ -901,10 +901,10 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::fixtures::{self, FakeDevice};
+    use crate::device::tests::fixtures::{self, FakeDevice};
     use crate::proto::rpc::{Method, RpcError};
     use crate::proto::PacketType;
-    use crate::proxy::fixtures::assert_took;
+    use crate::proxy::tests::fixtures::assert_took;
     use crate::proxy::CLIENT_KEEPALIVE;
     use crate::proxy::{client_name, decode, Introduction};
     use crate::rt::BoxFuture;

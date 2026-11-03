@@ -106,9 +106,9 @@ impl BatchCoalescer {
 mod tests {
     use super::*;
     use crate::data::continuity::{Boundary, Loss};
-    use crate::data::fixtures;
     use crate::data::metadata::StreamMetadataSnapshot;
     use crate::data::sample::{BatchContext, ColumnArray, ColumnData};
+    use crate::data::tests::fixtures;
     use crate::proto::data as wire;
     use crate::proto::data::DataType;
     use crate::proto::DeviceRoute;
