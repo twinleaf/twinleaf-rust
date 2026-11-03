@@ -64,8 +64,10 @@ flume = { version = "0.12", default-features = false, features = ["async", "sele
 minicbor = { version = "2.3", features = ["derive", "std"] }
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
 proptest = "1"
 proptest-state-machine = "0.9"
+syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
 tokio = { version = "1.47", features = ["test-util"] }
 
