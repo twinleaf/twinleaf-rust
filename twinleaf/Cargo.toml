@@ -19,6 +19,9 @@ targets = []
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)", "cfg(shuttle)", "cfg(turmoil)", "cfg(tokio_unstable)"] }
 
+[lints.clippy]
+self_named_module_files = "deny"
+
 [features]
 default = ["serial", "firmware-update", "hdf5"]
 serial = ["dep:tokio-serial", "dep:serialport"]

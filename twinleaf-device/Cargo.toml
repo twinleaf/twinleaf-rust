@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["twinleaf", "protocol", "no-std", "sensor", "firmware"]
 categories = ["embedded", "no-std"]
 
+[lints.clippy]
+self_named_module_files = "deny"
+
 [features]
 defmt = ["dep:defmt", "twinleaf-proto/defmt"]
 

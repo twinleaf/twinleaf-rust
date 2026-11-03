@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["twinleaf", "sensor", "cli", "tio", "quantum"]
 categories = ["command-line-utilities", "hardware-support", "science"]
 
+[lints.clippy]
+self_named_module_files = "deny"
+
 [features]
 default = ["serial", "mdns", "hdf5"]
 serial = ["dep:serialport", "twinleaf/serial"]
