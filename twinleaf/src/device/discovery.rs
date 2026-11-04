@@ -867,18 +867,26 @@ fn instance_label(fullname: &str) -> String {
     fullname.to_string()
 }
 
-/// Returns the host for a discovered device's URL. That is its advertised
-/// hostname, or else its lowest routable IPv4 address.
+/// Returns the host for a discovered device's URL. That is loopback for a service this machine
+/// advertises, so a proxy knows its own advertisement, or else its advertised hostname, or else
+/// its lowest routable IPv4 address.
 // The hostname stays the same when the device's address changes, and a
 // person can read it. Each open of the URL resolves it again.
 #[cfg(feature = "mdns")]
 fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
+    let v4 = info.get_addresses_v4();
+    let local = if_addrs::get_if_addrs().unwrap_or_default();
+    if local.iter().any(
+        |interface| matches!(interface.addr, if_addrs::IfAddr::V4(ref own) if v4.contains(&own.ip)),
+    ) {
+        return Some(std::net::Ipv4Addr::LOCALHOST.to_string());
+    }
     let hostname = info.get_hostname().trim_end_matches('.');
     if !hostname.is_empty() {
         return Some(hostname.to_string());
     }
 
-    let mut v4: Vec<_> = info.get_addresses_v4().into_iter().collect();
+    let mut v4: Vec<_> = v4.into_iter().collect();
     v4.sort();
     let ip = v4
         .iter()
