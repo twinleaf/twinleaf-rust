@@ -6,6 +6,9 @@
 //! [`metadata`] reply a host asks for. A board implements [`Streams`] over the
 //! streams it has; nothing here decides when a sample is taken.
 
+// A change to the segment ring returns the record it owes; dropping one is an error.
+#![deny(unused_must_use)]
+
 mod publisher;
 mod segments;
 mod stream;
@@ -15,6 +18,6 @@ pub mod metadata;
 
 pub use filter::Filter;
 pub use metadata::Streams;
-pub use publisher::{Publisher, MAX_SAMPLE_BYTES};
-pub use segments::{Busy, Issued, Params, Segment, SegmentState, Segments, Timeref};
+pub use publisher::MAX_SAMPLE_BYTES;
+pub use segments::{Busy, Params, Segment, SegmentState, Timeref};
 pub use stream::{float_columns, ColumnDef, DataStream, StreamDef};

@@ -10,7 +10,7 @@ use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 use super::filter::{Filter, MAX_COLUMNS};
 use super::metadata::Streams;
 use super::publisher::{Publisher, MAX_SAMPLE_BYTES};
-use super::segments::{Busy, Params, Segment, Segments, Timeref};
+use super::segments::{Busy, Opening, Params, Segment, Segments, Timeref};
 use crate::Sink;
 
 /// One column of a stream's sample.
@@ -125,9 +125,7 @@ impl<const N: usize> DataStream<N> {
     pub fn start(&mut self, timeref: Timeref, out: &mut impl Sink) -> Result<(), Busy> {
         self.filter.prime();
         self.tuned = None;
-        self.segments.start(timeref)?;
-        self.opened(out);
-        Ok(())
+        self.transition(out, |segments| segments.start(timeref))
     }
 
     /// Stop acquiring.
@@ -137,14 +135,12 @@ impl<const N: usize> DataStream<N> {
 
     /// Acquire with `params` from the next segment on.
     pub fn retune(&mut self, params: Params, out: &mut impl Sink) {
-        self.segments.retune(params);
-        self.opened(out);
+        self.transition(out, |segments| segments.retune(params));
     }
 
     /// Begin a new segment with the same parameters.
     pub fn rollover(&mut self, out: &mut impl Sink) {
-        self.segments.rollover();
-        self.opened(out);
+        self.transition(out, Segments::rollover);
     }
 
     /// Mark every segment opened from here on as begun while the time
@@ -156,8 +152,7 @@ impl<const N: usize> DataStream<N> {
     /// Name second `from` of the current time reference `to` from the next
     /// segment on.
     pub fn relabel(&mut self, from: u32, to: Timeref, out: &mut impl Sink) {
-        self.segments.relabel(from, to);
-        self.opened(out);
+        self.transition(out, |segments| segments.relabel(from, to));
     }
 
     /// Publish one sample of [`StreamDef::sample_size`] bytes, packed in column
@@ -165,10 +160,9 @@ impl<const N: usize> DataStream<N> {
     /// output for its [`DataType::F32`] columns; everything else goes out as it
     /// came.
     pub fn push(&mut self, sample: &[u8], out: &mut impl Sink) {
-        let Some(issued) = self.segments.issue() else {
+        let Some(issued) = self.transition(out, Segments::issue) else {
             return;
         };
-        self.opened(out);
         let segment = self
             .segments
             .get(issued.segment)
@@ -190,8 +184,7 @@ impl<const N: usize> DataStream<N> {
 
     /// Advance past `count` samples without publishing them.
     pub fn skip(&mut self, count: u32, out: &mut impl Sink) {
-        self.segments.skip(count);
-        self.opened(out);
+        self.transition(out, |segments| segments.skip(count));
     }
 
     /// Send the packet being filled, if there is one.
@@ -199,12 +192,21 @@ impl<const N: usize> DataStream<N> {
         self.publisher.flush(out);
     }
 
-    /// Send the record of a segment that opened, or changed before issuing.
-    fn opened(&mut self, out: &mut impl Sink) {
-        if let Some(segment) = self.segments.opened() {
+    /// Apply `change` to the ring, sending the current segment's record if it
+    /// opened or changed before issuing. Every change to the ring passes
+    /// through here, so a record always precedes what its segment issues.
+    fn transition<T>(
+        &mut self,
+        out: &mut impl Sink,
+        change: impl FnOnce(&mut Segments<N>) -> Opening<T>,
+    ) -> T {
+        let (value, opened) = change(&mut self.segments).into_parts();
+        if opened {
+            let segment = self.segments.current();
             self.publisher
                 .record(segment.record(self.id, self.filter.kind()), out);
         }
+        value
     }
 
     /// The segment a host asks about: the one its samples arrive on.

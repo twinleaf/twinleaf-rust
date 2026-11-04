@@ -15,7 +15,7 @@ use crate::Sink;
 pub const MAX_SAMPLE_BYTES: usize = Packet::MAX_PAYLOAD - SAMPLE_HEADER_SIZE;
 
 /// The packet a stream is filling.
-pub struct Publisher {
+pub(crate) struct Publisher {
     buf: [u8; Packet::MAX_SIZE],
     open: Option<Open>,
     capacity: usize,

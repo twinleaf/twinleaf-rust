@@ -191,9 +191,40 @@ impl Segment {
     }
 }
 
+/// What a change to the ring returns: its result, and whether the current
+/// segment opened or changed before issuing, so that its record goes out
+/// ahead of anything it issues. Only the ring makes one.
+#[derive(Debug, PartialEq)]
+#[must_use = "a segment that opened owes its record before anything it issues"]
+pub(crate) struct Opening<T> {
+    value: T,
+    opened: bool,
+}
+
+impl<T> Opening<T> {
+    fn quiet(value: T) -> Self {
+        Self {
+            value,
+            opened: false,
+        }
+    }
+
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Opening<U> {
+        Opening {
+            value: f(self.value),
+            opened: self.opened,
+        }
+    }
+
+    /// The result, and whether the current segment's record is owed.
+    pub(crate) fn into_parts(self) -> (T, bool) {
+        (self.value, self.opened)
+    }
+}
+
 /// One issued sample, as the publisher needs to see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Issued {
+pub(crate) struct Issued {
     /// Segment the sample belongs to.
     pub segment: SegmentId,
     /// Its output sample number, `None` when nothing is published for it.
@@ -213,12 +244,12 @@ enum Phase {
     Switching { from: u8, to: u8, at: u32 },
 }
 
-/// A stream's segments, and the sample numbers it issues from them.
-pub struct Segments<const N: usize> {
+/// A stream's segments, and the sample numbers it issues from them. Every
+/// change that can open a segment returns an [`Opening`].
+pub(crate) struct Segments<const N: usize> {
     entries: [Segment; N],
     phase: Phase,
     latest: u8,
-    owed: bool,
     holdover: bool,
 }
 
@@ -234,22 +265,20 @@ impl<const N: usize> Segments<N> {
             entries,
             phase: Phase::Stopped { next: 0 },
             latest: 0,
-            owed: false,
             holdover: false,
         }
     }
 
     /// Begin acquiring, with sample zero at `timeref`.
-    pub fn start(&mut self, timeref: Timeref) -> Result<(), Busy> {
+    pub fn start(&mut self, timeref: Timeref) -> Opening<Result<(), Busy>> {
         let Phase::Stopped { next } = self.phase else {
-            return Err(Busy);
+            return Opening::quiet(Err(Busy));
         };
         let entry = &mut self.entries[usize::from(next)];
         entry.timeref = timeref;
         entry.holdover = self.holdover;
         self.phase = Phase::Issuing { current: next };
-        self.enter(next);
-        Ok(())
+        self.enter(next).map(Ok)
     }
 
     /// Stop acquiring. The next start begins a fresh segment.
@@ -276,51 +305,45 @@ impl<const N: usize> Segments<N> {
     }
 
     /// Acquire with `params` from the next segment on.
-    pub fn retune(&mut self, params: Params) {
-        self.next().params = params;
+    pub fn retune(&mut self, params: Params) -> Opening<()> {
+        self.next().map(|next| next.params = params)
     }
 
     /// Begin a new segment with the same parameters, restarting its sample
     /// numbers at zero.
-    pub fn rollover(&mut self) {
-        self.next();
+    pub fn rollover(&mut self) -> Opening<()> {
+        self.next().map(|_| ())
     }
 
     /// Name second `from` of the current time reference `to` from the next
     /// segment on, wherever that segment begins.
-    pub fn relabel(&mut self, from: u32, to: Timeref) {
-        let next = self.next();
-        next.timeref = Timeref {
-            start_time: to
-                .start_time
-                .wrapping_add(next.timeref.start_time.wrapping_sub(from)),
-            ..to
-        };
+    pub fn relabel(&mut self, from: u32, to: Timeref) -> Opening<()> {
+        self.next().map(|next| {
+            next.timeref = Timeref {
+                start_time: to
+                    .start_time
+                    .wrapping_add(next.timeref.start_time.wrapping_sub(from)),
+                ..to
+            };
+        })
     }
 
     /// Issue the next sample number, `None` while stopped.
-    pub fn issue(&mut self) -> Option<Issued> {
+    pub fn issue(&mut self) -> Opening<Option<Issued>> {
         self.advance(true)
     }
 
     /// Advance past `count` samples without issuing them: the one gap a
     /// segment's sample numbers may have.
-    pub fn skip(&mut self, count: u32) {
-        (0..count).for_each(|_| {
-            self.advance(false);
-        });
+    pub fn skip(&mut self, count: u32) -> Opening<()> {
+        let opened = (0..count).fold(false, |opened, _| self.advance(false).opened | opened);
+        Opening { value: (), opened }
     }
 
     /// What a host asks about: the segment opened last, which is the one its
     /// samples arrive on.
     pub fn current(&self) -> &Segment {
         &self.entries[usize::from(self.latest)]
-    }
-
-    /// The segment that opened, or changed before issuing, since this was last
-    /// asked: its record goes out before anything it issues.
-    pub fn opened(&mut self) -> Option<&Segment> {
-        core::mem::take(&mut self.owed).then(|| self.current())
     }
 
     /// The segment `id` names, `None` if the ring holds none.
@@ -330,8 +353,14 @@ impl<const N: usize> Segments<N> {
             .filter(|segment| segment.state != SegmentState::Invalid)
     }
 
-    fn advance(&mut self, publishing: bool) -> Option<Issued> {
-        let current = self.switched()?;
+    fn advance(&mut self, publishing: bool) -> Opening<Option<Issued>> {
+        let Opening {
+            value: Some(current),
+            mut opened,
+        } = self.switched()
+        else {
+            return Opening::quiet(None);
+        };
         let entry = &mut self.entries[usize::from(current)];
         let number = entry.next_issue;
         entry.next_issue += 1;
@@ -349,7 +378,7 @@ impl<const N: usize> Segments<N> {
             Phase::Issuing { .. }
                 if issued >= MAX_INPUT_SAMPLES || generated >= MAX_OUTPUT_SAMPLES =>
             {
-                self.rollover()
+                opened |= self.rollover().opened;
             }
             Phase::Stopped { .. } | Phase::Issuing { .. } | Phase::Switching { .. } => {}
         }
@@ -361,39 +390,42 @@ impl<const N: usize> Segments<N> {
         if last && entry.state == SegmentState::Issuing {
             entry.state = SegmentState::Done;
         }
-        Some(Issued {
-            segment: entry.id,
-            output: published,
-            last,
-        })
+        Opening {
+            value: Some(Issued {
+                segment: entry.id,
+                output: published,
+                last,
+            }),
+            opened,
+        }
     }
 
     /// The entry issuing now, taking a scheduled switch once it is due.
-    fn switched(&mut self) -> Option<u8> {
+    fn switched(&mut self) -> Opening<Option<u8>> {
         match self.phase {
-            Phase::Stopped { .. } => None,
-            Phase::Issuing { current } => Some(current),
+            Phase::Stopped { .. } => Opening::quiet(None),
+            Phase::Issuing { current } => Opening::quiet(Some(current)),
             Phase::Switching { from, to, at }
                 if self.entries[usize::from(from)].next_issue == at =>
             {
                 self.retire(from);
                 self.phase = Phase::Issuing { current: to };
-                self.enter(to);
-                Some(to)
+                self.enter(to).map(|()| Some(to))
             }
-            Phase::Switching { from, .. } => Some(from),
+            Phase::Switching { from, .. } => Opening::quiet(Some(from)),
         }
     }
 
     /// The entry a parameter change lands on, scheduling a switch onto a new
-    /// one when the segment issuing has already had samples.
-    fn next(&mut self) -> &mut Segment {
-        let index = match self.phase {
-            Phase::Stopped { next } => next,
-            Phase::Switching { to, .. } => to,
+    /// one when the segment issuing has already had samples. A change to a
+    /// segment that has issued nothing yet edits it in place, which owes its
+    /// record again.
+    fn next(&mut self) -> Opening<&mut Segment> {
+        let (index, opened) = match self.phase {
+            Phase::Stopped { next } => (next, false),
+            Phase::Switching { to, .. } => (to, false),
             Phase::Issuing { current } if self.entries[usize::from(current)].next_issue == 0 => {
-                self.owed = true;
-                current
+                (current, true)
             }
             Phase::Issuing { current } => {
                 let entry = &self.entries[usize::from(current)];
@@ -405,12 +437,15 @@ impl<const N: usize> Segments<N> {
                     to,
                     at,
                 };
-                to
+                (to, false)
             }
         };
         let entry = &mut self.entries[usize::from(index)];
         entry.holdover = self.holdover;
-        entry
+        Opening {
+            value: entry,
+            opened,
+        }
     }
 
     /// Prepare the entry after `from` to take over at its sample `at`, which
@@ -432,10 +467,13 @@ impl<const N: usize> Segments<N> {
     }
 
     /// A segment opens: it issues from here, and its record is owed.
-    fn enter(&mut self, index: u8) {
+    fn enter(&mut self, index: u8) -> Opening<()> {
         self.entries[usize::from(index)].state = SegmentState::Issuing;
         self.latest = index;
-        self.owed = true;
+        Opening {
+            value: (),
+            opened: true,
+        }
     }
 
     /// A segment stops issuing: one that opened stays readable, one that never did is gone.
@@ -472,24 +510,28 @@ mod tests {
 
     fn started<const N: usize>(params: Params) -> Segments<N> {
         let mut segments = Segments::new(params);
-        segments.start(timeref(1000)).unwrap();
+        segments.start(timeref(1000)).value.unwrap();
         segments
     }
 
     fn issue<const N: usize>(segments: &mut Segments<N>, count: u32) -> Vec<Issued> {
-        (0..count).filter_map(|_| segments.issue()).collect()
+        (0..count).filter_map(|_| segments.issue().value).collect()
     }
 
     #[test]
     fn a_stopped_ring_issues_nothing_and_an_acquiring_one_refuses_a_start() {
         let mut segments: Segments<4> = Segments::new(params(10));
-        assert_eq!(segments.issue(), None);
-        assert_eq!(segments.start(timeref(1000)), Ok(()));
-        assert_eq!(segments.start(timeref(2000)), Err(Busy));
-        assert!(segments.issue().is_some());
+        assert_eq!(segments.issue().value, None);
+        assert_eq!(segments.start(timeref(1000)).into_parts(), (Ok(()), true));
+        assert_eq!(
+            segments.start(timeref(2000)).into_parts(),
+            (Err(Busy), false),
+            "a refused start opens nothing"
+        );
+        assert!(segments.issue().value.is_some());
         segments.stop();
-        assert_eq!(segments.issue(), None);
-        assert_eq!(segments.start(timeref(2000)), Ok(()));
+        assert_eq!(segments.issue().value, None);
+        assert_eq!(segments.start(timeref(2000)).into_parts(), (Ok(()), true));
     }
 
     #[test]
@@ -498,7 +540,7 @@ mod tests {
         let ids: Vec<u8> = (0..5)
             .map(|_| {
                 let id = issue(&mut segments, 10).last().unwrap().segment.value();
-                segments.rollover();
+                let () = segments.rollover().value;
                 id
             })
             .collect();
@@ -509,10 +551,12 @@ mod tests {
     fn a_switch_lands_on_a_whole_second_of_the_outgoing_segment() {
         let mut segments: Segments<4> = started(params(10));
         issue(&mut segments, 13);
-        segments.retune(Params {
-            decimation: NonZeroU32::new(2).unwrap(),
-            ..params(10)
-        });
+        let () = segments
+            .retune(Params {
+                decimation: NonZeroU32::new(2).unwrap(),
+                ..params(10)
+            })
+            .value;
 
         let pending = segments.get(id(1)).unwrap();
         assert_eq!(pending.state(), SegmentState::Next);
@@ -535,13 +579,19 @@ mod tests {
     fn sample_numbers_restart_in_a_new_segment() {
         let mut segments: Segments<4> = started(params(10));
         issue(&mut segments, 25);
-        segments.rollover();
-        let issued = issue(&mut segments, 6);
+        assert!(
+            !segments.rollover().opened,
+            "a switch waits for a whole second"
+        );
+        let issued = issue(&mut segments, 5);
         assert_eq!(issued[4].segment.value(), 0);
         assert_eq!(issued[4].output, Some(SampleNumber::new(29)));
-        assert_eq!(issued[5].segment.value(), 1);
-        assert_eq!(issued[5].output, Some(SampleNumber::new(0)));
-        assert_eq!(segments.opened().map(Segment::id), Some(id(1)));
+        let (issued, opened) = segments.issue().into_parts();
+        let issued = issued.unwrap();
+        assert_eq!(issued.segment.value(), 1);
+        assert_eq!(issued.output, Some(SampleNumber::new(0)));
+        assert!(opened, "the sample that switches opens its segment");
+        assert_eq!(segments.current().id(), id(1));
         assert_eq!(segments.current().timeref().start_time, 1003);
     }
 
@@ -549,7 +599,7 @@ mod tests {
     fn a_retune_never_changes_the_segment_issuing() {
         let mut segments: Segments<4> = started(params(10));
         issue(&mut segments, 5);
-        segments.retune(params(100));
+        let () = segments.retune(params(100)).value;
 
         assert_eq!(segments.get(id(0)).unwrap().params().rate.get(), 10);
         assert_eq!(segments.get(id(1)).unwrap().params().rate.get(), 100);
@@ -561,14 +611,14 @@ mod tests {
     #[test]
     fn a_retune_while_stopped_edits_the_segment_in_place() {
         let mut segments: Segments<4> = Segments::new(params(10));
-        segments.retune(params(50));
+        let () = segments.retune(params(50)).value;
         assert_eq!(segments.current().id().value(), 0);
         assert_eq!(segments.current().params().rate.get(), 50);
 
-        segments.start(timeref(1000)).unwrap();
-        segments.retune(params(20));
+        segments.start(timeref(1000)).value.unwrap();
+        let () = segments.retune(params(20)).value;
         assert_eq!(segments.current().id().value(), 0);
-        assert_eq!(segments.issue().unwrap().segment.value(), 0);
+        assert_eq!(segments.issue().value.unwrap().segment.value(), 0);
         assert_eq!(segments.get(id(0)).unwrap().params().rate.get(), 20);
     }
 
@@ -593,12 +643,13 @@ mod tests {
     #[test]
     fn a_rollover_is_forced_before_the_wire_limit() {
         let mut segments: Segments<4> = started(params(1000));
-        (0..MAX_OUTPUT_SAMPLES).for_each(|_| {
-            segments.issue();
-        });
+        let opened = (0..MAX_OUTPUT_SAMPLES).any(|_| segments.issue().opened);
+        assert!(!opened, "a forced rollover schedules its switch");
         assert_eq!(segments.get(id(1)).unwrap().state(), SegmentState::Next);
 
-        let issued = segments.issue().unwrap();
+        let (issued, opened) = segments.issue().into_parts();
+        assert!(opened);
+        let issued = issued.unwrap();
         assert_eq!(issued.segment.value(), 1);
         assert_eq!(issued.output, Some(SampleNumber::new(0)));
         const { assert!(MAX_OUTPUT_SAMPLES < SampleNumber::MAX) };
@@ -612,7 +663,7 @@ mod tests {
     fn skipping_is_the_only_gap_in_a_segment() {
         let mut segments: Segments<4> = started(params(10));
         issue(&mut segments, 3);
-        segments.skip(2);
+        let () = segments.skip(2).value;
         let outputs: Vec<u32> = issue(&mut segments, 2)
             .iter()
             .filter_map(|issued| issued.output.map(SampleNumber::value))
@@ -624,22 +675,26 @@ mod tests {
     /// change before it issues.
     #[test]
     fn a_segment_owes_its_record_from_its_opening() {
-        let mut segments: Segments<4> = started(params(10));
-        assert_eq!(segments.opened().map(Segment::id), Some(id(0)));
-        assert_eq!(segments.opened(), None);
-        segments.relabel(1000, timeref(5000));
+        let mut segments: Segments<4> = Segments::new(params(10));
+        assert!(segments.start(timeref(1000)).opened);
+        assert_eq!(segments.current().id(), id(0));
+        assert!(segments.relabel(1000, timeref(5000)).opened);
+        assert_eq!(segments.current().timeref().start_time, 5000);
+        assert!(!segments.skip(1).opened);
         assert_eq!(
-            segments
-                .opened()
-                .map(|segment| segment.timeref().start_time),
-            Some(5000)
+            segments.issue().into_parts(),
+            (
+                Some(Issued {
+                    segment: id(0),
+                    output: Some(SampleNumber::new(1)),
+                    last: false,
+                }),
+                false
+            )
         );
-        segments.skip(1);
-        assert_eq!(segments.issue().unwrap().output, Some(SampleNumber::new(1)));
-        segments.retune(params(20));
-        assert_eq!(segments.opened(), None);
-        segments.skip(9);
-        assert_eq!(segments.opened().map(Segment::id), Some(id(1)));
+        assert!(!segments.retune(params(20)).opened);
+        assert!(segments.skip(9).opened, "a skip can carry the switch");
+        assert_eq!(segments.current().id(), id(1));
     }
 
     #[test]
@@ -652,12 +707,13 @@ mod tests {
             .iter()
             .all(|issued| issued.output.is_none()));
 
-        segments.retune(params(10));
+        let () = segments.retune(params(10)).value;
         issue(&mut segments, 7);
-        let issued = segments.issue().unwrap();
+        let (issued, opened) = segments.issue().into_parts();
+        let issued = issued.unwrap();
         assert_eq!(issued.segment.value(), 1);
         assert_eq!(issued.output, Some(SampleNumber::new(0)));
-        assert_eq!(segments.opened().map(Segment::id), Some(id(1)));
+        assert!(opened);
     }
 
     #[test]
@@ -668,7 +724,7 @@ mod tests {
         assert_eq!(segments.get(id(1)), None);
         assert_eq!(segments.get(id(4)), None);
 
-        segments.start(timeref(1000)).unwrap();
+        segments.start(timeref(1000)).value.unwrap();
         assert_eq!(segments.current().state(), SegmentState::Issuing);
         assert_eq!(
             segments.current().flags(),
@@ -676,7 +732,7 @@ mod tests {
         );
 
         issue(&mut segments, 1);
-        segments.rollover();
+        let () = segments.rollover().value;
         issue(&mut segments, 10);
         assert_eq!(segments.get(id(0)).unwrap().state(), SegmentState::Inactive);
         assert_eq!(segments.get(id(0)).unwrap().flags(), SegmentFlags::VALID);
@@ -689,7 +745,7 @@ mod tests {
     fn a_segment_opened_in_holdover_carries_the_flag() {
         let mut segments: Segments<4> = Segments::new(params(10));
         segments.set_holdover(true);
-        segments.start(timeref(1000)).unwrap();
+        segments.start(timeref(1000)).value.unwrap();
         issue(&mut segments, 1);
         assert_eq!(
             segments.current().flags(),
@@ -697,7 +753,7 @@ mod tests {
         );
 
         segments.set_holdover(false);
-        segments.rollover();
+        let () = segments.rollover().value;
         issue(&mut segments, 10);
         assert_eq!(segments.current().id().value(), 1);
         assert_eq!(
@@ -714,7 +770,7 @@ mod tests {
     fn holdover_set_before_a_segment_issues_reaches_it_at_the_rollover() {
         let mut segments: Segments<4> = started(params(10));
         segments.set_holdover(true);
-        segments.rollover();
+        let () = segments.rollover().value;
         issue(&mut segments, 1);
         assert_eq!(segments.current().id().value(), 0);
         assert_eq!(
@@ -730,7 +786,7 @@ mod tests {
         let switched = |rate: u32, samples: u32| {
             let mut segments: Segments<4> = started(params(rate));
             issue(&mut segments, samples);
-            segments.relabel(1002, gps.clone());
+            let () = segments.relabel(1002, gps.clone()).value;
             let issued = issue(&mut segments, 3 * rate);
             let first = issued
                 .iter()
@@ -759,8 +815,8 @@ mod tests {
     #[test]
     fn a_relabel_before_any_sample_renames_the_segment_in_place() {
         let mut segments: Segments<4> = started(params(10));
-        segments.relabel(1000, timeref(5000));
-        let issued = segments.issue().unwrap();
+        let () = segments.relabel(1000, timeref(5000)).value;
+        let issued = segments.issue().value.unwrap();
         assert_eq!(issued.segment.value(), 0);
         assert_eq!(segments.current().timeref().start_time, 5000);
     }
@@ -774,8 +830,8 @@ mod tests {
         assert_eq!(segments.current(), segments.get(id(0)).unwrap());
         assert_eq!(segments.get(id(1)).unwrap().state(), SegmentState::Next);
 
-        segments.start(timeref(2000)).unwrap();
-        let issued = segments.issue().unwrap();
+        segments.start(timeref(2000)).value.unwrap();
+        let issued = segments.issue().value.unwrap();
         assert_eq!(issued.segment.value(), 1);
         assert_eq!(issued.output, Some(SampleNumber::new(0)));
         assert_eq!(segments.current().timeref().start_time, 2000);
@@ -814,7 +870,9 @@ mod tests {
             state
         };
         let rates = [5u32, 10, 25];
-        let mut segments: Segments<4> = started(params(10));
+        let mut segments: Segments<4> = Segments::new(params(10));
+        // Records owed since the last sample, as a stream would send them.
+        let mut owed = segments.start(timeref(1000)).opened;
         let mut previous: Option<u8> = None;
         let mut ended = false;
         let mut switches = 0;
@@ -822,12 +880,14 @@ mod tests {
         for _ in 0..20_000 {
             let before = issuing(&segments);
             match next() % 8 {
-                0 => segments.retune(params(rates[(next() % 3) as usize])),
-                1 => segments.rollover(),
-                2 => segments.skip(1 + (next() % 3) as u32),
+                0 => owed |= segments.retune(params(rates[(next() % 3) as usize])).opened,
+                1 => owed |= segments.rollover().opened,
+                2 => owed |= segments.skip(1 + (next() % 3) as u32).opened,
                 3..=7 => {
-                    let sample = segments.issue().unwrap();
-                    let opened = segments.opened().map(Segment::id);
+                    let (sample, opened) = segments.issue().into_parts();
+                    let sample = sample.unwrap();
+                    let opened =
+                        (core::mem::take(&mut owed) | opened).then(|| segments.current().id());
                     let entry = segments.get(sample.segment).unwrap();
                     let output = sample.output.unwrap().value();
                     assert_eq!(output, entry.next_issue - 1);
