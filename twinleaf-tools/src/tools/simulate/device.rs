@@ -8,18 +8,14 @@ use std::num::NonZeroU32;
 use twinleaf::proto::capture::{CaptureMetadata, METADATA_VERSION};
 use twinleaf::proto::data::DataType;
 use twinleaf::proto::log::LogLevel;
-use twinleaf::proto::packet::PacketView;
 use twinleaf::proto::rpc::{RpcError, RpcMetaFlags};
-use twinleaf::proto::sync::Epoch;
 use twinleaf::proto::{BoardId, DeviceRoute, FirmwareMagic, HwRev, SessionId, StreamId};
-use twinleaf_device::data::{filter, ColumnDef, DataStream, Params, StreamDef, Timeref};
-use twinleaf_device::device::{
-    self, Action, Actions, Announcer, Deferred, Entries, Entry, FlashOp, Group, Identity, Input,
-    OneLane, Pending, SyncRequest,
-};
+use twinleaf_device::data::{filter, ColumnDef, DataStream, Params, StreamDef};
+use twinleaf_device::device::{Action, Announcer, Entry, Group, Identity};
 use twinleaf_device::rpc::{Access, Capture, Reply, RpcSpec, Selector, Setting, Status, STANDARD};
-use twinleaf_device::storage::update::{Package, Take, Upload};
-use twinleaf_device::{Device, Sink};
+use twinleaf_device::sim::{self, Port, Sim, Slot};
+use twinleaf_device::storage::update::{Package, Upload};
+use twinleaf_device::Sink;
 
 use super::{unix_duration, GaussianRng};
 use crate::{SimulateCli, UploadKind};
@@ -48,6 +44,8 @@ pub(super) const CAPTURE_SAMPLES_MIN: usize = 800;
 pub(super) const CAPTURE_SAMPLES_MAX: usize = 1200;
 /// The bytes of an image's upload chunk that are envelope rather than image.
 const CHUNK_ENVELOPE: usize = 32;
+/// Packets each lane of the host's port holds, more than one tick sends.
+const PORT_CAPACITY: usize = 1 << 16;
 
 /// What a signed package for the simulator names.
 pub(super) const PACKAGE: Package = Package {
@@ -57,74 +55,6 @@ pub(super) const PACKAGE: Package = Package {
     development: true,
     image_max: 1 << 20,
 };
-
-/// The firmware slot, as the kind of device being simulated keeps it.
-enum Slot {
-    /// One that takes images, counting the image bytes of each chunk it takes.
-    Image { uploaded: u32 },
-    /// A `twinleaf-device` firmware's, keeping the crate's own cursor.
-    Signed(Upload),
-}
-
-impl Slot {
-    fn new(kind: UploadKind) -> Self {
-        match kind {
-            UploadKind::Image => Self::Image { uploaded: 0 },
-            UploadKind::Signed => Self::Signed(Upload::new()),
-        }
-    }
-
-    fn kind(&self) -> UploadKind {
-        match self {
-            Self::Image { .. } => UploadKind::Image,
-            Self::Signed(_) => UploadKind::Signed,
-        }
-    }
-
-    /// Takes one chunk of `dev.firmware.upload`, or reads the cursor for an
-    /// empty one. The image goes nowhere, so every write lands.
-    fn upload(&mut self, chunk: &[u8], now_ns: u64) -> Result<Vec<u8>, RpcError> {
-        match self {
-            Self::Image { uploaded } if chunk.is_empty() => Ok(uploaded.to_le_bytes().to_vec()),
-            Self::Image { uploaded } => {
-                let image = chunk.len().saturating_sub(CHUNK_ENVELOPE) as u32;
-                *uploaded = uploaded.saturating_add(image);
-                Ok(Vec::new())
-            }
-            Self::Signed(upload) if chunk.is_empty() => {
-                Ok(upload.cursor(now_ns).to_le_bytes().to_vec())
-            }
-            Self::Signed(upload) => match upload.chunk(&PACKAGE, chunk, now_ns)? {
-                Take::Header { .. } => Ok(Vec::new()),
-                Take::Image(image) => {
-                    image.written();
-                    Ok(Vec::new())
-                }
-            },
-        }
-    }
-
-    /// `dev.firmware.upgrade`. The simulator holds no key, so a signed
-    /// package's signature goes unchecked.
-    fn upgrade(&mut self, now_ns: u64) -> Result<(), RpcError> {
-        match self {
-            Self::Image { .. } => Ok(()),
-            Self::Signed(upload) => {
-                upload.upgrade(now_ns)?;
-                upload.armed();
-                Ok(())
-            }
-        }
-    }
-
-    /// `dev.firmware.abort`, which a device that takes images does not answer.
-    fn abort(&mut self) -> Result<(), RpcError> {
-        match self {
-            Self::Image { .. } => Err(RpcError::NotFound),
-            Self::Signed(upload) => upload.abort(),
-        }
-    }
-}
 
 static SINE: StreamDef = StreamDef {
     name: "sine",
@@ -188,6 +118,7 @@ pub(super) struct Board {
     status: Setting<u8>,
     enable: Setting<bool>,
     go: Go,
+    samplerate: u32,
 }
 
 /// Refuses a value that is negative or not finite.
@@ -207,6 +138,7 @@ impl Board {
             status: Setting::new("test.status", 0),
             enable: Setting::new("test.enable", true),
             go: Go,
+            samplerate: cli.samplerate,
         }
     }
 
@@ -235,6 +167,25 @@ impl Group for Board {
         visit(Entry::Setting(&mut self.status));
         visit(Entry::Setting(&mut self.enable));
         visit(Entry::Action(&mut self.go));
+    }
+}
+
+impl sim::Board<SEGMENTS> for Board {
+    fn streams(&self) -> Vec<DataStream<SEGMENTS>> {
+        let stream = |id: u8, def: &'static StreamDef, rate: u32| {
+            let params = Params {
+                rate: NonZeroU32::new(rate).expect("a sample rate is never zero"),
+                decimation: NonZeroU32::MIN,
+                enabled: true,
+            };
+            let filter = Box::leak(Box::new(filter::None));
+            DataStream::new(StreamId::new(id), def, filter, params).expect("a sample fits a packet")
+        };
+        vec![
+            stream(1, &SINE, self.samplerate),
+            stream(2, &STATUS, self.samplerate),
+            stream(3, &AUX, AUX_SAMPLE_RATE),
+        ]
     }
 }
 
@@ -339,36 +290,18 @@ impl Clock {
     }
 }
 
-/// The port of a device no host has reached yet, as at boot.
-struct Unheard;
-
-impl Sink for Unheard {
-    fn send(&mut self, _packet: &[u8]) {}
-}
-
-/// One simulated device.
+/// One simulated device, its board's waveforms and capture buffer around a [`Sim`] on one port.
 pub(super) struct SimDevice {
     pub(super) route: DeviceRoute,
-    device: Device<Board>,
-    /// The sine, status and aux streams, in id order. The first two take the
-    /// main clock's samples, the last the aux clock's.
-    streams: [DataStream<SEGMENTS>; 3],
+    sim: Sim<Board, SEGMENTS>,
     segment_seconds: u32,
     no_drop: bool,
-    /// When the acquisition started, while it runs.
+    /// When the acquisition the clocks follow started, while one runs.
     started_ns: Option<u64>,
-    /// The second sample zero of the acquisition belongs to.
-    start_second: u32,
-    /// The first whole second a new acquisition may start at, the one at
-    /// or after the end of the last sample of the acquisition before it.
-    resume_second: u32,
     main: Clock,
     aux: Clock,
     rng: GaussianRng,
     capture: Captured,
-    slot: Slot,
-    /// The configuration `dev.conf.save` or an autosave stored, if any.
-    stored: Option<Entries>,
     next_log_ns: u64,
     next_log_level: usize,
 }
@@ -388,127 +321,97 @@ impl SimDevice {
         };
         let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, &serial, DEVICE_FIRMWARE)
             .expect("the simulator's identity fits");
-        let session = next_session(&mut rng);
-        let stream = |id: u8, def: &'static StreamDef, rate: u32| {
-            let params = Params {
-                rate: NonZeroU32::new(rate).expect("a sample rate is never zero"),
-                decimation: NonZeroU32::MIN,
-                enabled: true,
-            };
-            // Each stream makes its filter once and keeps it for the whole run.
-            let filter = Box::leak(Box::new(filter::None));
-            DataStream::new(StreamId::new(id), def, filter, params).expect("a sample fits a packet")
-        };
-        let streams = [
-            stream(1, &SINE, cli.samplerate),
-            stream(2, &STATUS, cli.samplerate),
-            stream(3, &AUX, AUX_SAMPLE_RATE),
-        ];
-        let device = Device::new(
+        let mut sim = Sim::new(
             identity,
-            session,
+            next_session(&mut rng),
             table(cli),
             Board::new(cli),
             PASSWORD,
             now_ns,
-            &streams[..],
-            &mut OneLane(Unheard),
+            vec![Port::new(PORT_CAPACITY)],
         );
+        sim.offset = unix_duration().as_secs() as i64 - (now_ns / 1_000_000_000) as i64;
+        sim.slot = Some(match cli.upload {
+            UploadKind::Image => Slot::Image {
+                envelope: CHUNK_ENVELOPE,
+                uploaded: 0,
+            },
+            UploadKind::Signed => Slot::Signed(PACKAGE, Upload::new()),
+        });
+        sim.upgraded = Identity::new(DEVICE_NAME, UPGRADED_DESC, &serial, DEVICE_FIRMWARE);
         let next_log_ns = now_ns + next_log_delay_ns(&mut rng);
-        let mut sim = Self {
+        let mut device = Self {
             route,
-            device,
-            streams,
+            sim,
             segment_seconds: cli.segment_seconds,
             no_drop: cli.no_drop,
             started_ns: None,
-            start_second: 0,
-            resume_second: 0,
             main: Clock::stopped(cli.samplerate),
             aux: Clock::stopped(AUX_SAMPLE_RATE),
             rng,
             capture: Captured::idle(),
-            slot: Slot::new(cli.upload),
-            stored: None,
             next_log_ns,
             next_log_level: 0,
         };
         // Firmware waits `dev.autostart` seconds before it acquires; the
         // simulator acquires from boot.
-        sim.start(now_ns, &mut Unheard);
-        sim
+        let _ = device.sim.start(now_ns);
+        device.follow();
+        device
     }
 
     #[cfg(test)]
     pub(super) fn serial(&self) -> &str {
-        &self.device.identity.serial
+        &self.sim.device.identity.serial
     }
 
     #[cfg(test)]
     pub(super) fn session(&self) -> SessionId {
-        self.device.session
+        self.sim.device.session
     }
 
     pub(super) fn board(&self) -> &Board {
-        self.device.settings()
+        self.sim.device.settings()
     }
 
     /// Sends what a host that just connected needs to know.
     pub(super) fn connected(&mut self, now_ns: u64, out: &mut impl Sink) {
-        self.device.connected(&self.streams[..], now_ns, out);
+        self.sim.connect(0, now_ns);
+        self.drain(out);
     }
 
-    /// Answers a packet addressed to this device.
+    /// Answers a packet addressed to this device, and the board answers what no entry does.
     pub(super) fn handle(&mut self, packet: &[u8], now_ns: u64, out: &mut impl Sink) {
-        let Ok((view, _)) = PacketView::parse_prefix(packet) else {
-            return;
-        };
-        let actions = self.device.handle(
-            &self.streams[..],
-            Input::Packet(view),
-            now_ns,
-            &mut OneLane(&mut *out),
-        );
-        self.carry_out(actions, now_ns, out);
-    }
-
-    /// Carries out what the device decided and left to its platform.
-    fn carry_out(&mut self, actions: Actions<'_>, now_ns: u64, out: &mut impl Sink) {
-        let Actions {
-            call,
-            deferred,
-            reboot,
-            log,
-            ..
-        } = actions;
-        if let Some((level, message)) = log {
-            terminal_println!("{}: {message} ({level:?})", self.route);
-        }
-        if let Some((pending, name, args)) = call {
-            let answered = match name {
-                "test.capture" => self.capture_rpc(args, now_ns),
-                "test.drop" => self.drop_rpc(args),
+        let session = self.sim.device.session;
+        if let Some(call) = self.sim.request(0, packet, now_ns) {
+            let answered = match call.name {
+                "test.capture" => self.capture_rpc(&call.args, now_ns),
+                "test.drop" => self.drop_rpc(&call.args),
                 _ => Err(RpcError::NotFound),
             };
-            device::answer(pending, answered.as_deref().map_err(|&error| error), out);
+            self.sim
+                .answer(&call, answered.as_deref().map_err(|&error| error));
         }
-        match deferred {
-            Some((pending, Deferred::Flash(op))) => self.flash(pending, op, now_ns, out),
-            Some((pending, Deferred::Acquire(request))) => {
-                match request {
-                    SyncRequest::Start => self.start(now_ns, out),
-                    SyncRequest::Stop => self.stop(out),
-                    SyncRequest::Restart => {
-                        self.stop(out);
-                        self.start(now_ns, out);
-                    }
-                }
-                device::answer(pending, Ok::<_, RpcError>(&[][..]), out);
-            }
-            None => {}
+        if self.sim.device.session != session {
+            self.booted(now_ns);
         }
-        if reboot {
-            self.reboot(now_ns, out);
+        self.follow();
+        self.drain(out);
+    }
+
+    /// Sends the host what the port holds, as firmware egress does.
+    fn drain(&mut self, out: &mut impl Sink) {
+        while let Some(packet) = self.sim.ports[0].egress() {
+            out.send(&packet);
+        }
+    }
+
+    /// Puts the clocks at sample zero of an acquisition that started since they last looked.
+    fn follow(&mut self) {
+        if self.sim.started() != self.started_ns {
+            self.started_ns = self.sim.started();
+            self.main = self.started(self.main.rate);
+            self.aux = self.started(self.aux.rate);
         }
     }
 
@@ -529,7 +432,7 @@ impl SimDevice {
         let span = CAPTURE_SAMPLES_MAX - CAPTURE_SAMPLES_MIN + 1;
         let count = CAPTURE_SAMPLES_MIN + (self.rng.next_u64() as usize % span);
         let rate = f64::from(self.main.rate);
-        let board = self.device.settings();
+        let board = self.sim.device.settings();
         let (amplitude, frequency) = (board.amplitude(), board.frequency());
         let noise_sigma = board.noise() * (rate / 2.0).sqrt();
         let start = self.main.taken;
@@ -568,71 +471,6 @@ impl SimDevice {
         }
     }
 
-    /// What firmware does with its flash, in memory. An upload goes to the
-    /// slot of the kind of device being simulated.
-    fn flash(&mut self, pending: Pending<'_>, op: FlashOp, now_ns: u64, out: &mut impl Sink) {
-        let answered: Result<Vec<u8>, RpcError> = match op {
-            FlashOp::ConfSave(image) => {
-                self.stored = Some(image);
-                Ok(Vec::new())
-            }
-            FlashOp::ConfReset => {
-                self.stored = None;
-                Ok(Vec::new())
-            }
-            FlashOp::ConfLoad => {
-                let stored = self.stored.clone();
-                let image = stored.as_deref().ok_or(RpcError::State);
-                let actions = self.device.handle(
-                    &self.streams[..],
-                    Input::Loaded(Some(pending), image),
-                    now_ns,
-                    &mut OneLane(&mut *out),
-                );
-                return self.carry_out(actions, now_ns, out);
-            }
-            FlashOp::Upload(chunk) => self.slot.upload(&chunk, now_ns),
-            FlashOp::Upgrade => {
-                if let Err(error) = self.slot.upgrade(now_ns) {
-                    return device::answer(pending, Err(error), out);
-                }
-                device::answer(pending, Ok::<_, RpcError>(&[][..]), out);
-                let serial = self.device.identity.serial.clone();
-                self.device.identity =
-                    Identity::new(DEVICE_NAME, UPGRADED_DESC, &serial, DEVICE_FIRMWARE)
-                        .expect("the simulator's identity fits");
-                return self.reboot(now_ns, out);
-            }
-            FlashOp::Abort => self.slot.abort().map(|()| Vec::new()),
-        };
-        device::answer(pending, answered.as_deref().map_err(|&error| error), out);
-    }
-
-    /// Starts acquiring every stream, from a segment at the current whole
-    /// second, or at the first whole second after the acquisition before
-    /// when that is later, so time never goes back across a restart.
-    fn start(&mut self, now_ns: u64, out: &mut impl Sink) {
-        if self.started_ns.is_some() {
-            return;
-        }
-        self.start_second = (unix_duration().as_secs() as u32).max(self.resume_second);
-        let timeref = Timeref::new(
-            Epoch::UNIX,
-            self.start_second,
-            self.device.session,
-            &self.device.identity.serial,
-        )
-        .expect("a serial that fits the identity fits the time reference");
-        for stream in &mut self.streams {
-            stream
-                .start(timeref.clone(), &mut *out)
-                .expect("a stopped stream starts");
-        }
-        self.main = self.started(self.main.rate);
-        self.aux = self.started(self.aux.rate);
-        self.started_ns = Some(now_ns);
-    }
-
     /// A clock at sample zero, with its first drop and rollover.
     fn started(&mut self, rate: u32) -> Clock {
         Clock {
@@ -643,55 +481,27 @@ impl SimDevice {
         }
     }
 
-    /// Stops acquiring every stream, each closing its segment into `out`. A clock's sample `n`
-    /// ends `n + 1` periods after the start, so the last one taken ends by the whole second its
-    /// count of periods rounds up to.
-    fn stop(&mut self, out: &mut impl Sink) {
-        if self.started_ns.is_some() {
-            let seconds = [&self.main, &self.aux]
-                .map(|clock| clock.taken.div_ceil(u64::from(clock.rate)))
-                .into_iter()
-                .max()
-                .unwrap_or(0);
-            self.resume_second = self.start_second.saturating_add(seconds as u32);
-        }
-        for stream in &mut self.streams {
-            stream.stop(&mut *out);
-        }
-        self.started_ns = None;
+    /// Power-cycles into a new session. The board's entries go back to their
+    /// defaults and then to what is stored, and the acquisition starts afresh.
+    pub(super) fn reboot(&mut self, now_ns: u64, out: &mut impl Sink) {
+        let session = SessionId::new(self.sim.device.session.value().wrapping_add(1));
+        self.sim.reboot(session, now_ns);
+        self.booted(now_ns);
+        self.follow();
+        self.drain(out);
     }
 
-    /// Power-cycles into a new session. The board's entries go back to their
-    /// defaults and then to what is stored, the acquisition starts afresh,
-    /// and the device sends a host what it sends once it is up.
-    pub(super) fn reboot(&mut self, now_ns: u64, out: &mut impl Sink) {
-        let session = next_session(&mut self.rng);
-        self.device
-            .reboot(session, now_ns, &self.streams[..], &mut OneLane(&mut *out));
-        self.device.settings_mut().entries(&mut |entry| {
-            if let Entry::Setting(cell) = entry {
-                let _ = cell.reset(&mut Reply::new());
-            }
-        });
-        if let Some(stored) = self.stored.clone() {
-            let actions = self.device.handle(
-                &self.streams[..],
-                Input::Loaded(None, Ok(&stored)),
-                now_ns,
-                &mut OneLane(&mut *out),
-            );
-            self.carry_out(actions, now_ns, out);
-        }
-        self.slot = Slot::new(self.slot.kind());
+    /// Comes up as the board does, with an idle capture, an acquisition from boot and the records
+    /// a host needs.
+    fn booted(&mut self, now_ns: u64) {
         self.capture = Captured::idle();
-        self.stop(&mut Unheard);
-        self.start(now_ns, out);
+        let _ = self.sim.start(now_ns);
         terminal_println!(
             "{}: rebooted; new session id {}",
             self.route,
-            session.value()
+            self.sim.device.session.value()
         );
-        self.connected(now_ns, out);
+        self.sim.connect(0, now_ns);
     }
 
     /// Drops the next sample of each clock, as a random drop does.
@@ -718,34 +528,31 @@ impl SimDevice {
     /// Sends the heartbeat, log message and samples due at `now_ns`. A configuration left unsaved long
     /// enough is stored, as firmware's autosave does.
     pub(super) fn tick(&mut self, now_ns: u64, out: &mut impl Sink) {
-        if let Some(image) = self.device.tick(now_ns, &mut OneLane(&mut *out)) {
-            self.stored = Some(image);
-            self.device.saved();
-        }
+        self.sim.tick(now_ns);
+        self.follow();
         self.update_capture(now_ns);
-        self.log_if_due(now_ns, out);
+        self.log_if_due(now_ns);
         let Some(started_ns) = self.started_ns else {
             return;
         };
         let elapsed_ns = now_ns.saturating_sub(started_ns);
         let (main_due, aux_due) = (self.main.due(elapsed_ns), self.aux.due(elapsed_ns));
         while self.main.taken < main_due {
-            self.sample_main(out);
+            self.sample_main();
         }
         while self.aux.taken < aux_due {
-            self.sample_aux(out);
+            self.sample_aux();
         }
-        for stream in &mut self.streams {
-            stream.flush(out);
-        }
+        self.sim.flush();
+        self.drain(out);
     }
 
     /// Takes the next sine and status sample.
-    fn sample_main(&mut self, out: &mut impl Sink) {
+    fn sample_main(&mut self) {
         if self.main.taken == self.main.rollover_at {
             self.main.rollover_at += u64::from(self.main.rate) * u64::from(self.segment_seconds);
-            self.streams[0].rollover(out);
-            self.streams[1].rollover(out);
+            self.sim.rollover(0);
+            self.sim.rollover(1);
         }
         if self.main.taken == self.main.drop_at {
             terminal_println!(
@@ -753,14 +560,14 @@ impl SimDevice {
                 self.route,
                 self.main.taken
             );
-            self.streams[0].skip(1, out);
-            self.streams[1].skip(1, out);
+            self.sim.skip(0, 1);
+            self.sim.skip(1, 1);
             self.main.taken += 1;
             self.main.drop_at = self.next_drop_after(self.main.taken, self.main.rate);
             return;
         }
         let rate = f64::from(self.main.rate);
-        let board = self.device.settings();
+        let board = self.sim.device.settings();
         let (amplitude, frequency) = (board.amplitude(), board.frequency());
         let noise_sigma = board.noise() * (rate / 2.0).sqrt();
         let status = board.status();
@@ -770,16 +577,16 @@ impl SimDevice {
         let mut sample = [0u8; 16];
         sample[..8].copy_from_slice(&sine.to_le_bytes());
         sample[8..].copy_from_slice(&cosine.to_le_bytes());
-        self.streams[0].push(&sample, out);
-        self.streams[1].push(&[status, SIGNAL_LEVEL], out);
+        self.sim.push(0, &sample);
+        self.sim.push(1, &[status, SIGNAL_LEVEL]);
         self.main.taken += 1;
     }
 
     /// Takes the next aux sample.
-    fn sample_aux(&mut self, out: &mut impl Sink) {
+    fn sample_aux(&mut self) {
         if self.aux.taken == self.aux.rollover_at {
             self.aux.rollover_at += u64::from(self.aux.rate) * u64::from(self.segment_seconds);
-            self.streams[2].rollover(out);
+            self.sim.rollover(2);
         }
         if self.aux.taken == self.aux.drop_at {
             terminal_println!(
@@ -787,7 +594,7 @@ impl SimDevice {
                 self.route,
                 self.aux.taken
             );
-            self.streams[2].skip(1, out);
+            self.sim.skip(2, 1);
             self.aux.taken += 1;
             self.aux.drop_at = self.next_drop_after(self.aux.taken, self.aux.rate);
             return;
@@ -799,7 +606,7 @@ impl SimDevice {
         let mut sample = [0u8; 16];
         sample[..8].copy_from_slice(&triangle.to_le_bytes());
         sample[8..].copy_from_slice(&sawtooth.to_le_bytes());
-        self.streams[2].push(&sample, out);
+        self.sim.push(2, &sample);
         self.aux.taken += 1;
     }
 
@@ -815,7 +622,7 @@ impl SimDevice {
 
     /// Sends a log message once one is due, cycling through the levels. One
     /// beneath `dev.loglevel` goes unsent, as firmware leaves it.
-    fn log_if_due(&mut self, now_ns: u64, out: &mut impl Sink) {
+    fn log_if_due(&mut self, now_ns: u64) {
         if now_ns < self.next_log_ns {
             return;
         }
@@ -839,7 +646,7 @@ impl SimDevice {
         ];
         let template = templates[(self.rng.next_u64() % templates.len() as u64) as usize];
         let message = template.replace("{lucky}", &lucky.to_string());
-        self.device.log(level, lucky, &message, out);
+        self.sim.log(level, lucky, &message);
         self.next_log_ns = now_ns + next_log_delay_ns(&mut self.rng);
     }
 }
@@ -927,7 +734,7 @@ mod tests {
     }
 
     /// A restart, by one `dev.restart` or by `dev.stop` and then `dev.start`,
-    /// reaches a host as one boundary of every stream with no loss, and the new
+    /// reaches a host as a restart of every stream with no loss, and the new
     /// acquisition's samples come after the last of the one before.
     #[test]
     fn a_restart_reaches_a_host_with_no_loss_and_goes_on_in_time() {
@@ -950,6 +757,10 @@ mod tests {
                     panic!("{asks:?} stream {stream} reports {boundaries:?}");
                 };
                 assert_eq!(initial.change, Some(Change::Initial));
+                assert!(
+                    matches!(restart.change, Some(Change::Restarted { .. })),
+                    "{asks:?} stream {stream} reports {restart:?}"
+                );
                 assert_eq!(restart.loss, None, "{asks:?} stream {stream}");
                 assert!(
                     batches[*at].0 > batches[at - 1].1,
