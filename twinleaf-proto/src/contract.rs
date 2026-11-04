@@ -12,8 +12,9 @@
 //! go out again with another start, reference or rate, as a change made
 //! before the segment issues lands on it. A stream is checked from its first record, as a trace
 //! may begin mid-stream, and a record without [`SegmentFlags::VALID`] is none. Each route is
-//! checked alone, and starts over at a heartbeat naming a new session, as a boot empties every
-//! lane. A device keeps the laws of the [`Law::revision`] its record declares and those before.
+//! checked alone. Its control starts over at its first heartbeat and at each naming a new session, as what came before may be of another, and each stream's
+//! data at a [`SegmentFlags::START`] record opening another segment, as each begins its lane
+//! afresh while the other lanes may still carry what came before. A device keeps the laws of the [`Law::revision`] its record declares and those before.
 //! A packet whose payload does not parse is not checked.
 
 use alloc::collections::BTreeMap;
@@ -76,7 +77,7 @@ pub enum Law {
     /// increasing sample numbers.
     S3,
     /// A segment's rows never number back after a row of another segment of
-    /// its stream, so no second acquisition reuses its id, start and reference.
+    /// its stream, so no switch back reuses its id, start and reference.
     S4,
     /// A record that moves a segment id's start or reference between two of its rows, with no
     /// record of another id between them, restarts the count, so the next row numbers no higher.
@@ -85,8 +86,8 @@ pub enum Law {
     D1,
     /// A segment's closing record is its opening record with [`SegmentFlags::ACTIVE`] cleared.
     D2,
-    /// A record opening a segment carries [`SegmentFlags::START`] exactly when its stream has no
-    /// segment open, as every stop closes the segment it ends.
+    /// A record opening a segment while its stream has none open carries [`SegmentFlags::START`],
+    /// and one with it while a segment is open ends that segment unclosed.
     D3,
 }
 
@@ -239,11 +240,7 @@ fn d2(stream: &Stream, record: &Record) -> bool {
 }
 
 fn d3(stream: &Stream, record: &Record) -> bool {
-    let open = stream.opened.as_ref().filter(|_| !stream.closed);
-    let opens = record.active() && open.is_none_or(|open| open.segment.id != record.segment.id);
-    stream.latest.is_none()
-        || !opens
-        || record.flags.contains(SegmentFlags::START) == open.is_none()
+    stream.latest.is_none() || !record.active() || stream.open().is_some() || record.starts()
 }
 
 /// A segment as a row names it, its id with the start and time reference of its latest record.
@@ -270,6 +267,10 @@ struct Record {
 impl Record {
     fn active(&self) -> bool {
         self.flags.contains(SegmentFlags::ACTIVE)
+    }
+
+    fn starts(&self) -> bool {
+        self.flags.contains(SegmentFlags::START)
     }
 }
 
@@ -299,6 +300,10 @@ struct Stream {
 }
 
 impl Stream {
+    fn open(&self) -> Option<&Record> {
+        self.opened.as_ref().filter(|_| !self.closed)
+    }
+
     fn segment(&self, row: Row) -> Option<&Segment> {
         self.records.get(&row.segment)
     }
@@ -331,6 +336,17 @@ impl Stream {
             filter_cutoff: record.filter_cutoff,
             filter_type: record.filter_type,
         };
+        if record.active()
+            && record.starts()
+            && self
+                .open()
+                .is_none_or(|open| open.segment != record.segment)
+        {
+            *self = Self {
+                sample_size: self.sample_size,
+                ..Self::default()
+            };
+        }
         let broken = [(Law::D2, d2(self, &record)), (Law::D3, d3(self, &record))]
             .into_iter()
             .find_map(|(law, holds)| (!holds).then_some(law));
@@ -510,8 +526,14 @@ impl Route {
 
     fn beat(&mut self, session: SessionId, settings: Option<u32>) {
         match self.control.session {
-            Some(known) if known != session => *self = Self::default(),
-            Some(_) | None => {}
+            Some(known) if known != session => self.control = Control::default(),
+            Some(_) => {}
+            None => {
+                self.control = Control {
+                    protocol: self.control.protocol,
+                    ..Control::default()
+                }
+            }
         }
         self.control.session = Some(session);
         self.control.shown = self.control.shown.max(settings);
@@ -804,7 +826,7 @@ mod tests {
                     row(1, 1),
                     session(2, 0),
                     v1(),
-                    record(0, 100),
+                    start(0, 100),
                     row(0, 0),
                 ],
                 vec![
@@ -908,11 +930,16 @@ mod tests {
                     segment(1, 99, 3, SegmentFlags::VALID),
                     start(0, 100),
                     record(1, 101),
-                    segment(1, 101, 3, SegmentFlags::VALID),
                     start(2, 102),
+                    close(2, 102),
                 ],
-                vec![v1(), record(1, 99), start(0, 100)],
-                2,
+                vec![
+                    v1(),
+                    record(1, 99),
+                    segment(1, 99, 3, SegmentFlags::VALID),
+                    record(0, 100),
+                ],
+                3,
             ),
             (
                 Law::D3,
@@ -954,6 +981,40 @@ mod tests {
             breaking(vec![declare(1)]),
             [(Law::S1, 2), (Law::F1, 3), (Law::S1, 3)]
         );
+    }
+
+    /// A heartbeat of the next session that overtakes the last session's rows, as a hop that keeps
+    /// each lane's order and no other delivers it, leaves the stream to be checked on to its start.
+    #[test]
+    fn a_heartbeat_overtaking_the_last_sessions_rows_keeps_the_contract() {
+        let trace = |late: Step| {
+            broken(&[
+                session(1, 0),
+                declare(1),
+                stream(),
+                start(0, 100),
+                row(0, 0),
+                session(2, 0),
+                declare(1),
+                late,
+                start(0, 105),
+                row(0, 0),
+            ])
+        };
+        assert_eq!(trace(row(0, 2)), []);
+        assert_eq!(trace(row(0, 0)), [(Law::S3, 7)]);
+    }
+
+    /// A trace that begins with the last session's announcements numbers the next session's
+    /// afresh from its first heartbeat.
+    #[test]
+    fn announcements_before_the_first_heartbeat_are_of_a_session_of_their_own() {
+        let steps = [
+            announce("dev.name", 1, b"a"),
+            session(2, 0),
+            announce("dev.name", 1, b"b"),
+        ];
+        assert_eq!(broken(&steps), []);
     }
 
     /// A segment's record sent again before its first row, with the start a
