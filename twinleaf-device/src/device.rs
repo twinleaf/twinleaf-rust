@@ -3092,12 +3092,14 @@ mod tests {
     /// read by hosts on its ports that each merge its lanes in an order of their own.
     mod contract {
         use super::*;
+        use crate::data::Timeref;
         use crate::sim::{self, Port, Sim};
         use proptest::prelude::*;
         use std::collections::VecDeque;
         use twinleaf_proto::contract::{self, Observed, Sender};
         use twinleaf_proto::data::{Metadata, SegmentFlags};
         use twinleaf_proto::packet::Lane;
+        use twinleaf_proto::sync::Epoch;
         use twinleaf_proto::DeviceRoute;
 
         const RATE: u32 = 10;
@@ -3206,7 +3208,7 @@ mod tests {
                 BOOT,
                 ports,
             );
-            sim.reference.serial = "REF".try_into().unwrap();
+            sim.reference = Timeref::new(Epoch::UNIX, 0, SessionId::new(1), "REF");
             sim
         }
 

@@ -205,8 +205,10 @@ pub struct Call {
     pub args: Vec<u8>,
 }
 
-/// An acquisition under way: the second its sample zero labels, and each stream's samples since.
+/// An acquisition under way: when it began, the second its sample zero labels, and each stream's
+/// samples since.
 struct Acquiring {
+    started_ns: u64,
     second: u32,
     taken: Vec<u64>,
 }
@@ -225,8 +227,8 @@ pub struct Sim<B: Board<N>, const N: usize> {
     pub slot: Option<Slot>,
     /// The identity a firmware upgrade boots into, or `None` to keep this one.
     pub upgraded: Option<Identity>,
-    /// The time reference's epoch, session and serial; a start labels its seconds.
-    pub reference: Timeref,
+    /// The time reference a start labels its seconds by, or `None` for the device's own clock.
+    pub reference: Option<Timeref>,
     /// Seconds the time reference runs ahead of the clock.
     pub offset: i64,
     acquiring: Option<Acquiring>,
@@ -247,8 +249,6 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
         mut ports: Vec<Port>,
     ) -> Self {
         let streams = board.streams();
-        let reference = Timeref::new(Epoch::UNIX, 0, session, &identity.serial)
-            .expect("a serial that fits an identity fits a time reference");
         let mut written = 0;
         let device = Device::new(
             identity,
@@ -267,7 +267,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
             stored: None,
             slot: None,
             upgraded: None,
-            reference,
+            reference: None,
             offset: 0,
             acquiring: None,
             resume: 0,
@@ -310,7 +310,6 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
             self.device.saved();
         }
         if self.autostart.is_some_and(|at| now_ns >= at) {
-            self.autostart = None;
             let _ = self.start(now_ns);
         }
     }
@@ -354,8 +353,11 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
     pub fn relabel(&mut self, shift: i64, session: SessionId, now_ns: u64) {
         let from = self.second(now_ns);
         self.offset += shift;
-        self.reference.session = session;
-        let to = self.timeref(now_ns);
+        let to = Timeref {
+            session,
+            ..self.timeref(now_ns)
+        };
+        self.reference = Some(to.clone());
         let mut data = Wires::new(&mut self.ports, &mut self.written, None);
         self.streams
             .iter_mut()
@@ -365,6 +367,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
     /// Every stream starts at the clock's second, or the first after the last acquisition ended
     /// when that is later, so time never goes back; refused while acquiring.
     pub fn start(&mut self, now_ns: u64) -> Result<(), RpcError> {
+        self.autostart = None;
         if self.acquiring.is_some() {
             return Err(RpcError::State);
         }
@@ -379,6 +382,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
                 .expect("a stopped stream starts")
         });
         self.acquiring = Some(Acquiring {
+            started_ns: now_ns,
             second: timeref.start_time,
             taken: std::vec![0; self.streams.len()],
         });
@@ -387,6 +391,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
 
     /// Every stream stops, each sending its staged rows and then its closing record.
     pub fn stop(&mut self) {
+        self.autostart = None;
         if let Some(acquiring) = self.acquiring.take() {
             let seconds = acquiring
                 .taken
@@ -405,9 +410,11 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
             .for_each(|stream| stream.stop(&mut data));
     }
 
-    /// Whether the streams are acquiring.
-    pub fn acquiring(&self) -> bool {
-        self.acquiring.is_some()
+    /// When the acquisition under way began, `None` while stopped.
+    pub fn started(&self) -> Option<u64> {
+        self.acquiring
+            .as_ref()
+            .map(|acquiring| acquiring.started_ns)
     }
 
     /// Power-cycles into `session`: every lane empties, the board's entries go back to their
@@ -418,6 +425,12 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
                 .into_iter()
                 .for_each(|lane| port.lane(lane).packets.clear())
         });
+        self.boot(session, now_ns);
+    }
+
+    /// Comes up in `session` behind what the ports still hold, as a reset a request asked for
+    /// does once each port has sent it.
+    fn boot(&mut self, session: SessionId, now_ns: u64) {
         if let Some(identity) = self.upgraded.take() {
             self.device.identity = identity;
         }
@@ -484,9 +497,19 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
     }
 
     fn timeref(&self, now_ns: u64) -> Timeref {
-        Timeref {
-            start_time: self.second(now_ns),
-            ..self.reference.clone()
+        let start_time = self.second(now_ns);
+        match &self.reference {
+            Some(reference) => Timeref {
+                start_time,
+                ..reference.clone()
+            },
+            None => Timeref::new(
+                Epoch::UNIX,
+                start_time,
+                self.device.session,
+                &self.device.identity.serial,
+            )
+            .expect("a serial that fits an identity fits a time reference"),
         }
     }
 
@@ -513,7 +536,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
             ..
         } = actions;
         if let Some((level, message)) = log {
-            self.log(level, message);
+            self.log(level, 0, message);
         }
         let call = call.map(|(pending, name, args)| Call {
             port,
@@ -542,7 +565,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
         }
         if reboot {
             let session = SessionId::new(self.device.session.value().wrapping_add(1));
-            self.reboot(session, now_ns);
+            self.boot(session, now_ns);
         }
         call
     }
@@ -589,7 +612,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
                 );
                 if upgraded.is_ok() {
                     let session = SessionId::new(self.device.session.value().wrapping_add(1));
-                    self.reboot(session, now_ns);
+                    self.boot(session, now_ns);
                 }
                 return;
             }
@@ -604,10 +627,10 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
         );
     }
 
-    /// Logs `message` on every port's event lane, as the device's threshold lets it.
-    pub fn log(&mut self, level: LogLevel, message: &str) {
+    /// Logs `message` with `data` on every port's event lane, as the device's threshold lets it.
+    pub fn log(&mut self, level: LogLevel, data: u32, message: &str) {
         let mut wires = Wires::new(&mut self.ports, &mut self.written, None);
-        self.device.log(level, 0, message, &mut wires.events());
+        self.device.log(level, data, message, &mut wires.events());
     }
 }
 
