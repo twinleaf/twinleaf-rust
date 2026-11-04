@@ -1,5 +1,6 @@
 //! `tio` end to end on loopback: a simulated tree served by `tio proxy`, found by `tio list`,
 //! answering `tio rpc` through the machine's shared proxy, and held as its default by a pick.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
