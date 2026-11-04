@@ -250,10 +250,9 @@ use std::sync::OnceLock;
 use std::task::Poll;
 use twinleaf_device::device::{
     self, Action, Actions, Announcer, Deferred, Entries, Entry, FlashOp, Group, Identity, Input,
-    Lanes, Probe, Refusal, SyncRequest,
+    Lanes, Probe, Refusal,
 };
 use twinleaf_device::rpc::{finite, Channel, RpcSpec, Setting, Std, STANDARD};
-use twinleaf_device::sync::AcquisitionState;
 use twinleaf_device::{Device, Sink};
 
 const MS: u64 = 1_000_000;
@@ -722,6 +721,21 @@ impl Sink for Out {
     }
 }
 
+impl Out {
+    /// The setting announcements written, without the heartbeats and device record that share
+    /// their lane.
+    fn announced(&self) -> impl Iterator<Item = &[u8]> {
+        self.0
+            .iter()
+            .filter(|(lane, packet)| {
+                *lane == Lane::Announce
+                    && PacketView::parse_prefix(packet)
+                        .is_ok_and(|(view, _)| view.header.ptype == PacketType::SETTING)
+            })
+            .map(|(_, packet)| packet.as_slice())
+    }
+}
+
 /// Every value a session's cacheable entries held, by position.
 struct Oracle {
     /// The count the session booted at, as it goes on the wire.
@@ -948,6 +962,8 @@ impl<'c> World<'c> {
             Board::new((0, 0)),
             PASSWORD,
             0,
+            &(),
+            &mut Out::default(),
         );
         let clients = case
             .clients
@@ -1189,7 +1205,7 @@ impl<'c> World<'c> {
     /// Counts each announcement into the oracle of the device's session,
     /// which must see them numbered one after another.
     fn record(&mut self, out: &Out) {
-        for (_, packet) in out.0.iter().filter(|(lane, _)| *lane == Lane::Announce) {
+        for packet in out.announced() {
             let Some(setting) = PacketView::parse_prefix(packet)
                 .ok()
                 .and_then(|(view, _)| Announcement::parse(view.payload))
@@ -1268,20 +1284,15 @@ impl<'c> World<'c> {
     fn boot(&mut self) {
         self.boots += 1;
         let session = SessionId::new(self.boots.wrapping_mul(0x9E37_79B9) ^ self.case.seed as u32);
-        self.device.reboot(session, self.now);
-        self.device.set_acquisition(AcquisitionState::Idle);
+        let mut early = Out::default();
+        self.device.reboot(session, self.now, &(), &mut early);
         self.device.settings_mut().entries(&mut |entry| {
             if let Entry::Setting(cell) = entry {
                 let _ = cell.reset(&mut twinleaf_device::rpc::Reply::new());
             }
         });
-        let mut early = Out::default();
         let (booted, values) = self.read_all(&mut early);
-        let known = early
-            .0
-            .iter()
-            .filter(|(lane, _)| *lane == Lane::Announce)
-            .count();
+        let known = early.announced().count();
         let mut out = Out::default();
         if let Some(stored) = self.stored.clone() {
             let _ = self
@@ -1420,13 +1431,7 @@ impl<'c> World<'c> {
                 pending,
                 Deferred::Flash(FlashOp::Upload(_) | FlashOp::Upgrade | FlashOp::Abort),
             )) => device::answer(pending, Err::<&[u8], _>(RpcError::State), out),
-            Some((pending, Deferred::Acquire(request))) => {
-                self.device.set_acquisition(match request {
-                    SyncRequest::Start | SyncRequest::Restart => AcquisitionState::Running,
-                    SyncRequest::Stop => AcquisitionState::Idle,
-                });
-                device::answer(pending, done, out);
-            }
+            Some((pending, Deferred::Acquire(_))) => device::answer(pending, done, out),
         }
         reboot
     }
@@ -2218,7 +2223,7 @@ impl<'c> World<'c> {
         }
         let mut out = Out::default();
         let (raw, values) = self.read_all(&mut out);
-        if out.0.iter().any(|(lane, _)| *lane == Lane::Announce) {
+        if out.announced().next().is_some() {
             return self.fail("(model) the device still had a change to announce".into());
         }
         let oracle = self.current();

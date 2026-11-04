@@ -4,7 +4,7 @@
 //! publisher turns issued samples into packets. A slice of streams is what a
 //! device describes itself with.
 
-use twinleaf_proto::data::{self, DataType, FilterType, CURRENT_SEGMENT};
+use twinleaf_proto::data::{self, DataType, FilterType, MetadataFlags, CURRENT_SEGMENT};
 use twinleaf_proto::{ColumnId, SegmentId, StreamId};
 
 use super::filter::{Filter, MAX_COLUMNS};
@@ -130,9 +130,13 @@ impl<const N: usize> DataStream<N> {
         Ok(())
     }
 
-    /// Stop acquiring.
-    pub fn stop(&mut self) {
-        self.segments.stop();
+    /// Stop acquiring, sending what is staged and then the record that closes the segment.
+    pub fn stop(&mut self, out: &mut impl Sink) {
+        self.publisher.flush(out);
+        if self.segments.stop() {
+            let record = self.segments.current().record(self.id, self.filter.kind());
+            self.publisher.record(record, MetadataFlags::UPDATE, out);
+        }
     }
 
     /// Acquire with `params` from the next segment on.
@@ -199,11 +203,11 @@ impl<const N: usize> DataStream<N> {
         self.publisher.flush(out);
     }
 
-    /// Send the record of a segment that opened, or changed before issuing.
+    /// Send the record the current segment owes.
     fn opened(&mut self, out: &mut impl Sink) {
-        if let Some(segment) = self.segments.opened() {
+        if let Some((segment, flags)) = self.segments.opened() {
             self.publisher
-                .record(segment.record(self.id, self.filter.kind()), out);
+                .record(segment.record(self.id, self.filter.kind()), flags, out);
         }
     }
 
@@ -569,7 +573,14 @@ mod tests {
 
         assert_eq!(
             sent.types(),
-            [stream_packet(1), PacketType::METADATA, stream_packet(1)]
+            [
+                stream_packet(1),
+                PacketType::METADATA,
+                stream_packet(1),
+                PacketType::METADATA,
+                stream_packet(1)
+            ],
+            "the new segment's record again at its first whole second"
         );
         let (view, _) = PacketView::parse_prefix(&sent.0[2]).unwrap();
         let samples = data::Samples::parse(view.header, view.payload).unwrap();
@@ -602,7 +613,7 @@ mod tests {
 
         (0..5).for_each(|_| {
             streams[0].push(&[0; 16], &mut sent);
-            assert_eq!(current(&streams), (0, 10, issuing));
+            assert_eq!(current(&streams), (0, 10, issuing | SegmentFlags::START));
         });
         streams[0].push(&[0; 16], &mut sent);
         assert_eq!(current(&streams), (1, 20, issuing));
@@ -620,7 +631,10 @@ mod tests {
         streams[0].rollover(&mut sent);
         (0..11).for_each(|_| streams[0].push(&[0; 16], &mut sent));
 
-        assert_eq!(streams[0].segment(0).unwrap().flags, SegmentFlags::VALID);
+        assert_eq!(
+            streams[0].segment(0).unwrap().flags,
+            SegmentFlags::VALID | SegmentFlags::START
+        );
         assert_eq!(
             streams[0].segment(1).unwrap().flags,
             SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
@@ -812,7 +826,10 @@ mod tests {
 
         let current = streams.segment(1, CURRENT_SEGMENT).unwrap();
         assert_eq!(current.segment_id.value(), 0);
-        assert_eq!(current.flags, SegmentFlags::VALID | SegmentFlags::ACTIVE);
+        assert_eq!(
+            current.flags,
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::START
+        );
         assert_eq!(streams.segment(1, 0).unwrap(), current);
         assert_eq!(streams.segment(1, 1), None);
         assert_eq!(streams.segment(1, 4), None);
@@ -851,9 +868,37 @@ mod tests {
     fn a_stopped_stream_keeps_its_segment_readable() {
         let mut streams = started();
         streams[0].push(&[0; 16], &mut Sent::default());
-        streams[0].stop();
+        streams[0].stop(&mut Sent::default());
         assert_eq!(streams[0].segment(CURRENT_SEGMENT), streams[0].segment(0));
         assert_eq!(streams[0].segment(0).unwrap().segment_id.value(), 0);
-        assert_eq!(streams[0].segment(0).unwrap().flags, SegmentFlags::VALID);
+        assert_eq!(
+            streams[0].segment(0).unwrap().flags,
+            SegmentFlags::VALID | SegmentFlags::START
+        );
+    }
+
+    /// A stop sends what is staged and then the segment's record with ACTIVE cleared, and a
+    /// stream already stopped sends nothing.
+    #[test]
+    fn a_stop_closes_the_segment_after_its_last_row() {
+        let mut streams = started();
+        let mut sent = Sent::default();
+        streams[0].push(&[0; 16], &mut sent);
+        streams[0].stop(&mut sent);
+        streams[0].stop(&mut sent);
+        assert_eq!(sent.types(), [stream_packet(1), PacketType::METADATA]);
+        let (view, _) = PacketView::parse_prefix(&sent.0[1]).unwrap();
+        let Some((data::Metadata::Segment(record), _)) = data::Metadata::parse(view.payload) else {
+            panic!("a segment record");
+        };
+        assert_eq!(record.flags, SegmentFlags::VALID | SegmentFlags::START);
+
+        let mut sent = Sent::default();
+        streams[1].stop(&mut sent);
+        assert_eq!(
+            sent.types(),
+            [PacketType::METADATA],
+            "a segment with no rows closes too"
+        );
     }
 }

@@ -19,7 +19,6 @@ use twinleaf_device::device::{
 };
 use twinleaf_device::rpc::{Access, Capture, Reply, RpcSpec, Selector, Setting, Status, STANDARD};
 use twinleaf_device::storage::update::{Package, Take, Upload};
-use twinleaf_device::sync::AcquisitionState;
 use twinleaf_device::{Device, Sink};
 
 use super::{unix_duration, GaussianRng};
@@ -390,14 +389,6 @@ impl SimDevice {
         let identity = Identity::new(DEVICE_NAME, DEVICE_DESC, &serial, DEVICE_FIRMWARE)
             .expect("the simulator's identity fits");
         let session = next_session(&mut rng);
-        let device = Device::new(
-            identity,
-            session,
-            table(cli),
-            Board::new(cli),
-            PASSWORD,
-            now_ns,
-        );
         let stream = |id: u8, def: &'static StreamDef, rate: u32| {
             let params = Params {
                 rate: NonZeroU32::new(rate).expect("a sample rate is never zero"),
@@ -413,6 +404,16 @@ impl SimDevice {
             stream(2, &STATUS, cli.samplerate),
             stream(3, &AUX, AUX_SAMPLE_RATE),
         ];
+        let device = Device::new(
+            identity,
+            session,
+            table(cli),
+            Board::new(cli),
+            PASSWORD,
+            now_ns,
+            &streams[..],
+            &mut OneLane(Unheard),
+        );
         let next_log_ns = now_ns + next_log_delay_ns(&mut rng);
         let mut sim = Self {
             route,
@@ -496,9 +497,9 @@ impl SimDevice {
             Some((pending, Deferred::Acquire(request))) => {
                 match request {
                     SyncRequest::Start => self.start(now_ns, out),
-                    SyncRequest::Stop => self.stop(),
+                    SyncRequest::Stop => self.stop(out),
                     SyncRequest::Restart => {
-                        self.stop();
+                        self.stop(out);
                         self.start(now_ns, out);
                     }
                 }
@@ -630,7 +631,6 @@ impl SimDevice {
         self.main = self.started(self.main.rate);
         self.aux = self.started(self.aux.rate);
         self.started_ns = Some(now_ns);
-        self.device.set_acquisition(AcquisitionState::Running);
     }
 
     /// A clock at sample zero, with its first drop and rollover.
@@ -643,10 +643,10 @@ impl SimDevice {
         }
     }
 
-    /// Stops acquiring every stream. A clock's sample `n` ends `n + 1`
-    /// periods after the start, so the last one taken ends by the whole
-    /// second its count of periods rounds up to.
-    fn stop(&mut self) {
+    /// Stops acquiring every stream, each closing its segment into `out`. A clock's sample `n`
+    /// ends `n + 1` periods after the start, so the last one taken ends by the whole second its
+    /// count of periods rounds up to.
+    fn stop(&mut self, out: &mut impl Sink) {
         if self.started_ns.is_some() {
             let seconds = [&self.main, &self.aux]
                 .map(|clock| clock.taken.div_ceil(u64::from(clock.rate)))
@@ -656,10 +656,9 @@ impl SimDevice {
             self.resume_second = self.start_second.saturating_add(seconds as u32);
         }
         for stream in &mut self.streams {
-            stream.stop();
+            stream.stop(&mut *out);
         }
         self.started_ns = None;
-        self.device.set_acquisition(AcquisitionState::Idle);
     }
 
     /// Power-cycles into a new session. The board's entries go back to their
@@ -667,7 +666,8 @@ impl SimDevice {
     /// and the device sends a host what it sends once it is up.
     pub(super) fn reboot(&mut self, now_ns: u64, out: &mut impl Sink) {
         let session = next_session(&mut self.rng);
-        self.device.reboot(session, now_ns);
+        self.device
+            .reboot(session, now_ns, &self.streams[..], &mut OneLane(&mut *out));
         self.device.settings_mut().entries(&mut |entry| {
             if let Entry::Setting(cell) = entry {
                 let _ = cell.reset(&mut Reply::new());
@@ -684,7 +684,7 @@ impl SimDevice {
         }
         self.slot = Slot::new(self.slot.kind());
         self.capture = Captured::idle();
-        self.stop();
+        self.stop(&mut Unheard);
         self.start(now_ns, out);
         terminal_println!(
             "{}: rebooted; new session id {}",
@@ -927,10 +927,10 @@ mod tests {
     }
 
     /// A restart, by one `dev.restart` or by `dev.stop` and then `dev.start`,
-    /// reaches a host as a restart of every stream with no loss, and the new
+    /// reaches a host as one boundary of every stream with no loss, and the new
     /// acquisition's samples come after the last of the one before.
     #[test]
-    fn a_restart_reads_as_a_restart_with_no_loss_and_goes_on_in_time() {
+    fn a_restart_reaches_a_host_with_no_loss_and_goes_on_in_time() {
         for asks in [&["dev.restart"][..], &["dev.stop", "dev.start"]] {
             let mut driven = Driven::new();
             driven.run(3);
@@ -950,10 +950,6 @@ mod tests {
                     panic!("{asks:?} stream {stream} reports {boundaries:?}");
                 };
                 assert_eq!(initial.change, Some(Change::Initial));
-                assert!(
-                    matches!(restart.change, Some(Change::Restarted { .. })),
-                    "{asks:?} stream {stream} reports {restart:?}"
-                );
                 assert_eq!(restart.loss, None, "{asks:?} stream {stream}");
                 assert!(
                     batches[*at].0 > batches[at - 1].1,
