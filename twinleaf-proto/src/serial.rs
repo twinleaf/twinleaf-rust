@@ -33,29 +33,32 @@ pub const fn max_serialized_size(packet_size: usize) -> usize {
 /// frame length, or `None` if `out` is too small. A buffer sized by
 /// [`max_serialized_size`] always fits.
 pub fn serialize(packet: &[u8], out: &mut [u8]) -> Option<usize> {
-    fn put(out: &mut [u8], len: &mut usize, value: u8) -> Option<()> {
-        *out.get_mut(*len)? = value;
-        *len += 1;
-        Some(())
-    }
-
     let crc = CRC32.checksum(packet).to_le_bytes();
     let mut len = 0;
-    for &byte in packet.iter().chain(crc.iter()) {
-        match byte {
-            SLIP_END => {
-                put(out, &mut len, SLIP_ESC)?;
-                put(out, &mut len, SLIP_ESC_END)?;
-            }
-            SLIP_ESC => {
-                put(out, &mut len, SLIP_ESC)?;
-                put(out, &mut len, SLIP_ESC_ESC)?;
-            }
-            _ => put(out, &mut len, byte)?,
+    for mut part in [packet, &crc[..]] {
+        // Copy each run between escaped bytes whole.
+        loop {
+            let run = part
+                .iter()
+                .position(|&byte| byte == SLIP_END || byte == SLIP_ESC)
+                .unwrap_or(part.len());
+            out.get_mut(len..len + run)?.copy_from_slice(&part[..run]);
+            len += run;
+            let Some((&special, rest)) = part[run..].split_first() else {
+                break;
+            };
+            let code = match special {
+                SLIP_END => SLIP_ESC_END,
+                _ => SLIP_ESC_ESC,
+            };
+            out.get_mut(len..len + 2)?
+                .copy_from_slice(&[SLIP_ESC, code]);
+            len += 2;
+            part = rest;
         }
     }
-    put(out, &mut len, SLIP_END)?;
-    Some(len)
+    *out.get_mut(len)? = SLIP_END;
+    Some(len + 1)
 }
 
 /// Frame-level error bits, matching `TL_SERIAL_ERROR_*`.
@@ -169,9 +172,27 @@ impl<const CAPACITY: usize> Deserializer<CAPACITY> {
     /// the number of bytes consumed and the completed frame, if any. The rest
     /// of `input` is left for the next call.
     pub fn push(&mut self, input: &[u8]) -> (usize, Option<Frame<'_>>) {
-        for (index, &byte) in input.iter().enumerate() {
-            let consumed = index + 1;
-            let mut byte = byte;
+        let mut index = 0;
+        while index < input.len() {
+            // Copy a run of plain bytes whole. The bytes that end it, and the
+            // leading zeros before the first frame, take the path below.
+            if !self.esc && (self.len > 0 || !self.first) {
+                let rest = &input[index..];
+                let run = rest
+                    .iter()
+                    .position(|&byte| matches!(byte, SLIP_END | SLIP_ESC | b'\n' | b'\r'))
+                    .unwrap_or(rest.len())
+                    .min(CAPACITY - self.len);
+                self.buf[self.len..self.len + run].copy_from_slice(&rest[..run]);
+                self.len += run;
+                index += run;
+                if index == input.len() {
+                    break;
+                }
+            }
+            let mut byte = input[index];
+            index += 1;
+            let consumed = index;
 
             if byte == SLIP_END {
                 if self.len == 0 {
@@ -471,5 +492,225 @@ mod tests {
         let mut wire = vec![0; max_serialized_size(8)];
         let n = serialize(&packet, &mut wire).unwrap();
         assert!(n <= max_serialized_size(8));
+    }
+}
+
+/// The byte-at-a-time codec the run-copying one replaced, kept as the model it
+/// must agree with.
+#[cfg(test)]
+mod bytewise {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn serialize_bytewise(packet: &[u8], out: &mut [u8]) -> Option<usize> {
+        fn put(out: &mut [u8], len: &mut usize, value: u8) -> Option<()> {
+            *out.get_mut(*len)? = value;
+            *len += 1;
+            Some(())
+        }
+
+        let crc = CRC32.checksum(packet).to_le_bytes();
+        let mut len = 0;
+        for &byte in packet.iter().chain(crc.iter()) {
+            match byte {
+                SLIP_END => {
+                    put(out, &mut len, SLIP_ESC)?;
+                    put(out, &mut len, SLIP_ESC_END)?;
+                }
+                SLIP_ESC => {
+                    put(out, &mut len, SLIP_ESC)?;
+                    put(out, &mut len, SLIP_ESC_ESC)?;
+                }
+                _ => put(out, &mut len, byte)?,
+            }
+        }
+        put(out, &mut len, SLIP_END)?;
+        Some(len)
+    }
+
+    impl<const CAPACITY: usize> Deserializer<CAPACITY> {
+        fn push_bytewise(&mut self, input: &[u8]) -> (usize, Option<Frame<'_>>) {
+            for (index, &byte) in input.iter().enumerate() {
+                let consumed = index + 1;
+                let mut byte = byte;
+
+                if byte == SLIP_END {
+                    if self.len == 0 {
+                        self.esc = false;
+                        self.errors = FrameErrors::default();
+                        continue;
+                    }
+                    let mut errors = self.errors;
+                    if self.esc {
+                        errors.insert(FrameErrors::DANGLING_ESC);
+                    }
+                    let end = self.len;
+                    let mut size = end;
+                    self.len = 0;
+                    self.errors = FrameErrors::default();
+                    self.esc = false;
+                    self.first = false;
+
+                    match self.buf[..size].split_last_chunk::<CRC_SIZE>() {
+                        None => errors.insert(FrameErrors::SHORT),
+                        Some((data, crc)) => {
+                            if CRC32.checksum(data) != u32::from_le_bytes(*crc) {
+                                errors.insert(FrameErrors::CRC);
+                            }
+                            if errors.is_empty() {
+                                size -= CRC_SIZE;
+                            }
+                        }
+                    }
+                    return (
+                        consumed,
+                        Some(Frame {
+                            buf: &mut self.buf[..end],
+                            len: size,
+                            errors,
+                        }),
+                    );
+                }
+
+                if byte == b'\n' || byte == b'\r' {
+                    // Packet headers cannot be printable text ending in CR/LF.
+                    let text = self.buf[..self.len]
+                        .iter()
+                        .all(|&b| b == b'\t' || (0x20..=0x7e).contains(&b));
+                    if text {
+                        if self.len == 0 {
+                            continue; // bare newline or the LF of a CRLF pair
+                        }
+                        let mut errors = self.errors;
+                        errors.insert(FrameErrors::TEXT);
+                        let size = self.len;
+                        self.len = 0;
+                        self.errors = FrameErrors::default();
+                        self.esc = false;
+                        self.first = false;
+                        return (
+                            consumed,
+                            Some(Frame {
+                                buf: &mut self.buf[..size],
+                                len: size,
+                                errors,
+                            }),
+                        );
+                    }
+                }
+
+                if !self.esc && byte == SLIP_ESC {
+                    self.esc = true;
+                    continue;
+                }
+                if self.esc {
+                    self.esc = false;
+                    byte = match byte {
+                        SLIP_ESC_END => SLIP_END,
+                        SLIP_ESC_ESC => SLIP_ESC,
+                        other => {
+                            self.errors.insert(FrameErrors::ESC_CODE);
+                            other
+                        }
+                    };
+                }
+
+                if self.len < CAPACITY {
+                    if self.len > 0 || byte != 0 || !self.first {
+                        self.buf[self.len] = byte;
+                        self.len += 1;
+                    }
+                } else {
+                    // Emit the partial frame and restart after overflow.
+                    let mut errors = self.errors;
+                    errors.insert(FrameErrors::TOO_BIG);
+                    self.len = 0;
+                    self.errors = FrameErrors::default();
+                    return (
+                        consumed,
+                        Some(Frame {
+                            buf: &mut self.buf,
+                            len: CAPACITY,
+                            errors,
+                        }),
+                    );
+                }
+            }
+            (input.len(), None)
+        }
+    }
+
+    /// The bytes one call consumed, and the buffer, length and error bits of
+    /// the frame it completed.
+    type Call = (usize, Option<(Vec<u8>, usize, u8)>);
+
+    /// Each frame a deserializer completes from `input` delivered in `chunks`
+    /// sized pieces, with the bytes each call consumed.
+    fn decode<const C: usize>(input: &[u8], chunks: &[usize], bytewise: bool) -> Vec<Call> {
+        let mut des = Deserializer::<C>::new();
+        let mut calls = Vec::new();
+        let mut rest = input;
+        let mut sizes = chunks.iter().cycle();
+        while !rest.is_empty() {
+            let mut chunk = &rest[..(*sizes.next().unwrap()).clamp(1, rest.len())];
+            rest = &rest[chunk.len()..];
+            while !chunk.is_empty() {
+                let (n, frame) = match bytewise {
+                    true => des.push_bytewise(chunk),
+                    false => des.push(chunk),
+                };
+                let frame = frame.map(|f| (f.buf.to_vec(), f.len, f.errors.bits()));
+                calls.push((n, frame));
+                chunk = &chunk[n..];
+            }
+        }
+        calls
+    }
+
+    /// Bytes weighted toward the ones SLIP and text detection treat apart.
+    fn wire_byte() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            4 => any::<u8>(),
+            1 => prop::sample::select(vec![SLIP_END, SLIP_ESC, SLIP_ESC_END, SLIP_ESC_ESC, 0, b'\n', b'\r', b'A']),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn serialize_writes_what_the_bytewise_encoder_wrote(
+            packet in prop::collection::vec(wire_byte(), 0..600),
+            room in 0usize..1300,
+        ) {
+            let (mut runs, mut bytes) = (vec![0; room], vec![0; room]);
+            let (ran, bytewise) = (serialize(&packet, &mut runs), serialize_bytewise(&packet, &mut bytes));
+            prop_assert_eq!(ran, bytewise);
+            if let Some(len) = ran {
+                prop_assert_eq!(&runs[..len], &bytes[..len]);
+            }
+        }
+
+        #[test]
+        fn push_decodes_as_the_bytewise_decoder_did(
+            input in prop::collection::vec(wire_byte(), 0..1500),
+            chunks in prop::collection::vec(1usize..80, 1..8),
+        ) {
+            prop_assert_eq!(decode::<64>(&input, &chunks, false), decode::<64>(&input, &chunks, true));
+            prop_assert_eq!(decode::<516>(&input, &chunks, false), decode::<516>(&input, &chunks, true));
+        }
+
+        #[test]
+        fn encoded_packets_decode_as_the_bytewise_decoder_did(
+            packets in prop::collection::vec(prop::collection::vec(wire_byte(), 0..520), 1..4),
+            noise in prop::collection::vec(wire_byte(), 0..40),
+            chunks in prop::collection::vec(1usize..600, 1..4),
+        ) {
+            let mut input = noise;
+            for packet in &packets {
+                let mut frame = vec![0; max_serialized_size(packet.len())];
+                let len = serialize(packet, &mut frame).unwrap();
+                input.extend_from_slice(&frame[..len]);
+            }
+            prop_assert_eq!(decode::<516>(&input, &chunks, false), decode::<516>(&input, &chunks, true));
+        }
     }
 }
