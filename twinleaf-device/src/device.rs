@@ -3088,69 +3088,93 @@ mod tests {
         );
     }
 
-    /// A device and its streams on one port, run by a platform the way a board's tasks run them.
+    /// A device and its streams on a [`Sim`](crate::sim::Sim), alone or as the hub of children,
+    /// read by hosts on its ports that each merge its lanes in an order of their own.
     mod contract {
         use super::*;
-        use crate::data::Timeref;
+        use crate::sim::{self, Port, Sim};
         use proptest::prelude::*;
         use std::collections::VecDeque;
         use twinleaf_proto::contract::{self, Observed, Sender};
         use twinleaf_proto::data::{Metadata, SegmentFlags};
-        use twinleaf_proto::sync::Epoch;
+        use twinleaf_proto::packet::Lane;
         use twinleaf_proto::DeviceRoute;
 
         const RATE: u32 = 10;
         const SECOND: u64 = 1_000_000_000;
+        /// What a child's port holds, so the hop above it never laps it.
+        const LOSSLESS: usize = 1 << 20;
 
-        /// What a host asks or a platform does next.
+        impl sim::Board<4> for Board {
+            fn streams(&self) -> Vec<DataStream<4>> {
+                streams().into()
+            }
+        }
+
+        /// What a host asks or a platform does next. A port is a host's, taken modulo the hosts,
+        /// and a device is the hub at `/` or the child at its index, taken modulo the devices.
         #[derive(Debug, Clone)]
         enum Step {
-            /// Every stream takes this many samples, a period apart.
-            Sample(u32),
-            /// Every stream loses this many samples.
-            Skip(u32),
-            /// A host asks this RPC by name with these argument bytes, and the device reads it at once.
-            Ask(&'static str, Vec<u8>),
-            /// A host asks this RPC by name with these argument bytes, and the request is in flight.
-            Send(&'static str, Vec<u8>),
-            /// The device reads the request longest in flight.
-            Deliver,
-            /// A host asks `dev.restart` this many times, one after another.
-            Restarts(usize),
-            /// A stream acquires at this rate with this decimation, enabled or not, from its next
-            /// segment.
-            Retune(usize, u32, u32, bool),
-            /// A stream begins a new segment.
-            Rollover(usize),
-            /// The time reference is replaced by one this many seconds ahead, or behind.
-            Relabel(i32),
+            /// A device's every stream takes this many samples, a period apart.
+            Sample(usize, u32),
+            /// A device's every stream loses this many samples.
+            Skip(usize, u32),
+            /// A host asks a device this RPC with these argument bytes, and it is read at once.
+            Ask(usize, usize, &'static str, Vec<u8>),
+            /// A host asks a device this RPC with these argument bytes, and it is in flight.
+            Send(usize, usize, &'static str, Vec<u8>),
+            /// The request a host has had in flight longest is read.
+            Deliver(usize),
+            /// A host asks a device for `dev.restart` this many times, one after another.
+            Restarts(usize, usize, usize),
+            /// A device's stream acquires at this rate with this decimation, enabled or not, from
+            /// its next segment.
+            Retune(usize, usize, u32, u32, bool),
+            /// A device's stream begins a new segment.
+            Rollover(usize, usize),
+            /// A device's time reference is replaced by one this many seconds ahead, or behind.
+            Relabel(usize, i32),
             /// The clock moves this many nanoseconds on.
             Wait(u64),
-            /// A host connects.
-            Connect,
-            /// The device boots again into the next session, and a host connects to it or not.
-            Reboot(bool),
+            /// A host reads the next packet of each lane named, in turn.
+            Read(usize, Vec<Lane>),
+            /// The hub forwards the next packet of each lane of a child's port named, in turn.
+            Forward(usize, Vec<Lane>),
+            /// A host lets its port go and opens it again.
+            Reconnect(usize),
+            /// A device boots again into its next session.
+            Reboot(usize),
+        }
+
+        fn lanes() -> impl Strategy<Value = Vec<Lane>> {
+            let lane = prop::sample::select(&[Lane::Control, Lane::Data, Lane::Event][..]);
+            prop::collection::vec(lane, 1..16)
         }
 
         fn step() -> impl Strategy<Value = Step> {
             let control = || prop::sample::select(&["dev.start", "dev.stop", "dev.restart"][..]);
+            let at = || (0..4usize, 0..3usize);
             prop_oneof![
-                4 => (1..30u32).prop_map(Step::Sample),
-                1 => (1..20u32).prop_map(Step::Skip),
-                4 => control().prop_map(|name| Step::Ask(name, Vec::new())),
-                2 => control().prop_map(|name| Step::Send(name, Vec::new())),
-                2 => Just(Step::Deliver),
-                1 => (2..6usize).prop_map(Step::Restarts),
-                1 => any::<u32>().prop_map(|value| Step::Ask("board.first", value.to_le_bytes().to_vec())),
-                2 => (0..2usize, prop::sample::select(&[5, RATE, 20][..]), 1..=3u32, any::<bool>())
-                    .prop_map(|(stream, rate, decimation, enabled)| {
-                        Step::Retune(stream, rate, decimation, enabled)
+                4 => (0..3usize, 1..30u32).prop_map(|(at, count)| Step::Sample(at, count)),
+                1 => (0..3usize, 1..20u32).prop_map(|(at, count)| Step::Skip(at, count)),
+                4 => (at(), control()).prop_map(|((port, at), name)| Step::Ask(port, at, name, Vec::new())),
+                2 => (at(), control()).prop_map(|((port, at), name)| Step::Send(port, at, name, Vec::new())),
+                2 => (0..4usize).prop_map(Step::Deliver),
+                1 => (at(), 2..6usize).prop_map(|((port, at), count)| Step::Restarts(port, at, count)),
+                1 => (at(), any::<u32>()).prop_map(|((port, at), value)| {
+                    Step::Ask(port, at, "board.first", value.to_le_bytes().to_vec())
+                }),
+                2 => (0..3usize, 0..2usize, prop::sample::select(&[5, RATE, 20][..]), 1..=3u32, any::<bool>())
+                    .prop_map(|(at, stream, rate, decimation, enabled)| {
+                        Step::Retune(at, stream, rate, decimation, enabled)
                     }),
-                1 => (0..2usize).prop_map(Step::Rollover),
-                1 => (-5..=5i32).prop_map(Step::Relabel),
+                1 => (0..3usize, 0..2usize).prop_map(|(at, stream)| Step::Rollover(at, stream)),
+                1 => (0..3usize, -5..=5i32).prop_map(|(at, shift)| Step::Relabel(at, shift)),
                 2 => (0..2 * HEARTBEAT_INTERVAL).prop_map(Step::Wait),
-                1 => Just(Step::Connect),
-                1 => any::<bool>().prop_map(Step::Reboot),
+                6 => (0..4usize, lanes()).prop_map(|(port, lanes)| Step::Read(port, lanes)),
+                6 => (0..3usize, lanes()).prop_map(|(at, lanes)| Step::Forward(at, lanes)),
+                1 => (0..4usize).prop_map(Step::Reconnect),
+                1 => (0..3usize).prop_map(Step::Reboot),
             ]
         }
 
@@ -3171,266 +3195,242 @@ mod tests {
             [stream(1).batched(16), stream(2)]
         }
 
-        /// The platform, and every packet on its port with the nanosecond it went.
-        struct Platform {
-            device: Device<Board>,
-            streams: [DataStream<4>; 2],
-            port: Sent,
-            times: Vec<u64>,
-            now: u64,
-            /// The time reference's seconds ahead of the clock's.
-            offset: i64,
-            /// The time reference's session, one more at each relabel.
-            reference: u32,
-            running: bool,
-            /// The id the host's next request takes.
-            next_id: u16,
-            /// Each request the host sent, after how many of the device's packets.
-            sent: Vec<(usize, Vec<u8>)>,
-            /// The requests the device has yet to read, oldest first.
-            in_flight: VecDeque<Vec<u8>>,
+        fn booted(session: u32, ports: Vec<Port>) -> Sim<Board, 4> {
+            let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
+            let mut sim = Sim::new(
+                identity,
+                SessionId::new(session),
+                table(),
+                Board::new(),
+                PASSWORD,
+                BOOT,
+                ports,
+            );
+            sim.reference.serial = "REF".try_into().unwrap();
+            sim
         }
 
-        impl Platform {
-            /// A device that boots with a host on its port.
-            fn new() -> Self {
-                let streams = streams();
-                let mut port = Sent::default();
-                let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
-                let device = Device::new(
-                    identity,
-                    SESSION,
-                    table(),
-                    Board::new(),
-                    PASSWORD,
-                    BOOT,
-                    &streams[..],
-                    &mut OneLane(&mut port),
-                );
+        /// One host on a port of the hub: what it heard and asked in the order it did, cut where
+        /// it lost its link or fell behind, and its requests still in flight.
+        #[derive(Default)]
+        struct Host {
+            heard: Vec<(Sender, Vec<u8>)>,
+            cut: Vec<Vec<(Sender, Vec<u8>)>>,
+            in_flight: VecDeque<Vec<u8>>,
+            next_id: u16,
+            dropped: u64,
+        }
+
+        /// The hub and its children, every host, and the clock.
+        struct World {
+            devices: Vec<Sim<Board, 4>>,
+            hosts: Vec<Host>,
+            now: u64,
+            reference: u32,
+            /// Whether every host reads all it can in write order after each step.
+            eager: bool,
+        }
+
+        impl World {
+            /// A hub with `children`, booted with `ports` hosts on ports of `capacity` packets a
+            /// lane.
+            fn new(children: usize, ports: usize, capacity: usize) -> Self {
+                let devices = (0..=children)
+                    .map(|at| match at {
+                        0 => booted(1, (0..ports).map(|_| Port::new(capacity)).collect()),
+                        child => booted(0x100 * child as u32, vec![Port::new(LOSSLESS)]),
+                    })
+                    .collect();
+                let hosts = (0..ports)
+                    .map(|port| Host {
+                        next_id: (port as u16) << 12,
+                        ..Host::default()
+                    })
+                    .collect();
                 Self {
-                    device,
-                    streams,
-                    times: vec![BOOT; port.0.len()],
-                    port,
+                    devices,
+                    hosts,
                     now: BOOT,
-                    offset: 0,
                     reference: 1,
-                    running: false,
-                    next_id: 1,
-                    sent: Vec::new(),
-                    in_flight: VecDeque::new(),
+                    eager: false,
                 }
             }
 
-            fn timeref(&self) -> Timeref {
-                let second = (self.now / SECOND) as i64 + self.offset;
-                Timeref::new(
-                    Epoch::UNIX,
-                    second as u32,
-                    SessionId::new(self.reference),
-                    "REF",
-                )
-                .unwrap()
+            /// One device and one host, every host reading eagerly.
+            fn alone() -> Self {
+                Self {
+                    eager: true,
+                    ..Self::new(0, 1, LOSSLESS)
+                }
             }
 
             fn take(&mut self, step: &Step) {
+                let devices = self.devices.len();
+                let hosts = self.hosts.len();
                 match *step {
-                    Step::Sample(count) => (0..count).for_each(|_| {
+                    Step::Sample(at, count) => (0..count).for_each(|_| {
                         self.now += SECOND / u64::from(RATE);
-                        self.streams
-                            .iter_mut()
-                            .for_each(|stream| stream.push(&1.0f32.to_le_bytes(), &mut self.port));
-                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                        let device = &mut self.devices[at % devices];
+                        (0..2).for_each(|stream| device.push(stream, &1.0f32.to_le_bytes()));
+                        self.tick();
                     }),
-                    Step::Skip(count) => {
+                    Step::Skip(at, count) => {
                         self.now += u64::from(count) * SECOND / u64::from(RATE);
-                        self.streams
-                            .iter_mut()
-                            .for_each(|stream| stream.skip(count, &mut self.port));
+                        let device = &mut self.devices[at % devices];
+                        (0..2).for_each(|stream| device.skip(stream, count));
                     }
-                    Step::Ask(name, ref args) => {
-                        self.send(name, args);
-                        while !self.in_flight.is_empty() {
-                            self.take(&Step::Deliver);
+                    Step::Ask(port, at, name, ref args) => {
+                        self.send(port % hosts, at % devices, name, args);
+                        while !self.hosts[port % hosts].in_flight.is_empty() {
+                            self.deliver(port % hosts);
                         }
                     }
-                    Step::Send(name, ref args) => self.send(name, args),
-                    Step::Deliver => {
-                        if let Some(request) = self.in_flight.pop_front() {
-                            self.deliver(&request);
-                        }
+                    Step::Send(port, at, name, ref args) => {
+                        self.send(port % hosts, at % devices, name, args)
                     }
-                    Step::Restarts(count) => {
-                        (0..count).for_each(|_| self.take(&Step::Ask("dev.restart", Vec::new())))
+                    Step::Deliver(port) => self.deliver(port % hosts),
+                    Step::Restarts(port, at, count) => (0..count)
+                        .for_each(|_| self.take(&Step::Ask(port, at, "dev.restart", Vec::new()))),
+                    Step::Retune(at, stream, rate, decimation, enabled) => {
+                        self.devices[at % devices].retune(stream, params(rate, decimation, enabled))
                     }
-                    Step::Retune(stream, rate, decimation, enabled) => self.streams[stream]
-                        .retune(params(rate, decimation, enabled), &mut self.port),
-                    Step::Rollover(stream) => self.streams[stream].rollover(&mut self.port),
-                    Step::Relabel(shift) => {
-                        let from = self.timeref().start_time;
-                        self.offset += i64::from(shift);
+                    Step::Rollover(at, stream) => self.devices[at % devices].rollover(stream),
+                    Step::Relabel(at, shift) => {
                         self.reference += 1;
-                        let to = self.timeref();
-                        self.streams
-                            .iter_mut()
-                            .for_each(|stream| stream.relabel(from, to.clone(), &mut self.port));
+                        let reference = SessionId::new(self.reference);
+                        self.devices[at % devices].relabel(i64::from(shift), reference, self.now);
                     }
                     Step::Wait(ns) => {
                         self.now += ns;
-                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                        self.tick();
                     }
-                    Step::Connect => {
-                        self.device
-                            .connected(&self.streams[..], self.now, &mut self.port)
-                    }
-                    Step::Reboot(connect) => {
-                        let session = SessionId::new(self.device.session.value().wrapping_add(1));
-                        self.streams = streams();
-                        self.running = false;
-                        self.device.reboot(
-                            session,
-                            self.now,
-                            &self.streams[..],
-                            &mut OneLane(&mut self.port),
-                        );
-                        if connect {
-                            self.take(&Step::Connect);
+                    Step::Read(port, ref lanes) => lanes
+                        .iter()
+                        .for_each(|&lane| self.read(port % hosts, |port| port.lane(lane).pop())),
+                    Step::Forward(at, ref lanes) => match at % devices {
+                        0 => {}
+                        child => lanes.iter().for_each(|&lane| self.forward(child, lane)),
+                    },
+                    Step::Reconnect(port) => self.reconnect(port % hosts),
+                    Step::Reboot(at) => {
+                        let device = &mut self.devices[at % devices];
+                        let session = SessionId::new(device.device.session.value().wrapping_add(1));
+                        device.reboot(session, self.now);
+                        if at % devices == 0 {
+                            self.hosts.iter_mut().for_each(|host| {
+                                host.cut.push(core::mem::take(&mut host.heard));
+                                host.in_flight.clear();
+                            });
                         }
                     }
                 }
-                self.times.resize(self.port.0.len(), self.now);
+                if self.eager {
+                    (0..hosts).for_each(|port| self.drain(port));
+                }
             }
 
-            /// A host's request, put in flight to the device.
-            fn send(&mut self, name: &str, args: &[u8]) {
+            fn tick(&mut self) {
+                let now = self.now;
+                self.devices.iter_mut().for_each(|device| device.tick(now));
+            }
+
+            /// A host's request to a device, put in flight.
+            fn send(&mut self, port: usize, at: usize, name: &str, args: &[u8]) {
+                let host = &mut self.hosts[port];
                 let mut buf = [0u8; Packet::MAX_SIZE];
                 let method = Method::ByName(name.as_bytes());
-                let id = RpcRequestId::new(self.next_id);
-                self.next_id = self.next_id.wrapping_add(1);
-                let len = rpc::write_request(&mut buf, id, method, args).unwrap();
-                let heard = self
-                    .port
-                    .views()
-                    .iter()
-                    .filter(|view| !requested(view))
-                    .count();
-                self.sent.push((heard, buf[..len].to_vec()));
-                self.in_flight.push_back(buf[..len].to_vec());
+                let id = RpcRequestId::new(host.next_id);
+                host.next_id = host.next_id.wrapping_add(1);
+                let mut len = rpc::write_request(&mut buf, id, method, args).unwrap();
+                if at > 0 {
+                    len = route::push_hop(&mut buf, at as u8).unwrap();
+                }
+                host.heard.push((Sender::Host, buf[..len].to_vec()));
+                host.in_flight.push_back(buf[..len].to_vec());
             }
 
-            /// The device reads `request`, and what it and the platform answer goes on the port
-            /// after it.
-            fn deliver(&mut self, request: &[u8]) {
-                self.port.send(request);
-                let (view, _) = PacketView::parse_prefix(request).unwrap();
-                let Actions { call, deferred, .. } = self.device.handle(
-                    &self.streams[..],
-                    Input::Packet(view),
-                    self.now,
-                    &mut OneLane(&mut self.port),
-                );
-                if let Some((pending, _, _)) = call {
-                    answer(pending, Err(RpcError::NotFound), &mut self.port);
-                }
-                match deferred {
-                    Some((pending, Deferred::Acquire(request))) => self.acquire(pending, request),
-                    Some((pending, Deferred::Flash(_))) => {
-                        answer(pending, Err(RpcError::State), &mut self.port)
+            /// The request a host has had in flight longest reaches the device its route names,
+            /// through the hub's hop for a child, and a call no entry answers is refused.
+            fn deliver(&mut self, port: usize) {
+                let Some(mut request) = self.hosts[port].in_flight.pop_front() else {
+                    return;
+                };
+                let (at, from) = match route::pop_hop(&mut request) {
+                    Ok((hop, len)) => {
+                        request.truncate(len);
+                        (usize::from(hop), 0)
                     }
-                    None => {}
+                    Err(_) => (0, port),
+                };
+                let device = &mut self.devices[at];
+                if let Some(call) = device.request(from, &request, self.now) {
+                    device.answer(&call, Err(RpcError::NotFound));
                 }
             }
 
-            /// Carry out a start, stop or restart: a stop closes its streams before it answers,
-            /// and a start answers first and begins on the second after next.
-            fn acquire(&mut self, pending: Pending<'_>, request: SyncRequest) {
-                match (request, self.running) {
-                    (SyncRequest::Start, true) => {
-                        answer(pending, Err(RpcError::State), &mut self.port)
-                    }
-                    (SyncRequest::Start, false) => {
-                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
-                        self.start();
-                    }
-                    (SyncRequest::Stop, _) => {
-                        self.stop();
-                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
-                    }
-                    (SyncRequest::Restart, _) => {
-                        self.stop();
-                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
-                        self.start();
-                    }
+            /// The hub sends up the next packet of a child's lane, wearing the child's hop.
+            fn forward(&mut self, child: usize, lane: Lane) {
+                let Some(mut packet) = self.devices[child].ports[0].lane(lane).pop() else {
+                    return;
+                };
+                packet.resize(Packet::MAX_SIZE, 0);
+                let len = route::push_hop(&mut packet, child as u8).unwrap();
+                self.devices[0].forward(&packet[..len]);
+            }
+
+            /// A host reads the packet `next` takes from its port, reconnecting first when the
+            /// port lapped it.
+            fn read(&mut self, port: usize, next: impl FnOnce(&mut Port) -> Option<Vec<u8>>) {
+                if self.devices[0].ports[port].dropped() != self.hosts[port].dropped {
+                    self.reconnect(port);
+                }
+                if let Some(packet) = next(&mut self.devices[0].ports[port]) {
+                    self.hosts[port].heard.push((Sender::Device, packet));
                 }
             }
 
-            fn start(&mut self) {
-                self.now = (self.now / SECOND + 2) * SECOND;
-                let timeref = self.timeref();
-                self.streams.iter_mut().for_each(|stream| {
-                    stream
-                        .start(timeref.clone(), &mut self.port)
-                        .expect("a stopped stream starts")
+            /// A host reads everything its port holds, in write order.
+            fn drain(&mut self, port: usize) {
+                while !self.devices[0].ports[port].is_empty() {
+                    self.read(port, Port::written);
+                }
+            }
+
+            /// A host lets its port go and opens it again, starting a trace of its own.
+            fn reconnect(&mut self, port: usize) {
+                let host = &mut self.hosts[port];
+                host.cut.push(core::mem::take(&mut host.heard));
+                host.in_flight.clear();
+                let hub = &mut self.devices[0];
+                hub.disconnect(port);
+                hub.connect(port, self.now);
+                host.dropped = hub.ports[port].dropped();
+            }
+
+            /// The hub forwards all its children hold, and every host reads all its port holds.
+            fn settle(&mut self) {
+                (1..self.devices.len()).for_each(|child| {
+                    while !self.devices[child].ports[0].is_empty() {
+                        [Lane::Control, Lane::Data, Lane::Event]
+                            .into_iter()
+                            .for_each(|lane| self.forward(child, lane));
+                    }
                 });
-                self.running = true;
+                (0..self.hosts.len()).for_each(|port| self.drain(port));
             }
 
-            fn stop(&mut self) {
-                self.streams
-                    .iter_mut()
-                    .for_each(|stream| stream.stop(&mut self.port));
-                self.running = false;
-            }
-
-            /// Every packet at the port, each request where the device read it.
-            fn trace(&self) -> Vec<Observed<'_>> {
-                self.port
-                    .views()
-                    .into_iter()
-                    .zip(&self.times)
-                    .map(|(packet, &arrival_ns)| Observed {
-                        arrival_ns,
-                        route: DeviceRoute::root(),
-                        sender: match requested(&packet) {
-                            true => Sender::Host,
-                            false => Sender::Device,
-                        },
-                        packet,
-                    })
+            /// Every packet the first host heard, as views.
+            fn views(&self) -> Vec<PacketView<'_>> {
+                self.hosts[0]
+                    .heard
+                    .iter()
+                    .map(|(_, packet)| PacketView::parse_prefix(packet).unwrap().0)
                     .collect()
             }
 
-            /// Every packet as the host saw it, each request where the host sent it, ahead of
-            /// what the device sent while it was in flight.
-            fn heard(&self) -> Vec<Observed<'_>> {
-                fn asked((_, request): &(usize, Vec<u8>)) -> Observed<'_> {
-                    Observed {
-                        arrival_ns: 0,
-                        route: DeviceRoute::root(),
-                        sender: Sender::Host,
-                        packet: PacketView::parse_prefix(request).unwrap().0,
-                    }
-                }
-                let mut sent = self.sent.iter().peekable();
-                let mut heard = Vec::new();
-                let device = self
-                    .trace()
-                    .into_iter()
-                    .filter(|seen| seen.sender == Sender::Device);
-                for (at, seen) in device.enumerate() {
-                    while let Some(request) = sent.next_if(|(after, _)| *after <= at) {
-                        heard.push(asked(request));
-                    }
-                    heard.push(seen);
-                }
-                heard.extend(sent.map(asked));
-                heard
-            }
-
-            /// The segment records of `stream` on the port, in order.
+            /// The segment records of `stream` the first host heard, in order.
             fn records(&self, stream: u8) -> Vec<(u8, SegmentFlags)> {
-                self.port
-                    .views()
+                self.views()
                     .into_iter()
                     .filter_map(|view| match Metadata::parse(view.payload) {
                         Some((Metadata::Segment(record), _))
@@ -3445,28 +3445,54 @@ mod tests {
                     .collect()
             }
 
-            /// Both traces keep the contract.
-            fn keeps(&self) {
-                assert_eq!(contract::check(&self.trace()), [], "at the port");
-                assert_eq!(contract::check(&self.heard()), [], "as the host saw it");
+            /// What breaks the contract in any trace a host heard.
+            fn broken(&mut self) -> Vec<contract::Violation> {
+                self.settle();
+                self.hosts
+                    .iter()
+                    .flat_map(|host| host.cut.iter().chain([&host.heard]))
+                    .flat_map(|heard| contract::check(&observed(heard)))
+                    .collect()
+            }
+
+            /// Every trace keeps the contract.
+            fn keeps(&mut self) {
+                assert_eq!(self.broken(), []);
             }
         }
 
-        /// Whether `packet` is a host's request.
-        fn requested(packet: &PacketView<'_>) -> bool {
-            packet.header.ptype == PacketType::RPC_REQ
+        /// A host's trace, each packet on the route its hops name.
+        fn observed(heard: &[(Sender, Vec<u8>)]) -> Vec<Observed<'_>> {
+            heard
+                .iter()
+                .map(|(sender, packet)| {
+                    let packet = PacketView::parse_prefix(packet).unwrap().0;
+                    Observed {
+                        arrival_ns: 0,
+                        route: DeviceRoute::from_wire(packet.routing).unwrap(),
+                        sender: *sender,
+                        packet,
+                    }
+                })
+                .collect()
         }
 
         proptest! {
-            /// Whatever a host asks and the platform does, starting, stopping, retuning, rolling
-            /// over, relabelling and rebooting, with requests read at once or after a while in
-            /// flight, every packet keeps the contract, as the host saw them and at the port.
+            /// Whatever hosts ask and the platforms do, starting, stopping, retuning, rolling
+            /// over, relabelling and rebooting, on a device alone or a hub whose hop keeps each
+            /// route's lanes in order and interleaves them freely, with requests read at once or
+            /// after a while in flight, every host that merges its lanes in any order and falls
+            /// behind or not hears the contract kept on every route.
             #[test]
-            fn a_device_keeps_the_contract(steps in prop::collection::vec(step(), 1..40)) {
-                let mut platform = Platform::new();
-                steps.iter().for_each(|step| platform.take(step));
-                prop_assert_eq!(contract::check(&platform.trace()), []);
-                prop_assert_eq!(contract::check(&platform.heard()), []);
+            fn a_device_keeps_the_contract(
+                children in 0..3usize,
+                ports in 1..4usize,
+                capacity in prop::sample::select(&[8, 64, LOSSLESS][..]),
+                steps in prop::collection::vec(step(), 1..60),
+            ) {
+                let mut world = World::new(children, ports, capacity);
+                steps.iter().for_each(|step| world.take(step));
+                prop_assert_eq!(world.broken(), []);
             }
         }
 
@@ -3474,8 +3500,9 @@ mod tests {
         /// revision the contract holds it to.
         #[test]
         fn a_device_declares_the_revision_it_keeps_as_it_boots() {
-            let platform = Platform::new();
-            let views = platform.port.views();
+            let mut world = World::alone();
+            world.settle();
+            let views = world.views();
             assert_eq!(views[0].header.ptype, PacketType::HEARTBEAT);
             let Some((Metadata::Device(record), _)) = Metadata::parse(views[1].payload) else {
                 panic!("the device record follows the heartbeat");
@@ -3488,17 +3515,17 @@ mod tests {
         /// a restart's next segment says a start opened it, where a switch's does not.
         #[test]
         fn a_stop_closes_each_stream_after_its_last_row() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(15));
-            platform.take(&Step::Rollover(1));
-            platform.take(&Step::Sample(15));
-            platform.take(&Step::Ask("dev.restart", Vec::new()));
-            platform.take(&Step::Ask("dev.stop", Vec::new()));
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 15));
+            world.take(&Step::Rollover(0, 1));
+            world.take(&Step::Sample(0, 15));
+            world.take(&Step::Ask(0, 0, "dev.restart", Vec::new()));
+            world.take(&Step::Ask(0, 0, "dev.stop", Vec::new()));
             let open = SegmentFlags::VALID | SegmentFlags::ACTIVE;
             let start = open | SegmentFlags::START;
             let closed = SegmentFlags::VALID | SegmentFlags::START;
-            let records = platform.records(2);
+            let records = world.records(2);
             assert_eq!(records.first(), Some(&(0, start)));
             assert!(records.contains(&(1, open)), "a switch opened segment 1");
             assert!(
@@ -3506,7 +3533,7 @@ mod tests {
                 "the restart closed it"
             );
             assert_eq!(records[records.len() - 2..], [(2, start), (2, closed)]);
-            let views = platform.port.views();
+            let views = world.views();
             let last = |stream: u8| {
                 views
                     .iter()
@@ -3520,80 +3547,77 @@ mod tests {
                 last(2).is_some_and(|row| row < closes),
                 "the rows went first"
             );
-            platform.keeps();
+            world.keeps();
         }
 
         /// A segment that reaches the sample numbers a packet carries rolls over at its next
         /// whole second and keeps the contract across it.
         #[test]
         fn the_wire_limit_rollover_keeps_the_contract() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(5));
-            platform.take(&Step::Skip(15_999_990));
-            platform.take(&Step::Sample(30));
-            let rows =
-                platform.port.views().into_iter().filter_map(|view| {
-                    twinleaf_proto::data::Samples::parse(view.header, view.payload)
-                });
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Skip(0, 15_999_990));
+            world.take(&Step::Sample(0, 30));
+            let rows = world
+                .views()
+                .into_iter()
+                .filter_map(|view| twinleaf_proto::data::Samples::parse(view.header, view.payload));
             assert!(
                 rows.map(|row| row.segment_id.value()).any(|id| id == 1),
                 "it rolled over"
             );
-            platform.keeps();
+            world.keeps();
         }
 
         /// Restarts that take no samples each open a segment, so the ring comes back to the first's id
         /// with a count that starts past zero, which is lawful as each record goes out as it opens.
         #[test]
         fn restarts_that_take_no_samples_keep_the_contract() {
-            let mut platform = Platform::new();
+            let mut world = World::alone();
             [
-                Step::Ask("dev.start", Vec::new()),
-                Step::Sample(1),
-                Step::Relabel(0),
-                Step::Skip(10),
-                Step::Restarts(3),
-                Step::Skip(1),
-                Step::Sample(5),
+                Step::Ask(0, 0, "dev.start", Vec::new()),
+                Step::Sample(0, 1),
+                Step::Relabel(0, 0),
+                Step::Skip(0, 10),
+                Step::Restarts(0, 0, 3),
+                Step::Skip(0, 1),
+                Step::Sample(0, 5),
             ]
             .iter()
-            .for_each(|step| platform.take(step));
-            platform.keeps();
+            .for_each(|step| world.take(step));
+            world.keeps();
         }
 
         /// A time reference four seconds behind lands a stream's fifth segment on the first's id
         /// and start, which is lawful as the reference is another.
         #[test]
         fn a_reference_that_steps_back_keeps_the_contract() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(10));
-            platform.take(&Step::Relabel(-4));
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 10));
+            world.take(&Step::Relabel(0, -4));
             (0..3).for_each(|_| {
-                platform.take(&Step::Sample(10));
-                platform.take(&Step::Rollover(0));
+                world.take(&Step::Sample(0, 10));
+                world.take(&Step::Rollover(0, 0));
             });
-            platform.take(&Step::Sample(10));
-            platform.keeps();
+            world.take(&Step::Sample(0, 10));
+            world.keeps();
         }
 
         /// A device that reboots while no host connects opens its new session with its
         /// heartbeat and record, so the settings it numbers from one again follow them.
         #[test]
         fn a_reboot_no_host_connects_to_opens_its_session_with_its_heartbeat() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(5));
-            platform.take(&Step::Ask("board.first", 8u32.to_le_bytes().to_vec()));
-            platform.take(&Step::Sample(5));
-            let booted = platform.port.0.len();
-            platform.take(&Step::Reboot(false));
-            platform.take(&Step::Ask("board.first", 9u32.to_le_bytes().to_vec()));
-            let after: Vec<PacketType> = platform.port.views()[booted..]
-                .iter()
-                .map(|view| view.header.ptype)
-                .collect();
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Ask(0, 0, "board.first", 8u32.to_le_bytes().to_vec()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Reboot(0));
+            world.take(&Step::Ask(0, 0, "board.first", 9u32.to_le_bytes().to_vec()));
+            let after: Vec<PacketType> =
+                world.views().iter().map(|view| view.header.ptype).collect();
             assert_eq!(
                 after,
                 [
@@ -3604,7 +3628,7 @@ mod tests {
                     PacketType::RPC_REP
                 ]
             );
-            platform.keeps();
+            world.keeps();
         }
 
         /// A stop in flight while a retune switches segments at a whole second reaches the
@@ -3612,27 +3636,65 @@ mod tests {
         /// host saw it.
         #[test]
         fn a_stop_in_flight_across_a_segment_switch_keeps_the_contract() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(5));
-            platform.take(&Step::Retune(0, RATE, 2, true));
-            platform.take(&Step::Send("dev.stop", Vec::new()));
-            platform.take(&Step::Sample(10));
-            platform.take(&Step::Deliver);
-            let heard = platform.heard();
-            let asked = heard
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Retune(0, 0, RATE, 2, true));
+            world.take(&Step::Send(0, 0, "dev.stop", Vec::new()));
+            world.take(&Step::Sample(0, 10));
+            world.take(&Step::Deliver(0));
+            let views = world.views();
+            let asked = views
                 .iter()
-                .rposition(|seen| requested(&seen.packet))
+                .rposition(|view| view.header.ptype == PacketType::RPC_REQ)
                 .unwrap();
-            let crossed = heard[asked..].iter().any(|seen| {
-                seen.packet.header.ptype == PacketType::METADATA
+            let crossed = views[asked..].iter().any(|view| {
+                view.header.ptype == PacketType::METADATA
                     && matches!(
-                        Metadata::parse(seen.packet.payload),
+                        Metadata::parse(view.payload),
                         Some((Metadata::Segment(_), _))
                     )
             });
             assert!(crossed, "a record went out while the stop was in flight");
-            platform.keeps();
+            world.keeps();
+        }
+
+        /// A child that reboots while its last session's rows still wait at the hub has its new
+        /// heartbeat heard ahead of them, which keeps the contract on its route.
+        #[test]
+        fn a_childs_heartbeat_overtaking_its_last_rows_at_the_hub_keeps_the_contract() {
+            let mut world = World::new(1, 1, LOSSLESS);
+            world.take(&Step::Ask(0, 1, "dev.start", Vec::new()));
+            world.take(&Step::Sample(1, 20));
+            world.take(&Step::Forward(1, vec![Lane::Control; 8]));
+            world.take(&Step::Forward(1, vec![Lane::Data; 64]));
+            world.take(&Step::Reboot(1));
+            world.take(&Step::Forward(1, vec![Lane::Control; 2]));
+            world.take(&Step::Read(0, vec![Lane::Control; 64]));
+            world.take(&Step::Ask(0, 1, "dev.start", Vec::new()));
+            world.take(&Step::Sample(1, 20));
+            assert!(
+                !world.devices[0].ports[0].data.is_empty(),
+                "rows wait at the hub"
+            );
+            world.keeps();
+        }
+
+        /// A host that falls behind its port is cut off with the drop counted, and the trace it
+        /// starts as it opens the port again keeps the contract.
+        #[test]
+        fn a_host_that_falls_behind_reconnects_and_keeps_the_contract() {
+            let mut world = World::new(0, 1, 8);
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 60));
+            world.take(&Step::Read(0, vec![Lane::Data; 4]));
+            assert_eq!(world.hosts[0].cut.len(), 1, "the lap cut the trace");
+            assert!(
+                world.devices[0].ports[0].data.dropped > 0,
+                "and counted its drops"
+            );
+            world.take(&Step::Sample(0, 10));
+            world.keeps();
         }
     }
 }
