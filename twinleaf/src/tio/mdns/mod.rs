@@ -1,7 +1,7 @@
 //! The process's one mDNS daemon, which the transports resolve `.local`
 //! names with.
 
-mod one_shot;
+pub(crate) mod one_shot;
 
 use crate::chan::lock;
 use crate::chan::MdnsReceiver as Receiver;

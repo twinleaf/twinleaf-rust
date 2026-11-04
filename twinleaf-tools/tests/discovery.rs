@@ -124,11 +124,7 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The browses a test makes before it gives up, as a browse on this machine at times hears
-/// nothing at all.
-const TRIES: usize = 5;
-
-/// How long one browse waits to hear the tree.
+/// How long the picker has to show the tree.
 const BROWSE: Duration = Duration::from_secs(8);
 
 /// `tio list` finds the tree `tio proxy` advertises on this machine at loopback, with the name
@@ -139,16 +135,11 @@ const BROWSE: Duration = Duration::from_secs(8);
 #[test]
 fn a_served_tree_is_listed_answers_and_is_held_by_a_pick() {
     let served = Served::start();
-    let ours = (0..TRIES)
-        .find_map(|_| {
-            let listed = served.tio(&["list", "--json", "--duration", "4s"]);
-            let devices: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-            let found = devices
-                .as_array()?
-                .iter()
-                .find(|device| device["url"] == served.url());
-            found.cloned()
-        })
+    let listed = served.tio(&["list", "--json", "--duration", "4s"]);
+    let devices: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let ours = devices
+        .as_array()
+        .and_then(|devices| devices.iter().find(|device| device["url"] == served.url()))
         .expect("tio list finds the tree");
     assert_eq!(ours["name"], "tio-test");
     assert_eq!(
@@ -163,10 +154,11 @@ fn a_served_tree_is_listed_answers_and_is_held_by_a_pick() {
         );
     }
 
-    let mut picker = (0..TRIES)
-        .map(|_| Picker::open(&served.shared_url()))
-        .find(|picker| picker.shows("tio-test", BROWSE))
-        .expect("the picker shows the tree");
+    let mut picker = Picker::open(&served.shared_url());
+    assert!(
+        picker.shows("tio-test", BROWSE),
+        "the picker shows the tree"
+    );
     let mut shared = tio();
     shared.args(["proxy", "--background", "-p", &served.shared.to_string()]);
     let shared = Running(
@@ -181,14 +173,15 @@ fn a_served_tree_is_listed_answers_and_is_held_by_a_pick() {
         assert!(Instant::now() < deadline, "the shared proxy never listened");
         thread::sleep(Duration::from_millis(50));
     }
-    picker
-        .running
-        .0
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"\r")
-        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !picker.highlights("tio-test", Duration::from_millis(500)) {
+        assert!(
+            Instant::now() < deadline,
+            "the picker never highlights the tree"
+        );
+        picker.press(b"\t");
+    }
+    picker.press(b"\r");
     assert!(
         picker.shows("as the default while this runs", WAIT),
         "the pick is held"
@@ -251,13 +244,41 @@ impl Picker {
 
     /// Whether it draws `text` within `within`.
     fn shows(&self, text: &str, within: Duration) -> bool {
+        self.draws(within, |screen| screen.contains(text))
+    }
+
+    /// Whether the row it highlights last holds `text` within `within`, as another device on
+    /// the network may be the one it highlights.
+    fn highlights(&self, text: &str, within: Duration) -> bool {
+        self.draws(within, |screen| {
+            screen
+                .rsplit('❯')
+                .next()
+                .and_then(|row| row.split('\x1b').next())
+                .is_some_and(|row| row.contains(text))
+        })
+    }
+
+    /// Whether what it has drawn passes `drawn` within `within`.
+    fn draws(&self, within: Duration, drawn: impl Fn(&str) -> bool) -> bool {
         let deadline = Instant::now() + within;
-        while !String::from_utf8_lossy(&self.screen.lock().unwrap()).contains(text) {
+        while !drawn(&String::from_utf8_lossy(&self.screen.lock().unwrap())) {
             if Instant::now() >= deadline {
                 return false;
             }
             thread::sleep(Duration::from_millis(100));
         }
         true
+    }
+
+    /// Types `keys` into it.
+    fn press(&mut self, keys: &[u8]) {
+        self.running
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(keys)
+            .unwrap();
     }
 }

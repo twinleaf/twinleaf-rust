@@ -795,10 +795,15 @@ async fn browse_network(
     }
     drop(found);
 
+    let (heard, mut answered) = mpsc::unbounded_channel();
+    let asking = crate::tio::mdns::one_shot::browse(&TWINLEAF_MDNS_SERVICES, heard);
+    tokio::pin!(asking);
+    let mut asked = false;
+
     let mut instances: HashMap<String, Instance> = HashMap::new();
     let preferred = if prefer_udp { "udp" } else { "tcp" };
     loop {
-        let event = tokio::select! {
+        let (fullname, url) = tokio::select! {
             _ = &mut alive => break,
             event = probes.report() => {
                 if tx.send(event).is_err() {
@@ -806,36 +811,38 @@ async fn browse_network(
                 }
                 continue;
             }
-            Some(event) = events.recv() => event,
+            () = &mut asking, if !asked => {
+                asked = true;
+                continue;
+            }
+            Some(event) = events.recv() => match event {
+                ServiceEvent::ServiceResolved(info) => {
+                    let url = instance_url(&info.ty_domain, &info.host, info.port, info.get_addresses_v4());
+                    (info.fullname, url)
+                }
+                ServiceEvent::ServiceRemoved(_, fullname) => (fullname, None),
+                _ => continue,
+            },
+            Some(found) = answered.recv() => {
+                let url = instance_url(&found.service, &found.host, found.port, found.v4);
+                (found.fullname, url)
+            }
         };
-        let label = match event {
-            ServiceEvent::ServiceResolved(info) => {
-                let Some(host) = url_host(&info) else {
-                    continue;
-                };
-                let scheme = if info.ty_domain.contains("._udp.") {
-                    "udp"
-                } else {
-                    "tcp"
-                };
-                let url = format!("{}://{}:{}", scheme, host, info.get_port());
-                let label = instance_label(info.get_fullname());
+        let label = instance_label(&fullname);
+        match url {
+            Some(url) => {
                 instances
                     .entry(label.clone())
                     .or_default()
                     .urls
-                    .insert(info.get_fullname().to_string(), url);
-                label
+                    .insert(fullname, url);
             }
-            ServiceEvent::ServiceRemoved(_, fullname) => {
-                let label = instance_label(&fullname);
+            None => {
                 if let Some(instance) = instances.get_mut(&label) {
                     instance.urls.remove(&fullname);
                 }
-                label
             }
-            _ => continue,
-        };
+        }
         if sync_instance(&mut instances, &label, preferred, &tx, &mut probes).is_err() {
             break;
         }
@@ -867,32 +874,40 @@ fn instance_label(fullname: &str) -> String {
     fullname.to_string()
 }
 
-/// Returns the host for a discovered device's URL. That is loopback for a service this machine
-/// advertises, so a proxy knows its own advertisement, or else its advertised hostname, or else
-/// its lowest routable IPv4 address.
+/// Returns the URL of an instance of `service` at `host` and `port` with the IPv4 addresses `v4`.
+/// Its host is loopback for a service this machine advertises, so a proxy knows its own
+/// advertisement, or else its advertised hostname, or else its lowest routable IPv4 address.
 // The hostname stays the same when the device's address changes, and a
 // person can read it. Each open of the URL resolves it again.
 #[cfg(feature = "mdns")]
-fn url_host(info: &mdns_sd::ResolvedService) -> Option<String> {
-    let v4 = info.get_addresses_v4();
-    let local = if_addrs::get_if_addrs().unwrap_or_default();
-    if local.iter().any(
-        |interface| matches!(interface.addr, if_addrs::IfAddr::V4(ref own) if v4.contains(&own.ip)),
-    ) {
-        return Some(std::net::Ipv4Addr::LOCALHOST.to_string());
-    }
-    let hostname = info.get_hostname().trim_end_matches('.');
-    if !hostname.is_empty() {
-        return Some(hostname.to_string());
-    }
-
+fn instance_url(
+    service: &str,
+    host: &str,
+    port: u16,
+    v4: impl IntoIterator<Item = std::net::Ipv4Addr>,
+) -> Option<String> {
+    let scheme = if service.contains("._udp.") {
+        "udp"
+    } else {
+        "tcp"
+    };
     let mut v4: Vec<_> = v4.into_iter().collect();
     v4.sort();
-    let ip = v4
-        .iter()
-        .find(|ip| !ip.is_loopback() && !ip.is_link_local())
-        .or_else(|| v4.first())?;
-    Some(ip.to_string())
+    let local = if_addrs::get_if_addrs().unwrap_or_default();
+    let named = host.trim_end_matches('.');
+    let host = if local.iter().any(
+        |interface| matches!(interface.addr, if_addrs::IfAddr::V4(ref own) if v4.contains(&own.ip)),
+    ) {
+        std::net::Ipv4Addr::LOCALHOST.to_string()
+    } else if !named.is_empty() {
+        named.to_string()
+    } else {
+        v4.iter()
+            .find(|ip| !ip.is_loopback() && !ip.is_link_local())
+            .or_else(|| v4.first())?
+            .to_string()
+    };
+    Some(format!("{scheme}://{host}:{port}"))
 }
 
 #[cfg(test)]
