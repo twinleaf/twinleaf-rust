@@ -8,7 +8,7 @@ use super::model::Model;
 use super::report::dump;
 use super::schedule::{pairs, plan, Action, Case, Host};
 use super::{APPS, BOUND, DURATION, RECONNECT, SETTLE, WARM_UP, WINDOW};
-use crate::proxy::tests::turmoil::{device, traced, Traced, Tracer, World, SPIN_LIMIT};
+use crate::proxy::tests::turmoil::{device, traced, Traced, Tracer, Watchdog, World};
 use crate::seam::turmoil::seeded;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
@@ -109,6 +109,7 @@ fn simulation<'a>(case: &Case, world: &Arc<World>, control: &Arc<Control>) -> ::
 /// down.
 struct Driver<'a> {
     sim: ::turmoil::Sim<'a>,
+    watchdog: Watchdog,
     world: Arc<World>,
     control: Arc<Control>,
     down: BTreeSet<Host>,
@@ -122,8 +123,8 @@ impl Driver<'_> {
 
     /// Takes one step.
     fn step(&mut self) -> Result<(), Unjudged> {
-        self.sim
-            .step()
+        self.watchdog
+            .step(&mut self.sim)
             .map(drop)
             .map_err(|error| Unjudged::Step(error.to_string()))
     }
@@ -273,6 +274,7 @@ fn run(case: &Case) -> Result<Run, Unjudged> {
     let control = Arc::new(Control::default());
     let mut driver = Driver {
         sim: simulation(case, &world, &control),
+        watchdog: Watchdog::new(format!("TWINLEAF_TURMOIL_CASE={}", case.seed)),
         world,
         control,
         down: BTreeSet::new(),
@@ -354,31 +356,10 @@ pub(super) struct Checked {
     pub(super) real: Duration,
 }
 
-/// Runs `f`, and ends the test process if it takes longer than
-/// [`SPIN_LIMIT`] of real time, as a host that spins never gives a step
-/// back.
-fn watched<T>(f: impl FnOnce() -> T) -> T {
-    let (done, finished) = std::sync::mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || {
-        let waited = finished.recv_timeout(SPIN_LIMIT);
-        if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            use std::io::Write;
-            let spun = format!("a turmoil case spun for {SPIN_LIMIT:?} of real time");
-            let _ = writeln!(std::io::stderr(), "{spun}");
-            std::process::exit(101);
-        }
-    });
-    let given = f();
-    let _ = done.send(());
-    watchdog.join().expect("the watchdog");
-    given
-}
-
 /// Runs `case` and judges it.
 pub(super) fn check(case: &Case) -> Checked {
     let started = std::time::Instant::now();
-    let simulated =
-        watched(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| simulate(case))));
+    let simulated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| simulate(case)));
     let real = started.elapsed();
     let broke = |law: &'static str, what: String| Checked {
         broken: vec![Broken { law, at: 0, what }],

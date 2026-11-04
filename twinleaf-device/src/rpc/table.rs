@@ -332,7 +332,6 @@ standard! {
     PrivLock "dev.priv.lock" Protocol action().privileged(),
     PrivPassword "dev.priv.password" Protocol
         prop(Kind::String, Access::WRITE.union(Access::PERSISTENT)).privileged(),
-    Running "dev.running" Report prop(Kind::Bool, Access::READ).announced(),
 }
 
 /// `rpc.hash`: a CRC32 over the name, flags, description, and signature of
@@ -481,7 +480,7 @@ mod tests {
     use super::*;
 
     /// What [`STANDARD`] hashes to, over every entry.
-    const HASH: u32 = 0x5f31_83fa;
+    const HASH: u32 = 0x1b98_ccb2;
 
     fn table() -> [RpcSpec; 3] {
         [
@@ -545,9 +544,9 @@ mod tests {
 
     #[test]
     fn the_standard_table_order_is_pinned() {
-        assert_eq!(STANDARD.len(), 39);
+        assert_eq!(STANDARD.len(), 38);
         assert_eq!(STANDARD.first().unwrap().name, "dev.metadata");
-        assert_eq!(STANDARD.last().unwrap().name, "dev.running");
+        assert_eq!(STANDARD.last().unwrap().name, "dev.priv.password");
         assert_eq!(hash(STANDARD), HASH);
     }
 
@@ -603,7 +602,7 @@ mod tests {
     #[test]
     fn every_position_of_the_standard_table_names_an_entry() {
         assert_eq!(Std::at(0), Some(Std::Metadata));
-        assert_eq!(Std::at(STANDARD.len() - 1), Some(Std::Running));
+        assert_eq!(Std::at(STANDARD.len() - 1), Some(Std::PrivPassword));
         assert_eq!(Std::at(STANDARD.len()), None);
     }
 

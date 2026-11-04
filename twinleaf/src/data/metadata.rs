@@ -469,6 +469,7 @@ mod tests {
             name: "device",
             serial: "serial",
             firmware: "firmware",
+            protocol: 0,
         };
         let record = DeviceRecord::encode(fields).expect("a short record fits");
 
@@ -494,6 +495,7 @@ mod tests {
             name: &long,
             serial: &long,
             firmware: &long,
+            protocol: 0,
         })
         .is_none());
     }

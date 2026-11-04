@@ -262,7 +262,7 @@ impl Session {
     }
 
     /// Opens a session that holds `layout` as the proxy's default for as long
-    /// as it lasts, and opens nothing itself.
+    /// as it lasts, and follows what it holds.
     pub(crate) async fn hold_default_async(
         proxy: &ProxyAddress,
         layout: &Layout,

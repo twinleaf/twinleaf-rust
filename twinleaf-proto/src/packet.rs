@@ -8,6 +8,7 @@
 
 use core::ops::Range;
 
+use crate::data::{split_metadata, MetadataType};
 use crate::route::{DeviceRoute, ForwardError};
 
 /// Valid packet type, including unknown extension values.
@@ -98,6 +99,46 @@ impl PacketType {
         } else {
             None
         }
+    }
+}
+
+/// The lane a device's packet travels. Each lane keeps its write order, and lanes keep none
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Lane {
+    /// Announcements, heartbeats and the device record to every port, replies to the port that asked.
+    Control,
+    /// Each stream's records and rows.
+    Data,
+    /// Logs.
+    Event,
+}
+
+/// The lane `packet` travels from a device or a hub, the same at every hop, or `None` for a
+/// request, a time reference, console text, a legacy descriptor or an application packet.
+pub fn lane_of(packet: PacketView<'_>) -> Option<Lane> {
+    match packet.header.ptype {
+        PacketType::SETTING
+        | PacketType::RPC_REP
+        | PacketType::RPC_ERROR
+        | PacketType::HEARTBEAT => Some(Lane::Control),
+        PacketType::METADATA => {
+            match split_metadata(packet.payload).map(|(kind, ..)| kind.into()) {
+                Some(MetadataType::Device) => Some(Lane::Control),
+                Some(
+                    MetadataType::Stream
+                    | MetadataType::Segment
+                    | MetadataType::Column
+                    | MetadataType::Unknown(_),
+                )
+                | None => Some(Lane::Data),
+            }
+        }
+        PacketType::LEGACY_STREAM => Some(Lane::Data),
+        PacketType::LOG => Some(Lane::Event),
+        ptype if ptype.stream_id().is_some() => Some(Lane::Data),
+        _ => None,
     }
 }
 
@@ -400,5 +441,39 @@ mod tests {
         for reserved in [0, 9, 10, 13] {
             assert!(PacketType::try_new(reserved).is_none());
         }
+    }
+
+    /// A device record shares control with announcements, replies and heartbeats, every other
+    /// record shares data with rows, and a log travels alone.
+    #[test]
+    fn each_packet_type_has_one_lane() {
+        let lane = |ptype: PacketType, payload: &[u8]| {
+            let raw = [&[ptype.value(), 0, payload.len() as u8, 0][..], payload].concat();
+            lane_of(PacketView::parse_prefix(&raw).unwrap().0)
+        };
+        let control = [
+            PacketType::SETTING,
+            PacketType::RPC_REP,
+            PacketType::RPC_ERROR,
+        ];
+        assert!(control
+            .into_iter()
+            .all(|ptype| lane(ptype, &[]) == Some(Lane::Control)));
+        assert_eq!(lane(PacketType::HEARTBEAT, &[0; 8]), Some(Lane::Control));
+        assert_eq!(lane(PacketType::METADATA, &[1, 0]), Some(Lane::Control));
+        assert!([2, 3, 4, 9]
+            .into_iter()
+            .all(|kind| lane(PacketType::METADATA, &[kind, 0]) == Some(Lane::Data)));
+        assert_eq!(lane(PacketType::stream(1).unwrap(), &[]), Some(Lane::Data));
+        assert_eq!(lane(PacketType::LEGACY_STREAM, &[]), Some(Lane::Data));
+        assert_eq!(lane(PacketType::LOG, &[]), Some(Lane::Event));
+        assert!([
+            PacketType::RPC_REQ,
+            PacketType::SYNC,
+            PacketType::TEXT,
+            PacketType::USER
+        ]
+        .into_iter()
+        .all(|ptype| lane(ptype, &[]).is_none()));
     }
 }

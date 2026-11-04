@@ -214,8 +214,8 @@ impl Connection {
 
     /// Makes `layout` the default of the machine's background proxy, the
     /// tree every client that names no device opens, until the returned
-    /// connection closes. The connection itself sees nothing. Starts the
-    /// proxy when none runs.
+    /// connection closes. The connection sees the tree it holds, as one that
+    /// opened it does. Starts the proxy when none runs.
     ///
     /// # Errors
     ///

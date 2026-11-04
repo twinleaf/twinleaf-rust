@@ -33,25 +33,20 @@ use std::collections::VecDeque;
 /// only if the device announced its segment since the stream's last rows,
 /// by a broadcast, a proxy metadata update or a bootstrap reply.
 ///
-/// A device announces `dev.running` turning off as it hands a stop or
-/// restart a host asked for to its platform, and otherwise at a refresh
-/// after it stops acquiring, so ahead of the record of any segment a later
-/// start begins. Rows of a segment the device announced after such a stop
-/// come as a [`Change::Restarted`](super::Change::Restarted), and rows of
-/// the stopped acquisition that arrive after the stop come as before. A
-/// new segment that starts before the last rows end comes as a backward
-/// step in time.
+/// A device whose record declares a protocol revision marks the record of
+/// each segment a start opens with [`START`](crate::proto::data::SegmentFlags::START)
+/// and closes each segment a stop ends with a record without
+/// [`ACTIVE`](crate::proto::data::SegmentFlags::ACTIVE), both on the lane of
+/// its rows. Rows of a segment a start opened, or of one after a close, come
+/// as a [`Change::Restarted`](super::Change::Restarted) with no loss, a
+/// reboot among them, and a new session changes nothing of a stream's
+/// state, as rows of the last session may still come after it. A new segment
+/// that starts before the last rows end comes as a backward step in time.
 ///
-/// Three kinds of restart reach the parser with no stop announced, and come as a
-/// rollover with a loss of the sample periods between the acquisitions.
-///
-/// - A restart whose announcement was lost, in a gap on the link or in a
-///   client's inlet.
-/// - A stop and start no host asked for, with no refresh between them,
-///   which leave `dev.running` where it was.
-/// - Every restart of deprecated firmware, which has no `dev.running`, as
-///   [`RpcRegistry::is_deprecated_firmware`](crate::device::rpc::RpcRegistry::is_deprecated_firmware)
-///   tells.
+/// A device whose record declares no revision, the deprecated C firmware,
+/// marks neither, so its restarts come as a rollover with a loss of the
+/// sample periods between the acquisitions, and its reboots as a
+/// [`Change::SessionChanged`](super::Change::SessionChanged).
 ///
 /// # Examples
 ///
@@ -68,7 +63,7 @@ use std::collections::VecDeque;
 /// # let (id, route) = (StreamId::new(1), DeviceRoute::root());
 /// # let mut file = tempfile::NamedTempFile::new()?;
 /// # for record in [
-/// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1" }),
+/// #     wire::Metadata::Device(wire::Device { session: SessionId::new(1), n_streams: 1, name: "sensor", serial: "S1", firmware: "1", protocol: 0 }),
 /// #     wire::Metadata::Stream(wire::Stream { stream_id: id, n_columns: 1, n_segments: 1, sample_size: 4, buf_samples: 128, name: "field" }),
 /// #     wire::Metadata::Segment(wire::Segment { stream_id: id, segment_id: SegmentId::new(0), flags: wire::SegmentFlags::default(), epoch: Epoch::UNIX, timeref_serial: "", timeref_session: SessionId::new(1), start_time: 0, sampling_rate: 10, decimation: 1, filter_cutoff: 0.0, filter_type: wire::FilterType::NONE }),
 /// #     wire::Metadata::Column(wire::Column { stream_id: id, index: ColumnId::new(0), data_type: DataType::F32, name: "x", units: "nT", description: "" }),
@@ -1059,6 +1054,93 @@ mod tests {
                 }),
             })
         );
+    }
+
+    /// A segment a start opened, on a device that declares a revision, comes as a restart with no
+    /// loss, where a switch or any segment of a device that declares none comes as a rollover
+    /// with the periods between lost.
+    #[test]
+    fn a_declared_start_is_a_restart_and_anything_else_a_rollover() {
+        let boundary = |protocol: u8, flags: wire::SegmentFlags| {
+            let mut parser = PacketParser::new(true);
+            let device = wire::Device {
+                protocol,
+                ..fixtures::device()
+            };
+            announce_schema_for(&mut parser, device, &[DataType::F32], 4, 4, 1, 1);
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .unwrap();
+            parser.pop_batch().expect("the first batch");
+            let next = wire::Segment {
+                segment_id: crate::proto::SegmentId::new(1),
+                start_time: 4,
+                flags,
+                ..fixtures::segment(STREAM_ID)
+            };
+            announce(&mut parser, wire::Metadata::Segment(next));
+            parser
+                .push_packet(&stream_data_packet_in_segment(1, 0, vec![0; 4]))
+                .unwrap();
+            parser
+                .pop_batch()
+                .expect("the batch after")
+                .boundary()
+                .cloned()
+        };
+        let open = fixtures::segment(STREAM_ID).flags;
+        let lost = Some(Loss {
+            samples: 3,
+            expected: Some(SampleNumber::new(1)),
+            dropped_batches: 0,
+        });
+        let restarted = Change::Restarted {
+            old_id: crate::proto::SegmentId::new(0),
+            new_id: crate::proto::SegmentId::new(1),
+        };
+        assert_eq!(
+            boundary(1, open | wire::SegmentFlags::START),
+            Some(Boundary::of(restarted))
+        );
+        for (protocol, flags) in [(1, open), (0, open | wire::SegmentFlags::START)] {
+            assert_eq!(
+                boundary(protocol, flags),
+                Some(Boundary {
+                    change: rollover(0, 1),
+                    loss: lost.clone(),
+                }),
+                "revision {protocol} with {flags:?}"
+            );
+        }
+    }
+
+    /// A device that declares a revision may send its next session's heartbeat and record ahead
+    /// of its last session's rows, which still decode under the records they came after.
+    #[test]
+    fn a_declared_devices_new_session_leaves_its_streams_as_they_were() {
+        let mut parser = PacketParser::new(false);
+        let device = |session: u32| wire::Device {
+            session: crate::proto::SessionId::new(session),
+            protocol: 1,
+            ..fixtures::device()
+        };
+        announce_schema_for(&mut parser, device(42), &[DataType::F32], 4, 4, 1, 1);
+        parser
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
+            .unwrap();
+        parser.pop_batch().expect("the first batch");
+        parser
+            .push_packet(&tio::Packet::heartbeat_session(43, DeviceRoute::root()))
+            .unwrap();
+        announce(&mut parser, wire::Metadata::Device(device(43)));
+        parser
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .unwrap();
+        let late = parser.pop_batch().expect("the last session's rows decode");
+        assert_eq!(late.boundary(), None);
+        assert!(parser
+            .take_metadata_queries_for(DeviceRoute::root())
+            .is_empty());
     }
 
     /// A device announces only the segment it is publishing, so the parser

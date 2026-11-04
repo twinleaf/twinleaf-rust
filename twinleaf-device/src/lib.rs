@@ -18,6 +18,8 @@
 //!   requests still waiting for an answer.
 //! - [`storage`] — what outlives a boot: the configuration image and the
 //!   firmware upload cursor.
+//! - `sim`, with the `sim` feature — a host platform that runs a device to
+//!   the lane rules on a clock it is handed, for tools and tests.
 //!
 //! # Channels
 //!
@@ -36,7 +38,7 @@
 //! stream, and an occurrence a log. The standard table also holds protocol
 //! and actions; [`rpc::Channel`] classifies every entry of it.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "sim")), no_std)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![warn(rustdoc::all)]
@@ -49,6 +51,9 @@ pub mod sync;
 
 pub mod hub;
 pub mod storage;
+
+#[cfg(any(test, feature = "sim"))]
+pub mod sim;
 
 pub use device::Device;
 

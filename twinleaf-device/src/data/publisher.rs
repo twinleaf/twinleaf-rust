@@ -83,13 +83,17 @@ impl Publisher {
         out.send(&self.buf[..len]);
     }
 
-    /// Send the record of a segment that opened, after what is staged, so
-    /// rows of the segment before it never follow it.
-    pub fn record(&mut self, segment: data::Segment<'_>, out: &mut impl Sink) {
+    /// Send a segment's record under `flags`, after what is staged, so rows
+    /// written before it never follow it.
+    pub fn record(
+        &mut self,
+        segment: data::Segment<'_>,
+        flags: MetadataFlags,
+        out: &mut impl Sink,
+    ) {
         self.flush(out);
-        let flags = MetadataFlags::UPDATE | MetadataFlags::LAST;
         let len = Metadata::Segment(segment)
-            .write(flags, &mut self.buf)
+            .write(flags | MetadataFlags::LAST, &mut self.buf)
             .expect("a segment record fits a packet");
         out.send(&self.buf[..len]);
     }
@@ -228,7 +232,7 @@ mod tests {
         let mut sent = Sent::default();
         push(&mut publisher, issued(0, 0, false), &mut sent);
         push(&mut publisher, issued(0, 1, false), &mut sent);
-        publisher.record(segment(1), &mut sent);
+        publisher.record(segment(1), MetadataFlags::UPDATE, &mut sent);
         push(&mut publisher, issued(1, 0, false), &mut sent);
         publisher.flush(&mut sent);
         assert_eq!(

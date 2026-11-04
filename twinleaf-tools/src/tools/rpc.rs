@@ -607,7 +607,7 @@ mod tests {
         let read: Vec<Value> = read_selected(
             &device,
             &registry,
-            &patterns(&["test.enable", "dev.running", "dev.nothing"]),
+            &patterns(&["test.enable", "dev.autostart", "dev.nothing"]),
             false,
         )
         .iter()
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(
             read,
             [
-                json!({"name": "dev.running", "type": "bool", "value": true}),
+                json!({"name": "dev.autostart", "type": "u8", "value": 5}),
                 json!({"name": "test.enable", "type": "bool", "value": true}),
                 json!({"name": "dev.nothing", "type": null, "error": "matches no readable RPC"}),
             ]

@@ -163,6 +163,8 @@ impl SegmentFlags {
     pub const ACTIVE: Self = Self(2);
     /// The time reference's pulses were absent when this segment began.
     pub const HOLDOVER: Self = Self(4);
+    /// A start opened this segment, so it begins an acquisition rather than following a switch.
+    pub const START: Self = Self(8);
 
     /// Creates flags from their byte.
     pub const fn from_bits(bits: u8) -> Self {
@@ -250,6 +252,8 @@ pub struct Device<'a> {
     pub serial: &'a str,
     /// Firmware build serial.
     pub firmware: &'a str,
+    /// The [`PROTOCOL`](crate::PROTOCOL) revision the device keeps, 0 from firmware that declares none.
+    pub protocol: u8,
 }
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -261,6 +265,7 @@ struct DeviceHead {
     serial_len: u8,
     firmware_len: u8,
     n_streams: u8,
+    protocol: u8,
 }
 
 impl<'a> Device<'a> {
@@ -282,6 +287,7 @@ impl<'a> Device<'a> {
             serial_len,
             firmware_len,
             n_streams: self.n_streams,
+            protocol: self.protocol,
         }))
     }
 
@@ -296,6 +302,7 @@ impl<'a> Device<'a> {
             name: strings.take(head.name_len)?,
             serial: strings.take(head.serial_len)?,
             firmware: strings.take(head.firmware_len)?,
+            protocol: head.protocol,
         })
     }
 }
@@ -632,6 +639,11 @@ impl<'a> DeviceView<'a> {
     /// Streams the host should expect to be described in this sweep.
     pub fn n_streams(&self) -> u8 {
         self.field::<u8>(core::mem::offset_of!(DeviceHead, n_streams))
+    }
+
+    /// The protocol revision the device keeps, 0 from firmware that declares none.
+    pub fn protocol(&self) -> u8 {
+        self.field::<u8>(core::mem::offset_of!(DeviceHead, protocol))
     }
 
     /// Device name.
@@ -1334,7 +1346,8 @@ mod tests {
     //! no writer and no head type of the code. The heads are these.
     //!
     //! ```text
-    //! device  [9, name_len, session u32, serial_len, firmware_len, n_streams]
+    //! device  [10, name_len, session u32, serial_len, firmware_len, n_streams,
+    //!          protocol]
     //! stream  [9, stream_id, n_columns, n_segments, sample_size u16,
     //!          buf_samples u16, name_len]
     //! segment [27, stream_id, segment_id, flags, epoch, timeref_serial_len,
@@ -1473,6 +1486,7 @@ mod tests {
             name: "COMM-USB",
             serial: "twinleaf-37383731",
             firmware: "2026-07-24/a1b2c3-DEV",
+            protocol: crate::PROTOCOL,
         }
     }
 
@@ -1542,19 +1556,21 @@ mod tests {
             name: "AB",
             serial: "CDE",
             firmware: "F",
+            protocol: 1,
         };
         let mut buf = [0u8; 64];
         let flags = MetadataFlags::PERIODIC | MetadataFlags::LAST;
         let len = record_bytes(Metadata::Device(record), flags, &mut buf);
         #[rustfmt::skip]
         assert_eq!(&buf[..len], &[
-            11, 0, 17, 0,               // header: METADATA, no routing, payload 17
+            11, 0, 18, 0,               // header: METADATA, no routing, payload 18
             1, 0b101,                   // record type DEVICE, PERIODIC | LAST
-            9,                          // fixed_len
+            10,                         // fixed_len
             2,                          // name_varlen
             0x0D, 0x0C, 0x0B, 0x0A,     // session_id, little-endian
             3, 1,                       // serial_varlen, firmware_varlen
             5,                          // n_streams
+            1,                          // protocol
             b'A', b'B', b'C', b'D', b'E', b'F',
         ]);
     }
@@ -1731,14 +1747,16 @@ mod tests {
                 view.n_streams(),
                 view.name(),
                 view.serial(),
-                view.firmware()
+                view.firmware(),
+                view.protocol()
             ),
             (
                 SESSION,
                 2,
                 "COMM-USB",
                 "twinleaf-37383731",
-                "2026-07-24/a1b2c3-DEV"
+                "2026-07-24/a1b2c3-DEV",
+                crate::PROTOCOL
             )
         );
 
@@ -2025,6 +2043,7 @@ mod tests {
             name: &long,
             serial: &long,
             firmware: &long,
+            protocol: 0,
         });
         let mut buf = [0u8; 512];
         assert!(record.record_len() > usize::from(u8::MAX));
@@ -2189,6 +2208,7 @@ mod tests {
             name: String,
             serial: String,
             firmware: String,
+            protocol: u8,
         },
         Stream {
             stream_id: u8,
@@ -2255,7 +2275,8 @@ mod tests {
         /// The size of the head the firmware struct lays out.
         fn head_size(&self) -> usize {
             match self {
-                Self::Device { .. } | Self::Stream { .. } => 9,
+                Self::Device { .. } => 10,
+                Self::Stream { .. } => 9,
                 Self::Segment { .. } => 27,
                 Self::Column { .. } => 7,
             }
@@ -2265,7 +2286,7 @@ mod tests {
         /// whole head.
         fn shorter_ends(&self) -> Vec<usize> {
             match self {
-                Self::Device { .. } => vec![2, 6, 7, 8],
+                Self::Device { .. } => vec![2, 6, 7, 8, 9],
                 Self::Stream { .. } => vec![2, 3, 4, 6, 8],
                 Self::Segment { .. } => vec![2, 3, 4, 5, 6, 10, 14, 18, 22, 26],
                 Self::Column { .. } => vec![2, 3, 4, 5, 6],
@@ -2327,10 +2348,11 @@ mod tests {
                     name,
                     serial,
                     firmware,
+                    protocol,
                 } => [
-                    &[9, len(name)][..],
+                    &[10, len(name)][..],
                     &session.to_le_bytes(),
-                    &[len(serial), len(firmware), *n_streams],
+                    &[len(serial), len(firmware), *n_streams, *protocol],
                 ]
                 .concat(),
                 Self::Stream {
@@ -2414,12 +2436,14 @@ mod tests {
                     name,
                     serial,
                     firmware,
+                    protocol,
                 } => Self::Device {
                     name: kept(name, 2, end),
                     session: kept(session, 6, end),
                     serial: kept(serial, 7, end),
                     firmware: kept(firmware, 8, end),
                     n_streams: kept(n_streams, 9, end),
+                    protocol: kept(protocol, 10, end),
                 },
                 Self::Stream {
                     stream_id,
@@ -2488,6 +2512,7 @@ mod tests {
                     name: record.name.to_owned(),
                     serial: record.serial.to_owned(),
                     firmware: record.firmware.to_owned(),
+                    protocol: record.protocol,
                 },
                 Metadata::Stream(record) => Self::Stream {
                     stream_id: record.stream_id.value(),
@@ -2530,12 +2555,14 @@ mod tests {
                     name,
                     serial,
                     firmware,
+                    protocol,
                 } => Metadata::Device(Device {
                     session: SessionId::new(*session),
                     n_streams: *n_streams,
                     name,
                     serial,
                     firmware,
+                    protocol: *protocol,
                 }),
                 Self::Stream {
                     stream_id,
@@ -2794,14 +2821,15 @@ mod tests {
     /// strings from [`text`] of up to `max` bytes.
     fn fields(max: usize) -> BoxedStrategy<Fields> {
         prop_oneof![
-            (word(), octet(), text(max), text(max), text(max))
+            (word(), octet(), text(max), text(max), text(max), octet())
                 .prop_map(
-                    |(session, n_streams, name, serial, firmware)| Fields::Device {
+                    |(session, n_streams, name, serial, firmware, protocol)| Fields::Device {
                         session,
                         n_streams,
                         name,
                         serial,
                         firmware,
+                        protocol,
                     }
                 )
                 .boxed(),
@@ -2884,18 +2912,21 @@ mod tests {
             Just(Packet::MAX_PAYLOAD - METADATA_HEADER_SIZE + 1),
             head..=head + 600,
         ];
-        (record, word(), octet()).prop_map(move |(record, session, n_streams)| {
-            let strings = record - head;
-            let name = strings.min(MAX_STRING);
-            let serial = (strings - name).min(MAX_STRING);
-            Fields::Device {
-                session,
-                n_streams,
-                name: "n".repeat(name),
-                serial: "s".repeat(serial),
-                firmware: "f".repeat(strings - name - serial),
-            }
-        })
+        (record, word(), octet(), octet()).prop_map(
+            move |(record, session, n_streams, protocol)| {
+                let strings = record - head;
+                let name = strings.min(MAX_STRING);
+                let serial = (strings - name).min(MAX_STRING);
+                Fields::Device {
+                    session,
+                    n_streams,
+                    name: "n".repeat(name),
+                    serial: "s".repeat(serial),
+                    firmware: "f".repeat(strings - name - serial),
+                    protocol,
+                }
+            },
+        )
     }
 
     /// A `METADATA` payload. A fifth are under two bytes or any bytes. The

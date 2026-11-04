@@ -9,7 +9,7 @@
 use core::num::NonZeroU32;
 
 use heapless::String;
-use twinleaf_proto::data::{self, FilterType, SegmentFlags};
+use twinleaf_proto::data::{self, FilterType, MetadataFlags, SegmentFlags};
 use twinleaf_proto::sync::Epoch;
 use twinleaf_proto::{SampleNumber, SegmentId, SessionId, StreamId};
 
@@ -119,6 +119,8 @@ pub struct Segment {
     params: Params,
     timeref: Timeref,
     holdover: bool,
+    /// Whether a start opened it, rather than a switch.
+    starts: bool,
     next_issue: u32,
     next_output: u32,
 }
@@ -131,6 +133,7 @@ impl Segment {
             params,
             timeref: Timeref::default(),
             holdover: false,
+            starts: false,
             next_issue: 0,
             next_output: 0,
         }
@@ -176,17 +179,17 @@ impl Segment {
     /// A segment is valid on the wire once it opens, and active until the
     /// next segment takes over.
     fn flags(&self) -> SegmentFlags {
-        let holdover = if self.holdover {
-            SegmentFlags::HOLDOVER
-        } else {
-            SegmentFlags::default()
-        };
+        let marked = [
+            (self.holdover, SegmentFlags::HOLDOVER),
+            (self.starts, SegmentFlags::START),
+        ]
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .fold(SegmentFlags::VALID, |flags, (_, flag)| flags | flag);
         match self.state {
             SegmentState::Invalid | SegmentState::Next => SegmentFlags::default(),
-            SegmentState::Issuing | SegmentState::Done => {
-                SegmentFlags::VALID | SegmentFlags::ACTIVE | holdover
-            }
-            SegmentState::Inactive => SegmentFlags::VALID | holdover,
+            SegmentState::Issuing | SegmentState::Done => marked | SegmentFlags::ACTIVE,
+            SegmentState::Inactive => marked,
         }
     }
 }
@@ -218,7 +221,8 @@ pub struct Segments<const N: usize> {
     entries: [Segment; N],
     phase: Phase,
     latest: u8,
-    owed: bool,
+    /// The record owed of the current segment, with the flags it goes out under.
+    owed: Option<MetadataFlags>,
     holdover: bool,
 }
 
@@ -234,7 +238,7 @@ impl<const N: usize> Segments<N> {
             entries,
             phase: Phase::Stopped { next: 0 },
             latest: 0,
-            owed: false,
+            owed: None,
             holdover: false,
         }
     }
@@ -247,26 +251,28 @@ impl<const N: usize> Segments<N> {
         let entry = &mut self.entries[usize::from(next)];
         entry.timeref = timeref;
         entry.holdover = self.holdover;
+        entry.starts = true;
         self.phase = Phase::Issuing { current: next };
         self.enter(next);
         Ok(())
     }
 
-    /// Stop acquiring. The next start begins a fresh segment.
-    pub fn stop(&mut self) {
-        let next = match self.phase {
-            Phase::Stopped { next } => next,
+    /// Stop acquiring, and say whether it was. The next start begins a fresh segment.
+    pub fn stop(&mut self) -> bool {
+        let (next, acquiring) = match self.phase {
+            Phase::Stopped { next } => (next, false),
             Phase::Issuing { current } => {
                 let issued = self.entries[usize::from(current)].next_issue;
                 self.retire(current);
-                self.open(current, issued)
+                (self.open(current, issued), true)
             }
             Phase::Switching { from, to, .. } => {
                 self.retire(from);
-                to
+                (to, true)
             }
         };
         self.phase = Phase::Stopped { next };
+        acquiring
     }
 
     /// Mark every segment opened from here on as begun while the time
@@ -317,10 +323,10 @@ impl<const N: usize> Segments<N> {
         &self.entries[usize::from(self.latest)]
     }
 
-    /// The segment that opened, or changed before issuing, since this was last
-    /// asked: its record goes out before anything it issues.
-    pub fn opened(&mut self) -> Option<&Segment> {
-        core::mem::take(&mut self.owed).then(|| self.current())
+    /// The segment that opened, changed before issuing, or reached a whole second since this was
+    /// last asked, with the flags its record goes out under ahead of anything it issues next.
+    pub fn opened(&mut self) -> Option<(&Segment, MetadataFlags)> {
+        self.owed.take().map(|flags| (self.current(), flags))
     }
 
     /// The segment `id` names, `None` if the ring holds none.
@@ -334,6 +340,7 @@ impl<const N: usize> Segments<N> {
         let current = self.switched()?;
         let entry = &mut self.entries[usize::from(current)];
         let number = entry.next_issue;
+        let second = number > 0 && number.is_multiple_of(entry.params.rate.get());
         entry.next_issue += 1;
         let kept = (number + 1).is_multiple_of(entry.params.decimation.get());
         let output = kept.then(|| {
@@ -345,6 +352,9 @@ impl<const N: usize> Segments<N> {
             .filter(|_| publishing && entry.params.enabled)
             .map(SampleNumber::new);
         let (issued, generated) = (entry.next_issue, entry.next_output);
+        if second {
+            self.owed.get_or_insert(MetadataFlags::PERIODIC);
+        }
         match self.phase {
             Phase::Issuing { .. }
                 if issued >= MAX_INPUT_SAMPLES || generated >= MAX_OUTPUT_SAMPLES =>
@@ -392,7 +402,7 @@ impl<const N: usize> Segments<N> {
             Phase::Stopped { next } => next,
             Phase::Switching { to, .. } => to,
             Phase::Issuing { current } if self.entries[usize::from(current)].next_issue == 0 => {
-                self.owed = true;
+                self.owed = Some(MetadataFlags::UPDATE);
                 current
             }
             Phase::Issuing { current } => {
@@ -426,6 +436,7 @@ impl<const N: usize> Segments<N> {
         entry.params = params;
         entry.timeref = timeref;
         entry.holdover = self.holdover;
+        entry.starts = false;
         entry.next_issue = 0;
         entry.next_output = 0;
         to
@@ -435,7 +446,7 @@ impl<const N: usize> Segments<N> {
     fn enter(&mut self, index: u8) {
         self.entries[usize::from(index)].state = SegmentState::Issuing;
         self.latest = index;
-        self.owed = true;
+        self.owed = Some(MetadataFlags::UPDATE);
     }
 
     /// A segment stops issuing: one that opened stays readable, one that never did is gone.
@@ -520,7 +531,7 @@ mod tests {
         assert_eq!(segments.current(), segments.get(id(0)).unwrap());
         assert_eq!(
             segments.current().flags(),
-            SegmentFlags::VALID | SegmentFlags::ACTIVE
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::START
         );
         assert_eq!(segments.get(id(0)).unwrap().timeref().start_time, 1000);
 
@@ -541,7 +552,10 @@ mod tests {
         assert_eq!(issued[4].output, Some(SampleNumber::new(29)));
         assert_eq!(issued[5].segment.value(), 1);
         assert_eq!(issued[5].output, Some(SampleNumber::new(0)));
-        assert_eq!(segments.opened().map(Segment::id), Some(id(1)));
+        assert_eq!(
+            segments.opened().map(|(segment, _)| segment.id()),
+            Some(id(1))
+        );
         assert_eq!(segments.current().timeref().start_time, 1003);
     }
 
@@ -625,13 +639,16 @@ mod tests {
     #[test]
     fn a_segment_owes_its_record_from_its_opening() {
         let mut segments: Segments<4> = started(params(10));
-        assert_eq!(segments.opened().map(Segment::id), Some(id(0)));
+        assert_eq!(
+            segments.opened().map(|(segment, _)| segment.id()),
+            Some(id(0))
+        );
         assert_eq!(segments.opened(), None);
         segments.relabel(1000, timeref(5000));
         assert_eq!(
             segments
                 .opened()
-                .map(|segment| segment.timeref().start_time),
+                .map(|(segment, _)| segment.timeref().start_time),
             Some(5000)
         );
         segments.skip(1);
@@ -639,7 +656,49 @@ mod tests {
         segments.retune(params(20));
         assert_eq!(segments.opened(), None);
         segments.skip(9);
-        assert_eq!(segments.opened().map(Segment::id), Some(id(1)));
+        assert_eq!(
+            segments.opened().map(|(segment, _)| segment.id()),
+            Some(id(1))
+        );
+    }
+
+    /// An issuing segment owes its record again at each whole second, so a host that joins
+    /// mid-stream hears it within one.
+    #[test]
+    fn a_segment_owes_its_record_again_each_second() {
+        let mut segments: Segments<4> = started(params(10));
+        segments.opened();
+        let owed: Vec<(u32, MetadataFlags)> = (0..25)
+            .filter_map(|number| {
+                segments.issue();
+                segments.opened().map(|(_, flags)| (number, flags))
+            })
+            .collect();
+        assert_eq!(
+            owed,
+            [(10, MetadataFlags::PERIODIC), (20, MetadataFlags::PERIODIC)]
+        );
+    }
+
+    /// A start opens a segment that says so, and a switch from it opens one that does not.
+    #[test]
+    fn only_a_start_opens_a_segment_that_starts_an_acquisition() {
+        let mut segments: Segments<4> = started(params(10));
+        issue(&mut segments, 3);
+        segments.rollover();
+        issue(&mut segments, 8);
+        let starts = |segments: &Segments<4>, at: u8| {
+            segments
+                .get(id(at))
+                .unwrap()
+                .flags()
+                .contains(SegmentFlags::START)
+        };
+        assert!(starts(&segments, 0) && !starts(&segments, 1));
+        assert!(segments.stop());
+        assert!(!segments.stop(), "a stopped ring has nothing to stop");
+        segments.start(timeref(2000)).unwrap();
+        assert!(starts(&segments, 2));
     }
 
     #[test]
@@ -657,7 +716,10 @@ mod tests {
         let issued = segments.issue().unwrap();
         assert_eq!(issued.segment.value(), 1);
         assert_eq!(issued.output, Some(SampleNumber::new(0)));
-        assert_eq!(segments.opened().map(Segment::id), Some(id(1)));
+        assert_eq!(
+            segments.opened().map(|(segment, _)| segment.id()),
+            Some(id(1))
+        );
     }
 
     #[test]
@@ -672,14 +734,17 @@ mod tests {
         assert_eq!(segments.current().state(), SegmentState::Issuing);
         assert_eq!(
             segments.current().flags(),
-            SegmentFlags::VALID | SegmentFlags::ACTIVE
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::START
         );
 
         issue(&mut segments, 1);
         segments.rollover();
         issue(&mut segments, 10);
         assert_eq!(segments.get(id(0)).unwrap().state(), SegmentState::Inactive);
-        assert_eq!(segments.get(id(0)).unwrap().flags(), SegmentFlags::VALID);
+        assert_eq!(
+            segments.get(id(0)).unwrap().flags(),
+            SegmentFlags::VALID | SegmentFlags::START
+        );
         assert_eq!(segments.get(id(1)).unwrap().state(), SegmentState::Issuing);
     }
 
@@ -693,7 +758,10 @@ mod tests {
         issue(&mut segments, 1);
         assert_eq!(
             segments.current().flags(),
-            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
+            SegmentFlags::VALID
+                | SegmentFlags::ACTIVE
+                | SegmentFlags::HOLDOVER
+                | SegmentFlags::START
         );
 
         segments.set_holdover(false);
@@ -706,7 +774,7 @@ mod tests {
         );
         assert_eq!(
             segments.get(id(0)).unwrap().flags(),
-            SegmentFlags::VALID | SegmentFlags::HOLDOVER
+            SegmentFlags::VALID | SegmentFlags::HOLDOVER | SegmentFlags::START
         );
     }
 
@@ -719,7 +787,10 @@ mod tests {
         assert_eq!(segments.current().id().value(), 0);
         assert_eq!(
             segments.current().flags(),
-            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::HOLDOVER
+            SegmentFlags::VALID
+                | SegmentFlags::ACTIVE
+                | SegmentFlags::HOLDOVER
+                | SegmentFlags::START
         );
     }
 
@@ -793,7 +864,10 @@ mod tests {
             .record(StreamId::new(2), FilterType::IIR_BW_LPF4);
         assert_eq!(record.stream_id, StreamId::new(2));
         assert_eq!(record.segment_id, SegmentId::new(0));
-        assert_eq!(record.flags, SegmentFlags::VALID | SegmentFlags::ACTIVE);
+        assert_eq!(
+            record.flags,
+            SegmentFlags::VALID | SegmentFlags::ACTIVE | SegmentFlags::START
+        );
         assert_eq!(record.epoch, Epoch::UNIX);
         assert_eq!(record.timeref_serial, "S1");
         assert_eq!(record.timeref_session, SessionId::new(3));
@@ -827,7 +901,10 @@ mod tests {
                 2 => segments.skip(1 + (next() % 3) as u32),
                 3..=7 => {
                     let sample = segments.issue().unwrap();
-                    let opened = segments.opened().map(Segment::id);
+                    let opened = segments
+                        .opened()
+                        .filter(|(_, flags)| *flags == MetadataFlags::UPDATE)
+                        .map(|(segment, _)| segment.id());
                     let entry = segments.get(sample.segment).unwrap();
                     let output = sample.output.unwrap().value();
                     assert_eq!(output, entry.next_issue - 1);

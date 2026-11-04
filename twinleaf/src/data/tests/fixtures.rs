@@ -43,6 +43,7 @@ pub(crate) fn device() -> wire::Device<'static> {
         name: "test-device",
         serial: "SN123",
         firmware: "fw",
+        protocol: 0,
     }
 }
 
@@ -120,6 +121,7 @@ pub(crate) fn metadata_records(session: u32) -> [wire::Metadata<'static>; 4] {
             name: "d",
             serial: "s",
             firmware: "f",
+            protocol: 0,
         }),
         wire::Metadata::Stream(wire::Stream {
             stream_id: StreamId::new(1),

@@ -14,7 +14,7 @@
 //! list, and as the position a request reaches.
 
 use heapless::String;
-use twinleaf_proto::data::{self, MetadataFlags};
+use twinleaf_proto::data::{self, Metadata, MetadataFlags};
 use twinleaf_proto::heartbeat::Heartbeat;
 use twinleaf_proto::log::{LogLevel, LogMessage, MAX_MESSAGE_SIZE};
 use twinleaf_proto::packet::{Packet, PacketType, PacketView};
@@ -27,7 +27,6 @@ use crate::data::metadata::{self, Streams};
 use crate::rpc::{self as table, put, read, Access, Kind, Reply, RpcSpec, Std, STANDARD};
 use crate::rpc::{finite, Atomic, Changed, Persisted, Scalar, Setting, Text, UID_SIZE};
 use crate::storage::conf::{self, Image};
-use crate::sync::AcquisitionState;
 use crate::Sink;
 
 /// Nanoseconds between heartbeats.
@@ -202,25 +201,24 @@ impl<'p> Actions<'p> {
     }
 }
 
-/// Where a device's packets go.
+/// Where a device's control and event packets go, each on the lane
+/// [`lane_of`](twinleaf_proto::lane_of) names. A stream sends its data through a [`Sink`] of its
+/// own.
 ///
-/// A reply belongs to the port that asked and outranks everything queued for
-/// it. An announcement belongs to every port, in one order everywhere, and on
-/// the port that asked ahead of the reply that follows it. A log or heartbeat
-/// belongs to every port with no order against either. A platform with one
-/// port is [`OneLane`].
+/// Control is every port's announcements, heartbeats and device record in one write order, with
+/// each port's own replies merged in so that an announcement written before a reply leaves ahead
+/// of it. A port that falls behind is cut off, with a counted drop and a gap in the sequence, and
+/// resynchronises from a snapshot, so no port delays the device or another port. Events are
+/// logs, in no order against anything. A platform with one port is [`OneLane`].
 pub trait Lanes {
-    /// The ordered lane of the port that asked: its replies.
+    /// The control lane of the port that asked: its replies.
     fn reply(&mut self, packet: &[u8]);
 
-    /// Every port's ordered lane: a setting announcement, behind every one
-    /// before it and ahead of any reply after it. A platform sends the
-    /// announcements and its publishers' sample packets and records in the
-    /// order they were written, which a host's parser relies on to tell a
-    /// stop from the acquisition after it.
+    /// Every port's control lane: an announcement, a heartbeat or the device record, behind
+    /// every one before it.
     fn announce(&mut self, packet: &[u8]);
 
-    /// The lane every port drains: what the device logged or beat on its own account.
+    /// Every port's event lane: a log.
     fn event(&mut self, packet: &[u8]);
 }
 
@@ -273,7 +271,7 @@ fn to<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
     }
 }
 
-/// Every port's ordered lane of announcements.
+/// Every port's control lane.
 fn announcements<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
     Lane {
         lanes,
@@ -281,7 +279,7 @@ fn announcements<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
     }
 }
 
-/// The lane every port drains.
+/// Every port's event lane.
 fn events<L: Lanes + ?Sized>(lanes: &mut L) -> Lane<'_, L> {
     Lane {
         lanes,
@@ -324,18 +322,14 @@ pub struct Device<S: Group> {
     time_status: u8,
     /// `sync.status`, moved to what the platform published at each refresh.
     sync_status: Setting<u8>,
-    /// What the platform last published of its acquisition, or `Stopping`
-    /// once a stop or restart of a running acquisition is handed to it.
-    acquisition: AcquisitionState,
-    /// `dev.running`, moved to whether that acquisition runs at each refresh,
-    /// and turned off as a stop or restart is handed to the platform.
-    running: Setting<bool>,
 }
 
 impl<S: Group> Device<S> {
     /// A device come up at `now_ns`, answering `table`: [`STANDARD`] first,
     /// then what `settings` declares, and `dev.priv` taking `password` until
-    /// `dev.priv.password` overrides it.
+    /// `dev.priv.password` overrides it. Its session opens on control with a
+    /// heartbeat and then the device record.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: Identity,
         session: SessionId,
@@ -343,8 +337,10 @@ impl<S: Group> Device<S> {
         settings: S,
         password: &str,
         now_ns: u64,
+        streams: &(impl Streams + ?Sized),
+        lanes: &mut (impl Lanes + ?Sized),
     ) -> Self {
-        Self {
+        let mut device = Self {
             identity,
             session,
             table,
@@ -363,9 +359,9 @@ impl<S: Group> Device<S> {
             dirty_since: None,
             time_status: 0,
             sync_status: Setting::new("sync.status", 0).read_only(),
-            acquisition: AcquisitionState::Idle,
-            running: Setting::new("dev.running", false).read_only(),
-        }
+        };
+        device.open(now_ns, streams, lanes);
+        device
     }
 
     /// Restores lifetime powered-on hours without changing the current boot clock.
@@ -414,14 +410,6 @@ impl<S: Group> Device<S> {
         self.time_status = code;
     }
 
-    /// Publish the state of the platform's acquisition, for `dev.running` to
-    /// announce at the next refresh. The platform publishes a state once it
-    /// has acted on it. A stop or restart the device hands over leaves the
-    /// acquisition stopping until the platform publishes again.
-    pub fn set_acquisition(&mut self, state: AcquisitionState) {
-        self.acquisition = state;
-    }
-
     /// The device record: identity, session, and how many streams.
     pub fn record(&self, streams: &(impl Streams + ?Sized)) -> data::Device<'_> {
         data::Device {
@@ -430,6 +418,7 @@ impl<S: Group> Device<S> {
             name: &self.identity.name,
             serial: &self.identity.serial,
             firmware: &self.identity.firmware,
+            protocol: twinleaf_proto::PROTOCOL,
         }
     }
 
@@ -656,20 +645,15 @@ impl<S: Group> Device<S> {
                     }
                 }),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
-                Std::Stop => {
-                    self.stopping(&mut announcements(lanes));
-                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop));
-                }
+                Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
                 Std::Restart => {
-                    self.stopping(&mut announcements(lanes));
-                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Restart));
+                    return actions.defer(pending, Deferred::Acquire(SyncRequest::Restart))
                 }
                 Std::Abort => return actions.defer(pending, Deferred::Flash(FlashOp::Abort)),
                 Std::SettingsVersion => {
                     read(&mut reply, args, &self.settings_version.to_le_bytes())
                 }
                 Std::SyncStatus => self.sync_status.rpc(args, &mut reply).map(drop),
-                Std::Running => self.running.rpc(args, &mut reply).map(drop),
                 Std::Priv => self.unlock(args, &mut reply),
                 Std::PrivLock => {
                     self.privileged = false;
@@ -878,10 +862,15 @@ impl<S: Group> Device<S> {
     }
 
     /// Power-cycle: a new session, and the heartbeat, log threshold,
-    /// `settings.version`, and uptime a boot starts from.
-    pub fn reboot(&mut self, session: SessionId, now_ns: u64) {
+    /// `settings.version`, and uptime a boot starts from, opened as [`Device::new`] opens one.
+    pub fn reboot(
+        &mut self,
+        session: SessionId,
+        now_ns: u64,
+        streams: &(impl Streams + ?Sized),
+        lanes: &mut (impl Lanes + ?Sized),
+    ) {
         self.session = session;
-        self.next_beat = 0;
         self.booted_ns = now_ns;
         self.loglevel.reset();
         self.password.reset();
@@ -890,6 +879,21 @@ impl<S: Group> Device<S> {
         self.privileged = false;
         self.settings_version = 0;
         self.dirty_since = None;
+        self.open(now_ns, streams, lanes);
+    }
+
+    /// Open the session on control, a heartbeat ahead of the device record.
+    fn open(
+        &mut self,
+        now_ns: u64,
+        streams: &(impl Streams + ?Sized),
+        lanes: &mut (impl Lanes + ?Sized),
+    ) {
+        let mut control = announcements(lanes);
+        self.beat(now_ns, &mut control);
+        send(&mut control, &[], |buf| {
+            Metadata::Device(self.record(streams)).write(MetadataFlags::UPDATE, buf)
+        });
     }
 
     /// Send whatever is due at `now_ns`, the reports that moved as
@@ -897,8 +901,9 @@ impl<S: Group> Device<S> {
     /// change left unsaved for a period, owed until [`Device::saved`].
     pub fn tick(&mut self, now_ns: u64, lanes: &mut (impl Lanes + ?Sized)) -> Option<Entries> {
         if now_ns >= self.next_beat {
-            self.refresh(now_ns, &mut announcements(&mut *lanes));
-            self.beat(now_ns, &mut events(lanes));
+            let mut control = announcements(lanes);
+            self.refresh(now_ns, &mut control);
+            self.beat(now_ns, &mut control);
         }
         if now_ns < self.dirty_since? + AUTOSAVE_INTERVAL {
             return None;
@@ -940,35 +945,6 @@ impl<S: Group> Device<S> {
         self.settings.refresh(&mut to);
         let _ = to.set(&mut self.lifetime, hours);
         let _ = to.set(&mut self.sync_status, self.time_status);
-        let _ = to.set(
-            &mut self.running,
-            self.acquisition == AcquisitionState::Running,
-        );
-    }
-
-    /// Turns `dev.running` off for a stop or restart about to be handed to
-    /// the platform, and announces it into `out` ahead of anything the
-    /// platform does with the request. The announcement goes out on every
-    /// such request, though `dev.running` was already off, as while the
-    /// platform is starting and its first sample may be out. A running
-    /// acquisition counts as stopping until the platform publishes its
-    /// state, so no refresh before that announces it running again. A stop
-    /// or restart a host asks for thus announces `dev.running` off before
-    /// the first sample of the acquisition after it.
-    fn stopping(&mut self, out: &mut impl Sink) {
-        if self.acquisition == AcquisitionState::Running {
-            self.acquisition = AcquisitionState::Stopping;
-        }
-        let mut announced = Reply::new();
-        let off = self.running.put(false).is_ok() && false.encode(&mut announced).is_ok();
-        if off {
-            announce(
-                &mut self.settings_version,
-                out,
-                self.running.name(),
-                &announced,
-            );
-        }
     }
 
     fn beat(&mut self, now_ns: u64, out: &mut impl Sink) {
@@ -1575,9 +1551,30 @@ mod tests {
         .unwrap()
     }
 
+    /// A device come up at boot with no streams, its session opened where no port hears it.
+    fn opened<S: Group>(
+        identity: Identity,
+        table: &'static [RpcSpec],
+        settings: S,
+        password: &str,
+    ) -> Device<S> {
+        let none: [DataStream<4>; 0] = [];
+        let mut nowhere = OneLane(Sent::default());
+        Device::new(
+            identity,
+            SESSION,
+            table,
+            settings,
+            password,
+            BOOT,
+            &none[..],
+            &mut nowhere,
+        )
+    }
+
     fn device(table: &'static [RpcSpec]) -> Device<Board> {
         let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
-        Device::new(identity, SESSION, table, Board::new(), PASSWORD, BOOT)
+        opened(identity, table, Board::new(), PASSWORD)
     }
 
     fn harness() -> Harness {
@@ -1672,6 +1669,12 @@ mod tests {
             self.device.table()
         }
 
+        /// Boot the device again into `session`, its opening on the lanes.
+        fn boot(&mut self, session: SessionId, now_ns: u64) {
+            self.device
+                .reboot(session, now_ns, &self.streams[..], &mut self.lanes);
+        }
+
         /// How many entries `rpc.list` says this session has.
         fn listed(&mut self) -> usize {
             let count = self.ask("rpc.list", &[]).value().try_into().unwrap();
@@ -1746,7 +1749,7 @@ mod tests {
     #[test]
     fn hardware_a_platform_does_not_name_is_the_state_error() {
         let mut device = harness();
-        device.device = Device::new(identity(), SESSION, table(), Board::new(), PASSWORD, BOOT);
+        device.device = opened(identity(), table(), Board::new(), PASSWORD);
         device.ask("dev.priv", PASSWORD.as_bytes());
         for name in ["dev.uid", "dev.model", "dev.mcu.model", "dev.revision"] {
             assert_eq!(device.ask(name, &[]).error(), RpcError::State, "{name}");
@@ -1922,7 +1925,7 @@ mod tests {
             panic!("a save carries the image");
         };
 
-        device.device.reboot(SessionId::new(2), BOOT);
+        device.boot(SessionId::new(2), BOOT);
         assert_eq!(device.device.autostart(), DEFAULT_AUTOSTART);
         device.drive(Input::Loaded(None, Ok(&image)), BOOT);
         assert_eq!(device.device.autostart(), 0);
@@ -1963,7 +1966,7 @@ mod tests {
             panic!("a save carries the image");
         };
 
-        device.device.reboot(SessionId::new(2), BOOT);
+        device.boot(SessionId::new(2), BOOT);
         assert_eq!(device.device.sync_delay_ns(), 0.0);
         device.drive(Input::Loaded(None, Ok(&image)), BOOT);
         assert_eq!(device.device.sync_delay_ns(), 12.5);
@@ -1985,7 +1988,7 @@ mod tests {
             panic!("a save carries the image");
         };
 
-        device.device.reboot(SessionId::new(2), BOOT);
+        device.boot(SessionId::new(2), BOOT);
         assert_eq!(device.ask("dev.priv", &[]).value(), &[0], "a boot locks");
         device.drive(Input::Loaded(None, Ok(&image)), BOOT);
         assert_eq!(
@@ -2010,7 +2013,7 @@ mod tests {
     #[test]
     fn a_device_with_no_password_answers_the_state_error() {
         let mut device = harness();
-        device.device = Device::new(identity(), SESSION, table(), Board::new(), "", BOOT);
+        device.device = opened(identity(), table(), Board::new(), "");
         assert_eq!(device.ask("dev.priv", b"895895").error(), RpcError::State);
         assert_eq!(device.ask("dev.priv", &[]).value(), &[0]);
     }
@@ -2138,7 +2141,9 @@ mod tests {
         let mut device = harness();
         device.ask("board.first", &8u32.to_le_bytes());
         let mut sent = Sent::default();
-        device.device.tick(BOOT, &mut OneLane(&mut sent));
+        device
+            .device
+            .tick(BOOT + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent));
         assert_eq!(
             Heartbeat::parse(sent.views()[0].payload),
             Some(Heartbeat::Session {
@@ -2280,7 +2285,7 @@ mod tests {
         device.ask("dev.loglevel", &[LogLevel::DEBUG.value()]);
 
         let later = BOOT + 3 * NANOS_PER_HOUR;
-        device.device.reboot(SessionId::new(10), later);
+        device.boot(SessionId::new(10), later);
         assert_eq!(device.device.session, SessionId::new(10));
         assert_eq!(
             device.ask_at("dev.loglevel", &[], later).value(),
@@ -2318,7 +2323,7 @@ mod tests {
         let device = harness();
         let names: Vec<&str> = device.table().iter().map(|spec| spec.name).collect();
         assert_eq!(names[0], "dev.metadata", "the standard table comes first");
-        assert_eq!(names[STANDARD.len() - 1], "dev.running");
+        assert_eq!(names[STANDARD.len() - 1], "dev.priv.password");
         assert_eq!(&names[STANDARD.len()..], BOARD_NAMES);
     }
 
@@ -2414,6 +2419,55 @@ mod tests {
         fn event(&mut self, packet: &[u8]) {
             self.ports.iter_mut().for_each(|port| port.send(packet));
         }
+    }
+
+    /// A session opens on every port with its heartbeat and then the device record, and every
+    /// later heartbeat shares their lane.
+    #[test]
+    fn a_session_opens_on_every_port_with_its_heartbeat_and_record() {
+        let mut device = harness();
+        let rebooted = SessionId::new(SESSION.value() + 1);
+        let mut lanes = Ports {
+            ports: Default::default(),
+            asking: 1,
+        };
+        device
+            .device
+            .reboot(rebooted, BOOT, &device.streams[..], &mut lanes);
+        for port in &lanes.ports {
+            let views = port.views();
+            assert_eq!(
+                Heartbeat::parse(views[0].payload),
+                Some(Heartbeat::Session {
+                    session: rebooted,
+                    settings: Some(0),
+                })
+            );
+            assert!(matches!(
+                twinleaf_proto::data::Metadata::parse(views[1].payload),
+                Some((twinleaf_proto::data::Metadata::Device(record), _)) if record.session == rebooted
+            ));
+        }
+
+        device.boot(rebooted, BOOT);
+        device
+            .device
+            .tick(BOOT + HEARTBEAT_INTERVAL, &mut device.lanes);
+        let control: Vec<PacketType> = device
+            .lanes
+            .to
+            .views()
+            .iter()
+            .map(|view| view.header.ptype)
+            .collect();
+        assert_eq!(
+            control,
+            [
+                PacketType::HEARTBEAT,
+                PacketType::METADATA,
+                PacketType::HEARTBEAT
+            ]
+        );
     }
 
     #[test]
@@ -2560,13 +2614,11 @@ mod tests {
         let mut specs: Vec<RpcSpec> = table().to_vec();
         specs.push(RpcSpec::std("board.capture", Access::READ));
         let mut device = harness();
-        device.device = Device::new(
+        device.device = opened(
             identity(),
-            SESSION,
             Box::leak(specs.into_boxed_slice()),
             Board::new(),
             PASSWORD,
-            BOOT,
         );
 
         let packet = asking(Method::ByName(b"board.capture"), &[3], &[2, 1]);
@@ -2662,75 +2714,20 @@ mod tests {
         assert_eq!(device.ask("sync.status", &[1]).error(), RpcError::ReadOnly);
     }
 
-    /// `dev.running` follows what the platform publishes of its acquisition,
-    /// true only once samples flow.
+    /// A stop or restart is handed to the platform, which closes each stream's segment on its
+    /// data, and announces nothing.
     #[test]
-    fn dev_running_follows_the_acquisition_the_platform_publishes() {
-        let mut device = harness();
-        assert_eq!(device.ask("dev.running", &[]).value(), [0]);
-        device.device.set_acquisition(AcquisitionState::Starting);
-        assert_eq!(device.ask("dev.running", &[]).value(), [0]);
-        device.device.set_acquisition(AcquisitionState::Running);
-        let answered = device.ask("dev.running", &[]);
-        assert_eq!(answered.announced(), [("dev.running".to_owned(), vec![1])]);
-        assert_eq!(answered.value(), [1]);
-        assert_eq!(device.ask("dev.running", &[1]).error(), RpcError::ReadOnly);
-    }
-
-    /// A stop or restart of a running acquisition announces `dev.running` off
-    /// in the request that asks for it, before the platform acts on it. A
-    /// refresh before the platform publishes again leaves it off, and the
-    /// first refresh after the platform publishes it running announces it on.
-    #[test]
-    fn a_stop_or_restart_announces_dev_running_off_as_it_is_handed_over() {
+    fn a_stop_or_restart_is_handed_over_and_announces_nothing() {
         for name in ["dev.stop", "dev.restart"] {
             let mut device = harness();
-            device.device.set_acquisition(AcquisitionState::Running);
-            device.ask("dev.running", &[]);
-            let asked = device.ask(name, &[]);
-            assert_eq!(
-                asked.announced(),
-                [("dev.running".to_owned(), vec![0])],
-                "{name} announces the stop"
+            assert!(
+                device.ask(name, &[]).0.is_empty(),
+                "{name} is the platform's to answer"
             );
-            assert!(asked.0.len() == 1, "{name} is answered by the platform");
             assert!(matches!(
                 device.deferred.take(),
                 Some((_, Deferred::Acquire(_)))
             ));
-
-            let mut sent = Sent::default();
-            let beat = BOOT + HEARTBEAT_INTERVAL;
-            device.device.tick(beat, &mut OneLane(&mut sent));
-            assert_eq!(sent.announced(), [], "{name} stays off while it stops");
-
-            device.device.set_acquisition(AcquisitionState::Running);
-            let mut sent = Sent::default();
-            device
-                .device
-                .tick(beat + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent));
-            assert_eq!(
-                sent.announced(),
-                [("dev.running".to_owned(), vec![1])],
-                "{name} is on again once the platform runs"
-            );
-        }
-    }
-
-    /// A stop or restart handed over while the platform starts, before it
-    /// ran and so with `dev.running` never on, announces `dev.running` off,
-    /// as the starting acquisition's first sample may be out already.
-    #[test]
-    fn a_stop_or_restart_while_starting_announces_dev_running_off() {
-        for name in ["dev.stop", "dev.restart"] {
-            let mut device = harness();
-            device.device.set_acquisition(AcquisitionState::Starting);
-            assert_eq!(device.ask("dev.running", &[]).value(), [0]);
-            assert_eq!(
-                device.ask(name, &[]).announced(),
-                [("dev.running".to_owned(), vec![0])],
-                "{name} announces the stop"
-            );
         }
     }
 
@@ -3060,13 +3057,11 @@ mod tests {
         let mut board = Fat(cells);
         let mut specs = STANDARD.to_vec();
         board.entries(&mut |entry| specs.push(entry.spec()));
-        let mut device = Device::new(
+        let mut device = opened(
             identity(),
-            SESSION,
             Box::leak(specs.into_boxed_slice()),
             board,
             PASSWORD,
-            BOOT,
         );
 
         let asked = asking(Method::ByName(b"board.filler000"), &1u32.to_le_bytes(), &[]);
@@ -3093,61 +3088,101 @@ mod tests {
         );
     }
 
-    /// A device and its streams on one port, run by a platform the way a board's tasks run them.
+    /// A device and its streams on a [`Sim`](crate::sim::Sim), alone or as the hub of children,
+    /// read by hosts on its ports that each merge its lanes in an order of their own.
     mod contract {
         use super::*;
         use crate::data::Timeref;
+        use crate::sim::{self, Port, Sim};
         use proptest::prelude::*;
+        use std::collections::VecDeque;
         use twinleaf_proto::contract::{self, Observed, Sender};
+        use twinleaf_proto::data::{Metadata, SegmentFlags};
+        use twinleaf_proto::packet::Lane;
         use twinleaf_proto::sync::Epoch;
         use twinleaf_proto::DeviceRoute;
 
         const RATE: u32 = 10;
         const SECOND: u64 = 1_000_000_000;
+        /// What a child's port holds, so the hop above it never laps it.
+        const LOSSLESS: usize = 1 << 20;
 
-        /// What a host asks or a platform does next.
+        impl sim::Board<4> for Board {
+            fn streams(&self) -> Vec<DataStream<4>> {
+                streams().into()
+            }
+        }
+
+        /// What a host asks or a platform does next. A port is a host's, taken modulo the hosts,
+        /// and a device is the hub at `/` or the child at its index, taken modulo the devices.
         #[derive(Debug, Clone)]
         enum Step {
-            /// Every stream takes this many samples, a period apart.
-            Sample(u32),
-            /// Every stream loses this many samples.
-            Skip(u32),
-            /// A host asks this RPC by name with these argument bytes.
-            Ask(&'static str, Vec<u8>),
-            /// A stream acquires with this decimation, enabled or not, from its next segment.
-            Retune(usize, u32, bool),
-            /// A stream begins a new segment.
-            Rollover(usize),
-            /// The time reference is replaced by one this many seconds ahead, or behind.
-            Relabel(i32),
+            /// A device's every stream takes this many samples, a period apart.
+            Sample(usize, u32),
+            /// A device's every stream loses this many samples.
+            Skip(usize, u32),
+            /// A host asks a device this RPC with these argument bytes, and it is read at once.
+            Ask(usize, usize, &'static str, Vec<u8>),
+            /// A host asks a device this RPC with these argument bytes, and it is in flight.
+            Send(usize, usize, &'static str, Vec<u8>),
+            /// The request a host has had in flight longest is read.
+            Deliver(usize),
+            /// A host asks a device for `dev.restart` this many times, one after another.
+            Restarts(usize, usize, usize),
+            /// A device's stream acquires at this rate with this decimation, enabled or not, from
+            /// its next segment.
+            Retune(usize, usize, u32, u32, bool),
+            /// A device's stream begins a new segment.
+            Rollover(usize, usize),
+            /// A device's time reference is replaced by one this many seconds ahead, or behind.
+            Relabel(usize, i32),
             /// The clock moves this many nanoseconds on.
             Wait(u64),
-            /// A host connects.
-            Connect,
-            /// The device boots again into the next session.
-            Reboot,
+            /// A host reads the next packet of each lane named, in turn.
+            Read(usize, Vec<Lane>),
+            /// The hub forwards the next packet of each lane of a child's port named, in turn.
+            Forward(usize, Vec<Lane>),
+            /// A host lets its port go and opens it again.
+            Reconnect(usize),
+            /// A device boots again into its next session.
+            Reboot(usize),
+        }
+
+        fn lanes() -> impl Strategy<Value = Vec<Lane>> {
+            let lane = prop::sample::select(&[Lane::Control, Lane::Data, Lane::Event][..]);
+            prop::collection::vec(lane, 1..16)
         }
 
         fn step() -> impl Strategy<Value = Step> {
+            let control = || prop::sample::select(&["dev.start", "dev.stop", "dev.restart"][..]);
+            let at = || (0..4usize, 0..3usize);
             prop_oneof![
-                4 => (1..30u32).prop_map(Step::Sample),
-                1 => (1..20u32).prop_map(Step::Skip),
-                4 => prop::sample::select(&["dev.start", "dev.stop", "dev.restart"][..])
-                    .prop_map(|name| Step::Ask(name, Vec::new())),
-                1 => any::<u32>().prop_map(|value| Step::Ask("board.first", value.to_le_bytes().to_vec())),
-                2 => (0..2usize, 1..=3u32, any::<bool>())
-                    .prop_map(|(stream, decimation, enabled)| Step::Retune(stream, decimation, enabled)),
-                1 => (0..2usize).prop_map(Step::Rollover),
-                1 => (-5..=5i32).prop_map(Step::Relabel),
+                4 => (0..3usize, 1..30u32).prop_map(|(at, count)| Step::Sample(at, count)),
+                1 => (0..3usize, 1..20u32).prop_map(|(at, count)| Step::Skip(at, count)),
+                4 => (at(), control()).prop_map(|((port, at), name)| Step::Ask(port, at, name, Vec::new())),
+                2 => (at(), control()).prop_map(|((port, at), name)| Step::Send(port, at, name, Vec::new())),
+                2 => (0..4usize).prop_map(Step::Deliver),
+                1 => (at(), 2..6usize).prop_map(|((port, at), count)| Step::Restarts(port, at, count)),
+                1 => (at(), any::<u32>()).prop_map(|((port, at), value)| {
+                    Step::Ask(port, at, "board.first", value.to_le_bytes().to_vec())
+                }),
+                2 => (0..3usize, 0..2usize, prop::sample::select(&[5, RATE, 20][..]), 1..=3u32, any::<bool>())
+                    .prop_map(|(at, stream, rate, decimation, enabled)| {
+                        Step::Retune(at, stream, rate, decimation, enabled)
+                    }),
+                1 => (0..3usize, 0..2usize).prop_map(|(at, stream)| Step::Rollover(at, stream)),
+                1 => (0..3usize, -5..=5i32).prop_map(|(at, shift)| Step::Relabel(at, shift)),
                 2 => (0..2 * HEARTBEAT_INTERVAL).prop_map(Step::Wait),
-                1 => Just(Step::Connect),
-                1 => Just(Step::Reboot),
+                6 => (0..4usize, lanes()).prop_map(|(port, lanes)| Step::Read(port, lanes)),
+                6 => (0..3usize, lanes()).prop_map(|(at, lanes)| Step::Forward(at, lanes)),
+                1 => (0..4usize).prop_map(Step::Reconnect),
+                1 => (0..3usize).prop_map(Step::Reboot),
             ]
         }
 
-        fn params(decimation: u32, enabled: bool) -> Params {
+        fn params(rate: u32, decimation: u32, enabled: bool) -> Params {
             Params {
-                rate: NonZeroU32::new(RATE).unwrap(),
+                rate: NonZeroU32::new(rate).unwrap(),
                 decimation: NonZeroU32::new(decimation).unwrap(),
                 enabled,
             }
@@ -3157,253 +3192,511 @@ mod tests {
         fn streams() -> [DataStream<4>; 2] {
             let stream = |id| {
                 let filter = Box::leak(Box::new(Butterworth4::<1>::new()));
-                DataStream::new(StreamId::new(id), &AUX, filter, params(1, true)).unwrap()
+                DataStream::new(StreamId::new(id), &AUX, filter, params(RATE, 1, true)).unwrap()
             };
             [stream(1).batched(16), stream(2)]
         }
 
-        /// The platform, and every packet on its port with the nanosecond it went.
-        struct Platform {
-            device: Device<Board>,
-            streams: [DataStream<4>; 2],
-            port: Sent,
-            times: Vec<u64>,
-            now: u64,
-            /// The time reference's seconds ahead of the clock's.
-            offset: i64,
-            /// The time reference's session, one more at each relabel.
-            reference: u32,
-            running: bool,
+        fn booted(session: u32, ports: Vec<Port>) -> Sim<Board, 4> {
+            let identity = identity().hardware("COMM-USB", "STM32G484xE", &[0xAB; 12], 8);
+            let mut sim = Sim::new(
+                identity,
+                SessionId::new(session),
+                table(),
+                Board::new(),
+                PASSWORD,
+                BOOT,
+                ports,
+            );
+            sim.reference = Timeref::new(Epoch::UNIX, 0, SessionId::new(1), "REF");
+            sim
         }
 
-        impl Platform {
-            fn new() -> Self {
-                let mut platform = Self {
-                    device: device(table()),
-                    streams: streams(),
-                    port: Sent::default(),
-                    times: Vec::new(),
+        /// One host on a port of the hub: what it heard and asked in the order it did, cut where
+        /// it lost its link or fell behind, and its requests still in flight.
+        #[derive(Default)]
+        struct Host {
+            heard: Vec<(Sender, Vec<u8>)>,
+            cut: Vec<Vec<(Sender, Vec<u8>)>>,
+            in_flight: VecDeque<Vec<u8>>,
+            next_id: u16,
+            dropped: u64,
+        }
+
+        /// The hub and its children, every host, and the clock.
+        struct World {
+            devices: Vec<Sim<Board, 4>>,
+            hosts: Vec<Host>,
+            now: u64,
+            reference: u32,
+            /// Whether every host reads all it can in write order after each step.
+            eager: bool,
+        }
+
+        impl World {
+            /// A hub with `children`, booted with `ports` hosts on ports of `capacity` packets a
+            /// lane.
+            fn new(children: usize, ports: usize, capacity: usize) -> Self {
+                let devices = (0..=children)
+                    .map(|at| match at {
+                        0 => booted(1, (0..ports).map(|_| Port::new(capacity)).collect()),
+                        child => booted(0x100 * child as u32, vec![Port::new(LOSSLESS)]),
+                    })
+                    .collect();
+                let hosts = (0..ports)
+                    .map(|port| Host {
+                        next_id: (port as u16) << 12,
+                        ..Host::default()
+                    })
+                    .collect();
+                Self {
+                    devices,
+                    hosts,
                     now: BOOT,
-                    offset: 0,
                     reference: 1,
-                    running: false,
-                };
-                platform.take(&Step::Connect);
-                platform
+                    eager: false,
+                }
             }
 
-            fn timeref(&self) -> Timeref {
-                let second = (self.now / SECOND) as i64 + self.offset;
-                Timeref::new(
-                    Epoch::UNIX,
-                    second as u32,
-                    SessionId::new(self.reference),
-                    "REF",
-                )
-                .unwrap()
+            /// One device and one host, every host reading eagerly.
+            fn alone() -> Self {
+                Self {
+                    eager: true,
+                    ..Self::new(0, 1, LOSSLESS)
+                }
             }
 
             fn take(&mut self, step: &Step) {
+                let devices = self.devices.len();
+                let hosts = self.hosts.len();
                 match *step {
-                    Step::Sample(count) => (0..count).for_each(|_| {
+                    Step::Sample(at, count) => (0..count).for_each(|_| {
                         self.now += SECOND / u64::from(RATE);
-                        self.streams
-                            .iter_mut()
-                            .for_each(|stream| stream.push(&1.0f32.to_le_bytes(), &mut self.port));
-                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                        let device = &mut self.devices[at % devices];
+                        (0..2).for_each(|stream| device.push(stream, &1.0f32.to_le_bytes()));
+                        self.tick();
                     }),
-                    Step::Skip(count) => {
+                    Step::Skip(at, count) => {
                         self.now += u64::from(count) * SECOND / u64::from(RATE);
-                        self.streams
-                            .iter_mut()
-                            .for_each(|stream| stream.skip(count, &mut self.port));
+                        let device = &mut self.devices[at % devices];
+                        (0..2).for_each(|stream| device.skip(stream, count));
                     }
-                    Step::Ask(name, ref args) => self.ask(name, args),
-                    Step::Retune(stream, decimation, enabled) => {
-                        self.streams[stream].retune(params(decimation, enabled), &mut self.port)
+                    Step::Ask(port, at, name, ref args) => {
+                        self.send(port % hosts, at % devices, name, args);
+                        while !self.hosts[port % hosts].in_flight.is_empty() {
+                            self.deliver(port % hosts);
+                        }
                     }
-                    Step::Rollover(stream) => self.streams[stream].rollover(&mut self.port),
-                    Step::Relabel(shift) => {
-                        let from = self.timeref().start_time;
-                        self.offset += i64::from(shift);
+                    Step::Send(port, at, name, ref args) => {
+                        self.send(port % hosts, at % devices, name, args)
+                    }
+                    Step::Deliver(port) => self.deliver(port % hosts),
+                    Step::Restarts(port, at, count) => (0..count)
+                        .for_each(|_| self.take(&Step::Ask(port, at, "dev.restart", Vec::new()))),
+                    Step::Retune(at, stream, rate, decimation, enabled) => {
+                        self.devices[at % devices].retune(stream, params(rate, decimation, enabled))
+                    }
+                    Step::Rollover(at, stream) => self.devices[at % devices].rollover(stream),
+                    Step::Relabel(at, shift) => {
                         self.reference += 1;
-                        let to = self.timeref();
-                        self.streams
-                            .iter_mut()
-                            .for_each(|stream| stream.relabel(from, to.clone(), &mut self.port));
+                        let reference = SessionId::new(self.reference);
+                        self.devices[at % devices].relabel(i64::from(shift), reference, self.now);
                     }
                     Step::Wait(ns) => {
                         self.now += ns;
-                        self.device.tick(self.now, &mut OneLane(&mut self.port));
+                        self.tick();
                     }
-                    Step::Connect => {
-                        self.device
-                            .connected(&self.streams[..], self.now, &mut self.port)
-                    }
-                    Step::Reboot => {
-                        let session = SessionId::new(self.device.session.value().wrapping_add(1));
-                        self.device.reboot(session, self.now);
-                        self.device.set_acquisition(AcquisitionState::Idle);
-                        self.streams = streams();
-                        self.running = false;
-                        self.device
-                            .connected(&self.streams[..], self.now, &mut self.port);
+                    Step::Read(port, ref lanes) => lanes
+                        .iter()
+                        .for_each(|&lane| self.read(port % hosts, |port| port.lane(lane).pop())),
+                    Step::Forward(at, ref lanes) => match at % devices {
+                        0 => {}
+                        child => lanes.iter().for_each(|&lane| self.forward(child, lane)),
+                    },
+                    Step::Reconnect(port) => self.reconnect(port % hosts),
+                    Step::Reboot(at) => {
+                        let device = &mut self.devices[at % devices];
+                        let session = SessionId::new(device.device.session.value().wrapping_add(1));
+                        device.reboot(session, self.now);
+                        if at % devices == 0 {
+                            self.hosts.iter_mut().for_each(|host| {
+                                host.cut.push(core::mem::take(&mut host.heard));
+                                host.in_flight.clear();
+                            });
+                        }
                     }
                 }
-                self.times.resize(self.port.0.len(), self.now);
-            }
-
-            /// A host's request and what the device and the platform answer, all on the port.
-            fn ask(&mut self, name: &str, args: &[u8]) {
-                let request = asking(Method::ByName(name.as_bytes()), args, &[]);
-                self.port.send(&request);
-                let (view, _) = PacketView::parse_prefix(&request).unwrap();
-                let Actions { call, deferred, .. } = self.device.handle(
-                    &self.streams[..],
-                    Input::Packet(view),
-                    self.now,
-                    &mut OneLane(&mut self.port),
-                );
-                if let Some((pending, _, _)) = call {
-                    answer(pending, Err(RpcError::NotFound), &mut self.port);
-                }
-                match deferred {
-                    Some((pending, Deferred::Acquire(request))) => self.acquire(pending, request),
-                    Some((pending, Deferred::Flash(_))) => {
-                        answer(pending, Err(RpcError::State), &mut self.port)
-                    }
-                    None => {}
+                if self.eager {
+                    (0..hosts).for_each(|port| self.drain(port));
                 }
             }
 
-            /// Carry out a start, stop or restart: a stop flushes what its streams staged before it answers,
-            /// and a start answers first and begins on the second after next.
-            fn acquire(&mut self, pending: Pending<'_>, request: SyncRequest) {
-                match (request, self.running) {
-                    (SyncRequest::Start, true) => {
-                        answer(pending, Err(RpcError::State), &mut self.port)
+            fn tick(&mut self) {
+                let now = self.now;
+                self.devices.iter_mut().for_each(|device| device.tick(now));
+            }
+
+            /// A host's request to a device, put in flight.
+            fn send(&mut self, port: usize, at: usize, name: &str, args: &[u8]) {
+                let host = &mut self.hosts[port];
+                let mut buf = [0u8; Packet::MAX_SIZE];
+                let method = Method::ByName(name.as_bytes());
+                let id = RpcRequestId::new(host.next_id);
+                host.next_id = host.next_id.wrapping_add(1);
+                let mut len = rpc::write_request(&mut buf, id, method, args).unwrap();
+                if at > 0 {
+                    len = route::push_hop(&mut buf, at as u8).unwrap();
+                }
+                host.heard.push((Sender::Host, buf[..len].to_vec()));
+                host.in_flight.push_back(buf[..len].to_vec());
+            }
+
+            /// The request a host has had in flight longest reaches the device its route names,
+            /// through the hub's hop for a child, and a call no entry answers is refused.
+            fn deliver(&mut self, port: usize) {
+                let Some(mut request) = self.hosts[port].in_flight.pop_front() else {
+                    return;
+                };
+                let (at, from) = match route::pop_hop(&mut request) {
+                    Ok((hop, len)) => {
+                        request.truncate(len);
+                        (usize::from(hop), 0)
                     }
-                    (SyncRequest::Start, false) => {
-                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
-                        self.start();
-                    }
-                    (SyncRequest::Stop, _) => {
-                        self.stop();
-                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
-                    }
-                    (SyncRequest::Restart, _) => {
-                        self.stop();
-                        answer(pending, Ok::<_, RpcError>(&[][..]), &mut self.port);
-                        self.start();
-                    }
+                    Err(_) => (0, port),
+                };
+                let device = &mut self.devices[at];
+                if let Some(call) = device.request(from, &request, self.now) {
+                    device.answer(&call, Err(RpcError::NotFound));
                 }
             }
 
-            fn start(&mut self) {
-                self.now = (self.now / SECOND + 2) * SECOND;
-                let timeref = self.timeref();
-                self.streams.iter_mut().for_each(|stream| {
-                    stream
-                        .start(timeref.clone(), &mut self.port)
-                        .expect("a stopped stream starts")
+            /// The hub sends up the next packet of a child's lane, wearing the child's hop.
+            fn forward(&mut self, child: usize, lane: Lane) {
+                let Some(mut packet) = self.devices[child].ports[0].lane(lane).pop() else {
+                    return;
+                };
+                packet.resize(Packet::MAX_SIZE, 0);
+                let len = route::push_hop(&mut packet, child as u8).unwrap();
+                self.devices[0].forward(&packet[..len]);
+            }
+
+            /// A host reads the packet `next` takes from its port, reconnecting first when the
+            /// port lapped it.
+            fn read(&mut self, port: usize, next: impl FnOnce(&mut Port) -> Option<Vec<u8>>) {
+                if self.devices[0].ports[port].dropped() != self.hosts[port].dropped {
+                    self.reconnect(port);
+                }
+                if let Some(packet) = next(&mut self.devices[0].ports[port]) {
+                    self.hosts[port].heard.push((Sender::Device, packet));
+                }
+            }
+
+            /// A host reads everything its port holds, in write order.
+            fn drain(&mut self, port: usize) {
+                while !self.devices[0].ports[port].is_empty() {
+                    self.read(port, Port::written);
+                }
+            }
+
+            /// A host lets its port go and opens it again, starting a trace of its own.
+            fn reconnect(&mut self, port: usize) {
+                let host = &mut self.hosts[port];
+                host.cut.push(core::mem::take(&mut host.heard));
+                host.in_flight.clear();
+                let hub = &mut self.devices[0];
+                hub.disconnect(port);
+                hub.connect(port, self.now);
+                host.dropped = hub.ports[port].dropped();
+            }
+
+            /// The hub forwards all its children hold, and every host reads all its port holds.
+            fn settle(&mut self) {
+                (1..self.devices.len()).for_each(|child| {
+                    while !self.devices[child].ports[0].is_empty() {
+                        [Lane::Control, Lane::Data, Lane::Event]
+                            .into_iter()
+                            .for_each(|lane| self.forward(child, lane));
+                    }
                 });
-                self.device.set_acquisition(AcquisitionState::Running);
-                self.running = true;
+                (0..self.hosts.len()).for_each(|port| self.drain(port));
             }
 
-            fn stop(&mut self) {
-                self.streams.iter_mut().for_each(|stream| {
-                    stream.stop();
-                    stream.flush(&mut self.port);
-                });
-                self.device.set_acquisition(AcquisitionState::Idle);
-                self.running = false;
-            }
-
-            fn trace(&self) -> Vec<Observed<'_>> {
-                self.port
-                    .views()
-                    .into_iter()
-                    .zip(&self.times)
-                    .map(|(packet, &arrival_ns)| Observed {
-                        arrival_ns,
-                        route: DeviceRoute::root(),
-                        sender: match packet.header.ptype {
-                            PacketType::RPC_REQ => Sender::Host,
-                            _ => Sender::Device,
-                        },
-                        packet,
-                    })
+            /// Every packet the first host heard, as views.
+            fn views(&self) -> Vec<PacketView<'_>> {
+                self.hosts[0]
+                    .heard
+                    .iter()
+                    .map(|(_, packet)| PacketView::parse_prefix(packet).unwrap().0)
                     .collect()
+            }
+
+            /// The segment records of `stream` the first host heard, in order.
+            fn records(&self, stream: u8) -> Vec<(u8, SegmentFlags)> {
+                self.views()
+                    .into_iter()
+                    .filter_map(|view| match Metadata::parse(view.payload) {
+                        Some((Metadata::Segment(record), _))
+                            if view.header.ptype == PacketType::METADATA =>
+                        {
+                            Some(record)
+                        }
+                        Some(_) | None => None,
+                    })
+                    .filter(|record| record.stream_id.value() == stream)
+                    .map(|record| (record.segment_id.value(), record.flags))
+                    .collect()
+            }
+
+            /// What breaks the contract in any trace a host heard.
+            fn broken(&mut self) -> Vec<contract::Violation> {
+                self.settle();
+                self.hosts
+                    .iter()
+                    .flat_map(|host| host.cut.iter().chain([&host.heard]))
+                    .flat_map(|heard| contract::check(&observed(heard)))
+                    .collect()
+            }
+
+            /// Every trace keeps the contract.
+            fn keeps(&mut self) {
+                assert_eq!(self.broken(), []);
             }
         }
 
+        /// A host's trace, each packet on the route its hops name.
+        fn observed(heard: &[(Sender, Vec<u8>)]) -> Vec<Observed<'_>> {
+            heard
+                .iter()
+                .map(|(sender, packet)| {
+                    let packet = PacketView::parse_prefix(packet).unwrap().0;
+                    Observed {
+                        arrival_ns: 0,
+                        route: DeviceRoute::from_wire(packet.routing).unwrap(),
+                        sender: *sender,
+                        packet,
+                    }
+                })
+                .collect()
+        }
+
         proptest! {
-            /// Whatever a host asks and the platform does, starting, stopping, retuning, rolling
-            /// over, relabelling and rebooting, every packet on the port keeps the contract.
+            /// Whatever hosts ask and the platforms do, starting, stopping, retuning, rolling
+            /// over, relabelling and rebooting, on a device alone or a hub whose hop keeps each
+            /// route's lanes in order and interleaves them freely, with requests read at once or
+            /// after a while in flight, every host that merges its lanes in any order and falls
+            /// behind or not hears the contract kept on every route.
             #[test]
-            fn a_device_keeps_the_contract(steps in prop::collection::vec(step(), 1..40)) {
-                let mut platform = Platform::new();
-                steps.iter().for_each(|step| platform.take(step));
-                prop_assert_eq!(contract::check(&platform.trace()), []);
+            fn a_device_keeps_the_contract(
+                children in 0..3usize,
+                ports in 1..4usize,
+                capacity in prop::sample::select(&[8, 64, LOSSLESS][..]),
+                steps in prop::collection::vec(step(), 1..60),
+            ) {
+                let mut world = World::new(children, ports, capacity);
+                steps.iter().for_each(|step| world.take(step));
+                prop_assert_eq!(world.broken(), []);
             }
+        }
+
+        /// A device opens its session with a heartbeat and then its record, which declares the
+        /// revision the contract holds it to.
+        #[test]
+        fn a_device_declares_the_revision_it_keeps_as_it_boots() {
+            let mut world = World::alone();
+            world.settle();
+            let views = world.views();
+            assert_eq!(views[0].header.ptype, PacketType::HEARTBEAT);
+            let Some((Metadata::Device(record), _)) = Metadata::parse(views[1].payload) else {
+                panic!("the device record follows the heartbeat");
+            };
+            assert_eq!(record.protocol, twinleaf_proto::PROTOCOL);
+            assert_eq!(record.n_streams, 2);
+        }
+
+        /// A stop sends each stream's staged rows and then the record that closes its segment, and
+        /// a restart's next segment says a start opened it, where a switch's does not.
+        #[test]
+        fn a_stop_closes_each_stream_after_its_last_row() {
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 15));
+            world.take(&Step::Rollover(0, 1));
+            world.take(&Step::Sample(0, 15));
+            world.take(&Step::Ask(0, 0, "dev.restart", Vec::new()));
+            world.take(&Step::Ask(0, 0, "dev.stop", Vec::new()));
+            let open = SegmentFlags::VALID | SegmentFlags::ACTIVE;
+            let start = open | SegmentFlags::START;
+            let closed = SegmentFlags::VALID | SegmentFlags::START;
+            let records = world.records(2);
+            assert_eq!(records.first(), Some(&(0, start)));
+            assert!(records.contains(&(1, open)), "a switch opened segment 1");
+            assert!(
+                records.contains(&(1, SegmentFlags::VALID)),
+                "the restart closed it"
+            );
+            assert_eq!(records[records.len() - 2..], [(2, start), (2, closed)]);
+            let views = world.views();
+            let last = |stream: u8| {
+                views
+                    .iter()
+                    .rposition(|view| view.header.ptype == PacketType::stream(stream).unwrap())
+            };
+            let closes = views
+                .iter()
+                .rposition(|view| view.header.ptype == PacketType::METADATA)
+                .unwrap();
+            assert!(
+                last(2).is_some_and(|row| row < closes),
+                "the rows went first"
+            );
+            world.keeps();
         }
 
         /// A segment that reaches the sample numbers a packet carries rolls over at its next
         /// whole second and keeps the contract across it.
         #[test]
         fn the_wire_limit_rollover_keeps_the_contract() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(5));
-            platform.take(&Step::Skip(15_999_990));
-            platform.take(&Step::Sample(30));
-            let rows =
-                platform.port.views().into_iter().filter_map(|view| {
-                    twinleaf_proto::data::Samples::parse(view.header, view.payload)
-                });
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Skip(0, 15_999_990));
+            world.take(&Step::Sample(0, 30));
+            let rows = world
+                .views()
+                .into_iter()
+                .filter_map(|view| twinleaf_proto::data::Samples::parse(view.header, view.payload));
             assert!(
                 rows.map(|row| row.segment_id.value()).any(|id| id == 1),
                 "it rolled over"
             );
-            assert_eq!(contract::check(&platform.trace()), []);
+            world.keeps();
         }
 
         /// Restarts that take no samples each open a segment, so the ring comes back to the first's id
         /// with a count that starts past zero, which is lawful as each record goes out as it opens.
         #[test]
         fn restarts_that_take_no_samples_keep_the_contract() {
-            let mut platform = Platform::new();
+            let mut world = World::alone();
             [
-                Step::Ask("dev.start", Vec::new()),
-                Step::Sample(1),
-                Step::Relabel(0),
-                Step::Skip(10),
-                Step::Ask("dev.restart", Vec::new()),
-                Step::Ask("dev.restart", Vec::new()),
-                Step::Ask("dev.restart", Vec::new()),
-                Step::Skip(1),
-                Step::Sample(5),
+                Step::Ask(0, 0, "dev.start", Vec::new()),
+                Step::Sample(0, 1),
+                Step::Relabel(0, 0),
+                Step::Skip(0, 10),
+                Step::Restarts(0, 0, 3),
+                Step::Skip(0, 1),
+                Step::Sample(0, 5),
             ]
             .iter()
-            .for_each(|step| platform.take(step));
-            assert_eq!(contract::check(&platform.trace()), []);
+            .for_each(|step| world.take(step));
+            world.keeps();
         }
 
         /// A time reference four seconds behind lands a stream's fifth segment on the first's id
         /// and start, which is lawful as the reference is another.
         #[test]
         fn a_reference_that_steps_back_keeps_the_contract() {
-            let mut platform = Platform::new();
-            platform.take(&Step::Ask("dev.start", Vec::new()));
-            platform.take(&Step::Sample(10));
-            platform.take(&Step::Relabel(-4));
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 10));
+            world.take(&Step::Relabel(0, -4));
             (0..3).for_each(|_| {
-                platform.take(&Step::Sample(10));
-                platform.take(&Step::Rollover(0));
+                world.take(&Step::Sample(0, 10));
+                world.take(&Step::Rollover(0, 0));
             });
-            platform.take(&Step::Sample(10));
-            assert_eq!(contract::check(&platform.trace()), []);
+            world.take(&Step::Sample(0, 10));
+            world.keeps();
+        }
+
+        /// A device that reboots while no host connects opens its new session with its
+        /// heartbeat and record, so the settings it numbers from one again follow them.
+        #[test]
+        fn a_reboot_no_host_connects_to_opens_its_session_with_its_heartbeat() {
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Ask(0, 0, "board.first", 8u32.to_le_bytes().to_vec()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Reboot(0));
+            world.take(&Step::Ask(0, 0, "board.first", 9u32.to_le_bytes().to_vec()));
+            let after: Vec<PacketType> =
+                world.views().iter().map(|view| view.header.ptype).collect();
+            assert_eq!(
+                after,
+                [
+                    PacketType::HEARTBEAT,
+                    PacketType::METADATA,
+                    PacketType::RPC_REQ,
+                    PacketType::SETTING,
+                    PacketType::RPC_REP
+                ]
+            );
+            world.keeps();
+        }
+
+        /// A stop in flight while a retune switches segments at a whole second reaches the
+        /// device after the new segment's record went out, which keeps the contract as the
+        /// host saw it.
+        #[test]
+        fn a_stop_in_flight_across_a_segment_switch_keeps_the_contract() {
+            let mut world = World::alone();
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 5));
+            world.take(&Step::Retune(0, 0, RATE, 2, true));
+            world.take(&Step::Send(0, 0, "dev.stop", Vec::new()));
+            world.take(&Step::Sample(0, 10));
+            world.take(&Step::Deliver(0));
+            let views = world.views();
+            let asked = views
+                .iter()
+                .rposition(|view| view.header.ptype == PacketType::RPC_REQ)
+                .unwrap();
+            let crossed = views[asked..].iter().any(|view| {
+                view.header.ptype == PacketType::METADATA
+                    && matches!(
+                        Metadata::parse(view.payload),
+                        Some((Metadata::Segment(_), _))
+                    )
+            });
+            assert!(crossed, "a record went out while the stop was in flight");
+            world.keeps();
+        }
+
+        /// A child that reboots while its last session's rows still wait at the hub has its new
+        /// heartbeat heard ahead of them, which keeps the contract on its route.
+        #[test]
+        fn a_childs_heartbeat_overtaking_its_last_rows_at_the_hub_keeps_the_contract() {
+            let mut world = World::new(1, 1, LOSSLESS);
+            world.take(&Step::Ask(0, 1, "dev.start", Vec::new()));
+            world.take(&Step::Sample(1, 20));
+            world.take(&Step::Forward(1, vec![Lane::Control; 8]));
+            world.take(&Step::Forward(1, vec![Lane::Data; 64]));
+            world.take(&Step::Reboot(1));
+            world.take(&Step::Forward(1, vec![Lane::Control; 2]));
+            world.take(&Step::Read(0, vec![Lane::Control; 64]));
+            world.take(&Step::Ask(0, 1, "dev.start", Vec::new()));
+            world.take(&Step::Sample(1, 20));
+            assert!(
+                !world.devices[0].ports[0].data.is_empty(),
+                "rows wait at the hub"
+            );
+            world.keeps();
+        }
+
+        /// A host that falls behind its port is cut off with the drop counted, and the trace it
+        /// starts as it opens the port again keeps the contract.
+        #[test]
+        fn a_host_that_falls_behind_reconnects_and_keeps_the_contract() {
+            let mut world = World::new(0, 1, 8);
+            world.take(&Step::Ask(0, 0, "dev.start", Vec::new()));
+            world.take(&Step::Sample(0, 60));
+            world.take(&Step::Read(0, vec![Lane::Data; 4]));
+            assert_eq!(world.hosts[0].cut.len(), 1, "the lap cut the trace");
+            assert!(
+                world.devices[0].ports[0].data.dropped > 0,
+                "and counted its drops"
+            );
+            world.take(&Step::Sample(0, 10));
+            world.keeps();
         }
     }
 }
