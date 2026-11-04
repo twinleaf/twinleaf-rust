@@ -278,7 +278,7 @@ fn a_proxy_listens_on_both_loopback_addresses() {
 }
 
 /// A client holds a background proxy's default for others to open with
-/// `auto`, one holder at a time, until it leaves.
+/// `auto`, one holder at a time and bound to what it holds, until it leaves.
 #[test]
 fn a_held_default_serves_auto_until_its_holder_leaves() {
     let device = FakeDevice::start();
@@ -299,7 +299,7 @@ fn a_held_default_serves_auto_until_its_holder_leaves() {
     holder.hello(4242, "tio list");
     assert_eq!(
         holder.control("proxy.default", &encode(&layout), 2),
-        Ok(Vec::new())
+        Ok(encode(&layout.to_string()))
     );
 
     let client = TestClient::connect(&proxy.endpoint());
@@ -326,7 +326,7 @@ fn a_held_default_serves_auto_until_its_holder_leaves() {
     };
     assert_eq!(
         late.control("proxy.default", &encode(&layout), 3),
-        Ok(Vec::new())
+        Ok(encode(&layout.to_string()))
     );
 }
 

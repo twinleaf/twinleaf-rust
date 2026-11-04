@@ -464,9 +464,9 @@ impl Client {
         }
     }
 
-    /// Makes `layout` the default until this client leaves, answering control
-    /// request `id`. Only a background proxy lets a client hold its default,
-    /// and one client at a time.
+    /// Makes `layout` the default until this client leaves, and binds the client to it so it
+    /// follows what it holds, answering control request `id` once bound. Only a background proxy
+    /// lets a client hold its default, and one client at a time.
     fn hold_default(&mut self, id: u16, layout: Layout) {
         if !self.shared.options.stoppable {
             let message = format!(
@@ -496,8 +496,12 @@ impl Client {
         }
         drop(holder);
         log::info!("Client {} holds {layout} as the default", self.addr);
-        self.shared.default.send_replace(Some(layout));
-        self.answer(id, Ok(Vec::new()))
+        self.shared.default.send_replace(Some(layout.clone()));
+        let (shared, addr) = (self.shared.clone(), self.addr.clone());
+        let outbox = Arc::clone(&self.outbox);
+        let target = layout.to_string();
+        let binding = attach(shared, addr, target, layout, None, Purpose::Use, outbox);
+        self.request(id, binding)
     }
 
     /// Begins the open of `target` for `purpose` that control request `id`

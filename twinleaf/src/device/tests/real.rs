@@ -88,3 +88,35 @@ async fn the_sync_api_works_inside_an_applications_runtime() {
     drop(connection);
     drop(proxy);
 }
+
+/// A connection that holds a layout as a background proxy's default follows the tree it holds,
+/// its routes heard and not ended, until it closes and gives the default back.
+#[test]
+fn a_held_default_follows_the_tree_it_holds() {
+    let device = FakeDevice::start();
+    let proxy = Proxy::host(HostOptions {
+        stoppable: true,
+        ..options()
+    })
+    .unwrap();
+    let address = ProxyAddress {
+        url: proxy.endpoint(),
+        ensure: None,
+    };
+    let held = Connection::hold_default_at(&address, &Layout::single(&device.url), WAIT).unwrap();
+    let routes = held.tree(DeviceRoute::root()).routes_updates();
+    assert_eq!(routes.recv_timeout(WAIT), Ok(vec![DeviceRoute::root()]));
+    let user = Connection::open(&proxy.endpoint()).unwrap();
+    assert_eq!(
+        user.device(DeviceRoute::root())
+            .get::<String>("dev.name")
+            .unwrap(),
+        "FAKE"
+    );
+    assert!(matches!(
+        routes.recv_timeout(std::time::Duration::from_millis(500)),
+        Err(crate::session::RecvError::Timeout)
+    ));
+    held.close();
+    proxy.shutdown();
+}
