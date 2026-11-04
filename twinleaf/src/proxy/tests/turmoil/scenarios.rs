@@ -198,7 +198,7 @@ fn a_hub_child_lost_while_its_metadata_is_retried_leaves_the_proxy_idle() {
         });
         step_until(&mut sim, &world, 1);
         let before = polls();
-        run_to_end(&mut sim);
+        run_to_end(&mut sim, seed);
         let polls = polls() - before;
         let ticks = IDLE.as_millis() as u64;
         assert!(

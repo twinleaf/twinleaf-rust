@@ -20,10 +20,12 @@ pub(crate) const PAUSED_WAIT: Duration = Duration::from_secs(60);
 /// or join a multicast group. Windows asks whether to let each new build of
 /// a binary open such a socket, so every other test binds loopback alone.
 /// Run them with `TWINLEAF_TEST_ALL_INTERFACES=1 cargo test`.
+#[cfg(any(not(turmoil), feature = "mdns"))]
 pub(crate) const ALL_INTERFACES: &str = "TWINLEAF_TEST_ALL_INTERFACES";
 
 /// Returns `true` if [`ALL_INTERFACES`] is `1`. Otherwise says on stderr
 /// that `test` is skipped and how to run it, and returns `false`.
+#[cfg(any(not(turmoil), feature = "mdns"))]
 pub(crate) fn binds_every_interface(test: &str) -> bool {
     if std::env::var_os(ALL_INTERFACES).is_some_and(|value| value == "1") {
         return true;

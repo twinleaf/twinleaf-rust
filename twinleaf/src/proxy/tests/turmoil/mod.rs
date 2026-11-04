@@ -43,10 +43,10 @@ const TABLE_HASH: u32 = 0x5157_0001;
 /// reboots.
 const CHILD_REBOOT_STEP: u32 = 0x100;
 
-/// How long a test lets the simulation after its last phase take in real
-/// time. The simulation runs in about a second. A spawned task that spins
-/// fails it at once, as [`polls`] says, and a host's
-/// own future that spins never returns from a step.
+/// How long one step of a simulation may take in real time. A step takes
+/// well under a millisecond. A spawned task that spins fails a run at once,
+/// as [`polls`] says, and a host's own future that spins never returns from
+/// its step.
 const SPIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// What the hosts of one scenario share, and how its device behaves.
@@ -190,25 +190,66 @@ fn step_until(sim: &mut ::turmoil::Sim<'_>, world: &World, phase: u8) {
     }
 }
 
-/// Runs `sim` to its end. Fails the test process if the run takes longer
-/// than [`SPIN_LIMIT`], as a host that spins outside a spawned task never
-/// gives a step back. A run that fails ends the watchdog with it.
-fn run_to_end(sim: &mut ::turmoil::Sim<'_>) {
-    let (done, finished) = std::sync::mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || {
-        let waited = finished.recv_timeout(SPIN_LIMIT);
-        if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            // The test harness captures `eprintln!`, and loses what it holds
-            // when the process exits.
-            use std::io::Write;
-            let spun = format!("a turmoil simulation spun for {SPIN_LIMIT:?} of real time");
-            let _ = writeln!(std::io::stderr(), "{spun}");
-            std::process::exit(101);
+/// A watch from a thread of its own on the steps of a simulation. It ends
+/// the test process when one step takes longer than [`SPIN_LIMIT`] of real
+/// time, as a host's own future that spins never gives its step back, and
+/// says how to run the simulation alone. A run is as slow as the machine it
+/// runs on, so the watch bounds each step and not the run. Dropping it ends
+/// the watch.
+struct Watchdog {
+    stepped: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    /// Watches a simulation that `rerun`, set in the environment, runs alone.
+    fn new(rerun: String) -> Watchdog {
+        let (stepped, steps) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || loop {
+            match steps.recv_timeout(SPIN_LIMIT) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // The test harness captures `eprintln!`, and loses what
+                    // it holds when the process exits.
+                    use std::io::Write;
+                    let spun = format!(
+                        "a turmoil step spun for {SPIN_LIMIT:?} of real time, run it alone with {rerun}"
+                    );
+                    let _ = writeln!(std::io::stderr(), "{spun}");
+                    std::process::exit(101);
+                }
+            }
+        });
+        Watchdog {
+            stepped: Some(stepped),
+            thread: Some(thread),
         }
-    });
-    while !sim.step().expect("a step") {}
-    let _ = done.send(());
-    watchdog.join().expect("the watchdog");
+    }
+
+    /// Takes one step of `sim`, and returns whether the simulation ended.
+    fn step(&self, sim: &mut ::turmoil::Sim<'_>) -> ::turmoil::Result<bool> {
+        let ended = sim.step();
+        if let Some(stepped) = &self.stepped {
+            let _ = stepped.send(());
+        }
+        ended
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.stepped.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Runs `sim`, the scenario of `seed`, to its end under a [`Watchdog`].
+fn run_to_end(sim: &mut ::turmoil::Sim<'_>, seed: u64) {
+    let watchdog = Watchdog::new(format!("TWINLEAF_TURMOIL_SEED={seed}"));
+    while !watchdog.step(sim).expect("a step") {}
 }
 
 /// Opens the device through the proxy, as an app does, once the proxy

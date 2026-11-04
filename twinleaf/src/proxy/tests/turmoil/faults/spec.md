@@ -637,10 +637,13 @@ full server socket buffer), 4 in half the cases. Its panic, a case whose
 `H'` comes late, and a case that reaches `simulation_duration` are
 harness errors, reported apart from failures. Implicit oracle.
 
-I2. No case spins. Each case ends within `SPIN_LIMIT` of real time
-(`proxy/tests/turmoil/mod.rs`). In the regression
+I2. No case spins. Each step of a case ends within `SPIN_LIMIT` of real
+time (`Watchdog` in `proxy/tests/turmoil/mod.rs`), however long the whole
+run takes on a slow machine. A spawned task that spins fails the run at
+once, as `polls` counts. In the regression
 `a_hub_child_lost_while_its_metadata_is_retried_leaves_the_proxy_idle`,
-60 s of an idle proxy take under 10 s of real time. Implicit oracle.
+the hosts' tasks are polled fewer times than 60 s of an idle proxy have
+ticks of 1 ms. Implicit oracle.
 
 # 4. The fault alphabet and the generator
 
