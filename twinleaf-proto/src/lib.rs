@@ -26,8 +26,11 @@ pub use identifiers::{
     BoardId, ColumnId, DeviceSerial, FirmwareMagic, FirmwareSerial, HwRev, RpcMethodId,
     RpcRequestId, SampleNumber, SegmentId, SessionId, StreamId,
 };
-pub use packet::PacketType;
+pub use packet::{lane_of, Lane, PacketType};
 pub use route::{DeviceRoute, RouteError};
+
+/// The protocol revision a device declares in its record when it keeps the laws `contract` states.
+pub const PROTOCOL: u8 = 1;
 
 /// Default TCP port of a proxy or a networked device, packets back to back.
 pub const TCP_DEFAULT_PORT: u16 = 7855;

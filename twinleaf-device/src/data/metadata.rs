@@ -220,6 +220,7 @@ mod tests {
             name,
             serial: "S1",
             firmware: "fw",
+            protocol: 0,
         }
     }
 

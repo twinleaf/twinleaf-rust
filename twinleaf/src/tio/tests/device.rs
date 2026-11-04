@@ -299,6 +299,7 @@ pub(crate) fn description() -> [wire::Metadata<'static>; 4] {
             name: "FAKE",
             serial: "F1",
             firmware: "1",
+            protocol: 0,
         }),
         wire::Metadata::Stream(wire::Stream {
             stream_id,

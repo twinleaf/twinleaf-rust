@@ -833,6 +833,7 @@ mod tests {
             name: "d",
             serial: "S1",
             firmware: "fw",
+            protocol: 0,
         };
         crate::data::metadata::reply(device, &streams[..], &[], &mut out).unwrap();
         let kinds: Vec<MetadataType> = data::MetadataReply::parse(&out)

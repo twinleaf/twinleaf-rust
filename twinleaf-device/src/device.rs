@@ -430,6 +430,7 @@ impl<S: Group> Device<S> {
             name: &self.identity.name,
             serial: &self.identity.serial,
             firmware: &self.identity.firmware,
+            protocol: 0,
         }
     }
 

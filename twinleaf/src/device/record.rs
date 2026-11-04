@@ -386,6 +386,7 @@ mod tests {
                 name: "d",
                 serial: "s",
                 firmware: "f",
+                protocol: 0,
             }),
             wire::Metadata::Stream(wire::Stream {
                 stream_id: StreamId::new(STREAM),

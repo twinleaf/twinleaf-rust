@@ -31,6 +31,7 @@ pub(in crate::tools::log) fn metadata() -> Vec<Packet> {
             name: "device",
             serial: "SN1",
             firmware: "fw",
+            protocol: 0,
         }),
         wire::Metadata::Stream(wire::Stream {
             stream_id: StreamId::new(1),
