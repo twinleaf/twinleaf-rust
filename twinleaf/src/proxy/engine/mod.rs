@@ -628,6 +628,12 @@ impl Engine {
         let Some((revision, snapshot)) = self.parser.revised_metadata(route, seen) else {
             return;
         };
+        if seen.is_none() && snapshot.device().protocol() == 0 {
+            log::warn!(
+                "the device at {route} runs deprecated C firmware, which Twinleaf is porting to \
+                 Rust. Its stops and starts read as lost data. Ask Twinleaf for its Rust firmware."
+            );
+        }
         self.metadata_seen.insert(route, revision);
         self.set_metadata(route, MetadataState::Ready(snapshot));
     }
@@ -738,17 +744,7 @@ impl Worker {
                 store.set_loaded(self.route, registry.clone(), started);
             }
             let tracked = match registry {
-                Ok(registry) => {
-                    if registry.is_deprecated_firmware() {
-                        log::warn!(
-                            "the device at {} runs deprecated C firmware, which Twinleaf is \
-                             porting to Rust. Its stops and starts read as lost data. Ask \
-                             Twinleaf for its Rust firmware.",
-                            self.route
-                        );
-                    }
-                    self.track(&registry).await
-                }
+                Ok(registry) => self.track(&registry).await,
                 Err(error) => {
                     log::warn!("could not load the RPC table of {}: {error}", self.route);
                     self.await_new_table().await

@@ -6,7 +6,7 @@
 //! [`RecordMode`] picks this or a raw copy of every packet.
 
 use super::connection::DeviceTree;
-use crate::data::{announces_stop, PacketParser, RowSource};
+use crate::data::{PacketParser, RowSource};
 use crate::proto::DeviceRoute;
 use crate::session::{MetadataState, Receiver, RecvError};
 use crate::tio;
@@ -122,7 +122,6 @@ impl<W: Write> Transcript<W> {
                 None => Ok(()),
             },
             packet::Payload::Metadata(..) => self.describe(route),
-            packet::Payload::Setting(setting) if announces_stop(&setting) => self.write(packet),
             packet::Payload::ProxyTx(_)
             | packet::Payload::ProxyRx(
                 packet::ProxyRx::Reply(_)
@@ -665,29 +664,31 @@ mod tests {
         );
     }
 
-    /// A device's stop is recorded where it came, so replay reads the
-    /// samples of its next acquisition as a restart, and the recorder counts
-    /// no sample lost in the pause.
+    /// A device that declares a revision marks the segment a start opens, and the recording keeps
+    /// the mark, so replay reads the next acquisition as a restart and counts no sample lost.
     #[test]
-    fn a_recorded_stop_replays_as_a_restart() {
+    fn a_recorded_start_replays_as_a_restart() {
         let route = DeviceRoute::root();
         let mut file = transcript();
-
-        describe(&mut file, 1, route);
+        let [wire::Metadata::Device(device), stream, wire::Metadata::Segment(segment), column] =
+            metadata_records(1)
+        else {
+            panic!("the records are a device's, a stream's, a segment's and a column's");
+        };
+        let declared = wire::Metadata::Device(wire::Device {
+            protocol: 1,
+            ..device
+        });
+        for record in [declared, stream, wire::Metadata::Segment(segment), column] {
+            file.packet(&broadcast(record, route)).unwrap();
+        }
         file.packet(&samples_in(0, 0, route)).unwrap();
-        let mut raw = [0u8; 64];
-        let stopped = crate::proto::settings::Setting {
-            name: b"dev.running",
-            seq: Some(1),
-            reply: &[0],
+        let next = wire::Segment {
+            segment_id: SegmentId::new(1),
+            start_time: 5,
+            flags: segment.flags | wire::SegmentFlags::START,
+            ..segment
         };
-        let len = stopped.write(&mut raw).expect("the announcement fits");
-        let (stopped, _) = Packet::from_slice_prefix(&raw[..len]).expect("a packet");
-        file.packet(&stopped.with_route(route)).unwrap();
-        let wire::Metadata::Segment(mut next) = metadata_records(1)[2] else {
-            panic!("the third record describes a segment");
-        };
-        (next.segment_id, next.start_time) = (SegmentId::new(1), 5);
         file.packet(&broadcast(wire::Metadata::Segment(next), route))
             .unwrap();
         file.packet(&samples_in(1, 0, route)).unwrap();
@@ -701,7 +702,7 @@ mod tests {
                 old_id: SegmentId::new(0),
                 new_id: SegmentId::new(1),
             }),
-            "the recorded stop marks the restart on replay"
+            "the recorded start marks the restart on replay"
         );
     }
 

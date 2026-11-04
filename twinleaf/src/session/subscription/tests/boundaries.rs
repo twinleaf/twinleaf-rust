@@ -16,12 +16,12 @@
 //! loses, as it decodes a segment's rows only with that segment's record.
 //! After the first lap of its ring, such a rollover lands on a slot whose
 //! record the parser holds from the lap before, and that record can be of
-//! an older time reference. A stop announces `dev.running` turning off, and
-//! the samples its publisher held of the stopped acquisition follow the
-//! announcement. A start begins the segment after the stopped one at a
-//! whole second, with or without sending the segment's record first as a
-//! rollover does, and announces `dev.running` turning on before or after
-//! the segment's first packet. Its packets go through the parser, and the
+//! an older time reference. The device declares a protocol revision, so a
+//! stop sends the samples its publisher held of the stopped acquisition and
+//! then the record that closes its segment, and a start begins the segment
+//! after the stopped one at a whole second, with or without sending the
+//! segment's record first as a rollover does, the record marking the
+//! segment a start opened. Its packets go through the parser, and the
 //! batches through a [`BatchLane`] as the pump sends them, to a reader
 //! whose reads interleave with the device's steps. A lane with little room
 //! drops batches, as for a slow app. Every sample carries its position in
@@ -37,14 +37,12 @@
 //!
 //! - Another device in the place of the last comes as an `Initial`, and
 //!   stands for whatever else changed and was lost before it.
-//! - A reboot comes as a `SessionChanged` naming the sessions of the two
-//!   batches, and stands for whatever else changed and was lost before it.
 //! - Otherwise a new time reference comes as a `TimeRefSessionChanged`, and
 //!   a rate change as a `RateChanged` naming both rates, each standing for
 //!   what else changed and was lost before it.
-//! - Otherwise a restart comes as a `Restarted` naming the segments of the
-//!   two batches, and stands for what else was lost before it and for any
-//!   rollover.
+//! - Otherwise a restart, a reboot among them, comes as a `Restarted` naming
+//!   the segments of the two batches, and stands for what else was lost
+//!   before it and for any rollover.
 //!   Rows the parser decodes after its link came back, in another segment
 //!   than its last rows before, come as a restart too, as a restart while
 //!   the link was down may have gone unseen.
@@ -92,9 +90,6 @@
 //! the device describes itself again. A device in the place of the last
 //! has another serial and the same session number.
 //!
-//! A case announces every stop. A stop and start no host asked for, with
-//! no refresh between them, announce nothing, and their packets are those
-//! of a rollover after lost samples.
 //! A segment that published nothing sends no record, so the ring can
 //! come round to the slot the parser takes as current with no record
 //! between. A start there sends its record first, as the parser has no
@@ -241,25 +236,17 @@ enum Step {
     /// goes on with it in its next segment.
     TimeRef { within: u32, shift: i32 },
     /// The device reboots into a new session, describes itself again and
-    /// acquires. It announces `dev.running` turning on after its first
-    /// packet.
+    /// acquires.
     Reboot,
-    /// A host stops the device, which announces `dev.running` off in that
-    /// request, whether or not it announced it on, and the on it owed goes
-    /// unannounced. Its publisher holds `staged` samples of the stopped
-    /// acquisition, and sends them after the announcement.
+    /// A host stops the device. Its publisher sends the `staged` samples it
+    /// holds of the stopped acquisition, and then the record that closes the
+    /// segment, unless that segment sent no record.
     Stop { staged: u32 },
     /// The device starts acquiring again in a fresh segment, `pause` whole
     /// seconds after the second its stop fell in. Unless `forced`, it sends
     /// the segment's record first, and otherwise the record follows the
-    /// segment's first packet, as for a rollover. It announces `dev.running`
-    /// turning on ahead of the segment if `early`, and otherwise after the
-    /// segment's first packet.
-    Start {
-        pause: u32,
-        early: bool,
-        forced: bool,
-    },
+    /// segment's first packet, as for a rollover.
+    Start { pause: u32, forced: bool },
     /// The link to the device goes down. The device drops its next `lost`
     /// samples, and if `opens`, rolls into its next segment or starts
     /// again if it was stopped, all unseen. The link comes back, and the
@@ -287,6 +274,7 @@ enum Sent {
         rate: u32,
         decimation: u32,
         timeref: u32,
+        flags: wire::SegmentFlags,
     },
     Column,
     /// The status a lost link reaches the parser as.
@@ -299,28 +287,11 @@ enum Sent {
         position: u64,
         rows: u32,
     },
-    /// The announcement of `dev.running`, numbered `seq` in the device's
-    /// settings version.
-    Running {
-        on: bool,
-        seq: u32,
-    },
 }
 
 impl Sent {
     fn packet(&self) -> tio::Packet {
         let record = match *self {
-            Sent::Running { on, seq } => {
-                let mut raw = [0u8; 64];
-                let announcement = crate::proto::settings::Setting {
-                    name: b"dev.running",
-                    seq: Some(seq),
-                    reply: &[u8::from(on)],
-                };
-                let len = announcement.write(&mut raw).expect("the announcement fits");
-                let (packet, _) = tio::Packet::from_slice_prefix(&raw[..len]).expect("a packet");
-                return packet.with_route(DeviceRoute::root());
-            }
             Sent::Disconnect => {
                 let lost = tio::Packet::link(tio::packet::LinkStatus::SensorDisconnected);
                 return lost.with_route(DeviceRoute::root());
@@ -328,6 +299,7 @@ impl Sent {
             Sent::Device { session, serial } => wire::Metadata::Device(wire::Device {
                 session: SessionId::new(session),
                 serial: SERIALS[serial],
+                protocol: 1,
                 ..fixtures::device()
             }),
             Sent::Stream => wire::Metadata::Stream(wire::Stream {
@@ -340,7 +312,9 @@ impl Sent {
                 rate,
                 decimation,
                 timeref,
+                flags,
             } => wire::Metadata::Segment(wire::Segment {
+                flags,
                 segment_id: SegmentId::new(id),
                 start_time: start,
                 sampling_rate: rate,
@@ -369,7 +343,6 @@ impl Sent {
 /// Where the device was at one position of its sequence.
 #[derive(Clone, Copy, Debug)]
 struct At {
-    session: u32,
     timeref: u32,
     segment: u8,
     /// The segment's place among those the device opened, from 0.
@@ -410,11 +383,8 @@ struct Device {
     told: u8,
     /// Whether the device is acquiring.
     running: bool,
-    /// Whether `dev.running` turning on waits for the current segment's
-    /// first packet.
-    running_due: bool,
-    /// The device's settings version, which counts its announcements.
-    settings: u32,
+    /// Whether a start opened the current segment, rather than a switch.
+    starts: bool,
     /// Each change, at the position of the first sample after it.
     changes: Vec<(u64, Change)>,
     /// Whether the time of each segment the device left, in the order it
@@ -451,8 +421,7 @@ impl Device {
             record_due: false,
             told: 0,
             running: true,
-            running_due: false,
-            settings: 0,
+            starts: true,
             changes: Vec::new(),
             splits: Vec::new(),
             history: Vec::new(),
@@ -482,26 +451,27 @@ impl Device {
         self.sent.push(Sent::Column);
     }
 
-    /// Sends the current segment's record.
+    /// Sends the current segment's record, open while the device acquires and closed after.
     fn send_record(&mut self) {
         self.record_due = false;
         self.told = self.segment;
+        let flags = [
+            (true, wire::SegmentFlags::VALID),
+            (self.running, wire::SegmentFlags::ACTIVE),
+            (self.starts, wire::SegmentFlags::START),
+        ]
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .fold(wire::SegmentFlags::default(), |flags, (_, flag)| {
+            flags | flag
+        });
         self.sent.push(Sent::Segment {
             id: self.segment,
             start: self.start,
             rate: self.rate,
             decimation: self.decimation,
             timeref: self.timeref,
-        });
-    }
-
-    /// Announces `dev.running` as `on`.
-    fn announce_running(&mut self, on: bool) {
-        self.running_due = false;
-        self.settings += 1;
-        self.sent.push(Sent::Running {
-            on,
-            seq: self.settings,
+            flags,
         });
     }
 
@@ -509,7 +479,6 @@ impl Device {
     fn advance(&mut self) {
         let period = f64::from(self.decimation) / f64::from(self.rate);
         self.history.push(At {
-            session: self.session,
             timeref: self.timeref,
             segment: self.segment,
             ordinal: self.splits.len(),
@@ -540,9 +509,6 @@ impl Device {
             });
             if self.record_due {
                 self.send_record();
-            }
-            if self.running_due {
-                self.announce_running(true);
             }
             (0..rows).for_each(|_| self.advance());
             self.sent_since_change += u64::from(rows);
@@ -591,6 +557,7 @@ impl Device {
         self.since_change = 0;
         self.sent_since_change = 0;
         self.segmented_last = !matches!(change, Change::Reboot | Change::Replace);
+        self.starts = matches!(change, Change::Reboot | Change::Restart | Change::Replace);
         self.segment = match change {
             Change::Reboot | Change::Replace => 0,
             _ => self.next_segment(),
@@ -714,15 +681,8 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
         let timerefs =
             within.flat_map(|within| SHIFTS.map(move |shift| Step::TimeRef { within, shift }));
         let stops = (0..=2).map(|staged| Step::Stop { staged });
-        let starts = (0..=2).flat_map(|pause| {
-            [(false, false), (false, true), (true, false), (true, true)].map(|(early, forced)| {
-                Step::Start {
-                    pause,
-                    early,
-                    forced,
-                }
-            })
-        });
+        let starts =
+            (0..=2).flat_map(|pause| [false, true].map(|forced| Step::Start { pause, forced }));
         let outages =
             (0..=2u32).flat_map(|lost| [false, true].map(|opens| Step::Outage { lost, opens }));
         let changes: [(u32, Vec<Step>); 8] = [
@@ -786,32 +746,21 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                 let seconds = (device.next * device.decimation).div_ceil(device.rate) + 10;
                 device.change(Change::Reboot, seconds);
                 device.session += 1;
-                device.describe();
                 device.running = true;
-                device.running_due = true;
+                device.describe();
             }
             Step::Stop { staged } => {
-                device.running_due = false;
                 device.take(staged, staged.max(1));
-                let held = std::mem::take(&mut device.sent);
                 device.running = false;
                 // A segment that published nothing never sends its record.
-                device.record_due = false;
-                device.announce_running(false);
-                device.sent.extend(held);
+                if !std::mem::take(&mut device.record_due) {
+                    device.send_record();
+                }
             }
-            Step::Start {
-                pause,
-                early,
-                forced,
-            } => {
+            Step::Start { pause, forced } => {
                 let seconds = (device.next * device.decimation).div_ceil(device.rate) + pause;
                 device.change(Change::Restart, seconds);
                 device.running = true;
-                device.running_due = true;
-                if early {
-                    device.announce_running(true);
-                }
                 device.record_due = true;
                 if !forced {
                     device.send_record();
@@ -830,7 +779,6 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                     let seconds = (device.next * device.decimation).div_ceil(device.rate);
                     device.change(Change::Restart, seconds);
                     device.running = true;
-                    device.running_due = true;
                 }
                 if device.position() > from {
                     device.dropped_last = true;
@@ -844,7 +792,6 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
                 device.change(Change::Replace, seconds);
                 device.serial += 1;
                 device.running = true;
-                device.running_due = true;
                 device.resumes_due += 1;
                 device.sent = vec![Sent::Disconnect];
                 device.describe();
@@ -859,10 +806,6 @@ impl<C: Case> ReferenceStateMachine for Pipeline<C> {
 #[derive(Clone, Debug, PartialEq)]
 enum Told {
     Initial,
-    Reboot {
-        old: u32,
-        new: u32,
-    },
     TimeRef {
         old: u32,
         new: u32,
@@ -922,10 +865,6 @@ fn reported(batch: &SampleBatch, gap: bool) -> (Option<Told>, Option<Loss>) {
     );
     let change = boundary.change.as_ref().map(|change| match change {
         Reported::Initial => Told::Initial,
-        Reported::SessionChanged { old, new } => Told::Reboot {
-            old: old.value(),
-            new: new.value(),
-        },
         Reported::TimeRefSessionChanged { old, new } => Told::TimeRef {
             old: old.value(),
             new: new.value(),
@@ -1123,11 +1062,6 @@ impl Reader {
                 });
                 let due = if between(Change::Replace) {
                     Some(Told::Initial)
-                } else if between(Change::Reboot) {
-                    Some(Told::Reboot {
-                        old: was.session,
-                        new: now.session,
-                    })
                 } else if between(Change::TimeRef) {
                     Some(Told::TimeRef {
                         old: was.timeref,
@@ -1138,7 +1072,7 @@ impl Reader {
                         old: was.rate,
                         new: now.rate,
                     })
-                } else if between(Change::Restart) || reopened {
+                } else if between(Change::Restart) || between(Change::Reboot) || reopened {
                     Some(Told::Restart {
                         old: was.segment,
                         new: now.segment,
@@ -1272,7 +1206,6 @@ fn a_start_that_comes_round_the_ring_to_the_current_slot_is_a_restart() {
         Step::Stop { staged: 0 },
         Step::Start {
             pause: 0,
-            early: true,
             forced: true,
         },
         Step::Drop { count: 1 },
@@ -1285,7 +1218,6 @@ fn a_start_that_comes_round_the_ring_to_the_current_slot_is_a_restart() {
         Step::Stop { staged: 0 },
         Step::Start {
             pause: 0,
-            early: true,
             forced: false,
         },
         Step::Samples { count: 1, rows: 1 },
@@ -1314,7 +1246,6 @@ fn rows_in_the_last_slot_a_lap_later_after_a_lost_link_are_a_restart() {
         Step::Stop { staged: 0 },
         Step::Start {
             pause: 0,
-            early: false,
             forced: true,
         },
         Step::Outage {

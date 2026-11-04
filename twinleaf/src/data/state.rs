@@ -14,7 +14,6 @@ use super::sample::{sample_time, BatchContext, RowSource, SampleBatchBuilder};
 use crate::proto::data as wire;
 use crate::proto::data::MAX_SAMPLE_NUMBER;
 use crate::proto::heartbeat::Heartbeat;
-use crate::proto::settings::Setting;
 use crate::proto::DeviceRoute;
 use crate::proto::{SampleNumber, SegmentId, SessionId, StreamId};
 use crate::tio;
@@ -111,15 +110,6 @@ pub enum StreamDataError {
     },
 }
 
-/// Returns `true` if `setting` announces that the device stopped acquiring,
-/// as `dev.running` turning off. The device announces it as it hands a stop
-/// or restart a host asked for to its platform, and otherwise at a refresh
-/// after the stop, in either case ahead of the record of any segment a later
-/// start begins.
-pub(crate) fn announces_stop(setting: &Setting<'_>) -> bool {
-    setting.name == b"dev.running" && setting.reply == [0]
-}
-
 /// Metadata and continuity state for one stream on one device.
 #[derive(Debug, Clone)]
 struct StreamTracker {
@@ -160,16 +150,8 @@ struct StreamTracker {
     /// them, so that the slot holds the record the device sent last.
     renewed: bool,
     rate_hz: f64,
-    /// The stops the device announced since the stream's records were last
-    /// learned, each as `dev.running` turning off.
-    stops: u32,
-    /// The stops announced before the current segment became current. A
-    /// segment that became current after a stop is of an acquisition the
-    /// device started after it, as the device announces the stop before the
-    /// record of any segment it starts later.
-    current_stops: u32,
-    /// The stops announced before the last rows' segment became current.
-    last_stops: u32,
+    /// Whether the device sent the closing record of the last rows' segment since them.
+    closed: bool,
 }
 
 impl StreamTracker {
@@ -194,18 +176,14 @@ impl StreamTracker {
             moved_on: false,
             renewed: false,
             rate_hz: 0.0,
-            stops: 0,
-            current_stops: 0,
-            last_stops: 0,
+            closed: false,
         }
     }
 
-    /// Names `segment_id` the current segment, of the acquisition in force
-    /// after the stops announced so far.
+    /// Names `segment_id` the current segment.
     fn switch_to(&mut self, segment_id: SegmentId) {
         self.moved_on |= segment_id != self.last_segment_id;
         self.current_segment_id = segment_id;
-        self.current_stops = self.stops;
     }
 
     fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
@@ -284,7 +262,8 @@ impl StreamTracker {
             return Some(Boundary::of(Change::Initial));
         }
 
-        if device.session() != self.last_session_id {
+        let declared = device.protocol() > 0;
+        if !declared && device.session() != self.last_session_id {
             return Some(Boundary::of(Change::SessionChanged {
                 old: self.last_session_id,
                 new: device.session(),
@@ -336,14 +315,13 @@ impl StreamTracker {
                 .last_segment
                 .as_ref()
                 .is_some_and(|last| last.get().start_time() != segment.start_time());
-        // Rows are of the current segment. A stop announced between the
-        // last rows' segment and this one becoming current puts the rows in
-        // a later acquisition, and the time between holds no sample to lose.
-        // Rows in another segment after the records were dropped may be of a
-        // restart that went unseen, whose time cannot be told from time lost.
+        // Rows are of the current segment. A device that declares a revision marks the segment a
+        // start opens and closes the one a stop ends, so the time between holds no sample to
+        // lose. Rows in another segment after the records were dropped may be of a restart that
+        // went unseen, whose time cannot be told from time lost.
         let opened = segment.segment_id() != self.last_segment_id || lapped;
-        let restarted = self.current_stops != self.last_stops;
-        if restarted || opened && self.relearned {
+        let started = segment.flags().contains(wire::SegmentFlags::START) || self.closed;
+        if opened && (self.relearned || declared && started) {
             return Some(Boundary::of(Change::Restarted {
                 old_id: self.last_segment_id,
                 new_id: segment.segment_id(),
@@ -559,7 +537,7 @@ impl StreamTracker {
         self.relearned = false;
         self.moved_on = false;
         self.renewed = false;
-        self.last_stops = self.current_stops;
+        self.closed = false;
         self.rate_hz = new_rate;
         self.established = true;
 
@@ -585,24 +563,14 @@ impl StreamTracker {
         }))
     }
 
-    /// Drops the stream's records to learn them again, and the stops
-    /// announced under them. Its last rows stay, so the rows under the new
-    /// records are told against them.
+    /// Drops the stream's records to learn them again. Its last rows stay, so the rows under the
+    /// new records are told against them.
     fn relearn(&mut self) {
         self.metadata = None;
         self.segments.clear();
         self.columns.clear();
         self.schema = None;
-        self.stops = 0;
-        self.current_stops = 0;
-        self.last_stops = 0;
         self.relearned = true;
-    }
-
-    /// Counts a stop the device announced. Segments that become current
-    /// after it are of a later acquisition.
-    fn stop(&mut self) {
-        self.stops = self.stops.wrapping_add(1);
     }
 
     /// Forgets metadata and ends the current run. The run counter is kept, and
@@ -765,7 +733,7 @@ impl DeviceState {
                     let (old, new) = (previous.get(), incoming.get());
                     if old.serial() != new.serial() {
                         self.forget_all_metadata(global_generation);
-                    } else if old.session() != new.session() {
+                    } else if old.session() != new.session() && new.protocol() == 0 {
                         // Keeping continuity state lets the first rows under the
                         // new metadata report a specific SessionChanged boundary.
                         if in_force {
@@ -812,17 +780,16 @@ impl DeviceState {
                 if !self.accepts_stream(stream_id, global_generation) {
                     return;
                 }
-                let start_time = segment.start_time();
+                let closes = source == MetadataSource::Broadcast
+                    && !segment.flags().contains(wire::SegmentFlags::ACTIVE);
                 let stream = self.stream_mut(stream_id);
                 let learned = stream.segment(segment_id) != Some(&incoming);
-                // A broadcast of the current slot at another start names a
-                // segment begun there since, as the ring came round to it
-                // through segments that published nothing.
-                let begun = source == MetadataSource::Broadcast
-                    && stream.current_segment_id == segment_id
+                stream.closed |= closes
+                    && segment_id == stream.last_segment_id
                     && stream
-                        .segment(segment_id)
-                        .is_some_and(|held| held.get().start_time() != start_time);
+                        .last_segment
+                        .as_ref()
+                        .is_some_and(|last| last.get().start_time() == segment.start_time());
                 stream.set_segment(segment_id, incoming);
                 let switched = stream.current_segment_id != segment_id
                     && match source {
@@ -834,8 +801,6 @@ impl DeviceState {
                     };
                 if switched {
                     stream.switch_to(segment_id);
-                } else if begun {
-                    stream.current_stops = stream.stops;
                 }
                 if learned || switched {
                     self.revise_metadata();
@@ -893,14 +858,11 @@ impl DeviceState {
             }
             packet::Payload::Heartbeat(Heartbeat::Session { session, .. }) => {
                 if let Some(device) = &self.metadata {
-                    if device.get().session() != session && !self.ignore_session {
+                    let device = device.get();
+                    if device.session() != session && device.protocol() == 0 && !self.ignore_session
+                    {
                         self.relearn_metadata();
                     }
-                }
-            }
-            packet::Payload::Setting(setting) if announces_stop(&setting) => {
-                for stream in self.streams.iter_mut().flatten() {
-                    stream.stop();
                 }
             }
             _ => {}

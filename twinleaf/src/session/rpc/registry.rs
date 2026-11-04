@@ -17,10 +17,6 @@ const WALK_ATTEMPTS: usize = 3;
 /// The boot a device is in, which a heartbeat also carries.
 const SESSION: &str = "dev.session";
 
-/// Whether the device acquires, which every firmware but the deprecated
-/// offers.
-const RUNNING: &str = "dev.running";
-
 /// Why a device's RPC table could not be loaded.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -149,16 +145,6 @@ impl RpcRegistry {
     /// Returns every RPC name, sorted.
     pub fn names(&self) -> Vec<String> {
         self.rpcs.keys().cloned().collect()
-    }
-
-    /// Returns `true` when the table is of deprecated firmware, the C
-    /// firmware Twinleaf is porting to Rust. That firmware offers no
-    /// `dev.running`, which every Rust firmware does, so a stop and start
-    /// reads as a rollover with a loss of the time between, as
-    /// [`PacketParser`](crate::data::PacketParser) describes. An empty table
-    /// is never deprecated, as it tells nothing of the firmware.
-    pub fn is_deprecated_firmware(&self) -> bool {
-        !self.rpcs.is_empty() && self.find(RUNNING).is_none()
     }
 
     /// Returns an iterator over every RPC, sorted by name.
@@ -383,18 +369,5 @@ mod tests {
             optional(Err(CallError::Timeout)),
             Err(RpcRegistryError::DeviceRpcError(CallError::Timeout))
         ));
-    }
-
-    /// A table without `dev.running` is of deprecated firmware, and a table
-    /// with it, or with nothing, is not.
-    #[test]
-    fn only_a_table_without_dev_running_is_of_deprecated_firmware() {
-        let table = |names: &[&str]| {
-            let entries = names.iter().map(|name| (name.to_string(), 0)).collect();
-            RpcRegistry::from_entries(entries, None, None)
-        };
-        assert!(table(&["dev.name", "dev.session"]).is_deprecated_firmware());
-        assert!(!table(&["dev.name", "dev.running"]).is_deprecated_firmware());
-        assert!(!table(&[]).is_deprecated_firmware());
     }
 }
