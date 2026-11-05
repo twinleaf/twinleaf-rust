@@ -317,7 +317,7 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
             view.routing.is_empty(),
             Heartbeat::parse(view.payload).and_then(|beat| beat.session()),
         ) {
-            self.observe(port, session, now_ns, events);
+            self.observe(port, session, now_ns, up, events);
         }
         if let Presence::Present { last_heard_ns, .. } = &mut self.ports[usize::from(port)] {
             *last_heard_ns = now_ns;
@@ -342,8 +342,8 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
         up.send(&buf[..len]);
     }
 
-    /// Unplug the ports that have gone quiet and time out the calls nobody
-    /// answered.
+    /// Unplug the ports that have gone quiet, time out the calls sent down
+    /// them, and time out the calls nobody answered.
     fn tick(&mut self, now_ns: u64, up: &mut impl Sink, events: &mut impl Events<P>) {
         for port in 0..PORTS {
             let Presence::Present { last_heard_ns, .. } = self.ports[port] else {
@@ -352,26 +352,30 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
             if now_ns.saturating_sub(last_heard_ns) >= UNPLUG_NS {
                 self.ports[port] = Presence::Absent;
                 events.event(Event::Unplugged(port as u8));
+                self.abandon(port as u8, up, events);
             }
         }
         while let Some(origin) = self.calls.expired(now_ns) {
-            match origin {
-                Origin::Forwarded { id, route } => answer_up(up, route, id, RpcError::Timeout),
-                Origin::Internal(purpose) => {
-                    events.event(Event::Answered(purpose, Err(RpcError::Timeout)))
-                }
-            }
+            time_out(origin, up, events);
         }
     }
 
     /// A heartbeat from a child: which boot of it this is, and whether that is
-    /// news.
-    fn observe(&mut self, port: u8, session: SessionId, now_ns: u64, events: &mut impl Events<P>) {
+    /// news, a new boot timing out the calls the old one took with it.
+    fn observe(
+        &mut self,
+        port: u8,
+        session: SessionId,
+        now_ns: u64,
+        up: &mut impl Sink,
+        events: &mut impl Events<P>,
+    ) {
         match self.ports[usize::from(port)] {
             Presence::Absent => events.event(Event::Plugged(port)),
             Presence::Present { session: known, .. } if known == session => {}
             Presence::Present { .. } => {
                 events.event(Event::Unplugged(port));
+                self.abandon(port, up, events);
                 events.event(Event::Plugged(port));
             }
         }
@@ -379,6 +383,13 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
             session,
             last_heard_ns: now_ns,
         };
+    }
+
+    /// Time out every call sent down a port whose child has gone.
+    fn abandon(&mut self, port: u8, up: &mut impl Sink, events: &mut impl Events<P>) {
+        while let Some(origin) = self.calls.abandoned(port) {
+            time_out(origin, up, events);
+        }
     }
 
     fn present(&self, port: u8) -> bool {
@@ -397,6 +408,14 @@ impl<P, const PORTS: usize, const SLOTS: usize> Hub<P, PORTS, SLOTS> {
 impl<P, const PORTS: usize, const SLOTS: usize> Default for Hub<P, PORTS, SLOTS> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Answer a call nobody will, as a child that never replied would have it.
+fn time_out<P>(origin: Origin<P>, up: &mut impl Sink, events: &mut impl Events<P>) {
+    match origin {
+        Origin::Forwarded { id, route } => answer_up(up, route, id, RpcError::Timeout),
+        Origin::Internal(purpose) => events.event(Event::Answered(purpose, Err(RpcError::Timeout))),
     }
 }
 
@@ -728,6 +747,8 @@ mod tests {
         hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default())
             .unwrap();
 
+        let mut beat = heartbeat(7);
+        deliver(&mut hub, child(1, &mut beat), NOW + calls::DEADLINE_NS - 1);
         let out = deliver(&mut hub, Input::Tick, NOW + calls::DEADLINE_NS);
         let view = out.up.one();
         assert_eq!(view.routing, [1]);
@@ -740,12 +761,92 @@ mod tests {
         );
         assert_eq!(
             out.log.0,
+            [Seen::Answered(Ask::Name, Err(RpcError::Timeout))],
+            "the child is still heard"
+        );
+        assert_eq!(hub.counters().calls.expired, 2);
+    }
+
+    /// A host's request and a call of the hub's own, both sent down port 1 and
+    /// one host request down port 3, each answered nothing yet.
+    fn waiting() -> Hub<Ask, 4> {
+        let mut hub = hub();
+        deliver(&mut hub, child(3, &mut heartbeat(11)), NOW);
+        for (id, hops) in [(7, [1]), (8, [3])] {
+            let mut packet = request(id, b"dev.name", &hops);
+            deliver(&mut hub, Input::FromHost(&mut packet), NOW);
+        }
+        hub.call(1, "dev.name", &[], Ask::Name, NOW, &mut Down::default())
+            .unwrap();
+        hub
+    }
+
+    /// The id, error and route of every answer that went up.
+    fn refusals(up: &Sent) -> Vec<(RpcRequestId, RpcError, Vec<u8>)> {
+        up.views()
+            .into_iter()
+            .filter_map(
+                |view| match Answer::parse(view.header.ptype, view.payload)? {
+                    Answer::Error(error) => {
+                        Some((error.req_id, error.error(), view.routing.to_vec()))
+                    }
+                    Answer::Reply(_) => None,
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn a_port_that_unplugs_times_out_its_calls_at_once_and_no_others() {
+        let mut hub = waiting();
+        let mut beat = heartbeat(11);
+        deliver(&mut hub, child(3, &mut beat), NOW + UNPLUG_NS - 1);
+
+        let out = deliver(&mut hub, Input::Tick, NOW + UNPLUG_NS);
+        assert_eq!(
+            refusals(&out.up),
+            [(RpcRequestId::new(7), RpcError::Timeout, vec![1])]
+        );
+        assert_eq!(
+            out.log.0,
             [
                 Seen::Unplugged(1),
                 Seen::Answered(Ask::Name, Err(RpcError::Timeout))
             ]
         );
         assert_eq!(hub.counters().calls.expired, 2);
+        assert_eq!(
+            hub.deadline_ns(),
+            Some(NOW + UNPLUG_NS - 1 + UNPLUG_NS),
+            "port 3's call waits on, behind port 3's silence"
+        );
+    }
+
+    #[test]
+    fn a_child_that_reboots_unheard_times_out_the_calls_its_old_boot_took() {
+        let mut hub = waiting();
+        let mut rebooted = heartbeat(8);
+        let out = deliver(&mut hub, child(1, &mut rebooted), NOW + 1);
+        assert_eq!(
+            refusals(&out.up),
+            [(RpcRequestId::new(7), RpcError::Timeout, vec![1])]
+        );
+        assert_eq!(
+            out.log.0,
+            [
+                Seen::Unplugged(1),
+                Seen::Answered(Ask::Name, Err(RpcError::Timeout)),
+                Seen::Plugged(1)
+            ]
+        );
+        assert_eq!(hub.counters().calls.expired, 2);
+
+        let out = deliver(&mut hub, Input::Tick, NOW + calls::DEADLINE_NS);
+        assert_eq!(
+            refusals(&out.up),
+            [(RpcRequestId::new(8), RpcError::Timeout, vec![3])],
+            "only port 3's is left to expire"
+        );
     }
 
     #[test]
