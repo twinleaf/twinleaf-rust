@@ -38,7 +38,7 @@ pub struct CallCounters {
     pub unmatched: u32,
     /// Requests refused because every slot was live.
     pub exhausted: u32,
-    /// Entries that reached their deadline with no answer.
+    /// Entries given up on with no answer, at their deadline or when their child went.
     pub expired: u32,
 }
 
@@ -148,10 +148,19 @@ impl<P, const N: usize> Calls<P, N> {
 
     /// Free one entry whose deadline has passed. Call until it returns `None`.
     pub fn expired(&mut self, now_ns: u64) -> Option<Origin<P>> {
+        self.lapse(|live| live.deadline_ns <= now_ns)
+    }
+
+    /// Free one entry sent down `port`, whose child has gone. Call until it returns `None`.
+    pub fn abandoned(&mut self, port: u8) -> Option<Origin<P>> {
+        self.lapse(|live| live.port == port)
+    }
+
+    fn lapse(&mut self, due: impl Fn(&Live<P>) -> bool) -> Option<Origin<P>> {
         let origin = self
             .slots
             .iter_mut()
-            .find_map(|slot| slot.live.take_if(|live| live.deadline_ns <= now_ns))
+            .find_map(|slot| slot.live.take_if(|live| due(live)))
             .map(|live| live.origin)?;
         self.expired = self.expired.saturating_add(1);
         Some(origin)
@@ -359,6 +368,31 @@ mod tests {
         );
         assert_eq!(table.deadline_ns(), None);
         assert_eq!(table.counters().expired, 2);
+    }
+
+    /// A child that went takes only its own port's entries with it, each
+    /// counted as expired, and its late answers find nothing.
+    #[test]
+    fn an_abandoned_port_frees_its_entries_and_no_others() {
+        let mut table = table();
+        let minted = forwarded(&mut table, 1, 5);
+        table.call(1, Ask::Name, NOW).unwrap();
+        forwarded(&mut table, 2, 6);
+
+        let freed: Vec<_> = core::iter::from_fn(|| table.abandoned(1)).collect();
+        assert_eq!(
+            freed,
+            [
+                Origin::Forwarded {
+                    id: RpcRequestId::new(5),
+                    route: route(&[1])
+                },
+                Origin::Internal(Ask::Name)
+            ]
+        );
+        assert_eq!(table.counters().expired, 2);
+        assert_eq!(table.answered(1, answer(&reply(minted, b""))), None);
+        assert_eq!(table.deadline_ns(), Some(NOW + DEADLINE_NS), "port 2's");
     }
 
     /// An expired entry frees its slot, and the answer that finally arrives
