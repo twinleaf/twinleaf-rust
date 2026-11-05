@@ -1258,3 +1258,92 @@ fn rows_in_the_last_slot_a_lap_later_after_a_lost_link_are_a_restart() {
     ];
     run::<LosesAtRollover>(1, 1, &steps);
 }
+
+/// A forced rollover drops its only sample and stops before its record goes
+/// out, and the segment a start opens drops its only sample and rolls over.
+/// The rows after come as a restart, as the start's record marks the segment
+/// it opened.
+#[test]
+fn segments_without_rows_on_both_sides_of_a_restart_are_a_restart() {
+    let steps = [
+        Step::Samples { count: 1, rows: 1 },
+        Step::Rollover {
+            forced: true,
+            within: 0,
+        },
+        Step::Drop { count: 1 },
+        Step::Stop { staged: 0 },
+        Step::Start {
+            pause: 0,
+            forced: false,
+        },
+        Step::Drop { count: 1 },
+        Step::Rollover {
+            forced: false,
+            within: 0,
+        },
+        Step::Samples { count: 1, rows: 1 },
+    ];
+    run::<LosesAtRollover>(1, 1, &steps);
+}
+
+/// The steps the exhaustive history takes, each kind of sample, drop, rollover, stop, start and
+/// outage once.
+const ALPHABET: [Step; 9] = [
+    Step::Samples { count: 1, rows: 1 },
+    Step::Drop { count: 1 },
+    Step::Rollover {
+        forced: false,
+        within: 0,
+    },
+    Step::Rollover {
+        forced: true,
+        within: 0,
+    },
+    Step::Stop { staged: 0 },
+    Step::Start {
+        pause: 0,
+        forced: false,
+    },
+    Step::Start {
+        pause: 0,
+        forced: true,
+    },
+    Step::Outage {
+        lost: 0,
+        opens: false,
+    },
+    Step::Outage {
+        lost: 0,
+        opens: true,
+    },
+];
+
+/// The steps in the longest history the exhaustive test takes.
+const LENGTH: usize = 8;
+
+/// Every history of up to `LENGTH` steps of `ALPHABET` that ends in a sample, the only step that
+/// gives the reader rows, reaches the reader as the device made it.
+#[test]
+fn every_short_history_reaches_the_reader_as_the_device_made_it() {
+    let mut frontier = vec![(Device::new(ROOMY, 1, 1), Vec::new())];
+    for _ in 0..LENGTH {
+        frontier = frontier
+            .into_iter()
+            .flat_map(|(device, steps): (Device, Vec<Step>)| {
+                ALPHABET
+                    .iter()
+                    .filter(|step| device.allows::<LosesAtRollover>(step))
+                    .map(|step| {
+                        let next = Pipeline::<LosesAtRollover>::apply(device.clone(), step);
+                        (next, steps.iter().chain([step]).cloned().collect())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        frontier
+            .iter()
+            .filter(|(_, steps)| matches!(steps.last(), Some(Step::Samples { .. })))
+            .for_each(|(_, steps)| run::<LosesAtRollover>(1, 1, steps));
+    }
+}

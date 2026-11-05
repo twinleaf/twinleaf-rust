@@ -1088,7 +1088,7 @@ mod tests {
                 .boundary()
                 .cloned()
         };
-        let open = fixtures::segment(STREAM_ID).flags;
+        let open = wire::SegmentFlags::VALID | wire::SegmentFlags::ACTIVE;
         let lost = Some(Loss {
             samples: 3,
             expected: Some(SampleNumber::new(1)),
@@ -1112,6 +1112,62 @@ mod tests {
                 "revision {protocol} with {flags:?}"
             );
         }
+    }
+
+    /// Rows a device that declares no revision sends after its link came back go on from the last
+    /// rows in their segment, with the rows between lost, and come as a restart in another.
+    #[test]
+    fn rows_after_a_lost_link_go_on_in_their_segment_and_restart_in_another() {
+        let boundary = |segment_id: u8, start_time: u32, first: u32| {
+            let mut parser = parser_with_clock(&[DataType::F32], 4, 4, 1, 1);
+            parser
+                .push_packet(&stream_data_packet(0, vec![0; 4]))
+                .unwrap();
+            parser.pop_batch().expect("the first batch");
+            let lost = tio::Packet::link(LinkStatus::SensorDisconnected);
+            parser
+                .push_packet(&lost.with_route(DeviceRoute::root()))
+                .unwrap();
+            announce_schema(&mut parser, &[DataType::F32], 4, 4, 1, 1);
+            announce(
+                &mut parser,
+                wire::Metadata::Segment(wire::Segment {
+                    segment_id: crate::proto::SegmentId::new(segment_id),
+                    start_time,
+                    ..fixtures::segment(STREAM_ID)
+                }),
+            );
+            parser
+                .push_packet(&stream_data_packet_in_segment(
+                    segment_id,
+                    first,
+                    vec![0; 4],
+                ))
+                .unwrap();
+            parser
+                .pop_batch()
+                .expect("the batch after")
+                .boundary()
+                .cloned()
+        };
+        assert_eq!(
+            boundary(0, 0, 3),
+            Some(Boundary {
+                change: None,
+                loss: Some(Loss {
+                    samples: 2,
+                    expected: Some(SampleNumber::new(1)),
+                    dropped_batches: 0,
+                }),
+            })
+        );
+        assert_eq!(
+            boundary(1, 4, 0),
+            Some(Boundary::of(Change::Restarted {
+                old_id: crate::proto::SegmentId::new(0),
+                new_id: crate::proto::SegmentId::new(1),
+            }))
+        );
     }
 
     /// A device that declares a revision may send its next session's heartbeat and record ahead
@@ -1164,7 +1220,7 @@ mod tests {
             }),
         );
         parser
-            .push_packet(&stream_data_packet(1, vec![0; 4]))
+            .push_packet(&stream_data_packet(0, vec![0; 4]))
             .expect("valid rows");
         assert!(
             parser.pop_batch().is_none(),
@@ -1177,10 +1233,13 @@ mod tests {
         );
         parser.apply_metadata_reply(
             query,
-            &metadata_reply(&[wire::Metadata::Segment(fixtures::segment(STREAM_ID))]),
+            &metadata_reply(&[wire::Metadata::Segment(wire::Segment {
+                start_time: 2,
+                ..fixtures::segment(STREAM_ID)
+            })]),
         );
         parser
-            .push_packet(&stream_data_packet(2, vec![0; 4]))
+            .push_packet(&stream_data_packet(1, vec![0; 4]))
             .expect("valid rows");
 
         let batch = parser.pop_batch().expect("the rows after the reply");
@@ -1189,7 +1248,7 @@ mod tests {
             Some(Boundary {
                 change: rollover(0, 0),
                 loss: Some(Loss {
-                    samples: 1,
+                    samples: 2,
                     expected: Some(SampleNumber::new(1)),
                     dropped_batches: 0,
                 }),

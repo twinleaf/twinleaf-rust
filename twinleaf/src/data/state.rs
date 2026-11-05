@@ -125,9 +125,7 @@ struct StreamTracker {
 
     // Accepted sample history survives metadata invalidation, so the first
     // rows under new metadata are told against the last rows.
-    established: bool,
     run: u32,
-    last_segment_id: SegmentId,
     last_sample_number: SampleNumber,
     last_timestamp: f64,
     last_session_id: SessionId,
@@ -142,16 +140,13 @@ struct StreamTracker {
     /// its last rows, as after its link was lost. Rows of another segment
     /// then may be of a restart whose stop went unseen.
     relearned: bool,
-    /// Whether the device announced a segment other than the last rows'
-    /// since them, so that rows in the last rows' slot are of a later lap of
-    /// the ring.
-    moved_on: bool,
     /// Whether the device sent the record of the last rows' slot again since
     /// them, so that the slot holds the record the device sent last.
     renewed: bool,
     rate_hz: f64,
-    /// Whether the device sent the closing record of the last rows' segment since them.
-    closed: bool,
+    /// Whether the device sent a closing record, or the record a start opened of a segment other
+    /// than the last rows', since them.
+    restarted: bool,
 }
 
 impl StreamTracker {
@@ -163,9 +158,7 @@ impl StreamTracker {
             schema: None,
             key,
             current_segment_id: SegmentId::new(0),
-            established: false,
             run: 0,
-            last_segment_id: SegmentId::new(0),
             last_sample_number: SampleNumber::new(0),
             last_timestamp: 0.0,
             last_session_id: SessionId::new(0),
@@ -173,17 +166,18 @@ impl StreamTracker {
             last_segment: None,
             last_schema: None,
             relearned: false,
-            moved_on: false,
             renewed: false,
             rate_hz: 0.0,
-            closed: false,
+            restarted: false,
         }
     }
 
-    /// Names `segment_id` the current segment.
-    fn switch_to(&mut self, segment_id: SegmentId) {
-        self.moved_on |= segment_id != self.last_segment_id;
-        self.current_segment_id = segment_id;
+    /// Whether `segment` is the segment of the last accepted rows.
+    fn is_last(&self, segment: wire::SegmentView<'_>) -> bool {
+        self.last_segment.as_ref().is_some_and(|last| {
+            (last.get().segment_id(), last.get().start_time())
+                == (segment.segment_id(), segment.start_time())
+        })
     }
 
     fn segment(&self, segment_id: SegmentId) -> Option<&SegmentRecord> {
@@ -196,7 +190,10 @@ impl StreamTracker {
             self.segments.resize(index + 1, None);
         }
         self.segments[index] = Some(segment);
-        self.renewed |= segment_id == self.last_segment_id;
+        self.renewed |= self
+            .last_segment
+            .as_ref()
+            .is_some_and(|last| last.get().segment_id() == segment_id);
     }
 
     /// Learns the stream record of a stream that had none.
@@ -258,9 +255,9 @@ impl StreamTracker {
         segment: wire::SegmentView<'_>,
         new_rate: f64,
     ) -> Option<Boundary> {
-        if !self.established {
+        let Some(last) = self.last_segment.as_ref().map(SegmentRecord::get) else {
             return Some(Boundary::of(Change::Initial));
-        }
+        };
 
         let declared = device.protocol() > 0;
         if !declared && device.session() != self.last_session_id {
@@ -306,24 +303,19 @@ impl StreamTracker {
             dropped_batches: 0,
         };
 
-        // Rows in the last rows' slot are of a later lap of the ring after
-        // the device announced another segment, or when that slot's segment
-        // starts at another time. A device never moves a segment's start, and
-        // never starts two acquisitions of one slot in the same second.
-        let lapped = self.moved_on
-            || self
-                .last_segment
-                .as_ref()
-                .is_some_and(|last| last.get().start_time() != segment.start_time());
+        // Rows in the last rows' slot are of a later lap of the ring when
+        // that slot's segment starts at another time. A device never moves a
+        // segment's start, and never starts two acquisitions of one slot in
+        // the same second.
         // Rows are of the current segment. A device that declares a revision marks the segment a
         // start opens and closes the one a stop ends, so the time between holds no sample to
         // lose. Rows in another segment after the records were dropped may be of a restart that
         // went unseen, whose time cannot be told from time lost.
-        let opened = segment.segment_id() != self.last_segment_id || lapped;
-        let started = segment.flags().contains(wire::SegmentFlags::START) || self.closed;
+        let opened = !self.is_last(segment);
+        let started = segment.flags().contains(wire::SegmentFlags::START) || self.restarted;
         if opened && (self.relearned || declared && started) {
             return Some(Boundary::of(Change::Restarted {
-                old_id: self.last_segment_id,
+                old_id: last.segment_id(),
                 new_id: segment.segment_id(),
             }));
         }
@@ -331,7 +323,7 @@ impl StreamTracker {
             let missing = self.missing_before(segment, first_sample_n);
             return Some(Boundary {
                 change: Some(Change::SegmentRollover {
-                    old_id: self.last_segment_id,
+                    old_id: last.segment_id(),
                     new_id: segment.segment_id(),
                 }),
                 loss: u64::try_from(missing).ok().filter(|&n| n >= 1).map(lost),
@@ -408,9 +400,11 @@ impl StreamTracker {
         // no record of that slot since them, are of a new acquisition in the
         // slot whose record has not come. A child behind a hub sends such
         // rows after a reboot it has not yet announced.
-        let behind = self.established
-            && !self.renewed
-            && data.segment_id == self.last_segment_id
+        let behind = !self.renewed
+            && self
+                .last_segment
+                .as_ref()
+                .is_some_and(|last| last.get().segment_id() == data.segment_id)
             && data.first.value() <= self.last_sample_number.value();
         let announced = self.current_segment_id == data.segment_id && !behind;
         // A device sends a segment's record before the segment's first
@@ -425,7 +419,7 @@ impl StreamTracker {
             }
         }
         if !announced {
-            self.switch_to(data.segment_id);
+            self.current_segment_id = data.segment_id;
             *metadata_revision = metadata_revision.wrapping_add(1);
         }
 
@@ -521,7 +515,7 @@ impl StreamTracker {
             // Streams start up independently, so their first data must not bump
             // the generations their peers share. A stream that starts over
             // bumps them as any other break does.
-            if !boundary.is_initial() || self.established {
+            if !boundary.is_initial() || self.last_segment.is_some() {
                 *device_generation += 1;
                 *global_generation += 1;
             }
@@ -531,15 +525,12 @@ impl StreamTracker {
         self.last_timestamp = sample_time(segment, last_sample_n.value() + 1);
         self.last_session_id = device.session();
         self.last_time_ref_session_id = segment.timeref_session();
-        self.last_segment_id = segment.segment_id();
         self.last_segment = Some(segment_record.clone());
         self.last_schema = self.schema.clone();
         self.relearned = false;
-        self.moved_on = false;
         self.renewed = false;
-        self.closed = false;
+        self.restarted = false;
         self.rate_hz = new_rate;
-        self.established = true;
 
         let schema = self
             .schema
@@ -577,7 +568,7 @@ impl StreamTracker {
     /// the rebuilt stream numbers its runs after it.
     fn reset(&mut self) {
         self.relearn();
-        self.established = false;
+        self.last_segment = None;
         self.relearned = false;
     }
 
@@ -784,12 +775,9 @@ impl DeviceState {
                     && !segment.flags().contains(wire::SegmentFlags::ACTIVE);
                 let stream = self.stream_mut(stream_id);
                 let learned = stream.segment(segment_id) != Some(&incoming);
-                stream.closed |= closes
-                    && segment_id == stream.last_segment_id
-                    && stream
-                        .last_segment
-                        .as_ref()
-                        .is_some_and(|last| last.get().start_time() == segment.start_time());
+                stream.restarted |= closes
+                    || segment.flags().contains(wire::SegmentFlags::START)
+                        && !stream.is_last(segment);
                 stream.set_segment(segment_id, incoming);
                 let switched = stream.current_segment_id != segment_id
                     && match source {
@@ -800,7 +788,7 @@ impl DeviceState {
                         MetadataSource::Reply => false,
                     };
                 if switched {
-                    stream.switch_to(segment_id);
+                    stream.current_segment_id = segment_id;
                 }
                 if learned || switched {
                     self.revise_metadata();
