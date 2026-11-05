@@ -4,11 +4,11 @@
 //! stream with its current segment and its columns, as far as one reply holds.
 //! Otherwise each selector names one record, in request order. Either way the
 //! reply stops at the first record that does not fit, and the host asks again
-//! for the rest.
+//! for the rest. A [`Carousel`] repeats the records a session fixes on control.
 
 use twinleaf_proto::data::{
-    self, Metadata, MetadataRequest, MetadataRequestError, MetadataSelector, MetadataType,
-    CURRENT_SEGMENT, METADATA_REPLY_FRAME_HEADER,
+    self, Metadata, MetadataFlags, MetadataRequest, MetadataRequestError, MetadataSelector,
+    MetadataType, CURRENT_SEGMENT, METADATA_REPLY_FRAME_HEADER,
 };
 use twinleaf_proto::rpc::RpcError;
 
@@ -89,10 +89,11 @@ pub fn reply(
 }
 
 /// Round-robin cursor over a device's metadata: the device, then for each
-/// stream its shape, its current segment, and its columns.
+/// stream its shape, its current segment unless it skips segments, and its columns.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sweep {
     position: Position,
+    skips_segments: bool,
 }
 
 impl Sweep {
@@ -100,6 +101,15 @@ impl Sweep {
     pub const fn new() -> Self {
         Self {
             position: Position::Device,
+            skips_segments: false,
+        }
+    }
+
+    /// A sweep of the records a session fixes: the device's, and each stream's and its columns'.
+    pub const fn layout() -> Self {
+        Self {
+            position: Position::Device,
+            skips_segments: true,
         }
     }
 
@@ -130,13 +140,15 @@ impl Sweep {
         self.position = match here {
             Position::Device if id(0).is_some() => Position::Stream(0),
             Position::Device => Position::Device,
-            Position::Stream(s) => Position::Segment(s),
-            Position::Segment(s) if columns(s)? > 0 => Position::Column(s, 0),
+            Position::Stream(s) if !self.skips_segments => Position::Segment(s),
+            Position::Stream(s) | Position::Segment(s) if columns(s)? > 0 => Position::Column(s, 0),
             Position::Column(s, c) if c + 1 < columns(s)? => Position::Column(s, c + 1),
-            Position::Segment(s) | Position::Column(s, _) => match id(s + 1) {
-                Some(_) => Position::Stream(s + 1),
-                None => Position::Device,
-            },
+            Position::Stream(s) | Position::Segment(s) | Position::Column(s, _) => {
+                match id(s + 1) {
+                    Some(_) => Position::Stream(s + 1),
+                    None => Position::Device,
+                }
+            }
         };
         Some((record, matches!(self.position, Position::Device)))
     }
@@ -152,31 +164,91 @@ enum Position {
     Column(u8, u8),
 }
 
-/// Every record a device describes itself with, in bootstrap order.
-///
-/// The sweep stops where `describe` says it has no more room, and a listed
-/// stream the device cannot describe is an internal error.
-pub fn sweep(
-    device: data::Device<'_>,
-    streams: &(impl Streams + ?Sized),
-    describe: &mut dyn FnMut(Metadata<'_>) -> Result<bool, RpcError>,
-) -> Result<(), RpcError> {
-    let mut sweep = Sweep::new();
-    loop {
-        let (record, last) = sweep.step(device, streams).ok_or(RpcError::Internal)?;
-        if !describe(record)? || last {
-            return Ok(());
+/// The device, stream and column records a device repeats on control, one every pass time over
+/// the records in a pass, so a listener that missed them learns the device within a pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Carousel {
+    sweep: Sweep,
+    next_ns: u64,
+}
+
+impl Carousel {
+    /// A carousel whose first record, the device's, is due a step after `now_ns`.
+    pub fn new(
+        now_ns: u64,
+        pass_ns: u64,
+        device: data::Device<'_>,
+        streams: &(impl Streams + ?Sized),
+    ) -> Self {
+        Self {
+            sweep: Sweep::layout(),
+            next_ns: now_ns + step(pass_ns, device, streams),
+        }
+    }
+
+    /// When its next record is due, never while `pass_ns` is zero.
+    pub fn deadline(&self, pass_ns: u64) -> u64 {
+        match pass_ns {
+            0 => u64::MAX,
+            _ => self.next_ns,
+        }
+    }
+
+    /// Hand `send` each record due by `now_ns` under PERIODIC, with LAST on the one closing a
+    /// pass, owing at most a pass and waiting at most a step, and none while `pass_ns` is zero.
+    pub fn turn(
+        &mut self,
+        now_ns: u64,
+        pass_ns: u64,
+        device: data::Device<'_>,
+        streams: &(impl Streams + ?Sized),
+        send: &mut dyn FnMut(Metadata<'_>, MetadataFlags),
+    ) {
+        if pass_ns == 0 {
+            self.next_ns = now_ns;
+            return;
+        }
+        let step = step(pass_ns, device, streams);
+        self.next_ns = self
+            .next_ns
+            .clamp(now_ns.saturating_sub(pass_ns), now_ns + step);
+        while self.next_ns <= now_ns {
+            self.next_ns += step;
+            let Some((record, last)) = self.sweep.step(device, streams) else {
+                return;
+            };
+            let flags = match last {
+                true => MetadataFlags::PERIODIC | MetadataFlags::LAST,
+                false => MetadataFlags::PERIODIC,
+            };
+            send(record, flags);
         }
     }
 }
 
-/// The bootstrap set, as far as one reply holds.
+/// Nanoseconds between a carousel's records: a pass's time over the records in it.
+fn step(pass_ns: u64, device: data::Device<'_>, streams: &(impl Streams + ?Sized)) -> u64 {
+    let mut pass = Sweep::layout();
+    let records = core::iter::from_fn(|| pass.step(device, streams))
+        .position(|(_, last)| last)
+        .map_or(1, |at| at as u64 + 1);
+    (pass_ns / records).max(1)
+}
+
+/// The bootstrap set, as far as one reply holds. A listed stream the device
+/// cannot describe is an internal error.
 fn bootstrap(
     device: data::Device<'_>,
     streams: &(impl Streams + ?Sized),
     out: &mut Reply,
 ) -> Result<(), RpcError> {
-    sweep(device, streams, &mut |record| append(out, record))
+    let mut sweep = Sweep::new();
+    loop {
+        let (record, last) = sweep.step(device, streams).ok_or(RpcError::Internal)?;
+        if !append(out, record)? || last {
+            return Ok(());
+        }
+    }
 }
 
 /// Append one `[type][length][record]` frame, whole or not at all: proto's
@@ -282,37 +354,55 @@ mod tests {
             .collect()
     }
 
-    fn walk(shape: &[u8], steps: usize) -> Vec<(MetadataType, u8, u8, bool)> {
+    /// A record as its type, stream and index.
+    fn named(record: Metadata<'_>) -> (MetadataType, u8, u8) {
+        match record {
+            Metadata::Device(_) => (MetadataType::Device, 0, 0),
+            Metadata::Stream(s) => (MetadataType::Stream, s.stream_id.value(), 0),
+            Metadata::Segment(s) => (
+                MetadataType::Segment,
+                s.stream_id.value(),
+                s.segment_id.value(),
+            ),
+            Metadata::Column(c) => (MetadataType::Column, c.stream_id.value(), c.index.value()),
+        }
+    }
+
+    fn walk(mut sweep: Sweep, shape: &[u8], steps: usize) -> Vec<(MetadataType, u8, u8, bool)> {
         let streams = Shape(shape.to_vec());
-        let mut sweep = Sweep::new();
         (0..steps)
             .map(|_| {
                 let (record, last) = sweep.step(device("d"), &streams).unwrap();
-                match record {
-                    Metadata::Device(_) => (MetadataType::Device, 0, 0, last),
-                    Metadata::Stream(s) => (MetadataType::Stream, s.stream_id.value(), 0, last),
-                    Metadata::Segment(s) => (
-                        MetadataType::Segment,
-                        s.stream_id.value(),
-                        s.segment_id.value(),
-                        last,
-                    ),
-                    Metadata::Column(c) => (
-                        MetadataType::Column,
-                        c.stream_id.value(),
-                        c.index.value(),
-                        last,
-                    ),
-                }
+                let (kind, stream, index) = named(record);
+                (kind, stream, index, last)
             })
             .collect()
+    }
+
+    const PASS: u64 = 5_000_000_000;
+
+    /// What a carousel begun at zero sends turned at each of `at`, as type, stream, index and flags.
+    fn carousel(
+        shape: &[u8],
+        at: impl IntoIterator<Item = u64>,
+    ) -> Vec<(MetadataType, u8, u8, u8)> {
+        let streams = Shape(shape.to_vec());
+        let mut carousel = Carousel::new(0, PASS, device("d"), &streams);
+        let mut sent = Vec::new();
+        at.into_iter().for_each(|now| {
+            carousel.turn(now, PASS, device("d"), &streams, &mut |record, flags| {
+                let (kind, stream, index) = named(record);
+                sent.push((kind, stream, index, flags.bits()));
+            })
+        });
+        sent
     }
 
     #[test]
     fn a_sweep_walks_the_device_then_each_stream_with_its_columns() {
         use MetadataType::*;
         #[rustfmt::skip]
-        assert_eq!(walk(&[2, 3], 11), vec![
+        assert_eq!(walk(Sweep::new(), &[2, 3], 11), vec![
             (Device, 0, 0, false),
             (Stream, 1, 0, false),
             (Segment, 1, 3, false),
@@ -329,14 +419,17 @@ mod tests {
 
     #[test]
     fn a_sweep_of_a_device_with_no_streams_is_the_device_record() {
-        assert_eq!(walk(&[], 2), vec![(MetadataType::Device, 0, 0, true); 2]);
+        assert_eq!(
+            walk(Sweep::new(), &[], 2),
+            vec![(MetadataType::Device, 0, 0, true); 2]
+        );
     }
 
     #[test]
     fn a_sweep_skips_a_stream_with_no_columns() {
         use MetadataType::*;
         #[rustfmt::skip]
-        assert_eq!(walk(&[0, 1], 6), vec![
+        assert_eq!(walk(Sweep::new(), &[0, 1], 6), vec![
             (Device, 0, 0, false),
             (Stream, 1, 0, false),
             (Segment, 1, 3, false),
@@ -344,6 +437,85 @@ mod tests {
             (Segment, 2, 3, false),
             (Column, 2, 0, true),
         ]);
+    }
+
+    #[test]
+    fn a_layout_sweep_skips_every_segment() {
+        use MetadataType::*;
+        #[rustfmt::skip]
+        assert_eq!(walk(Sweep::layout(), &[2, 0, 1], 8), vec![
+            (Device, 0, 0, false),
+            (Stream, 1, 0, false),
+            (Column, 1, 0, false),
+            (Column, 1, 1, false),
+            (Stream, 2, 0, false),
+            (Stream, 3, 0, false),
+            (Column, 3, 0, true),
+            (Device, 0, 0, false),
+        ]);
+    }
+
+    /// Turned a step at a time, a carousel sends the layout sweep's pass once, LAST on its end.
+    #[test]
+    fn a_carousel_pass_is_the_layout_sweep_once() {
+        use MetadataType::*;
+        let (periodic, last) = (
+            MetadataFlags::PERIODIC.bits(),
+            (MetadataFlags::PERIODIC | MetadataFlags::LAST).bits(),
+        );
+        let step = PASS / 8;
+        #[rustfmt::skip]
+        assert_eq!(carousel(&[2, 3], (1..=9).map(|k| k * step)), vec![
+            (Device, 0, 0, periodic),
+            (Stream, 1, 0, periodic),
+            (Column, 1, 0, periodic),
+            (Column, 1, 1, periodic),
+            (Stream, 2, 0, periodic),
+            (Column, 2, 0, periodic),
+            (Column, 2, 1, periodic),
+            (Column, 2, 2, last),
+            (Device, 0, 0, periodic),
+        ]);
+    }
+
+    /// However many records a pass holds, and however coarsely it is turned, a pass takes the
+    /// pass time.
+    #[test]
+    fn a_carousel_paces_a_pass_to_the_pass_time() {
+        for shape in [&[][..], &[1], &[2, 3], &[4, 0, 9, 1]] {
+            let records = 1 + shape
+                .iter()
+                .map(|&columns| 1 + usize::from(columns))
+                .sum::<usize>();
+            for turns in [1, 3, 10, 100] {
+                let sent = carousel(shape, (1..=turns).map(|k| k * PASS / turns));
+                assert_eq!(sent.len(), records, "{shape:?} turned {turns} times");
+                assert!(sent[records - 1].3 & MetadataFlags::LAST.bits() != 0);
+            }
+        }
+    }
+
+    /// A carousel left unturned owes at most a pass, and none while its pass time is zero.
+    #[test]
+    fn a_carousel_owes_at_most_a_pass() {
+        assert_eq!(carousel(&[2, 3], [100 * PASS]).len(), 9);
+        let streams = Shape(vec![2, 3]);
+        let mut carousel = Carousel::new(0, 0, device("d"), &streams);
+        let mut sent = 0;
+        carousel.turn(PASS, 0, device("d"), &streams, &mut |_, _| sent += 1);
+        assert_eq!((sent, carousel.deadline(0)), (0, u64::MAX));
+        carousel.turn(PASS + 1, PASS, device("d"), &streams, &mut |_, _| sent += 1);
+        assert_eq!(sent, 1);
+    }
+
+    /// A pass time shortened while a record waits brings that record within the new step.
+    #[test]
+    fn a_shorter_pass_time_waits_at_most_its_step() {
+        let streams = Shape(vec![2, 3]);
+        let mut carousel = Carousel::new(0, 100 * PASS, device("d"), &streams);
+        let mut sent = 0;
+        carousel.turn(0, PASS, device("d"), &streams, &mut |_, _| sent += 1);
+        assert_eq!((sent, carousel.deadline(PASS)), (0, PASS / 8));
     }
 
     #[test]
