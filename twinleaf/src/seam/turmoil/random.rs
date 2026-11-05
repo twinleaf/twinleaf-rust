@@ -1,13 +1,14 @@
 //! The randomness of a run, which follows its seed.
 //!
 //! The standard library takes the keys of a thread's hash maps from the C
-//! library's `getrandom`, once per thread, and tokio seeds its runtimes and
-//! the start of each `StreamMap` poll from those keys. So the test binary
-//! defines `getrandom` itself, as madsim and mad-turmoil do. On a thread
-//! that [`seeded`] started, it gives the bytes of a generator seeded with
-//! the run's seed. Everywhere else it asks the kernel, as the C library's
-//! does. A run on a thread of its own then hashes, picks streams and draws
-//! jitter the same way each time it runs with one seed.
+//! library's `getrandom`, or `CCRandomGenerateBytes` on macOS, once per
+//! thread, and tokio seeds its runtimes and the start of each `StreamMap`
+//! poll from those keys. So the test binary defines those itself, and
+//! `getentropy` on macOS, as madsim and mad-turmoil do. On a thread that
+//! [`seeded`] started, they give the bytes of a generator seeded with the
+//! run's seed. Everywhere else they ask the operating system. A run on a
+//! thread of its own then hashes, picks streams and draws jitter the same
+//! way each time it runs with one seed.
 
 use std::cell::Cell;
 
@@ -41,10 +42,22 @@ pub(crate) fn seeded<T: Send>(seed: u64, run: impl FnOnce() -> T + Send) -> T {
 ///
 /// `buf` must be valid for writes of `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
+pub unsafe extern "C" fn getrandom(
+    buf: *mut u8,
+    len: usize,
+    #[cfg_attr(not(target_os = "linux"), expect(unused_variables))] flags: u32,
+) -> isize {
     let Some(mut state) = GENERATOR.with(Cell::get) else {
         // SAFETY: the caller's promise about `buf` is the kernel's.
+        #[cfg(target_os = "linux")]
         return unsafe { libc::syscall(libc::SYS_getrandom, buf, len, flags) as isize };
+        // SAFETY: the caller's promise about `buf` is the C library's, whose
+        // `arc4random_buf` this binary does not define.
+        #[cfg(target_os = "macos")]
+        return unsafe {
+            libc::arc4random_buf(buf.cast(), len);
+            len as isize
+        };
     };
     for at in 0..len {
         // SplitMix64, of which each byte takes the top eight bits.
@@ -57,4 +70,37 @@ pub unsafe extern "C" fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isiz
     }
     GENERATOR.with(|generator| generator.set(Some(state)));
     len as isize
+}
+
+/// Fills `bytes` with `count` random bytes as [`getrandom`] does, returning
+/// `kCCSuccess`, as the C library's `CCRandomGenerateBytes` does.
+///
+/// # Safety
+///
+/// `bytes` must be valid for writes of `count` bytes.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn CCRandomGenerateBytes(bytes: *mut u8, count: usize) -> i32 {
+    // SAFETY: the caller's promise about `bytes` is `getrandom`'s.
+    unsafe { getrandom(bytes, count, 0) };
+    libc::kCCSuccess
+}
+
+/// Fills `buf` with `len` random bytes as [`getrandom`] does, returning 0,
+/// or -1 with `EIO` for more than 256, as the C library's `getentropy` does.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `len` bytes.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getentropy(buf: *mut u8, len: usize) -> i32 {
+    if len > 256 {
+        // SAFETY: `__error` points at this thread's `errno`.
+        unsafe { *libc::__error() = libc::EIO };
+        return -1;
+    }
+    // SAFETY: the caller's promise about `buf` is `getrandom`'s.
+    unsafe { getrandom(buf, len, 0) };
+    0
 }

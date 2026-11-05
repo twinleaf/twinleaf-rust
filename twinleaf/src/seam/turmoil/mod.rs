@@ -12,8 +12,8 @@
 //! follows the run's seed, so a run made twice with one seed runs the same
 //! way.
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("the turmoil tests run on Linux, whose `getrandom` they seed");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("the turmoil tests run on Linux and macOS, whose randomness they seed");
 
 pub(crate) mod net;
 mod random;
