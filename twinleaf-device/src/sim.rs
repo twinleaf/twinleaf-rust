@@ -305,6 +305,7 @@ impl<B: Board<N>, const N: usize> Sim<B, N> {
     pub fn tick(&mut self, now_ns: u64) {
         if let Some(image) = self.device.tick(
             now_ns,
+            &self.streams[..],
             &mut Wires::new(&mut self.ports, &mut self.written, None),
         ) {
             self.stored = Some(image);

@@ -93,7 +93,7 @@ impl Publisher {
     ) {
         self.flush(out);
         let len = Metadata::Segment(segment)
-            .write(flags | MetadataFlags::LAST, &mut self.buf)
+            .write(flags, &mut self.buf)
             .expect("a segment record fits a packet");
         out.send(&self.buf[..len]);
     }

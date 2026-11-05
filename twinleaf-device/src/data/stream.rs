@@ -901,4 +901,29 @@ mod tests {
             "a segment with no rows closes too"
         );
     }
+
+    /// A start, a rollover, whole seconds and a stop send their segment records without LAST.
+    #[test]
+    fn segment_records_carry_no_last() {
+        let mut streams = streams();
+        let mut sent = Sent::default();
+        streams[0].start(timeref(), &mut sent).unwrap();
+        (0..25).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+        streams[0].rollover(&mut sent);
+        (0..25).for_each(|_| streams[0].push(&[0; 16], &mut sent));
+        streams[0].stop(&mut sent);
+        let flags: Vec<MetadataFlags> = sent
+            .0
+            .iter()
+            .filter_map(|packet| {
+                data::Metadata::parse(PacketView::parse_prefix(packet).ok()?.0.payload)
+            })
+            .map(|(_, flags)| flags)
+            .collect();
+        let (update, periodic) = (MetadataFlags::UPDATE, MetadataFlags::PERIODIC);
+        assert_eq!(
+            flags,
+            [update, periodic, periodic, update, periodic, update]
+        );
+    }
 }

@@ -41,6 +41,9 @@ pub const DEFAULT_LOGLEVEL: LogLevel = LogLevel::INFO;
 /// Seconds `dev.autostart` waits at boot before acquiring.
 pub const DEFAULT_AUTOSTART: u8 = 5;
 
+/// Milliseconds `dev.metadata.broadcast.period` boots at for a pass of the description.
+pub const DEFAULT_BROADCAST_PERIOD: u16 = 5_000;
+
 /// As much flash as a stored configuration may take.
 pub const IMAGE_MAX: usize = 1024;
 
@@ -55,6 +58,8 @@ pub type Entries = Image<IMAGE_MAX>;
 
 /// Nanoseconds in the second `dev.uptime` counts.
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Nanoseconds in the millisecond `dev.metadata.broadcast.period` counts.
+const NANOS_PER_MILLI: u64 = 1_000_000;
 /// Nanoseconds in the hour `dev.lifetime` counts.
 const NANOS_PER_HOUR: u64 = 3_600 * NANOS_PER_SECOND;
 
@@ -305,6 +310,9 @@ pub struct Device<S: Group> {
     autostart: Setting<u8>,
     /// Nanoseconds the wire carrying a parent's PPS delays it.
     sync_delay: Setting<f32>,
+    /// Milliseconds the carousel takes for a pass, or never at zero.
+    broadcast_period: Setting<u16>,
+    carousel: metadata::Carousel,
     settings: S,
     next_beat: u64,
     /// The nanosecond the device came up, which `dev.systime`, `dev.uptime`
@@ -349,6 +357,12 @@ impl<S: Group> Device<S> {
             password: Setting::new("dev.priv.password", Text::from(password)).persistent(),
             autostart: Setting::new("dev.autostart", DEFAULT_AUTOSTART).persistent(),
             sync_delay: Setting::new("sync.delay", 0.0).checked(finite).persistent(),
+            broadcast_period: Setting::new(
+                "dev.metadata.broadcast.period",
+                DEFAULT_BROADCAST_PERIOD,
+            )
+            .persistent(),
+            carousel: metadata::Carousel::default(),
             settings,
             next_beat: 0,
             booted_ns: now_ns,
@@ -644,6 +658,18 @@ impl<S: Group> Device<S> {
                         self.dirty_since = Some(now_ns);
                     }
                 }),
+                Std::BroadcastPeriod => write(
+                    &mut self.settings_version,
+                    &mut self.broadcast_period,
+                    args,
+                    &mut reply,
+                    &mut announcements(lanes),
+                )
+                .map(|changed| {
+                    if changed == Changed::Changed {
+                        self.dirty_since = Some(now_ns);
+                    }
+                }),
                 Std::Start => return actions.defer(pending, Deferred::Acquire(SyncRequest::Start)),
                 Std::Stop => return actions.defer(pending, Deferred::Acquire(SyncRequest::Stop)),
                 Std::Restart => {
@@ -773,6 +799,7 @@ impl<S: Group> Device<S> {
                 &mut self.autostart,
                 &mut self.loglevel,
                 &mut self.sync_delay,
+                &mut self.broadcast_period,
             ],
             image,
         );
@@ -800,11 +827,17 @@ impl<S: Group> Device<S> {
             autostart,
             loglevel,
             sync_delay,
+            broadcast_period,
             ..
         } = self;
         let mut outcome =
             conf::load([password as &mut dyn Persisted], image, |_, _| {}).and(conf::load(
-                [autostart as &mut dyn Persisted, loglevel, sync_delay],
+                [
+                    autostart as &mut dyn Persisted,
+                    loglevel,
+                    sync_delay,
+                    broadcast_period,
+                ],
                 image,
                 |name, reply| {
                     announce(
@@ -876,13 +909,15 @@ impl<S: Group> Device<S> {
         self.password.reset();
         self.autostart.reset();
         self.sync_delay.reset();
+        self.broadcast_period.reset();
         self.privileged = false;
         self.settings_version = 0;
         self.dirty_since = None;
         self.open(now_ns, streams, lanes);
     }
 
-    /// Open the session on control, a heartbeat ahead of the device record.
+    /// Open the session on control, a heartbeat ahead of the device record, and start the
+    /// carousel's pass over.
     fn open(
         &mut self,
         now_ns: u64,
@@ -894,17 +929,38 @@ impl<S: Group> Device<S> {
         send(&mut control, &[], |buf| {
             Metadata::Device(self.record(streams)).write(MetadataFlags::UPDATE, buf)
         });
+        self.carousel =
+            metadata::Carousel::new(now_ns, self.pass_ns(), self.record(streams), streams);
     }
 
-    /// Send whatever is due at `now_ns`, the reports that moved as
-    /// announcements and then a heartbeat, and hand back the configuration a
-    /// change left unsaved for a period, owed until [`Device::saved`].
-    pub fn tick(&mut self, now_ns: u64, lanes: &mut (impl Lanes + ?Sized)) -> Option<Entries> {
+    /// Nanoseconds the carousel takes for a pass, or zero for none.
+    fn pass_ns(&self) -> u64 {
+        u64::from(self.broadcast_period.get()) * NANOS_PER_MILLI
+    }
+
+    /// Send whatever is due at `now_ns`, the reports that moved as announcements, a heartbeat
+    /// and the carousel's records, and hand back the configuration a change left unsaved for a
+    /// period, owed until [`Device::saved`].
+    pub fn tick(
+        &mut self,
+        now_ns: u64,
+        streams: &(impl Streams + ?Sized),
+        lanes: &mut (impl Lanes + ?Sized),
+    ) -> Option<Entries> {
+        let mut control = announcements(lanes);
         if now_ns >= self.next_beat {
-            let mut control = announcements(lanes);
             self.refresh(now_ns, &mut control);
             self.beat(now_ns, &mut control);
         }
+        let mut carousel = self.carousel;
+        carousel.turn(
+            now_ns,
+            self.pass_ns(),
+            self.record(streams),
+            streams,
+            &mut |record, flags| send(&mut control, &[], |buf| record.write(flags, buf)),
+        );
+        self.carousel = carousel;
         if now_ns < self.dirty_since? + AUTOSAVE_INTERVAL {
             return None;
         }
@@ -929,7 +985,9 @@ impl<S: Group> Device<S> {
         let save = self
             .dirty_since
             .map_or(u64::MAX, |at| at + AUTOSAVE_INTERVAL);
-        self.next_beat.min(save)
+        self.next_beat
+            .min(save)
+            .min(self.carousel.deadline(self.pass_ns()))
     }
 
     /// Bring the reports up to date, announcing into `out` what moved.
@@ -1694,7 +1752,9 @@ mod tests {
         /// Drive the clock to `now_ns` and store what the device decided to
         /// save on its own account, as a platform whose flash took it does.
         fn tick(&mut self, now_ns: u64) -> Option<Entries> {
-            let image = self.device.tick(now_ns, &mut OneLane(Sent::default()))?;
+            let image =
+                self.device
+                    .tick(now_ns, &self.streams[..], &mut OneLane(Sent::default()))?;
             self.device.saved();
             Some(image)
         }
@@ -2068,6 +2128,55 @@ mod tests {
         assert_eq!(segment.sampling_rate, 10);
     }
 
+    /// Every port's control lane alone.
+    #[derive(Default)]
+    struct Control(Sent);
+
+    impl Lanes for Control {
+        fn reply(&mut self, _: &[u8]) {
+            panic!("no request was asked");
+        }
+
+        fn announce(&mut self, packet: &[u8]) {
+            self.0.send(packet);
+        }
+
+        fn event(&mut self, _: &[u8]) {
+            panic!("nothing was logged");
+        }
+    }
+
+    /// The carousel steps a pass of the device's and every stream's records, a stopped one too,
+    /// through every port's control lane in the pass time `dev.metadata.broadcast.period` names.
+    #[test]
+    fn the_carousel_describes_every_stream_on_control() {
+        let mut device = harness();
+        device.ask("dev.metadata.broadcast.period", &300u16.to_le_bytes());
+        let mut control = Control::default();
+        (1..=4).for_each(|tick| {
+            let now = BOOT + tick * 100 * NANOS_PER_MILLI;
+            device.device.tick(now, &device.streams[..], &mut control);
+        });
+        let records: Vec<_> = control
+            .0
+            .views()
+            .iter()
+            .filter(|view| view.header.ptype == PacketType::METADATA)
+            .map(|view| data::split_metadata(view.payload).unwrap())
+            .map(|(kind, flags, _)| (MetadataType::from(kind), flags))
+            .collect();
+        use MetadataType::*;
+        let periodic = MetadataFlags::PERIODIC;
+        assert_eq!(
+            records,
+            [
+                (Device, periodic),
+                (Stream, periodic),
+                (Column, periodic | MetadataFlags::LAST)
+            ]
+        );
+    }
+
     /// What a host learns the moment it connects, ending on the record that
     /// closes the sweep.
     #[test]
@@ -2123,12 +2232,20 @@ mod tests {
 
         assert!(device
             .device
-            .tick(BOOT + HEARTBEAT_INTERVAL / 2, &mut OneLane(&mut sent))
+            .tick(
+                BOOT + HEARTBEAT_INTERVAL / 2,
+                &device.streams[..],
+                &mut OneLane(&mut sent)
+            )
             .is_none());
         assert!(sent.0.is_empty());
         assert!(device
             .device
-            .tick(BOOT + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent))
+            .tick(
+                BOOT + HEARTBEAT_INTERVAL,
+                &device.streams[..],
+                &mut OneLane(&mut sent)
+            )
             .is_none());
         assert_eq!(sent.views()[0].header.ptype, PacketType::HEARTBEAT);
         assert_eq!(device.device.deadline(), BOOT + 2 * HEARTBEAT_INTERVAL);
@@ -2141,9 +2258,11 @@ mod tests {
         let mut device = harness();
         device.ask("board.first", &8u32.to_le_bytes());
         let mut sent = Sent::default();
-        device
-            .device
-            .tick(BOOT + HEARTBEAT_INTERVAL, &mut OneLane(&mut sent));
+        device.device.tick(
+            BOOT + HEARTBEAT_INTERVAL,
+            &device.streams[..],
+            &mut OneLane(&mut sent),
+        );
         assert_eq!(
             Heartbeat::parse(sent.views()[0].payload),
             Some(Heartbeat::Session {
@@ -2323,7 +2442,7 @@ mod tests {
         let device = harness();
         let names: Vec<&str> = device.table().iter().map(|spec| spec.name).collect();
         assert_eq!(names[0], "dev.metadata", "the standard table comes first");
-        assert_eq!(names[STANDARD.len() - 1], "dev.priv.password");
+        assert_eq!(names[STANDARD.len() - 1], "dev.metadata.broadcast.period");
         assert_eq!(&names[STANDARD.len()..], BOARD_NAMES);
     }
 
@@ -2450,9 +2569,11 @@ mod tests {
         }
 
         device.boot(rebooted, BOOT);
-        device
-            .device
-            .tick(BOOT + HEARTBEAT_INTERVAL, &mut device.lanes);
+        device.device.tick(
+            BOOT + HEARTBEAT_INTERVAL,
+            &device.streams[..],
+            &mut device.lanes,
+        );
         let control: Vec<PacketType> = device
             .lanes
             .to
@@ -2738,9 +2859,11 @@ mod tests {
         let mut device = harness();
         device.device.set_time_status(3);
         let mut sent = Sent::default();
-        device
-            .device
-            .tick(BOOT + NANOS_PER_HOUR, &mut OneLane(&mut sent));
+        device.device.tick(
+            BOOT + NANOS_PER_HOUR,
+            &device.streams[..],
+            &mut OneLane(&mut sent),
+        );
         assert_eq!(
             sent.announced(),
             [
@@ -2776,13 +2899,14 @@ mod tests {
                 b"dev.autostart",
                 b"dev.loglevel",
                 b"sync.delay",
+                b"dev.metadata.broadcast.period",
                 b"board.first",
                 b"board.second",
                 b"board.count"
             ],
             "every persistent cell, in table order"
         );
-        assert_eq!(stored[5].1, 42u32.to_le_bytes());
+        assert_eq!(stored[6].1, 42u32.to_le_bytes());
     }
 
     /// The boot restore: every stored value is taken, announced where every
@@ -2931,7 +3055,7 @@ mod tests {
             .map(|entry| entry.unwrap())
             .map(|entry| (entry.name, entry.value))
             .collect();
-        assert_eq!(stored[5], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
+        assert_eq!(stored[6], (&b"board.second"[..], &42u32.to_le_bytes()[..]));
         assert!(
             device.tick(BOOT + 3 * AUTOSAVE_INTERVAL).is_none(),
             "one save, not a save every period"
@@ -3029,20 +3153,23 @@ mod tests {
         let mut sent = Sent::default();
         let due = BOOT + AUTOSAVE_INTERVAL;
         assert!(
-            device.device.tick(due, &mut OneLane(&mut sent)).is_some(),
+            device
+                .device
+                .tick(due, &device.streams[..], &mut OneLane(&mut sent))
+                .is_some(),
             "the save"
         );
         assert!(
             device
                 .device
-                .tick(due + 1, &mut OneLane(&mut sent))
+                .tick(due + 1, &device.streams[..], &mut OneLane(&mut sent))
                 .is_some(),
             "still owed"
         );
         device.device.saved();
         assert!(device
             .device
-            .tick(due + 2, &mut OneLane(&mut sent))
+            .tick(due + 2, &device.streams[..], &mut OneLane(&mut sent))
             .is_none());
     }
 
@@ -3074,12 +3201,16 @@ mod tests {
         let mut sent = Sent::default();
         assert!(
             device
-                .tick(BOOT + AUTOSAVE_INTERVAL, &mut OneLane(&mut sent))
+                .tick(BOOT + AUTOSAVE_INTERVAL, &none[..], &mut OneLane(&mut sent))
                 .is_none(),
             "the image has no room for them"
         );
         assert!(device
-            .tick(BOOT + 2 * AUTOSAVE_INTERVAL - 1, &mut OneLane(&mut sent))
+            .tick(
+                BOOT + 2 * AUTOSAVE_INTERVAL - 1,
+                &none[..],
+                &mut OneLane(&mut sent)
+            )
             .is_none());
         assert_eq!(
             device.deadline(),
